@@ -10043,8 +10043,13 @@ dependencies = [
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
 dependencies = [
+ "arrow-arith 58.3.0",
+ "arrow-array 58.3.0",
+ "arrow-ord 58.3.0",
+ "codspeed-divan-compat",
  "num-traits",
  "prost 0.14.4",
+ "rand 0.10.2",
  "rstest",
  "vortex-array",
  "vortex-buffer",
