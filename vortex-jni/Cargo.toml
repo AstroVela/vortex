@@ -38,6 +38,7 @@ vortex-object-store-opendal = { path = "../vortex-object-store-opendal", optiona
 vortex-parquet-variant = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
 jni = { workspace = true, features = ["invocation"] }
 
 [features]
@@ -46,7 +47,11 @@ jni = { workspace = true, features = ["invocation"] }
 opendal = ["dep:vortex-object-store-opendal"]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bench]]
+name = "read_boundary"
+harness = false
 
 [lints]
 workspace = true
