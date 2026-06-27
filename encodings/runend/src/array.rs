@@ -27,7 +27,6 @@ use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-use vortex_array::legacy_session;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::smallvec::smallvec;
 use vortex_array::validity::Validity;
@@ -85,12 +84,11 @@ impl VTable for RunEnd {
         *ID
     }
 
-    #[allow(clippy::disallowed_methods)]
     fn validate(
         &self,
         data: &Self::TypedArrayData,
         dtype: &DType,
-        len: usize,
+        _len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         let ends = slots[ENDS_SLOT]
@@ -99,9 +97,12 @@ impl VTable for RunEnd {
         let values = slots[VALUES_SLOT]
             .as_ref()
             .vortex_expect("RunEndArray values slot");
-        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
-        let mut ctx = legacy_session().create_execution_ctx();
-        RunEndData::validate_parts(ends, values, data.offset, len, &mut ctx)?;
+        // `VTable::validate` runs inside `try_from_parts`, which has no session, so it performs
+        // only the ctx-free structural checks. The value-level run-end bound checks need to read
+        // scalars out of the possibly-encoded `ends` child (and therefore an `ExecutionCtx`); they
+        // run at construction time in `RunEnd::try_new*` and `RunEnd::deserialize`, where a real
+        // session is available.
+        RunEndData::validate_structure(ends, values, data.offset)?;
         vortex_ensure!(
             values.dtype() == dtype,
             "expected dtype {}, got {}",
@@ -153,7 +154,7 @@ impl VTable for RunEnd {
         metadata: &[u8],
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = RunEndMetadata::decode(metadata)?;
         let ends_dtype = DType::Primitive(metadata.ends_ptype(), Nullability::NonNullable);
@@ -162,6 +163,10 @@ impl VTable for RunEnd {
 
         let values = children.get(1, dtype, runs)?;
         let offset = usize::try_from(metadata.offset).vortex_expect("Offset must be a valid usize");
+        // Run the value-level validation here, where a real session (and thus `ExecutionCtx`) is
+        // available, instead of relying on the global legacy session inside `VTable::validate`.
+        let mut ctx = session.create_execution_ctx();
+        RunEndData::validate_parts(&ends, &values, offset, len, &mut ctx)?;
         let slots = smallvec![Some(ends), Some(values)];
         let data = RunEndData::new(offset);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
@@ -272,10 +277,9 @@ impl RunEnd {
     ) -> VortexResult<RunEndArray> {
         let len = RunEndData::logical_len_from_ends(&ends, ctx)?;
         RunEndData::validate_parts(&ends, &values, 0, len, ctx)?;
-        let dtype = values.dtype().clone();
-        let slots = smallvec![Some(ends), Some(values)];
-        let data = RunEndData::new(0);
-        Array::try_from_parts(ArrayParts::new(RunEnd, dtype, len, data).with_slots(slots))
+        // SAFETY: `validate_parts` checked every invariant above, so we skip the structural
+        // re-validation that `try_from_parts` would otherwise run.
+        Ok(unsafe { RunEnd::new_unchecked(ends, values, 0, len) })
     }
 
     /// Build a new [`RunEndArray`] from ends, values, offset, and length.
@@ -287,10 +291,9 @@ impl RunEnd {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<RunEndArray> {
         RunEndData::validate_parts(&ends, &values, offset, length, ctx)?;
-        let dtype = values.dtype().clone();
-        let slots = smallvec![Some(ends), Some(values)];
-        let data = RunEndData::new(offset);
-        Array::try_from_parts(ArrayParts::new(RunEnd, dtype, length, data).with_slots(slots))
+        // SAFETY: `validate_parts` checked every invariant above, so we skip the structural
+        // re-validation that `try_from_parts` would otherwise run.
+        Ok(unsafe { RunEnd::new_unchecked(ends, values, offset, length) })
     }
 
     /// Build a new [`RunEndArray`] from ends and values (panics on invalid input).
@@ -323,6 +326,9 @@ impl RunEndData {
         }
     }
 
+    /// Validate every invariant, including the value-level run-end bounds that require an
+    /// [`ExecutionCtx`]. Used by the construction and deserialization paths, where a real session
+    /// is available.
     pub(crate) fn validate_parts(
         ends: &ArrayRef,
         values: &ArrayRef,
@@ -330,30 +336,10 @@ impl RunEndData {
         length: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        // DType validation
-        vortex_ensure!(
-            ends.dtype().is_unsigned_int(),
-            "run ends must be unsigned integers, was {}",
-            ends.dtype(),
-        );
-        vortex_ensure!(
-            ends.len() == values.len(),
-            "run ends len != run values len, {} != {}",
-            ends.len(),
-            values.len()
-        );
+        Self::validate_structure(ends, values, offset)?;
 
-        // Handle empty run-ends
-        if ends.is_empty() {
-            vortex_ensure!(
-                offset == 0,
-                "non-zero offset provided for empty RunEndArray"
-            );
-            return Ok(());
-        }
-
-        // Zero-length logical slices may retain run metadata from the source array.
-        if length == 0 {
+        // Empty run-ends and zero-length logical slices carry no run-end values to check.
+        if ends.is_empty() || length == 0 {
             return Ok(());
         }
 
@@ -390,6 +376,33 @@ impl RunEndData {
         let min_required_end = offset + length;
         if last_run_end < min_required_end {
             vortex_bail!("Last run end {last_run_end} must be >= offset+length {min_required_end}");
+        }
+
+        Ok(())
+    }
+
+    /// Validate the ctx-free structural invariants (dtypes, matching run/value lengths, and the
+    /// empty-array offset). These checks read no element values, so they need no [`ExecutionCtx`]
+    /// and run on every construction path via `VTable::validate`.
+    fn validate_structure(ends: &ArrayRef, values: &ArrayRef, offset: usize) -> VortexResult<()> {
+        vortex_ensure!(
+            ends.dtype().is_unsigned_int(),
+            "run ends must be unsigned integers, was {}",
+            ends.dtype(),
+        );
+        vortex_ensure!(
+            ends.len() == values.len(),
+            "run ends len != run values len, {} != {}",
+            ends.len(),
+            values.len()
+        );
+
+        // An empty run-end array cannot carry a non-zero offset.
+        if ends.is_empty() {
+            vortex_ensure!(
+                offset == 0,
+                "non-zero offset provided for empty RunEndArray"
+            );
         }
 
         Ok(())
