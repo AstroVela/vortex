@@ -13,6 +13,7 @@ use crate::LayoutEncoding;
 use crate::LayoutEncodingRef;
 use crate::layouts::chunked::Chunked;
 use crate::layouts::dict::Dict;
+use crate::layouts::fixed_size_list::FixedSizeList;
 use crate::layouts::flat::Flat;
 use crate::layouts::list::List;
 use crate::layouts::struct_::Struct;
@@ -56,6 +57,7 @@ impl Default for LayoutSession {
 
         // Register the built-in layout encodings.
         this.register(&Chunked as &dyn LayoutEncoding);
+        this.register(&FixedSizeList as &dyn LayoutEncoding);
         this.register(&Flat as &dyn LayoutEncoding);
         this.register(&Struct as &dyn LayoutEncoding);
         this.register(&Zoned as &dyn LayoutEncoding);
