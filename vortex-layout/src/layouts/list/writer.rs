@@ -69,7 +69,7 @@ pub struct ListLayoutStrategy {
 ///
 /// Small enough that the sample vector is a negligible addition to the resident layout tree, yet
 /// fine-grained enough to bound a random-access elements read tightly. Lists shorter than
-/// `2 * stride` are not sampled at all (see [`sample_offsets`]).
+/// `2 * stride` rows are not sampled at all, in which case readers take the sequential path.
 pub const DEFAULT_OFFSET_SAMPLE_STRIDE: u32 = 1024;
 
 impl Default for ListLayoutStrategy {

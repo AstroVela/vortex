@@ -232,7 +232,8 @@ impl ListReader {
     /// Bracket the elements range for `row_range` from the resident offset-sample index, *without*
     /// fetching `offsets` first. The returned range is guaranteed to contain the exact elements
     /// range for `row_range`, so the caller can start the elements fetch in parallel with the
-    /// offsets fetch and trim to the exact range once offsets resolve (see [`Self::project_full_range`]).
+    /// offsets fetch and trim to the exact range once offsets resolve (see
+    /// [`ElementsProjection::project_full_range`]).
     ///
     /// Returns `None` when the index is unusable (sampling disabled, or fewer than two samples), in
     /// which case the caller falls back to fetching offsets before elements.
