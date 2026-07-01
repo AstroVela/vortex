@@ -70,7 +70,11 @@ impl VTable for List {
     }
 
     fn metadata(layout: &Self::Layout) -> Self::Metadata {
-        ProstMetadata(ListLayoutMetadata::new(layout.offsets_ptype()))
+        ProstMetadata(ListLayoutMetadata::new(
+            layout.offsets_ptype(),
+            layout.sample_stride(),
+            layout.offset_samples().to_vec(),
+        ))
     }
 
     fn segment_ids(_layout: &Self::Layout) -> Vec<SegmentId> {
@@ -143,12 +147,14 @@ impl VTable for List {
             .then(|| children.child(VALIDITY_CHILD_INDEX, &DType::Bool(Nullability::NonNullable)))
             .transpose()?;
 
-        Ok(ListLayout {
-            dtype: dtype.clone(),
+        Ok(ListLayout::new_with_samples(
+            dtype.clone(),
             elements,
             offsets,
             validity,
-        })
+            metadata.sample_stride,
+            Arc::from(metadata.offset_samples.as_slice()),
+        ))
     }
 
     fn with_children(layout: &mut Self::Layout, children: Vec<LayoutRef>) -> VortexResult<()> {
@@ -195,10 +201,17 @@ pub struct ListLayout {
     elements: LayoutRef,
     offsets: LayoutRef,
     validity: Option<LayoutRef>,
+    /// Distance, in rows, between adjacent offset samples. `0` means no samples are stored.
+    sample_stride: u32,
+    /// `offset_samples[k]` equals `offsets[k * sample_stride]`, always promoted to `u64`. Lets a
+    /// reader bracket the elements range for a row window from resident metadata, so the elements
+    /// fetch runs in parallel with the offsets fetch instead of waiting on it. Empty when sampling
+    /// is disabled or the list is too small to be worth indexing.
+    offset_samples: Arc<[u64]>,
 }
 
 impl ListLayout {
-    /// Construct a new `ListLayout` from its components.
+    /// Construct a new `ListLayout` from its components, without an offset-sample index.
     ///
     /// # Invariants
     ///
@@ -213,11 +226,28 @@ impl ListLayout {
         offsets: LayoutRef,
         validity: Option<LayoutRef>,
     ) -> Self {
+        Self::new_with_samples(dtype, elements, offsets, validity, 0, Arc::from([]))
+    }
+
+    /// Like [`Self::new`] but carrying a pre-computed offset-sample index.
+    ///
+    /// `sample_stride` is the row distance between adjacent samples; pass `0` (and an empty slice)
+    /// to disable sampling. When enabled, `offset_samples[k]` must equal `offsets[k * sample_stride]`.
+    pub fn new_with_samples(
+        dtype: DType,
+        elements: LayoutRef,
+        offsets: LayoutRef,
+        validity: Option<LayoutRef>,
+        sample_stride: u32,
+        offset_samples: Arc<[u64]>,
+    ) -> Self {
         Self {
             dtype,
             elements,
             offsets,
             validity,
+            sample_stride,
+            offset_samples,
         }
     }
 
@@ -254,18 +284,41 @@ impl ListLayout {
             .as_list_element_opt()
             .vortex_expect("ListLayout dtype must be a List")
     }
+
+    /// Row distance between adjacent offset samples, or `0` when sampling is disabled.
+    #[inline]
+    pub fn sample_stride(&self) -> u32 {
+        self.sample_stride
+    }
+
+    /// Cached offset samples. The `k`-th entry equals `offsets[k * sample_stride]`.
+    #[inline]
+    pub fn offset_samples(&self) -> &[u64] {
+        &self.offset_samples
+    }
 }
 
 #[derive(prost::Message)]
 pub struct ListLayoutMetadata {
     #[prost(enumeration = "PType", tag = "1")]
     offsets_ptype: i32,
+    /// Row distance between offset samples. `0` indicates samples are not present, in which case
+    /// readers fall back to fetching offsets before elements.
+    #[prost(uint32, tag = "2")]
+    pub sample_stride: u32,
+    /// `offset_samples[k]` is the value of the underlying `offsets` array at position
+    /// `k * sample_stride`, always promoted to `u64` regardless of the offset `PType` so the
+    /// reader can treat samples uniformly.
+    #[prost(uint64, repeated, tag = "3")]
+    pub offset_samples: Vec<u64>,
 }
 
 impl ListLayoutMetadata {
-    pub fn new(offsets_ptype: PType) -> Self {
+    pub fn new(offsets_ptype: PType, sample_stride: u32, offset_samples: Vec<u64>) -> Self {
         let mut metadata = Self::default();
         metadata.set_offsets_ptype(offsets_ptype);
+        metadata.sample_stride = sample_stride;
+        metadata.offset_samples = offset_samples;
         metadata
     }
 }

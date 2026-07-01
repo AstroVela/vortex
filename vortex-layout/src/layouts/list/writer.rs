@@ -13,9 +13,11 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::List;
 use vortex_array::arrays::ListView;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::list::ListDataParts;
 use vortex_array::arrays::listview::list_from_list_view;
 use vortex_array::dtype::DType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::matcher::Matcher;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -60,11 +62,20 @@ pub struct ListLayoutStrategy {
     offsets: Arc<dyn LayoutStrategy>,
     validity: Arc<dyn LayoutStrategy>,
     fallback: Arc<dyn LayoutStrategy>,
+    sample_stride: u32,
 }
+
+/// Default row distance between offset samples written into [`ListLayout`] metadata.
+///
+/// Small enough that the sample vector is a negligible addition to the resident layout tree, yet
+/// fine-grained enough to bound a random-access elements read tightly. Lists shorter than
+/// `2 * stride` are not sampled at all (see [`sample_offsets`]).
+pub const DEFAULT_OFFSET_SAMPLE_STRIDE: u32 = 1024;
 
 impl Default for ListLayoutStrategy {
     /// Routes every child (elements, offsets, validity) and the non-list fallback through
-    /// [`FlatLayoutStrategy`]. Override individual children with the `with_*` builder methods.
+    /// [`FlatLayoutStrategy`], and samples offsets at [`DEFAULT_OFFSET_SAMPLE_STRIDE`]. Override
+    /// individual children with the `with_*` builder methods.
     fn default() -> Self {
         let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
         Self {
@@ -72,11 +83,19 @@ impl Default for ListLayoutStrategy {
             offsets: Arc::clone(&flat),
             validity: Arc::clone(&flat),
             fallback: flat,
+            sample_stride: DEFAULT_OFFSET_SAMPLE_STRIDE,
         }
     }
 }
 
 impl ListLayoutStrategy {
+    /// Override the offset-sample stride written into layout metadata. Pass `0` to disable
+    /// sampling entirely, in which case readers fetch offsets before elements.
+    pub fn with_sample_stride(mut self, sample_stride: u32) -> Self {
+        self.sample_stride = sample_stride;
+        self
+    }
+
     /// Strategy for the `elements` child.
     pub fn with_elements(mut self, elements: Arc<dyn LayoutStrategy>) -> Self {
         self.elements = elements;
@@ -146,6 +165,13 @@ impl LayoutStrategy for ListLayoutStrategy {
             })
             .transpose()?;
 
+        // Materialize offsets once so we can both sample them for the resident index and hand a
+        // canonical primitive array to the child writer (the offsets strategy may recompress).
+        let offsets_primitive = offsets.execute::<PrimitiveArray>(&mut exec_ctx)?;
+        let (sample_stride, offset_samples) =
+            sample_offsets(&offsets_primitive, self.sample_stride);
+        let offsets = offsets_primitive.into_array();
+
         // Spawn each child write onto the runtime so they run concurrently
         let handle = session.handle();
         let (elements_task, offsets_task, validity_task) = {
@@ -183,7 +209,15 @@ impl LayoutStrategy for ListLayoutStrategy {
                 }
             },)?;
 
-        Ok(ListLayout::new(dtype, elements_layout, offsets_layout, validity_layout).into_layout())
+        Ok(ListLayout::new_with_samples(
+            dtype,
+            elements_layout,
+            offsets_layout,
+            validity_layout,
+            sample_stride,
+            offset_samples,
+        )
+        .into_layout())
     }
 
     fn buffered_bytes(&self) -> u64 {
@@ -210,6 +244,43 @@ fn canonicalize_to_list_parts(
     } else {
         unreachable!("AnyList matcher guarantees List or ListView")
     }
+}
+
+/// Sample `offsets[0], offsets[stride], offsets[2*stride], ...` (all promoted to `u64`) so the
+/// reader can derive a bracketing elements range from resident metadata without first
+/// materializing every offset.
+///
+/// Returns `(0, [])` when sampling is disabled (`stride == 0`) or when the list is too short to be
+/// worth indexing — concretely, when a full stride does not fit past the start of the offsets
+/// buffer, so fewer than two samples would exist. The `0` stride tells the reader to fall back to
+/// the sequential path.
+fn sample_offsets(offsets: &PrimitiveArray, stride: u32) -> (u32, Arc<[u64]>) {
+    let empty = (0u32, Arc::<[u64]>::from([]));
+    if stride == 0 {
+        return empty;
+    }
+    let stride_us = stride as usize;
+    let n = offsets.len();
+    // Need at least one stride past the start so we can bracket *some* row range.
+    if n <= stride_us {
+        return empty;
+    }
+
+    let n_samples = (n - 1) / stride_us + 1;
+    let mut samples = Vec::<u64>::with_capacity(n_samples);
+    // List offsets are validated non-negative upstream (see `ListArray::validate`), so a primitive
+    // `as u64` cast is safe for both signed and unsigned offset ptypes. The cast is a no-op when
+    // `T == u64`; the lint for that arm is allowed below.
+    match_each_integer_ptype!(offsets.ptype(), |T| {
+        let slice = offsets.as_slice::<T>();
+        let mut i = 0usize;
+        while i < n {
+            #[allow(clippy::unnecessary_cast)]
+            samples.push(slice[i] as u64);
+            i += stride_us;
+        }
+    });
+    (stride, Arc::from(samples))
 }
 
 /// Wrap a single array as a one-shot [`SendableSequentialStream`] for handoff to a child writer.
@@ -267,6 +338,44 @@ mod tests {
 
     fn flat_list_strategy() -> ListLayoutStrategy {
         ListLayoutStrategy::default()
+    }
+
+    /// offsets `[0, 2, 5, 5, 8, 10]` sampled at stride 2 yields `offsets[0], offsets[2], offsets[4]`.
+    #[test]
+    fn sample_offsets_indexes_large_list() {
+        let offsets =
+            PrimitiveArray::new::<u32>(buffer![0u32, 2, 5, 5, 8, 10], Validity::NonNullable);
+        let (stride, samples) = sample_offsets(&offsets, 2);
+        assert_eq!(stride, 2);
+        assert_eq!(&*samples, &[0u64, 5, 8]);
+    }
+
+    /// A list too short for a full stride past the start is not sampled (reader falls back).
+    #[test]
+    fn sample_offsets_skips_short_list() {
+        let offsets = PrimitiveArray::new::<u32>(buffer![0u32, 2, 5], Validity::NonNullable);
+        let (stride, samples) = sample_offsets(&offsets, 4);
+        assert_eq!(stride, 0);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn sample_offsets_disabled_when_stride_zero() {
+        let offsets =
+            PrimitiveArray::new::<u32>(buffer![0u32, 2, 5, 5, 8, 10], Validity::NonNullable);
+        let (stride, samples) = sample_offsets(&offsets, 0);
+        assert_eq!(stride, 0);
+        assert!(samples.is_empty());
+    }
+
+    /// Signed offsets promote to `u64` identically (offsets are validated non-negative upstream).
+    #[test]
+    fn sample_offsets_promotes_signed_to_u64() {
+        let offsets =
+            PrimitiveArray::new::<i64>(buffer![0i64, 3, 7, 7, 12, 20], Validity::NonNullable);
+        let (stride, samples) = sample_offsets(&offsets, 2);
+        assert_eq!(stride, 2);
+        assert_eq!(&*samples, &[0u64, 7, 12]);
     }
 
     async fn write<S: LayoutStrategy>(strategy: &S, array: ArrayRef) -> VortexResult<LayoutRef> {

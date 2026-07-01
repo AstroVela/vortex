@@ -228,6 +228,48 @@ impl ListReader {
             MaskFuture::new_true(offsets_count),
         )
     }
+
+    /// Bracket the elements range for `row_range` from the resident offset-sample index, *without*
+    /// fetching `offsets` first. The returned range is guaranteed to contain the exact elements
+    /// range for `row_range`, so the caller can start the elements fetch in parallel with the
+    /// offsets fetch and trim to the exact range once offsets resolve (see [`Self::project_full_range`]).
+    ///
+    /// Returns `None` when the index is unusable (sampling disabled, or fewer than two samples), in
+    /// which case the caller falls back to fetching offsets before elements.
+    fn bracket_elements_range(&self, row_range: &Range<u64>) -> Option<Range<u64>> {
+        let stride = self.layout.sample_stride();
+        if stride == 0 {
+            return None;
+        }
+        let samples = self.layout.offset_samples();
+        // A single sample only pins the lower end; we need a second one to bound the upper end.
+        if samples.len() < 2 {
+            return None;
+        }
+        let stride = u64::from(stride);
+        let n = samples.len();
+
+        // Lower bracket: sample at the greatest stride multiple `<= row_range.start`. `samples` is
+        // monotonic non-decreasing, so `samples[k_lo] <= offsets[row_range.start]`. Clamp for the
+        // degenerate case of a range starting past the last sampled row.
+        let k_lo = usize::try_from(row_range.start / stride)
+            .vortex_expect("sample index fits in usize")
+            .min(n - 1);
+        let bracket_start = samples[k_lo];
+
+        // Upper bracket: sample at the least stride multiple `>= row_range.end`. When the range
+        // ends inside the final partial stride there is no such sample, so bound the read by the
+        // total element count — still a superset of the exact range, just wider.
+        let k_hi = usize::try_from(row_range.end.div_ceil(stride))
+            .vortex_expect("sample index fits in usize");
+        let bracket_end = if k_hi < n {
+            samples[k_hi]
+        } else {
+            self.elements.row_count()
+        };
+
+        Some(bracket_start..bracket_end)
+    }
 }
 
 /// Read `offsets[0]` and `offsets[-1]` and return the elements-buffer range they describe.
@@ -601,9 +643,13 @@ impl ElementsProjection {
         )
     }
 
-    /// Partial range with an all-true mask. The elements bound is
-    /// `offsets[a]..offsets[b]`, so we await offsets before firing the elements read and rebase the
-    /// offsets to start at zero.
+    /// Partial range with an all-true mask. The exact elements bound is `offsets[a]..offsets[b]`.
+    ///
+    /// When the resident offset-sample index can bracket the window (see
+    /// [`ListReader::bracket_elements_range`]), we fire a widened elements read immediately so it
+    /// overlaps the offsets fetch already in flight, then trim it to the exact range once offsets
+    /// resolve — turning the offsets→elements serial dependency into a single round-trip. Without a
+    /// usable index we fall back to awaiting offsets first and firing the exact elements read after.
     async fn project_full_range(self) -> VortexResult<ArrayRef> {
         let Self {
             reader,
@@ -611,23 +657,52 @@ impl ElementsProjection {
             row_range,
             offsets,
         } = self;
-        let offsets = offsets.await?;
-        let elements_range = calculate_elements_range(&offsets, &reader.session)?;
-        let rebased_offsets = rebase_offsets(offsets, elements_range.start)?;
-        let elements_len = elements_range.end - elements_range.start;
         let validity_row_count = usize::try_from(row_range.end - row_range.start)?;
 
-        let elements_fut = reader.elements.projection_evaluation(
-            &elements_range,
-            &root(),
-            MaskFuture::new_true(usize::try_from(elements_len)?),
-        )?;
+        let bracket = reader.bracket_elements_range(&row_range);
+        let bracketed_elements_fut = bracket
+            .as_ref()
+            .map(|b| -> VortexResult<ArrayFuture> {
+                let len = usize::try_from(b.end - b.start)?;
+                reader
+                    .elements
+                    .projection_evaluation(b, &root(), MaskFuture::new_true(len))
+            })
+            .transpose()?;
+
         let validity_fut = fetch_validity(
             reader.validity.as_ref(),
             &row_range,
             MaskFuture::new_true(validity_row_count),
         )?;
-        let (elements, validity) = try_join!(elements_fut, validity_fut)?;
+
+        let offsets = offsets.await?;
+        let elements_range = calculate_elements_range(&offsets, &reader.session)?;
+        let rebased_offsets = rebase_offsets(offsets, elements_range.start)?;
+
+        let (elements, validity) = match (bracketed_elements_fut, bracket) {
+            (Some(fut), Some(bracket)) => {
+                let (bracketed, validity) = try_join!(fut, validity_fut)?;
+                // The bracket is guaranteed to contain `elements_range`, so this slice is in-bounds.
+                let lo = usize::try_from(elements_range.start - bracket.start)?;
+                let hi = usize::try_from(elements_range.end - bracket.start)?;
+                let elements = if lo == 0 && hi == bracketed.len() {
+                    bracketed
+                } else {
+                    bracketed.slice(lo..hi)?
+                };
+                (elements, validity)
+            }
+            _ => {
+                let elements_len = elements_range.end - elements_range.start;
+                let elements_fut = reader.elements.projection_evaluation(
+                    &elements_range,
+                    &root(),
+                    MaskFuture::new_true(usize::try_from(elements_len)?),
+                )?;
+                try_join!(elements_fut, validity_fut)?
+            }
+        };
         build_list(
             ListParts {
                 elements,
@@ -894,6 +969,12 @@ mod tests {
 
     fn flat_list_strategy() -> ListLayoutStrategy {
         ListLayoutStrategy::default()
+    }
+
+    /// A list strategy that samples offsets at `stride`, so partial-range reads exercise the
+    /// bracketed elements path in [`ElementsProjection::project_full_range`].
+    fn list_strategy_with_stride(stride: u32) -> ListLayoutStrategy {
+        ListLayoutStrategy::default().with_sample_stride(stride)
     }
 
     fn layout_test_session() -> VortexSession {
@@ -1238,6 +1319,64 @@ mod tests {
             .await?;
 
         let expected = list.filter(mask)?;
+        let mut exec_ctx = session.create_execution_ctx();
+        assert_arrays_eq!(result, expected, &mut exec_ctx);
+        Ok(())
+    }
+
+    /// The resident offset-sample index brackets a row window without fetching offsets. For the
+    /// wider list (offsets `[0,2,5,5,8,10]`) sampled at stride 2 the samples are `[0, 5, 8]`.
+    #[tokio::test]
+    async fn bracket_elements_range_uses_samples() -> VortexResult<()> {
+        let list = create_wider_list_array(false);
+        let ctx = LayoutReaderContext::new();
+        let (segments, layout, session) = write_layout(&list_strategy_with_stride(2), list).await?;
+        let reader = layout.new_reader("".into(), segments, &session, &ctx)?;
+        let reader = reader
+            .as_any()
+            .downcast_ref::<ListReader>()
+            .expect("ListReader");
+
+        assert_eq!(reader.layout.sample_stride(), 2);
+        assert_eq!(reader.layout.offset_samples(), &[0u64, 5, 8]);
+
+        // `1..3`: k_lo = 1/2 = 0 -> samples[0] = 0; k_hi = ceil(3/2) = 2 -> samples[2] = 8.
+        // The exact range `offsets[1..3] = 2..5` is contained in the bracket.
+        assert_eq!(reader.bracket_elements_range(&(1..3)), Some(0..8));
+        // `3..5` ends in the final partial stride (no sample >= row 5), so the upper bound falls
+        // back to the total element count (10). Exact range `offsets[3..5] = 5..10` is contained.
+        assert_eq!(reader.bracket_elements_range(&(3..5)), Some(5..10));
+        Ok(())
+    }
+
+    /// A partial-range read through the bracketed path must produce the exact same array as a
+    /// direct slice — proving the widen-then-trim logic is correct across both bracket branches
+    /// and for nullable lists.
+    #[rstest]
+    #[case::within(1..3, false)]
+    #[case::within_nullable(1..3, true)]
+    #[case::tail(3..5, false)]
+    #[case::tail_nullable(3..5, true)]
+    #[case::single_middle(2..3, false)]
+    #[case::spans_empty_row(1..4, false)]
+    #[tokio::test]
+    async fn projection_bracketed_round_trips(
+        #[case] row_range: Range<u64>,
+        #[case] nullable: bool,
+    ) -> VortexResult<()> {
+        let list = create_wider_list_array(nullable);
+        let ctx = LayoutReaderContext::new();
+        let len = usize::try_from(row_range.end - row_range.start)?;
+        let (segments, layout, session) =
+            write_layout(&list_strategy_with_stride(2), list.clone()).await?;
+        let reader = layout.new_reader("".into(), segments, &session, &ctx)?;
+
+        let result = reader
+            .projection_evaluation(&row_range, &root(), MaskFuture::new_true(len))?
+            .await?;
+
+        let expected =
+            list.slice(usize::try_from(row_range.start)?..usize::try_from(row_range.end)?)?;
         let mut exec_ctx = session.create_execution_ctx();
         assert_arrays_eq!(result, expected, &mut exec_ctx);
         Ok(())
