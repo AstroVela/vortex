@@ -54,12 +54,18 @@ vortex-session = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }
 
 [dev-dependencies]
+divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 insta = { workspace = true }
+rand = { workspace = true }
 rstest = { workspace = true }
 temp-env = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
+vortex-alp = { workspace = true }
 vortex-array = { path = "../vortex-array", features = ["_test-harness"] }
+vortex-fastlanes = { workspace = true }
+vortex-fsst = { workspace = true }
 vortex-io = { path = "../vortex-io", features = ["tokio"] }
 
 [features]
@@ -68,6 +74,11 @@ tokio = ["dep:tokio", "vortex-error/tokio"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "list_vs_flat"
+harness = false
+test = false
 
 [package.metadata.cargo-machete]
 ignored = ["uuid"]
