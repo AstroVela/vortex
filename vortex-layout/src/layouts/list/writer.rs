@@ -13,10 +13,13 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::List;
 use vortex_array::arrays::ListView;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::list::ListDataParts;
 use vortex_array::arrays::listview::list_from_list_view;
 use vortex_array::dtype::DType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::matcher::Matcher;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_io::session::RuntimeSessionExt;
@@ -25,6 +28,7 @@ use vortex_session::VortexSession;
 use crate::IntoLayout;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
+use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
 use crate::layouts::flat::writer::FlatLayoutStrategy;
 use crate::layouts::list::ListLayout;
 use crate::segments::SegmentSinkRef;
@@ -60,11 +64,18 @@ pub struct ListLayoutStrategy {
     offsets: Arc<dyn LayoutStrategy>,
     validity: Arc<dyn LayoutStrategy>,
     fallback: Arc<dyn LayoutStrategy>,
+    /// When set, the flattened `elements` are split into chunks of approximately this many element
+    /// rows — cutting only on list boundaries, so no single list straddles two chunks — and written
+    /// through a [`ChunkedLayoutStrategy`]. A selective read then fetches only the element chunks
+    /// its rows reference instead of the whole elements buffer. `None` writes the elements as a
+    /// single (unchunked) layout.
+    element_chunk_len: Option<usize>,
 }
 
 impl Default for ListLayoutStrategy {
     /// Routes every child (elements, offsets, validity) and the non-list fallback through
-    /// [`FlatLayoutStrategy`]. Override individual children with the `with_*` builder methods.
+    /// [`FlatLayoutStrategy`], and does not chunk the elements. Override individual children with
+    /// the `with_*` builder methods.
     fn default() -> Self {
         let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
         Self {
@@ -72,6 +83,7 @@ impl Default for ListLayoutStrategy {
             offsets: Arc::clone(&flat),
             validity: Arc::clone(&flat),
             fallback: flat,
+            element_chunk_len: None,
         }
     }
 }
@@ -81,6 +93,39 @@ impl ListLayoutStrategy {
     pub fn with_elements(mut self, elements: Arc<dyn LayoutStrategy>) -> Self {
         self.elements = elements;
         self
+    }
+
+    /// Chunk the flattened `elements` into blocks of approximately `len` element rows, cutting only
+    /// on list boundaries so no single list straddles two chunks, and write them through a
+    /// [`ChunkedLayoutStrategy`] wrapping the configured elements strategy. This makes selective and
+    /// range reads fetch only the element chunks they reference. Pass a large `len` (or leave unset)
+    /// to keep the elements as a single layout.
+    pub fn with_element_chunk_len(mut self, len: usize) -> Self {
+        self.element_chunk_len = Some(len);
+        self
+    }
+
+    /// Split the flattened `elements` into list-aligned chunks (see [`list_aligned_boundaries`]),
+    /// returning `None` when chunking is disabled or would produce a single chunk (in which case
+    /// the elements are written as one layout).
+    fn split_elements_into_chunks(
+        &self,
+        elements: &ArrayRef,
+        offsets: &ArrayRef,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Vec<ArrayRef>>> {
+        let Some(target) = self.element_chunk_len else {
+            return Ok(None);
+        };
+        if target == 0 || offsets.len() <= 1 {
+            return Ok(None);
+        }
+        let offsets_primitive = offsets.clone().execute::<PrimitiveArray>(exec_ctx)?;
+        let boundaries = list_aligned_boundaries(&offsets_primitive, target);
+        if boundaries.len() <= 2 {
+            return Ok(None);
+        }
+        Ok(Some(slice_elements(elements, &boundaries)?))
     }
 
     /// Strategy for the `offsets` child.
@@ -146,28 +191,62 @@ impl LayoutStrategy for ListLayoutStrategy {
             })
             .transpose()?;
 
-        // Spawn each child write onto the runtime so they run concurrently
+        // Split the flattened elements into list-aligned chunks when chunking is enabled, so a
+        // selective read touches only the element chunks its rows reference and no list straddles a
+        // chunk boundary. `None` keeps the elements as a single layout.
+        let element_chunks = self.split_elements_into_chunks(&elements, &offsets, &mut exec_ctx)?;
+
+        // Spawn each child write onto the runtime so they run concurrently.
         let handle = session.handle();
-        let (elements_task, offsets_task, validity_task) = {
-            let mut sp = sequence_id.descend();
-            let mut spawn_layout_writer = |strategy: Arc<dyn LayoutStrategy>, array: ArrayRef| {
-                let stream = single_chunk_stream(array.dtype().clone(), sp.advance(), array);
-                let child_eof = eof.split_off();
-                let ctx = ctx.clone();
-                let segment_sink = Arc::clone(&segment_sink);
-                let session = session.clone();
-                handle.spawn_nested(move |h| async move {
-                    let session = session.with_handle(h);
-                    strategy
-                        .write_stream(ctx, segment_sink, stream, child_eof, &session)
-                        .await
-                })
-            };
-            (
-                spawn_layout_writer(Arc::clone(&self.elements), elements),
-                spawn_layout_writer(Arc::clone(&self.offsets), offsets),
-                validity_array.map(|arr| spawn_layout_writer(Arc::clone(&self.validity), arr)),
-            )
+        let mut sp = sequence_id.descend();
+        let elements_dtype = elements.dtype().clone();
+        let offsets_dtype = offsets.dtype().clone();
+
+        let elements_seq = sp.advance();
+        let offsets_seq = sp.advance();
+        let validity_seq = validity_array.as_ref().map(|_| sp.advance());
+
+        let spawn = |strategy: Arc<dyn LayoutStrategy>,
+                     stream: SendableSequentialStream,
+                     child_eof: SequencePointer| {
+            let ctx = ctx.clone();
+            let segment_sink = Arc::clone(&segment_sink);
+            let session = session.clone();
+            handle.spawn_nested(move |h| async move {
+                let session = session.with_handle(h);
+                strategy
+                    .write_stream(ctx, segment_sink, stream, child_eof, &session)
+                    .await
+            })
+        };
+
+        let (elements_strategy, elements_stream): (
+            Arc<dyn LayoutStrategy>,
+            SendableSequentialStream,
+        ) = match element_chunks {
+            Some(chunks) => (
+                Arc::new(ChunkedLayoutStrategy::new(Arc::clone(&self.elements))),
+                multi_chunk_stream(elements_dtype, elements_seq, chunks),
+            ),
+            None => (
+                Arc::clone(&self.elements),
+                single_chunk_stream(elements_dtype, elements_seq, elements),
+            ),
+        };
+
+        let elements_task = spawn(elements_strategy, elements_stream, eof.split_off());
+        let offsets_task = spawn(
+            Arc::clone(&self.offsets),
+            single_chunk_stream(offsets_dtype, offsets_seq, offsets),
+            eof.split_off(),
+        );
+        let validity_task = match (validity_array, validity_seq) {
+            (Some(arr), Some(seq)) => Some(spawn(
+                Arc::clone(&self.validity),
+                single_chunk_stream(arr.dtype().clone(), seq, arr),
+                eof.split_off(),
+            )),
+            _ => None,
         };
 
         // Should not have more than one chunk
@@ -225,6 +304,70 @@ fn single_chunk_stream(
     .sendable()
 }
 
+/// Wrap a sequence of element chunks as a multi-chunk [`SendableSequentialStream`], assigning each
+/// chunk a sequence id descended from `base` (the same pattern the repartition writer uses).
+fn multi_chunk_stream(
+    dtype: DType,
+    base: SequenceId,
+    chunks: Vec<ArrayRef>,
+) -> SendableSequentialStream {
+    let mut sp = base.descend();
+    let items: Vec<VortexResult<(SequenceId, ArrayRef)>> =
+        chunks.into_iter().map(|c| Ok((sp.advance(), c))).collect();
+    SequentialStreamAdapter::new(dtype, stream::iter(items).boxed()).sendable()
+}
+
+/// Pick element-buffer boundaries at which to cut the flattened elements into chunks of roughly
+/// `target` element rows, cutting only on list boundaries so no list straddles two chunks.
+///
+/// `offsets` is the canonical (gapless, `offsets[0] == 0`) list offset array with `rows + 1`
+/// entries. The returned boundaries are element positions beginning with `0` and ending with the
+/// total element count; a list longer than `target` becomes its own chunk (it is never split).
+// The `match_each_integer_ptype!` expansion duplicates the loop body across every integer ptype,
+// which inflates clippy's cognitive-complexity score; the logic itself is a single linear scan.
+#[allow(clippy::cognitive_complexity)]
+fn list_aligned_boundaries(offsets: &PrimitiveArray, target: usize) -> Vec<u64> {
+    let n = offsets.len();
+    if n <= 1 {
+        return vec![0];
+    }
+    let target = target as u64;
+    let mut boundaries = vec![0u64];
+    let mut last_cut = 0u64;
+    // Offsets are validated non-negative upstream, so `as u64` is safe for signed ptypes; it is a
+    // no-op when `T == u64`.
+    match_each_integer_ptype!(offsets.ptype(), |T| {
+        let slice = offsets.as_slice::<T>();
+        for i in 0..(n - 1) {
+            // Row `i` ends at `offsets[i + 1]`. Cut after it once the chunk reaches `target`.
+            #[allow(clippy::unnecessary_cast)]
+            let end = slice[i + 1] as u64;
+            if end - last_cut >= target {
+                boundaries.push(end);
+                last_cut = end;
+            }
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let total = slice[n - 1] as u64;
+        if *boundaries.last().vortex_expect("boundaries starts with 0") != total {
+            boundaries.push(total);
+        }
+    });
+    boundaries
+}
+
+/// Slice `elements` into the sub-arrays delimited by `boundaries` (element positions).
+fn slice_elements(elements: &ArrayRef, boundaries: &[u64]) -> VortexResult<Vec<ArrayRef>> {
+    boundaries
+        .windows(2)
+        .map(|w| {
+            let start = usize::try_from(w[0])?;
+            let end = usize::try_from(w[1])?;
+            elements.slice(start..end)
+        })
+        .collect()
+}
+
 /// Matcher for `Array<List>` or `Array<ListView>`. Used to short-circuit the execution loop
 /// when the input is already in (or directly produces) a list form, avoiding a redundant
 /// `ListView` round-trip when the writer already has the parts it needs.
@@ -247,12 +390,14 @@ mod tests {
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_io::session::RuntimeSession;
 
     use super::*;
     use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
+    use crate::layouts::list::ELEMENTS_CHILD_INDEX;
     use crate::layouts::table::TableStrategy;
     use crate::segments::TestSegments;
     use crate::sequence::SequentialArrayStreamExt;
@@ -506,6 +651,41 @@ mod tests {
             ├── elements: vortex.flat, dtype: i32, segment: 2
             └── offsets: vortex.flat, dtype: u32, segment: 3
         ");
+        Ok(())
+    }
+
+    /// Element-chunk boundaries must land on list boundaries: no single list may straddle two
+    /// element chunks.
+    #[tokio::test]
+    async fn element_chunks_do_not_straddle_lists() -> VortexResult<()> {
+        // 9 lists, 20 elements. The offset values are the only legal chunk-boundary positions.
+        let offsets = [0u64, 2, 5, 5, 8, 10, 13, 14, 18, 20];
+        let list = ListArray::try_new(
+            Buffer::from((0i32..20).collect::<Vec<_>>()).into_array(),
+            buffer![0u32, 2, 5, 5, 8, 10, 13, 14, 18, 20].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+
+        // Target 4 elements/chunk => cut at the first list boundary at/after each 4-element run.
+        let strategy = ListLayoutStrategy::default().with_element_chunk_len(4);
+        let layout = write(&strategy, list).await?;
+
+        let elements = layout.child(ELEMENTS_CHILD_INDEX)?;
+        assert!(
+            elements.nchildren() > 1,
+            "expected the elements to be split into multiple chunks"
+        );
+
+        // Chunk start offsets (skipping the leading 0) are the interior boundaries; each must
+        // coincide with a list boundary.
+        let boundaries: Vec<u64> = elements.child_row_offsets().flatten().collect();
+        for &boundary in boundaries.iter().skip(1) {
+            assert!(
+                offsets.contains(&boundary),
+                "element chunk boundary {boundary} is not a list boundary; offsets={offsets:?}"
+            );
+        }
         Ok(())
     }
 }

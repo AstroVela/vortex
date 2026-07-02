@@ -678,6 +678,8 @@ impl ElementsProjection {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     use rstest::rstest;
     use vortex_array::ArrayContext;
@@ -700,6 +702,8 @@ mod tests {
     use crate::LayoutRef;
     use crate::LayoutStrategy;
     use crate::layouts::list::writer::ListLayoutStrategy;
+    use crate::segments::SegmentFuture;
+    use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
@@ -1241,6 +1245,118 @@ mod tests {
         let expected = list.filter(mask)?;
         let mut exec_ctx = session.create_execution_ctx();
         assert_arrays_eq!(result, expected, &mut exec_ctx);
+        Ok(())
+    }
+
+    // ---- element chunking ---------------------------------------------------------------------
+
+    /// Chunking the elements must not change the result of any read.
+    #[rstest]
+    #[case::full(0..5, false)]
+    #[case::partial(1..4, false)]
+    #[case::partial_nullable(1..4, true)]
+    #[case::single(3..4, false)]
+    #[tokio::test]
+    async fn chunked_elements_round_trips(
+        #[case] row_range: Range<u64>,
+        #[case] nullable: bool,
+    ) -> VortexResult<()> {
+        let list = create_wider_list_array(nullable);
+        let ctx = LayoutReaderContext::new();
+        let len = usize::try_from(row_range.end - row_range.start)?;
+        // Chunk elements every 3 element rows: the 10-element child spans 4 chunks.
+        let strategy = ListLayoutStrategy::default().with_element_chunk_len(3);
+        let (segments, layout, session) = write_layout(&strategy, list.clone()).await?;
+        let reader = layout.new_reader("".into(), segments, &session, &ctx)?;
+
+        let result = reader
+            .projection_evaluation(&row_range, &root(), MaskFuture::new_true(len))?
+            .await?;
+
+        let expected =
+            list.slice(usize::try_from(row_range.start)?..usize::try_from(row_range.end)?)?;
+        let mut exec_ctx = session.create_execution_ctx();
+        assert_arrays_eq!(result, expected, &mut exec_ctx);
+        Ok(())
+    }
+
+    /// Records the total bytes fetched during a read, to measure the effect of element chunking.
+    #[derive(Clone)]
+    struct AccountingSegments {
+        inner: Arc<dyn SegmentSource>,
+        bytes: Arc<AtomicU64>,
+    }
+
+    impl AccountingSegments {
+        fn new(inner: Arc<dyn SegmentSource>) -> Self {
+            Self {
+                inner,
+                bytes: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl SegmentSource for AccountingSegments {
+        fn request(&self, id: SegmentId) -> SegmentFuture {
+            let fut = self.inner.request(id);
+            let bytes = Arc::clone(&self.bytes);
+            async move {
+                let handle = fut.await?;
+                bytes.fetch_add(handle.len() as u64, Ordering::Relaxed);
+                Ok(handle)
+            }
+            .boxed()
+        }
+    }
+
+    async fn range_read_bytes(
+        strategy: ListLayoutStrategy,
+        array: ArrayRef,
+        row_range: Range<u64>,
+    ) -> VortexResult<u64> {
+        let ctx = LayoutReaderContext::new();
+        let (segments, layout, session) = write_layout(&strategy, array).await?;
+        let acct = AccountingSegments::new(segments);
+        let reader = layout.new_reader("".into(), Arc::new(acct.clone()), &session, &ctx)?;
+        let len = usize::try_from(row_range.end - row_range.start)?;
+        let _result = reader
+            .projection_evaluation(&row_range, &root(), MaskFuture::new_true(len))?
+            .await?;
+        Ok(acct.bytes.load(Ordering::Relaxed))
+    }
+
+    /// A selective range read fetches far fewer bytes when the elements are chunked: the flat
+    /// elements layout must be read wholesale, while chunked elements skip to the referenced chunks.
+    #[tokio::test]
+    async fn chunked_elements_reduce_range_read_bytes() -> VortexResult<()> {
+        // 4096 lists x 64 elements = 262_144 i32 elements (~1 MiB of element data). The element
+        // values are irrelevant to the byte accounting, so keep them zero.
+        let n = 4096usize;
+        let l = 64usize;
+        let elements = Buffer::from(vec![0i32; n * l]).into_array();
+        let offsets = (0..=n)
+            .map(|i| u32::try_from(i * l))
+            .collect::<Result<Vec<_>, _>>()?;
+        let offsets = Buffer::from(offsets).into_array();
+        let list = ListArray::try_new(elements, offsets, Validity::NonNullable)?.into_array();
+
+        // 64 contiguous lists = 4096 of 262_144 elements (1.6%).
+        let range = 2000..2064;
+        let flat_bytes =
+            range_read_bytes(ListLayoutStrategy::default(), list.clone(), range.clone()).await?;
+        let chunked_bytes = range_read_bytes(
+            ListLayoutStrategy::default().with_element_chunk_len(8192),
+            list,
+            range,
+        )
+        .await?;
+
+        // The flat read pulls the whole ~1 MiB elements buffer; the chunked read pulls only the
+        // couple of element chunks the range touches. Require at least a 4x reduction.
+        assert!(
+            chunked_bytes * 4 < flat_bytes,
+            "expected chunked range read to fetch <1/4 the bytes: flat={flat_bytes}, chunked={chunked_bytes}"
+        );
         Ok(())
     }
 }
