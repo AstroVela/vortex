@@ -77,6 +77,21 @@ using Projections = unordered_map<TableIndex, LogicalProjection &>;
 
 LogicalOperatorPtr TryPushdownScalarFunctions(ClientContext &context, LogicalOperatorPtr plan);
 
+/*
+ * We override spatial's `ST_DWithin` with a copy that keeps the radius as a plain third
+ * argument (see expr.h); the original folds it into bind data at bind time. We need the
+ * radius visible to push the filter into a Vortex scan, but spatial's join optimizer only
+ * recognizes the folded 2-argument form. So this pass rebinds join conditions through
+ * spatial's original function and leaves filters alone:
+ *
+ *   FILTER st_dwithin(t.geom, 'POINT(0 0)', 10.0)   -- untouched, pushed into the scan
+ *   JOIN ON st_dwithin(a.geom, b.geom, 10.0)        -- rebound: st_dwithin(a.geom, b.geom)
+ *                                                      with the radius in bind data
+ *
+ * Runs in the pre-optimize hook, before any extension's optimizer pass.
+ */
+void RestoreStDWithin(ClientContext &context, LogicalOperator &plan);
+
 /**
  * Collect fn(col) expressions i.e. expressions where a single function (not
  * a function chain) wraps a single bound column. If "col" is used without
