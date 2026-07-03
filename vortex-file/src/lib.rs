@@ -70,10 +70,13 @@
 //! ├────────────────────────────┤
 //! │    Statistics flatbuffer   │  optional; file-level per-field statistics
 //! ├────────────────────────────┤
+//! │     Metadata flatbuffer    │  optional; arbitrary user-provided key/value
+//! │                            │  metadata, written via `with_file_metadata`
+//! ├────────────────────────────┤
 //! │      Footer flatbuffer     │  required; dictionary-encoded segment map
 //! │                            │  and array/layout/compression/encryption specs
 //! ├────────────────────────────┤
-//! │         Postscript         │  offsets of the four footer segments above;
+//! │         Postscript         │  offsets of the footer segments above;
 //! │                            │  at most 65528 bytes
 //! ├────────────────────────────┤
 //! │     8-byte End of File     │  u16 version, u16 postscript length,
@@ -81,9 +84,9 @@
 //! └────────────────────────────┘
 //! ```
 //!
-//! The postscript records the offset, length, and alignment of the dtype, layout, statistics, and
-//! footer segments, so a single read of the file tail (defaulting to 64KiB) is enough to locate and
-//! parse the footer. The byte-level format is specified in full at
+//! The postscript records the offset, length, and alignment of the dtype, layout, statistics,
+//! metadata, and footer segments, so a single read of the file tail (defaulting to 64KiB) is enough
+//! to locate and parse the footer. The byte-level format is specified in full at
 //! <https://docs.vortex.dev/specs/file-format.html>.
 //!
 //! A Parquet-style file is realized by nesting a chunked layout of struct layouts of chunked layouts

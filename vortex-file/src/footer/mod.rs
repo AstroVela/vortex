@@ -9,6 +9,7 @@
 //! The byte-level footer and postscript layout is part of the file-format spec; this module exposes
 //! the structured Rust representation and serializer/deserializer state machine.
 mod file_layout;
+mod file_metadata;
 mod file_statistics;
 mod postscript;
 mod segment;
@@ -19,6 +20,7 @@ mod serializer;
 pub use serializer::*;
 mod deserializer;
 pub use deserializer::*;
+pub use file_metadata::FileMetadata;
 pub use file_statistics::FileStatistics;
 use flatbuffers::root;
 use itertools::Itertools;
@@ -43,6 +45,7 @@ pub struct Footer {
     root_layout: LayoutRef,
     segments: Arc<[SegmentSpec]>,
     statistics: Option<FileStatistics>,
+    file_metadata: Option<FileMetadata>,
     // The specific arrays used within the file, in the order they were registered.
     array_read_ctx: ReadContext,
     // The approximate size of the footer in bytes, used for caching and memory management.
@@ -60,9 +63,16 @@ impl Footer {
             root_layout,
             segments,
             statistics,
+            file_metadata: None,
             array_read_ctx,
             approx_byte_size: None,
         }
+    }
+
+    /// Attach arbitrary user-provided [`FileMetadata`] to this footer.
+    pub fn with_file_metadata(mut self, file_metadata: FileMetadata) -> Self {
+        self.file_metadata = Some(file_metadata);
+        self
     }
 
     pub(crate) fn with_approx_byte_size(mut self, approx_byte_size: usize) -> Self {
@@ -76,6 +86,7 @@ impl Footer {
         layout_bytes: FlatBuffer,
         dtype: DType,
         statistics: Option<FileStatistics>,
+        file_metadata: Option<FileMetadata>,
         session: &VortexSession,
     ) -> VortexResult<Self> {
         let approx_byte_size = footer_bytes.len() + layout_bytes.len();
@@ -126,6 +137,7 @@ impl Footer {
             root_layout,
             segments,
             statistics,
+            file_metadata,
             array_read_ctx,
             approx_byte_size: Some(approx_byte_size),
         })
@@ -144,6 +156,14 @@ impl Footer {
     /// Returns the statistics of the file.
     pub fn statistics(&self) -> Option<&FileStatistics> {
         self.statistics.as_ref()
+    }
+
+    /// Returns the arbitrary user-provided metadata of the file.
+    ///
+    /// Returns `None` if the file has no metadata, or if it was excluded when reading the footer
+    /// via [`FooterDeserializer::exclude_file_metadata`].
+    pub fn file_metadata(&self) -> Option<&FileMetadata> {
+        self.file_metadata.as_ref()
     }
 
     /// Returns the [`DType`] of the file.

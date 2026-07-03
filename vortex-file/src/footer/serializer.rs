@@ -95,6 +95,16 @@ impl FooterSerializer {
             }
         };
 
+        let metadata_segment = match self.footer.file_metadata() {
+            None => None,
+            Some(metadata) if metadata.is_empty() => None,
+            Some(metadata) => {
+                let (buffer, metadata_segment) = write_flatbuffer(&mut self.offset, metadata)?;
+                buffers.push(buffer);
+                Some(metadata_segment)
+            }
+        };
+
         let (buffer, footer_segment) = write_flatbuffer(
             &mut self.offset,
             &FooterFlatBufferWriter {
@@ -111,6 +121,7 @@ impl FooterSerializer {
             layout: layout_segment,
             statistics: statistics_segment,
             footer: footer_segment,
+            metadata: metadata_segment,
         };
         let postscript_buffer = postscript.write_flatbuffer_bytes()?;
         if postscript_buffer.len() > MAX_POSTSCRIPT_SIZE as usize {

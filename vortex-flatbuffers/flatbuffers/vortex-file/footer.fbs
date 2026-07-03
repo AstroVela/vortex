@@ -29,6 +29,8 @@ table Postscript {
     statistics: PostscriptSegment;
     /// Segment containing the 'Footer' flatbuffer (required)
     footer: PostscriptSegment;
+    /// Segment containing the file-level `FileMetadata` flatbuffer.
+    metadata: PostscriptSegment;
 }
 
 /// A `PostscriptSegment` describes the location of a segment in the file without referencing any
@@ -48,6 +50,21 @@ table FileStatistics {
     /// Statistics for each field in the root schema. If the root schema is not a struct, there will
     /// be a single entry in this array.
     field_stats: [ArrayStats];
+}
+
+/// A single entry of arbitrary user-provided file-level metadata.
+table MetadataEntry {
+    /// The metadata key. Keys are unique within a `FileMetadata` and sorted by their bytes.
+    key: [ubyte] (required);
+    /// The metadata value.
+    value: [ubyte] (required);
+}
+
+/// The `FileMetadata` object stores arbitrary user-provided key/value metadata for the
+/// Vortex file, for example an Iceberg field-id mapping. It is fully opaque to Vortex.
+table FileMetadata {
+    /// The metadata entries, sorted by their key bytes with no duplicate keys.
+    entries: [MetadataEntry];
 }
 
 /// The `Registry` object stores dictionary-encoded configuration for segments,
@@ -113,5 +130,6 @@ table EncryptionSpec {
 // [footer]
 
 root_type FileStatistics;
+root_type FileMetadata;
 root_type Footer;
 root_type Postscript;

@@ -53,6 +53,7 @@ use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
 use crate::counting::CountingVortexWrite;
+use crate::footer::FileMetadata;
 use crate::footer::FileStatistics;
 use crate::segments::writer::BufferedSegmentSink;
 
@@ -70,6 +71,7 @@ pub struct VortexWriteOptions {
     exclude_dtype: bool,
     max_variable_length_statistics_size: usize,
     file_statistics: Vec<Stat>,
+    file_metadata: Option<FileMetadata>,
 }
 
 /// Extension trait for constructing [`VortexWriteOptions`] from a session.
@@ -83,6 +85,7 @@ pub trait WriteOptionsSessionExt: SessionExt {
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
+            file_metadata: None,
         }
     }
 }
@@ -97,6 +100,7 @@ impl VortexWriteOptions {
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
+            file_metadata: None,
         }
     }
 
@@ -123,6 +127,15 @@ impl VortexWriteOptions {
     /// Pass an empty vector to omit file-level statistics.
     pub fn with_file_statistics(mut self, file_statistics: Vec<Stat>) -> Self {
         self.file_statistics = file_statistics;
+        self
+    }
+
+    /// Attach arbitrary key/value [`FileMetadata`] to the Vortex file.
+    ///
+    /// The metadata is opaque to Vortex and is stored in its own segment referenced from the
+    /// postscript. If the metadata is empty, no segment is written.
+    pub fn with_file_metadata(mut self, file_metadata: FileMetadata) -> Self {
+        self.file_metadata = Some(file_metadata);
         self
     }
 }
@@ -238,6 +251,9 @@ impl VortexWriteOptions {
             },
             ReadContext::new(ctx.to_ids()),
         );
+        if let Some(file_metadata) = self.file_metadata {
+            footer = footer.with_file_metadata(file_metadata);
+        }
 
         // Emit the footer buffers and EOF.
         let footer_buffers = footer

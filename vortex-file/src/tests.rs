@@ -62,6 +62,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::Layout;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
@@ -72,6 +73,7 @@ use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
+use crate::FileMetadata;
 use crate::OpenOptionsSessionExt;
 use crate::V1_FOOTER_FBS_SIZE;
 use crate::VERSION;
@@ -1226,6 +1228,75 @@ async fn file_excluding_dtype() -> VortexResult<()> {
         .open_buffer(buffer)?;
     assert_eq!(vxf.dtype(), &dtype);
     assert_eq!(vxf.row_count(), 9);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_metadata_roundtrip() -> VortexResult<()> {
+    let array =
+        ChunkedArray::from_iter([buffer![0, 1, 2].into_array(), buffer![3, 4, 5].into_array()])
+            .into_array();
+
+    let metadata = FileMetadata::from_iter([
+        (b"iceberg.field-ids".to_vec(), b"{\"a\": 1}".to_vec()),
+        (b"writer".to_vec(), b"vortex-test".to_vec()),
+    ]);
+
+    let mut writer = vec![];
+    let summary = SESSION
+        .write_options()
+        .with_file_metadata(metadata.clone())
+        .write(&mut writer, array.to_array_stream())
+        .await?;
+    let buffer: Bytes = writer.into();
+
+    // The footer returned by the writer carries the metadata.
+    let written = summary
+        .footer()
+        .file_metadata()
+        .ok_or_else(|| vortex_err!("Written footer missing file metadata"))?;
+    assert_eq!(written.len(), 2);
+
+    // The metadata is read back by default.
+    let vxf = SESSION.open_options().open_buffer(buffer.clone())?;
+    let read = vxf
+        .file_metadata()
+        .ok_or_else(|| vortex_err!("Footer missing file metadata"))?;
+    assert_eq!(read.entries(), metadata.entries());
+    assert_eq!(
+        read.get(b"writer").map(|v| v.as_slice()),
+        Some(b"vortex-test".as_slice())
+    );
+    assert!(read.get(b"missing").is_none());
+
+    // The metadata can be excluded on read.
+    let vxf = SESSION
+        .open_options()
+        .exclude_file_metadata()
+        .open_buffer(buffer)?;
+    assert!(vxf.file_metadata().is_none());
+    assert_eq!(vxf.row_count(), 6);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_without_metadata() -> VortexResult<()> {
+    let vxf = chunked_file().await?;
+    assert!(vxf.file_metadata().is_none());
+
+    // Empty metadata is not written to the file.
+    let array = buffer![0, 1, 2].into_array();
+    let mut writer = vec![];
+    SESSION
+        .write_options()
+        .with_file_metadata(FileMetadata::default())
+        .write(&mut writer, array.to_array_stream())
+        .await?;
+
+    let vxf = SESSION.open_options().open_buffer(Bytes::from(writer))?;
+    assert!(vxf.file_metadata().is_none());
 
     Ok(())
 }

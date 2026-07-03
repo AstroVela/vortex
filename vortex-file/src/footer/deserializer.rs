@@ -17,6 +17,7 @@ use crate::EOF_SIZE;
 use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::VERSION;
+use crate::footer::FileMetadata;
 use crate::footer::FileStatistics;
 use crate::footer::postscript::Postscript;
 use crate::footer::postscript::PostscriptSegment;
@@ -37,6 +38,8 @@ pub struct FooterDeserializer {
     session: VortexSession,
     // The DType, if provided externally.
     dtype: Option<DType>,
+    // Whether to skip reading the file metadata segment.
+    exclude_file_metadata: bool,
 
     // Internal state that we accumulate
 
@@ -52,6 +55,7 @@ impl FooterDeserializer {
             buffer: initial_read,
             session,
             dtype: None,
+            exclude_file_metadata: false,
             file_size: None,
             postscript: None,
         }
@@ -68,6 +72,21 @@ impl FooterDeserializer {
     /// Provide or clear the externally known file dtype.
     pub fn with_some_dtype(mut self, dtype: Option<DType>) -> Self {
         self.dtype = dtype;
+        self
+    }
+
+    /// Skip reading the file metadata segment.
+    /// The resulting [`Footer`] will report no [`FileMetadata`] even if the file contains some.
+    pub fn exclude_file_metadata(mut self) -> Self {
+        self.exclude_file_metadata = true;
+        self
+    }
+
+    /// Whether to skip reading the file metadata segment.
+    /// If skipped, the resulting [`Footer`] will report no [`FileMetadata`] even if the file
+    /// contains some.
+    pub fn with_exclude_file_metadata(mut self, exclude_file_metadata: bool) -> Self {
+        self.exclude_file_metadata = exclude_file_metadata;
         self
     }
 
@@ -126,12 +145,20 @@ impl FooterDeserializer {
         };
         let initial_offset = file_size - (self.buffer.len() as u64);
 
+        // If we've been asked to skip the file metadata, we don't need to cover its segment.
+        let metadata_segment = (!self.exclude_file_metadata)
+            .then_some(postscript.metadata.as_ref())
+            .flatten();
+
         let mut read_more_offset = initial_offset;
         if let Some(dtype_segment) = &dtype_segment {
             read_more_offset = read_more_offset.min(dtype_segment.offset);
         }
         if let Some(stats_segment) = &postscript.statistics {
             read_more_offset = read_more_offset.min(stats_segment.offset);
+        }
+        if let Some(metadata_segment) = &metadata_segment {
+            read_more_offset = read_more_offset.min(metadata_segment.offset);
         }
         read_more_offset = read_more_offset.min(postscript.layout.offset);
         read_more_offset = read_more_offset.min(postscript.footer.offset);
@@ -165,6 +192,9 @@ impl FooterDeserializer {
                 )
             })
             .transpose()?;
+        let file_metadata = metadata_segment
+            .map(|segment| self.parse_file_metadata(initial_offset, &self.buffer, segment))
+            .transpose()?;
 
         Ok(DeserializeStep::Done(self.parse_footer(
             initial_offset,
@@ -173,6 +203,7 @@ impl FooterDeserializer {
             &postscript.layout,
             dtype,
             file_stats,
+            file_metadata,
         )?))
     }
 
@@ -252,7 +283,21 @@ impl FooterDeserializer {
         FileStatistics::from_flatbuffer(&fb, dtype, session)
     }
 
+    /// Parse the [`FileMetadata`] from the initial read buffer.
+    fn parse_file_metadata(
+        &self,
+        initial_offset: u64,
+        initial_read: &[u8],
+        segment: &PostscriptSegment,
+    ) -> VortexResult<FileMetadata> {
+        let offset = usize::try_from(segment.offset - initial_offset)?;
+        FileMetadata::read_flatbuffer_bytes(
+            &initial_read[offset..offset + (segment.length as usize)],
+        )
+    }
+
     /// Parse the rest of the footer from the initial read.
+    #[expect(clippy::too_many_arguments)]
     fn parse_footer(
         &self,
         initial_offset: u64,
@@ -261,6 +306,7 @@ impl FooterDeserializer {
         layout_segment: &PostscriptSegment,
         dtype: DType,
         file_stats: Option<FileStatistics>,
+        file_metadata: Option<FileMetadata>,
     ) -> VortexResult<Footer> {
         let footer_offset = usize::try_from(footer_segment.offset - initial_offset)?;
         let footer_bytes = FlatBuffer::copy_from(
@@ -272,7 +318,14 @@ impl FooterDeserializer {
             &initial_read[layout_offset..layout_offset + (layout_segment.length as usize)],
         );
 
-        Footer::from_flatbuffer(footer_bytes, layout_bytes, dtype, file_stats, &self.session)
+        Footer::from_flatbuffer(
+            footer_bytes,
+            layout_bytes,
+            dtype,
+            file_stats,
+            file_metadata,
+            &self.session,
+        )
     }
 }
 

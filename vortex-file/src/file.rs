@@ -24,6 +24,7 @@ use vortex_layout::segments::SegmentSource;
 use vortex_scan::DataSourceRef;
 use vortex_session::VortexSession;
 
+use crate::FileMetadata;
 use crate::FileStatistics;
 use crate::footer::Footer;
 use crate::pruning::can_prune_file_stats;
@@ -115,6 +116,11 @@ impl VortexFile {
     /// Statistics can be used for query optimization and data exploration.
     pub fn file_stats(&self) -> Option<&FileStatistics> {
         self.footer.statistics()
+    }
+
+    /// Returns the file's arbitrary user-provided metadata, if available.
+    pub fn file_metadata(&self) -> Option<&FileMetadata> {
+        self.footer.file_metadata()
     }
 
     /// Create a new segment source for reading from the file.

@@ -20,6 +20,7 @@ pub(crate) struct Postscript {
     pub(crate) layout: PostscriptSegment,
     pub(crate) statistics: Option<PostscriptSegment>,
     pub(crate) footer: PostscriptSegment,
+    pub(crate) metadata: Option<PostscriptSegment>,
 }
 
 impl FlatBufferRoot for Postscript {}
@@ -43,6 +44,11 @@ impl WriteFlatBuffer for Postscript {
             .map(|ps| ps.write_flatbuffer(fbb))
             .transpose()?;
         let footer = self.footer.write_flatbuffer(fbb)?;
+        let metadata = self
+            .metadata
+            .as_ref()
+            .map(|ps| ps.write_flatbuffer(fbb))
+            .transpose()?;
         Ok(fb::Postscript::create(
             fbb,
             &fb::PostscriptArgs {
@@ -50,6 +56,7 @@ impl WriteFlatBuffer for Postscript {
                 layout: Some(layout),
                 statistics,
                 footer: Some(footer),
+                metadata,
             },
         ))
     }
@@ -79,6 +86,10 @@ impl ReadFlatBuffer for Postscript {
                 &fb.footer()
                     .ok_or_else(|| vortex_err!("Postscript missing footer segment"))?,
             )?,
+            metadata: fb
+                .metadata()
+                .map(|ps| PostscriptSegment::read_flatbuffer(&ps))
+                .transpose()?,
         })
     }
 }

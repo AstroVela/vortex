@@ -359,6 +359,7 @@ impl<'a> Postscript<'a> {
   pub const VT_LAYOUT: ::flatbuffers::VOffsetT = 6;
   pub const VT_STATISTICS: ::flatbuffers::VOffsetT = 8;
   pub const VT_FOOTER: ::flatbuffers::VOffsetT = 10;
+  pub const VT_METADATA: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -370,6 +371,7 @@ impl<'a> Postscript<'a> {
     args: &'args PostscriptArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Postscript<'bldr>> {
     let mut builder = PostscriptBuilder::new(_fbb);
+    if let Some(x) = args.metadata { builder.add_metadata(x); }
     if let Some(x) = args.footer { builder.add_footer(x); }
     if let Some(x) = args.statistics { builder.add_statistics(x); }
     if let Some(x) = args.layout { builder.add_layout(x); }
@@ -410,6 +412,14 @@ impl<'a> Postscript<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>(Postscript::VT_FOOTER, None)}
   }
+  /// Segment containing the file-level `FileMetadata` flatbuffer.
+  #[inline]
+  pub fn metadata(&self) -> Option<PostscriptSegment<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>(Postscript::VT_METADATA, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Postscript<'_> {
@@ -422,6 +432,7 @@ impl ::flatbuffers::Verifiable for Postscript<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("layout", Self::VT_LAYOUT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("statistics", Self::VT_STATISTICS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("footer", Self::VT_FOOTER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("metadata", Self::VT_METADATA, false)?
      .finish();
     Ok(())
   }
@@ -431,6 +442,7 @@ pub struct PostscriptArgs<'a> {
     pub layout: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
     pub statistics: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
     pub footer: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
+    pub metadata: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
 }
 impl<'a> Default for PostscriptArgs<'a> {
   #[inline]
@@ -440,6 +452,7 @@ impl<'a> Default for PostscriptArgs<'a> {
       layout: None,
       statistics: None,
       footer: None,
+      metadata: None,
     }
   }
 }
@@ -466,6 +479,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> PostscriptBuilder<'a, 'b, A> 
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<PostscriptSegment>>(Postscript::VT_FOOTER, footer);
   }
   #[inline]
+  pub fn add_metadata(&mut self, metadata: ::flatbuffers::WIPOffset<PostscriptSegment<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<PostscriptSegment>>(Postscript::VT_METADATA, metadata);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> PostscriptBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     PostscriptBuilder {
@@ -487,6 +504,7 @@ impl ::core::fmt::Debug for Postscript<'_> {
       ds.field("layout", &self.layout());
       ds.field("statistics", &self.statistics());
       ds.field("footer", &self.footer());
+      ds.field("metadata", &self.metadata());
       ds.finish()
   }
 }
@@ -752,6 +770,223 @@ impl ::core::fmt::Debug for FileStatistics<'_> {
   fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
     let mut ds = f.debug_struct("FileStatistics");
       ds.field("field_stats", &self.field_stats());
+      ds.finish()
+  }
+}
+pub enum MetadataEntryOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+/// A single entry of arbitrary user-provided file-level metadata.
+pub struct MetadataEntry<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for MetadataEntry<'a> {
+  type Inner = MetadataEntry<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> MetadataEntry<'a> {
+  pub const VT_KEY: ::flatbuffers::VOffsetT = 4;
+  pub const VT_VALUE: ::flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    MetadataEntry { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args MetadataEntryArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<MetadataEntry<'bldr>> {
+    let mut builder = MetadataEntryBuilder::new(_fbb);
+    if let Some(x) = args.value { builder.add_value(x); }
+    if let Some(x) = args.key { builder.add_key(x); }
+    builder.finish()
+  }
+
+
+  /// The metadata key. Keys are unique within a `FileMetadata` and sorted by their bytes.
+  #[inline]
+  pub fn key(&self) -> ::flatbuffers::Vector<'a, u8> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(MetadataEntry::VT_KEY, None).unwrap()}
+  }
+  /// The metadata value.
+  #[inline]
+  pub fn value(&self) -> ::flatbuffers::Vector<'a, u8> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(MetadataEntry::VT_VALUE, None).unwrap()}
+  }
+}
+
+impl ::flatbuffers::Verifiable for MetadataEntry<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("key", Self::VT_KEY, true)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("value", Self::VT_VALUE, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct MetadataEntryArgs<'a> {
+    pub key: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub value: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+}
+impl<'a> Default for MetadataEntryArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    MetadataEntryArgs {
+      key: None, // required field
+      value: None, // required field
+    }
+  }
+}
+
+pub struct MetadataEntryBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> MetadataEntryBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_key(&mut self, key: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(MetadataEntry::VT_KEY, key);
+  }
+  #[inline]
+  pub fn add_value(&mut self, value: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(MetadataEntry::VT_VALUE, value);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> MetadataEntryBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    MetadataEntryBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<MetadataEntry<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, MetadataEntry::VT_KEY,"key");
+    self.fbb_.required(o, MetadataEntry::VT_VALUE,"value");
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for MetadataEntry<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("MetadataEntry");
+      ds.field("key", &self.key());
+      ds.field("value", &self.value());
+      ds.finish()
+  }
+}
+pub enum FileMetadataOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+/// The `FileMetadata` object stores arbitrary user-provided key/value metadata for the
+/// Vortex file, for example an Iceberg field-id mapping. It is fully opaque to Vortex.
+pub struct FileMetadata<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for FileMetadata<'a> {
+  type Inner = FileMetadata<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> FileMetadata<'a> {
+  pub const VT_ENTRIES: ::flatbuffers::VOffsetT = 4;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    FileMetadata { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args FileMetadataArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<FileMetadata<'bldr>> {
+    let mut builder = FileMetadataBuilder::new(_fbb);
+    if let Some(x) = args.entries { builder.add_entries(x); }
+    builder.finish()
+  }
+
+
+  /// The metadata entries, sorted by their key bytes with no duplicate keys.
+  #[inline]
+  pub fn entries(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<MetadataEntry<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<MetadataEntry>>>>(FileMetadata::VT_ENTRIES, None)}
+  }
+}
+
+impl ::flatbuffers::Verifiable for FileMetadata<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<MetadataEntry>>>>("entries", Self::VT_ENTRIES, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct FileMetadataArgs<'a> {
+    pub entries: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<MetadataEntry<'a>>>>>,
+}
+impl<'a> Default for FileMetadataArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    FileMetadataArgs {
+      entries: None,
+    }
+  }
+}
+
+pub struct FileMetadataBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> FileMetadataBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_entries(&mut self, entries: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<MetadataEntry<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(FileMetadata::VT_ENTRIES, entries);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> FileMetadataBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    FileMetadataBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<FileMetadata<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for FileMetadata<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("FileMetadata");
+      ds.field("entries", &self.entries());
       ds.finish()
   }
 }

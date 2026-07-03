@@ -58,6 +58,8 @@ pub struct VortexOpenOptions {
     file_size: Option<u64>,
     /// An optional, externally provided, DType.
     dtype: Option<DType>,
+    /// Whether to skip reading the file metadata segment.
+    exclude_file_metadata: bool,
     /// An optional, externally provided, file layout.
     footer: Option<Footer>,
     /// The segments read during the initial read.
@@ -82,6 +84,7 @@ pub trait OpenOptionsSessionExt:
             initial_read_size: INITIAL_READ_SIZE,
             file_size: None,
             dtype: None,
+            exclude_file_metadata: false,
             footer: None,
             initial_read_segments: Default::default(),
             metrics_registry: None,
@@ -149,6 +152,15 @@ impl VortexOpenOptions {
     /// For Vortex files that do not contain a `DType`, this is required.
     pub fn with_dtype(mut self, dtype: DType) -> Self {
         self.dtype = Some(dtype);
+        self
+    }
+
+    /// Skip reading the arbitrary user-provided metadata of the file.
+    ///
+    /// The resulting footer will report no [`FileMetadata`](crate::FileMetadata) even if the
+    /// file contains some. This can avoid IO if the metadata segment is large and not needed.
+    pub fn exclude_file_metadata(mut self) -> Self {
+        self.exclude_file_metadata = true;
         self
     }
 
@@ -306,7 +318,8 @@ impl VortexOpenOptions {
 
         let mut deserializer = Footer::deserializer(initial_read, self.session.clone())
             .with_size(file_size)
-            .with_some_dtype(self.dtype.clone());
+            .with_some_dtype(self.dtype.clone())
+            .with_exclude_file_metadata(self.exclude_file_metadata);
 
         let footer = loop {
             match deserializer.deserialize()? {
