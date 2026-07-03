@@ -103,10 +103,10 @@ pub unsafe extern "C-unwind" fn vx_struct_fields_builder_add_field(
 ) {
     try_or_default(error_out, || {
         let builder = vx_struct_fields_builder::as_mut(builder);
-        builder.names.push(Arc::from(unsafe { name.as_str() }?));
         builder
             .fields
             .push(vx_dtype::into_arc(dtype).deref().clone());
+        builder.names.push(Arc::from(unsafe { name.as_str() }?));
         Ok(())
     })
 }

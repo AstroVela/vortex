@@ -9,9 +9,7 @@ template <typename T>
 struct ForOp {
     T reference;
 
-    __device__ inline T operator()(T value) const {
-        return value + reference;
-    }
+    __device__ inline T operator()(T value) const { return value + reference; }
 };
 
 // Macro to generate in-place FoR kernel for each type.

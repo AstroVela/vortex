@@ -1,0 +1,8 @@
+#  SPDX-License-Identifier: Apache-2.0
+#  SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+InheritParentConfig: true
+Checks: |
+  -google-build-using-namespace,
+  -performance-unnecessary-copy-initialization,
+  -bugprone-unchecked-optional-access,

@@ -523,8 +523,8 @@ jobs:
           command: check ${{ matrix.checks }}
 
   cxx-test:
-    name: "C++ build"
-    timeout-minutes: 30
+    name: "C++ API tests"
+    timeout-minutes: 5
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-build', github.run_id)
@@ -538,20 +538,42 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      - name: Build and run C++ unit tests
+      - name: Install Rust nightly toolchain
+        run: |
+          rustup toolchain install $NIGHTLY_TOOLCHAIN
+          rustup component add --toolchain $NIGHTLY_TOOLCHAIN rust-src rustfmt clippy llvm-tools-preview
+      - name: Build FFI library (asan)
+        run: |
+          RUSTFLAGS="-A warnings -Cunsafe-allow-abi-mismatch=sanitizer \
+                -C debuginfo=2 -C opt-level=0 -C strip=none -Zexternal-clangrt \
+                -Zsanitizer=address,leak" \
+          cargo +$NIGHTLY_TOOLCHAIN build --locked --no-default-features \
+            --target x86_64-unknown-linux-gnu -Zbuild-std \
+            -p vortex-ffi
+      - name: Build C++ tests (asan)
         run: |
           mkdir -p vortex-cxx/build
-          cmake -S vortex-cxx -B vortex-cxx/build -DVORTEX_ENABLE_TESTING=ON -DVORTEX_ENABLE_ASAN=ON
+          cmake -S vortex-cxx -B vortex-cxx/build -DBUILD_TESTS=ON -DSANITIZER=asan -DTARGET_TRIPLE="x86_64-unknown-linux-gnu"
           cmake --build vortex-cxx/build --parallel $(nproc)
-          ctest --test-dir vortex-cxx/build -j $(nproc) -V
-      - name: Build and run the example in release mode
+      - name: Run C++ tests
         run: |
-          cmake -S vortex-cxx/examples -B vortex-cxx/examples/build -DCMAKE_BUILD_TYPE=Release
+          vortex-cxx/build/tests/vortex_cxx_test
+      - name: Build and run examples
+        run: |
+          cmake -S vortex-cxx -B vortex-cxx/examples/build -DSANITIZER=asan -DBUILD_EXAMPLES=1 -DTARGET_TRIPLE="x86_64-unknown-linux-gnu"
           cmake --build vortex-cxx/examples/build --parallel $(nproc)
-          vortex-cxx/examples/build/hello-vortex vortex-cxx/examples/goldenfiles/example.vortex
-      - uses: ./.github/actions/check-rebuild
-        with:
-          command: "cargo build --profile ci --locked -p vortex-cxx --lib"
+          cd vortex-cxx/examples/build/examples
+          # filesystem loop detected
+          rm -fr ../_deps/nanoarrow-src/python/subprojects/arrow-nanoarrow
+
+          ./writer people0.vortex
+          ./writer people1.vortex
+          ./writer me.vortex
+
+          ./scan '*.vortex'
+          ./dtype me.vortex
+
+          ./reader
 
   sqllogic-test:
     name: "SQL logic tests"

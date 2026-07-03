@@ -1,35 +1,37 @@
-# Vortex C++ Bindings
+# Vortex C++ bindings
 
-This directory contains C++ bindings for Vortex using the [cxx](https://cxx.rs/) crate. The bindings provide a C++ interface to Vortex file operations, including roundtripping with Arrow Array stream with advanced pushdown support.
+For a usage guide, see docs/api/cpp/index.rst.
 
-## Building
+## Requirements
 
-### Requirements
+- CMake 3.10+
+- C++20 compiler (C++23 compiler for tests).
+- Rust toolchain for building `vortex-ffi`.
 
-- CMake 3.22 or higher
-- C++20 compatible compiler
-- Rust toolchain (for building the Rust components)
-- (optional) Ninja (`ninja-build`)
+## Build
 
-### Build Steps
-
-```bash
-mkdir build
-cmake -Bbuild -GNinja
+```sh
+cargo build --release -p vortex-ffi
+cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-### Running Tests
+This will generate `libvortex_cxx` shared and static libraries.
+You can use `vortex_cxx` and `vortex_cxx_shared` CMake targets.
 
-```bash
-# Enable tests in CMake
-cmake -Bbuild -DVORTEX_ENABLE_TESTING=ON -GNinja
+## Test
+
+```sh
+cargo build --release -p vortex-ffi
+cmake -Bbuild -DBUILD_TESTS=ON
 cmake --build build -j
-./vortex_cxx_test
+ctest --test-dir build -j "$(nproc)"
 ```
 
-## C++ Coding Convention
+## Run examples
 
-We use `.clang-tidy` and `.clang-format` to setup the coding convention. Both are borrowed from DuckDB.
-
-`cppcoreguidelines-avoid-non-const-global-variables` is removed from `.clang-tidy` because GTest violates it.
+```sh
+cmake -Bbuild -DBUILD_EXAMPLES=ON
+cmake --build build -j
+./build/examples/hello-vortex
+```

@@ -1054,7 +1054,7 @@ int8_t vx_dtype_decimal_scale(const vx_dtype *dtype);
 /**
  * If "dtype" is DTYPE_STRUCT, return owned vx_struct_fields for this struct,
  * return NULL otherwise. Returned vx_struct_fields must be released with
- * vx_dtype_free.
+ * vx_struct_fields_free.
  */
 const vx_struct_fields *vx_dtype_struct_dtype(const vx_dtype *dtype);
 
@@ -1161,6 +1161,8 @@ void vx_expression_free(const vx_expression *ptr);
  */
 vx_expression *vx_expression_root(void);
 
+vx_expression *vx_expression_clone(const vx_expression *ptr);
+
 /**
  * Create a literal expression from a scalar.
  *
@@ -1253,7 +1255,7 @@ vx_expression_binary(vx_binary_operator operator_, const vx_expression *lhs, con
  *
  * Returns the logical negation of the input boolean expression.
  */
-const vx_expression *vx_expression_not(const vx_expression *child);
+vx_expression *vx_expression_not(const vx_expression *child);
 
 /**
  * Create an expression that checks for null values.
@@ -1283,21 +1285,6 @@ vx_expression *vx_expression_get_item(vx_view item, const vx_expression *child);
  * Returns a boolean array indicating whether the value appears in each list.
  */
 vx_expression *vx_expression_list_contains(const vx_expression *list, const vx_expression *value);
-
-/**
- * Clone a vx_file
- */
-const vx_file *vx_file_clone(const vx_file *ptr);
-
-/**
- * Free an owned [`vx_file`] object.
- */
-void vx_file_free(const vx_file *ptr);
-
-void vx_file_write_array(const vx_session *session,
-                         vx_view path,
-                         const vx_array *array,
-                         vx_error **error_out);
 
 /**
  * Set the stderr logger to output at the specified level.
@@ -1630,6 +1617,16 @@ vx_session *vx_session_new(void);
 vx_session *vx_session_clone(const vx_session *session);
 
 /**
+ * Clone a vx_file
+ */
+const vx_file *vx_file_clone(const vx_file *ptr);
+
+/**
+ * Free an owned [`vx_file`] object.
+ */
+void vx_file_free(const vx_file *ptr);
+
+/**
  * Opens a writable array stream, where sink is used to push values into the stream.
  * To close the stream close the sink with `vx_array_sink_close`.
  * "path" is copied.
@@ -1639,7 +1636,9 @@ vx_array_sink_open_file(const vx_session *session, vx_view path, const vx_dtype 
 
 /**
  * Push an array into a file sink.
- * Does not take ownership of array
+ * Does not take ownership of array.
+ *
+ * Errors if array's DType doesn't match sink's DType.
  */
 void vx_array_sink_push(vx_array_sink *sink, const vx_array *array, vx_error **error_out);
 

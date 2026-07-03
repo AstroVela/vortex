@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.10)
+project(VortexCXX
+    VERSION 0.0.1
+    LANGUAGES CXX)
 
-# FetchContent from URL timestamp handling
-cmake_policy(SET CMP0135 NEW)
+include(FetchContent)
 
-project(vortex)
-
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_program(SCCACHE_PROGRAM sccache)
 if (SCCACHE_PROGRAM)
@@ -21,100 +21,122 @@ else ()
     message(STATUS "Sccache not found")
 endif ()
 
+option(BUILD_TESTS "Build tests" OFF)
+option(BUILD_EXAMPLES "Build examples" OFF)
+
+set(SANITIZER "" CACHE STRING "Build with sanitizers")
+set(TARGET_TRIPLE "" CACHE STRING "Rust target triple for FFI library")
+set(RUST_BUILD_PROFILE "" CACHE STRING "Cargo profile name for Rust FFI library")
+
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-dollar-in-identifier-extension")
+if (NOT SANITIZER STREQUAL "")
+    message(NOTICE "Sanitizer: ${SANITIZER}")
+    if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(FATAL_ERROR "Only debug build is supported for sanitizer builds")
+    endif()
 
-option(VORTEX_ENABLE_TESTING "Enable building test binary for vortex-cxx" OFF)
-option(VORTEX_ENABLE_ASAN "Enable address sanitizer" OFF)
-
-include(FetchContent)
-FetchContent_Declare(
-    Corrosion
-    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG v0.5
-)
-FetchContent_MakeAvailable(Corrosion)
-
-set(RUST_SOURCE_FILE lib.rs)
-
-# Import Rust crate using Corrosion
-corrosion_import_crate(
-    MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml
-    FEATURES ${CORROSION_FEATURES}
-    CRATES vortex-cxx
-)
-
-# Enable CXX bridge for the Rust crate
-corrosion_add_cxxbridge(vortex_cxx_bridge CRATE vortex_cxx FILES ${RUST_SOURCE_FILE})
-
-FetchContent_Declare(
-    nanoarrow
-    GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
-    GIT_TAG a579fbf5d192e85b6249935e117de7d02a6dc4e9 # v0.8.0
-)
-FetchContent_MakeAvailable(nanoarrow)
-
-file(GLOB_RECURSE CPP_SOURCE_FILE CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/*.cpp"
-)
-
-# Public headers
-set(CPP_INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
-)
-
-# Private headers
-set(CPP_PRIVATE_INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src
-)
-
-# Create the main library combining C++ and Rust code
-add_library(vortex STATIC ${CPP_SOURCE_FILE})
-target_include_directories(vortex PUBLIC ${CPP_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_BINARY_DIR}/corrosion_generated/cxxbridge/vortex_cxx_bridge/include)
-target_include_directories(vortex PRIVATE
-    ${CPP_PRIVATE_INCLUDE_DIRS}
-)
-target_link_libraries(vortex
-    PUBLIC nanoarrow_static
-    PRIVATE vortex_cxx_bridge
-)
-
-if (VORTEX_ENABLE_ASAN)
-    target_compile_options(vortex PRIVATE -fsanitize=leak,address,undefined -fno-omit-frame-pointer -fno-common -O1)
-    target_link_options(vortex PRIVATE -fsanitize=leak,address,undefined)
+    if (SANITIZER STREQUAL "asan")
+        set(SANITIZER_FLAGS "-fsanitize=address,undefined,leak")
+    elseif (SANITIZER STREQUAL "tsan")
+        set(SANITIZER_FLAGS "-fsanitize=thread")
+    else()
+        message(FATAL_ERROR "Unknown sanitizer ${SANITIZER}")
+    endif()
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SANITIZER_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SANITIZER_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${SANITIZER_FLAGS}")
 endif()
 
-# Tests
-if (VORTEX_ENABLE_TESTING)
-    FetchContent_Declare(
-        googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG v1.17.0
-        GIT_SHALLOW TRUE
+if (RUST_BUILD_PROFILE STREQUAL "")
+    if (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        set(RUST_BUILD_PROFILE "release_debug")
+    else()
+        string(TOLOWER "${CMAKE_BUILD_TYPE}" RUST_BUILD_PROFILE)
+    endif()
+endif()
+
+set(VORTEX_FFI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vortex-ffi")
+set(VORTEX_FFI_LIB_DIR "${VORTEX_FFI_DIR}/../target/${TARGET_TRIPLE}/${RUST_BUILD_PROFILE}")
+set(VORTEX_FFI_HEADERS "${VORTEX_FFI_DIR}/cinclude")
+
+if(APPLE)
+    set(VORTEX_FFI_STATIC "${VORTEX_FFI_LIB_DIR}/libvortex_ffi.a")
+    set(VORTEX_FFI_SHARED "${VORTEX_FFI_LIB_DIR}/libvortex_ffi.dylib")
+elseif(WIN32)
+    set(VORTEX_FFI_STATIC "${VORTEX_FFI_LIB_DIR}/libvortex_ffi.lib")
+    set(VORTEX_FFI_SHARED "${VORTEX_FFI_LIB_DIR}/libvortex_ffi.dll")
+else()
+    set(VORTEX_FFI_STATIC "${VORTEX_FFI_LIB_DIR}/libvortex_ffi.a")
+    set(VORTEX_FFI_SHARED "${VORTEX_FFI_LIB_DIR}/libvortex_ffi.so")
+endif()
+
+if(NOT EXISTS "${VORTEX_FFI_STATIC}")
+    message(FATAL_ERROR
+        "vortex-ffi static library not found at ${VORTEX_FFI_STATIC}. "
+        "Run: cargo build --profile <profile> -p vortex-ffi")
+endif()
+
+add_library(vortex_ffi STATIC IMPORTED)
+set_target_properties(vortex_ffi PROPERTIES
+    IMPORTED_LOCATION "${VORTEX_FFI_STATIC}"
+    INTERFACE_INCLUDE_DIRECTORIES "${VORTEX_FFI_HEADERS}")
+
+if(EXISTS "${VORTEX_FFI_SHARED}")
+    add_library(vortex_ffi_shared SHARED IMPORTED)
+    set_target_properties(vortex_ffi_shared PROPERTIES
+        IMPORTED_LOCATION "${VORTEX_FFI_SHARED}"
+        INTERFACE_INCLUDE_DIRECTORIES "${VORTEX_FFI_HEADERS}"
+        INTERFACE_LINK_OPTIONS "LINKER:-rpath,${VORTEX_FFI_LIB_DIR}")
+endif()
+
+file(GLOB VORTEX_CXX_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+add_library(vortex_cxx STATIC ${VORTEX_CXX_SOURCES})
+target_include_directories(vortex_cxx PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vortex-ffi/cinclude
+)
+target_link_libraries(vortex_cxx PUBLIC vortex_ffi)
+add_library(vortex::cxx ALIAS vortex_cxx)
+
+if(TARGET vortex_ffi_shared)
+    add_library(vortex_cxx_shared SHARED ${VORTEX_CXX_SOURCES})
+    set_target_properties(vortex_cxx_shared PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(vortex_cxx_shared PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vortex-ffi/cinclude
     )
-    FetchContent_MakeAvailable(googletest)
+    target_link_libraries(vortex_cxx_shared PUBLIC vortex_ffi_shared)
+    add_library(vortex::cxx_shared ALIAS vortex_cxx_shared)
+endif()
+
+if (BUILD_TESTS OR BUILD_EXAMPLES)
+    FetchContent_Declare(
+      Nanoarrow
+      GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow
+      GIT_TAG        apache-arrow-nanoarrow-0.8.0
+    )
+    FetchContent_MakeAvailable(Nanoarrow)
+endif()
+
+if (BUILD_TESTS)
+    FetchContent_Declare(
+        Catch
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG        v3.8.1
+    )
+    FetchContent_MakeAvailable(Catch)
+    include(Catch)
+    target_compile_definitions(Catch2 PRIVATE CATCH_CONFIG_NO_POSIX_SIGNALS)
 
     enable_testing()
-    add_executable(vortex_cxx_test cpp/tests/basic_test.cpp cpp/tests/test_data_generator.cpp)
-    target_include_directories(vortex_cxx_test PUBLIC ${CPP_INCLUDE_DIRS})
-    target_include_directories(vortex_cxx_test PRIVATE cpp/tests)
-    target_link_libraries(vortex_cxx_test PRIVATE gtest_main vortex nanoarrow_static)
-    target_include_directories(vortex_cxx_test PRIVATE
-        ${CMAKE_CURRENT_BINARY_DIR}/corrosion_generated/cxxbridge/vortex_cxx_bridge/include
-    )
-    # Platform-specific configuration
-    if(APPLE)
-        set(APPLE_LINK_FLAGS "-framework CoreFoundation -framework Security")
-    endif()
-    target_link_libraries(vortex_cxx_test PRIVATE vortex_cxx_bridge ${APPLE_LINK_FLAGS})
-    if (VORTEX_ENABLE_ASAN)
-        target_compile_options(vortex_cxx_test PRIVATE -fsanitize=leak,address,undefined -fno-omit-frame-pointer -fno-common -O1)
-        target_link_options(vortex_cxx_test PRIVATE -fsanitize=leak,address,undefined)
-    endif()
-    include(GoogleTest)
-    gtest_discover_tests(vortex_cxx_test)
+    add_subdirectory(tests)
+endif()
+
+if (BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()

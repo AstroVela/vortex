@@ -146,10 +146,9 @@ macro_rules! arc_wrapper {
             #[doc = r" Free an owned [`" $ffi_ident "`] object."]
             #[unsafe(no_mangle)]
             pub unsafe extern "C-unwind" fn [<$ffi_ident _free>](ptr: *const $ffi_ident) {
-                if ptr.is_null() {
-                    vortex::error::vortex_panic!("null pointer");
+                if !ptr.is_null() {
+                    unsafe { std::sync::Arc::decrement_strong_count(ptr) };
                 }
-                unsafe { std::sync::Arc::decrement_strong_count(ptr) };
             }
         }
     };

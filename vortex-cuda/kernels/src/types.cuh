@@ -13,9 +13,7 @@ struct __align__(16) int128_t {
 };
 
 // 256-bit signed integer type for decimal values
-struct __align__(32) int256_t {
-    int64_t parts[4];
-};
+struct __align__(32) int256_t { int64_t parts[4]; };
 
 // Type iteration macros - call MACRO(suffix, Type) for each type in category.
 // These mirror the Rust match_each_*_ptype macros.
