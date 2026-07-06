@@ -15,6 +15,10 @@ use crate::scalar_fn::session::ScalarFnSessionExt;
 pub trait ExprSerializeProtoExt {
     /// Serialize the expression to its protobuf representation.
     fn serialize_proto(&self) -> VortexResult<pb::Expr>;
+
+    /// Serialize the expression to its protobuf representation, returning `Ok(None)` if any
+    /// node in the tree is not serializable.
+    fn try_serialize_proto(&self) -> VortexResult<Option<pb::Expr>>;
 }
 
 impl ExprSerializeProtoExt for Expression {
@@ -34,6 +38,26 @@ impl ExprSerializeProtoExt for Expression {
             children,
             metadata: Some(metadata),
         })
+    }
+
+    fn try_serialize_proto(&self) -> VortexResult<Option<pb::Expr>> {
+        let mut children = Vec::with_capacity(self.children().len());
+        for child in self.children().iter() {
+            match child.try_serialize_proto()? {
+                Some(child) => children.push(child),
+                None => return Ok(None),
+            }
+        }
+
+        let Some(metadata) = self.options().serialize()? else {
+            return Ok(None);
+        };
+
+        Ok(Some(pb::Expr {
+            id: self.id().to_string(),
+            children,
+            metadata: Some(metadata),
+        }))
     }
 }
 
