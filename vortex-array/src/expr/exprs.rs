@@ -38,6 +38,8 @@ use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeOptions;
 use crate::scalar_fn::fns::list_contains::ListContains;
 use crate::scalar_fn::fns::list_length::ListLength;
+use crate::scalar_fn::fns::list_transform::ListTransform;
+use crate::scalar_fn::fns::list_transform::ListTransformOptions;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::mask::Mask;
 use crate::scalar_fn::fns::merge::DuplicateHandling;
@@ -764,4 +766,22 @@ pub fn ext_storage(input: Expression) -> Expression {
 /// ```
 pub fn list_length(input: Expression) -> Expression {
     ListLength.new_expr(EmptyOptions, [input])
+}
+
+// ---- ListTransform ----
+
+/// Creates an expression that transforms every element of a list with `body`, preserving the
+/// list's structure (offsets and list-level validity). This is akin to DuckDB's
+/// `list_transform()` with a lambda.
+///
+/// `body` is evaluated with the list's elements as its root scope: within `body`, `root()`
+/// refers to the element rather than the enclosing row. For example, DuckDB's
+/// `list_transform(tags, lambda x: x + 1)` is expressed as:
+///
+/// ```rust
+/// # use vortex_array::expr::{checked_add, get_item, list_transform, lit, root};
+/// let expr = list_transform(get_item("tags", root()), checked_add(root(), lit(1)));
+/// ```
+pub fn list_transform(input: Expression, body: Expression) -> Expression {
+    ListTransform.new_expr(ListTransformOptions { body }, [input])
 }

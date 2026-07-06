@@ -31,6 +31,7 @@ use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::fns::list_transform::ListTransform;
 use crate::scalar_fn::fns::operators::Operator;
 
 /// Number of elements in each list of a `List` or `FixedSizeList` typed array.
@@ -96,6 +97,20 @@ impl ScalarFnVTable for ListLength {
         }
 
         list_length(&input, nullability, ctx)
+    }
+
+    fn simplify_untyped(
+        &self,
+        _options: &Self::Options,
+        expr: &Expression,
+    ) -> VortexResult<Option<Expression>> {
+        // `list_transform` preserves list lengths, so skip it entirely:
+        // list_length(list_transform(l, f)) == list_length(l).
+        let input = expr.child(0);
+        if input.is::<ListTransform>() {
+            return Ok(Some(expr.clone().with_children([input.child(0).clone()])?));
+        }
+        Ok(None)
     }
 
     fn validity(
@@ -173,7 +188,7 @@ fn list_length_from_offsets(list: ArrayView<'_, List>) -> VortexResult<ArrayRef>
 }
 
 /// Matches an `Array<List>`, `Array<ListView>`, or `Array<FixedSizeList>`
-struct AnyList;
+pub(crate) struct AnyList;
 
 impl Matcher for AnyList {
     type Match<'a> = ();
