@@ -231,6 +231,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::array_session;
     use crate::dtype::DType;
     use crate::dtype::DecimalDType;
     use crate::dtype::Field;
@@ -502,7 +503,8 @@ mod tests {
 
     #[test]
     fn test_unknown_extension_allow_unknown() {
-        let session = crate::array_session().allow_unknown();
+        let session = array_session();
+        session.allow_unknown();
         let proto = pb::DType {
             dtype_type: Some(DtypeType::Extension(Box::new(pb::Extension {
                 id: "vortex.test.foreign_ext".to_string(),
