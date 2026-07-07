@@ -9,6 +9,7 @@ use vortex_array::Canonical;
 use vortex_array::CanonicalValidity;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
@@ -31,6 +32,7 @@ use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
 use crate::builtins::IntDictScheme;
+use crate::constant;
 use crate::ctx::CompressorContext;
 use crate::estimate::CompressionEstimate;
 use crate::estimate::DeferredEstimate;
@@ -232,6 +234,12 @@ impl CascadingCompressor {
                     return Ok(scheme_compressed);
                 }
 
+                // A constant extension array is already in its terminal representation;
+                // compressing the storage separately cannot do better.
+                if scheme_compressed.is::<Constant>() {
+                    return Ok(scheme_compressed);
+                }
+
                 // Also compress the underlying storage array. Some extension schemes can beat the
                 // extension storage but still lose to ordinary storage compression.
                 let compressed_storage = self.compress(ext_array.storage_array(), exec_ctx)?;
@@ -274,7 +282,8 @@ impl CascadingCompressor {
     /// If a winner is found and its compressed output is actually smaller, that output is
     /// returned. Otherwise, the original array is returned unchanged.
     ///
-    /// Empty and all-null arrays are short-circuited before any scheme evaluation.
+    /// Empty, all-null, and constant arrays are handled by the compressor itself before any
+    /// scheme evaluation (constant detection is skipped while compressing samples).
     ///
     /// [`matches`]: Scheme::matches
     /// [`stats_options`]: Scheme::stats_options
@@ -293,7 +302,7 @@ impl CascadingCompressor {
 
         let array: ArrayRef = canonical.into();
 
-        if eligible_schemes.is_empty() || array.is_empty() {
+        if array.is_empty() {
             return Ok(array);
         }
 
@@ -313,6 +322,31 @@ impl CascadingCompressor {
         let compress_ctx = compress_ctx.with_merged_stats_options(merged_opts);
 
         let data = ArrayAndStats::new(array, merged_opts);
+
+        // Constant detection is built into the compressor: a constant leaf always short-circuits
+        // scheme selection. Samples are exempt because a constant sample does not imply that the
+        // full array is constant.
+        if !compress_ctx.is_sample() && constant::is_constant_for_compression(&data, exec_ctx)? {
+            let _winner_span =
+                trace::winner_compress_span(constant::CONSTANT_SCHEME_ID, before_nbytes).entered();
+            let compressed = constant::compress_constant(data.array(), exec_ctx)?;
+
+            let after_nbytes = compressed.nbytes();
+            let actual_ratio =
+                (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);
+            let accepted = after_nbytes < before_nbytes;
+            trace::record_winner_compress_result(after_nbytes, None, actual_ratio, accepted);
+
+            return if accepted {
+                Ok(compressed)
+            } else {
+                Ok(data.into_array())
+            };
+        }
+
+        if eligible_schemes.is_empty() {
+            return Ok(data.into_array());
+        }
 
         let Some((winner, winner_estimate)) =
             self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
