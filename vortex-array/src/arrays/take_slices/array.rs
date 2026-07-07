@@ -23,7 +23,7 @@ pub(super) const CHILD_SLOT: usize = 0;
 pub(super) const NUM_SLOTS: usize = 1;
 pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child"];
 
-/// Metadata for a [`TakeSlices`](crate::arrays::TakeSlices) array.
+/// Metadata for a [`TakeSlices`] array.
 #[derive(Clone, Debug)]
 pub struct TakeSlicesData {
     pub(super) slices: Arc<[(usize, usize)]>,
@@ -36,7 +36,7 @@ impl Display for TakeSlicesData {
     }
 }
 
-/// Extension methods for [`TakeSlices`](crate::arrays::TakeSlices) arrays.
+/// Extension methods for [`TakeSlices`] arrays.
 pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
     /// The child array selected by this ordered range list.
     fn child(&self) -> &ArrayRef {

@@ -151,6 +151,22 @@ Notes:
   self-explanatory code.
 - Keep public APIs small and consistent with neighboring crates.
 
+## Local Reasoning and Edge Cases
+
+- Before adding helper state, boolean flags, or small enums to handle edge cases inside a general
+  loop, first ask whether the input space naturally splits into a few structural cases with
+  different invariants. If it does, dispatch once near the top of the function to clearly named
+  helpers for each case.
+- Prefer helpers whose names state the invariant they rely on and whose bodies only handle that
+  case. A reader should be able to prove each helper correct without carrying unrelated cases in
+  their head.
+- Avoid making a broad path responsible for exceptional setup, fallback construction, and normal
+  processing at the same time. If a fallback is only valid under a narrow precondition, isolate it
+  behind that precondition instead of threading flags through the main algorithm.
+- When a branch exists only to preserve a representation invariant, put that invariant at the
+  branch boundary and keep the subsequent code free of defensive state that is impossible under
+  the branch's preconditions.
+
 ## Performance: avoid hidden-cost accessors in hot loops
 
 The most common performance trap in this codebase is calling a *per-element accessor that

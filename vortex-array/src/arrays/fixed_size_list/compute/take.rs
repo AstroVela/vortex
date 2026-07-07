@@ -2,12 +2,10 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::BitBufferMut;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
 use crate::ArrayRef;
@@ -58,36 +56,90 @@ fn take_with_indices<I: IntegerPType>(
     let indices_array = indices_array.reinterpret_cast(indices_array.ptype().to_unsigned());
 
     if list_size == 0 {
-        vortex_ensure!(
-            array.elements().is_empty(),
-            "degenerate list must have empty elements"
-        );
-
-        validate_valid_indices::<I>(&indices_array.as_view(), array.as_ref().len(), ctx)?;
-        let new_validity = array.validity()?.take(indices)?;
-        let new_len = indices_array.len();
-
-        // SAFETY: degenerate FSL inputs have no elements, valid index payloads were checked
-        // against the source length, and `Validity::take` produces validity for `new_len`.
-        return Ok(unsafe {
-            FixedSizeListArray::new_unchecked(
-                array.elements().clone(),
-                array.list_size(),
-                new_validity,
-                new_len,
-            )
-        }
-        .into_array());
+        return take_degenerate_fsl::<I>(array, indices, indices_array.as_view(), ctx);
     }
 
-    if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
-        take_nullable_fsl::<I>(array, indices_array.as_view(), ctx)
+    if array.is_empty() {
+        return take_empty_non_degenerate_fsl::<I>(array, indices, indices_array.as_view(), ctx);
+    }
+
+    take_non_empty_non_degenerate_fsl::<I>(array, indices_array.as_view(), ctx)
+}
+
+fn take_degenerate_fsl<I: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices: &ArrayRef,
+    indices_array: ArrayView<'_, Primitive>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    vortex_ensure!(
+        array.elements().is_empty(),
+        "degenerate list must have empty elements"
+    );
+
+    validate_valid_indices::<I>(&indices_array, array.as_ref().len(), ctx)?;
+    let new_validity = array.validity()?.take(indices)?;
+    let new_len = indices_array.len();
+
+    // SAFETY: degenerate FSL inputs have no elements, valid index payloads were checked against
+    // the source length, and `Validity::take` produces validity for `new_len`.
+    Ok(unsafe {
+        FixedSizeListArray::new_unchecked(
+            array.elements().clone(),
+            array.list_size(),
+            new_validity,
+            new_len,
+        )
+    }
+    .into_array())
+}
+
+fn take_empty_non_degenerate_fsl<I: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices: &ArrayRef,
+    indices_array: ArrayView<'_, Primitive>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    debug_assert_ne!(array.list_size(), 0);
+    debug_assert!(array.is_empty());
+
+    validate_valid_indices::<I>(&indices_array, 0, ctx)?;
+
+    let list_size = array.list_size() as usize;
+    let new_len = indices_array.len();
+    let expected_elements_len = take_elements_len(new_len, list_size)?;
+    let new_elements = default_elements(array, expected_elements_len);
+    ensure_elements_len(new_elements.len(), expected_elements_len)?;
+    let new_validity = if new_len == 0 {
+        array.validity()?.take(indices)?
     } else {
-        take_non_nullable_fsl::<I>(array, indices_array.as_view())
+        Validity::AllInvalid
+    };
+
+    // SAFETY: an empty non-degenerate source has no usable element slices. Valid indices have
+    // already been rejected, so non-empty output is all null and backed by default child values.
+    Ok(unsafe {
+        FixedSizeListArray::new_unchecked(new_elements, array.list_size(), new_validity, new_len)
+    }
+    .into_array())
+}
+
+fn take_non_empty_non_degenerate_fsl<I: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    debug_assert_ne!(array.list_size(), 0);
+    debug_assert!(!array.is_empty());
+
+    if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
+        take_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
+    } else {
+        take_non_nullable_non_empty_fsl::<I>(array, indices_array)
     }
 }
 
-fn take_non_nullable_fsl<I: IntegerPType>(
+fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
 ) -> VortexResult<ArrayRef> {
@@ -99,7 +151,7 @@ fn take_non_nullable_fsl<I: IntegerPType>(
     let mut slices = Vec::with_capacity(new_len);
 
     for &data_idx in indices {
-        let data_idx = index_to_usize(data_idx);
+        let data_idx = index_to_usize(data_idx)?;
         slices.push(list_range(data_idx, list_size, array_len)?);
     }
 
@@ -119,7 +171,7 @@ fn take_non_nullable_fsl<I: IntegerPType>(
     .into_array())
 }
 
-fn take_nullable_fsl<I: IntegerPType>(
+fn take_nullable_non_empty_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
@@ -132,46 +184,33 @@ fn take_nullable_fsl<I: IntegerPType>(
 
     let array_validity = array
         .fixed_size_list_validity()
-        .execute_mask(array.as_ref().len(), ctx)
-        .vortex_expect("Failed to compute validity mask");
+        .execute_mask(array.as_ref().len(), ctx)?;
     let indices_validity = indices_validity_mask(&indices_array, ctx)?;
 
-    let null_elements = null_list_elements(array, list_size);
-    let mut has_valid_elements = false;
-    let mut needs_default_elements = false;
+    let null_elements = (0, list_size);
     let mut slices = Vec::with_capacity(new_len);
     let mut new_validity_builder = BitBufferMut::with_capacity(new_len);
 
     for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
         if !is_index_valid {
-            needs_default_elements |=
-                append_null_list_elements(null_elements, &mut slices, &mut new_validity_builder);
+            slices.push(null_elements);
+            new_validity_builder.append(false);
             continue;
         }
 
-        let data_idx = index_to_usize(data_idx);
+        let data_idx = index_to_usize(data_idx)?;
         let range = list_range(data_idx, list_size, array_len)?;
         if !array_validity.value(data_idx) {
-            needs_default_elements |=
-                append_null_list_elements(null_elements, &mut slices, &mut new_validity_builder);
+            slices.push(null_elements);
+            new_validity_builder.append(false);
             continue;
         }
 
         slices.push(range);
-        has_valid_elements = true;
         new_validity_builder.append(true);
     }
 
-    let new_elements = if needs_default_elements {
-        if has_valid_elements {
-            vortex_bail!(
-                "Cannot build placeholder elements for nullable FixedSizeList take with mixed valid and null rows"
-            );
-        }
-        default_elements(array, expected_elements_len)
-    } else {
-        array.elements().take_slices(slices)?
-    };
+    let new_elements = array.elements().take_slices(slices)?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
     let new_validity = Validity::from(new_validity_builder.freeze());
@@ -185,33 +224,12 @@ fn take_nullable_fsl<I: IntegerPType>(
     .into_array())
 }
 
-fn append_null_list_elements(
-    null_elements: NullListElements,
-    slices: &mut Vec<(usize, usize)>,
-    new_validity_builder: &mut BitBufferMut,
-) -> bool {
-    match null_elements {
-        NullListElements::PlaceholderRange(range) => {
-            slices.push(range);
-            new_validity_builder.append(false);
-            false
-        }
-        NullListElements::DefaultsOnly => {
-            new_validity_builder.append(false);
-            true
-        }
-    }
-}
-
 fn indices_validity_mask(
     indices_array: &ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Mask> {
     let indices_len = indices_array.as_ref().len();
-    match indices_array
-        .validity()
-        .vortex_expect("Failed to compute validity mask")
-    {
+    match indices_array.validity()? {
         Validity::NonNullable | Validity::AllValid => Ok(Mask::new_true(indices_len)),
         Validity::AllInvalid => Ok(Mask::new_false(indices_len)),
         Validity::Array(a) => Ok(a.execute::<BoolArray>(ctx)?.execute_mask(ctx)),
@@ -228,7 +246,7 @@ fn validate_valid_indices<I: IntegerPType>(
 
     for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
         if is_index_valid {
-            check_index_in_bounds(index_to_usize(data_idx), array_len)?;
+            check_index_in_bounds(index_to_usize(data_idx)?, array_len)?;
         }
     }
     Ok(())
@@ -273,28 +291,14 @@ fn check_index_in_bounds(data_idx: usize, array_len: usize) -> VortexResult<()> 
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum NullListElements {
-    PlaceholderRange((usize, usize)),
-    DefaultsOnly,
-}
-
-fn null_list_elements(array: ArrayView<'_, FixedSizeList>, list_size: usize) -> NullListElements {
-    if array.elements().len() >= list_size {
-        NullListElements::PlaceholderRange((0, list_size))
-    } else {
-        NullListElements::DefaultsOnly
-    }
-}
-
 fn default_elements(array: ArrayView<'_, FixedSizeList>, len: usize) -> ArrayRef {
     let mut builder = builder_with_capacity(array.elements().dtype(), len);
     builder.append_defaults(len);
     builder.finish()
 }
 
-fn index_to_usize<I: IntegerPType>(index: I) -> usize {
+fn index_to_usize<I: IntegerPType>(index: I) -> VortexResult<usize> {
     index
         .to_usize()
-        .unwrap_or_else(|| vortex_panic!("Failed to convert index to usize: {}", index))
+        .ok_or_else(|| vortex_err!("FixedSizeList take index {index} does not fit in usize"))
 }

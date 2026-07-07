@@ -8,6 +8,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -94,12 +95,7 @@ impl VTable for TakeSlices {
             child.dtype(),
             dtype
         );
-        vortex_ensure!(
-            data.len() == len,
-            "TakeSlicesArray length {} does not match outer length {}",
-            data.len(),
-            len
-        );
+        let mut computed_len = 0usize;
         for &(start, end) in data.slices() {
             vortex_ensure!(
                 start < end,
@@ -110,7 +106,22 @@ impl VTable for TakeSlices {
                 "TakeSlicesArray range {start}..{end} exceeds child length {}",
                 child.len()
             );
+            computed_len = computed_len
+                .checked_add(end - start)
+                .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
         }
+        vortex_ensure!(
+            data.len() == computed_len,
+            "TakeSlicesArray metadata length {} does not match computed range length {}",
+            data.len(),
+            computed_len
+        );
+        vortex_ensure!(
+            computed_len == len,
+            "TakeSlicesArray computed length {} does not match outer length {}",
+            computed_len,
+            len
+        );
         Ok(())
     }
 

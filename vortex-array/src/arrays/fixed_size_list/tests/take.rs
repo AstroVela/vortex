@@ -2,9 +2,15 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use rstest::rstest;
+use smallvec::smallvec;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_error::vortex_panic;
+use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use super::common::create_basic_fsl;
 use super::common::create_empty_fsl;
@@ -12,10 +18,18 @@ use super::common::create_large_fsl;
 use super::common::create_nullable_fsl;
 use super::common::create_single_element_fsl;
 use crate::ArrayRef;
+use crate::ArrayView;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
+use crate::array::Array;
+use crate::array::ArrayId;
+use crate::array::ArrayParts;
+use crate::array::EmptyArrayData;
+use crate::array::OperationsVTable;
+use crate::array::VTable;
+use crate::array::ValidityVTable;
+use crate::array::with_empty_buffers;
 use crate::array_session;
-use crate::arrays::DictArray;
 use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::PrimitiveArray;
@@ -23,13 +37,17 @@ use crate::arrays::TakeSlices;
 use crate::arrays::dict::TakeExecute;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::assert_arrays_eq;
+use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::FixedSizeListBuilder;
 use crate::compute::conformance::take::test_take_conformance;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
+use crate::executor::ExecutionCtx;
+use crate::executor::ExecutionResult;
 use crate::scalar::Scalar;
+use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 
 // Conformance tests for common take scenarios.
@@ -351,28 +369,29 @@ fn test_take_execute_empty_source_all_null_indices_builds_default_elements() -> 
 }
 
 #[test]
-fn test_take_uses_take_slices_for_encoded_elements_child() {
+fn test_take_empty_source_rejects_valid_index_after_null_index() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
-    let dict_elements = DictArray::try_new(
-        buffer![0u8, 1, 2, 3, 1, 2].into_array(),
-        PrimitiveArray::from_iter([10i32, 20, 30, 40]).into_array(),
-    )
-    .unwrap()
-    .into_array();
-    let fsl = FixedSizeListArray::new(dict_elements, 2, Validity::NonNullable, 3);
+    let fsl = create_empty_fsl();
+    let indices =
+        PrimitiveArray::new(buffer![999u64, 0], Validity::from_iter([false, true])).into_array();
 
-    let result = fsl.take(buffer![2u8, 0].into_array()).unwrap();
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx);
 
-    let executed = result
-        .clone()
-        .execute_until::<FixedSizeList>(&mut ctx)
-        .unwrap();
-    assert!(
-        executed
-            .as_::<FixedSizeList>()
-            .elements()
-            .is::<TakeSlices>()
-    );
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_take_uses_take_slices_for_encoded_elements_child() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let encoded_elements = NoTakeSlicesArray::wrap(buffer![10i32, 20, 30, 40, 20, 30].into_array());
+    let fsl = FixedSizeListArray::new(encoded_elements, 2, Validity::NonNullable, 3);
+    let indices = buffer![2u8, 0].into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+
+    assert!(result.as_::<FixedSizeList>().elements().is::<TakeSlices>());
     let expected = FixedSizeListArray::new(
         PrimitiveArray::from_iter([20i32, 30, 10, 20]).into_array(),
         2,
@@ -380,6 +399,141 @@ fn test_take_uses_take_slices_for_encoded_elements_child() {
         2,
     );
     assert_arrays_eq!(expected, result, &mut ctx);
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct NoTakeSlicesArray;
+
+impl NoTakeSlicesArray {
+    fn wrap(child: ArrayRef) -> ArrayRef {
+        let dtype = child.dtype().clone();
+        let len = child.len();
+
+        // SAFETY: `NoTakeSlicesArray` has one child with matching dtype and length, and no
+        // top-level metadata beyond `EmptyArrayData`.
+        unsafe {
+            Array::from_parts_unchecked(
+                ArrayParts::new(NoTakeSlicesArray, dtype, len, EmptyArrayData)
+                    .with_slots(smallvec![Some(child)]),
+            )
+        }
+        .into_array()
+    }
+}
+
+impl VTable for NoTakeSlicesArray {
+    type TypedArrayData = EmptyArrayData;
+    type OperationsVTable = Self;
+    type ValidityVTable = Self;
+
+    fn id(&self) -> ArrayId {
+        static ID: CachedId = CachedId::new("vortex.test.no_take_slices");
+        *ID
+    }
+
+    fn validate(
+        &self,
+        _data: &Self::TypedArrayData,
+        dtype: &DType,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()> {
+        vortex_ensure!(
+            slots.len() == 1,
+            "NoTakeSlicesArray expected one child slot"
+        );
+        let child = slots[0]
+            .as_ref()
+            .ok_or_else(|| vortex_err!("NoTakeSlicesArray child slot must be present"))?;
+        vortex_ensure!(
+            child.dtype() == dtype,
+            "NoTakeSlicesArray child dtype {} does not match outer dtype {}",
+            child.dtype(),
+            dtype
+        );
+        vortex_ensure!(
+            child.len() == len,
+            "NoTakeSlicesArray child length {} does not match outer length {}",
+            child.len(),
+            len
+        );
+        Ok(())
+    }
+
+    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
+        0
+    }
+
+    fn buffer(_array: ArrayView<'_, Self>, _idx: usize) -> BufferHandle {
+        vortex_panic!("NoTakeSlicesArray has no buffers")
+    }
+
+    fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
+        None
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
+    }
+
+    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
+        match idx {
+            0 => "child".to_string(),
+            _ => vortex_panic!("NoTakeSlicesArray slot index {idx} out of bounds"),
+        }
+    }
+
+    fn serialize(
+        _array: ArrayView<'_, Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
+        vortex_bail!("NoTakeSlicesArray is not serializable")
+    }
+
+    fn deserialize(
+        &self,
+        _dtype: &DType,
+        _len: usize,
+        _metadata: &[u8],
+        _buffers: &[BufferHandle],
+        _children: &dyn ArrayChildren,
+        _session: &VortexSession,
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_bail!("NoTakeSlicesArray is not serializable")
+    }
+
+    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        Ok(ExecutionResult::done(array.slots()[0].clone().ok_or_else(
+            || vortex_err!("NoTakeSlicesArray child slot must be present"),
+        )?))
+    }
+}
+
+impl OperationsVTable<NoTakeSlicesArray> for NoTakeSlicesArray {
+    fn scalar_at(
+        array: ArrayView<'_, NoTakeSlicesArray>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        array.as_ref().slots()[0]
+            .as_ref()
+            .ok_or_else(|| vortex_err!("NoTakeSlicesArray child slot must be present"))?
+            .execute_scalar(index, ctx)
+    }
+}
+
+impl ValidityVTable<NoTakeSlicesArray> for NoTakeSlicesArray {
+    fn validity(array: ArrayView<'_, NoTakeSlicesArray>) -> VortexResult<Validity> {
+        array.as_ref().slots()[0]
+            .as_ref()
+            .ok_or_else(|| vortex_err!("NoTakeSlicesArray child slot must be present"))?
+            .validity()
+    }
 }
 
 // Parameterized test for nullable array scenarios that are specific to FSL's implementation.

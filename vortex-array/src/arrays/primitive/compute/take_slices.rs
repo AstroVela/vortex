@@ -3,6 +3,7 @@
 
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::IntoArray;
@@ -22,7 +23,10 @@ impl TakeSlicesExecute for Primitive {
         let validity = array.validity()?.take_slices(slices)?;
         match_each_native_ptype!(array.ptype(), |T| {
             let source = array.as_slice::<T>();
-            let len = slices.iter().map(|(start, end)| end - start).sum();
+            let len = slices.iter().try_fold(0usize, |len, &(start, end)| {
+                len.checked_add(end - start)
+                    .ok_or_else(|| vortex_err!("TakeSlices output length overflow"))
+            })?;
             let mut values = BufferMut::<T>::with_capacity(len);
 
             for &(start, end) in slices {

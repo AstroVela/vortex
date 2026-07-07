@@ -18,6 +18,7 @@ use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::assert_arrays_eq;
 use crate::dtype::Nullability;
 use crate::kernel::ExecuteParentKernel;
+use crate::validity::Validity;
 
 #[test]
 fn take_slices_preserves_order_duplicates_and_overlap() -> VortexResult<()> {
@@ -89,6 +90,30 @@ fn take_slices_size_one_child_can_repeat_the_only_range() -> VortexResult<()> {
 
     let actual = array.take_slices(vec![(0, 1), (0, 1)])?;
     let expected = PrimitiveArray::from_iter([7i32, 7]);
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn take_slices_size_one_nullable_child_can_repeat_null() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = PrimitiveArray::from_option_iter([None::<i32>]).into_array();
+
+    let actual = array.take_slices(vec![(0, 1), (0, 1)])?;
+    let expected = PrimitiveArray::from_option_iter([None::<i32>, None]);
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn take_slices_preserves_all_invalid_validity() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = PrimitiveArray::new(buffer![1i32, 2, 3], Validity::AllInvalid).into_array();
+
+    let actual = array.take_slices(vec![(2, 3), (0, 2)])?;
+    let expected = PrimitiveArray::from_option_iter([None::<i32>, None, None]);
 
     assert_arrays_eq!(actual, expected, &mut ctx);
     Ok(())
