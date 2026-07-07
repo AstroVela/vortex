@@ -8,12 +8,12 @@ use std::fmt::Formatter;
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use Nullability::NonNullable;
 pub use expr::*;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use once_cell::sync::OnceCell;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
@@ -50,7 +50,7 @@ pub struct RowIdxLayoutReader {
     name: Arc<str>,
     row_offset: u64,
     child: Arc<dyn LayoutReader>,
-    partition_cache: DashMap<ExactExpr, Arc<OnceLock<Partitioning>>>,
+    partition_cache: DashMap<ExactExpr, Arc<OnceCell<Partitioning>>>,
     session: VortexSession,
 }
 
@@ -67,22 +67,18 @@ impl RowIdxLayoutReader {
 
     fn partition_expr(&self, expr: &Expression) -> VortexResult<Partitioning> {
         let key = ExactExpr(expr.clone());
+        let entry = match self.partition_cache.get(&key) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.partition_cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceCell::new()))
+                    .value(),
+            ),
+        };
 
-        // Check cache first with read-only lock.
-        if let Some(entry) = self.partition_cache.get(&key)
-            && let Some(partitioning) = entry.value().get()
-        {
-            return Ok(partitioning.clone());
-        }
-
-        let result = self.compute_partitioning(expr)?;
-
-        self.partition_cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceLock::new()))
-            .get_or_init(|| result.clone());
-
-        Ok(result)
+        let partitioning = entry.get_or_try_init(|| self.compute_partitioning(expr))?;
+        Ok(partitioning.clone())
     }
 
     fn compute_partitioning(&self, expr: &Expression) -> VortexResult<Partitioning> {

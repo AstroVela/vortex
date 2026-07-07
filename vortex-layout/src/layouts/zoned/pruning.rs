@@ -35,6 +35,7 @@ use crate::layouts::zoned::zone_map::ZoneMap;
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
 pub(super) type SharedPruningResult =
     Shared<BoxFuture<'static, SharedVortexResult<Arc<PruningResult>>>>;
+type PruningResultCache = Arc<OnceLock<Option<SharedPruningResult>>>;
 type PredicateCache = Arc<OnceLock<Option<Expression>>>;
 
 pub(super) struct PruningState {
@@ -46,7 +47,7 @@ pub(super) struct PruningState {
     lazy_children: Arc<LazyReaderChildren>,
     session: VortexSession,
 
-    pruning_result: LazyLock<DashMap<Expression, Option<SharedPruningResult>>>,
+    pruning_result: LazyLock<DashMap<Expression, PruningResultCache>>,
     zone_map: OnceLock<SharedZoneMap>,
     pruning_predicates: LazyLock<Arc<DashMap<Expression, PredicateCache>>>,
 }
@@ -73,53 +74,69 @@ impl PruningState {
     }
 
     pub(super) fn pruning_mask_future(&self, expr: Expression) -> Option<SharedPruningResult> {
-        if let Some(result) = self.pruning_result.get(&expr) {
-            return result.value().clone();
-        }
+        let entry = match self.pruning_result.get(&expr) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.pruning_result
+                    .entry(expr.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .value(),
+            ),
+        };
 
-        self.pruning_result
-            .entry(expr.clone())
-            .or_insert_with(|| match self.pruning_predicate(expr.clone()) {
-                None => {
-                    trace!(%expr, "no pruning predicate");
-                    None
-                }
-                Some(predicate) => {
-                    trace!(%expr, ?predicate, "constructed pruning predicate");
-                    let zone_map = self.zone_map();
-                    let dynamic_updates = DynamicExprUpdates::new(&expr);
-                    let session = self.session.clone();
-
-                    Some(
-                        async move {
-                            let zone_map = zone_map.await?;
-                            let initial_mask =
-                                zone_map.prune(&predicate, &session).map_err(|err| {
-                                    err.with_context(format!(
-                                        "While evaluating pruning predicate {} (derived from {})",
-                                        predicate, expr
-                                    ))
-                                })?;
-                            Ok(Arc::new(PruningResult {
-                                zone_map,
-                                predicate,
-                                dynamic_updates,
-                                latest_result: RwLock::new((0, initial_mask)),
-                                session,
-                            }))
-                        }
-                        .boxed()
-                        .shared(),
-                    )
-                }
-            })
+        entry
+            .get_or_init(|| self.compute_pruning_mask_future(expr))
             .clone()
     }
 
+    fn compute_pruning_mask_future(&self, expr: Expression) -> Option<SharedPruningResult> {
+        match self.pruning_predicate(expr.clone()) {
+            None => {
+                trace!(%expr, "no pruning predicate");
+                None
+            }
+            Some(predicate) => {
+                trace!(%expr, ?predicate, "constructed pruning predicate");
+                let zone_map = self.zone_map();
+                let dynamic_updates = DynamicExprUpdates::new(&expr);
+                let session = self.session.clone();
+
+                Some(
+                    async move {
+                        let zone_map = zone_map.await?;
+                        let initial_mask = zone_map.prune(&predicate, &session).map_err(|err| {
+                            err.with_context(format!(
+                                "While evaluating pruning predicate {} (derived from {})",
+                                predicate, expr
+                            ))
+                        })?;
+                        Ok(Arc::new(PruningResult {
+                            zone_map,
+                            predicate,
+                            dynamic_updates,
+                            latest_result: RwLock::new((0, initial_mask)),
+                            session,
+                        }))
+                    }
+                    .boxed()
+                    .shared(),
+                )
+            }
+        }
+    }
+
     fn pruning_predicate(&self, expr: Expression) -> Option<Expression> {
-        self.pruning_predicates
-            .entry(expr.clone())
-            .or_default()
+        let entry = match self.pruning_predicates.get(&expr) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.pruning_predicates
+                    .entry(expr.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .value(),
+            ),
+        };
+
+        entry
             .get_or_init(move || match expr.falsify(&self.dtype, &self.session) {
                 Ok(predicate) => predicate,
                 Err(error) => {

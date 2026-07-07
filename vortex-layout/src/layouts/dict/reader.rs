@@ -53,7 +53,7 @@ pub struct DictReader {
     /// Cached dict values array
     values_array: OnceLock<SharedArrayFuture>,
     /// Cache of expression evaluation results on the values array by expression
-    values_evals: DashMap<Expression, SharedArrayFuture>,
+    values_evals: DashMap<Expression, Arc<OnceLock<SharedArrayFuture>>>,
 
     values: LayoutReaderRef,
     codes: LayoutReaderRef,
@@ -139,14 +139,18 @@ impl DictReader {
         // shouldn't.
         // TODO(joe): fixme
 
-        // Check cache first with read-only lock
-        if let Some(fut) = self.values_evals.get(&expr) {
-            return fut.clone();
-        }
+        let entry = match self.values_evals.get(&expr) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.values_evals
+                    .entry(expr.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .value(),
+            ),
+        };
 
-        self.values_evals
-            .entry(expr.clone())
-            .or_insert_with(|| {
+        entry
+            .get_or_init(|| {
                 self.values_array_uncanonical()
                     .map(move |array| {
                         let array = array?.apply(&expr)?;
