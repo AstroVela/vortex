@@ -3,6 +3,8 @@
 
 use rstest::rstest;
 use vortex_buffer::buffer;
+use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use super::common::create_basic_fsl;
 use super::common::create_empty_fsl;
@@ -13,8 +15,13 @@ use crate::ArrayRef;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
 use crate::array_session;
+use crate::arrays::DictArray;
+use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::TakeSlices;
+use crate::arrays::dict::TakeExecute;
+use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::assert_arrays_eq;
 use crate::builders::ArrayBuilder;
 use crate::builders::FixedSizeListBuilder;
@@ -113,6 +120,36 @@ fn test_take_degenerate_lists(
 }
 
 #[test]
+fn test_take_degenerate_rejects_out_of_bounds_valid_index() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::empty::<i32>(Nullability::NonNullable).into_array();
+    let fsl = FixedSizeListArray::new(elements, 0, Validity::NonNullable, 5);
+    let indices = buffer![5u32].into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx);
+
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_take_degenerate_ignores_out_of_bounds_null_index_payload() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::empty::<i32>(Nullability::NonNullable).into_array();
+    let fsl = FixedSizeListArray::new(elements, 0, Validity::NonNullable, 5);
+    let indices =
+        PrimitiveArray::new(buffer![999u32, 1], Validity::from_iter([false, true])).into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+
+    assert_eq!(result.len(), 2);
+    assert!(result.execute_scalar(0, &mut ctx)?.is_null());
+    assert!(!result.execute_scalar(1, &mut ctx)?.is_null());
+    Ok(())
+}
+
+#[test]
 fn test_take_large_list_size() {
     let mut ctx = array_session().create_execution_ctx();
     let elements = buffer![0i32..300].into_array();
@@ -124,6 +161,41 @@ fn test_take_large_list_size() {
     // Expected: [[200..300], [0..100]]
     let expected_elems = PrimitiveArray::from_iter((200i32..300).chain(0..100)).into_array();
     let expected = FixedSizeListArray::new(expected_elems, 100, Validity::NonNullable, 2);
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+#[test]
+fn test_take_range_path_large_list_size_non_nullable() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::from_iter(0i32..768).into_array();
+    let fsl = FixedSizeListArray::new(elements, 256, Validity::NonNullable, 3);
+
+    let indices = buffer![2u16, 0].into_array();
+    let result = fsl.take(indices).unwrap();
+
+    let expected_elems = PrimitiveArray::from_iter((512i32..768).chain(0..256)).into_array();
+    let expected = FixedSizeListArray::new(expected_elems, 256, Validity::NonNullable, 2);
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+#[test]
+fn test_take_range_path_large_list_size_nullable() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::from_iter(0i32..768).into_array();
+    let fsl = FixedSizeListArray::new(elements, 256, Validity::from_iter([true, false, true]), 3);
+
+    let indices = buffer![2u16, 1, 0].into_array();
+    let result = fsl.take(indices).unwrap();
+
+    let expected_elems =
+        PrimitiveArray::from_iter((512i32..768).chain((0..256).map(|_| 0)).chain(0..256))
+            .into_array();
+    let expected = FixedSizeListArray::new(
+        expected_elems,
+        256,
+        Validity::from_iter([true, false, true]),
+        3,
+    );
     assert_arrays_eq!(expected, result, &mut ctx);
 }
 
@@ -147,8 +219,7 @@ fn test_take_fsl_with_null_indices_preserves_elements() {
     assert_arrays_eq!(expected, result, &mut ctx);
 }
 
-// Element index overflow: with u8 indices and list_size=16, data_idx=16 produces element index
-// 16*16=256 which overflows u8. The take kernel must widen the element index type.
+// List offsets must not truncate when small index types select large lists.
 #[rstest]
 #[case::non_nullable(
     FixedSizeListArray::new(
@@ -181,24 +252,164 @@ fn test_element_index_overflow(
     assert_arrays_eq!(result, expected, &mut ctx);
 }
 
+#[test]
+fn test_take_nullable_indices_ignores_out_of_bounds_null_value() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = buffer![1i32, 2, 3, 4, 5, 6].into_array();
+    let fsl = FixedSizeListArray::new(elements.into_array(), 2, Validity::NonNullable, 3);
+
+    let indices = PrimitiveArray::new(
+        buffer![1u64, 999, 0],
+        Validity::from_iter([true, false, true]),
+    );
+    let result = fsl.take(indices.into_array()).unwrap();
+
+    let expected = FixedSizeListArray::new(
+        buffer![3i32, 4, 0, 0, 1, 2].into_array(),
+        2,
+        Validity::from_iter([true, false, true]),
+        3,
+    );
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+#[test]
+fn test_take_rejects_overflowing_valid_index() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = buffer![1i32, 2, 3, 4].into_array();
+    let fsl = FixedSizeListArray::new(elements.into_array(), 2, Validity::NonNullable, 2);
+    let overflowing_index = (usize::MAX / 2 + 1) as u64;
+    let indices = buffer![overflowing_index].into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_take_nullable_fsl_with_nullable_indices() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = buffer![1i32, 2, 3, 4, 5, 6].into_array();
+    let fsl = FixedSizeListArray::new(
+        elements.into_array(),
+        2,
+        Validity::from_iter([true, false, true]),
+        3,
+    );
+
+    let indices = PrimitiveArray::new(
+        buffer![2u64, 999, 1, 0],
+        Validity::from_iter([true, false, true, true]),
+    );
+    let result = fsl.take(indices.into_array()).unwrap();
+
+    let expected = FixedSizeListArray::new(
+        buffer![5i32, 6, 0, 0, 0, 0, 1, 2].into_array(),
+        2,
+        Validity::from_iter([true, false, false, true]),
+        4,
+    );
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+#[test]
+fn test_take_empty_source_with_all_null_indices() {
+    let fsl = create_empty_fsl();
+    let indices = PrimitiveArray::new(buffer![999u64, 123], Validity::AllInvalid);
+
+    let result = fsl.take(indices.into_array()).unwrap();
+
+    assert_eq!(result.len(), 2);
+    for idx in 0..result.len() {
+        assert!(
+            result
+                .execute_scalar(idx, &mut array_session().create_execution_ctx())
+                .unwrap()
+                .is_null()
+        );
+    }
+}
+
+#[test]
+fn test_take_execute_empty_source_all_null_indices_builds_default_elements() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let fsl = create_empty_fsl();
+    let indices = PrimitiveArray::new(buffer![999u64, 123], Validity::AllInvalid).into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+    let result_fsl = result.as_::<FixedSizeList>();
+
+    assert_eq!(
+        result_fsl.elements().len(),
+        result.len() * result_fsl.list_size() as usize
+    );
+    for idx in 0..result.len() {
+        assert!(result.execute_scalar(idx, &mut ctx)?.is_null());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_take_uses_take_slices_for_encoded_elements_child() {
+    let mut ctx = array_session().create_execution_ctx();
+    let dict_elements = DictArray::try_new(
+        buffer![0u8, 1, 2, 3, 1, 2].into_array(),
+        PrimitiveArray::from_iter([10i32, 20, 30, 40]).into_array(),
+    )
+    .unwrap()
+    .into_array();
+    let fsl = FixedSizeListArray::new(dict_elements, 2, Validity::NonNullable, 3);
+
+    let result = fsl.take(buffer![2u8, 0].into_array()).unwrap();
+
+    let executed = result
+        .clone()
+        .execute_until::<FixedSizeList>(&mut ctx)
+        .unwrap();
+    assert!(
+        executed
+            .as_::<FixedSizeList>()
+            .elements()
+            .is::<TakeSlices>()
+    );
+    let expected = FixedSizeListArray::new(
+        PrimitiveArray::from_iter([20i32, 30, 10, 20]).into_array(),
+        2,
+        Validity::NonNullable,
+        2,
+    );
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
 // Parameterized test for nullable array scenarios that are specific to FSL's implementation.
 #[rstest]
 #[case::nullable_mixed_elements(
     vec![Some(vec![1i32, 2]), None, Some(vec![5, 6])],
     vec![Some(2u32), Some(1), Some(0)],
-    vec![false, true, false]
+    vec![Some(vec![5i32, 6]), None, Some(vec![1, 2])]
 )]
 #[case::nullable_with_null_indices(
     vec![Some(vec![1i32, 2]), None, Some(vec![5, 6])],
     vec![Some(0u32), None, Some(1), Some(2)],
-    vec![false, true, true, false]
+    vec![Some(vec![1i32, 2]), None, None, Some(vec![5, 6])]
 )]
 fn test_take_nullable_arrays_fsl_specific(
     #[case] array_values: Vec<Option<Vec<i32>>>,
     #[case] indices: Vec<Option<u32>>,
-    #[case] expected_nulls: Vec<bool>,
+    #[case] expected_values: Vec<Option<Vec<i32>>>,
 ) {
-    // Build the nullable FSL array.
+    let mut ctx = array_session().create_execution_ctx();
+    let fsl = nullable_i32_fsl(array_values);
+
+    let indices_array = PrimitiveArray::from_option_iter(indices);
+    let result = fsl.take(indices_array.into_array()).unwrap();
+    let expected = nullable_i32_fsl(expected_values);
+
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+fn nullable_i32_fsl(array_values: Vec<Option<Vec<i32>>>) -> ArrayRef {
     let list_size = if let Some(Some(first)) = array_values.first() {
         u32::try_from(first.len()).unwrap()
     } else {
@@ -231,20 +442,5 @@ fn test_take_nullable_arrays_fsl_specific(
         }
     }
 
-    let fsl = builder.finish();
-
-    // Create indices (with possible nulls).
-    let indices_array = PrimitiveArray::from_option_iter(indices.clone());
-    let result = fsl.take(indices_array.into_array()).unwrap();
-
-    assert_eq!(result.len(), indices.len());
-    for (i, expected_null) in expected_nulls.iter().enumerate() {
-        assert_eq!(
-            result
-                .execute_scalar(i, &mut array_session().create_execution_ctx())
-                .unwrap()
-                .is_null(),
-            *expected_null
-        );
-    }
+    builder.finish()
 }

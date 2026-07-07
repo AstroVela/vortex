@@ -41,6 +41,7 @@ use crate::arrays::FilterArray;
 use crate::arrays::Null;
 use crate::arrays::Primitive;
 use crate::arrays::SliceArray;
+use crate::arrays::TakeSlicesArray;
 use crate::arrays::VarBin;
 use crate::arrays::VarBinView;
 use crate::buffer::BufferHandle;
@@ -260,6 +261,14 @@ impl ArrayRef {
     /// Wraps the array in a [`DictArray`] such that it is logically taken by the given indices.
     pub fn take(&self, indices: ArrayRef) -> VortexResult<ArrayRef> {
         DictArray::try_new(indices, self.clone())?
+            .into_array()
+            .optimize()
+    }
+
+    /// Wraps the array in a [`TakeSlicesArray`] such that it is logically selected by ordered
+    /// child ranges.
+    pub fn take_slices(&self, slices: Vec<(usize, usize)>) -> VortexResult<ArrayRef> {
+        TakeSlicesArray::try_new(self.clone(), slices)?
             .into_array()
             .optimize()
     }

@@ -224,6 +224,14 @@ impl Validity {
         }
     }
 
+    /// Select validity values by concatenating ordered, non-empty ranges.
+    pub fn take_slices(&self, slices: &[(usize, usize)]) -> VortexResult<Self> {
+        match self {
+            v @ (Self::NonNullable | Self::AllValid | Self::AllInvalid) => Ok(v.clone()),
+            Self::Array(is_valid) => Ok(Self::Array(is_valid.take_slices(slices.to_vec())?)),
+        }
+    }
+
     // Invert the validity
     pub fn not(&self) -> VortexResult<Self> {
         match self {

@@ -27,6 +27,7 @@ use crate::arrays::Masked;
 use crate::arrays::Null;
 use crate::arrays::Primitive;
 use crate::arrays::Struct;
+use crate::arrays::TakeSlices;
 use crate::arrays::VarBin;
 use crate::arrays::VarBinView;
 use crate::arrays::Variant;
@@ -81,6 +82,7 @@ impl Default for ArraySession {
         this.register(Dict);
         this.register(List);
         this.register(Masked);
+        this.register(TakeSlices);
         this.register(VarBin);
 
         this

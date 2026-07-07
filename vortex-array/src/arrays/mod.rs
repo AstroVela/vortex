@@ -104,6 +104,10 @@ pub mod slice;
 pub use slice::Slice;
 pub use slice::SliceArray;
 
+pub mod take_slices;
+pub use take_slices::TakeSlices;
+pub use take_slices::TakeSlicesArray;
+
 pub mod struct_;
 pub use struct_::Struct;
 pub use struct_::StructArray;
