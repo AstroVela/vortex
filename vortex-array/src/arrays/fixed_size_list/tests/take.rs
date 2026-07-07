@@ -128,6 +128,41 @@ fn test_take_large_list_size() {
 }
 
 #[test]
+fn test_take_range_path_large_list_size_non_nullable() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::from_iter(0i32..768).into_array();
+    let fsl = FixedSizeListArray::new(elements, 256, Validity::NonNullable, 3);
+
+    let indices = buffer![2u16, 0].into_array();
+    let result = fsl.take(indices).unwrap();
+
+    let expected_elems = PrimitiveArray::from_iter((512i32..768).chain(0..256)).into_array();
+    let expected = FixedSizeListArray::new(expected_elems, 256, Validity::NonNullable, 2);
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+#[test]
+fn test_take_range_path_large_list_size_nullable() {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::from_iter(0i32..768).into_array();
+    let fsl = FixedSizeListArray::new(elements, 256, Validity::from_iter([true, false, true]), 3);
+
+    let indices = buffer![2u16, 1, 0].into_array();
+    let result = fsl.take(indices).unwrap();
+
+    let expected_elems =
+        PrimitiveArray::from_iter((512i32..768).chain((0..256).map(|_| 0)).chain(0..256))
+            .into_array();
+    let expected = FixedSizeListArray::new(
+        expected_elems,
+        256,
+        Validity::from_iter([true, false, true]),
+        3,
+    );
+    assert_arrays_eq!(expected, result, &mut ctx);
+}
+
+#[test]
 fn test_take_fsl_with_null_indices_preserves_elements() {
     let mut ctx = array_session().create_execution_ctx();
     let elements = buffer![1i32, 2, 3, 4, 5, 6].into_array();

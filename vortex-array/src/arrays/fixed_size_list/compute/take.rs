@@ -21,16 +21,26 @@ use crate::arrays::dict::TakeExecute;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::dtype::IntegerPType;
+use crate::dtype::NativePType;
 use crate::executor::ExecutionCtx;
+use crate::match_each_native_ptype;
 use crate::match_each_unsigned_integer_ptype;
 use crate::match_smallest_offset_type;
 use crate::validity::Validity;
 
+/// Use range copies when the child values are already a contiguous primitive buffer.
+///
+/// This deliberately does not canonicalize encoded children just to make range slicing possible:
+/// the existing child `take` path lets those encodings handle the gather without eagerly
+/// decompressing the full child.
+const RANGE_TAKE_MIN_PRIMITIVE_LIST_BYTES: usize = 4;
+
 /// Take implementation for [`FixedSizeListArray`].
 ///
 /// Unlike `ListView`, `FixedSizeListArray` must rebuild the elements array because it requires
-/// that elements start at offset 0 and be perfectly packed without gaps. We expand list indices
-/// into element indices and push them down to the child elements array.
+/// that elements start at offset 0 and be perfectly packed without gaps. We either use a bulk child
+/// `take` over expanded element indices or copy selected child ranges directly, depending on the
+/// child encoding and list width.
 impl TakeExecute for FixedSizeList {
     fn take(
         array: ArrayView<'_, FixedSizeList>,
@@ -88,12 +98,39 @@ fn take_with_indices<I: IntegerPType, E: IntegerPType>(
         // The result's nullability is the union of the input nullabilities.
         if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
             let indices_array = indices_array.as_view();
-            take_nullable_fsl::<I, E>(array, indices_array, ctx)
+            if should_take_fsl_with_ranges(&array, list_size) {
+                take_nullable_fsl_by_ranges::<I, E>(array, indices_array, ctx)
+            } else {
+                take_nullable_fsl::<I, E>(array, indices_array, ctx)
+            }
         } else {
             let indices_array = indices_array.as_view();
-            take_non_nullable_fsl::<I, E>(array, indices_array)
+            if should_take_fsl_with_ranges(&array, list_size) {
+                take_non_nullable_fsl_by_ranges::<I, E>(array, indices_array)
+            } else {
+                take_non_nullable_fsl::<I, E>(array, indices_array)
+            }
         }
     }
+}
+
+fn should_take_fsl_with_ranges(array: &ArrayView<'_, FixedSizeList>, list_size: usize) -> bool {
+    let element_dtype = array
+        .dtype()
+        .as_fixed_size_list_element_opt()
+        .vortex_expect("FixedSizeList dtype must have an element dtype");
+
+    if !element_dtype.is_nullable() && array.elements().is::<Primitive>() {
+        return element_dtype.element_size().is_some_and(|element_size| {
+            element_size
+                .checked_mul(list_size)
+                .is_some_and(|list_byte_width| {
+                    list_byte_width >= RANGE_TAKE_MIN_PRIMITIVE_LIST_BYTES
+                })
+        });
+    }
+
+    false
 }
 
 /// Takes from an array when both the array and indices are non-nullable.
@@ -143,6 +180,75 @@ fn take_non_nullable_fsl<I: IntegerPType, E: IntegerPType>(
         )
     }
     .into_array())
+}
+
+/// Takes from an array when both the array and indices are non-nullable, copying each selected
+/// list as a contiguous range instead of expanding it into per-element gather indices.
+fn take_non_nullable_fsl_by_ranges<I: IntegerPType, E: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+) -> VortexResult<ArrayRef> {
+    if let Some(new_elements) =
+        take_primitive_non_nullable_elements_by_ranges::<I>(array, indices_array)?
+    {
+        let new_len = indices_array.len();
+        return Ok(unsafe {
+            FixedSizeListArray::new_unchecked(
+                new_elements,
+                array.list_size(),
+                Validity::NonNullable,
+                new_len,
+            )
+        }
+        .into_array());
+    }
+
+    take_non_nullable_fsl::<I, E>(array, indices_array)
+}
+
+fn take_primitive_non_nullable_elements_by_ranges<I: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+) -> VortexResult<Option<ArrayRef>> {
+    let Some(elements) = array.elements().as_typed::<Primitive>() else {
+        return Ok(None);
+    };
+    if !PrimitiveArrayExt::validity(&elements).definitely_no_nulls() {
+        return Ok(None);
+    }
+
+    match_each_native_ptype!(elements.ptype(), |T| {
+        Ok(Some(
+            take_primitive_non_nullable_elements_by_ranges_typed::<I, T>(
+                array,
+                indices_array,
+                elements,
+            ),
+        ))
+    })
+}
+
+fn take_primitive_non_nullable_elements_by_ranges_typed<I, T>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+    elements: ArrayView<'_, Primitive>,
+) -> ArrayRef
+where
+    I: IntegerPType,
+    T: NativePType,
+{
+    let list_size = array.list_size() as usize;
+    let indices: &[I] = indices_array.as_slice::<I>();
+    let mut values = BufferMut::<T>::with_capacity(indices.len() * list_size);
+    let source = elements.as_slice::<T>();
+
+    for &data_idx in indices {
+        let data_idx = index_to_usize(data_idx);
+        let list_start = data_idx * list_size;
+        values.extend_from_slice(&source[list_start..list_start + list_size]);
+    }
+
+    PrimitiveArray::new(values.freeze(), Validity::from(elements.nullability())).into_array()
 }
 
 /// Takes from an array when either the array or indices are nullable.
@@ -218,4 +324,117 @@ fn take_nullable_fsl<I: IntegerPType, E: IntegerPType>(
         FixedSizeListArray::new_unchecked(new_elements, array.list_size(), new_validity, new_len)
     }
     .into_array())
+}
+
+/// Takes from an array when either the array or indices are nullable, copying each selected
+/// non-null list as a contiguous range.
+fn take_nullable_fsl_by_ranges<I: IntegerPType, E: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let indices: &[I] = indices_array.as_slice::<I>();
+    let new_len = indices.len();
+
+    let array_validity = array
+        .fixed_size_list_validity()
+        .execute_mask(array.as_ref().len(), ctx)
+        .vortex_expect("Failed to compute validity mask");
+    let indices_len = indices_array.as_ref().len();
+    let indices_validity = match indices_array
+        .validity()
+        .vortex_expect("Failed to compute validity mask")
+    {
+        Validity::NonNullable | Validity::AllValid => Mask::new_true(indices_len),
+        Validity::AllInvalid => Mask::new_false(indices_len),
+        Validity::Array(a) => a.execute::<BoolArray>(ctx)?.execute_mask(ctx),
+    };
+
+    if let Some((new_elements, new_validity)) = take_primitive_nullable_elements_by_ranges::<I>(
+        array,
+        indices_array,
+        &array_validity,
+        &indices_validity,
+    )? {
+        debug_assert!(new_validity.maybe_len().is_none_or(|vl| vl == new_len));
+        return Ok(unsafe {
+            FixedSizeListArray::new_unchecked(
+                new_elements,
+                array.list_size(),
+                new_validity,
+                new_len,
+            )
+        }
+        .into_array());
+    }
+
+    take_nullable_fsl::<I, E>(array, indices_array, ctx)
+}
+
+fn take_primitive_nullable_elements_by_ranges<I: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+    array_validity: &Mask,
+    indices_validity: &Mask,
+) -> VortexResult<Option<(ArrayRef, Validity)>> {
+    let Some(elements) = array.elements().as_typed::<Primitive>() else {
+        return Ok(None);
+    };
+    if !PrimitiveArrayExt::validity(&elements).definitely_no_nulls() {
+        return Ok(None);
+    }
+
+    match_each_native_ptype!(elements.ptype(), |T| {
+        Ok(Some(
+            take_primitive_nullable_elements_by_ranges_typed::<I, T>(
+                array,
+                indices_array,
+                elements,
+                array_validity,
+                indices_validity,
+            ),
+        ))
+    })
+}
+
+fn take_primitive_nullable_elements_by_ranges_typed<I, T>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices_array: ArrayView<'_, Primitive>,
+    elements: ArrayView<'_, Primitive>,
+    array_validity: &Mask,
+    indices_validity: &Mask,
+) -> (ArrayRef, Validity)
+where
+    I: IntegerPType,
+    T: NativePType,
+{
+    let list_size = array.list_size() as usize;
+    let indices: &[I] = indices_array.as_slice::<I>();
+    let mut values = BufferMut::<T>::with_capacity(indices.len() * list_size);
+    let mut new_validity_builder = BitBufferMut::with_capacity(indices.len());
+    let source = elements.as_slice::<T>();
+
+    for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
+        let data_idx = index_to_usize(data_idx);
+        if !is_index_valid || !array_validity.value(data_idx) {
+            values.push_n(T::default(), list_size);
+            new_validity_builder.append(false);
+        } else {
+            let list_start = data_idx * list_size;
+            values.extend_from_slice(&source[list_start..list_start + list_size]);
+            new_validity_builder.append(true);
+        }
+    }
+
+    let new_elements =
+        PrimitiveArray::new(values.freeze(), Validity::from(elements.nullability())).into_array();
+    let new_validity = Validity::from(new_validity_builder.freeze());
+
+    (new_elements, new_validity)
+}
+
+fn index_to_usize<I: IntegerPType>(index: I) -> usize {
+    index
+        .to_usize()
+        .unwrap_or_else(|| vortex_panic!("Failed to convert index to usize: {}", index))
 }
