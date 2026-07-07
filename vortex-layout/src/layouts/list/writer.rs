@@ -206,6 +206,15 @@ fn canonicalize_to_list_parts(
     if let Some(list) = canonical.as_opt::<List>() {
         Ok(list.into_owned().into_data_parts())
     } else if let Some(view) = canonical.as_opt::<ListView>() {
+        // TODO(list-layout): when the input is a *compressed* non-zero-copy `ListView` (overlapping
+        // / reordered element ranges), `list_from_list_view` gathers/`take`s to rebuild a gapless
+        // `List`, which materializes and thus *decompresses* the elements — the resulting children
+        // are written uncompressed, losing compression. Fix by forcing zero-copy-to-list form
+        // *before* compression (so the compressor emits a `List` with compressed children and no
+        // rebuild is needed), or by compressing each child after the shred rather than compressing
+        // the whole list beforehand. Harmless for the common case (Parquet/Arrow lists are already
+        // gapless, so this branch is a cheap no-op), and only reachable when the experimental list
+        // layout is enabled.
         Ok(list_from_list_view(view.into_owned(), exec_ctx)?.into_data_parts())
     } else {
         unreachable!("AnyList matcher guarantees List or ListView")

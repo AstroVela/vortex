@@ -5,7 +5,9 @@ mod expr;
 mod reader;
 pub mod writer;
 
+use std::env;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use reader::ListReader;
 use vortex_array::DeserializeMetadata;
@@ -34,6 +36,15 @@ use crate::children::LayoutChildren;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 use crate::vtable;
+
+/// Whether the file write strategy decomposes list columns into a [`ListLayout`] by default. This
+/// is experimental and off unless the environment variable `VORTEX_EXPERIMENTAL_LIST_LAYOUT` is set
+/// to `1`; otherwise list columns are written as flat arrays.
+pub fn use_experimental_list_layout() -> bool {
+    static USE_EXPERIMENTAL_LIST_LAYOUT: LazyLock<bool> =
+        LazyLock::new(|| env::var("VORTEX_EXPERIMENTAL_LIST_LAYOUT").is_ok_and(|v| v == "1"));
+    *USE_EXPERIMENTAL_LIST_LAYOUT
+}
 
 /// Child index of the `elements` layout.
 pub const ELEMENTS_CHILD_INDEX: usize = 0;

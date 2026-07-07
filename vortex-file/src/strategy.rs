@@ -50,7 +50,7 @@ use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::compressed::CompressorPlugin;
 use vortex_layout::layouts::dict::writer::DictStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
-#[cfg(feature = "unstable_encodings")]
+use vortex_layout::layouts::list::use_experimental_list_layout;
 use vortex_layout::layouts::list::writer::ListLayoutStrategy;
 use vortex_layout::layouts::repartition::RepartitionStrategy;
 use vortex_layout::layouts::repartition::RepartitionWriterOptions;
@@ -244,22 +244,18 @@ impl WriteStrategyBuilder {
             Arc::new(FlatLayoutStrategy::default())
         };
 
-        // 7. for each chunk create a layout. Under the `unstable_encodings` feature, list-typed
-        // chunks route through `ListLayoutStrategy` (separately-addressable elements/offsets/
-        // validity sub-layouts; non-list chunks fall through its built-in fallback to `flat`).
-        // Otherwise everything goes through the flat strategy.
-        #[cfg(feature = "unstable_encodings")]
-        let leaf: Arc<dyn LayoutStrategy> = Arc::new(
-            // Thread the configured `flat` (which carries `allow_encodings` / any custom flat
-            // override) through every child.
-            ListLayoutStrategy::default()
-                .with_elements(Arc::clone(&flat))
-                .with_offsets(Arc::clone(&flat))
-                .with_validity(Arc::clone(&flat))
-                .with_fallback(Arc::clone(&flat)),
-        );
-        #[cfg(not(feature = "unstable_encodings"))]
-        let leaf: Arc<dyn LayoutStrategy> = Arc::clone(&flat);
+        // 7. for each chunk create a layout
+        let leaf: Arc<dyn LayoutStrategy> = if use_experimental_list_layout() {
+            Arc::new(
+                ListLayoutStrategy::default()
+                    .with_elements(Arc::clone(&flat))
+                    .with_offsets(Arc::clone(&flat))
+                    .with_validity(Arc::clone(&flat))
+                    .with_fallback(Arc::clone(&flat)),
+            )
+        } else {
+            Arc::clone(&flat)
+        };
 
         let chunked = ChunkedLayoutStrategy::new(leaf);
         // 6. buffer chunks so they end up with closer segment ids physically
