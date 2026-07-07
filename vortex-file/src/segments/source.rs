@@ -36,6 +36,8 @@ use crate::read::IoRequestStream;
 use crate::read::ReadRequest;
 use crate::read::RequestId;
 
+const READ_RANGES_BATCH_SIZE: usize = 16;
+
 #[derive(Debug)]
 /// Events sent from segment futures to the coalescing read driver.
 pub enum ReadEvent {
@@ -108,6 +110,8 @@ impl FileSegmentSource {
                 reader.uri()
             );
         }
+        let read_batch_size = concurrency.min(READ_RANGES_BATCH_SIZE);
+        let read_batch_concurrency = concurrency.div_ceil(read_batch_size);
 
         let stream = IoRequestStream::new(
             StreamExt::boxed(recv),
@@ -119,7 +123,7 @@ impl FileSegmentSource {
 
         let drive_fut = async move {
             stream
-                .ready_chunks(concurrency)
+                .ready_chunks(read_batch_size)
                 .map(move |requests| {
                     let reader = reader.clone();
                     async move {
@@ -163,7 +167,7 @@ impl FileSegmentSource {
                         }
                     }
                 })
-                .buffer_unordered(1)
+                .buffer_unordered(read_batch_concurrency)
                 .collect::<()>()
                 .await
         };

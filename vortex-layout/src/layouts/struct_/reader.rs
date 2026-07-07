@@ -157,15 +157,18 @@ impl StructReader {
     /// Utility for partitioning an expression over the fields of a struct.
     fn partition_expr(&self, expr: Expression) -> VortexResult<Partitioned> {
         let key = ExactExpr(expr.clone());
-        let binding = self
-            .partitioned_expr_cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceLock::new()));
-        let entry = binding.value();
-        if let Some(value) = entry.get() {
+        if let Some(entry) = self.partitioned_expr_cache.get(&key)
+            && let Some(value) = entry.value().get()
+        {
             return Ok(value.clone());
         }
+
         let result = self.compute_partitioned_expr(expr)?;
+        let entry = self
+            .partitioned_expr_cache
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone();
         let result = entry.get_or_init(|| result);
         Ok(result.clone())
     }
