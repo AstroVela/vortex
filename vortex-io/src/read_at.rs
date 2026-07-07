@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -11,6 +12,8 @@ use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_metrics::Counter;
 use vortex_metrics::Histogram;
 use vortex_metrics::Label;
@@ -49,6 +52,77 @@ impl CoalesceConfig {
     }
 }
 
+/// A positional read request against a [`VortexReadAt`] source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadOp {
+    /// Starting byte offset in the source.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub length: usize,
+    /// Alignment required by the returned buffer.
+    pub alignment: Alignment,
+}
+
+impl ReadOp {
+    /// Create a new read operation with no alignment requirement.
+    pub const fn new(offset: u64, length: usize) -> Self {
+        Self::aligned(offset, length, Alignment::none())
+    }
+
+    /// Create a new read operation with an explicit alignment requirement.
+    pub const fn aligned(offset: u64, length: usize, alignment: Alignment) -> Self {
+        Self {
+            offset,
+            length,
+            alignment,
+        }
+    }
+
+    /// Return a copy of this read operation with a different alignment.
+    pub const fn with_alignment(mut self, alignment: Alignment) -> Self {
+        self.alignment = alignment;
+        self
+    }
+
+    /// Starting byte offset in the source.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Number of bytes to read.
+    pub const fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Whether this operation reads zero bytes.
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Alignment required by the returned buffer.
+    pub const fn alignment(&self) -> Alignment {
+        self.alignment
+    }
+
+    /// Exclusive end offset for this read operation.
+    pub fn end(&self) -> VortexResult<u64> {
+        let length = u64::try_from(self.length)
+            .map_err(|_| vortex_err!("ReadOp length exceeds u64::MAX: {}", self.length))?;
+        self.offset.checked_add(length).ok_or_else(|| {
+            vortex_err!(
+                "ReadOp range overflow: offset={}, length={}",
+                self.offset,
+                self.length
+            )
+        })
+    }
+
+    /// Byte range covered by this read operation.
+    pub fn byte_range(&self) -> VortexResult<Range<u64>> {
+        Ok(self.offset..self.end()?)
+    }
+}
+
 /// The unified read trait for Vortex I/O sources.
 ///
 /// This trait provides async positional reads to underlying storage and is used by the vortex-file
@@ -64,11 +138,12 @@ pub trait VortexReadAt: Send + Sync + 'static {
         None
     }
 
-    /// Maximum number of concurrent I/O requests for that should be pulled from this source.
+    /// Maximum number of physical read operations the driver should pull for this source.
     ///
-    /// This value is used to control how many [`VortexReadAt::read_at`] calls can
-    /// be in-flight simultaneously. Higher values allow more parallelism but consume
-    /// more resources (memory, file descriptors, network connections).
+    /// This value controls the largest batch passed to [`VortexReadAt::read_ranges`].
+    /// Implementations may execute the operations concurrently or serially depending on the
+    /// underlying storage system. Higher values allow more coalescing and internal parallelism but
+    /// consume more resources (memory, file descriptors, network connections).
     ///
     /// Implementations should choose a value appropriate for their underlying storage
     /// characteristics. Low-latency sources benefit less from high concurrency, while
@@ -79,6 +154,11 @@ pub trait VortexReadAt: Send + Sync + 'static {
     /// Asynchronously get the number of bytes of the underlying source.
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>>;
 
+    /// Request asynchronous positional reads.
+    ///
+    /// Results must be returned in the same order as `ops`.
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>>;
+
     /// Request an asynchronous positional read. Results will be returned as a [`BufferHandle`].
     ///
     /// If the reader does not have the requested number of bytes, the returned Future will complete
@@ -88,7 +168,21 @@ pub trait VortexReadAt: Send + Sync + 'static {
         offset: u64,
         length: usize,
         alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>>;
+    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+        let read_fut = self.read_ranges(vec![ReadOp::aligned(offset, length, alignment)]);
+        async move {
+            let mut buffers = read_fut.await?;
+            vortex_ensure!(
+                buffers.len() == 1,
+                "VortexReadAt::read_ranges returned {} buffers for one read operation",
+                buffers.len()
+            );
+            Ok(buffers
+                .pop()
+                .vortex_expect("single read operation returns one buffer"))
+        }
+        .boxed()
+    }
 }
 
 impl VortexReadAt for Arc<dyn VortexReadAt> {
@@ -108,13 +202,8 @@ impl VortexReadAt for Arc<dyn VortexReadAt> {
         self.as_ref().size()
     }
 
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-        self.as_ref().read_at(offset, length, alignment)
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        self.as_ref().read_ranges(ops)
     }
 }
 
@@ -135,13 +224,8 @@ impl<R: VortexReadAt> VortexReadAt for Arc<R> {
         self.as_ref().size()
     }
 
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-        self.as_ref().read_at(offset, length, alignment)
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        self.as_ref().read_ranges(ops)
     }
 }
 
@@ -155,28 +239,26 @@ impl VortexReadAt for ByteBuffer {
         16
     }
 
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
         let buffer = self.clone();
         async move {
-            let start = usize::try_from(offset).vortex_expect("start too big for usize");
-            let end =
-                usize::try_from(offset + length as u64).vortex_expect("end too big for usize");
-            if end > buffer.len() {
-                vortex_bail!(
-                    "Requested range {}..{} out of bounds for buffer of length {}",
-                    start,
-                    end,
-                    buffer.len()
-                );
-            }
-            Ok(BufferHandle::new_host(
-                buffer.slice_unaligned(start..end).aligned(alignment),
-            ))
+            ops.into_iter()
+                .map(|op| {
+                    let start = usize::try_from(op.offset).vortex_expect("start too big for usize");
+                    let end = usize::try_from(op.end()?).vortex_expect("end too big for usize");
+                    if end > buffer.len() {
+                        vortex_bail!(
+                            "Requested range {}..{} out of bounds for buffer of length {}",
+                            start,
+                            end,
+                            buffer.len()
+                        );
+                    }
+                    Ok(BufferHandle::new_host(
+                        buffer.slice_unaligned(start..end).aligned(op.alignment),
+                    ))
+                })
+                .collect()
         }
         .boxed()
     }
@@ -296,23 +378,21 @@ impl<T: VortexReadAt + Clone> VortexReadAt for InstrumentedReadAt<T> {
         self.read.size()
     }
 
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
         let durations = self.metrics.durations.clone();
         let sizes = self.metrics.sizes.clone();
         let total_size = self.metrics.total_size.clone();
+        let lengths = ops.iter().map(|op| op.length).collect::<Vec<_>>();
 
-        let read_fut = self.read.read_at(offset, length, alignment);
+        let read_fut = self.read.read_ranges(ops);
         async move {
             let _timer = durations.time();
-            let buf = read_fut.await;
-            sizes.update(length as f64);
-            total_size.add(length as u64);
-            buf
+            let buffers = read_fut.await;
+            for length in lengths {
+                sizes.update(length as f64);
+                total_size.add(length as u64);
+            }
+            buffers
         }
         .boxed()
     }

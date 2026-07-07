@@ -9,6 +9,7 @@ use vortex::array::buffer::BufferHandle;
 use vortex::buffer::Alignment;
 use vortex::error::VortexResult;
 use vortex::io::CoalesceConfig;
+use vortex::io::ReadOp;
 use vortex::io::VortexReadAt;
 
 use crate::stream::VortexCudaStream;
@@ -41,6 +42,28 @@ impl<T: VortexReadAt + Clone> VortexReadAt for CopyDeviceReadAt<T> {
 
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
         self.read.size()
+    }
+
+    fn read_ranges(
+        &self,
+        ranges: Vec<ReadOp>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        let read = self.read.clone();
+        let stream = self.stream.clone();
+        async move {
+            let handles = read.read_ranges(ranges).await?;
+            let mut buffers = Vec::with_capacity(handles.len());
+            for handle in handles {
+                if handle.is_on_device() {
+                    buffers.push(handle);
+                } else {
+                    let host_buffer = handle.as_host().clone();
+                    buffers.push(stream.copy_to_device(host_buffer)?.await?);
+                }
+            }
+            Ok(buffers)
+        }
+        .boxed()
     }
 
     fn read_at(

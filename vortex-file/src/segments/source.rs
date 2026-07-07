@@ -15,10 +15,11 @@ use futures::future;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
+use vortex_io::ReadOp;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
 use vortex_layout::segments::SegmentFuture;
@@ -118,28 +119,51 @@ impl FileSegmentSource {
 
         let drive_fut = async move {
             stream
-                .map(move |req| {
+                .ready_chunks(concurrency)
+                .map(move |requests| {
                     let reader = reader.clone();
                     async move {
-                        let result = reader
-                            .read_at(req.offset(), req.len(), req.alignment())
-                            .await;
-                        let result = result.and_then(|buffer| {
-                            if req.len() != buffer.len() {
-                                vortex_bail!(
-                                    "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
-                                    req.len(),
-                                    buffer.len(),
-                                    req
-                                )
-                            }
-                            Ok(buffer)
-                        });
+                        let ranges = requests
+                            .iter()
+                            .map(|req| ReadOp::aligned(req.offset(), req.len(), req.alignment()))
+                            .collect();
 
-                        req.resolve(result);
+                        match reader.read_ranges(ranges).await {
+                            Ok(buffers) if buffers.len() == requests.len() => {
+                                for (req, buffer) in requests.into_iter().zip(buffers) {
+                                    let result = if req.len() == buffer.len() {
+                                        Ok(buffer)
+                                    } else {
+                                        Err(vortex_err!(
+                                            "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
+                                            req.len(),
+                                            buffer.len(),
+                                            req
+                                        ))
+                                    };
+                                    req.resolve(result);
+                                }
+                            }
+                            Ok(buffers) => {
+                                let err = Arc::new(vortex_err!(
+                                    "FileSegmentSource: expected {} buffers but received {}",
+                                    requests.len(),
+                                    buffers.len()
+                                ));
+                                for req in requests {
+                                    req.resolve(Err(VortexError::from(Arc::clone(&err))));
+                                }
+                            }
+                            Err(e) => {
+                                let err = Arc::new(e);
+                                for req in requests {
+                                    req.resolve(Err(VortexError::from(Arc::clone(&err))));
+                                }
+                            }
+                        }
                     }
                 })
-                .buffer_unordered(concurrency)
+                .buffer_unordered(1)
                 .collect::<()>()
                 .await
         };

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::StreamExt;
+use futures::future;
 use futures::future::BoxFuture;
 use object_store::GetOptions;
 use object_store::GetRange;
@@ -16,12 +17,12 @@ use object_store::path::Path as ObjectPath;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::memory::DefaultHostAllocator;
 use vortex_array::memory::HostAllocatorRef;
-use vortex_buffer::Alignment;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
 use crate::CoalesceConfig;
+use crate::ReadOp;
 use crate::VortexReadAt;
 use crate::runtime::Handle;
 #[cfg(not(target_arch = "wasm32"))]
@@ -105,79 +106,82 @@ impl VortexReadAt for ObjectStoreReadAt {
         .boxed()
     }
 
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
         let store = Arc::clone(&self.store);
         let path = self.path.clone();
         let handle = self.handle.clone();
         let allocator = Arc::clone(&self.allocator);
-        let range = offset..(offset + length as u64);
 
         // Requires to deal with borrowed lifetimes
         let io_handle = handle.clone();
 
         handle
                 .spawn_io(async move {
-                    let mut buffer = allocator.allocate(length, alignment)?;
+                    future::try_join_all(ops.into_iter().map(|op| {
+                        let store = Arc::clone(&store);
+                        let path = path.clone();
+                        let io_handle = io_handle.clone();
+                        let allocator = Arc::clone(&allocator);
+                        async move {
+                            let range = op.byte_range()?;
+                            let mut buffer = allocator.allocate(op.length, op.alignment)?;
 
-                    let response = store
-                        .get_opts(
-                            &path,
-                            GetOptions {
-                                range: Some(GetRange::Bounded(range.clone())),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
+                            let response = store
+                                .get_opts(
+                                    &path,
+                                    GetOptions {
+                                        range: Some(GetRange::Bounded(range.clone())),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
 
-                    let buffer = match response.payload {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        GetResultPayload::File(file, _) => {
-                            io_handle
-                                .spawn_blocking(move || {
-                                    read_exact_at(&file, buffer.as_mut_slice(), range.start)?;
-                                    Ok::<_, io::Error>(buffer)
-                                })
-                                .await
-                                .map_err(io::Error::other)?
+                            let buffer = match response.payload {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                GetResultPayload::File(file, _) => {
+                                    io_handle
+                                        .spawn_blocking(move || {
+                                            read_exact_at(&file, buffer.as_mut_slice(), range.start)?;
+                                            Ok::<_, io::Error>(buffer)
+                                        })
+                                        .await
+                                        .map_err(io::Error::other)?
+                                }
+                                #[cfg(target_arch = "wasm32")]
+                                GetResultPayload::File(..) => {
+                                    unreachable!("File payload not supported on wasm32")
+                                }
+                                GetResultPayload::Stream(mut byte_stream) => {
+                                    let mut written = 0usize;
+                                    while let Some(bytes) = byte_stream.next().await {
+                                        let bytes = bytes?;
+                                        let end = written + bytes.len();
+                                        vortex_ensure!(
+                                            end <= op.length,
+                                            "Object store stream returned too many bytes: {} > expected {} (range: {:?})",
+                                            end,
+                                            op.length,
+                                            range
+                                        );
+                                        buffer.as_mut_slice()[written..end].copy_from_slice(&bytes);
+                                        written = end;
+                                    }
+
+                                    vortex_ensure!(
+                                        written == op.length,
+                                        "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
+                                        written,
+                                        op.length,
+                                        range
+                                    );
+
+                                    buffer
+                                }
+                            };
+
+                            Ok(BufferHandle::new_host(buffer.freeze()))
                         }
-                        #[cfg(target_arch = "wasm32")]
-                        GetResultPayload::File(..) => {
-                            unreachable!("File payload not supported on wasm32")
-                        }
-                        GetResultPayload::Stream(mut byte_stream) => {
-                            let mut written = 0usize;
-                            while let Some(bytes) = byte_stream.next().await {
-                                let bytes = bytes?;
-                                let end = written + bytes.len();
-                                vortex_ensure!(
-                                    end <= length,
-                                    "Object store stream returned too many bytes: {} > expected {} (range: {:?})",
-                                    end,
-                                    length,
-                                    range
-                                );
-                                buffer.as_mut_slice()[written..end].copy_from_slice(&bytes);
-                                written = end;
-                            }
-
-                            vortex_ensure!(
-                                written == length,
-                                "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
-                                written,
-                                length,
-                                range
-                            );
-
-                            buffer
-                        }
-                    };
-
-                    Ok(BufferHandle::new_host(buffer.freeze()))
+                    })).await
                 })
         .boxed()
     }
@@ -191,6 +195,7 @@ mod tests {
 
     use object_store::PutPayload;
     use object_store::memory::InMemory;
+    use vortex_buffer::Alignment;
 
     use super::*;
     use crate::runtime::AbortHandle;

@@ -16,6 +16,7 @@ use arrow_schema::Field;
 use arrow_schema::Schema;
 use futures::FutureExt;
 use futures::TryStreamExt;
+use futures::future;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use vortex::array::ArrayRef;
@@ -33,6 +34,7 @@ use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VERSION;
 use vortex::file::VortexFile;
 use vortex::io::CoalesceConfig;
+use vortex::io::ReadOp;
 use vortex::io::VortexReadAt;
 use vortex::layout::LayoutChildType;
 use vortex::layout::LayoutRef;
@@ -90,6 +92,14 @@ impl VortexReadAt for BlobReadAt {
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
         let size = self.size;
         async move { Ok(size) }.boxed()
+    }
+
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        let read_futures = ops
+            .into_iter()
+            .map(|op| self.read_at(op.offset, op.length, op.alignment))
+            .collect::<Vec<_>>();
+        future::try_join_all(read_futures).boxed()
     }
 
     fn read_at(

@@ -396,6 +396,7 @@ mod tests {
     use vortex_buffer::Buffer;
     use vortex_buffer::ByteBuffer;
     use vortex_buffer::ByteBufferMut;
+    use vortex_io::ReadOp;
     use vortex_io::session::RuntimeSession;
     use vortex_layout::session::LayoutSession;
 
@@ -415,20 +416,21 @@ mod tests {
             self.inner.size()
         }
 
-        fn read_at(
+        fn read_ranges(
             &self,
-            offset: u64,
-            length: usize,
-            alignment: Alignment,
-        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-            self.total_read.fetch_add(length, Ordering::Relaxed);
-            let _ = self.first_read_len.compare_exchange(
-                0,
-                length,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-            self.inner.read_at(offset, length, alignment)
+            ops: Vec<ReadOp>,
+        ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+            let total = ops.iter().map(|op| op.length).sum::<usize>();
+            self.total_read.fetch_add(total, Ordering::Relaxed);
+            if let Some(first) = ops.first() {
+                let _ = self.first_read_len.compare_exchange(
+                    0,
+                    first.length,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+            self.inner.read_ranges(ops)
         }
 
         fn concurrency(&self) -> usize {

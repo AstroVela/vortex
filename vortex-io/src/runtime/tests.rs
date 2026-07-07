@@ -17,6 +17,7 @@ use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexResult;
 
+use crate::ReadOp;
 use crate::VortexReadAt;
 use crate::runtime::single::block_on;
 use crate::runtime::tokio::TokioRuntime;
@@ -248,25 +249,24 @@ impl VortexReadAt for CountingReadAt {
         16
     }
 
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-        self.read_count.fetch_add(1, Ordering::SeqCst);
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        self.read_count.fetch_add(ops.len(), Ordering::SeqCst);
         let data = self.data.clone();
         async move {
-            let start = offset as usize;
-            if start + length > data.len() {
-                return Err(vortex_error::vortex_err!("Read out of bounds"));
-            }
-            let mut buffer = ByteBufferMut::with_capacity_aligned(length, alignment);
-            unsafe { buffer.set_len(length) };
-            buffer
-                .as_mut_slice()
-                .copy_from_slice(&data.as_slice()[start..start + length]);
-            Ok(BufferHandle::new_host(buffer.freeze()))
+            ops.into_iter()
+                .map(|op| {
+                    let start = op.offset as usize;
+                    if start + op.length > data.len() {
+                        return Err(vortex_error::vortex_err!("Read out of bounds"));
+                    }
+                    let mut buffer = ByteBufferMut::with_capacity_aligned(op.length, op.alignment);
+                    unsafe { buffer.set_len(op.length) };
+                    buffer
+                        .as_mut_slice()
+                        .copy_from_slice(&data.as_slice()[start..start + op.length]);
+                    Ok(BufferHandle::new_host(buffer.freeze()))
+                })
+                .collect()
         }
         .boxed()
     }

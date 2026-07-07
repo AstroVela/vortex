@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::StreamExt;
+use futures::future;
 use futures::future::BoxFuture;
 use object_store::GetOptions;
 use object_store::GetRange;
@@ -23,6 +24,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 use vortex::io::CoalesceConfig;
+use vortex::io::ReadOp;
 use vortex::io::VortexReadAt;
 use vortex::io::runtime::Handle;
 use vortex::io::std_file::read_exact_at;
@@ -118,6 +120,46 @@ impl VortexReadAt for PooledFileReadAt {
         }
         .boxed()
     }
+
+    fn read_ranges(
+        &self,
+        ranges: Vec<ReadOp>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        if ranges.is_empty() {
+            return async { Ok(Vec::new()) }.boxed();
+        }
+
+        let file = Arc::clone(&self.file);
+        let handle = self.handle.clone();
+        let stream = self.stream.clone();
+        let pool = Arc::clone(&self.pool);
+
+        async move {
+            let mut targets = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                targets.push((range.offset, pool.get(range.length)?));
+            }
+
+            let targets = handle
+                .spawn_blocking(move || {
+                    let mut targets = targets;
+                    for (offset, target) in &mut targets {
+                        read_exact_at(&file, target.as_mut_slice(), *offset)?;
+                    }
+                    Ok::<_, io::Error>(targets)
+                })
+                .await
+                .map_err(VortexError::from)?;
+
+            let mut buffers = Vec::with_capacity(targets.len());
+            for (_, target) in targets {
+                let cuda_buf = target.transfer_to_device(&stream)?;
+                buffers.push(BufferHandle::new_device(Arc::new(cuda_buf)));
+            }
+            Ok(buffers)
+        }
+        .boxed()
+    }
 }
 
 /// Object store reader that uses CUDA pinned host memory for I/O buffers and
@@ -196,6 +238,14 @@ impl VortexReadAt for PooledObjectStoreReadAt {
                 .map_err(VortexError::from)
         }
         .boxed()
+    }
+
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        let read_futures = ops
+            .into_iter()
+            .map(|op| self.read_at(op.offset, op.length, op.alignment))
+            .collect::<Vec<_>>();
+        future::try_join_all(read_futures).boxed()
     }
 
     fn read_at(
@@ -321,6 +371,14 @@ impl VortexReadAt for PooledByteBufferReadAt {
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
         let len = self.buffer.len() as u64;
         async move { Ok(len) }.boxed()
+    }
+
+    fn read_ranges(&self, ops: Vec<ReadOp>) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        let read_futures = ops
+            .into_iter()
+            .map(|op| self.read_at(op.offset, op.length, op.alignment))
+            .collect::<Vec<_>>();
+        future::try_join_all(read_futures).boxed()
     }
 
     fn read_at(
