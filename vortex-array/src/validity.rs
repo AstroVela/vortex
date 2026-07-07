@@ -224,7 +224,7 @@ impl Validity {
         }
     }
 
-    /// Select validity values by concatenating ordered, non-empty ranges.
+    /// Select validity values by concatenating a sequence of non-empty ranges.
     pub fn take_slices(&self, slices: &[(usize, usize)]) -> VortexResult<Self> {
         match self {
             v @ (Self::NonNullable | Self::AllValid | Self::AllInvalid) => Ok(v.clone()),

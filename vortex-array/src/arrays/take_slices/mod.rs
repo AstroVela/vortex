@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Reduce and execute adaptors for ordered slice-take operations.
+//! Reduce and execute adaptors for slice-sequence take operations.
 //!
-//! `TakeSlicesArray` represents concatenating an ordered list of non-empty child ranges. The
-//! ranges preserve caller order and may overlap. Encodings that know how to serve those ranges
-//! efficiently implement [`TakeSlicesReduce`] or [`TakeSlicesExecute`].
+//! `TakeSlicesArray` represents concatenating a caller-provided sequence of non-empty child
+//! ranges. The ranges are not required to be sorted or disjoint, and the output preserves the
+//! sequence order. Encodings that know how to serve those ranges efficiently implement
+//! [`TakeSlicesReduce`] or [`TakeSlicesExecute`].
 
 mod array;
 mod rules;
@@ -26,9 +27,9 @@ use crate::kernel::ExecuteParentKernel;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
 
-/// Metadata-only implementation hook for taking ordered child ranges.
+/// Metadata-only implementation hook for taking a sequence of child ranges.
 pub trait TakeSlicesReduce: VTable {
-    /// Take ordered slices from an array without reading buffers.
+    /// Take a sequence of slices from an array without reading buffers.
     ///
     /// Implementations should return `None` if serving the ranges requires buffer access.
     ///
@@ -41,9 +42,9 @@ pub trait TakeSlicesReduce: VTable {
     ) -> VortexResult<Option<ArrayRef>>;
 }
 
-/// Execution implementation hook for taking ordered child ranges.
+/// Execution implementation hook for taking a sequence of child ranges.
 pub trait TakeSlicesExecute: VTable {
-    /// Take ordered slices from an array, potentially reading buffers.
+    /// Take a sequence of slices from an array, potentially reading buffers.
     ///
     /// # Preconditions
     ///

@@ -44,7 +44,7 @@ use crate::validity::Validity;
 /// A [`TakeSlices`]-encoded Vortex array.
 pub type TakeSlicesArray = Array<TakeSlices>;
 
-/// Ordered child-range selection encoding.
+/// Child-range sequence selection encoding.
 #[derive(Clone, Debug)]
 pub struct TakeSlices;
 

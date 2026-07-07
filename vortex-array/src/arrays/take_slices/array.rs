@@ -18,7 +18,7 @@ use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
 use crate::arrays::TakeSlices;
 
-/// The child array being selected by ordered slices.
+/// The child array selected by the range sequence.
 pub(super) const CHILD_SLOT: usize = 0;
 pub(super) const NUM_SLOTS: usize = 1;
 pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child"];
@@ -38,14 +38,14 @@ impl Display for TakeSlicesData {
 
 /// Extension methods for [`TakeSlices`] arrays.
 pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
-    /// The child array selected by this ordered range list.
+    /// The child array selected by this range sequence.
     fn child(&self) -> &ArrayRef {
         self.as_ref().slots()[CHILD_SLOT]
             .as_ref()
             .vortex_expect("validated take-slices child slot")
     }
 
-    /// The ordered, non-empty child ranges represented by this array.
+    /// The caller-provided, non-empty child ranges represented by this array.
     fn slices(&self) -> &[(usize, usize)] {
         &self.slices
     }
@@ -85,12 +85,12 @@ impl TakeSlicesData {
         self.slices.is_empty()
     }
 
-    /// The ordered ranges used to select child values.
+    /// The ranges used to select child values.
     pub fn slices(&self) -> &[(usize, usize)] {
         &self.slices
     }
 
-    /// Returns the ordered ranges as `Range<usize>` values.
+    /// Returns the ranges as `Range<usize>` values.
     pub fn slice_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         self.slices.iter().map(|&(start, end)| start..end)
     }
