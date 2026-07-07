@@ -20,6 +20,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_buffer::buffer;
 use vortex_compressor::CascadingCompressor;
+use vortex_compressor::DictTypes;
 use vortex_error::VortexResult;
 use vortex_fastlanes::RLE;
 use vortex_sequence::Sequence;
@@ -118,7 +119,9 @@ fn test_rle_compression() -> VortexResult<()> {
     values.extend(iter::repeat_n(987i32, 150));
 
     let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
-    let compressor = CascadingCompressor::new(vec![&IntRLEScheme]);
+    // Disable the built-in dict compression so RLE is tested in isolation.
+    let compressor =
+        CascadingCompressor::new(vec![&IntRLEScheme]).with_dict_types(DictTypes::none());
     let compressed =
         compressor.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<RLE>());

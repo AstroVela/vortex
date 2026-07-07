@@ -8,10 +8,8 @@ use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_compressor::builtins::BinaryDictScheme;
-use vortex_compressor::builtins::FloatDictScheme;
-use vortex_compressor::builtins::IntDictScheme;
-use vortex_compressor::builtins::StringDictScheme;
+use vortex_compressor::DICT_SCHEME_ID;
+use vortex_compressor::dict_children;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::EstimateVerdict;
 use vortex_compressor::scheme::AncestorExclusion;
@@ -26,7 +24,6 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
-use crate::SchemeExt;
 
 /// Frame of Reference encoding.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -43,24 +40,10 @@ impl Scheme for FoRScheme {
 
     /// Dict codes always start at 0, so FoR (which subtracts the min) is a no-op.
     fn ancestor_exclusions(&self) -> Vec<AncestorExclusion> {
-        vec![
-            AncestorExclusion {
-                ancestor: IntDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: FloatDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: StringDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: BinaryDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-        ]
+        vec![AncestorExclusion {
+            ancestor: DICT_SCHEME_ID,
+            children: ChildSelection::One(dict_children::CODES),
+        }]
     }
 
     fn expected_compression_ratio(

@@ -13,10 +13,8 @@ pub mod temporal;
 
 pub(crate) mod patches;
 
-use vortex_compressor::builtins::BinaryDictScheme;
-use vortex_compressor::builtins::FloatDictScheme;
-use vortex_compressor::builtins::IntDictScheme;
-use vortex_compressor::builtins::StringDictScheme;
+use vortex_compressor::DICT_SCHEME_ID;
+use vortex_compressor::dict_children;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
 use vortex_compressor::scheme::DescendantExclusion;
@@ -32,7 +30,7 @@ use crate::schemes::integer::SparseScheme;
 fn rle_descendant_exclusions() -> Vec<DescendantExclusion> {
     vec![
         DescendantExclusion {
-            excluded: IntDictScheme.id(),
+            excluded: DICT_SCHEME_ID,
             children: ChildSelection::Many(&[1, 2]),
         },
         // TODO(connor): This is wrong for some reason?
@@ -51,22 +49,8 @@ fn rle_descendant_exclusions() -> Vec<DescendantExclusion> {
 ///
 /// Dict values (child 0) are all unique by definition, so RLE is pointless on them.
 fn rle_ancestor_exclusions() -> Vec<AncestorExclusion> {
-    vec![
-        AncestorExclusion {
-            ancestor: IntDictScheme.id(),
-            children: ChildSelection::One(0),
-        },
-        AncestorExclusion {
-            ancestor: FloatDictScheme.id(),
-            children: ChildSelection::One(0),
-        },
-        AncestorExclusion {
-            ancestor: StringDictScheme.id(),
-            children: ChildSelection::One(0),
-        },
-        AncestorExclusion {
-            ancestor: BinaryDictScheme.id(),
-            children: ChildSelection::One(0),
-        },
-    ]
+    vec![AncestorExclusion {
+        ancestor: DICT_SCHEME_ID,
+        children: ChildSelection::One(dict_children::VALUES),
+    }]
 }

@@ -29,8 +29,6 @@ pub(crate) use rle::try_compress_delta;
 pub use runend::RunEndScheme;
 pub use sequence::SequenceScheme;
 pub use sparse::SparseScheme;
-// Re-export builtin schemes from vortex-compressor.
-pub use vortex_compressor::builtins::IntDictScheme;
 pub use vortex_compressor::stats::IntegerStats;
 pub use zigzag::ZigZagScheme;
 

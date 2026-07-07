@@ -21,14 +21,14 @@ use crate::CascadingCompressor;
 ///
 /// ```rust
 /// use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme, SchemeExt};
-/// use vortex_btrblocks::schemes::integer::IntDictScheme;
+/// use vortex_btrblocks::schemes::integer::FoRScheme;
 ///
 /// // Default compressor - all schemes allowed.
 /// let compressor = BtrBlocksCompressor::default();
 ///
 /// // Remove specific schemes using the builder.
 /// let compressor = BtrBlocksCompressorBuilder::default()
-///     .exclude_schemes([IntDictScheme.id()])
+///     .exclude_schemes([FoRScheme.id()])
 ///     .build();
 /// ```
 #[derive(Clone)]

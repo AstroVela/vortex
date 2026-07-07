@@ -8,10 +8,8 @@ use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_compressor::builtins::BinaryDictScheme;
-use vortex_compressor::builtins::FloatDictScheme;
-use vortex_compressor::builtins::IntDictScheme;
-use vortex_compressor::builtins::StringDictScheme;
+use vortex_compressor::DICT_SCHEME_ID;
+use vortex_compressor::dict_children;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::DeferredEstimate;
 use vortex_compressor::estimate::EstimateVerdict;
@@ -56,7 +54,7 @@ impl Scheme for RunEndScheme {
     fn descendant_exclusions(&self) -> Vec<DescendantExclusion> {
         vec![
             DescendantExclusion {
-                excluded: IntDictScheme.id(),
+                excluded: DICT_SCHEME_ID,
                 children: ChildSelection::One(1),
             },
             DescendantExclusion {
@@ -77,24 +75,10 @@ impl Scheme for RunEndScheme {
     /// Dict values (child 0) are all unique by definition, so run-end encoding them is
     /// pointless. Codes (child 1) can have runs and may benefit from RunEnd.
     fn ancestor_exclusions(&self) -> Vec<AncestorExclusion> {
-        vec![
-            AncestorExclusion {
-                ancestor: IntDictScheme.id(),
-                children: ChildSelection::One(0),
-            },
-            AncestorExclusion {
-                ancestor: FloatDictScheme.id(),
-                children: ChildSelection::One(0),
-            },
-            AncestorExclusion {
-                ancestor: StringDictScheme.id(),
-                children: ChildSelection::One(0),
-            },
-            AncestorExclusion {
-                ancestor: BinaryDictScheme.id(),
-                children: ChildSelection::One(0),
-            },
-        ]
+        vec![AncestorExclusion {
+            ancestor: DICT_SCHEME_ID,
+            children: ChildSelection::One(dict_children::VALUES),
+        }]
     }
 
     fn expected_compression_ratio(

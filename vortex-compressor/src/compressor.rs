@@ -31,9 +31,11 @@ use vortex_array::arrays::variant::VariantArrayExt;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
-use crate::builtins::IntDictScheme;
 use crate::constant;
 use crate::ctx::CompressorContext;
+use crate::dict;
+use crate::dict::DICT_SCHEME_ID;
+use crate::dict::DictTypes;
 use crate::estimate::CompressionEstimate;
 use crate::estimate::DeferredEstimate;
 use crate::estimate::EstimateScore;
@@ -88,24 +90,35 @@ pub struct CascadingCompressor {
     /// Descendant exclusion rules for the compressor's own cascading (e.g. excluding Dict from
     /// list offsets).
     root_exclusions: Vec<DescendantExclusion>,
+
+    /// Which type classes the built-in dictionary compression applies to.
+    dict_types: DictTypes,
 }
 
 impl CascadingCompressor {
     /// Creates a new compressor with the given schemes.
     ///
     /// Root-level exclusion rules (e.g. excluding Dict from list offsets) are built
-    /// automatically.
+    /// automatically. Built-in dictionary compression is enabled for all type classes; use
+    /// [`with_dict_types`](Self::with_dict_types) to disable it per type class.
     pub fn new(schemes: Vec<&'static dyn Scheme>) -> Self {
-        // Root exclusion: exclude IntDict from list/listview offsets (monotonically
+        // Root exclusion: exclude dict from list/listview offsets (monotonically
         // increasing data where dictionary encoding is wasteful).
         let root_exclusions = vec![DescendantExclusion {
-            excluded: IntDictScheme.id(),
+            excluded: DICT_SCHEME_ID,
             children: ChildSelection::One(root_list_children::OFFSETS),
         }];
         Self {
             schemes,
             root_exclusions,
+            dict_types: DictTypes::default(),
         }
+    }
+
+    /// Configures which type classes the built-in dictionary compression applies to.
+    pub fn with_dict_types(mut self, dict_types: DictTypes) -> Self {
+        self.dict_types = dict_types;
+        self
     }
 
     /// Compresses an array using cascading adaptive compression.
@@ -293,12 +306,21 @@ impl CascadingCompressor {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let eligible_schemes: Vec<&'static dyn Scheme> = self
+        let mut eligible_schemes: Vec<&'static dyn Scheme> = self
             .schemes
             .iter()
             .copied()
             .filter(|s| s.matches(&canonical) && !self.is_excluded(*s, &compress_ctx))
             .collect();
+
+        // Built-in dictionary compression competes with the registered schemes whenever it is
+        // enabled for the array's type class and not excluded by the cascade history. It is
+        // appended last so registered schemes win estimate ties.
+        if self.dict_types.enabled_for(&canonical)
+            && !self.is_excluded(&dict::DICT_SCHEME, &compress_ctx)
+        {
+            eligible_schemes.push(&dict::DICT_SCHEME);
+        }
 
         let array: ArrayRef = canonical.into();
 
@@ -633,6 +655,7 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::Constant;
+    use vortex_array::arrays::Dict;
     use vortex_array::arrays::NullArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::validity::Validity;
@@ -640,9 +663,6 @@ mod tests {
     use vortex_session::VortexSession;
 
     use super::*;
-    use crate::builtins::FloatDictScheme;
-    use crate::builtins::IntDictScheme;
-    use crate::builtins::StringDictScheme;
     use crate::ctx::CompressorContext;
     use crate::estimate::CompressionEstimate;
     use crate::estimate::DeferredEstimate;
@@ -654,7 +674,7 @@ mod tests {
     static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
     fn compressor() -> CascadingCompressor {
-        CascadingCompressor::new(vec![&IntDictScheme, &FloatDictScheme, &StringDictScheme])
+        CascadingCompressor::new(Vec::new())
     }
 
     fn estimate_test_data() -> ArrayAndStats {
@@ -897,12 +917,16 @@ mod tests {
     }
 
     #[test]
-    fn test_self_exclusion() {
+    fn test_dict_self_exclusion() {
         let c = compressor();
-        let ctx = CompressorContext::default().descend_with_scheme(IntDictScheme.id(), 0);
 
-        // IntDictScheme is in the history, so it should be excluded.
-        assert!(c.is_excluded(&IntDictScheme, &ctx));
+        // Built-in dict is in the history (on either child), so it should be excluded from the
+        // entire subtree: dict values are already deduplicated and dict codes are compact
+        // integers, so dictionary encoding either child again is pointless.
+        for child_index in [dict::dict_children::VALUES, dict::dict_children::CODES] {
+            let ctx = CompressorContext::default().descend_with_scheme(DICT_SCHEME_ID, child_index);
+            assert!(c.is_excluded(&dict::DICT_SCHEME, &ctx));
+        }
     }
 
     #[test]
@@ -911,29 +935,8 @@ mod tests {
         let ctx = CompressorContext::default()
             .descend_with_scheme(ROOT_SCHEME_ID, root_list_children::OFFSETS);
 
-        // IntDict should be excluded for list offsets.
-        assert!(c.is_excluded(&IntDictScheme, &ctx));
-    }
-
-    #[test]
-    fn test_push_rule_float_dict_excludes_int_dict_from_codes() {
-        let c = compressor();
-        // FloatDict cascading through codes (child 1).
-        let ctx = CompressorContext::default().descend_with_scheme(FloatDictScheme.id(), 1);
-
-        // IntDict should be excluded from FloatDict's codes child.
-        assert!(c.is_excluded(&IntDictScheme, &ctx));
-    }
-
-    #[test]
-    fn test_push_rule_float_dict_excludes_int_dict_from_values() {
-        let c = compressor();
-        // FloatDict cascading through values (child 0).
-        let ctx = CompressorContext::default().descend_with_scheme(FloatDictScheme.id(), 0);
-
-        // IntDict should also be excluded from FloatDict's values child (ALP propagation
-        // replacement).
-        assert!(c.is_excluded(&IntDictScheme, &ctx));
+        // Dict should be excluded for list offsets.
+        assert!(c.is_excluded(&dict::DICT_SCHEME, &ctx));
     }
 
     #[test]
@@ -942,7 +945,7 @@ mod tests {
         let ctx = CompressorContext::default();
 
         // No history means no exclusions.
-        assert!(!c.is_excluded(&IntDictScheme, &ctx));
+        assert!(!c.is_excluded(&dict::DICT_SCHEME, &ctx));
     }
 
     #[test]
@@ -1317,10 +1320,36 @@ mod tests {
 
         // The compressor should produce a `ConstantArray` for an all-null array regardless of
         // which schemes are registered.
-        let compressor = CascadingCompressor::new(vec![&IntDictScheme]);
+        let compressor = CascadingCompressor::new(Vec::new());
         let mut exec_ctx = SESSION.create_execution_ctx();
         let compressed = compressor.compress(&array, &mut exec_ctx)?;
         assert!(compressed.is::<Constant>());
+        Ok(())
+    }
+
+    #[test]
+    fn dict_compresses_without_registered_schemes() -> VortexResult<()> {
+        // Low-cardinality integers should dictionary-encode even with an empty scheme list,
+        // since dictionary compression is built into the compressor.
+        let array =
+            PrimitiveArray::from_iter((0..4096).map(|i| [10i64, 20, 30][i % 3])).into_array();
+
+        let compressor = CascadingCompressor::new(Vec::new());
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        let compressed = compressor.compress(&array, &mut exec_ctx)?;
+        assert!(compressed.is::<Dict>());
+        Ok(())
+    }
+
+    #[test]
+    fn dict_types_none_disables_builtin_dict() -> VortexResult<()> {
+        let array =
+            PrimitiveArray::from_iter((0..4096).map(|i| [10i64, 20, 30][i % 3])).into_array();
+
+        let compressor = CascadingCompressor::new(Vec::new()).with_dict_types(DictTypes::none());
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        let compressed = compressor.compress(&array, &mut exec_ctx)?;
+        assert!(!compressed.is::<Dict>());
         Ok(())
     }
 
@@ -1332,14 +1361,15 @@ mod tests {
     /// distinct values were never computed for the sample.
     #[test]
     fn sampling_uses_scheme_stats_options() -> VortexResult<()> {
-        // Low-cardinality float array so FloatDictScheme considers it compressible.
+        // Low-cardinality float array so the built-in dict compression considers it
+        // compressible.
         let array = PrimitiveArray::new(
             buffer![1.0f32, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
             Validity::NonNullable,
         )
         .into_array();
 
-        let compressor = CascadingCompressor::new(vec![&FloatDictScheme]);
+        let compressor = CascadingCompressor::new(Vec::new());
 
         // A context with default stats_options (count_distinct_values = false) and
         // marked as a sample so the function skips the sampling step and compresses
@@ -1347,11 +1377,11 @@ mod tests {
         let ctx = CompressorContext::new().with_sampling();
 
         // Before the fix this panicked with:
-        //   "this must be present since `DictScheme` declared that we need distinct values"
+        //   "this must be present since ... declared that we need distinct values"
         let mut exec_ctx = SESSION.create_execution_ctx();
         let score = estimate_compression_ratio_with_sampling(
             &compressor,
-            &FloatDictScheme,
+            &dict::DICT_SCHEME,
             &array,
             ctx,
             &mut exec_ctx,

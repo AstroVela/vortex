@@ -78,7 +78,8 @@ pub struct DescendantExclusion {
 /// cascade chain.
 ///
 /// Use this when the excluded scheme (the descendant) knows about the ancestor. For example,
-/// `Sequence` excludes itself when `IntDict` is an ancestor on its codes child.
+/// `Sequence` excludes itself when the built-in dictionary compression
+/// ([`DICT_SCHEME_ID`](crate::DICT_SCHEME_ID)) is an ancestor on its codes child.
 #[derive(Debug, Clone, Copy)]
 pub struct AncestorExclusion {
     /// The ancestor scheme that makes the declaring scheme ineligible.

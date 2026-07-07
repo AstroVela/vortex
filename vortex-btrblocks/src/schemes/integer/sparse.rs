@@ -11,7 +11,7 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::scalar::Scalar;
-use vortex_compressor::builtins::IntDictScheme;
+use vortex_compressor::DICT_SCHEME_ID;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::EstimateVerdict;
 use vortex_compressor::scheme::ChildSelection;
@@ -59,7 +59,7 @@ impl Scheme for SparseScheme {
     fn descendant_exclusions(&self) -> Vec<DescendantExclusion> {
         vec![
             DescendantExclusion {
-                excluded: IntDictScheme.id(),
+                excluded: DICT_SCHEME_ID,
                 children: ChildSelection::One(1),
             },
             DescendantExclusion {

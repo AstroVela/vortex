@@ -31,8 +31,7 @@ use vortex_array::arrays::Variant;
 use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::dtype::FieldPath;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
-use vortex_btrblocks::SchemeExt;
-use vortex_btrblocks::schemes::integer::IntDictScheme;
+use vortex_btrblocks::DictTypes;
 use vortex_bytebool::ByteBool;
 use vortex_datetime_parts::DateTimeParts;
 use vortex_decimal_byte_parts::DecimalByteParts;
@@ -132,8 +131,8 @@ pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
 /// How the compressor was configured on [`WriteStrategyBuilder`].
 enum CompressorConfig {
     /// A [`BtrBlocksCompressorBuilder`] that [`WriteStrategyBuilder::build`] will finalize.
-    /// `IntDictScheme` is automatically excluded from the data compressor to prevent recursive
-    /// dictionary encoding.
+    /// Integer dictionary compression is automatically disabled for the data compressor to
+    /// prevent recursive dictionary encoding.
     BtrBlocks(BtrBlocksCompressorBuilder),
     /// An opaque compressor used as-is for both data and stats compression.
     Opaque(Arc<dyn CompressorPlugin>),
@@ -216,7 +215,7 @@ impl WriteStrategyBuilder {
     /// Override the default [`BtrBlocksCompressorBuilder`] used for compression.
     ///
     /// The builder is finalized during [`build`](Self::build), producing two compressors: one for
-    /// data (with `IntDictScheme` excluded) and one for stats.
+    /// data (with integer dictionary compression disabled) and one for stats.
     pub fn with_btrblocks_builder(mut self, builder: BtrBlocksCompressorBuilder) -> Self {
         self.compressor = CompressorConfig::BtrBlocks(builder);
         self
@@ -248,14 +247,17 @@ impl WriteStrategyBuilder {
         let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
 
         // 5. compress each chunk.
-        // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
-        // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
+        // Disable integer dictionary compression in the data compressor because DictStrategy
+        // (step 3) already dictionary-encodes columns. Allowing it here would redundantly
         // dictionary-encode the integer codes produced by that earlier step.
         let data_compressor: Arc<dyn CompressorPlugin> = match &self.compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(
                 builder
                     .clone()
-                    .exclude_schemes([IntDictScheme.id()])
+                    .with_dict_types(DictTypes {
+                        integer: false,
+                        ..builder.dict_types()
+                    })
                     .build(),
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),

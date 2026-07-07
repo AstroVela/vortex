@@ -17,8 +17,6 @@ pub use alprd::ALPRDScheme;
 pub use pco::PcoScheme;
 pub use rle::FloatRLEScheme;
 pub use sparse::NullDominatedSparseScheme;
-// Re-export builtin schemes from vortex-compressor.
-pub use vortex_compressor::builtins::FloatDictScheme;
 pub use vortex_compressor::stats::FloatStats;
 
 #[cfg(test)]

@@ -6,10 +6,8 @@
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
-use vortex_compressor::builtins::BinaryDictScheme;
-use vortex_compressor::builtins::FloatDictScheme;
-use vortex_compressor::builtins::IntDictScheme;
-use vortex_compressor::builtins::StringDictScheme;
+use vortex_compressor::DICT_SCHEME_ID;
+use vortex_compressor::dict_children;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::DeferredEstimate;
 use vortex_compressor::estimate::EstimateScore;
@@ -25,7 +23,6 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
-use crate::SchemeExt;
 
 /// Sequence encoding for sequential patterns.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -44,24 +41,10 @@ impl Scheme for SequenceScheme {
     /// the data. Dict codes are compact integers that benefit from BitPacking or FoR, not from
     /// sequence detection.
     fn ancestor_exclusions(&self) -> Vec<AncestorExclusion> {
-        vec![
-            AncestorExclusion {
-                ancestor: IntDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: FloatDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: StringDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: BinaryDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-        ]
+        vec![AncestorExclusion {
+            ancestor: DICT_SCHEME_ID,
+            children: ChildSelection::One(dict_children::CODES),
+        }]
     }
 
     fn expected_compression_ratio(

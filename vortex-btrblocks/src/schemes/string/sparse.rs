@@ -9,6 +9,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
+use vortex_compressor::DICT_SCHEME_ID;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::EstimateVerdict;
 use vortex_compressor::scheme::ChildSelection;
@@ -22,7 +23,6 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 use crate::SchemeExt;
-use crate::schemes::integer::IntDictScheme;
 use crate::schemes::integer::SparseScheme as IntSparseScheme;
 
 /// Sparse encoding for null-dominated arrays.
@@ -53,7 +53,7 @@ impl Scheme for NullDominatedSparseScheme {
                 children: ChildSelection::All,
             },
             DescendantExclusion {
-                excluded: IntDictScheme.id(),
+                excluded: DICT_SCHEME_ID,
                 children: ChildSelection::All,
             },
         ]

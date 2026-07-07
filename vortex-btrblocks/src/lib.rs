@@ -31,7 +31,9 @@
 //! Each `Scheme` implementation declares whether it [`matches`](Scheme::matches) a given
 //! canonical form and, if so, estimates the compression ratio (often by compressing a ~1%
 //! sample). There is no dynamic registry — the set of schemes is fixed at build time via
-//! [`ALL_SCHEMES`].
+//! [`ALL_SCHEMES`]. Constant and dictionary compression are built into the compressor itself
+//! rather than being schemes; use [`DictTypes`] to disable dictionary compression per type
+//! class.
 //!
 //! Schemes can produce arrays that are themselves further compressed (e.g. FoR then BitPacking),
 //! up to [`MAX_CASCADE`] (3) layers deep. Descendant exclusion rules for of [`SchemeId`] prevents
@@ -44,7 +46,7 @@
 //! use vortex_array::arrays::PrimitiveArray;
 //! use vortex_array::validity::Validity;
 //! use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme, SchemeExt};
-//! use vortex_btrblocks::schemes::integer::IntDictScheme;
+//! use vortex_btrblocks::schemes::integer::FoRScheme;
 //! use vortex_buffer::buffer;
 //!
 //! # fn example() -> vortex_error::VortexResult<()> {
@@ -57,7 +59,7 @@
 //!
 //! // Remove specific schemes using the builder.
 //! let compressor = BtrBlocksCompressorBuilder::default()
-//!     .exclude_schemes([IntDictScheme.id()])
+//!     .exclude_schemes([FoRScheme.id()])
 //!     .build();
 //! # let _ = compressor;
 //! # Ok(())
@@ -78,8 +80,11 @@ pub use builder::BtrBlocksCompressorBuilder;
 pub use canonical_compressor::BtrBlocksCompressor;
 pub use schemes::patches::compress_patches;
 pub use vortex_compressor::CascadingCompressor;
+pub use vortex_compressor::DICT_SCHEME_ID;
+pub use vortex_compressor::DictTypes;
 pub use vortex_compressor::ctx::CompressorContext;
 pub use vortex_compressor::ctx::MAX_CASCADE;
+pub use vortex_compressor::dict_children;
 pub use vortex_compressor::scheme::Scheme;
 pub use vortex_compressor::scheme::SchemeExt;
 pub use vortex_compressor::scheme::SchemeId;

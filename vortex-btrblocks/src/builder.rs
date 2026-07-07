@@ -3,6 +3,7 @@
 
 //! Builder for configuring `BtrBlocksCompressor` instances.
 
+use vortex_compressor::DictTypes;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::BtrBlocksCompressor;
@@ -10,6 +11,7 @@ use crate::CascadingCompressor;
 use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
+#[cfg(feature = "zstd")]
 use crate::schemes::binary;
 use crate::schemes::decimal;
 use crate::schemes::float;
@@ -18,6 +20,9 @@ use crate::schemes::string;
 use crate::schemes::temporal;
 
 /// All available compression schemes.
+///
+/// Constant and dictionary compression are built into the compressor itself and do not appear in
+/// this list (see [`DictTypes`] for disabling dictionary compression per type class).
 ///
 /// This list is order-sensitive: the builder preserves this order when constructing
 /// the final scheme list, so that tie-breaking is deterministic.
@@ -31,7 +36,6 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     &integer::ZigZagScheme,
     &integer::BitPackingScheme,
     &integer::SparseScheme,
-    &integer::IntDictScheme,
     &integer::RunEndScheme,
     &integer::SequenceScheme,
     &integer::IntRLEScheme,
@@ -43,13 +47,11 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     &float::ALPScheme,
     &float::ALPRDScheme,
-    &float::FloatDictScheme,
     &float::NullDominatedSparseScheme,
     &float::FloatRLEScheme,
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // String schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    &string::StringDictScheme,
     // Both string-fragmentation schemes are registered; the sample-based
     // selector keeps whichever is smaller per column.
     &string::FSSTScheme,
@@ -57,18 +59,19 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     &string::OnPairScheme,
     &string::NullDominatedSparseScheme,
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    // Binary schemes.
-    ////////////////////////////////////////////////////////////////////////////////////////////////
-    &binary::BinaryDictScheme,
     // Decimal schemes.
+    ////////////////////////////////////////////////////////////////////////////////////////////////
     &decimal::DecimalScheme,
+    ////////////////////////////////////////////////////////////////////////////////////////////////
     // Temporal schemes.
+    ////////////////////////////////////////////////////////////////////////////////////////////////
     &temporal::TemporalScheme,
 ];
 
 /// Builder for creating configured [`BtrBlocksCompressor`] instances.
 ///
-/// By default, all schemes in [`ALL_SCHEMES`] are enabled in a deterministic order. Feature-gated
+/// By default, all schemes in [`ALL_SCHEMES`] are enabled in a deterministic order, and the
+/// compressor's built-in dictionary compression is enabled for every type class. Feature-gated
 /// schemes (Pco, Zstd) are not in `ALL_SCHEMES` and must be added explicitly via
 /// [`with_new_scheme`](BtrBlocksCompressorBuilder::with_new_scheme) or `with_compact` when the
 /// `zstd` feature is enabled.
@@ -76,26 +79,37 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 /// # Examples
 ///
 /// ```rust
-/// use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
-/// use vortex_btrblocks::schemes::integer::IntDictScheme;
+/// use vortex_btrblocks::{BtrBlocksCompressorBuilder, DictTypes, Scheme, SchemeExt};
+/// use vortex_btrblocks::schemes::integer::FoRScheme;
 ///
 /// // Default compressor with all schemes in ALL_SCHEMES.
 /// let compressor = BtrBlocksCompressorBuilder::default().build();
 ///
 /// // Remove specific schemes.
 /// let compressor = BtrBlocksCompressorBuilder::default()
-///     .exclude_schemes([IntDictScheme.id()])
+///     .exclude_schemes([FoRScheme.id()])
+///     .build();
+///
+/// // Disable the built-in dictionary compression for strings and binary.
+/// let compressor = BtrBlocksCompressorBuilder::default()
+///     .with_dict_types(DictTypes {
+///         string: false,
+///         binary: false,
+///         ..DictTypes::all()
+///     })
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
 pub struct BtrBlocksCompressorBuilder {
     schemes: Vec<&'static dyn Scheme>,
+    dict_types: DictTypes,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
     fn default() -> Self {
         Self {
             schemes: ALL_SCHEMES.to_vec(),
+            dict_types: DictTypes::default(),
         }
     }
 }
@@ -103,10 +117,13 @@ impl Default for BtrBlocksCompressorBuilder {
 impl BtrBlocksCompressorBuilder {
     /// Creates a builder with no schemes registered.
     ///
-    /// Useful when the caller wants explicit, scheme-by-scheme control over the compressor.
+    /// Useful when the caller wants explicit, scheme-by-scheme control over the compressor. Note
+    /// that the compressor's built-in constant and dictionary compression still apply; use
+    /// [`with_dict_types`](Self::with_dict_types) to disable dictionary compression.
     pub fn empty() -> Self {
         Self {
             schemes: Vec::new(),
+            dict_types: DictTypes::default(),
         }
     }
 
@@ -127,6 +144,18 @@ impl BtrBlocksCompressorBuilder {
 
         self.schemes.push(scheme);
         self
+    }
+
+    /// Configures which type classes the compressor's built-in dictionary compression applies
+    /// to. All type classes are enabled by default.
+    pub fn with_dict_types(mut self, dict_types: DictTypes) -> Self {
+        self.dict_types = dict_types;
+        self
+    }
+
+    /// Returns the currently configured dictionary compression type classes.
+    pub fn dict_types(&self) -> DictTypes {
+        self.dict_types
     }
 
     /// Adds compact encoding schemes (Zstd for strings and binary, Pco for numerics).
@@ -171,9 +200,7 @@ impl BtrBlocksCompressorBuilder {
             integer::IntRLEScheme.id(),
             float::FloatRLEScheme.id(),
             float::NullDominatedSparseScheme.id(),
-            string::StringDictScheme.id(),
             string::FSSTScheme.id(),
-            binary::BinaryDictScheme.id(),
         ];
         #[cfg(feature = "unstable_encodings")]
         excluded.push(string::OnPairScheme.id());
@@ -181,7 +208,13 @@ impl BtrBlocksCompressorBuilder {
         // is incompatible with pure-GPU decompression paths.
         #[cfg(feature = "unstable_encodings")]
         excluded.push(integer::DeltaScheme::default().id());
-        let builder = self.exclude_schemes(excluded);
+        // String and binary dictionaries require host-side expansion at decode time, so disable
+        // the built-in dictionary compression for those type classes.
+        let builder = self.exclude_schemes(excluded).with_dict_types(DictTypes {
+            string: false,
+            binary: false,
+            ..DictTypes::all()
+        });
 
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
         let builder = builder
@@ -204,7 +237,7 @@ impl BtrBlocksCompressorBuilder {
 
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
+        BtrBlocksCompressor(CascadingCompressor::new(self.schemes).with_dict_types(self.dict_types))
     }
 }
 

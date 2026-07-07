@@ -18,10 +18,11 @@
 //!
 //! # Example
 //!
-//! A [`CascadingCompressor`] can be created directly with a fixed scheme list. With no schemes it
-//! still canonicalizes supported inputs, recursively handles nested structure, and encodes
-//! constant leaves (constant detection is built into the compressor), but no other leaf
-//! compression is selected.
+//! A [`CascadingCompressor`] can be created directly with a fixed scheme list. Constant
+//! detection and dictionary compression are built into the compressor itself: even with no
+//! registered schemes it canonicalizes supported inputs, recursively handles nested structure,
+//! encodes constant leaves, and considers dictionary encoding for low-cardinality leaves (see
+//! [`DictTypes`] for disabling the latter per type class).
 //!
 //! ```rust
 //! use vortex_array::{IntoArray, VortexSessionExecute, array_session};
@@ -62,9 +63,9 @@
 //! From those fields you can derive per-scheme savings, rejection counts, and estimator accuracy
 //! with a short `jq` query.
 
-pub mod builtins;
 mod constant;
 pub mod ctx;
+mod dict;
 pub mod estimate;
 pub mod scheme;
 pub mod stats;
@@ -74,3 +75,6 @@ mod sample;
 mod compressor;
 mod trace;
 pub use compressor::CascadingCompressor;
+pub use dict::DICT_SCHEME_ID;
+pub use dict::DictTypes;
+pub use dict::dict_children;
