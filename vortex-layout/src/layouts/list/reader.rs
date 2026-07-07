@@ -11,6 +11,7 @@ use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
@@ -21,6 +22,7 @@ use vortex_array::expr::Expression;
 use vortex_array::expr::root;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -31,6 +33,7 @@ use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::layouts::chunked::reader::ChunkedReader;
 use crate::layouts::list::ListLayout;
 use crate::layouts::list::expr::ListChildrenNeeded;
 use crate::layouts::list::expr::get_necessary_list_children;
@@ -138,14 +141,43 @@ impl ListReader {
     /// Projection for [`ListChildrenNeeded::All`] expressions: materializes the list and applies
     /// the expression.
     ///
-    /// This is a single **whole-chunk** read: the entire `elements` buffer, `offsets`, and
-    /// `validity` for the chunk are fetched concurrently — there is no offsets→elements round-trip
-    /// because the elements bound is the whole buffer (`offsets[0] == 0` within a chunk). The
-    /// assembled list is sliced to `row_range` and filtered by the caller mask in memory. Reading
-    /// the whole chunk keeps this one simple, allocation-light path with trivial nested
-    /// composition; the chunk is the unit of random-access granularity (controlled by the writer's
-    /// chunk size).
+    /// Dispatches between two reads of the same chunk:
+    ///
+    /// * [`project_elements_bounded`](Self::project_elements_bounded) — used for a strict sub-range
+    ///   when `elements` is a chunked layout. It decodes the first and last offset of the range and
+    ///   reads only the elements they bound, so the underlying [`ChunkedReader`] fetches just the
+    ///   element-chunks the range overlaps. This costs one offsets→elements round-trip.
+    /// * [`project_elements_whole_chunk`](Self::project_elements_whole_chunk) — used for a
+    ///   full-range read, or when `elements` is a single flat segment (nothing to skip). It fetches
+    ///   `offsets`, `elements`, and `validity` concurrently with no round-trip.
     fn project_elements(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture> {
+        let is_full_range = row_range.start == 0 && row_range.end == self.layout.row_count();
+        if is_full_range || !self.elements_are_chunked() {
+            self.project_elements_whole_chunk(row_range, expr, mask)
+        } else {
+            self.project_elements_bounded(row_range, expr, mask)
+        }
+    }
+
+    /// Returns `true` if the `elements` child is a chunked layout, so a bounded elements read can
+    /// skip the chunks a row range does not overlap.
+    fn elements_are_chunked(&self) -> bool {
+        self.elements
+            .as_any()
+            .downcast_ref::<ChunkedReader>()
+            .is_some()
+    }
+
+    /// Whole-chunk read: the entire `elements` buffer, `offsets`, and `validity` for the chunk are
+    /// fetched concurrently — there is no offsets→elements round-trip because the elements bound is
+    /// the whole buffer (`offsets[0] == 0` within a chunk). The assembled list is sliced to
+    /// `row_range` and filtered by the caller mask in memory.
+    fn project_elements_whole_chunk(
         &self,
         row_range: &Range<u64>,
         expr: &Expression,
@@ -187,6 +219,65 @@ impl ListReader {
             } else {
                 list.slice(usize::try_from(row_range.start)?..usize::try_from(row_range.end)?)?
             };
+
+            // Filter before applying the expression: the expression may depend on the filtered
+            // rows being removed (e.g. `cast(a, u8) where a < 256`).
+            let mask = mask.await?;
+            let list = if mask.all_true() {
+                list
+            } else {
+                list.filter(mask)?
+            };
+            list.apply(&expr)
+        }
+        .boxed())
+    }
+
+    /// Bounded read for a strict sub-range of a chunked-elements list. Reads `offsets[row_range]`,
+    /// decodes the first and last offset to bound the elements read to `[first..last)`, then rebases
+    /// the offsets to index into that sliced elements buffer. With chunked elements, reading only
+    /// `[first..last)` fetches just the element-chunks the range overlaps. The offsets read is on
+    /// the critical path (the elements bound depends on it); validity is read concurrently.
+    fn project_elements_bounded(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture> {
+        let nullability = self.layout.dtype().nullability();
+        let expr = expr.clone();
+        let row_count = usize::try_from(row_range.end - row_range.start)?;
+        let session = self.session.clone();
+        let elements_reader = Arc::clone(&self.elements);
+
+        // Offsets are on the critical path (they bound the elements read); validity is independent.
+        let offsets_fut = self.fetch_offsets(row_range)?;
+        let validity_fut = fetch_validity(
+            self.validity.as_ref(),
+            row_range,
+            MaskFuture::new_true(row_count),
+        )?;
+
+        Ok(async move {
+            let offsets = offsets_fut.await?;
+            let elements_range = calculate_elements_range(&offsets, &session)?;
+            let elements_len = usize::try_from(elements_range.end - elements_range.start)?;
+
+            // Read only the elements this range covers; a chunked elements layout skips the rest.
+            let elements = elements_reader
+                .projection_evaluation(
+                    &elements_range,
+                    &root(),
+                    MaskFuture::new_true(elements_len),
+                )?
+                .await?;
+
+            // Rebase offsets to index into the sliced elements buffer.
+            let offsets = rebase_offsets(offsets, elements_range.start)?;
+            let validity = validity_fut.await?;
+            let list =
+                ListArray::try_new(elements, offsets, create_validity(validity, nullability))?
+                    .into_array();
 
             // Filter before applying the expression: the expression may depend on the filtered
             // rows being removed (e.g. `cast(a, u8) where a < 256`).
@@ -253,6 +344,40 @@ impl ListReader {
             MaskFuture::new_true(offsets_count),
         )
     }
+}
+
+/// Read `offsets[0]` and `offsets[-1]` and return the elements-buffer range they describe.
+fn calculate_elements_range(
+    offsets: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<Range<u64>> {
+    if offsets.is_empty() {
+        return Ok(0..0);
+    }
+    let mut exec_ctx = session.create_execution_ctx();
+    let start = offsets
+        .execute_scalar(0, &mut exec_ctx)?
+        .as_primitive()
+        .as_::<u64>()
+        .vortex_expect("offset value fits in u64");
+    let end = offsets
+        .execute_scalar(offsets.len() - 1, &mut exec_ctx)?
+        .as_primitive()
+        .as_::<u64>()
+        .vortex_expect("offset value fits in u64");
+    Ok(start..end)
+}
+
+/// Subtract `first` from every offset so the resulting offsets index into a sliced
+/// `elements[first..]` buffer starting at zero. The constant array is cast to the offsets' dtype.
+fn rebase_offsets(offsets: ArrayRef, first: u64) -> VortexResult<ArrayRef> {
+    if first == 0 {
+        return Ok(offsets);
+    }
+    let constant = ConstantArray::new(first, offsets.len())
+        .into_array()
+        .cast(offsets.dtype().clone())?;
+    offsets.binary(constant, Operator::Sub)
 }
 
 fn create_validity(validity_array: Option<ArrayRef>, nullability: Nullability) -> Validity {
@@ -426,7 +551,11 @@ mod tests {
     use super::*;
     use crate::LayoutRef;
     use crate::LayoutStrategy;
+    use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::layouts::list::writer::ListLayoutStrategy;
+    use crate::layouts::repartition::RepartitionStrategy;
+    use crate::layouts::repartition::RepartitionWriterOptions;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
@@ -809,6 +938,76 @@ mod tests {
             .await?;
 
         let expected = list.slice(1..4)?;
+        let mut exec_ctx = session.create_execution_ctx();
+        assert_arrays_eq!(result, expected, &mut exec_ctx);
+        Ok(())
+    }
+
+    /// A list strategy whose `elements` child is repartitioned into two-element chunks, so the
+    /// reader takes the bounded (chunk-skipping) path for strict sub-ranges.
+    fn chunked_elements_list_strategy() -> ListLayoutStrategy {
+        let chunked_elements: Arc<dyn LayoutStrategy> = Arc::new(RepartitionStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            RepartitionWriterOptions {
+                block_size_minimum: 0,
+                block_len_multiple: 2,
+                block_size_target: None,
+                canonicalize: true,
+            },
+        ));
+        ListLayoutStrategy::default().with_elements(chunked_elements)
+    }
+
+    /// The chunked-elements strategy must actually produce a chunked `elements` layout, otherwise
+    /// the reader would silently fall back to the whole-chunk path and the bounded read would be
+    /// untested.
+    #[tokio::test]
+    async fn chunked_elements_produces_chunked_layout() -> VortexResult<()> {
+        let list = create_wider_list_array(false);
+        let (_segments, layout, _session) =
+            write_layout(&chunked_elements_list_strategy(), list).await?;
+        let tree = layout.display_tree().to_string();
+        assert!(
+            tree.contains("elements: vortex.chunked"),
+            "elements should be chunked:\n{tree}"
+        );
+        Ok(())
+    }
+
+    /// With chunked elements, sub-range projections take the bounded read path. Every
+    /// range/mask/nullability combination must match the same projection over the ground-truth
+    /// array (`list.slice(range).filter(mask)`).
+    #[rstest]
+    #[case::full_all_true(0..5, Mask::new_true(5), false)]
+    #[case::subrange_all_true(1..4, Mask::new_true(3), false)]
+    #[case::subrange_sparse(1..4, Mask::from_iter([true, false, true]), false)]
+    #[case::partial_start(0..2, Mask::new_true(2), false)]
+    #[case::partial_end(2..5, Mask::new_true(3), false)]
+    #[case::single_non_empty(0..1, Mask::new_true(1), false)]
+    #[case::single_empty_row(2..3, Mask::from_iter([true]), false)]
+    #[case::empty_range(2..2, Mask::new_true(0), false)]
+    #[case::subrange_all_false(1..4, Mask::new_false(3), false)]
+    #[case::subrange_sparse_nullable(1..4, Mask::from_iter([true, false, true]), true)]
+    #[case::partial_end_nullable(2..5, Mask::new_true(3), true)]
+    #[tokio::test]
+    async fn chunked_elements_round_trips(
+        #[case] row_range: Range<u64>,
+        #[case] mask: Mask,
+        #[case] nullable: bool,
+    ) -> VortexResult<()> {
+        let list = create_wider_list_array(nullable);
+        let ctx = LayoutReaderContext::new();
+        let (segments, layout, session) =
+            write_layout(&chunked_elements_list_strategy(), list.clone()).await?;
+        let reader = layout.new_reader("".into(), segments, &session, &ctx)?;
+
+        let result = reader
+            .projection_evaluation(&row_range, &root(), MaskFuture::ready(mask.clone()))?
+            .await?;
+
+        let sliced =
+            list.slice(usize::try_from(row_range.start)?..usize::try_from(row_range.end)?)?;
+        let expected = sliced.filter(mask)?;
         let mut exec_ctx = session.create_execution_ctx();
         assert_arrays_eq!(result, expected, &mut exec_ctx);
         Ok(())

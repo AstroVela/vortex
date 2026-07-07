@@ -72,6 +72,14 @@ use vortex_zstd::ZstdBuffers;
 
 const ONE_MEG: u64 = 1 << 20;
 
+/// Upper bound on the number of `elements` rows in a single element-chunk of a list column.
+///
+/// The `elements` child of a list is repartitioned into chunks so a reader can fetch only the
+/// element-chunks a row range overlaps. `block_size_target` keeps each chunk near 1 MiB for
+/// fixed-width elements; this bounds the row count for narrow/variable-width elements where the
+/// byte target alone would produce very large chunks.
+const ELEMENTS_PER_CHUNK: usize = 1 << 20;
+
 /// Static registry of all allowed array encodings for file writing.
 ///
 /// This includes all canonical encodings from vortex-array plus all compressed
@@ -243,24 +251,8 @@ impl WriteStrategyBuilder {
             Arc::new(FlatLayoutStrategy::default())
         };
 
-        // 7. for each chunk create a layout. List-typed chunks route through
-        // `ListLayoutStrategy` (separately-addressable elements/offsets/validity sub-layouts;
-        // non-list chunks fall through its built-in fallback to `flat`).
-        let leaf: Arc<dyn LayoutStrategy> = Arc::new(
-            // Thread the configured `flat` (which carries `allow_encodings` / any custom flat
-            // override) through every child.
-            ListLayoutStrategy::default()
-                .with_elements(Arc::clone(&flat))
-                .with_offsets(Arc::clone(&flat))
-                .with_validity(Arc::clone(&flat))
-                .with_fallback(Arc::clone(&flat)),
-        );
-
-        let chunked = ChunkedLayoutStrategy::new(leaf);
-        // 6. buffer chunks so they end up with closer segment ids physically
-        let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
-
-        // 5. compress each chunk.
+        // The data compressor is built up front: the list leaf (step 7) reuses it to compress each
+        // elements chunk, and the outer chain reuses it at step 5.
         // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
         // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
         // dictionary-encode the integer codes produced by that earlier step.
@@ -273,7 +265,42 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        let compressing = CompressingStrategy::new(buffered, data_compressor);
+
+        // The `elements` child of a list is repartitioned into ~1 MiB chunks, each compressed
+        // independently, producing a `ChunkedLayout`. This lets the reader fetch only the
+        // element-chunks a row range overlaps (bounded read) instead of the whole elements buffer.
+        let chunked_elements: Arc<dyn LayoutStrategy> = Arc::new(RepartitionStrategy::new(
+            CompressingStrategy::new(
+                ChunkedLayoutStrategy::new(Arc::clone(&flat)),
+                Arc::clone(&data_compressor),
+            ),
+            RepartitionWriterOptions {
+                block_size_minimum: ONE_MEG,
+                block_len_multiple: ELEMENTS_PER_CHUNK,
+                block_size_target: Some(ONE_MEG),
+                canonicalize: true,
+            },
+        ));
+
+        // 7. for each chunk create a layout. List-typed chunks route through
+        // `ListLayoutStrategy` (separately-addressable elements/offsets/validity sub-layouts;
+        // non-list chunks fall through its built-in fallback to `flat`). Offsets, validity, and the
+        // fallback thread the configured `flat` (which carries `allow_encodings` / any custom flat
+        // override); elements route through the chunked+compressed strategy above.
+        let leaf: Arc<dyn LayoutStrategy> = Arc::new(
+            ListLayoutStrategy::default()
+                .with_elements(chunked_elements)
+                .with_offsets(Arc::clone(&flat))
+                .with_validity(Arc::clone(&flat))
+                .with_fallback(Arc::clone(&flat)),
+        );
+
+        let chunked = ChunkedLayoutStrategy::new(leaf);
+        // 6. buffer chunks so they end up with closer segment ids physically
+        let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
+
+        // 5. compress each chunk.
+        let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(

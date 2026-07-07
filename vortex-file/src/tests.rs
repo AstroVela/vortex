@@ -2004,6 +2004,50 @@ async fn test_segment_ordering_dict_codes_before_values() -> VortexResult<()> {
     Ok(())
 }
 
+/// A list column whose per-chunk elements exceed the ~1 MiB element-chunk target is written with a
+/// chunked `elements` layout, so a reader can fetch only the element-chunks a row range overlaps.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn list_layout_chunks_large_elements() -> VortexResult<()> {
+    // 20k lists of length 64 => ~1.28M i32 elements. After the 8k-row repartition each list-chunk
+    // still holds > 1 MiB of elements, so `elements` is written as a chunked layout (rather than a
+    // single flat segment, which `ChunkedLayoutStrategy` would collapse to for < 1 MiB).
+    let list_len = 64u32;
+    let n_rows = 20_000usize;
+    let n_elems = n_rows * list_len as usize;
+    let elements = PrimitiveArray::from_iter(0..n_elems as i32).into_array();
+    let offsets = PrimitiveArray::from_iter((0..=n_rows as u32).map(|i| i * list_len)).into_array();
+    let list = ListArray::try_new(elements, offsets, Validity::NonNullable)?.into_array();
+    let st = StructArray::from_fields(&[("l", list)])?.into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    let summary = SESSION
+        .write_options()
+        .write(&mut buf, st.to_array_stream())
+        .await?;
+
+    fn any_list_has_chunked_elements(layout: &dyn Layout) -> bool {
+        if layout.encoding_id().as_ref() == "vortex.list"
+            && layout.child(0).unwrap().encoding_id().as_ref() == "vortex.chunked"
+        {
+            return true;
+        }
+        for child in layout.children().unwrap() {
+            if any_list_has_chunked_elements(child.as_ref()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    let root = summary.footer().layout();
+    assert!(
+        any_list_has_chunked_elements(root.as_ref()),
+        "expected a list layout with chunked elements"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_segment_ordering_zonemaps_after_data() -> VortexResult<()> {
