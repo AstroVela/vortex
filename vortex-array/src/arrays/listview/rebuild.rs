@@ -162,7 +162,7 @@ impl ListViewArray {
         let total: u64 = sizes_canonical
             .as_slice::<S>()
             .iter()
-            .map(|s| (*s).as_() as u64)
+            .map(|s| s.as_() as u64)
             .sum();
         if Self::should_use_take(total, self.len()) {
             self.rebuild_with_take::<O, NewOffset, S>(ctx)

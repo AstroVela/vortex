@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use itertools::Itertools as _;
-use vortex_buffer::Buffer;
+use std::mem;
+use std::mem::MaybeUninit;
+
+use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
+use crate::AnyCanonical;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
@@ -15,22 +18,24 @@ use crate::IntoArray;
 use crate::array::ArrayView;
 use crate::arrays::Chunked;
 use crate::arrays::ChunkedArray;
+use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
+use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::Struct;
 use crate::arrays::StructArray;
+use crate::arrays::Variant;
 use crate::arrays::VariantArray;
 use crate::arrays::chunked::ChunkedArrayExt;
-use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
+use crate::arrays::fixed_size_list::FixedSizeListDataParts;
 use crate::arrays::listview::ListViewArrayExt;
 use crate::arrays::listview::ListViewRebuildMode;
 use crate::arrays::variant::VariantArrayExt;
-use crate::builders::builder_with_capacity_in;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
-use crate::memory::HostAllocatorExt;
 use crate::validity::Validity;
 
 pub(super) fn _canonicalize(
@@ -45,35 +50,32 @@ pub(super) fn _canonicalize(
         return Ok(Canonical::empty(array.dtype()));
     }
     if array.nchunks() == 1 {
-        return array.chunk(0).clone().execute::<Canonical>(ctx);
+        return Ok(Canonical::from(array.chunk(0).as_::<AnyCanonical>()));
     }
 
     let owned_chunks: Vec<ArrayRef> = array.iter_chunks().cloned().collect();
     Ok(match array.dtype() {
         DType::Struct(..) => {
-            let struct_array = pack_struct_chunks(owned_chunks, ctx)?;
+            let struct_array = pack_struct_chunks(owned_chunks)?;
             Canonical::Struct(struct_array)
         }
         DType::List(elem_dtype, _) => Canonical::List(swizzle_list_chunks(
-            &owned_chunks,
+            owned_chunks,
             array.array().validity()?,
             elem_dtype,
             ctx,
         )?),
         DType::FixedSizeList(elem_dtype, list_size, _) => {
             Canonical::FixedSizeList(swizzle_fixed_size_list_chunks(
-                &owned_chunks,
+                owned_chunks,
                 array.array().validity()?,
                 elem_dtype,
                 *list_size,
-                ctx,
             )?)
         }
-        DType::Variant(_) => Canonical::Variant(pack_variant_chunks(owned_chunks, ctx)?),
+        DType::Variant(_) => Canonical::Variant(pack_variant_chunks(owned_chunks)?),
         _ => {
-            let mut builder = builder_with_capacity_in(ctx.allocator(), array.dtype(), array.len());
-            array.array().append_to_builder(builder.as_mut(), ctx)?;
-            builder.finish_into_canonical(ctx)
+            unreachable!("All non nested types should be handled by execute loop")
         }
     })
 }
@@ -82,24 +84,18 @@ pub(super) fn _canonicalize(
 /// field is a [`ChunkedArray`].
 ///
 /// The caller guarantees there are at least 2 chunks.
-fn pack_struct_chunks(chunks: Vec<ArrayRef>, ctx: &mut ExecutionCtx) -> VortexResult<StructArray> {
-    chunks
-        .into_iter()
-        .map(|c| c.execute::<StructArray>(ctx))
-        .process_results(|iter| StructArray::try_concat(iter))?
+fn pack_struct_chunks(chunks: Vec<ArrayRef>) -> VortexResult<StructArray> {
+    StructArray::try_concat(chunks.into_iter().map(|c| c.downcast::<Struct>()))
 }
 
 /// Packs many [`VariantArray`]s into one [`VariantArray`] with chunked children.
 ///
 /// The caller guarantees there are at least 2 chunks.
-fn pack_variant_chunks(
-    chunks: Vec<ArrayRef>,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<VariantArray> {
+fn pack_variant_chunks(chunks: Vec<ArrayRef>) -> VortexResult<VariantArray> {
     let variant_chunks: Vec<VariantArray> = chunks
         .into_iter()
-        .map(|chunk| chunk.execute::<VariantArray>(ctx))
-        .try_collect()?;
+        .map(|chunk| chunk.downcast::<Variant>())
+        .collect();
 
     let outer_dtype = variant_chunks[0].dtype().clone();
     let core_chunks = variant_chunks
@@ -151,7 +147,7 @@ fn pack_variant_chunks(
 ///
 /// The caller guarantees there are at least 2 chunks.
 fn swizzle_list_chunks(
-    chunks: &[ArrayRef],
+    chunks: Vec<ArrayRef>,
     validity: Validity,
     elem_dtype: &DType,
     ctx: &mut ExecutionCtx,
@@ -177,15 +173,14 @@ fn swizzle_list_chunks(
     // this much more complicated.
     // We (somewhat arbitrarily) choose `u64` for our offsets and sizes here. These can always be
     // narrowed later by the compressor.
-    let allocator = ctx.allocator();
-    let mut offsets = allocator.allocate_typed::<u64>(len)?;
-    let mut sizes = allocator.allocate_typed::<u64>(len)?;
-    let offsets_out: &mut [u64] = offsets.as_mut_slice_typed::<u64>()?;
-    let sizes_slice_out: &mut [u64] = sizes.as_mut_slice_typed::<u64>()?;
+    let mut offsets = BufferMut::<u64>::with_capacity(len);
+    let mut sizes = BufferMut::<u64>::with_capacity(len);
+    let offsets_out = &mut offsets.spare_capacity_mut()[..len];
+    let sizes_slice_out = &mut sizes.spare_capacity_mut()[..len];
     let mut next_list = 0usize;
 
     for chunk in chunks {
-        let chunk_array = chunk.clone().execute::<ListViewArray>(ctx)?;
+        let chunk_array = chunk.downcast::<ListView>();
         // By rebuilding as zero-copy to `List` and trimming all elements (to prevent gaps), we make
         // the final output `ListView` also zero-copyable to `List`.
         let chunk_array = chunk_array.rebuild(ListViewRebuildMode::MakeExact, ctx)?;
@@ -211,13 +206,25 @@ fn swizzle_list_chunks(
         let offsets_slice = offsets_arr.as_slice::<u64>();
         let sizes_slice = sizes_arr.as_slice::<u64>();
 
+        let chunk_len = chunk_array.len();
+
+        // SAFETY: MaybeUninit has the same memory layout as the underlying type
+        unsafe {
+            mem::transmute::<&mut [MaybeUninit<u64>], &mut [u64]>(
+                &mut sizes_slice_out[next_list..][..chunk_len],
+            )
+        }
+        .copy_from_slice(sizes_slice);
+
         // Append offsets and sizes, adjusting offsets to point into the combined array.
-        for (&offset, &size) in offsets_slice.iter().zip(sizes_slice.iter()) {
-            offsets_out[next_list] = offset + num_elements;
-            sizes_slice_out[next_list] = size;
-            next_list += 1;
+        for (off_out, &offset) in offsets_out[next_list..][..chunk_len]
+            .iter_mut()
+            .zip(offsets_slice)
+        {
+            off_out.write(offset + num_elements);
         }
 
+        next_list += chunk_array.len();
         num_elements += chunk_array.elements().len() as u64;
     }
     debug_assert_eq!(next_list, len);
@@ -227,16 +234,8 @@ fn swizzle_list_chunks(
         unsafe { ChunkedArray::new_unchecked(list_elements_chunks, elem_dtype.clone()) }
             .into_array();
 
-    let offsets = PrimitiveArray::new(
-        Buffer::<u64>::from_byte_buffer(offsets.freeze()),
-        Validity::NonNullable,
-    )
-    .into_array();
-    let sizes = PrimitiveArray::new(
-        Buffer::<u64>::from_byte_buffer(sizes.freeze()),
-        Validity::NonNullable,
-    )
-    .into_array();
+    let offsets = PrimitiveArray::new(offsets.freeze(), Validity::NonNullable).into_array();
+    let sizes = PrimitiveArray::new(sizes.freeze(), Validity::NonNullable).into_array();
 
     // SAFETY:
     // - `offsets` and `sizes` are non-nullable u64 arrays of the same length
@@ -260,21 +259,21 @@ fn swizzle_list_chunks(
 ///
 /// The caller guarantees there are at least 2 chunks.
 fn swizzle_fixed_size_list_chunks(
-    chunks: &[ArrayRef],
+    chunks: Vec<ArrayRef>,
     validity: Validity,
     elem_dtype: &DType,
     list_size: u32,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<FixedSizeListArray> {
     let len: usize = chunks.iter().map(|c| c.len()).sum();
 
     let mut element_chunks = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let chunk_array = chunk.clone().execute::<FixedSizeListArray>(ctx)?;
+        let FixedSizeListDataParts { elements, .. } =
+            chunk.downcast::<FixedSizeList>().into_data_parts();
         // A canonical `FixedSizeListArray` keeps its `elements` child trimmed to exactly
         // `list_size * chunk.len()` starting at the first list, so the children concatenate
         // cleanly into the combined `elements` array.
-        element_chunks.push(chunk_array.elements().clone());
+        element_chunks.push(elements);
     }
 
     let chunked_elements = ChunkedArray::try_new(element_chunks, elem_dtype.clone())?.into_array();

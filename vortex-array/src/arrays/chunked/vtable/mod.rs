@@ -256,6 +256,7 @@ impl VTable for Chunked {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         match array.dtype() {
+            // TODO(joe)[#7674]: iterative execution here too
             // Struct, List, FixedSizeList, and Variant canonicalize by swizzling chunking
             // down into their children zero-copy, which the value-copying builder path cannot
             // express. Drive every chunk to its canonical encoding through the scheduler
