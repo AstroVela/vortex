@@ -205,7 +205,7 @@ impl VTable for Dict {
 
         Ok(ExecutionResult::done(take_canonical(
             values.as_::<AnyCanonical>(),
-            &codes.downcast::<Primitive>(),
+            codes.as_::<Primitive>(),
             ctx,
         )?))
     }
@@ -222,8 +222,7 @@ impl VTable for Dict {
             )
             && !codes.validity()?.definitely_all_null()
         {
-            let codes = codes.into_owned();
-            let canonical = take_canonical(values, &codes, ctx)?.into_array();
+            let canonical = take_canonical(values, codes, ctx)?.into_array();
             canonical.append_to_builder(builder, ctx)?;
             return Ok(());
         }

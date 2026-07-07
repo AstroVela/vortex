@@ -29,7 +29,10 @@ use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::with_empty_buffers;
-use crate::arrays::PrimitiveArray;
+use crate::arrays::{FixedSizeList, PrimitiveArray};
+use crate::arrays::ListView;
+use crate::arrays::Struct;
+use crate::arrays::Variant;
 use crate::arrays::chunked::ChunkedArrayExt;
 use crate::arrays::chunked::ChunkedData;
 use crate::arrays::chunked::array::CHUNK_OFFSETS_SLOT;
@@ -41,7 +44,9 @@ use crate::builders::ArrayBuilder;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
+use crate::matcher::Matcher;
 use crate::serde::ArrayChildren;
+
 mod canonical;
 mod operations;
 mod validity;
@@ -251,12 +256,14 @@ impl VTable for Chunked {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         match array.dtype() {
-            // Struct, List, FixedSizeList, and Variant need child swizzling that the builder path
-            // cannot express.
-            DType::Struct(..) | DType::List(..) | DType::FixedSizeList(..) | DType::Variant(..) => {
-                // TODO(joe)[#7674]: iterative execution here too
-                Ok(ExecutionResult::done(_canonicalize(array.as_view(), ctx)?))
-            }
+            // Struct, List, FixedSizeList, and Variant canonicalize by swizzling chunking
+            // down into their children zero-copy, which the value-copying builder path cannot
+            // express. Drive every chunk to its canonical encoding through the scheduler
+            // first, then swizzle the canonical chunks as pure metadata.
+            DType::Struct(..) => execute_swizzle::<Struct>(array, ctx),
+            DType::List(..) => execute_swizzle::<ListView>(array, ctx),
+            DType::FixedSizeList(..) => execute_swizzle::<FixedSizeList>(array, ctx),
+            DType::Variant(..) => execute_swizzle::<Variant>(array, ctx),
             // For all other types, use the builder path via AppendChild.
             _ => {
                 let slot_idx = array.next_builder_slot.max(CHUNKS_OFFSET);
@@ -289,4 +296,30 @@ impl VTable for Chunked {
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
+}
+
+/// Iteratively request execution of each chunk to its canonical encoding `M` on the
+/// scheduler's explicit stack, then swizzle the canonical chunks without copying values.
+///
+/// The `next_builder_slot` cursor tracks progress across re-entries; chunks that already
+/// match `M` are skipped without a scheduler round-trip.
+fn execute_swizzle<M: Matcher>(
+    array: Array<Chunked>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ExecutionResult> {
+    let mut slot_idx = array.next_builder_slot.max(CHUNKS_OFFSET);
+    while slot_idx < array.slots().len()
+        && array.slots()[slot_idx]
+            .as_ref()
+            .is_some_and(|chunk| M::matches(chunk))
+    {
+        slot_idx += 1;
+    }
+    if slot_idx < array.slots().len() {
+        return Ok(ExecutionResult::execute_slot::<M>(
+            array.with_next_builder_slot(slot_idx + 1),
+            slot_idx,
+        ));
+    }
+    Ok(ExecutionResult::done(_canonicalize(array.as_view(), ctx)?))
 }
