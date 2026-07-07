@@ -3,10 +3,10 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use futures::try_join;
 use itertools::Itertools;
+use once_cell::sync::OnceCell;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
@@ -59,7 +59,7 @@ pub struct StructReader {
     expanded_root_expr: Expression,
 
     field_lookup: Option<HashMap<FieldName, usize>>,
-    partitioned_expr_cache: DashMap<ExactExpr, Arc<OnceLock<Partitioned>>>,
+    partitioned_expr_cache: DashMap<ExactExpr, Arc<OnceCell<Partitioned>>>,
 }
 
 impl StructReader {
@@ -157,19 +157,16 @@ impl StructReader {
     /// Utility for partitioning an expression over the fields of a struct.
     fn partition_expr(&self, expr: Expression) -> VortexResult<Partitioned> {
         let key = ExactExpr(expr.clone());
-        if let Some(entry) = self.partitioned_expr_cache.get(&key)
-            && let Some(value) = entry.value().get()
-        {
-            return Ok(value.clone());
-        }
-
-        let result = self.compute_partitioned_expr(expr)?;
-        let entry = self
-            .partitioned_expr_cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceLock::new()))
-            .clone();
-        let result = entry.get_or_init(|| result);
+        let entry = match self.partitioned_expr_cache.get(&key) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.partitioned_expr_cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceCell::new()))
+                    .value(),
+            ),
+        };
+        let result = entry.get_or_try_init(|| self.compute_partitioned_expr(expr))?;
         Ok(result.clone())
     }
 
