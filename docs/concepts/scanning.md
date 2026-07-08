@@ -1,8 +1,8 @@
 # Scan API
 
 :::{note}
-The Scan API is on the roadmap and under active development. The core `Source` trait and scan pipeline
-are functional, but the full API surface is not yet fully defined or implemented.
+The Scan API is on the roadmap and under active development. The core `DataSource` trait and scan
+pipeline are functional, but the full API surface is not yet fully defined or implemented.
 :::
 
 The Vortex Scan API defines a standard interface between data storage and query engines. It solves the
@@ -18,11 +18,9 @@ interface that both sides can implement against.
     Iceberg Tables ──► └──────────────┘ ──►  Spark
 ```
 
-Storage backends implement the `Source` trait for reads. Query engines issue a scan request
+Storage backends implement the source interface for reads. Query engines issue a scan request
 describing the filter and projection to push down, and the source returns a stream of
-independently-executable splits that can be run concurrently to produce result arrays. An
-equivalent `Sink` trait exists for the write path, accepting an array stream and writing it to
-the underlying storage.
+independently-executable splits that can be run concurrently to produce result arrays.
 
 ## Motivation
 
@@ -38,15 +36,13 @@ any decompression step.
 
 ## Source
 
-A **Source** represents any scannable tabular data. It accepts a scan request (filter, projection,
-limit) and returns a stream of independently-executable splits. An equivalent **Sink** interface
-exists for the write path, allowing query engines to both read from and write to any storage
-backend through a single pair of interfaces.
+A **source** (the `DataSource` trait) represents any scannable tabular data. It accepts a scan request
+(filter, projection, limit) and returns a stream of independently-executable splits.
 
 ### Splits
 
-A source produces splits, each representing an independent unit of work that can be executed in
-parallel. A split typically corresponds to a range of rows in a layout, such as a chunk or a set
+A source produces splits (the `Partition` trait), each representing an independent unit of work that
+can be executed in parallel. A split typically corresponds to a range of rows in a layout, such as a chunk or a set
 of row-group partitions.
 
 Each split carries size and row count estimates that query engines use for scheduling decisions.
@@ -56,7 +52,7 @@ Splits can also be serialized for distributed execution across remote workers.
 
 A source may front remote storage rather than local files. In this case, the split's execution
 issues a remote call and receives the result over the network. The
-[Vortex IPC format](../specs/ipc-format.md) can be used as the wire protocol for these calls, allowing
+[Vortex IPC format](../specification/ipc-format.md) can be used as the wire protocol for these calls, allowing
 compressed arrays to be transferred without decompression. This gives remote sources the same
 zero-decompression benefits as local scans -- the data stays in its compressed encoding end-to-end,
 from remote storage through the network and into the query engine.
@@ -89,5 +85,5 @@ pipeline.
 
 Query engines integrate with the Scan API by translating their internal plan representations into
 scan requests and consuming the resulting array stream in their preferred format. Integrations
-exist for DuckDB, DataFusion, Spark, and Trino, with each engine converting its native filter
-and projection representations into Vortex [expressions](expressions.md).
+exist for DuckDB, DataFusion, and Spark, each engine converting its native filter and projection
+representations into Vortex [expressions](expressions.md).

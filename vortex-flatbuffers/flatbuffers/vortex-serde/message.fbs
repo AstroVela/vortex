@@ -8,7 +8,8 @@ enum MessageVersion: uint8 {
     V0 = 0,
 }
 
-/// Indicates the message body contains a flatbuffer Array message, followed by array buffers.
+/// Indicates the message body is a serialized array: the data buffers first, followed by a flatbuffer
+/// Array message and a trailing little-endian u32 length of that message.
 table ArrayMessage {
     /// The row count of the array.
     row_count: uint32;

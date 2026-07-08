@@ -28,7 +28,7 @@ format, and I/O.
 | ------------------------- | ----------------------------------------------------------------------------- |
 | `vortex-error`            | `VortexError` and `VortexResult` types, `vortex_err!` / `vortex_bail!` macros |
 | `vortex-buffer`           | Zero-copy aligned `Buffer<T>` with guaranteed alignment                       |
-| `vortex-array/src/dtype`  | `DType` enum: Null, Bool, Primitive, UTF8, Binary, Struct, List, Extension    |
+| `vortex-array/src/dtype`  | `DType` enum: Null, Bool, Primitive, Decimal, Utf8, Binary, List, FixedSizeList, Struct, Union, Variant, Extension |
 | `vortex-array/src/scalar` | Single-value representations of each dtype                                    |
 | `vortex-mask`             | Bitmask operations for validity and selection                                 |
 | `vortex-session`          | Session object holding registries for encodings, layouts, and extension types |
@@ -38,7 +38,7 @@ format, and I/O.
 | `vortex-ipc`              | IPC format for inter-process communication                                    |
 | `vortex-file`             | `.vortex` file reading and writing                                            |
 | `vortex-scan`             | Table scan with filter and projection pushdown                                |
-| `vortex-expr`             | Expression representation and optimization                                    |
+| `vortex-array/src/expr`   | Expression representation and optimization                                    |
 | `vortex-flatbuffers`      | FlatBuffer schema definitions                                                 |
 
 ## Encodings
@@ -54,12 +54,13 @@ and registers itself with the session. The standard encodings are bundled into t
 | `vortex-runend`             | Run-end encoding for repetitive data                 |
 | `vortex-sparse`             | Sparse array encoding                                |
 | `vortex-zigzag`             | ZigZag encoding for signed integers                  |
-| `vortex-roaring`            | Roaring bitmap encoding                              |
-| `vortex-dict`               | Dictionary encoding                                  |
 | `vortex-bytebool`           | Byte-per-boolean encoding                            |
 | `vortex-datetime-parts`     | DateTime field decomposition                         |
 | `vortex-decimal-byte-parts` | Decimal byte decomposition                           |
 | `vortex-sequence`           | Arithmetic sequence encoding                         |
+| `vortex-pco`                | Pcodec compression for numeric data                  |
+| `vortex-zstd`               | Zstd block compression                               |
+| `vortex-parquet-variant`    | Parquet Variant (semi-structured) encoding           |
 
 ## Language Bindings
 
@@ -70,7 +71,7 @@ Language bindings expose Vortex to non-Rust environments.
 | `vortex-python/`   | Python bindings via PyO3 and Maturin  |
 | `java/vortex-jni/` | Java JNI bindings                     |
 | `vortex-ffi/`      | C FFI bindings (generates `vortex.h`) |
-| `vortex-cxx/`      | C++ wrapper around the C FFI          |
+| `vortex-cxx/`      | C++ binding via the `cxx` Rust bridge |
 
 ## Integrations
 
@@ -80,8 +81,7 @@ Query engine integrations allow Vortex files to be queried through existing anal
 |----------------------------------| ---------- |----------------------------------------------|
 | `vortex-datafusion/`             | DataFusion | `TableProvider` and `FileFormat` integration |
 | `vortex-duckdb/`                 | DuckDB     | Table function integration                   |
-| `java/vortex-spark_{2.12,2.13}/` | Spark      | Spark DataSource V2 connector via JNI        |
-| `java/vortex-trino/`             | Trino      | Trino connector (in development)             |
+| `java/vortex-spark/`             | Spark      | Spark DataSource V2 connector via JNI (published as `vortex-spark_2.12` and `vortex-spark_2.13`) |
 
 ## Other Crates
 

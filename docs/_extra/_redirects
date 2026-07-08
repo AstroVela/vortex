@@ -1,0 +1,16 @@
+# Cloudflare Pages redirects for docs.vortex.dev.
+# Copied verbatim to the site root via `html_extra_path` in conf.py.
+# More specific rules must come before broader splat rules.
+
+# The internals/serialization page was split across several specification pages
+# (array-format, ipc-format, reading-a-file); send it to the Specification index, which
+# fans out to all of them.
+/developer-guide/internals/serialization      /specification/  301
+/developer-guide/internals/serialization.html /specification/  301
+
+# The specs/ section was renamed to specification/. Cover the section root explicitly
+# (the splat does not match the bare /specs path) before the child-path splat rule.
+/specs            /specification/  301
+/specs/           /specification/  301
+/specs/index.html /specification/  301
+/specs/*          /specification/:splat  301

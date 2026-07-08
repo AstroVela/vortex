@@ -70,7 +70,7 @@ mod native_cli {
     enum Commands {
         /// Print tree views of a Vortex file (layout tree or array tree)
         Tree(super::tree::TreeArgs),
-        /// Convert a Parquet file to a Vortex file. Chunking occurs on Parquet RowGroup boundaries.
+        /// Convert a Parquet file to a Vortex file. Chunking occurs in 8192-row batches.
         Convert(#[command(flatten)] super::convert::ConvertArgs),
         /// Interactively browse the Vortex file.
         Browse { file: PathBuf },

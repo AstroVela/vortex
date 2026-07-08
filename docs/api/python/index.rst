@@ -27,6 +27,7 @@ The Python bindings require Python 3.11 or newer. Pre-built wheels are available
 * x86_64 Linux
 * ARM64 Linux
 * Apple Silicon macOS
+* Intel macOS
 
 They support any Linux distribution with a GLIBC version >= 2.17. This includes
 
@@ -41,14 +42,17 @@ Here's a basic example of using the Vortex Python API to write and read a Vortex
 
 .. code-block:: python
 
+    import pyarrow as pa
     import vortex
 
     # Write a Vortex file from a PyArrow table
-    vortex.io.write_path(my_table, "data.vortex")
+    my_table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+    vortex.io.write(my_table, "data.vortex")
 
     # Read a Vortex file
-    dataset = vortex.dataset("data.vortex")
-    table = dataset.to_arrow()
+    vf = vortex.open("data.vortex")
+    reader = vf.to_arrow()  # a pyarrow.RecordBatchReader
+    table = reader.read_all()
 
 
 API Reference

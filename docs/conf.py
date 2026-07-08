@@ -67,14 +67,62 @@ doctest_default_flags = (
 
 myst_enable_extensions = [
     "colon_fence",  # Use ::: for Sphinx directives
+    "substitution",  # Allow {{ name }} substitutions sourced from code (see myst_substitutions)
 ]
 myst_heading_anchors = 3
+
+
+def _read_rust_usize_const(rel_path: str, const_name: str) -> str:
+    """Read a ``pub const <NAME>: usize = <N>`` value from a Rust source file at build time, so the
+    docs can inline it via a MyST substitution instead of hard-coding (and drifting from) it. Fails
+    loudly if the constant moved, mirroring the doc-conformance lint's source-of-truth discipline.
+
+    This is the BUILD-TIME, source-from-code counterpart to ``scripts/check-docs-conformance.py``
+    (the LINT-TIME, value-is-present counterpart): substitutions auto-update the rendered value here,
+    while the conformance lint locks values that appear in prose/commands the substitution can't reach.
+    The two readers deliberately have separate semantics (this one parses Rust ``usize`` consts for
+    substitution; the script parses TOML/Rust/Java/C++ for presence locks) and separate tests
+    (the script's ``--self-test``); keep both fail-loud on a moved source."""
+    text = (git_root / rel_path).read_text(encoding="utf-8")
+    # Anchor to the start of a const statement and require the value to be the COMPLETE RHS — a plain
+    # integer literal terminated by `;` — so a non-literal RHS (`= 1_024;`, `= 64 * 3;`, `= 32usize;`)
+    # fails rather than partial-matching. Require EXACTLY ONE match: a commented-out/decoy copy of the
+    # const (e.g. an old value documented in a block comment) produces a second match and fails loudly
+    # rather than silently sourcing the wrong one. (A lone commented copy can't occur in code that
+    # compiles, since the const is referenced.)
+    matches = re.findall(
+        rf"^\s*pub const {re.escape(const_name)}: usize = (\d+)\s*;",
+        text,
+        re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"conf.py: expected exactly one plain-integer `pub const {const_name}: usize = N;` in "
+            f"{rel_path} for a MyST substitution, found {len(matches)} — the constant moved, is no "
+            f"longer a bare literal, or has a decoy copy; update conf.py."
+        )
+    return matches[0]
+
+
+# Substitutions sourced from code at build time so the rendered docs cannot drift from the
+# implementation. Used in prose/tables (MyST substitutions do not expand inside ``` code fences ```;
+# values that appear in commands/code blocks are covered by scripts/check-docs-conformance.py).
+myst_substitutions = {
+    "io_concurrency_local": _read_rust_usize_const(
+        "vortex-io/src/std_file/read_at.rs", "DEFAULT_CONCURRENCY"
+    ),
+    "io_concurrency_object": _read_rust_usize_const(
+        "vortex-io/src/object_store/read_at.rs", "DEFAULT_CONCURRENCY"
+    ),
+}
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
+# Files copied verbatim to the site root (e.g. the Cloudflare Pages `_redirects` map).
+html_extra_path = ["_extra"]
 html_css_files = ["style.css"]
 html_favicon = "_static/vortex_logo.svg"  # relative to _static/
 

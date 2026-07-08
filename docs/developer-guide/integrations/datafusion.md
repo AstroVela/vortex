@@ -64,7 +64,7 @@ DataFusion. Batches are sliced to respect DataFusion's configured batch size pre
 ## Future Work
 
 The current integration builds directly on the `ScanBuilder` and layout reader APIs. Future work
-will migrate it to use the [Scan API](/concepts/scanning) `Source` trait, which will simplify
+will migrate it to use the [Scan API](/concepts/scanning) `DataSource` trait, which will simplify
 the integration by providing a standard interface for file discovery, partitioning, and pushdown
 that is shared across all engine integrations.
 

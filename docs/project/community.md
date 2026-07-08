@@ -33,6 +33,16 @@ technical direction, approving proposals, and establishing community norms and r
 The TSC aims to reach consensus; when a vote is needed, decisions require a majority of those
 present with at least 50% quorum.
 
+### Membership
+
+The TSC's voting members are the project **Maintainers**; its non-voting members are the
+**Committers** (see [Governance](#governance) above for the role definitions). The current roster —
+including the TSC chair — is maintained in
+[CONTRIBUTING.md](https://github.com/vortex-data/vortex/blob/develop/CONTRIBUTING.md#project-roles)
+so it stays in one place as membership changes.
+
+### Meetings
+
 TSC meetings are open to the public and held monthly. Meeting details and agendas are posted
 in the Slack workspace. See the
 [public meeting calendar](https://zoom-lfx.platform.linuxfoundation.org/meetings/vortex)

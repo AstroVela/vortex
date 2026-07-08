@@ -7,7 +7,8 @@ and serializes the layout and its segments into a single file.
 The bulk of the file format specification describes the representation of the footer bytes such that the
 layout tree can be reconstructed for scans.
 
-See the [Vortex File Format Specification](../specs/file-format.md) for full details.
+See the [Vortex File Format Specification](../specification/file-format.md) for full details, or
+[Reading a File](../specification/reading-a-file.md) for a step-by-step walkthrough of the read path.
 
 ## Layout Strategy
 
@@ -15,15 +16,15 @@ The default layout strategy for Vortex files is roughly:
 
 * Struct Layout at the top-level to partition by columns
   * Zoned Layout to store pruning statistics for every 8k rows
-      * Chunked Layout to partition the column into 2MB of uncompressed data
+      * Chunked Layout to partition the column into chunks
         * Compressor Layout to apply a compression strategy
-          * Buffered Layout to localize up to 1MB of compressed chunks per column.
+          * Buffered Layout to localize up to 2 MB of compressed chunks per column.
               * Flat Layout to serialize each individual array chunk
 
 This strategy optimizes for analytical query patterns: column pruning avoids reading unused columns,
 zone statistics enable skipping irrelevant row ranges, and buffered chunks allow efficient I/O
-with parallel decompression. The 8k row zones and 2MB chunks balance pruning granularity against
-metadata overhead.
+with parallel decompression. The 8k row zones and buffered chunk locality balance pruning
+granularity against metadata overhead.
 
 ## Compression Strategies
 

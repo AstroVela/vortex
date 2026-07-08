@@ -1,9 +1,10 @@
 C++ API
 =======
 
-The Vortex C++ API provides an idiomatic C++ wrapper around the Vortex C FFI, built using
-`cxx <https://cxx.rs/>`_. It currently supports reading and writing Vortex files and integrates
-with the Arrow C Data Interface via `nanoarrow <https://arrow.apache.org/nanoarrow/>`_.
+The Vortex C++ API is an idiomatic C++ binding built with `cxx <https://cxx.rs/>`_, which generates
+a direct bridge between C++ and Rust. It supports reading and writing Vortex files and integrates
+with the Arrow C Data Interface via `nanoarrow <https://arrow.apache.org/nanoarrow/>`_. A future
+migration to build the C++ API on top of the C FFI is planned.
 
 In the future we will expand the C++ API to cover Vortex's plugin and extension points. Please
 reach out if you are interested in extending Vortex from C++ so we can prioritize these features.

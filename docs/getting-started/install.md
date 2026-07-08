@@ -47,7 +47,7 @@ vx --help
 
 The `vx` CLI is the quickest way to get started, but Vortex can also be used as a library
 for reading, writing, and manipulating compressed arrays programmatically. See the language
-quickstarts for [Python](python.rst), [Rust](rust.rst), and [Java](java.md).
+quickstarts for [Python](python.rst) and [Rust](rust.rst) (a [Java](java.md) guide is in progress).
 
 ## Sample data
 

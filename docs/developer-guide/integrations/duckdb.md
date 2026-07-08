@@ -64,6 +64,6 @@ vectorized execution model.
 ## Future Work
 
 The current integration builds directly on the `ScanBuilder`, layout reader, and file APIs.
-Future work will migrate it to use the [Scan API](/concepts/scanning) `Source` trait, unifying
+Future work will migrate it to use the [Scan API](/concepts/scanning) `DataSource` trait, unifying
 file discovery, multi-file coordination, and pushdown behind a single interface shared across
 all engine integrations.

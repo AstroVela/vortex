@@ -26,8 +26,9 @@ still benefiting from Vortex's encoding, compression, and I/O infrastructure.
 
 ### Scan API
 
-An abstract table-scan interface that positions Vortex as an interchange layer between data sources
-and query engines. The Scan API will support pluggable data sources and can be consumed over the
+The Scan API (the `vortex-scan` crate) already provides an abstract table-scan interface with
+pluggable data sources (the `DataSource` trait), positioning Vortex as an interchange layer between
+data sources and query engines. Upcoming work stabilizes that surface and adds consumption over the
 C ABI for in-process integrations or over RPC for remote/distributed access.
 
 ### Language Bindings Overhaul
@@ -50,5 +51,6 @@ fixed-shape and variable-shape tensors within Vortex arrays and files.
 
 ### Variant DType
 
-A DType for representing arbitrarily nested, JSON-like data within Vortex arrays and files. This
-enables efficient columnar storage and querying of semi-structured data.
+The `Variant` DType already exists in the Vortex type system. It represents arbitrarily nested,
+JSON-like data within arrays and files, enabling efficient columnar storage and querying of
+semi-structured data; upcoming work completes its encoding and compute support.

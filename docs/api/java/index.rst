@@ -39,21 +39,17 @@ They support any Linux distribution with a GLIBC version >= 2.31. This includes
 * Ubuntu 20.04 or newer
 
 
-Usage Example
--------------
+Core API
+--------
 
-Here's a basic example of using the Vortex Java API to read a Vortex file:
+The main entry points of the Vortex Java API are:
 
-.. code-block:: java
+* ``Session`` — the top-level handle that owns data sources and writers.
+* ``DataSource`` — opens a Vortex file, glob, or table via ``DataSource.open(session, uri)`` and
+  exposes its schema and row count.
+* ``Scan`` / ``Partition`` — a scan over a ``DataSource`` iterates its partitions, yielding
+  Arrow-compatible batches.
+* ``VortexWriter`` — writes arrays to a Vortex file.
 
-    import dev.vortex.api.File;
-    import dev.vortex.api.Array;
-
-    // Open a Vortex file
-    File vortexFile = File.open("path/to/file.vortex");
-
-    // Read arrays from the file
-    Array array = vortexFile.readArray();
-
-    // Work with the array data
-    System.out.println("Array length: " + array.getLength());
+See the `Vortex JNI API <../../_static/vortex-jni/index.html>`_ above for the full,
+method-level reference.

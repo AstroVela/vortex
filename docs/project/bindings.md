@@ -25,6 +25,10 @@ libraries.
 
 Each language chooses the binding strategy that makes the most sense:
 
+<!-- CROSS-DOC CONSISTENCY: the "Python stays on PyO3" stance here (and in the Python section below)
+     must match docs/developer-guide/language-bindings.md's C-API section. This roadmap claim is NOT
+     code-derivable, so it is intentionally not conformance-locked — change both docs in lockstep. -->
+
 - **Python** uses PyO3 to call Rust directly and will continue to do so. PyO3 provides the best
   ergonomics and performance for Python.
 - **Other languages** use Rust-specific bindings where it makes sense (e.g. cxx for C++), or wrap
@@ -66,7 +70,7 @@ This is a future concern — the current priority is stabilizing the C API for n
 Java's Foreign Function & Memory API (Panama) graduated to a stable API in JDK 22. Key
 considerations:
 
-- Trino already supports JDK 22 and can adopt Panama immediately.
+- Engines already on JDK 22+ can adopt Panama immediately.
 - Spark targets older LTS releases and will not support Panama for some time.
 - JNI must remain supported as the primary path for Spark and any other engine on older JDKs.
 - Panama provides direct C ABI access, eliminating JNI overhead and enabling Tier 2 capabilities.
@@ -117,9 +121,9 @@ releases. JNI stays at Tier 1.
 
 Build a new binding layer using Panama's Foreign Function & Memory API to call the C API directly.
 This enables native array access, lower overhead, and a path to Tier 2 capabilities. Panama
-bindings are opt-in for environments running JDK 22+. Trino already supports JDK 22 and is the
-likely first adopter. Spark will not support Panama until it moves to a compatible JDK. Connectors
-should abstract over the binding layer so they can use JNI or Panama transparently.
+bindings are opt-in for environments running JDK 22+. Spark will not support Panama until it moves
+to a compatible JDK. Connectors should abstract over the binding layer so they can use JNI or Panama
+transparently.
 
 ### Rust
 
@@ -153,7 +157,7 @@ Remains native Tier 3. Future considerations:
 - Design the plugin registration interface in the C API (Tier 3 capabilities).
 - Formalize the Python plugin API (array plugins, compute plugins, extension DTypes).
 - Investigate Rust stable plugin ABI for dynamic loading of encoding crates.
-- Evaluate Panama adoption timeline based on Spark/Trino JDK requirements.
+- Evaluate Panama adoption timeline based on Spark's JDK requirements.
 
 ## Expression Strategy
 

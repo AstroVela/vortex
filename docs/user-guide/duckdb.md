@@ -28,7 +28,8 @@ WHERE age > 30;
 ```
 
 :::{note}
-Direct file path syntax (`SELECT * FROM 'data.vortex'`) is coming in an upcoming DuckDB release.
+Direct file path syntax (`SELECT * FROM 'data.vortex'`) also works: the extension registers a
+replacement scan that rewrites a `.vortex` path to `read_vortex(...)`.
 :::
 
 ## Writing Vortex Files

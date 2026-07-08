@@ -16,64 +16,39 @@ sd_hide_title: true
 :align: center
 :::
 
-An extensible ecosystem for compressed columnar data. Spans in-memory arrays,
-on-disk file formats, over-the-wire protocols, and integrations with query engines — all built
-around the latest research from the database community.
+An extensible ecosystem for compressed columnar data. Vortex spans in-memory arrays,
+on-disk file formats, over-the-wire protocols, and query-engine integrations — all built around
+recent research from the database community.
 
-## Where to start
+These docs are organized by what you're trying to do. If you're **using** Vortex, start with the
+guides and API reference. If you're **building on or contributing to** Vortex, start with the
+concepts and the format specification.
 
-::::{grid} 1 2 2 3
-:gutter: 3
+## Using Vortex
 
-:::{grid-item-card} Read & write Vortex files
-:link: getting-started/index
-:link-type: doc
+**[Getting Started](getting-started/index)** — Install the `vx` command-line tool or a language
+binding, convert a Parquet file, and run your first query in Python or Rust.
 
-Get started with Vortex in **Python**, **Rust**, or **Java**. Convert from Parquet, compress
-your data, and query it.
-:::
+**[User Guide](user-guide/index)** — Query Vortex data with **DataFusion**, **DuckDB**, **Spark**,
+or **Ray**, and move data to and from **pandas**, **Polars**, and
+**PyArrow**.
 
-:::{grid-item-card} Use with a query engine
-:link: user-guide/index
-:link-type: doc
+**[API Reference](api/index)** — Reference for the **Python**, **Rust**, **Java**, **C**, and **C++**
+interfaces. The Rust and Python APIs are the most complete; the C, C++, and Java bindings are still
+evolving.
 
-Integrate Vortex with **DataFusion**, **DuckDB**, **Spark**, **Trino**, or **Ray** for
-accelerated queries over compressed data.
-:::
+## Understanding & extending Vortex
 
-:::{grid-item-card} Understand the architecture
-:link: concepts/index
-:link-type: doc
+**[Concepts](concepts/index)** — The mental model behind Vortex: how **DTypes**, **Arrays**,
+**Encodings**, **Layouts**, and the **Scan API** fit together as composable building blocks.
 
-Learn how **DTypes**, **Arrays**, **Encodings**, **Layouts**, and the **Scan API** fit together
-as building blocks.
-:::
+**[Specification](specification/index)** — The on-disk file format (stable) and the over-the-wire IPC
+protocol (still unstable), plus a step-by-step walkthrough of how to **read a Vortex file** from
+scratch. The starting point for implementing a reader or porting Vortex to a new language.
 
-:::{grid-item-card} Extend Vortex
-:link: developer-guide/index
-:link-type: doc
-
-Write your own **encodings**, **layouts**, **compute functions**, or **extension types** from
-Rust or Python.
-:::
-
-:::{grid-item-card} Create an engine integration
-:link: developer-guide/index
-:link-type: doc
-
-Build a **query engine connector** or **data source** using the **Scan API**, **C FFI**, or
-**C++ wrapper**.
-:::
-
-:::{grid-item-card} Internals
-:link: developer-guide/index
-:link-type: doc
-
-Explore the **crate architecture**, **async runtime**, **session system**, and integration
-internals. Build and benchmark locally.
-:::
-
-::::
+**[Developer Guide](developer-guide/index)** — **Extend** Vortex with your own encodings, layouts,
+compute functions, and types; **embed** it through the C FFI, C++ binding, or Scan API; or dig into
+the **internals**.
 
 ## Highlights
 
@@ -82,14 +57,14 @@ internals. Build and benchmark locally.
   [FSST](https://github.com/spiraldb/fsst), and
   [ALP](https://github.com/spiraldb/alp) — no decompression needed for many operations.
 
-- **Extensible file format**: Zero-allocation reads, FlatBuffer metadata for O(1) column access,
-  and optional WASM decompression kernels for forward compatibility.
+- **Extensible file format**: Zero-allocation reads and FlatBuffer metadata for O(1) column access,
+  with a layout system designed to evolve without breaking existing readers.
 
 - **Query engine integration**: Filter and projection pushdown through the Scan API, with native
-  integrations for DataFusion, DuckDB, Spark, Trino, and Ray.
+  integrations for DataFusion, DuckDB, Spark, and Ray.
 
-- **Language bindings**: First-class support for Python (PyO3), Java (JNI + Spark/Trino connectors),
-  and C/C++ (FFI).
+- **Language bindings**: First-class Python (PyO3) and Rust support, with Java (JNI), C (FFI), and
+  C++ (cxx) bindings evolving.
 
 ```{toctree}
 ---
@@ -97,10 +72,10 @@ hidden:
 ---
 
 getting-started/index
-concepts/index
 user-guide/index
+concepts/index
+specification/index
 developer-guide/index
-specs/index
 api/index
 project/index
 ```

@@ -11,12 +11,12 @@ async `read_at(offset, length, alignment)` method that returns an aligned buffer
 metadata methods that inform the I/O scheduler:
 
 - **`concurrency()`** -- the maximum number of concurrent reads the backend can efficiently
-  sustain. Local files default to 32; object stores default to 192.
+  sustain. Local files default to {{io_concurrency_local}}; object stores default to {{io_concurrency_object}}.
 - **`coalesce_config()`** -- optional parameters that control read merging (see below).
 - **`size()`** -- the total size of the source, used for footer reads and bounds checking.
 
-Implementations exist for local files (`FileReadAdapter`), object stores
-(`ObjectStoreSource` via the `object_store` crate), and in-memory buffers.
+Implementations exist for local files (`FileReadAt`), object stores
+(`ObjectStoreReadAt` via the `object_store` crate), and in-memory buffers.
 
 ## Read Coalescing
 
@@ -28,9 +28,14 @@ behaviour with two parameters:
   more than this are issued independently.
 - **`max_size`** -- the maximum span of a single coalesced read.
 
-Default configurations are tuned per backend. Local files use 8 KB for both distance and max
-size, reflecting the low cost of small NVMe reads. Object stores use 1 MB distance and 16 MB
-max size, reflecting the high per-request overhead of HTTP round-trips.
+`CoalesceConfig` provides presets tuned per backend:
+
+- Local files use a 1 MB distance and 4 MB max size.
+- Object stores use a 1 MB distance and 16 MB max size, reflecting the high per-request overhead of HTTP round-trips.
+- In-memory sources use an 8 KB distance and 8 KB max size.
+
+For in-memory sources, coalescing is opt-in: the default reader does not coalesce, while readers that
+opt in adopt the 8 KB preset above.
 
 The coalescing algorithm runs inside an `IoRequestStream` that maintains a spatial index of
 pending requests. When a request is polled, the stream scans for nearby requests within the
@@ -83,10 +88,13 @@ callers request the same segment simultaneously.
 Each `VortexReadAt` implementation provides its own concurrency and coalescing parameters,
 allowing the I/O scheduler to adapt automatically:
 
-| Backend       | Concurrency | Coalesce Distance | Coalesce Max Size |
-|---------------|-------------|--------------------|--------------------|
-| Local file    | 32          | 8 KB               | 8 KB               |
-| Object store  | 192         | 1 MB               | 16 MB              |
+| Backend       | Concurrency                | Coalesce Distance | Coalesce Max Size |
+|---------------|----------------------------|--------------------|--------------------|
+| Local file    | {{io_concurrency_local}}   | 1 MB               | 4 MB               |
+| Object store  | {{io_concurrency_object}}  | 1 MB               | 16 MB              |
+
+In-memory readers coalesce only when opted in (see above); the table lists the two backends with
+fixed per-backend defaults.
 
 Local file reads are dispatched via `spawn_blocking` to avoid blocking the async executor.
 Object store reads are natively async and wrapped with `async_compat` for runtime

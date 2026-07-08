@@ -41,19 +41,22 @@ define their own.
 
 ### Canonical Arrays
 
-In order to avoid having to implement logic for an exponential combination of encodings, Vortex defines one canonical
-encoding per logical data type. All arrays can eventually be decompressed one of these canonical encodings.
+In order to avoid having to implement logic for an exponential combination of encodings, Vortex defines a canonical
+encoding for each logical data type — every type except `Union`, which is not yet canonicalized. Arrays of those types
+can eventually be decompressed to one of the canonical encodings listed below.
 
 | Data Type              | Canonical Encoding   |
 |------------------------|----------------------|
 | `DType::Null`          | `NullArray`          |
 | `DType::Bool`          | `BoolArray`          |
 | `DType::Primitive`     | `PrimitiveArray`     |
-| `DType::UTF8`          | `VarBinViewArray`    |
+| `DType::Decimal`       | `DecimalArray`       |
+| `DType::Utf8`          | `VarBinViewArray`    |
 | `DType::Binary`        | `VarBinViewArray`    |
 | `DType::Struct`        | `StructArray`        |
 | `DType::List`          | `ListViewArray`      |
 | `DType::FixedSizeList` | `FixedSizeListArray` |
+| `DType::Variant`       | `VariantArray`       |
 | `DType::Extension`     | `ExtensionArray`     | 
 
 ### Builtin Arrays
@@ -100,15 +103,15 @@ These can be found in the `encodings/` directory of the Vortex repository.
 Arrays carry their own statistics with them, allowing many compute functions to short-circuit or optimize their
 implementations. Currently, the available statistics are:
 
+* `is_constant`: Whether the array holds only a single unique value (treating nulls as equal).
+* `is_sorted`: Whether the array's values are in ascending order.
+* `is_strict_sorted`: Whether the array's values are in strictly ascending order, with no duplicates.
+* `max`: The maximum value in the array (ignoring nulls).
+* `min`: The minimum value in the array (ignoring nulls).
+* `sum`: The sum of the non-null values in the array.
 * `null_count`: The number of null values in the array.
-* `true_count`: The number of `true` values in a boolean array.
-* `run_count`: The number of consecutive runs in an array.
-* `is_constant`: Whether the array only holds a single unique value
-* `is_sorted`: Whether the array values are sorted.
-* `is_strict_sorted`: Whether the array values are sorted and unique.
-* `min`: The minimum value in the array.
-* `max`: The maximum value in the array.
-* `uncompressed_size`: The size of the array in memory before any compression.
+* `uncompressed_size_in_bytes`: The size of the array in memory before any compression.
+* `nan_count`: The number of NaN values in the array.
 
 ## Execution
 

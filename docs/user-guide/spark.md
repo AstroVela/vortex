@@ -1,15 +1,17 @@
 # Spark
 
 Vortex provides a Spark DataSource V2 connector for reading and writing Vortex files. The
-connector is published to Maven Central as `dev.vortex:vortex-spark`.
+connector is published to Maven Central as `dev.vortex:vortex-spark_2.13` (the artifact name carries
+the Scala binary version; `vortex-spark_2.12` is also published).
 
 ## Installation
 
-Add the dependency to your build. The connector is built against Spark 4.x with Scala 2.13.
+Add the dependency to your build. The `vortex-spark_2.13` artifact targets Spark 4.x; a
+`vortex-spark_2.12` artifact targeting Spark 3.x is also published.
 
 ````{tab} Gradle (Kotlin)
 ```kotlin
-implementation("dev.vortex:vortex-spark:<version>")
+implementation("dev.vortex:vortex-spark_2.13:<version>")
 ```
 ````
 
@@ -17,7 +19,7 @@ implementation("dev.vortex:vortex-spark:<version>")
 ```xml
 <dependency>
     <groupId>dev.vortex</groupId>
-    <artifactId>vortex-spark</artifactId>
+    <artifactId>vortex-spark_2.13</artifactId>
     <version>${vortex.version}</version>
 </dependency>
 ```
@@ -52,7 +54,9 @@ df.write()
     .save();
 ```
 
-Each Spark partition produces one output file named `part-{partitionId}-{taskId}.vortex`.
+Each write task writes one `part-%05d-%d.vortex` file per partition path it touches (just one file
+for an unpartitioned write); the zero-padded partition id and the task id (e.g. `part-00000-3.vortex`)
+keep the name unique within each path.
 
 ### Write Options
 

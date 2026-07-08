@@ -19,7 +19,7 @@ with many columns.
 
 ## Logical Types
 
-The following table lists the built-in dtypes in Vortex, each of which can be marked as either nullable or non-nullable.
+The following table lists the built-in dtypes in Vortex, each of which can be marked as either nullable or non-nullable (the `Extension` type is the exception — it inherits nullability from its storage type).
 
 | Name            | Domain                                      |
 |-----------------|---------------------------------------------|
@@ -32,11 +32,14 @@ The following table lists the built-in dtypes in Vortex, each of which can be ma
 | `List`          | See [List](#list)                           |
 | `FixedSizeList` | See [List](#list)                           |
 | `Struct`        | See [Struct](#struct)                       |
+| `Union`         | Tagged union of variant types (partial)     |
+| `Variant`       | Semi-structured, JSON-like values (partial) |
 | `Extension`     | See [Extension](#extension)                 |
 
 :::{note}
-There are additional logical types that Vortex does not yet support, for example fixed-length binary, maps, and variants.
-These may be added in future versions.
+Vortex's logical type system is still evolving. Some types (e.g. fixed-length binary and maps) are
+not yet supported, and others (notably `Variant` for semi-structured values, and `Union`) are only
+partially implemented — see the [roadmap](../project/roadmap.md).
 :::
 
 ### Primitive

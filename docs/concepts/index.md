@@ -24,7 +24,8 @@ without dictating physical layout, allowing the same logical data to use differe
 
 **[Arrays](arrays.md)** are the in-memory representation. Unlike Arrow, Vortex arrays can be
 *compressed*—an integer array might be bit-packed rather than stored as a flat buffer. Arrays
-share the same representation on disk and over the wire, enabling zero-copy I/O.
+share the same representation in memory, on disk, and over the wire; the on-disk file layout adds
+alignment padding so reads can be zero-copy.
 
 **[Compute](expressions.md)** functions operate directly on compressed arrays where possible,
 dispatching to encoding-specific kernels or falling back to canonical implementations.
@@ -34,10 +35,11 @@ dispatching to encoding-specific kernels or falling back to canonical implementa
 **[Layouts](layouts.md)** organize arrays into larger-than-memory datasets (e.g., chunked row groups)
 and can read from any block storage: local disk, object stores, caches, etc.
 
-**[File Format](../specs/file-format.md)** (`.vortex` files) serialize layouts to disk with efficient
-segment retrieval, FlatBuffer metadata for O(1) schema access, and support for memory mapping.
+**[File Format](../specification/file-format.md)** (`.vortex` files) serialize layouts to disk with
+efficient segment retrieval, FlatBuffer metadata for O(1) schema access, and support for memory
+mapping.
 
-**[IPC Format](../specs/ipc-format.md)** provides streaming transfer of compressed arrays.
+**[IPC Format](../specification/ipc-format.md)** provides streaming transfer of compressed arrays.
 
 ## Integrations
 

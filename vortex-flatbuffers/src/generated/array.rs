@@ -371,8 +371,9 @@ impl<'a> Buffer {
 pub enum ArrayOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
-/// An Array describes the hierarchy of an array as well as the locations of the data buffers that appear
-/// immediately after the message in the byte stream.
+/// An Array describes the hierarchy of an array as well as the locations of the data buffers. In the
+/// byte stream the data buffers appear first; this Array message is written as a suffix after them,
+/// followed by a little-endian u32 length of the message.
 pub struct Array<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }

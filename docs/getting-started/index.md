@@ -24,5 +24,5 @@ caption: Language Libraries
 
 Python Quickstart <python>
 Rust Quickstart <rust>
-Java Quickstart <java>
+Java (work in progress) <java>
 ```

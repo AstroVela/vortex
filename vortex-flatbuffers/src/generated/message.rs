@@ -182,7 +182,8 @@ pub struct MessageHeaderUnionTableOffset {}
 pub enum ArrayMessageOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
-/// Indicates the message body contains a flatbuffer Array message, followed by array buffers.
+/// Indicates the message body is a serialized array: the data buffers first, followed by a flatbuffer
+/// Array message and a trailing little-endian u32 length of that message.
 pub struct ArrayMessage<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }

@@ -39,8 +39,10 @@ Projection pushdown is supported through Spark's `SupportsPushDownRequiredColumn
 The scan builder prunes the column list to only those referenced by the query, and the pruned
 column set is passed to the native scan via `ScanOptions`.
 
-Filter pushdown infrastructure exists in the `ScanOptions` type but is not yet connected to
-Spark's `SupportsPushDownFilters` interface. This is planned future work.
+Filter pushdown is supported through Spark's `SupportsPushDownV2Filters` interface. The scan builder
+maps each pushable predicate to a Vortex expression (via `SparkPredicateToVortexExpression`) and pushes
+it into the native scan; predicates Spark cannot push (for example those referencing partition columns)
+are returned for post-scan evaluation.
 
 ## Data Export
 
@@ -52,6 +54,6 @@ through direct byte buffers.
 ## Future Work
 
 The current integration builds directly on the native file and scan APIs via JNI. Future work
-will migrate it to use the [Scan API](/concepts/scanning) `Source` trait, which will provide a
-standard interface for file discovery, partitioning, and pushdown. This will also enable
-connecting Spark's filter pushdown to Vortex's expression-based filtering.
+will migrate it to use the [Scan API](/concepts/scanning) `DataSource` trait, which will provide a
+standard interface for file discovery, partitioning, and pushdown — unifying the existing column-
+pruning and filter-pushdown paths with the other engine integrations.

@@ -1,9 +1,10 @@
 C API
 =====
 
-The Vortex C API provides a low-level FFI interface to the Vortex library. It is the foundation for
-other language bindings (including C++) and is suitable for embedding Vortex into C applications or
-building higher-level wrappers.
+The Vortex C API provides a low-level FFI interface to the Vortex library. It is the intended
+foundation for other language bindings and is suitable for embedding Vortex into C applications or
+building higher-level wrappers. (The C++ binding currently uses a direct ``cxx`` Rust bridge; a future
+migration to build it on top of this C FFI is planned.)
 
 .. warning::
     This API should be considered entirely unstable. It *will* change. Please reach out if a stable

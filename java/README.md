@@ -2,16 +2,16 @@
 
 We provide two interfaces for working with Vortex from Java:
 
-- `vortex-java` - a low-level interface JNI for working with Vortex files and arrays on cloud and local storage
+- `vortex-jni` - a low-level JNI interface for working with Vortex files and arrays on cloud and local storage
 - `vortex-spark` - A Spark connector for working with datasets of Vortex files
 
 ## Publishing
 
-We publish three artifacts out of this repo at CI time to Maven Central Sonatype:
+We publish the following artifacts out of this repo at CI time to Maven Central Sonatype:
 
 * `vortex-jni` JAR containing the JNI code, plus compiled native libraries for all of the following targets: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`
 * `vortex-jni-all` which is the "shadow JAR" containing all of `vortex-jni` as well as all upstream Java dependencies packaged in a single JAR.
-* `vortex-spark` which is the runtime JAR needed for the Vortex Spark bindings
+* `vortex-spark_2.12` and `vortex-spark_2.13` — the runtime JARs needed for the Vortex Spark bindings (the artifact name carries the Scala binary version)
 
 We use the [following GPG key](https://keyserver.ubuntu.com/pks/lookup?search=8745D1A87C0B2159&fingerprint=on&op=index) for publishing:
 

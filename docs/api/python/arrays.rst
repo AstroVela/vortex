@@ -22,8 +22,9 @@ Base Class
 Canonical Encodings
 -------------------
 
-Each :class:`~vortex.DType` has a corresponding canonical encoding. These encodings represent the uncompressed version
-of the array, and are also zero-copy to Apache Arrow.
+Each :class:`~vortex.DType` has a corresponding canonical encoding, with the sole exception of ``Union`` (not yet
+canonicalized). These encodings represent the uncompressed version of the array, and are also zero-copy to
+Apache Arrow. The classes below are the canonical encodings currently exposed in Python.
 
 .. autoclass:: vortex.NullArray
      :members:
@@ -37,19 +38,15 @@ of the array, and are also zero-copy to Apache Arrow.
      :members:
 
 
-.. autoclass:: vortex.VarBinArray
-    :members:
-
-
 .. autoclass:: vortex.VarBinViewArray
     :members:
 
 
-.. autoclass:: vortex.StructArray
+.. autoclass:: vortex.FixedSizeListArray
     :members:
 
 
-.. autoclass:: vortex.ListArray
+.. autoclass:: vortex.StructArray
     :members:
 
 
@@ -70,6 +67,14 @@ Utility Encodings
 
 .. autoclass:: vortex.ByteBoolArray
      :members:
+
+
+.. autoclass:: vortex.VarBinArray
+    :members:
+
+
+.. autoclass:: vortex.ListArray
+    :members:
 
 
 Compressed Encodings

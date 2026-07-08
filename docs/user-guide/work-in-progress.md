@@ -13,7 +13,3 @@ Substrait plan consumption for portable query execution over Vortex data.
 ## cuDF
 
 RAPIDS cuDF integration for GPU-accelerated DataFrames backed by Vortex arrays.
-
-## Trino
-
-Trino connector for querying Vortex tables via JNI.

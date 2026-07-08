@@ -13,7 +13,7 @@ vx convert yellow_tripdata_2024-01.parquet
 ```
 
 This produces `yellow_tripdata_2024-01.vortex` in the same directory. By default it uses
-BtrBlocks compression, chunking on Parquet row-group boundaries.
+BtrBlocks compression, chunking into 8192-row batches.
 
 ## Compression strategies
 
