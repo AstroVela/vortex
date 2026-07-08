@@ -178,7 +178,7 @@ fn take_chunked(
         for chunk in &chunks {
             chunk.append_to_builder(builder.as_mut(), ctx)?;
         }
-        builder.finish_into_canonical().into_array()
+        builder.finish_into_canonical(ctx).into_array()
     };
 
     // 5. Single take to restore original order and expand duplicates.

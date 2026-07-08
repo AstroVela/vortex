@@ -23,6 +23,7 @@ use half::f16;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::seq::index::sample;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
@@ -132,6 +133,18 @@ fn sorted_indices(num_indices: usize, max_index: usize) -> ArrayRef {
     Buffer::from(indices).into_array()
 }
 
+/// Strictly increasing indices with no duplicates (samples without replacement), the shape
+/// that hits the sorted-unique fast path in `take_chunked`.
+fn sorted_unique_indices(num_indices: usize, max_index: usize) -> ArrayRef {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut indices: Vec<u64> = sample(&mut rng, max_index, num_indices)
+        .into_iter()
+        .map(|i| i as u64)
+        .collect();
+    indices.sort_unstable();
+    Buffer::from(indices).into_array()
+}
+
 fn take_to_builder(array: &ArrayRef, indices: &ArrayRef, session: &VortexSession) -> ArrayRef {
     let mut ctx = session.create_execution_ctx();
     let taken = array.take(indices.clone()).unwrap();
@@ -154,6 +167,16 @@ fn take_chunked_f32_to_builder_shuffled(bencher: Bencher, num_indices: usize) {
 fn take_chunked_f32_to_builder_sorted(bencher: Bencher, num_indices: usize) {
     let array = make_chunked_f32(CHUNK_LEN, NCHUNKS);
     let indices = sorted_indices(num_indices, CHUNK_LEN * NCHUNKS);
+
+    bencher
+        .with_inputs(|| (&array, &indices))
+        .bench_refs(|(array, indices)| take_to_builder(array, indices, &SESSION));
+}
+
+#[divan::bench(args = NUM_INDICES)]
+fn take_chunked_f32_to_builder_sorted_unique(bencher: Bencher, num_indices: usize) {
+    let array = make_chunked_f32(CHUNK_LEN, NCHUNKS);
+    let indices = sorted_unique_indices(num_indices, CHUNK_LEN * NCHUNKS);
 
     bencher
         .with_inputs(|| (&array, &indices))

@@ -545,8 +545,11 @@ fn finalize_done(
     if cfg!(debug_assertions) {
         vortex_ensure!(
             output.len() == expected_len,
-            "Result length mismatch for {:?}",
-            encoding_id
+            "Result length mismatch for {:?}: output {} expected {} (output encoding {:?})",
+            encoding_id,
+            output.len(),
+            expected_len,
+            output.encoding_id()
         );
         vortex_ensure!(
             output.dtype() == &expected_dtype,

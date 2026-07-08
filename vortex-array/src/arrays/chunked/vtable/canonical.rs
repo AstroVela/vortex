@@ -208,13 +208,10 @@ fn swizzle_list_chunks(
 
         let chunk_len = chunk_array.len();
 
-        // SAFETY: MaybeUninit has the same memory layout as the underlying type
-        unsafe {
-            mem::transmute::<&mut [MaybeUninit<u64>], &mut [u64]>(
-                &mut sizes_slice_out[next_list..][..chunk_len],
-            )
-        }
-        .copy_from_slice(sizes_slice);
+        // SAFETY: `&[u64]` and `&[MaybeUninit<u64>]` have identical layout, and viewing
+        // initialized values as possibly-uninitialized is always sound (unlike the reverse).
+        let sizes_uninit = unsafe { mem::transmute::<&[u64], &[MaybeUninit<u64>]>(sizes_slice) };
+        sizes_slice_out[next_list..][..chunk_len].copy_from_slice(sizes_uninit);
 
         // Append offsets and sizes, adjusting offsets to point into the combined array.
         for (off_out, &offset) in offsets_out[next_list..][..chunk_len]
@@ -228,6 +225,12 @@ fn swizzle_list_chunks(
         num_elements += chunk_array.elements().len() as u64;
     }
     debug_assert_eq!(next_list, len);
+
+    // SAFETY: the loop above initialized exactly `len` offsets and sizes.
+    unsafe {
+        offsets.set_len(len);
+        sizes.set_len(len);
+    }
 
     // SAFETY: elements are sliced from valid `ListViewArray`s (from `to_listview()`).
     let chunked_elements =
@@ -285,8 +288,6 @@ fn swizzle_fixed_size_list_chunks(
 mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
 
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
@@ -315,31 +316,11 @@ mod tests {
     use crate::dtype::DType::Variant as VariantDType;
     use crate::dtype::Nullability::NonNullable;
     use crate::dtype::PType::I32;
-    use crate::memory::DefaultHostAllocator;
-    use crate::memory::HostAllocator;
-    use crate::memory::MemorySessionExt;
-    use crate::memory::WritableHostBuffer;
     use crate::scalar::Scalar;
     use crate::validity::Validity;
 
     /// A shared session for these chunked-array tests, used to create execution contexts.
     static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
-
-    #[derive(Debug)]
-    struct CountingAllocator {
-        allocations: Arc<AtomicUsize>,
-    }
-
-    impl HostAllocator for CountingAllocator {
-        fn allocate(
-            &self,
-            len: usize,
-            alignment: vortex_buffer::Alignment,
-        ) -> VortexResult<WritableHostBuffer> {
-            self.allocations.fetch_add(1, Ordering::Relaxed);
-            DefaultHostAllocator.allocate(len, alignment)
-        }
-    }
 
     fn variant_scalar(value: i32) -> Scalar {
         Scalar::variant(Scalar::primitive(value, NonNullable))
@@ -654,40 +635,5 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    #[test]
-    fn list_canonicalize_uses_memory_session_allocator() {
-        let allocations = Arc::new(AtomicUsize::new(0));
-        let session = crate::array_session().with_allocator(Arc::new(CountingAllocator {
-            allocations: Arc::clone(&allocations),
-        }));
-        let mut ctx = session.create_execution_ctx();
-
-        let l1 = ListArray::try_new(
-            buffer![1, 2, 3, 4].into_array(),
-            buffer![0, 3].into_array(),
-            Validity::NonNullable,
-        )
-        .unwrap();
-        let l2 = ListArray::try_new(
-            buffer![5, 6].into_array(),
-            buffer![0, 2].into_array(),
-            Validity::NonNullable,
-        )
-        .unwrap();
-
-        let chunked_list = ChunkedArray::try_new(
-            vec![l1.into_array(), l2.into_array()],
-            List(Arc::new(Primitive(I32, NonNullable)), NonNullable),
-        )
-        .unwrap()
-        .into_array();
-
-        drop(chunked_list.execute::<Canonical>(&mut ctx).unwrap());
-        assert!(
-            allocations.load(Ordering::Relaxed) >= 2,
-            "expected offset+size allocations through MemorySession"
-        );
     }
 }
