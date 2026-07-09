@@ -19,6 +19,7 @@ and a mini table of contents.
 | [5. Roadmap & open questions](./05-roadmap-and-open-questions.md) | Measurement-first phasing with acceptance criteria, risks, unresolved decisions | you want next steps |
 | [Appendix: encoding capabilities](./appendix-encoding-capabilities.md) | Verified per-encoding kernel coverage, random-access classes, decode notes | reference material |
 | [NEXT-STEPS](./NEXT-STEPS.md) | Briefing for a follow-up session: produce a small-PR implementation plan ending at the pluggable cost model | you're the agent tasked with planning the implementation |
+| [IMPLEMENTATION-PLAN](./IMPLEMENTATION-PLAN.md) | The resulting plan: verified code anchors, decisions on doc 5's open questions, the PR ladder (refactor/measurement/payoff tracks), dependency sketch, stop/go checkpoint | you're implementing or reviewing the rungs |
 
 ## TL;DR
 
