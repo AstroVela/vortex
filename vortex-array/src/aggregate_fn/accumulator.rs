@@ -18,6 +18,7 @@ use crate::executor::max_iterations;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
+use crate::expr::stats::StatsProviderExt;
 use crate::scalar::Scalar;
 
 /// Reference-counted type-erased accumulator.
@@ -119,26 +120,40 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
             batch.dtype()
         );
 
-        // 0. Legacy stats bridge: if this aggregate is still cached under a legacy Stat slot,
-        //    consume that exact stat before kernel dispatch or decode.
+        // 0. Stats bridge: if this aggregate is cached under a Stat slot, consume that exact
+        //    stat before kernel dispatch or decode. The stat may be stored in partial form or,
+        //    for aggregates whose partial differs from their result (e.g. `Sum`'s `{sum, seen}`
+        //    partial vs its monoid sum statistic), in result form — `combine_partials` accepts
+        //    both. Result-form stats cannot express "no valid values", so they are only
+        //    consumed when the batch's null count proves at least one valid value; otherwise
+        //    fall through to a real accumulation.
         if let Some(stat) = Stat::from_aggregate_fn(&self.aggregate_fn)
             && let Precision::Exact(partial) = batch.statistics().get(stat)
         {
-            let partial = if partial.dtype() == &self.partial_dtype {
-                partial
-            } else {
-                vortex_ensure!(
-                    partial.dtype().eq_ignore_nullability(&self.partial_dtype),
-                    "Aggregate {} read legacy stat {} with dtype {}, expected {}",
-                    self.aggregate_fn,
-                    stat,
-                    partial.dtype(),
-                    self.partial_dtype,
-                );
-                partial.cast(&self.partial_dtype)?
-            };
-            self.vtable.combine_partials(&mut self.partial, partial)?;
-            return Ok(());
+            if partial.dtype() == &self.partial_dtype {
+                self.vtable.combine_partials(&mut self.partial, partial)?;
+                return Ok(());
+            }
+            if partial.dtype().eq_ignore_nullability(&self.partial_dtype) {
+                self.vtable
+                    .combine_partials(&mut self.partial, partial.cast(&self.partial_dtype)?)?;
+                return Ok(());
+            }
+            if stat.dtype(&self.dtype).as_ref() == Some(partial.dtype()) {
+                match batch.statistics().get_as::<u64>(Stat::NullCount) {
+                    Precision::Exact(null_count) if null_count == batch.len() as u64 => {
+                        // No valid values: the batch contributes the identity; skip the stat.
+                        return Ok(());
+                    }
+                    Precision::Exact(_) => {
+                        self.vtable.combine_partials(&mut self.partial, partial)?;
+                        return Ok(());
+                    }
+                    _ => {
+                        // Unknown validity: fall through to a real accumulation.
+                    }
+                }
+            }
         }
 
         let session = ctx.session().clone();
@@ -320,8 +335,8 @@ mod tests {
         }
     }
 
-    /// Sum partial sentinel `42.0` — distinguishable from the natural Sum of
-    /// `dict_of_seven()` which is `7.0`.
+    /// Sum partial sentinel `{sum: 42.0, seen: true}` — distinguishable from the natural Sum
+    /// of `dict_of_seven()` which is `7.0`.
     #[derive(Debug)]
     struct SentinelSumPartialKernel;
     impl DynAggregateKernel for SentinelSumPartialKernel {
@@ -331,7 +346,7 @@ mod tests {
             _batch: &ArrayRef,
             _ctx: &mut ExecutionCtx,
         ) -> VortexResult<Option<Scalar>> {
-            Ok(Some(Scalar::primitive(42.0f64, Nullability::Nullable)))
+            Ok(Some(sum_partial(42.0)))
         }
     }
 
@@ -359,9 +374,33 @@ mod tests {
 
     fn sentinel_partial() -> Scalar {
         let acc = mean_f64_accumulator().expect("build accumulator");
-        let sum = Scalar::primitive(42.0f64, Nullability::Nullable);
         let count = Scalar::primitive(1u64, Nullability::NonNullable);
-        Scalar::struct_(acc.partial_dtype, vec![sum, count])
+        Scalar::struct_(acc.partial_dtype, vec![sum_partial(42.0), count])
+    }
+
+    /// A `{sum, seen: true}` Sum partial over f64 input.
+    fn sum_partial(value: f64) -> Scalar {
+        let sum_partial_dtype = Sum
+            .partial_dtype(
+                &NumericalAggregateOpts::default(),
+                &DType::Primitive(PType::F64, Nullability::NonNullable),
+            )
+            .expect("sum partial dtype");
+        Scalar::struct_(
+            sum_partial_dtype,
+            vec![
+                Scalar::primitive(value, Nullability::Nullable),
+                Scalar::bool(true, Nullability::NonNullable),
+            ],
+        )
+    }
+
+    /// The running sum value of a `{sum, seen}` Sum partial.
+    fn sum_of(partial: &Scalar) -> Option<f64> {
+        partial
+            .as_struct()
+            .field("sum")
+            .and_then(|s| s.as_primitive().as_::<f64>())
     }
 
     /// Kernel registered for `(Dict, Combined<Mean>)` fires in preference to
@@ -380,10 +419,7 @@ mod tests {
         let partial = acc.flush()?;
 
         let s = partial.as_struct();
-        assert_eq!(
-            s.field("sum").unwrap().as_primitive().as_::<f64>(),
-            Some(42.0)
-        );
+        assert_eq!(sum_of(&s.field("sum").unwrap()), Some(42.0));
         assert_eq!(
             s.field("count").unwrap().as_primitive().as_::<u64>(),
             Some(1)
@@ -407,10 +443,7 @@ mod tests {
         let partial = acc.flush()?;
 
         let s = partial.as_struct();
-        assert_eq!(
-            s.field("sum").unwrap().as_primitive().as_::<f64>(),
-            Some(7.0)
-        );
+        assert_eq!(sum_of(&s.field("sum").unwrap()), Some(7.0));
         assert_eq!(
             s.field("count").unwrap().as_primitive().as_::<u64>(),
             Some(1)
@@ -438,10 +471,7 @@ mod tests {
         // `Sum` child returned the sentinel 42.0 — proves the (Dict, Sum) kernel fired
         // via `Combined<Mean>`'s fan-out. `Count`'s native `try_accumulate` reads the
         // batch's valid_count, so count is the real 1.
-        assert_eq!(
-            s.field("sum").unwrap().as_primitive().as_::<f64>(),
-            Some(42.0)
-        );
+        assert_eq!(sum_of(&s.field("sum").unwrap()), Some(42.0));
         assert_eq!(
             s.field("count").unwrap().as_primitive().as_::<u64>(),
             Some(1)

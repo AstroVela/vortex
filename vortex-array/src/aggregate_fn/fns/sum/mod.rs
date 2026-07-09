@@ -23,30 +23,82 @@ use crate::ArrayRef;
 use crate::Canonical;
 use crate::Columnar;
 use crate::ExecutionCtx;
+use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
+use crate::arrays::ConstantArray;
+use crate::arrays::scalar_fn::ScalarFnFactoryExt;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
+use crate::dtype::FieldName;
+use crate::dtype::FieldNames;
 use crate::dtype::MAX_PRECISION;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
+use crate::dtype::StructFields;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::expr::stats::StatsProviderExt;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
+use crate::scalar_fn::EmptyOptions;
+use crate::scalar_fn::fns::fill_null::FillNull;
+use crate::scalar_fn::fns::get_item::GetItem;
+use crate::scalar_fn::fns::mask::Mask;
 
-/// Return the sum of an array.
+/// The monoid sum of an array: zero when there are no valid values, null on overflow.
+///
+/// This is the value stored as `Stat::Sum`. Unlike SQL [`sum`], the empty sum is zero so that
+/// per-chunk and per-zone statistics merge as a monoid (`combine(empty, x) = x`); SQL
+/// semantics are recovered at read boundaries by combining this stat with the null count.
+pub fn stat_sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
+    if let Precision::Exact(sum_scalar) = array.statistics().get(Stat::Sum) {
+        return Ok(sum_scalar);
+    }
+
+    let mut acc = Accumulator::try_new(
+        Sum,
+        NumericalAggregateOpts::default(),
+        array.dtype().clone(),
+    )?;
+    acc.accumulate(array, ctx)?;
+    let partial = acc.partial_scalar()?;
+    let result = partial
+        .as_struct()
+        .field("sum")
+        .vortex_expect("Sum partial is missing the `sum` field");
+
+    // Cache the computed sum as a statistic (only if non-null, i.e. no overflow).
+    if let Some(val) = result.value().cloned() {
+        array.statistics().set(Stat::Sum, Precision::Exact(val));
+    }
+
+    Ok(result)
+}
+
+/// Return the SQL sum of an array: null when the array has no valid values or the sum
+/// overflows.
 ///
 /// See [`Sum`] for details.
 pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
-    // Short-circuit using cached array statistics.
+    // Short-circuit using cached array statistics. `Stat::Sum` is the monoid sum (zero for an
+    // array with no valid values), so the SQL empty-sum rule needs the null count: when it is
+    // unknown for a nullable array, fall through and compute rather than trust the cache.
     if let Precision::Exact(sum_scalar) = array.statistics().get(Stat::Sum) {
-        return Ok(sum_scalar);
+        if !array.dtype().is_nullable() {
+            return Ok(sum_scalar);
+        }
+        match array.statistics().get_as::<u64>(Stat::NullCount) {
+            Precision::Exact(null_count) if null_count == array.len() as u64 => {
+                return Ok(Scalar::null(sum_scalar.dtype().as_nullable()));
+            }
+            Precision::Exact(_) => return Ok(sum_scalar),
+            _ => {}
+        }
     }
 
     // Compute using Accumulator<Sum>.
@@ -59,7 +111,8 @@ pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     acc.accumulate(array, ctx)?;
     let result = acc.finish()?;
 
-    // Cache the computed sum as a statistic (only if non-null, i.e. no overflow).
+    // Cache the computed sum as a statistic (only if non-null, i.e. no overflow and at least
+    // one valid value).
     if let Some(val) = result.value().cloned() {
         array.statistics().set(Stat::Sum, Precision::Exact(val));
     }
@@ -67,10 +120,16 @@ pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     Ok(result)
 }
 
-/// Sum an array, starting from zero.
+/// Sum an array following SQL `SUM` semantics.
 ///
-/// If the sum overflows, a null scalar will be returned.
-/// If the array is all-invalid, the sum will be zero.
+/// A sum over zero valid values yields null (the SQL rule: nulls are eliminated, and the sum
+/// of an empty set is null), and a sum that overflows yields null.
+///
+/// The partial state is a `{sum, seen}` struct: `sum` is the running monoid value (null once
+/// saturated by overflow, which poisons merges), and `seen` records whether any valid value
+/// contributed (merged with OR). `finalize` maps `seen == false` to null. `seen` is decided by
+/// validity alone: NaN values are valid, so with `skip_nans` a sum over only NaNs is `0`, not
+/// null.
 ///
 /// NaN handling for float inputs is controlled by [`NumericalAggregateOpts`]: with `skip_nans` (the
 /// default) NaN values contribute nothing, otherwise any NaN value poisons the sum to NaN.
@@ -136,7 +195,7 @@ impl AggregateFnVTable for Sum {
     }
 
     fn partial_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
-        self.return_dtype(options, input_dtype)
+        Some(sum_partial_dtype(self.return_dtype(options, input_dtype)?))
     }
 
     fn empty_partial(
@@ -152,19 +211,45 @@ impl AggregateFnVTable for Sum {
         Ok(SumPartial {
             return_dtype,
             current: Some(initial),
+            seen: false,
             skip_nans: options.skip_nans,
         })
     }
 
     fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if other.is_null() {
-            // A null partial means the sub-accumulator saturated (overflow).
+        // Partials are `{sum, seen}` structs. A plain (non-struct) scalar is the legacy or
+        // statistic form: a monoid sum value from an older writer or a cached `Stat::Sum`. It
+        // cannot distinguish an empty sum from a zero sum, so it is treated as seen.
+        let (sum_value, other_seen) = if matches!(other.dtype(), DType::Struct(..)) {
+            if other.is_null() {
+                // A null struct partial carries no recoverable state; treat as saturated.
+                partial.seen = true;
+                partial.current = None;
+                return Ok(());
+            }
+            let fields = other.as_struct();
+            let sum_value = fields
+                .field("sum")
+                .ok_or_else(|| vortex_err!("Sum partial is missing the `sum` field"))?;
+            let other_seen = fields
+                .field("seen")
+                .and_then(|seen| seen.as_bool().value())
+                .unwrap_or(true);
+            (sum_value, other_seen)
+        } else {
+            (other, true)
+        };
+
+        partial.seen |= other_seen;
+        if sum_value.is_null() {
+            // A null sum value means the sub-accumulator saturated (overflow).
             partial.current = None;
             return Ok(());
         }
         let Some(ref mut inner) = partial.current else {
             return Ok(());
         };
+        let other = sum_value;
         let saturated = match inner {
             SumState::Unsigned(acc) => {
                 let val = other
@@ -209,23 +294,18 @@ impl AggregateFnVTable for Sum {
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        Ok(match &partial.current {
-            None => Scalar::null(partial.return_dtype.as_nullable()),
-            Some(SumState::Unsigned(v)) => Scalar::primitive(*v, Nullability::Nullable),
-            Some(SumState::Signed(v)) => Scalar::primitive(*v, Nullability::Nullable),
-            Some(SumState::Float(v)) => Scalar::primitive(*v, Nullability::Nullable),
-            Some(SumState::Decimal { value, .. }) => {
-                let decimal_dtype = *partial
-                    .return_dtype
-                    .as_decimal_opt()
-                    .vortex_expect("return dtype must be decimal");
-                Scalar::decimal(*value, decimal_dtype, Nullability::Nullable)
-            }
-        })
+        Ok(Scalar::struct_(
+            sum_partial_dtype(partial.return_dtype.as_nullable()),
+            vec![
+                sum_value_scalar(partial),
+                Scalar::bool(partial.seen, Nullability::NonNullable),
+            ],
+        ))
     }
 
     fn reset(&self, partial: &mut Self::Partial) {
         partial.current = Some(make_zero_state(&partial.return_dtype));
+        partial.seen = false;
     }
 
     #[inline]
@@ -253,6 +333,16 @@ impl AggregateFnVTable for Sum {
                 // NaN-free batch: the cached NaN-skipping sum (if any) equals the
                 // NaN-including sum.
                 if let Precision::Exact(sum) = batch.statistics().get(Stat::Sum) {
+                    // The cached sum is a monoid value that cannot carry `seen`; derive it
+                    // from the null count, or fall through to a real scan when unknown.
+                    match batch.statistics().get_as::<u64>(Stat::NullCount) {
+                        Precision::Exact(null_count) if null_count == batch.len() as u64 => {
+                            // No valid values: the batch is the identity.
+                            return Ok(true);
+                        }
+                        Precision::Exact(_) => partial.seen = true,
+                        _ => return Ok(false),
+                    }
                     let sum = if sum.dtype() == &partial.return_dtype {
                         sum
                     } else {
@@ -264,7 +354,8 @@ impl AggregateFnVTable for Sum {
                 Ok(false)
             }
             Precision::Exact(_) => {
-                // At least one NaN value: the sum is NaN without scanning the batch.
+                // At least one NaN value (a valid value): the sum is NaN without scanning.
+                partial.seen = true;
                 if let Some(SumState::Float(acc)) = partial.current.as_mut() {
                     *acc = f64::NAN;
                 }
@@ -282,6 +373,9 @@ impl AggregateFnVTable for Sum {
     ) -> VortexResult<()> {
         // Constants compute scalar * len and combine via combine_partials.
         if let Columnar::Constant(c) = batch {
+            // Any valid value counts as seen, including NaN and `false` constants that
+            // contribute nothing to the running sum.
+            partial.seen |= !c.scalar().is_null() && !c.is_empty();
             // NaN constants are treated as missing when skipping NaNs.
             if partial.skip_nans && c.scalar().as_primitive_opt().is_some_and(|p| p.is_nan()) {
                 return Ok(());
@@ -300,9 +394,11 @@ impl AggregateFnVTable for Sum {
 
         let result = match batch {
             Columnar::Canonical(c) => match c {
-                Canonical::Primitive(p) => accumulate_primitive(&mut inner, p, ctx, skip_nans),
-                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx),
-                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx),
+                Canonical::Primitive(p) => {
+                    accumulate_primitive(&mut inner, p, ctx, skip_nans, &mut partial.seen)
+                }
+                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx, &mut partial.seen),
+                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx, &mut partial.seen),
                 _ => vortex_bail!("Unsupported canonical type for sum: {}", batch.dtype()),
             },
             Columnar::Constant(_) => unreachable!(),
@@ -320,11 +416,32 @@ impl AggregateFnVTable for Sum {
     }
 
     fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
-        Ok(partials)
+        // Entries that saw no valid values finalize to null (SQL `SUM`), while a null `sum`
+        // field (overflow) and null partial rows (e.g. null groups) stay null via the mask's
+        // validity intersection.
+        //
+        // The expressions are built unoptimized: `optimize` costs multiples of the whole
+        // aggregation at small group counts, and the caller's execution evaluates the lazy
+        // expression as-is.
+        let len = partials.len();
+        let sum = GetItem.try_new_array(len, FieldName::from("sum"), [partials.clone()])?;
+        let seen = GetItem.try_new_array(len, FieldName::from("seen"), [partials])?;
+        let seen = FillNull.try_new_array(
+            len,
+            EmptyOptions,
+            [
+                seen,
+                ConstantArray::new(Scalar::bool(false, Nullability::NonNullable), len).into_array(),
+            ],
+        )?;
+        Mask.try_new_array(len, EmptyOptions, [sum, seen])
     }
 
     fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+        if !partial.seen {
+            return Ok(Scalar::null(partial.return_dtype.as_nullable()));
+        }
+        Ok(sum_value_scalar(partial))
     }
 }
 
@@ -334,8 +451,53 @@ pub struct SumPartial {
     return_dtype: DType,
     /// The current accumulated state, or `None` if saturated (checked overflow).
     current: Option<SumState>,
+    /// Whether at least one valid value has been accumulated. A sum over zero valid values
+    /// finalizes to null (SQL `SUM` semantics) rather than the monoid zero.
+    seen: bool,
     /// Whether NaN values in float inputs are skipped.
     skip_nans: bool,
+}
+
+/// The partial dtype for a sum whose result is `sum_dtype`: a `{sum, seen}` struct, where
+/// `sum` is the running monoid value (null once saturated by overflow, poisoning merges) and
+/// `seen` records whether any valid value contributed (merged with OR). Keeping the flag
+/// separate from the sum lets merges stay a monoid — the identity is `{0, false}` — while
+/// `finalize` maps unseen sums to null.
+fn sum_partial_dtype(sum_dtype: DType) -> DType {
+    DType::Struct(
+        StructFields::new(
+            FieldNames::from_iter([FieldName::from("sum"), FieldName::from("seen")]),
+            vec![sum_dtype, DType::Bool(Nullability::NonNullable)],
+        ),
+        Nullability::Nullable,
+    )
+}
+
+/// The running sum as a nullable scalar of the return dtype (null when saturated by overflow).
+fn sum_value_scalar(partial: &SumPartial) -> Scalar {
+    match &partial.current {
+        None => Scalar::null(partial.return_dtype.as_nullable()),
+        Some(SumState::Unsigned(v)) => Scalar::primitive(*v, Nullability::Nullable),
+        Some(SumState::Signed(v)) => Scalar::primitive(*v, Nullability::Nullable),
+        Some(SumState::Float(v)) => Scalar::primitive(*v, Nullability::Nullable),
+        Some(SumState::Decimal { value, .. }) => {
+            let decimal_dtype = *partial
+                .return_dtype
+                .as_decimal_opt()
+                .vortex_expect("return dtype must be decimal");
+            Scalar::decimal(*value, decimal_dtype, Nullability::Nullable)
+        }
+    }
+}
+
+/// Whether the array contains at least one valid element. NaNs are valid values: with
+/// `skip_nans` they contribute nothing to the sum, but a sum over only NaNs is `0`, not null.
+fn has_valid_values(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+    Ok(array
+        .validity()?
+        .execute_mask(array.len(), ctx)?
+        .true_count()
+        > 0)
 }
 
 /// The accumulated sum value.
@@ -407,6 +569,7 @@ mod tests {
     use crate::aggregate_fn::GroupedAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::sum::Sum;
+    use crate::aggregate_fn::fns::sum::stat_sum;
     use crate::aggregate_fn::fns::sum::sum;
     use crate::array_session;
     use crate::arrays::BoolArray;
@@ -525,6 +688,102 @@ mod tests {
     // State merge tests (vtable-level)
 
     #[test]
+    fn sum_state_empty_is_null() -> VortexResult<()> {
+        // A state that never saw a valid value finalizes to null, and combining empty states
+        // stays empty.
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let mut state = Sum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
+        let empty = Sum.to_scalar(&state)?;
+        Sum.combine_partials(&mut state, empty)?;
+        assert!(Sum.finalize_scalar(&state)?.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn sum_state_empty_is_identity() -> VortexResult<()> {
+        // Combining an empty state into a seen state changes nothing: `{0, false}` is the
+        // identity of the `{sum, seen}` monoid.
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let mut state = Sum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
+        Sum.combine_partials(&mut state, Scalar::primitive(100i64, Nullable))?;
+
+        let empty =
+            Sum.to_scalar(&Sum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?)?;
+        Sum.combine_partials(&mut state, empty)?;
+
+        let result = Sum.finalize_scalar(&state)?;
+        assert_eq!(result.as_primitive().typed_value::<i64>(), Some(100));
+        Ok(())
+    }
+
+    #[test]
+    fn sum_state_overflow_poisons_but_stays_seen() -> VortexResult<()> {
+        // Overflow (a null `sum` field) poisons the merge even when combined with later
+        // values: the result is null via the sum value, not via `seen`.
+        let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
+        let mut overflowed = Sum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
+        Sum.combine_partials(&mut overflowed, Scalar::primitive(i64::MAX, Nullable))?;
+        Sum.combine_partials(&mut overflowed, Scalar::primitive(1i64, Nullable))?;
+        let overflowed = Sum.to_scalar(&overflowed)?;
+
+        let mut state = Sum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
+        Sum.combine_partials(&mut state, Scalar::primitive(5i64, Nullable))?;
+        Sum.combine_partials(&mut state, overflowed)?;
+        Sum.combine_partials(&mut state, Scalar::primitive(7i64, Nullable))?;
+
+        assert!(Sum.finalize_scalar(&state)?.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn sum_all_nan_is_zero_not_null() -> VortexResult<()> {
+        // NaNs are valid values: with the default `skip_nans` they contribute nothing, but
+        // the sum is a genuine `0.0`, unlike an all-null array whose sum is null.
+        let arr =
+            PrimitiveArray::new(buffer![f64::NAN, f64::NAN], Validity::NonNullable).into_array();
+        let result = sum(&arr, &mut array_session().create_execution_ctx())?;
+        assert_eq!(result.as_primitive().typed_value::<f64>(), Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn stat_sum_is_monoid_while_sum_is_sql() -> VortexResult<()> {
+        // The persisted statistic keeps the monoid semantics (zero for all-null) that zone
+        // and chunk merging require, while `sum` applies the SQL rule.
+        let mut ctx = array_session().create_execution_ctx();
+        let arr = PrimitiveArray::from_option_iter([None::<i32>, None, None]).into_array();
+        assert_eq!(
+            stat_sum(&arr, &mut ctx)?
+                .as_primitive()
+                .typed_value::<i64>(),
+            Some(0)
+        );
+        // The cached monoid statistic must not leak through `sum`'s cache short-circuit.
+        assert!(sum(&arr, &mut ctx)?.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_sum_fallback_empty_and_all_null_groups() -> VortexResult<()> {
+        // Bool elements are rejected by the primitive grouped kernel, forcing the generic
+        // per-group fallback: empty and all-null groups have null sums there too.
+        let mut ctx = array_session().create_execution_ctx();
+        let elements = BoolArray::from_iter([Some(true), Some(true), None, None]).into_array();
+        let groups = ListViewArray::try_new(
+            elements,
+            buffer![0i32, 2, 2].into_array(),
+            buffer![2i32, 0, 2].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+
+        let result = run_grouped_sum(&groups, &DType::Bool(Nullable))?;
+        let expected = PrimitiveArray::from_option_iter([Some(2u64), None, None]).into_array();
+        assert_arrays_eq!(&result, &expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
     fn sum_state_merge() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let mut state = Sum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
@@ -535,7 +794,7 @@ mod tests {
         let scalar2 = Scalar::primitive(50i64, Nullable);
         Sum.combine_partials(&mut state, scalar2)?;
 
-        let result = Sum.to_scalar(&state)?;
+        let result = Sum.finalize_scalar(&state)?;
         Sum.reset(&mut state);
         assert_eq!(result.as_primitive().typed_value::<i64>(), Some(150));
         Ok(())
@@ -648,7 +907,8 @@ mod tests {
         let elem_dtype = DType::Primitive(PType::I32, Nullable);
         let result = run_grouped_sum(&groups.into_array(), &elem_dtype)?;
 
-        let expected = PrimitiveArray::from_option_iter([Some(0i64), Some(7i64)]).into_array();
+        // The all-null group has a null sum (SQL `SUM` semantics).
+        let expected = PrimitiveArray::from_option_iter([None, Some(7i64)]).into_array();
         assert_arrays_eq!(&result, &expected, &mut ctx);
         Ok(())
     }
@@ -741,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_chunked_floats_all_nulls_is_zero() -> VortexResult<()> {
+    fn sum_chunked_floats_all_nulls_is_null() -> VortexResult<()> {
         let chunk1 = PrimitiveArray::from_option_iter::<f32, _>(vec![None, None, None]);
         let chunk2 = PrimitiveArray::from_option_iter::<f32, _>(vec![None, None]);
         let dtype = chunk1.dtype().clone();
@@ -750,7 +1010,8 @@ mod tests {
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
-        assert_eq!(result, Scalar::primitive(0f64, Nullable));
+        // SQL `SUM`: no valid values across any chunk yields null.
+        assert!(result.is_null());
         Ok(())
     }
 

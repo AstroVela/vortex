@@ -20,6 +20,7 @@ use crate::convert::TryToDataFusion;
 pub(crate) fn stats_set_to_df(
     stats_set: &StatsSet,
     dtype: &DType,
+    row_count: Option<usize>,
 ) -> VortexResult<ColumnStatistics> {
     // Update the total size in bytes.
     let column_size = stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
@@ -52,8 +53,17 @@ pub(crate) fn stats_set_to_df(
         .ok()
     });
 
-    // Find the sum statistic
+    let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
+
+    // Find the sum statistic. `Stat::Sum` is the monoid sum (zero when the column has no
+    // valid values), while DataFusion's `sum_value` is the SQL sum (null in that case), so an
+    // all-null column must not export its zero; without a known null count the sum cannot be
+    // interpreted and is withheld.
     let sum = stats_set.get(Stat::Sum).and_then(|stat_val| {
+        match (&null_count, row_count) {
+            (VortexPrecision::Exact(null_count), Some(row_count)) if *null_count < row_count => {}
+            _ => return None,
+        }
         Scalar::try_new(
             Stat::Sum
                 .dtype(dtype)
@@ -64,8 +74,6 @@ pub(crate) fn stats_set_to_df(
         .try_to_df()
         .ok()
     });
-
-    let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
     Ok(ColumnStatistics {
         null_count: null_count.to_df(),
@@ -97,12 +105,20 @@ mod tests {
     #[test]
     fn is_constant_false_does_not_imply_one_distinct_value() -> VortexResult<()> {
         let false_constant = StatsSet::of(Stat::IsConstant, VortexPrecision::exact(false));
-        let false_stats = stats_set_to_df(&false_constant, &DType::Bool(Nullability::NonNullable))?;
+        let false_stats = stats_set_to_df(
+            &false_constant,
+            &DType::Bool(Nullability::NonNullable),
+            Some(5),
+        )?;
 
         assert_eq!(false_stats.distinct_count, Precision::Absent);
 
         let true_constant = StatsSet::of(Stat::IsConstant, VortexPrecision::exact(true));
-        let true_stats = stats_set_to_df(&true_constant, &DType::Bool(Nullability::NonNullable))?;
+        let true_stats = stats_set_to_df(
+            &true_constant,
+            &DType::Bool(Nullability::NonNullable),
+            Some(5),
+        )?;
 
         assert_eq!(true_stats.distinct_count, Precision::Exact(1));
 

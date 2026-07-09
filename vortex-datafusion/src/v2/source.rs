@@ -242,6 +242,10 @@ impl VortexDataSourceBuilder {
         };
 
         // We now compute initial statistics.
+        let row_count = match self.data_source.row_count() {
+            Precision::Exact(n) => usize::try_from(n).ok(),
+            _ => None,
+        };
         let field_paths: Vec<_> = fields
             .names()
             .iter()
@@ -256,7 +260,7 @@ impl VortexDataSourceBuilder {
         .await?
         .iter()
         .zip(fields.fields())
-        .map(|(stats, dtype)| stats_set_to_df(stats, &dtype))
+        .map(|(stats, dtype)| stats_set_to_df(stats, &dtype, row_count))
         .collect::<VortexResult<Vec<_>>>()?;
 
         Ok(VortexDataSource {

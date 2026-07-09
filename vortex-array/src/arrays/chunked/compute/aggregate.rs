@@ -120,7 +120,8 @@ mod tests {
             DType::Primitive(PType::I32, Nullability::Nullable),
         )?;
         let result = run_sum(&chunked.into_array())?;
-        assert_eq!(result.as_primitive().typed_value::<i64>(), Some(0));
+        // SQL `SUM`: no valid values yields null.
+        assert!(result.is_null());
         Ok(())
     }
 
@@ -158,7 +159,7 @@ mod tests {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let chunked = ChunkedArray::try_new(vec![], dtype)?;
         let result = run_sum(&chunked.into_array())?;
-        assert_eq!(result.as_primitive().typed_value::<i64>(), Some(0));
+        assert!(result.is_null());
         Ok(())
     }
 

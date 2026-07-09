@@ -11,6 +11,7 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::ArrayRef;
+use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnVTable;
@@ -164,7 +165,13 @@ where
     .unwrap();
     acc.accumulate_list(list_view, &mut SESSION.create_execution_ctx())
         .unwrap();
-    divan::black_box(acc.finish().unwrap())
+    let result = acc
+        .finish()
+        .unwrap()
+        .execute::<Canonical>(&mut SESSION.create_execution_ctx())
+        .unwrap()
+        .into_array();
+    divan::black_box(result)
 }
 
 #[divan::bench]

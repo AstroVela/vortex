@@ -315,11 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn mean_all_null_returns_nan() -> VortexResult<()> {
+    fn mean_all_null_returns_null() -> VortexResult<()> {
+        // The sum of zero valid values is null (SQL `SUM`), so the mean is null rather than
+        // the former 0/0 = NaN — matching SQL `AVG` of an all-null column.
         let array = PrimitiveArray::from_option_iter::<f64, _>([None, None, None]).into_array();
         let mut ctx = array_session().create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
-        assert!(result.as_primitive().as_::<f64>().is_some_and(f64::is_nan));
+        assert!(result.is_null());
         Ok(())
     }
 
