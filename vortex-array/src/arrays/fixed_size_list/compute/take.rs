@@ -52,7 +52,8 @@ fn take_with_indices<I: IntegerPType>(
     let list_size = array.list_size() as usize;
 
     let indices_array = indices.clone().execute::<PrimitiveArray>(ctx)?;
-    // Reinterpret to unsigned so `as_slice::<I>` (with unsigned `I`) matches; values are unchanged.
+    // Bit-identical reinterpret so `as_slice::<I>` (with unsigned `I`) matches. Negative signed
+    // inputs become large unsigned values and are rejected by the bounds check below.
     let indices_array = indices_array.reinterpret_cast(indices_array.ptype().to_unsigned());
 
     if list_size == 0 {

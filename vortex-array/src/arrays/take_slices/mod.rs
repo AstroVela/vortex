@@ -171,12 +171,6 @@ fn primitive_selector_slices(
     starts: ArrayView<'_, Primitive>,
     lengths: ArrayView<'_, Primitive>,
 ) -> VortexResult<Vec<(usize, usize)>> {
-    vortex_ensure!(
-        starts.len() == lengths.len(),
-        "TakeSlicesArray selectors must have equal length, got starts {} and lengths {}",
-        starts.len(),
-        lengths.len()
-    );
     match_each_unsigned_integer_ptype!(starts.ptype(), |S| {
         match_each_unsigned_integer_ptype!(lengths.ptype(), |L| {
             selector_slices_typed::<S, L>(

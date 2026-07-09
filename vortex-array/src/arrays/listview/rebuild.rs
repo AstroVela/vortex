@@ -165,14 +165,15 @@ impl ListViewArray {
 
         let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
         let mut new_sizes = BufferMut::<S>::with_capacity(len);
+        let validity = self.validity()?;
 
         // Resolve validity to a mask once instead of probing it per row: `execute_is_valid`
         // executes a scalar on every call for array-backed validity, which is O(len) work repeated
         // `len` times.
-        let validity = self.validity()?.execute_mask(len, ctx)?;
+        let validity_mask = validity.execute_mask(len, ctx)?;
 
         let mut n_elements = NewOffset::zero();
-        for (index, is_valid) in validity.iter().enumerate() {
+        for (index, is_valid) in validity_mask.iter().enumerate() {
             if !is_valid {
                 new_offsets.push(n_elements);
                 new_sizes.push(S::zero());
@@ -202,7 +203,7 @@ impl ListViewArray {
         // SAFETY: offsets are sequential and non-overlapping, all (offset, size) pairs reference
         // valid elements, and the validity array is preserved from the original.
         Ok(unsafe {
-            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity()?)
+            ListViewArray::new_unchecked(elements, offsets, sizes, validity)
                 .with_zero_copy_to_list(true)
         })
     }
