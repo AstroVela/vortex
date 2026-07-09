@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use num_traits::AsPrimitive;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
@@ -17,6 +19,8 @@ use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBinView;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::dict::TakeExecute;
+use crate::arrays::take_slices::TakeSlicesExecute;
+use crate::arrays::take_slices::selector_slices;
 use crate::arrays::varbinview::BinaryView;
 use crate::buffer::BufferHandle;
 use crate::executor::ExecutionCtx;
@@ -49,6 +53,42 @@ impl TakeExecute for VarBinView {
                     array
                         .dtype()
                         .union_nullability(indices.dtype().nullability()),
+                    validity,
+                )
+                .into_array(),
+            ))
+        }
+    }
+}
+
+impl TakeSlicesExecute for VarBinView {
+    fn take_slices(
+        array: ArrayView<'_, VarBinView>,
+        starts: &ArrayRef,
+        lengths: &ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let slices = selector_slices(array.len(), starts, lengths, ctx)?;
+        let validity = array.validity()?.take_slices(starts, lengths)?;
+        let len = slices.iter().try_fold(0usize, |len, &(start, end)| {
+            len.checked_add(end - start)
+                .ok_or_else(|| vortex_err!("TakeSlices output length overflow"))
+        })?;
+
+        let source_views = array.views();
+        let mut views = BufferMut::<BinaryView>::with_capacity(len);
+        for (start, end) in slices {
+            views.extend_from_slice(&source_views[start..end]);
+        }
+
+        // SAFETY: views are copied from a valid VarBinView array and still reference the same
+        // backing data buffers, so all view pointers remain valid.
+        unsafe {
+            Ok(Some(
+                VarBinViewArray::new_handle_unchecked(
+                    BufferHandle::new_host(views.freeze().into_byte_buffer()),
+                    Arc::clone(array.data_buffers()),
+                    array.dtype().clone(),
                     validity,
                 )
                 .into_array(),

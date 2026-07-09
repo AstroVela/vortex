@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::Arc;
+
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -12,11 +14,15 @@ use crate::array_session;
 use crate::arrays::DictArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::Struct;
+use crate::arrays::StructArray;
 use crate::arrays::TakeSlices;
 use crate::arrays::TakeSlicesArray;
+use crate::arrays::VarBinViewArray;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
 use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::assert_arrays_eq;
+use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
 use crate::kernel::ExecuteParentKernel;
 use crate::validity::Validity;
@@ -142,6 +148,60 @@ fn primitive_take_slices_execute_parent_copies_runs_directly() -> VortexResult<(
         PrimitiveArray::from_iter([3i32, 4, 5, 0, 1]),
         &mut ctx
     );
+    Ok(())
+}
+
+#[test]
+fn struct_take_slices_pushes_runs_to_fields() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = StructArray::try_new(
+        FieldNames::from(["id", "name"]),
+        vec![
+            PrimitiveArray::from_iter(0i32..6).into_array(),
+            VarBinViewArray::from_iter_str(["a", "b", "c", "d", "e", "f"]).into_array(),
+        ],
+        6,
+        Validity::NonNullable,
+    )?
+    .into_array();
+
+    let actual = take_slices(&array, &[(3, 2), (0, 2)])?;
+    let expected = StructArray::try_new(
+        FieldNames::from(["id", "name"]),
+        vec![
+            PrimitiveArray::from_iter([3i32, 4, 0, 1]).into_array(),
+            VarBinViewArray::from_iter_str(["d", "e", "a", "b"]).into_array(),
+        ],
+        4,
+        Validity::NonNullable,
+    )?;
+
+    assert!(actual.is::<Struct>());
+    assert!(!actual.is::<TakeSlices>());
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn varbinview_take_slices_execute_reuses_data_buffers() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = VarBinViewArray::from_iter_str([
+        "long-string-value-000000",
+        "long-string-value-000001",
+        "long-string-value-000002",
+        "long-string-value-000003",
+        "long-string-value-000004",
+        "long-string-value-000005",
+    ]);
+
+    let actual = take_slices(&array.clone().into_array(), &[(3, 2), (0, 2)])?
+        .execute::<VarBinViewArray>(&mut ctx)?;
+
+    assert!(Arc::ptr_eq(actual.data_buffers(), array.data_buffers()));
+    assert_eq!(actual.bytes_at(0).as_slice(), b"long-string-value-000003");
+    assert_eq!(actual.bytes_at(1).as_slice(), b"long-string-value-000004");
+    assert_eq!(actual.bytes_at(2).as_slice(), b"long-string-value-000000");
+    assert_eq!(actual.bytes_at(3).as_slice(), b"long-string-value-000001");
     Ok(())
 }
 

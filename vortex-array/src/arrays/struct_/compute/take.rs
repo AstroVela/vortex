@@ -10,6 +10,8 @@ use crate::arrays::Struct;
 use crate::arrays::StructArray;
 use crate::arrays::dict::TakeReduce;
 use crate::arrays::struct_::StructArrayExt;
+use crate::arrays::take_slices::TakeSlicesReduce;
+use crate::arrays::take_slices::selector_output_len;
 use crate::builtins::ArrayBuiltins;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
@@ -47,6 +49,32 @@ impl TakeReduce for Struct {
             array.validity()?.take(indices)?,
         )
         .map(|a| a.into_array())
+        .map(Some)
+    }
+}
+
+impl TakeSlicesReduce for Struct {
+    fn take_slices(
+        array: ArrayView<'_, Struct>,
+        starts: &ArrayRef,
+        lengths: &ArrayRef,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let fields = array
+            .iter_unmasked_fields()
+            .map(|field| field.take_slices(starts.clone(), lengths.clone()))
+            .collect::<VortexResult<Vec<_>>>()?;
+        let len = fields.first().map_or_else(
+            || selector_output_len(array.len(), starts, lengths),
+            |f| Ok(f.len()),
+        )?;
+
+        StructArray::try_new_with_dtype(
+            fields,
+            array.struct_fields().clone(),
+            len,
+            array.validity()?.take_slices(starts, lengths)?,
+        )
+        .map(StructArray::into_array)
         .map(Some)
     }
 }
