@@ -18,6 +18,7 @@ and a mini table of contents.
 | [4. Design: pluggable cost model](./04-design-pluggable-cost-model.md) | The concrete proposal: `Candidate` + `CostModel` trait, how selection changes, `SizeCost`/`TimeCost`, presets | you want the *how* |
 | [5. Roadmap & open questions](./05-roadmap-and-open-questions.md) | Measurement-first phasing with acceptance criteria, risks, unresolved decisions | you want next steps |
 | [Appendix: encoding capabilities](./appendix-encoding-capabilities.md) | Verified per-encoding kernel coverage, random-access classes, decode notes | reference material |
+| [NEXT-STEPS](./NEXT-STEPS.md) | Briefing for a follow-up session: produce a small-PR implementation plan ending at the pluggable cost model | you're the agent tasked with planning the implementation |
 
 ## TL;DR
 
