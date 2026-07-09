@@ -224,11 +224,13 @@ impl Validity {
         }
     }
 
-    /// Select validity values by concatenating a sequence of non-empty ranges.
-    pub fn take_slices(&self, slices: &[(usize, usize)]) -> VortexResult<Self> {
+    /// Select validity values by concatenating a sequence of contiguous runs.
+    pub fn take_slices(&self, starts: &ArrayRef, lengths: &ArrayRef) -> VortexResult<Self> {
         match self {
             v @ (Self::NonNullable | Self::AllValid | Self::AllInvalid) => Ok(v.clone()),
-            Self::Array(is_valid) => Ok(Self::Array(is_valid.take_slices(slices.to_vec())?)),
+            Self::Array(is_valid) => Ok(Self::Array(
+                is_valid.take_slices(starts.clone(), lengths.clone())?,
+            )),
         }
     }
 

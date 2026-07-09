@@ -209,17 +209,24 @@ fn take_fsl_f16_take_slices_strategy<const LIST_SIZE: usize>(
     array: &FixedSizeListArray,
     indices: &Buffer<u64>,
 ) -> FixedSizeListArray {
-    let slices = indices
+    let starts = indices
         .as_ref()
         .iter()
         .map(|&idx| {
             let start = idx as usize * LIST_SIZE;
-            (start, start + LIST_SIZE)
+            start as u64
         })
-        .collect();
-    let elements = array.elements().take_slices(slices).unwrap();
+        .collect::<Vec<_>>();
+    let lengths = std::iter::repeat_n(LIST_SIZE as u64, indices.len()).collect::<Vec<_>>();
+    let elements = array
+        .elements()
+        .take_slices(
+            PrimitiveArray::from_iter(starts).into_array(),
+            PrimitiveArray::from_iter(lengths).into_array(),
+        )
+        .unwrap();
 
-    // SAFETY: each generated slice has width `LIST_SIZE`, and there is one slice per input index,
+    // SAFETY: each generated run has width `LIST_SIZE`, and there is one run per input index,
     // so `elements.len() == indices.len() * LIST_SIZE`.
     unsafe {
         FixedSizeListArray::new_unchecked(

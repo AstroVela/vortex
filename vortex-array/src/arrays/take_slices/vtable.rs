@@ -8,7 +8,6 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -27,11 +26,15 @@ use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
 use crate::arrays::take_slices::array::CHILD_SLOT;
+use crate::arrays::take_slices::array::LENGTHS_SLOT;
 use crate::arrays::take_slices::array::NUM_SLOTS;
 use crate::arrays::take_slices::array::SLOT_NAMES;
+use crate::arrays::take_slices::array::STARTS_SLOT;
 use crate::arrays::take_slices::array::TakeSlicesData;
 use crate::arrays::take_slices::rules::PARENT_RULES;
 use crate::arrays::take_slices::rules::RULES;
+use crate::arrays::take_slices::selector_output_len;
+use crate::arrays::take_slices::selector_slices;
 use crate::buffer::BufferHandle;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
@@ -44,19 +47,19 @@ use crate::validity::Validity;
 /// A [`TakeSlices`]-encoded Vortex array.
 pub type TakeSlicesArray = Array<TakeSlices>;
 
-/// Child-range sequence selection encoding.
+/// Contiguous-run gather selection encoding.
 #[derive(Clone, Debug)]
 pub struct TakeSlices;
 
 impl ArrayHash for TakeSlicesData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
-        self.slices.hash(state);
+        self.len().hash(state);
     }
 }
 
 impl ArrayEq for TakeSlicesData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
-        self.slices == other.slices
+        self.len() == other.len()
     }
 }
 
@@ -86,6 +89,14 @@ impl VTable for TakeSlices {
             slots[CHILD_SLOT].is_some(),
             "TakeSlicesArray child slot must be present"
         );
+        vortex_ensure!(
+            slots[STARTS_SLOT].is_some(),
+            "TakeSlicesArray starts slot must be present"
+        );
+        vortex_ensure!(
+            slots[LENGTHS_SLOT].is_some(),
+            "TakeSlicesArray lengths slot must be present"
+        );
         let child = slots[CHILD_SLOT]
             .as_ref()
             .vortex_expect("validated child slot");
@@ -95,24 +106,16 @@ impl VTable for TakeSlices {
             child.dtype(),
             dtype
         );
-        let mut computed_len = 0usize;
-        for &(start, end) in data.slices() {
-            vortex_ensure!(
-                start < end,
-                "TakeSlicesArray range must be non-empty: {start}..{end}"
-            );
-            vortex_ensure!(
-                end <= child.len(),
-                "TakeSlicesArray range {start}..{end} exceeds child length {}",
-                child.len()
-            );
-            computed_len = computed_len
-                .checked_add(end - start)
-                .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
-        }
+        let starts = slots[STARTS_SLOT]
+            .as_ref()
+            .vortex_expect("validated starts slot");
+        let lengths = slots[LENGTHS_SLOT]
+            .as_ref()
+            .vortex_expect("validated lengths slot");
+        let computed_len = selector_output_len(child.len(), starts, lengths)?;
         vortex_ensure!(
             data.len() == computed_len,
-            "TakeSlicesArray metadata length {} does not match computed range length {}",
+            "TakeSlicesArray metadata length {} does not match computed run length {}",
             data.len(),
             computed_len
         );
@@ -170,8 +173,9 @@ impl VTable for TakeSlices {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let mut builder = builder_with_capacity_in(ctx.allocator(), array.dtype(), array.len());
-        for range in array.slice_ranges() {
-            let slice = array.child().slice(range)?;
+        let slices = selector_slices(array.child().len(), array.starts(), array.lengths(), ctx)?;
+        for (start, end) in slices {
+            let slice = array.child().slice(start..end)?;
             slice.append_to_builder(builder.as_mut(), ctx)?;
         }
         Ok(ExecutionResult::done(builder.finish()))
@@ -196,8 +200,9 @@ impl OperationsVTable<TakeSlices> for TakeSlices {
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        let slices = selector_slices(array.child().len(), array.starts(), array.lengths(), ctx)?;
         let mut logical_start = 0usize;
-        for &(start, end) in array.slices() {
+        for (start, end) in slices {
             let len = end - start;
             let logical_end = logical_start + len;
             if index < logical_end {
@@ -214,6 +219,9 @@ impl OperationsVTable<TakeSlices> for TakeSlices {
 
 impl ValidityVTable<TakeSlices> for TakeSlices {
     fn validity(array: ArrayView<'_, TakeSlices>) -> VortexResult<Validity> {
-        array.child().validity()?.take_slices(array.slices())
+        array
+            .child()
+            .validity()?
+            .take_slices(array.starts(), array.lengths())
     }
 }

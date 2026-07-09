@@ -11,16 +11,19 @@ use crate::array::ArrayView;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::take_slices::TakeSlicesExecute;
+use crate::arrays::take_slices::selector_slices;
 use crate::executor::ExecutionCtx;
 use crate::match_each_native_ptype;
 
 impl TakeSlicesExecute for Primitive {
     fn take_slices(
         array: ArrayView<'_, Self>,
-        slices: &[(usize, usize)],
-        _ctx: &mut ExecutionCtx,
+        starts: &ArrayRef,
+        lengths: &ArrayRef,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let validity = array.validity()?.take_slices(slices)?;
+        let slices = selector_slices(array.len(), starts, lengths, ctx)?;
+        let validity = array.validity()?.take_slices(starts, lengths)?;
         match_each_native_ptype!(array.ptype(), |T| {
             let source = array.as_slice::<T>();
             let len = slices.iter().try_fold(0usize, |len, &(start, end)| {
@@ -29,7 +32,7 @@ impl TakeSlicesExecute for Primitive {
             })?;
             let mut values = BufferMut::<T>::with_capacity(len);
 
-            for &(start, end) in slices {
+            for (start, end) in slices {
                 values.extend_from_slice(&source[start..end]);
             }
 

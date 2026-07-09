@@ -29,7 +29,7 @@ use crate::validity::Validity;
 /// Take implementation for [`FixedSizeListArray`].
 ///
 /// `FixedSizeListArray` must rebuild its elements array because selected lists need to become
-/// packed from offset 0. The FSL layer translates selected list rows into ordered element ranges
+/// packed from offset 0. The FSL layer translates selected list rows into ordered element runs
 /// and delegates the execution strategy to the elements child via `take_slices`.
 impl TakeExecute for FixedSizeList {
     fn take(
@@ -148,17 +148,18 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     let indices: &[I] = indices_array.as_slice::<I>();
     let new_len = indices.len();
     let expected_elements_len = take_elements_len(new_len, list_size)?;
-    let mut slices = Vec::with_capacity(new_len);
+    let mut starts = Vec::with_capacity(new_len);
 
     for &data_idx in indices {
         let data_idx = index_to_usize(data_idx)?;
-        slices.push(list_range(data_idx, list_size, array_len)?);
+        let start = list_start(data_idx, list_size, array_len)?;
+        starts.push(usize_to_u64(start, "FixedSizeList take element start")?);
     }
 
-    let new_elements = array.elements().take_slices(slices)?;
+    let new_elements = take_element_runs(array.elements(), starts, list_size)?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
-    // SAFETY: `slices` contains one checked range of `list_size` elements for each output row,
+    // SAFETY: `starts` contains one checked run of `list_size` elements for each output row,
     // `new_elements` has `new_len * list_size` elements, and non-nullable validity has no length.
     Ok(unsafe {
         FixedSizeListArray::new_unchecked(
@@ -187,30 +188,30 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         .execute_mask(array.as_ref().len(), ctx)?;
     let indices_validity = indices_validity_mask(&indices_array, ctx)?;
 
-    let null_elements = (0, list_size);
-    let mut slices = Vec::with_capacity(new_len);
+    let null_element_start = 0u64;
+    let mut starts = Vec::with_capacity(new_len);
     let mut new_validity_builder = BitBufferMut::with_capacity(new_len);
 
     for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
         if !is_index_valid {
-            slices.push(null_elements);
+            starts.push(null_element_start);
             new_validity_builder.append(false);
             continue;
         }
 
         let data_idx = index_to_usize(data_idx)?;
-        let range = list_range(data_idx, list_size, array_len)?;
+        let start = list_start(data_idx, list_size, array_len)?;
         if !array_validity.value(data_idx) {
-            slices.push(null_elements);
+            starts.push(null_element_start);
             new_validity_builder.append(false);
             continue;
         }
 
-        slices.push(range);
+        starts.push(usize_to_u64(start, "FixedSizeList take element start")?);
         new_validity_builder.append(true);
     }
 
-    let new_elements = array.elements().take_slices(slices)?;
+    let new_elements = take_element_runs(array.elements(), starts, list_size)?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
     let new_validity = Validity::from(new_validity_builder.freeze());
@@ -268,7 +269,7 @@ fn ensure_elements_len(actual: usize, expected: usize) -> VortexResult<()> {
     Ok(())
 }
 
-fn list_range(data_idx: usize, list_size: usize, array_len: usize) -> VortexResult<(usize, usize)> {
+fn list_start(data_idx: usize, list_size: usize, array_len: usize) -> VortexResult<usize> {
     check_index_in_bounds(data_idx, array_len)?;
 
     let start = data_idx.checked_mul(list_size).ok_or_else(|| {
@@ -276,12 +277,12 @@ fn list_range(data_idx: usize, list_size: usize, array_len: usize) -> VortexResu
             "FixedSizeList take element range overflow for index {data_idx} and list size {list_size}"
         )
     })?;
-    let end = start.checked_add(list_size).ok_or_else(|| {
+    start.checked_add(list_size).ok_or_else(|| {
         vortex_err!(
             "FixedSizeList take element range overflow for index {data_idx} and list size {list_size}"
         )
     })?;
-    Ok((start, end))
+    Ok(start)
 }
 
 fn check_index_in_bounds(data_idx: usize, array_len: usize) -> VortexResult<()> {
@@ -297,8 +298,25 @@ fn default_elements(array: ArrayView<'_, FixedSizeList>, len: usize) -> ArrayRef
     builder.finish()
 }
 
+fn take_element_runs(
+    elements: &ArrayRef,
+    starts: Vec<u64>,
+    length: usize,
+) -> VortexResult<ArrayRef> {
+    let run_count = starts.len();
+    let length = usize_to_u64(length, "FixedSizeList take element run length")?;
+    elements.take_slices(
+        PrimitiveArray::from_iter(starts).into_array(),
+        PrimitiveArray::from_iter(std::iter::repeat_n(length, run_count)).into_array(),
+    )
+}
+
 fn index_to_usize<I: IntegerPType>(index: I) -> VortexResult<usize> {
     index
         .to_usize()
         .ok_or_else(|| vortex_err!("FixedSizeList take index {index} does not fit in usize"))
+}
+
+fn usize_to_u64(value: usize, name: &str) -> VortexResult<u64> {
+    u64::try_from(value).map_err(|_| vortex_err!("{name} {value} does not fit in u64"))
 }

@@ -6,7 +6,6 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
@@ -14,7 +13,6 @@ use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::listview::ListViewArrayExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
-use crate::builders::builder_with_capacity;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::IntegerPType;
 use crate::dtype::Nullability;
@@ -140,55 +138,15 @@ impl ListViewArray {
         // for sizes as well.
         match_each_unsigned_integer_ptype!(sizes_ptype.to_unsigned(), |S| {
             match offsets_ptype.to_unsigned() {
-                PType::U8 => self.naive_rebuild::<u8, u32, S>(ctx),
-                PType::U16 => self.naive_rebuild::<u16, u32, S>(ctx),
-                PType::U32 => self.naive_rebuild::<u32, u32, S>(ctx),
-                PType::U64 => self.naive_rebuild::<u64, u64, S>(ctx),
+                PType::U8 | PType::U16 | PType::U32 => self.rebuild_with_take_slices::<u32, S>(ctx),
+                PType::U64 => self.rebuild_with_take_slices::<u64, S>(ctx),
                 _ => unreachable!("invalid offsets PType"),
             }
         })
     }
 
-    /// Picks between [`rebuild_with_take`](Self::rebuild_with_take) and
-    /// [`rebuild_list_by_list`](Self::rebuild_list_by_list) based on element dtype and average
-    /// list size.
-    fn naive_rebuild<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
-        &self,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ListViewArray> {
-        let sizes_canonical = self.sizes().clone().execute::<PrimitiveArray>(ctx)?;
-        let sizes_canonical =
-            sizes_canonical.reinterpret_cast(sizes_canonical.ptype().to_unsigned());
-        let total: u64 = sizes_canonical
-            .as_slice::<S>()
-            .iter()
-            .map(|s| (*s).as_() as u64)
-            .sum();
-        if Self::should_use_take(total, self.len()) {
-            self.rebuild_with_take::<O, NewOffset, S>(ctx)
-        } else {
-            self.rebuild_list_by_list::<O, NewOffset, S>(ctx)
-        }
-    }
-
-    /// Returns `true` when we are confident that `rebuild_with_take` will
-    /// outperform `rebuild_list_by_list`.
-    ///
-    /// Take is dramatically faster for small lists (often 10-100×) because it
-    /// avoids per-list builder overhead. LBL is the safer default for larger
-    /// lists since its sequential memcpy scales well. We only choose take when
-    /// the average list size is small enough that take clearly dominates.
-    fn should_use_take(total_output_elements: u64, num_lists: usize) -> bool {
-        if num_lists == 0 {
-            return true;
-        }
-        let avg = total_output_elements / num_lists as u64;
-        avg < 128
-    }
-
-    /// Rebuilds elements using a single bulk `take`: collect all element indices into a flat
-    /// `BufferMut<u64>`, perform a single `take`.
-    fn rebuild_with_take<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
+    /// Rebuilds elements using a single contiguous-run gather over the element child.
+    fn rebuild_with_take_slices<NewOffset: IntegerPType, S: IntegerPType>(
         &self,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ListViewArray> {
@@ -198,17 +156,15 @@ impl ListViewArray {
         let offsets_canonical = self.offsets().clone().execute::<PrimitiveArray>(ctx)?;
         let offsets_canonical =
             offsets_canonical.reinterpret_cast(offsets_canonical.ptype().to_unsigned());
-        let offsets_slice = offsets_canonical.as_slice::<O>();
         let sizes_canonical = self.sizes().clone().execute::<PrimitiveArray>(ctx)?;
         let sizes_canonical =
             sizes_canonical.reinterpret_cast(sizes_canonical.ptype().to_unsigned());
         let sizes_slice = sizes_canonical.as_slice::<S>();
 
-        let len = offsets_slice.len();
+        let len = offsets_canonical.len();
 
         let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
         let mut new_sizes = BufferMut::<S>::with_capacity(len);
-        let mut take_indices = BufferMut::<u64>::with_capacity(self.elements().len());
 
         // Resolve validity to a mask once instead of probing it per row: `execute_is_valid`
         // executes a scalar on every call for array-backed validity, which is O(len) work repeated
@@ -216,137 +172,35 @@ impl ListViewArray {
         let validity = self.validity()?.execute_mask(len, ctx)?;
 
         let mut n_elements = NewOffset::zero();
-        for index in 0..len {
-            if !validity.value(index) {
+        for (index, is_valid) in validity.iter().enumerate() {
+            if !is_valid {
                 new_offsets.push(n_elements);
                 new_sizes.push(S::zero());
                 continue;
             }
 
-            let offset = offsets_slice[index];
             let size = sizes_slice[index];
-            let start = offset.as_();
-            let stop = start + size.as_();
 
             new_offsets.push(n_elements);
             new_sizes.push(size);
-            take_indices.extend(start as u64..stop as u64);
             n_elements += num_traits::cast(size).vortex_expect("Cast failed");
         }
 
-        let elements = self.elements().take(take_indices.into_array())?;
-        // Built unsigned; reinterpret back to the signed-preserving result types.
-        let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
-            .reinterpret_cast(new_offset_ptype)
-            .into_array();
-        let sizes = PrimitiveArray::new(new_sizes.freeze(), Validity::NonNullable)
-            .reinterpret_cast(size_ptype)
-            .into_array();
-
-        // SAFETY: same invariants as `rebuild_list_by_list` — offsets are sequential and
-        // non-overlapping, all (offset, size) pairs reference valid elements, and the validity
-        // array is preserved from the original.
-        Ok(unsafe {
-            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity()?)
-                .with_zero_copy_to_list(true)
-        })
-    }
-
-    /// Rebuilds elements list-by-list: canonicalize elements upfront, then for each list `slice`
-    /// the relevant range and `append_to_builder` into a typed builder.
-    fn rebuild_list_by_list<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
-        &self,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ListViewArray> {
-        let element_dtype = self
-            .dtype()
-            .as_list_element_opt()
-            .vortex_expect("somehow had a canonical list that was not a list");
-
-        let new_offset_ptype = rebuilt_offset_ptype(self.offsets().dtype().as_ptype());
-        let size_ptype = self.sizes().dtype().as_ptype();
-
-        let offsets_canonical = self.offsets().clone().execute::<PrimitiveArray>(ctx)?;
-        let offsets_canonical =
-            offsets_canonical.reinterpret_cast(offsets_canonical.ptype().to_unsigned());
-        let offsets_slice = offsets_canonical.as_slice::<O>();
-        let sizes_canonical = self.sizes().clone().execute::<PrimitiveArray>(ctx)?;
-        let sizes_canonical =
-            sizes_canonical.reinterpret_cast(sizes_canonical.ptype().to_unsigned());
-        let sizes_slice = sizes_canonical.as_slice::<S>();
-
-        let len = offsets_slice.len();
-
-        let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
-        // TODO(connor)[ListView]: Do we really need to do this?
-        // The only reason we need to rebuild the sizes here is that the validity may indicate that
-        // a list is null even though it has a non-zero size. This rebuild will set the size of all
-        // null lists to 0.
-        let mut new_sizes = BufferMut::<S>::with_capacity(len);
-
-        // Canonicalize the elements up front as we will be slicing the elements quite a lot.
-        let elements_canonical = self
+        let new_sizes = new_sizes.freeze();
+        let lengths = PrimitiveArray::new(new_sizes.clone(), Validity::NonNullable);
+        let elements = self
             .elements()
-            .clone()
-            .execute::<Canonical>(ctx)?
-            .into_array();
-
-        // Note that we do not know what the exact capacity should be of the new elements since
-        // there could be overlaps in the existing `ListViewArray`.
-        let mut new_elements_builder =
-            builder_with_capacity(element_dtype.as_ref(), self.elements().len());
-
-        // Resolve validity to a mask once instead of probing it per row (see `rebuild_with_take`).
-        let validity = self.validity()?.execute_mask(len, ctx)?;
-
-        let mut n_elements = NewOffset::zero();
-        for index in 0..len {
-            if !validity.value(index) {
-                // For NULL lists, place them after the previous item's data to maintain the
-                // no-overlap invariant for zero-copy to `ListArray` arrays.
-                new_offsets.push(n_elements);
-                new_sizes.push(S::zero());
-                continue;
-            }
-
-            let offset = offsets_slice[index];
-            let size = sizes_slice[index];
-
-            let start = offset.as_();
-            let stop = start + size.as_();
-
-            new_offsets.push(n_elements);
-            new_sizes.push(size);
-            elements_canonical
-                .slice(start..stop)?
-                .append_to_builder(new_elements_builder.as_mut(), ctx)?;
-
-            n_elements += num_traits::cast(size).vortex_expect("Cast failed");
-        }
-
+            .take_slices(offsets_canonical.into_array(), lengths.into_array())?;
         // Built unsigned; reinterpret back to the signed-preserving result types.
         let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
             .reinterpret_cast(new_offset_ptype)
             .into_array();
-        let sizes = PrimitiveArray::new(new_sizes.freeze(), Validity::NonNullable)
+        let sizes = PrimitiveArray::new(new_sizes, Validity::NonNullable)
             .reinterpret_cast(size_ptype)
             .into_array();
-        let elements = new_elements_builder.finish();
 
-        debug_assert_eq!(
-            n_elements.as_(),
-            elements.len(),
-            "The accumulated elements somehow had the wrong length"
-        );
-
-        // SAFETY:
-        // - All offsets are sequential and non-overlapping (`n_elements` tracks running total).
-        // - Each `offset[i] + size[i]` equals `offset[i+1]` for all valid indices (including null
-        //   lists).
-        // - All elements referenced by (offset, size) pairs exist within the new `elements` array.
-        // - The validity array is preserved from the original array unchanged
-        // - The array satisfies the zero-copy-to-list property by having sorted offsets, no gaps,
-        //   and no overlaps.
+        // SAFETY: offsets are sequential and non-overlapping, all (offset, size) pairs reference
+        // valid elements, and the validity array is preserved from the original.
         Ok(unsafe {
             ListViewArray::new_unchecked(elements, offsets, sizes, self.validity()?)
                 .with_zero_copy_to_list(true)
@@ -593,7 +447,7 @@ mod tests {
         assert_eq!(rebuilt.size_at(2), 0); // NULL has size 0
         assert_eq!(rebuilt.size_at(3), 0); // NULL has size 0
 
-        // Now rebuild with MakeExact (which calls naive_rebuild then trim_elements)
+        // Now rebuild with MakeExact; this should keep using the zero-copy-to-list fast path.
         // This should not panic (issue #5412)
         let exact = rebuilt.rebuild(ListViewRebuildMode::MakeExact, &mut ctx)?;
 
@@ -695,21 +549,6 @@ mod tests {
         assert_eq!(rebuilt.offsets().dtype().as_ptype(), PType::I32);
         assert_eq!(rebuilt.sizes().dtype().as_ptype(), PType::I16);
         Ok(())
-    }
-
-    // ── should_use_take heuristic tests ────────────────────────────────────
-
-    #[test]
-    fn heuristic_zero_lists_uses_take() {
-        assert!(ListViewArray::should_use_take(0, 0));
-    }
-
-    #[test]
-    fn heuristic_small_lists_use_take() {
-        // avg = 127 → take
-        assert!(ListViewArray::should_use_take(127_000, 1_000));
-        // avg = 128 → LBL
-        assert!(!ListViewArray::should_use_take(128_000, 1_000));
     }
 
     /// Regression test for <https://github.com/vortex-data/vortex/issues/6973>.

@@ -266,9 +266,12 @@ impl ArrayRef {
     }
 
     /// Wraps the array in a [`TakeSlicesArray`] such that it is logically selected by a
-    /// caller-provided sequence of child ranges.
-    pub fn take_slices(&self, slices: Vec<(usize, usize)>) -> VortexResult<ArrayRef> {
-        TakeSlicesArray::try_new(self.clone(), slices)?
+    /// caller-provided sequence of child runs.
+    ///
+    /// The output is the concatenation of `self[starts[i]..starts[i] + lengths[i]]` for each
+    /// selector row.
+    pub fn take_slices(&self, starts: ArrayRef, lengths: ArrayRef) -> VortexResult<ArrayRef> {
+        TakeSlicesArray::try_new(self.clone(), starts, lengths)?
             .into_array()
             .optimize()
     }

@@ -2,16 +2,20 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
+use super::legacy_execution_ctx;
 use super::trivial_take_slices;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::array::ArrayView;
+use crate::arrays::PrimitiveArray;
 use crate::arrays::TakeSlices;
 use crate::arrays::TakeSlicesArray;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
 use crate::arrays::take_slices::TakeSlicesReduce;
 use crate::arrays::take_slices::TakeSlicesReduceAdaptor;
+use crate::arrays::take_slices::selector_slices;
 use crate::optimizer::rules::ArrayReduceRule;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::optimizer::rules::ReduceRuleSet;
@@ -26,18 +30,28 @@ struct TrivialTakeSlicesRule;
 
 impl ArrayReduceRule<TakeSlices> for TrivialTakeSlicesRule {
     fn reduce(&self, array: ArrayView<'_, TakeSlices>) -> VortexResult<Option<ArrayRef>> {
-        trivial_take_slices(array.child(), array.slices())
+        trivial_take_slices(array.child(), array.starts(), array.lengths())
     }
 }
 
 impl TakeSlicesReduce for TakeSlices {
     fn take_slices(
         array: ArrayView<'_, Self>,
-        slices: &[(usize, usize)],
+        starts: &ArrayRef,
+        lengths: &ArrayRef,
     ) -> VortexResult<Option<ArrayRef>> {
-        let combined = project_slices(array.slices(), slices);
+        let mut ctx = legacy_execution_ctx();
+        let inner = selector_slices(
+            array.child().len(),
+            array.starts(),
+            array.lengths(),
+            &mut ctx,
+        )?;
+        let outer = selector_slices(array.len(), starts, lengths, &mut ctx)?;
+        let combined = project_slices(&inner, &outer);
+        let (starts, lengths) = selectors_from_slices(&combined)?;
         Ok(Some(
-            TakeSlicesArray::try_new(array.child().clone(), combined)?.into_array(),
+            TakeSlicesArray::try_new(array.child().clone(), starts, lengths)?.into_array(),
         ))
     }
 }
@@ -68,4 +82,24 @@ fn project_slices(inner: &[(usize, usize)], outer: &[(usize, usize)]) -> Vec<(us
     }
 
     projected
+}
+
+fn selectors_from_slices(slices: &[(usize, usize)]) -> VortexResult<(ArrayRef, ArrayRef)> {
+    let starts = slices
+        .iter()
+        .map(|&(start, _)| selector_value(start, "start"))
+        .collect::<VortexResult<Vec<_>>>()?;
+    let lengths = slices
+        .iter()
+        .map(|&(start, end)| selector_value(end - start, "length"))
+        .collect::<VortexResult<Vec<_>>>()?;
+    Ok((
+        PrimitiveArray::from_iter(starts).into_array(),
+        PrimitiveArray::from_iter(lengths).into_array(),
+    ))
+}
+
+fn selector_value(value: usize, name: &str) -> VortexResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| vortex_err!("TakeSlicesArray projected {name} {value} does not fit in u64"))
 }
