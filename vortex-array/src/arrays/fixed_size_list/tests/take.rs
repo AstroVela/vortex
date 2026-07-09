@@ -237,6 +237,22 @@ fn test_take_fsl_with_null_indices_preserves_elements() {
     assert_arrays_eq!(expected, result, &mut ctx);
 }
 
+#[test]
+fn test_take_non_nullable_fsl_nullable_indices_makes_nullable_output() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = buffer![1i32, 2, 3, 4, 5, 6].into_array();
+    let fsl = FixedSizeListArray::new(elements.into_array(), 2, Validity::NonNullable, 3);
+
+    let indices = PrimitiveArray::from_option_iter([Some(2u32), None, Some(0)]);
+    let result = fsl.take(indices.into_array())?;
+
+    assert_eq!(result.dtype().nullability(), Nullability::Nullable);
+    assert!(!result.execute_scalar(0, &mut ctx)?.is_null());
+    assert!(result.execute_scalar(1, &mut ctx)?.is_null());
+    assert!(!result.execute_scalar(2, &mut ctx)?.is_null());
+    Ok(())
+}
+
 // List offsets must not truncate when small index types select large lists.
 #[rstest]
 #[case::non_nullable(
