@@ -12,6 +12,12 @@ path = "vortex-btrblocks/decision-tree.*"
 SPDX-FileCopyrightText = "Copyright the Vortex contributors"
 SPDX-License-Identifier = "CC-BY-4.0"
 
+# Research notes are licensed under CC-BY-4.0.
+[[annotations]]
+path = "research/**"
+SPDX-FileCopyrightText = "Copyright the Vortex contributors"
+SPDX-License-Identifier = "CC-BY-4.0"
+
 [[annotations]]
 path = "benchmarks-website/**"
 SPDX-FileCopyrightText = "Copyright the Vortex contributors"
