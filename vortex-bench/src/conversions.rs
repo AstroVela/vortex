@@ -43,6 +43,7 @@ use vortex::dtype::extension::ExtDType;
 use vortex::dtype::extension::ExtDTypeRef;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
+use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
@@ -65,6 +66,7 @@ use crate::CompactionStrategy;
 use crate::Format;
 use crate::SESSION;
 use crate::utils::file::idempotent_async;
+use crate::utils::file::temp_download_filepath;
 
 /// Memory budget per concurrent conversion stream in GB. This is somewhat arbitary.
 const MEMORY_PER_STREAM_GB: u64 = 4;
@@ -167,6 +169,84 @@ pub async fn convert_parquet_file_to_vortex(
     Ok(())
 }
 
+async fn parquet_file_row_count(parquet_path: &Path) -> anyhow::Result<u64> {
+    let file = File::open(parquet_path).await?;
+    let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
+    let row_count = builder.metadata().file_metadata().num_rows();
+    u64::try_from(row_count)
+        .map_err(|_| anyhow::anyhow!("Parquet file has a negative row count: {parquet_path:?}"))
+}
+
+async fn vortex_file_row_count(vortex_path: &Path) -> anyhow::Result<u64> {
+    Ok(SESSION
+        .open_options()
+        .open_path(vortex_path)
+        .await?
+        .row_count())
+}
+
+async fn existing_vortex_file_is_current(
+    parquet_path: &Path,
+    vortex_path: &Path,
+) -> anyhow::Result<bool> {
+    if !vortex_path.exists() {
+        return Ok(false);
+    }
+
+    let expected_row_count = parquet_file_row_count(parquet_path).await?;
+    match vortex_file_row_count(vortex_path).await {
+        Ok(actual_row_count) if actual_row_count == expected_row_count => Ok(true),
+        Ok(actual_row_count) => {
+            info!(
+                parquet_path = %parquet_path.display(),
+                vortex_path = %vortex_path.display(),
+                expected_row_count,
+                actual_row_count,
+                "Regenerating Vortex file with stale row count"
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            info!(
+                parquet_path = %parquet_path.display(),
+                vortex_path = %vortex_path.display(),
+                %error,
+                "Regenerating unreadable Vortex file"
+            );
+            Ok(false)
+        }
+    }
+}
+
+async fn convert_parquet_file_to_current_vortex(
+    parquet_path: &Path,
+    output_path: &Path,
+    compaction: CompactionStrategy,
+) -> anyhow::Result<PathBuf> {
+    if existing_vortex_file_is_current(parquet_path, output_path).await? {
+        return Ok(output_path.to_path_buf());
+    }
+
+    if let Some(parent) = output_path.parent() {
+        create_dir_all(parent).await?;
+    }
+
+    let temp_path = temp_download_filepath();
+    info!(
+        parquet_path = %parquet_path.display(),
+        vortex_path = %output_path.display(),
+        ?compaction,
+        "Processing Parquet file as Vortex"
+    );
+    convert_parquet_file_to_vortex(parquet_path, &temp_path, compaction).await?;
+    if output_path.exists() {
+        tokio::fs::remove_file(output_path).await?;
+    }
+    tokio::fs::rename(&temp_path, output_path).await?;
+
+    Ok(output_path.to_path_buf())
+}
+
 /// Whether `path` points at SpatialBench data.
 fn is_spatialbench(path: &Path) -> bool {
     path.components()
@@ -221,7 +301,8 @@ fn no_dict_layout() -> Arc<dyn LayoutStrategy> {
 /// `{input_path}/vortex-file-compressed/` (for Default compaction) or
 /// `{input_path}/vortex-compact/` (for Compact compaction).
 ///
-/// The conversion is idempotent: existing Vortex files will not be regenerated.
+/// Existing Vortex files are reused when their footer row count matches the source Parquet file.
+/// Unreadable or stale Vortex files are regenerated.
 pub async fn convert_parquet_directory_to_vortex(
     input_path: &Path,
     compaction: CompactionStrategy,
@@ -247,7 +328,7 @@ pub async fn convert_parquet_directory_to_vortex(
         .filter(|entry| entry.path().extension().is_some_and(|e| e == "parquet"));
 
     let concurrency = calculate_concurrency();
-    futures::stream::iter(iter)
+    let conversion_results = futures::stream::iter(iter)
         .map(|dir_entry| {
             let filename = {
                 let mut temp = dir_entry.path();
@@ -259,16 +340,12 @@ pub async fn convert_parquet_directory_to_vortex(
 
             tokio::spawn(
                 async move {
-                    idempotent_async(output_path.as_path(), move |vtx_file| async move {
-                        info!(
-                            "Processing file '{filename}' with {:?} strategy",
-                            compaction
-                        );
-                        convert_parquet_file_to_vortex(&parquet_file_path, &vtx_file, compaction)
-                            .await
-                    })
+                    convert_parquet_file_to_current_vortex(
+                        &parquet_file_path,
+                        &output_path,
+                        compaction,
+                    )
                     .await
-                    .expect("Failed to write Vortex file")
                 }
                 .in_current_span(),
             )
@@ -276,6 +353,9 @@ pub async fn convert_parquet_directory_to_vortex(
         .buffer_unordered(concurrency)
         .try_collect::<Vec<_>>()
         .await?;
+    for result in conversion_results {
+        result?;
+    }
 
     Ok(())
 }
