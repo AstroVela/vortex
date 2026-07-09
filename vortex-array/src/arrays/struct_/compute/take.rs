@@ -59,14 +59,11 @@ impl TakeSlicesReduce for Struct {
         starts: &ArrayRef,
         lengths: &ArrayRef,
     ) -> VortexResult<Option<ArrayRef>> {
+        let len = selector_output_len(array.len(), starts, lengths)?;
         let fields = array
             .iter_unmasked_fields()
             .map(|field| field.take_slices(starts.clone(), lengths.clone()))
             .collect::<VortexResult<Vec<_>>>()?;
-        let len = fields.first().map_or_else(
-            || selector_output_len(array.len(), starts, lengths),
-            |f| Ok(f.len()),
-        )?;
 
         StructArray::try_new_with_dtype(
             fields,

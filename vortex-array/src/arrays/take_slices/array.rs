@@ -9,11 +9,13 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
 use crate::arrays::TakeSlices;
 use crate::arrays::take_slices::selector_output_len;
+use crate::arrays::take_slices::selector_output_len_with_ctx;
 
 /// The child array selected by the run sequence.
 pub(super) const CHILD_SLOT: usize = 0;
@@ -79,14 +81,32 @@ impl TakeSlicesData {
 
 impl Array<TakeSlices> {
     /// Constructs a new validated `TakeSlicesArray`.
+    ///
+    /// Prefer [`Self::try_new_with_ctx`] when the caller already has an execution context.
     pub fn try_new(child: ArrayRef, starts: ArrayRef, lengths: ArrayRef) -> VortexResult<Self> {
-        let dtype = child.dtype().clone();
         let len = selector_output_len(child.len(), &starts, &lengths)?;
+        Ok(Self::new_validated(child, starts, lengths, len))
+    }
+
+    /// Constructs a new validated `TakeSlicesArray` using the caller's execution context to
+    /// validate selector arrays and compute the output length.
+    pub fn try_new_with_ctx(
+        child: ArrayRef,
+        starts: ArrayRef,
+        lengths: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self> {
+        let len = selector_output_len_with_ctx(child.len(), &starts, &lengths, ctx)?;
+        Ok(Self::new_validated(child, starts, lengths, len))
+    }
+
+    fn new_validated(child: ArrayRef, starts: ArrayRef, lengths: ArrayRef, len: usize) -> Self {
+        let dtype = child.dtype().clone();
         let data = TakeSlicesData::new(len);
 
         // SAFETY: `selector_output_len` validates selector dtypes, run bounds, and computes `len`;
         // the outer dtype is copied from the child, and all required slots are populated.
-        Ok(unsafe {
+        unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(TakeSlices, dtype, len, data).with_slots(smallvec![
                     Some(child),
@@ -94,6 +114,6 @@ impl Array<TakeSlices> {
                     Some(lengths)
                 ]),
             )
-        })
+        }
     }
 }

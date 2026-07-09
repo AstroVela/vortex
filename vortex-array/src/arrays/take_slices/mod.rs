@@ -86,8 +86,8 @@ fn trivial_take_slices_with_ctx(
     lengths: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
-    let slices = selector_slices(child.len(), starts, lengths, ctx)?;
-    trivial_take_slices_from_ranges(child, &slices)
+    let selectors = RunSelectors::new(child.len(), starts, lengths, ctx)?;
+    trivial_take_slices_from_ranges(child, selectors.slices())
 }
 
 fn trivial_take_slices_from_ranges(
@@ -114,11 +114,16 @@ pub(super) fn selector_output_len(
     lengths: &ArrayRef,
 ) -> VortexResult<usize> {
     let mut ctx = legacy_execution_ctx();
-    let slices = selector_slices(child_len, starts, lengths, &mut ctx)?;
-    slices.iter().try_fold(0usize, |len, &(start, end)| {
-        len.checked_add(end - start)
-            .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))
-    })
+    selector_output_len_with_ctx(child_len, starts, lengths, &mut ctx)
+}
+
+pub(super) fn selector_output_len_with_ctx(
+    child_len: usize,
+    starts: &ArrayRef,
+    lengths: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<usize> {
+    Ok(RunSelectors::new(child_len, starts, lengths, ctx)?.output_len())
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -126,16 +131,75 @@ fn legacy_execution_ctx() -> ExecutionCtx {
     legacy_session().create_execution_ctx()
 }
 
-pub(super) fn selector_slices(
+#[derive(Debug)]
+pub(super) struct RunSelectors {
+    slices: Vec<(usize, usize)>,
+    output_len: usize,
+}
+
+impl RunSelectors {
+    pub(super) fn new(
+        child_len: usize,
+        starts: &ArrayRef,
+        lengths: &ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self> {
+        check_selector_arrays(starts, lengths)?;
+        let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
+        let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
+        primitive_run_selectors(child_len, starts.as_view(), lengths.as_view())
+    }
+
+    pub(super) fn slices(&self) -> &[(usize, usize)] {
+        &self.slices
+    }
+
+    pub(super) fn output_len(&self) -> usize {
+        self.output_len
+    }
+}
+
+fn run_selectors_from_slices<S: IntegerPType, L: IntegerPType>(
     child_len: usize,
-    starts: &ArrayRef,
-    lengths: &ArrayRef,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<Vec<(usize, usize)>> {
-    check_selector_arrays(starts, lengths)?;
-    let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
-    let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
-    primitive_selector_slices(child_len, starts.as_view(), lengths.as_view())
+    starts: &[S],
+    lengths: &[L],
+) -> VortexResult<RunSelectors> {
+    let mut slices = Vec::with_capacity(starts.len());
+    let mut output_len = 0usize;
+    for (&start, &length) in starts.iter().zip(lengths) {
+        let start = selector_to_usize("start", start)?;
+        let length = selector_to_usize("length", length)?;
+        let end = start.checked_add(length).ok_or_else(|| {
+            vortex_err!("TakeSlicesArray run overflow for start {start} and length {length}")
+        })?;
+        vortex_ensure!(
+            end <= child_len,
+            "TakeSlicesArray run {start}..{end} exceeds child array length {child_len}"
+        );
+        if length != 0 {
+            output_len = output_len
+                .checked_add(length)
+                .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
+            slices.push((start, end));
+        }
+    }
+    Ok(RunSelectors { slices, output_len })
+}
+
+fn primitive_run_selectors(
+    child_len: usize,
+    starts: ArrayView<'_, Primitive>,
+    lengths: ArrayView<'_, Primitive>,
+) -> VortexResult<RunSelectors> {
+    match_each_unsigned_integer_ptype!(starts.ptype(), |S| {
+        match_each_unsigned_integer_ptype!(lengths.ptype(), |L| {
+            run_selectors_from_slices::<S, L>(
+                child_len,
+                starts.as_slice::<S>(),
+                lengths.as_slice::<L>(),
+            )
+        })
+    })
 }
 
 pub(super) fn check_selector_arrays(starts: &ArrayRef, lengths: &ArrayRef) -> VortexResult<()> {
@@ -164,45 +228,6 @@ fn check_selector_dtype(name: &str, selector: &ArrayRef) -> VortexResult<()> {
             "TakeSlicesArray {name} must be a non-nullable unsigned integer, got {other}"
         ),
     }
-}
-
-fn primitive_selector_slices(
-    child_len: usize,
-    starts: ArrayView<'_, Primitive>,
-    lengths: ArrayView<'_, Primitive>,
-) -> VortexResult<Vec<(usize, usize)>> {
-    match_each_unsigned_integer_ptype!(starts.ptype(), |S| {
-        match_each_unsigned_integer_ptype!(lengths.ptype(), |L| {
-            selector_slices_typed::<S, L>(
-                child_len,
-                starts.as_slice::<S>(),
-                lengths.as_slice::<L>(),
-            )
-        })
-    })
-}
-
-fn selector_slices_typed<S: IntegerPType, L: IntegerPType>(
-    child_len: usize,
-    starts: &[S],
-    lengths: &[L],
-) -> VortexResult<Vec<(usize, usize)>> {
-    let mut slices = Vec::with_capacity(starts.len());
-    for (&start, &length) in starts.iter().zip(lengths) {
-        let start = selector_to_usize("start", start)?;
-        let length = selector_to_usize("length", length)?;
-        let end = start.checked_add(length).ok_or_else(|| {
-            vortex_err!("TakeSlicesArray run overflow for start {start} and length {length}")
-        })?;
-        vortex_ensure!(
-            end <= child_len,
-            "TakeSlicesArray run {start}..{end} exceeds child array length {child_len}"
-        );
-        if length != 0 {
-            slices.push((start, end));
-        }
-    }
-    Ok(slices)
 }
 
 fn selector_to_usize<T: IntegerPType>(name: &str, value: T) -> VortexResult<usize> {

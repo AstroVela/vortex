@@ -24,6 +24,7 @@ use crate::array::OperationsVTable;
 use crate::array::VTable;
 use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
+use crate::arrays::take_slices::RunSelectors;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
 use crate::arrays::take_slices::array::CHILD_SLOT;
 use crate::arrays::take_slices::array::LENGTHS_SLOT;
@@ -34,7 +35,6 @@ use crate::arrays::take_slices::array::TakeSlicesData;
 use crate::arrays::take_slices::rules::PARENT_RULES;
 use crate::arrays::take_slices::rules::RULES;
 use crate::arrays::take_slices::selector_output_len;
-use crate::arrays::take_slices::selector_slices;
 use crate::buffer::BufferHandle;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
@@ -48,6 +48,9 @@ use crate::validity::Validity;
 pub type TakeSlicesArray = Array<TakeSlices>;
 
 /// Contiguous-run gather selection encoding.
+///
+/// Like [`crate::arrays::Slice`], this is a lazy compute encoding and is not serialized as a file
+/// encoding.
 #[derive(Clone, Debug)]
 pub struct TakeSlices;
 
@@ -173,8 +176,9 @@ impl VTable for TakeSlices {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let mut builder = builder_with_capacity_in(ctx.allocator(), array.dtype(), array.len());
-        let slices = selector_slices(array.child().len(), array.starts(), array.lengths(), ctx)?;
-        for (start, end) in slices {
+        let selectors =
+            RunSelectors::new(array.child().len(), array.starts(), array.lengths(), ctx)?;
+        for &(start, end) in selectors.slices() {
             let slice = array.child().slice(start..end)?;
             slice.append_to_builder(builder.as_mut(), ctx)?;
         }
@@ -200,9 +204,10 @@ impl OperationsVTable<TakeSlices> for TakeSlices {
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        let slices = selector_slices(array.child().len(), array.starts(), array.lengths(), ctx)?;
+        let selectors =
+            RunSelectors::new(array.child().len(), array.starts(), array.lengths(), ctx)?;
         let mut logical_start = 0usize;
-        for (start, end) in slices {
+        for &(start, end) in selectors.slices() {
             let len = end - start;
             let logical_end = logical_start + len;
             if index < logical_end {

@@ -3,15 +3,14 @@
 
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
-use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::array::ArrayView;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::take_slices::RunSelectors;
 use crate::arrays::take_slices::TakeSlicesExecute;
-use crate::arrays::take_slices::selector_slices;
 use crate::executor::ExecutionCtx;
 use crate::match_each_native_ptype;
 
@@ -22,17 +21,16 @@ impl TakeSlicesExecute for Primitive {
         lengths: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let slices = selector_slices(array.len(), starts, lengths, ctx)?;
-        let validity = array.validity()?.take_slices(starts, lengths)?;
+        let selectors = RunSelectors::new(array.len(), starts, lengths, ctx)?;
+        let validity = array
+            .validity()?
+            .take_slices_with_ctx(starts, lengths, ctx)?;
         match_each_native_ptype!(array.ptype(), |T| {
             let source = array.as_slice::<T>();
-            let len = slices.iter().try_fold(0usize, |len, &(start, end)| {
-                len.checked_add(end - start)
-                    .ok_or_else(|| vortex_err!("TakeSlices output length overflow"))
-            })?;
+            let len = selectors.output_len();
             let mut values = BufferMut::<T>::with_capacity(len);
 
-            for (start, end) in slices {
+            for &(start, end) in selectors.slices() {
                 values.extend_from_slice(&source[start..end]);
             }
 

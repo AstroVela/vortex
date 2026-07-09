@@ -136,13 +136,14 @@ fn take_non_empty_non_degenerate_fsl<I: IntegerPType>(
     if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
         take_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
     } else {
-        take_non_nullable_non_empty_fsl::<I>(array, indices_array)
+        take_non_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
     }
 }
 
 fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let list_size = array.list_size() as usize;
     let array_len = array.as_ref().len();
@@ -157,7 +158,7 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
         starts.push(usize_to_u64(start, "FixedSizeList take element start")?);
     }
 
-    let new_elements = take_element_runs(array.elements(), starts, list_size)?;
+    let new_elements = take_element_runs(array.elements(), starts, list_size, ctx)?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
     // SAFETY: `starts` contains one checked run of `list_size` elements for each output row,
@@ -189,13 +190,12 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         .execute_mask(array.as_ref().len(), ctx)?;
     let indices_validity = indices_validity_mask(&indices_array, ctx)?;
 
-    let null_element_start = 0u64;
     let mut starts = Vec::with_capacity(new_len);
     let mut new_validity_builder = BitBufferMut::with_capacity(new_len);
 
     for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
         if !is_index_valid {
-            starts.push(null_element_start);
+            starts.push(null_element_run_start());
             new_validity_builder.append(false);
             continue;
         }
@@ -203,7 +203,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         let data_idx = index_to_usize(data_idx)?;
         let start = list_start(data_idx, list_size, array_len)?;
         if !array_validity.value(data_idx) {
-            starts.push(null_element_start);
+            starts.push(null_element_run_start());
             new_validity_builder.append(false);
             continue;
         }
@@ -212,7 +212,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         new_validity_builder.append(true);
     }
 
-    let new_elements = take_element_runs(array.elements(), starts, list_size)?;
+    let new_elements = take_element_runs(array.elements(), starts, list_size, ctx)?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
     let new_validity = Validity::from(new_validity_builder.freeze());
@@ -303,13 +303,21 @@ fn take_element_runs(
     elements: &ArrayRef,
     starts: Vec<u64>,
     length: usize,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let run_count = starts.len();
     let length = usize_to_u64(length, "FixedSizeList take element run length")?;
-    elements.take_slices(
+    elements.take_slices_with_ctx(
         PrimitiveArray::from_iter(starts).into_array(),
         PrimitiveArray::from_iter(std::iter::repeat_n(length, run_count)).into_array(),
+        ctx,
     )
+}
+
+fn null_element_run_start() -> u64 {
+    // Null output rows still need placeholder child elements so the FSL elements length stays
+    // `rows * list_size`. Any in-bounds run is fine because row validity hides these elements.
+    0
 }
 
 fn index_to_usize<I: IntegerPType>(index: I) -> VortexResult<usize> {

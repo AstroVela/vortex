@@ -12,10 +12,10 @@ use crate::array::ArrayView;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::TakeSlices;
 use crate::arrays::TakeSlicesArray;
+use crate::arrays::take_slices::RunSelectors;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
 use crate::arrays::take_slices::TakeSlicesReduce;
 use crate::arrays::take_slices::TakeSlicesReduceAdaptor;
-use crate::arrays::take_slices::selector_slices;
 use crate::optimizer::rules::ArrayReduceRule;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::optimizer::rules::ReduceRuleSet;
@@ -41,17 +41,18 @@ impl TakeSlicesReduce for TakeSlices {
         lengths: &ArrayRef,
     ) -> VortexResult<Option<ArrayRef>> {
         let mut ctx = legacy_execution_ctx();
-        let inner = selector_slices(
+        let inner = RunSelectors::new(
             array.child().len(),
             array.starts(),
             array.lengths(),
             &mut ctx,
         )?;
-        let outer = selector_slices(array.len(), starts, lengths, &mut ctx)?;
-        let combined = project_slices(&inner, &outer);
+        let outer = RunSelectors::new(array.len(), starts, lengths, &mut ctx)?;
+        let combined = project_slices(inner.slices(), outer.slices());
         let (starts, lengths) = selectors_from_slices(&combined)?;
         Ok(Some(
-            TakeSlicesArray::try_new(array.child().clone(), starts, lengths)?.into_array(),
+            TakeSlicesArray::try_new_with_ctx(array.child().clone(), starts, lengths, &mut ctx)?
+                .into_array(),
         ))
     }
 }

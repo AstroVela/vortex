@@ -146,6 +146,9 @@ impl ListViewArray {
     }
 
     /// Rebuilds elements using a single contiguous-run gather over the element child.
+    ///
+    /// `take_slices` is the rebuild primitive for ListView packing. Children with specialized
+    /// kernels can preserve their representation; other children fall back to generic execution.
     fn rebuild_with_take_slices<NewOffset: IntegerPType, S: IntegerPType>(
         &self,
         ctx: &mut ExecutionCtx,
@@ -189,9 +192,11 @@ impl ListViewArray {
 
         let new_sizes = new_sizes.freeze();
         let lengths = PrimitiveArray::new(new_sizes.clone(), Validity::NonNullable);
-        let elements = self
-            .elements()
-            .take_slices(offsets_canonical.into_array(), lengths.into_array())?;
+        let elements = self.elements().take_slices_with_ctx(
+            offsets_canonical.into_array(),
+            lengths.into_array(),
+            ctx,
+        )?;
         // Built unsigned; reinterpret back to the signed-preserving result types.
         let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
             .reinterpret_cast(new_offset_ptype)

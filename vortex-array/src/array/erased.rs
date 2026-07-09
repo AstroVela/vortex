@@ -270,8 +270,23 @@ impl ArrayRef {
     ///
     /// The output is the concatenation of `self[starts[i]..starts[i] + lengths[i]]` for each
     /// selector row.
+    ///
+    /// Prefer [`Self::take_slices_with_ctx`] when the caller already has an execution context.
     pub fn take_slices(&self, starts: ArrayRef, lengths: ArrayRef) -> VortexResult<ArrayRef> {
         TakeSlicesArray::try_new(self.clone(), starts, lengths)?
+            .into_array()
+            .optimize()
+    }
+
+    /// Wraps the array in a [`TakeSlicesArray`] using the caller's execution context to validate
+    /// selector arrays and compute the output length.
+    pub fn take_slices_with_ctx(
+        &self,
+        starts: ArrayRef,
+        lengths: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        TakeSlicesArray::try_new_with_ctx(self.clone(), starts, lengths, ctx)?
             .into_array()
             .optimize()
     }

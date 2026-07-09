@@ -185,7 +185,7 @@ async fn vortex_file_row_count(vortex_path: &Path) -> anyhow::Result<u64> {
         .row_count())
 }
 
-async fn existing_vortex_file_is_current(
+async fn existing_vortex_file_has_matching_row_count(
     parquet_path: &Path,
     vortex_path: &Path,
 ) -> anyhow::Result<bool> {
@@ -223,7 +223,7 @@ async fn convert_parquet_file_to_current_vortex(
     output_path: &Path,
     compaction: CompactionStrategy,
 ) -> anyhow::Result<PathBuf> {
-    if existing_vortex_file_is_current(parquet_path, output_path).await? {
+    if existing_vortex_file_has_matching_row_count(parquet_path, output_path).await? {
         return Ok(output_path.to_path_buf());
     }
 
