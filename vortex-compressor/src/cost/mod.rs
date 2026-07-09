@@ -39,6 +39,7 @@ mod size;
 
 use std::fmt::Debug;
 
+pub use size::SchemePrior;
 pub use size::SizeCost;
 
 pub use crate::candidate::Candidate;

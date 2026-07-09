@@ -116,7 +116,7 @@ impl CascadingCompressor {
         Self {
             schemes,
             root_exclusions,
-            cost_model: Arc::new(SizeCost),
+            cost_model: Arc::new(SizeCost::default()),
         }
     }
 
@@ -1467,11 +1467,11 @@ mod tests {
 
     impl CostModel for PruneAllDeferredModel {
         fn cost(&self, candidate: &Candidate) -> Option<Cost> {
-            SizeCost.cost(candidate)
+            SizeCost::default().cost(candidate)
         }
 
         fn canonical_cost(&self, data: &ArrayAndStats, n_values: u64) -> Cost {
-            SizeCost.canonical_cost(data, n_values)
+            SizeCost::default().canonical_cost(data, n_values)
         }
 
         fn lower_bound(&self, _scheme: SchemeId, _data: &ArrayAndStats) -> Option<Cost> {
