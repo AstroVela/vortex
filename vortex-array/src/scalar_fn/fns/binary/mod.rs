@@ -118,7 +118,7 @@ impl ScalarFnVTable for Binary {
         let rhs = &arg_dtypes[1];
 
         if operator.is_arithmetic() {
-            if lhs.is_primitive() && lhs.eq_ignore_nullability(rhs) {
+            if (lhs.is_primitive() || lhs.is_decimal()) && lhs.eq_ignore_nullability(rhs) {
                 return Ok(lhs.with_nullability(lhs.nullability() | rhs.nullability()));
             }
             vortex_bail!(

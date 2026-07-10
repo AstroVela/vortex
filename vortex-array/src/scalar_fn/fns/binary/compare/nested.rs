@@ -151,8 +151,8 @@ fn build_values_comparator(
             let rhs = rhs.clone().execute::<DecimalArray>(ctx)?;
             let common = lhs.values_type().max(rhs.values_type());
             crate::match_each_decimal_value_type!(common, |W| {
-                let lhs = super::decimal::widened_buffer::<W>(&lhs);
-                let rhs = super::decimal::widened_buffer::<W>(&rhs);
+                let lhs = crate::arrays::decimal::widened_buffer::<W>(&lhs);
+                let rhs = crate::arrays::decimal::widened_buffer::<W>(&rhs);
                 Box::new(move |i: usize, j: usize| lhs[i].cmp(&rhs[j])) as RowComparator
             })
         }
