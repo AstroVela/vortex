@@ -115,7 +115,7 @@ impl AggregateFnVTable for Count {
         unreachable!("Count::try_accumulate handles all arrays")
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(&self, partials: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 

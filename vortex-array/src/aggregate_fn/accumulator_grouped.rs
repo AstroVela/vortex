@@ -238,7 +238,7 @@ pub trait DynGroupedAccumulator: 'static + Send {
 
     /// Finish the accumulation and return the final aggregate results for all groups.
     /// Resets the accumulator state for the next round of accumulation.
-    fn finish(&mut self) -> VortexResult<ArrayRef>;
+    fn finish(&mut self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef>;
 }
 
 impl<V: AggregateFnVTable> DynGroupedAccumulator for GroupedAccumulator<V> {
@@ -276,9 +276,15 @@ impl<V: AggregateFnVTable> DynGroupedAccumulator for GroupedAccumulator<V> {
         Ok(ChunkedArray::try_new(states, self.partial_dtype.clone())?.into_array())
     }
 
-    fn finish(&mut self) -> VortexResult<ArrayRef> {
-        let states = self.flush()?;
-        let results = self.vtable.finalize(states)?;
+    fn finish(&mut self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        // The single-batch case (one accumulate_list call) skips the chunked wrapper so that
+        // finalize implementations can operate on the batch's states directly.
+        let states = if self.partials.len() == 1 {
+            self.partials.pop().vortex_expect("checked length")
+        } else {
+            self.flush()?
+        };
+        let results = self.vtable.finalize(states, ctx)?;
 
         vortex_ensure!(
             results.dtype() == &self.return_dtype,

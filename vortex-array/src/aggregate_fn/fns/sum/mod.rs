@@ -12,6 +12,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -29,8 +30,13 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
-use crate::arrays::ConstantArray;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::Bool;
+use crate::arrays::BoolArray;
+use crate::arrays::Struct;
+use crate::arrays::StructArray;
+use crate::arrays::bool::BoolArrayExt;
+use crate::arrays::masked::mask_validity_canonical;
+use crate::arrays::struct_::StructArrayExt;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::FieldName;
@@ -45,10 +51,7 @@ use crate::expr::stats::StatsProvider;
 use crate::expr::stats::StatsProviderExt;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
-use crate::scalar_fn::EmptyOptions;
-use crate::scalar_fn::fns::fill_null::FillNull;
-use crate::scalar_fn::fns::get_item::GetItem;
-use crate::scalar_fn::fns::mask::Mask;
+use crate::validity::Validity;
 
 /// The monoid sum of an array: zero when there are no valid values, null on overflow.
 ///
@@ -415,26 +418,35 @@ impl AggregateFnVTable for Sum {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(&self, partials: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         // Entries that saw no valid values finalize to null (SQL `SUM`), while a null `sum`
-        // field (overflow) and null partial rows (e.g. null groups) stay null via the mask's
-        // validity intersection.
-        //
-        // The expressions are built unoptimized: `optimize` costs multiples of the whole
-        // aggregation at small group counts, and the caller's execution evaluates the lazy
-        // expression as-is.
+        // field (overflow) and null partial rows (e.g. null groups) stay null via the
+        // validity intersection. Implemented structurally rather than as a `get_item`/`mask`
+        // expression: expression construction and dispatch cost multiples of the whole
+        // aggregation at small group counts.
         let len = partials.len();
-        let sum = GetItem.try_new_array(len, FieldName::from("sum"), [partials.clone()])?;
-        let seen = GetItem.try_new_array(len, FieldName::from("seen"), [partials])?;
-        let seen = FillNull.try_new_array(
-            len,
-            EmptyOptions,
-            [
-                seen,
-                ConstantArray::new(Scalar::bool(false, Nullability::NonNullable), len).into_array(),
-            ],
-        )?;
-        Mask.try_new_array(len, EmptyOptions, [sum, seen])
+        let states = match partials.as_opt::<Struct>() {
+            Some(states) => states.into_owned(),
+            None => partials.execute::<StructArray>(ctx)?,
+        };
+        let struct_mask = states.as_ref().validity()?.execute_mask(len, ctx)?;
+        let seen = states.unmasked_field_by_name("seen")?.clone();
+        let seen = match seen.as_opt::<Bool>() {
+            Some(seen) => seen.into_owned(),
+            None => seen.execute::<BoolArray>(ctx)?,
+        };
+        let valid = &struct_mask & &Mask::from_buffer(seen.to_bit_buffer());
+
+        let sum = states.unmasked_field_by_name("sum")?.clone();
+        if valid.all_true() {
+            // Every partial row is a seen, valid group: the sums are already the result.
+            return Ok(sum);
+        }
+        let sum = sum.execute::<Canonical>(ctx)?;
+        Ok(
+            mask_validity_canonical(sum, Validity::from_mask(valid, Nullability::Nullable), ctx)?
+                .into_array(),
+        )
     }
 
     fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
@@ -844,8 +856,9 @@ mod tests {
             NumericalAggregateOpts::default(),
             elem_dtype.clone(),
         )?;
-        acc.accumulate_list(groups, &mut array_session().create_execution_ctx())?;
-        acc.finish()
+        let mut ctx = array_session().create_execution_ctx();
+        acc.accumulate_list(groups, &mut ctx)?;
+        acc.finish(&mut ctx)
     }
 
     #[test]
@@ -939,7 +952,7 @@ mod tests {
             PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
         let groups1 = FixedSizeListArray::try_new(elements1, 2, Validity::NonNullable, 2)?;
         acc.accumulate_list(&groups1.into_array(), &mut ctx)?;
-        let result1 = acc.finish()?;
+        let result1 = acc.finish(&mut ctx)?;
 
         let expected1 = PrimitiveArray::from_option_iter([Some(3i64), Some(7i64)]).into_array();
         assert_arrays_eq!(&result1, &expected1, &mut ctx);
@@ -947,7 +960,7 @@ mod tests {
         let elements2 = PrimitiveArray::new(buffer![10i32, 20], Validity::NonNullable).into_array();
         let groups2 = FixedSizeListArray::try_new(elements2, 2, Validity::NonNullable, 1)?;
         acc.accumulate_list(&groups2.into_array(), &mut ctx)?;
-        let result2 = acc.finish()?;
+        let result2 = acc.finish(&mut ctx)?;
 
         let expected2 = PrimitiveArray::from_option_iter([Some(30i64)]).into_array();
         assert_arrays_eq!(&result2, &expected2, &mut ctx);

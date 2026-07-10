@@ -279,7 +279,7 @@ impl AggregateFnVTable for BoundedMax {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(&self, partials: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         partials.get_item(BOUNDED_MAX_BOUND)
     }
 
