@@ -9,15 +9,18 @@
 //! cost that (strictly) beats [`CostModel::canonical_cost`] — the price of leaving the array
 //! in its canonical encoding.
 //!
-//! The default model is [`SizeCost`], which reproduces the compressor's historical
-//! ratio-argmax selection bit-exactly.
+//! The default model is [`SizeCost`], which preserves the compressor's historical candidate
+//! ordering and canonical-acceptance threshold.
 //!
 //! # What sits outside the model
 //!
-//! Two selection mechanisms are deliberately *not* routed through the cost model:
+//! The initial cost-model boundary covers scored candidates inside
+//! `CascadingCompressor::choose_best_scheme`. The following pre-existing decisions remain
+//! outside it:
 //!
-//! - [`EstimateVerdict::AlwaysUse`] short-circuits selection entirely. It expresses semantic
-//!   normalization (e.g. decimal byte-parts, temporal decomposition), not a priced trade-off.
+//! - Constant-array handling occurs before scheme selection.
+//! - [`EstimateVerdict::AlwaysUse`] is a forced-selection path that short-circuits priced
+//!   candidates.
 //! - The byte-acceptance gate: after the winning scheme compresses the full array, the result
 //!   is kept only if it is byte-wise smaller than its input. This is an axiom for **all**
 //!   models — compression never grows bytes. A model that prefers canonical (e.g. for speed)
@@ -25,6 +28,8 @@
 //!   returns no winner and the array stays canonical; the gate never forces a *bad* encoding,
 //!   only "no encoding". (The gate's `AnyScalarFn` carve-out is likewise semantic
 //!   denormalization, not cost.)
+//! - Extension arrays separately compare scheme-based compression with compression of their
+//!   storage array by byte size.
 //!
 //! # Determinism
 //!
@@ -37,6 +42,7 @@
 
 mod size;
 
+use std::cmp::Ordering;
 use std::fmt::Debug;
 
 pub use size::SizeCost;
@@ -52,7 +58,7 @@ use crate::stats::ArrayAndStats;
 ///
 /// Values must be finite. `NaN`/infinite prices are not representable orderings; a model
 /// that cannot price a candidate rejects it by returning `None` from [`CostModel::cost`].
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cost(f64);
 
 impl Cost {
@@ -60,15 +66,35 @@ impl Cost {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if `value` is not finite.
+    /// Panics if `value` is not finite.
     pub fn new(value: f64) -> Self {
-        debug_assert!(value.is_finite(), "Cost must be finite, got {value}");
-        Self(value)
+        assert!(value.is_finite(), "Cost must be finite, got {value}");
+        Self(if value == 0.0 { 0.0 } else { value })
     }
 
     /// Returns the raw cost value.
     pub fn value(self) -> f64 {
         self.0
+    }
+}
+
+impl PartialEq for Cost {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Cost {}
+
+impl PartialOrd for Cost {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Cost {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -83,6 +109,10 @@ impl Cost {
 /// order) and to beat [`canonical_cost`]. Returning `None` from [`cost`] rejects the
 /// candidate outright.
 ///
+/// Installing a custom model also disables compression-ratio early-exit hints for deferred
+/// scheme callbacks. A custom ordering may prefer a candidate whose ratio is below the current
+/// winner, so ratio-based pruning would be unsound.
+///
 /// See the [module docs](self) for the acceptance axioms that apply to all models.
 ///
 /// [`canonical_cost`]: CostModel::canonical_cost
@@ -90,9 +120,44 @@ impl Cost {
 pub trait CostModel: Debug + Send + Sync + 'static {
     /// Estimated cost of choosing this candidate. Lower is better; `None` rejects the
     /// candidate.
-    fn cost(&self, candidate: &Candidate) -> Option<Cost>;
+    fn cost(&self, candidate: &Candidate<'_>) -> Option<Cost>;
 
     /// Cost of leaving the array canonical — the baseline every candidate must strictly
     /// beat to be selected.
     fn canonical_cost(&self, data: &ArrayAndStats, n_values: u64) -> Cost;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use super::Cost;
+
+    #[test]
+    fn rejects_non_finite_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                std::panic::catch_unwind(|| Cost::new(value)).is_err(),
+                "non-finite cost {value} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_zero_has_one_representation() {
+        let negative = Cost::new(-0.0);
+        let positive = Cost::new(0.0);
+
+        assert_eq!(negative, positive);
+        assert_eq!(negative.cmp(&positive), Ordering::Equal);
+        assert_eq!(negative.value().to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn costs_have_a_total_order() {
+        let mut costs = [Cost::new(3.0), Cost::new(-2.0), Cost::new(0.0)];
+        costs.sort();
+
+        assert_eq!(costs.map(Cost::value), [-2.0, 0.0, 3.0]);
+    }
 }

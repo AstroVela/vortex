@@ -87,8 +87,8 @@ pub(super) fn zero_byte_sample_result(scheme: SchemeId, sampled_before: u64) {
 /// Builds a span covering the winning scheme's full-array compression.
 ///
 /// `scheme_chosen` and `input_nbytes` are known up front. `compressed_nbytes`,
-/// `estimated_ratio`, `estimated_cost`, `achieved_ratio`, and `accepted` are filled in by
-/// [`record_winner_compress_result`] once the encode completes.
+/// `estimated_ratio`, the model-defined `estimated_cost`, `achieved_ratio`, and `accepted` are
+/// filled in by [`record_winner_compress_result`] once the encode completes.
 #[inline]
 pub(super) fn winner_compress_span(scheme: SchemeId, before_nbytes: u64) -> tracing::Span {
     tracing::debug_span!(

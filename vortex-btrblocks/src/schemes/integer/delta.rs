@@ -14,7 +14,6 @@ use vortex_compressor::builtins::IntDictScheme;
 use vortex_compressor::builtins::StringDictScheme;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::DeferredEstimate;
-use vortex_compressor::estimate::EstimateScore;
 use vortex_compressor::estimate::EstimateVerdict;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
@@ -133,14 +132,13 @@ impl Scheme for DeltaScheme {
         // delta-encodes the array and measures the residual range.
         let min_ratio = self.min_ratio;
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
-            move |_compressor, data, best_so_far, _ctx, exec_ctx| {
+            move |_compressor, data, best_ratio, _ctx, exec_ctx| {
                 let primitive = data.array().clone().execute::<PrimitiveArray>(exec_ctx)?;
                 let full_width = primitive.ptype().bit_width() as f64;
 
                 // Delta's best case is residuals collapsing to a single bit. If even that, after
                 // the penalty, can't beat the incumbent, skip before doing the encode work.
-                let threshold = best_so_far.and_then(EstimateScore::finite_ratio);
-                if threshold.is_some_and(|t| full_width * DELTA_PENALTY <= t) {
+                if best_ratio.is_some_and(|ratio| full_width * DELTA_PENALTY <= ratio) {
                     return Ok(EstimateVerdict::Skip);
                 }
 

@@ -12,7 +12,6 @@ use vortex_compressor::builtins::IntDictScheme;
 use vortex_compressor::builtins::StringDictScheme;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::DeferredEstimate;
-use vortex_compressor::estimate::EstimateScore;
 use vortex_compressor::estimate::EstimateVerdict;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
@@ -94,7 +93,7 @@ impl Scheme for SequenceScheme {
         // TODO(connor): `sequence_encode` allocates the encoded array just to confirm feasibility.
         // A cheaper `is_sequence` probe would let us skip the allocation entirely.
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
-            |_compressor, data, best_so_far, _ctx, exec_ctx| {
+            |_compressor, data, best_ratio, _ctx, exec_ctx| {
                 // `SequenceArray` stores exactly two scalars (base and multiplier), so the best
                 // achievable compression ratio is `array_len / 2`.
                 let compressed_size = 2usize;
@@ -102,8 +101,7 @@ impl Scheme for SequenceScheme {
 
                 // If we cannot beat the best so far, then we do not want to even try sequence
                 // encoding the data.
-                let threshold = best_so_far.and_then(EstimateScore::finite_ratio);
-                if threshold.is_some_and(|t| max_ratio <= t) {
+                if best_ratio.is_some_and(|ratio| max_ratio <= ratio) {
                     return Ok(EstimateVerdict::Skip);
                 }
 

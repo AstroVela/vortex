@@ -24,21 +24,20 @@ use crate::trace;
 
 /// Closure type for [`DeferredEstimate::Callback`].
 ///
-/// The compressor calls this with the same arguments it would pass to sampling, plus the best
-/// [`EstimateScore`] observed so far (if any). The closure must resolve directly to a terminal
-/// [`EstimateVerdict`].
+/// The compressor calls this with the same arguments it would pass to sampling, plus a safe best
+/// ratio when using the built-in default size model. Models installed through
+/// [`CascadingCompressor::with_cost_model`] receive `None` because they may prefer a lower-ratio
+/// candidate. The closure must resolve directly to a terminal [`EstimateVerdict`].
 ///
-/// The `best_so_far` threshold is an early-exit hint. If your scheme's maximum achievable
-/// compression ratio is not strictly greater than
-/// `best_so_far.and_then(EstimateScore::finite_ratio)`, you should return
-/// [`EstimateVerdict::Skip`]. Returning a ratio equal to the threshold is permitted but will
-/// lose to the prior best due to strict `>` tie-breaking in the selector. Use the threshold
-/// only as an early-exit hint, never to perform additional work.
+/// `best_ratio` is an early-exit hint. If your scheme's maximum achievable compression ratio is
+/// not strictly greater than it, you should return [`EstimateVerdict::Skip`]. Returning an equal
+/// ratio is permitted but will lose to the prior best due to strict tie-breaking in the selector.
+/// Use the threshold only to avoid work, never to perform additional work.
 #[rustfmt::skip]
 pub type EstimateFn = dyn FnOnce(
         &CascadingCompressor,
         &ArrayAndStats,
-        Option<EstimateScore>,
+        Option<f64>,
         CompressorContext,
         &mut ExecutionCtx,
     ) -> VortexResult<EstimateVerdict>
@@ -79,8 +78,10 @@ pub enum EstimateVerdict {
     /// [`Scheme::matches`]: crate::scheme::Scheme::matches
     AlwaysUse,
 
-    /// The estimated compression ratio. This must be greater than `1.0` to be considered by the
-    /// compressor, otherwise it is worse than the canonical encoding.
+    /// The estimated compression ratio, interpreted by the configured cost model.
+    ///
+    /// The default size model requires a finite, non-subnormal ratio greater than `1.0` to beat
+    /// the canonical encoding. Other models may price the same signal differently.
     Ratio(f64),
 }
 
@@ -97,47 +98,12 @@ pub enum DeferredEstimate {
     /// it cannot request more sampling or another deferred callback.
     ///
     /// The compressor evaluates all immediate [`CompressionEstimate::Verdict`] results before
-    /// invoking any deferred callback, and passes the best [`EstimateScore`] observed so far to
-    /// the callback. This lets the callback return [`EstimateVerdict::Skip`] without performing
-    /// expensive work when its maximum achievable ratio cannot beat the current best. See
-    /// [`EstimateFn`] for the full contract.
+    /// invoking any deferred callback. With the default size model, it passes the best ratio
+    /// observed so far to the callback. This lets the callback return [`EstimateVerdict::Skip`]
+    /// without performing expensive work when its maximum achievable ratio cannot beat the
+    /// current best. Custom models receive no ratio threshold. See [`EstimateFn`] for the full
+    /// contract.
     Callback(Box<EstimateFn>),
-}
-
-/// Ranked estimate used for comparing non-terminal compression candidates.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EstimateScore {
-    /// A finite compression ratio. Higher means a smaller amount of data, so it is better.
-    FiniteCompression(f64),
-    /// Trial compression produced a 0-byte output.
-    ///
-    /// This has no finite ratio and is not eligible for scheme selection.
-    ///
-    /// TODO(connor): A zero-byte sample usually means the sampler happened to hit an all-null
-    /// sample. Improve this logic so we can distinguish real zero-byte wins from sampling artifacts.
-    ZeroBytes,
-}
-
-impl EstimateScore {
-    /// Converts measured sample sizes into a ranked estimate.
-    pub(super) fn from_sample_sizes(before_nbytes: u64, after_nbytes: u64) -> Self {
-        if after_nbytes == 0 {
-            Self::ZeroBytes
-        } else {
-            Self::FiniteCompression(before_nbytes as f64 / after_nbytes as f64)
-        }
-    }
-
-    /// Returns the finite compression ratio, or [`None`] for the zero-byte special case.
-    ///
-    /// Callers comparing a scheme's maximum achievable ratio against a "best so far" threshold
-    /// should use this to extract a numeric value from an [`EstimateScore`].
-    pub fn finite_ratio(self) -> Option<f64> {
-        match self {
-            Self::FiniteCompression(ratio) => Some(ratio),
-            Self::ZeroBytes => None,
-        }
-    }
 }
 
 /// Winner estimate carried from scheme selection into result tracing.
@@ -145,10 +111,10 @@ impl EstimateScore {
 pub(super) enum WinnerEstimate {
     /// The scheme must be used immediately.
     AlwaysUse,
-    /// The scheme won by a ranked estimate, priced by the compressor's cost model.
-    Score {
-        /// The winning candidate's ranked estimate.
-        score: EstimateScore,
+    /// The scheme won after being priced by the compressor's cost model.
+    Priced {
+        /// The winning candidate's estimated compression ratio, if one exists.
+        estimated_ratio: Option<f64>,
         /// The winning candidate's cost under the compressor's cost model.
         cost: Cost,
     },
@@ -159,7 +125,9 @@ impl WinnerEstimate {
     pub(super) fn trace_ratio(self) -> Option<f64> {
         match self {
             Self::AlwaysUse => None,
-            Self::Score { score, .. } => score.finite_ratio(),
+            Self::Priced {
+                estimated_ratio, ..
+            } => estimated_ratio,
         }
     }
 
@@ -167,16 +135,15 @@ impl WinnerEstimate {
     pub(super) fn trace_cost(self) -> Option<f64> {
         match self {
             Self::AlwaysUse => None,
-            Self::Score { cost, .. } => Some(cost.value()),
+            Self::Priced { cost, .. } => Some(cost.value()),
         }
     }
 }
 
-/// A sampling-based estimate: the ranked score together with the compressed sample array it
-/// was measured on.
+/// A sampling-based estimate: the optional measured ratio and compressed sample array.
 pub(crate) struct SampledEstimate {
-    /// The ranked estimate measured on the sample.
-    pub(crate) score: EstimateScore,
+    /// The compression ratio measured on the sample, or `None` for a zero-byte output.
+    pub(crate) estimated_ratio: Option<f64>,
 
     /// The compressed sample array. Its encoding tree is the best available prediction of
     /// the full-array encoding tree.
@@ -188,8 +155,8 @@ pub(crate) struct SampledEstimate {
 /// Creates a new [`ArrayAndStats`] for the sample so that stats are generated from the sample, not
 /// the full array.
 ///
-/// Returns the compressed sample alongside its score so the selection loop can keep the
-/// sample's encoding tree for the winning candidate.
+/// Returns the compressed sample alongside its measured ratio so the cost model can inspect its
+/// encoding tree while pricing the candidate.
 ///
 /// # Errors
 ///
@@ -225,14 +192,14 @@ pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
     let after = compressed.nbytes();
     let before = sample_data.array().nbytes();
 
-    let score = EstimateScore::from_sample_sizes(before, after);
+    let estimated_ratio = (after != 0).then(|| before as f64 / after as f64);
 
-    if matches!(score, EstimateScore::ZeroBytes) {
+    if estimated_ratio.is_none() {
         trace::zero_byte_sample_result(scheme.id(), before);
     }
 
     Ok(SampledEstimate {
-        score,
+        estimated_ratio,
         sampled: compressed,
     })
 }
