@@ -535,7 +535,7 @@ fn test_decimal_empty() {
     let dtype = DecimalDType::new(10, 2);
     let empty = DecimalArray::from_iter::<i64, _>([], dtype).into_array();
 
-    let result = decimal_binary(empty.clone(), empty.clone(), Operator::Add).unwrap();
+    let result = decimal_binary(empty.clone(), empty, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
         DecimalArray::from_iter::<i64, _>([], dtype),

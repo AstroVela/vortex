@@ -187,9 +187,10 @@ fn working_type(
         // The pre-scaled dividend (or divisor) has at most p + |s| digits.
         NumericOperator::Div => precision + scale_digits,
     };
-    let needed_digits = needed_digits.min(<i256 as NativeDecimalType>::MAX_PRECISION as u16);
-    let needed =
-        DecimalType::smallest_decimal_value_type(&DecimalDType::new(needed_digits as u8, 0));
+    let needed_digits = u8::try_from(needed_digits)
+        .unwrap_or(<i256 as NativeDecimalType>::MAX_PRECISION)
+        .min(<i256 as NativeDecimalType>::MAX_PRECISION);
+    let needed = DecimalType::smallest_decimal_value_type(&DecimalDType::new(needed_digits, 0));
 
     let operand_type = |operand: &DecimalOperand| match operand {
         DecimalOperand::Array { values, .. } => values.values_type(),
