@@ -19,8 +19,8 @@ use vortex_array::aggregate_fn::DynGroupedAccumulator;
 use vortex_array::aggregate_fn::GroupedAccumulator;
 use vortex_array::aggregate_fn::NumericalAggregateOpts;
 use vortex_array::aggregate_fn::fns::count::Count;
-use vortex_array::aggregate_fn::fns::stat_sum::StatSum;
 use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::aggregate_fn::fns::total::Total;
 use vortex_array::arrays::ListViewArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
@@ -180,7 +180,7 @@ fn sum_i32_nullable_all_valid(bencher: Bencher) {
     let input = i32_nullable_all_valid_input();
     bencher
         .with_inputs(|| &input)
-        .bench_refs(|input| grouped_accumulator(input, StatSum));
+        .bench_refs(|input| grouped_accumulator(input, Total));
 }
 
 #[divan::bench]
@@ -188,7 +188,7 @@ fn sum_i32_clustered_nulls(bencher: Bencher) {
     let input = i32_clustered_nulls_input();
     bencher
         .with_inputs(|| &input)
-        .bench_refs(|input| grouped_accumulator(input, StatSum));
+        .bench_refs(|input| grouped_accumulator(input, Total));
 }
 
 #[divan::bench]
@@ -196,7 +196,7 @@ fn sum_f64_all_valid(bencher: Bencher) {
     let input = f64_all_valid_input();
     bencher
         .with_inputs(|| &input)
-        .bench_refs(|input| grouped_accumulator(input, StatSum));
+        .bench_refs(|input| grouped_accumulator(input, Total));
 }
 
 #[divan::bench]
@@ -204,7 +204,7 @@ fn sum_f64_clustered_nulls(bencher: Bencher) {
     let input = f64_clustered_nulls_input();
     bencher
         .with_inputs(|| &input)
-        .bench_refs(|input| grouped_accumulator(input, StatSum));
+        .bench_refs(|input| grouped_accumulator(input, Total));
 }
 
 #[divan::bench]

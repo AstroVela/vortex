@@ -5,7 +5,7 @@ use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
-use super::StatSum;
+use super::Total;
 use super::primitive::sum_float_all;
 use super::primitive::sum_signed_all;
 use super::primitive::sum_unsigned_all;
@@ -21,25 +21,25 @@ use crate::arrays::PrimitiveArray;
 use crate::dtype::NativePType;
 use crate::match_each_native_ptype;
 
-/// Encoding-specific grouped [`StatSum`] kernel for primitive element arrays.
+/// Encoding-specific grouped [`Total`] kernel for primitive element arrays.
 #[derive(Debug)]
-pub(crate) struct PrimitiveGroupedStatSumEncodingKernel;
+pub(crate) struct PrimitiveGroupedTotalEncodingKernel;
 
-impl DynGroupedAggregateKernel for PrimitiveGroupedStatSumEncodingKernel {
+impl DynGroupedAggregateKernel for PrimitiveGroupedTotalEncodingKernel {
     fn grouped_aggregate(
         &self,
         aggregate_fn: &AggregateFnRef,
         groups: &GroupedArray,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let Some(options) = aggregate_fn.as_opt::<StatSum>() else {
+        let Some(options) = aggregate_fn.as_opt::<Total>() else {
             return Ok(None);
         };
         try_grouped_sum(groups, ctx, options.skip_nans)
     }
 }
 
-/// Grouped [`StatSum`] implementation for canonical primitive elements.
+/// Grouped [`Total`] implementation for canonical primitive elements.
 ///
 /// Reuses the scalar primitive-sum reductions ([`sum_unsigned_all`]/[`sum_signed_all`]/
 /// [`sum_float_all`]) so the per-group semantics match scalar `sum` exactly (overflow saturates to
@@ -66,7 +66,7 @@ pub(super) fn try_grouped_sum(
     )?))
 }
 
-/// StatSum each group described by `group_ranges` (element `(offset, size)` pairs), one sum per group.
+/// Total each group described by `group_ranges` (element `(offset, size)` pairs), one sum per group.
 fn grouped_sum(
     elements: &PrimitiveArray,
     group_ranges: &GroupRanges,
@@ -126,7 +126,7 @@ fn collect_sums<T: NativePType, A: NativePType + Default>(
     PrimitiveArray::from_option_iter(sums)
 }
 
-/// StatSum the valid elements of a single group, using the contiguous valid runs of the element mask
+/// Total the valid elements of a single group, using the contiguous valid runs of the element mask
 /// intersected with the group's `[offset, offset + size)` range.
 fn sum_masked_group<T: NativePType, A>(
     acc: &mut A,
@@ -163,8 +163,8 @@ mod tests {
     use crate::aggregate_fn::DynGroupedAccumulator;
     use crate::aggregate_fn::GroupedAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
-    use crate::aggregate_fn::fns::stat_sum::StatSum;
-    use crate::aggregate_fn::fns::stat_sum::stat_sum;
+    use crate::aggregate_fn::fns::total::Total;
+    use crate::aggregate_fn::fns::total::total;
     use crate::array_session;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListViewArray;
@@ -180,7 +180,7 @@ mod tests {
     /// Run a grouped sum through the accumulator.
     fn grouped_sum_actual(groups: &ArrayRef, elem_dtype: &DType) -> VortexResult<ArrayRef> {
         let mut acc = GroupedAccumulator::try_new(
-            StatSum,
+            Total,
             NumericalAggregateOpts::default(),
             elem_dtype.clone(),
         )?;
@@ -200,14 +200,14 @@ mod tests {
         use crate::aggregate_fn::AggregateFnVTable;
 
         let mut ctx = array_session().create_execution_ctx();
-        let sum_dtype = StatSum
+        let sum_dtype = Total
             .partial_dtype(&NumericalAggregateOpts::default(), elem_dtype)
             .expect("sum partial dtype");
         let mut builder = builder_with_capacity(&sum_dtype, ranges.len());
         for (i, &(offset, size)) in ranges.iter().enumerate() {
             if group_valid[i] {
                 let slice = elements.slice(offset..offset + size)?;
-                builder.append_scalar(&stat_sum(&slice, &mut ctx)?)?;
+                builder.append_scalar(&total(&slice, &mut ctx)?)?;
             } else {
                 builder.append_null();
             }
@@ -369,11 +369,8 @@ mod tests {
         let elem_dtype = DType::Primitive(PType::F64, NonNullable);
         let groups = listview(elements, &[(0, 3), (3, 2)], &[true, true])?;
 
-        let mut acc = GroupedAccumulator::try_new(
-            StatSum,
-            NumericalAggregateOpts::include_nans(),
-            elem_dtype,
-        )?;
+        let mut acc =
+            GroupedAccumulator::try_new(Total, NumericalAggregateOpts::include_nans(), elem_dtype)?;
         let mut ctx2 = array_session().create_execution_ctx();
         acc.accumulate_list(&groups, &mut ctx2)?;
         let actual = acc.finish(&mut ctx2)?;

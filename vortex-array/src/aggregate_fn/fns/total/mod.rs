@@ -6,7 +6,7 @@ mod constant;
 mod decimal;
 mod grouped;
 mod primitive;
-pub(crate) use grouped::PrimitiveGroupedStatSumEncodingKernel;
+pub(crate) use grouped::PrimitiveGroupedTotalEncodingKernel;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -45,17 +45,17 @@ use crate::scalar::Scalar;
 /// This is the value stored as `Stat::Sum` and merged across chunks, zones, and files: the
 /// empty sum is zero so that partials merge as a monoid (`combine(empty, x) = x`). For the
 /// SQL rule (a sum over zero valid values is null) use
-/// [`sum`](crate::aggregate_fn::fns::sql_sum::sum) / [`SqlSum`](crate::aggregate_fn::fns::sql_sum::SqlSum).
-pub fn stat_sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
+/// [`sum`](crate::aggregate_fn::fns::sum::sum) / [`Sum`](crate::aggregate_fn::fns::sum::Sum).
+pub fn total(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     // Short-circuit using cached array statistics.
     if let Precision::Exact(sum_scalar) = array.statistics().get(Stat::Sum) {
         return Ok(sum_scalar);
     }
 
-    // Compute using Accumulator<StatSum>.
+    // Compute using Accumulator<Total>.
     // TODO(ngates): we may want to wrap this three-step dance up into an extension crate maybe.
     let mut acc = Accumulator::try_new(
-        StatSum,
+        Total,
         NumericalAggregateOpts::default(),
         array.dtype().clone(),
     )?;
@@ -74,15 +74,15 @@ pub fn stat_sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar
 ///
 /// This aggregate's plain partial is the persisted wire form of sum statistics (zone maps,
 /// file stats), so its partial dtype and semantics must stay stable. The SQL `SUM` rule is
-/// provided by the separate [`SqlSum`](crate::aggregate_fn::fns::sql_sum::SqlSum) aggregate.
+/// provided by the separate [`Sum`](crate::aggregate_fn::fns::sum::Sum) aggregate.
 ///
 /// NaN handling for float inputs is controlled by [`NumericalAggregateOpts`]: with `skip_nans` (the
 /// default) NaN values contribute nothing, otherwise any NaN value poisons the sum to NaN.
 #[derive(Clone, Debug)]
-pub struct StatSum;
+pub struct Total;
 
 // Both Spark and DataFusion use this heuristic.
-// - https://github.com/apache/spark/blob/fcf636d9eb8d645c24be3db2d599aba2d7e2955a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/StatSum.scala#L66
+// - https://github.com/apache/spark/blob/fcf636d9eb8d645c24be3db2d599aba2d7e2955a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/Total.scala#L66
 // - https://github.com/apache/datafusion/blob/4153adf2c0f6e317ef476febfdc834208bd46622/datafusion/functions-aggregate/src/sum.rs#L188
 pub(crate) fn sum_decimal_dtype(input: &DecimalDType) -> DecimalDType {
     DecimalDType::new(
@@ -91,9 +91,9 @@ pub(crate) fn sum_decimal_dtype(input: &DecimalDType) -> DecimalDType {
     )
 }
 
-impl AggregateFnVTable for StatSum {
+impl AggregateFnVTable for Total {
     type Options = NumericalAggregateOpts;
-    type Partial = StatSumPartial;
+    type Partial = TotalPartial;
 
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.sum");
@@ -153,7 +153,7 @@ impl AggregateFnVTable for StatSum {
             .ok_or_else(|| vortex_err!("Unsupported sum dtype: {}", input_dtype))?;
         let initial = make_zero_state(&return_dtype);
 
-        Ok(StatSumPartial {
+        Ok(TotalPartial {
             return_dtype,
             current: Some(initial),
             skip_nans: options.skip_nans,
@@ -334,7 +334,7 @@ impl AggregateFnVTable for StatSum {
 
 /// The group state for a sum aggregate, containing the accumulated value and configuration
 /// needed for reset/result without external context.
-pub struct StatSumPartial {
+pub struct TotalPartial {
     return_dtype: DType,
     /// The current accumulated state, or `None` if saturated (checked overflow).
     current: Option<SumState>,
@@ -410,8 +410,8 @@ mod tests {
     use crate::aggregate_fn::DynGroupedAccumulator;
     use crate::aggregate_fn::GroupedAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
-    use crate::aggregate_fn::fns::stat_sum::StatSum;
-    use crate::aggregate_fn::fns::stat_sum::stat_sum;
+    use crate::aggregate_fn::fns::total::Total;
+    use crate::aggregate_fn::fns::total::total;
     use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
@@ -435,18 +435,18 @@ mod tests {
     use crate::scalar::Scalar;
     use crate::validity::Validity;
 
-    /// StatSum an array with an initial value (test-only helper).
+    /// Total an array with an initial value (test-only helper).
     fn sum_with_accumulator(array: &ArrayRef, accumulator: &Scalar) -> VortexResult<Scalar> {
         let mut ctx = array_session().create_execution_ctx();
         if accumulator.is_null() {
             return Ok(accumulator.clone());
         }
         if accumulator.is_zero() == Some(true) {
-            return stat_sum(array, &mut ctx);
+            return total(array, &mut ctx);
         }
 
         let sum_dtype = Stat::Sum.dtype(array.dtype()).ok_or_else(|| {
-            vortex_error::vortex_err!("StatSum not supported for dtype: {}", array.dtype())
+            vortex_error::vortex_err!("Total not supported for dtype: {}", array.dtype())
         })?;
 
         // For non-float types, try statistics short-circuit with accumulator.
@@ -457,7 +457,7 @@ mod tests {
         }
 
         // Compute array sum from zero (also caches stats).
-        let array_sum = stat_sum(array, &mut ctx)?;
+        let array_sum = total(array, &mut ctx)?;
 
         // Combine with the accumulator.
         add_scalars(&sum_dtype, &array_sum, accumulator)
@@ -485,7 +485,7 @@ mod tests {
                 .checked_binary_numeric(&rhs.as_decimal(), NumericOperator::Add)
                 .map(Scalar::from)
                 .unwrap_or_else(|| Scalar::null(sum_dtype.as_nullable())),
-            _ => unreachable!("StatSum will always be a decimal or a primitive dtype"),
+            _ => unreachable!("Total will always be a decimal or a primitive dtype"),
         })
     }
 
@@ -495,7 +495,7 @@ mod tests {
     fn sum_multi_batch() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let mut acc = Accumulator::try_new(StatSum, NumericalAggregateOpts::default(), dtype)?;
+        let mut acc = Accumulator::try_new(Total, NumericalAggregateOpts::default(), dtype)?;
 
         let batch1 = PrimitiveArray::new(buffer![10i32, 20], Validity::NonNullable).into_array();
         acc.accumulate(&batch1, &mut ctx)?;
@@ -512,7 +512,7 @@ mod tests {
     fn sum_finish_resets_state() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let mut acc = Accumulator::try_new(StatSum, NumericalAggregateOpts::default(), dtype)?;
+        let mut acc = Accumulator::try_new(Total, NumericalAggregateOpts::default(), dtype)?;
 
         let batch1 = PrimitiveArray::new(buffer![10i32, 20], Validity::NonNullable).into_array();
         acc.accumulate(&batch1, &mut ctx)?;
@@ -531,16 +531,16 @@ mod tests {
     #[test]
     fn sum_state_merge() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let mut state = StatSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
+        let mut state = Total.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
 
         let scalar1 = Scalar::primitive(100i64, Nullable);
-        StatSum.combine_partials(&mut state, scalar1)?;
+        Total.combine_partials(&mut state, scalar1)?;
 
         let scalar2 = Scalar::primitive(50i64, Nullable);
-        StatSum.combine_partials(&mut state, scalar2)?;
+        Total.combine_partials(&mut state, scalar2)?;
 
-        let result = StatSum.to_scalar(&state)?;
-        StatSum.reset(&mut state);
+        let result = Total.to_scalar(&state)?;
+        Total.reset(&mut state);
         assert_eq!(result.as_primitive().typed_value::<i64>(), Some(150));
         Ok(())
     }
@@ -561,7 +561,7 @@ mod tests {
         // compute sum with accumulator to populate stats
         sum_with_accumulator(&array, &Scalar::primitive(2i64, Nullable))?;
 
-        let sum_without_acc = stat_sum(&array, &mut array_session().create_execution_ctx())?;
+        let sum_without_acc = total(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(sum_without_acc, Scalar::primitive(9i64, Nullable));
         Ok(())
     }
@@ -585,7 +585,7 @@ mod tests {
 
     fn run_grouped_sum(groups: &ArrayRef, elem_dtype: &DType) -> VortexResult<ArrayRef> {
         let mut acc = GroupedAccumulator::try_new(
-            StatSum,
+            Total,
             NumericalAggregateOpts::default(),
             elem_dtype.clone(),
         )?;
@@ -678,7 +678,7 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let elem_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let mut acc =
-            GroupedAccumulator::try_new(StatSum, NumericalAggregateOpts::default(), elem_dtype)?;
+            GroupedAccumulator::try_new(Total, NumericalAggregateOpts::default(), elem_dtype)?;
 
         let elements1 =
             PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
@@ -737,7 +737,7 @@ mod tests {
             dtype,
         )?;
 
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
@@ -751,7 +751,7 @@ mod tests {
         let chunk2 = PrimitiveArray::from_option_iter::<f32, _>(vec![None, None]);
         let dtype = chunk1.dtype().clone();
         let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
@@ -774,7 +774,7 @@ mod tests {
             dtype,
         )?;
 
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
@@ -789,7 +789,7 @@ mod tests {
         let dtype = chunk1.dtype().clone();
         let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
 
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
@@ -821,7 +821,7 @@ mod tests {
             dtype,
         )?;
 
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
@@ -857,7 +857,7 @@ mod tests {
             dtype,
         )?;
 
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
@@ -891,7 +891,7 @@ mod tests {
         let dtype = chunk1.dtype().clone();
         let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
 
-        let result = stat_sum(
+        let result = total(
             &chunked.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;

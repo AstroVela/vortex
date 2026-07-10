@@ -29,11 +29,11 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
-use crate::aggregate_fn::fns::stat_sum::SumState;
-use crate::aggregate_fn::fns::stat_sum::checked_add_i64;
-use crate::aggregate_fn::fns::stat_sum::checked_add_u64;
-use crate::aggregate_fn::fns::stat_sum::make_zero_state;
-use crate::aggregate_fn::fns::stat_sum::sum_decimal_dtype;
+use crate::aggregate_fn::fns::total::SumState;
+use crate::aggregate_fn::fns::total::checked_add_i64;
+use crate::aggregate_fn::fns::total::checked_add_u64;
+use crate::aggregate_fn::fns::total::make_zero_state;
+use crate::aggregate_fn::fns::total::sum_decimal_dtype;
 use crate::arrays::Bool;
 use crate::arrays::BoolArray;
 use crate::arrays::Struct;
@@ -98,7 +98,7 @@ pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
 ///
 /// A sum over zero valid values yields null (the SQL rule: nulls are eliminated, and the sum
 /// of an empty set is null), and a sum that overflows yields null. This is a distinct
-/// aggregate from the monoid [`Sum`](crate::aggregate_fn::fns::sum::Sum), whose empty sum is
+/// aggregate from the monoid [`Total`](crate::aggregate_fn::fns::total::Total), whose empty sum is
 /// zero and whose plain partial is the persisted form of sum statistics; `Sum`'s
 /// `{sum, seen}` partial is never written to statistics.
 ///
@@ -497,9 +497,9 @@ mod tests {
     use crate::aggregate_fn::DynGroupedAccumulator;
     use crate::aggregate_fn::GroupedAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
-    use crate::aggregate_fn::fns::stat_sum::stat_sum;
     use crate::aggregate_fn::fns::sum::Sum;
     use crate::aggregate_fn::fns::sum::sum;
+    use crate::aggregate_fn::fns::total::total;
     use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
@@ -676,15 +676,13 @@ mod tests {
     }
 
     #[test]
-    fn stat_sum_is_monoid_while_sum_is_sql() -> VortexResult<()> {
+    fn total_is_monoid_while_sum_is_sql() -> VortexResult<()> {
         // The persisted statistic keeps the monoid semantics (zero for all-null) that zone
         // and chunk merging require, while `sum` applies the SQL rule.
         let mut ctx = array_session().create_execution_ctx();
         let arr = PrimitiveArray::from_option_iter([None::<i32>, None, None]).into_array();
         assert_eq!(
-            stat_sum(&arr, &mut ctx)?
-                .as_primitive()
-                .typed_value::<i64>(),
+            total(&arr, &mut ctx)?.as_primitive().typed_value::<i64>(),
             Some(0)
         );
         // The cached monoid statistic must not leak through `sum`'s cache short-circuit.

@@ -86,7 +86,7 @@ pub(crate) fn legacy_stats_table_dtype(column_dtype: &DType, present_stats: &[St
                 .filter_map(|stat| {
                     stat.dtype(column_dtype)
                         .or_else(|| {
-                            // Backward compat: older files may have stored stats (e.g. StatSum)
+                            // Backward compat: older files may have stored stats (e.g. Total)
                             // for extension types by resolving through the storage dtype.
                             if let DType::Extension(ext) = column_dtype {
                                 stat.dtype(ext.storage_dtype())
@@ -157,7 +157,7 @@ mod tests {
     use vortex_array::aggregate_fn::NumericalAggregateOpts;
     use vortex_array::aggregate_fn::fns::max::Max;
     use vortex_array::aggregate_fn::fns::min::Min;
-    use vortex_array::aggregate_fn::fns::stat_sum::StatSum;
+    use vortex_array::aggregate_fn::fns::total::Total;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
@@ -208,7 +208,7 @@ mod tests {
             &[
                 Max.bind(NumericalAggregateOpts::skip_nans()),
                 Min.bind(NumericalAggregateOpts::skip_nans()),
-                StatSum.bind(NumericalAggregateOpts::skip_nans()),
+                Total.bind(NumericalAggregateOpts::skip_nans()),
             ],
         );
 
@@ -217,9 +217,7 @@ mod tests {
             &[
                 Max.bind(NumericalAggregateOpts::skip_nans()).to_string(),
                 Min.bind(NumericalAggregateOpts::skip_nans()).to_string(),
-                StatSum
-                    .bind(NumericalAggregateOpts::skip_nans())
-                    .to_string(),
+                Total.bind(NumericalAggregateOpts::skip_nans()).to_string(),
             ]
         );
     }

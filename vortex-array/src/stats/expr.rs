@@ -14,7 +14,7 @@ use crate::aggregate_fn::fns::all_null::AllNull;
 use crate::aggregate_fn::fns::min_max::MinMax;
 use crate::aggregate_fn::fns::nan_count::NanCount;
 use crate::aggregate_fn::fns::null_count::NullCount;
-use crate::aggregate_fn::fns::stat_sum::StatSum;
+use crate::aggregate_fn::fns::total::Total;
 use crate::expr::Expression;
 use crate::scalar_fn::ScalarFnVTableExt;
 pub use crate::scalar_fn::fns::stat::StatFn;
@@ -37,7 +37,7 @@ pub fn min_max(expr: Expression) -> Expression {
 /// Creates `stat(expr, sum)`, returning a nullable sum statistic.
 pub fn sum(expr: Expression) -> Expression {
     // Statistics follow NaN-skipping semantics; request it explicitly rather than via the default.
-    stat(expr, StatSum.bind(NumericalAggregateOpts::skip_nans()))
+    stat(expr, Total.bind(NumericalAggregateOpts::skip_nans()))
 }
 
 /// Creates `stat(expr, null_count)`, returning a nullable null-count statistic.

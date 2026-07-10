@@ -12,7 +12,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::aggregate_fn::fns::stat_sum::stat_sum;
+use vortex_array::aggregate_fn::fns::total::total;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -168,7 +168,7 @@ impl StatsAccumulator {
                     }
                 }
                 Stat::NullCount | Stat::NaNCount | Stat::UncompressedSizeInBytes => {
-                    if let Some(sum_value) = stat_sum(array, ctx)?
+                    if let Some(sum_value) = total(array, ctx)?
                         .cast(&DType::Primitive(PType::U64, Nullability::Nullable))?
                         .into_value()
                     {

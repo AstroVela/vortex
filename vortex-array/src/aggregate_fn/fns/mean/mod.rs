@@ -17,8 +17,8 @@ use crate::aggregate_fn::combined::Combined;
 use crate::aggregate_fn::combined::CombinedOptions;
 use crate::aggregate_fn::combined::PairOptions;
 use crate::aggregate_fn::fns::count::Count;
-use crate::aggregate_fn::fns::stat_sum::StatSum;
-use crate::aggregate_fn::fns::stat_sum::sum_decimal_dtype;
+use crate::aggregate_fn::fns::total::Total;
+use crate::aggregate_fn::fns::total::sum_decimal_dtype;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
@@ -49,7 +49,7 @@ pub fn mean(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
 
 /// Compute the arithmetic mean of an array.
 ///
-/// Implemented as `StatSum / Count` via [`BinaryCombined`].
+/// Implemented as `Total / Count` via [`BinaryCombined`].
 ///
 /// Booleans and primitive numeric types are cast to f64. Decimals stay decimals.
 #[derive(Clone, Debug)]
@@ -62,7 +62,7 @@ impl Mean {
 }
 
 impl BinaryCombined for Mean {
-    type Left = StatSum;
+    type Left = Total;
     type Right = Count;
 
     fn id(&self) -> AggregateFnId {
@@ -70,8 +70,8 @@ impl BinaryCombined for Mean {
         *ID
     }
 
-    fn left(&self) -> StatSum {
-        StatSum
+    fn left(&self) -> Total {
+        Total
     }
 
     fn right(&self) -> Count {
@@ -112,7 +112,7 @@ impl BinaryCombined for Mean {
         let sum = sum_cast.as_primitive().typed_value::<f64>();
         let count = count_cast.as_primitive().typed_value::<f64>();
         let value = match (sum, count) {
-            (None, _) | (_, None) => return Ok(Scalar::null(target)), // StatSum overflowed
+            (None, _) | (_, None) => return Ok(Scalar::null(target)), // Total overflowed
             // A count of zero yields 0/0 = NaN, matching the array `finalize` path: nulls are
             // skipped during accumulation, so an all-null input is an empty mean, not null.
             (Some(s), Some(c)) => s / c,
@@ -127,7 +127,7 @@ impl BinaryCombined for Mean {
     fn coerce_args(
         &self,
         _options: &PairOptions<
-            <StatSum as AggregateFnVTable>::Options,
+            <Total as AggregateFnVTable>::Options,
             <Count as AggregateFnVTable>::Options,
         >,
         input_dtype: &DType,
@@ -140,7 +140,7 @@ impl BinaryCombined for Mean {
 
 /// Hint for callers: what to cast the input to before accumulation.
 ///
-/// - Bool stays as bool — `StatSum` has a native bool path and bool → f64 isn't
+/// - Bool stays as bool — `Total` has a native bool path and bool → f64 isn't
 ///   currently a direct cast in vortex.
 /// - Primitive numerics → `f64` so the sum and finalize work without overflow.
 /// - Decimals stay as decimals

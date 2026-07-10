@@ -17,7 +17,7 @@ use vortex::aggregate_fn::fns::first::First;
 use vortex::aggregate_fn::fns::max::Max;
 use vortex::aggregate_fn::fns::mean::Mean;
 use vortex::aggregate_fn::fns::min::Min;
-use vortex::aggregate_fn::fns::stat_sum::StatSum;
+use vortex::aggregate_fn::fns::total::Total;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -483,7 +483,7 @@ pub fn try_from_projection_expression(
 pub enum PushedAggregate {
     Min,
     Max,
-    StatSum,
+    Total,
     Mean,
     // Also used for ANY_VALUE() which is allowed by definition
     First,
@@ -496,7 +496,7 @@ impl Display for PushedAggregate {
         match self {
             PushedAggregate::Min => f.write_str("min"),
             PushedAggregate::Max => f.write_str("max"),
-            PushedAggregate::StatSum => f.write_str("sum"),
+            PushedAggregate::Total => f.write_str("sum"),
             PushedAggregate::Mean => f.write_str("mean"),
             PushedAggregate::First => f.write_str("first"),
             PushedAggregate::Count => f.write_str("count"),
@@ -510,7 +510,7 @@ impl PushedAggregate {
         Ok(match self {
             Self::Min => Box::new(Accumulator::try_new(Min, opts, dtype)?),
             Self::Max => Box::new(Accumulator::try_new(Max, opts, dtype)?),
-            Self::StatSum => Box::new(Accumulator::try_new(StatSum, opts, dtype)?),
+            Self::Total => Box::new(Accumulator::try_new(Total, opts, dtype)?),
             Self::Mean => Box::new(Accumulator::try_new(
                 Mean::combined(),
                 PairOptions(opts, opts),
@@ -535,7 +535,7 @@ pub fn try_from_projection_aggregate(
     Ok(Some(match agg.aggregate_function.name() {
         "min" => PushedAggregate::Min,
         "max" => PushedAggregate::Max,
-        "sum" | "sum_no_overflow" => PushedAggregate::StatSum,
+        "sum" | "sum_no_overflow" => PushedAggregate::Total,
         "avg" | "mean" => PushedAggregate::Mean,
         "first" | "any_value" => PushedAggregate::First,
         "count" => PushedAggregate::Count,

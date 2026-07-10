@@ -25,7 +25,7 @@ use vortex_array::aggregate_fn::fns::max::Max;
 use vortex_array::aggregate_fn::fns::min::Min;
 use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::aggregate_fn::fns::null_count::NullCount;
-use vortex_array::aggregate_fn::fns::stat_sum::StatSum;
+use vortex_array::aggregate_fn::fns::total::Total;
 use vortex_array::dtype::DType;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
@@ -212,11 +212,11 @@ fn default_zoned_aggregate_fns(dtype: &DType) -> Arc<[AggregateFnRef]> {
     };
 
     let mut aggregate_fns = vec![max, min];
-    if StatSum
+    if Total
         .return_dtype(&NumericalAggregateOpts::skip_nans(), dtype)
         .is_some()
     {
-        aggregate_fns.push(StatSum.bind(NumericalAggregateOpts::skip_nans()));
+        aggregate_fns.push(Total.bind(NumericalAggregateOpts::skip_nans()));
     }
     aggregate_fns.push(NanCount.bind(EmptyOptions));
     aggregate_fns.push(NullCount.bind(EmptyOptions));
@@ -230,7 +230,7 @@ mod tests {
     use vortex_array::aggregate_fn::fns::bounded_min::BoundedMin;
     use vortex_array::aggregate_fn::fns::max::Max;
     use vortex_array::aggregate_fn::fns::min::Min;
-    use vortex_array::aggregate_fn::fns::stat_sum::StatSum;
+    use vortex_array::aggregate_fn::fns::total::Total;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::extension::datetime::TimeUnit;
@@ -258,7 +258,7 @@ mod tests {
 
         assert!(aggregate_fns[0].is::<Max>());
         assert!(aggregate_fns[1].is::<Min>());
-        assert!(aggregate_fns[2].is::<StatSum>());
+        assert!(aggregate_fns[2].is::<Total>());
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
         assert!(
             aggregate_fns
                 .iter()
-                .all(|aggregate_fn| !aggregate_fn.is::<StatSum>())
+                .all(|aggregate_fn| !aggregate_fn.is::<Total>())
         );
     }
 }
