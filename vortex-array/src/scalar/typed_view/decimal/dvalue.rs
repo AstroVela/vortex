@@ -154,6 +154,27 @@ impl DecimalValue {
         }
     }
 
+    /// Rescales a stored decimal value from one scale to another, truncating toward zero when
+    /// reducing the scale discards fractional digits.
+    ///
+    /// Scales are `i16` because intermediate scales (e.g. the raw product of a fixed-point
+    /// multiplication, whose scale is twice the operand scale) can exceed the `i8` range.
+    /// Returns `None` if increasing the scale overflows [`i256`].
+    pub(crate) fn rescale_i256_trunc(value: i256, from_scale: i16, to_scale: i16) -> Option<i256> {
+        if from_scale == to_scale || value == i256::ZERO {
+            return Some(value);
+        }
+
+        let scale_delta = to_scale - from_scale;
+        if scale_delta > 0 {
+            let factor = decimal_scale_factor(scale_delta as u32).ok()?;
+            value.checked_mul(&factor)
+        } else {
+            let factor = decimal_scale_factor((-scale_delta) as u32).ok()?;
+            Some(value / factor)
+        }
+    }
+
     /// Rescales this value to `to_decimal_dtype`, checks precision, and stores it in the target
     /// decimal value width.
     pub(crate) fn cast_decimal(
@@ -239,14 +260,50 @@ impl DecimalValue {
         checked_widening_binary_op!(self, other, CheckedSub::checked_sub)
     }
 
-    /// Checked multiplication. Returns `None` on overflow.
+    /// Checked multiplication of the raw stored integers. Returns `None` on overflow.
+    ///
+    /// This is scale-oblivious: the raw product of two values at scale `s` has scale `2s`. Use
+    /// [`DecimalValue::checked_mul_fixed_point`] for scale-preserving multiplication.
     pub fn checked_mul(&self, other: &Self) -> Option<Self> {
         checked_widening_binary_op!(self, other, CheckedMul::checked_mul)
     }
 
-    /// Checked division. Returns `None` on overflow or division by zero.
+    /// Checked division of the raw stored integers. Returns `None` on overflow or division by
+    /// zero.
+    ///
+    /// This is scale-oblivious: the raw quotient of two values at scale `s` has scale `0`. Use
+    /// [`DecimalValue::checked_div_fixed_point`] for scale-preserving division.
     pub fn checked_div(&self, other: &Self) -> Option<Self> {
         checked_widening_binary_op!(self, other, CheckedDiv::checked_div)
+    }
+
+    /// Checked fixed-point multiplication of two stored values sharing `scale`.
+    ///
+    /// The raw integer product has scale `2 * scale`; the result is rescaled back to `scale`,
+    /// truncating toward zero. Returns `None` if an intermediate value overflows [`i256`].
+    pub fn checked_mul_fixed_point(&self, other: &Self, scale: i8) -> Option<Self> {
+        let product = self.as_i256().checked_mul(&other.as_i256())?;
+        let rescaled = Self::rescale_i256_trunc(product, 2 * scale as i16, scale as i16)?;
+        Some(Self::I256(rescaled))
+    }
+
+    /// Checked fixed-point division of two stored values sharing `scale`, truncating toward
+    /// zero.
+    ///
+    /// Returns `None` on division by zero or if an intermediate value overflows [`i256`].
+    pub fn checked_div_fixed_point(&self, other: &Self, scale: i8) -> Option<Self> {
+        let lhs = self.as_i256();
+        let rhs = other.as_i256();
+        // The raw quotient has scale 0; pre-scaling the dividend (or, for negative scales,
+        // the divisor) by 10^|scale| yields a quotient at `scale`.
+        let quotient = if scale >= 0 {
+            let factor = decimal_scale_factor(scale as u32).ok()?;
+            lhs.checked_mul(&factor)?.checked_div(&rhs)?
+        } else {
+            let factor = decimal_scale_factor(scale.unsigned_abs() as u32).ok()?;
+            lhs.checked_div(&rhs.checked_mul(&factor)?)?
+        };
+        Some(Self::I256(quotient))
     }
 }
 

@@ -179,14 +179,14 @@ impl<'a> DecimalScalar<'a> {
 
     /// Apply the (checked) operator to self and other using SQL-style null semantics.
     ///
-    /// If the operation overflows, None is returned.
+    /// Both operands must share the same decimal type (precision and scale), and the result
+    /// keeps that type. Add and Sub are exact; Mul and Div are fixed-point at the shared scale,
+    /// truncating toward zero when digits beyond the scale are discarded.
     ///
-    /// If the types are incompatible (ignoring nullability and precision/scale), an error is returned.
+    /// If the operation overflows, exceeds the precision, or divides by zero, `None` is
+    /// returned.
     ///
     /// If either value is null, the result is null.
-    ///
-    /// The result will have the same decimal type (precision/scale) as `self`, and the result
-    /// is checked to ensure it fits within the precision constraints.
     pub fn checked_binary_numeric(
         &self,
         other: &DecimalScalar<'a>,
@@ -212,12 +212,13 @@ impl<'a> DecimalScalar<'a> {
         let result_value = match (self.decimal_value, other.decimal_value) {
             (None, _) | (_, None) => None,
             (Some(lhs), Some(rhs)) => {
-                // Perform the operation
+                // Add/Sub on stored integers preserve the shared scale; Mul/Div must rescale.
+                let scale = self.decimal_type.scale();
                 let operation_result = match op {
                     NumericOperator::Add => lhs.checked_add(&rhs),
                     NumericOperator::Sub => lhs.checked_sub(&rhs),
-                    NumericOperator::Mul => lhs.checked_mul(&rhs),
-                    NumericOperator::Div => lhs.checked_div(&rhs),
+                    NumericOperator::Mul => lhs.checked_mul_fixed_point(&rhs, scale),
+                    NumericOperator::Div => lhs.checked_div_fixed_point(&rhs, scale),
                 }?;
 
                 // Check if the result fits within the precision constraints

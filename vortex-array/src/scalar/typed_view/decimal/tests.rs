@@ -14,6 +14,7 @@ use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::i256;
 use crate::scalar::DecimalValue;
+use crate::scalar::NumericOperator;
 use crate::scalar::Scalar;
 
 #[rstest]
@@ -834,8 +835,6 @@ fn test_decimal_i256_overflow_cast() {
 // Tests for checked_binary_numeric
 #[test]
 fn test_decimal_scalar_checked_add() {
-    use crate::scalar::NumericOperator;
-
     let decimal1 = Scalar::decimal(
         DecimalValue::I64(100),
         DecimalDType::new(10, 2),
@@ -861,8 +860,6 @@ fn test_decimal_scalar_checked_add() {
 
 #[test]
 fn test_decimal_scalar_checked_sub() {
-    use crate::scalar::NumericOperator;
-
     let decimal1 = Scalar::decimal(
         DecimalValue::I64(500),
         DecimalDType::new(10, 2),
@@ -888,8 +885,6 @@ fn test_decimal_scalar_checked_sub() {
 
 #[test]
 fn test_decimal_scalar_checked_mul() {
-    use crate::scalar::NumericOperator;
-
     let decimal1 = Scalar::decimal(
         DecimalValue::I32(50),
         DecimalDType::new(10, 2),
@@ -904,19 +899,18 @@ fn test_decimal_scalar_checked_mul() {
     );
     let scalar2 = decimal2.as_decimal();
 
+    // 0.50 * 0.10 = 0.05, stored as 5 at scale 2.
     let result = scalar1
         .checked_binary_numeric(&scalar2, NumericOperator::Mul)
         .unwrap();
     assert_eq!(
         result.decimal_value(),
-        Some(DecimalValue::I256(i256::from_i128(500)))
+        Some(DecimalValue::I256(i256::from_i128(5)))
     );
 }
 
 #[test]
 fn test_decimal_scalar_checked_div() {
-    use crate::scalar::NumericOperator;
-
     let decimal1 = Scalar::decimal(
         DecimalValue::I64(1000),
         DecimalDType::new(10, 2),
@@ -931,19 +925,18 @@ fn test_decimal_scalar_checked_div() {
     );
     let scalar2 = decimal2.as_decimal();
 
+    // 10.00 / 0.10 = 100.00, stored as 10000 at scale 2.
     let result = scalar1
         .checked_binary_numeric(&scalar2, NumericOperator::Div)
         .unwrap();
     assert_eq!(
         result.decimal_value(),
-        Some(DecimalValue::I256(i256::from_i128(100)))
+        Some(DecimalValue::I256(i256::from_i128(10000)))
     );
 }
 
 #[test]
 fn test_decimal_scalar_checked_div_by_zero() {
-    use crate::scalar::NumericOperator;
-
     let decimal1 = Scalar::decimal(
         DecimalValue::I64(1000),
         DecimalDType::new(10, 2),
@@ -962,10 +955,80 @@ fn test_decimal_scalar_checked_div_by_zero() {
     assert_eq!(result, None);
 }
 
+/// Applies `op` to two non-null decimal scalars of `dtype`, returning the stored result value or
+/// `None` if the operation failed (overflow, precision violation, or division by zero).
+fn checked_decimal_op(
+    lhs: i128,
+    rhs: i128,
+    dtype: DecimalDType,
+    op: NumericOperator,
+) -> Option<DecimalValue> {
+    let lhs = Scalar::decimal(DecimalValue::I128(lhs), dtype, Nullability::NonNullable);
+    let rhs = Scalar::decimal(DecimalValue::I128(rhs), dtype, Nullability::NonNullable);
+    lhs.as_decimal()
+        .checked_binary_numeric(&rhs.as_decimal(), op)?
+        .decimal_value()
+}
+
+#[rstest]
+#[case::mul_rescales(50, 10, NumericOperator::Mul, Some(5))] // 0.50 * 0.10 = 0.05
+#[case::mul_truncates(15, 15, NumericOperator::Mul, Some(2))] // 0.15 * 0.15 = 0.0225 -> 0.02
+#[case::mul_truncates_toward_zero(-15, 15, NumericOperator::Mul, Some(-2))]
+#[case::div_rescales(1000, 10, NumericOperator::Div, Some(10000))] // 10.00 / 0.10 = 100.00
+#[case::div_truncates(1000, 300, NumericOperator::Div, Some(333))] // 10.00 / 3.00 = 3.33...
+#[case::div_truncates_toward_zero(-1000, 300, NumericOperator::Div, Some(-333))]
+fn test_decimal_scalar_fixed_point(
+    #[case] lhs: i128,
+    #[case] rhs: i128,
+    #[case] op: NumericOperator,
+    #[case] expected: Option<i128>,
+) {
+    let result = checked_decimal_op(lhs, rhs, DecimalDType::new(10, 2), op);
+    assert_eq!(result, expected.map(DecimalValue::I128));
+}
+
+#[rstest]
+#[case::mul(5, 3, NumericOperator::Mul, Some(1500))] // 500 * 300 = 150_000, stored 1500
+#[case::div(600, 3, NumericOperator::Div, Some(2))] // 60_000 / 300 = 200, stored 2
+#[case::div_truncates(5000, 3, NumericOperator::Div, Some(16))] // 500_000 / 300 = 1666.67 -> 1600
+fn test_decimal_scalar_fixed_point_negative_scale(
+    #[case] lhs: i128,
+    #[case] rhs: i128,
+    #[case] op: NumericOperator,
+    #[case] expected: Option<i128>,
+) {
+    let result = checked_decimal_op(lhs, rhs, DecimalDType::new(10, -2), op);
+    assert_eq!(result, expected.map(DecimalValue::I128));
+}
+
+#[test]
+fn test_decimal_scalar_checked_mul_precision_overflow() {
+    // 99.9 * 99.9 = 9980.01, which exceeds precision 3 at scale 1.
+    let result = checked_decimal_op(999, 999, DecimalDType::new(3, 1), NumericOperator::Mul);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn test_decimal_scalar_checked_mul_wider_than_operand_storage() {
+    // 3000.00 * 3000.00 = 9_000_000.00: the raw product (9e10) overflows the i32 operand
+    // storage, but the rescaled result (9e8) fits both i32 and precision 10.
+    let lhs = Scalar::decimal(
+        DecimalValue::I32(300000),
+        DecimalDType::new(10, 2),
+        Nullability::NonNullable,
+    );
+    let result = lhs
+        .as_decimal()
+        .checked_binary_numeric(&lhs.as_decimal(), NumericOperator::Mul)
+        .unwrap();
+    assert_eq!(
+        result.decimal_value(),
+        Some(DecimalValue::I128(900_000_000))
+    );
+}
+
 #[test]
 fn test_decimal_scalar_null_handling() {
-    use crate::scalar::NumericOperator;
-
     let decimal1 = Scalar::null(DType::Decimal(
         DecimalDType::new(10, 2),
         Nullability::Nullable,
@@ -987,8 +1050,6 @@ fn test_decimal_scalar_null_handling() {
 
 #[test]
 fn test_decimal_scalar_precision_overflow() {
-    use crate::scalar::NumericOperator;
-
     // Create decimals with precision 3 (max value 999)
     let decimal1 = Scalar::decimal(
         DecimalValue::I16(999),
