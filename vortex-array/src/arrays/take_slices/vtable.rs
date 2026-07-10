@@ -27,9 +27,9 @@ use crate::arrays::take_slices::array::LENGTHS_SLOT;
 use crate::arrays::take_slices::array::NUM_SLOTS;
 use crate::arrays::take_slices::array::SLOT_NAMES;
 use crate::arrays::take_slices::array::STARTS_SLOT;
-use crate::arrays::take_slices::check_selector_arrays;
-use crate::arrays::take_slices::selector_constant;
-use crate::arrays::take_slices::selector_to_usize;
+use crate::arrays::take_slices::check_index_arrays;
+use crate::arrays::take_slices::constant_index_value;
+use crate::arrays::take_slices::index_value_to_usize;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::builder_with_capacity_in;
@@ -102,7 +102,7 @@ impl VTable for TakeSlices {
         let lengths = slots[LENGTHS_SLOT]
             .as_ref()
             .vortex_expect("validated lengths slot");
-        check_selector_arrays(starts, lengths)?;
+        check_index_arrays(starts, lengths)?;
         Ok(())
     }
 
@@ -188,29 +188,28 @@ fn append_selected_ranges(
 ) -> VortexResult<usize> {
     let starts = array.starts();
     let lengths = array.lengths();
-    check_selector_arrays(starts, lengths)?;
+    check_index_arrays(starts, lengths)?;
 
     match_each_unsigned_integer_ptype!(starts.dtype().as_ptype(), |S| {
         match_each_unsigned_integer_ptype!(lengths.dtype().as_ptype(), |L| {
-            let start = selector_constant::<S>("start", starts)?;
-            let length = selector_constant::<L>("length", lengths)?;
+            let start = constant_index_value::<S>("start", starts)?;
+            let length = constant_index_value::<L>("length", lengths)?;
             match (start, length) {
-                (Some(start), Some(length)) => append_ranges::<S, L, _, _>(
+                (Some(start), Some(length)) => append_constant_start_and_length_ranges(
                     array.child(),
                     starts.len(),
-                    |_| start,
-                    |_| length,
+                    index_value_to_usize("start", start)?,
+                    index_value_to_usize("length", length)?,
                     builder,
                     ctx,
                 ),
                 (Some(start), None) => {
                     let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
                     let lengths = lengths.as_slice::<L>();
-                    append_ranges::<S, L, _, _>(
+                    append_constant_start_ranges(
                         array.child(),
-                        starts.len(),
-                        |_| start,
-                        |index| lengths[index],
+                        index_value_to_usize("start", start)?,
+                        lengths,
                         builder,
                         ctx,
                     )
@@ -218,11 +217,10 @@ fn append_selected_ranges(
                 (None, Some(length)) => {
                     let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
-                    append_ranges::<S, L, _, _>(
+                    append_constant_length_ranges(
                         array.child(),
-                        starts.len(),
-                        |index| starts[index],
-                        |_| length,
+                        starts,
+                        index_value_to_usize("length", length)?,
                         builder,
                         ctx,
                     )
@@ -232,47 +230,91 @@ fn append_selected_ranges(
                     let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
                     let lengths = lengths.as_slice::<L>();
-                    append_ranges::<S, L, _, _>(
-                        array.child(),
-                        starts.len(),
-                        |index| starts[index],
-                        |index| lengths[index],
-                        builder,
-                        ctx,
-                    )
+                    append_array_ranges(array.child(), starts, lengths, builder, ctx)
                 }
             }
         })
     })
 }
 
-fn append_ranges<S, L, StartAt, LengthAt>(
+fn append_constant_start_and_length_ranges(
     child: &ArrayRef,
     len: usize,
-    mut start_at: StartAt,
-    mut length_at: LengthAt,
+    start: usize,
+    length: usize,
+    builder: &mut dyn ArrayBuilder,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<usize> {
+    let mut produced_len = 0usize;
+    for _ in 0..len {
+        append_range(child, start, length, builder, ctx)?;
+        produced_len = checked_output_len(produced_len, length, "produced")?;
+    }
+    Ok(produced_len)
+}
+
+fn append_constant_start_ranges<L: IntegerPType>(
+    child: &ArrayRef,
+    start: usize,
+    lengths: &[L],
+    builder: &mut dyn ArrayBuilder,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<usize> {
+    let mut produced_len = 0usize;
+    for &length in lengths {
+        let length = index_value_to_usize("length", length)?;
+        append_range(child, start, length, builder, ctx)?;
+        produced_len = checked_output_len(produced_len, length, "produced")?;
+    }
+    Ok(produced_len)
+}
+
+fn append_constant_length_ranges<S: IntegerPType>(
+    child: &ArrayRef,
+    starts: &[S],
+    length: usize,
+    builder: &mut dyn ArrayBuilder,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<usize> {
+    let mut produced_len = 0usize;
+    for &start in starts {
+        let start = index_value_to_usize("start", start)?;
+        append_range(child, start, length, builder, ctx)?;
+        produced_len = checked_output_len(produced_len, length, "produced")?;
+    }
+    Ok(produced_len)
+}
+
+fn append_array_ranges<S, L>(
+    child: &ArrayRef,
+    starts: &[S],
+    lengths: &[L],
     builder: &mut dyn ArrayBuilder,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<usize>
 where
     S: IntegerPType,
     L: IntegerPType,
-    StartAt: FnMut(usize) -> S,
-    LengthAt: FnMut(usize) -> L,
 {
     let mut produced_len = 0usize;
-    for index in 0..len {
-        let start = selector_to_usize("start", start_at(index))?;
-        let length = selector_to_usize("length", length_at(index))?;
-        let end = start.checked_add(length).ok_or_else(|| {
-            vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
-        })?;
-        child.slice(start..end)?.append_to_builder(builder, ctx)?;
-        produced_len = produced_len
-            .checked_add(length)
-            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
+    for (&start, &length) in starts.iter().zip(lengths) {
+        let start = index_value_to_usize("start", start)?;
+        let length = index_value_to_usize("length", length)?;
+        append_range(child, start, length, builder, ctx)?;
+        produced_len = checked_output_len(produced_len, length, "produced")?;
     }
     Ok(produced_len)
+}
+
+fn append_range(
+    child: &ArrayRef,
+    start: usize,
+    length: usize,
+    builder: &mut dyn ArrayBuilder,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    let end = checked_range_end(start, length)?;
+    child.slice(start..end)?.append_to_builder(builder, ctx)
 }
 
 fn scalar_at_selected_range(
@@ -282,42 +324,40 @@ fn scalar_at_selected_range(
 ) -> VortexResult<Option<Scalar>> {
     let starts = array.starts();
     let lengths = array.lengths();
-    check_selector_arrays(starts, lengths)?;
+    check_index_arrays(starts, lengths)?;
 
     match_each_unsigned_integer_ptype!(starts.dtype().as_ptype(), |S| {
         match_each_unsigned_integer_ptype!(lengths.dtype().as_ptype(), |L| {
-            let start = selector_constant::<S>("start", starts)?;
-            let length = selector_constant::<L>("length", lengths)?;
+            let start = constant_index_value::<S>("start", starts)?;
+            let length = constant_index_value::<L>("length", lengths)?;
             match (start, length) {
-                (Some(start), Some(length)) => scalar_from_ranges::<S, L, _, _>(
+                (Some(start), Some(length)) => scalar_from_constant_start_and_length_ranges(
                     array.child(),
                     starts.len(),
                     index,
-                    |_| start,
-                    |_| length,
+                    index_value_to_usize("start", start)?,
+                    index_value_to_usize("length", length)?,
                     ctx,
                 ),
                 (Some(start), None) => {
                     let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
                     let lengths = lengths.as_slice::<L>();
-                    scalar_from_ranges::<S, L, _, _>(
+                    scalar_from_constant_start_ranges(
                         array.child(),
-                        starts.len(),
                         index,
-                        |_| start,
-                        |range_index| lengths[range_index],
+                        index_value_to_usize("start", start)?,
+                        lengths,
                         ctx,
                     )
                 }
                 (None, Some(length)) => {
                     let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
-                    scalar_from_ranges::<S, L, _, _>(
+                    scalar_from_constant_length_ranges(
                         array.child(),
-                        starts.len(),
                         index,
-                        |range_index| starts[range_index],
-                        |_| length,
+                        starts,
+                        index_value_to_usize("length", length)?,
                         ctx,
                     )
                 }
@@ -326,55 +366,121 @@ fn scalar_at_selected_range(
                     let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
                     let lengths = lengths.as_slice::<L>();
-                    scalar_from_ranges::<S, L, _, _>(
-                        array.child(),
-                        starts.len(),
-                        index,
-                        |range_index| starts[range_index],
-                        |range_index| lengths[range_index],
-                        ctx,
-                    )
+                    scalar_from_array_ranges(array.child(), index, starts, lengths, ctx)
                 }
             }
         })
     })
 }
 
-fn scalar_from_ranges<S, L, StartAt, LengthAt>(
+fn scalar_from_constant_start_and_length_ranges(
     child: &ArrayRef,
     len: usize,
     index: usize,
-    mut start_at: StartAt,
-    mut length_at: LengthAt,
+    start: usize,
+    length: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<Scalar>> {
+    let mut logical_start = 0usize;
+    for _ in 0..len {
+        if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
+            return Ok(Some(scalar));
+        }
+        logical_start = checked_output_len(logical_start, length, "logical")?;
+    }
+    Ok(None)
+}
+
+fn scalar_from_constant_start_ranges<L: IntegerPType>(
+    child: &ArrayRef,
+    index: usize,
+    start: usize,
+    lengths: &[L],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<Scalar>> {
+    let mut logical_start = 0usize;
+    for &length in lengths {
+        let length = index_value_to_usize("length", length)?;
+        if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
+            return Ok(Some(scalar));
+        }
+        logical_start = checked_output_len(logical_start, length, "logical")?;
+    }
+    Ok(None)
+}
+
+fn scalar_from_constant_length_ranges<S: IntegerPType>(
+    child: &ArrayRef,
+    index: usize,
+    starts: &[S],
+    length: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<Scalar>> {
+    let mut logical_start = 0usize;
+    for &start in starts {
+        let start = index_value_to_usize("start", start)?;
+        if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
+            return Ok(Some(scalar));
+        }
+        logical_start = checked_output_len(logical_start, length, "logical")?;
+    }
+    Ok(None)
+}
+
+fn scalar_from_array_ranges<S, L>(
+    child: &ArrayRef,
+    index: usize,
+    starts: &[S],
+    lengths: &[L],
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<Scalar>>
 where
     S: IntegerPType,
     L: IntegerPType,
-    StartAt: FnMut(usize) -> S,
-    LengthAt: FnMut(usize) -> L,
 {
     let mut logical_start = 0usize;
-    for range_index in 0..len {
-        let start = selector_to_usize("start", start_at(range_index))?;
-        let length = selector_to_usize("length", length_at(range_index))?;
-        let end = start.checked_add(length).ok_or_else(|| {
-            vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
-        })?;
-        vortex_ensure!(
-            end <= child.len(),
-            "TakeSlicesArray range {start}..{end} exceeds child array length {}",
-            child.len()
-        );
-        let logical_end = logical_start
-            .checked_add(length)
-            .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
-        if index < logical_end {
-            return child
-                .execute_scalar(start + (index - logical_start), ctx)
-                .map(Some);
+    for (&start, &length) in starts.iter().zip(lengths) {
+        let start = index_value_to_usize("start", start)?;
+        let length = index_value_to_usize("length", length)?;
+        if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
+            return Ok(Some(scalar));
         }
-        logical_start = logical_end;
+        logical_start = checked_output_len(logical_start, length, "logical")?;
     }
     Ok(None)
+}
+
+fn scalar_from_range(
+    child: &ArrayRef,
+    logical_start: usize,
+    index: usize,
+    start: usize,
+    length: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<Scalar>> {
+    let end = checked_range_end(start, length)?;
+    vortex_ensure!(
+        end <= child.len(),
+        "TakeSlicesArray range {start}..{end} exceeds child array length {}",
+        child.len()
+    );
+    let logical_end = checked_output_len(logical_start, length, "logical")?;
+    if index < logical_end {
+        return child
+            .execute_scalar(start + (index - logical_start), ctx)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+fn checked_range_end(start: usize, length: usize) -> VortexResult<usize> {
+    start.checked_add(length).ok_or_else(|| {
+        vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
+    })
+}
+
+fn checked_output_len(current: usize, length: usize, name: &str) -> VortexResult<usize> {
+    current
+        .checked_add(length)
+        .ok_or_else(|| vortex_err!("TakeSlicesArray {name} length overflow"))
 }

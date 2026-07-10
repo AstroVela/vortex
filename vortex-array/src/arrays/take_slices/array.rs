@@ -14,9 +14,9 @@ use crate::arrays::TakeSlices;
 
 /// The child array selected by the run sequence.
 pub(super) const CHILD_SLOT: usize = 0;
-/// The selector naming the start of each child run.
+/// The start index for each child run.
 pub(super) const STARTS_SLOT: usize = 1;
-/// The selector naming the length of each child run.
+/// The length for each child run.
 pub(super) const LENGTHS_SLOT: usize = 2;
 pub(super) const NUM_SLOTS: usize = 3;
 pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child", "starts", "lengths"];
@@ -30,14 +30,14 @@ pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
             .vortex_expect("validated take-slices child slot")
     }
 
-    /// The selector naming each child run's start offset.
+    /// The start index for each child run.
     fn starts(&self) -> &ArrayRef {
         self.as_ref().slots()[STARTS_SLOT]
             .as_ref()
             .vortex_expect("validated take-slices starts slot")
     }
 
-    /// The selector naming each child run's length.
+    /// The length for each child run.
     fn lengths(&self) -> &ArrayRef {
         self.as_ref().slots()[LENGTHS_SLOT]
             .as_ref()
@@ -47,9 +47,9 @@ pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
 impl<T: TypedArrayRef<TakeSlices>> TakeSlicesArrayExt for T {}
 
 impl Array<TakeSlices> {
-    /// Constructs a new `TakeSlicesArray` from selector arrays and caller-provided output length.
+    /// Constructs a new `TakeSlicesArray` from start/length arrays and caller-provided output length.
     ///
-    /// Construction validates only the structural array invariants. Selector values are interpreted
+    /// Construction validates only the structural array invariants. Index values are interpreted
     /// when the lazy gather is executed.
     pub fn try_new(
         child: ArrayRef,
@@ -71,7 +71,7 @@ impl Array<TakeSlices> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the child dtype is the output dtype, selector arrays are
+    /// The caller must ensure the child dtype is the output dtype, start/length arrays are
     /// non-nullable unsigned integers of equal length, and `len` is the sum of selected lengths.
     pub unsafe fn new_unchecked(
         child: ArrayRef,

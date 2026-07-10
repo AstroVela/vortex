@@ -333,7 +333,7 @@ fn take_element_runs(
 
     // SAFETY: callers produced one start per output row after validating list indices against the
     // source FSL length. `length` is the fixed list size, represented as a non-nullable unsigned
-    // constant selector, and `output_len` was computed as `run_count * length`.
+    // constant array, and `output_len` was computed as `run_count * length`.
     Ok(
         unsafe { TakeSlicesArray::new_unchecked(elements.clone(), starts, lengths, output_len) }
             .into_array()

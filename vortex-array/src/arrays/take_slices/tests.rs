@@ -122,7 +122,7 @@ fn take_slices_construction_defers_out_of_bounds_starts_to_execution() -> Vortex
 }
 
 #[test]
-fn take_slices_accepts_constant_length_selector() -> VortexResult<()> {
+fn take_slices_accepts_constant_length() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let array = PrimitiveArray::from_iter(0i32..6).into_array();
     let starts = PrimitiveArray::from_iter([0u64, 1, 2]).into_array();
@@ -136,7 +136,7 @@ fn take_slices_accepts_constant_length_selector() -> VortexResult<()> {
 }
 
 #[test]
-fn take_slices_accepts_constant_start_selector() -> VortexResult<()> {
+fn take_slices_accepts_constant_start() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let array = PrimitiveArray::from_iter(0i32..6).into_array();
     let starts = ConstantArray::new(1u64, 3).into_array();
@@ -150,7 +150,7 @@ fn take_slices_accepts_constant_start_selector() -> VortexResult<()> {
 }
 
 #[test]
-fn take_slices_accepts_constant_start_and_length_selectors() -> VortexResult<()> {
+fn take_slices_accepts_constant_start_and_length() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let array = PrimitiveArray::from_iter(0i32..6).into_array();
     let starts = ConstantArray::new(0u64, 3).into_array();

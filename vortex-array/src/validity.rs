@@ -232,19 +232,6 @@ impl Validity {
         lengths: &ArrayRef,
         len: usize,
     ) -> VortexResult<Self> {
-        let mut ctx = legacy_session().create_execution_ctx();
-        self.take_slices_with_ctx(starts, lengths, len, &mut ctx)
-    }
-
-    /// Select validity values by concatenating a sequence of contiguous ranges, using the caller's
-    /// execution context for array-backed validity.
-    pub fn take_slices_with_ctx(
-        &self,
-        starts: &ArrayRef,
-        lengths: &ArrayRef,
-        len: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Self> {
         match self {
             v @ (Self::NonNullable | Self::AllValid | Self::AllInvalid) => Ok(v.clone()),
             Self::Array(is_valid) => Ok(Self::Array(
@@ -255,7 +242,7 @@ impl Validity {
                     len,
                 )?
                 .into_array()
-                .optimize_ctx(ctx.session())?,
+                .optimize()?,
             )),
         }
     }

@@ -269,12 +269,12 @@ impl ArrayRef {
     /// Wraps the array in a [`TakeSlicesArray`] selected by caller-provided child ranges.
     ///
     /// The output is the concatenation of `self[starts[i]..starts[i] + lengths[i]]` for each
-    /// selector row. This computes the output length from `lengths`, but child bounds are checked
+    /// range row. This computes the output length from `lengths`, but child bounds are checked
     /// only when the lazy gather executes.
     pub fn take_slices(&self, starts: Vec<usize>, lengths: Vec<usize>) -> VortexResult<ArrayRef> {
         vortex_ensure!(
             starts.len() == lengths.len(),
-            "TakeSlicesArray selectors must have equal length, got starts {} and lengths {}",
+            "TakeSlicesArray starts and lengths must have equal length, got starts {} and lengths {}",
             starts.len(),
             lengths.len()
         );
