@@ -106,7 +106,6 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
-    use crate::validity::Validity;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 

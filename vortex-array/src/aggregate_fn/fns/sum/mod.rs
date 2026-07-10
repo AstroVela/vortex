@@ -502,16 +502,6 @@ fn sum_value_scalar(partial: &SumPartial) -> Scalar {
     }
 }
 
-/// Whether the array contains at least one valid element. NaNs are valid values: with
-/// `skip_nans` they contribute nothing to the sum, but a sum over only NaNs is `0`, not null.
-fn has_valid_values(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
-    Ok(array
-        .validity()?
-        .execute_mask(array.len(), ctx)?
-        .true_count()
-        > 0)
-}
-
 /// The accumulated sum value.
 // TODO(ngates): instead of an enum, we should use a Box<dyn State> to avoid dispatcher over the
 //  input type every time? Perhaps?
