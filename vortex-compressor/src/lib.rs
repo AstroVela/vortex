@@ -70,7 +70,6 @@ pub mod estimate;
 pub mod scheme;
 pub mod stats;
 
-mod candidate;
 mod constant;
 mod sample;
 

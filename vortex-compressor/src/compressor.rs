@@ -36,8 +36,8 @@ use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
 use crate::builtins::IntDictScheme;
-use crate::candidate::Candidate;
 use crate::constant;
+use crate::cost::Candidate;
 use crate::cost::Cost;
 use crate::cost::CostModel;
 use crate::cost::SizeCost;
