@@ -15,6 +15,8 @@ pub use array::TakeSlicesArrayExt;
 use itertools::Itertools as _;
 pub use kernel::TakeSlicesExecuteAdaptor;
 pub use kernel::TakeSlicesKernel;
+pub use kernel::TakeSlicesReduce;
+pub use kernel::TakeSlicesReduceAdaptor;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;

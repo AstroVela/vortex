@@ -5,6 +5,7 @@ use crate::arrays::Masked;
 use crate::arrays::dict::TakeReduceAdaptor;
 use crate::arrays::filter::FilterReduceAdaptor;
 use crate::arrays::slice::SliceReduceAdaptor;
+use crate::arrays::take_slices::TakeSlicesReduceAdaptor;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::scalar_fn::fns::mask::MaskReduceAdaptor;
 
@@ -13,4 +14,5 @@ pub(crate) const PARENT_RULES: ParentRuleSet<Masked> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&MaskReduceAdaptor(Masked)),
     ParentRuleSet::lift(&SliceReduceAdaptor(Masked)),
     ParentRuleSet::lift(&TakeReduceAdaptor(Masked)),
+    ParentRuleSet::lift(&TakeSlicesReduceAdaptor(Masked)),
 ]);

@@ -5,10 +5,12 @@ use crate::arrays::Variant;
 use crate::arrays::dict::TakeReduceAdaptor;
 use crate::arrays::filter::FilterReduceAdaptor;
 use crate::arrays::slice::SliceReduceAdaptor;
+use crate::arrays::take_slices::TakeSlicesReduceAdaptor;
 use crate::optimizer::rules::ParentRuleSet;
 
 pub(crate) const RULES: ParentRuleSet<Variant> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&SliceReduceAdaptor(Variant)),
     ParentRuleSet::lift(&FilterReduceAdaptor(Variant)),
     ParentRuleSet::lift(&TakeReduceAdaptor(Variant)),
+    ParentRuleSet::lift(&TakeSlicesReduceAdaptor(Variant)),
 ]);

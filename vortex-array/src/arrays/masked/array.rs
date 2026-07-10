@@ -92,4 +92,27 @@ impl Array<Masked> {
             )
         })
     }
+
+    /// Constructs a new `MaskedArray` when the caller has already proven that `child` contains no
+    /// logical nulls.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that every child value is valid and that `validity` has `child.len()`
+    /// rows when it has an array-backed representation.
+    pub(crate) unsafe fn new_unchecked_child_all_valid(
+        child: ArrayRef,
+        validity: Validity,
+    ) -> VortexResult<Self> {
+        let dtype = child.dtype().as_nullable();
+        let len = child.len();
+        let validity_slot = validity_to_child(&validity, len);
+        let data = MaskedData::try_new(len, true, validity)?;
+        Ok(unsafe {
+            Array::from_parts_unchecked(
+                ArrayParts::new(Masked, dtype, len, data)
+                    .with_slots(smallvec![Some(child), validity_slot]),
+            )
+        })
+    }
 }

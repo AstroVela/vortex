@@ -9,25 +9,40 @@ use crate::IntoArray;
 use crate::VortexSessionExecute;
 use crate::array_session;
 use crate::arrays::BoolArray;
+use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::DictArray;
+use crate::arrays::Extension;
+use crate::arrays::ExtensionArray;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListArray;
+use crate::arrays::Masked;
+use crate::arrays::MaskedArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::Struct;
 use crate::arrays::StructArray;
 use crate::arrays::TakeSlices;
 use crate::arrays::TakeSlicesArray;
 use crate::arrays::VarBinArray;
 use crate::arrays::VarBinViewArray;
+use crate::arrays::Variant;
+use crate::arrays::VariantArray;
+use crate::arrays::extension::ExtensionArrayExt;
+use crate::arrays::masked::MaskedArraySlotsExt;
+use crate::arrays::struct_::StructArrayExt;
 use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
+use crate::arrays::variant::VariantArrayExt;
 use crate::assert_arrays_eq;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
+use crate::extension::datetime::Date;
+use crate::extension::datetime::TimeUnit;
 use crate::kernel::ExecuteParentKernel;
+use crate::scalar::Scalar;
 use crate::validity::Validity;
 
 #[test]
@@ -209,7 +224,7 @@ fn primitive_take_slices_execute_parent_handles_only_child_slot() -> VortexResul
 }
 
 #[test]
-fn struct_take_slices_executes_generically() -> VortexResult<()> {
+fn struct_take_slices_reduce_pushes_into_fields() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let array = StructArray::try_new(
         FieldNames::from(["id", "name"]),
@@ -233,6 +248,93 @@ fn struct_take_slices_executes_generically() -> VortexResult<()> {
         Validity::NonNullable,
     )?;
 
+    let reduced = actual.clone().execute::<ArrayRef>(&mut ctx)?;
+    let reduced_struct = reduced
+        .as_opt::<Struct>()
+        .ok_or_else(|| vortex_err!("expected TakeSlices reduce to return Struct"))?;
+    assert!(
+        reduced_struct
+            .iter_unmasked_fields()
+            .all(|field| field.is::<TakeSlices>())
+    );
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn extension_take_slices_reduce_pushes_into_storage() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let ext_dtype = Date::new(TimeUnit::Days, Nullability::NonNullable).erased();
+    let array = ExtensionArray::new(
+        ext_dtype.clone(),
+        PrimitiveArray::from_iter(0i32..6).into_array(),
+    )
+    .into_array();
+
+    let actual = take_slices(&array, &[(3, 2), (0, 2)])?;
+    let expected = ExtensionArray::new(
+        ext_dtype,
+        PrimitiveArray::from_iter([3i32, 4, 0, 1]).into_array(),
+    );
+
+    let reduced = actual.clone().execute::<ArrayRef>(&mut ctx)?;
+    let reduced_extension = reduced
+        .as_opt::<Extension>()
+        .ok_or_else(|| vortex_err!("expected TakeSlices reduce to return Extension"))?;
+    assert!(reduced_extension.storage_array().is::<TakeSlices>());
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn masked_take_slices_reduce_preserves_mask() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = MaskedArray::try_new(
+        PrimitiveArray::from_iter(0i32..6).into_array(),
+        Validity::from_iter([true, false, true, true, false, true]),
+    )?
+    .into_array();
+
+    let actual = take_slices(&array, &[(3, 2), (0, 2)])?;
+    let expected = MaskedArray::try_new(
+        PrimitiveArray::from_iter([3i32, 4, 0, 1]).into_array(),
+        Validity::from_iter([true, false, true, false]),
+    )?;
+
+    let reduced = actual.clone().execute::<ArrayRef>(&mut ctx)?;
+    let reduced_masked = reduced
+        .as_opt::<Masked>()
+        .ok_or_else(|| vortex_err!("expected TakeSlices reduce to return Masked"))?;
+    assert!(reduced_masked.child().is::<TakeSlices>());
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn variant_take_slices_reduce_pushes_into_storage_and_shredded() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = VariantArray::try_new(
+        variant_storage(0..6)?,
+        Some(PrimitiveArray::from_iter(10i32..16).into_array()),
+    )?
+    .into_array();
+
+    let actual = take_slices(&array, &[(3, 2), (0, 2)])?;
+    let expected = VariantArray::try_new(
+        variant_storage([3, 4, 0, 1])?,
+        Some(PrimitiveArray::from_iter([13i32, 14, 10, 11]).into_array()),
+    )?;
+
+    let reduced = actual.clone().execute::<ArrayRef>(&mut ctx)?;
+    let reduced_variant = reduced
+        .as_opt::<Variant>()
+        .ok_or_else(|| vortex_err!("expected TakeSlices reduce to return Variant"))?;
+    assert!(reduced_variant.core_storage().is::<TakeSlices>());
+    assert!(
+        reduced_variant
+            .shredded()
+            .is_some_and(|shredded| shredded.is::<TakeSlices>())
+    );
     assert_arrays_eq!(actual, expected, &mut ctx);
     Ok(())
 }
@@ -496,4 +598,19 @@ fn take_slices(array: &ArrayRef, runs: &[(usize, usize)]) -> VortexResult<ArrayR
         len,
     )
     .map(IntoArray::into_array)
+}
+
+fn variant_storage(values: impl IntoIterator<Item = i32>) -> VortexResult<ArrayRef> {
+    let chunks = values
+        .into_iter()
+        .map(|value| {
+            ConstantArray::new(
+                Scalar::variant(Scalar::primitive(value, Nullability::NonNullable)),
+                1,
+            )
+            .into_array()
+        })
+        .collect();
+
+    Ok(ChunkedArray::try_new(chunks, DType::Variant(Nullability::NonNullable))?.into_array())
 }

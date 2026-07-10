@@ -31,13 +31,19 @@ use crate::matcher::Matcher;
 ///
 /// Unlike reduce rules, parent kernels may read buffers and perform real computation.
 ///
+/// The returned array must be semantically equivalent to the parent array and must have the same
+/// logical length and dtype. It does not have to be recursively canonical or fully materialized:
+/// the executor optimizes the returned array and continues execution toward the caller's requested
+/// target. If a caller needs all nested children fully executed, it should request
+/// `RecursiveCanonical`.
+///
 /// Return `Ok(None)` to decline handling (the scheduler will try the next kernel or fall
 /// through to the encoding's own `execute`).
 pub trait ExecuteParentKernel<V: VTable>: Debug + Send + Sync + 'static {
     /// The parent array type this kernel handles.
     type Parent: Matcher;
 
-    /// Attempt to execute the parent array fused with the child array.
+    /// Attempt to rewrite or execute the parent array fused with the child array.
     fn execute_parent(
         &self,
         array: ArrayView<'_, V>,

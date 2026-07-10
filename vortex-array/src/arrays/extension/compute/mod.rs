@@ -8,6 +8,7 @@ mod mask;
 pub(crate) mod rules;
 mod slice;
 mod take;
+mod take_slices;
 
 #[cfg(test)]
 mod test {

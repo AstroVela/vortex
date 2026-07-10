@@ -5,3 +5,4 @@ mod filter;
 pub(crate) mod rules;
 mod slice;
 mod take;
+mod take_slices;
