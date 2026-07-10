@@ -8,16 +8,21 @@ mod ctx;
 pub use ctx::CompressorContext;
 pub use ctx::MAX_CASCADE;
 
-pub(crate) mod estimate;
+mod estimate;
+pub use estimate::CompressionEstimate;
+pub use estimate::DeferredEstimate;
+pub use estimate::EstimateFn;
+pub use estimate::EstimateVerdict;
+
+mod exclusion;
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-pub use estimate::CompressionEstimate;
-pub use estimate::DeferredEstimate;
-pub use estimate::EstimateFn;
-pub use estimate::EstimateVerdict;
+pub use exclusion::AncestorExclusion;
+pub use exclusion::ChildSelection;
+pub use exclusion::DescendantExclusion;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
@@ -45,54 +50,6 @@ impl fmt::Display for SchemeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name)
     }
-}
-
-/// Selects which children of a cascading scheme a rule applies to.
-#[derive(Debug, Clone, Copy)]
-pub enum ChildSelection {
-    /// Rule applies to all children.
-    All,
-    /// Rule applies to a single child.
-    One(usize),
-    /// Rule applies to multiple specific children.
-    Many(&'static [usize]),
-}
-
-impl ChildSelection {
-    /// Returns `true` if this selection includes the given child index.
-    pub fn contains(&self, child_index: usize) -> bool {
-        match self {
-            ChildSelection::All => true,
-            ChildSelection::One(idx) => *idx == child_index,
-            ChildSelection::Many(indices) => indices.contains(&child_index),
-        }
-    }
-}
-
-/// Push rule: declared by a cascading scheme to exclude another scheme from the subtree
-/// rooted at the specified children.
-///
-/// Use this when the declaring scheme (the ancestor) knows about the excluded scheme. For example,
-/// `ZigZag` excludes `Dict` from all its children.
-#[derive(Debug, Clone, Copy)]
-pub struct DescendantExclusion {
-    /// The scheme to exclude from descendants.
-    pub excluded: SchemeId,
-    /// Which children of the declaring scheme this rule applies to.
-    pub children: ChildSelection,
-}
-
-/// Pull rule: declared by a scheme to exclude itself when the specified ancestor is in the
-/// cascade chain.
-///
-/// Use this when the excluded scheme (the descendant) knows about the ancestor. For example,
-/// `Sequence` excludes itself when `IntDict` is an ancestor on its codes child.
-#[derive(Debug, Clone, Copy)]
-pub struct AncestorExclusion {
-    /// The ancestor scheme that makes the declaring scheme ineligible.
-    pub ancestor: SchemeId,
-    /// Which children of the ancestor this rule applies to.
-    pub children: ChildSelection,
 }
 
 // TODO(connor): Remove all default implemented methods.

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Sampling utilities for compression ratio estimation.
+//! Sampling utilities and sampling-based compression ratio estimation.
 
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::prelude::StdRng;
 use vortex_array::ArrayRef;
+use vortex_array::Canonical;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
+
+use crate::CascadingCompressor;
+use crate::scheme::CompressorContext;
+use crate::scheme::Scheme;
+use crate::scheme::SchemeExt;
+use crate::stats::ArrayAndStats;
+use crate::trace;
 
 /// The size of each sampled run.
 pub const SAMPLE_SIZE: u32 = 64;
@@ -128,6 +138,70 @@ fn partition_indices(length: usize, num_partitions: u32) -> Vec<(usize, usize)> 
                 .map(|off| (off, off + short_step)),
         )
         .collect()
+}
+
+/// A sampling-based estimate: the optional measured ratio and compressed sample array.
+pub(super) struct SampledEstimate {
+    /// The compression ratio measured on the sample, or `None` for a zero-byte output.
+    pub(super) estimated_ratio: Option<f64>,
+
+    /// The compressed sample array. Its encoding tree is the best available prediction of
+    /// the full-array encoding tree.
+    pub(super) sampled: ArrayRef,
+}
+
+/// Estimates compression ratio by compressing a ~1% sample of the data.
+///
+/// Creates a new [`ArrayAndStats`] for the sample so that stats are generated from the sample, not
+/// the full array.
+///
+/// Returns the compressed sample alongside its measured ratio so the cost model can inspect its
+/// encoding tree while pricing the candidate.
+///
+/// # Errors
+///
+/// Returns an error if sample compression fails.
+pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
+    compressor: &CascadingCompressor,
+    scheme: &S,
+    array: &ArrayRef,
+    compress_ctx: CompressorContext,
+    exec_ctx: &mut ExecutionCtx,
+) -> VortexResult<SampledEstimate> {
+    let sample_array = if compress_ctx.is_sample() {
+        array.clone()
+    } else {
+        let sample_count = sample_count_approx_one_percent(array.len());
+        // `ArrayAndStats` expects a canonical array (so that it can easily compute lazy stats).
+        let canonical: Canonical = sample(array, SAMPLE_SIZE, sample_count).execute(exec_ctx)?;
+        canonical.into_array()
+    };
+
+    let sample_data = ArrayAndStats::new(sample_array, scheme.stats_options());
+    let error_ctx = trace::enabled_error_context(&compress_ctx);
+    let sample_ctx = compress_ctx.with_sampling();
+
+    let compressed = match scheme.compress(compressor, &sample_data, sample_ctx, exec_ctx) {
+        Ok(compressed) => compressed,
+        Err(err) => {
+            trace::sample_compress_failed(scheme.id(), error_ctx.as_ref(), &err);
+            return Err(err);
+        }
+    };
+
+    let after = compressed.nbytes();
+    let before = sample_data.array().nbytes();
+
+    let estimated_ratio = (after != 0).then(|| before as f64 / after as f64);
+
+    if estimated_ratio.is_none() {
+        trace::zero_byte_sample_result(scheme.id(), before);
+    }
+
+    Ok(SampledEstimate {
+        estimated_ratio,
+        sampled: compressed,
+    })
 }
 
 #[cfg(test)]
