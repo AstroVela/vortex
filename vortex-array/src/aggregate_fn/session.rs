@@ -29,6 +29,8 @@ use crate::aggregate_fn::fns::min::Min;
 use crate::aggregate_fn::fns::min_max::MinMax;
 use crate::aggregate_fn::fns::nan_count::NanCount;
 use crate::aggregate_fn::fns::null_count::NullCount;
+use crate::aggregate_fn::fns::stat_sum::PrimitiveGroupedStatSumEncodingKernel;
+use crate::aggregate_fn::fns::stat_sum::StatSum;
 use crate::aggregate_fn::fns::sum::PrimitiveGroupedSumEncodingKernel;
 use crate::aggregate_fn::fns::sum::Sum;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
@@ -99,6 +101,7 @@ impl Default for AggregateFnSession {
         this.register(MinMax);
         this.register(NanCount);
         this.register(NullCount);
+        this.register(StatSum);
         this.register(Sum);
         this.register(UncompressedSizeInBytes);
 
@@ -114,6 +117,11 @@ impl Default for AggregateFnSession {
             Primitive.id(),
             Sum.id(),
             &PrimitiveGroupedSumEncodingKernel,
+        );
+        this.register_grouped_encoding_kernel(
+            Primitive.id(),
+            StatSum.id(),
+            &PrimitiveGroupedStatSumEncodingKernel,
         );
 
         this

@@ -29,8 +29,8 @@ use crate::scalar_fn::ScalarFnVTable;
 ///
 /// Follows SQL `SUM` semantics per list, matching DuckDB's `list_sum`: null lists, empty
 /// lists, and lists whose elements are all null yield a null sum; null elements are skipped.
-/// Integer and decimal overflow yields a null sum value, matching [`Sum`]. The result dtype
-/// follows [`Sum`]'s widening rules and is always nullable.
+/// Integer and decimal overflow yields a null sum value, matching [`Sum`]. The result
+/// dtype follows [`Sum`]'s widening rules and is always nullable.
 ///
 /// NaN handling for float elements is controlled by [`NumericalAggregateOpts`]: with
 /// `skip_nans` (the default) NaN values contribute nothing, otherwise any NaN poisons the

@@ -14,7 +14,7 @@ use crate::aggregate_fn::fns::all_null::AllNull;
 use crate::aggregate_fn::fns::min_max::MinMax;
 use crate::aggregate_fn::fns::nan_count::NanCount;
 use crate::aggregate_fn::fns::null_count::NullCount;
-use crate::aggregate_fn::fns::sum::Sum;
+use crate::aggregate_fn::fns::stat_sum::StatSum;
 use crate::expr::Expression;
 use crate::scalar_fn::ScalarFnVTableExt;
 pub use crate::scalar_fn::fns::stat::StatFn;
@@ -37,7 +37,7 @@ pub fn min_max(expr: Expression) -> Expression {
 /// Creates `stat(expr, sum)`, returning a nullable sum statistic.
 pub fn sum(expr: Expression) -> Expression {
     // Statistics follow NaN-skipping semantics; request it explicitly rather than via the default.
-    stat(expr, Sum.bind(NumericalAggregateOpts::skip_nans()))
+    stat(expr, StatSum.bind(NumericalAggregateOpts::skip_nans()))
 }
 
 /// Creates `stat(expr, null_count)`, returning a nullable null-count statistic.
@@ -89,8 +89,6 @@ mod tests {
     use crate::Canonical;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::aggregate_fn::NumericalAggregateOpts;
-    use crate::aggregate_fn::fns::sum::Sum;
     use crate::array_session;
     use crate::arrays::Chunked;
     use crate::arrays::ChunkedArray;
@@ -106,29 +104,9 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
+    use crate::validity::Validity;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
-
-    /// The `{sum, seen}` state dtype for a sum over non-nullable i32 input.
-    fn sum_state_dtype() -> DType {
-        use crate::aggregate_fn::AggregateFnVTable;
-        Sum.partial_dtype(
-            &NumericalAggregateOpts::skip_nans(),
-            &DType::Primitive(PType::I32, Nullability::NonNullable),
-        )
-        .vortex_expect("sum partial dtype")
-    }
-
-    /// A seen `{sum, seen}` state scalar with the given running sum.
-    fn sum_state(value: i64) -> Scalar {
-        Scalar::struct_(
-            sum_state_dtype(),
-            vec![
-                Scalar::primitive(value, Nullability::Nullable),
-                Scalar::bool(true, Nullability::NonNullable),
-            ],
-        )
-    }
 
     #[test]
     fn stat_expr_reads_cached_sum() -> VortexResult<()> {
@@ -144,8 +122,8 @@ mod tests {
             .execute::<Canonical>(&mut SESSION.create_execution_ctx())?
             .into_array();
 
-        // Stat expressions resolve to the aggregate's `{sum, seen}` state form.
-        let expected = ConstantArray::new(sum_state(6), 3).into_array();
+        let expected =
+            ConstantArray::new(Scalar::primitive(6i64, Nullability::Nullable), 3).into_array();
         assert_arrays_eq!(result, expected, &mut SESSION.create_execution_ctx());
 
         Ok(())
@@ -160,7 +138,11 @@ mod tests {
             .execute::<Canonical>(&mut SESSION.create_execution_ctx())?
             .into_array();
 
-        let expected = ConstantArray::new(Scalar::null(sum_state_dtype()), 3).into_array();
+        let expected = ConstantArray::new(
+            Scalar::null(DType::Primitive(PType::I64, Nullability::Nullable)),
+            3,
+        )
+        .into_array();
         assert_arrays_eq!(result, expected, &mut SESSION.create_execution_ctx());
 
         Ok(())
@@ -191,13 +173,10 @@ mod tests {
         let result = result
             .execute::<Canonical>(&mut SESSION.create_execution_ctx())?
             .into_array();
-        let expected = ChunkedArray::try_new(
-            vec![
-                ConstantArray::new(sum_state(3), 2).into_array(),
-                ConstantArray::new(Scalar::null(sum_state_dtype()), 3).into_array(),
-            ],
-            sum_state_dtype(),
-        )?
+        let expected = PrimitiveArray::new(
+            buffer![3i64, 3, 0, 0, 0],
+            Validity::from_iter([true, true, false, false, false]),
+        )
         .into_array();
         assert_arrays_eq!(result, expected, &mut SESSION.create_execution_ctx());
 

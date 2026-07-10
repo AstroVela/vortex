@@ -173,16 +173,12 @@ fn stat_array(
         }
         .map(ScalarValue::Bool)
     } else if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
-        let stored = array
+        array
             .statistics()
             .with_typed_stats_set(|stats| stats.get(stat))
             // We don't mind whether the stat is approxed or not, since these are row-wise bounds.
-            .into_inner();
-        match stored {
-            Some(scalar) if scalar.dtype().eq_ignore_nullability(&dtype) => scalar.into_value(),
-            Some(scalar) => result_stat_to_state(array, aggregate_fn, scalar, len)?,
-            None => None,
-        }
+            .into_inner()
+            .and_then(Scalar::into_value)
     } else {
         tracing::trace!(
             "No legacy Stat slot for aggregate {}; stat expression will resolve to null",
@@ -193,29 +189,4 @@ fn stat_array(
 
     let scalar = Scalar::try_new(dtype, value)?;
     Ok(ConstantArray::new(scalar, len).into_array())
-}
-
-/// Rebuild an aggregate's partial state from a result-form statistic (e.g. `Sum`'s monoid
-/// statistic vs its `{sum, seen}` state). A result-form stat cannot express "no valid values",
-/// so the array's null count decides between the empty state and a seen state; when the null
-/// count is unknown for a nullable array, the stat is unusable and resolves to missing.
-fn result_stat_to_state(
-    array: &ArrayRef,
-    aggregate_fn: &AggregateFnRef,
-    stat_scalar: Scalar,
-    len: usize,
-) -> VortexResult<Option<ScalarValue>> {
-    let all_null = if array.dtype().is_nullable() {
-        match array.statistics().get_as::<u64>(Stat::NullCount) {
-            Precision::Exact(null_count) => null_count == len as u64,
-            _ => return Ok(None),
-        }
-    } else {
-        false
-    };
-    let mut acc = aggregate_fn.accumulator(array.dtype())?;
-    if !all_null {
-        acc.combine_partials(stat_scalar)?;
-    }
-    Ok(acc.partial_scalar()?.into_value())
 }

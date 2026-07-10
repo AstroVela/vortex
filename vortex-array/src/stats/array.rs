@@ -23,7 +23,7 @@ use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
 use crate::aggregate_fn::fns::min_max::MinMaxResult;
 use crate::aggregate_fn::fns::min_max::min_max;
 use crate::aggregate_fn::fns::nan_count::nan_count;
-use crate::aggregate_fn::fns::sum::stat_sum;
+use crate::aggregate_fn::fns::stat_sum::stat_sum;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
