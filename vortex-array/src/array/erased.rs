@@ -286,12 +286,12 @@ impl ArrayRef {
         }
         let starts = starts
             .into_iter()
-            .map(selector_value)
-            .collect::<VortexResult<Vec<_>>>()?;
+            .map(|start| start as u64)
+            .collect::<Vec<_>>();
         let lengths = lengths
             .into_iter()
-            .map(selector_value)
-            .collect::<VortexResult<Vec<_>>>()?;
+            .map(|length| length as u64)
+            .collect::<Vec<_>>();
         TakeSlicesArray::try_new(
             self.clone(),
             PrimitiveArray::from_iter(starts).into_array(),
@@ -815,11 +815,6 @@ impl ArrayRef {
             stack: vec![self.clone()],
         }
     }
-}
-
-fn selector_value(value: usize) -> VortexResult<u64> {
-    u64::try_from(value)
-        .map_err(|_| vortex_err!("TakeSlicesArray selector {value} does not fit in u64"))
 }
 
 impl IntoArray for ArrayRef {

@@ -147,7 +147,9 @@ primitive_scalar!(f64);
 // `Scalar` <---> `usize` conversions.
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-// NB: We cast `usize` to `u64` (which should always succeed) for better ergonomics.
+// NB: Vortex represents `usize` scalar values as `u64` for better ergonomics. Rust's current
+// supported target pointer widths fit in `u64`; fail to compile if that assumption changes.
+static_assertions::const_assert!(usize::BITS <= u64::BITS);
 
 /// Fallible conversion from a [`ScalarValue`] into an `T`.
 ///

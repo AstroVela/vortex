@@ -202,9 +202,11 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
     let mut starts = Vec::with_capacity(new_len);
     let mut new_validity_builder = BitBufferMut::with_capacity(new_len);
 
+    // Null output rows still need placeholder child elements so the FSL elements length stays
+    // `rows * list_size`. This path has a non-empty source, so 0 is in bounds and validity hides it.
     for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
         if !is_index_valid {
-            starts.push(null_element_run_start());
+            starts.push(0);
             new_validity_builder.append(false);
             continue;
         }
@@ -212,7 +214,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         let data_idx = index_to_usize(data_idx)?;
         let start = list_start(data_idx, list_size, array_len)?;
         if !array_validity.value(data_idx) {
-            starts.push(null_element_run_start());
+            starts.push(0);
             new_validity_builder.append(false);
             continue;
         }
@@ -324,10 +326,10 @@ fn take_element_runs(
     let run_count = starts.len();
     let starts = starts
         .into_iter()
-        .map(selector_value)
-        .collect::<VortexResult<Vec<_>>>()?;
+        .map(|start| start as u64)
+        .collect::<Vec<_>>();
     let starts = PrimitiveArray::from_iter(starts).into_array();
-    let lengths = ConstantArray::new(selector_value(length)?, run_count).into_array();
+    let lengths = ConstantArray::new(length as u64, run_count).into_array();
 
     // SAFETY: callers produced one start per output row after validating list indices against the
     // source FSL length. `length` is the fixed list size, represented as a non-nullable unsigned
@@ -341,19 +343,8 @@ fn take_element_runs(
     )
 }
 
-fn null_element_run_start() -> usize {
-    // Null output rows still need placeholder child elements so the FSL elements length stays
-    // `rows * list_size`. Any in-bounds run is fine because row validity hides these elements.
-    0
-}
-
 fn index_to_usize<I: IntegerPType>(index: I) -> VortexResult<usize> {
     index
         .to_usize()
         .ok_or_else(|| vortex_err!("FixedSizeList take index {index} does not fit in usize"))
-}
-
-fn selector_value(value: usize) -> VortexResult<u64> {
-    u64::try_from(value)
-        .map_err(|_| vortex_err!("FixedSizeList take selector {value} does not fit in u64"))
 }
