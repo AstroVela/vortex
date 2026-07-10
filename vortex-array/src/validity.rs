@@ -224,30 +224,39 @@ impl Validity {
         }
     }
 
-    /// Select validity values by concatenating a sequence of contiguous runs.
-    ///
-    /// Prefer [`Self::take_slices_with_ctx`] when the caller already has an execution context.
+    /// Select validity values by concatenating a sequence of contiguous ranges.
     #[allow(clippy::disallowed_methods)]
-    pub fn take_slices(&self, starts: &ArrayRef, lengths: &ArrayRef) -> VortexResult<Self> {
+    pub fn take_slices(
+        &self,
+        starts: &ArrayRef,
+        ends: &ArrayRef,
+        len: usize,
+    ) -> VortexResult<Self> {
         let mut ctx = legacy_session().create_execution_ctx();
-        self.take_slices_with_ctx(starts, lengths, &mut ctx)
+        self.take_slices_with_ctx(starts, ends, len, &mut ctx)
     }
 
-    /// Select validity values by concatenating a sequence of contiguous runs, using the caller's
+    /// Select validity values by concatenating a sequence of contiguous ranges, using the caller's
     /// execution context for array-backed validity.
     pub fn take_slices_with_ctx(
         &self,
         starts: &ArrayRef,
-        lengths: &ArrayRef,
+        ends: &ArrayRef,
+        len: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
         match self {
             v @ (Self::NonNullable | Self::AllValid | Self::AllInvalid) => Ok(v.clone()),
-            Self::Array(is_valid) => Ok(Self::Array(is_valid.take_slices_with_ctx(
-                starts.clone(),
-                lengths.clone(),
-                ctx,
-            )?)),
+            Self::Array(is_valid) => Ok(Self::Array(
+                crate::arrays::TakeSlicesArray::try_new(
+                    is_valid.clone(),
+                    starts.clone(),
+                    ends.clone(),
+                    len,
+                )?
+                .into_array()
+                .optimize_ctx(ctx.session())?,
+            )),
         }
     }
 

@@ -5,9 +5,12 @@ use num_traits::FromPrimitive;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+use vortex_mask::Mask;
 
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::RecursiveCanonical;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
@@ -147,8 +150,9 @@ impl ListViewArray {
 
     /// Rebuilds elements using a single contiguous-run gather over the element child.
     ///
-    /// `take_slices` is the rebuild primitive for ListView packing. Children with specialized
-    /// kernels can preserve their representation; other children fall back to generic execution.
+    /// `take_slices` is the rebuild primitive for ListView packing. This path materializes the
+    /// element gather so the rebuilt ListView has a physical packed child rather than a lazy
+    /// `TakeSlices` wrapper.
     fn rebuild_with_take_slices<NewOffset: IntegerPType, S: IntegerPType>(
         &self,
         ctx: &mut ExecutionCtx,
@@ -162,12 +166,9 @@ impl ListViewArray {
         let sizes_canonical = self.sizes().clone().execute::<PrimitiveArray>(ctx)?;
         let sizes_canonical =
             sizes_canonical.reinterpret_cast(sizes_canonical.ptype().to_unsigned());
-        let sizes_slice = sizes_canonical.as_slice::<S>();
 
         let len = offsets_canonical.len();
 
-        let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
-        let mut new_sizes = BufferMut::<S>::with_capacity(len);
         let validity = self.validity()?;
 
         // Resolve validity to a mask once instead of probing it per row: `execute_is_valid`
@@ -175,30 +176,23 @@ impl ListViewArray {
         // `len` times.
         let validity_mask = validity.execute_mask(len, ctx)?;
 
-        let mut n_elements = NewOffset::zero();
-        for (index, is_valid) in validity_mask.iter().enumerate() {
-            if !is_valid {
-                new_offsets.push(n_elements);
-                new_sizes.push(S::zero());
-                continue;
-            }
+        let ranges = match_each_unsigned_integer_ptype!(offsets_canonical.ptype(), |O| {
+            rebuild_ranges::<NewOffset, O, S>(
+                offsets_canonical.as_slice::<O>(),
+                sizes_canonical.as_slice::<S>(),
+                &validity_mask,
+            )
+        })?;
 
-            let size = sizes_slice[index];
-
-            new_offsets.push(n_elements);
-            new_sizes.push(size);
-            n_elements += num_traits::cast(size).vortex_expect("Cast failed");
-        }
-
-        let new_sizes = new_sizes.freeze();
-        let lengths = PrimitiveArray::new(new_sizes.clone(), Validity::NonNullable);
-        let elements = self.elements().take_slices_with_ctx(
-            offsets_canonical.into_array(),
-            lengths.into_array(),
-            ctx,
-        )?;
+        let new_sizes = ranges.new_sizes.freeze();
+        let elements = self
+            .elements()
+            .take_slices(ranges.starts, ranges.ends)?
+            .execute::<RecursiveCanonical>(ctx)?
+            .0
+            .into_array();
         // Built unsigned; reinterpret back to the signed-preserving result types.
-        let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
+        let offsets = PrimitiveArray::new(ranges.new_offsets.freeze(), Validity::NonNullable)
             .reinterpret_cast(new_offset_ptype)
             .into_array();
         let sizes = PrimitiveArray::new(new_sizes, Validity::NonNullable)
@@ -272,6 +266,70 @@ impl ListViewArray {
             self.rebuild_zero_copy_to_list(ctx)
         }
     }
+}
+
+struct RebuildRanges<NewOffset, S> {
+    new_offsets: BufferMut<NewOffset>,
+    new_sizes: BufferMut<S>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+}
+
+fn rebuild_ranges<NewOffset, O, S>(
+    offsets: &[O],
+    sizes: &[S],
+    validity_mask: &Mask,
+) -> VortexResult<RebuildRanges<NewOffset, S>>
+where
+    NewOffset: IntegerPType,
+    O: IntegerPType,
+    S: IntegerPType,
+{
+    let len = offsets.len();
+    let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
+    let mut new_sizes = BufferMut::<S>::with_capacity(len);
+    let mut starts = Vec::with_capacity(len);
+    let mut ends = Vec::with_capacity(len);
+    let mut n_elements = NewOffset::zero();
+
+    for (index, is_valid) in validity_mask.iter().enumerate() {
+        if !is_valid {
+            new_offsets.push(n_elements);
+            new_sizes.push(S::zero());
+            starts.push(0);
+            ends.push(0);
+            continue;
+        }
+
+        let size = sizes[index];
+        let start = offsets[index].to_usize().ok_or_else(|| {
+            vortex_err!(
+                "ListView rebuild offset {} does not fit in usize",
+                offsets[index]
+            )
+        })?;
+        let length = size
+            .to_usize()
+            .ok_or_else(|| vortex_err!("ListView rebuild size {size} does not fit in usize"))?;
+        let end = start.checked_add(length).ok_or_else(|| {
+            vortex_err!(
+                "ListView rebuild element range overflow for start {start} and length {length}"
+            )
+        })?;
+
+        new_offsets.push(n_elements);
+        new_sizes.push(size);
+        starts.push(start);
+        ends.push(end);
+        n_elements += num_traits::cast(size).vortex_expect("Cast failed");
+    }
+
+    Ok(RebuildRanges {
+        new_offsets,
+        new_sizes,
+        starts,
+        ends,
+    })
 }
 
 #[cfg(test)]

@@ -5,10 +5,8 @@ use vortex_session::VortexSession;
 
 use crate::ArrayVTable;
 use crate::arrays::Dict;
-use crate::arrays::TakeSlices;
 use crate::arrays::VarBinView;
 use crate::arrays::dict::TakeExecuteAdaptor;
-use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::cast::Cast;
@@ -20,10 +18,5 @@ pub(crate) fn initialize(session: &VortexSession) {
     let kernels = session.kernels();
     kernels.register_execute_parent_kernel(Cast.id(), VarBinView, CastExecuteAdaptor(VarBinView));
     kernels.register_execute_parent_kernel(Dict.id(), VarBinView, TakeExecuteAdaptor(VarBinView));
-    kernels.register_execute_parent_kernel(
-        TakeSlices.id(),
-        VarBinView,
-        TakeSlicesExecuteAdaptor(VarBinView),
-    );
     kernels.register_execute_parent_kernel(Zip.id(), VarBinView, ZipExecuteAdaptor(VarBinView));
 }

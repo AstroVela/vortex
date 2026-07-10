@@ -6,9 +6,7 @@ use vortex_session::VortexSession;
 use crate::ArrayVTable;
 use crate::arrays::Dict;
 use crate::arrays::Primitive;
-use crate::arrays::TakeSlices;
 use crate::arrays::dict::TakeExecuteAdaptor;
-use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::between::Between;
@@ -34,10 +32,5 @@ pub(crate) fn initialize(session: &VortexSession) {
         FillNullExecuteAdaptor(Primitive),
     );
     kernels.register_execute_parent_kernel(Dict.id(), Primitive, TakeExecuteAdaptor(Primitive));
-    kernels.register_execute_parent_kernel(
-        TakeSlices.id(),
-        Primitive,
-        TakeSlicesExecuteAdaptor(Primitive),
-    );
     kernels.register_execute_parent_kernel(Zip.id(), Primitive, ZipExecuteAdaptor(Primitive));
 }

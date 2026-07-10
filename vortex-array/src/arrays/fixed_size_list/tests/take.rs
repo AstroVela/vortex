@@ -32,8 +32,8 @@ use crate::array::with_empty_buffers;
 use crate::array_session;
 use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
+use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::TakeSlices;
 use crate::arrays::dict::TakeExecute;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::assert_arrays_eq;
@@ -398,7 +398,7 @@ fn test_take_empty_source_rejects_valid_index_after_null_index() -> VortexResult
 }
 
 #[test]
-fn test_take_uses_take_slices_for_encoded_elements_child() -> VortexResult<()> {
+fn test_take_materializes_encoded_elements_child() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let encoded_elements = NoTakeSlicesArray::wrap(buffer![10i32, 20, 30, 40, 20, 30].into_array());
     let fsl = FixedSizeListArray::new(encoded_elements, 2, Validity::NonNullable, 3);
@@ -407,7 +407,7 @@ fn test_take_uses_take_slices_for_encoded_elements_child() -> VortexResult<()> {
     let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
         .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
 
-    assert!(result.as_::<FixedSizeList>().elements().is::<TakeSlices>());
+    assert!(result.as_::<FixedSizeList>().elements().is::<Primitive>());
     let expected = FixedSizeListArray::new(
         PrimitiveArray::from_iter([20i32, 30, 10, 20]).into_array(),
         2,

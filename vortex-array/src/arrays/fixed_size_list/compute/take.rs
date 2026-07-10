@@ -10,6 +10,7 @@ use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::IntoArray;
+use crate::RecursiveCanonical;
 use crate::array::ArrayView;
 use crate::arrays::BoolArray;
 use crate::arrays::FixedSizeList;
@@ -30,7 +31,7 @@ use crate::validity::Validity;
 ///
 /// `FixedSizeListArray` must rebuild its elements array because selected lists need to become
 /// packed from offset 0. The FSL layer translates selected list rows into ordered element runs
-/// and delegates the execution strategy to the elements child via `take_slices`.
+/// and delegates the execution strategy to the elements child via materialized `take_slices`.
 impl TakeExecute for FixedSizeList {
     fn take(
         array: ArrayView<'_, FixedSizeList>,
@@ -155,7 +156,7 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     for &data_idx in indices {
         let data_idx = index_to_usize(data_idx)?;
         let start = list_start(data_idx, list_size, array_len)?;
-        starts.push(usize_to_u64(start, "FixedSizeList take element start")?);
+        starts.push(start);
     }
 
     let new_elements = take_element_runs(array.elements(), starts, list_size, ctx)?;
@@ -208,7 +209,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
             continue;
         }
 
-        starts.push(usize_to_u64(start, "FixedSizeList take element start")?);
+        starts.push(start);
         new_validity_builder.append(true);
     }
 
@@ -301,20 +302,29 @@ fn default_elements(array: ArrayView<'_, FixedSizeList>, len: usize) -> ArrayRef
 
 fn take_element_runs(
     elements: &ArrayRef,
-    starts: Vec<u64>,
+    starts: Vec<usize>,
     length: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let run_count = starts.len();
-    let length = usize_to_u64(length, "FixedSizeList take element run length")?;
-    elements.take_slices_with_ctx(
-        PrimitiveArray::from_iter(starts).into_array(),
-        PrimitiveArray::from_iter(std::iter::repeat_n(length, run_count)).into_array(),
-        ctx,
-    )
+    let ends = starts
+        .iter()
+        .map(|&start| {
+            start.checked_add(length).ok_or_else(|| {
+                vortex_err!(
+                    "FixedSizeList take element range overflow for start {start} and length {length}"
+                )
+            })
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+
+    Ok(elements
+        .take_slices(starts, ends)?
+        .execute::<RecursiveCanonical>(ctx)?
+        .0
+        .into_array())
 }
 
-fn null_element_run_start() -> u64 {
+fn null_element_run_start() -> usize {
     // Null output rows still need placeholder child elements so the FSL elements length stays
     // `rows * list_size`. Any in-bounds run is fine because row validity hides these elements.
     0
@@ -324,8 +334,4 @@ fn index_to_usize<I: IntegerPType>(index: I) -> VortexResult<usize> {
     index
         .to_usize()
         .ok_or_else(|| vortex_err!("FixedSizeList take index {index} does not fit in usize"))
-}
-
-fn usize_to_u64(value: usize, name: &str) -> VortexResult<u64> {
-    u64::try_from(value).map_err(|_| vortex_err!("{name} {value} does not fit in u64"))
 }

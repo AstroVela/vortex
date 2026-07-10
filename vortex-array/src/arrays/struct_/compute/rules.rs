@@ -16,7 +16,6 @@ use crate::arrays::scalar_fn::ScalarFnArrayView;
 use crate::arrays::slice::SliceReduceAdaptor;
 use crate::arrays::struct_::StructArrayExt;
 use crate::arrays::struct_::compute::cast::struct_cast_fields;
-use crate::arrays::take_slices::TakeSlicesReduceAdaptor;
 use crate::builtins::ArrayBuiltins;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
@@ -32,7 +31,6 @@ pub(crate) const PARENT_RULES: ParentRuleSet<Struct> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&MaskReduceAdaptor(Struct)),
     ParentRuleSet::lift(&SliceReduceAdaptor(Struct)),
     ParentRuleSet::lift(&TakeReduceAdaptor(Struct)),
-    ParentRuleSet::lift(&TakeSlicesReduceAdaptor(Struct)),
 ]);
 
 pub(crate) fn struct_cast_reduce_parent(

@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -13,10 +14,15 @@ use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetRecordBatchStream;
 use parquet::file::metadata::KeyValue;
 use parquet::file::metadata::ParquetMetaData;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use sysinfo::System;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
 use tokio::fs::create_dir_all;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
 use tracing::info;
@@ -76,6 +82,7 @@ const MIN_CONCURRENCY: u64 = 1;
 
 /// Maximum number of concurrent conversion streams. This is somewhat arbitary.
 const MAX_CONCURRENCY: u64 = 16;
+const CONVERSION_CACHE_VERSION: u32 = 1;
 
 /// Returns the available system memory in bytes.
 fn available_memory_bytes() -> u64 {
@@ -169,40 +176,87 @@ pub async fn convert_parquet_file_to_vortex(
     Ok(())
 }
 
-async fn parquet_file_row_count(parquet_path: &Path) -> anyhow::Result<u64> {
+struct ParquetFileSummary {
+    row_count: u64,
+    dtype: DType,
+    source: SourceFileFingerprint,
+}
+
+struct VortexFileSummary {
+    row_count: u64,
+    dtype: DType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceFileFingerprint {
+    len: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ConversionManifest {
+    version: u32,
+    compaction: String,
+    parquet: SourceFileFingerprint,
+    row_count: u64,
+    dtype: String,
+}
+
+async fn parquet_file_summary(parquet_path: &Path) -> anyhow::Result<ParquetFileSummary> {
     let file = File::open(parquet_path).await?;
     let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
+    let geo_columns = geoparquet_columns(builder.metadata());
+    let dtype = tag_geo_dtype(DType::from_arrow(builder.schema().as_ref()), &geo_columns)?;
     let row_count = builder.metadata().file_metadata().num_rows();
-    u64::try_from(row_count)
-        .map_err(|_| anyhow::anyhow!("Parquet file has a negative row count: {parquet_path:?}"))
+    let row_count = u64::try_from(row_count)
+        .map_err(|_| anyhow::anyhow!("Parquet file has a negative row count: {parquet_path:?}"))?;
+    Ok(ParquetFileSummary {
+        row_count,
+        dtype,
+        source: source_file_fingerprint(parquet_path).await?,
+    })
 }
 
-async fn vortex_file_row_count(vortex_path: &Path) -> anyhow::Result<u64> {
-    Ok(SESSION
-        .open_options()
-        .open_path(vortex_path)
-        .await?
-        .row_count())
+async fn vortex_file_summary(vortex_path: &Path) -> anyhow::Result<VortexFileSummary> {
+    let file = SESSION.open_options().open_path(vortex_path).await?;
+    Ok(VortexFileSummary {
+        row_count: file.row_count(),
+        dtype: file.dtype().clone(),
+    })
 }
 
-async fn existing_vortex_file_has_matching_row_count(
+async fn existing_vortex_file_matches_parquet(
     parquet_path: &Path,
     vortex_path: &Path,
+    compaction: CompactionStrategy,
 ) -> anyhow::Result<bool> {
     if !vortex_path.exists() {
         return Ok(false);
     }
 
-    let expected_row_count = parquet_file_row_count(parquet_path).await?;
-    match vortex_file_row_count(vortex_path).await {
-        Ok(actual_row_count) if actual_row_count == expected_row_count => Ok(true),
-        Ok(actual_row_count) => {
+    let expected = parquet_file_summary(parquet_path).await?;
+    let expected_manifest = ConversionManifest::new(&expected, compaction);
+    let manifest = read_conversion_manifest(vortex_path).await;
+    match vortex_file_summary(vortex_path).await {
+        Ok(actual)
+            if actual.row_count == expected.row_count
+                && actual.dtype == expected.dtype
+                && manifest.as_ref().is_ok_and(|m| m == &expected_manifest) =>
+        {
+            Ok(true)
+        }
+        Ok(actual) => {
             info!(
                 parquet_path = %parquet_path.display(),
                 vortex_path = %vortex_path.display(),
-                expected_row_count,
-                actual_row_count,
-                "Regenerating Vortex file with stale row count"
+                expected_row_count = expected.row_count,
+                actual_row_count = actual.row_count,
+                expected_dtype = %expected.dtype,
+                actual_dtype = %actual.dtype,
+                manifest_error = manifest.as_ref().err().map(|e| e.to_string()),
+                "Regenerating stale Vortex file"
             );
             Ok(false)
         }
@@ -218,12 +272,84 @@ async fn existing_vortex_file_has_matching_row_count(
     }
 }
 
+impl ConversionManifest {
+    fn new(summary: &ParquetFileSummary, compaction: CompactionStrategy) -> Self {
+        Self {
+            version: CONVERSION_CACHE_VERSION,
+            compaction: format!("{compaction:?}"),
+            parquet: summary.source.clone(),
+            row_count: summary.row_count,
+            dtype: summary.dtype.to_string(),
+        }
+    }
+}
+
+async fn source_file_fingerprint(path: &Path) -> anyhow::Result<SourceFileFingerprint> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
+    let mut file = File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(SourceFileFingerprint {
+        len: metadata.len(),
+        modified_secs: modified.as_secs(),
+        modified_nanos: modified.subsec_nanos(),
+        sha256: hex_encode(hasher.finalize()),
+    })
+}
+
+fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn conversion_manifest_path(vortex_path: &Path) -> PathBuf {
+    let mut manifest_path = vortex_path.to_path_buf();
+    let file_name = vortex_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "vortex".into());
+    manifest_path.set_file_name(format!("{file_name}.manifest.json"));
+    manifest_path
+}
+
+async fn read_conversion_manifest(vortex_path: &Path) -> anyhow::Result<ConversionManifest> {
+    let bytes = tokio::fs::read(conversion_manifest_path(vortex_path)).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn write_conversion_manifest(
+    parquet_path: &Path,
+    vortex_path: &Path,
+    compaction: CompactionStrategy,
+) -> anyhow::Result<()> {
+    let summary = parquet_file_summary(parquet_path).await?;
+    let manifest = ConversionManifest::new(&summary, compaction);
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    tokio::fs::write(conversion_manifest_path(vortex_path), bytes).await?;
+    Ok(())
+}
+
 async fn convert_parquet_file_to_current_vortex(
     parquet_path: &Path,
     output_path: &Path,
     compaction: CompactionStrategy,
 ) -> anyhow::Result<PathBuf> {
-    if existing_vortex_file_has_matching_row_count(parquet_path, output_path).await? {
+    if existing_vortex_file_matches_parquet(parquet_path, output_path, compaction).await? {
         return Ok(output_path.to_path_buf());
     }
 
@@ -243,6 +369,7 @@ async fn convert_parquet_file_to_current_vortex(
         tokio::fs::remove_file(output_path).await?;
     }
     tokio::fs::rename(&temp_path, output_path).await?;
+    write_conversion_manifest(parquet_path, output_path, compaction).await?;
 
     Ok(output_path.to_path_buf())
 }
@@ -301,8 +428,8 @@ fn no_dict_layout() -> Arc<dyn LayoutStrategy> {
 /// `{input_path}/vortex-file-compressed/` (for Default compaction) or
 /// `{input_path}/vortex-compact/` (for Compact compaction).
 ///
-/// Existing Vortex files are reused when their footer row count matches the source Parquet file.
-/// Unreadable or stale Vortex files are regenerated.
+/// Existing Vortex files are reused when their footer metadata and conversion manifest match the
+/// source Parquet file. Unreadable or stale Vortex files are regenerated.
 pub async fn convert_parquet_directory_to_vortex(
     input_path: &Path,
     compaction: CompactionStrategy,

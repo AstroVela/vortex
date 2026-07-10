@@ -212,19 +212,13 @@ fn take_fsl_f16_take_slices_strategy<const LIST_SIZE: usize>(
     let starts = indices
         .as_ref()
         .iter()
-        .map(|&idx| {
-            let start = idx as usize * LIST_SIZE;
-            start as u64
-        })
+        .map(|&idx| idx as usize * LIST_SIZE)
         .collect::<Vec<_>>();
-    let lengths = std::iter::repeat_n(LIST_SIZE as u64, indices.len()).collect::<Vec<_>>();
-    let elements = array
-        .elements()
-        .take_slices(
-            PrimitiveArray::from_iter(starts).into_array(),
-            PrimitiveArray::from_iter(lengths).into_array(),
-        )
-        .unwrap();
+    let ends = starts
+        .iter()
+        .map(|&start| start + LIST_SIZE)
+        .collect::<Vec<_>>();
+    let elements = array.elements().take_slices(starts, ends).unwrap();
 
     // SAFETY: each generated run has width `LIST_SIZE`, and there is one run per input index,
     // so `elements.len() == indices.len() * LIST_SIZE`.

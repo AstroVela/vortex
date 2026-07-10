@@ -40,6 +40,7 @@ use crate::arrays::DictArray;
 use crate::arrays::FilterArray;
 use crate::arrays::Null;
 use crate::arrays::Primitive;
+use crate::arrays::PrimitiveArray;
 use crate::arrays::SliceArray;
 use crate::arrays::TakeSlicesArray;
 use crate::arrays::VarBin;
@@ -265,30 +266,44 @@ impl ArrayRef {
             .optimize()
     }
 
-    /// Wraps the array in a [`TakeSlicesArray`] such that it is logically selected by a
-    /// caller-provided sequence of child runs.
+    /// Wraps the array in a [`TakeSlicesArray`] selected by caller-provided child ranges.
     ///
-    /// The output is the concatenation of `self[starts[i]..starts[i] + lengths[i]]` for each
-    /// selector row.
-    ///
-    /// Prefer [`Self::take_slices_with_ctx`] when the caller already has an execution context.
-    pub fn take_slices(&self, starts: ArrayRef, lengths: ArrayRef) -> VortexResult<ArrayRef> {
-        TakeSlicesArray::try_new(self.clone(), starts, lengths)?
-            .into_array()
-            .optimize()
-    }
-
-    /// Wraps the array in a [`TakeSlicesArray`] using the caller's execution context to validate
-    /// selector arrays and compute the output length.
-    pub fn take_slices_with_ctx(
-        &self,
-        starts: ArrayRef,
-        lengths: ArrayRef,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        TakeSlicesArray::try_new_with_ctx(self.clone(), starts, lengths, ctx)?
-            .into_array()
-            .optimize()
+    /// The output is the concatenation of `self[starts[i]..ends[i]]` for each selector row. This
+    /// computes the output length from `starts` and `ends`, but child bounds are checked only when
+    /// the lazy gather executes.
+    pub fn take_slices(&self, starts: Vec<usize>, ends: Vec<usize>) -> VortexResult<ArrayRef> {
+        vortex_ensure!(
+            starts.len() == ends.len(),
+            "TakeSlicesArray selectors must have equal length, got starts {} and ends {}",
+            starts.len(),
+            ends.len()
+        );
+        let mut len = 0usize;
+        for (&start, &end) in starts.iter().zip(&ends) {
+            vortex_ensure!(
+                start <= end,
+                "TakeSlicesArray start {start} must be <= end {end}"
+            );
+            len = len
+                .checked_add(end - start)
+                .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
+        }
+        let starts = starts
+            .into_iter()
+            .map(selector_value)
+            .collect::<VortexResult<Vec<_>>>()?;
+        let ends = ends
+            .into_iter()
+            .map(selector_value)
+            .collect::<VortexResult<Vec<_>>>()?;
+        TakeSlicesArray::try_new(
+            self.clone(),
+            PrimitiveArray::from_iter(starts).into_array(),
+            PrimitiveArray::from_iter(ends).into_array(),
+            len,
+        )?
+        .into_array()
+        .optimize()
     }
 
     /// Fetch the scalar at the given index.
@@ -804,6 +819,11 @@ impl ArrayRef {
             stack: vec![self.clone()],
         }
     }
+}
+
+fn selector_value(value: usize) -> VortexResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| vortex_err!("TakeSlicesArray selector {value} does not fit in u64"))
 }
 
 impl IntoArray for ArrayRef {
