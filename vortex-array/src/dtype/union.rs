@@ -345,6 +345,9 @@ impl UnionVariants {
     /// - `Nullable`: at least one variant is `DType::Null` or has nullable nullability.
     /// - `NonNullable`: no `DType::Null` variants and no nullable variants.
     ///
+    /// This is a type-level summary of whether a selected variant can be null. A concrete union
+    /// array has no parent validity bitmap; its row validity is the validity of the selected child.
+    ///
     /// The check materializes each [`FieldDType`] (so it may be expensive if some are still
     /// flatbuffer-backed views).
     ///

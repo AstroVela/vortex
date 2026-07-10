@@ -80,7 +80,13 @@ impl DType {
         self.with_nullability(Nullability::Nullable)
     }
 
-    /// Get a new DType with the given nullability (but otherwise the same as `self`)
+    /// Get a new `DType` with the given nullability (but otherwise the same as `self`).
+    ///
+    /// For [`DType::Union`], this currently changes only the union-level nullability summary. It
+    /// does not rewrite the variants and can therefore produce a `DType` that fails
+    /// [`UnionVariants::nullability_constraints_satisfied`](crate::dtype::UnionVariants::nullability_constraints_satisfied).
+    /// Until [union nullability-changing operations](https://github.com/vortex-data/vortex/issues/7882)
+    /// are defined, construct union variants and their matching nullability explicitly instead.
     pub fn with_nullability(&self, nullability: Nullability) -> Self {
         match self {
             Null => Null,

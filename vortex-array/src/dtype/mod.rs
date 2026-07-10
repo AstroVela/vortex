@@ -114,6 +114,16 @@ pub enum DType {
     /// A `Union` is composed of one or more **variants**, each with a name and a `DType`. A per-row
     /// `i8` tag selects which variant is "live" at that row.
     ///
+    /// Union nullability is derived from its variants: a nullable union must have at least one
+    /// nullable or [`DType::Null`] variant, while a non-nullable union must have neither. A concrete
+    /// union array has no separate parent validity bitmap. A row is logically null exactly when
+    /// its selected child value is null; nulls in inactive sparse-child positions are ignored.
+    ///
+    /// Operations that change a union's nullability require further design. Until
+    /// [issue #7882](https://github.com/vortex-data/vortex/issues/7882) is resolved, they should be
+    /// unsupported unless the output variants and union-level nullability already satisfy the
+    /// constraint above.
+    ///
     /// See [`UnionVariants`] for the type-tag conventions and accessors.
     Union(UnionVariants, Nullability),
 
