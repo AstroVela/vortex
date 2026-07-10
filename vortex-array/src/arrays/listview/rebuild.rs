@@ -14,6 +14,7 @@ use crate::RecursiveCanonical;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::TakeSlicesArray;
 use crate::arrays::listview::ListViewArrayExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::builtins::ArrayBuiltins;
@@ -184,15 +185,29 @@ impl ListViewArray {
             )
         })?;
 
-        let new_sizes = ranges.new_sizes.freeze();
-        let elements = self
-            .elements()
-            .take_slices(ranges.starts, ranges.lengths)?
-            .execute::<RecursiveCanonical>(ctx)?
-            .0
-            .into_array();
+        let RebuildRanges {
+            new_offsets,
+            new_sizes,
+            starts,
+            lengths,
+        } = ranges;
+        let elements_len = lengths.iter().try_fold(0usize, |acc, &length| {
+            acc.checked_add(length)
+                .ok_or_else(|| vortex_err!("ListView rebuild elements length overflow"))
+        })?;
+        let starts =
+            PrimitiveArray::from_iter(starts.into_iter().map(|start| start as u64)).into_array();
+        let lengths =
+            PrimitiveArray::from_iter(lengths.into_iter().map(|length| length as u64)).into_array();
+        let new_sizes = new_sizes.freeze();
+        let elements =
+            TakeSlicesArray::try_new(self.elements().clone(), starts, lengths, elements_len)?
+                .into_array()
+                .execute::<RecursiveCanonical>(ctx)?
+                .0
+                .into_array();
         // Built unsigned; reinterpret back to the signed-preserving result types.
-        let offsets = PrimitiveArray::new(ranges.new_offsets.freeze(), Validity::NonNullable)
+        let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
             .reinterpret_cast(new_offset_ptype)
             .into_array();
         let sizes = PrimitiveArray::new(new_sizes, Validity::NonNullable)

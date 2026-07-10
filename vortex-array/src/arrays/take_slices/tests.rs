@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::IntoArray;
@@ -221,16 +222,14 @@ fn take_slices_rejects_invalid_ranges_at_the_right_layer() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let array = PrimitiveArray::from_iter(0i32..6).into_array();
 
-    assert!(array.take_slices(vec![0, 0], vec![usize::MAX, 1]).is_err());
-
-    let out_of_bounds_empty = array.take_slices(vec![7], vec![0])?;
+    let out_of_bounds_empty = take_slices(&array, &[(7, 0)])?;
     assert!(
         out_of_bounds_empty
             .execute::<PrimitiveArray>(&mut ctx)
             .is_err()
     );
 
-    let out_of_bounds_non_empty = array.take_slices(vec![4], vec![3])?;
+    let out_of_bounds_non_empty = take_slices(&array, &[(4, 3)])?;
     assert!(
         out_of_bounds_non_empty
             .execute::<PrimitiveArray>(&mut ctx)
@@ -303,7 +302,23 @@ fn take_slices_generic_execution_preserves_nullable_encoded_child() -> VortexRes
 }
 
 fn take_slices(array: &ArrayRef, runs: &[(usize, usize)]) -> VortexResult<ArrayRef> {
-    let starts = runs.iter().map(|&(start, _)| start).collect::<Vec<_>>();
-    let lengths = runs.iter().map(|&(_, length)| length).collect::<Vec<_>>();
-    array.take_slices(starts, lengths)
+    let len = runs.iter().try_fold(0usize, |acc, &(_, length)| {
+        acc.checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))
+    })?;
+    let starts = runs
+        .iter()
+        .map(|&(start, _)| start as u64)
+        .collect::<Vec<_>>();
+    let lengths = runs
+        .iter()
+        .map(|&(_, length)| length as u64)
+        .collect::<Vec<_>>();
+    TakeSlicesArray::try_new(
+        array.clone(),
+        PrimitiveArray::from_iter(starts).into_array(),
+        PrimitiveArray::from_iter(lengths).into_array(),
+        len,
+    )
+    .map(IntoArray::into_array)
 }

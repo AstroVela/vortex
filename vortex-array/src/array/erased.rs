@@ -40,9 +40,7 @@ use crate::arrays::DictArray;
 use crate::arrays::FilterArray;
 use crate::arrays::Null;
 use crate::arrays::Primitive;
-use crate::arrays::PrimitiveArray;
 use crate::arrays::SliceArray;
-use crate::arrays::TakeSlicesArray;
 use crate::arrays::VarBin;
 use crate::arrays::VarBinView;
 use crate::buffer::BufferHandle;
@@ -264,42 +262,6 @@ impl ArrayRef {
         DictArray::try_new(indices, self.clone())?
             .into_array()
             .optimize()
-    }
-
-    /// Wraps the array in a [`TakeSlicesArray`] selected by caller-provided child ranges.
-    ///
-    /// The output is the concatenation of `self[starts[i]..starts[i] + lengths[i]]` for each
-    /// range row. This computes the output length from `lengths`, but child bounds are checked
-    /// only when the lazy gather executes.
-    pub fn take_slices(&self, starts: Vec<usize>, lengths: Vec<usize>) -> VortexResult<ArrayRef> {
-        vortex_ensure!(
-            starts.len() == lengths.len(),
-            "TakeSlicesArray starts and lengths must have equal length, got starts {} and lengths {}",
-            starts.len(),
-            lengths.len()
-        );
-        let mut len = 0usize;
-        for &length in &lengths {
-            len = len
-                .checked_add(length)
-                .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
-        }
-        let starts = starts
-            .into_iter()
-            .map(|start| start as u64)
-            .collect::<Vec<_>>();
-        let lengths = lengths
-            .into_iter()
-            .map(|length| length as u64)
-            .collect::<Vec<_>>();
-        TakeSlicesArray::try_new(
-            self.clone(),
-            PrimitiveArray::from_iter(starts).into_array(),
-            PrimitiveArray::from_iter(lengths).into_array(),
-            len,
-        )?
-        .into_array()
-        .optimize()
     }
 
     /// Fetch the scalar at the given index.
