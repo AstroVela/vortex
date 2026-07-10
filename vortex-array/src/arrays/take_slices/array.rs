@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::fmt::Display;
-use std::fmt::Formatter;
-
 use smallvec::smallvec;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -11,6 +8,7 @@ use vortex_error::VortexResult;
 use crate::ArrayRef;
 use crate::array::Array;
 use crate::array::ArrayParts;
+use crate::array::EmptyArrayData;
 use crate::array::TypedArrayRef;
 use crate::arrays::TakeSlices;
 
@@ -22,18 +20,6 @@ pub(super) const STARTS_SLOT: usize = 1;
 pub(super) const LENGTHS_SLOT: usize = 2;
 pub(super) const NUM_SLOTS: usize = 3;
 pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child", "starts", "lengths"];
-
-/// Metadata for a [`TakeSlices`] array.
-#[derive(Clone, Debug)]
-pub struct TakeSlicesData {
-    len: usize,
-}
-
-impl Display for TakeSlicesData {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "len: {}", self.len())
-    }
-}
 
 /// Extension methods for [`TakeSlices`] arrays.
 pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
@@ -60,22 +46,6 @@ pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
 }
 impl<T: TypedArrayRef<TakeSlices>> TakeSlicesArrayExt for T {}
 
-impl TakeSlicesData {
-    fn new(len: usize) -> Self {
-        Self { len }
-    }
-
-    /// Returns the length of this array.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns `true` if this array is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 impl Array<TakeSlices> {
     /// Constructs a new `TakeSlicesArray` from selector arrays and caller-provided output length.
     ///
@@ -88,9 +58,8 @@ impl Array<TakeSlices> {
         len: usize,
     ) -> VortexResult<Self> {
         let dtype = child.dtype().clone();
-        let data = TakeSlicesData::new(len);
         Array::try_from_parts(
-            ArrayParts::new(TakeSlices, dtype, len, data).with_slots(smallvec![
+            ArrayParts::new(TakeSlices, dtype, len, EmptyArrayData).with_slots(smallvec![
                 Some(child),
                 Some(starts),
                 Some(lengths)
@@ -111,10 +80,9 @@ impl Array<TakeSlices> {
         len: usize,
     ) -> Self {
         let dtype = child.dtype().clone();
-        let data = TakeSlicesData::new(len);
         unsafe {
             Array::from_parts_unchecked(
-                ArrayParts::new(TakeSlices, dtype, len, data).with_slots(smallvec![
+                ArrayParts::new(TakeSlices, dtype, len, EmptyArrayData).with_slots(smallvec![
                     Some(child),
                     Some(starts),
                     Some(lengths)

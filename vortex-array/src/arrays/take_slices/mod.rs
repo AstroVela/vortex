@@ -11,7 +11,6 @@ mod array;
 mod vtable;
 
 pub use array::TakeSlicesArrayExt;
-pub use array::TakeSlicesData;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;

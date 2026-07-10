@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::hash::Hash;
-use std::hash::Hasher;
-
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -13,11 +10,9 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::ArrayEq;
-use crate::ArrayHash;
 use crate::ArrayParts;
 use crate::ArrayRef;
-use crate::EqMode;
+use crate::EmptyArrayData;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -32,7 +27,6 @@ use crate::arrays::take_slices::array::LENGTHS_SLOT;
 use crate::arrays::take_slices::array::NUM_SLOTS;
 use crate::arrays::take_slices::array::SLOT_NAMES;
 use crate::arrays::take_slices::array::STARTS_SLOT;
-use crate::arrays::take_slices::array::TakeSlicesData;
 use crate::arrays::take_slices::check_selector_arrays;
 use crate::arrays::take_slices::selector_constant;
 use crate::arrays::take_slices::selector_to_usize;
@@ -59,20 +53,8 @@ pub type TakeSlicesArray = Array<TakeSlices>;
 #[derive(Clone, Debug)]
 pub struct TakeSlices;
 
-impl ArrayHash for TakeSlicesData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
-        self.len().hash(state);
-    }
-}
-
-impl ArrayEq for TakeSlicesData {
-    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
-        self.len() == other.len()
-    }
-}
-
 impl VTable for TakeSlices {
-    type TypedArrayData = TakeSlicesData;
+    type TypedArrayData = EmptyArrayData;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
 
@@ -83,9 +65,9 @@ impl VTable for TakeSlices {
 
     fn validate(
         &self,
-        data: &Self::TypedArrayData,
+        _data: &Self::TypedArrayData,
         dtype: &DType,
-        len: usize,
+        _len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
@@ -121,12 +103,6 @@ impl VTable for TakeSlices {
             .as_ref()
             .vortex_expect("validated lengths slot");
         check_selector_arrays(starts, lengths)?;
-        vortex_ensure!(
-            data.len() == len,
-            "TakeSlicesArray metadata length {} does not match outer length {}",
-            data.len(),
-            len
-        );
         Ok(())
     }
 
