@@ -229,11 +229,11 @@ impl Validity {
     pub fn take_slices(
         &self,
         starts: &ArrayRef,
-        ends: &ArrayRef,
+        lengths: &ArrayRef,
         len: usize,
     ) -> VortexResult<Self> {
         let mut ctx = legacy_session().create_execution_ctx();
-        self.take_slices_with_ctx(starts, ends, len, &mut ctx)
+        self.take_slices_with_ctx(starts, lengths, len, &mut ctx)
     }
 
     /// Select validity values by concatenating a sequence of contiguous ranges, using the caller's
@@ -241,7 +241,7 @@ impl Validity {
     pub fn take_slices_with_ctx(
         &self,
         starts: &ArrayRef,
-        ends: &ArrayRef,
+        lengths: &ArrayRef,
         len: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
@@ -251,7 +251,7 @@ impl Validity {
                 crate::arrays::TakeSlicesArray::try_new(
                     is_valid.clone(),
                     starts.clone(),
-                    ends.clone(),
+                    lengths.clone(),
                     len,
                 )?
                 .into_array()

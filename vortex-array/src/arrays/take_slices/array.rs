@@ -18,10 +18,10 @@ use crate::arrays::TakeSlices;
 pub(super) const CHILD_SLOT: usize = 0;
 /// The selector naming the start of each child run.
 pub(super) const STARTS_SLOT: usize = 1;
-/// The selector naming the end of each child run.
-pub(super) const ENDS_SLOT: usize = 2;
+/// The selector naming the length of each child run.
+pub(super) const LENGTHS_SLOT: usize = 2;
 pub(super) const NUM_SLOTS: usize = 3;
-pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child", "starts", "ends"];
+pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child", "starts", "lengths"];
 
 /// Metadata for a [`TakeSlices`] array.
 #[derive(Clone, Debug)]
@@ -51,11 +51,11 @@ pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
             .vortex_expect("validated take-slices starts slot")
     }
 
-    /// The selector naming each child run's end offset.
-    fn ends(&self) -> &ArrayRef {
-        self.as_ref().slots()[ENDS_SLOT]
+    /// The selector naming each child run's length.
+    fn lengths(&self) -> &ArrayRef {
+        self.as_ref().slots()[LENGTHS_SLOT]
             .as_ref()
-            .vortex_expect("validated take-slices ends slot")
+            .vortex_expect("validated take-slices lengths slot")
     }
 }
 impl<T: TypedArrayRef<TakeSlices>> TakeSlicesArrayExt for T {}
@@ -84,7 +84,7 @@ impl Array<TakeSlices> {
     pub fn try_new(
         child: ArrayRef,
         starts: ArrayRef,
-        ends: ArrayRef,
+        lengths: ArrayRef,
         len: usize,
     ) -> VortexResult<Self> {
         let dtype = child.dtype().clone();
@@ -93,8 +93,33 @@ impl Array<TakeSlices> {
             ArrayParts::new(TakeSlices, dtype, len, data).with_slots(smallvec![
                 Some(child),
                 Some(starts),
-                Some(ends)
+                Some(lengths)
             ]),
         )
+    }
+
+    /// Constructs a new `TakeSlicesArray` without validation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the child dtype is the output dtype, selector arrays are
+    /// non-nullable unsigned integers of equal length, and `len` is the sum of selected lengths.
+    pub unsafe fn new_unchecked(
+        child: ArrayRef,
+        starts: ArrayRef,
+        lengths: ArrayRef,
+        len: usize,
+    ) -> Self {
+        let dtype = child.dtype().clone();
+        let data = TakeSlicesData::new(len);
+        unsafe {
+            Array::from_parts_unchecked(
+                ArrayParts::new(TakeSlices, dtype, len, data).with_slots(smallvec![
+                    Some(child),
+                    Some(starts),
+                    Some(lengths)
+                ]),
+            )
+        }
     }
 }

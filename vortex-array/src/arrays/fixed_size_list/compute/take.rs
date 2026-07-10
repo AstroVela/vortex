@@ -13,10 +13,12 @@ use crate::IntoArray;
 use crate::RecursiveCanonical;
 use crate::array::ArrayView;
 use crate::arrays::BoolArray;
+use crate::arrays::ConstantArray;
 use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::TakeSlicesArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::dict::TakeExecute;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
@@ -159,7 +161,13 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
         starts.push(start);
     }
 
-    let new_elements = take_element_runs(array.elements(), starts, list_size, ctx)?;
+    let new_elements = take_element_runs(
+        array.elements(),
+        starts,
+        list_size,
+        expected_elements_len,
+        ctx,
+    )?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
     // SAFETY: `starts` contains one checked run of `list_size` elements for each output row,
@@ -213,7 +221,13 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         new_validity_builder.append(true);
     }
 
-    let new_elements = take_element_runs(array.elements(), starts, list_size, ctx)?;
+    let new_elements = take_element_runs(
+        array.elements(),
+        starts,
+        list_size,
+        expected_elements_len,
+        ctx,
+    )?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
     let new_validity = Validity::from(new_validity_builder.freeze());
@@ -304,24 +318,27 @@ fn take_element_runs(
     elements: &ArrayRef,
     starts: Vec<usize>,
     length: usize,
+    output_len: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let ends = starts
-        .iter()
-        .map(|&start| {
-            start.checked_add(length).ok_or_else(|| {
-                vortex_err!(
-                    "FixedSizeList take element range overflow for start {start} and length {length}"
-                )
-            })
-        })
+    let run_count = starts.len();
+    let starts = starts
+        .into_iter()
+        .map(selector_value)
         .collect::<VortexResult<Vec<_>>>()?;
+    let starts = PrimitiveArray::from_iter(starts).into_array();
+    let lengths = ConstantArray::new(selector_value(length)?, run_count).into_array();
 
-    Ok(elements
-        .take_slices(starts, ends)?
-        .execute::<RecursiveCanonical>(ctx)?
-        .0
-        .into_array())
+    // SAFETY: callers produced one start per output row after validating list indices against the
+    // source FSL length. `length` is the fixed list size, represented as a non-nullable unsigned
+    // constant selector, and `output_len` was computed as `run_count * length`.
+    Ok(
+        unsafe { TakeSlicesArray::new_unchecked(elements.clone(), starts, lengths, output_len) }
+            .into_array()
+            .execute::<RecursiveCanonical>(ctx)?
+            .0
+            .into_array(),
+    )
 }
 
 fn null_element_run_start() -> usize {
@@ -334,4 +351,9 @@ fn index_to_usize<I: IntegerPType>(index: I) -> VortexResult<usize> {
     index
         .to_usize()
         .ok_or_else(|| vortex_err!("FixedSizeList take index {index} does not fit in usize"))
+}
+
+fn selector_value(value: usize) -> VortexResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| vortex_err!("FixedSizeList take selector {value} does not fit in u64"))
 }

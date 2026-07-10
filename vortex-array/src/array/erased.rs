@@ -268,38 +268,34 @@ impl ArrayRef {
 
     /// Wraps the array in a [`TakeSlicesArray`] selected by caller-provided child ranges.
     ///
-    /// The output is the concatenation of `self[starts[i]..ends[i]]` for each selector row. This
-    /// computes the output length from `starts` and `ends`, but child bounds are checked only when
-    /// the lazy gather executes.
-    pub fn take_slices(&self, starts: Vec<usize>, ends: Vec<usize>) -> VortexResult<ArrayRef> {
+    /// The output is the concatenation of `self[starts[i]..starts[i] + lengths[i]]` for each
+    /// selector row. This computes the output length from `lengths`, but child bounds are checked
+    /// only when the lazy gather executes.
+    pub fn take_slices(&self, starts: Vec<usize>, lengths: Vec<usize>) -> VortexResult<ArrayRef> {
         vortex_ensure!(
-            starts.len() == ends.len(),
-            "TakeSlicesArray selectors must have equal length, got starts {} and ends {}",
+            starts.len() == lengths.len(),
+            "TakeSlicesArray selectors must have equal length, got starts {} and lengths {}",
             starts.len(),
-            ends.len()
+            lengths.len()
         );
         let mut len = 0usize;
-        for (&start, &end) in starts.iter().zip(&ends) {
-            vortex_ensure!(
-                start <= end,
-                "TakeSlicesArray start {start} must be <= end {end}"
-            );
+        for &length in &lengths {
             len = len
-                .checked_add(end - start)
+                .checked_add(length)
                 .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
         }
         let starts = starts
             .into_iter()
             .map(selector_value)
             .collect::<VortexResult<Vec<_>>>()?;
-        let ends = ends
+        let lengths = lengths
             .into_iter()
             .map(selector_value)
             .collect::<VortexResult<Vec<_>>>()?;
         TakeSlicesArray::try_new(
             self.clone(),
             PrimitiveArray::from_iter(starts).into_array(),
-            PrimitiveArray::from_iter(ends).into_array(),
+            PrimitiveArray::from_iter(lengths).into_array(),
             len,
         )?
         .into_array()

@@ -28,7 +28,7 @@ use crate::array::with_empty_buffers;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
 use crate::arrays::take_slices::array::CHILD_SLOT;
-use crate::arrays::take_slices::array::ENDS_SLOT;
+use crate::arrays::take_slices::array::LENGTHS_SLOT;
 use crate::arrays::take_slices::array::NUM_SLOTS;
 use crate::arrays::take_slices::array::SLOT_NAMES;
 use crate::arrays::take_slices::array::STARTS_SLOT;
@@ -102,8 +102,8 @@ impl VTable for TakeSlices {
             "TakeSlicesArray starts slot must be present"
         );
         vortex_ensure!(
-            slots[ENDS_SLOT].is_some(),
-            "TakeSlicesArray ends slot must be present"
+            slots[LENGTHS_SLOT].is_some(),
+            "TakeSlicesArray lengths slot must be present"
         );
         let child = slots[CHILD_SLOT]
             .as_ref()
@@ -117,10 +117,10 @@ impl VTable for TakeSlices {
         let starts = slots[STARTS_SLOT]
             .as_ref()
             .vortex_expect("validated starts slot");
-        let ends = slots[ENDS_SLOT]
+        let lengths = slots[LENGTHS_SLOT]
             .as_ref()
-            .vortex_expect("validated ends slot");
-        check_selector_arrays(starts, ends)?;
+            .vortex_expect("validated lengths slot");
+        check_selector_arrays(starts, lengths)?;
         vortex_ensure!(
             data.len() == len,
             "TakeSlicesArray metadata length {} does not match outer length {}",
@@ -175,7 +175,12 @@ impl VTable for TakeSlices {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let mut builder = builder_with_capacity_in(ctx.allocator(), array.dtype(), array.len());
-        append_selected_ranges(array.as_view(), builder.as_mut(), ctx)?;
+        let produced_len = append_selected_ranges(array.as_view(), builder.as_mut(), ctx)?;
+        vortex_ensure!(
+            produced_len == array.len(),
+            "TakeSlicesArray produced length {produced_len} does not match declared length {}",
+            array.len()
+        );
         Ok(ExecutionResult::done(builder.finish()))
     }
 }
@@ -196,7 +201,7 @@ impl ValidityVTable<TakeSlices> for TakeSlices {
         array
             .child()
             .validity()?
-            .take_slices(array.starts(), array.ends(), array.len())
+            .take_slices(array.starts(), array.lengths(), array.len())
     }
 }
 
@@ -204,58 +209,58 @@ fn append_selected_ranges(
     array: ArrayView<'_, TakeSlices>,
     builder: &mut dyn ArrayBuilder,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<()> {
+) -> VortexResult<usize> {
     let starts = array.starts();
-    let ends = array.ends();
-    check_selector_arrays(starts, ends)?;
+    let lengths = array.lengths();
+    check_selector_arrays(starts, lengths)?;
 
     match_each_unsigned_integer_ptype!(starts.dtype().as_ptype(), |S| {
-        match_each_unsigned_integer_ptype!(ends.dtype().as_ptype(), |E| {
+        match_each_unsigned_integer_ptype!(lengths.dtype().as_ptype(), |L| {
             let start = selector_constant::<S>("start", starts)?;
-            let end = selector_constant::<E>("end", ends)?;
-            match (start, end) {
-                (Some(start), Some(end)) => append_ranges::<S, E, _, _>(
+            let length = selector_constant::<L>("length", lengths)?;
+            match (start, length) {
+                (Some(start), Some(length)) => append_ranges::<S, L, _, _>(
                     array.child(),
                     starts.len(),
                     |_| start,
-                    |_| end,
+                    |_| length,
                     builder,
                     ctx,
                 ),
                 (Some(start), None) => {
-                    let ends = ends.clone().execute::<PrimitiveArray>(ctx)?;
-                    let ends = ends.as_slice::<E>();
-                    append_ranges::<S, E, _, _>(
+                    let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
+                    let lengths = lengths.as_slice::<L>();
+                    append_ranges::<S, L, _, _>(
                         array.child(),
                         starts.len(),
                         |_| start,
-                        |index| ends[index],
+                        |index| lengths[index],
                         builder,
                         ctx,
                     )
                 }
-                (None, Some(end)) => {
+                (None, Some(length)) => {
                     let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
-                    append_ranges::<S, E, _, _>(
+                    append_ranges::<S, L, _, _>(
                         array.child(),
                         starts.len(),
                         |index| starts[index],
-                        |_| end,
+                        |_| length,
                         builder,
                         ctx,
                     )
                 }
                 (None, None) => {
                     let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
-                    let ends = ends.clone().execute::<PrimitiveArray>(ctx)?;
+                    let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
-                    let ends = ends.as_slice::<E>();
-                    append_ranges::<S, E, _, _>(
+                    let lengths = lengths.as_slice::<L>();
+                    append_ranges::<S, L, _, _>(
                         array.child(),
                         starts.len(),
                         |index| starts[index],
-                        |index| ends[index],
+                        |index| lengths[index],
                         builder,
                         ctx,
                     )
@@ -265,26 +270,33 @@ fn append_selected_ranges(
     })
 }
 
-fn append_ranges<S, E, StartAt, EndAt>(
+fn append_ranges<S, L, StartAt, LengthAt>(
     child: &ArrayRef,
     len: usize,
     mut start_at: StartAt,
-    mut end_at: EndAt,
+    mut length_at: LengthAt,
     builder: &mut dyn ArrayBuilder,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<()>
+) -> VortexResult<usize>
 where
     S: IntegerPType,
-    E: IntegerPType,
+    L: IntegerPType,
     StartAt: FnMut(usize) -> S,
-    EndAt: FnMut(usize) -> E,
+    LengthAt: FnMut(usize) -> L,
 {
+    let mut produced_len = 0usize;
     for index in 0..len {
         let start = selector_to_usize("start", start_at(index))?;
-        let end = selector_to_usize("end", end_at(index))?;
+        let length = selector_to_usize("length", length_at(index))?;
+        let end = start.checked_add(length).ok_or_else(|| {
+            vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
+        })?;
         child.slice(start..end)?.append_to_builder(builder, ctx)?;
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
     }
-    Ok(())
+    Ok(produced_len)
 }
 
 fn scalar_at_selected_range(
@@ -293,57 +305,57 @@ fn scalar_at_selected_range(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<Scalar>> {
     let starts = array.starts();
-    let ends = array.ends();
-    check_selector_arrays(starts, ends)?;
+    let lengths = array.lengths();
+    check_selector_arrays(starts, lengths)?;
 
     match_each_unsigned_integer_ptype!(starts.dtype().as_ptype(), |S| {
-        match_each_unsigned_integer_ptype!(ends.dtype().as_ptype(), |E| {
+        match_each_unsigned_integer_ptype!(lengths.dtype().as_ptype(), |L| {
             let start = selector_constant::<S>("start", starts)?;
-            let end = selector_constant::<E>("end", ends)?;
-            match (start, end) {
-                (Some(start), Some(end)) => scalar_from_ranges::<S, E, _, _>(
+            let length = selector_constant::<L>("length", lengths)?;
+            match (start, length) {
+                (Some(start), Some(length)) => scalar_from_ranges::<S, L, _, _>(
                     array.child(),
                     starts.len(),
                     index,
                     |_| start,
-                    |_| end,
+                    |_| length,
                     ctx,
                 ),
                 (Some(start), None) => {
-                    let ends = ends.clone().execute::<PrimitiveArray>(ctx)?;
-                    let ends = ends.as_slice::<E>();
-                    scalar_from_ranges::<S, E, _, _>(
+                    let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
+                    let lengths = lengths.as_slice::<L>();
+                    scalar_from_ranges::<S, L, _, _>(
                         array.child(),
                         starts.len(),
                         index,
                         |_| start,
-                        |range_index| ends[range_index],
+                        |range_index| lengths[range_index],
                         ctx,
                     )
                 }
-                (None, Some(end)) => {
+                (None, Some(length)) => {
                     let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
-                    scalar_from_ranges::<S, E, _, _>(
+                    scalar_from_ranges::<S, L, _, _>(
                         array.child(),
                         starts.len(),
                         index,
                         |range_index| starts[range_index],
-                        |_| end,
+                        |_| length,
                         ctx,
                     )
                 }
                 (None, None) => {
                     let starts = starts.clone().execute::<PrimitiveArray>(ctx)?;
-                    let ends = ends.clone().execute::<PrimitiveArray>(ctx)?;
+                    let lengths = lengths.clone().execute::<PrimitiveArray>(ctx)?;
                     let starts = starts.as_slice::<S>();
-                    let ends = ends.as_slice::<E>();
-                    scalar_from_ranges::<S, E, _, _>(
+                    let lengths = lengths.as_slice::<L>();
+                    scalar_from_ranges::<S, L, _, _>(
                         array.child(),
                         starts.len(),
                         index,
                         |range_index| starts[range_index],
-                        |range_index| ends[range_index],
+                        |range_index| lengths[range_index],
                         ctx,
                     )
                 }
@@ -352,32 +364,34 @@ fn scalar_at_selected_range(
     })
 }
 
-fn scalar_from_ranges<S, E, StartAt, EndAt>(
+fn scalar_from_ranges<S, L, StartAt, LengthAt>(
     child: &ArrayRef,
     len: usize,
     index: usize,
     mut start_at: StartAt,
-    mut end_at: EndAt,
+    mut length_at: LengthAt,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<Scalar>>
 where
     S: IntegerPType,
-    E: IntegerPType,
+    L: IntegerPType,
     StartAt: FnMut(usize) -> S,
-    EndAt: FnMut(usize) -> E,
+    LengthAt: FnMut(usize) -> L,
 {
     let mut logical_start = 0usize;
     for range_index in 0..len {
         let start = selector_to_usize("start", start_at(range_index))?;
-        let end = selector_to_usize("end", end_at(range_index))?;
+        let length = selector_to_usize("length", length_at(range_index))?;
+        let end = start.checked_add(length).ok_or_else(|| {
+            vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
+        })?;
         vortex_ensure!(
-            start <= end && end <= child.len(),
+            end <= child.len(),
             "TakeSlicesArray range {start}..{end} exceeds child array length {}",
             child.len()
         );
-        let run_len = end - start;
         let logical_end = logical_start
-            .checked_add(run_len)
+            .checked_add(length)
             .ok_or_else(|| vortex_err!("TakeSlicesArray length overflow"))?;
         if index < logical_end {
             return child

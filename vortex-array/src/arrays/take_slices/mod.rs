@@ -3,8 +3,9 @@
 
 //! Lazy gather of contiguous child ranges.
 //!
-//! `TakeSlicesArray` represents the concatenation of `values[starts[i]..ends[i]]` for each
-//! selector row. Ranges may overlap, repeat, and appear in any order.
+//! `TakeSlicesArray` represents the concatenation of
+//! `values[starts[i]..starts[i] + lengths[i]]` for each selector row. Ranges may overlap, repeat,
+//! and appear in any order.
 
 mod array;
 mod vtable;
@@ -21,14 +22,14 @@ use crate::ArrayRef;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 
-pub(super) fn check_selector_arrays(starts: &ArrayRef, ends: &ArrayRef) -> VortexResult<()> {
+pub(super) fn check_selector_arrays(starts: &ArrayRef, lengths: &ArrayRef) -> VortexResult<()> {
     check_selector_dtype("starts", starts)?;
-    check_selector_dtype("ends", ends)?;
+    check_selector_dtype("lengths", lengths)?;
     vortex_ensure!(
-        starts.len() == ends.len(),
-        "TakeSlicesArray selectors must have equal length, got starts {} and ends {}",
+        starts.len() == lengths.len(),
+        "TakeSlicesArray selectors must have equal length, got starts {} and lengths {}",
         starts.len(),
-        ends.len()
+        lengths.len()
     );
     Ok(())
 }

@@ -24,8 +24,10 @@ use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::TakeSlicesArray;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::dtype::IntegerPType;
 use vortex_array::dtype::NativePType;
@@ -214,11 +216,24 @@ fn take_fsl_f16_take_slices_strategy<const LIST_SIZE: usize>(
         .iter()
         .map(|&idx| idx as usize * LIST_SIZE)
         .collect::<Vec<_>>();
-    let ends = starts
-        .iter()
-        .map(|&start| start + LIST_SIZE)
+    let run_count = starts.len();
+    let starts = starts
+        .into_iter()
+        .map(|start| start as u64)
         .collect::<Vec<_>>();
-    let elements = array.elements().take_slices(starts, ends).unwrap();
+    let starts = PrimitiveArray::from_iter(starts).into_array();
+    let lengths = ConstantArray::new(LIST_SIZE as u64, run_count).into_array();
+    // SAFETY: benchmark indices are generated in-bounds, lengths is a non-nullable unsigned
+    // constant selector, and output length is exactly `indices.len() * LIST_SIZE`.
+    let elements = unsafe {
+        TakeSlicesArray::new_unchecked(
+            array.elements().clone(),
+            starts,
+            lengths,
+            indices.len() * LIST_SIZE,
+        )
+    }
+    .into_array();
 
     // SAFETY: each generated run has width `LIST_SIZE`, and there is one run per input index,
     // so `elements.len() == indices.len() * LIST_SIZE`.

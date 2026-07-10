@@ -187,7 +187,7 @@ impl ListViewArray {
         let new_sizes = ranges.new_sizes.freeze();
         let elements = self
             .elements()
-            .take_slices(ranges.starts, ranges.ends)?
+            .take_slices(ranges.starts, ranges.lengths)?
             .execute::<RecursiveCanonical>(ctx)?
             .0
             .into_array();
@@ -272,7 +272,7 @@ struct RebuildRanges<NewOffset, S> {
     new_offsets: BufferMut<NewOffset>,
     new_sizes: BufferMut<S>,
     starts: Vec<usize>,
-    ends: Vec<usize>,
+    lengths: Vec<usize>,
 }
 
 fn rebuild_ranges<NewOffset, O, S>(
@@ -289,7 +289,7 @@ where
     let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
     let mut new_sizes = BufferMut::<S>::with_capacity(len);
     let mut starts = Vec::with_capacity(len);
-    let mut ends = Vec::with_capacity(len);
+    let mut lengths = Vec::with_capacity(len);
     let mut n_elements = NewOffset::zero();
 
     for (index, is_valid) in validity_mask.iter().enumerate() {
@@ -297,7 +297,7 @@ where
             new_offsets.push(n_elements);
             new_sizes.push(S::zero());
             starts.push(0);
-            ends.push(0);
+            lengths.push(0);
             continue;
         }
 
@@ -311,7 +311,7 @@ where
         let length = size
             .to_usize()
             .ok_or_else(|| vortex_err!("ListView rebuild size {size} does not fit in usize"))?;
-        let end = start.checked_add(length).ok_or_else(|| {
+        start.checked_add(length).ok_or_else(|| {
             vortex_err!(
                 "ListView rebuild element range overflow for start {start} and length {length}"
             )
@@ -320,7 +320,7 @@ where
         new_offsets.push(n_elements);
         new_sizes.push(size);
         starts.push(start);
-        ends.push(end);
+        lengths.push(length);
         n_elements += num_traits::cast(size).vortex_expect("Cast failed");
     }
 
@@ -328,7 +328,7 @@ where
         new_offsets,
         new_sizes,
         starts,
-        ends,
+        lengths,
     })
 }
 
