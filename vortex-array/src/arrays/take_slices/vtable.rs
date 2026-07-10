@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use itertools::Itertools as _;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -247,8 +248,11 @@ fn append_constant_start_and_length_ranges(
 ) -> VortexResult<usize> {
     let mut produced_len = 0usize;
     for _ in 0..len {
-        append_range(child, start, length, builder, ctx)?;
-        produced_len = checked_output_len(produced_len, length, "produced")?;
+        let end = checked_range_end(start, length)?;
+        child.slice(start..end)?.append_to_builder(builder, ctx)?;
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
     }
     Ok(produced_len)
 }
@@ -263,8 +267,11 @@ fn append_constant_start_ranges<L: IntegerPType>(
     let mut produced_len = 0usize;
     for &length in lengths {
         let length = index_value_to_usize("length", length)?;
-        append_range(child, start, length, builder, ctx)?;
-        produced_len = checked_output_len(produced_len, length, "produced")?;
+        let end = checked_range_end(start, length)?;
+        child.slice(start..end)?.append_to_builder(builder, ctx)?;
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
     }
     Ok(produced_len)
 }
@@ -279,8 +286,11 @@ fn append_constant_length_ranges<S: IntegerPType>(
     let mut produced_len = 0usize;
     for &start in starts {
         let start = index_value_to_usize("start", start)?;
-        append_range(child, start, length, builder, ctx)?;
-        produced_len = checked_output_len(produced_len, length, "produced")?;
+        let end = checked_range_end(start, length)?;
+        child.slice(start..end)?.append_to_builder(builder, ctx)?;
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
     }
     Ok(produced_len)
 }
@@ -297,24 +307,16 @@ where
     L: IntegerPType,
 {
     let mut produced_len = 0usize;
-    for (&start, &length) in starts.iter().zip(lengths) {
+    for (&start, &length) in starts.iter().zip_eq(lengths) {
         let start = index_value_to_usize("start", start)?;
         let length = index_value_to_usize("length", length)?;
-        append_range(child, start, length, builder, ctx)?;
-        produced_len = checked_output_len(produced_len, length, "produced")?;
+        let end = checked_range_end(start, length)?;
+        child.slice(start..end)?.append_to_builder(builder, ctx)?;
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
     }
     Ok(produced_len)
-}
-
-fn append_range(
-    child: &ArrayRef,
-    start: usize,
-    length: usize,
-    builder: &mut dyn ArrayBuilder,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<()> {
-    let end = checked_range_end(start, length)?;
-    child.slice(start..end)?.append_to_builder(builder, ctx)
 }
 
 fn scalar_at_selected_range(
@@ -386,7 +388,9 @@ fn scalar_from_constant_start_and_length_ranges(
         if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
             return Ok(Some(scalar));
         }
-        logical_start = checked_output_len(logical_start, length, "logical")?;
+        logical_start = logical_start
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray logical length overflow"))?;
     }
     Ok(None)
 }
@@ -404,7 +408,9 @@ fn scalar_from_constant_start_ranges<L: IntegerPType>(
         if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
             return Ok(Some(scalar));
         }
-        logical_start = checked_output_len(logical_start, length, "logical")?;
+        logical_start = logical_start
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray logical length overflow"))?;
     }
     Ok(None)
 }
@@ -422,7 +428,9 @@ fn scalar_from_constant_length_ranges<S: IntegerPType>(
         if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
             return Ok(Some(scalar));
         }
-        logical_start = checked_output_len(logical_start, length, "logical")?;
+        logical_start = logical_start
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray logical length overflow"))?;
     }
     Ok(None)
 }
@@ -439,13 +447,15 @@ where
     L: IntegerPType,
 {
     let mut logical_start = 0usize;
-    for (&start, &length) in starts.iter().zip(lengths) {
+    for (&start, &length) in starts.iter().zip_eq(lengths) {
         let start = index_value_to_usize("start", start)?;
         let length = index_value_to_usize("length", length)?;
         if let Some(scalar) = scalar_from_range(child, logical_start, index, start, length, ctx)? {
             return Ok(Some(scalar));
         }
-        logical_start = checked_output_len(logical_start, length, "logical")?;
+        logical_start = logical_start
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray logical length overflow"))?;
     }
     Ok(None)
 }
@@ -464,7 +474,9 @@ fn scalar_from_range(
         "TakeSlicesArray range {start}..{end} exceeds child array length {}",
         child.len()
     );
-    let logical_end = checked_output_len(logical_start, length, "logical")?;
+    let logical_end = logical_start
+        .checked_add(length)
+        .ok_or_else(|| vortex_err!("TakeSlicesArray logical length overflow"))?;
     if index < logical_end {
         return child
             .execute_scalar(start + (index - logical_start), ctx)
@@ -477,10 +489,4 @@ fn checked_range_end(start: usize, length: usize) -> VortexResult<usize> {
     start.checked_add(length).ok_or_else(|| {
         vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
     })
-}
-
-fn checked_output_len(current: usize, length: usize, name: &str) -> VortexResult<usize> {
-    current
-        .checked_add(length)
-        .ok_or_else(|| vortex_err!("TakeSlicesArray {name} length overflow"))
 }
