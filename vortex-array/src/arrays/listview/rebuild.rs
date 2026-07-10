@@ -142,10 +142,110 @@ impl ListViewArray {
         // for sizes as well.
         match_each_unsigned_integer_ptype!(sizes_ptype.to_unsigned(), |S| {
             match offsets_ptype.to_unsigned() {
-                PType::U8 | PType::U16 | PType::U32 => self.rebuild_with_take_slices::<u32, S>(ctx),
-                PType::U64 => self.rebuild_with_take_slices::<u64, S>(ctx),
+                PType::U8 => self.rebuild_with_take_or_slices::<u8, u32, S>(ctx),
+                PType::U16 => self.rebuild_with_take_or_slices::<u16, u32, S>(ctx),
+                PType::U32 => self.rebuild_with_take_or_slices::<u32, u32, S>(ctx),
+                PType::U64 => self.rebuild_with_take_or_slices::<u64, u64, S>(ctx),
                 _ => unreachable!("invalid offsets PType"),
             }
+        })
+    }
+
+    /// Picks between flat-index `take` and contiguous-run `TakeSlices` based on average list size.
+    ///
+    /// Small lists are faster with one bulk `take` because it avoids per-run builder overhead.
+    /// Larger contiguous runs can benefit from `TakeSlices` because it avoids materializing every
+    /// element index.
+    fn rebuild_with_take_or_slices<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
+        &self,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ListViewArray> {
+        let sizes_canonical = self.sizes().clone().execute::<PrimitiveArray>(ctx)?;
+        let sizes_canonical =
+            sizes_canonical.reinterpret_cast(sizes_canonical.ptype().to_unsigned());
+        let total: u64 = sizes_canonical
+            .as_slice::<S>()
+            .iter()
+            .map(|s| (*s).as_() as u64)
+            .sum();
+
+        if Self::should_use_take(total, self.len()) {
+            self.rebuild_with_take::<O, NewOffset, S>(ctx)
+        } else {
+            self.rebuild_with_take_slices::<NewOffset, S>(ctx)
+        }
+    }
+
+    fn should_use_take(total_output_elements: u64, num_lists: usize) -> bool {
+        if num_lists == 0 {
+            return true;
+        }
+        let avg = total_output_elements / num_lists as u64;
+        avg < 128
+    }
+
+    /// Rebuilds elements using a single bulk `take`: collect all element indices into a flat
+    /// `BufferMut<u64>`, perform a single `take`.
+    fn rebuild_with_take<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
+        &self,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ListViewArray> {
+        let new_offset_ptype = rebuilt_offset_ptype(self.offsets().dtype().as_ptype());
+        let size_ptype = self.sizes().dtype().as_ptype();
+
+        let offsets_canonical = self.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+        let offsets_canonical =
+            offsets_canonical.reinterpret_cast(offsets_canonical.ptype().to_unsigned());
+        let offsets_slice = offsets_canonical.as_slice::<O>();
+        let sizes_canonical = self.sizes().clone().execute::<PrimitiveArray>(ctx)?;
+        let sizes_canonical =
+            sizes_canonical.reinterpret_cast(sizes_canonical.ptype().to_unsigned());
+        let sizes_slice = sizes_canonical.as_slice::<S>();
+
+        let len = offsets_slice.len();
+
+        let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
+        let mut new_sizes = BufferMut::<S>::with_capacity(len);
+        let mut take_indices = BufferMut::<u64>::with_capacity(self.elements().len());
+
+        // Resolve validity to a mask once instead of probing it per row: `execute_is_valid`
+        // executes a scalar on every call for array-backed validity, which is O(len) work repeated
+        // `len` times.
+        let validity = self.validity()?.execute_mask(len, ctx)?;
+
+        let mut n_elements = NewOffset::zero();
+        for index in 0..len {
+            if !validity.value(index) {
+                new_offsets.push(n_elements);
+                new_sizes.push(S::zero());
+                continue;
+            }
+
+            let offset = offsets_slice[index];
+            let size = sizes_slice[index];
+            let start = offset.as_();
+            let stop = start + size.as_();
+
+            new_offsets.push(n_elements);
+            new_sizes.push(size);
+            take_indices.extend(start as u64..stop as u64);
+            n_elements += num_traits::cast(size).vortex_expect("Cast failed");
+        }
+
+        let elements = self.elements().take(take_indices.into_array())?;
+        // Built unsigned; reinterpret back to the signed-preserving result types.
+        let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
+            .reinterpret_cast(new_offset_ptype)
+            .into_array();
+        let sizes = PrimitiveArray::new(new_sizes.freeze(), Validity::NonNullable)
+            .reinterpret_cast(size_ptype)
+            .into_array();
+
+        // SAFETY: offsets are sequential and non-overlapping, all (offset, size) pairs reference
+        // valid elements, and the validity array is preserved from the original.
+        Ok(unsafe {
+            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity()?)
+                .with_zero_copy_to_list(true)
         })
     }
 
