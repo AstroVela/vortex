@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Unified compression scheme trait and exclusion rules.
+//! Everything a scheme author implements or receives: the [`Scheme`] trait, exclusion rules,
+//! compression estimates, and the compression context.
 
+mod ctx;
+pub use ctx::CompressorContext;
+pub use ctx::MAX_CASCADE;
+
+pub(crate) mod estimate;
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::hash::Hasher;
 
+pub use estimate::CompressionEstimate;
+pub use estimate::DeferredEstimate;
+pub use estimate::EstimateFn;
+pub use estimate::EstimateVerdict;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_error::VortexResult;
 
 use crate::CascadingCompressor;
-use crate::ctx::CompressorContext;
-use crate::estimate::CompressionEstimate;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
 
@@ -199,10 +207,10 @@ pub trait Scheme: Debug + Send + Sync {
     /// entire array.
     ///
     /// [`CompressionEstimate::Verdict`] means the scheme already knows the terminal
-    /// [`crate::estimate::EstimateVerdict`]. `CompressionEstimate::Deferred(DeferredEstimate::Sample)`
+    /// [`crate::scheme::EstimateVerdict`]. `CompressionEstimate::Deferred(DeferredEstimate::Sample)`
     /// asks the compressor to sample. `CompressionEstimate::Deferred(DeferredEstimate::Callback(...))`
     /// asks the compressor to run custom deferred work. Deferred callbacks must return a
-    /// [`crate::estimate::EstimateVerdict`] directly, never another deferred request.
+    /// [`crate::scheme::EstimateVerdict`] directly, never another deferred request.
     ///
     /// Note that the compressor will also use this method when compressing samples, so some
     /// statistics that might hold for the samples may not hold for the entire array (e.g.,

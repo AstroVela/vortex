@@ -49,9 +49,9 @@ mod tests {
 
     use super::*;
     use crate::CascadingCompressor;
-    use crate::ctx::CompressorContext;
-    use crate::estimate::CompressionEstimate;
-    use crate::estimate::EstimateVerdict;
+    use crate::scheme::CompressionEstimate;
+    use crate::scheme::CompressorContext;
+    use crate::scheme::EstimateVerdict;
     use crate::scheme::Scheme;
     use crate::stats::GenerateStatsOptions;
 

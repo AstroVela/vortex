@@ -12,11 +12,11 @@ use vortex_array::IntoArray;
 use vortex_error::VortexResult;
 
 use crate::CascadingCompressor;
+use crate::compressor::sample::SAMPLE_SIZE;
+use crate::compressor::sample::sample;
+use crate::compressor::sample::sample_count_approx_one_percent;
 use crate::cost::Cost;
-use crate::ctx::CompressorContext;
-use crate::sample::SAMPLE_SIZE;
-use crate::sample::sample;
-use crate::sample::sample_count_approx_one_percent;
+use crate::scheme::CompressorContext;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
 use crate::stats::ArrayAndStats;
@@ -108,7 +108,7 @@ pub enum DeferredEstimate {
 
 /// Winner estimate carried from scheme selection into result tracing.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum WinnerEstimate {
+pub(crate) enum WinnerEstimate {
     /// The scheme must be used immediately.
     AlwaysUse,
     /// The scheme won after being priced by the compressor's cost model.
@@ -122,7 +122,7 @@ pub(super) enum WinnerEstimate {
 
 impl WinnerEstimate {
     /// Returns the traceable numeric ratio for the winning estimate.
-    pub(super) fn trace_ratio(self) -> Option<f64> {
+    pub(crate) fn trace_ratio(self) -> Option<f64> {
         match self {
             Self::AlwaysUse => None,
             Self::Priced {
@@ -132,7 +132,7 @@ impl WinnerEstimate {
     }
 
     /// Returns the traceable cost for the winning estimate.
-    pub(super) fn trace_cost(self) -> Option<f64> {
+    pub(crate) fn trace_cost(self) -> Option<f64> {
         match self {
             Self::AlwaysUse => None,
             Self::Priced { cost, .. } => Some(cost.value()),
@@ -161,7 +161,7 @@ pub(crate) struct SampledEstimate {
 /// # Errors
 ///
 /// Returns an error if sample compression fails.
-pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
+pub(crate) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
     compressor: &CascadingCompressor,
     scheme: &S,
     array: &ArrayRef,

@@ -38,7 +38,7 @@
 //! deterministic function of its input and configuration.
 //!
 //! [`Scheme`]: crate::scheme::Scheme
-//! [`EstimateVerdict::AlwaysUse`]: crate::estimate::EstimateVerdict::AlwaysUse
+//! [`EstimateVerdict::AlwaysUse`]: crate::scheme::EstimateVerdict::AlwaysUse
 
 mod candidate;
 pub use candidate::Candidate;
