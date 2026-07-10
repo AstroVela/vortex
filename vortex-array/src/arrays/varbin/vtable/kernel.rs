@@ -6,9 +6,11 @@ use vortex_session::VortexSession;
 use crate::ArrayVTable;
 use crate::arrays::Dict;
 use crate::arrays::Filter;
+use crate::arrays::TakeSlices;
 use crate::arrays::VarBin;
 use crate::arrays::dict::TakeExecuteAdaptor;
 use crate::arrays::filter::FilterExecuteAdaptor;
+use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::binary::Binary;
@@ -22,4 +24,9 @@ pub(crate) fn initialize(session: &VortexSession) {
     kernels.register_execute_parent_kernel(Binary.id(), VarBin, CompareExecuteAdaptor(VarBin));
     kernels.register_execute_parent_kernel(Filter.id(), VarBin, FilterExecuteAdaptor(VarBin));
     kernels.register_execute_parent_kernel(Dict.id(), VarBin, TakeExecuteAdaptor(VarBin));
+    kernels.register_execute_parent_kernel(
+        TakeSlices.id(),
+        VarBin,
+        TakeSlicesExecuteAdaptor(VarBin),
+    );
 }

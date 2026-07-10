@@ -8,6 +8,7 @@ mod mask;
 pub(crate) mod rules;
 mod slice;
 mod take;
+mod take_slices;
 
 pub(crate) fn initialize(session: &vortex_session::VortexSession) {
     kernels::initialize(session);

@@ -8,16 +8,26 @@ use crate::ArrayRef;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
 use crate::array_session;
+use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
+use crate::arrays::DecimalArray;
 use crate::arrays::DictArray;
+use crate::arrays::FixedSizeListArray;
+use crate::arrays::ListArray;
+use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
 use crate::arrays::TakeSlices;
 use crate::arrays::TakeSlicesArray;
+use crate::arrays::VarBinArray;
 use crate::arrays::VarBinViewArray;
+use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::assert_arrays_eq;
+use crate::dtype::DType;
+use crate::dtype::DecimalDType;
 use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
+use crate::kernel::ExecuteParentKernel;
 use crate::validity::Validity;
 
 #[test]
@@ -165,6 +175,40 @@ fn take_slices_accepts_constant_start_and_length() -> VortexResult<()> {
 }
 
 #[test]
+fn primitive_take_slices_execute_parent_handles_only_child_slot() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let child = PrimitiveArray::from_iter(0i32..6).into_array();
+    let starts = PrimitiveArray::from_iter([3u64, 0]).into_array();
+    let lengths = PrimitiveArray::from_iter([2u64, 2]).into_array();
+    let parent = TakeSlicesArray::try_new(child.clone(), starts, lengths, 4)?;
+
+    let skipped = TakeSlicesExecuteAdaptor(Primitive).execute_parent(
+        child
+            .as_typed::<Primitive>()
+            .ok_or_else(|| vortex_err!("expected primitive child"))?,
+        parent.as_view(),
+        1,
+        &mut ctx,
+    )?;
+    assert!(skipped.is_none());
+
+    let actual = TakeSlicesExecuteAdaptor(Primitive)
+        .execute_parent(
+            child
+                .as_typed::<Primitive>()
+                .ok_or_else(|| vortex_err!("expected primitive child"))?,
+            parent.as_view(),
+            0,
+            &mut ctx,
+        )?
+        .ok_or_else(|| vortex_err!("primitive TakeSlices execute parent returned no result"))?;
+    let expected = PrimitiveArray::from_iter([3i32, 4, 0, 1]);
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
 fn struct_take_slices_executes_generically() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let array = StructArray::try_new(
@@ -188,6 +232,137 @@ fn struct_take_slices_executes_generically() -> VortexResult<()> {
         4,
         Validity::NonNullable,
     )?;
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn bool_take_slices_kernel_preserves_values_and_validity() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array =
+        BoolArray::from_iter([Some(true), None, Some(false), Some(true), None, Some(false)])
+            .into_array();
+
+    let actual = take_slices(&array, &[(2, 3), (0, 2)])?;
+    let expected = BoolArray::from_iter([Some(false), Some(true), None, Some(true), None]);
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn decimal_take_slices_kernel_preserves_values_and_validity() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let dtype = DecimalDType::new(19, 2);
+    let array = DecimalArray::new(
+        vortex_buffer::buffer![10i128, 20, 30, 40, 50, 60],
+        dtype,
+        Validity::from_iter([true, false, true, true, false, true]),
+    )
+    .into_array();
+
+    let actual = take_slices(&array, &[(2, 3), (0, 2)])?;
+    let expected = DecimalArray::new(
+        vortex_buffer::buffer![30i128, 40, 50, 10, 20],
+        dtype,
+        Validity::from_iter([true, true, false, true, false]),
+    );
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn varbinview_take_slices_kernel_reuses_views_and_preserves_validity() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = VarBinViewArray::from_iter(
+        [
+            Some("short"),
+            None,
+            Some("a string that is long enough to be outlined"),
+            Some("middle"),
+            Some("another outlined string value"),
+            None,
+        ],
+        DType::Utf8(Nullability::Nullable),
+    )
+    .into_array();
+
+    let actual = take_slices(&array, &[(2, 3), (0, 2)])?;
+    let expected = VarBinViewArray::from_iter(
+        [
+            Some("a string that is long enough to be outlined"),
+            Some("middle"),
+            Some("another outlined string value"),
+            Some("short"),
+            None,
+        ],
+        DType::Utf8(Nullability::Nullable),
+    );
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn varbin_take_slices_kernel_rebuilds_offsets_and_preserves_validity() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = VarBinArray::from_iter(
+        [Some("aa"), None, Some("ccc"), Some(""), Some("dddd"), None],
+        DType::Utf8(Nullability::Nullable),
+    )
+    .into_array();
+
+    let actual = take_slices(&array, &[(2, 3), (0, 2)])?;
+    let expected = VarBinArray::from_iter(
+        [Some("ccc"), Some(""), Some("dddd"), Some("aa"), None],
+        DType::Utf8(Nullability::Nullable),
+    );
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn fixed_size_list_take_slices_kernel_maps_row_runs_to_element_runs() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = FixedSizeListArray::new(
+        PrimitiveArray::from_iter(0i32..8).into_array(),
+        2,
+        Validity::from_iter([true, false, true, true]),
+        4,
+    )
+    .into_array();
+
+    let actual = take_slices(&array, &[(1, 2), (0, 1)])?;
+    let expected = FixedSizeListArray::new(
+        PrimitiveArray::from_iter([2i32, 3, 4, 5, 0, 1]).into_array(),
+        2,
+        Validity::from_iter([false, true, true]),
+        3,
+    );
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn list_take_slices_kernel_rebuilds_offsets_and_pushes_into_elements() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = ListArray::new(
+        PrimitiveArray::from_iter(0i32..8).into_array(),
+        vortex_buffer::buffer![0u32, 2, 5, 5, 8].into_array(),
+        Validity::from_iter([true, false, true, true]),
+    )
+    .into_array();
+
+    let actual = take_slices(&array, &[(1, 3), (0, 1)])?;
+    let expected = ListArray::new(
+        PrimitiveArray::from_iter([2i32, 3, 4, 5, 6, 7, 0, 1]).into_array(),
+        vortex_buffer::buffer![0u32, 3, 3, 6, 8].into_array(),
+        Validity::from_iter([false, true, true, true]),
+    );
 
     assert_arrays_eq!(actual, expected, &mut ctx);
     Ok(())

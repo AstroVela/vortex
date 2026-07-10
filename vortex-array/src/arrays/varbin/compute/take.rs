@@ -27,7 +27,7 @@ use crate::validity::Validity;
 
 /// The widened offset type used for a taken `VarBinArray`: offsets are widened to at least 32 bits
 /// (to avoid overflow) while preserving signedness, so a signed result stays Arrow-compatible.
-fn taken_offset_ptype(offsets_ptype: PType) -> PType {
+pub(super) fn taken_offset_ptype(offsets_ptype: PType) -> PType {
     match offsets_ptype {
         PType::U8 | PType::U16 | PType::U32 => PType::U32,
         PType::U64 => PType::U64,

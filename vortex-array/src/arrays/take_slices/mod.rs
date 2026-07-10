@@ -8,9 +8,13 @@
 //! and appear in any order.
 
 mod array;
+mod kernel;
 mod vtable;
 
 pub use array::TakeSlicesArrayExt;
+use itertools::Itertools as _;
+pub use kernel::TakeSlicesExecuteAdaptor;
+pub use kernel::TakeSlicesKernel;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -49,25 +53,46 @@ fn check_index_dtype(name: &str, indices: &ArrayRef) -> VortexResult<()> {
     }
 }
 
-pub(super) fn constant_index_value<T: IntegerPType>(
-    name: &str,
-    indices: &ArrayRef,
-) -> VortexResult<Option<T>> {
-    indices
-        .as_constant()
-        .map(|scalar| {
-            scalar
-                .as_primitive()
-                .try_typed_value::<T>()?
-                .ok_or_else(|| vortex_err!("TakeSlicesArray {name} constant value is null"))
-        })
-        .transpose()
-}
-
 pub(super) fn index_value_to_usize<T: IntegerPType>(name: &str, value: T) -> VortexResult<usize> {
     value
         .to_usize()
         .ok_or_else(|| vortex_err!("TakeSlicesArray {name} value {value} does not fit in usize"))
+}
+
+pub(super) fn checked_range_end(start: usize, length: usize) -> VortexResult<usize> {
+    start.checked_add(length).ok_or_else(|| {
+        vortex_err!("TakeSlicesArray range overflow for start {start} and length {length}")
+    })
+}
+
+pub(super) fn validate_index_ranges<S, L>(
+    child_len: usize,
+    starts: &[S],
+    lengths: &[L],
+    output_len: usize,
+) -> VortexResult<()>
+where
+    S: IntegerPType,
+    L: IntegerPType,
+{
+    let mut produced_len = 0usize;
+    for (&start, &length) in starts.iter().zip_eq(lengths) {
+        let start = index_value_to_usize("start", start)?;
+        let length = index_value_to_usize("length", length)?;
+        let end = checked_range_end(start, length)?;
+        vortex_ensure!(
+            end <= child_len,
+            "TakeSlicesArray range {start}..{end} exceeds child array length {child_len}",
+        );
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
+    }
+    vortex_ensure!(
+        produced_len == output_len,
+        "TakeSlicesArray produced length {produced_len} does not match declared length {output_len}",
+    );
+    Ok(())
 }
 
 #[cfg(test)]

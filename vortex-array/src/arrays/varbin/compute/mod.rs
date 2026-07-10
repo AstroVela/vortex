@@ -9,6 +9,7 @@ mod compare;
 mod filter;
 mod mask;
 mod take;
+mod take_slices;
 
 #[cfg(test)]
 mod tests {

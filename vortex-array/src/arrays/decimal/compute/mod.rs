@@ -7,6 +7,7 @@ mod fill_null;
 mod mask;
 pub mod rules;
 mod take;
+mod take_slices;
 
 #[cfg(test)]
 mod tests {

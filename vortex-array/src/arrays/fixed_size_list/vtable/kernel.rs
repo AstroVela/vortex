@@ -6,7 +6,9 @@ use vortex_session::VortexSession;
 use crate::ArrayVTable;
 use crate::arrays::Dict;
 use crate::arrays::FixedSizeList;
+use crate::arrays::TakeSlices;
 use crate::arrays::dict::TakeExecuteAdaptor;
+use crate::arrays::take_slices::TakeSlicesExecuteAdaptor;
 use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::cast::Cast;
@@ -23,5 +25,10 @@ pub(crate) fn initialize(session: &VortexSession) {
         Dict.id(),
         FixedSizeList,
         TakeExecuteAdaptor(FixedSizeList),
+    );
+    kernels.register_execute_parent_kernel(
+        TakeSlices.id(),
+        FixedSizeList,
+        TakeSlicesExecuteAdaptor(FixedSizeList),
     );
 }
