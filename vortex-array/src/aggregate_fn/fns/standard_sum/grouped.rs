@@ -56,7 +56,7 @@ impl DynGroupedAggregateKernel for PrimitiveGroupedStandardSumEncodingKernel {
 ///
 /// Produces `{sum, seen}` partial rows (see `StandardSum`'s partial dtype): `seen` records whether the
 /// group contained at least one valid element, so that `finalize` yields null for empty and
-/// all-null groups (SQL `SUM`), and null groups are null struct rows.
+/// all-null groups, and null groups are null struct rows.
 pub(super) fn try_grouped_sum(
     groups: &GroupedArray,
     ctx: &mut ExecutionCtx,
@@ -220,8 +220,7 @@ mod tests {
     }
 
     /// Reference sums computed exactly like the generic slow path: per-group scalar [`sum`]
-    /// (SQL semantics: null for zero valid elements) for valid groups, a null sum for invalid
-    /// groups.
+    /// for valid groups, a null sum for invalid groups.
     fn grouped_sum_reference(
         elements: &ArrayRef,
         ranges: &[(usize, usize)],
@@ -323,7 +322,6 @@ mod tests {
         let actual = grouped_sum_actual(&groups, &elem_dtype)?;
         let expected = grouped_sum_reference(&elements, &ranges, &valid, &elem_dtype)?;
 
-        // The all-null and empty groups have null sums (SQL `SUM` semantics).
         let direct = PrimitiveArray::from_option_iter([Some(4i64), None, None, Some(9i64)]);
         assert_arrays_eq!(&actual, &direct.into_array(), &mut ctx);
         assert_arrays_eq!(&actual, &expected, &mut ctx);

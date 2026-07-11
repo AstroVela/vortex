@@ -75,12 +75,8 @@ pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
 /// Sum an array, starting from zero.
 ///
 /// If the sum overflows, a null scalar will be returned. If the array is all-invalid or empty, the sum will be zero.
-/// Note that sum aggregates typically produce null for arrays without at least one valid element. See
-/// - [DuckDB](https://duckdb.org/docs/stable/sql/functions/aggregates.html)
-/// - [Arrow](https://docs.rs/arrow/latest/arrow/compute/fn.sum.html)
-/// - [DataFusion](https://github.com/apache/datafusion/blob/4153adf2c0f6e317ef476febfdc834208bd46622/datafusion/functions-aggregate/src/sum.rs#L370)
-///
-/// For a sum aggregate with more standard behavior, see [`StandardSum`](crate::aggregate_fn::fns::standard_sum::StandardSum).
+/// Note that sum aggregates typically produce null for arrays without at least one valid element. Use
+/// [`StandardSum`](crate::aggregate_fn::fns::standard_sum::StandardSum) for this behavior and more detail.
 #[derive(Clone, Debug)]
 pub struct Sum;
 
