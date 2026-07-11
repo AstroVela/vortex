@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
-use super::Total;
+use super::StandardSum;
 use super::primitive::sum_float_all;
 use super::primitive::sum_signed_all;
 use super::primitive::sum_unsigned_all;
@@ -16,35 +18,45 @@ use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::GroupRanges;
 use crate::aggregate_fn::GroupedArray;
 use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
+use crate::arrays::BoolArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::StructArray;
+use crate::dtype::FieldName;
+use crate::dtype::FieldNames;
 use crate::dtype::NativePType;
+use crate::dtype::Nullability;
 use crate::match_each_native_ptype;
+use crate::validity::Validity;
 
-/// Encoding-specific grouped [`Total`] kernel for primitive element arrays.
+/// Encoding-specific grouped [`StandardSum`] kernel for primitive element arrays.
 #[derive(Debug)]
-pub(crate) struct PrimitiveGroupedTotalEncodingKernel;
+pub(crate) struct PrimitiveGroupedStandardSumEncodingKernel;
 
-impl DynGroupedAggregateKernel for PrimitiveGroupedTotalEncodingKernel {
+impl DynGroupedAggregateKernel for PrimitiveGroupedStandardSumEncodingKernel {
     fn grouped_aggregate(
         &self,
         aggregate_fn: &AggregateFnRef,
         groups: &GroupedArray,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let Some(options) = aggregate_fn.as_opt::<Total>() else {
+        let Some(options) = aggregate_fn.as_opt::<StandardSum>() else {
             return Ok(None);
         };
         try_grouped_sum(groups, ctx, options.skip_nans)
     }
 }
 
-/// Grouped [`Total`] implementation for canonical primitive elements.
+/// Grouped [`StandardSum`] implementation for canonical primitive elements.
 ///
 /// Reuses the scalar primitive-sum reductions ([`sum_unsigned_all`]/[`sum_signed_all`]/
 /// [`sum_float_all`]) so the per-group semantics match scalar `sum` exactly (overflow saturates to
 /// a null sum, NaNs are skipped). The element validity mask is materialized once and sliced per
 /// group, rather than the per-group accumulator setup of the generic fallback path.
+///
+/// Produces `{sum, seen}` partial rows (see `StandardSum`'s partial dtype): `seen` records whether the
+/// group contained at least one valid element, so that `finalize` yields null for empty and
+/// all-null groups (SQL `SUM`), and null groups are null struct rows.
 pub(super) fn try_grouped_sum(
     groups: &GroupedArray,
     ctx: &mut ExecutionCtx,
@@ -66,7 +78,7 @@ pub(super) fn try_grouped_sum(
     )?))
 }
 
-/// Total each group described by `group_ranges` (element `(offset, size)` pairs), one sum per group.
+/// StandardSum each group described by `group_ranges` (element `(offset, size)` pairs), one sum per group.
 fn grouped_sum(
     elements: &PrimitiveArray,
     group_ranges: &GroupRanges,
@@ -80,7 +92,7 @@ fn grouped_sum(
         .execute_mask(elements.as_ref().len(), ctx)?;
     let all_valid = matches!(elem_mask.slices(), AllOr::All);
 
-    let result = match_each_native_ptype!(elements.ptype(),
+    let (sums, seen) = match_each_native_ptype!(elements.ptype(),
         unsigned: |T| {
             let values = elements.as_slice::<T>();
             collect_sums::<T, u64>(values, group_ranges, group_validity, &elem_mask, all_valid,
@@ -98,11 +110,22 @@ fn grouped_sum(
         }
     );
 
-    Ok(result.into_array())
+    Ok(StructArray::try_new(
+        FieldNames::from_iter([FieldName::from("sum"), FieldName::from("seen")]),
+        vec![
+            sums.into_array(),
+            BoolArray::new(seen, Validity::NonNullable).into_array(),
+        ],
+        group_validity.len(),
+        Validity::from_mask(group_validity.clone(), Nullability::Nullable),
+    )?
+    .into_array())
 }
 
-/// Reduce each group's element slice into a nullable sum. A group is null when the group
-/// itself is invalid, or when summing it overflows (`sum_run` returns `true`).
+/// Reduce each group's element slice into a nullable sum plus a per-group `seen` bit. A sum is
+/// null when the group itself is invalid or when summing it overflows (`sum_run` returns
+/// `true`); `seen` records whether the group contained at least one valid element, decided by
+/// validity alone (with `skip_nans`, a valid all-NaN group is still seen and sums to zero).
 fn collect_sums<T: NativePType, A: NativePType + Default>(
     values: &[T],
     group_ranges: &GroupRanges,
@@ -110,24 +133,31 @@ fn collect_sums<T: NativePType, A: NativePType + Default>(
     elem_mask: &Mask,
     all_valid: bool,
     sum_run: impl Fn(&mut A, &[T]) -> bool,
-) -> PrimitiveArray {
+) -> (PrimitiveArray, BitBuffer) {
+    let mut seen = BitBufferMut::with_capacity(group_ranges.len());
     let sums = group_ranges.iter().enumerate().map(|(i, (offset, size))| {
         if !group_validity.value(i) {
+            seen.append(false);
             return None;
         }
         let mut acc = A::default();
-        let overflow = if all_valid {
-            sum_run(&mut acc, &values[offset..offset + size])
+        let (overflow, any_valid) = if all_valid {
+            (sum_run(&mut acc, &values[offset..offset + size]), size > 0)
         } else {
             sum_masked_group(&mut acc, values, offset, size, elem_mask, &sum_run)
         };
+        seen.append(any_valid);
         (!overflow).then_some(acc)
     });
-    PrimitiveArray::from_option_iter(sums)
+    let sums = PrimitiveArray::from_option_iter(sums);
+    (sums, seen.freeze())
 }
 
-/// Total the valid elements of a single group, using the contiguous valid runs of the element mask
+/// StandardSum the valid elements of a single group, using the contiguous valid runs of the element mask
 /// intersected with the group's `[offset, offset + size)` range.
+///
+/// Returns `(overflow, any_valid)`, where `any_valid` records whether the group contained at
+/// least one valid element.
 fn sum_masked_group<T: NativePType, A>(
     acc: &mut A,
     values: &[T],
@@ -135,17 +165,17 @@ fn sum_masked_group<T: NativePType, A>(
     size: usize,
     elem_mask: &Mask,
     sum_run: &impl Fn(&mut A, &[T]) -> bool,
-) -> bool {
+) -> (bool, bool) {
     match elem_mask.slice(offset..offset + size).slices() {
-        AllOr::All => sum_run(acc, &values[offset..offset + size]),
-        AllOr::None => false,
+        AllOr::All => (sum_run(acc, &values[offset..offset + size]), size > 0),
+        AllOr::None => (false, false),
         AllOr::Some(runs) => {
             for &(start, end) in runs {
                 if sum_run(acc, &values[offset + start..offset + end]) {
-                    return true;
+                    return (true, true);
                 }
             }
-            false
+            (false, !runs.is_empty())
         }
     }
 }
@@ -163,8 +193,8 @@ mod tests {
     use crate::aggregate_fn::DynGroupedAccumulator;
     use crate::aggregate_fn::GroupedAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
-    use crate::aggregate_fn::fns::total::Total;
-    use crate::aggregate_fn::fns::total::total;
+    use crate::aggregate_fn::fns::standard_sum::StandardSum;
+    use crate::aggregate_fn::fns::standard_sum::standard_sum;
     use crate::array_session;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListViewArray;
@@ -180,7 +210,7 @@ mod tests {
     /// Run a grouped sum through the accumulator.
     fn grouped_sum_actual(groups: &ArrayRef, elem_dtype: &DType) -> VortexResult<ArrayRef> {
         let mut acc = GroupedAccumulator::try_new(
-            Total,
+            StandardSum,
             NumericalAggregateOpts::default(),
             elem_dtype.clone(),
         )?;
@@ -189,8 +219,9 @@ mod tests {
         acc.finish(&mut ctx)
     }
 
-    /// Reference sums computed exactly like the generic slow path: per-group scalar [`sum`] for
-    /// valid groups, a null sum for invalid groups.
+    /// Reference sums computed exactly like the generic slow path: per-group scalar [`sum`]
+    /// (SQL semantics: null for zero valid elements) for valid groups, a null sum for invalid
+    /// groups.
     fn grouped_sum_reference(
         elements: &ArrayRef,
         ranges: &[(usize, usize)],
@@ -200,14 +231,14 @@ mod tests {
         use crate::aggregate_fn::AggregateFnVTable;
 
         let mut ctx = array_session().create_execution_ctx();
-        let sum_dtype = Total
-            .partial_dtype(&NumericalAggregateOpts::default(), elem_dtype)
-            .expect("sum partial dtype");
+        let sum_dtype = StandardSum
+            .return_dtype(&NumericalAggregateOpts::default(), elem_dtype)
+            .expect("sum return dtype");
         let mut builder = builder_with_capacity(&sum_dtype, ranges.len());
         for (i, &(offset, size)) in ranges.iter().enumerate() {
             if group_valid[i] {
                 let slice = elements.slice(offset..offset + size)?;
-                builder.append_scalar(&total(&slice, &mut ctx)?)?;
+                builder.append_scalar(&standard_sum(&slice, &mut ctx)?)?;
             } else {
                 builder.append_null();
             }
@@ -292,8 +323,8 @@ mod tests {
         let actual = grouped_sum_actual(&groups, &elem_dtype)?;
         let expected = grouped_sum_reference(&elements, &ranges, &valid, &elem_dtype)?;
 
-        let direct =
-            PrimitiveArray::from_option_iter([Some(4i64), Some(0i64), Some(0i64), Some(9i64)]);
+        // The all-null and empty groups have null sums (SQL `SUM` semantics).
+        let direct = PrimitiveArray::from_option_iter([Some(4i64), None, None, Some(9i64)]);
         assert_arrays_eq!(&actual, &direct.into_array(), &mut ctx);
         assert_arrays_eq!(&actual, &expected, &mut ctx);
         Ok(())
@@ -369,8 +400,11 @@ mod tests {
         let elem_dtype = DType::Primitive(PType::F64, NonNullable);
         let groups = listview(elements, &[(0, 3), (3, 2)], &[true, true])?;
 
-        let mut acc =
-            GroupedAccumulator::try_new(Total, NumericalAggregateOpts::include_nans(), elem_dtype)?;
+        let mut acc = GroupedAccumulator::try_new(
+            StandardSum,
+            NumericalAggregateOpts::include_nans(),
+            elem_dtype,
+        )?;
         let mut ctx2 = array_session().create_execution_ctx();
         acc.accumulate_list(&groups, &mut ctx2)?;
         let actual = acc.finish(&mut ctx2)?;

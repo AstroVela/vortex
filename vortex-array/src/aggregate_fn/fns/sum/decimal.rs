@@ -27,10 +27,8 @@ pub(super) fn accumulate_decimal(
     inner: &mut SumState,
     d: &DecimalArray,
     ctx: &mut ExecutionCtx,
-    seen: &mut bool,
 ) -> VortexResult<bool> {
     let mask = d.as_ref().validity()?.execute_mask(d.as_ref().len(), ctx)?;
-    *seen |= mask.true_count() > 0;
     let validity = match &mask {
         Mask::AllTrue(_) => None,
         Mask::Values(mask_values) => Some(mask_values.bit_buffer()),
@@ -372,7 +370,7 @@ mod tests {
         let small = Scalar::decimal(DecimalValue::from(9i64), DecimalDType::new(14, 0), Nullable);
         Sum.combine_partials(&mut state, small)?;
 
-        let result = Sum.finalize_scalar(&state)?;
+        let result = Sum.to_scalar(&state)?;
         assert!(!result.is_null());
         assert_eq!(
             result.as_decimal().decimal_value(),
@@ -403,7 +401,7 @@ mod tests {
             Scalar::decimal(DecimalValue::from(1i64), DecimalDType::new(14, 0), Nullable);
         Sum.combine_partials(&mut state, one_more)?;
 
-        let result = Sum.finalize_scalar(&state)?;
+        let result = Sum.to_scalar(&state)?;
         assert!(result.is_null());
         assert_eq!(
             result.dtype(),
@@ -432,7 +430,7 @@ mod tests {
         );
         Sum.combine_partials(&mut state, one_more)?;
 
-        let result = Sum.finalize_scalar(&state)?;
+        let result = Sum.to_scalar(&state)?;
         assert!(result.is_null());
         Ok(())
     }
@@ -465,7 +463,7 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         Sum.accumulate(&mut state, &columnar, &mut ctx)?;
 
-        let result = Sum.finalize_scalar(&state)?;
+        let result = Sum.to_scalar(&state)?;
         assert!(result.is_null());
         Ok(())
     }

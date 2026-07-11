@@ -26,19 +26,12 @@ pub(super) fn accumulate_primitive(
     p: &PrimitiveArray,
     ctx: &mut ExecutionCtx,
     skip_nans: bool,
-    seen: &mut bool,
 ) -> VortexResult<bool> {
     let mask = p.as_ref().validity()?.execute_mask(p.as_ref().len(), ctx)?;
     match mask.slices() {
         AllOr::None => Ok(false),
-        AllOr::All => {
-            *seen |= !p.as_ref().is_empty();
-            accumulate_primitive_all(inner, p, skip_nans)
-        }
-        AllOr::Some(slices) => {
-            *seen |= !slices.is_empty();
-            accumulate_primitive_valid(inner, p, slices, skip_nans)
-        }
+        AllOr::All => accumulate_primitive_all(inner, p, skip_nans),
+        AllOr::Some(slices) => accumulate_primitive_valid(inner, p, slices, skip_nans),
     }
 }
 
@@ -267,8 +260,7 @@ mod tests {
     fn sum_all_null() -> VortexResult<()> {
         let arr = PrimitiveArray::from_option_iter([None::<i32>, None, None]).into_array();
         let result = sum(&arr, &mut array_session().create_execution_ctx())?;
-        // SQL `SUM`: no valid values yields null.
-        assert!(result.is_null());
+        assert_eq!(result.as_primitive().typed_value::<i64>(), Some(0));
         Ok(())
     }
 
@@ -276,7 +268,7 @@ mod tests {
     fn sum_all_invalid_float() -> VortexResult<()> {
         let arr = PrimitiveArray::from_option_iter::<f32, _>([None, None, None]).into_array();
         let result = sum(&arr, &mut array_session().create_execution_ctx())?;
-        assert_eq!(result, Scalar::null(DType::Primitive(PType::F64, Nullable)));
+        assert_eq!(result, Scalar::primitive(0f64, Nullable));
         Ok(())
     }
 
@@ -297,21 +289,20 @@ mod tests {
     }
 
     #[test]
-    fn sum_empty_is_null() -> VortexResult<()> {
+    fn sum_empty_produces_zero() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(Sum, NumericalAggregateOpts::default(), dtype)?;
         let result = acc.finish()?;
-        // SQL `SUM`: the sum over no values is null.
-        assert!(result.is_null());
+        assert_eq!(result.as_primitive().typed_value::<i64>(), Some(0));
         Ok(())
     }
 
     #[test]
-    fn sum_empty_f64_is_null() -> VortexResult<()> {
+    fn sum_empty_f64_produces_zero() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(Sum, NumericalAggregateOpts::default(), dtype)?;
         let result = acc.finish()?;
-        assert!(result.is_null());
+        assert_eq!(result.as_primitive().typed_value::<f64>(), Some(0.0));
         Ok(())
     }
 
@@ -404,8 +395,6 @@ mod tests {
             .set(Stat::NaNCount, Precision::Exact(ScalarValue::from(0u64)));
         arr.statistics()
             .set(Stat::Sum, Precision::Exact(ScalarValue::from(42.0f64)));
-        arr.statistics()
-            .set(Stat::NullCount, Precision::Exact(ScalarValue::from(0u64)));
         let result = sum_with_options(&arr, NumericalAggregateOpts::include_nans())?;
         assert_eq!(result.as_primitive().typed_value::<f64>(), Some(42.0));
         Ok(())

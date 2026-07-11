@@ -93,7 +93,7 @@ mod tests {
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::aggregate_fn::fns::total::total;
+    use crate::aggregate_fn::fns::standard_sum::standard_sum;
     use crate::array_session;
     use crate::arrays::ConstantArray;
     use crate::dtype::DType;
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn sum_constant_unsigned() -> VortexResult<()> {
         let array = ConstantArray::new(5u64, 10).into_array();
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(result, 50u64.into());
         Ok(())
     }
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn sum_constant_signed() -> VortexResult<()> {
         let array = ConstantArray::new(-5i64, 10).into_array();
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(result, (-50i64).into());
         Ok(())
     }
@@ -126,15 +126,16 @@ mod tests {
     fn sum_constant_nullable_value() -> VortexResult<()> {
         let array = ConstantArray::new(Scalar::null(DType::Primitive(PType::U32, Nullable)), 10)
             .into_array();
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
-        assert_eq!(result, Scalar::primitive(0u64, Nullable));
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
+        // SQL `SUM`: an all-null constant has no valid values.
+        assert_eq!(result, Scalar::null(DType::Primitive(PType::U64, Nullable)));
         Ok(())
     }
 
     #[test]
     fn sum_constant_bool_false() -> VortexResult<()> {
         let array = ConstantArray::new(false, 10).into_array();
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(result, 0u64.into());
         Ok(())
     }
@@ -142,7 +143,7 @@ mod tests {
     #[test]
     fn sum_constant_bool_true() -> VortexResult<()> {
         let array = ConstantArray::new(true, 10).into_array();
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(result, 10u64.into());
         Ok(())
     }
@@ -150,8 +151,8 @@ mod tests {
     #[test]
     fn sum_constant_bool_null() -> VortexResult<()> {
         let array = ConstantArray::new(Scalar::null(DType::Bool(Nullable)), 10).into_array();
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
-        assert_eq!(result, Scalar::primitive(0u64, Nullable));
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
+        assert_eq!(result, Scalar::null(DType::Primitive(PType::U64, Nullable)));
         Ok(())
     }
 
@@ -168,7 +169,7 @@ mod tests {
         )
         .into_array();
 
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
 
         assert_eq!(
             result.as_decimal().decimal_value(),
@@ -184,14 +185,10 @@ mod tests {
         let array = ConstantArray::new(Scalar::null(DType::Decimal(decimal_dtype, Nullable)), 10)
             .into_array();
 
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(
             result,
-            Scalar::decimal(
-                DecimalValue::I256(i256::ZERO),
-                DecimalDType::new(20, 2),
-                Nullable
-            )
+            Scalar::null(DType::Decimal(DecimalDType::new(20, 2), Nullable))
         );
         Ok(())
     }
@@ -209,7 +206,7 @@ mod tests {
         )
         .into_array();
 
-        let result = total(&array, &mut array_session().create_execution_ctx())?;
+        let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
         assert_eq!(
             result.as_decimal().decimal_value(),
             Some(DecimalValue::I256(i256::from_i128(99_999_999_900)))

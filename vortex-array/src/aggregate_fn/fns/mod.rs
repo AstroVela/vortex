@@ -19,6 +19,6 @@ pub mod min;
 pub mod min_max;
 pub mod nan_count;
 pub mod null_count;
+pub mod standard_sum;
 pub mod sum;
-pub mod total;
 pub mod uncompressed_size_in_bytes;

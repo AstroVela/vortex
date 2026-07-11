@@ -17,14 +17,12 @@ pub(super) fn accumulate_bool(
     inner: &mut SumState,
     b: &BoolArray,
     ctx: &mut ExecutionCtx,
-    seen: &mut bool,
 ) -> VortexResult<bool> {
     let SumState::Unsigned(acc) = inner else {
         vortex_panic!("expected unsigned sum state for bool input");
     };
 
     let mask = b.as_ref().validity()?.execute_mask(b.as_ref().len(), ctx)?;
-    *seen |= mask.true_count() > 0;
     let true_count = match mask.bit_buffer() {
         AllOr::None => return Ok(false),
         AllOr::All => b.bit_buffer_view().true_count() as u64,
@@ -103,17 +101,16 @@ mod tests {
             &arr.into_array(),
             &mut array_session().create_execution_ctx(),
         )?;
-        // SQL `SUM`: no valid values yields null.
-        assert!(result.is_null());
+        assert_eq!(result.as_primitive().typed_value::<u64>(), Some(0));
         Ok(())
     }
 
     #[test]
-    fn sum_bool_empty_is_null() -> VortexResult<()> {
+    fn sum_bool_empty_produces_zero() -> VortexResult<()> {
         let dtype = DType::Bool(Nullability::NonNullable);
         let mut acc = Accumulator::try_new(Sum, NumericalAggregateOpts::default(), dtype)?;
         let result = acc.finish()?;
-        assert!(result.is_null());
+        assert_eq!(result.as_primitive().typed_value::<u64>(), Some(0));
         Ok(())
     }
 

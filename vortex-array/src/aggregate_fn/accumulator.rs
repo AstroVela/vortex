@@ -279,7 +279,7 @@ mod tests {
     use crate::aggregate_fn::combined::Combined;
     use crate::aggregate_fn::combined::PairOptions;
     use crate::aggregate_fn::fns::mean::Mean;
-    use crate::aggregate_fn::fns::total::Total;
+    use crate::aggregate_fn::fns::sum::Sum;
     use crate::aggregate_fn::kernels::DynAggregateKernel;
     use crate::aggregate_fn::session::AggregateFnSession;
     use crate::array::VTable;
@@ -320,7 +320,7 @@ mod tests {
         }
     }
 
-    /// Total partial sentinel `42.0` — distinguishable from the natural Total of
+    /// Sum partial sentinel `42.0` — distinguishable from the natural Sum of
     /// `dict_of_seven()` which is `7.0`.
     #[derive(Debug)]
     struct SentinelSumPartialKernel;
@@ -418,7 +418,7 @@ mod tests {
         Ok(())
     }
 
-    /// A kernel registered for the inner `(Dict, Total)` child fires when accumulating a
+    /// A kernel registered for the inner `(Dict, Sum)` child fires when accumulating a
     /// Dict batch through `Combined<Mean>`. This is the reusable-primitive case the
     /// refactor enables: no `(Dict, Combined<Mean>)` kernel is needed.
     #[test]
@@ -427,7 +427,7 @@ mod tests {
         let session = fresh_session();
         session
             .get::<AggregateFnSession>()
-            .register_aggregate_kernel(Dict.id(), Some(Total.id()), &KERNEL);
+            .register_aggregate_kernel(Dict.id(), Some(Sum.id()), &KERNEL);
         let mut ctx = session.create_execution_ctx();
 
         let mut acc = mean_f64_accumulator()?;
@@ -435,7 +435,7 @@ mod tests {
         let partial = acc.flush()?;
 
         let s = partial.as_struct();
-        // `Total` child returned the sentinel 42.0 — proves the (Dict, Total) kernel fired
+        // `Sum` child returned the sentinel 42.0 — proves the (Dict, Sum) kernel fired
         // via `Combined<Mean>`'s fan-out. `Count`'s native `try_accumulate` reads the
         // batch's valid_count, so count is the real 1.
         assert_eq!(

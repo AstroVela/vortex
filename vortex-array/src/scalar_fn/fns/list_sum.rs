@@ -16,7 +16,7 @@ use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynGroupedAccumulator;
 use crate::aggregate_fn::GroupedAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
-use crate::aggregate_fn::fns::sum::Sum;
+use crate::aggregate_fn::fns::standard_sum::StandardSum;
 use crate::arrays::ConstantArray;
 use crate::dtype::DType;
 use crate::scalar_fn::Arity;
@@ -29,8 +29,8 @@ use crate::scalar_fn::ScalarFnVTable;
 ///
 /// Follows SQL `SUM` semantics per list, matching DuckDB's `list_sum`: null lists, empty
 /// lists, and lists whose elements are all null yield a null sum; null elements are skipped.
-/// Integer and decimal overflow yields a null sum value, matching [`Sum`]. The result
-/// dtype follows [`Sum`]'s widening rules and is always nullable.
+/// Integer and decimal overflow yields a null sum value, matching [`StandardSum`]. The result
+/// dtype follows [`StandardSum`]'s widening rules and is always nullable.
 ///
 /// NaN handling for float elements is controlled by [`NumericalAggregateOpts`]: with
 /// `skip_nans` (the default) NaN values contribute nothing, otherwise any NaN poisons the
@@ -74,7 +74,8 @@ impl ScalarFnVTable for ListSum {
             DType::List(elem, _) | DType::FixedSizeList(elem, ..) => elem.as_ref(),
             other => vortex_bail!("list_sum() requires List or FixedSizeList, got {other}"),
         };
-        Sum.return_dtype(options, elem_dtype)
+        StandardSum
+            .return_dtype(options, elem_dtype)
             .ok_or_else(|| vortex_err!("list_sum() cannot sum elements of type {elem_dtype}"))
     }
 
@@ -121,7 +122,7 @@ impl ScalarFnVTable for ListSum {
 
 /// Sum each list of a canonical `array` into one value per list.
 ///
-/// The grouped [`Sum`] finalize already yields null for null, empty, and all-null lists
+/// The grouped [`StandardSum`] finalize already yields null for null, empty, and all-null lists
 /// (SQL `SUM` semantics), so no post-processing is needed.
 fn list_sum_impl(
     canonical: ArrayRef,
@@ -129,7 +130,7 @@ fn list_sum_impl(
     options: &NumericalAggregateOpts,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let mut acc = GroupedAccumulator::try_new(Sum, *options, elem_dtype)?;
+    let mut acc = GroupedAccumulator::try_new(StandardSum, *options, elem_dtype)?;
     acc.accumulate_list(&canonical, ctx)?;
     acc.finish(ctx)
 }

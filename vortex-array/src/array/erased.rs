@@ -28,7 +28,7 @@ use crate::ExecutionResult;
 use crate::IntoArray;
 use crate::VTable;
 use crate::VortexSessionExecute;
-use crate::aggregate_fn::fns::total::total;
+use crate::aggregate_fn::fns::sum::sum;
 use crate::array::ArrayData;
 use crate::array::ArrayId;
 use crate::array::ArrayInner;
@@ -334,7 +334,7 @@ impl ArrayRef {
             Validity::NonNullable | Validity::AllValid => len,
             Validity::AllInvalid => 0,
             Validity::Array(a) => {
-                let array_sum = total(&a, ctx)?;
+                let array_sum = sum(&a, ctx)?;
                 array_sum
                     .as_primitive()
                     .as_::<usize>()

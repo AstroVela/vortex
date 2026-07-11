@@ -1002,7 +1002,7 @@ fn test_slice_aggregate_consistency(array: &ArrayRef, ctx: &mut ExecutionCtx) {
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::min_max::min_max;
     use crate::aggregate_fn::fns::nan_count::nan_count;
-    use crate::aggregate_fn::fns::total::total;
+    use crate::aggregate_fn::fns::sum::sum;
     use crate::dtype::DType;
 
     let len = array.len();
@@ -1045,8 +1045,7 @@ fn test_slice_aggregate_consistency(array: &ArrayRef, ctx: &mut ExecutionCtx) {
         return;
     }
 
-    if let (Ok(slice_sum), Ok(canonical_sum)) = (total(&sliced, ctx), total(&canonical_sliced, ctx))
-    {
+    if let (Ok(slice_sum), Ok(canonical_sum)) = (sum(&sliced, ctx), sum(&canonical_sliced, ctx)) {
         // Compare sum scalars
         assert_eq!(
             slice_sum, canonical_sum,

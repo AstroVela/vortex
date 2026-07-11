@@ -29,10 +29,10 @@ use crate::aggregate_fn::fns::min::Min;
 use crate::aggregate_fn::fns::min_max::MinMax;
 use crate::aggregate_fn::fns::nan_count::NanCount;
 use crate::aggregate_fn::fns::null_count::NullCount;
+use crate::aggregate_fn::fns::standard_sum::PrimitiveGroupedStandardSumEncodingKernel;
+use crate::aggregate_fn::fns::standard_sum::StandardSum;
 use crate::aggregate_fn::fns::sum::PrimitiveGroupedSumEncodingKernel;
 use crate::aggregate_fn::fns::sum::Sum;
-use crate::aggregate_fn::fns::total::PrimitiveGroupedTotalEncodingKernel;
-use crate::aggregate_fn::fns::total::Total;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use crate::aggregate_fn::kernels::DynAggregateKernel;
 use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
@@ -101,7 +101,7 @@ impl Default for AggregateFnSession {
         this.register(MinMax);
         this.register(NanCount);
         this.register(NullCount);
-        this.register(Total);
+        this.register(StandardSum);
         this.register(Sum);
         this.register(UncompressedSizeInBytes);
 
@@ -120,8 +120,8 @@ impl Default for AggregateFnSession {
         );
         this.register_grouped_encoding_kernel(
             Primitive.id(),
-            Total.id(),
-            &PrimitiveGroupedTotalEncodingKernel,
+            StandardSum.id(),
+            &PrimitiveGroupedStandardSumEncodingKernel,
         );
 
         this

@@ -17,7 +17,7 @@ use vortex::aggregate_fn::fns::first::First;
 use vortex::aggregate_fn::fns::max::Max;
 use vortex::aggregate_fn::fns::mean::Mean;
 use vortex::aggregate_fn::fns::min::Min;
-use vortex::aggregate_fn::fns::total::Total;
+use vortex::aggregate_fn::fns::sum::Sum;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -483,7 +483,7 @@ pub fn try_from_projection_expression(
 pub enum PushedAggregate {
     Min,
     Max,
-    Total,
+    Sum,
     Mean,
     // Also used for ANY_VALUE() which is allowed by definition
     First,
@@ -496,7 +496,7 @@ impl Display for PushedAggregate {
         match self {
             PushedAggregate::Min => f.write_str("min"),
             PushedAggregate::Max => f.write_str("max"),
-            PushedAggregate::Total => f.write_str("sum"),
+            PushedAggregate::Sum => f.write_str("sum"),
             PushedAggregate::Mean => f.write_str("mean"),
             PushedAggregate::First => f.write_str("first"),
             PushedAggregate::Count => f.write_str("count"),
@@ -510,7 +510,7 @@ impl PushedAggregate {
         Ok(match self {
             Self::Min => Box::new(Accumulator::try_new(Min, opts, dtype)?),
             Self::Max => Box::new(Accumulator::try_new(Max, opts, dtype)?),
-            Self::Total => Box::new(Accumulator::try_new(Total, opts, dtype)?),
+            Self::Sum => Box::new(Accumulator::try_new(Sum, opts, dtype)?),
             Self::Mean => Box::new(Accumulator::try_new(
                 Mean::combined(),
                 PairOptions(opts, opts),
@@ -535,7 +535,7 @@ pub fn try_from_projection_aggregate(
     Ok(Some(match agg.aggregate_function.name() {
         "min" => PushedAggregate::Min,
         "max" => PushedAggregate::Max,
-        "sum" | "sum_no_overflow" => PushedAggregate::Total,
+        "sum" | "sum_no_overflow" => PushedAggregate::Sum,
         "avg" | "mean" => PushedAggregate::Mean,
         "first" | "any_value" => PushedAggregate::First,
         "count" => PushedAggregate::Count,
