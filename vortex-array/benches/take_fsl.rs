@@ -48,8 +48,9 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 /// Number of lists in the source array.
 const NUM_LISTS: usize = 500;
 
-/// Number of indices to take.
-const NUM_INDICES: &[usize] = &[100, 1_000];
+/// Number of indices to take. This keeps even the widest, longest cases below one millisecond in
+/// CodSpeed's instruction-count simulation.
+const NUM_INDICES: &[usize] = &[10];
 
 /// Fixed size list lengths (elements per list).
 const LIST_SIZES: &[usize] = &[16, 64, 128, 256, 512, 1024, 2048, 4096];
