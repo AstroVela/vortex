@@ -15,8 +15,8 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-// The accumulation kernels are shared with `StandardSum`, which layers `seen` tracking on
-// the same summation; [`Sum`] itself ignores the seen bit.
+// The accumulation kernels are also used by `StandardSum`, which tracks its `seen` bit
+// separately from validity; the kernels themselves are unchanged.
 pub(crate) use self::bool::accumulate_bool;
 pub(crate) use self::constant::multiply_constant;
 pub(crate) use self::decimal::accumulate_decimal;
@@ -305,15 +305,11 @@ impl AggregateFnVTable for Sum {
             None => return Ok(()),
         };
 
-        // The shared kernels track a `seen` bit for `StandardSum`; the monoid sum ignores it.
-        let mut seen = false;
         let result = match batch {
             Columnar::Canonical(c) => match c {
-                Canonical::Primitive(p) => {
-                    accumulate_primitive(&mut inner, p, ctx, skip_nans, &mut seen)
-                }
-                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx, &mut seen),
-                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx, &mut seen),
+                Canonical::Primitive(p) => accumulate_primitive(&mut inner, p, ctx, skip_nans),
+                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx),
+                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx),
                 _ => vortex_bail!("Unsupported canonical type for sum: {}", batch.dtype()),
             },
             Columnar::Constant(_) => unreachable!(),

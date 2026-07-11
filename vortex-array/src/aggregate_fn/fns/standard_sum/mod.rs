@@ -46,6 +46,7 @@ use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::fns::fill_null::FillNull;
 use crate::scalar_fn::fns::get_item::GetItem;
 use crate::scalar_fn::fns::mask::Mask;
+use crate::validity::Validity;
 
 /// Return the SQL sum of an array: null when the array has no valid values or the sum
 /// overflows.
@@ -339,13 +340,22 @@ impl AggregateFnVTable for StandardSum {
             None => return Ok(()),
         };
 
+        // `seen` is decided by validity alone (NaNs are valid values), so it is tracked here
+        // and the summation reuses [`Sum`]'s accumulation kernels unchanged.
         let result = match batch {
             Columnar::Canonical(c) => match c {
                 Canonical::Primitive(p) => {
-                    accumulate_primitive(&mut inner, p, ctx, skip_nans, &mut partial.seen)
+                    partial.seen |= any_valid(p.as_ref().validity()?, p.as_ref().len(), ctx)?;
+                    accumulate_primitive(&mut inner, p, ctx, skip_nans)
                 }
-                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx, &mut partial.seen),
-                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx, &mut partial.seen),
+                Canonical::Bool(b) => {
+                    partial.seen |= any_valid(b.as_ref().validity()?, b.as_ref().len(), ctx)?;
+                    accumulate_bool(&mut inner, b, ctx)
+                }
+                Canonical::Decimal(d) => {
+                    partial.seen |= any_valid(d.as_ref().validity()?, d.as_ref().len(), ctx)?;
+                    accumulate_decimal(&mut inner, d, ctx)
+                }
                 _ => vortex_bail!("Unsupported canonical type for sum: {}", batch.dtype()),
             },
             Columnar::Constant(_) => unreachable!(),
@@ -418,6 +428,11 @@ fn try_accumulate_cached_sum(
     };
     vtable.combine_partials(partial, sum)?;
     Ok(true)
+}
+
+/// Whether a batch contains at least one valid element.
+fn any_valid(validity: Validity, len: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+    Ok(validity.execute_mask(len, ctx)?.true_count() > 0)
 }
 
 /// The group state for a sum aggregate, containing the accumulated value and configuration

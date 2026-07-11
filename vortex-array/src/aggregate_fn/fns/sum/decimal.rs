@@ -27,10 +27,8 @@ pub(crate) fn accumulate_decimal(
     inner: &mut SumState,
     d: &DecimalArray,
     ctx: &mut ExecutionCtx,
-    seen: &mut bool,
 ) -> VortexResult<bool> {
     let mask = d.as_ref().validity()?.execute_mask(d.as_ref().len(), ctx)?;
-    *seen |= mask.true_count() > 0;
     let validity = match &mask {
         Mask::AllTrue(_) => None,
         Mask::Values(mask_values) => Some(mask_values.bit_buffer()),

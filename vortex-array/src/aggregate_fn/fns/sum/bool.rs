@@ -17,14 +17,12 @@ pub(crate) fn accumulate_bool(
     inner: &mut SumState,
     b: &BoolArray,
     ctx: &mut ExecutionCtx,
-    seen: &mut bool,
 ) -> VortexResult<bool> {
     let SumState::Unsigned(acc) = inner else {
         vortex_panic!("expected unsigned sum state for bool input");
     };
 
     let mask = b.as_ref().validity()?.execute_mask(b.as_ref().len(), ctx)?;
-    *seen |= mask.true_count() > 0;
     let true_count = match mask.bit_buffer() {
         AllOr::None => return Ok(false),
         AllOr::All => b.bit_buffer_view().true_count() as u64,

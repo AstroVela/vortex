@@ -26,19 +26,12 @@ pub(crate) fn accumulate_primitive(
     p: &PrimitiveArray,
     ctx: &mut ExecutionCtx,
     skip_nans: bool,
-    seen: &mut bool,
 ) -> VortexResult<bool> {
     let mask = p.as_ref().validity()?.execute_mask(p.as_ref().len(), ctx)?;
     match mask.slices() {
         AllOr::None => Ok(false),
-        AllOr::All => {
-            *seen |= !p.as_ref().is_empty();
-            accumulate_primitive_all(inner, p, skip_nans)
-        }
-        AllOr::Some(slices) => {
-            *seen |= !slices.is_empty();
-            accumulate_primitive_valid(inner, p, slices, skip_nans)
-        }
+        AllOr::All => accumulate_primitive_all(inner, p, skip_nans),
+        AllOr::Some(slices) => accumulate_primitive_valid(inner, p, slices, skip_nans),
     }
 }
 
