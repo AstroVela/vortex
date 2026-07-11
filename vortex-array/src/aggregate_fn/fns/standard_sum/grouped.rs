@@ -8,15 +8,15 @@ use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use super::StandardSum;
-use super::primitive::sum_float_all;
-use super::primitive::sum_signed_all;
-use super::primitive::sum_unsigned_all;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::GroupRanges;
 use crate::aggregate_fn::GroupedArray;
+use crate::aggregate_fn::fns::sum::sum_float_all;
+use crate::aggregate_fn::fns::sum::sum_signed_all;
+use crate::aggregate_fn::fns::sum::sum_unsigned_all;
 use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
 use crate::arrays::BoolArray;
 use crate::arrays::Primitive;

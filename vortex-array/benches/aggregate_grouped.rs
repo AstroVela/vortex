@@ -201,6 +201,38 @@ fn sum_f64_clustered_nulls(bencher: Bencher) {
         .bench_refs(|input| grouped_accumulator(input, Sum));
 }
 
+#[divan::bench]
+fn standard_sum_i32_nullable_all_valid(bencher: Bencher) {
+    let input = i32_nullable_all_valid_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator(input, StandardSum));
+}
+
+#[divan::bench]
+fn standard_sum_i32_clustered_nulls(bencher: Bencher) {
+    let input = i32_clustered_nulls_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator(input, StandardSum));
+}
+
+#[divan::bench]
+fn standard_sum_f64_all_valid(bencher: Bencher) {
+    let input = f64_all_valid_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator(input, StandardSum));
+}
+
+#[divan::bench]
+fn standard_sum_f64_clustered_nulls(bencher: Bencher) {
+    let input = f64_clustered_nulls_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator(input, StandardSum));
+}
+
 /// Like [`grouped_accumulator`], but executes the lazy finalize result to canonical so the
 /// bench measures the full cost of producing usable sums.
 fn grouped_accumulator_canonical<V>(list_view: &ArrayRef, vtable: V) -> ArrayRef
@@ -225,7 +257,39 @@ where
 }
 
 #[divan::bench]
-fn standard_sum_i32_nullable_all_valid(bencher: Bencher) {
+fn canonical_sum_i32_nullable_all_valid(bencher: Bencher) {
+    let input = i32_nullable_all_valid_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator_canonical(input, Sum));
+}
+
+#[divan::bench]
+fn canonical_sum_i32_clustered_nulls(bencher: Bencher) {
+    let input = i32_clustered_nulls_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator_canonical(input, Sum));
+}
+
+#[divan::bench]
+fn canonical_sum_f64_all_valid(bencher: Bencher) {
+    let input = f64_all_valid_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator_canonical(input, Sum));
+}
+
+#[divan::bench]
+fn canonical_sum_f64_clustered_nulls(bencher: Bencher) {
+    let input = f64_clustered_nulls_input();
+    bencher
+        .with_inputs(|| &input)
+        .bench_refs(|input| grouped_accumulator_canonical(input, Sum));
+}
+
+#[divan::bench]
+fn canonical_standard_sum_i32_nullable_all_valid(bencher: Bencher) {
     let input = i32_nullable_all_valid_input();
     bencher
         .with_inputs(|| &input)
@@ -233,7 +297,7 @@ fn standard_sum_i32_nullable_all_valid(bencher: Bencher) {
 }
 
 #[divan::bench]
-fn standard_sum_i32_clustered_nulls(bencher: Bencher) {
+fn canonical_standard_sum_i32_clustered_nulls(bencher: Bencher) {
     let input = i32_clustered_nulls_input();
     bencher
         .with_inputs(|| &input)
@@ -241,7 +305,7 @@ fn standard_sum_i32_clustered_nulls(bencher: Bencher) {
 }
 
 #[divan::bench]
-fn standard_sum_f64_all_valid(bencher: Bencher) {
+fn canonical_standard_sum_f64_all_valid(bencher: Bencher) {
     let input = f64_all_valid_input();
     bencher
         .with_inputs(|| &input)
@@ -249,7 +313,7 @@ fn standard_sum_f64_all_valid(bencher: Bencher) {
 }
 
 #[divan::bench]
-fn standard_sum_f64_clustered_nulls(bencher: Bencher) {
+fn canonical_standard_sum_f64_clustered_nulls(bencher: Bencher) {
     let input = f64_clustered_nulls_input();
     bencher
         .with_inputs(|| &input)

@@ -15,10 +15,15 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use self::bool::accumulate_bool;
-use self::constant::multiply_constant;
-use self::decimal::accumulate_decimal;
-use self::primitive::accumulate_primitive;
+// The accumulation kernels are shared with `StandardSum`, which layers `seen` tracking on
+// the same summation; [`Sum`] itself ignores the seen bit.
+pub(crate) use self::bool::accumulate_bool;
+pub(crate) use self::constant::multiply_constant;
+pub(crate) use self::decimal::accumulate_decimal;
+pub(crate) use self::primitive::accumulate_primitive;
+pub(crate) use self::primitive::sum_float_all;
+pub(crate) use self::primitive::sum_signed_all;
+pub(crate) use self::primitive::sum_unsigned_all;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::Columnar;
@@ -40,13 +45,9 @@ use crate::expr::stats::StatsProviderExt;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
 
-/// The monoid sum of an array: zero when there are no valid values, null on overflow.
+/// Return the sum of an array.
 ///
-/// This is the value stored as `Stat::Sum` and merged across chunks, zones, and files: the
-/// empty sum is zero so that partials merge as a monoid (`combine(empty, x) = x`). For the
-/// SQL rule (a sum over zero valid values is null) use
-/// [`standard_sum`](crate::aggregate_fn::fns::standard_sum::standard_sum) /
-/// [`StandardSum`](crate::aggregate_fn::fns::standard_sum::StandardSum).
+/// See [`Sum`] for details.
 pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     // Short-circuit using cached array statistics.
     if let Precision::Exact(sum_scalar) = array.statistics().get(Stat::Sum) {
@@ -71,15 +72,15 @@ pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     Ok(result)
 }
 
-/// The monoid sum aggregate: an all-invalid or empty sum is zero, an overflowing sum is null.
+/// Sum an array, starting from zero.
 ///
-/// This aggregate's plain partial is the persisted wire form of sum statistics (zone maps,
-/// file stats), so its partial dtype and semantics must stay stable. The SQL `SUM` rule is
-/// provided by the separate [`StandardSum`](crate::aggregate_fn::fns::standard_sum::StandardSum)
-/// aggregate.
+/// If the sum overflows, a null scalar will be returned. If the array is all-invalid or empty, the sum will be zero.
+/// Note that sum aggregates typically produce null for arrays without at least one valid element. See
+/// - [DuckDB](https://duckdb.org/docs/stable/sql/functions/aggregates.html)
+/// - [Arrow](https://docs.rs/arrow/latest/arrow/compute/fn.sum.html)
+/// - [DataFusion](https://github.com/apache/datafusion/blob/4153adf2c0f6e317ef476febfdc834208bd46622/datafusion/functions-aggregate/src/sum.rs#L370)
 ///
-/// NaN handling for float inputs is controlled by [`NumericalAggregateOpts`]: with `skip_nans` (the
-/// default) NaN values contribute nothing, otherwise any NaN value poisons the sum to NaN.
+/// For a sum aggregate with more standard behavior, see [`StandardSum`](crate::aggregate_fn::fns::standard_sum::StandardSum).
 #[derive(Clone, Debug)]
 pub struct Sum;
 
@@ -304,11 +305,15 @@ impl AggregateFnVTable for Sum {
             None => return Ok(()),
         };
 
+        // The shared kernels track a `seen` bit for `StandardSum`; the monoid sum ignores it.
+        let mut seen = false;
         let result = match batch {
             Columnar::Canonical(c) => match c {
-                Canonical::Primitive(p) => accumulate_primitive(&mut inner, p, ctx, skip_nans),
-                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx),
-                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx),
+                Canonical::Primitive(p) => {
+                    accumulate_primitive(&mut inner, p, ctx, skip_nans, &mut seen)
+                }
+                Canonical::Bool(b) => accumulate_bool(&mut inner, b, ctx, &mut seen),
+                Canonical::Decimal(d) => accumulate_decimal(&mut inner, d, ctx, &mut seen),
                 _ => vortex_bail!("Unsupported canonical type for sum: {}", batch.dtype()),
             },
             Columnar::Constant(_) => unreachable!(),
