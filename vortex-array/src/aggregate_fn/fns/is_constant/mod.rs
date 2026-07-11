@@ -420,7 +420,7 @@ impl AggregateFnVTable for IsConstant {
         }
     }
 
-    fn finalize(&self, partials: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
         partials.get_item(NAMES.get(0).vortex_expect("out of bounds").clone())
     }
 

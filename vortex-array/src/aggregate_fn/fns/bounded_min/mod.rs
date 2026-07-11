@@ -197,7 +197,7 @@ impl AggregateFnVTable for BoundedMin {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 

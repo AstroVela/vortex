@@ -108,7 +108,7 @@ impl AggregateFnVTable for ForeignAggregateFnVTable {
         vortex_bail!("Cannot execute unknown aggregate function '{}'", self.id)
     }
 
-    fn finalize(&self, _states: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    fn finalize(&self, _states: ArrayRef) -> VortexResult<ArrayRef> {
         vortex_bail!("Cannot execute unknown aggregate function '{}'", self.id)
     }
 

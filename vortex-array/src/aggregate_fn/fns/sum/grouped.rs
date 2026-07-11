@@ -184,9 +184,8 @@ mod tests {
             NumericalAggregateOpts::default(),
             elem_dtype.clone(),
         )?;
-        let mut ctx = array_session().create_execution_ctx();
-        acc.accumulate_list(groups, &mut ctx)?;
-        acc.finish(&mut ctx)
+        acc.accumulate_list(groups, &mut array_session().create_execution_ctx())?;
+        acc.finish()
     }
 
     /// Reference sums computed exactly like the generic slow path: per-group scalar [`sum`] for
@@ -371,9 +370,8 @@ mod tests {
 
         let mut acc =
             GroupedAccumulator::try_new(Sum, NumericalAggregateOpts::include_nans(), elem_dtype)?;
-        let mut ctx2 = array_session().create_execution_ctx();
-        acc.accumulate_list(&groups, &mut ctx2)?;
-        let actual = acc.finish(&mut ctx2)?;
+        acc.accumulate_list(&groups, &mut array_session().create_execution_ctx())?;
+        let actual = acc.finish()?;
 
         let mut ctx = array_session().create_execution_ctx();
         // Group 0 contains a NaN -> NaN sum; group 1 sums normally.

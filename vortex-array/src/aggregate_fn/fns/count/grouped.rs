@@ -122,7 +122,7 @@ mod tests {
             elem_dtype.clone(),
         )?;
         acc.accumulate_list(groups, ctx)?;
-        acc.finish(ctx)
+        acc.finish()
     }
 
     /// Reference valid-counts (non-nullable `U64`), one per group.
@@ -235,7 +235,7 @@ mod tests {
         let mut acc =
             GroupedAccumulator::try_new(Count, NumericalAggregateOpts::include_nans(), elem_dtype)?;
         acc.accumulate_list(&groups, &mut ctx)?;
-        let actual = acc.finish(&mut ctx)?;
+        let actual = acc.finish()?;
         let expected = PrimitiveArray::new(buffer![2u64, 1], Validity::NonNullable).into_array();
         assert_arrays_eq!(&actual, &expected, &mut ctx);
         Ok(())

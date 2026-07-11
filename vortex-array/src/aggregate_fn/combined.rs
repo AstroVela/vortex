@@ -245,11 +245,11 @@ impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
         unreachable!("Combined::try_accumulate handles all batches")
     }
 
-    fn finalize(&self, states: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    fn finalize(&self, states: ArrayRef) -> VortexResult<ArrayRef> {
         let l_field = states.get_item(FieldName::from(self.0.left_name()))?;
         let r_field = states.get_item(FieldName::from(self.0.right_name()))?;
-        let l_finalized = self.0.left().finalize(l_field, ctx)?;
-        let r_finalized = self.0.right().finalize(r_field, ctx)?;
+        let l_finalized = self.0.left().finalize(l_field)?;
+        let r_finalized = self.0.right().finalize(r_field)?;
         BinaryCombined::finalize(&self.0, l_finalized, r_finalized)
     }
 

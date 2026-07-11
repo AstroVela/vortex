@@ -325,7 +325,7 @@ impl AggregateFnVTable for Sum {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 
@@ -591,9 +591,8 @@ mod tests {
             NumericalAggregateOpts::default(),
             elem_dtype.clone(),
         )?;
-        let mut ctx = array_session().create_execution_ctx();
-        acc.accumulate_list(groups, &mut ctx)?;
-        acc.finish(&mut ctx)
+        acc.accumulate_list(groups, &mut array_session().create_execution_ctx())?;
+        acc.finish()
     }
 
     #[test]
@@ -686,7 +685,7 @@ mod tests {
             PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
         let groups1 = FixedSizeListArray::try_new(elements1, 2, Validity::NonNullable, 2)?;
         acc.accumulate_list(&groups1.into_array(), &mut ctx)?;
-        let result1 = acc.finish(&mut ctx)?;
+        let result1 = acc.finish()?;
 
         let expected1 = PrimitiveArray::from_option_iter([Some(3i64), Some(7i64)]).into_array();
         assert_arrays_eq!(&result1, &expected1, &mut ctx);
@@ -694,7 +693,7 @@ mod tests {
         let elements2 = PrimitiveArray::new(buffer![10i32, 20], Validity::NonNullable).into_array();
         let groups2 = FixedSizeListArray::try_new(elements2, 2, Validity::NonNullable, 1)?;
         acc.accumulate_list(&groups2.into_array(), &mut ctx)?;
-        let result2 = acc.finish(&mut ctx)?;
+        let result2 = acc.finish()?;
 
         let expected2 = PrimitiveArray::from_option_iter([Some(30i64)]).into_array();
         assert_arrays_eq!(&result2, &expected2, &mut ctx);

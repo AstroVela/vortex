@@ -152,7 +152,7 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
     ///
     /// The provides `states` array has dtype as specified by `state_dtype`, the result array
     /// must have dtype as specified by `return_dtype`.
-    fn finalize(&self, states: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef>;
+    fn finalize(&self, states: ArrayRef) -> VortexResult<ArrayRef>;
 
     /// Finalize a scalar accumulator state into an aggregate result.
     ///

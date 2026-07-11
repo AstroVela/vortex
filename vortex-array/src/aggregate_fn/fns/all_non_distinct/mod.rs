@@ -233,7 +233,7 @@ impl AggregateFnVTable for AllNonDistinct {
         }
     }
 
-    fn finalize(&self, _partials: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    fn finalize(&self, _partials: ArrayRef) -> VortexResult<ArrayRef> {
         vortex_bail!("AllNonDistinct does not support array finalization");
     }
 

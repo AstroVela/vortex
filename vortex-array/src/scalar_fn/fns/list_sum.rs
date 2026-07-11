@@ -132,7 +132,7 @@ fn list_sum_impl(
 ) -> VortexResult<ArrayRef> {
     let mut acc = GroupedAccumulator::try_new(StandardSum, *options, elem_dtype)?;
     acc.accumulate_list(&canonical, ctx)?;
-    acc.finish(ctx)
+    acc.finish()
 }
 
 #[cfg(test)]
