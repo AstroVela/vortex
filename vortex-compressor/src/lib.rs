@@ -63,13 +63,8 @@
 //! with a short `jq` query.
 
 pub mod builtins;
-pub mod ctx;
-pub mod estimate;
 pub mod scheme;
 pub mod stats;
-
-mod constant;
-mod sample;
 
 mod compressor;
 mod trace;

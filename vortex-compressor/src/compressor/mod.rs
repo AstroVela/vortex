@@ -33,21 +33,23 @@ use vortex_array::arrays::variant::VariantArrayExt;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
+mod constant;
+pub(crate) mod sample;
+
 use crate::builtins::IntDictScheme;
-use crate::constant;
-use crate::ctx::CompressorContext;
-use crate::estimate::CompressionEstimate;
-use crate::estimate::DeferredEstimate;
-use crate::estimate::EstimateScore;
-use crate::estimate::EstimateVerdict;
-use crate::estimate::WinnerEstimate;
-use crate::estimate::estimate_compression_ratio_with_sampling;
-use crate::estimate::is_better_score;
 use crate::scheme::ChildSelection;
+use crate::scheme::CompressionEstimate;
+use crate::scheme::CompressorContext;
+use crate::scheme::DeferredEstimate;
 use crate::scheme::DescendantExclusion;
+use crate::scheme::EstimateScore;
+use crate::scheme::EstimateVerdict;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
 use crate::scheme::SchemeId;
+use crate::scheme::estimate::WinnerEstimate;
+use crate::scheme::estimate::estimate_compression_ratio_with_sampling;
+use crate::scheme::estimate::is_better_score;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
 use crate::trace;
@@ -650,13 +652,13 @@ mod tests {
     use crate::builtins::FloatDictScheme;
     use crate::builtins::IntDictScheme;
     use crate::builtins::StringDictScheme;
-    use crate::ctx::CompressorContext;
-    use crate::estimate::CompressionEstimate;
-    use crate::estimate::DeferredEstimate;
-    use crate::estimate::EstimateScore;
-    use crate::estimate::EstimateVerdict;
-    use crate::estimate::WinnerEstimate;
+    use crate::scheme::CompressionEstimate;
+    use crate::scheme::CompressorContext;
+    use crate::scheme::DeferredEstimate;
+    use crate::scheme::EstimateScore;
+    use crate::scheme::EstimateVerdict;
     use crate::scheme::SchemeExt;
+    use crate::scheme::estimate::WinnerEstimate;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 

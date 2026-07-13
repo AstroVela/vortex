@@ -12,10 +12,10 @@ use vortex_array::IntoArray;
 use vortex_error::VortexResult;
 
 use crate::CascadingCompressor;
-use crate::ctx::CompressorContext;
-use crate::sample::SAMPLE_SIZE;
-use crate::sample::sample;
-use crate::sample::sample_count_approx_one_percent;
+use crate::compressor::sample::SAMPLE_SIZE;
+use crate::compressor::sample::sample;
+use crate::compressor::sample::sample_count_approx_one_percent;
+use crate::scheme::CompressorContext;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
 use crate::stats::ArrayAndStats;
@@ -119,7 +119,7 @@ pub enum EstimateScore {
 
 impl EstimateScore {
     /// Converts measured sample sizes into a ranked estimate.
-    pub(super) fn from_sample_sizes(before_nbytes: u64, after_nbytes: u64) -> Self {
+    pub(crate) fn from_sample_sizes(before_nbytes: u64, after_nbytes: u64) -> Self {
         if after_nbytes == 0 {
             Self::ZeroBytes
         } else {
@@ -162,7 +162,7 @@ impl EstimateScore {
 
 /// Winner estimate carried from scheme selection into result tracing.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum WinnerEstimate {
+pub(crate) enum WinnerEstimate {
     /// The scheme must be used immediately.
     AlwaysUse,
     /// The scheme won by a ranked estimate.
@@ -171,7 +171,7 @@ pub(super) enum WinnerEstimate {
 
 impl WinnerEstimate {
     /// Returns the traceable numeric ratio for the winning estimate.
-    pub(super) fn trace_ratio(self) -> Option<f64> {
+    pub(crate) fn trace_ratio(self) -> Option<f64> {
         match self {
             Self::AlwaysUse => None,
             Self::Score(score) => score.finite_ratio(),
@@ -180,7 +180,7 @@ impl WinnerEstimate {
 }
 
 /// Returns `true` if `score` beats the current best estimate.
-pub(super) fn is_better_score(
+pub(crate) fn is_better_score(
     score: EstimateScore,
     best: Option<&(&'static dyn Scheme, EstimateScore)>,
 ) -> bool {
@@ -195,7 +195,7 @@ pub(super) fn is_better_score(
 /// # Errors
 ///
 /// Returns an error if sample compression fails.
-pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
+pub(crate) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
     compressor: &CascadingCompressor,
     scheme: &S,
     array: &ArrayRef,
