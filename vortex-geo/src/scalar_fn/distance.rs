@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! `ST_Distance`: planar (Euclidean) distance between two native geometries via the `geo` crate.
+//! `ST_Distance`: planar (Euclidean) distance between two native geometries.
 
 use geo::Distance;
 use geo::Euclidean;
@@ -10,12 +10,8 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::ScalarFnArray;
-use vortex_array::arrays::StructArray;
-use vortex_array::arrays::extension::ExtensionArrayExt;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
@@ -28,17 +24,16 @@ use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::Point;
-use crate::extension::coordinate::coordinate_from_struct;
 use crate::extension::geometries;
 use crate::extension::single_geometry;
+use crate::extension::validate_geometry_operands;
 
-/// Planar (Euclidean) `ST_Distance` (no geodesic correction) between two native geometry operands.
-/// Each is a column or a constant literal; `geo` computes the distance between each pair.
+/// Planar (Euclidean) `ST_Distance` (no geodesic correction) between two native geometry
+/// operands, each a column or a constant literal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct GeoDistance;
 
@@ -81,7 +76,8 @@ impl ScalarFnVTable for GeoDistance {
         }
     }
 
-    fn return_dtype(&self, _: &Self::Options, _: &[DType]) -> VortexResult<DType> {
+    fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
+        validate_geometry_operands(dtypes)?;
         Ok(DType::Primitive(PType::F64, Nullability::NonNullable))
     }
 
@@ -107,23 +103,13 @@ impl ScalarFnVTable for GeoDistance {
             (Some(query), None) => distances_to_constant(&b, query.scalar(), ctx),
             (None, Some(query)) => distances_to_constant(&a, query.scalar(), ctx),
             (None, None) => {
-                vortex_ensure!(
-                    a.len() == b.len(),
+                vortex_ensure_eq!(
+                    a.len(),
+                    b.len(),
                     "geo distance: operand length mismatch {} vs {}",
                     a.len(),
                     b.len()
                 );
-                // Fast path: two Point columns, distance straight over their `x`/`y` f64 buffers.
-                if is_nonnull_point(a.dtype()) && is_nonnull_point(b.dtype()) {
-                    let (xa, ya) = point_xy(&a, ctx)?;
-                    let (xb, yb) = point_xy(&b, ctx)?;
-                    return Ok(point_distances(
-                        xa.as_slice::<f64>().iter().copied(),
-                        ya.as_slice::<f64>().iter().copied(),
-                        xb.as_slice::<f64>().iter().copied(),
-                        yb.as_slice::<f64>().iter().copied(),
-                    ));
-                }
                 let ag = geometries(&a, ctx)?;
                 let bg = geometries(&b, ctx)?;
                 let distances = ag.iter().zip(&bg).map(|(x, y)| Euclidean.distance(x, y));
@@ -133,78 +119,17 @@ impl ScalarFnVTable for GeoDistance {
     }
 }
 
-/// Distance from each row of `operand` to a constant `query` geometry, decoded once and broadcast.
-/// Distance is symmetric, so this serves a constant on either side.
+/// Distance from each row of `operand` to the constant `query` geometry. Distance is symmetric,
+/// so this serves a constant on either side.
 fn distances_to_constant(
     operand: &ArrayRef,
     query: &Scalar,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    // Fast path: Point column vs constant Point, `x`/`y` f64 buffers, broadcasting the constant.
-    if is_nonnull_point(operand.dtype()) && is_point(query.dtype()) {
-        let q = coordinate_from_struct(&query.as_extension().to_storage_scalar())?;
-        let (xs, ys) = point_xy(operand, ctx)?;
-        return Ok(point_distances(
-            xs.as_slice::<f64>().iter().copied(),
-            ys.as_slice::<f64>().iter().copied(),
-            std::iter::repeat(q.x),
-            std::iter::repeat(q.y),
-        ));
-    }
-
     let query = single_geometry(query, ctx)?;
     let geoms = geometries(operand, ctx)?;
     let distances = geoms.iter().map(|g| Euclidean.distance(g, &query));
     Ok(PrimitiveArray::from_iter(distances).into_array())
-}
-
-/// Extract the `x` and `y` `f64` columns from a native `Point` operand, for the columnar fast paths.
-fn point_xy(
-    operand: &ArrayRef,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<(PrimitiveArray, PrimitiveArray)> {
-    let storage = operand
-        .clone()
-        .execute::<ExtensionArray>(ctx)?
-        .storage_array()
-        .clone()
-        .execute::<StructArray>(ctx)?;
-    let xs = storage
-        .unmasked_field_by_name("x")?
-        .clone()
-        .execute::<PrimitiveArray>(ctx)?;
-    let ys = storage
-        .unmasked_field_by_name("y")?
-        .clone()
-        .execute::<PrimitiveArray>(ctx)?;
-    Ok((xs, ys))
-}
-
-/// Per-row planar distance `sqrt(dx^2 + dy^2)` over two `(x, y)` f64 streams; a constant side is fed
-/// as `repeat(c)`.
-fn point_distances(
-    xa: impl Iterator<Item = f64>,
-    ya: impl Iterator<Item = f64>,
-    xb: impl Iterator<Item = f64>,
-    yb: impl Iterator<Item = f64>,
-) -> ArrayRef {
-    let distances = xa.zip(ya).zip(xb.zip(yb)).map(|((xa, ya), (xb, yb))| {
-        let (dx, dy) = (xa - xb, ya - yb);
-        (dx * dx + dy * dy).sqrt()
-    });
-    PrimitiveArray::from_iter(distances).into_array()
-}
-
-/// Whether `dtype` is the native `Point` extension (eligible for the columnar fast path).
-fn is_point(dtype: &DType) -> bool {
-    dtype
-        .as_extension_opt()
-        .is_some_and(|ext| ext.is::<Point>())
-}
-
-/// A non-nullable native `Point`, a column operand the fast path can read straight from `x`/`y`.
-fn is_nonnull_point(dtype: &DType) -> bool {
-    is_point(dtype) && !dtype.is_nullable()
 }
 
 #[cfg(test)]
@@ -215,6 +140,11 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ConstantArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::scalar_fn::EmptyOptions;
+    use vortex_array::scalar_fn::ScalarFnVTable;
     use vortex_error::VortexResult;
 
     use super::GeoDistance;
@@ -294,6 +224,25 @@ mod tests {
         let distance = GeoDistance::try_new_array(a, b)?.into_array();
 
         assert_eq!(distances(distance, &mut ctx)?, vec![5.0, 5.0, 5.0]);
+        Ok(())
+    }
+
+    /// Geometry arrays are never nullable, so a nullable operand dtype is rejected.
+    #[test]
+    fn nullable_operand_is_rejected() -> VortexResult<()> {
+        let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let result = GeoDistance.return_dtype(&EmptyOptions, &[dtype.as_nullable(), dtype]);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    /// A non-geometry operand dtype is rejected up front, before execution.
+    #[test]
+    fn non_geometry_operand_is_rejected() -> VortexResult<()> {
+        let geo = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let numeric = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result = GeoDistance.return_dtype(&EmptyOptions, &[geo, numeric]);
+        assert!(result.is_err());
         Ok(())
     }
 }
