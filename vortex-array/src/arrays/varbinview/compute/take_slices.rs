@@ -98,8 +98,7 @@ where
     for (&start, &length) in starts.iter().zip_eq(lengths) {
         let start = index_value_to_usize("start", start)?;
         let length = index_value_to_usize("length", length)?;
-        let end = start + length;
-        views.extend_from_slice(&source[start..end]);
+        views.extend_from_slice(&source[start..][..length]);
     }
 
     Ok(views.freeze())
