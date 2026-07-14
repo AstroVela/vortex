@@ -21,6 +21,7 @@ use vortex_array::scalar_fn::fns::between::BetweenOptions;
 use vortex_array::scalar_fn::fns::between::StrictComparison;
 use vortex_array::scalar_fn::fns::operators::CompareOperator;
 use vortex_buffer::BitBuffer;
+#[cfg(target_arch = "x86_64")]
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;

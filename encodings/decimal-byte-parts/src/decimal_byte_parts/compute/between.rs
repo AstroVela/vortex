@@ -61,7 +61,7 @@ impl BetweenKernel for DecimalByteParts {
         }
 
         let scalar_type = arr.msp().dtype().with_nullability(nullability);
-        let msp_ptype = arr.msp().as_primitive_typed().ptype();
+        let msp_ptype = arr.msp().dtype().as_ptype();
 
         // If either bound falls outside the MSP's physical integer range we cannot push the
         // comparison down losslessly. Fall back to the canonical decimal `between`, which handles
@@ -93,10 +93,11 @@ impl BetweenKernel for DecimalByteParts {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ConstantArray;
@@ -114,9 +115,16 @@ mod tests {
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use super::super::two_limb::two_limb_array;
     use crate::DecimalByteParts;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = vortex_array::array_session();
+        crate::initialize(&session);
+        session
+    });
 
     fn decimal_const(value: DecimalValue, decimal_type: DecimalDType, len: usize) -> ArrayRef {
         ConstantArray::new(
@@ -141,7 +149,7 @@ mod tests {
         #[case] lower_strict: StrictComparison,
         #[case] upper_strict: StrictComparison,
     ) -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let decimal_type = DecimalDType::new(38, 0);
         let values: Vec<i128> = vec![
             0,
@@ -181,14 +189,14 @@ mod tests {
             .between(lower_arr, upper_arr, options)?
             .execute::<BoolArray>(&mut ctx)?;
 
-        assert_arrays_eq!(got, want);
+        assert_arrays_eq!(got, want, &mut ctx);
         Ok(())
     }
 
     /// A two-limb array must canonicalize to the same values as a canonical i128 `DecimalArray`.
     #[test]
     fn two_limb_canonicalizes_to_i128() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let decimal_type = DecimalDType::new(38, 0);
         let values: Vec<i128> = vec![
             0,
@@ -204,7 +212,7 @@ mod tests {
             decimal_type,
             Validity::NonNullable,
         );
-        assert_arrays_eq!(got.into_array(), want.into_array());
+        assert_arrays_eq!(got.into_array(), want.into_array(), &mut ctx);
         Ok(())
     }
 
@@ -232,7 +240,8 @@ mod tests {
         )?;
         assert_arrays_eq!(
             res,
-            BoolArray::from_iter([Some(false), Some(true), Some(true), Some(true), Some(false)])
+            BoolArray::from_iter([Some(false), Some(true), Some(true), Some(true), Some(false)]),
+            &mut SESSION.create_execution_ctx()
         );
 
         // 200 < value < 400
@@ -252,7 +261,8 @@ mod tests {
                 Some(true),
                 Some(false),
                 Some(false)
-            ])
+            ]),
+            &mut SESSION.create_execution_ctx()
         );
 
         Ok(())
@@ -284,7 +294,8 @@ mod tests {
         )?;
         assert_arrays_eq!(
             res,
-            BoolArray::from_iter([None, Some(true), Some(true), Some(false)])
+            BoolArray::from_iter([None, Some(true), Some(true), Some(false)]),
+            &mut SESSION.create_execution_ctx()
         );
 
         Ok(())
@@ -319,7 +330,8 @@ mod tests {
         )?;
         assert_arrays_eq!(
             res,
-            BoolArray::from_iter([Some(false), Some(true), Some(true)])
+            BoolArray::from_iter([Some(false), Some(true), Some(true)]),
+            &mut SESSION.create_execution_ctx()
         );
 
         Ok(())

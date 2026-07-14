@@ -13,6 +13,8 @@
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
+use std::sync::LazyLock;
+
 use arrow_arith::boolean::and;
 use arrow_array::Decimal128Array;
 use arrow_array::Scalar as ArrowScalar;
@@ -23,7 +25,6 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
@@ -38,10 +39,17 @@ use vortex_array::scalar_fn::fns::between::BetweenOptions;
 use vortex_array::scalar_fn::fns::between::StrictComparison;
 use vortex_array::validity::Validity;
 use vortex_decimal_byte_parts::DecimalByteParts;
+use vortex_session::VortexSession;
 
 fn main() {
     divan::main();
 }
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = vortex_array::array_session();
+    vortex_decimal_byte_parts::initialize(&session);
+    session
+});
 
 const LENGTHS: &[usize] = &[1 << 16, 1 << 17];
 
@@ -91,7 +99,7 @@ fn vortex_byteparts_i32(bencher: Bencher, len: usize) {
                 arr.clone(),
                 lower.clone(),
                 upper.clone(),
-                LEGACY_SESSION.create_execution_ctx(),
+                SESSION.create_execution_ctx(),
             )
         })
         .bench_values(|(arr, lower, upper, mut ctx)| {
@@ -128,7 +136,7 @@ fn vortex_byteparts_i64(bencher: Bencher, len: usize) {
                 arr.clone(),
                 lower.clone(),
                 upper.clone(),
-                LEGACY_SESSION.create_execution_ctx(),
+                SESSION.create_execution_ctx(),
             )
         })
         .bench_values(|(arr, lower, upper, mut ctx)| {
@@ -177,7 +185,7 @@ fn vortex_canonical_i128(bencher: Bencher, len: usize) {
                 arr.clone(),
                 lower.clone(),
                 upper.clone(),
-                LEGACY_SESSION.create_execution_ctx(),
+                SESSION.create_execution_ctx(),
             )
         })
         .bench_values(|(arr, lower, upper, mut ctx)| {
@@ -269,7 +277,7 @@ fn vortex_byteparts_twolimb(bencher: Bencher, len: usize) {
                 arr.clone(),
                 lower.clone(),
                 upper.clone(),
-                LEGACY_SESSION.create_execution_ctx(),
+                SESSION.create_execution_ctx(),
             )
         })
         .bench_values(|(arr, lower, upper, mut ctx)| {
