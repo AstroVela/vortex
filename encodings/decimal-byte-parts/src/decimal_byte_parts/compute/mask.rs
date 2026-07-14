@@ -27,12 +27,8 @@ impl MaskReduce for DecimalByteParts {
             EmptyOptions,
             [array.msp().clone(), mask.clone()],
         )?;
-        let masked = match array.lower() {
-            None => DecimalByteParts::try_new(masked_msp, decimal_dtype)?,
-            Some(lower) => {
-                DecimalByteParts::try_new_with_lower(masked_msp, lower.clone(), decimal_dtype)?
-            }
-        };
+        let masked =
+            DecimalByteParts::try_new_parts(masked_msp, array.lower().cloned(), decimal_dtype)?;
         Ok(Some(masked.into_array()))
     }
 }

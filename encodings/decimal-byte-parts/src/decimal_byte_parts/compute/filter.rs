@@ -18,14 +18,11 @@ impl FilterReduce for DecimalByteParts {
             .as_decimal_opt()
             .vortex_expect("must be a decimal dtype");
         let msp = array.msp().filter(mask.clone())?;
-        let filtered = match array.lower() {
-            None => DecimalByteParts::try_new(msp, decimal_dtype)?,
-            Some(lower) => DecimalByteParts::try_new_with_lower(
-                msp,
-                lower.filter(mask.clone())?,
-                decimal_dtype,
-            )?,
-        };
+        let lower = array
+            .lower()
+            .map(|lower| lower.filter(mask.clone()))
+            .transpose()?;
+        let filtered = DecimalByteParts::try_new_parts(msp, lower, decimal_dtype)?;
         Ok(Some(filtered.into_array()))
     }
 }

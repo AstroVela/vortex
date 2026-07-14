@@ -7,14 +7,21 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::Scalar;
+use vortex_array::scalar::ScalarValue;
 use vortex_array::scalar_fn::fns::between::BetweenKernel;
 use vortex_array::scalar_fn::fns::between::BetweenOptions;
+use vortex_array::scalar_fn::fns::between::StrictComparison;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::DecimalByteParts;
 use crate::decimal_byte_parts::DecimalBytePartsArrayExt;
+use crate::decimal_byte_parts::compute::compare::Sign;
+use crate::decimal_byte_parts::compute::compare::decimal_value_to_i128;
 use crate::decimal_byte_parts::compute::compare::decimal_value_wrapper_to_primitive;
 use crate::decimal_byte_parts::compute::two_limb::between_bits;
 use crate::decimal_byte_parts::compute::two_limb::eval;
@@ -49,28 +56,53 @@ impl BetweenKernel for DecimalByteParts {
 
         if arr.lower().is_some() {
             // Two-limb representation: a lexicographic comparison over the (signed high, unsigned
-            // low) limbs. Both bounds must fit in i128 to be split into limbs.
-            let (Some(lower_i128), Some(upper_i128)) =
-                (lower_decimal.cast::<i128>(), upper_decimal.cast::<i128>())
+            // low) limbs. A bound that does not fit in i128 lies outside every two-limb value's
+            // range: clamp it to the i128 domain boundary non-strictly (always satisfied), or
+            // resolve the whole `between` to all-false when it excludes the entire domain.
+            let lower_bound = match decimal_value_to_i128(lower_decimal) {
+                Ok(v) => Some((v, options.lower_strict)),
+                Err(Sign::Negative) => Some((i128::MIN, StrictComparison::NonStrict)),
+                Err(Sign::Positive) => None,
+            };
+            let upper_bound = match decimal_value_to_i128(upper_decimal) {
+                Ok(v) => Some((v, options.upper_strict)),
+                Err(Sign::Positive) => Some((i128::MAX, StrictComparison::NonStrict)),
+                Err(Sign::Negative) => None,
+            };
+            let (Some((lower_i128, lower_strict)), Some((upper_i128, upper_strict))) =
+                (lower_bound, upper_bound)
             else {
-                return Ok(None);
+                return never_satisfied(&arr, lower, upper, nullability, ctx);
+            };
+            let options = BetweenOptions {
+                lower_strict,
+                upper_strict,
             };
             return Ok(Some(eval(&arr, nullability, ctx, |high, low| {
-                between_bits(high, low, lower_i128, upper_i128, options)
+                between_bits(high, low, lower_i128, upper_i128, &options)
             })?));
         }
 
         let scalar_type = arr.msp().dtype().with_nullability(nullability);
         let msp_ptype = arr.msp().dtype().as_ptype();
 
-        // If either bound falls outside the MSP's physical integer range we cannot push the
-        // comparison down losslessly. Fall back to the canonical decimal `between`, which handles
-        // the overflow directions (all-true / all-false constraints) correctly.
-        let (Ok(lower_value), Ok(upper_value)) = (
-            decimal_value_wrapper_to_primitive(lower_decimal, msp_ptype),
-            decimal_value_wrapper_to_primitive(upper_decimal, msp_ptype),
-        ) else {
-            return Ok(None);
+        // A bound outside the MSP's physical integer range lies outside every stored value:
+        // clamp it to the type's boundary non-strictly (always satisfied), or resolve the whole
+        // `between` to all-false when it excludes the entire domain.
+        let lower_bound = match decimal_value_wrapper_to_primitive(lower_decimal, msp_ptype) {
+            Ok(v) => Some((v, options.lower_strict)),
+            Err(Sign::Negative) => Some((min_scalar_value(msp_ptype), StrictComparison::NonStrict)),
+            Err(Sign::Positive) => None,
+        };
+        let upper_bound = match decimal_value_wrapper_to_primitive(upper_decimal, msp_ptype) {
+            Ok(v) => Some((v, options.upper_strict)),
+            Err(Sign::Positive) => Some((max_scalar_value(msp_ptype), StrictComparison::NonStrict)),
+            Err(Sign::Negative) => None,
+        };
+        let (Some((lower_value, lower_strict)), Some((upper_value, upper_strict))) =
+            (lower_bound, upper_bound)
+        else {
+            return never_satisfied(&arr, lower, upper, nullability, ctx);
         };
 
         let lower_const = ConstantArray::new(
@@ -85,10 +117,40 @@ impl BetweenKernel for DecimalByteParts {
             .between(
                 lower_const.into_array(),
                 upper_const.into_array(),
-                options.clone(),
+                BetweenOptions {
+                    lower_strict,
+                    upper_strict,
+                },
             )
             .map(Some)
     }
+}
+
+/// The `between` result when a bound excludes the array's entire value domain: constant false,
+/// provided every input is non-null. Otherwise returns `None` to fall back to the canonicalized
+/// implementation, which does per-row null-checking instead.
+fn never_satisfied(
+    arr: &ArrayView<'_, DecimalByteParts>,
+    lower: &ArrayRef,
+    upper: &ArrayRef,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    if arr.array().all_valid(ctx)? && lower.all_valid(ctx)? && upper.all_valid(ctx)? {
+        Ok(Some(
+            ConstantArray::new(Scalar::bool(false, nullability), arr.len()).into_array(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+fn min_scalar_value(ptype: PType) -> ScalarValue {
+    match_each_integer_ptype!(ptype, |P| { ScalarValue::from(P::MIN) })
+}
+
+fn max_scalar_value(ptype: PType) -> ScalarValue {
+    match_each_integer_ptype!(ptype, |P| { ScalarValue::from(P::MAX) })
 }
 
 #[cfg(test)]
@@ -107,13 +169,16 @@ mod tests {
     use vortex_array::builtins::ArrayBuiltins;
     use vortex_array::dtype::DecimalDType;
     use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::i256;
     use vortex_array::scalar::DecimalValue;
     use vortex_array::scalar::Scalar;
+    use vortex_array::scalar_fn::fns::between::BetweenKernel;
     use vortex_array::scalar_fn::fns::between::BetweenOptions;
     use vortex_array::scalar_fn::fns::between::StrictComparison;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
@@ -301,9 +366,67 @@ mod tests {
         Ok(())
     }
 
-    /// Bounds that do not fit in the MSP's physical type must fall back to the canonical decimal
-    /// `between`, which handles the overflow directions. Here the array uses i32 storage but the
-    /// upper bound only fits in i128, so the upper constraint is always satisfied.
+    /// Bounds outside the representable domain must resolve inside the kernel (clamped to an
+    /// always-satisfied constraint, or constant false) rather than declining the pushdown.
+    #[test]
+    fn between_out_of_range_bounds_stay_pushed_down() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let nonstrict = BetweenOptions {
+            lower_strict: StrictComparison::NonStrict,
+            upper_strict: StrictComparison::NonStrict,
+        };
+
+        // Two-limb array with bounds beyond the i128 range (precision 39 holds +/- 2^128).
+        let dt = DecimalDType::new(38, 0);
+        let arr = two_limb_array(
+            &[0, 1i128 << 64, (1i128 << 64) | 5, -(1i128 << 64)],
+            Validity::NonNullable,
+            dt,
+        );
+        let wide = DecimalDType::new(39, 0);
+        let below = decimal_const(DecimalValue::I256(i256::from_parts(0, -1)), wide, arr.len());
+        let above = decimal_const(DecimalValue::I256(i256::from_parts(0, 1)), wide, arr.len());
+        let mid = decimal_const(DecimalValue::I128(1i128 << 64), dt, arr.len());
+
+        // -2^128 <= v <= 2^64 reduces to v <= 2^64.
+        let res = BetweenKernel::between(arr.as_view(), &below, &mid, &nonstrict, &mut ctx)?
+            .vortex_expect("kernel must clamp an out-of-range lower bound");
+        assert_arrays_eq!(
+            res,
+            BoolArray::from_iter([true, true, false, true]),
+            &mut ctx
+        );
+
+        // 2^128 <= v <= 2^128 excludes every i128: constant false.
+        let res = BetweenKernel::between(arr.as_view(), &above, &above, &nonstrict, &mut ctx)?
+            .vortex_expect("kernel must resolve a never-satisfied between");
+        assert_arrays_eq!(
+            res,
+            BoolArray::from_iter([false, false, false, false]),
+            &mut ctx
+        );
+
+        // Single-limb i32 msp with bounds beyond the i32 range.
+        let dt = DecimalDType::new(38, 2);
+        let arr = DecimalByteParts::try_new(buffer![100i32, 200, 300].into_array(), dt)?;
+        let below = decimal_const(DecimalValue::I64(i64::from(i32::MIN) - 1), dt, arr.len());
+        let mid = decimal_const(DecimalValue::I64(200), dt, arr.len());
+
+        // below-i32-range <= v <= 200 reduces to v <= 200.
+        let res = BetweenKernel::between(arr.as_view(), &below, &mid, &nonstrict, &mut ctx)?
+            .vortex_expect("kernel must clamp a lower bound below the msp range");
+        assert_arrays_eq!(res, BoolArray::from_iter([true, true, false]), &mut ctx);
+
+        // v <= below-i32-range excludes every stored value: constant false.
+        let res = BetweenKernel::between(arr.as_view(), &below, &below, &nonstrict, &mut ctx)?
+            .vortex_expect("kernel must resolve a never-satisfied between");
+        assert_arrays_eq!(res, BoolArray::from_iter([false, false, false]), &mut ctx);
+
+        Ok(())
+    }
+
+    /// End-to-end: an upper bound that only fits in i128 over i32 storage is always satisfied,
+    /// so the result reduces to the lower constraint alone.
     #[test]
     fn between_decimal_unconvertible_bound() -> VortexResult<()> {
         let decimal_type = DecimalDType::new(38, 2);

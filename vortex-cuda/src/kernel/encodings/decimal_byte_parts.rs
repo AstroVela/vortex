@@ -35,6 +35,12 @@ impl CudaExecute for DecimalBytePartsExecutor {
             vortex_bail!("cannot downcast to DecimalBytePartsArray")
         };
 
+        // The decode below reads only the msp; silently dropping a lower limb would decode
+        // two-limb i128 values to just their high 64 bits.
+        if array.lower().is_some() {
+            vortex_bail!("two-limb DecimalByteParts arrays are not supported on CUDA");
+        }
+
         let decimal_dtype = *array
             .dtype()
             .as_decimal_opt()

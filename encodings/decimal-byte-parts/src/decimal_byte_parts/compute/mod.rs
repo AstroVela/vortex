@@ -9,24 +9,34 @@ pub(crate) mod is_constant;
 pub(crate) mod kernel;
 mod mask;
 mod take;
-mod two_limb;
+pub(crate) mod two_limb;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::compute::conformance::consistency::test_array_consistency;
     use vortex_array::dtype::DecimalDType;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_session::VortexSession;
 
     use super::two_limb::two_limb_array as two_limb;
     use crate::DecimalByteParts;
     use crate::DecimalBytePartsArray;
+
+    // Register this crate's kernels so consistency runs through the compare/between/take
+    // pushdowns rather than only the canonicalization fallback.
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = vortex_array::array_session();
+        crate::initialize(&session);
+        session
+    });
 
     // 99 i128 values whose high (i64) limb varies in sign and whose low (u64) limb spans the full
     // unsigned range, so limb tie-breaks and sign handling are covered across SIMD chunks.
@@ -110,7 +120,7 @@ mod tests {
     ))]
 
     fn test_decimal_byte_parts_consistency(#[case] array: DecimalBytePartsArray) {
-        let ctx = &mut array_session().create_execution_ctx();
+        let ctx = &mut SESSION.create_execution_ctx();
         test_array_consistency(&array.into_array(), ctx);
     }
 }

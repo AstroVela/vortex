@@ -30,12 +30,8 @@ impl CastReduce for DecimalByteParts {
             .msp()
             .cast(array.msp().dtype().with_nullability(*target_nullability))?;
 
-        let casted = match array.lower() {
-            None => DecimalByteParts::try_new(new_msp, *target_decimal)?,
-            Some(lower) => {
-                DecimalByteParts::try_new_with_lower(new_msp, lower.clone(), *target_decimal)?
-            }
-        };
+        let casted =
+            DecimalByteParts::try_new_parts(new_msp, array.lower().cloned(), *target_decimal)?;
         Ok(Some(casted.into_array()))
     }
 }

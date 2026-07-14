@@ -48,6 +48,7 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::decimal_byte_parts::compute::two_limb::reconstruct;
 use crate::decimal_byte_parts::rules::PARENT_RULES;
 
 /// A [`DecimalByteParts`]-encoded Vortex array.
@@ -238,6 +239,12 @@ pub trait DecimalBytePartsArrayExt: TypedArrayRef<DecimalByteParts> {
 impl<T: TypedArrayRef<DecimalByteParts>> DecimalBytePartsArrayExt for T {}
 
 impl DecimalBytePartsData {
+    /// Validate the invariants of a decimal byte parts array.
+    ///
+    /// The `msp` must be a signed integer array whose nullability matches `dtype`, with
+    /// `msp.len() == len`. When a `lower` limb is present (the two-limb i128 representation),
+    /// the msp must be an `i64` and `lower` must be a non-nullable `u64` of the same length;
+    /// validity is carried solely by the msp.
     pub fn validate(
         msp: &ArrayRef,
         lower: Option<&ArrayRef>,
@@ -286,16 +293,7 @@ impl DecimalByteParts {
         msp: ArrayRef,
         decimal_dtype: DecimalDType,
     ) -> VortexResult<DecimalBytePartsArray> {
-        let len = msp.len();
-        let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
-        DecimalBytePartsData::validate(&msp, None, decimal_dtype, &dtype, len)?;
-        let slots = smallvec![Some(msp)];
-        Ok(unsafe {
-            Array::from_parts_unchecked(
-                ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData)
-                    .with_slots(slots),
-            )
-        })
+        Self::try_new_parts(msp, None, decimal_dtype)
     }
 
     /// Construct a two-limb [`DecimalBytePartsArray`] representing an i128 decimal.
@@ -303,21 +301,33 @@ impl DecimalByteParts {
     /// `msp` is the signed high 64-bit limb (carrying validity); `lower` is the non-nullable
     /// unsigned low 64-bit limb. The decimal value at index `i` is
     /// `(msp[i] as i128) << 64 | (lower[i] as u64 as i128)`.
+    ///
+    /// Note that serialized files containing two-limb arrays cannot be read by Vortex versions
+    /// that predate this representation: their readers reject a non-zero `lower_part_count`.
     pub fn try_new_with_lower(
         msp: ArrayRef,
         lower: ArrayRef,
         decimal_dtype: DecimalDType,
     ) -> VortexResult<DecimalBytePartsArray> {
+        Self::try_new_parts(msp, Some(lower), decimal_dtype)
+    }
+
+    /// Construct from an MSP and an optional lower limb, preserving whichever representation the
+    /// source array used. Compute kernels use this to rebuild an array after a per-limb operation.
+    pub(crate) fn try_new_parts(
+        msp: ArrayRef,
+        lower: Option<ArrayRef>,
+        decimal_dtype: DecimalDType,
+    ) -> VortexResult<DecimalBytePartsArray> {
         let len = msp.len();
         let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
-        DecimalBytePartsData::validate(&msp, Some(&lower), decimal_dtype, &dtype, len)?;
-        let slots = smallvec![Some(msp), Some(lower)];
-        Ok(unsafe {
-            Array::from_parts_unchecked(
-                ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData)
-                    .with_slots(slots),
-            )
-        })
+        let mut slots = smallvec![Some(msp)];
+        if let Some(lower) = lower {
+            slots.push(Some(lower));
+        }
+        Array::try_from_parts(
+            ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData).with_slots(slots),
+        )
     }
 }
 
@@ -344,17 +354,15 @@ fn to_canonical_decimal(
         }));
     };
 
-    // Two-limb: reconstruct each i128 as `(high as i128) << 64 | low`.
+    // Two-limb: validation guarantees an i64 msp, so reconstruct each i128 from the limb pair.
     let lower = lower.clone().execute::<PrimitiveArray>(ctx)?;
     let validity = msp.validity()?;
-    let low = lower.as_slice::<u64>();
-    let values: Buffer<i128> = match_each_signed_integer_ptype!(msp.ptype(), |P| {
-        msp.as_slice::<P>()
-            .iter()
-            .zip(low)
-            .map(|(&high, &low)| ((high as i128) << 64) | i128::from(low))
-            .collect()
-    });
+    let values: Buffer<i128> = msp
+        .as_slice::<i64>()
+        .iter()
+        .zip(lower.as_slice::<u64>())
+        .map(|(&high, &low)| reconstruct(high, low))
+        .collect();
 
     // SAFETY: validity comes from the msp and the reconstructed values match the decimal dtype.
     Ok(unsafe { DecimalArray::new_unchecked(values, decimal_dtype, validity) }.into_array())
@@ -383,7 +391,7 @@ impl OperationsVTable<DecimalByteParts> for DecimalByteParts {
                     .as_primitive()
                     .as_::<u64>()
                     .vortex_expect("lower limb is non-nullable");
-                DecimalValue::I128((i128::from(high) << 64) | i128::from(low))
+                DecimalValue::I128(reconstruct(high, low))
             }
         };
         Scalar::try_new(
@@ -402,21 +410,38 @@ impl ValidityChild<DecimalByteParts> for DecimalByteParts {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
+    use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::DecimalDType;
     use vortex_array::dtype::Nullability;
     use vortex_array::scalar::DecimalValue;
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar::ScalarValue;
+    use vortex_array::serde::SerializeOptions;
+    use vortex_array::serde::SerializedArray;
     use vortex_array::validity::Validity;
+    use vortex_buffer::ByteBufferMut;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
+    use vortex_session::registry::ReadContext;
 
+    use super::compute::two_limb::two_limb_array;
     use crate::DecimalByteParts;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = array_session();
+        crate::initialize(&session);
+        session
+    });
 
     #[test]
     fn test_scalar_at_decimal_parts() {
@@ -455,5 +480,41 @@ mod tests {
                 .execute_scalar(2, &mut array_session().create_execution_ctx())
                 .unwrap()
         );
+    }
+
+    /// A two-limb array must serialize with `lower_part_count = 1` and deserialize back to the
+    /// same values (this exercises the two-limb `deserialize` arm, which no single-limb test
+    /// reaches).
+    #[test]
+    fn two_limb_serde_round_trip() -> VortexResult<()> {
+        let array = two_limb_array(
+            &[0, -1, (3i128 << 64) | 42, -(9i128 << 64) | 17, i128::MIN],
+            Validity::Array(BoolArray::from_iter([true, false, true, true, true]).into_array()),
+            DecimalDType::new(38, 2),
+        );
+        let dtype = array.dtype().clone();
+        let len = array.len();
+
+        let array_ctx = ArrayContext::empty();
+        let serialized = array.clone().into_array().serialize(
+            &array_ctx,
+            &SESSION,
+            &SerializeOptions::default(),
+        )?;
+        let mut concat = ByteBufferMut::empty();
+        for buf in serialized {
+            concat.extend_from_slice(buf.as_ref());
+        }
+
+        let parts = SerializedArray::try_from(concat.freeze())?;
+        let decoded = parts.decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &SESSION)?;
+
+        assert!(decoded.is::<DecimalByteParts>());
+        assert_arrays_eq!(
+            decoded,
+            array.into_array(),
+            &mut SESSION.create_execution_ctx()
+        );
+        Ok(())
     }
 }

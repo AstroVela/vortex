@@ -13,6 +13,7 @@ use vortex_array::dtype::IntegerPType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::ToI256;
+use vortex_array::dtype::i256;
 use vortex_array::match_each_decimal_value;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::DecimalValue;
@@ -49,15 +50,16 @@ impl CompareKernel for DecimalByteParts {
             .vortex_expect("checked for null in entry func");
 
         if lhs.lower().is_some() {
-            // Two-limb representation: reconstruct each i128 and compare directly in a single fused
-            // pass. The constant must fit in i128, which it always does for a two-limb (<= 38 digit)
-            // decimal; defer to canonical otherwise.
-            let Some(rhs_i128) = rhs_decimal.cast::<i128>() else {
-                return Ok(None);
+            // Two-limb representation: reconstruct each i128 and compare directly in a single
+            // fused pass. A constant that does not fit in i128 lies outside the range of every
+            // two-limb value, so it resolves to a constant result like the single-limb overflow
+            // path below.
+            return match decimal_value_to_i128(rhs_decimal) {
+                Ok(rhs_i128) => Ok(Some(eval(&lhs, nullability, ctx, |high, low| {
+                    compare_bits(high, low, rhs_i128, operator)
+                })?)),
+                Err(sign) => out_of_range_result(&lhs, rhs, sign, operator, nullability, ctx),
             };
-            return Ok(Some(eval(&lhs, nullability, ctx, |high, low| {
-                compare_bits(high, low, rhs_i128, operator)
-            })?));
         }
 
         let scalar_type = lhs.msp().dtype().with_nullability(nullability);
@@ -71,26 +73,44 @@ impl CompareKernel for DecimalByteParts {
                     .map(Some)
             }
 
-            Err(sign) => {
-                // If the MSP and the constant are non-null, we know that failing to coerce the
-                // constant into the MSP bit-width means that it is larger/smaller
-                // (depending on the `sign`) than all values in MSP.
-                // If the LHS or the RHS contain nulls, then we must fallback to the canonicalized
-                // implementation which does null-checking instead.
-                if lhs.array().all_valid(ctx)? && rhs.all_valid(ctx)? {
-                    Ok(Some(
-                        ConstantArray::new(
-                            unconvertible_value(sign, operator, nullability),
-                            lhs.len(),
-                        )
-                        .into_array(),
-                    ))
-                } else {
-                    Ok(None)
-                }
-            }
+            Err(sign) => out_of_range_result(&lhs, rhs, sign, operator, nullability, ctx),
         }
     }
+}
+
+/// The comparison result when the constant lies outside the representable range on side `sign`.
+///
+/// If the array and the constant are non-null, failing to coerce the constant means it is
+/// larger/smaller (depending on `sign`) than every stored value, so the comparison collapses to a
+/// constant. If either side contains nulls, returns `None` to fall back to the canonicalized
+/// implementation, which does per-row null-checking instead.
+fn out_of_range_result(
+    lhs: &ArrayView<'_, DecimalByteParts>,
+    rhs: &ArrayRef,
+    sign: Sign,
+    operator: CompareOperator,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    if lhs.array().all_valid(ctx)? && rhs.all_valid(ctx)? {
+        Ok(Some(
+            ConstantArray::new(unconvertible_value(sign, operator, nullability), lhs.len())
+                .into_array(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Converts a decimal constant to `i128`, or reports which side of the `i128` range it falls on.
+pub(crate) fn decimal_value_to_i128(decimal_value: DecimalValue) -> Result<i128, Sign> {
+    decimal_value.cast::<i128>().ok_or(
+        // Only an I256 value can fail the cast, and its own sign gives the overflow direction.
+        match decimal_value {
+            DecimalValue::I256(v) if v < i256::ZERO => Negative,
+            _ => Positive,
+        },
+    )
 }
 
 // Used to represent the overflow direction when trying to
@@ -172,11 +192,15 @@ mod tests {
     use vortex_array::dtype::DType;
     use vortex_array::dtype::DecimalDType;
     use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::i256;
     use vortex_array::scalar::DecimalValue;
     use vortex_array::scalar::Scalar;
+    use vortex_array::scalar_fn::fns::binary::CompareKernel;
+    use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::scalar_fn::fns::operators::Operator;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
@@ -254,6 +278,38 @@ mod tests {
             BoolArray::from_iter([Some(true), None, Some(false)]),
             &mut SESSION.create_execution_ctx()
         );
+
+        Ok(())
+    }
+
+    /// A constant outside the i128 range must resolve inside the kernel to a constant result
+    /// rather than declining the pushdown.
+    #[test]
+    fn two_limb_compare_out_of_range_constant() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let arr = two_limb_array(
+            &[0, 1i128 << 64, -(1i128 << 64)],
+            Validity::NonNullable,
+            DecimalDType::new(38, 0),
+        );
+        // 2^128, above every i128 value; precision 39 is the smallest that can hold it.
+        let rhs = ConstantArray::new(
+            Scalar::decimal(
+                DecimalValue::I256(i256::from_parts(0, 1)),
+                DecimalDType::new(39, 0),
+                Nullability::NonNullable,
+            ),
+            arr.len(),
+        )
+        .into_array();
+
+        let lt = CompareKernel::compare(arr.as_view(), &rhs, CompareOperator::Lt, &mut ctx)?
+            .vortex_expect("kernel must resolve an out-of-range constant");
+        assert_arrays_eq!(lt, BoolArray::from_iter([true, true, true]), &mut ctx);
+
+        let gt = CompareKernel::compare(arr.as_view(), &rhs, CompareOperator::Gt, &mut ctx)?
+            .vortex_expect("kernel must resolve an out-of-range constant");
+        assert_arrays_eq!(gt, BoolArray::from_iter([false, false, false]), &mut ctx);
 
         Ok(())
     }

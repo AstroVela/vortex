@@ -20,12 +20,11 @@ impl SliceReduce for DecimalByteParts {
             .as_decimal_opt()
             .vortex_expect("must be a decimal dtype");
         let msp = array.msp().slice(range.clone())?;
-        let sliced = match array.lower() {
-            None => DecimalByteParts::try_new(msp, decimal_dtype)?,
-            Some(lower) => {
-                DecimalByteParts::try_new_with_lower(msp, lower.slice(range)?, decimal_dtype)?
-            }
-        };
+        let lower = array
+            .lower()
+            .map(|lower| lower.slice(range.clone()))
+            .transpose()?;
+        let sliced = DecimalByteParts::try_new_parts(msp, lower, decimal_dtype)?;
         Ok(Some(sliced.into_array()))
     }
 }

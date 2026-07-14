@@ -52,7 +52,7 @@ pub(crate) fn eval(
 
 /// Reconstruct the i128 value from its limbs: sign-extend the high limb, zero-extend the low limb.
 #[inline(always)]
-fn reconstruct(high: i64, low: u64) -> i128 {
+pub(crate) fn reconstruct(high: i64, low: u64) -> i128 {
     ((high as i128) << 64) | (low as i128)
 }
 
@@ -96,7 +96,9 @@ pub(crate) fn compare_bits(
     bound: i128,
     op: CompareOperator,
 ) -> BitBuffer {
-    debug_assert_eq!(high.len(), low.len());
+    // A hard assert: the kernels below index `low` by positions in `0..high.len()` without
+    // bounds checks.
+    assert_eq!(high.len(), low.len());
     let code = op_code(op);
 
     #[cfg(target_arch = "x86_64")]
@@ -119,7 +121,9 @@ pub(crate) fn between_bits(
     upper: i128,
     options: &BetweenOptions,
 ) -> BitBuffer {
-    debug_assert_eq!(high.len(), low.len());
+    // A hard assert: the kernels below index `low` by positions in `0..high.len()` without
+    // bounds checks.
+    assert_eq!(high.len(), low.len());
     let lower_op = match options.lower_strict {
         StrictComparison::Strict => OP_GT,
         StrictComparison::NonStrict => OP_GE,
@@ -165,7 +169,8 @@ fn compare_scalar(high: &[i64], low: &[u64], bound: i128, code: u8) -> BitBuffer
 
 fn compare_scalar_impl<const OP: u8>(high: &[i64], low: &[u64], bound: i128) -> BitBuffer {
     BitBuffer::collect_bool(high.len(), |idx| {
-        // SAFETY: collect_bool yields idx in 0..high.len(), and low.len() == high.len().
+        // SAFETY: collect_bool yields idx in 0..high.len(), and the entry points assert
+        // low.len() == high.len().
         let value = reconstruct(unsafe { *high.get_unchecked(idx) }, unsafe {
             *low.get_unchecked(idx)
         });
@@ -196,7 +201,8 @@ fn between_scalar_impl<const LOWER: u8, const UPPER: u8>(
     upper: i128,
 ) -> BitBuffer {
     BitBuffer::collect_bool(high.len(), |idx| {
-        // SAFETY: collect_bool yields idx in 0..high.len(), and low.len() == high.len().
+        // SAFETY: collect_bool yields idx in 0..high.len(), and the entry points assert
+        // low.len() == high.len().
         let value = reconstruct(unsafe { *high.get_unchecked(idx) }, unsafe {
             *low.get_unchecked(idx)
         });
@@ -375,4 +381,146 @@ pub(crate) fn two_limb_array(
         dt,
     )
     .unwrap()
+}
+
+// The AVX-512 and scalar kernels are selected by runtime hardware detection, so a given machine
+// only ever executes one of them through `compare_bits`/`between_bits`. These tests therefore
+// check the dispatched path *and* the scalar fallback directly against a native i128 reference:
+// on an AVX-512 host both implementations are verified, elsewhere the scalar path is verified
+// twice.
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::cast_possible_truncation)]
+
+    use super::*;
+
+    // Highs and lows crossing sign boundaries, limb ties, and the low-limb wraparound. 40 values:
+    // several full 8-lane chunks plus a scalar tail.
+    fn values() -> Vec<i128> {
+        let highs = [i64::MIN, -2, -1, 0, 1, 2, i64::MAX];
+        let lows = [0u64, 1, 5, u64::MAX - 1, u64::MAX];
+        let mut values: Vec<i128> = highs
+            .iter()
+            .flat_map(|&high| lows.iter().map(move |&low| reconstruct(high, low)))
+            .collect();
+        values.extend([i128::MIN, i128::MAX, 0, -1, 1]);
+        values
+    }
+
+    fn split(values: &[i128]) -> (Vec<i64>, Vec<u64>) {
+        (
+            values.iter().map(|v| (v >> 64) as i64).collect(),
+            values.iter().map(|v| *v as u64).collect(),
+        )
+    }
+
+    fn bounds() -> Vec<i128> {
+        vec![
+            i128::MIN,
+            -(1i128 << 64),
+            -1,
+            0,
+            1,
+            (1i128 << 64) - 1,
+            1i128 << 64,
+            (1i128 << 64) | 5,
+            reconstruct(2, u64::MAX),
+            i128::MAX,
+        ]
+    }
+
+    const OPS: [CompareOperator; 6] = [
+        CompareOperator::Lt,
+        CompareOperator::Lte,
+        CompareOperator::Gt,
+        CompareOperator::Gte,
+        CompareOperator::Eq,
+        CompareOperator::NotEq,
+    ];
+
+    fn reference_compare(values: &[i128], bound: i128, op: CompareOperator) -> BitBuffer {
+        BitBuffer::collect_bool(values.len(), |i| match op {
+            CompareOperator::Lt => values[i] < bound,
+            CompareOperator::Lte => values[i] <= bound,
+            CompareOperator::Gt => values[i] > bound,
+            CompareOperator::Gte => values[i] >= bound,
+            CompareOperator::Eq => values[i] == bound,
+            CompareOperator::NotEq => values[i] != bound,
+        })
+    }
+
+    #[test]
+    fn limb_compare_matches_i128_reference() {
+        let values = values();
+        let (high, low) = split(&values);
+        // Lengths straddling the 8-lane chunk boundary plus the full set.
+        for len in [0, 1, 7, 8, 9, values.len()] {
+            for bound in bounds() {
+                for op in OPS {
+                    let expected = reference_compare(&values[..len], bound, op);
+                    assert_eq!(
+                        compare_bits(&high[..len], &low[..len], bound, op),
+                        expected,
+                        "dispatched compare disagrees with i128 reference: len={len} {op:?} bound={bound}"
+                    );
+                    assert_eq!(
+                        compare_scalar(&high[..len], &low[..len], bound, op_code(op)),
+                        expected,
+                        "scalar compare disagrees with i128 reference: len={len} {op:?} bound={bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn limb_between_matches_i128_reference() {
+        let values = values();
+        let (high, low) = split(&values);
+        let strictness = [StrictComparison::Strict, StrictComparison::NonStrict];
+        // Includes inverted (empty) and single-point ranges.
+        for lower in bounds() {
+            for upper in bounds() {
+                for lower_strict in strictness {
+                    for upper_strict in strictness {
+                        let options = BetweenOptions {
+                            lower_strict,
+                            upper_strict,
+                        };
+                        let expected = BitBuffer::collect_bool(values.len(), |i| {
+                            let lo = match lower_strict {
+                                StrictComparison::Strict => values[i] > lower,
+                                StrictComparison::NonStrict => values[i] >= lower,
+                            };
+                            let hi = match upper_strict {
+                                StrictComparison::Strict => values[i] < upper,
+                                StrictComparison::NonStrict => values[i] <= upper,
+                            };
+                            lo & hi
+                        });
+                        let lower_op = match lower_strict {
+                            StrictComparison::Strict => OP_GT,
+                            StrictComparison::NonStrict => OP_GE,
+                        };
+                        let upper_op = match upper_strict {
+                            StrictComparison::Strict => OP_LT,
+                            StrictComparison::NonStrict => OP_LE,
+                        };
+                        assert_eq!(
+                            between_bits(&high, &low, lower, upper, &options),
+                            expected,
+                            "dispatched between disagrees with i128 reference: \
+                             [{lower}, {upper}] {options:?}"
+                        );
+                        assert_eq!(
+                            between_scalar(&high, &low, lower, upper, lower_op, upper_op),
+                            expected,
+                            "scalar between disagrees with i128 reference: \
+                             [{lower}, {upper}] {options:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
