@@ -347,25 +347,7 @@ fn test_take_nullable_fsl_with_nullable_indices() {
 }
 
 #[test]
-fn test_take_empty_source_with_all_null_indices() {
-    let fsl = create_empty_fsl();
-    let indices = PrimitiveArray::new(buffer![999u64, 123], Validity::AllInvalid);
-
-    let result = fsl.take(indices.into_array()).unwrap();
-
-    assert_eq!(result.len(), 2);
-    for idx in 0..result.len() {
-        assert!(
-            result
-                .execute_scalar(idx, &mut array_session().create_execution_ctx())
-                .unwrap()
-                .is_null()
-        );
-    }
-}
-
-#[test]
-fn test_take_execute_empty_source_all_null_indices_builds_default_elements() -> VortexResult<()> {
+fn test_take_empty_source_with_all_null_indices() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let fsl = create_empty_fsl();
     let indices = PrimitiveArray::new(buffer![999u64, 123], Validity::AllInvalid).into_array();
@@ -374,6 +356,8 @@ fn test_take_execute_empty_source_all_null_indices_builds_default_elements() -> 
         .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
     let result_fsl = result.as_::<FixedSizeList>();
 
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.dtype().nullability(), Nullability::Nullable);
     assert_eq!(
         result_fsl.elements().len(),
         result.len() * result_fsl.list_size() as usize
@@ -381,6 +365,59 @@ fn test_take_execute_empty_source_all_null_indices_builds_default_elements() -> 
     for idx in 0..result.len() {
         assert!(result.execute_scalar(idx, &mut ctx)?.is_null());
     }
+    Ok(())
+}
+
+#[test]
+fn test_take_empty_degenerate_source_with_all_null_indices() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = PrimitiveArray::empty::<i32>(Nullability::NonNullable).into_array();
+    let fsl = FixedSizeListArray::new(elements, 0, Validity::NonNullable, 0);
+    let indices = PrimitiveArray::new(buffer![999u64, 123], Validity::AllInvalid).into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+    let result_fsl = result.as_::<FixedSizeList>();
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result_fsl.list_size(), 0);
+    assert_eq!(result.dtype().nullability(), Nullability::Nullable);
+    assert_eq!(result_fsl.elements().len(), 0);
+    for idx in 0..result.len() {
+        assert!(result.execute_scalar(idx, &mut ctx)?.is_null());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_take_execute_empty_source_accepts_empty_indices() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let fsl = create_empty_fsl();
+    let indices = PrimitiveArray::from_iter::<[u64; 0]>([]).into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+    let result_fsl = result.as_::<FixedSizeList>();
+
+    assert_eq!(result.len(), 0);
+    assert_eq!(result.dtype().nullability(), Nullability::NonNullable);
+    assert_eq!(result_fsl.elements().len(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_take_empty_source_accepts_empty_nullable_indices() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let fsl = create_empty_fsl();
+    let indices = PrimitiveArray::empty::<u64>(Nullability::Nullable).into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+    let result_fsl = result.as_::<FixedSizeList>();
+
+    assert_eq!(result.len(), 0);
+    assert_eq!(result.dtype().nullability(), Nullability::Nullable);
+    assert_eq!(result_fsl.elements().len(), 0);
     Ok(())
 }
 

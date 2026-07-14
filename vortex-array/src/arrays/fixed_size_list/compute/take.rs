@@ -39,18 +39,25 @@ impl TakeExecute for FixedSizeList {
         indices: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        match_each_unsigned_integer_ptype!(indices.dtype().as_ptype().to_unsigned(), |I| {
-            take_with_indices::<I>(array, indices, ctx)
+        if array.is_empty() {
+            return take_empty_fsl(array, indices, ctx).map(Some);
+        }
+
+        let indices_ptype = indices.dtype().as_ptype().to_unsigned();
+        match_each_unsigned_integer_ptype!(indices_ptype, |I| {
+            take_non_empty_with_indices::<I>(array, indices, ctx)
         })
         .map(Some)
     }
 }
 
-fn take_with_indices<I: IntegerPType>(
+fn take_non_empty_with_indices<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
+    debug_assert!(!array.is_empty());
+
     let list_size = array.list_size() as usize;
 
     let indices_array = indices.clone().execute::<PrimitiveArray>(ctx)?;
@@ -59,22 +66,20 @@ fn take_with_indices<I: IntegerPType>(
     let indices_array = indices_array.reinterpret_cast(indices_array.ptype().to_unsigned());
 
     if list_size == 0 {
-        return take_degenerate_fsl::<I>(array, indices, indices_array.as_view(), ctx);
-    }
-
-    if array.is_empty() {
-        return take_empty_non_degenerate_fsl::<I>(array, indices, indices_array.as_view(), ctx);
+        return take_non_empty_degenerate_fsl::<I>(array, indices, indices_array.as_view(), ctx);
     }
 
     take_non_empty_non_degenerate_fsl::<I>(array, indices_array.as_view(), ctx)
 }
 
-fn take_degenerate_fsl<I: IntegerPType>(
+fn take_non_empty_degenerate_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices: &ArrayRef,
     indices_array: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
+    debug_assert!(!array.is_empty());
+    debug_assert_eq!(array.list_size(), 0);
     vortex_ensure!(
         array.elements().is_empty(),
         "degenerate list must have empty elements"
@@ -97,19 +102,23 @@ fn take_degenerate_fsl<I: IntegerPType>(
     .into_array())
 }
 
-fn take_empty_non_degenerate_fsl<I: IntegerPType>(
+fn take_empty_fsl(
     array: ArrayView<'_, FixedSizeList>,
     indices: &ArrayRef,
-    indices_array: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    debug_assert_ne!(array.list_size(), 0);
     debug_assert!(array.is_empty());
 
-    validate_valid_indices::<I>(&indices_array, 0, ctx)?;
+    let new_len = indices.len();
+    if new_len != 0 {
+        let indices_validity = indices.validity()?.execute_mask(new_len, ctx)?;
+        vortex_ensure!(
+            indices_validity.all_false(),
+            "cannot take valid indices from an empty FixedSizeList"
+        );
+    }
 
     let list_size = array.list_size() as usize;
-    let new_len = indices_array.len();
     let expected_elements_len = take_elements_len(new_len, list_size)?;
     let new_elements = default_elements(array, expected_elements_len);
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
@@ -119,8 +128,8 @@ fn take_empty_non_degenerate_fsl<I: IntegerPType>(
         Validity::AllInvalid
     };
 
-    // SAFETY: an empty non-degenerate source has no usable element slices. Valid indices have
-    // already been rejected, so non-empty output is all null and backed by default child values.
+    // SAFETY: empty output needs no child values; otherwise the index validity mask proves every
+    // output row is null. Placeholder child elements have the exact length required by FSL.
     Ok(unsafe {
         FixedSizeListArray::new_unchecked(new_elements, array.list_size(), new_validity, new_len)
     }
@@ -132,8 +141,8 @@ fn take_non_empty_non_degenerate_fsl<I: IntegerPType>(
     indices_array: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    debug_assert_ne!(array.list_size(), 0);
     debug_assert!(!array.is_empty());
+    debug_assert_ne!(array.list_size(), 0);
 
     if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
         take_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
@@ -146,6 +155,9 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
 ) -> VortexResult<ArrayRef> {
+    debug_assert!(!array.is_empty());
+    debug_assert_ne!(array.list_size(), 0);
+
     let list_size = array.list_size() as usize;
     let array_len = array.as_ref().len();
     let indices: &[I] = indices_array.as_slice::<I>();
@@ -185,6 +197,9 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
     indices_array: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
+    debug_assert!(!array.is_empty());
+    debug_assert_ne!(array.list_size(), 0);
+
     let list_size = array.list_size() as usize;
     let array_len = array.as_ref().len();
     let indices: &[I] = indices_array.as_slice::<I>();
@@ -281,6 +296,9 @@ fn ensure_elements_len(actual: usize, expected: usize) -> VortexResult<()> {
 }
 
 fn list_start_u64(data_idx: usize, list_size: usize, array_len: usize) -> VortexResult<u64> {
+    debug_assert_ne!(array_len, 0);
+    debug_assert_ne!(list_size, 0);
+
     check_index_in_bounds(data_idx, array_len)?;
 
     let start = data_idx.checked_mul(list_size).ok_or_else(|| {
