@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -151,7 +153,7 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     let indices: &[I] = indices_array.as_slice::<I>();
     let new_len = indices.len();
     let expected_elements_len = take_elements_len(new_len, list_size)?;
-    let mut starts = Vec::with_capacity(new_len);
+    let mut starts = BufferMut::<u64>::with_capacity(new_len);
 
     for &data_idx in indices {
         let data_idx = index_to_usize(data_idx)?;
@@ -161,7 +163,7 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
 
     let new_elements = take_element_runs(
         array.elements(),
-        starts,
+        starts.freeze(),
         list_size,
         expected_elements_len,
         ctx,
@@ -197,7 +199,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         .execute_mask(array.as_ref().len(), ctx)?;
     let indices_validity = indices_validity_mask(&indices_array, ctx)?;
 
-    let mut starts = Vec::with_capacity(new_len);
+    let mut starts = BufferMut::<u64>::with_capacity(new_len);
     let mut new_validity_builder = BitBufferMut::with_capacity(new_len);
 
     // Null output rows still need placeholder child elements so the FSL elements length stays
@@ -223,7 +225,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
 
     let new_elements = take_element_runs(
         array.elements(),
-        starts,
+        starts.freeze(),
         list_size,
         expected_elements_len,
         ctx,
@@ -313,13 +315,13 @@ fn default_elements(array: ArrayView<'_, FixedSizeList>, len: usize) -> ArrayRef
 
 fn take_element_runs(
     elements: &ArrayRef,
-    starts: Vec<u64>,
+    starts: Buffer<u64>,
     length: usize,
     output_len: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let run_count = starts.len();
-    let starts = PrimitiveArray::from_iter(starts).into_array();
+    let starts = PrimitiveArray::new(starts, Validity::NonNullable).into_array();
     let lengths = ConstantArray::new(length as u64, run_count).into_array();
 
     // SAFETY: callers produced one start per output row after validating list indices against the
