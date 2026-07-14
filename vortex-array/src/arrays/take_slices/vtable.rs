@@ -27,7 +27,6 @@ use crate::arrays::take_slices::array::TakeSlicesSlots;
 use crate::arrays::take_slices::check_index_arrays;
 use crate::arrays::take_slices::checked_range_end;
 use crate::arrays::take_slices::index_value_to_usize;
-use crate::arrays::take_slices::validate_index_ranges;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::builder_with_capacity_in;
@@ -212,14 +211,20 @@ where
     S: IntegerPType,
     L: IntegerPType,
 {
-    validate_index_ranges(child.len(), starts, lengths, output_len)?;
-
+    let mut produced_len = 0usize;
     for (&start, &length) in starts.iter().zip_eq(lengths) {
         let start = index_value_to_usize("start", start)?;
         let length = index_value_to_usize("length", length)?;
-        let end = start + length;
+        let end = checked_range_end(start, length)?;
+        produced_len = produced_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("TakeSlicesArray produced length overflow"))?;
         child.slice(start..end)?.append_to_builder(builder, ctx)?;
     }
+    vortex_ensure!(
+        produced_len == output_len,
+        "TakeSlicesArray produced length {produced_len} does not match declared length {output_len}",
+    );
 
     Ok(())
 }
