@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use num_traits::AsPrimitive;
 use smallvec::smallvec;
+use vortex_array_macros::array_slots;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -38,14 +39,15 @@ use crate::match_each_native_ptype;
 use crate::scalar_fn::fns::operators::Operator;
 use crate::validity::Validity;
 
-/// The elements data array containing all list elements concatenated together.
-pub(super) const ELEMENTS_SLOT: usize = 0;
-/// The offsets array defining the start/end of each list within the elements array.
-pub(super) const OFFSETS_SLOT: usize = 1;
-/// The validity bitmap indicating which list elements are non-null.
-pub(super) const VALIDITY_SLOT: usize = 2;
-pub(super) const NUM_SLOTS: usize = 3;
-pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["elements", "offsets", "validity"];
+#[array_slots(List)]
+pub struct ListSlots {
+    /// The elements data array containing all list elements concatenated together.
+    pub elements: ArrayRef,
+    /// The offsets array defining the start/end of each list within the elements array.
+    pub offsets: ArrayRef,
+    /// The validity bitmap indicating which list elements are non-null.
+    pub validity: ArrayRef,
+}
 
 /// A list array that stores variable-length lists of elements, similar to `Vec<Vec<T>>`.
 ///
@@ -279,20 +281,20 @@ pub trait ListArrayExt: TypedArrayRef<List> {
     }
 
     fn elements(&self) -> &ArrayRef {
-        self.as_ref().slots()[ELEMENTS_SLOT]
+        self.as_ref().slots()[ListSlots::ELEMENTS]
             .as_ref()
             .vortex_expect("ListArray elements slot")
     }
 
     fn offsets(&self) -> &ArrayRef {
-        self.as_ref().slots()[OFFSETS_SLOT]
+        self.as_ref().slots()[ListSlots::OFFSETS]
             .as_ref()
             .vortex_expect("ListArray offsets slot")
     }
 
     fn list_validity(&self) -> Validity {
         child_to_validity(
-            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.as_ref().slots()[ListSlots::VALIDITY].as_ref(),
             self.nullability(),
         )
     }
@@ -405,17 +407,12 @@ impl Array<List> {
     }
 
     pub fn into_data_parts(self) -> ListDataParts {
+        let slots = ListSlotsView::from_slots(self.slots());
         let dtype = self.dtype().clone();
-        let elements = self.slots()[ELEMENTS_SLOT]
-            .clone()
-            .vortex_expect("ListArray elements slot");
-        let offsets = self.slots()[OFFSETS_SLOT]
-            .clone()
-            .vortex_expect("ListArray offsets slot");
         let validity = self.list_validity();
         ListDataParts {
-            elements,
-            offsets,
+            elements: slots.elements.clone(),
+            offsets: slots.offsets.clone(),
             validity,
             dtype,
         }

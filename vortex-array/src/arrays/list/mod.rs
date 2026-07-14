@@ -4,6 +4,7 @@
 mod array;
 pub use array::ListArrayExt;
 pub use array::ListData;
+pub use array::ListSlots;
 pub use array::ListDataParts;
 pub use vtable::ListArray;
 

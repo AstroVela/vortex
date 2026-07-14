@@ -23,6 +23,8 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinView;
 use vortex::array::arrays::bool::BoolArrayExt;
+use vortex::array::arrays::dict::DictSlots;
+use vortex::array::arrays::list::ListSlots;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrow::FromArrowArray;
 use vortex::array::legacy_session;
@@ -611,6 +613,41 @@ pub unsafe extern "C" fn vx_array_apply(
     })
 }
 
+/// Return array's encoding name
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vx_array_encoding(array: *const vx_array) -> vx_view {
+    let array = vx_array::as_ref(array);
+    vx_view::from_bytes(array.encoding_id().as_str().as_bytes())
+}
+
+/// The codes array mapping each element to a dictionary entry.
+pub const VX_SLOT_DICT_CODES: usize = DictSlots::CODES;
+/// The dictionary values array containing the unique values.
+pub const VX_SLOT_DICT_VALUES: usize = DictSlots::VALUES;
+
+/// The elements data array containing all list elements concatenated together.
+pub const VX_SLOT_LIST_ELEMENTS: usize = ListSlots::ELEMENTS;
+/// The offsets array defining the start/end of each list within the elements array.
+pub const VX_SLOT_LIST_OFFSETS: usize = ListSlots::OFFSETS;
+/// The validity bitmap indicating which list elements are non-null.
+pub const VX_SLOT_LIST_VALIDITY: usize = ListSlots::VALIDITY;
+
+/// Return array's slot from VX_SLOT_* constants. Returns NULL if
+/// index is out of bounds.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vx_array_slot(array: *const vx_array, index: usize) -> *const vx_array {
+    let array = vx_array::as_ref(array);
+    let slots = array.slots();
+    if index >= slots.len() {
+        return ptr::null();
+    }
+    if let Some(slot) = &slots[index] {
+        vx_array::new(Arc::new(slot.clone()))
+    } else {
+        ptr::null()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ptr;
@@ -625,12 +662,15 @@ mod tests {
     use vortex::array::arrays::VarBinViewArray;
     use vortex::array::arrays::bool::BoolArrayExt;
     use vortex::array::validity::Validity;
+    use vortex::buffer::BitBuffer;
     use vortex::buffer::buffer;
     #[cfg(not(miri))]
     use vortex::dtype::half::f16;
     use vortex::expr::eq;
     use vortex::expr::lit;
     use vortex::expr::root;
+    use vortex_array::arrays::DictArray;
+    use vortex_array::assert_arrays_eq;
 
     use crate::array::*;
     use crate::dtype::vx_dtype_free;
@@ -1185,6 +1225,44 @@ mod tests {
             let bits = vx_array_data_ptr_bool(array, &raw mut bit_offset, &raw mut error);
             assert!(bits.is_null());
             assert_error(error);
+
+            vx_array_free(array);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_dict_slots() {
+        let mut ctx = legacy_session().create_execution_ctx();
+        let codes_buffer = buffer![0u32, 1, 2, 2, 1];
+        let codes_validity = Validity::from(BitBuffer::from(vec![true, false, true, false, true]));
+        let codes = PrimitiveArray::new(codes_buffer, codes_validity).into_array();
+        let values = PrimitiveArray::new(buffer![3, 6, 9], Validity::AllValid).into_array();
+        let dict = DictArray::try_new(codes.clone(), values.clone())
+            .unwrap()
+            .into_array();
+
+        unsafe {
+            let array = vx_array::new(Arc::new(dict));
+            let encoding_view = vx_array_encoding(array);
+            assert_eq!(
+                "vortex.dict".as_bytes(),
+                from_raw_parts(encoding_view.ptr, encoding_view.len)
+            );
+            let codes_slot = vx_array_slot(array, VX_SLOT_DICT_CODES);
+            {
+                let codes_slot = vx_array::as_ref(codes_slot);
+                assert_arrays_eq!(codes, codes_slot, &mut ctx);
+            }
+
+            let values_slot = vx_array_slot(array, VX_SLOT_DICT_VALUES);
+            {
+                let values_slot = vx_array::as_ref(values_slot);
+                assert_arrays_eq!(values, values_slot, &mut ctx);
+            }
+
+            let invalid_slot = vx_array_slot(array, 999);
+            assert_eq!(invalid_slot, ptr::null());
 
             vx_array_free(array);
         }
