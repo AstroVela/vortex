@@ -54,9 +54,9 @@ impl DynGroupedAggregateKernel for PrimitiveGroupedStandardSumEncodingKernel {
 /// a null sum, NaNs are skipped). The element validity mask is materialized once and sliced per
 /// group, rather than the per-group accumulator setup of the generic fallback path.
 ///
-/// Produces `{sum, seen}` partial rows (see `StandardSum`'s partial dtype): `seen` records whether the
-/// group contained at least one valid element, so that `finalize` yields null for empty and
-/// all-null groups, and null groups are null struct rows.
+/// Produces `{sum, overflowed}` partial rows (see `StandardSum`'s partial dtype): `sum` is null for
+/// empty, all-null, and overflowed groups, while `overflowed` distinguishes saturation from the
+/// empty identity during partial merges. Null groups are null struct rows.
 pub(super) fn try_grouped_sum(
     groups: &GroupedArray,
     ctx: &mut ExecutionCtx,
@@ -92,7 +92,7 @@ fn grouped_sum(
         .execute_mask(elements.as_ref().len(), ctx)?;
     let all_valid = matches!(elem_mask.slices(), AllOr::All);
 
-    let (sums, seen) = match_each_native_ptype!(elements.ptype(),
+    let (sums, overflowed) = match_each_native_ptype!(elements.ptype(),
         unsigned: |T| {
             let values = elements.as_slice::<T>();
             collect_sums::<T, u64>(values, group_ranges, group_validity, &elem_mask, all_valid,
@@ -111,10 +111,10 @@ fn grouped_sum(
     );
 
     Ok(StructArray::try_new(
-        FieldNames::from_iter([FieldName::from("sum"), FieldName::from("seen")]),
+        FieldNames::from_iter([FieldName::from("sum"), FieldName::from("overflowed")]),
         vec![
             sums.into_array(),
-            BoolArray::new(seen, Validity::NonNullable).into_array(),
+            BoolArray::new(overflowed, Validity::NonNullable).into_array(),
         ],
         group_validity.len(),
         Validity::from_mask(group_validity.clone(), Nullability::Nullable),
@@ -122,10 +122,9 @@ fn grouped_sum(
     .into_array())
 }
 
-/// Reduce each group's element slice into a nullable sum plus a per-group `seen` bit. A sum is
-/// null when the group itself is invalid or when summing it overflows (`sum_run` returns
-/// `true`); `seen` records whether the group contained at least one valid element, decided by
-/// validity alone (with `skip_nans`, a valid all-NaN group is still seen and sums to zero).
+/// Reduce each group's element slice into a nullable sum plus a per-group overflow bit. A sum is
+/// null when the group is invalid, has no valid elements, or summing it overflows. With
+/// `skip_nans`, a valid all-NaN group has a real zero sum because NaNs remain valid elements.
 fn collect_sums<T: NativePType, A: NativePType + Default>(
     values: &[T],
     group_ranges: &GroupRanges,
@@ -134,10 +133,10 @@ fn collect_sums<T: NativePType, A: NativePType + Default>(
     all_valid: bool,
     sum_run: impl Fn(&mut A, &[T]) -> bool,
 ) -> (PrimitiveArray, BitBuffer) {
-    let mut seen = BitBufferMut::with_capacity(group_ranges.len());
+    let mut overflowed = BitBufferMut::with_capacity(group_ranges.len());
     let sums = group_ranges.iter().enumerate().map(|(i, (offset, size))| {
         if !group_validity.value(i) {
-            seen.append(false);
+            overflowed.append(false);
             return None;
         }
         let mut acc = A::default();
@@ -146,11 +145,11 @@ fn collect_sums<T: NativePType, A: NativePType + Default>(
         } else {
             sum_masked_group(&mut acc, values, offset, size, elem_mask, &sum_run)
         };
-        seen.append(any_valid);
-        (!overflow).then_some(acc)
+        overflowed.append(overflow);
+        (!overflow && any_valid).then_some(acc)
     });
     let sums = PrimitiveArray::from_option_iter(sums);
-    (sums, seen.freeze())
+    (sums, overflowed.freeze())
 }
 
 /// StandardSum the valid elements of a single group, using the contiguous valid runs of the element mask

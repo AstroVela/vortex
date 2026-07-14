@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Tests for [`StandardSum`]-specific behavior: the `{sum, seen}` state algebra, the
-//! null-for-zero-valid-values rule across input kinds, NaN and overflow interplay with
-//! `seen`, cached-statistic consumption, and grouped aggregation. Plain summation
-//! arithmetic is covered by the shared kernels' tests in [`super::super::sum`].
+//! Tests for [`StandardSum`]-specific behavior: the `{sum, overflowed}` state algebra, the
+//! null-for-zero-valid-values rule across input kinds, NaN and overflow handling, cached-statistic
+//! consumption, and grouped aggregation. Plain summation arithmetic is covered by the shared
+//! kernels' tests in [`super::super::sum`].
 
 use rstest::rstest;
 use vortex_buffer::buffer;
@@ -51,7 +51,7 @@ fn sum_with_options(arr: &ArrayRef, options: NumericalAggregateOpts) -> VortexRe
     acc.finish()
 }
 
-// State algebra: the `{sum, seen}` monoid.
+// State algebra: the `{sum, overflowed}` monoid.
 
 #[test]
 fn sum_state_empty_is_null() -> VortexResult<()> {
@@ -60,6 +60,14 @@ fn sum_state_empty_is_null() -> VortexResult<()> {
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
     let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
     let empty = StandardSum.to_scalar(&state)?;
+    let fields = empty.as_struct();
+    assert!(fields.field("sum").is_some_and(|sum| sum.is_null()));
+    assert_eq!(
+        fields
+            .field("overflowed")
+            .and_then(|overflowed| overflowed.as_bool().value()),
+        Some(false)
+    );
     StandardSum.combine_partials(&mut state, empty)?;
     assert!(StandardSum.finalize_scalar(&state)?.is_null());
     Ok(())
@@ -67,8 +75,8 @@ fn sum_state_empty_is_null() -> VortexResult<()> {
 
 #[test]
 fn sum_state_empty_is_identity() -> VortexResult<()> {
-    // Combining an empty state into a seen state changes nothing: `{0, false}` is the
-    // identity of the `{sum, seen}` monoid.
+    // Combining an empty state into a non-empty state changes nothing: `{null, false}` is the
+    // identity of the `{sum, overflowed}` monoid.
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
     let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
     StandardSum.combine_partials(&mut state, Scalar::primitive(100i64, Nullable))?;
@@ -83,14 +91,21 @@ fn sum_state_empty_is_identity() -> VortexResult<()> {
 }
 
 #[test]
-fn sum_state_overflow_poisons_but_stays_seen() -> VortexResult<()> {
-    // Overflow (a null `sum` field) poisons the merge even when combined with later
-    // values: the result is null via the sum value, not via `seen`.
+fn sum_state_overflow_sets_flag_and_poisons() -> VortexResult<()> {
+    // Overflow sets the flag and poisons the merge even when combined with later values.
     let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
     let mut overflowed = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
     StandardSum.combine_partials(&mut overflowed, Scalar::primitive(i64::MAX, Nullable))?;
     StandardSum.combine_partials(&mut overflowed, Scalar::primitive(1i64, Nullable))?;
     let overflowed = StandardSum.to_scalar(&overflowed)?;
+    let fields = overflowed.as_struct();
+    assert!(fields.field("sum").is_some_and(|sum| sum.is_null()));
+    assert_eq!(
+        fields
+            .field("overflowed")
+            .and_then(|overflowed| overflowed.as_bool().value()),
+        Some(true)
+    );
 
     let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
     StandardSum.combine_partials(&mut state, Scalar::primitive(5i64, Nullable))?;
@@ -236,6 +251,14 @@ fn sum_constant() -> VortexResult<()> {
 }
 
 #[test]
+fn sum_constant_false_is_zero_not_null() -> VortexResult<()> {
+    let array = ConstantArray::new(false, 10).into_array();
+    let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
+    assert_eq!(result.as_primitive().typed_value::<u64>(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn sum_multi_batch_and_finish_resets() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
@@ -248,7 +271,7 @@ fn sum_multi_batch_and_finish_resets() -> VortexResult<()> {
     let result = acc.finish()?;
     assert_eq!(result.as_primitive().typed_value::<i64>(), Some(48));
 
-    // finish resets the state, including `seen`: an untouched accumulator is empty again.
+    // finish resets the state: an untouched accumulator is empty again.
     assert!(acc.finish()?.is_null());
     let batch3 = PrimitiveArray::new(buffer![1i32], Validity::NonNullable).into_array();
     acc.accumulate(&batch3, &mut ctx)?;
@@ -256,7 +279,7 @@ fn sum_multi_batch_and_finish_resets() -> VortexResult<()> {
     Ok(())
 }
 
-// Chunked accumulation: `seen` must merge across chunks.
+// Chunked accumulation: the nullable sum must merge across chunks.
 
 #[test]
 fn sum_chunked_floats_with_nulls() -> VortexResult<()> {
@@ -311,9 +334,9 @@ fn sum_chunked_empty_chunks() -> VortexResult<()> {
 }
 
 #[test]
-fn sum_chunked_seen_from_one_chunk() -> VortexResult<()> {
-    // One valid value in one chunk, an all-null chunk after: seen from the first chunk
-    // must survive merging with the second's identity.
+fn sum_chunked_value_survives_empty_chunk() -> VortexResult<()> {
+    // One valid value in one chunk, followed by an all-null chunk: the value must survive merging
+    // with the second chunk's null identity.
     let chunk1 = PrimitiveArray::from_option_iter::<u32, _>(vec![Some(1)]);
     let chunk2 = PrimitiveArray::from_option_iter::<u32, _>(vec![None]);
     let dtype = chunk1.dtype().clone();
@@ -327,7 +350,7 @@ fn sum_chunked_seen_from_one_chunk() -> VortexResult<()> {
     Ok(())
 }
 
-// NaN handling and its interplay with `seen` and the cached statistics.
+// NaN handling and its interplay with the nullable sum and cached statistics.
 
 #[test]
 fn sum_f64_with_nan_and_nulls() -> VortexResult<()> {
@@ -391,7 +414,7 @@ fn sum_not_skipping_uses_cached_sum_when_nan_free() -> VortexResult<()> {
 #[test]
 fn sum_constant_nan() -> VortexResult<()> {
     let arr = ConstantArray::new(f64::NAN, 4).into_array();
-    // NaN constants are skipped by default (a seen, zero sum) and poison the sum otherwise.
+    // NaN constants are skipped by default (a non-empty zero sum) and poison the sum otherwise.
     let result = sum_with_options(&arr, NumericalAggregateOpts::default())?;
     assert_eq!(result.as_primitive().typed_value::<f64>(), Some(0.0));
 
@@ -421,7 +444,7 @@ fn sum_f64_with_infinity() -> VortexResult<()> {
     Ok(())
 }
 
-// Overflow: a null sum value, distinct from the unseen null.
+// Overflow: a null sum value plus an explicit saturation flag.
 
 #[test]
 fn sum_checked_overflow_is_null_and_saturates() -> VortexResult<()> {
@@ -565,6 +588,66 @@ fn run_grouped_sum(groups: &ArrayRef, elem_dtype: &DType) -> VortexResult<ArrayR
 }
 
 #[test]
+fn grouped_sum_partial_distinguishes_empty_overflow_and_null_group() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements =
+        PrimitiveArray::from_option_iter([Some(5i64), None, Some(i64::MAX), Some(1)]).into_array();
+    let groups = ListViewArray::try_new(
+        elements,
+        buffer![0i32, 0, 1, 2, 0].into_array(),
+        buffer![1i32, 0, 1, 2, 1].into_array(),
+        Validity::from_iter([true, true, true, true, false]),
+    )?
+    .into_array();
+    let mut acc = GroupedAccumulator::try_new(
+        StandardSum,
+        NumericalAggregateOpts::default(),
+        DType::Primitive(PType::I64, Nullable),
+    )?;
+    acc.accumulate_list(&groups, &mut ctx)?;
+    let partials = acc.flush()?;
+
+    let value = partials.execute_scalar(0, &mut ctx)?;
+    let fields = value.as_struct();
+    assert_eq!(
+        fields
+            .field("sum")
+            .and_then(|sum| sum.as_primitive().typed_value::<i64>()),
+        Some(5)
+    );
+    assert_eq!(
+        fields
+            .field("overflowed")
+            .and_then(|overflowed| overflowed.as_bool().value()),
+        Some(false)
+    );
+
+    for index in [1, 2] {
+        let empty = partials.execute_scalar(index, &mut ctx)?;
+        let fields = empty.as_struct();
+        assert!(fields.field("sum").is_some_and(|sum| sum.is_null()));
+        assert_eq!(
+            fields
+                .field("overflowed")
+                .and_then(|overflowed| overflowed.as_bool().value()),
+            Some(false)
+        );
+    }
+
+    let overflow = partials.execute_scalar(3, &mut ctx)?;
+    let fields = overflow.as_struct();
+    assert!(fields.field("sum").is_some_and(|sum| sum.is_null()));
+    assert_eq!(
+        fields
+            .field("overflowed")
+            .and_then(|overflowed| overflowed.as_bool().value()),
+        Some(true)
+    );
+    assert!(partials.execute_scalar(4, &mut ctx)?.is_null());
+    Ok(())
+}
+
+#[test]
 fn grouped_sum_fallback_empty_and_all_null_groups() -> VortexResult<()> {
     // Bool elements are rejected by the primitive grouped kernel, forcing the generic
     // per-group fallback: empty and all-null groups have null sums there too.
@@ -645,6 +728,22 @@ fn grouped_sum_all_null_elements_in_group() -> VortexResult<()> {
 
     // The all-null group has a null sum
     let expected = PrimitiveArray::from_option_iter([None, Some(7i64)]).into_array();
+    assert_arrays_eq!(&result, &expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn grouped_sum_all_nan_is_zero_not_null() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements =
+        PrimitiveArray::new(buffer![f64::NAN, f64::NAN, 3.0, 4.0], Validity::NonNullable)
+            .into_array();
+    let groups = FixedSizeListArray::try_new(elements, 2, Validity::NonNullable, 2)?;
+
+    let elem_dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+    let result = run_grouped_sum(&groups.into_array(), &elem_dtype)?;
+
+    let expected = PrimitiveArray::from_option_iter([Some(0.0f64), Some(7.0)]).into_array();
     assert_arrays_eq!(&result, &expected, &mut ctx);
     Ok(())
 }
