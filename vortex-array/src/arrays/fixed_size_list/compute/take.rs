@@ -12,7 +12,6 @@ use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::RecursiveCanonical;
 use crate::array::ArrayView;
 use crate::arrays::ConstantArray;
 use crate::arrays::FixedSizeList;
@@ -33,7 +32,7 @@ use crate::validity::Validity;
 ///
 /// `FixedSizeListArray` must rebuild its elements array because selected lists need to become
 /// packed from offset 0. The FSL layer translates selected list rows into ordered element runs
-/// and delegates the execution strategy to the elements child via materialized `take_slices`.
+/// and delegates the execution strategy to the elements child via `take_slices`.
 impl TakeExecute for FixedSizeList {
     fn take(
         array: ArrayView<'_, FixedSizeList>,
@@ -139,14 +138,13 @@ fn take_non_empty_non_degenerate_fsl<I: IntegerPType>(
     if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
         take_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
     } else {
-        take_non_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
+        take_non_nullable_non_empty_fsl::<I>(array, indices_array)
     }
 }
 
 fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let list_size = array.list_size() as usize;
     let array_len = array.as_ref().len();
@@ -166,7 +164,6 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
         starts.freeze(),
         list_size,
         expected_elements_len,
-        ctx,
     )?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
@@ -228,7 +225,6 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         starts.freeze(),
         list_size,
         expected_elements_len,
-        ctx,
     )?;
     ensure_elements_len(new_elements.len(), expected_elements_len)?;
 
@@ -318,7 +314,6 @@ fn take_element_runs(
     starts: Buffer<u64>,
     length: usize,
     output_len: usize,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let run_count = starts.len();
     let starts = PrimitiveArray::new(starts, Validity::NonNullable).into_array();
@@ -329,9 +324,6 @@ fn take_element_runs(
     // constant array, and `output_len` was computed as `run_count * length`.
     Ok(
         unsafe { TakeSlicesArray::new_unchecked(elements.clone(), starts, lengths, output_len) }
-            .into_array()
-            .execute::<RecursiveCanonical>(ctx)?
-            .0
             .into_array(),
     )
 }
