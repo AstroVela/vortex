@@ -155,7 +155,7 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
 
     for &data_idx in indices {
         let data_idx = index_to_usize(data_idx)?;
-        let start = list_start(data_idx, list_size, array_len)?;
+        let start = list_start_u64(data_idx, list_size, array_len)?;
         starts.push(start);
     }
 
@@ -210,7 +210,7 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
         }
 
         let data_idx = index_to_usize(data_idx)?;
-        let start = list_start(data_idx, list_size, array_len)?;
+        let start = list_start_u64(data_idx, list_size, array_len)?;
         if !array_validity.value(data_idx) {
             starts.push(0);
             new_validity_builder.append(false);
@@ -282,7 +282,7 @@ fn ensure_elements_len(actual: usize, expected: usize) -> VortexResult<()> {
     Ok(())
 }
 
-fn list_start(data_idx: usize, list_size: usize, array_len: usize) -> VortexResult<usize> {
+fn list_start_u64(data_idx: usize, list_size: usize, array_len: usize) -> VortexResult<u64> {
     check_index_in_bounds(data_idx, array_len)?;
 
     let start = data_idx.checked_mul(list_size).ok_or_else(|| {
@@ -294,8 +294,8 @@ fn list_start(data_idx: usize, list_size: usize, array_len: usize) -> VortexResu
         vortex_err!(
             "FixedSizeList take element range overflow for index {data_idx} and list size {list_size}"
         )
-    })?;
-    Ok(start)
+        })?;
+    Ok(start as u64)
 }
 
 fn check_index_in_bounds(data_idx: usize, array_len: usize) -> VortexResult<()> {
@@ -313,16 +313,12 @@ fn default_elements(array: ArrayView<'_, FixedSizeList>, len: usize) -> ArrayRef
 
 fn take_element_runs(
     elements: &ArrayRef,
-    starts: Vec<usize>,
+    starts: Vec<u64>,
     length: usize,
     output_len: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let run_count = starts.len();
-    let starts = starts
-        .into_iter()
-        .map(|start| start as u64)
-        .collect::<Vec<_>>();
     let starts = PrimitiveArray::from_iter(starts).into_array();
     let lengths = ConstantArray::new(length as u64, run_count).into_array();
 
