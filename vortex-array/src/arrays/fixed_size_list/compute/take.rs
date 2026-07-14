@@ -12,14 +12,12 @@ use crate::ArrayRef;
 use crate::IntoArray;
 use crate::RecursiveCanonical;
 use crate::array::ArrayView;
-use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::TakeSlicesArray;
-use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::dict::TakeExecute;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
@@ -247,12 +245,9 @@ fn indices_validity_mask(
     indices_array: &ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Mask> {
-    let indices_len = indices_array.as_ref().len();
-    match indices_array.validity()? {
-        Validity::NonNullable | Validity::AllValid => Ok(Mask::new_true(indices_len)),
-        Validity::AllInvalid => Ok(Mask::new_false(indices_len)),
-        Validity::Array(a) => Ok(a.execute::<BoolArray>(ctx)?.execute_mask(ctx)),
-    }
+    indices_array
+        .validity()?
+        .execute_mask(indices_array.as_ref().len(), ctx)
 }
 
 fn validate_valid_indices<I: IntegerPType>(
