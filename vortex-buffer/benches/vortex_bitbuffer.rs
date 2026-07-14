@@ -16,6 +16,7 @@ fn main() {
     {
         let _ = is_x86_feature_detected!("avx2");
         let _ = is_x86_feature_detected!("avx512f");
+        let _ = is_x86_feature_detected!("avx512bw");
         let _ = is_x86_feature_detected!("avx512vpopcntdq");
     }
 
@@ -36,6 +37,64 @@ const INPUT_SIZE: &[usize] = &[128, 1024, 2048, 16_384, 65_536];
 #[inline]
 fn true_count_pattern(i: usize) -> bool {
     (i.is_multiple_of(3)) ^ (i.is_multiple_of(11))
+}
+
+/// Pseudo-random `i32` operand vectors for the comparison benches.
+fn cmp_inputs(length: usize) -> (Vec<i32>, Vec<i32>) {
+    let idx = |i: usize| i32::try_from(i).unwrap_or(i32::MAX);
+    let a = (0..length)
+        .map(|i| idx(i).wrapping_mul(-1640531527))
+        .collect();
+    let b = (0..length).map(|i| idx(i).wrapping_mul(40503)).collect();
+    (a, b)
+}
+
+/// `collect_bool` over an unchecked comparison closure — the shape used by the
+/// compare/between kernels (see `vortex-array` `primitive/compute/between.rs`).
+#[divan::bench(args = INPUT_SIZE)]
+fn collect_bool_cmp_unchecked(bencher: Bencher, length: usize) {
+    let (a, b) = cmp_inputs(length);
+    bencher.with_inputs(|| (&a, &b)).bench_refs(|(a, b)| {
+        BitBuffer::collect_bool(a.len(), |i| {
+            // SAFETY: `collect_bool` yields i < len == a.len() == b.len().
+            unsafe { a.get_unchecked(i) > b.get_unchecked(i) }
+        })
+    });
+}
+
+/// `collect_bool` over a bounds-checked comparison closure: the worst case for the
+/// staging pack, since the potential panic blocks vectorization of the staging loop.
+#[divan::bench(args = INPUT_SIZE)]
+fn collect_bool_cmp_checked(bencher: Bencher, length: usize) {
+    let (a, b) = cmp_inputs(length);
+    bencher
+        .with_inputs(|| (&a, &b))
+        .bench_refs(|(a, b)| BitBuffer::collect_bool(a.len(), |i| a[i] > b[i]));
+}
+
+/// `collect_bool` over a bool-slice closure, the shape used by `From<&[bool]>` and
+/// ByteBool canonicalization.
+#[divan::bench(args = INPUT_SIZE)]
+fn collect_bool_from_bools(bencher: Bencher, length: usize) {
+    let src: Vec<bool> = (0..length).map(true_count_pattern).collect();
+    bencher
+        .with_inputs(|| &src)
+        .bench_refs(|src| BitBuffer::collect_bool(src.len(), |i| src[i]));
+}
+
+/// `collect_bool` over a gather closure, the shape used by bool `take`.
+#[divan::bench(args = INPUT_SIZE)]
+fn collect_bool_gather(bencher: Bencher, length: usize) {
+    let bits = BitBuffer::collect_bool(length, true_count_pattern);
+    let indices: Vec<usize> = (0..length).map(|i| (i * 7) % length).collect();
+    bencher
+        .with_inputs(|| (&bits, &indices))
+        .bench_refs(|(bits, indices)| {
+            BitBuffer::collect_bool(indices.len(), |i| {
+                // SAFETY: `collect_bool` yields i < len == indices.len().
+                bits.value(unsafe { *indices.get_unchecked(i) })
+            })
+        });
 }
 
 #[cfg(not(codspeed))]
