@@ -119,8 +119,25 @@ where
         let start = index_value_to_usize("start", start)?;
         let length = index_value_to_usize("length", length)?;
         let end = start + length;
-        values.extend_from_slice(&source[start..end]);
+        // SAFETY: `validate_index_ranges` checked every source range and the total output length,
+        // so `source[start..end]` is in bounds and `values` has enough spare capacity.
+        unsafe { extend_from_slice_unchecked(&mut values, source.get_unchecked(start..end)) };
     }
 
     Ok(values.freeze())
+}
+
+unsafe fn extend_from_slice_unchecked<T>(values: &mut BufferMut<T>, source: &[T])
+where
+    T: NativeDecimalType,
+{
+    let old_len = values.len();
+    let new_len = old_len + source.len();
+
+    // SAFETY: the caller guarantees `values` has enough spare capacity for `source.len()` values.
+    unsafe {
+        let dst = values.spare_capacity_mut().as_mut_ptr().cast::<T>();
+        std::ptr::copy_nonoverlapping(source.as_ptr(), dst, source.len());
+        values.set_len(new_len);
+    }
 }
