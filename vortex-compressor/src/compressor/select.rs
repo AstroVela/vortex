@@ -112,6 +112,16 @@ impl CascadingCompressor {
         // Pass 2: resolve deferred candidates without exposing current selection state.
         for (scheme, deferred_evaluation) in deferred {
             let _span = trace::scheme_eval_span(scheme.id()).entered();
+
+            // Model-side pruning: skip the deferred work outright when even this scheme's
+            // best case cannot strictly beat the best candidate so far.
+            if let Some(best_candidate) = best.as_ref()
+                && let Some(lower_bound) = self.cost_model.lower_bound(scheme.id(), data)
+                && lower_bound >= best_candidate.cost
+            {
+                continue;
+            }
+
             match deferred_evaluation {
                 DeferredEvaluation::Sample => {
                     let sampled_candidate = evaluate_candidate_with_sampling(

@@ -31,6 +31,7 @@ use crate::builtins::StringDictScheme;
 use crate::cost::Candidate;
 use crate::cost::Cost;
 use crate::cost::CostModel;
+use crate::cost::SizeCost;
 use crate::scheme::CandidateEstimate;
 use crate::scheme::CompressorContext;
 use crate::scheme::DeferredEvaluation;
@@ -38,6 +39,7 @@ use crate::scheme::ResolvedEvaluation;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeEvaluation;
 use crate::scheme::SchemeExt;
+use crate::scheme::SchemeId;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
 
@@ -529,6 +531,68 @@ fn deferred_candidate_competes_by_cost() -> VortexResult<()> {
         winner,
         Some((scheme, SelectionOutcome::Cost(_)))
             if scheme.id() == CallbackRatioScheme.id()
+    ));
+    Ok(())
+}
+
+/// Delegates pricing to [`SizeCost`] but bounds every scheme at a cost that can never
+/// win, so all deferred work is pruned as soon as any best candidate exists.
+#[derive(Debug)]
+struct PruneAllDeferredModel;
+
+impl CostModel for PruneAllDeferredModel {
+    fn cost(&self, candidate: &Candidate<'_>) -> Option<Cost> {
+        SizeCost.cost(candidate)
+    }
+
+    fn canonical_cost(&self, data: &ArrayAndStats, n_values: u64) -> Cost {
+        SizeCost.canonical_cost(data, n_values)
+    }
+
+    fn lower_bound(&self, _scheme: SchemeId, _data: &ArrayAndStats) -> Option<Cost> {
+        Some(Cost::new(f64::MAX))
+    }
+}
+
+#[test]
+fn lower_bound_prunes_deferred_work_behind_a_best() -> VortexResult<()> {
+    // `CallbackRatioScheme`'s deferred ratio 3.0 would beat `DirectRatioScheme`'s
+    // immediate ratio 2.0 (see `deferred_candidate_competes_by_cost`), but the model
+    // bounds it above the running best, so its deferred work is pruned.
+    let compressor = CascadingCompressor::new(vec![&DirectRatioScheme, &CallbackRatioScheme])
+        .with_cost_model(Arc::new(PruneAllDeferredModel));
+    let schemes: [&'static dyn Scheme; 2] = [&DirectRatioScheme, &CallbackRatioScheme];
+    let data = estimate_test_data();
+    let mut exec_ctx = SESSION.create_execution_ctx();
+
+    let winner =
+        compressor.choose_best_scheme(&schemes, &data, CompressorContext::new(), &mut exec_ctx)?;
+
+    assert!(matches!(
+        winner,
+        Some((scheme, SelectionOutcome::Cost(cost)))
+            if scheme.id() == DirectRatioScheme.id() && cost.value() == -2.0
+    ));
+    Ok(())
+}
+
+#[test]
+fn lower_bound_never_prunes_without_a_best() -> VortexResult<()> {
+    // With no best candidate there is nothing to prune against, so the deferred
+    // callback still runs even under a prune-everything bound.
+    let compressor = CascadingCompressor::new(vec![&CallbackRatioScheme])
+        .with_cost_model(Arc::new(PruneAllDeferredModel));
+    let schemes: [&'static dyn Scheme; 1] = [&CallbackRatioScheme];
+    let data = estimate_test_data();
+    let mut exec_ctx = SESSION.create_execution_ctx();
+
+    let winner =
+        compressor.choose_best_scheme(&schemes, &data, CompressorContext::new(), &mut exec_ctx)?;
+
+    assert!(matches!(
+        winner,
+        Some((scheme, SelectionOutcome::Cost(cost)))
+            if scheme.id() == CallbackRatioScheme.id() && cost.value() == -3.0
     ));
     Ok(())
 }
