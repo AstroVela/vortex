@@ -11,7 +11,7 @@ use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::TakeSlices;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
-use crate::arrays::take_slices::array::CHILD_SLOT;
+use crate::arrays::take_slices::array::TakeSlicesSlots;
 use crate::kernel::ExecuteParentKernel;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
@@ -47,7 +47,7 @@ where
         parent: <Self::Parent as Matcher>::Match<'_>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
-        if child_idx != CHILD_SLOT {
+        if child_idx != TakeSlicesSlots::CHILD {
             return Ok(None);
         }
 
@@ -91,7 +91,7 @@ where
         child_idx: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        if child_idx != CHILD_SLOT {
+        if child_idx != TakeSlicesSlots::CHILD {
             return Ok(None);
         }
 

@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use smallvec::smallvec;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
@@ -10,41 +9,37 @@ use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::EmptyArrayData;
 use crate::array::TypedArrayRef;
+use crate::array_slots;
 use crate::arrays::TakeSlices;
 
-/// The child array selected by the run sequence.
-pub(super) const CHILD_SLOT: usize = 0;
-/// The start index for each child run.
-pub(super) const STARTS_SLOT: usize = 1;
-/// The length for each child run.
-pub(super) const LENGTHS_SLOT: usize = 2;
-pub(super) const NUM_SLOTS: usize = 3;
-pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child", "starts", "lengths"];
+#[array_slots(TakeSlices)]
+pub struct TakeSlicesSlots {
+    /// The child array selected by the run sequence.
+    pub child: ArrayRef,
+    /// The start index for each child run.
+    pub starts: ArrayRef,
+    /// The length for each child run.
+    pub lengths: ArrayRef,
+}
 
 /// Extension methods for [`TakeSlices`] arrays.
-pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> {
+pub trait TakeSlicesArrayExt: TypedArrayRef<TakeSlices> + TakeSlicesArraySlotsExt {
     /// The child array selected by this run sequence.
     fn child(&self) -> &ArrayRef {
-        self.as_ref().slots()[CHILD_SLOT]
-            .as_ref()
-            .vortex_expect("validated take-slices child slot")
+        TakeSlicesArraySlotsExt::child(self)
     }
 
     /// The start index for each child run.
     fn starts(&self) -> &ArrayRef {
-        self.as_ref().slots()[STARTS_SLOT]
-            .as_ref()
-            .vortex_expect("validated take-slices starts slot")
+        TakeSlicesArraySlotsExt::starts(self)
     }
 
     /// The length for each child run.
     fn lengths(&self) -> &ArrayRef {
-        self.as_ref().slots()[LENGTHS_SLOT]
-            .as_ref()
-            .vortex_expect("validated take-slices lengths slot")
+        TakeSlicesArraySlotsExt::lengths(self)
     }
 }
-impl<T: TypedArrayRef<TakeSlices>> TakeSlicesArrayExt for T {}
+impl<T: TypedArrayRef<TakeSlices> + TakeSlicesArraySlotsExt> TakeSlicesArrayExt for T {}
 
 impl Array<TakeSlices> {
     /// Constructs a new `TakeSlicesArray` from start/length arrays and caller-provided output length.

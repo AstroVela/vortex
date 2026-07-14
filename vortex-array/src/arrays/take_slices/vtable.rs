@@ -24,11 +24,7 @@ use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::take_slices::TakeSlicesArrayExt;
-use crate::arrays::take_slices::array::CHILD_SLOT;
-use crate::arrays::take_slices::array::LENGTHS_SLOT;
-use crate::arrays::take_slices::array::NUM_SLOTS;
-use crate::arrays::take_slices::array::SLOT_NAMES;
-use crate::arrays::take_slices::array::STARTS_SLOT;
+use crate::arrays::take_slices::array::TakeSlicesSlots;
 use crate::arrays::take_slices::check_index_arrays;
 use crate::arrays::take_slices::checked_range_end;
 use crate::arrays::take_slices::index_value_to_usize;
@@ -74,23 +70,24 @@ impl VTable for TakeSlices {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "TakeSlicesArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == TakeSlicesSlots::NAMES.len(),
+            "TakeSlicesArray expected {} slots, found {}",
+            TakeSlicesSlots::NAMES.len(),
             slots.len()
         );
         vortex_ensure!(
-            slots[CHILD_SLOT].is_some(),
+            slots[TakeSlicesSlots::CHILD].is_some(),
             "TakeSlicesArray child slot must be present"
         );
         vortex_ensure!(
-            slots[STARTS_SLOT].is_some(),
+            slots[TakeSlicesSlots::STARTS].is_some(),
             "TakeSlicesArray starts slot must be present"
         );
         vortex_ensure!(
-            slots[LENGTHS_SLOT].is_some(),
+            slots[TakeSlicesSlots::LENGTHS].is_some(),
             "TakeSlicesArray lengths slot must be present"
         );
-        let child = slots[CHILD_SLOT]
+        let child = slots[TakeSlicesSlots::CHILD]
             .as_ref()
             .vortex_expect("validated child slot");
         vortex_ensure!(
@@ -99,10 +96,10 @@ impl VTable for TakeSlices {
             child.dtype(),
             dtype
         );
-        let starts = slots[STARTS_SLOT]
+        let starts = slots[TakeSlicesSlots::STARTS]
             .as_ref()
             .vortex_expect("validated starts slot");
-        let lengths = slots[LENGTHS_SLOT]
+        let lengths = slots[TakeSlicesSlots::LENGTHS]
             .as_ref()
             .vortex_expect("validated lengths slot");
         check_index_arrays(starts, lengths)?;
@@ -130,7 +127,7 @@ impl VTable for TakeSlices {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        TakeSlicesSlots::NAMES[idx].to_string()
     }
 
     fn serialize(
@@ -154,7 +151,10 @@ impl VTable for TakeSlices {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let parent = array.clone().into_array();
-        if let Some(reduced) = array.child().reduce_parent(&parent, CHILD_SLOT)? {
+        if let Some(reduced) = array
+            .child()
+            .reduce_parent(&parent, TakeSlicesSlots::CHILD)?
+        {
             return Ok(ExecutionResult::done(reduced));
         }
 
