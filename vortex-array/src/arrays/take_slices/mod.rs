@@ -6,6 +6,11 @@
 //! `TakeSlicesArray` represents the concatenation of
 //! `values[starts[i]..starts[i] + lengths[i]]` for each range row. Ranges may overlap, repeat,
 //! and appear in any order.
+//!
+//! This is equivalent to a `Take` with concatenated sequence codes, but keeps the selectors
+//! proportional to the number of ranges instead of the output length. A run-end encoded code array
+//! cannot represent a general range compactly because each output position within a range selects
+//! a different child index.
 
 mod array;
 mod kernel;
