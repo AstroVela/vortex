@@ -144,11 +144,13 @@ impl ArrayRef {
     ///   Step 2a: if stack.top exists:
     ///               parent = stack.top.parent_array
     ///               child = current_array
+    ///               child.reduce_parent(parent, stack.top.slot_idx), then
     ///               kernels[(parent.encoding_id(), child.encoding_id())]
     ///                 .try_execute_parent(child, parent, stack.top.slot_idx)
     ///
     ///   Step 2b: for child in current_array.children():
     ///               parent = current_array
+    ///               child.reduce_parent(parent, child.slot_idx), then
     ///               kernels[(parent.encoding_id(), child.encoding_id())]
     ///                 .try_execute_parent(child, parent, child.slot_idx)
     ///
@@ -193,16 +195,34 @@ impl ArrayRef {
                 }
             }
 
-            // Step 2a: execute_parent against the suspended parent from ExecuteSlot.
+            // Step 2a: reduce_parent/execute_parent against the suspended parent from ExecuteSlot.
             //
-            // When executing a child for ExecuteSlot, try execute_parent against
-            // the suspended parent on the stack. This lets kernels like RunEnd's
+            // When executing a child for ExecuteSlot, try parent rewrites against the suspended
+            // parent on the stack. This lets rules like Struct get_item or kernels like RunEnd's
             // FilterKernel fire before the child is forced to canonical.
             //
             // Skip when a builder is active: the current array has been partially
             // consumed by AppendChild (some slots are already in the builder), so
             // a parent rewrite would see inconsistent state and the builder data
             // would be lost when we restore frame.parent_builder.
+            if current_builder.is_none()
+                && let Some(frame) = stack.last()
+                && let Some(result) =
+                    current_array.reduce_parent(&frame.parent_array, frame.slot_idx)?
+            {
+                ctx.log(format_args!(
+                    "reduce_parent (stack) rewrote {} -> {}",
+                    current_array, result
+                ));
+                result
+                    .statistics()
+                    .inherit_from(frame.parent_array.statistics());
+                let frame = stack.pop().vortex_expect("just peeked");
+                current_array = result.optimize_ctx(ctx.session())?;
+                current_builder = frame.parent_builder;
+                continue;
+            }
+
             if current_builder.is_none()
                 && let Some(frame) = stack.last()
                 && let Some(result) = {
@@ -225,7 +245,18 @@ impl ArrayRef {
                 continue;
             }
 
-            // Step 2b: execute_parent against current_array's own children.
+            // Step 2b: reduce_parent/execute_parent against current_array's own children.
+            if current_builder.is_none()
+                && let Some(rewritten) = try_reduce_parent(&current_array, ctx)?
+            {
+                ctx.log(format_args!(
+                    "reduce_parent rewrote {} -> {}",
+                    current_array, rewritten
+                ));
+                current_array = rewritten.optimize_ctx(ctx.session())?;
+                continue;
+            }
+
             if current_builder.is_none()
                 && let Some(rewritten) = try_execute_parent(&current_array, kernels, ctx)?
             {
@@ -587,6 +618,25 @@ fn execute_parent_for_child(
         }
     }
 
+    Ok(None)
+}
+
+/// Try reduce_parent on each occupied slot of the array.
+fn try_reduce_parent(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>> {
+    for (slot_idx, slot) in array.slots().iter().enumerate() {
+        let Some(child) = slot else { continue };
+        if let Some(reduced_parent) = child.reduce_parent(array, slot_idx)? {
+            ctx.log(format_args!(
+                "reduce_parent: slot[{}]({}) rewrote {} -> {}",
+                slot_idx,
+                child.encoding_id(),
+                array,
+                reduced_parent
+            ));
+            reduced_parent.statistics().inherit_from(array.statistics());
+            return Ok(Some(reduced_parent));
+        }
+    }
     Ok(None)
 }
 

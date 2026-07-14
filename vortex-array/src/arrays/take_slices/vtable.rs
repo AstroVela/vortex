@@ -14,7 +14,6 @@ use vortex_session::registry::CachedId;
 use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::EmptyArrayData;
-use crate::IntoArray;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -150,14 +149,6 @@ impl VTable for TakeSlices {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        let parent = array.clone().into_array();
-        if let Some(reduced) = array
-            .child()
-            .reduce_parent(&parent, TakeSlicesSlots::CHILD)?
-        {
-            return Ok(ExecutionResult::done(reduced));
-        }
-
         let mut builder = builder_with_capacity_in(ctx.allocator(), array.dtype(), array.len());
         append_selected_ranges(array.as_view(), builder.as_mut(), ctx)?;
         Ok(ExecutionResult::done(builder.finish()))
