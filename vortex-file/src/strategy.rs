@@ -322,12 +322,14 @@ impl WriteStrategyBuilder {
             probe_compressor,
         );
 
+        let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
+
         // 2. calculate stats for each row group
         let stats = ZonedStrategy::new(
             dict,
             compress_then_flat.clone(),
             ZonedLayoutOptions {
-                block_size: NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0"),
+                block_size: row_block_size,
                 ..Default::default()
             },
         );
@@ -346,6 +348,7 @@ impl WriteStrategyBuilder {
         );
 
         // 0. start with splitting columns
+        let list_stats: Arc<dyn LayoutStrategy> = Arc::new(compress_then_flat.clone());
         let validity_strategy = CollectStrategy::new(compress_then_flat);
 
         // Take any field overrides from the builder and apply them to the final strategy.
@@ -354,7 +357,7 @@ impl WriteStrategyBuilder {
                 .with_field_writers(self.field_writers);
 
         if self.use_list_layout {
-            table_strategy = table_strategy.with_list_layout();
+            table_strategy = table_strategy.with_zoned_list_layout(row_block_size, list_stats);
         }
 
         Arc::new(table_strategy)

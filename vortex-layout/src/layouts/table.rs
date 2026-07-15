@@ -13,6 +13,7 @@
 //! at any depth — onto a custom strategy.
 
 use std::env;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -29,7 +30,11 @@ use vortex_utils::aliases::hash_set::HashSet;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
 use crate::layouts::list::writer::ListLayoutStrategy;
+use crate::layouts::repartition::RepartitionStrategy;
+use crate::layouts::repartition::RepartitionWriterOptions;
 use crate::layouts::struct_::StructStrategy;
+use crate::layouts::zoned::writer::ZonedLayoutOptions;
+use crate::layouts::zoned::writer::ZonedStrategy;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
 use crate::sequence::SequencePointer;
@@ -43,6 +48,12 @@ pub fn use_experimental_list_layout() -> bool {
     static USE_EXPERIMENTAL_LIST_LAYOUT: LazyLock<bool> =
         LazyLock::new(|| env::var("VORTEX_EXPERIMENTAL_LIST_LAYOUT").is_ok_and(|v| v == "1"));
     *USE_EXPERIMENTAL_LIST_LAYOUT
+}
+
+#[derive(Clone)]
+struct ListLayoutZones {
+    row_block_size: NonZeroUsize,
+    stats: Arc<dyn LayoutStrategy>,
 }
 
 /// A configurable strategy for writing nested tabular data, dispatching each (sub)stream to the
@@ -71,6 +82,8 @@ pub struct TableStrategy {
     ///
     /// [`ListLayoutStrategy`]: crate::layouts::list::writer::ListLayoutStrategy
     use_list_layout: bool,
+    /// Optional outer-row zoning applied before a list is structurally decomposed.
+    list_layout_zones: Option<ListLayoutZones>,
 }
 
 impl TableStrategy {
@@ -98,6 +111,7 @@ impl TableStrategy {
             validity,
             leaf: fallback,
             use_list_layout: false,
+            list_layout_zones: None,
         }
     }
 
@@ -170,6 +184,20 @@ impl TableStrategy {
         self.use_list_layout = true;
         self
     }
+
+    /// Enable list layouts, repartitioned and zoned in outer-row space before decomposition.
+    pub fn with_zoned_list_layout(
+        mut self,
+        row_block_size: NonZeroUsize,
+        stats: Arc<dyn LayoutStrategy>,
+    ) -> Self {
+        self.use_list_layout = true;
+        self.list_layout_zones = Some(ListLayoutZones {
+            row_block_size,
+            stats,
+        });
+        self
+    }
 }
 
 impl TableStrategy {
@@ -210,12 +238,35 @@ impl TableStrategy {
     /// The `elements` sub-column is routed back through a clean descended dispatcher so nested
     /// structs/lists recurse; `offsets` go straight to the leaf (they are always a primitive
     /// column); and `validity` uses the shared validity strategy.
-    fn list_strategy(&self) -> ListLayoutStrategy {
-        ListLayoutStrategy::default()
+    fn list_strategy(&self) -> Arc<dyn LayoutStrategy> {
+        let mut list_layout = ListLayoutStrategy::default()
             .with_elements(Arc::new(self.descend_clean()))
             .with_offsets(Arc::clone(&self.leaf))
             .with_validity(Arc::clone(&self.validity))
-            .with_fallback(Arc::clone(&self.leaf))
+            .with_fallback(Arc::clone(&self.leaf));
+
+        let Some(zones) = &self.list_layout_zones else {
+            return Arc::new(list_layout);
+        };
+
+        list_layout = list_layout.with_input_row_splits();
+        let zoned = ZonedStrategy::new(
+            list_layout,
+            Arc::clone(&zones.stats),
+            ZonedLayoutOptions {
+                block_size: zones.row_block_size,
+                ..Default::default()
+            },
+        );
+        Arc::new(RepartitionStrategy::new(
+            zoned,
+            RepartitionWriterOptions {
+                block_size_minimum: 0,
+                block_len_multiple: zones.row_block_size.get(),
+                block_size_target: None,
+                canonicalize: false,
+            },
+        ))
     }
 
     /// Descend into a subfield, retaining only the overrides that apply beneath it (rebased to be
@@ -237,6 +288,7 @@ impl TableStrategy {
             validity: Arc::clone(&self.validity),
             leaf: Arc::clone(&self.leaf),
             use_list_layout: self.use_list_layout,
+            list_layout_zones: self.list_layout_zones.clone(),
         }
     }
 
@@ -248,6 +300,7 @@ impl TableStrategy {
             validity: Arc::clone(&self.validity),
             leaf: Arc::clone(&self.leaf),
             use_list_layout: self.use_list_layout,
+            list_layout_zones: self.list_layout_zones.clone(),
         }
     }
 
@@ -306,6 +359,7 @@ impl LayoutStrategy for TableStrategy {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::task::Poll;
 
@@ -325,6 +379,7 @@ mod tests {
     use vortex_array::field_path;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
@@ -333,7 +388,9 @@ mod tests {
     use crate::LayoutStrategy;
     use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
+    use crate::layouts::list::List;
     use crate::layouts::table::TableStrategy;
+    use crate::layouts::zoned::Zoned;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
@@ -439,9 +496,7 @@ mod tests {
         Ok(())
     }
 
-    /// A multi-chunk `list<i32>` written with a chunked leaf: each sub-column (`elements`,
-    /// `offsets`) becomes its own `ChunkedLayout`, so elements are chunked independently of rows.
-    /// This is the "list-of-chunkeds" topology top-level decomposition unlocks.
+    /// A multi-chunk list remains one list layout whose children use the configured chunked leaf.
     #[tokio::test]
     async fn dispatches_chunked_list() -> VortexResult<()> {
         let chunk0 = ListArray::try_new(
@@ -475,6 +530,35 @@ mod tests {
             ├── [0]: vortex.flat, dtype: u64, segment: 2
             └── [1]: vortex.flat, dtype: u64, segment: 3
         ");
+        Ok(())
+    }
+
+    /// Zones are computed before list decomposition, while the data remains one list layout whose
+    /// shared scan splits match the actual repartitioned input boundaries.
+    #[tokio::test]
+    async fn keeps_one_list_layout_across_outer_splits() -> VortexResult<()> {
+        let list = ListArray::try_new(
+            PrimitiveArray::from_iter(0..9_i32).into_array(),
+            PrimitiveArray::from_iter(0..=9_u32).into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+
+        let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+        let chunked: Arc<dyn LayoutStrategy> =
+            Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()));
+        let dispatcher = TableStrategy::new(Arc::clone(&flat), chunked)
+            .with_zoned_list_layout(NonZeroUsize::new(4).vortex_expect("4 is non-zero"), flat);
+
+        let layout = write(&dispatcher, list).await?;
+        let zoned = layout.as_::<Zoned>();
+        assert_eq!(zoned.zone_len(), 4);
+        assert_eq!(zoned.nzones(), 3);
+
+        let data = layout.child(0)?;
+        assert!(data.is::<List>());
+        assert_eq!(data.row_count(), 9);
+        assert_eq!(data.as_::<List>().row_splits(), [4, 8]);
         Ok(())
     }
 

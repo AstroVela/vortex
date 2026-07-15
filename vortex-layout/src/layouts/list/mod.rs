@@ -16,6 +16,7 @@ use vortex_array::dtype::PType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
@@ -70,7 +71,10 @@ impl VTable for List {
     }
 
     fn metadata(layout: &Self::Layout) -> Self::Metadata {
-        ProstMetadata(ListLayoutMetadata::new(layout.offsets_ptype()))
+        ProstMetadata(ListLayoutMetadata::new(
+            layout.offsets_ptype(),
+            layout.row_splits().to_vec(),
+        ))
     }
 
     fn segment_ids(_layout: &Self::Layout) -> Vec<SegmentId> {
@@ -122,13 +126,14 @@ impl VTable for List {
     fn build(
         _encoding: &Self::Encoding,
         dtype: &DType,
-        _row_count: u64,
+        row_count: u64,
         metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
         _ctx: &LayoutBuildContext<'_>,
     ) -> VortexResult<Self::Layout> {
         validate_children(dtype, children.nchildren())?;
+        validate_row_splits(row_count, &metadata.row_splits)?;
 
         let elements_dtype = dtype
             .as_list_element_opt()
@@ -148,6 +153,7 @@ impl VTable for List {
             elements,
             offsets,
             validity,
+            row_splits: Arc::from(metadata.row_splits.clone()),
         })
     }
 
@@ -185,6 +191,18 @@ fn validate_children(dtype: &DType, n_children: usize) -> VortexResult<()> {
     Ok(())
 }
 
+fn validate_row_splits(row_count: u64, row_splits: &[u64]) -> VortexResult<()> {
+    let mut previous = 0;
+    for &split in row_splits {
+        vortex_ensure!(
+            split > previous && split < row_count,
+            "List row splits must be strictly increasing interior boundaries: {row_splits:?} for row count {row_count}"
+        );
+        previous = split;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ListLayoutEncoding;
 
@@ -195,6 +213,7 @@ pub struct ListLayout {
     elements: LayoutRef,
     offsets: LayoutRef,
     validity: Option<LayoutRef>,
+    row_splits: Arc<[u64]>,
 }
 
 impl ListLayout {
@@ -218,7 +237,17 @@ impl ListLayout {
             elements,
             offsets,
             validity,
+            row_splits: Arc::new([]),
         }
+    }
+
+    pub(crate) fn with_row_splits(mut self, row_splits: Vec<u64>) -> Self {
+        self.row_splits = row_splits.into();
+        self
+    }
+
+    pub(crate) fn row_splits(&self) -> &[u64] {
+        &self.row_splits
     }
 
     /// Number of lists in this layout.
@@ -260,12 +289,15 @@ impl ListLayout {
 pub struct ListLayoutMetadata {
     #[prost(enumeration = "PType", tag = "1")]
     offsets_ptype: i32,
+    #[prost(uint64, repeated, tag = "2")]
+    row_splits: Vec<u64>,
 }
 
 impl ListLayoutMetadata {
-    pub fn new(offsets_ptype: PType) -> Self {
+    pub fn new(offsets_ptype: PType, row_splits: Vec<u64>) -> Self {
         let mut metadata = Self::default();
         metadata.set_offsets_ptype(offsets_ptype);
+        metadata.row_splits = row_splits;
         metadata
     }
 }

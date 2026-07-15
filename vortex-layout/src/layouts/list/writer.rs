@@ -70,6 +70,7 @@ pub struct ListLayoutStrategy {
     offsets: Arc<dyn LayoutStrategy>,
     validity: Arc<dyn LayoutStrategy>,
     fallback: Arc<dyn LayoutStrategy>,
+    record_input_row_splits: bool,
 }
 
 impl Default for ListLayoutStrategy {
@@ -82,6 +83,7 @@ impl Default for ListLayoutStrategy {
             offsets: Arc::clone(&flat),
             validity: Arc::clone(&flat),
             fallback: flat,
+            record_input_row_splits: false,
         }
     }
 }
@@ -108,6 +110,12 @@ impl ListLayoutStrategy {
     /// Strategy for non-list input, which is forwarded through this strategy unchanged.
     pub fn with_fallback(mut self, fallback: Arc<dyn LayoutStrategy>) -> Self {
         self.fallback = fallback;
+        self
+    }
+
+    /// Record the input stream's cumulative chunk boundaries as outer-row scan splits.
+    pub fn with_input_row_splits(mut self) -> Self {
+        self.record_input_row_splits = true;
         self
     }
 }
@@ -197,14 +205,23 @@ impl LayoutStrategy for ListLayoutStrategy {
             })
             .collect();
 
-        let (_, layouts) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
+        let (row_splits, layouts) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
         let mut layouts = layouts.into_iter();
         let elements_layout = layouts.next().vortex_expect("elements layout present");
         let offsets_layout = layouts.next().vortex_expect("offsets layout present");
         let validity_layout =
             is_nullable.then(|| layouts.next().vortex_expect("validity layout present"));
 
-        Ok(ListLayout::new(dtype, elements_layout, offsets_layout, validity_layout).into_layout())
+        let row_splits = if self.record_input_row_splits {
+            row_splits
+        } else {
+            Vec::new()
+        };
+        Ok(
+            ListLayout::new(dtype, elements_layout, offsets_layout, validity_layout)
+                .with_row_splits(row_splits)
+                .into_layout(),
+        )
     }
 
     fn buffered_bytes(&self) -> u64 {
@@ -227,11 +244,13 @@ async fn transpose_list_column(
     elements_tx: kanal::AsyncSender<ChildChunk>,
     offsets_tx: kanal::AsyncSender<ChildChunk>,
     validity_tx: Option<kanal::AsyncSender<ChildChunk>>,
-) -> VortexResult<()> {
+) -> VortexResult<Vec<u64>> {
     let mut exec_ctx = session.create_execution_ctx();
     let mut element_base: u64 = 0;
     let mut first = true;
     let mut saw_chunk = false;
+    let mut row_end = 0_u64;
+    let mut row_splits = Vec::new();
     while let Some(chunk) = stream.next().await {
         let (sequence_id, array) = chunk?;
         saw_chunk = true;
@@ -244,6 +263,12 @@ async fn transpose_list_column(
         } = canonicalize_to_list_parts(array, &mut exec_ctx)?;
         let n_elements = elements.len() as u64;
         let row_count = offsets.len().saturating_sub(1);
+        if row_count > 0 {
+            row_end = row_end
+                .checked_add(u64::try_from(row_count)?)
+                .vortex_expect("List row count overflow");
+            row_splits.push(row_end);
+        }
         let offsets = global_offsets(offsets, element_base, first, &mut exec_ctx)?;
         element_base += n_elements;
         first = false;
@@ -272,7 +297,8 @@ async fn transpose_list_column(
     if !saw_chunk {
         vortex_bail!("ListLayoutStrategy needs at least one chunk");
     }
-    Ok(())
+    row_splits.pop();
+    Ok(row_splits)
 }
 
 /// Canonicalize a list-dtype array into [`ListDataParts`].
