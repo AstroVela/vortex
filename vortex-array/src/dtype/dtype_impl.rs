@@ -82,8 +82,9 @@ impl DType {
 
     /// Get a new DType with the given nullability (but otherwise the same as `self`).
     ///
-    /// [`DType::Null`] and [`DType::Union`] have intrinsic nullability and are returned unchanged.
-    /// To change a union's nullability, construct different [`UnionVariants`].
+    /// [`DType::Null`] has intrinsic nullability and is returned unchanged. A [`DType::Union`] has
+    /// no top-level nullability of its own — its nullability is derived from its variants — so
+    /// `nullability` is propagated into every variant instead.
     pub fn with_nullability(&self, nullability: Nullability) -> Self {
         match self {
             Null => Null,
@@ -95,7 +96,7 @@ impl DType {
             List(edt, _) => List(Arc::clone(edt), nullability),
             FixedSizeList(edt, size, _) => FixedSizeList(Arc::clone(edt), *size, nullability),
             Struct(sf, _) => Struct(sf.clone(), nullability),
-            Union(vs) => Union(vs.clone()),
+            Union(vs) => Union(vs.with_nullability(nullability)),
             Variant(_) => Variant(nullability),
             Extension(ext) => Extension(ext.with_nullability(nullability)),
         }

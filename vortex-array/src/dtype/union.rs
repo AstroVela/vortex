@@ -353,6 +353,21 @@ impl UnionVariants {
     pub fn derived_nullability(&self) -> Nullability {
         self.variants().any(|dtype| dtype.is_nullable()).into()
     }
+
+    /// Returns a copy of these variants with `nullability` applied to every variant [`DType`].
+    ///
+    /// A union has no top-level nullability of its own; its nullability is derived from its
+    /// variants (see [`Self::derived_nullability`]). Setting a union's nullability therefore means
+    /// propagating `nullability` into each variant.
+    pub fn with_nullability(&self, nullability: Nullability) -> Self {
+        let dtypes: Vec<DType> = self
+            .variants()
+            .map(|variant| variant.with_nullability(nullability))
+            .collect();
+
+        Self::try_new(self.names().clone(), dtypes, self.type_ids().to_vec())
+            .vortex_expect("changing variant nullability preserves union validity")
+    }
 }
 
 #[cfg(test)]
@@ -526,16 +541,29 @@ mod tests {
     }
 
     #[test]
-    fn test_with_nullability_does_not_change_union_variants() {
+    fn test_with_nullability_propagates_to_variants() {
         let nonnullable = DType::Union(i32_variants());
-        assert_eq!(nonnullable.as_nullable(), nonnullable);
         assert_eq!(nonnullable.nullability(), Nullability::NonNullable);
 
-        let nullable = DType::Union(
-            UnionVariants::new(["value"].into(), vec![DType::Utf8(Nullability::Nullable)]).unwrap(),
-        );
-        assert_eq!(nullable.as_nonnullable(), nullable);
+        // `as_nullable` makes every variant nullable, since a union has no top-level nullability.
+        let nullable = nonnullable.as_nullable();
         assert_eq!(nullable.nullability(), Nullability::Nullable);
+        assert_eq!(
+            nullable,
+            DType::Union(
+                UnionVariants::new(
+                    ["int", "str"].into(),
+                    vec![
+                        DType::Primitive(PType::I32, Nullability::Nullable),
+                        DType::Utf8(Nullability::Nullable),
+                    ],
+                )
+                .unwrap()
+            )
+        );
+
+        // `as_nonnullable` propagates the other direction, round-tripping back to the original.
+        assert_eq!(nullable.as_nonnullable(), nonnullable);
     }
 
     #[test]
