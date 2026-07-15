@@ -157,9 +157,8 @@ fn distance_prune_proof(
         Operator::Gt if radius < 0.0 => return None,
         _ => {}
     }
-    // The stat is read through `ext_storage`/`get_item`, which propagate a missing stat (null) to
-    // "keep the chunk". Compared squared to avoid a `sqrt`; all operands are `>= 0`.
-    let aabb = ext_storage(stat(geom.clone(), GeometryAabb.bind(EmptyOptions)));
+    // Compared squared to avoid a `sqrt`; all operands are `>= 0`.
+    let aabb = aabb_stat(geom);
     let r2 = lit(radius * radius);
     Some(match op {
         // Beyond the threshold: even the nearest the box can be exceeds `r`.
@@ -170,6 +169,14 @@ fn distance_prune_proof(
         Operator::Gt => lt_eq(max_dist_sq(&aabb, query), r2),
         _ => return None,
     })
+}
+
+/// The chunk's AABB statistic, as the storage struct with `xmin`/`ymin`/`xmax`/`ymax` fields.
+///
+/// A chunk written without the statistic reads as null here; every proof built on top must let
+/// that null propagate to its root, where the zone map keeps the chunk.
+fn aabb_stat(geom: &Expression) -> Expression {
+    ext_storage(stat(geom.clone(), GeometryAabb.bind(EmptyOptions)))
 }
 
 /// Squared minimum distance between the chunk box `aabb` and the query box - a lower bound on every
