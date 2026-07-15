@@ -548,6 +548,53 @@ Artifacts:
 
 Status: completed; currently present in the worktree.
 
+### 14. Expand the mask into element space versus crop then filter
+
+Configuration:
+
+- Both readers await the outer-row mask, return without reading elements for an all-false mask,
+  and crop the request to the first and last selected outer rows.
+- Variant A expands interior holes into an elements-space mask and passes it to the elements
+  layout.
+- Variant B reads the same cropped contiguous element range, reconstructs the cropped list, and
+  delegates interior holes to the existing `ListArray::filter` kernel.
+- Both variants use the same SF100 outer-zoned file, DuckDB binary configuration, list-layout env
+  flag, and 20 iterations. The original branch used for this isolated reader comparison does not
+  yet consume the persisted list row splits, so the absolute q10 time is not comparable with
+  experiment 13; the A/B ratio is comparable.
+
+Results:
+
+| Query | Expanded mask (ms) | Crop + existing filter (ms) | Crop / expanded |
+| --- | ---: | ---: | ---: |
+| q07 | 50.833 | 49.919 | 0.98x |
+| q08 | 53.746 | 54.082 | 1.01x |
+| q10 | 6374.661 | 6376.089 | 1.00x |
+
+Direct segment-request check:
+
+- With the expanded-mask reader, selecting the first and last rows of a five-element-chunk test
+  list requests all five element segments plus the offsets segment.
+- `ChunkedReader::projection_evaluation` constructs a child projection for every chunk that
+  intersects the requested element range, and `FlatReader` registers its segment request while
+  constructing that projection. Interior all-false masks therefore do not prune physical reads.
+
+Learning:
+
+- The observed selective-query improvement comes from skipping all elements for all-false outer
+  ranges and cropping leading/trailing unselected lists, not from the interior elements mask.
+- The expanded mask adds no measurable benefit under the current chunked reader.
+- Crop then delegate interior filtering to the existing list filter kernel is the simpler reader
+  structure to retain. True interior-chunk pruning, if needed, should be evaluated separately with
+  resolved-mask-aware chunk selection.
+
+Artifacts:
+
+- Expanded mask: `/private/tmp/statpopgen-mask-expanded-ab-20.jsonl`
+- Crop + existing filter: `/private/tmp/statpopgen-crop-filter-ab-20.jsonl`
+
+Status: completed; crop + existing filter is present but uncommitted on `mk/list-layout-refactor`.
+
 ## Current synthesis
 
 - Whole-column list decomposition gives the element reader useful structure but divorces physical
@@ -557,6 +604,8 @@ Status: completed; currently present in the worktree.
 - A common/coalesced root grid works well for selective wide scans.
 - A list reader must choose between dense and selective element reads from the resolved row mask,
   not from whether the requested range happens to cover a complete local layout child.
+- The current chunked projection reader does not prune interior all-false child masks; the proven
+  selective-list benefit is all-false short-circuiting plus first/last outer-row cropping.
 - A single whole-column list wrapped in outer-row zones is the best overall ordinary-chunk
   configuration tested; chunking the list itself adds avoidable selective-read overhead.
 - Zone the outer list before shredding, and derive the shared row splits from those same
