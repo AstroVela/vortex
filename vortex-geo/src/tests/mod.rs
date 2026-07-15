@@ -17,4 +17,8 @@ use std::sync::LazyLock;
 use vortex_session::VortexSession;
 
 /// A session with the geospatial types and functions registered.
-static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::test_harness::geo_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = vortex_array::array_session();
+    crate::initialize(&session);
+    session
+});
