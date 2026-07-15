@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Chunk pruning for spatial filters, using the per-chunk [`GeometryBounds`] bounding box.
+//! Chunk pruning for spatial filters, using the per-chunk [`GeometryAabb`] axis-aligned
+//! bounding box (AABB).
 
 use geo::BoundingRect;
 use geo::Rect as GeoRect;
@@ -32,13 +33,13 @@ use vortex_array::stats::stat;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::aggregate_fn::GeometryBounds;
+use crate::aggregate_fn::GeometryAabb;
 use crate::extension::is_native_geometry;
 use crate::extension::single_geometry;
 use crate::scalar_fn::distance::GeoDistance;
 
-/// Prunes chunks for `ST_Distance(geom, const) <op> r` filters using the chunk's [`GeometryBounds`]
-/// bounding box. Register it with `crate::initialize`; a chunk written without the `GeometryBounds`
+/// Prunes chunks for `ST_Distance(geom, const) <op> r` filters using the chunk's [`GeometryAabb`]
+/// bounding box. Register it with `crate::initialize`; a chunk written without the `GeometryAabb`
 /// statistic is scanned rather than skipped.
 ///
 /// All four comparisons prune: `<= r` / `< r` skip a chunk whose box is wholly beyond `r` (box
@@ -47,9 +48,9 @@ use crate::scalar_fn::distance::GeoDistance;
 /// `geometry_and_constant` + `distance_prune_proof` helpers; no new statistic or file-format change
 /// is needed.
 #[derive(Debug)]
-pub struct GeoDistanceBoundsPrune;
+pub struct GeoDistancePrune;
 
-impl StatsRewriteRule for GeoDistanceBoundsPrune {
+impl StatsRewriteRule for GeoDistancePrune {
     fn scalar_fn_id(&self) -> ScalarFnId {
         // The predicate root is the comparison, not `GeoDistance`, so key on `Binary`.
         Binary.id()
@@ -60,7 +61,10 @@ impl StatsRewriteRule for GeoDistanceBoundsPrune {
         expr: &Expression,
         ctx: &StatsRewriteCtx<'_>,
     ) -> VortexResult<Option<Expression>> {
-        // Only the distance comparisons prune; `==` / `!=` and other operators fall through.
+        // Only the ordered comparisons prune today. `== r` could prune in the future (a chunk is
+        // provably empty when `r` lies outside its box's [min, max] distance interval), it's just
+        // not implemented. `!= r` cannot: pruning would need every row's distance to equal `r`,
+        // which an AABB can't prove.
         let op = *expr.as_::<Binary>();
         if !matches!(
             op,
@@ -80,6 +84,9 @@ impl StatsRewriteRule for GeoDistanceBoundsPrune {
         let Some(radius) = expr.child(1).as_opt::<Literal>() else {
             return Ok(None);
         };
+        // Casts any primitive radius (integer literals included); it fails only for a null or
+        // non-primitive literal, where falling through means "scan the chunk", which is always
+        // sound.
         let Ok(radius) = f64::try_from(radius) else {
             return Ok(None);
         };
@@ -89,7 +96,7 @@ impl StatsRewriteRule for GeoDistanceBoundsPrune {
             return Ok(None);
         }
 
-        // Reduce `const` (any geometry type) to its bounding box. Every row sits in the chunk MBR
+        // Reduce `const` (any geometry type) to its AABB. Every row sits in the chunk AABB
         // and `const` in this box, so the box-to-box distance bounds the true distance soundly for
         // any geometry types.
         let mut exec = ctx.session().create_execution_ctx();
@@ -100,9 +107,9 @@ impl StatsRewriteRule for GeoDistanceBoundsPrune {
     }
 }
 
-/// Shared bounds-pruning helper: split a symmetric geo predicate's operands into the scope-rooted
+/// Shared AABB-pruning helper: split a symmetric geo predicate's operands into the scope-rooted
 /// geometry column and the constant's scalar, or `None` when the expression doesn't have that
-/// shape or the geometry's dtype has no [`GeometryBounds`] support. Symmetric only - an asymmetric
+/// shape or the geometry's dtype has no [`GeometryAabb`] support. Symmetric only - an asymmetric
 /// predicate that needs to know *which* operand is the column must recover the role separately.
 fn geometry_and_constant<'a>(
     expr: &'a Expression,
@@ -119,7 +126,7 @@ fn geometry_and_constant<'a>(
         return Ok(None);
     };
 
-    // A `GeometryBounds` stat reference only binds for dtypes it supports; anything else (e.g. a
+    // A `GeometryAabb` stat reference only binds for dtypes it supports; anything else (e.g. a
     // WKB column) must fall through to the scan.
     if !is_native_geometry(&ctx.return_dtype(geom)?) {
         return Ok(None);
@@ -152,24 +159,24 @@ fn distance_prune_proof(
     }
     // The stat is read through `ext_storage`/`get_item`, which propagate a missing stat (null) to
     // "keep the chunk". Compared squared to avoid a `sqrt`; all operands are `>= 0`.
-    let mbr = ext_storage(stat(geom.clone(), GeometryBounds.bind(EmptyOptions)));
+    let aabb = ext_storage(stat(geom.clone(), GeometryAabb.bind(EmptyOptions)));
     let r2 = lit(radius * radius);
     Some(match op {
         // Beyond the threshold: even the nearest the box can be exceeds `r`.
-        Operator::Lte => gt(min_dist_sq(&mbr, query), r2),
-        Operator::Lt => gt_eq(min_dist_sq(&mbr, query), r2),
+        Operator::Lte => gt(min_dist_sq(&aabb, query), r2),
+        Operator::Lt => gt_eq(min_dist_sq(&aabb, query), r2),
         // Within the threshold: even the farthest the box can be is below `r`.
-        Operator::Gte => lt(max_dist_sq(&mbr, query), r2),
-        Operator::Gt => lt_eq(max_dist_sq(&mbr, query), r2),
+        Operator::Gte => lt(max_dist_sq(&aabb, query), r2),
+        Operator::Gt => lt_eq(max_dist_sq(&aabb, query), r2),
         _ => return None,
     })
 }
 
-/// Squared minimum distance between the chunk box `mbr` and the query box - a lower bound on every
+/// Squared minimum distance between the chunk box `aabb` and the query box - a lower bound on every
 /// row's distance. `dx^2 + dy^2`, each axis gap clamped at zero (zero when the intervals overlap).
-fn min_dist_sq(mbr: &Expression, query: GeoRect<f64>) -> Expression {
-    let field = |name: &str| get_item(name, mbr.clone());
-    // max(0, q_lo - mbr_hi, mbr_lo - q_hi): positive only when the intervals are separated.
+fn min_dist_sq(aabb: &Expression, query: GeoRect<f64>) -> Expression {
+    let field = |name: &str| get_item(name, aabb.clone());
+    // max(0, q_lo - aabb_hi, aabb_lo - q_hi): positive only when the intervals are separated.
     let gap = |q_lo: f64, q_hi: f64, lo: Expression, hi: Expression| {
         maximum(
             lit(0.0),
@@ -184,12 +191,12 @@ fn min_dist_sq(mbr: &Expression, query: GeoRect<f64>) -> Expression {
     checked_add(square(dx), square(dy))
 }
 
-/// Squared maximum distance between the chunk box `mbr` and the query box - an upper bound on every
+/// Squared maximum distance between the chunk box `aabb` and the query box - an upper bound on every
 /// row's distance. `Dx^2 + Dy^2`, each axis span the full extent of the two intervals' union.
-fn max_dist_sq(mbr: &Expression, query: GeoRect<f64>) -> Expression {
-    let field = |name: &str| get_item(name, mbr.clone());
-    // max(q_hi, mbr_hi) - min(q_lo, mbr_lo): the farthest two points of the boxes can be on an axis.
-    // The (nullable) MBR field is passed as the second arg so `case_when`'s else branch carries the
+fn max_dist_sq(aabb: &Expression, query: GeoRect<f64>) -> Expression {
+    let field = |name: &str| get_item(name, aabb.clone());
+    // max(q_hi, aabb_hi) - min(q_lo, aabb_lo): the farthest two points of the boxes can be on an axis.
+    // The (nullable) AABB field is passed as the second arg so `case_when`'s else branch carries the
     // nullability - a missing stat then propagates null through to "keep the chunk".
     let span = |q_lo: f64, q_hi: f64, lo: Expression, hi: Expression| {
         binop(
@@ -257,11 +264,12 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_layout::layouts::zoned::zone_map::ZoneMap;
 
-    use super::GeoDistanceBoundsPrune;
-    use crate::aggregate_fn::GeometryBounds;
+    use super::GeoDistancePrune;
+    use crate::aggregate_fn::GeometryAabb;
     use crate::extension::GeoMetadata;
     use crate::extension::Rect;
     use crate::scalar_fn::distance::GeoDistance;
+    use crate::test_harness::geo_session;
     use crate::test_harness::point_column;
 
     /// Run the rule against `GeoDistance(root, origin) <operator> radius`, operands swapped when
@@ -271,8 +279,7 @@ mod tests {
         geom_first: bool,
         radius: f64,
     ) -> VortexResult<Option<Expression>> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
         let mut ctx = session.create_execution_ctx();
 
         let scope = point_column(vec![0.0], vec![0.0])?.dtype().clone();
@@ -285,7 +292,7 @@ mod tests {
         let distance = GeoDistance.new_expr(EmptyOptions, operands);
         let predicate = Binary.new_expr(operator, [distance, lit(radius)]);
 
-        GeoDistanceBoundsPrune.falsify(&predicate, &StatsRewriteCtx::new(&session, &scope))
+        GeoDistancePrune.falsify(&predicate, &StatsRewriteCtx::new(&session, &scope))
     }
 
     /// All four distance comparisons prune (`<=`/`<` via min-distance, `>=`/`>` via max-distance);
@@ -326,12 +333,11 @@ mod tests {
         Ok(())
     }
 
-    /// A scope dtype without `GeometryBounds` support gets no proof - the stat reference would
+    /// A scope dtype without `GeometryAabb` support gets no proof - the stat reference would
     /// fail to bind at prune time.
     #[test]
     fn unsupported_scope_is_not_pruned() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
         let mut ctx = session.create_execution_ctx();
 
         let scope = DType::Primitive(PType::F64, Nullability::NonNullable);
@@ -340,34 +346,32 @@ mod tests {
         let predicate = lt_eq(distance, lit(0.5f64));
 
         let ctx = StatsRewriteCtx::new(&session, &scope);
-        assert!(GeoDistanceBoundsPrune.falsify(&predicate, &ctx)?.is_none());
+        assert!(GeoDistancePrune.falsify(&predicate, &ctx)?.is_none());
         Ok(())
     }
 
     /// A comparison that does not wrap `GeoDistance` is left untouched.
     #[test]
     fn ignores_non_distance_comparison() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
         let scope = point_column(vec![0.0], vec![0.0])?.dtype().clone();
 
         let predicate = lt_eq(lit(1.0f64), lit(2.0f64));
         let ctx = StatsRewriteCtx::new(&session, &scope);
-        assert!(GeoDistanceBoundsPrune.falsify(&predicate, &ctx)?.is_none());
+        assert!(GeoDistancePrune.falsify(&predicate, &ctx)?.is_none());
         Ok(())
     }
 
     /// End-to-end over a hand-built zone map: the far chunk is skipped, the near one kept.
     #[test]
     fn prunes_far_chunk_keeps_near() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
         let mut ctx = session.create_execution_ctx();
 
         let point_dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
-        let bounds_fn = GeometryBounds.bind(AggregateEmptyOptions);
+        let aabb_fn = GeometryAabb.bind(AggregateEmptyOptions);
 
-        // Two chunks' MBRs, stored as the native `geoarrow.box` stat column with default
+        // Two chunks' AABBs, stored as the native `geoarrow.box` stat column with default
         // (unreferenced) metadata to match the aggregate's return dtype: chunk 0 near the origin
         // (0,0..1,1), chunk 1 far away (100,100..101,101).
         let ord = |a: f64, b: f64| PrimitiveArray::from_iter([a, b]).into_array();
@@ -385,10 +389,10 @@ mod tests {
         .into_array();
         let box_dtype =
             ExtDType::<Rect>::try_new(GeoMetadata::default(), boxes.dtype().clone())?.erased();
-        let mbrs = ExtensionArray::try_new(box_dtype, boxes)?.into_array();
-        let zone_array = StructArray::from_fields(&[(bounds_fn.to_string().as_str(), mbrs)])?;
+        let aabbs = ExtensionArray::try_new(box_dtype, boxes)?.into_array();
+        let zone_array = StructArray::from_fields(&[(aabb_fn.to_string().as_str(), aabbs)])?;
         let zone_map =
-            ZoneMap::try_new(point_dtype.clone(), zone_array, Arc::new([bounds_fn]), 1, 2)?;
+            ZoneMap::try_new(point_dtype.clone(), zone_array, Arc::new([aabb_fn]), 1, 2)?;
 
         let origin = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
         let distance = GeoDistance.new_expr(EmptyOptions, [root(), lit(origin)]);
@@ -407,14 +411,13 @@ mod tests {
     /// neither axis alone exceeds `r` - the case a per-axis box-overlap test would wrongly keep.
     #[test]
     fn prunes_diagonally_distant_chunk() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
         let mut ctx = session.create_execution_ctx();
 
         let point_dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
-        let bounds_fn = GeometryBounds.bind(AggregateEmptyOptions);
+        let aabb_fn = GeometryAabb.bind(AggregateEmptyOptions);
 
-        // One chunk, MBR (0.8,0.8)..(0.9,0.9): each axis is only 0.8 from the origin (<= r = 1), but
+        // One chunk, AABB (0.8,0.8)..(0.9,0.9): each axis is only 0.8 from the origin (<= r = 1), but
         // the near corner is sqrt(0.8^2 + 0.8^2) ~= 1.13 away (> 1), so no point in the box is within 1.
         let ord = |a: f64| PrimitiveArray::from_iter([a]).into_array();
         let boxes = StructArray::try_new(
@@ -426,10 +429,10 @@ mod tests {
         .into_array();
         let box_dtype =
             ExtDType::<Rect>::try_new(GeoMetadata::default(), boxes.dtype().clone())?.erased();
-        let mbrs = ExtensionArray::try_new(box_dtype, boxes)?.into_array();
-        let zone_array = StructArray::from_fields(&[(bounds_fn.to_string().as_str(), mbrs)])?;
+        let aabbs = ExtensionArray::try_new(box_dtype, boxes)?.into_array();
+        let zone_array = StructArray::from_fields(&[(aabb_fn.to_string().as_str(), aabbs)])?;
         let zone_map =
-            ZoneMap::try_new(point_dtype.clone(), zone_array, Arc::new([bounds_fn]), 1, 1)?;
+            ZoneMap::try_new(point_dtype.clone(), zone_array, Arc::new([aabb_fn]), 1, 1)?;
 
         let origin = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
         let distance = GeoDistance.new_expr(EmptyOptions, [root(), lit(origin)]);
@@ -448,12 +451,11 @@ mod tests {
         Ok(())
     }
 
-    /// Backward compat: a zone map written without the `GeometryBounds` stat (an older file) keeps
+    /// Backward compat: a zone map written without the `GeometryAabb` stat (an older file) keeps
     /// every zone - the missing stat binds to null and `null_as_false` retains the zone.
     #[test]
-    fn missing_bounds_stat_keeps_all_zones() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+    fn missing_aabb_stat_keeps_all_zones() -> VortexResult<()> {
+        let session = geo_session();
         let mut ctx = session.create_execution_ctx();
 
         let point_dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
@@ -480,14 +482,13 @@ mod tests {
     /// satisfy `>= r`) via the box max-distance, while a chunk beyond `r` is kept.
     #[test]
     fn prunes_within_chunk_for_far_filter() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
         let mut ctx = session.create_execution_ctx();
 
         let point_dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
-        let bounds_fn = GeometryBounds.bind(AggregateEmptyOptions);
+        let aabb_fn = GeometryAabb.bind(AggregateEmptyOptions);
 
-        // Chunk 0 (MBR 0,0..0.5,0.5, farthest corner ~= 0.707) is entirely within 2 of the origin;
+        // Chunk 0 (AABB 0,0..0.5,0.5, farthest corner ~= 0.707) is entirely within 2 of the origin;
         // chunk 1 (100,100..101,101) is entirely beyond it.
         let ord = |a: f64, b: f64| PrimitiveArray::from_iter([a, b]).into_array();
         let boxes = StructArray::try_new(
@@ -504,10 +505,10 @@ mod tests {
         .into_array();
         let box_dtype =
             ExtDType::<Rect>::try_new(GeoMetadata::default(), boxes.dtype().clone())?.erased();
-        let mbrs = ExtensionArray::try_new(box_dtype, boxes)?.into_array();
-        let zone_array = StructArray::from_fields(&[(bounds_fn.to_string().as_str(), mbrs)])?;
+        let aabbs = ExtensionArray::try_new(box_dtype, boxes)?.into_array();
+        let zone_array = StructArray::from_fields(&[(aabb_fn.to_string().as_str(), aabbs)])?;
         let zone_map =
-            ZoneMap::try_new(point_dtype.clone(), zone_array, Arc::new([bounds_fn]), 1, 2)?;
+            ZoneMap::try_new(point_dtype.clone(), zone_array, Arc::new([aabb_fn]), 1, 2)?;
 
         let origin = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
         let distance = GeoDistance.new_expr(EmptyOptions, [root(), lit(origin)]);

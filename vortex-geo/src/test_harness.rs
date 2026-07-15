@@ -17,6 +17,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
+use vortex_session::VortexSession;
 
 use crate::extension::GeoMetadata;
 use crate::extension::LineString;
@@ -35,6 +36,13 @@ use crate::extension::multilinestring_storage_dtype;
 use crate::extension::multipoint_storage_dtype;
 use crate::extension::multipolygon_storage_dtype;
 use crate::extension::polygon_storage_dtype;
+
+/// A fresh session with the geospatial types, functions, and pruning rules registered.
+pub(crate) fn geo_session() -> VortexSession {
+    let session = vortex_array::array_session();
+    crate::initialize(&session);
+    session
+}
 
 /// The WGS 84 (`EPSG:4326`) metadata tagged onto test geometry columns.
 fn wgs84() -> GeoMetadata {

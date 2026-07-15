@@ -10,7 +10,7 @@ use vortex_array::stats::session::StatsSessionExt;
 use vortex_arrow::ArrowSessionExt;
 use vortex_session::VortexSession;
 
-use crate::aggregate_fn::GeometryBounds;
+use crate::aggregate_fn::GeometryAabb;
 use crate::extension::LineString;
 use crate::extension::MultiLineString;
 use crate::extension::MultiPoint;
@@ -19,7 +19,7 @@ use crate::extension::Point;
 use crate::extension::Polygon;
 use crate::extension::Rect;
 use crate::extension::WellKnownBinary;
-use crate::prune::GeoDistanceBoundsPrune;
+use crate::prune::GeoDistancePrune;
 use crate::scalar_fn::contains::GeoContains;
 use crate::scalar_fn::distance::GeoDistance;
 use crate::scalar_fn::intersects::GeoIntersects;
@@ -66,9 +66,10 @@ pub fn initialize(session: &VortexSession) {
     session.scalar_fns().register(GeoDistance);
     session.scalar_fns().register(GeoIntersects);
 
-    // The bounding-box aggregate; self-declares as a per-chunk zone stat for geometry columns.
-    session.aggregate_fns().register(GeometryBounds);
+    // The axis-aligned bounding-box (AABB) aggregate; self-declares as a per-chunk zone stat for
+    // geometry columns.
+    session.aggregate_fns().register(GeometryAabb);
 
-    // Register the spatial pruning rule that uses that bounding box.
-    session.stats().register_rewrite(GeoDistanceBoundsPrune);
+    // Register the spatial pruning rule that uses that AABB.
+    session.stats().register_rewrite(GeoDistancePrune);
 }

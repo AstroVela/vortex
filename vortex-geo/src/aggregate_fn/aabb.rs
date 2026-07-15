@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! A zone-map statistic: the 2D bounding box of a native geometry column.
+//! The 2D axis-aligned bounding-box (AABB) aggregate for native geometry columns.
 
 use geo::Rect as GeoRect;
 use vortex_array::ArrayRef;
@@ -32,23 +32,23 @@ use crate::extension::coordinate::Dimension;
 use crate::extension::flatten_coordinates;
 use crate::extension::is_native_geometry;
 
-/// Aggregates a native geometry column's 2D minimum bounding box as the native `geoarrow.box` type.
-/// Stored as a zone statistic, it lets spatial filters skip chunks whose bounding box cannot hold a
-/// matching row.
+/// Aggregates a native geometry column's 2D axis-aligned bounding box (AABB) as a native
+/// `geoarrow.box`, the spatial analogue of min/max. Also the default zone statistic for such
+/// columns (via `zone_stat_default`).
 #[derive(Clone, Debug)]
-pub struct GeometryBounds;
+pub struct GeometryAabb;
 
-/// Running union of geometry bounding boxes, or `None` until the first row. A transient
+/// Running union of geometry AABBs, or `None` until the first row. A transient
 /// `geo::Rect` value - the persisted stat is the native box (see `to_scalar`).
-pub struct BoundsPartial {
+pub struct AabbPartial {
     rect: Option<GeoRect<f64>>,
 }
 
-impl BoundsPartial {
+impl AabbPartial {
     /// Grow the accumulated box to also cover `other`.
     fn merge(&mut self, other: GeoRect<f64>) {
-        self.rect = Some(match self.rect {
-            Some(cur) => GeoRect::new(
+        self.rect = Some(self.rect.map_or(other, |cur| {
+            GeoRect::new(
                 (
                     cur.min().x.min(other.min().x),
                     cur.min().y.min(other.min().y),
@@ -57,28 +57,27 @@ impl BoundsPartial {
                     cur.max().x.max(other.max().x),
                     cur.max().y.max(other.max().y),
                 ),
-            ),
-            None => other,
-        });
+            )
+        }));
     }
 }
 
 /// The stat's type: the native `geoarrow.box` (2D), nullable so an empty group is a null box.
-fn bounds_dtype() -> DType {
+fn aabb_dtype() -> DType {
     DType::Extension(
-        ExtDType::<Rect>::try_new(GeoMetadata::default(), bounds_storage_dtype())
+        ExtDType::<Rect>::try_new(GeoMetadata::default(), aabb_storage_dtype())
             .vortex_expect("2D box storage is a valid Rect")
             .erased(),
     )
 }
 
 /// The `Rect` storage `Struct<xmin, ymin, xmax, ymax>` backing the zone statistic.
-fn bounds_storage_dtype() -> DType {
+fn aabb_storage_dtype() -> DType {
     box_storage_dtype(Dimension::Xy, Nullability::Nullable)
 }
 
-/// The bounding box of the raw `x`/`y` slices, or `None` when empty.
-fn bounds_of(xs: &[f64], ys: &[f64]) -> Option<GeoRect<f64>> {
+/// The AABB of the raw `x`/`y` slices, or `None` when empty.
+fn aabb_of(xs: &[f64], ys: &[f64]) -> Option<GeoRect<f64>> {
     if xs.is_empty() {
         return None;
     }
@@ -93,7 +92,7 @@ fn bounds_of(xs: &[f64], ys: &[f64]) -> Option<GeoRect<f64>> {
     Some(GeoRect::new((xmin, ymin), (xmax, ymax)))
 }
 
-/// Read a bounds stat scalar (a nullable native `geoarrow.box`) into a [`GeoRect`], or `None` when
+/// Read an AABB stat scalar (a nullable native `geoarrow.box`) into a [`GeoRect`], or `None` when
 /// the scalar is null (an empty group).
 fn rect_from_storage(scalar: &Scalar) -> VortexResult<Option<GeoRect<f64>>> {
     if scalar.is_null() {
@@ -105,7 +104,7 @@ fn rect_from_storage(scalar: &Scalar) -> VortexResult<Option<GeoRect<f64>>> {
         f64::try_from(
             &fields
                 .field(name)
-                .ok_or_else(|| vortex_err!("bounds missing {name}"))?,
+                .ok_or_else(|| vortex_err!("AABB missing {name}"))?,
         )
     };
     Ok(Some(GeoRect::new(
@@ -117,7 +116,7 @@ fn rect_from_storage(scalar: &Scalar) -> VortexResult<Option<GeoRect<f64>>> {
 /// Serialize a [`GeoRect`] as a native `geoarrow.box` stat scalar (inverse of [`rect_from_storage`]).
 fn rect_to_storage(rect: GeoRect<f64>) -> Scalar {
     let storage = Scalar::struct_(
-        bounds_storage_dtype(),
+        aabb_storage_dtype(),
         vec![
             Scalar::primitive(rect.min().x, Nullability::NonNullable),
             Scalar::primitive(rect.min().y, Nullability::NonNullable),
@@ -128,12 +127,12 @@ fn rect_to_storage(rect: GeoRect<f64>) -> Scalar {
     Scalar::extension::<Rect>(GeoMetadata::default(), storage)
 }
 
-impl AggregateFnVTable for GeometryBounds {
+impl AggregateFnVTable for GeometryAabb {
     type Options = EmptyOptions;
-    type Partial = BoundsPartial;
+    type Partial = AabbPartial;
 
     fn id(&self) -> AggregateFnId {
-        static ID: CachedId = CachedId::new("vortex.geo.bounds");
+        static ID: CachedId = CachedId::new("vortex.geo.aabb");
         *ID
     }
 
@@ -151,7 +150,7 @@ impl AggregateFnVTable for GeometryBounds {
     }
 
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
-        is_native_geometry(input_dtype).then(bounds_dtype)
+        is_native_geometry(input_dtype).then(aabb_dtype)
     }
 
     fn zone_stat_default(&self, input_dtype: &DType) -> Option<AggregateFnRef> {
@@ -167,7 +166,7 @@ impl AggregateFnVTable for GeometryBounds {
         _options: &Self::Options,
         _input_dtype: &DType,
     ) -> VortexResult<Self::Partial> {
-        Ok(BoundsPartial { rect: None })
+        Ok(AabbPartial { rect: None })
     }
 
     fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
@@ -180,7 +179,7 @@ impl AggregateFnVTable for GeometryBounds {
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
         Ok(match partial.rect {
             Some(rect) => rect_to_storage(rect),
-            None => Scalar::null(bounds_dtype()),
+            None => Scalar::null(aabb_dtype()),
         })
     }
 
@@ -189,7 +188,7 @@ impl AggregateFnVTable for GeometryBounds {
     }
 
     fn is_saturated(&self, _partial: &Self::Partial) -> bool {
-        // A bounding box can always grow, so it is never saturated.
+        // An AABB can always grow, so it is never saturated.
         false
     }
 
@@ -214,14 +213,14 @@ impl AggregateFnVTable for GeometryBounds {
             .unmasked_field_by_name("y")?
             .clone()
             .execute::<PrimitiveArray>(ctx)?;
-        if let Some(rect) = bounds_of(xs.as_slice::<f64>(), ys.as_slice::<f64>()) {
+        if let Some(rect) = aabb_of(xs.as_slice::<f64>(), ys.as_slice::<f64>()) {
             partial.merge(rect);
         }
         Ok(())
     }
 
     fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
-        // The stored partial is already the MBR struct, so finalizing is the identity.
+        // The stored partial is already the AABB struct, so finalizing is the identity.
         Ok(partials)
     }
 
@@ -246,10 +245,11 @@ mod tests {
     use vortex_array::scalar::Scalar;
     use vortex_error::VortexResult;
 
-    use super::BoundsPartial;
-    use super::GeometryBounds;
-    use super::bounds_dtype;
+    use super::AabbPartial;
+    use super::GeometryAabb;
+    use super::aabb_dtype;
     use super::rect_from_storage;
+    use crate::test_harness::geo_session;
     use crate::test_harness::linestring_column;
     use crate::test_harness::multilinestring_column;
     use crate::test_harness::multipoint_column;
@@ -275,80 +275,79 @@ mod tests {
     #[test]
     fn serializes_for_zone_storage() -> VortexResult<()> {
         let session = vortex_array::array_session();
-        let metadata = GeometryBounds
+        let metadata = GeometryAabb
             .serialize(&EmptyOptions)?
-            .expect("GeometryBounds must be serializable to be stored as a zone statistic");
-        GeometryBounds.deserialize(&metadata, &session)?;
+            .expect("GeometryAabb must be serializable to be stored as a zone statistic");
+        GeometryAabb.deserialize(&metadata, &session)?;
         Ok(())
     }
 
-    /// The MBR result's corners as `(xmin, ymin, xmax, ymax)`.
-    fn mbr(result: &Scalar) -> VortexResult<(f64, f64, f64, f64)> {
-        let rect = rect_from_storage(result)?.expect("non-null bounds");
+    /// The AABB result's corners as `(xmin, ymin, xmax, ymax)`.
+    fn aabb(result: &Scalar) -> VortexResult<(f64, f64, f64, f64)> {
+        let rect = rect_from_storage(result)?.expect("non-null AABB");
         Ok((rect.min().x, rect.min().y, rect.max().x, rect.max().y))
     }
 
-    /// The MBR of a Point column is the min/max of its coordinates, accumulated across batches.
+    /// The AABB of a Point column is the min/max of its coordinates, accumulated across batches.
     #[test]
-    fn point_bounds_across_batches() -> VortexResult<()> {
+    fn point_aabb_across_batches() -> VortexResult<()> {
         let session = vortex_array::array_session();
         let mut ctx = session.create_execution_ctx();
 
         let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
-        let mut acc = Accumulator::try_new(GeometryBounds, EmptyOptions, dtype)?;
+        let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, dtype)?;
 
         acc.accumulate(&point_column(vec![1.0, 3.0], vec![2.0, 4.0])?, &mut ctx)?;
         acc.accumulate(&point_column(vec![-1.0], vec![5.0])?, &mut ctx)?;
 
-        assert_eq!(mbr(&acc.finish()?)?, (-1.0, 2.0, 3.0, 5.0));
+        assert_eq!(aabb(&acc.finish()?)?, (-1.0, 2.0, 3.0, 5.0));
         Ok(())
     }
 
-    /// The MBR of a Polygon column unions every ring vertex - exercising the `List<List<Struct>>`
+    /// The AABB of a Polygon column unions every ring vertex - exercising the `List<List<Struct>>`
     /// unwrap, not just the bare Point struct.
     #[test]
-    fn polygon_bounds_union_all_vertices() -> VortexResult<()> {
+    fn polygon_aabb_union_all_vertices() -> VortexResult<()> {
         let session = vortex_array::array_session();
         let mut ctx = session.create_execution_ctx();
 
-        // Two rectangles: (0,0)-(2,3) and (5,5)-(7,8). The chunk MBR is their union: (0,0)-(7,8).
+        // Two rectangles: (0,0)-(2,3) and (5,5)-(7,8). The chunk AABB is their union: (0,0)-(7,8).
         let polygons = polygon_column(vec![
             vec![vec![(0.0, 0.0), (2.0, 0.0), (2.0, 3.0), (0.0, 3.0)]],
             vec![vec![(5.0, 5.0), (7.0, 5.0), (7.0, 8.0), (5.0, 8.0)]],
         ])?;
         let dtype = polygons.dtype().clone();
-        let mut acc = Accumulator::try_new(GeometryBounds, EmptyOptions, dtype)?;
+        let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, dtype)?;
         acc.accumulate(&polygons, &mut ctx)?;
 
-        assert_eq!(mbr(&acc.finish()?)?, (0.0, 0.0, 7.0, 8.0));
+        assert_eq!(aabb(&acc.finish()?)?, (0.0, 0.0, 7.0, 8.0));
         Ok(())
     }
 
-    /// Every native geometry type over the same vertex set yields the same MBR - the zone stat
+    /// Every native geometry type over the same vertex set yields the same AABB - the zone stat
     /// covers the whole type family.
     #[test]
-    fn bounds_cover_every_native_geometry_type() -> VortexResult<()> {
+    fn aabb_covers_every_native_geometry_type() -> VortexResult<()> {
         let session = vortex_array::array_session();
         let mut ctx = session.create_execution_ctx();
 
         for column in every_native_column(&[(1.0, 2.0), (-1.0, 5.0), (3.0, 4.0)])? {
-            let mut acc =
-                Accumulator::try_new(GeometryBounds, EmptyOptions, column.dtype().clone())?;
+            let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, column.dtype().clone())?;
             acc.accumulate(&column, &mut ctx)?;
             assert_eq!(
-                mbr(&acc.finish()?)?,
+                aabb(&acc.finish()?)?,
                 (-1.0, 2.0, 3.0, 5.0),
-                "MBR mismatch for {}",
+                "AABB mismatch for {}",
                 column.dtype()
             );
         }
         Ok(())
     }
 
-    /// The MBR of a MultiPolygon column unions every vertex of every polygon's rings - exercising
+    /// The AABB of a MultiPolygon column unions every vertex of every polygon's rings - exercising
     /// the triple-`List` unwrap.
     #[test]
-    fn multipolygon_bounds_union_all_vertices() -> VortexResult<()> {
+    fn multipolygon_aabb_union_all_vertices() -> VortexResult<()> {
         let session = vortex_array::array_session();
         let mut ctx = session.create_execution_ctx();
 
@@ -366,10 +365,10 @@ mod tests {
             ]]],
         ])?;
         let dtype = multipolygons.dtype().clone();
-        let mut acc = Accumulator::try_new(GeometryBounds, EmptyOptions, dtype)?;
+        let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, dtype)?;
         acc.accumulate(&multipolygons, &mut ctx)?;
 
-        assert_eq!(mbr(&acc.finish()?)?, (-3.0, 0.0, 5.0, 9.0));
+        assert_eq!(aabb(&acc.finish()?)?, (-3.0, 0.0, 5.0, 9.0));
         Ok(())
     }
 
@@ -377,34 +376,34 @@ mod tests {
     /// array is chunked.
     #[test]
     fn combine_partials_unions_boxes() -> VortexResult<()> {
-        let bbox = |xmin, ymin, xmax, ymax| BoundsPartial {
+        let bbox = |xmin, ymin, xmax, ymax| AabbPartial {
             rect: Some(GeoRect::new((xmin, ymin), (xmax, ymax))),
         };
-        let mut partial = BoundsPartial { rect: None };
-        GeometryBounds.combine_partials(
+        let mut partial = AabbPartial { rect: None };
+        GeometryAabb.combine_partials(
             &mut partial,
-            GeometryBounds.to_scalar(&bbox(0.0, 0.0, 1.0, 1.0))?,
+            GeometryAabb.to_scalar(&bbox(0.0, 0.0, 1.0, 1.0))?,
         )?;
-        GeometryBounds.combine_partials(
+        GeometryAabb.combine_partials(
             &mut partial,
-            GeometryBounds.to_scalar(&bbox(5.0, -2.0, 7.0, 3.0))?,
+            GeometryAabb.to_scalar(&bbox(5.0, -2.0, 7.0, 3.0))?,
         )?;
         assert_eq!(
-            mbr(&GeometryBounds.to_scalar(&partial)?)?,
+            aabb(&GeometryAabb.to_scalar(&partial)?)?,
             (0.0, -2.0, 7.0, 3.0)
         );
         Ok(())
     }
 
-    /// A null partial (an empty group's MBR) is a no-op in `combine_partials`.
+    /// A null partial (an empty group's AABB) is a no-op in `combine_partials`.
     #[test]
     fn combine_partials_ignores_null() -> VortexResult<()> {
-        let mut partial = BoundsPartial {
+        let mut partial = AabbPartial {
             rect: Some(GeoRect::new((0.0, 0.0), (1.0, 1.0))),
         };
-        GeometryBounds.combine_partials(&mut partial, Scalar::null(bounds_dtype()))?;
+        GeometryAabb.combine_partials(&mut partial, Scalar::null(aabb_dtype()))?;
         assert_eq!(
-            mbr(&GeometryBounds.to_scalar(&partial)?)?,
+            aabb(&GeometryAabb.to_scalar(&partial)?)?,
             (0.0, 0.0, 1.0, 1.0)
         );
         Ok(())
@@ -419,19 +418,19 @@ mod tests {
         let mut ctx = session.create_execution_ctx();
 
         let column = point_column(vec![f64::NAN, f64::NAN], vec![f64::NAN, f64::NAN])?;
-        let mut acc = Accumulator::try_new(GeometryBounds, EmptyOptions, column.dtype().clone())?;
+        let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, column.dtype().clone())?;
         acc.accumulate(&column, &mut ctx)?;
 
-        let (xmin, ymin, xmax, ymax) = mbr(&acc.finish()?)?;
+        let (xmin, ymin, xmax, ymax) = aabb(&acc.finish()?)?;
         assert!(xmin <= xmax && ymin <= ymax);
         Ok(())
     }
 
-    /// An empty group yields a null MBR.
+    /// An empty group yields a null AABB.
     #[test]
     fn empty_group_is_null() -> VortexResult<()> {
         let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
-        let mut acc = Accumulator::try_new(GeometryBounds, EmptyOptions, dtype)?;
+        let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, dtype)?;
         assert!(acc.finish()?.is_null());
         Ok(())
     }
@@ -440,8 +439,7 @@ mod tests {
     /// type (so the zoned writer stores it) but none for ordinary numeric columns.
     #[test]
     fn registered_as_geometry_zone_default() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        crate::initialize(&session);
+        let session = geo_session();
 
         for column in every_native_column(&[(0.0, 0.0), (1.0, 1.0)])? {
             assert!(

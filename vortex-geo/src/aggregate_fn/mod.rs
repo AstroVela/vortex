@@ -3,6 +3,6 @@
 
 //! Aggregate functions over geometry columns.
 
-mod bounds;
+mod aabb;
 
-pub use bounds::*;
+pub use aabb::*;

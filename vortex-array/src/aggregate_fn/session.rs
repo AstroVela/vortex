@@ -138,6 +138,9 @@ impl AggregateFnSession {
 
     /// The default per-chunk zone statistics for a column of `input_dtype`, collected from every
     /// registered aggregate's `zone_stat_default`.
+    ///
+    /// Each call scans the whole plugin registry, so this is intended to be called once per
+    /// column when a zoned writer is opened, not per chunk or per row.
     pub fn zone_stat_defaults(&self, input_dtype: &DType) -> Vec<AggregateFnRef> {
         self.registry.read(|registry| {
             let mut fns: Vec<AggregateFnRef> = registry

@@ -30,8 +30,15 @@ pub trait AggregateFnPlugin: 'static + Send + Sync {
     fn deserialize(&self, metadata: &[u8], session: &VortexSession)
     -> VortexResult<AggregateFnRef>;
 
-    /// The default per-chunk zone statistic to store for a column of `input_dtype`, or `None` if
-    /// this aggregate isn't one.
+    /// The default zone statistic (per-chunk) for a column of `input_dtype`, or `None` if the
+    /// dtype is not supported (or this aggregate is not a zone statistic at all).
+    ///
+    /// This is how a registered aggregate volunteers itself as a per-chunk statistic: when a
+    /// zoned layout writer opens a column, it collects every plugin's default via
+    /// [`AggregateFnSession::zone_stat_defaults`], so new statistics can be added without the
+    /// writer knowing about them.
+    ///
+    /// [`AggregateFnSession::zone_stat_defaults`]: crate::aggregate_fn::session::AggregateFnSession::zone_stat_defaults
     fn zone_stat_default(&self, _input_dtype: &DType) -> Option<AggregateFnRef> {
         None
     }
