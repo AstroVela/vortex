@@ -84,9 +84,9 @@ impl StatsRewriteRule for GeoDistancePrune {
         let Some(radius) = expr.child(1).as_opt::<Literal>() else {
             return Ok(None);
         };
-        // Casts any primitive radius (integer literals included); it fails only for a null or
-        // non-primitive literal, where falling through means "scan the chunk", which is always
-        // sound.
+        // Casts any primitive radius (filters arrive uncoerced, so integer literals are
+        // legitimate); a null or non-primitive (e.g. extension-typed) literal has no value to
+        // reason about, decline and scan, never error.
         let Ok(radius) = f64::try_from(radius) else {
             return Ok(None);
         };
@@ -254,6 +254,7 @@ mod tests {
     use vortex_array::expr::lit;
     use vortex_array::expr::lt_eq;
     use vortex_array::expr::root;
+    use vortex_array::scalar::Scalar;
     use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::ScalarFnVTableExt;
     use vortex_array::scalar_fn::fns::binary::Binary;
@@ -273,11 +274,12 @@ mod tests {
     use crate::test_harness::point_column;
 
     /// Run the rule against `GeoDistance(root, origin) <operator> radius`, operands swapped when
-    /// `geom_first` is false.
+    /// `geom_first` is false. The radius is any literal scalar, matching the uncoerced filter
+    /// expressions the rule sees in production.
     fn falsify_distance(
         operator: Operator,
         geom_first: bool,
-        radius: f64,
+        radius: impl Into<Scalar>,
     ) -> VortexResult<Option<Expression>> {
         let session = geo_session();
         let mut ctx = session.create_execution_ctx();
@@ -290,7 +292,7 @@ mod tests {
             [lit(origin), root()]
         };
         let distance = GeoDistance.new_expr(EmptyOptions, operands);
-        let predicate = Binary.new_expr(operator, [distance, lit(radius)]);
+        let predicate = Binary.new_expr(operator, [distance, lit(radius.into())]);
 
         GeoDistancePrune.falsify(&predicate, &StatsRewriteCtx::new(&session, &scope))
     }
@@ -330,6 +332,34 @@ mod tests {
     #[test]
     fn negative_radius_prunes_vacuously() -> VortexResult<()> {
         assert!(falsify_distance(Operator::Lte, true, -0.5)?.is_some());
+        Ok(())
+    }
+
+    /// Filter expressions arrive uncoerced, so `distance <= 10` may carry an integer literal -
+    /// it casts and prunes like an f64 radius.
+    #[test]
+    fn integer_radius_prunes() -> VortexResult<()> {
+        assert!(falsify_distance(Operator::Lte, true, 10i64)?.is_some());
+        Ok(())
+    }
+
+    /// A null radius has no value to reason about; the rule declines and the chunk is scanned.
+    #[test]
+    fn null_radius_never_prunes() -> VortexResult<()> {
+        let radius = Scalar::null(DType::Primitive(PType::F64, Nullability::Nullable));
+        assert!(falsify_distance(Operator::Lte, true, radius)?.is_none());
+        Ok(())
+    }
+
+    /// An extension-typed radius passes `Binary`'s typecheck (extension operands are exempt) but
+    /// has no numeric value - the rule declines rather than erroring, and the chunk is scanned.
+    #[test]
+    fn extension_radius_never_prunes() -> VortexResult<()> {
+        let session = geo_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let geometry = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
+        assert!(falsify_distance(Operator::Lte, true, geometry)?.is_none());
         Ok(())
     }
 
