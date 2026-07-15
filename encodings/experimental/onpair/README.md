@@ -11,9 +11,10 @@ cascading-compressor support on every integer child.
 ## Compute
 
 Like the FSST encoding, this crate pushes down common operations over the
-encoded representation. It supports `cast`, `filter`, byte length, and
-constant equality / inequality. Unsupported operators fall back to ordinary
-decompression.
+encoded representation. It supports `cast`, `filter`, `take`, byte length,
+constant equality / inequality, simple constant `LIKE` patterns, and constant
+string-list membership (`IN (...)`). Unsupported operators or pattern shapes
+fall back to ordinary decompression.
 
 ## Default Configuration
 

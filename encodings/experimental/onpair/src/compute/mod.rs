@@ -5,4 +5,7 @@ mod byte_length;
 mod cast;
 mod compare;
 mod filter;
+mod like;
+mod list_contains;
 mod slice;
+mod take;

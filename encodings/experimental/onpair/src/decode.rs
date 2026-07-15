@@ -54,7 +54,7 @@ pub(crate) fn code_boundary_at(
 /// `slice` keeps the full `codes` child and only narrows `codes_offsets`, so
 /// for a sliced array the window starts at `offsets[0] > 0`; [`row`] resolves
 /// row indices relative to that start. Built once per query by the
-/// compressed-domain compare kernel.
+/// compressed-domain search kernels (LIKE, compare, list_contains).
 ///
 /// [`row`]: CodesWindow::row
 pub(crate) struct CodesWindow {
