@@ -308,6 +308,36 @@ fn test_take_nullable_indices_ignores_out_of_bounds_null_value() {
 }
 
 #[test]
+fn test_take_rejects_negative_signed_index() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = buffer![1i32, 2, 3, 4].into_array();
+    let fsl = FixedSizeListArray::new(elements.into_array(), 2, Validity::NonNullable, 2);
+    let indices = buffer![-1i32].into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx);
+
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_take_nullable_indices_ignores_negative_null_value() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = buffer![1i32, 2, 3, 4].into_array();
+    let fsl = FixedSizeListArray::new(elements.into_array(), 2, Validity::NonNullable, 2);
+    let indices =
+        PrimitiveArray::new(buffer![-1i32, 1], Validity::from_iter([false, true])).into_array();
+
+    let result = <FixedSizeList as TakeExecute>::take(fsl.as_view(), &indices, &mut ctx)?
+        .ok_or_else(|| vortex_err!("FixedSizeList TakeExecute returned no result"))?;
+
+    assert_eq!(result.len(), 2);
+    assert!(result.execute_scalar(0, &mut ctx)?.is_null());
+    assert!(!result.execute_scalar(1, &mut ctx)?.is_null());
+    Ok(())
+}
+
+#[test]
 fn test_take_rejects_overflowing_valid_index() {
     let mut ctx = array_session().create_execution_ctx();
     let elements = buffer![1i32, 2, 3, 4].into_array();

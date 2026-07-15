@@ -23,9 +23,12 @@ use crate::arrays::dict::TakeExecute;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::builders::builder_with_capacity;
+use crate::builtins::ArrayBuiltins;
+use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::executor::ExecutionCtx;
 use crate::match_each_unsigned_integer_ptype;
+use crate::scalar::Scalar;
 use crate::validity::Validity;
 
 /// Take implementation for [`FixedSizeListArray`].
@@ -43,40 +46,86 @@ impl TakeExecute for FixedSizeList {
             return take_empty_fsl(array, indices, ctx).map(Some);
         }
 
-        let indices_ptype = indices.dtype().as_ptype().to_unsigned();
-        match_each_unsigned_integer_ptype!(indices_ptype, |I| {
-            take_non_empty_with_indices::<I>(array, indices, ctx)
-        })
-        .map(Some)
+        take_non_empty_fsl(array, indices, ctx).map(Some)
     }
 }
 
-fn take_non_empty_with_indices<I: IntegerPType>(
+fn take_non_empty_fsl(
     array: ArrayView<'_, FixedSizeList>,
     indices: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     debug_assert!(!array.is_empty());
 
-    let list_size = array.list_size() as usize;
-
-    let indices_array = indices.clone().execute::<PrimitiveArray>(ctx)?;
-    // Bit-identical reinterpret so `as_slice::<I>` (with unsigned `I`) matches. Negative signed
-    // inputs become large unsigned values and are rejected by the bounds check below.
-    let indices_array = indices_array.reinterpret_cast(indices_array.ptype().to_unsigned());
-
-    if list_size == 0 {
-        return take_non_empty_degenerate_fsl::<I>(array, indices, indices_array.as_view(), ctx);
+    let DType::Primitive(ptype, nullability) = indices.dtype() else {
+        vortex_bail!("Invalid indices dtype: {}", indices.dtype())
+    };
+    if !ptype.is_int() {
+        vortex_bail!("Invalid indices dtype: {}", indices.dtype());
     }
 
-    take_non_empty_non_degenerate_fsl::<I>(array, indices_array.as_view(), ctx)
+    let indices_validity = indices.validity()?;
+    let indices_validity_mask = indices_validity.execute_mask(indices.len(), ctx)?;
+    // Null index lanes are semantically ignored. Zero them before checked signed-to-unsigned casts
+    // so a negative physical payload in a null lane does not fail the take.
+    let indices_nulls_zeroed = if indices_validity_mask.all_true() {
+        indices.clone()
+    } else {
+        indices
+            .clone()
+            .fill_null(Scalar::from(0).cast(indices.dtype())?)?
+    };
+
+    let unsigned_indices = if ptype.is_unsigned_int() {
+        indices_nulls_zeroed.execute::<PrimitiveArray>(ctx)?
+    } else {
+        indices_nulls_zeroed
+            .cast(DType::Primitive(ptype.to_unsigned(), *nullability))?
+            .execute::<PrimitiveArray>(ctx)?
+    };
+
+    match_each_unsigned_integer_ptype!(unsigned_indices.ptype(), |I| {
+        take_non_empty_with_indices::<I>(
+            array,
+            indices,
+            unsigned_indices.as_view(),
+            &indices_validity_mask,
+            nullability.is_nullable(),
+            ctx,
+        )
+    })
+}
+
+fn take_non_empty_with_indices<I: IntegerPType>(
+    array: ArrayView<'_, FixedSizeList>,
+    indices: &ArrayRef,
+    indices_array: ArrayView<'_, Primitive>,
+    indices_validity: &Mask,
+    indices_are_nullable: bool,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    debug_assert!(!array.is_empty());
+
+    let list_size = array.list_size() as usize;
+
+    if list_size == 0 {
+        return take_non_empty_degenerate_fsl::<I>(array, indices, indices_array, indices_validity);
+    }
+
+    take_non_empty_non_degenerate_fsl::<I>(
+        array,
+        indices_array,
+        indices_validity,
+        indices_are_nullable,
+        ctx,
+    )
 }
 
 fn take_non_empty_degenerate_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices: &ArrayRef,
     indices_array: ArrayView<'_, Primitive>,
-    ctx: &mut ExecutionCtx,
+    indices_validity: &Mask,
 ) -> VortexResult<ArrayRef> {
     debug_assert!(!array.is_empty());
     debug_assert_eq!(array.list_size(), 0);
@@ -85,7 +134,7 @@ fn take_non_empty_degenerate_fsl<I: IntegerPType>(
         "degenerate list must have empty elements"
     );
 
-    validate_valid_indices::<I>(&indices_array, array.as_ref().len(), ctx)?;
+    validate_valid_indices::<I>(&indices_array, indices_validity, array.as_ref().len())?;
     let new_validity = array.validity()?.take(indices)?;
     let new_len = indices_array.len();
 
@@ -139,13 +188,15 @@ fn take_empty_fsl(
 fn take_non_empty_non_degenerate_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
+    indices_validity: &Mask,
+    indices_are_nullable: bool,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     debug_assert!(!array.is_empty());
     debug_assert_ne!(array.list_size(), 0);
 
-    if array.dtype().is_nullable() || indices_array.dtype().is_nullable() {
-        take_nullable_non_empty_fsl::<I>(array, indices_array, ctx)
+    if array.dtype().is_nullable() || indices_are_nullable {
+        take_nullable_non_empty_fsl::<I>(array, indices_array, indices_validity, ctx)
     } else {
         take_non_nullable_non_empty_fsl::<I>(array, indices_array)
     }
@@ -195,6 +246,7 @@ fn take_non_nullable_non_empty_fsl<I: IntegerPType>(
 fn take_nullable_non_empty_fsl<I: IntegerPType>(
     array: ArrayView<'_, FixedSizeList>,
     indices_array: ArrayView<'_, Primitive>,
+    indices_validity: &Mask,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     debug_assert!(!array.is_empty());
@@ -209,7 +261,6 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
     let array_validity = array
         .fixed_size_list_validity()
         .execute_mask(array.as_ref().len(), ctx)?;
-    let indices_validity = indices_validity_mask(&indices_array, ctx)?;
 
     let mut starts = BufferMut::<u64>::with_capacity(new_len);
     let mut new_validity_builder = BitBufferMut::with_capacity(new_len);
@@ -254,22 +305,12 @@ fn take_nullable_non_empty_fsl<I: IntegerPType>(
     .into_array())
 }
 
-fn indices_validity_mask(
-    indices_array: &ArrayView<'_, Primitive>,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<Mask> {
-    indices_array
-        .validity()?
-        .execute_mask(indices_array.as_ref().len(), ctx)
-}
-
 fn validate_valid_indices<I: IntegerPType>(
     indices_array: &ArrayView<'_, Primitive>,
+    indices_validity: &Mask,
     array_len: usize,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
     let indices: &[I] = indices_array.as_slice::<I>();
-    let indices_validity = indices_validity_mask(indices_array, ctx)?;
 
     for (&data_idx, is_index_valid) in indices.iter().zip(indices_validity.iter()) {
         if is_index_valid {
