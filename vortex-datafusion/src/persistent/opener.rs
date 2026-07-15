@@ -86,7 +86,7 @@ pub(crate) struct VortexOpener {
     /// A hint for the desired row count of record batches returned from the scan.
     pub batch_size: usize,
     /// If provided, the scan will not return more than this many rows.
-    pub limit: Option<u64>,
+    pub limit: Option<usize>,
     /// A metrics object for tracking performance of the scan.
     pub metrics_registry: Arc<dyn MetricsRegistry>,
     /// A shared cache of file readers.
@@ -399,6 +399,11 @@ impl FileOpener for VortexOpener {
             if let Some(limit) = limit
                 && filter.is_none()
             {
+                // ScanBuilder cannot combine a filter and a limit. PrunableStream applies every
+                // limit after filtering; this pushdown avoids reading unnecessary rows when no
+                // filter is present.
+                let limit = u64::try_from(limit)
+                    .map_err(|_| exec_datafusion_err!("Vortex scan limit exceeds u64"))?;
                 scan_builder = scan_builder.with_limit(limit);
             }
 
@@ -461,8 +466,8 @@ impl FileOpener for VortexOpener {
                 })
                 .boxed();
 
-            if let Some(file_pruner) = file_pruner {
-                Ok(PrunableStream::new(file_pruner, stream).boxed())
+            if file_pruner.is_some() || limit.is_some() {
+                Ok(PrunableStream::new(file_pruner, limit, stream).boxed())
             } else {
                 Ok(stream)
             }
@@ -762,6 +767,42 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_applies_limit_after_filter() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "filtered/file.vortex";
+        let batch = record_batch!(("a", Int32, vec![0, 1, 2, 3, 4]))?;
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let filter = logical2physical(&col("a").gt(lit(1)), table_schema.table_schema());
+
+        let mut opener = make_opener(object_store, table_schema, Some(filter));
+        opener.limit = Some(2);
+
+        let batches = opener
+            .open(PartitionedFile::new(file_path.to_string(), data_size))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_snapshot!(pretty_format_batches_with_options(
+            &batches,
+            &FormatOptions::new().with_types_info(true),
+        )?
+        .to_string(), @r"
+        +-------+
+        | a     |
+        | Int32 |
+        +-------+
+        | 2     |
+        | 3     |
+        +-------+
+        ");
 
         Ok(())
     }

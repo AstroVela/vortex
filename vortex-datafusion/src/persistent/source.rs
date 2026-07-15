@@ -359,7 +359,7 @@ impl VortexSource {
             expr_adapter_factory,
             table_schema: self.table_schema.clone(),
             batch_size,
-            limit: base_config.limit.map(|l| l as u64),
+            limit: base_config.limit,
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
             layout_readers: Arc::clone(&self.layout_readers),
             natural_split_ranges: Arc::clone(&self.natural_split_ranges),
