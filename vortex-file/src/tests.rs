@@ -49,11 +49,14 @@ use vortex_array::expr::lt_eq;
 use vortex_array::expr::or;
 use vortex_array::expr::root;
 use vortex_array::expr::select;
+use vortex_array::expr::stats::Precision;
+use vortex_array::expr::stats::Stat;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::extension::datetime::Timestamp;
 use vortex_array::extension::datetime::TimestampOptions;
 use vortex_array::field_path;
 use vortex_array::scalar::Scalar;
+use vortex_array::scalar::ScalarValue;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
@@ -95,6 +98,7 @@ use crate::VERSION;
 use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
 use crate::footer::SegmentSpec;
+
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = array_session()
         .with::<LayoutSession>()
@@ -1907,6 +1911,48 @@ async fn test_writer_with_statistics() -> VortexResult<()> {
 
     assert!(summary.footer().statistics().is_some());
     assert_eq!(summary.row_count(), 5);
+
+    Ok(())
+}
+
+/// String columns whose extreme values exceed the variable-length statistics size limit must
+/// store truncated bounds marked inexact in the footer, matching the flat layout writer.
+#[tokio::test]
+async fn test_writer_truncates_long_string_statistics() -> VortexResult<()> {
+    let long_min = "a".repeat(100);
+    let long_max = "z".repeat(100);
+    let array = StructArray::from_fields(&[(
+        "strings",
+        VarBinViewArray::from_iter_str([long_min.as_str(), "middle", long_max.as_str()])
+            .into_array(),
+    )])?
+    .into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    let mut writer = SESSION
+        .write_options()
+        .with_file_statistics(PRUNING_STATS.to_vec())
+        .writer(&mut buf, array.dtype().clone());
+    writer.push(array).await?;
+    writer.finish().await?;
+
+    // Re-open the file so the statistics roundtrip through the footer flatbuffer.
+    let vxf = SESSION.open_options().open_buffer(buf.freeze())?;
+    let stats = vxf
+        .footer()
+        .statistics()
+        .vortex_expect("expected file statistics");
+    let (stats_set, _) = stats.get(0);
+
+    // Both extremes exceed the 64-byte limit, so the stored values are truncated bounds.
+    let Precision::Inexact(min) = stats_set.get(Stat::Min) else {
+        panic!("expected inexact min, got {:?}", stats_set.get(Stat::Min));
+    };
+    let Precision::Inexact(max) = stats_set.get(Stat::Max) else {
+        panic!("expected inexact max, got {:?}", stats_set.get(Stat::Max));
+    };
+    assert_eq!(min, ScalarValue::from("a".repeat(64)));
+    assert_eq!(max, ScalarValue::from(format!("{}{}", "z".repeat(63), '{')));
 
     Ok(())
 }

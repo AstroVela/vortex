@@ -233,7 +233,7 @@ impl VortexWriteOptions {
             self.file_statistics.clone().into(),
             self.max_variable_length_statistics_size,
             &self.session,
-        );
+        )?;
 
         // First, write the magic bytes.
         write.write_all(ByteBuffer::copy_from(MAGIC_BYTES)).await?;
@@ -281,7 +281,7 @@ impl VortexWriteOptions {
             None
         } else {
             Some(FileStatistics::new_with_dtype(
-                file_stats.stats_sets().into(),
+                file_stats.stats_sets()?.into(),
                 &dtype,
             ))
         };
