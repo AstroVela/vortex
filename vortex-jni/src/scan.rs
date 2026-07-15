@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
+use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::ArrowError;
 use arrow_schema::Field;
@@ -48,7 +49,6 @@ use vortex_arrow::ToArrowType;
 use crate::POOL;
 use crate::RUNTIME;
 use crate::data_source::NativeDataSource;
-use crate::dtype::export_dtype_to_arrow;
 use crate::errors::try_or_throw;
 use crate::session::session_ref;
 
@@ -215,7 +215,10 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_arrowSchema(
         let NativeScan::Pending(scan) = scan else {
             throw_runtime!("schema unavailable: scan already started");
         };
-        export_dtype_to_arrow(scan.dtype(), schema_addr)?;
+        let ffi_schema = FFI_ArrowSchema::try_from(&scan.dtype().to_arrow_schema()?)?;
+        unsafe {
+            ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+        }
         Ok(())
     });
 }

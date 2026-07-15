@@ -8,8 +8,10 @@
 //! and bare file paths are both accepted. Filesystems are cached per base URL so repeated
 //! globs against the same bucket share a single client.
 
+use std::ptr;
 use std::sync::Arc;
 
+use arrow_array::ffi::FFI_ArrowSchema;
 use jni::EnvUnowned;
 use jni::objects::JClass;
 use jni::objects::JLongArray;
@@ -28,9 +30,9 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
 use vortex::utils::aliases::hash_map::HashMap;
+use vortex_arrow::ToArrowType;
 
 use crate::RUNTIME;
-use crate::dtype::export_dtype_to_arrow;
 use crate::errors::try_or_throw;
 use crate::file::extract_properties;
 use crate::object_store::object_store_fs;
@@ -148,7 +150,10 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_arrowSchema(
             throw_runtime!("null arrow schema address");
         }
         let ds = unsafe { NativeDataSource::from_ptr(pointer) };
-        export_dtype_to_arrow(ds.inner.dtype(), schema_addr)?;
+        let ffi_schema = FFI_ArrowSchema::try_from(&ds.inner.dtype().to_arrow_schema()?)?;
+        unsafe {
+            ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+        }
         Ok(())
     });
 }
