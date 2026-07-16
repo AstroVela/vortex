@@ -454,6 +454,38 @@ async fn write_chunked() {
 
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
+async fn write_ordered() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let dtype = DType::Primitive(I32, Nullability::NonNullable);
+
+    let chunks: Vec<VortexResult<(u64, ArrayRef)>> = vec![
+        Ok((2, buffer![7i32, 8, 9].into_array())),
+        Ok((0, buffer![1i32, 2, 3].into_array())),
+        Ok((1, buffer![4i32, 5, 6].into_array())),
+    ];
+
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write_ordered(&mut buf, dtype, futures::stream::iter(chunks))
+        .await?;
+
+    let array = SESSION
+        .open_options()
+        .open_buffer(buf)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    let actual = array.execute::<PrimitiveArray>(&mut ctx)?;
+    let expected = buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9].into_array();
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
 async fn test_empty_varbin_array_roundtrip() {
     let empty = VarBinArray::from(Vec::<&str>::new()).into_array();
 

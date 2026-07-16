@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeMap;
 use std::io;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use futures::FutureExt;
+use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::Fuse;
@@ -153,6 +158,25 @@ impl VortexWriteOptions {
             .await
     }
 
+    /// Write a stream of pairs (index, chunk) to a Vortex file, sorting
+    /// chunks by index before write.
+    /// "index" must be a contiguous gap-free number starting at 0.
+    ///
+    /// Errors on duplicate or already written indices.
+    pub async fn write_ordered<W, S>(
+        self,
+        write: W,
+        dtype: DType,
+        stream: S,
+    ) -> VortexResult<WriteSummary>
+    where
+        W: VortexWrite + Unpin,
+        S: Stream<Item = VortexResult<(u64, ArrayRef)>> + Unpin + Send + 'static,
+    {
+        self.write(write, OrderedArrayStream::new(dtype, stream))
+            .await
+    }
+
     async fn write_internal<W: VortexWrite + Unpin>(
         self,
         mut write: W,
@@ -286,6 +310,69 @@ impl VortexWriteOptions {
             future,
             bytes_written,
             strategy,
+        }
+    }
+}
+
+/// Reorder a stream of pairs (index, chunk) into strictly increasing "index".
+/// "index" must be contiguous and gap-free starting from 0.
+struct OrderedArrayStream<S> {
+    dtype: DType,
+    next: u64,
+    pending: BTreeMap<u64, ArrayRef>,
+    inner: S,
+    done: bool,
+}
+
+impl<S> OrderedArrayStream<S> {
+    fn new(dtype: DType, inner: S) -> Self {
+        Self {
+            dtype,
+            next: 0,
+            pending: BTreeMap::new(),
+            inner,
+            done: false,
+        }
+    }
+}
+
+impl<S> ArrayStream for OrderedArrayStream<S>
+where
+    S: Stream<Item = VortexResult<(u64, ArrayRef)>> + Unpin,
+{
+    fn dtype(&self) -> &DType {
+        &self.dtype
+    }
+}
+
+impl<S> Stream for OrderedArrayStream<S>
+where
+    S: Stream<Item = VortexResult<(u64, ArrayRef)>> + Unpin,
+{
+    type Item = VortexResult<ArrayRef>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(array) = this.pending.remove(&this.next) {
+                this.next += 1;
+                return Poll::Ready(Some(Ok(array)));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            match futures::ready!(Pin::new(&mut this.inner).poll_next(cx)) {
+                Some(Ok((index, array))) => {
+                    if index < this.next || this.pending.contains_key(&index) {
+                        return Poll::Ready(Some(Err(vortex_err!(
+                            "Duplicate or already present index {index}"
+                        ))));
+                    }
+                    this.pending.insert(index, array);
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => this.done = true,
+            }
         }
     }
 }
