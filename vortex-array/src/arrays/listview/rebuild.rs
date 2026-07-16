@@ -290,15 +290,10 @@ impl ListViewArray {
             new_sizes,
             starts,
             lengths,
+            elements_len,
         } = ranges;
-        let elements_len = lengths.iter().try_fold(0usize, |acc, &length| {
-            acc.checked_add(length)
-                .ok_or_else(|| vortex_err!("ListView rebuild elements length overflow"))
-        })?;
-        let starts =
-            PrimitiveArray::from_iter(starts.into_iter().map(|start| start as u64)).into_array();
-        let lengths =
-            PrimitiveArray::from_iter(lengths.into_iter().map(|length| length as u64)).into_array();
+        let starts = PrimitiveArray::new(starts.freeze(), Validity::NonNullable).into_array();
+        let lengths = PrimitiveArray::new(lengths.freeze(), Validity::NonNullable).into_array();
         let new_sizes = new_sizes.freeze();
         let elements =
             TakeSlicesArray::try_new(self.elements().clone(), starts, lengths, elements_len)?
@@ -386,8 +381,9 @@ impl ListViewArray {
 struct RebuildRanges<NewOffset, S> {
     new_offsets: BufferMut<NewOffset>,
     new_sizes: BufferMut<S>,
-    starts: Vec<usize>,
-    lengths: Vec<usize>,
+    starts: BufferMut<u64>,
+    lengths: BufferMut<u64>,
+    elements_len: usize,
 }
 
 fn rebuild_ranges<NewOffset, O, S>(
@@ -403,9 +399,10 @@ where
     let len = offsets.len();
     let mut new_offsets = BufferMut::<NewOffset>::with_capacity(len);
     let mut new_sizes = BufferMut::<S>::with_capacity(len);
-    let mut starts = Vec::with_capacity(len);
-    let mut lengths = Vec::with_capacity(len);
+    let mut starts = BufferMut::<u64>::with_capacity(len);
+    let mut lengths = BufferMut::<u64>::with_capacity(len);
     let mut n_elements = NewOffset::zero();
+    let mut elements_len = 0usize;
 
     for (index, is_valid) in validity_mask.iter().enumerate() {
         if !is_valid {
@@ -431,11 +428,14 @@ where
                 "ListView rebuild element range overflow for start {start} and length {length}"
             )
         })?;
+        elements_len = elements_len
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("ListView rebuild elements length overflow"))?;
 
         new_offsets.push(n_elements);
         new_sizes.push(size);
-        starts.push(start);
-        lengths.push(length);
+        starts.push(start as u64);
+        lengths.push(length as u64);
         n_elements += num_traits::cast(size).vortex_expect("Cast failed");
     }
 
@@ -444,6 +444,7 @@ where
         new_sizes,
         starts,
         lengths,
+        elements_len,
     })
 }
 
