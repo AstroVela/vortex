@@ -15,6 +15,7 @@ use crate::IntoArray;
 use crate::array::ArrayView;
 use crate::arrays::Chunked;
 use crate::arrays::ChunkedArray;
+use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
@@ -270,11 +271,15 @@ fn swizzle_fixed_size_list_chunks(
 
     let mut element_chunks = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let chunk_array = chunk.clone().execute::<FixedSizeListArray>(ctx)?;
-        // A canonical `FixedSizeListArray` keeps its `elements` child trimmed to exactly
-        // `list_size * chunk.len()` starting at the first list, so the children concatenate
-        // cleanly into the combined `elements` array.
-        element_chunks.push(chunk_array.elements().clone());
+        if let Some(chunk_array) = chunk.as_opt::<FixedSizeList>() {
+            // A canonical `FixedSizeListArray` keeps its `elements` child trimmed to exactly
+            // `list_size * chunk.len()` starting at the first list, so the children concatenate
+            // cleanly into the combined `elements` array.
+            element_chunks.push(chunk_array.elements().clone());
+        } else {
+            let chunk_array = chunk.clone().execute::<FixedSizeListArray>(ctx)?;
+            element_chunks.push(chunk_array.elements().clone());
+        }
     }
 
     let chunked_elements = ChunkedArray::try_new(element_chunks, elem_dtype.clone())?.into_array();
