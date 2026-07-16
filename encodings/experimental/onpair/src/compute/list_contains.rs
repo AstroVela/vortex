@@ -12,9 +12,12 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsElementKernel;
+use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
+use vortex_mask::AllOr;
 
 use crate::OnPair;
 use crate::OnPairArraySlotsExt;
@@ -32,29 +35,32 @@ impl ListContainsElementKernel for OnPair {
         };
 
         let list_scalar = list_scalar.as_list();
+        if !list_scalar
+            .element_dtype()
+            .eq_ignore_nullability(element.dtype())
+        {
+            return Ok(None);
+        }
         let Some(elements) = list_scalar.elements() else {
             return Ok(Some(
                 ConstantArray::new(null_bool(list, element), element.len()).into_array(),
             ));
         };
-        if !matches!(
-            list_scalar.element_dtype(),
-            DType::Utf8(_) | DType::Binary(_)
-        ) {
-            return Ok(None);
+
+        let validity = element
+            .array()
+            .validity()?
+            .execute_mask(element.len(), ctx)?;
+        if matches!(validity.bit_buffer(), AllOr::None) {
+            return Ok(Some(
+                ConstantArray::new(null_bool(list, element), element.len()).into_array(),
+            ));
         }
 
         let needles = elements.iter().filter_map(scalar_bytes).collect::<Vec<_>>();
         if needles.is_empty() {
             return Ok(Some(
-                BoolArray::new(
-                    BitBuffer::new_unset(element.len()),
-                    element
-                        .array()
-                        .validity()?
-                        .union_nullability(list.dtype().nullability()),
-                )
-                .into_array(),
+                ConstantArray::new(false_bool(list, element), element.len()).into_array(),
             ));
         }
 
@@ -74,18 +80,28 @@ impl ListContainsElementKernel for OnPair {
 
         let window = collect_codes_window(element, ctx)?;
 
-        let result = BitBuffer::collect_bool(element.len(), |i| {
+        let matches = |i| {
             let row = window.row(i);
             queries.iter().any(|query| search::equals(row, query))
-        });
+        };
+        let result = match validity.bit_buffer() {
+            AllOr::All => BitBuffer::collect_bool(element.len(), matches),
+            AllOr::None => unreachable!("all-invalid element handled above"),
+            AllOr::Some(validity) => {
+                let mut result = BitBufferMut::new_unset(element.len());
+                validity.for_each_set_index(|i| {
+                    if matches(i) {
+                        result.set(i);
+                    }
+                });
+                result.freeze()
+            }
+        };
 
         Ok(Some(
             BoolArray::new(
                 result,
-                element
-                    .array()
-                    .validity()?
-                    .union_nullability(list.dtype().nullability()),
+                Validity::from(list.dtype().nullability() | element.dtype().nullability()),
             )
             .into_array(),
         ))
@@ -104,6 +120,13 @@ fn null_bool(list: &ArrayRef, element: ArrayView<'_, OnPair>) -> Scalar {
     Scalar::null(DType::Bool(
         list.dtype().nullability() | element.dtype().nullability(),
     ))
+}
+
+fn false_bool(list: &ArrayRef, element: ArrayView<'_, OnPair>) -> Scalar {
+    Scalar::bool(
+        false,
+        list.dtype().nullability() | element.dtype().nullability(),
+    )
 }
 
 #[cfg(test)]
@@ -161,9 +184,34 @@ mod tests {
         )
     }
 
+    fn assert_kernel_matches_canonical(
+        strings: &[Option<&str>],
+        nullability: Nullability,
+        list: Scalar,
+    ) -> VortexResult<()> {
+        let canonical =
+            VarBinArray::from_iter(strings.iter().copied(), DType::Utf8(nullability)).into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+        let onpair = onpair_compress(&canonical, DEFAULT_DICT12_CONFIG, &mut ctx)?;
+        let list_array = ConstantArray::new(list.clone(), canonical.len()).into_array();
+        let actual = <OnPair as ListContainsElementKernel>::list_contains(
+            &list_array,
+            onpair.as_view(),
+            &mut ctx,
+        )?
+        .expect("constant string list is handled by the OnPair kernel")
+        .execute::<BoolArray>(&mut ctx)?;
+
+        let expected = canonical
+            .apply(&list_contains(lit(list), root()))?
+            .execute::<BoolArray>(&mut ctx)?;
+        assert_arrays_eq!(actual, expected, &mut ctx);
+        Ok(())
+    }
+
     #[test]
     fn test_list_contains_string_literals() -> VortexResult<()> {
-        let onpair = make_onpair(
+        assert_kernel_matches_canonical(
             &[
                 Some("alpha"),
                 None,
@@ -172,44 +220,67 @@ mod tests {
                 Some("alpha"),
             ],
             Nullability::Nullable,
-        );
-        let list = string_list(
-            vec![
-                Scalar::utf8("alpha", Nullability::Nullable),
-                Scalar::null(DType::Utf8(Nullability::Nullable)),
-                Scalar::utf8("gamma", Nullability::Nullable),
-            ],
-            Nullability::Nullable,
-        );
-
-        let expr = list_contains(lit(list), root());
-        let result = onpair
-            .into_array()
-            .apply(&expr)?
-            .execute::<BoolArray>(&mut SESSION.create_execution_ctx())?;
-        assert_arrays_eq!(
-            &result,
-            &BoolArray::from_iter([Some(true), None, Some(false), Some(true), Some(true)]),
-            &mut SESSION.create_execution_ctx()
-        );
-        Ok(())
+            string_list(
+                vec![
+                    Scalar::utf8("alpha", Nullability::Nullable),
+                    Scalar::null(DType::Utf8(Nullability::Nullable)),
+                    Scalar::utf8("gamma", Nullability::Nullable),
+                ],
+                Nullability::Nullable,
+            ),
+        )
     }
 
     #[test]
     fn test_list_contains_empty_list() -> VortexResult<()> {
-        let onpair = make_onpair(&[Some("alpha"), Some("beta")], Nullability::NonNullable);
-        let list = string_list(Vec::new(), Nullability::Nullable);
+        assert_kernel_matches_canonical(
+            &[Some("alpha"), None, Some("beta")],
+            Nullability::Nullable,
+            string_list(Vec::new(), Nullability::Nullable),
+        )
+    }
 
-        let expr = list_contains(lit(list), root());
-        let result = onpair
-            .into_array()
-            .apply(&expr)?
-            .execute::<BoolArray>(&mut SESSION.create_execution_ctx())?;
-        assert_arrays_eq!(
-            &result,
-            &BoolArray::from_iter([Some(false), Some(false)]),
-            &mut SESSION.create_execution_ctx()
+    #[test]
+    fn test_list_contains_only_null_list_elements() -> VortexResult<()> {
+        assert_kernel_matches_canonical(
+            &[Some("alpha"), None, Some("beta")],
+            Nullability::Nullable,
+            string_list(
+                vec![Scalar::null(DType::Utf8(Nullability::Nullable))],
+                Nullability::Nullable,
+            ),
+        )
+    }
+
+    #[test]
+    fn test_list_contains_all_null_needles() -> VortexResult<()> {
+        assert_kernel_matches_canonical(
+            &[None, None],
+            Nullability::Nullable,
+            string_list(
+                vec![Scalar::utf8("alpha", Nullability::Nullable)],
+                Nullability::Nullable,
+            ),
+        )
+    }
+
+    #[test]
+    fn test_list_contains_mismatched_string_dtype_falls_back() -> VortexResult<()> {
+        let onpair = make_onpair(&[Some("alpha"), Some("beta")], Nullability::NonNullable);
+        let list = Scalar::list(
+            Arc::new(DType::Binary(Nullability::Nullable)),
+            vec![Scalar::binary(b"alpha".to_vec(), Nullability::Nullable)],
+            Nullability::Nullable,
         );
+        let list = ConstantArray::new(list, onpair.len()).into_array();
+
+        let result = <OnPair as ListContainsElementKernel>::list_contains(
+            &list,
+            onpair.as_view(),
+            &mut SESSION.create_execution_ctx(),
+        )?;
+
+        assert!(result.is_none());
         Ok(())
     }
 
