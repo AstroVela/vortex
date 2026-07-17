@@ -22,6 +22,7 @@ use vortex_array::dtype::StructFields;
 use vortex_array::expr::ExactExpr;
 use vortex_array::expr::Expression;
 use vortex_array::expr::col;
+use vortex_array::expr::is_root;
 use vortex_array::expr::make_free_field_annotator;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::PartitionedExpr;
@@ -319,6 +320,7 @@ impl LayoutReader for StructReader {
         expr: &Expression,
         mask_fut: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
+        let is_root_expr = is_root(expr);
         let validity_fut = self
             .validity()?
             .map(|reader| reader.projection_evaluation(row_range, &root(), mask_fut.clone()))
@@ -348,14 +350,17 @@ impl LayoutReader for StructReader {
                 partitioned.root.is::<Pack>() || partitioned.root.is::<Merge>(),
             ),
         };
+        let push_validity_into_fields = is_pack_merge && !is_root_expr;
 
         let session = self.session.clone();
         Ok(Box::pin(async move {
             if let Some(validity_fut) = validity_fut {
                 let (array, validity) = try_join!(projected, validity_fut)?;
 
-                // If root expression was a pack, then we apply the validity to each child field
-                if is_pack_merge {
+                // A user-authored pack or merge creates a new struct, so the source struct's
+                // validity applies to its fields. A root expression is also expanded to a pack for
+                // partitioning, but that synthetic pack must retain the source struct's validity.
+                if push_validity_into_fields {
                     let mut ctx = session.create_execution_ctx();
                     let struct_array = array.execute::<StructArray>(&mut ctx)?;
                     let masked_fields: Vec<ArrayRef> = struct_array
@@ -421,6 +426,7 @@ mod tests {
     use vortex_array::scalar::Scalar;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
     use vortex_mask::Mask;
@@ -746,6 +752,64 @@ mod tests {
         );
         assert_nth_scalar!(result, 1, 2, &mut ctx);
         assert_nth_scalar!(result, 2, 3, &mut ctx);
+    }
+
+    #[rstest]
+    fn test_struct_layout_root_preserves_validity(
+        #[from(null_struct_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        let reader = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+        let project = reader.projection_evaluation(&(0..3), &root(), MaskFuture::new_true(3))?;
+
+        let result = block_on(move |_| project)?;
+        assert_eq!(result.dtype(), reader.dtype());
+        assert!(
+            result
+                .execute_scalar(0, &mut SESSION.create_execution_ctx())?
+                .is_null()
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    fn test_struct_layout_pack_pushes_validity_into_fields(
+        #[from(null_struct_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        let reader = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+        let expr = pack([("a", get_item("a", root()))], Nullability::NonNullable);
+        let project = reader.projection_evaluation(&(0..3), &expr, MaskFuture::new_true(3))?;
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let result = block_on(move |_| project)?.execute::<StructArray>(&mut ctx)?;
+        assert!(!result.dtype().is_nullable());
+        assert!(
+            result
+                .unmasked_field_by_name("a")?
+                .execute_scalar(0, &mut ctx)?
+                .is_null()
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    fn test_nested_struct_layout_preserves_struct_validity(
+        #[from(nested_struct_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        let reader = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+        let project = reader.projection_evaluation(
+            &(0..3),
+            &get_item("a", root()),
+            MaskFuture::new_true(3),
+        )?;
+
+        let result = block_on(move |_| project)?;
+        assert!(result.dtype().is_nullable());
+        assert!(
+            result
+                .execute_scalar(1, &mut SESSION.create_execution_ctx())?
+                .is_null()
+        );
+        Ok(())
     }
 
     #[rstest]
