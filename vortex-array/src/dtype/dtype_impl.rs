@@ -3,6 +3,8 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use DType::*;
@@ -120,26 +122,33 @@ impl DType {
                 lhs_size == rhs_size && lhs_dtype.eq_ignore_nullability(rhs_dtype)
             }
             (Struct(lhs_dtype, _), Struct(rhs_dtype, _)) => {
-                (lhs_dtype.names() == rhs_dtype.names())
-                    && (lhs_dtype
-                        .fields()
-                        .zip_eq(rhs_dtype.fields())
-                        .all(|(l, r)| l.eq_ignore_nullability(&r)))
+                lhs_dtype.eq_ignore_nullability(rhs_dtype)
             }
-            (Union(lhs, _), Union(rhs, _)) => {
-                // Equal `names` implies equal length by FieldNames equality.
-                lhs.names() == rhs.names()
-                    && lhs.type_ids() == rhs.type_ids()
-                    && lhs
-                        .variants()
-                        .zip_eq(rhs.variants())
-                        .all(|(l, r)| l.eq_ignore_nullability(&r))
-            }
+            (Union(lhs, _), Union(rhs, _)) => lhs.eq_ignore_nullability(rhs),
             (Variant(_), Variant(_)) => true,
             (Extension(lhs_extdtype), Extension(rhs_extdtype)) => {
                 lhs_extdtype.eq_ignore_nullability(rhs_extdtype)
             }
             _ => false,
+        }
+    }
+
+    /// Hash this dtype using the same equivalence relation as [`Self::eq_ignore_nullability`].
+    pub(crate) fn hash_ignore_nullability<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+
+        match self {
+            Null | Bool(_) | Utf8(_) | Binary(_) | Variant(_) => {}
+            Primitive(ptype, _) => ptype.hash(state),
+            Decimal(decimal, _) => decimal.hash(state),
+            List(element, _) => element.hash_ignore_nullability(state),
+            FixedSizeList(element, size, _) => {
+                element.hash_ignore_nullability(state);
+                size.hash(state);
+            }
+            Struct(fields, _) => fields.hash_ignore_nullability(state),
+            Union(variants, _) => variants.hash_ignore_nullability(state),
+            Extension(ext) => ext.hash_ignore_nullability(state),
         }
     }
 
@@ -514,17 +523,28 @@ impl Display for DType {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
     use std::sync::Arc;
+
+    use vortex_error::VortexResult;
 
     use crate::dtype::DType;
     use crate::dtype::Nullability::NonNullable;
     use crate::dtype::Nullability::Nullable;
     use crate::dtype::PType;
+    use crate::dtype::UnionVariants;
     use crate::dtype::decimal::DecimalDType;
     use crate::extension::datetime::Date;
     use crate::extension::datetime::Time;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
+
+    fn hash_ignore_nullability(dtype: &DType) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        dtype.hash_ignore_nullability(&mut hasher);
+        hasher.finish()
+    }
 
     #[test]
     fn test_ext_dtype_eq_ignore_nullability() {
@@ -539,6 +559,37 @@ mod tests {
             Timestamp::new_with_tz(TimeUnit::Seconds, Some("ET".into()), Nullable).erased(),
         );
         assert!(!t1.eq_ignore_nullability(&t2));
+    }
+
+    #[test]
+    fn test_union_dtype_hash_ignores_variant_nullability() -> VortexResult<()> {
+        let lhs = DType::Union(
+            UnionVariants::try_new(
+                ["int", "string"].into(),
+                vec![
+                    DType::Primitive(PType::I32, Nullable),
+                    DType::Utf8(NonNullable),
+                ],
+                vec![5, 9],
+            )?,
+            NonNullable,
+        );
+        let rhs = DType::Union(
+            UnionVariants::try_new(
+                ["int", "string"].into(),
+                vec![
+                    DType::Primitive(PType::I32, NonNullable),
+                    DType::Utf8(Nullable),
+                ],
+                vec![5, 9],
+            )?,
+            NonNullable,
+        );
+
+        assert!(lhs.eq_ignore_nullability(&rhs));
+        assert_eq!(hash_ignore_nullability(&lhs), hash_ignore_nullability(&rhs));
+
+        Ok(())
     }
 
     #[test]
