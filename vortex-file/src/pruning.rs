@@ -34,7 +34,46 @@ pub(crate) fn can_prune_file_stats(
     struct_fields: &StructFields,
     session: &VortexSession,
 ) -> VortexResult<bool> {
-    let Some(pruning_expr) = expr.falsify(dtype, session)? else {
+    file_stats_proof(
+        expr,
+        dtype,
+        row_count,
+        file_stats,
+        struct_fields,
+        session,
+        Expression::falsify,
+    )
+}
+
+pub(crate) fn can_satisfy_file_stats(
+    expr: &Expression,
+    dtype: &DType,
+    row_count: u64,
+    file_stats: &FileStatistics,
+    struct_fields: &StructFields,
+    session: &VortexSession,
+) -> VortexResult<bool> {
+    file_stats_proof(
+        expr,
+        dtype,
+        row_count,
+        file_stats,
+        struct_fields,
+        session,
+        Expression::satisfy,
+    )
+}
+
+fn file_stats_proof(
+    expr: &Expression,
+    dtype: &DType,
+    row_count: u64,
+    file_stats: &FileStatistics,
+    struct_fields: &StructFields,
+    session: &VortexSession,
+    rewrite: fn(&Expression, &DType, &VortexSession) -> VortexResult<Option<Expression>>,
+) -> VortexResult<bool> {
+    let Some(proof_expr) = rewrite(expr, dtype, session)? else {
         return Ok(false);
     };
 
@@ -43,19 +82,19 @@ pub(crate) fn can_prune_file_stats(
         file_stats,
         struct_fields,
     };
-    let pruning_expr = bind_stats(pruning_expr, &binder)?;
+    let proof_expr = bind_stats(proof_expr, &binder)?;
 
-    let simplified = pruning_expr.optimize_recursive(&DType::Null)?;
+    let simplified = proof_expr.optimize_recursive(&DType::Null)?;
     if let Some(result) = simplified.as_opt::<Literal>() {
         return Ok(result.as_bool().value() == Some(true));
     }
 
-    let pruning = NullArray::new(1).into_array().apply(&pruning_expr)?;
-    let row_count_replacement = ConstantArray::new(row_count, pruning.len()).into_array();
-    let pruning = substitute_row_count(pruning, &row_count_replacement)?;
+    let proof = NullArray::new(1).into_array().apply(&proof_expr)?;
+    let row_count_replacement = ConstantArray::new(row_count, proof.len()).into_array();
+    let proof = substitute_row_count(proof, &row_count_replacement)?;
 
     let mut ctx = session.create_execution_ctx();
-    let result = pruning
+    let result = proof
         .execute::<Canonical>(&mut ctx)?
         .into_bool()
         .into_array()
