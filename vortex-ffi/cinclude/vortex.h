@@ -110,6 +110,10 @@ typedef enum {
      * Nested fixed-size list type.
      */
     DTYPE_FIXED_SIZE_LIST = 9,
+    /**
+     * Nested map type.
+     */
+    DTYPE_MAP = 10,
 } vx_dtype_variant;
 
 /**
@@ -966,6 +970,51 @@ const vx_dtype *vx_dtype_fixed_size_list_element(const vx_dtype *dtype);
  * Returns the size of a fixed-size list.
  */
 uint32_t vx_dtype_fixed_size_list_size(const vx_dtype *dtype);
+
+/**
+ * If "dtype" is DTYPE_MAP, return its owned key dtype, return NULL otherwise.
+ * Returned dtype must be released with vx_dtype_free.
+ */
+const vx_dtype *vx_dtype_map_key_type(const vx_dtype *dtype);
+
+/**
+ * If "dtype" is DTYPE_MAP, return its owned value dtype, return NULL otherwise.
+ * Returned dtype must be released with vx_dtype_free.
+ */
+const vx_dtype *vx_dtype_map_value_type(const vx_dtype *dtype);
+
+/**
+ * Returns whether "dtype" is a map that asserts sorted keys.
+ */
+bool vx_dtype_map_keys_sorted(const vx_dtype *dtype);
+
+/**
+ * Checks if the type is time.
+ */
+bool vx_dtype_is_time(const vx_dtype *dtype);
+
+/**
+ * Checks if the type is a date.
+ */
+bool vx_dtype_is_date(const vx_dtype *dtype);
+
+/**
+ * Checks if the type is a timestamp.
+ */
+bool vx_dtype_is_timestamp(const vx_dtype *dtype);
+
+/**
+ * Returns the time unit, assuming the type is time.
+ */
+uint8_t vx_dtype_time_unit(const vx_dtype *dtype);
+
+/**
+ * Return time zone assuming "dtype" is time.
+ * Returns {NULL, 0} when timestamp has no time zone.
+ *
+ * Returned view is valid as long as "dtype" is valid.
+ */
+vx_view vx_dtype_time_zone(const vx_dtype *dtype);
 
 /**
  * Convert a dtype to ArrowSchema.

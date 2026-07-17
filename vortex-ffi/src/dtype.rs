@@ -12,6 +12,10 @@ use vortex::dtype::DecimalDType;
 use vortex::error::VortexExpect;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_panic;
+use vortex::extension::datetime::AnyTemporal;
+use vortex::extension::datetime::Date;
+use vortex::extension::datetime::Time;
+use vortex::extension::datetime::Timestamp;
 use vortex_arrow::FromArrowType;
 use vortex_arrow::ToArrowType;
 
@@ -20,6 +24,7 @@ use crate::error::try_or;
 use crate::error::try_or_default;
 use crate::error::vx_error;
 use crate::ptype::vx_ptype;
+use crate::string::vx_view;
 use crate::struct_fields::vx_struct_fields;
 
 // DType has Arc fields inside for some enum items
@@ -59,6 +64,8 @@ pub enum vx_dtype_variant {
     DTYPE_DECIMAL = 8,
     /// Nested fixed-size list type.
     DTYPE_FIXED_SIZE_LIST = 9,
+    /// Nested map type.
+    DTYPE_MAP = 10,
 }
 
 // TODO(connor)[Union]
@@ -73,6 +80,7 @@ impl From<&DType> for vx_dtype_variant {
             DType::Binary(_) => vx_dtype_variant::DTYPE_BINARY,
             DType::List(..) => vx_dtype_variant::DTYPE_LIST,
             DType::FixedSizeList(..) => vx_dtype_variant::DTYPE_FIXED_SIZE_LIST,
+            DType::Map(..) => vx_dtype_variant::DTYPE_MAP,
             DType::Struct(..) => vx_dtype_variant::DTYPE_STRUCT,
             DType::Union(..) => vortex_panic!("Union is not supported in FFI yet"),
             DType::Variant(_) => vortex_panic!("Variant is not supported in FFI yet"),
@@ -253,6 +261,100 @@ pub unsafe extern "C-unwind" fn vx_dtype_fixed_size_list_size(dtype: *const vx_d
     match dtype_ref {
         DType::FixedSizeList(_, size, _) => *size,
         _ => vortex_panic!("not a fixed-size list dtype"),
+    }
+}
+
+/// If `dtype` is `DTYPE_MAP`, return its owned key dtype. Otherwise return `NULL`.
+///
+/// Returned dtypes must be released with [`vx_dtype_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_map_key_type(dtype: *const vx_dtype) -> *const vx_dtype {
+    let Some(map_dtype) = vx_dtype::as_ref(dtype).as_map_opt() else {
+        return ptr::null();
+    };
+    vx_dtype::new(map_dtype.key_dtype())
+}
+
+/// If `dtype` is `DTYPE_MAP`, return its owned value dtype. Otherwise return `NULL`.
+///
+/// Returned dtypes must be released with [`vx_dtype_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_map_value_type(dtype: *const vx_dtype) -> *const vx_dtype {
+    let Some(map_dtype) = vx_dtype::as_ref(dtype).as_map_opt() else {
+        return ptr::null();
+    };
+    vx_dtype::new(map_dtype.value_dtype())
+}
+
+/// Returns whether `dtype` is a map that asserts sorted keys.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_map_keys_sorted(dtype: *const vx_dtype) -> bool {
+    vx_dtype::as_ref(dtype)
+        .as_map_opt()
+        .is_some_and(|map_dtype| map_dtype.keys_sorted())
+}
+
+/// Checks if the type is time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_is_time(dtype: *const vx_dtype) -> bool {
+    match vx_dtype::as_ref(dtype) {
+        DType::Extension(ext_dtype) => ext_dtype.is::<Time>(),
+        _ => false,
+    }
+}
+
+/// Checks if the type is a date.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_is_date(dtype: *const vx_dtype) -> bool {
+    match vx_dtype::as_ref(dtype) {
+        DType::Extension(ext_dtype) => ext_dtype.is::<Date>(),
+        _ => false,
+    }
+}
+
+/// Checks if the type is a timestamp.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_is_timestamp(dtype: *const vx_dtype) -> bool {
+    match vx_dtype::as_ref(dtype) {
+        DType::Extension(ext_dtype) => ext_dtype.is::<Timestamp>(),
+        _ => false,
+    }
+}
+
+/// Returns the time unit, assuming the type is time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_time_unit(dtype: *const vx_dtype) -> u8 {
+    let dtype = vx_dtype::as_ref(dtype);
+    let DType::Extension(ext_dtype) = dtype else {
+        vortex_panic!("DType_time_unit: not a time dtype")
+    };
+
+    let Some(opts) = ext_dtype.metadata_opt::<AnyTemporal>() else {
+        // TODO(ngates): propagate this error up instead of expecting
+        vortex_panic!("DType_time_unit: not a temporal metadata: {ext_dtype:?}")
+    };
+    opts.time_unit().into()
+}
+
+/// Return time zone assuming "dtype" is time.
+/// Returns {NULL, 0} when timestamp has no time zone.
+///
+/// Returned view is valid as long as "dtype" is valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_dtype_time_zone(dtype: *const vx_dtype) -> vx_view {
+    let dtype = vx_dtype::as_ref(dtype);
+    let DType::Extension(ext_dtype) = dtype else {
+        vortex_panic!("vx_dtype_time_unit: not a time dtype")
+    };
+
+    let Some(opts) = ext_dtype.metadata_opt::<Timestamp>() else {
+        // TODO(joe): propagate this error up instead of expecting
+        vortex_panic!("DType_time_zone: not a timestamp: {ext_dtype:?}")
+    };
+
+    match opts.tz.as_ref() {
+        Some(zone) => vx_view::from_str(zone),
+        None => vx_view::null(),
     }
 }
 
@@ -496,6 +598,44 @@ mod tests {
     }
 
     #[test]
+    fn test_map_introspection() {
+        unsafe {
+            let map_dtype = vx_dtype::new(
+                DType::map(
+                    DType::Primitive(vortex::dtype::PType::I32, false.into()),
+                    DType::Utf8(true.into()),
+                    true,
+                    true.into(),
+                )
+                .unwrap(),
+            );
+
+            assert_eq!(vx_dtype_get_variant(map_dtype), vx_dtype_variant::DTYPE_MAP);
+            assert!(vx_dtype_is_nullable(map_dtype));
+            assert!(vx_dtype_map_keys_sorted(map_dtype));
+
+            let key = vx_dtype_map_key_type(map_dtype);
+            assert_eq!(vx_dtype_get_variant(key), vx_dtype_variant::DTYPE_PRIMITIVE);
+            assert_eq!(vx_dtype_primitive_ptype(key), vx_ptype::PTYPE_I32);
+            assert!(!vx_dtype_is_nullable(key));
+
+            let value = vx_dtype_map_value_type(map_dtype);
+            assert_eq!(vx_dtype_get_variant(value), vx_dtype_variant::DTYPE_UTF8);
+            assert!(vx_dtype_is_nullable(value));
+
+            let non_map = vx_dtype_new_bool(false);
+            assert!(vx_dtype_map_key_type(non_map).is_null());
+            assert!(vx_dtype_map_value_type(non_map).is_null());
+            assert!(!vx_dtype_map_keys_sorted(non_map));
+
+            vx_dtype_free(non_map);
+            vx_dtype_free(value);
+            vx_dtype_free(key);
+            vx_dtype_free(map_dtype);
+        }
+    }
+
+    #[test]
     fn test_nested_fixed_size_lists() {
         unsafe {
             // Create inner fixed-size list: FSL<i32>[5]
@@ -586,6 +726,13 @@ mod tests {
                 4,
                 true.into(),
             ),
+            DType::map(
+                DType::Primitive(vortex::dtype::PType::I32, false.into()),
+                DType::Utf8(true.into()),
+                true,
+                true.into(),
+            )
+            .unwrap(),
         ];
 
         for dtype in dtypes {
@@ -600,6 +747,7 @@ mod tests {
                 DType::FixedSizeList(..) => {
                     assert_eq!(variant, vx_dtype_variant::DTYPE_FIXED_SIZE_LIST)
                 }
+                DType::Map(..) => assert_eq!(variant, vx_dtype_variant::DTYPE_MAP),
                 _ => {}
             }
         }
