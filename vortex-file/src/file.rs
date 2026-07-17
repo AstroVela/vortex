@@ -27,6 +27,7 @@ use vortex_session::VortexSession;
 use crate::FileStatistics;
 use crate::footer::Footer;
 use crate::pruning::can_prune_file_stats;
+use crate::pruning::can_satisfy_file_stats;
 use crate::v2::FileStatsLayoutReader;
 
 /// Represents a Vortex file, providing access to its metadata and content.
@@ -197,6 +198,30 @@ impl VortexFile {
         };
 
         can_prune_file_stats(
+            filter,
+            self.footer.dtype(),
+            self.footer.row_count(),
+            stats,
+            fields,
+            &self.session,
+        )
+    }
+
+    /// Returns `true` if file-level statistics prove the expression matches
+    /// every row in this file.
+    ///
+    /// Row-count-aware satisfier predicates are evaluated with the file's total
+    /// row count as their scope.
+    pub fn can_match_all(&self, filter: &Expression) -> VortexResult<bool> {
+        let Some((stats, fields)) = self
+            .footer
+            .statistics()
+            .zip(self.footer.dtype().as_struct_fields_opt())
+        else {
+            return Ok(false);
+        };
+
+        can_satisfy_file_stats(
             filter,
             self.footer.dtype(),
             self.footer.row_count(),

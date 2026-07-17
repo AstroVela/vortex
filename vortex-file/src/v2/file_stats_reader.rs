@@ -5,7 +5,9 @@
 //!
 //! If file-level statistics prove that a filter expression cannot match any rows in the file,
 //! [`FileStatsLayoutReader`] short-circuits [`pruning_evaluation`](LayoutReader::pruning_evaluation)
-//! by returning an all-false mask — avoiding all downstream I/O.
+//! by returning an all-false mask. If they prove it matches every row, it short-circuits
+//! [`filter_evaluation`](LayoutReader::filter_evaluation) by returning the input mask. Both avoid
+//! downstream I/O.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -27,14 +29,16 @@ use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::FileStatistics;
 use crate::pruning::can_prune_file_stats;
+use crate::pruning::can_satisfy_file_stats;
 
-/// A [`LayoutReader`] decorator that prunes entire files based on file-level statistics.
+/// A [`LayoutReader`] decorator that short-circuits file-wide filter proofs from file statistics.
 ///
-/// This reader wraps an inner `LayoutReader` and intercepts `pruning_evaluation` calls.
+/// This reader wraps an inner `LayoutReader` and intercepts pruning and filter evaluation calls.
 /// When file-level stats prove that a filter expression is false for the entire file,
-/// it returns an all-false mask immediately — avoiding all downstream I/O.
+/// it returns an all-false mask immediately. When they prove it true for every row, it returns
+/// the filter's input mask. Both cases avoid all downstream I/O.
 ///
-/// Pruning results are cached per-expression since file-level stats are global
+/// File-level proof results are cached per expression since they are global
 /// (the result is the same regardless of which row range is requested).
 pub struct FileStatsLayoutReader {
     child: LayoutReaderRef,
@@ -42,6 +46,7 @@ pub struct FileStatsLayoutReader {
     struct_fields: StructFields,
     session: VortexSession,
     prune_cache: DashMap<Expression, bool>,
+    satisfy_cache: DashMap<Expression, bool>,
 }
 
 impl FileStatsLayoutReader {
@@ -64,6 +69,7 @@ impl FileStatsLayoutReader {
             struct_fields,
             session,
             prune_cache: Default::default(),
+            satisfy_cache: Default::default(),
         }
     }
 
@@ -73,6 +79,18 @@ impl FileStatsLayoutReader {
     /// independent of the requested row range.
     fn evaluate_file_stats(&self, expr: &Expression) -> VortexResult<bool> {
         can_prune_file_stats(
+            expr,
+            self.child.dtype(),
+            self.child.row_count(),
+            &self.file_stats,
+            &self.struct_fields,
+            &self.session,
+        )
+    }
+
+    /// Evaluates whether file-level statistics prove `expr` matches every row.
+    fn evaluate_satisfy_file_stats(&self, expr: &Expression) -> VortexResult<bool> {
+        can_satisfy_file_stats(
             expr,
             self.child.dtype(),
             self.child.row_count(),
@@ -141,7 +159,21 @@ impl LayoutReader for FileStatsLayoutReader {
         expr: &Expression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
-        self.child.filter_evaluation(row_range, expr, mask)
+        if let Some(satisfied) = self.satisfy_cache.get(expr) {
+            if *satisfied {
+                return Ok(mask);
+            }
+            return self.child.filter_evaluation(row_range, expr, mask);
+        }
+
+        let satisfied = self.evaluate_satisfy_file_stats(expr)?;
+        self.satisfy_cache.insert(expr.clone(), satisfied);
+
+        if satisfied {
+            Ok(mask)
+        } else {
+            self.child.filter_evaluation(row_range, expr, mask)
+        }
     }
 
     fn projection_evaluation(
@@ -160,10 +192,13 @@ impl LayoutReader for FileStatsLayoutReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::LazyLock;
 
     use vortex_array::ArrayContext;
+    use vortex_array::ArrayRef;
     use vortex_array::IntoArray as _;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::StructArray;
@@ -192,7 +227,10 @@ mod tests {
     use vortex_layout::LayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::layouts::table::TableStrategy;
+    use vortex_layout::segments::SegmentFuture;
+    use vortex_layout::segments::SegmentId;
     use vortex_layout::segments::SegmentSink;
+    use vortex_layout::segments::SegmentSource;
     use vortex_layout::segments::TestSegments;
     use vortex_layout::sequence::SequenceId;
     use vortex_layout::sequence::SequentialArrayStreamExt;
@@ -207,6 +245,18 @@ mod tests {
             .with::<LayoutSession>()
             .with::<RuntimeSession>()
     });
+
+    struct CountingSegmentSource {
+        inner: Arc<dyn SegmentSource>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    impl SegmentSource for CountingSegmentSource {
+        fn request(&self, id: SegmentId) -> SegmentFuture {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            self.inner.request(id)
+        }
+    }
 
     fn test_file_stats(min: i32, max: i32) -> FileStatistics {
         let mut stats = StatsSet::default();
@@ -228,6 +278,43 @@ mod tests {
             Arc::from([stats]),
             Arc::from([DType::Primitive(PType::I32, Nullability::Nullable)]),
         )
+    }
+
+    fn test_nullable_file_stats(min: i32, max: i32, null_count: u64) -> FileStatistics {
+        let mut stats = StatsSet::default();
+        stats.set(Stat::Min, Precision::exact(ScalarValue::from(min)));
+        stats.set(Stat::Max, Precision::exact(ScalarValue::from(max)));
+        stats.set(
+            Stat::NullCount,
+            Precision::exact(ScalarValue::from(null_count)),
+        );
+        FileStatistics::new(
+            Arc::from([stats]),
+            Arc::from([DType::Primitive(PType::I32, Nullability::Nullable)]),
+        )
+    }
+
+    async fn write_single_column_table(
+        session: &VortexSession,
+        segments: Arc<TestSegments>,
+        values: ArrayRef,
+    ) -> VortexResult<vortex_layout::LayoutRef> {
+        let ctx = ArrayContext::empty();
+        let (ptr, eof) = SequenceId::root().split();
+        let struct_array = StructArray::from_fields([("col", values)].as_slice())?;
+        let strategy = TableStrategy::new(
+            Arc::new(FlatLayoutStrategy::default()),
+            Arc::new(FlatLayoutStrategy::default()),
+        );
+        strategy
+            .write_stream(
+                ctx,
+                segments,
+                struct_array.into_array().to_array_stream().sequenced(ptr),
+                eof,
+                session,
+            )
+            .await
     }
 
     #[test]
@@ -305,6 +392,89 @@ mod tests {
             // Should delegate to child, which returns the mask unchanged (struct reader doesn't prune).
             assert_eq!(result, Mask::new_true(5));
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn filter_skipped_when_file_satisfies() -> VortexResult<()> {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let segments = Arc::new(TestSegments::default());
+            let layout = write_single_column_table(
+                &session,
+                Arc::clone(&segments),
+                buffer![60i32, 70, 80, 90, 100].into_array(),
+            )
+            .await?;
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let source: Arc<dyn SegmentSource> = Arc::new(CountingSegmentSource {
+                inner: segments,
+                request_count: Arc::clone(&request_count),
+            });
+            let child = layout.new_reader("".into(), source, &session, &Default::default())?;
+            let reader = FileStatsLayoutReader::new(child, test_file_stats(60, 100), session);
+            let expr = gt(get_item("col", root()), lit(50i32));
+            let input = Mask::from_iter([true, false, true, false, true]);
+
+            let result = reader
+                .filter_evaluation(&(0..5), &expr, MaskFuture::ready(input.clone()))?
+                .await?;
+
+            assert_eq!(result, input);
+            assert_eq!(request_count.load(Ordering::Relaxed), 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn filter_not_skipped_when_partial() -> VortexResult<()> {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let segments = Arc::new(TestSegments::default());
+            let layout = write_single_column_table(
+                &session,
+                Arc::clone(&segments),
+                buffer![0i32, 25, 50, 75, 100].into_array(),
+            )
+            .await?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
+            let reader = FileStatsLayoutReader::new(child, test_file_stats(0, 100), session);
+            let expr = gt(get_item("col", root()), lit(50i32));
+
+            let result = reader
+                .filter_evaluation(&(0..5), &expr, MaskFuture::new_true(5))?
+                .await?;
+
+            assert_eq!(result, Mask::from_iter([false, false, false, true, true]));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn filter_nullable_not_satisfied() -> VortexResult<()> {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let segments = Arc::new(TestSegments::default());
+            let layout = write_single_column_table(
+                &session,
+                Arc::clone(&segments),
+                PrimitiveArray::from_option_iter([None::<i32>, Some(60), Some(100)]).into_array(),
+            )
+            .await?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
+            let reader = FileStatsLayoutReader::new(
+                child,
+                test_nullable_file_stats(60, 100, 1),
+                session,
+            );
+            let expr = gt(get_item("col", root()), lit(50i32));
+
+            let result = reader
+                .filter_evaluation(&(0..3), &expr, MaskFuture::new_true(3))?
+                .await?;
+
+            assert_eq!(result, Mask::from_iter([false, true, true]));
             Ok(())
         })
     }
