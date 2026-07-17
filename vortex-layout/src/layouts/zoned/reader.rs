@@ -272,9 +272,9 @@ impl LayoutReader for ZonedReader {
 #[cfg(test)]
 mod test {
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
 
     use rstest::fixture;
     use rstest::rstest;

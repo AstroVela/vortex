@@ -2284,10 +2284,7 @@ async fn test_can_prune_composite_predicates() -> VortexResult<()> {
 
     // Satisfaction is the dual one-way proof: it only returns true when every row matches.
     assert!(file.can_match_all(&gt(col("age"), lit(10)))?);
-    assert!(file.can_match_all(&and(
-        gt(col("age"), lit(10)),
-        gt(col("price"), lit(100)),
-    ))?);
+    assert!(file.can_match_all(&and(gt(col("age"), lit(10)), gt(col("price"), lit(100)),))?);
     assert!(!file.can_match_all(&gt(col("age"), lit(20)))?);
 
     Ok(())

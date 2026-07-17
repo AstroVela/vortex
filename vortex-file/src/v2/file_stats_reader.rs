@@ -192,10 +192,10 @@ impl LayoutReader for FileStatsLayoutReader {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::LazyLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use vortex_array::ArrayContext;
     use vortex_array::ArrayRef;
@@ -463,11 +463,8 @@ mod tests {
             )
             .await?;
             let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
-            let reader = FileStatsLayoutReader::new(
-                child,
-                test_nullable_file_stats(60, 100, 1),
-                session,
-            );
+            let reader =
+                FileStatsLayoutReader::new(child, test_nullable_file_stats(60, 100, 1), session);
             let expr = gt(get_item("col", root()), lit(50i32));
 
             let result = reader

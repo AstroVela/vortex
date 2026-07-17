@@ -353,9 +353,9 @@ impl LayoutReader for ChunkedReader {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
 
     use futures::stream;
     use rstest::fixture;
@@ -369,9 +369,9 @@ mod test {
     use vortex_array::dtype::FieldMask;
     use vortex_array::dtype::Nullability::NonNullable;
     use vortex_array::dtype::PType;
-    use vortex_array::expr::root;
     use vortex_array::expr::gt;
     use vortex_array::expr::lit;
+    use vortex_array::expr::root;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
     use vortex_io::runtime::single::block_on;
@@ -388,8 +388,8 @@ mod test {
     use crate::layouts::flat::FlatLayout;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::scan::split_by::SplitBy;
-    use crate::segments::SegmentId;
     use crate::segments::SegmentFuture;
+    use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;

@@ -782,8 +782,11 @@ fn with_comparison_guards<'a, P: NonNanProof>(
 
     // `AllNonNull` is not a `Stat`, so FileStatsBinder cannot bind it. Keep this
     // in `NullCount == 0` form so the same satisfier works for zone and file stats.
-    let value_predicate = and_collect(null_checks.into_iter().chain(Some(value_predicate)))
-        .expect("comparison value predicate is always present");
+    let value_predicate = if let Some(null_checks) = and_collect(null_checks) {
+        and(null_checks, value_predicate)
+    } else {
+        value_predicate
+    };
     with_non_nan_guards::<P>(ctx, exprs, value_predicate)
 }
 
@@ -904,7 +907,10 @@ mod tests {
                 ("f", DType::Primitive(PType::F32, Nullability::NonNullable)),
                 ("s", DType::Utf8(Nullability::NonNullable)),
                 ("t", DType::Utf8(Nullability::NonNullable)),
-                ("nullable", DType::Primitive(PType::I32, Nullability::Nullable)),
+                (
+                    "nullable",
+                    DType::Primitive(PType::I32, Nullability::Nullable),
+                ),
                 ("n", nested_struct_dtype()),
             ]),
             Nullability::NonNullable,
