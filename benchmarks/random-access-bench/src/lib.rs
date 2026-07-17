@@ -282,6 +282,9 @@ async fn open_accessor(
 /// The benchmark ID used for output path.
 const BENCHMARK_ID: &str = "random-access";
 
+/// Repo-relative path of the suite explainer linked from CI benchmark PR comments.
+const DOC_PATH: &str = "benchmarks/random-access-bench/README.md";
+
 /// Fixed indices used by the original taxi benchmark (preserved for historical continuity).
 const FIXED_TAXI_INDICES: [u64; 6] = [10, 11, 12, 13, 100_000, 3_000_000];
 
@@ -409,7 +412,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
         }
         DisplayFormat::GhJson => {
             let timings: Vec<TimingMeasurement> = runs.into_iter().map(|r| r.timing).collect();
-            print_measurements_json(&mut writer, timings)?;
+            print_measurements_json(&mut writer, timings, DOC_PATH)?;
         }
     }
 
