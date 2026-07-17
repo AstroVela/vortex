@@ -269,9 +269,17 @@ impl LayoutReader for ChunkedReader {
         let mut chunk_evals = vec![];
 
         for (chunk_idx, _, chunk_range, mask_range) in self.ranges(row_range) {
+            let chunk_mask = mask.slice(mask_range);
+            if let Some(Ok(chunk_mask)) = chunk_mask.clone().now_or_never()
+                && chunk_mask.all_false()
+            {
+                chunk_evals.push(MaskFuture::ready(chunk_mask));
+                continue;
+            }
+
             let chunk_reader = self.chunk_reader(chunk_idx)?;
             let chunk_eval = chunk_reader
-                .filter_evaluation(&chunk_range, expr, mask.slice(mask_range))
+                .filter_evaluation(&chunk_range, expr, chunk_mask)
                 .map_err(|err| {
                     err.with_context(format!("While evaluating filter on chunk {chunk_idx}"))
                 })?;
@@ -345,6 +353,8 @@ impl LayoutReader for ChunkedReader {
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use futures::stream;
@@ -360,9 +370,13 @@ mod test {
     use vortex_array::dtype::Nullability::NonNullable;
     use vortex_array::dtype::PType;
     use vortex_array::expr::root;
+    use vortex_array::expr::gt;
+    use vortex_array::expr::lit;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
+    use vortex_mask::Mask;
     use vortex_session::registry::ReadContext;
 
     use crate::IntoLayout;
@@ -375,12 +389,25 @@ mod test {
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::scan::split_by::SplitBy;
     use crate::segments::SegmentId;
+    use crate::segments::SegmentFuture;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialStreamAdapter;
     use crate::sequence::SequentialStreamExt as _;
     use crate::test::SESSION;
+
+    struct CountingSegmentSource {
+        inner: Arc<dyn SegmentSource>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    impl SegmentSource for CountingSegmentSource {
+        fn request(&self, id: SegmentId) -> SegmentFuture {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            self.inner.request(id)
+        }
+    }
 
     #[fixture]
     /// Create a chunked layout with three chunks of primitive arrays.
@@ -487,6 +514,34 @@ mod test {
 
             let expected = buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9].into_array();
             assert_arrays_eq!(result, expected, &mut ctx);
+        })
+    }
+
+    #[rstest]
+    fn all_false_chunk_slice_skips_child(
+        #[from(chunked_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        block_on(|handle| async {
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingSegmentSource {
+                inner: segments,
+                request_count: Arc::clone(&request_count),
+            });
+            let session = SESSION.clone().with_handle(handle);
+            let reader = layout.new_reader("".into(), source, &session, &Default::default())?;
+            let mask = Mask::from_iter([false, false, false, true, true, true, true, true, true]);
+
+            let result = reader
+                .filter_evaluation(
+                    &(0..layout.row_count()),
+                    &gt(root(), lit(0i32)),
+                    MaskFuture::ready(mask.clone()),
+                )?
+                .await?;
+
+            assert_eq!(result, mask);
+            assert_eq!(request_count.load(Ordering::Relaxed), 2);
+            Ok(())
         })
     }
 }
