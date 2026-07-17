@@ -83,6 +83,14 @@ impl StatsRewriteRule for BinaryNanCountStatsRewrite {
     ) -> VortexResult<Option<Expression>> {
         binary_falsify::<NanCountProof>(expr, ctx)
     }
+
+    fn satisfy(
+        &self,
+        expr: &Expression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<Expression>> {
+        binary_satisfy::<NanCountProof>(expr, ctx)
+    }
 }
 
 #[derive(Debug)]
@@ -99,6 +107,14 @@ impl StatsRewriteRule for BinaryAllNonNanStatsRewrite {
         ctx: &StatsRewriteCtx<'_>,
     ) -> VortexResult<Option<Expression>> {
         binary_falsify::<AllNonNanProof>(expr, ctx)
+    }
+
+    fn satisfy(
+        &self,
+        expr: &Expression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<Expression>> {
+        binary_satisfy::<AllNonNanProof>(expr, ctx)
     }
 }
 
@@ -168,6 +184,82 @@ fn binary_falsify<P: NonNanProof>(
     })
 }
 
+fn binary_satisfy<P: NonNanProof>(
+    expr: &Expression,
+    ctx: &StatsRewriteCtx<'_>,
+) -> VortexResult<Option<Expression>> {
+    let operator = expr.as_::<Binary>();
+    let lhs = expr.child(0);
+    let rhs = expr.child(1);
+
+    Ok(match operator {
+        Operator::Eq => min(lhs, ctx)
+            .zip(max(rhs, ctx))
+            .zip(max(lhs, ctx).zip(min(rhs, ctx)))
+            .map(|((min_lhs, max_rhs), (max_lhs, min_rhs))| {
+                with_comparison_guards::<P>(
+                    ctx,
+                    [lhs, rhs],
+                    and(eq(min_lhs, max_rhs), eq(max_lhs, min_rhs)),
+                )
+            })
+            .transpose()?
+            .flatten(),
+        Operator::NotEq => min(lhs, ctx)
+            .zip(max(rhs, ctx))
+            .zip(min(rhs, ctx).zip(max(lhs, ctx)))
+            .map(|((min_lhs, max_rhs), (min_rhs, max_lhs))| {
+                with_comparison_guards::<P>(
+                    ctx,
+                    [lhs, rhs],
+                    or(gt(min_lhs, max_rhs), gt(min_rhs, max_lhs)),
+                )
+            })
+            .transpose()?
+            .flatten(),
+        Operator::Gt => min(lhs, ctx)
+            .zip(max(rhs, ctx))
+            .map(|(a, b)| with_comparison_guards::<P>(ctx, [lhs, rhs], gt(a, b)))
+            .transpose()?
+            .flatten(),
+        Operator::Gte => min(lhs, ctx)
+            .zip(max(rhs, ctx))
+            .map(|(a, b)| with_comparison_guards::<P>(ctx, [lhs, rhs], gt_eq(a, b)))
+            .transpose()?
+            .flatten(),
+        Operator::Lt => max(lhs, ctx)
+            .zip(min(rhs, ctx))
+            .map(|(a, b)| with_comparison_guards::<P>(ctx, [lhs, rhs], lt(a, b)))
+            .transpose()?
+            .flatten(),
+        Operator::Lte => max(lhs, ctx)
+            .zip(min(rhs, ctx))
+            .map(|(a, b)| with_comparison_guards::<P>(ctx, [lhs, rhs], lt_eq(a, b)))
+            .transpose()?
+            .flatten(),
+        Operator::And => {
+            if !P::EMIT_UNGUARDED_REWRITES {
+                return Ok(None);
+            }
+
+            match (ctx.satisfy(lhs)?, ctx.satisfy(rhs)?) {
+                (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
+                _ => None,
+            }
+        }
+        Operator::Or => {
+            if !P::EMIT_UNGUARDED_REWRITES {
+                return Ok(None);
+            }
+
+            let lhs_satisfier = ctx.satisfy(lhs)?;
+            let rhs_satisfier = ctx.satisfy(rhs)?;
+            or_collect(lhs_satisfier.into_iter().chain(rhs_satisfier))
+        }
+        Operator::Add | Operator::Sub | Operator::Mul | Operator::Div => None,
+    })
+}
+
 #[derive(Debug)]
 struct BetweenStatsRewrite;
 
@@ -189,6 +281,21 @@ impl StatsRewriteRule for BetweenStatsRewrite {
         let lhs = Binary.new_expr(options.lower_strict.to_operator(), [lower, arr.clone()]);
         let rhs = Binary.new_expr(options.upper_strict.to_operator(), [arr, upper]);
         ctx.falsify(&and(lhs, rhs))
+    }
+
+    fn satisfy(
+        &self,
+        expr: &Expression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<Expression>> {
+        let options = expr.as_::<Between>();
+        let arr = expr.child(0).clone();
+        let lower = expr.child(1).clone();
+        let upper = expr.child(2).clone();
+
+        let lhs = Binary.new_expr(options.lower_strict.to_operator(), [lower, arr.clone()]);
+        let rhs = Binary.new_expr(options.upper_strict.to_operator(), [arr, upper]);
+        ctx.satisfy(&and(lhs, rhs))
     }
 }
 
@@ -529,6 +636,12 @@ enum NanCheck {
     Unavailable,
 }
 
+enum NullCheck {
+    NotNeeded,
+    Check(Expression),
+    Unavailable,
+}
+
 trait NonNanProof {
     const EMIT_UNGUARDED_REWRITES: bool;
 
@@ -652,6 +765,39 @@ fn with_non_nan_guards<'a, P: NonNanProof>(
     })
 }
 
+fn with_comparison_guards<'a, P: NonNanProof>(
+    ctx: &StatsRewriteCtx<'_>,
+    exprs: impl IntoIterator<Item = &'a Expression>,
+    value_predicate: Expression,
+) -> VortexResult<Option<Expression>> {
+    let exprs = exprs.into_iter().collect::<Vec<_>>();
+    let mut null_checks = Vec::new();
+    for expr in &exprs {
+        match null_check(ctx, expr)? {
+            NullCheck::NotNeeded => {}
+            NullCheck::Check(check) => null_checks.push(check),
+            NullCheck::Unavailable => return Ok(None),
+        }
+    }
+
+    // `AllNonNull` is not a `Stat`, so FileStatsBinder cannot bind it. Keep this
+    // in `NullCount == 0` form so the same satisfier works for zone and file stats.
+    let value_predicate = and_collect(null_checks.into_iter().chain(Some(value_predicate)))
+        .expect("comparison value predicate is always present");
+    with_non_nan_guards::<P>(ctx, exprs, value_predicate)
+}
+
+fn null_check(ctx: &StatsRewriteCtx<'_>, expr: &Expression) -> VortexResult<NullCheck> {
+    if !ctx.return_dtype(expr)?.is_nullable() {
+        return Ok(NullCheck::NotNeeded);
+    }
+
+    Ok(match null_count(expr, ctx) {
+        Some(null_count) => NullCheck::Check(eq(null_count, lit(0u64))),
+        None => NullCheck::Unavailable,
+    })
+}
+
 fn literal_stat(expr: &Expression, stat: Stat) -> Option<Expression> {
     let scalar = expr.as_opt::<Literal>()?;
     match stat {
@@ -726,6 +872,7 @@ mod tests {
     use crate::expr::lit;
     use crate::expr::lt;
     use crate::expr::lt_eq;
+    use crate::expr::not_eq;
     use crate::expr::or;
     use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
@@ -757,6 +904,7 @@ mod tests {
                 ("f", DType::Primitive(PType::F32, Nullability::NonNullable)),
                 ("s", DType::Utf8(Nullability::NonNullable)),
                 ("t", DType::Utf8(Nullability::NonNullable)),
+                ("nullable", DType::Primitive(PType::I32, Nullability::Nullable)),
                 ("n", nested_struct_dtype()),
             ]),
             Nullability::NonNullable,
@@ -820,6 +968,33 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_comparison_satisfier() -> VortexResult<()> {
+        assert_eq!(
+            satisfy(&gt(col("a"), lit(10)))?,
+            Some(gt(stat(col("a"), Stat::Min), lit(10)))
+        );
+        assert_eq!(
+            satisfy(&lt(col("a"), lit(10)))?,
+            Some(lt(stat(col("a"), Stat::Max), lit(10)))
+        );
+        assert_eq!(
+            satisfy(&eq(col("a"), col("b")))?,
+            Some(and(
+                eq(stat(col("a"), Stat::Min), stat(col("b"), Stat::Max)),
+                eq(stat(col("a"), Stat::Max), stat(col("b"), Stat::Min)),
+            ))
+        );
+        assert_eq!(
+            satisfy(&not_eq(col("a"), col("b")))?,
+            Some(or(
+                gt(stat(col("a"), Stat::Min), stat(col("b"), Stat::Max)),
+                gt(stat(col("b"), Stat::Min), stat(col("a"), Stat::Max)),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rewrites_boolean_falsifiers() -> VortexResult<()> {
         let expr = and(gt(col("a"), lit(10)), lt(col("a"), lit(50)));
         assert_eq!(
@@ -827,6 +1002,29 @@ mod tests {
             Some(or(
                 lt_eq(stat(col("a"), Stat::Max), lit(10)),
                 gt_eq(stat(col("a"), Stat::Min), lit(50)),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rewrites_boolean_satisfiers() -> VortexResult<()> {
+        let satisfiable = gt(col("a"), lit(10));
+        let unavailable = like(col("s"), lit("prefix%"));
+
+        assert_eq!(
+            satisfy(&and(satisfiable.clone(), unavailable.clone()))?,
+            None
+        );
+        assert_eq!(
+            satisfy(&or(satisfiable.clone(), unavailable))?,
+            Some(gt(stat(col("a"), Stat::Min), lit(10)))
+        );
+        assert_eq!(
+            satisfy(&and(satisfiable, lt(col("a"), lit(50))))?,
+            Some(and(
+                gt(stat(col("a"), Stat::Min), lit(10)),
+                lt(stat(col("a"), Stat::Max), lit(50)),
             ))
         );
         Ok(())
@@ -851,6 +1049,67 @@ mod tests {
                 gt(stat(col("a"), Stat::Min), lit(50)),
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rewrites_between_satisfier() -> VortexResult<()> {
+        let expr = between(
+            col("a"),
+            lit(10),
+            lit(50),
+            BetweenOptions {
+                lower_strict: StrictComparison::NonStrict,
+                upper_strict: StrictComparison::NonStrict,
+            },
+        );
+
+        assert_eq!(
+            satisfy(&expr)?,
+            Some(and(
+                lt_eq(lit(10), stat(col("a"), Stat::Min)),
+                lt_eq(stat(col("a"), Stat::Max), lit(50)),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn satisfier_guards_nullable_operand() -> VortexResult<()> {
+        assert_eq!(
+            satisfy(&gt(col("nullable"), lit(10)))?,
+            Some(and(
+                eq(stat(col("nullable"), Stat::NullCount), lit(0u64)),
+                gt(stat(col("nullable"), Stat::Min), lit(10)),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn satisfier_nan_guards_float_operand() -> VortexResult<()> {
+        assert_eq!(
+            satisfy(&gt(col("f"), lit(1.0f32)))?,
+            Some(nan_guarded(
+                col("f"),
+                gt(stat(col("f"), Stat::Min), lit(1.0f32)),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_satisfier_for_dynamic_and_like() -> VortexResult<()> {
+        let dynamic = dynamic(
+            CompareOperator::Gt,
+            || Some(10i32.into()),
+            DType::Primitive(PType::I32, Nullability::NonNullable),
+            true,
+            col("a"),
+        );
+
+        assert_eq!(satisfy(&dynamic)?, None);
+        assert_eq!(satisfy(&like(col("s"), lit("prefix%")))?, None);
         Ok(())
     }
 
