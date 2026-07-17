@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::ops::BitAnd;
+use std::ops::BitOr;
 use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use tracing::trace;
@@ -88,6 +90,41 @@ impl ZonedReader {
             .saturating_mul(self.layout.zone_len as u64)
             .min(self.layout.row_count())
     }
+
+    fn zone_row_lengths(&self, row_range: &Range<u64>) -> VortexResult<(Range<u64>, Vec<usize>)> {
+        let row_count = row_range.end - row_range.start;
+        let zone_range = self.zone_range(row_range);
+        let zone_lengths = zone_range
+            .clone()
+            .map(|zone_idx| {
+                let start = usize::try_from(
+                    self.first_row_offset(zone_idx)
+                        .saturating_sub(row_range.start),
+                )?;
+                let end = usize::try_from(
+                    self.first_row_offset(zone_idx + 1)
+                        .saturating_sub(row_range.start)
+                        .min(row_count),
+                )?;
+                Ok::<_, VortexError>(end - start)
+            })
+            .try_collect()?;
+
+        Ok((zone_range, zone_lengths))
+    }
+
+    fn expand_zone_mask(&self, row_range: &Range<u64>, zone_mask: &Mask) -> VortexResult<Mask> {
+        let (zone_range, zone_lengths) = self.zone_row_lengths(row_range)?;
+        let row_mask_len = usize::try_from(row_range.end - row_range.start)?;
+        let mut builder = BitBufferMut::with_capacity(row_mask_len);
+        for (zone_idx, &zone_length) in zone_range.zip_eq(&zone_lengths) {
+            builder.append_n(zone_mask.value(usize::try_from(zone_idx)?), zone_length);
+        }
+
+        let row_mask = Mask::from(builder.freeze());
+        assert_eq!(row_mask.len(), row_mask_len, "Mask length mismatch");
+        Ok(row_mask)
+    }
 }
 
 impl LayoutReader for ZonedReader {
@@ -138,24 +175,7 @@ impl LayoutReader for ZonedReader {
             return Ok(data_eval);
         };
 
-        let row_count = row_range.end - row_range.start;
-        let zone_range = self.zone_range(row_range);
-        let zone_lengths: Vec<_> = zone_range
-            .clone()
-            .map(|zone_idx| {
-                // Figure out the range in the mask that corresponds to the zone
-                let start = usize::try_from(
-                    self.first_row_offset(zone_idx)
-                        .saturating_sub(row_range.start),
-                )?;
-                let end = usize::try_from(
-                    self.first_row_offset(zone_idx + 1)
-                        .saturating_sub(row_range.start)
-                        .min(row_count),
-                )?;
-                Ok::<_, VortexError>(end - start)
-            })
-            .try_collect()?;
+        let (zone_range, zone_lengths) = self.zone_row_lengths(row_range)?;
 
         let name = Arc::clone(&self.name);
         let expr = expr.clone();
@@ -201,7 +221,39 @@ impl LayoutReader for ZonedReader {
         expr: &Expression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
-        self.data_child()?.filter_evaluation(row_range, expr, mask)
+        if self.layout.zone_len == 0 {
+            return self.data_child()?.filter_evaluation(row_range, expr, mask);
+        }
+
+        let Some(satisfy_mask_future) = self.pruning.satisfy_mask_future(expr.clone()) else {
+            return self.data_child()?.filter_evaluation(row_range, expr, mask);
+        };
+
+        // The zone map is normally resolved by pruning before filter evaluation. If it or the
+        // input mask is not ready, delegate to preserve eager child prefetching.
+        let Some(Ok(satisfied_zones)) = satisfy_mask_future.clone().now_or_never() else {
+            return self.data_child()?.filter_evaluation(row_range, expr, mask);
+        };
+        let Some(Ok(input)) = mask.clone().now_or_never() else {
+            return self.data_child()?.filter_evaluation(row_range, expr, mask);
+        };
+
+        let satisfied_rows = self.expand_zone_mask(row_range, &satisfied_zones)?;
+        let child_input = input.clone().bitand_not(&satisfied_rows);
+        if child_input.all_false() {
+            return Ok(MaskFuture::ready(input));
+        }
+
+        let passthrough = input.bitand(&satisfied_rows);
+        let child_result = self.data_child()?.filter_evaluation(
+            row_range,
+            expr,
+            MaskFuture::ready(child_input),
+        )?;
+
+        Ok(MaskFuture::new(passthrough.len(), async move {
+            Ok(child_result.await?.bitor(&passthrough))
+        }))
     }
 
     fn projection_evaluation(
@@ -220,6 +272,8 @@ impl LayoutReader for ZonedReader {
 #[cfg(test)]
 mod test {
     use std::num::NonZeroUsize;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use rstest::fixture;
@@ -262,11 +316,36 @@ mod test {
     use crate::layouts::zoned::Zoned;
     use crate::layouts::zoned::writer::ZonedLayoutOptions;
     use crate::layouts::zoned::writer::ZonedStrategy;
+    use crate::segments::SegmentFuture;
+    use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::session::LayoutSession;
+
+    struct CountingSegmentSource {
+        inner: Arc<dyn SegmentSource>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    impl SegmentSource for CountingSegmentSource {
+        fn request(&self, id: SegmentId) -> SegmentFuture {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            self.inner.request(id)
+        }
+    }
+
+    fn counting_source(
+        inner: Arc<dyn SegmentSource>,
+    ) -> (Arc<dyn SegmentSource>, Arc<AtomicUsize>) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let source: Arc<dyn SegmentSource> = Arc::new(CountingSegmentSource {
+            inner,
+            request_count: Arc::clone(&request_count),
+        });
+        (source, request_count)
+    }
 
     fn session_with_handle(handle: Handle) -> VortexSession {
         array_session()
@@ -294,6 +373,37 @@ mod test {
             buffer![4, 5, 6].into_array(),
             buffer![7, 8, 9].into_array(),
         ])
+        .into_array()
+        .to_array_stream()
+        .sequenced(ptr);
+        let segments2 = Arc::<TestSegments>::clone(&segments);
+        let layout = block_on(|handle| async move {
+            let session = session_with_handle(handle);
+            strategy
+                .write_stream(ctx, segments2, array_stream, eof, &session)
+                .await
+        })
+        .unwrap();
+        (segments, layout)
+    }
+
+    #[fixture]
+    fn nullable_stats_layout() -> (Arc<dyn SegmentSource>, LayoutRef) {
+        let ctx = ArrayContext::empty();
+        let segments = Arc::new(TestSegments::default());
+        let (ptr, eof) = SequenceId::root().split();
+        let strategy = ZonedStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            FlatLayoutStrategy::default(),
+            ZonedLayoutOptions {
+                block_size: NonZeroUsize::new(3).vortex_expect("non zero"),
+                ..Default::default()
+            },
+        );
+        let array_stream = PrimitiveArray::new(
+            buffer![0i32, 4, 5],
+            Validity::from_iter([false, true, true]),
+        )
         .into_array()
         .to_array_stream()
         .sequenced(ptr);
@@ -363,6 +473,129 @@ mod test {
         })
     }
 
+    #[rstest]
+    fn satisfied_zones_skip_data_child(
+        #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        block_on(|handle| async {
+            let row_count = layout.row_count();
+            let (source, request_count) = counting_source(segments);
+            let session = session_with_handle(handle);
+            let reader = layout.new_reader("".into(), source, &session, &Default::default())?;
+            let input = Mask::new_true(usize::try_from(row_count)?);
+
+            reader
+                .pruning_evaluation(&(0..row_count), &gt(root(), lit(10)), input.clone())?
+                .await?;
+            let requests_before_filter = request_count.load(Ordering::Relaxed);
+
+            let result = reader
+                .filter_evaluation(
+                    &(0..row_count),
+                    &gt(root(), lit(0)),
+                    MaskFuture::ready(input.clone()),
+                )?
+                .await?;
+
+            assert_eq!(result, input);
+            assert_eq!(
+                request_count.load(Ordering::Relaxed),
+                requests_before_filter,
+                "a fully satisfied filter must not read the data child"
+            );
+            Ok(())
+        })
+    }
+
+    #[rstest]
+    fn partial_satisfaction_stitches(
+        #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        block_on(|handle| async {
+            let row_count = layout.row_count();
+            let (source, request_count) = counting_source(segments);
+            let session = session_with_handle(handle);
+            let reader = layout.new_reader("".into(), source, &session, &Default::default())?;
+            let input = Mask::new_true(usize::try_from(row_count)?);
+
+            reader
+                .pruning_evaluation(&(0..row_count), &gt(root(), lit(10)), input.clone())?
+                .await?;
+            let requests_before_filter = request_count.load(Ordering::Relaxed);
+
+            let result = reader
+                .filter_evaluation(
+                    &(0..row_count),
+                    &gt(root(), lit(3)),
+                    MaskFuture::ready(input),
+                )?
+                .await?;
+
+            assert_eq!(
+                result,
+                Mask::from_iter([false, false, false, true, true, true, true, true, true])
+            );
+            assert_eq!(
+                request_count.load(Ordering::Relaxed),
+                requests_before_filter + 1,
+                "only the unsatisfied zone should read a data segment"
+            );
+            Ok(())
+        })
+    }
+
+    #[rstest]
+    fn nullable_zone_with_nulls_not_skipped(
+        #[from(nullable_stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        block_on(|handle| async {
+            let row_count = layout.row_count();
+            let session = session_with_handle(handle);
+            let reader = layout.new_reader("".into(), segments, &session, &Default::default())?;
+            let input = Mask::new_true(usize::try_from(row_count)?);
+
+            reader
+                .pruning_evaluation(&(0..row_count), &gt(root(), lit(10)), input.clone())?
+                .await?;
+
+            let result = reader
+                .filter_evaluation(
+                    &(0..row_count),
+                    &gt(root(), lit(3)),
+                    MaskFuture::ready(input),
+                )?
+                .await?;
+
+            assert_eq!(result, Mask::from_iter([false, true, true]));
+            Ok(())
+        })
+    }
+
+    #[rstest]
+    fn unwarmed_zone_map_keeps_filter_correct(
+        #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        block_on(|handle| async {
+            let row_count = layout.row_count();
+            let session = session_with_handle(handle);
+            let reader = layout.new_reader("".into(), segments, &session, &Default::default())?;
+
+            let result = reader
+                .filter_evaluation(
+                    &(0..row_count),
+                    &gt(root(), lit(3)),
+                    MaskFuture::new_true(usize::try_from(row_count)?),
+                )?
+                .await?;
+
+            assert_eq!(
+                result,
+                Mask::from_iter([false, false, false, true, true, true, true, true, true])
+            );
+            Ok(())
+        })
+    }
+
     #[test]
     fn test_default_zoned_null_count_pruning_mask() {
         let ctx = ArrayContext::empty();
@@ -428,7 +661,7 @@ mod test {
     }
 
     #[rstest]
-    fn test_legacy_zero_zone_len_skips_zoned_pruning(
+    fn legacy_zero_zone_len_delegates_pruning_and_filter(
         #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
     ) -> VortexResult<()> {
         let zoned_layout = layout.as_::<Zoned>();
@@ -469,6 +702,18 @@ mod test {
                 .await?;
 
             assert!(result.all_true());
+
+            let result = reader
+                .filter_evaluation(
+                    &(0..row_count),
+                    &gt(root(), lit(7)),
+                    MaskFuture::new_true(usize::try_from(row_count)?),
+                )?
+                .await?;
+            assert_eq!(
+                result,
+                Mask::from_iter([false, false, false, false, false, false, false, true, true])
+            );
             Ok(())
         })
     }

@@ -35,6 +35,7 @@ use crate::layouts::zoned::zone_map::ZoneMap;
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
 pub(super) type SharedPruningResult =
     Shared<BoxFuture<'static, SharedVortexResult<Arc<PruningResult>>>>;
+pub(super) type SharedSatisfyMask = Shared<BoxFuture<'static, SharedVortexResult<Mask>>>;
 type PredicateCache = Arc<OnceLock<Option<Expression>>>;
 
 pub(super) struct PruningState {
@@ -47,8 +48,10 @@ pub(super) struct PruningState {
     session: VortexSession,
 
     pruning_result: LazyLock<DashMap<Expression, Option<SharedPruningResult>>>,
+    satisfy_result: LazyLock<DashMap<Expression, Option<SharedSatisfyMask>>>,
     zone_map: OnceLock<SharedZoneMap>,
     pruning_predicates: LazyLock<Arc<DashMap<Expression, PredicateCache>>>,
+    satisfy_predicates: LazyLock<Arc<DashMap<Expression, PredicateCache>>>,
 }
 
 impl PruningState {
@@ -67,8 +70,10 @@ impl PruningState {
             lazy_children,
             session,
             pruning_result: Default::default(),
+            satisfy_result: Default::default(),
             zone_map: Default::default(),
             pruning_predicates: Default::default(),
+            satisfy_predicates: Default::default(),
         }
     }
 
@@ -116,11 +121,66 @@ impl PruningState {
             .clone()
     }
 
+    pub(super) fn satisfy_mask_future(&self, expr: Expression) -> Option<SharedSatisfyMask> {
+        if let Some(result) = self.satisfy_result.get(&expr) {
+            return result.value().clone();
+        }
+
+        self.satisfy_result
+            .entry(expr.clone())
+            .or_insert_with(|| match self.satisfy_predicate(expr.clone()) {
+                None => {
+                    trace!(%expr, "no satisfy predicate");
+                    None
+                }
+                Some(predicate) => {
+                    trace!(%expr, ?predicate, "constructed satisfy predicate");
+                    let zone_map = self.zone_map();
+                    let session = self.session.clone();
+
+                    Some(
+                        async move {
+                            let zone_map = zone_map.await?;
+                            zone_map.prune(&predicate, &session).map_err(|err| {
+                                err.with_context(format!(
+                                    "While evaluating satisfy predicate {} (derived from {})",
+                                    predicate, expr
+                                ))
+                            })
+                        }
+                        .map_err(Arc::new)
+                        .boxed()
+                        .shared(),
+                    )
+                }
+            })
+            .clone()
+    }
+
     fn pruning_predicate(&self, expr: Expression) -> Option<Expression> {
         self.pruning_predicates
             .entry(expr.clone())
             .or_default()
             .get_or_init(move || match expr.falsify(&self.dtype, &self.session) {
+                Ok(predicate) => predicate,
+                Err(error) => {
+                    trace!(%expr, %error, "failed to construct stats rewrite predicate");
+                    None
+                }
+            })
+            .clone()
+    }
+
+    fn satisfy_predicate(&self, expr: Expression) -> Option<Expression> {
+        if DynamicExprUpdates::new(&expr).is_some() {
+            trace!(%expr, "no satisfy predicate for dynamic expression");
+            return None;
+        }
+
+        self.satisfy_predicates
+            .entry(expr.clone())
+            .or_default()
+            .get_or_init(move || match expr.satisfy(&self.dtype, &self.session) {
                 Ok(predicate) => predicate,
                 Err(error) => {
                     trace!(%expr, %error, "failed to construct stats rewrite predicate");
