@@ -82,7 +82,9 @@ impl BenchmarkOutput {
 ///
 /// Returns `target/vortex-bench/<benchmark_id>/results.json`.
 pub fn default_output_path(benchmark_id: &str) -> PathBuf {
-    vortex_bench_dir().join(benchmark_id).join(DEFAULT_FILENAME)
+    bench_results_dir()
+        .join(benchmark_id)
+        .join(DEFAULT_FILENAME)
 }
 
 /// Create an appropriate writer based on display format and output path.
@@ -106,10 +108,10 @@ pub fn create_output_writer(
     }
 }
 
-/// Get the base directory for vortex benchmark results.
+/// Get the base directory for benchmark results.
 ///
 /// Returns `target/vortex-bench/`.
-pub fn vortex_bench_dir() -> PathBuf {
+pub fn bench_results_dir() -> PathBuf {
     workspace_root().join("target").join("vortex-bench")
 }
 
