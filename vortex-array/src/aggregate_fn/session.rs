@@ -28,6 +28,7 @@ use crate::aggregate_fn::fns::last::Last;
 use crate::aggregate_fn::fns::max::Max;
 use crate::aggregate_fn::fns::min::Min;
 use crate::aggregate_fn::fns::min_max::MinMax;
+use crate::aggregate_fn::fns::min_max::PrimitiveGroupedExtremaEncodingKernel;
 use crate::aggregate_fn::fns::nan_count::NanCount;
 use crate::aggregate_fn::fns::null_count::NullCount;
 use crate::aggregate_fn::fns::sum::PrimitiveGroupedSumEncodingKernel;
@@ -116,6 +117,16 @@ impl Default for AggregateFnSession {
             Primitive.id(),
             Sum.id(),
             &PrimitiveGroupedSumEncodingKernel,
+        );
+        this.register_grouped_encoding_kernel(
+            Primitive.id(),
+            Min.id(),
+            &PrimitiveGroupedExtremaEncodingKernel,
+        );
+        this.register_grouped_encoding_kernel(
+            Primitive.id(),
+            Max.id(),
+            &PrimitiveGroupedExtremaEncodingKernel,
         );
 
         this

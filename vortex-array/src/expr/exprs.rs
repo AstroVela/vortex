@@ -39,6 +39,8 @@ use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeOptions;
 use crate::scalar_fn::fns::list_contains::ListContains;
 use crate::scalar_fn::fns::list_length::ListLength;
+use crate::scalar_fn::fns::list_min_max::ListMax;
+use crate::scalar_fn::fns::list_min_max::ListMin;
 use crate::scalar_fn::fns::list_sum::ListSum;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::mask::Mask;
@@ -778,6 +780,36 @@ pub fn ext_storage(input: Expression) -> Expression {
 /// ```
 pub fn list_length(input: Expression) -> Expression {
     ListLength.new_expr(EmptyOptions, [input])
+}
+
+// ---- ListMin / ListMax ----
+
+/// Creates an expression that returns the maximum participating element in each list for `List` and
+/// `FixedSizeList` inputs.
+///
+/// Null lists, empty lists, and lists whose elements are all null return null. Null elements and,
+/// by default, float NaNs are ignored. See [`list_min_opts`] to include NaNs instead.
+pub fn list_min(input: Expression) -> Expression {
+    ListMin.new_expr(NumericalAggregateOpts::default(), [input])
+}
+
+/// Creates a [`list_min`] expression with explicit NaN handling.
+pub fn list_min_opts(input: Expression, options: NumericalAggregateOpts) -> Expression {
+    ListMin.new_expr(options, [input])
+}
+
+/// Creates an expression that returns the minimum participating element in each list for `List` and
+/// `FixedSizeList` inputs.
+///
+/// Null lists, empty lists, and lists whose elements are all null return null. Null elements and,
+/// by default, float NaNs are ignored. See [`list_max_opts`] to include NaNs instead.
+pub fn list_max(input: Expression) -> Expression {
+    ListMax.new_expr(NumericalAggregateOpts::default(), [input])
+}
+
+/// Creates a [`list_max`] expression with explicit NaN handling.
+pub fn list_max_opts(input: Expression, options: NumericalAggregateOpts) -> Expression {
+    ListMax.new_expr(options, [input])
 }
 
 // ---- ListSum ----

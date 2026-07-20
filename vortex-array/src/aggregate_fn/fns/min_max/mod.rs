@@ -4,11 +4,13 @@
 mod bool;
 mod decimal;
 mod extension;
+mod grouped;
 mod primitive;
 mod varbin;
 
 use std::sync::LazyLock;
 
+pub(crate) use grouped::PrimitiveGroupedExtremaEncodingKernel;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
