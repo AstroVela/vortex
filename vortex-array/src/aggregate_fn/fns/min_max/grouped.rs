@@ -39,13 +39,15 @@ impl DynGroupedAggregateKernel for PrimitiveGroupedExtremaEncodingKernel {
         groups: &GroupedArray,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        if let Some(options) = aggregate_fn.as_opt::<Min>() {
-            return try_grouped_extreme(groups, ctx, options.skip_nans, Extreme::Min);
-        }
-        if let Some(options) = aggregate_fn.as_opt::<Max>() {
-            return try_grouped_extreme(groups, ctx, options.skip_nans, Extreme::Max);
-        }
-        Ok(None)
+        let (skip_nans, extreme) = if let Some(options) = aggregate_fn.as_opt::<Min>() {
+            (options.skip_nans, Extreme::Min)
+        } else if let Some(options) = aggregate_fn.as_opt::<Max>() {
+            (options.skip_nans, Extreme::Max)
+        } else {
+            return Ok(None);
+        };
+
+        try_grouped_extreme(groups, ctx, skip_nans, extreme)
     }
 }
 
@@ -477,27 +479,23 @@ fn reduce_nullable_word_scalar<T: NativePType>(
     mut word: u64,
     skip_nans: bool,
     is_better: &impl Fn(T, T) -> bool,
-) -> bool {
-    let valid_mask = if values.is_empty() {
-        0
-    } else {
-        (1u64 << values.len()) - 1
-    };
+) {
+    let valid_mask = (1u64 << values.len()) - 1;
     word &= valid_mask;
 
     if word == valid_mask {
-        return reduce_scalar_run(best, values, skip_nans, is_better);
+        reduce_scalar_run(best, values, skip_nans, is_better);
+        return;
     }
 
     while word != 0 {
         let start = word.trailing_zeros() as usize;
         let run_len = (word >> start).trailing_ones() as usize;
         if reduce_scalar_run(best, &values[start..start + run_len], skip_nans, is_better) {
-            return true;
+            return;
         }
         word &= !(((1u64 << run_len) - 1) << start);
     }
-    false
 }
 
 #[inline]

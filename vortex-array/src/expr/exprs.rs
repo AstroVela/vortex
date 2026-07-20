@@ -784,7 +784,7 @@ pub fn list_length(input: Expression) -> Expression {
 
 // ---- ListMin / ListMax ----
 
-/// Creates an expression that returns the maximum participating element in each list for `List` and
+/// Creates an expression that returns the minimum participating element in each list for `List` and
 /// `FixedSizeList` inputs.
 ///
 /// Null lists, empty lists, and lists whose elements are all null return null. Null elements and,
@@ -798,7 +798,7 @@ pub fn list_min_opts(input: Expression, options: NumericalAggregateOpts) -> Expr
     ListMin.new_expr(options, [input])
 }
 
-/// Creates an expression that returns the minimum participating element in each list for `List` and
+/// Creates an expression that returns the maximum participating element in each list for `List` and
 /// `FixedSizeList` inputs.
 ///
 /// Null lists, empty lists, and lists whose elements are all null return null. Null elements and,
