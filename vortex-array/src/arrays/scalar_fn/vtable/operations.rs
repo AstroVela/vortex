@@ -26,7 +26,7 @@ impl OperationsVTable<ScalarFn> for ScalarFn {
             .map(|child| Ok(ConstantArray::new(child.execute_scalar(index, ctx)?, 1).into_array()))
             .collect::<VortexResult<_>>()?;
 
-        let args = VecExecutionArgs::new(inputs, 1);
+        let args = VecExecutionArgs::all(inputs, 1);
         let result = array.scalar_fn().execute(&args, ctx)?;
 
         let scalar = match result.execute::<Columnar>(ctx)? {

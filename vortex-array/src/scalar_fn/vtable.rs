@@ -14,6 +14,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
@@ -121,6 +122,14 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     ///
     /// Implementations are encouraged to check their inputs for constant arrays to perform
     /// more optimized execution.
+    ///
+    /// # Demand
+    ///
+    /// [`ExecutionArgs::demand`] provides the rows whose output values the caller will
+    /// observe. Fallible implementations (see [`ScalarFnVTable::is_fallible`]) must not
+    /// raise a domain error attributable solely to undemanded rows. Infallible
+    /// implementations may ignore the demand mask, or use it to skip work. In all cases
+    /// the result must contain [`ExecutionArgs::row_count`] rows — demand never compacts.
     ///
     /// If the input arguments cannot be directly used for execution (for example, an expression
     /// may require canonical input arrays), then the implementation should perform a single
@@ -326,18 +335,49 @@ pub trait ExecutionArgs {
 
     /// Returns the row count of the execution scope.
     fn row_count(&self) -> usize;
+
+    /// Returns the demand mask: the rows whose output values the caller will observe.
+    ///
+    /// The mask is always [`ExecutionArgs::row_count`] long. Undemanded rows are
+    /// don't-care: the implementation may produce any well-typed value (including null)
+    /// at those positions, and fallible implementations must not raise a domain error
+    /// attributable solely to undemanded rows. Infallible implementations may ignore
+    /// this mask entirely; for them it is purely a performance hint.
+    ///
+    /// Demand never compacts: the result of execution must still contain
+    /// [`ExecutionArgs::row_count`] rows.
+    fn demand(&self) -> &Mask;
 }
 
 /// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
 pub struct VecExecutionArgs {
     inputs: Vec<ArrayRef>,
     row_count: usize,
+    demand: Mask,
 }
 
 impl VecExecutionArgs {
-    /// Create a new `VecExecutionArgs`.
-    pub fn new(inputs: Vec<ArrayRef>, row_count: usize) -> Self {
-        Self { inputs, row_count }
+    /// Create a new `VecExecutionArgs` with the given demand mask.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `demand.len() != row_count`.
+    pub fn new(inputs: Vec<ArrayRef>, row_count: usize, demand: Mask) -> Self {
+        assert_eq!(
+            demand.len(),
+            row_count,
+            "Demand mask length must match the execution row count"
+        );
+        Self {
+            inputs,
+            row_count,
+            demand,
+        }
+    }
+
+    /// Create a new `VecExecutionArgs` demanding every row.
+    pub fn all(inputs: Vec<ArrayRef>, row_count: usize) -> Self {
+        Self::new(inputs, row_count, Mask::new_true(row_count))
     }
 }
 
@@ -358,6 +398,10 @@ impl ExecutionArgs for VecExecutionArgs {
 
     fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    fn demand(&self) -> &Mask {
+        &self.demand
     }
 }
 
@@ -398,3 +442,135 @@ impl<V: ScalarFnVTable> ScalarFnVTableExt for V {}
 
 /// A reference to the name of a child expression.
 pub type ChildName = ArcRef<str>;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
+    use vortex_mask::Mask;
+    use vortex_session::registry::CachedId;
+
+    use super::*;
+    use crate::ExecutionCtx;
+    use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
+    use crate::scalar_fn::ScalarFnVTableExt;
+
+    /// A scalar fn that records the demand mask it was executed with.
+    #[derive(Clone)]
+    struct DemandProbe {
+        observed: Arc<Mutex<Option<Mask>>>,
+    }
+
+    impl ScalarFnVTable for DemandProbe {
+        type Options = EmptyOptions;
+
+        fn id(&self) -> ScalarFnId {
+            static ID: CachedId = CachedId::new("test.demand_probe");
+            *ID
+        }
+
+        fn arity(&self, _options: &Self::Options) -> Arity {
+            Arity::Exact(1)
+        }
+
+        fn child_name(&self, _options: &Self::Options, _child_idx: usize) -> ChildName {
+            ChildName::from("input")
+        }
+
+        fn return_dtype(&self, _options: &Self::Options, args: &[DType]) -> VortexResult<DType> {
+            Ok(args[0].clone())
+        }
+
+        fn execute(
+            &self,
+            _options: &Self::Options,
+            args: &dyn ExecutionArgs,
+            _ctx: &mut ExecutionCtx,
+        ) -> VortexResult<ArrayRef> {
+            *self.observed.lock() = Some(args.demand().clone());
+            args.get(0)
+        }
+    }
+
+    #[test]
+    fn test_all_demands_every_row() {
+        let args = VecExecutionArgs::all(vec![buffer![1i32, 2, 3].into_array()], 3);
+        assert_eq!(args.demand().len(), 3);
+        assert!(args.demand().all_true());
+    }
+
+    #[test]
+    #[should_panic(expected = "Demand mask length must match")]
+    fn test_demand_length_mismatch_panics() {
+        drop(VecExecutionArgs::new(
+            vec![buffer![1i32, 2, 3].into_array()],
+            3,
+            Mask::new_true(2),
+        ));
+    }
+
+    #[test]
+    fn test_demand_reaches_scalar_fn() -> VortexResult<()> {
+        let observed = Arc::new(Mutex::new(None));
+        let probe = DemandProbe {
+            observed: Arc::clone(&observed),
+        };
+        let scalar_fn = probe.bind(EmptyOptions);
+
+        let demand = Mask::from_iter([true, false, true]);
+        let args = VecExecutionArgs::new(vec![buffer![1i32, 2, 3].into_array()], 3, demand.clone());
+        scalar_fn.execute(&args, &mut array_session().create_execution_ctx())?;
+
+        let seen = observed
+            .lock()
+            .clone()
+            .ok_or_else(|| vortex_err!("probe was not executed"))?;
+        assert_eq!(seen.to_bit_buffer(), demand.to_bit_buffer());
+        Ok(())
+    }
+
+    /// An [`ExecutionArgs`] whose demand mask length disagrees with its row count.
+    struct MismatchedDemandArgs {
+        input: ArrayRef,
+        demand: Mask,
+    }
+
+    impl ExecutionArgs for MismatchedDemandArgs {
+        fn get(&self, _index: usize) -> VortexResult<ArrayRef> {
+            Ok(self.input.clone())
+        }
+
+        fn num_inputs(&self) -> usize {
+            1
+        }
+
+        fn row_count(&self) -> usize {
+            self.input.len()
+        }
+
+        fn demand(&self) -> &Mask {
+            &self.demand
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "does not match row count")]
+    fn test_execute_rejects_mismatched_demand() {
+        let probe = DemandProbe {
+            observed: Arc::new(Mutex::new(None)),
+        };
+        let scalar_fn = probe.bind(EmptyOptions);
+
+        let args = MismatchedDemandArgs {
+            input: buffer![1i32, 2, 3].into_array(),
+            demand: Mask::new_true(2),
+        };
+        drop(scalar_fn.execute(&args, &mut array_session().create_execution_ctx()));
+    }
+}

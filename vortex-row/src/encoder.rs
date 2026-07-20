@@ -119,7 +119,7 @@ impl RowEncoder {
                 );
             }
         }
-        Ok((options, VecExecutionArgs::new(cols.to_vec(), nrows)))
+        Ok((options, VecExecutionArgs::all(cols.to_vec(), nrows)))
     }
 }
 

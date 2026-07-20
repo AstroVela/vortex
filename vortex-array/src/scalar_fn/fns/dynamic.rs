@@ -104,7 +104,8 @@ impl ScalarFnVTable for DynamicComparison {
             let lhs = args.get(0)?;
             let rhs = ConstantArray::new(scalar, args.row_count()).into_array();
 
-            let delegate_args = VecExecutionArgs::new(vec![lhs, rhs], args.row_count());
+            let delegate_args =
+                VecExecutionArgs::new(vec![lhs, rhs], args.row_count(), args.demand().clone());
             return Binary
                 .bind(Operator::from(data.operator))
                 .execute(&delegate_args, ctx);

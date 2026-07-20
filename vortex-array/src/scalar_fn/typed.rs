@@ -127,6 +127,14 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
 
     fn execute(&self, args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         let expected_row_count = args.row_count();
+        assert_eq!(
+            args.demand().len(),
+            expected_row_count,
+            "Demand mask length {} does not match row count {} for {}",
+            args.demand().len(),
+            expected_row_count,
+            self.vtable.id(),
+        );
         #[cfg(debug_assertions)]
         let expected_dtype = {
             let args_dtypes: Vec<DType> = (0..args.num_inputs())

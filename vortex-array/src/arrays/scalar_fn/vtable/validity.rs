@@ -50,7 +50,7 @@ fn execute_expr(
         .map(|child| execute_expr(child, row_count, ctx))
         .collect::<VortexResult<_>>()?;
 
-    let args = VecExecutionArgs::new(inputs, row_count);
+    let args = VecExecutionArgs::all(inputs, row_count);
 
     Ok(expr.scalar_fn().execute(&args, ctx)?.into_array())
 }
