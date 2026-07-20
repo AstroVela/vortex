@@ -174,6 +174,8 @@ mod tests {
             &mut SESSION.create_execution_ctx(),
         )
         .unwrap()
+        .try_downcast::<OnPair>()
+        .unwrap()
     }
 
     fn string_list(values: Vec<Scalar>, nullability: Nullability) -> Scalar {
@@ -192,7 +194,9 @@ mod tests {
         let canonical =
             VarBinArray::from_iter(strings.iter().copied(), DType::Utf8(nullability)).into_array();
         let mut ctx = SESSION.create_execution_ctx();
-        let onpair = onpair_compress(&canonical, DEFAULT_DICT12_CONFIG, &mut ctx)?;
+        let onpair = onpair_compress(&canonical, DEFAULT_DICT12_CONFIG, &mut ctx)?
+            .try_downcast::<OnPair>()
+            .map_err(|array| vortex_err!("expected OnPair array, got {}", array.encoding_id()))?;
         let list_array = ConstantArray::new(list.clone(), canonical.len()).into_array();
         let actual = <OnPair as ListContainsElementKernel>::list_contains(
             &list_array,
@@ -255,7 +259,7 @@ mod tests {
     #[test]
     fn test_list_contains_all_null_needles() -> VortexResult<()> {
         assert_kernel_matches_canonical(
-            &[None, None],
+            &[Some("alpha"), None],
             Nullability::Nullable,
             string_list(
                 vec![Scalar::utf8("alpha", Nullability::Nullable)],

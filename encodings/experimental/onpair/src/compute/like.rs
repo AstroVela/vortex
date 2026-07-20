@@ -176,6 +176,8 @@ mod tests {
             &mut SESSION.create_execution_ctx(),
         )
         .unwrap()
+        .try_downcast::<OnPair>()
+        .unwrap()
     }
 
     fn run_like(array: OnPairArray, pattern: &str, opts: LikeOptions) -> VortexResult<BoolArray> {

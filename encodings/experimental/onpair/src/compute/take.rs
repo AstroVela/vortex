@@ -52,7 +52,7 @@ impl TakeExecute for OnPair {
                         .dtype()
                         .clone()
                         .union_nullability(indices.dtype().nullability()),
-                    array.dict_bytes_handle().clone(),
+                    array.data().clone(),
                     array.dict_offsets().clone(),
                     taken_codes.elements().clone(),
                     taken_codes.offsets().clone(),
