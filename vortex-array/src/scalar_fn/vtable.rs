@@ -338,7 +338,8 @@ pub trait ExecutionArgs {
 
     /// Returns the demand mask: the rows whose output values the caller will observe.
     ///
-    /// The mask is always [`ExecutionArgs::row_count`] long. Undemanded rows are
+    /// Implementations must return a mask of exactly [`ExecutionArgs::row_count`] length;
+    /// typed dispatch asserts this. Undemanded rows are
     /// don't-care: the implementation may produce any well-typed value (including null)
     /// at those positions, and fallible implementations must not raise a domain error
     /// attributable solely to undemanded rows. Infallible implementations may ignore
@@ -531,7 +532,7 @@ mod tests {
             .lock()
             .clone()
             .ok_or_else(|| vortex_err!("probe was not executed"))?;
-        assert_eq!(seen.to_bit_buffer(), demand.to_bit_buffer());
+        assert_eq!(seen, demand);
         Ok(())
     }
 

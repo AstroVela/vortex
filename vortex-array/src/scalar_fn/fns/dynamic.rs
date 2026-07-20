@@ -275,6 +275,7 @@ mod tests {
 
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_mask::Mask;
 
     use super::*;
     use crate::IntoArray;
@@ -353,6 +354,25 @@ mod tests {
             BoolArray::from_iter([false, false, false]),
             &mut ctx
         );
+        Ok(())
+    }
+
+    #[test]
+    fn execute_forwards_demand_to_delegate() -> VortexResult<()> {
+        // TODO: strengthen to observe the forwarded mask once Binary honors demand.
+        let scalar_fn = DynamicComparison.bind(DynamicComparisonExpr {
+            operator: CompareOperator::Lt,
+            rhs: Arc::new(Rhs {
+                value: Arc::new(|| Some(5i32.into())),
+                dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+            }),
+            default: true,
+        });
+
+        let demand = Mask::from_iter([true, false, true]);
+        let args = VecExecutionArgs::new(vec![buffer![1i32, 5, 10].into_array()], 3, demand);
+        let result = scalar_fn.execute(&args, &mut array_session().create_execution_ctx())?;
+        assert_eq!(result.len(), 3);
         Ok(())
     }
 
