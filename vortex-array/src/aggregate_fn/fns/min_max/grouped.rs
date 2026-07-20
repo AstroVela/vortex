@@ -102,12 +102,20 @@ macro_rules! impl_float_extrema_identity {
 
                 #[inline(always)]
                 fn minimum(candidate: Self, current: Self) -> Self {
-                    select(candidate.is_lt(current), candidate, current)
+                    if candidate.is_lt(current) {
+                        candidate
+                    } else {
+                        current
+                    }
                 }
 
                 #[inline(always)]
                 fn maximum(candidate: Self, current: Self) -> Self {
-                    select(candidate.is_gt(current), candidate, current)
+                    if candidate.is_gt(current) {
+                        candidate
+                    } else {
+                        current
+                    }
                 }
             }
         )*
@@ -124,17 +132,6 @@ struct ExtremaOps<T, B, C> {
     identity: T,
     is_better: B,
     combine: C,
-}
-
-/// Element validity materialized once for the complete shared element array.
-///
-/// The `Some` variant borrows the packed bitmap. Per-group reducers take zero-copy views or load a
-/// word directly rather than constructing a new [`Mask`] and its cached valid-run representation.
-#[derive(Clone, Copy)]
-enum ElementValidity<'a> {
-    All,
-    None,
-    Some(BitBufferView<'a>),
 }
 
 /// Run the encoding kernel when the shared elements are primitive.
@@ -231,9 +228,9 @@ where
     C: Fn(T, T) -> T + Copy,
 {
     let element_validity = match element_validity.bit_buffer() {
-        AllOr::All => ElementValidity::All,
-        AllOr::None => ElementValidity::None,
-        AllOr::Some(validity) => ElementValidity::Some(validity.as_view()),
+        AllOr::All => AllOr::All,
+        AllOr::None => AllOr::None,
+        AllOr::Some(validity) => AllOr::Some(validity.as_view()),
     };
     let mut extrema = BufferMut::<T>::zeroed(group_ranges.len());
     let mut missing = Vec::new();
@@ -244,7 +241,7 @@ where
         if !group_is_valid {
             continue;
         }
-        match reduce_group(values, offset, size, element_validity, ops) {
+        match reduce_group(values, offset, size, &element_validity, ops) {
             Some(extreme) => extrema.as_mut_slice()[index] = extreme,
             None => missing.push(index),
         }
@@ -289,7 +286,7 @@ fn reduce_group<T, B, C>(
     values: &[T],
     offset: usize,
     size: usize,
-    element_validity: ElementValidity<'_>,
+    element_validity: &AllOr<BitBufferView<'_>>,
     ops: ExtremaOps<T, B, C>,
 ) -> Option<T>
 where
@@ -338,7 +335,7 @@ fn reduce_group_lanes<T, B, C, const LANES: usize>(
     values: &[T],
     offset: usize,
     size: usize,
-    element_validity: ElementValidity<'_>,
+    element_validity: &AllOr<BitBufferView<'_>>,
     ops: ExtremaOps<T, B, C>,
 ) -> Option<T>
 where
@@ -349,9 +346,9 @@ where
     debug_assert!(LANES > 0 && LANES.is_power_of_two() && 64 % LANES == 0);
     let values = &values[offset..offset + size];
     let validity = match element_validity {
-        ElementValidity::All => None,
-        ElementValidity::None => return None,
-        ElementValidity::Some(validity) => Some(validity.slice(offset..offset + size)),
+        AllOr::All => None,
+        AllOr::None => return None,
+        AllOr::Some(validity) => Some(validity.slice(offset..offset + size)),
     };
     let mut accumulators = [ops.identity; LANES];
     let mut found = false;
@@ -446,22 +443,22 @@ fn reduce_group_scalar<T: NativePType>(
     values: &[T],
     offset: usize,
     size: usize,
-    element_validity: ElementValidity<'_>,
+    element_validity: &AllOr<BitBufferView<'_>>,
     skip_nans: bool,
     is_better: impl Fn(T, T) -> bool,
 ) -> Option<T> {
     let mut best = None;
     let group_values = &values[offset..offset + size];
     match element_validity {
-        ElementValidity::All => {
+        AllOr::All => {
             reduce_scalar_run(&mut best, group_values, skip_nans, &is_better);
         }
-        ElementValidity::None => {}
-        ElementValidity::Some(validity) => {
+        AllOr::None => {}
+        AllOr::Some(validity) => {
             reduce_nullable_word_scalar(
                 &mut best,
                 group_values,
-                validity_word(validity, offset, size),
+                validity_word(*validity, offset, size),
                 skip_nans,
                 &is_better,
             );
@@ -558,7 +555,7 @@ fn reduce_scalar_run<T: NativePType>(
 #[inline(always)]
 /// Combine one full lane chunk with its packed validity bits.
 ///
-/// The branchless combine-and-select form is intentional: after monomorphization, LLVM can lower
+/// The combine-and-select form is intentional: after monomorphization, LLVM can lower
 /// integer min/max plus validity selection to packed SIMD instructions. Float-only NaN logic is
 /// removed entirely for integer types through [`ExtremaIdentity::CAN_NAN`].
 fn reduce_lane_chunk<T: ExtremaIdentity, const LANES: usize>(
@@ -582,10 +579,10 @@ fn reduce_lane_chunk<T: ExtremaIdentity, const LANES: usize>(
                 return Some(candidate);
             }
             let reduced = combine(candidate, current);
-            accumulators[lane] = select(valid & !is_nan, reduced, current);
+            accumulators[lane] = if valid & !is_nan { reduced } else { current };
         } else {
             let reduced = combine(candidate, current);
-            accumulators[lane] = select(valid, reduced, current);
+            accumulators[lane] = if valid { reduced } else { current };
         }
     }
     None
@@ -612,10 +609,10 @@ fn reduce_lane_remainder<T: ExtremaIdentity, const LANES: usize>(
                 return Some(candidate);
             }
             let reduced = combine(candidate, current);
-            accumulators[lane] = select(valid & !is_nan, reduced, current);
+            accumulators[lane] = if valid & !is_nan { reduced } else { current };
         } else {
             let reduced = combine(candidate, current);
-            accumulators[lane] = select(valid, reduced, current);
+            accumulators[lane] = if valid { reduced } else { current };
         }
     }
     None
@@ -635,15 +632,13 @@ fn merge_accumulators<T: NativePType, const LANES: usize>(
         for lane in 0..mid {
             let candidate = accumulators[lane + mid];
             let current = accumulators[lane];
-            accumulators[lane] = select(is_better(candidate, current), candidate, current);
+            accumulators[lane] = if is_better(candidate, current) {
+                candidate
+            } else {
+                current
+            };
         }
         len /= 2;
     }
     accumulators[0]
-}
-
-#[inline(always)]
-/// Select a value in a form that the lane loop can lower to a SIMD mask operation.
-fn select<T: Copy>(condition: bool, if_true: T, if_false: T) -> T {
-    if condition { if_true } else { if_false }
 }
