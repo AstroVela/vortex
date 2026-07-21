@@ -167,7 +167,7 @@ where
     let care_lanes = if demand.all_true() {
         valid_rows
     } else {
-        &valid_rows & demand
+        valid_rows & demand
     };
 
     let checked = match (&lhs, &rhs) {
@@ -1204,6 +1204,26 @@ mod test {
         let result = execute_with_demand(lhs, rhs, Operator::Div, Mask::from_iter([false, true]))?;
 
         assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(5i32));
+        Ok(())
+    }
+
+    #[test]
+    fn test_div_by_zero_on_demanded_lane_errors() {
+        let lhs = buffer![10i32, 10].into_array();
+        let rhs = buffer![0i32, 2].into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Div, Mask::from_iter([true, false]));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scalar_add_array_overflow_on_undemanded_lane_is_ok() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let lhs = ConstantArray::new(1u8, 2).into_array();
+        let rhs = buffer![u8::MAX, 1].into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([false, true]))?;
+
+        assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(2u8));
         Ok(())
     }
 
