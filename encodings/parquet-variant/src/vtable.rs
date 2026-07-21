@@ -309,7 +309,6 @@ mod tests {
     use vortex_array::Canonical;
     use vortex_array::EqMode;
     use vortex_array::IntoArray;
-    use vortex_array::VTable;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinViewArray;
@@ -400,11 +399,7 @@ mod tests {
 
     #[fixture]
     fn write_strategy() -> Arc<dyn LayoutStrategy> {
-        let mut allowed = vortex_file::ALLOWED_ENCODINGS.clone();
-        allowed.insert(ParquetVariant.id());
-        vortex_file::WriteStrategyBuilder::default()
-            .with_allow_encodings(allowed)
-            .build()
+        vortex_file::WriteStrategyBuilder::default().build()
     }
 
     #[test]

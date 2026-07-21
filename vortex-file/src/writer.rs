@@ -17,12 +17,14 @@ use futures::pin_mut;
 use futures::select;
 use itertools::Itertools;
 use vortex_array::ArrayContext;
+use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldPath;
 use vortex_array::expr::stats::Stat;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorExt;
+use vortex_array::session::ArrayRegistry;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::ArrayStream;
@@ -30,6 +32,7 @@ use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::stream::SendableArrayStream;
 use vortex_buffer::ByteBuffer;
+use vortex_edition::EditionSessionExt;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -49,7 +52,6 @@ use vortex_session::SessionExt;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 
-use crate::ALLOWED_ENCODINGS;
 use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
@@ -158,14 +160,14 @@ impl VortexWriteOptions {
         mut write: W,
         stream: SendableArrayStream,
     ) -> VortexResult<WriteSummary> {
-        // NOTE(os): Setup an array context that already has all known encodings pre-populated.
-        // This is preferred for now over having an empty context here, because only the
-        // serialised array order is deterministic. The serialisation of arrays are done
-        // parallel and with an empty context they can register their encodings to the context
-        // in different order, changing the written bytes from run to run.
-        let ctx = ArrayContext::new(ALLOWED_ENCODINGS.iter().cloned().sorted().collect())
-            // Configure a registry just to ensure only known encodings are interned.
-            .with_registry(self.session.arrays().registry().clone());
+        // Pre-populate the array context with the registered encodings selected by the enabled
+        // editions. This keeps the serialized ordering deterministic without advertising every
+        // encoding the session happens to know how to read.
+        let array_registry = self.session.arrays().registry().clone();
+        let ctx = ArrayContext::new(self.session.enabled_encoding_ids())
+            // The registry supplies serialization implementations; the layout strategy applies
+            // the enabled-edition write policy before arrays reach serialization.
+            .with_registry(array_registry);
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();
@@ -530,5 +532,43 @@ impl WriteSummary {
                     .unwrap_or_default()
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::VTable;
+    use vortex_array::array_session;
+    use vortex_array::arrays::Bool;
+    use vortex_array::arrays::Primitive;
+    use vortex_array::session::ArraySessionExt;
+    use vortex_edition::Edition;
+    use vortex_edition::EditionDeclaration;
+    use vortex_edition::EditionId;
+    use vortex_edition::EditionSession;
+    use vortex_edition::EditionSessionExt;
+
+    use super::initial_array_ids;
+
+    #[test]
+    fn initial_array_ids_are_registered_and_enabled() -> Result<(), vortex_edition::EditionError> {
+        const EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
+        static DECLARATION: EditionDeclaration = EditionDeclaration {
+            edition: Edition {
+                id: EDITION,
+                min_vortex_version: None,
+            },
+            added: &[&"vortex.primitive", &"test.not_registered"],
+        };
+
+        let session = array_session().with::<EditionSession>();
+        session.register_edition(&DECLARATION)?;
+        session.enable_edition(EDITION)?;
+
+        let registry = session.arrays().registry().clone();
+        let ids = initial_array_ids(&session, &registry);
+        assert_eq!(ids, [Primitive.id()]);
+        assert!(!ids.contains(&Bool.id()));
+        Ok(())
     }
 }

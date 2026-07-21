@@ -32,6 +32,7 @@ use jni::sys::jlong;
 use jni::sys::jobject;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use vortex::array::ArrayId;
 use vortex::array::ArrayRef;
 use vortex::array::VTable;
 use vortex::array::scalar::PValue;
@@ -42,6 +43,7 @@ use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
 use vortex::dtype::Field as DTypeField;
 use vortex::dtype::FieldPath;
+use vortex::editions::EditionSessionExt;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
@@ -60,6 +62,7 @@ use vortex::io::runtime::Task;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
+use vortex::utils::aliases::hash_set::HashSet;
 use vortex_arrow::ArrowSessionExt;
 use vortex_parquet_variant::ParquetVariant;
 
@@ -108,7 +111,11 @@ fn write_options_for_schema(
         return session.write_options();
     }
 
-    let mut allowed = vortex::file::ALLOWED_ENCODINGS.clone();
+    let mut allowed: HashSet<ArrayId> = session
+        .enabled_encoding_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     allowed.insert(ParquetVariant.id());
 
     let strategy = WriteStrategyBuilder::default().with_allow_encodings(allowed);
