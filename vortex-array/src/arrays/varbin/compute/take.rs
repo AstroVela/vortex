@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::ptr;
+
 use itertools::Itertools as _;
 use vortex_buffer::BitBufferMut;
 use vortex_buffer::BufferMut;
@@ -442,7 +444,7 @@ where
     new_offsets.push(NewOffset::zero());
     let mut output_bytes = 0usize;
 
-    for &start in starts {
+    for start in starts {
         let start = start.as_();
         if length == 0 {
             continue;
@@ -474,7 +476,9 @@ where
     }
 
     let mut new_data = ByteBufferMut::with_capacity(output_bytes);
-    for &start in starts {
+    let spare = &mut new_data.spare_capacity_mut()[..output_bytes];
+    let mut cursor = 0usize;
+    for start in starts {
         let start = start.as_();
         if length == 0 {
             continue;
@@ -483,8 +487,24 @@ where
         let offset_range = &offsets[start..][..=length];
         let byte_start = offset_range[0].as_();
         let byte_end = offset_range[length].as_();
-        new_data.extend_from_slice(&data[byte_start..][..byte_end - byte_start]);
+        let src = &data[byte_start..byte_end];
+        // SAFETY: `src` and the checked `spare` range have equal lengths and cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                spare[cursor..][..src.len()].as_mut_ptr().cast::<u8>(),
+                src.len(),
+            );
+        }
+        cursor += src.len();
     }
+    // SAFETY: the loop initialized the prefix `0..cursor` of the spare capacity.
+    unsafe { new_data.set_len(cursor) };
+    vortex_ensure!(
+        new_data.len() == output_bytes,
+        "PiecewiseSequenceArray gathered byte length {} does not match declared byte length {output_bytes}",
+        new_data.len()
+    );
 
     let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
         .reinterpret_cast(out_offset_ptype)
@@ -551,6 +571,8 @@ where
     );
 
     let mut new_data = ByteBufferMut::with_capacity(output_bytes);
+    let spare = &mut new_data.spare_capacity_mut()[..output_bytes];
+    let mut cursor = 0usize;
     for (&start, &length) in starts.iter().zip_eq(lengths) {
         let start = start.as_();
         let length = length.as_();
@@ -561,8 +583,24 @@ where
         let offset_range = &offsets[start..][..=length];
         let byte_start = offset_range[0].as_();
         let byte_end = offset_range[length].as_();
-        new_data.extend_from_slice(&data[byte_start..][..byte_end - byte_start]);
+        let src = &data[byte_start..byte_end];
+        // SAFETY: `src` and the checked `spare` range have equal lengths and cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                spare[cursor..][..src.len()].as_mut_ptr().cast::<u8>(),
+                src.len(),
+            );
+        }
+        cursor += src.len();
     }
+    // SAFETY: the loop initialized the prefix `0..cursor` of the spare capacity.
+    unsafe { new_data.set_len(cursor) };
+    vortex_ensure!(
+        new_data.len() == output_bytes,
+        "PiecewiseSequenceArray gathered byte length {} does not match declared byte length {output_bytes}",
+        new_data.len()
+    );
 
     let offsets = PrimitiveArray::new(new_offsets.freeze(), Validity::NonNullable)
         .reinterpret_cast(out_offset_ptype)
