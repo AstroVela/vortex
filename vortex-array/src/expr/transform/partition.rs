@@ -34,11 +34,12 @@ use crate::expr::traversal::TraversalOrder;
 ///
 /// ## Note
 ///
-/// This function currently respects the validity of each field in the scope, but the not validity
-/// of the scope itself. The fix would be for the returned `PartitionedExpr` to include a partition
-/// expression for computing the validity, or to include that expression as part of the root.
-///
-/// See <https://github.com/vortex-data/vortex/issues/1907>.
+/// This function is agnostic to what the annotations denote. To partition over a *nullable*
+/// struct scope, expand the root with
+/// [`replace_root_scope`][crate::expr::transform::replace_root_scope] and annotate with
+/// [`make_struct_part_annotator`][crate::expr::analysis::make_struct_part_annotator], which
+/// treats the scope's own validity as one more coordinate alongside its fields
+/// (see <https://github.com/vortex-data/vortex/issues/1907>).
 pub fn partition<A: AnnotationFn>(
     expr: Expression,
     scope: &DType,
@@ -217,21 +218,28 @@ where
 mod tests {
     use rstest::fixture;
     use rstest::rstest;
+    use vortex_utils::aliases::hash_set::HashSet;
 
     use super::*;
     use crate::dtype::DType;
     use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::Nullability::Nullable;
     use crate::dtype::PType::I32;
     use crate::dtype::StructFields;
     use crate::expr::analysis::make_free_field_annotator;
+    use crate::expr::analysis::make_struct_part_annotator;
+    use crate::expr::analysis::struct_part::StructPart;
     use crate::expr::and;
     use crate::expr::col;
     use crate::expr::get_item;
+    use crate::expr::gt;
+    use crate::expr::is_not_null;
     use crate::expr::lit;
     use crate::expr::merge;
     use crate::expr::pack;
     use crate::expr::root;
     use crate::expr::transform::replace::replace_root_fields;
+    use crate::expr::transform::replace::replace_root_scope;
 
     #[fixture]
     fn dtype() -> DType {
@@ -327,6 +335,33 @@ mod tests {
 
         // One for id.a and id.b
         assert_eq!(partitioned.partitions.len(), 2);
+    }
+
+    #[rstest]
+    fn test_partition_validity_coordinate() -> VortexResult<()> {
+        // A nullable struct scope has a validity coordinate alongside its fields. After
+        // expanding the root, a validity observer partitions to the validity coordinate and
+        // a field predicate partitions to the field — the validity is never guessed at a
+        // fixed position.
+        let dtype = DType::Struct(
+            StructFields::from_iter([("a", I32.into()), ("b", DType::from(I32))]),
+            Nullable,
+        );
+        let fields = dtype.as_struct_fields_opt().unwrap();
+
+        let expr = and(is_not_null(root()), gt(get_item("a", root()), lit(5)));
+        let expr = replace_root_scope(expr, &dtype).optimize_recursive(&dtype)?;
+
+        let partitioned = partition(expr, &dtype, make_struct_part_annotator(fields, Nullable))?;
+
+        let annotations: HashSet<StructPart> =
+            partitioned.partition_annotations.iter().cloned().collect();
+        assert_eq!(
+            annotations,
+            HashSet::from_iter([StructPart::Validity, StructPart::Field("a".into())]),
+            "{partitioned}"
+        );
+        Ok(())
     }
 
     #[rstest]

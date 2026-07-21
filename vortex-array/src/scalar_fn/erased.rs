@@ -138,6 +138,15 @@ impl ScalarFnRef {
         }))
     }
 
+    /// Like [`Self::validity`], but returns `None` when the vtable does not define a validity
+    /// derivation, instead of falling back to `is_not_null(expr)`.
+    ///
+    /// Rewrites that turn `is_not_null(expr)` into the derived validity must use this method:
+    /// the fallback would make such a rewrite a self-referential no-op.
+    pub fn validity_opt(&self, expr: &Expression) -> VortexResult<Option<Expression>> {
+        self.0.validity(expr)
+    }
+
     /// Execute the expression given the input arguments.
     pub fn execute(
         &self,

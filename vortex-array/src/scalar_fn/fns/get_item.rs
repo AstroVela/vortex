@@ -154,6 +154,15 @@ impl ScalarFnVTable for GetItem {
     ) -> VortexResult<Option<Expression>> {
         let child = expr.child(0);
 
+        // `get_item` distributes over `mask`: `get_item(f, mask(s, m)) == mask(get_item(f, s), m)`
+        // (a field of a masked struct is the field masked by the same mask). This exposes the
+        // field access to a `pack` beneath the mask, letting it collapse to a single coordinate.
+        if child.is::<Mask>() {
+            let input = child.child(0).clone();
+            let m = child.child(1).clone();
+            return Ok(Some(GetItem.new_expr(field_name.clone(), [input]).mask(m)?));
+        }
+
         // If the child is a Pack expression, we can directly return the corresponding child.
         if let Some(pack) = child.as_opt::<Pack>() {
             let idx = pack
@@ -256,6 +265,22 @@ mod tests {
             item.dtype(),
             &DType::Primitive(PType::I32, Nullability::Nullable)
         );
+    }
+
+    #[test]
+    fn test_get_item_distributes_over_mask() -> vortex_error::VortexResult<()> {
+        use crate::expr::mask;
+        use crate::expr::test_harness;
+
+        // get_item(a, mask(pack(..), m)) == mask(get_item(a, pack(..)), m) == mask(a-child, m)
+        let m = get_item("bool1", root());
+        let expr = get_item(
+            "a",
+            mask(pack([("a", lit(1)), ("b", lit(2))], NonNullable), m.clone()),
+        );
+        let simplified = expr.optimize_recursive(&test_harness::struct_dtype())?;
+        assert_eq!(&simplified, &mask(lit(1), m));
+        Ok(())
     }
 
     #[test]

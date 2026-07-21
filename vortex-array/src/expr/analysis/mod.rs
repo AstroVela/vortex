@@ -7,6 +7,7 @@ pub mod immediate_access;
 mod labeling;
 mod null_sensitive;
 mod referenced_field_paths;
+pub mod struct_part;
 
 pub use annotation::*;
 pub use fallible::label_is_fallible;
@@ -15,3 +16,4 @@ pub use labeling::*;
 pub use null_sensitive::BooleanLabels;
 pub use null_sensitive::label_null_sensitive;
 pub use referenced_field_paths::referenced_field_paths;
+pub use struct_part::*;

@@ -88,6 +88,19 @@ impl ScalarFnVTable for IsNotNull {
         }
     }
 
+    fn simplify_untyped(
+        &self,
+        _options: &Self::Options,
+        expr: &Expression,
+    ) -> VortexResult<Option<Expression>> {
+        // `is_not_null(e)` IS `e`'s validity. If the child derives its validity as an
+        // expression (e.g. `mask(a, m)` derives `and(validity(a), m)`), absorb it so that
+        // validity observers reduce to expressions over the validity coordinates instead of
+        // forcing evaluation of the child's values.
+        let child = expr.child(0);
+        child.scalar_fn().validity_opt(child)
+    }
+
     fn is_null_sensitive(&self, _instance: &Self::Options) -> bool {
         true
     }
@@ -130,6 +143,19 @@ mod tests {
 
     static STATS_SESSION: LazyLock<VortexSession> =
         LazyLock::new(|| VortexSession::empty().with::<StatsSession>());
+
+    #[test]
+    fn absorbs_mask_validity() -> VortexResult<()> {
+        use crate::expr::and;
+        use crate::expr::mask;
+
+        // `is_not_null(e)` IS `e`'s validity: for `mask(a, m)` it absorbs to
+        // `and(is_not_null(a), m)` without evaluating the masked values.
+        let expr = is_not_null(mask(col("col1"), col("bool1")));
+        let simplified = expr.optimize_recursive(&test_harness::struct_dtype())?;
+        assert_eq!(&simplified, &and(is_not_null(col("col1")), col("bool1")));
+        Ok(())
+    }
 
     #[test]
     fn dtype() {
