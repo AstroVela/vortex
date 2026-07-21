@@ -40,8 +40,8 @@ impl Scheme for DecimalScheme {
         matches!(canonical, Canonical::Decimal(_))
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![DecimalByteParts.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![DecimalByteParts.id()]
     }
 
     /// Children: primitive=0.

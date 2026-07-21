@@ -49,8 +49,8 @@ impl Scheme for OnPairScheme {
         canonical.dtype().is_utf8()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![OnPair.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![OnPair.id()]
     }
 
     /// 4 primitive slot children flow through the cascading compressor:

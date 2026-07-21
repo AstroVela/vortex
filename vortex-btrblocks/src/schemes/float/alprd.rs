@@ -39,8 +39,8 @@ impl Scheme for ALPRDScheme {
         canonical.dtype().is_float()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![vortex_alp::ALPRD.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![vortex_alp::ALPRD.id()]
     }
 
     fn expected_compression_ratio(

@@ -54,8 +54,8 @@ impl Scheme for FloatDictScheme {
         canonical.dtype().is_float()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Dict.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Dict.id()]
     }
 
     fn stats_options(&self) -> GenerateStatsOptions {

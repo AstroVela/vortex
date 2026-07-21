@@ -41,8 +41,8 @@ impl Scheme for NullDominatedSparseScheme {
         canonical.dtype().is_float()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Sparse.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Sparse.id()]
     }
 
     /// Children: indices=0.

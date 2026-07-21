@@ -46,8 +46,8 @@ impl Scheme for SparseScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Sparse.id(), Constant.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Sparse.id(), Constant.id()]
     }
 
     fn stats_options(&self) -> GenerateStatsOptions {

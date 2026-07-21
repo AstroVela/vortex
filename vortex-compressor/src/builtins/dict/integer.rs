@@ -49,8 +49,8 @@ impl Scheme for IntDictScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Dict.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Dict.id()]
     }
 
     fn stats_options(&self) -> GenerateStatsOptions {

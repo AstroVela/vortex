@@ -43,8 +43,8 @@ impl Scheme for FoRScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![FoR.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![FoR.id()]
     }
 
     /// Dict codes always start at 0, so FoR (which subtracts the min) is a no-op.

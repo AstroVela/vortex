@@ -48,8 +48,8 @@ impl Scheme for RunEndScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![RunEnd.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![RunEnd.id()]
     }
 
     /// Children: values=0, ends=1.

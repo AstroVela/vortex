@@ -46,8 +46,8 @@ impl Scheme for FSSTScheme {
         canonical.dtype().is_utf8()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![FSST.id(), VarBin.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![FSST.id(), VarBin.id()]
     }
 
     /// Children: lengths=0, code_offsets=1.

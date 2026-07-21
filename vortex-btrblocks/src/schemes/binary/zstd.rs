@@ -31,8 +31,8 @@ impl Scheme for ZstdScheme {
         canonical.dtype().is_binary()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![vortex_zstd::Zstd.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![vortex_zstd::Zstd.id()]
     }
 
     fn expected_compression_ratio(

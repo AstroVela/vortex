@@ -48,8 +48,8 @@ impl Scheme for StringDictScheme {
         canonical.dtype().is_utf8()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Dict.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Dict.id()]
     }
 
     fn stats_options(&self) -> GenerateStatsOptions {

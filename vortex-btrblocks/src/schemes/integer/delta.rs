@@ -80,8 +80,8 @@ impl Scheme for DeltaScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Delta.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Delta.id()]
     }
 
     fn num_children(&self) -> usize {

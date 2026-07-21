@@ -42,12 +42,12 @@ impl Scheme for ALPScheme {
         canonical.dtype().is_float()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
+    fn produced_encodings(&self) -> Vec<ArrayId> {
         let mut encodings = vec![ALP.id()];
         if use_experimental_patches() {
             encodings.push(Patched.id());
         }
-        Some(encodings)
+        encodings
     }
 
     /// Children: encoded_ints=0.

@@ -55,8 +55,8 @@ impl Scheme for TemporalScheme {
         )
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![DateTimeParts.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![DateTimeParts.id()]
     }
 
     /// Children: days=0, seconds=1, subseconds=2.

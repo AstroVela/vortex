@@ -31,8 +31,8 @@ impl Scheme for PcoScheme {
         canonical.dtype().is_float()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![vortex_pco::Pco.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![vortex_pco::Pco.id()]
     }
 
     fn expected_compression_ratio(

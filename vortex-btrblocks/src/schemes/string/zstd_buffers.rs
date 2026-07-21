@@ -31,8 +31,8 @@ impl Scheme for ZstdBuffersScheme {
         canonical.dtype().is_utf8()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![vortex_zstd::ZstdBuffers.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![vortex_zstd::ZstdBuffers.id()]
     }
 
     fn expected_compression_ratio(

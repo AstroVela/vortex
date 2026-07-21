@@ -40,12 +40,12 @@ impl Scheme for BitPackingScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
+    fn produced_encodings(&self) -> Vec<ArrayId> {
         let mut encodings = vec![BitPacked.id()];
         if use_experimental_patches() {
             encodings.push(Patched.id());
         }
-        Some(encodings)
+        encodings
     }
 
     fn expected_compression_ratio(

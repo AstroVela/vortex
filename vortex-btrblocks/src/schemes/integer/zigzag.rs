@@ -46,8 +46,8 @@ impl Scheme for ZigZagScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![ZigZag.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![ZigZag.id()]
     }
 
     /// Children: encoded=0.

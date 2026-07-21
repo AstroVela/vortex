@@ -43,8 +43,8 @@ impl Scheme for SequenceScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![Sequence.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Sequence.id()]
     }
 
     /// Sequence encoding on dictionary codes just adds a layer of indirection without compressing

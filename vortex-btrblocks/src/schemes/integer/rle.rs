@@ -158,8 +158,8 @@ impl Scheme for IntRLEScheme {
         canonical.dtype().is_int()
     }
 
-    fn produced_encodings(&self) -> Option<Vec<ArrayId>> {
-        Some(vec![RLE.id()])
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![RLE.id()]
     }
 
     /// Children: values=0, indices=1, offsets=2.
