@@ -23,6 +23,7 @@ use vortex_error::VortexResult;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
+use crate::dtype::Nullability;
 use crate::expr::Expression;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
@@ -133,6 +134,12 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
             "Demand mask length {} does not match row count {} for {}",
             args.demand().len(),
             expected_row_count,
+            self.vtable.id(),
+        );
+        assert_eq!(
+            args.demand().dtype(),
+            &DType::Bool(Nullability::NonNullable),
+            "Demand mask for {} must be a non-nullable boolean array",
             self.vtable.id(),
         );
         #[cfg(debug_assertions)]

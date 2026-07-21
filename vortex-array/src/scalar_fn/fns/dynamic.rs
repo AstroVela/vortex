@@ -275,7 +275,6 @@ mod tests {
 
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
-    use vortex_mask::Mask;
 
     use super::*;
     use crate::IntoArray;
@@ -369,7 +368,7 @@ mod tests {
             default: true,
         });
 
-        let demand = Mask::from_iter([true, false, true]);
+        let demand = BoolArray::from_iter([true, false, true]).into_array();
         let args = VecExecutionArgs::new(vec![buffer![1i32, 5, 10].into_array()], 3, demand);
         let result = scalar_fn.execute(&args, &mut array_session().create_execution_ctx())?;
         assert_eq!(result.len(), 3);

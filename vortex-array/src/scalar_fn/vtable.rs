@@ -14,12 +14,14 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
-use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::arrays::ConstantArray;
 use crate::dtype::DType;
+use crate::dtype::Nullability;
 use crate::expr::Expression;
 use crate::expr::traversal::Node;
 use crate::scalar_fn::ScalarFnId;
@@ -338,23 +340,28 @@ pub trait ExecutionArgs {
 
     /// Returns the demand mask: the rows whose output values the caller will observe.
     ///
-    /// Implementations must return a mask of exactly [`ExecutionArgs::row_count`] length;
-    /// typed dispatch asserts this. Undemanded rows are
-    /// don't-care: the implementation may produce any well-typed value (including null)
-    /// at those positions, and fallible implementations must not raise a domain error
-    /// attributable solely to undemanded rows. Infallible implementations may ignore
-    /// this mask entirely; for them it is purely a performance hint.
+    /// The demand mask is a non-nullable boolean array of exactly
+    /// [`ExecutionArgs::row_count`] length; typed dispatch asserts both. It may use any
+    /// encoding (constant, run-end, or a lazy expression); consumers typically
+    /// materialize it once, e.g. via [`child_to_validity`](crate::child_to_validity) +
+    /// [`Validity::execute_mask`](crate::validity::Validity::execute_mask).
+    ///
+    /// Undemanded rows are don't-care: the implementation may produce any well-typed
+    /// value (including null) at those positions, and fallible implementations must not
+    /// raise a domain error attributable solely to undemanded rows. Infallible
+    /// implementations may ignore this mask entirely; for them it is purely a
+    /// performance hint.
     ///
     /// Demand never compacts: the result of execution must still contain
     /// [`ExecutionArgs::row_count`] rows.
-    fn demand(&self) -> &Mask;
+    fn demand(&self) -> &ArrayRef;
 }
 
 /// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
 pub struct VecExecutionArgs {
     inputs: Vec<ArrayRef>,
     row_count: usize,
-    demand: Mask,
+    demand: ArrayRef,
 }
 
 impl VecExecutionArgs {
@@ -362,12 +369,18 @@ impl VecExecutionArgs {
     ///
     /// # Panics
     ///
-    /// Panics if `demand.len() != row_count`.
-    pub fn new(inputs: Vec<ArrayRef>, row_count: usize, demand: Mask) -> Self {
+    /// Panics if `demand.len() != row_count` or the demand is not a non-nullable
+    /// boolean array.
+    pub fn new(inputs: Vec<ArrayRef>, row_count: usize, demand: ArrayRef) -> Self {
         assert_eq!(
             demand.len(),
             row_count,
             "Demand mask length must match the execution row count"
+        );
+        assert_eq!(
+            demand.dtype(),
+            &DType::Bool(Nullability::NonNullable),
+            "Demand mask must be a non-nullable boolean array"
         );
         Self {
             inputs,
@@ -378,7 +391,11 @@ impl VecExecutionArgs {
 
     /// Create a new `VecExecutionArgs` demanding every row.
     pub fn all(inputs: Vec<ArrayRef>, row_count: usize) -> Self {
-        Self::new(inputs, row_count, Mask::new_true(row_count))
+        Self::new(
+            inputs,
+            row_count,
+            ConstantArray::new(true, row_count).into_array(),
+        )
     }
 }
 
@@ -401,7 +418,7 @@ impl ExecutionArgs for VecExecutionArgs {
         self.row_count
     }
 
-    fn demand(&self) -> &Mask {
+    fn demand(&self) -> &ArrayRef {
         &self.demand
     }
 }
@@ -452,7 +469,6 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
-    use vortex_mask::Mask;
     use vortex_session::registry::CachedId;
 
     use super::*;
@@ -460,12 +476,16 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
+    use crate::arrays::BoolArray;
+    use crate::arrays::Constant;
+    use crate::assert_arrays_eq;
+    use crate::scalar::Scalar;
     use crate::scalar_fn::ScalarFnVTableExt;
 
     /// A scalar fn that records the demand mask it was executed with.
     #[derive(Clone)]
     struct DemandProbe {
-        observed: Arc<Mutex<Option<Mask>>>,
+        observed: Arc<Mutex<Option<ArrayRef>>>,
     }
 
     impl ScalarFnVTable for DemandProbe {
@@ -500,10 +520,16 @@ mod tests {
     }
 
     #[test]
-    fn test_all_demands_every_row() {
+    fn test_all_demands_every_row() -> VortexResult<()> {
         let args = VecExecutionArgs::all(vec![buffer![1i32, 2, 3].into_array()], 3);
         assert_eq!(args.demand().len(), 3);
-        assert!(args.demand().all_true());
+
+        let constant = args
+            .demand()
+            .as_opt::<Constant>()
+            .ok_or_else(|| vortex_err!("all-demand should be a constant array"))?;
+        assert_eq!(constant.scalar(), &Scalar::from(true));
+        Ok(())
     }
 
     #[test]
@@ -512,34 +538,45 @@ mod tests {
         drop(VecExecutionArgs::new(
             vec![buffer![1i32, 2, 3].into_array()],
             3,
-            Mask::new_true(2),
+            BoolArray::from_iter([true, false]).into_array(),
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a non-nullable boolean array")]
+    fn test_nullable_demand_panics() {
+        drop(VecExecutionArgs::new(
+            vec![buffer![1i32, 2, 3].into_array()],
+            3,
+            BoolArray::from_iter([Some(true), Some(false), None]).into_array(),
         ));
     }
 
     #[test]
     fn test_demand_reaches_scalar_fn() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
         let observed = Arc::new(Mutex::new(None));
         let probe = DemandProbe {
             observed: Arc::clone(&observed),
         };
         let scalar_fn = probe.bind(EmptyOptions);
 
-        let demand = Mask::from_iter([true, false, true]);
+        let demand = BoolArray::from_iter([true, false, true]).into_array();
         let args = VecExecutionArgs::new(vec![buffer![1i32, 2, 3].into_array()], 3, demand.clone());
-        scalar_fn.execute(&args, &mut array_session().create_execution_ctx())?;
+        scalar_fn.execute(&args, &mut ctx)?;
 
         let seen = observed
             .lock()
             .clone()
             .ok_or_else(|| vortex_err!("probe was not executed"))?;
-        assert_eq!(seen, demand);
+        assert_arrays_eq!(seen, demand, &mut ctx);
         Ok(())
     }
 
     /// An [`ExecutionArgs`] whose demand mask length disagrees with its row count.
     struct MismatchedDemandArgs {
         input: ArrayRef,
-        demand: Mask,
+        demand: ArrayRef,
     }
 
     impl ExecutionArgs for MismatchedDemandArgs {
@@ -555,7 +592,7 @@ mod tests {
             self.input.len()
         }
 
-        fn demand(&self) -> &Mask {
+        fn demand(&self) -> &ArrayRef {
             &self.demand
         }
     }
@@ -570,7 +607,7 @@ mod tests {
 
         let args = MismatchedDemandArgs {
             input: buffer![1i32, 2, 3].into_array(),
-            demand: Mask::new_true(2),
+            demand: BoolArray::from_iter([true, false]).into_array(),
         };
         drop(scalar_fn.execute(&args, &mut array_session().create_execution_ctx()));
     }

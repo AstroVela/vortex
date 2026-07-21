@@ -17,8 +17,10 @@ use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::PrimitiveArray;
 use crate::builtins::ArrayBuiltins;
+use crate::child_to_validity;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
+use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::half::f16;
 use crate::match_each_native_ptype;
@@ -112,7 +114,7 @@ pub(crate) fn execute_numeric(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
     op: NumericOperator,
-    demand: &Mask,
+    demand: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let ptype = PType::try_from(lhs.dtype())?;
@@ -137,7 +139,7 @@ pub(crate) fn execute_numeric(
 fn execute_checked_typed<T, Op>(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-    demand: &Mask,
+    demand: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef>
 where
@@ -162,12 +164,14 @@ where
 
     let validity = lhs.validity().and(rhs.validity())?;
     let valid_rows = validity.execute_mask(len, ctx)?;
+    let demand =
+        child_to_validity(Some(demand), Nullability::NonNullable).execute_mask(len, ctx)?;
     // Lanes that must produce correct values and whose errors are observable. Invalid
     // lanes are null and undemanded lanes are don't-care, so both are excluded.
     let care_lanes = if demand.all_true() {
         valid_rows
     } else {
-        valid_rows & demand
+        valid_rows & &demand
     };
 
     let checked = match (&lhs, &rhs) {
@@ -938,13 +942,13 @@ fn check_numeric_errors(failed: bool, error: &'static str) -> VortexResult<()> {
 mod test {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
-    use vortex_mask::Mask;
 
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::RecursiveCanonical;
     use crate::VortexSessionExecute;
     use crate::array_session;
+    use crate::arrays::BoolArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
     use crate::assert_arrays_eq;
@@ -960,7 +964,7 @@ mod test {
         lhs: ArrayRef,
         rhs: ArrayRef,
         op: Operator,
-        demand: Mask,
+        demand: ArrayRef,
     ) -> VortexResult<ArrayRef> {
         let len = lhs.len();
         let args = VecExecutionArgs::new(vec![lhs, rhs], len, demand);
@@ -1150,7 +1154,12 @@ mod test {
         let mut ctx = array_session().create_execution_ctx();
         let lhs = buffer![u8::MAX, 1].into_array();
         let rhs = buffer![1u8, 1].into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([false, true]))?;
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            BoolArray::from_iter([false, true]).into_array(),
+        )?;
 
         assert_eq!(result.len(), 2);
         assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(2u8));
@@ -1161,7 +1170,12 @@ mod test {
     fn test_add_overflow_on_demanded_lane_errors() {
         let lhs = buffer![u8::MAX, 1].into_array();
         let rhs = buffer![1u8, 1].into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([true, false]));
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            BoolArray::from_iter([true, false]).into_array(),
+        );
 
         assert!(result.is_err());
     }
@@ -1171,7 +1185,12 @@ mod test {
         let mut ctx = array_session().create_execution_ctx();
         let lhs = buffer![u8::MAX, 1].into_array();
         let rhs = ConstantArray::new(1u8, 2).into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([false, true]))?;
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            BoolArray::from_iter([false, true]).into_array(),
+        )?;
 
         assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(2u8));
         Ok(())
@@ -1181,7 +1200,12 @@ mod test {
     fn test_add_constant_overflow_fully_undemanded_is_ok() -> VortexResult<()> {
         let lhs = ConstantArray::new(u8::MAX, 2).into_array();
         let rhs = ConstantArray::new(1u8, 2).into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::new_false(2))?;
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            ConstantArray::new(false, 2).into_array(),
+        )?;
 
         assert_eq!(result.len(), 2);
         Ok(())
@@ -1191,7 +1215,12 @@ mod test {
     fn test_add_constant_overflow_on_demanded_lane_errors() {
         let lhs = ConstantArray::new(u8::MAX, 2).into_array();
         let rhs = ConstantArray::new(1u8, 2).into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([true, false]));
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            BoolArray::from_iter([true, false]).into_array(),
+        );
 
         assert!(result.is_err());
     }
@@ -1201,7 +1230,12 @@ mod test {
         let mut ctx = array_session().create_execution_ctx();
         let lhs = buffer![10i32, 10].into_array();
         let rhs = buffer![0i32, 2].into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Div, Mask::from_iter([false, true]))?;
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Div,
+            BoolArray::from_iter([false, true]).into_array(),
+        )?;
 
         assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(5i32));
         Ok(())
@@ -1211,7 +1245,12 @@ mod test {
     fn test_div_by_zero_on_demanded_lane_errors() {
         let lhs = buffer![10i32, 10].into_array();
         let rhs = buffer![0i32, 2].into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Div, Mask::from_iter([true, false]));
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Div,
+            BoolArray::from_iter([true, false]).into_array(),
+        );
 
         assert!(result.is_err());
     }
@@ -1221,7 +1260,12 @@ mod test {
         let mut ctx = array_session().create_execution_ctx();
         let lhs = ConstantArray::new(1u8, 2).into_array();
         let rhs = buffer![u8::MAX, 1].into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([false, true]))?;
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            BoolArray::from_iter([false, true]).into_array(),
+        )?;
 
         assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(2u8));
         Ok(())
@@ -1233,7 +1277,12 @@ mod test {
         let lhs = PrimitiveArray::new(buffer![u8::MAX, 1], Validity::from_iter([false, true]))
             .into_array();
         let rhs = buffer![1u8, 1].into_array();
-        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::new_true(2))?;
+        let result = execute_with_demand(
+            lhs,
+            rhs,
+            Operator::Add,
+            ConstantArray::new(true, 2).into_array(),
+        )?;
 
         assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(Some(2u8)));
         Ok(())
