@@ -11290,6 +11290,8 @@ dependencies = [
  "anyhow",
  "clap",
  "prost-build",
+ "serde",
+ "toml",
  "xshell",
 ]
 

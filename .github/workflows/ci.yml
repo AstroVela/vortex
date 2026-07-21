@@ -644,6 +644,9 @@ jobs:
         run: |
           cargo run --profile ci -p xtask -- generate-fbs
           cargo run --profile ci -p xtask -- generate-proto
+      - name: "regenerate the edition registry docs"
+        run: |
+          cargo run --profile ci -p xtask -- generate-editions-docs --profile ci
       - name: "regenerate FFI header file"
         run: |
           cargo +$NIGHTLY_TOOLCHAIN build --profile ci -p vortex-ffi

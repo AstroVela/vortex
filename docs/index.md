@@ -91,6 +91,12 @@ internals. Build and benchmark locally.
 - **Language bindings**: First-class support for Python (PyO3), Java (JNI + Spark/Trino connectors),
   and C/C++ (FFI).
 
+## Editions
+
+Vortex writers target **[editions](specs/editions.md)** — named, frozen sets of encodings that
+carry a forever read-compatibility guarantee. See every edition in the
+[edition registry](specs/editions/index.md).
+
 ```{toctree}
 ---
 hidden:

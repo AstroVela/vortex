@@ -23,6 +23,8 @@ test = false
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 prost-build = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
 xshell = { workspace = true }
 
 [lints]

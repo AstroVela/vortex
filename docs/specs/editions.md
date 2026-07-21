@@ -19,7 +19,7 @@ editions is the earliest version of vortex required to read that file.
 ## Resolving an unknown-encoding error
 
 If a read failed with an unknown encoding ID and pointed you here, the reader met an encoding
-it does not support. Find the encoding ID in the [registry](#edition-registry) below:
+it does not support. Find the encoding ID in the [registry](editions/index.md):
 
 1. **The ID is listed under an edition.** The file is newer than your Vortex build. Upgrade to
    at least that edition's required Vortex release and the file will read.
@@ -59,4 +59,14 @@ indefinitely, so deprecation never invalidates existing files.
 
 ## Edition registry
 
-Coming soon..
+The full registry — every edition, its encoding set, and each encoding's membership — is
+generated from the declarations in `vortex/src/editions/` and published as its own pages,
+one per edition: see the [edition registry](editions/index.md).
+
+```{toctree}
+---
+hidden:
+---
+
+editions/index
+```
