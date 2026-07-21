@@ -193,6 +193,37 @@ pub fn register_default_encodings(session: &VortexSession) {
 }
 
 #[cfg(test)]
+pub(crate) fn enable_all_registered_array_encodings(session: &VortexSession) {
+    use vortex_edition::Edition;
+    use vortex_edition::EditionId;
+    use vortex_edition::EditionInclusion;
+    use vortex_edition::EditionSessionExt;
+    use vortex_error::VortexExpect;
+    use vortex_error::vortex_err;
+
+    const TEST_EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
+
+    let editions = session.editions();
+    editions
+        .declare_edition(Edition {
+            id: TEST_EDITION,
+            min_vortex_version: None,
+        })
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("test edition is valid");
+    for id in session.arrays().registry().ids() {
+        editions
+            .declare_inclusion(EditionInclusion::new(&id, TEST_EDITION))
+            .map_err(|error| vortex_err!("{error}"))
+            .vortex_expect("registered array encoding has one test-edition inclusion");
+    }
+    session
+        .enable_edition(TEST_EDITION)
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("test edition is registered");
+}
+
+#[cfg(test)]
 mod default_encoding_tests {
     use vortex_array::VTable as _;
     use vortex_array::array_session;
@@ -221,11 +252,5 @@ mod default_encoding_tests {
                 .kernels()
                 .has_execute_parent(Filter.id(), OnPair.id())
         );
-    }
-
-    #[cfg(not(feature = "unstable_encodings"))]
-    #[test]
-    fn default_writer_does_not_allow_onpair() {
-        assert!(!crate::ALLOWED_ENCODINGS.contains(&OnPair.id()));
     }
 }

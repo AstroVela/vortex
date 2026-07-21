@@ -88,6 +88,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<RuntimeSession>();
 
     crate::register_default_encodings(&session);
+    crate::enable_all_registered_array_encodings(&session);
 
     session
 });

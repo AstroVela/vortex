@@ -230,8 +230,8 @@ pub trait EditionSessionExt: SessionExt {
 
     /// Returns the editions enabled for writing.
     ///
-    /// Accessing this method installs the enabled-editions session variable if it is absent,
-    /// opting the session into edition-gated writing with an initially empty selection.
+    /// Accessing this method installs the enabled-editions session variable if it is absent, with
+    /// an initially empty selection.
     fn enabled_editions(&self) -> SessionGuard<'_, EnabledEditions> {
         self.get::<EnabledEditions>()
     }
@@ -258,12 +258,11 @@ pub trait EditionSessionExt: SessionExt {
 
     /// Resolve the encodings in all enabled editions.
     ///
-    /// Returns `None` when the enabled-editions variable is absent, which is the explicit
-    /// opt-out used by lower-level sessions. Once the variable is present, an empty enabled
-    /// set resolves to `Some(Vec::new())` and therefore permits no edition encodings.
+    /// When the enabled-editions variable is absent or no editions are enabled, this returns an
+    /// empty vector and therefore permits no edition encodings.
     fn enabled_encoding_ids(&self) -> Vec<Id> {
         let Some(enabled) = self.get_opt::<EnabledEditions>() else {
-            vec![]
+            return vec![];
         };
         let editions = self.editions();
         let mut ids: Vec<Id> = enabled

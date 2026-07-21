@@ -62,8 +62,8 @@ use crate::segments::writer::BufferedSegmentSink;
 /// Configure a new writer, which can eventually be used to write an [`ArrayStream`] into a sink
 /// that implements [`VortexWrite`].
 ///
-/// Unless overridden, the default [write strategy][crate::WriteStrategyBuilder] will be used with no
-/// additional configuration.
+/// Unless overridden, the default [write strategy][crate::WriteStrategyBuilder] will be restricted
+/// to the encodings in the session's enabled editions.
 ///
 /// Construct with [`WriteOptionsSessionExt::write_options`] for normal use so the writer inherits
 /// the session's runtime, array registry, and memory configuration.
@@ -80,8 +80,9 @@ pub trait WriteOptionsSessionExt: SessionExt {
     /// Create [`VortexWriteOptions`] for writing to a Vortex file.
     fn write_options(&self) -> VortexWriteOptions {
         let session = self.session();
+        let strategy = default_write_strategy(&session);
         VortexWriteOptions {
-            strategy: WriteStrategyBuilder::default().build(),
+            strategy,
             session,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
@@ -91,11 +92,27 @@ pub trait WriteOptionsSessionExt: SessionExt {
 }
 impl<S: SessionExt> WriteOptionsSessionExt for S {}
 
+fn default_write_strategy(session: &VortexSession) -> Arc<dyn LayoutStrategy> {
+    WriteStrategyBuilder::default()
+        .with_allow_encodings(session.enabled_encoding_ids().into_iter().collect())
+        .build()
+}
+
+fn initial_array_ids(session: &VortexSession, registry: &ArrayRegistry) -> Vec<ArrayId> {
+    session
+        .enabled_encoding_ids()
+        .into_iter()
+        .filter(|id| registry.find(id).is_some())
+        .sorted()
+        .collect()
+}
+
 impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
     pub fn new(session: VortexSession) -> Self {
+        let strategy = default_write_strategy(&session);
         VortexWriteOptions {
-            strategy: WriteStrategyBuilder::default().build(),
+            strategy,
             session,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
@@ -164,7 +181,7 @@ impl VortexWriteOptions {
         // editions. This keeps the serialized ordering deterministic without advertising every
         // encoding the session happens to know how to read.
         let array_registry = self.session.arrays().registry().clone();
-        let ctx = ArrayContext::new(self.session.enabled_encoding_ids())
+        let ctx = ArrayContext::new(initial_array_ids(&self.session, &array_registry))
             // The registry supplies serialization implementations; the layout strategy applies
             // the enabled-edition write policy before arrays reach serialization.
             .with_registry(array_registry);

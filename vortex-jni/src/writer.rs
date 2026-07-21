@@ -111,11 +111,7 @@ fn write_options_for_schema(
         return session.write_options();
     }
 
-    let mut allowed: HashSet<ArrayId> = session
-        .enabled_encoding_ids()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let mut allowed: HashSet<ArrayId> = session.enabled_encoding_ids().into_iter().collect();
     allowed.insert(ParquetVariant.id());
 
     let strategy = WriteStrategyBuilder::default().with_allow_encodings(allowed);
