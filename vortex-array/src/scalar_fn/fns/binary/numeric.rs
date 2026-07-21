@@ -174,24 +174,15 @@ where
         (
             PrimitiveOperand::Array { values: lhs, .. },
             PrimitiveOperand::Array { values: rhs, .. },
-        ) => {
-            let (lhs, rhs) = (lhs.as_slice(), rhs.as_slice());
-            checked_op::<T, Op, _>(len, &care_lanes, |idx| (lhs[idx], rhs[idx]))
-        }
+        ) => checked_array_array::<T, Op>(lhs, rhs, &care_lanes),
         (
             PrimitiveOperand::Array { values: lhs, .. },
             PrimitiveOperand::Constant { value: rhs, .. },
-        ) => {
-            let (lhs, rhs) = (lhs.as_slice(), *rhs);
-            checked_op::<T, Op, _>(len, &care_lanes, |idx| (lhs[idx], rhs))
-        }
+        ) => checked_array_constant::<T, Op>(lhs, *rhs, &care_lanes),
         (
             PrimitiveOperand::Constant { value: lhs, .. },
             PrimitiveOperand::Array { values: rhs, .. },
-        ) => {
-            let (lhs, rhs) = (*lhs, rhs.as_slice());
-            checked_op::<T, Op, _>(len, &care_lanes, |idx| (lhs, rhs[idx]))
-        }
+        ) => checked_constant_array::<T, Op>(*lhs, rhs, &care_lanes),
         (
             PrimitiveOperand::Constant { value: lhs, .. },
             PrimitiveOperand::Constant { value: rhs, .. },
@@ -311,46 +302,130 @@ impl<T: NativePType> CheckedValues<T> {
     }
 }
 
-/// Dispatch a checked op over the care lanes, reading operands via `operands_at`.
-///
-/// The one-pass strategy short-circuits on the first observable error; the default
-/// split strategy computes every lane branch-free and re-scans only care lanes for
-/// errors, so undemanded and null lanes never fail the operation.
-fn checked_op<T, Op, F>(len: usize, care_lanes: &Mask, operands_at: F) -> CheckedValues<T>
+fn checked_array_array<T, Op>(lhs: &[T], rhs: &[T], care_lanes: &Mask) -> CheckedValues<T>
 where
     T: NativePType,
     Op: CheckedPrimitiveOp<T>,
-    F: Fn(usize) -> (T, T) + Copy,
+{
+    debug_assert_eq!(lhs.len(), rhs.len());
+
+    match care_lanes.bit_buffer() {
+        AllOr::All if Op::CHECKED_VALUE_LOOP => checked_array_array_one_pass::<T, Op>(lhs, rhs),
+        AllOr::All => checked_array_array_all_lanes::<T, Op>(lhs, rhs),
+        AllOr::None => CheckedValues::zeroed(lhs.len()),
+        AllOr::Some(valid_bits) if Op::CHECKED_VALUE_LOOP => {
+            checked_array_array_valid_lanes_one_pass::<T, Op>(lhs, rhs, valid_bits)
+        }
+        AllOr::Some(valid_bits) => checked_array_array_valid_lanes::<T, Op>(lhs, rhs, valid_bits),
+    }
+}
+
+fn checked_array_constant<T, Op>(lhs: &[T], rhs: T, care_lanes: &Mask) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
 {
     match care_lanes.bit_buffer() {
-        AllOr::All if Op::CHECKED_VALUE_LOOP => checked_all_lanes(len, |idx| {
-            let (lhs, rhs) = operands_at(idx);
-            Op::checked(lhs, rhs)
-        }),
-        AllOr::All => collect_all_lanes(len, |idx| {
-            let (lhs, rhs) = operands_at(idx);
-            Op::apply(lhs, rhs)
-        }),
-        AllOr::None => CheckedValues::zeroed(len),
-        AllOr::Some(care_bits) if Op::CHECKED_VALUE_LOOP => {
-            checked_valid_lanes(len, care_bits, |idx| {
-                let (lhs, rhs) = operands_at(idx);
-                Op::checked(lhs, rhs)
-            })
+        AllOr::All if Op::CHECKED_VALUE_LOOP => checked_array_constant_one_pass::<T, Op>(lhs, rhs),
+        AllOr::All => checked_array_constant_all_lanes::<T, Op>(lhs, rhs),
+        AllOr::None => CheckedValues::zeroed(lhs.len()),
+        AllOr::Some(valid_bits) if Op::CHECKED_VALUE_LOOP => {
+            checked_array_constant_valid_lanes_one_pass::<T, Op>(lhs, rhs, valid_bits)
         }
-        AllOr::Some(care_bits) => {
-            let mut checked = collect_all_lanes(len, |idx| {
-                let (lhs, rhs) = operands_at(idx);
-                Op::apply(lhs, rhs)
-            });
-            checked.failed = checked.failed
-                && any_valid_error(len, care_bits, |idx| {
-                    let (lhs, rhs) = operands_at(idx);
-                    Op::apply(lhs, rhs).1
-                });
-            checked
+        AllOr::Some(valid_bits) => {
+            checked_array_constant_valid_lanes::<T, Op>(lhs, rhs, valid_bits)
         }
     }
+}
+
+fn checked_constant_array<T, Op>(lhs: T, rhs: &[T], care_lanes: &Mask) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    match care_lanes.bit_buffer() {
+        AllOr::All if Op::CHECKED_VALUE_LOOP => checked_constant_array_one_pass::<T, Op>(lhs, rhs),
+        AllOr::All => checked_constant_array_all_lanes::<T, Op>(lhs, rhs),
+        AllOr::None => CheckedValues::zeroed(rhs.len()),
+        AllOr::Some(valid_bits) if Op::CHECKED_VALUE_LOOP => {
+            checked_constant_array_valid_lanes_one_pass::<T, Op>(lhs, rhs, valid_bits)
+        }
+        AllOr::Some(valid_bits) => {
+            checked_constant_array_valid_lanes::<T, Op>(lhs, rhs, valid_bits)
+        }
+    }
+}
+
+fn checked_array_array_all_lanes<T, Op>(lhs: &[T], rhs: &[T]) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    collect_all_lanes(lhs.len(), |idx| Op::apply(lhs[idx], rhs[idx]))
+}
+
+fn checked_array_array_valid_lanes<T, Op>(
+    lhs: &[T],
+    rhs: &[T],
+    valid_bits: &BitBuffer,
+) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    let mut checked = collect_all_lanes(lhs.len(), |idx| Op::apply(lhs[idx], rhs[idx]));
+
+    checked.failed = checked.failed
+        && any_valid_error(lhs.len(), valid_bits, |idx| Op::apply(lhs[idx], rhs[idx]).1);
+    checked
+}
+
+fn checked_array_constant_all_lanes<T, Op>(lhs: &[T], rhs: T) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    collect_all_lanes(lhs.len(), |idx| Op::apply(lhs[idx], rhs))
+}
+
+fn checked_array_constant_valid_lanes<T, Op>(
+    lhs: &[T],
+    rhs: T,
+    valid_bits: &BitBuffer,
+) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    let mut checked = collect_all_lanes(lhs.len(), |idx| Op::apply(lhs[idx], rhs));
+
+    checked.failed =
+        checked.failed && any_valid_error(lhs.len(), valid_bits, |idx| Op::apply(lhs[idx], rhs).1);
+    checked
+}
+
+fn checked_constant_array_all_lanes<T, Op>(lhs: T, rhs: &[T]) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    collect_all_lanes(rhs.len(), |idx| Op::apply(lhs, rhs[idx]))
+}
+
+fn checked_constant_array_valid_lanes<T, Op>(
+    lhs: T,
+    rhs: &[T],
+    valid_bits: &BitBuffer,
+) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    let mut checked = collect_all_lanes(rhs.len(), |idx| Op::apply(lhs, rhs[idx]));
+
+    checked.failed =
+        checked.failed && any_valid_error(rhs.len(), valid_bits, |idx| Op::apply(lhs, rhs[idx]).1);
+    checked
 }
 
 fn collect_all_lanes<T, F>(len: usize, mut value_and_error_at: F) -> CheckedValues<T>
@@ -373,6 +448,66 @@ where
         values: values.freeze(),
         failed,
     }
+}
+
+fn checked_array_array_one_pass<T, Op>(lhs: &[T], rhs: &[T]) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    checked_all_lanes(lhs.len(), |idx| Op::checked(lhs[idx], rhs[idx]))
+}
+
+fn checked_array_array_valid_lanes_one_pass<T, Op>(
+    lhs: &[T],
+    rhs: &[T],
+    valid_bits: &BitBuffer,
+) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    checked_valid_lanes(lhs.len(), valid_bits, |idx| Op::checked(lhs[idx], rhs[idx]))
+}
+
+fn checked_array_constant_one_pass<T, Op>(lhs: &[T], rhs: T) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    checked_all_lanes(lhs.len(), |idx| Op::checked(lhs[idx], rhs))
+}
+
+fn checked_array_constant_valid_lanes_one_pass<T, Op>(
+    lhs: &[T],
+    rhs: T,
+    valid_bits: &BitBuffer,
+) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    checked_valid_lanes(lhs.len(), valid_bits, |idx| Op::checked(lhs[idx], rhs))
+}
+
+fn checked_constant_array_one_pass<T, Op>(lhs: T, rhs: &[T]) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    checked_all_lanes(rhs.len(), |idx| Op::checked(lhs, rhs[idx]))
+}
+
+fn checked_constant_array_valid_lanes_one_pass<T, Op>(
+    lhs: T,
+    rhs: &[T],
+    valid_bits: &BitBuffer,
+) -> CheckedValues<T>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+{
+    checked_valid_lanes(rhs.len(), valid_bits, |idx| Op::checked(lhs, rhs[idx]))
 }
 
 // Checked one-pass ops delay early exit until the end of a small block. This
