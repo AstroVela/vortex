@@ -105,10 +105,14 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedDiv {
 }
 
 /// Execute a numeric operation between two arrays.
+///
+/// Undemanded rows are don't-care per the [`crate::scalar_fn::ExecutionArgs::demand`]
+/// contract: their output values are unspecified and they never raise a domain error.
 pub(crate) fn execute_numeric(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
     op: NumericOperator,
+    demand: &Mask,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let ptype = PType::try_from(lhs.dtype())?;
@@ -122,10 +126,10 @@ pub(crate) fn execute_numeric(
 
     match_each_native_ptype!(ptype, |T| {
         match op {
-            NumericOperator::Add => execute_checked_typed::<T, CheckedAdd>(lhs, rhs, ctx),
-            NumericOperator::Sub => execute_checked_typed::<T, CheckedSub>(lhs, rhs, ctx),
-            NumericOperator::Mul => execute_checked_typed::<T, CheckedMul>(lhs, rhs, ctx),
-            NumericOperator::Div => execute_checked_typed::<T, CheckedDiv>(lhs, rhs, ctx),
+            NumericOperator::Add => execute_checked_typed::<T, CheckedAdd>(lhs, rhs, demand, ctx),
+            NumericOperator::Sub => execute_checked_typed::<T, CheckedSub>(lhs, rhs, demand, ctx),
+            NumericOperator::Mul => execute_checked_typed::<T, CheckedMul>(lhs, rhs, demand, ctx),
+            NumericOperator::Div => execute_checked_typed::<T, CheckedDiv>(lhs, rhs, demand, ctx),
         }
     })
 }
@@ -133,6 +137,7 @@ pub(crate) fn execute_numeric(
 fn execute_checked_typed<T, Op>(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
+    demand: &Mask,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef>
 where
@@ -157,28 +162,36 @@ where
 
     let validity = lhs.validity().and(rhs.validity())?;
     let valid_rows = validity.execute_mask(len, ctx)?;
+    // Lanes that must produce correct values and whose errors are observable. Invalid
+    // lanes are null and undemanded lanes are don't-care, so both are excluded.
+    let care_lanes = if demand.all_true() {
+        valid_rows
+    } else {
+        &valid_rows & demand
+    };
 
     let checked = match (&lhs, &rhs) {
         (
             PrimitiveOperand::Array { values: lhs, .. },
             PrimitiveOperand::Array { values: rhs, .. },
-        ) => checked_array_array::<T, Op>(lhs, rhs, &valid_rows),
+        ) => checked_array_array::<T, Op>(lhs, rhs, &care_lanes),
         (
             PrimitiveOperand::Array { values: lhs, .. },
             PrimitiveOperand::Constant { value: rhs, .. },
-        ) => checked_array_constant::<T, Op>(lhs, *rhs, &valid_rows),
+        ) => checked_array_constant::<T, Op>(lhs, *rhs, &care_lanes),
         (
             PrimitiveOperand::Constant { value: lhs, .. },
             PrimitiveOperand::Array { values: rhs, .. },
-        ) => checked_constant_array::<T, Op>(*lhs, rhs, &valid_rows),
+        ) => checked_constant_array::<T, Op>(*lhs, rhs, &care_lanes),
         (
             PrimitiveOperand::Constant { value: lhs, .. },
             PrimitiveOperand::Constant { value: rhs, .. },
-        ) => {
-            let value = Op::checked(*lhs, *rhs)
-                .ok_or_else(|| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
-            return Ok(constant_result_array(value, len, &result_dtype));
-        }
+        ) => match Op::checked(*lhs, *rhs) {
+            Some(value) => return Ok(constant_result_array(value, len, &result_dtype)),
+            // The op fails on every lane, but no failing lane is observable.
+            None if care_lanes.all_false() => CheckedValues::zeroed(len),
+            None => vortex_bail!(InvalidArgument: "{}", Op::ERROR),
+        },
         (PrimitiveOperand::Null(_), _) | (_, PrimitiveOperand::Null(_)) => {
             CheckedValues::zeroed(len)
         }
@@ -289,14 +302,14 @@ impl<T: NativePType> CheckedValues<T> {
     }
 }
 
-fn checked_array_array<T, Op>(lhs: &[T], rhs: &[T], valid_rows: &Mask) -> CheckedValues<T>
+fn checked_array_array<T, Op>(lhs: &[T], rhs: &[T], care_lanes: &Mask) -> CheckedValues<T>
 where
     T: NativePType,
     Op: CheckedPrimitiveOp<T>,
 {
     debug_assert_eq!(lhs.len(), rhs.len());
 
-    match valid_rows.bit_buffer() {
+    match care_lanes.bit_buffer() {
         AllOr::All if Op::CHECKED_VALUE_LOOP => checked_array_array_one_pass::<T, Op>(lhs, rhs),
         AllOr::All => checked_array_array_all_lanes::<T, Op>(lhs, rhs),
         AllOr::None => CheckedValues::zeroed(lhs.len()),
@@ -307,12 +320,12 @@ where
     }
 }
 
-fn checked_array_constant<T, Op>(lhs: &[T], rhs: T, valid_rows: &Mask) -> CheckedValues<T>
+fn checked_array_constant<T, Op>(lhs: &[T], rhs: T, care_lanes: &Mask) -> CheckedValues<T>
 where
     T: NativePType,
     Op: CheckedPrimitiveOp<T>,
 {
-    match valid_rows.bit_buffer() {
+    match care_lanes.bit_buffer() {
         AllOr::All if Op::CHECKED_VALUE_LOOP => checked_array_constant_one_pass::<T, Op>(lhs, rhs),
         AllOr::All => checked_array_constant_all_lanes::<T, Op>(lhs, rhs),
         AllOr::None => CheckedValues::zeroed(lhs.len()),
@@ -325,12 +338,12 @@ where
     }
 }
 
-fn checked_constant_array<T, Op>(lhs: T, rhs: &[T], valid_rows: &Mask) -> CheckedValues<T>
+fn checked_constant_array<T, Op>(lhs: T, rhs: &[T], care_lanes: &Mask) -> CheckedValues<T>
 where
     T: NativePType,
     Op: CheckedPrimitiveOp<T>,
 {
-    match valid_rows.bit_buffer() {
+    match care_lanes.bit_buffer() {
         AllOr::All if Op::CHECKED_VALUE_LOOP => checked_constant_array_one_pass::<T, Op>(lhs, rhs),
         AllOr::All => checked_constant_array_all_lanes::<T, Op>(lhs, rhs),
         AllOr::None => CheckedValues::zeroed(rhs.len()),
@@ -925,6 +938,7 @@ fn check_numeric_errors(failed: bool, error: &'static str) -> VortexResult<()> {
 mod test {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_mask::Mask;
 
     use crate::ArrayRef;
     use crate::IntoArray;
@@ -936,8 +950,24 @@ mod test {
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::scalar::Scalar;
+    use crate::scalar_fn::ScalarFnVTableExt;
+    use crate::scalar_fn::VecExecutionArgs;
+    use crate::scalar_fn::fns::binary::Binary;
     use crate::scalar_fn::fns::operators::Operator;
     use crate::validity::Validity;
+
+    fn execute_with_demand(
+        lhs: ArrayRef,
+        rhs: ArrayRef,
+        op: Operator,
+        demand: Mask,
+    ) -> VortexResult<ArrayRef> {
+        let len = lhs.len();
+        let args = VecExecutionArgs::new(vec![lhs, rhs], len, demand);
+        Binary
+            .bind(op)
+            .execute(&args, &mut array_session().create_execution_ctx())
+    }
 
     fn sub_scalar(array: &ArrayRef, scalar: impl Into<Scalar>) -> VortexResult<ArrayRef> {
         array
@@ -1113,6 +1143,80 @@ mod test {
             .and_then(|a| a.execute::<PrimitiveArray>(&mut array_session().create_execution_ctx()));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_overflow_on_undemanded_lane_is_ok() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let lhs = buffer![u8::MAX, 1].into_array();
+        let rhs = buffer![1u8, 1].into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([false, true]))?;
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(2u8));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_overflow_on_demanded_lane_errors() {
+        let lhs = buffer![u8::MAX, 1].into_array();
+        let rhs = buffer![1u8, 1].into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([true, false]));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_scalar_overflow_on_undemanded_lane_is_ok() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let lhs = buffer![u8::MAX, 1].into_array();
+        let rhs = ConstantArray::new(1u8, 2).into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([false, true]))?;
+
+        assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(2u8));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_constant_overflow_fully_undemanded_is_ok() -> VortexResult<()> {
+        let lhs = ConstantArray::new(u8::MAX, 2).into_array();
+        let rhs = ConstantArray::new(1u8, 2).into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::new_false(2))?;
+
+        assert_eq!(result.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_constant_overflow_on_demanded_lane_errors() {
+        let lhs = ConstantArray::new(u8::MAX, 2).into_array();
+        let rhs = ConstantArray::new(1u8, 2).into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::from_iter([true, false]));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_div_by_zero_on_undemanded_lane_is_ok() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let lhs = buffer![10i32, 10].into_array();
+        let rhs = buffer![0i32, 2].into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Div, Mask::from_iter([false, true]))?;
+
+        assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(5i32));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_overflow_on_null_demanded_lane_is_ok() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let lhs = PrimitiveArray::new(buffer![u8::MAX, 1], Validity::from_iter([false, true]))
+            .into_array();
+        let rhs = buffer![1u8, 1].into_array();
+        let result = execute_with_demand(lhs, rhs, Operator::Add, Mask::new_true(2))?;
+
+        assert_eq!(result.execute_scalar(1, &mut ctx)?, Scalar::from(Some(2u8)));
+        Ok(())
     }
 
     #[test]

@@ -157,10 +157,10 @@ impl ScalarFnVTable for Binary {
             Operator::Gte => execute_compare(&lhs, &rhs, CompareOperator::Gte, ctx),
             Operator::And => execute_boolean(lhs, rhs, Operator::And, ctx),
             Operator::Or => execute_boolean(lhs, rhs, Operator::Or, ctx),
-            Operator::Add => execute_numeric(&lhs, &rhs, NumericOperator::Add, ctx),
-            Operator::Sub => execute_numeric(&lhs, &rhs, NumericOperator::Sub, ctx),
-            Operator::Mul => execute_numeric(&lhs, &rhs, NumericOperator::Mul, ctx),
-            Operator::Div => execute_numeric(&lhs, &rhs, NumericOperator::Div, ctx),
+            Operator::Add => execute_numeric(&lhs, &rhs, NumericOperator::Add, args.demand(), ctx),
+            Operator::Sub => execute_numeric(&lhs, &rhs, NumericOperator::Sub, args.demand(), ctx),
+            Operator::Mul => execute_numeric(&lhs, &rhs, NumericOperator::Mul, args.demand(), ctx),
+            Operator::Div => execute_numeric(&lhs, &rhs, NumericOperator::Div, args.demand(), ctx),
         }
     }
 
