@@ -120,8 +120,7 @@ impl WriteStrategyBuilder {
     /// Override the allowed array encodings for file writing.
     ///
     /// The configured flat leaf strategy is wrapped in a [`LayoutStrategyEncodingValidator`]
-    /// that recursively checks every chunk before passing it to the leaf writer. A configured
-    /// BtrBlocks builder is restricted to schemes whose output encodings are all in this set.
+    /// that recursively checks every chunk before passing it to the leaf writer.
     pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
         self.compressor = match self.compressor {
             CompressorConfig::BtrBlocks(builder) => {
