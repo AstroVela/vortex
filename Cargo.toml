@@ -194,7 +194,7 @@ object_store = { version = "0.13.2", default-features = false }
 object_store_opendal = "0.57.0"
 once_cell = "1.21"
 oneshot = { version = "0.2.0", features = ["async"] }
-onpair = { git = "https://github.com/spiraldb/onpair.git", branch = "feat/storage-backed-compact-dictionary" }
+onpair = { git = "https://github.com/spiraldb/onpair.git", branch = "feat/safety-correctness-validation" }
 opendal = { version = "0.57.0", default-features = false }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = "0.32.0"
