@@ -17,14 +17,12 @@ use futures::pin_mut;
 use futures::select;
 use itertools::Itertools;
 use vortex_array::ArrayContext;
-use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldPath;
 use vortex_array::expr::stats::Stat;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorExt;
-use vortex_array::session::ArrayRegistry;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::ArrayStream;
@@ -80,37 +78,17 @@ pub trait WriteOptionsSessionExt: SessionExt {
     /// Create [`VortexWriteOptions`] for writing to a Vortex file.
     fn write_options(&self) -> VortexWriteOptions {
         let session = self.session();
-        let strategy = default_write_strategy(&session);
-        VortexWriteOptions {
-            strategy,
-            session,
-            exclude_dtype: false,
-            file_statistics: PRUNING_STATS.to_vec(),
-            max_variable_length_statistics_size: 64,
-        }
+        VortexWriteOptions::new(session)
     }
 }
 impl<S: SessionExt> WriteOptionsSessionExt for S {}
 
-fn default_write_strategy(session: &VortexSession) -> Arc<dyn LayoutStrategy> {
-    WriteStrategyBuilder::default()
-        .with_allow_encodings(session.enabled_encoding_ids().into_iter().collect())
-        .build()
-}
-
-fn initial_array_ids(session: &VortexSession, registry: &ArrayRegistry) -> Vec<ArrayId> {
-    session
-        .enabled_encoding_ids()
-        .into_iter()
-        .filter(|id| registry.find(id).is_some())
-        .sorted()
-        .collect()
-}
-
 impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
     pub fn new(session: VortexSession) -> Self {
-        let strategy = default_write_strategy(&session);
+        let strategy = WriteStrategyBuilder::default()
+            .with_allow_encodings(session.enabled_encoding_ids().into_iter().collect())
+            .build();
         VortexWriteOptions {
             strategy,
             session,
@@ -180,11 +158,10 @@ impl VortexWriteOptions {
         // Pre-populate the array context with the registered encodings selected by the enabled
         // editions. This keeps the serialized ordering deterministic without advertising every
         // encoding the session happens to know how to read.
-        let array_registry = self.session.arrays().registry().clone();
-        let ctx = ArrayContext::new(initial_array_ids(&self.session, &array_registry))
+        let ctx = ArrayContext::new(self.session.enabled_encoding_ids())
             // The registry supplies serialization implementations; the layout strategy applies
             // the enabled-edition write policy before arrays reach serialization.
-            .with_registry(array_registry);
+            .with_registry(self.session.arrays().registry().clone());
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();
@@ -565,8 +542,6 @@ mod tests {
     use vortex_edition::EditionSession;
     use vortex_edition::EditionSessionExt;
 
-    use super::initial_array_ids;
-
     #[test]
     fn initial_array_ids_are_registered_and_enabled() -> Result<(), vortex_edition::EditionError> {
         const EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
@@ -583,7 +558,7 @@ mod tests {
         session.enable_edition(EDITION)?;
 
         let registry = session.arrays().registry().clone();
-        let ids = initial_array_ids(&session, &registry);
+        let ids = session.enabled_encoding_ids();
         assert_eq!(ids, [Primitive.id()]);
         assert!(!ids.contains(&Bool.id()));
         Ok(())
