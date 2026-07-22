@@ -353,7 +353,7 @@ impl<T> BufferMut<T> {
     }
 
     /// Appends a scalar to the buffer.
-    #[inline]
+    #[inline(always)]
     pub fn push(&mut self, value: T) {
         self.reserve(1);
         unsafe { self.push_unchecked(value) }
