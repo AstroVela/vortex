@@ -416,7 +416,7 @@ impl FileOpener for VortexOpener {
                         )));
                     }
 
-                    make_vortex_predicate(expr_convertor.as_ref(), &pushed).transpose()
+                    make_vortex_predicate(expr_convertor.as_ref(), &pushed, vxf.dtype()).transpose()
                 })
                 .transpose()?;
 

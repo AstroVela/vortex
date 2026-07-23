@@ -635,7 +635,7 @@ impl DataSource for VortexDataSource {
             .collect();
 
         // Convert to Vortex conjunction.
-        let vortex_pred = make_vortex_predicate(&convertor, &pushable)?;
+        let vortex_pred = make_vortex_predicate(&convertor, &pushable, self.data_source.dtype())?;
 
         // Combine with existing filter.
         let new_filter = match (&self.filter, vortex_pred) {

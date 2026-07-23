@@ -24,6 +24,7 @@ use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::VortexSessionDefault;
+use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
@@ -49,6 +50,8 @@ use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 
 use crate::convert::FromDataFusion;
+use crate::convert::decimal::coerce_decimal_arithmetic;
+use crate::convert::decimal::decimal_arithmetic_is_pushable;
 
 /// Result of splitting a projection into Vortex expressions and leftover DataFusion projections.
 pub struct ProcessedProjection {
@@ -57,13 +60,20 @@ pub struct ProcessedProjection {
 }
 
 /// Tries to convert the expressions into a vortex conjunction. Will return Ok(None) iff the input conjunction is empty.
+///
+/// `scope` is the dtype the predicate will be evaluated against; converted expressions
+/// containing decimal arithmetic are aligned to it with Vortex's coercion pass.
 pub(crate) fn make_vortex_predicate(
     expr_convertor: &dyn ExpressionConvertor,
     predicate: &[Arc<dyn PhysicalExpr>],
+    scope: &DType,
 ) -> DFResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| expr_convertor.convert(e.as_ref()))
+        .map(|e| {
+            let expr = expr_convertor.convert(e.as_ref())?;
+            coerce_decimal_arithmetic(expr, scope)
+        })
         .collect::<DFResult<Vec<_>>>()?;
 
     Ok(and_collect(exprs))
@@ -374,6 +384,14 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         let mut scan_projection = vec![];
         let mut leftover_projection: Vec<ProjectionExpr> = vec![];
 
+        // The dtype scope pushed-down projections are evaluated against, used to align any
+        // decimal arithmetic they contain.
+        let scope = self
+            .session
+            .arrow()
+            .from_arrow_schema(input_schema)
+            .map_err(|e| exec_datafusion_err!("Failed to convert input schema to dtype: {e}"))?;
+
         for projection_expr in source_projection.iter() {
             let r = projection_expr.expr.apply(|node| {
                 // We only pull column children of scalar functions that we can't push into the scan.
@@ -390,12 +408,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                     return Ok(TreeNodeRecursion::Stop);
                 }
 
-                // DataFusion assumes different decimal types can be coerced.
-                // Vortex expects a perfect match so we don't push it down.
+                // Vortex reproduces DataFusion's decimal arithmetic exactly only for Add/Sub
+                // below the physical type's precision ceiling; keep everything else in
+                // DataFusion. See `convert::decimal`.
                 if let Some(binary_expr) = node.downcast_ref::<df_expr::BinaryExpr>()
-                    && binary_expr.op().is_numerical_operators()
-                    && binary_expr.left().data_type(input_schema)?.is_decimal()
-                    && binary_expr.right().data_type(input_schema)?.is_decimal()
+                    && !decimal_arithmetic_can_be_pushed_down(binary_expr, input_schema)
                 {
                     scan_projection.extend(
                         collect_columns(node)
@@ -412,9 +429,10 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
             // if we didn't stop early
             if matches!(r, TreeNodeRecursion::Continue) {
+                let converted = self.convert(projection_expr.expr.as_ref())?;
                 scan_projection.push((
                     projection_expr.alias.clone(),
-                    self.convert(projection_expr.expr.as_ref())?,
+                    coerce_decimal_arithmetic(converted, &scope)?,
                 ));
                 leftover_projection.push(ProjectionExpr {
                     expr: Arc::new(df_expr::Column::new_with_schema(
@@ -507,7 +525,7 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
         supported_data_types(&lit.value().data_type())
     } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
         // CastExpr child must be an expression type that convert() can handle
-        is_convertible_expr(cast_expr.expr())
+        is_convertible_expr(cast_expr.expr(), schema)
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
         can_be_pushed_down_impl(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
@@ -531,15 +549,16 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
 /// Checks if an expression type is one that convert() can handle.
 /// This is less restrictive than can_be_pushed_down since it only checks
 /// expression types, not data type support.
-fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
+fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     // Expression types that convert() handles
-    expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
+    expr.downcast_ref::<df_expr::BinaryExpr>()
+        .is_some_and(|binary| binary_tree_decimal_arithmetic_ok(binary, schema))
         || expr.downcast_ref::<df_expr::Column>().is_some()
         || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
         || expr.downcast_ref::<df_expr::Literal>().is_some()
         || expr
             .downcast_ref::<df_expr::CastExpr>()
-            .is_some_and(|e| is_convertible_expr(e.expr()))
+            .is_some_and(|e| is_convertible_expr(e.expr(), schema))
         || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
         || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
         || expr.downcast_ref::<df_expr::InListExpr>().is_some()
@@ -550,9 +569,41 @@ fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
         })
 }
 
+/// Walk a [`df_expr::BinaryExpr`] tree checking that every decimal arithmetic node can be
+/// pushed down. Non-binary children are accepted structurally, matching
+/// [`is_convertible_expr`]'s shallow contract.
+fn binary_tree_decimal_arithmetic_ok(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
+    decimal_arithmetic_can_be_pushed_down(binary, schema)
+        && [binary.left(), binary.right()].into_iter().all(|child| {
+            child
+                .downcast_ref::<df_expr::BinaryExpr>()
+                .is_none_or(|b| binary_tree_decimal_arithmetic_ok(b, schema))
+        })
+}
+
+/// A numeric [`df_expr::BinaryExpr`] over decimals is pushable only when Vortex can reproduce
+/// DataFusion's arithmetic exactly; see `convert::decimal`. Non-numeric operators and
+/// non-decimal operands are unaffected.
+fn decimal_arithmetic_can_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
+    if !binary.op().is_numerical_operators() {
+        return true;
+    }
+    let (Ok(lhs), Ok(rhs)) = (
+        binary.left().data_type(schema),
+        binary.right().data_type(schema),
+    ) else {
+        return false;
+    };
+    if !lhs.is_decimal() && !rhs.is_decimal() {
+        return true;
+    }
+    decimal_arithmetic_is_pushable(binary.op(), &lhs, &rhs)
+}
+
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
     let is_op_supported = try_operator_from_df(binary.op()).is_ok();
     is_op_supported
+        && decimal_arithmetic_can_be_pushed_down(binary, schema)
         && can_be_pushed_down_impl(binary.left(), schema)
         && can_be_pushed_down_impl(binary.right(), schema)
 }
@@ -653,7 +704,7 @@ fn can_array_length_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Sche
             data_type,
             DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
         )
-    }) && is_convertible_expr(input)
+    }) && is_convertible_expr(input, schema)
 }
 
 /// Returns the list argument of an `array_length` call if the call is a form we can rewrite to
@@ -715,7 +766,31 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
                 true,
             ),
+            Field::new("price", DataType::Decimal128(10, 2), true),
+            Field::new("cost", DataType::Decimal128(12, 4), true),
+            Field::new("big", DataType::Decimal128(38, 0), true),
         ])
+    }
+
+    /// The dtype scope for expressions over `test_schema`.
+    fn scope(schema: &Schema) -> DType {
+        VortexSession::default()
+            .arrow()
+            .from_arrow_schema(schema)
+            .unwrap()
+    }
+
+    /// Build `left <op> right` over columns of `test_schema`.
+    fn binary_col_expr(
+        left: (&str, usize),
+        op: DFOperator,
+        right: (&str, usize),
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(df_expr::BinaryExpr::new(
+            Arc::new(df_expr::Column::new(left.0, left.1)) as Arc<dyn PhysicalExpr>,
+            op,
+            Arc::new(df_expr::Column::new(right.0, right.1)) as Arc<dyn PhysicalExpr>,
+        ))
     }
 
     fn octet_length_expr(input: Arc<dyn PhysicalExpr>, schema: &Schema) -> Arc<dyn PhysicalExpr> {
@@ -748,7 +823,7 @@ mod tests {
     #[test]
     fn test_make_vortex_predicate_empty() {
         let expr_convertor = DefaultExpressionConvertor::default();
-        let result = make_vortex_predicate(&expr_convertor, &[]).unwrap();
+        let result = make_vortex_predicate(&expr_convertor, &[], &scope(&Schema::empty())).unwrap();
         assert!(result.is_none());
     }
 
@@ -756,7 +831,8 @@ mod tests {
     fn test_make_vortex_predicate_single() {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col_expr]).unwrap();
+        let result =
+            make_vortex_predicate(&expr_convertor, &[col_expr], &scope(&Schema::empty())).unwrap();
         assert!(result.is_some());
     }
 
@@ -765,7 +841,9 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col1, col2]).unwrap();
+        let result =
+            make_vortex_predicate(&expr_convertor, &[col1, col2], &scope(&Schema::empty()))
+                .unwrap();
         assert!(result.is_some());
         // Result should be an AND expression combining the two columns
     }
@@ -1035,6 +1113,101 @@ mod tests {
             as Arc<dyn PhysicalExpr>;
 
         assert!(!can_be_pushed_down_impl(&binary_expr, &test_schema));
+    }
+
+    #[rstest]
+    #[case::add_same_dtype("price", 6, DFOperator::Plus, true)]
+    #[case::sub_same_dtype("price", 6, DFOperator::Minus, true)]
+    #[case::add_mixed_scale("cost", 7, DFOperator::Plus, true)]
+    #[case::mul_unsupported("price", 6, DFOperator::Multiply, false)]
+    #[case::div_unsupported("price", 6, DFOperator::Divide, false)]
+    #[case::add_at_precision_ceiling("big", 8, DFOperator::Plus, false)]
+    fn test_can_be_pushed_down_decimal_arithmetic(
+        test_schema: Schema,
+        #[case] rhs: &str,
+        #[case] rhs_idx: usize,
+        #[case] op: DFOperator,
+        #[case] expected: bool,
+    ) {
+        let binary = binary_col_expr(("price", 6), op, (rhs, rhs_idx));
+        assert_eq!(can_be_pushed_down_impl(&binary, &test_schema), expected);
+    }
+
+    /// A comparison whose operand contains un-pushable decimal arithmetic must not be pushed
+    /// down as a whole, so DataFusion keeps evaluating the filter itself.
+    #[rstest]
+    fn test_can_be_pushed_down_decimal_arithmetic_in_comparison(test_schema: Schema) {
+        let ceiling_sum = binary_col_expr(("big", 8), DFOperator::Plus, ("big", 8));
+        let literal = Arc::new(df_expr::Literal::new(ScalarValue::Decimal128(
+            Some(100),
+            38,
+            0,
+        ))) as Arc<dyn PhysicalExpr>;
+        let comparison = Arc::new(df_expr::BinaryExpr::new(
+            ceiling_sum,
+            DFOperator::Eq,
+            literal,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&comparison, &test_schema));
+    }
+
+    /// Un-pushable decimal arithmetic hiding under a cast is also rejected.
+    #[rstest]
+    fn test_can_be_pushed_down_decimal_arithmetic_under_cast(test_schema: Schema) {
+        let product = binary_col_expr(("price", 6), DFOperator::Multiply, ("price", 6));
+        let cast = Arc::new(df_expr::CastExpr::new(
+            product,
+            DataType::Decimal128(21, 4),
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&cast, &test_schema));
+    }
+
+    #[rstest]
+    fn test_expr_from_df_decimal_add_same_dtype_has_no_casts(test_schema: Schema) {
+        let binary = binary_col_expr(("price", 6), DFOperator::Plus, ("price", 6));
+
+        let result = make_vortex_predicate(
+            &DefaultExpressionConvertor::default(),
+            &[binary],
+            &scope(&test_schema),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @r"
+        vortex.binary(+)
+        ├── lhs: vortex.get_item(price)
+        │   └── input: vortex.root()
+        └── rhs: vortex.get_item(price)
+            └── input: vortex.root()
+        ");
+    }
+
+    /// Mixed decimal operand dtypes are aligned by the coercion pass to their least supertype,
+    /// here `decimal(12, 4)` for `Decimal128(10, 2) + Decimal128(12, 4)`.
+    #[rstest]
+    fn test_expr_from_df_decimal_add_mixed_scale_aligns_operands(test_schema: Schema) {
+        let binary = binary_col_expr(("price", 6), DFOperator::Plus, ("cost", 7));
+
+        let result = make_vortex_predicate(
+            &DefaultExpressionConvertor::default(),
+            &[binary],
+            &scope(&test_schema),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @r"
+        vortex.binary(+)
+        ├── lhs: vortex.cast(decimal(12,4)?)
+        │   └── input: vortex.get_item(price)
+        │       └── input: vortex.root()
+        └── rhs: vortex.get_item(cost)
+            └── input: vortex.root()
+        ");
     }
 
     #[rstest]
