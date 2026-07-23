@@ -648,6 +648,7 @@ mod tests {
             .with::<LayoutSession>()
             .with::<RuntimeSession>();
         crate::register_default_encodings(&session);
+        crate::enable_all_registered_array_encodings(&session);
 
         let metadata = ByteBuffer::copy_from(vec![0x5a; INITIAL_READ_SIZE * 2]);
         let mut output = ByteBufferMut::empty();
@@ -721,6 +722,7 @@ mod tests {
             .with::<LayoutSession>()
             .with::<RuntimeSession>();
         crate::register_default_encodings(&session);
+        crate::enable_all_registered_array_encodings(&session);
 
         let value = ByteBuffer::copy_from(b"supplied-footer metadata");
         let mut output = ByteBufferMut::empty();
