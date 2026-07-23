@@ -337,7 +337,10 @@ fn runend_decode_slice<E: IntegerPType, T: Copy + Default>(
             let mut pos = 0usize;
             for (&end, &value) in run_ends.iter().zip(values) {
                 let end = trim_end(end, offset_e, length_e);
-                assert!(end >= pos, "Runend ends must be monotonic, got {end} after {pos}");
+                assert!(
+                    end >= pos,
+                    "Runend ends must be monotonic, got {end} after {pos}"
+                );
                 // SAFETY: pos <= end <= length and the buffer was allocated with one chunk
                 // of padding beyond `length`.
                 unsafe { splat_run(base, pos, end, value) };
@@ -362,11 +365,12 @@ fn runend_decode_slice<E: IntegerPType, T: Copy + Default>(
             let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
             let base = decoded.spare_capacity_mut().as_mut_ptr();
             let mut pos = 0usize;
-            for ((&end, &value), is_valid) in
-                run_ends.iter().zip(values).zip(run_validity.iter())
-            {
+            for ((&end, &value), is_valid) in run_ends.iter().zip(values).zip(run_validity.iter()) {
                 let end = trim_end(end, offset_e, length_e);
-                assert!(end >= pos, "Runend ends must be monotonic, got {end} after {pos}");
+                assert!(
+                    end >= pos,
+                    "Runend ends must be monotonic, got {end} after {pos}"
+                );
                 if is_valid != prefill && end > pos {
                     // SAFETY: pos <= end <= length == decoded_validity.len()
                     unsafe { decoded_validity.fill_range_unchecked(pos, end, is_valid) };
