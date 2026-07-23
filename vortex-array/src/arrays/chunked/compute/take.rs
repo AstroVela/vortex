@@ -23,6 +23,7 @@ use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::PiecewiseSequence;
 use crate::arrays::PiecewiseSequenceArray;
+use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::chunked::ChunkedArrayExt;
 use crate::arrays::dict::TakeExecute;
@@ -36,6 +37,7 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::PType;
 use crate::executor::ExecutionCtx;
+use crate::match_each_integer_ptype;
 use crate::match_each_unsigned_integer_ptype;
 use crate::validity::Validity;
 
@@ -169,6 +171,10 @@ impl TakeExecute for Chunked {
             return array.chunk(0).take(indices.clone()).map(Some);
         }
 
+        if let Some(taken) = take_few_chunked(array, indices, ctx)? {
+            return Ok(Some(taken));
+        }
+
         if let Some(taken) = take_chunked_fsl(array, indices)? {
             return Ok(Some(taken));
         }
@@ -181,6 +187,46 @@ impl TakeExecute for Chunked {
 
         take_chunked(array, indices, ctx).map(Some)
     }
+}
+
+/// Takes a handful of rows by appending each row's slice straight into a canonical builder.
+///
+/// For tiny index counts the generic path's per-chunk sort, filter, flatten, and reorder
+/// machinery costs far more than the handful of row copies it saves, so gather the rows
+/// directly in index order instead. Only applies to non-nullable primitive indices, which keep
+/// the output dtype identical to the array dtype.
+fn take_few_chunked(
+    array: ArrayView<'_, Chunked>,
+    indices: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    const FEW_TAKE_THRESHOLD: usize = 64;
+
+    if indices.len() > FEW_TAKE_THRESHOLD || indices.dtype().is_nullable() {
+        return Ok(None);
+    }
+    let Some(primitive_indices) = indices.as_opt::<Primitive>() else {
+        return Ok(None);
+    };
+
+    let array_len = array.as_ref().len();
+    let chunk_offsets = array.chunk_offsets();
+    let mut builder = builder_with_capacity(array.dtype(), indices.len());
+    match_each_integer_ptype!(primitive_indices.ptype(), |I| {
+        for &index in primitive_indices.as_slice::<I>() {
+            let index: usize = index.as_();
+            if index >= array_len {
+                vortex_bail!(OutOfBounds: index, 0, array_len);
+            }
+            let chunk_idx = chunk_offsets.partition_point(|&offset| offset <= index) - 1;
+            let row = index - chunk_offsets[chunk_idx];
+            array
+                .chunk(chunk_idx)
+                .slice(row..row + 1)?
+                .append_to_builder(builder.as_mut(), ctx)?;
+        }
+    });
+    Ok(Some(builder.finish()))
 }
 
 /// Rewrites take over a chunked array of [`FixedSizeList`] chunks as take over a single
@@ -441,6 +487,23 @@ mod test {
             len,
         )?
         .into_array())
+    }
+
+    #[test]
+    fn test_take_few_unsorted_duplicates() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let arr = chunked_i32()?;
+
+        // Few enough indices for the direct row-append path; unsorted with duplicates.
+        let indices = buffer![12u64, 3, 3, 7, 0, 14].into_array();
+        let result = arr.take(indices)?;
+
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_iter([12i32, 3, 3, 7, 0, 14]),
+            &mut ctx
+        );
+        Ok(())
     }
 
     #[test]
