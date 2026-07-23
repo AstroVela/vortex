@@ -450,12 +450,18 @@ pub fn runend_decode_varbinview(
 mod tests {
     use std::sync::LazyLock;
 
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::NativePType;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
@@ -576,6 +582,103 @@ mod tests {
         expanded.extend(std::iter::repeat_n(3i64, 199));
         let expected = PrimitiveArray::from_iter(expanded);
         assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    /// Decode random runs with `runend_decode_primitive` and compare against a naive
+    /// element-by-element reference expansion.
+    ///
+    /// Random run lengths cover the byte-element memset threshold on both sides, zero-length
+    /// runs, offsets that partially trim the first run, and a final run overshooting the
+    /// logical length; validity covers non-nullable, mixed, and all-invalid values.
+    fn check_decode_matches_reference<T: NativePType + From<u8>>(seed: u64) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        for &max_run_len in &[3usize, 40, 700] {
+            for nullable in [false, true] {
+                let length = rng.random_range(1..=2000);
+                let offset = if rng.random_bool(0.5) {
+                    rng.random_range(0..50)
+                } else {
+                    0
+                };
+                let total = offset + length;
+
+                let mut ends = Vec::new();
+                let mut run_values: Vec<T> = Vec::new();
+                let mut run_valid = Vec::new();
+                let mut pos = 0usize;
+                while pos < total {
+                    let run_len = if !ends.is_empty() && rng.random_bool(0.05) {
+                        // Zero-length runs exercise the empty-run edge of the splat loop.
+                        0
+                    } else if ends.is_empty() {
+                        // The first run must reach past the offset.
+                        rng.random_range(offset + 1..=offset + max_run_len)
+                    } else {
+                        rng.random_range(1..=max_run_len)
+                    };
+                    pos += run_len;
+                    ends.push(u32::try_from(pos).vortex_expect("test lengths fit in u32"));
+                    run_values.push(<T as From<u8>>::from(rng.random::<u8>()));
+                    run_valid.push(rng.random_bool(0.9));
+                }
+
+                let all_invalid = nullable && rng.random_bool(0.1);
+                let validity = if all_invalid {
+                    Validity::AllInvalid
+                } else if nullable {
+                    Validity::from(BitBuffer::from(run_valid.clone()))
+                } else {
+                    Validity::NonNullable
+                };
+
+                let decoded = runend_decode_primitive(
+                    PrimitiveArray::from_iter(ends.clone()),
+                    PrimitiveArray::new(Buffer::from(run_values.clone()), validity),
+                    offset,
+                    length,
+                    &mut ctx,
+                )?;
+
+                let mut expected: Vec<Option<T>> = Vec::with_capacity(length);
+                for (&end, (value, valid)) in
+                    ends.iter().zip(run_values.iter().zip(run_valid.iter()))
+                {
+                    let end = (end as usize - offset).min(length);
+                    let value = match (nullable, all_invalid, valid) {
+                        (false, ..) => Some(*value),
+                        (true, true, _) => None,
+                        (true, false, valid) => valid.then_some(*value),
+                    };
+                    expected.resize(end, value);
+                }
+
+                if nullable {
+                    let expected = PrimitiveArray::from_option_iter(expected);
+                    assert_arrays_eq!(decoded, expected, &mut ctx);
+                } else {
+                    let expected = PrimitiveArray::from_iter(
+                        expected.into_iter().map(|v| v.vortex_expect("non-null")),
+                    );
+                    assert_arrays_eq!(decoded, expected, &mut ctx);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(0x5eed)]
+    fn decode_matches_reference(#[case] seed: u64) -> VortexResult<()> {
+        check_decode_matches_reference::<u8>(seed)?;
+        check_decode_matches_reference::<u16>(seed)?;
+        check_decode_matches_reference::<u32>(seed)?;
+        check_decode_matches_reference::<u64>(seed)?;
+        check_decode_matches_reference::<f32>(seed)?;
         Ok(())
     }
 }

@@ -7,6 +7,10 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -17,6 +21,12 @@ use vortex_buffer::BufferMut;
 use vortex_runend::compress::runend_decode_primitive;
 use vortex_runend::decompress_bool::runend_decode_bools;
 use vortex_session::VortexSession;
+
+// Decoding allocates its output buffers inside the timed region, so route allocation through
+// vendored mimalloc to keep glibc malloc (which varies across runner images) out of the
+// measured trace.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();
@@ -383,26 +393,28 @@ impl fmt::Display for PrimitiveBenchArgs {
     }
 }
 
-/// Creates primitive test data with fixed-length runs of cycling values.
+/// Creates primitive test data with random run lengths (uniform with the requested average),
+/// random values, and random 90%-valid run validity, so branch-heavy decode strategies are
+/// measured against unpredictable inputs rather than a fixed pattern.
 fn create_primitive_test_data<T: NativePType + From<u8>>(
     total_length: usize,
     avg_run_length: usize,
     nullable: bool,
 ) -> (PrimitiveArray, PrimitiveArray) {
+    let mut rng = StdRng::seed_from_u64(0x5eed);
     let num_runs = total_length / avg_run_length + 1;
     let mut ends = BufferMut::<u32>::with_capacity(num_runs);
     let mut values = BufferMut::<T>::with_capacity(num_runs);
     let mut validity_bits = Vec::with_capacity(num_runs);
 
+    let max_run_len = (2 * avg_run_length).saturating_sub(1).max(1);
     let mut pos = 0usize;
-    let mut run_index = 0usize;
     while pos < total_length {
-        let run_len = avg_run_length.min(total_length - pos);
+        let run_len = rng.random_range(1..=max_run_len).min(total_length - pos);
         pos += run_len;
         ends.push(pos as u32);
-        values.push(<T as From<u8>>::from((run_index % 251) as u8));
-        validity_bits.push(!run_index.is_multiple_of(10));
-        run_index += 1;
+        values.push(<T as From<u8>>::from(rng.random::<u8>()));
+        validity_bits.push(rng.random_bool(0.9));
     }
 
     let validity = if nullable {
