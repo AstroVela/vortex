@@ -400,7 +400,7 @@ fn create_primitive_test_data<T: NativePType + From<u8>>(
         let run_len = avg_run_length.min(total_length - pos);
         pos += run_len;
         ends.push(pos as u32);
-        values.push(T::from((run_index % 251) as u8));
+        values.push(<T as From<u8>>::from((run_index % 251) as u8));
         validity_bits.push(!run_index.is_multiple_of(10));
         run_index += 1;
     }

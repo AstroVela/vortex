@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use itertools::Itertools;
+use std::cmp::min;
+use std::mem::MaybeUninit;
+
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
@@ -14,6 +16,7 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::buffer::BufferHandle;
+use vortex_array::dtype::IntegerPType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::stats::Precision;
@@ -29,9 +32,8 @@ use vortex_buffer::BufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_panic;
 use vortex_mask::Mask;
-
-use crate::iter::trimmed_ends_iter;
 
 /// Run-end encode a `PrimitiveArray`, returning a tuple of `(ends, values)`.
 pub fn runend_encode(
@@ -195,7 +197,8 @@ pub fn runend_decode_primitive(
     Ok(match_each_native_ptype!(values.ptype(), |P| {
         match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
             runend_decode_typed_primitive(
-                trimmed_ends_iter(ends.as_slice::<E>(), offset, length),
+                ends.as_slice::<E>(),
+                offset,
                 values.as_slice::<P>(),
                 validity_mask,
                 values.dtype().nullability(),
@@ -205,70 +208,151 @@ pub fn runend_decode_primitive(
     }))
 }
 
+/// Number of bytes written by each unconditional splat store in the decode loop.
+///
+/// Each run is expanded chunk-at-a-time: short runs complete in a single store into the
+/// buffer's padding, so they never pay for a per-element tail loop.
+const DECODE_CHUNK_BYTES: usize = 32;
+
+/// Number of elements of `T` written per splat store (at least one).
+const fn decode_chunk_len<T>() -> usize {
+    let n = DECODE_CHUNK_BYTES / size_of::<T>();
+    if n == 0 { 1 } else { n }
+}
+
+/// Trim a raw run end down by `offset` and clamp it to `length`, panicking if the end
+/// precedes the offset.
+#[inline(always)]
+fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
+    if end < offset {
+        vortex_panic!("run end {end} must be >= offset {offset}");
+    }
+    min(end - offset, length).as_()
+}
+
+/// Splat `value` into `base[pos..end]` using unconditional chunk-wide stores.
+///
+/// Always writes at least one full chunk (rounding the run up to a multiple of the chunk
+/// length), so the overshoot past `end` is written and later either overwritten by the next
+/// run or discarded by the final `set_len`.
+///
+/// # Safety
+///
+/// The allocation behind `base` must have room for at least
+/// `max(pos, end) + decode_chunk_len::<T>()` elements.
+#[inline(always)]
+unsafe fn splat_run<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
+    let chunk = const { decode_chunk_len::<T>() };
+    // SAFETY: the caller guarantees the allocation extends one chunk past max(pos, end), so
+    // every store below lands inside it.
+    unsafe {
+        let mut p = base.add(pos);
+        let stop = base.add(end);
+        loop {
+            for i in 0..chunk {
+                p.add(i).write(MaybeUninit::new(value));
+            }
+            p = p.add(chunk);
+            if p >= stop {
+                break;
+            }
+        }
+    }
+}
+
 /// Decode a run-end encoded slice of values into a flat `Buffer<T>` and `Validity`.
 ///
-/// This is the core decode loop shared by primitive and varbinview run-end decoding.
-fn runend_decode_slice<T: Copy + Default>(
-    run_ends: impl Iterator<Item = usize>,
+/// This is the core decode loop shared by primitive and varbinview run-end decoding. Run
+/// ends are adjusted by `offset` and clamped to `length` while decoding.
+fn runend_decode_slice<E: IntegerPType, T: Copy + Default>(
+    run_ends: &[E],
+    offset: usize,
     values: &[T],
     values_validity: Mask,
     values_nullability: Nullability,
     length: usize,
 ) -> (Buffer<T>, Validity) {
+    assert_eq!(
+        run_ends.len(),
+        values.len(),
+        "runend ends and values must have equal lengths"
+    );
+    let offset_e = E::from_usize(offset).unwrap_or_else(|| {
+        vortex_panic!(
+            "offset {} cannot be converted to {}",
+            offset,
+            std::any::type_name::<E>()
+        )
+    });
+    let length_e = E::from_usize(length).unwrap_or_else(|| {
+        vortex_panic!(
+            "length {} cannot be converted to {}",
+            length,
+            std::any::type_name::<E>()
+        )
+    });
+
     match values_validity {
         Mask::AllTrue(_) => {
-            let mut decoded: BufferMut<T> = BufferMut::with_capacity(length);
-            for (end, value) in run_ends.zip_eq(values) {
-                assert!(
-                    end >= decoded.len(),
-                    "Runend ends must be monotonic, got {end} after {}",
-                    decoded.len()
-                );
-                assert!(end <= length, "Runend end must be less than overall length");
-                // SAFETY:
-                // We preallocate enough capacity because we know the total length
-                unsafe { decoded.push_n_unchecked(*value, end - decoded.len()) };
+            let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
+            let base = decoded.spare_capacity_mut().as_mut_ptr();
+            let mut pos = 0usize;
+            for (&end, &value) in run_ends.iter().zip(values) {
+                let end = trim_end(end, offset_e, length_e);
+                assert!(end >= pos, "Runend ends must be monotonic, got {end} after {pos}");
+                // SAFETY: pos <= end <= length and the buffer was allocated with one chunk
+                // of padding beyond `length`.
+                unsafe { splat_run(base, pos, end, value) };
+                pos = end;
             }
+            // SAFETY: every element in 0..pos was initialized by the loop above.
+            unsafe { decoded.set_len(pos) };
             (decoded.into(), values_nullability.into())
         }
         Mask::AllFalse(_) => (Buffer::<T>::zeroed(length), Validity::AllInvalid),
         Mask::Values(mask) => {
-            let mut decoded = BufferMut::with_capacity(length);
-            let mut decoded_validity = BitBufferMut::with_capacity(length);
-            for (end, value) in run_ends.zip_eq(
-                values
-                    .iter()
-                    .zip(mask.bit_buffer().iter())
-                    .map(|(&v, is_valid)| is_valid.then_some(v)),
-            ) {
-                assert!(
-                    end >= decoded.len(),
-                    "Runend ends must be monotonic, got {end} after {}",
-                    decoded.len()
-                );
-                assert!(end <= length, "Runend end must be less than overall length");
-                match value {
-                    None => {
-                        decoded_validity.append_n(false, end - decoded.len());
-                        // SAFETY:
-                        // We preallocate enough capacity because we know the total length
-                        unsafe { decoded.push_n_unchecked(T::default(), end - decoded.len()) };
-                    }
-                    Some(value) => {
-                        decoded_validity.append_n(true, end - decoded.len());
-                        // SAFETY:
-                        // We preallocate enough capacity because we know the total length
-                        unsafe { decoded.push_n_unchecked(value, end - decoded.len()) };
-                    }
+            let run_validity = mask.bit_buffer();
+            assert_eq!(
+                run_ends.len(),
+                run_validity.len(),
+                "runend ends and validity must have equal lengths"
+            );
+            // Prefill the element validity with the majority run validity; only minority
+            // runs then need their bit range rewritten.
+            let prefill = 2 * run_validity.true_count() > run_validity.len();
+            let mut decoded_validity = BitBufferMut::full(prefill, length);
+            let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
+            let base = decoded.spare_capacity_mut().as_mut_ptr();
+            let mut pos = 0usize;
+            for ((&end, &value), is_valid) in
+                run_ends.iter().zip(values).zip(run_validity.iter())
+            {
+                let end = trim_end(end, offset_e, length_e);
+                assert!(end >= pos, "Runend ends must be monotonic, got {end} after {pos}");
+                if is_valid != prefill && end > pos {
+                    // SAFETY: pos <= end <= length == decoded_validity.len()
+                    unsafe { decoded_validity.fill_range_unchecked(pos, end, is_valid) };
                 }
+                let value = if is_valid { value } else { T::default() };
+                // SAFETY: pos <= end <= length and the buffer was allocated with one chunk
+                // of padding beyond `length`.
+                unsafe { splat_run(base, pos, end, value) };
+                pos = end;
             }
+            // SAFETY: every element in 0..pos was initialized by the loop above.
+            unsafe { decoded.set_len(pos) };
+            decoded_validity.truncate(pos);
             (decoded.into(), Validity::from(decoded_validity.freeze()))
         }
     }
 }
 
-pub fn runend_decode_typed_primitive<T: NativePType>(
-    run_ends: impl Iterator<Item = usize>,
+/// Decode run-end encoded `values` with the given `run_ends` into a flat [`PrimitiveArray`].
+///
+/// Run ends are adjusted by `offset` and clamped to `length` while decoding.
+pub fn runend_decode_typed_primitive<E: IntegerPType, T: NativePType>(
+    run_ends: &[E],
+    offset: usize,
     values: &[T],
     values_validity: Mask,
     values_nullability: Nullability,
@@ -276,6 +360,7 @@ pub fn runend_decode_typed_primitive<T: NativePType>(
 ) -> PrimitiveArray {
     let (decoded, validity) = runend_decode_slice(
         run_ends,
+        offset,
         values,
         values_validity,
         values_nullability,
@@ -300,7 +385,8 @@ pub fn runend_decode_varbinview(
 
     let (decoded_views, validity) = match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
         runend_decode_slice(
-            trimmed_ends_iter(ends.as_slice::<E>(), offset, length),
+            ends.as_slice::<E>(),
+            offset,
             views,
             validity_mask,
             values.dtype().nullability(),
@@ -399,6 +485,54 @@ mod tests {
         let decoded = runend_decode_primitive(ends, values, 0, 10, &mut ctx)?;
 
         let expected = PrimitiveArray::from_iter(vec![1i32, 1, 2, 2, 2, 3, 3, 3, 3, 3]);
+        assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_with_offset() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let ends = PrimitiveArray::from_iter([2u32, 5, 10]);
+        let values = PrimitiveArray::from_iter([1i32, 2, 3]);
+        let decoded = runend_decode_primitive(ends, values, 2, 6, &mut ctx)?;
+
+        let expected = PrimitiveArray::from_iter(vec![2i32, 2, 2, 3, 3, 3]);
+        assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::mostly_valid(vec![Some(1i32), None, Some(3)])]
+    #[case::mostly_null(vec![None, Some(2i32), None])]
+    fn decode_nullable(#[case] run_values: Vec<Option<i32>>) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let ends = PrimitiveArray::from_iter([2u32, 5, 10]);
+        let values = PrimitiveArray::from_option_iter(run_values.clone());
+        let decoded = runend_decode_primitive(ends, values, 0, 10, &mut ctx)?;
+
+        let mut expanded = Vec::new();
+        let mut prev = 0usize;
+        for (&end, value) in [2usize, 5, 10].iter().zip(run_values) {
+            expanded.extend(std::iter::repeat_n(value, end - prev));
+            prev = end;
+        }
+        let expected = PrimitiveArray::from_option_iter(expanded);
+        assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_long_runs() -> VortexResult<()> {
+        // Runs longer than the splat chunk exercise the chunked-store loop's iteration path.
+        let mut ctx = SESSION.create_execution_ctx();
+        let ends = PrimitiveArray::from_iter([100u32, 101, 300]);
+        let values = PrimitiveArray::from_iter([1i64, 2, 3]);
+        let decoded = runend_decode_primitive(ends, values, 0, 300, &mut ctx)?;
+
+        let mut expanded = vec![1i64; 100];
+        expanded.push(2);
+        expanded.extend(std::iter::repeat_n(3i64, 199));
+        let expected = PrimitiveArray::from_iter(expanded);
         assert_arrays_eq!(decoded, expected, &mut ctx);
         Ok(())
     }
