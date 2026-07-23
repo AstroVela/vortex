@@ -230,6 +230,34 @@ fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
     min(end - offset, length).as_()
 }
 
+/// Replicate the bytes of `value` across a `u128` splat word.
+///
+/// Only used for little-endian targets with element sizes that divide 16; all such decode
+/// element types (primitives and binary views) contain no padding, so every copied byte is
+/// initialized.
+#[inline(always)]
+fn splat_word<T: Copy>(value: T) -> u128 {
+    let size = size_of::<T>();
+    debug_assert!(size <= 16 && 16 % size == 0);
+    let mut word = 0u128;
+    // SAFETY: at most 16 initialized bytes are copied into the zero-initialized word.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&raw const value).cast::<u8>(),
+            (&raw mut word).cast::<u8>(),
+            size,
+        );
+    }
+    if size < 16 {
+        // Multiplying by ((2^128 - 1) / (2^(8 * size) - 1)) replicates the low bytes across
+        // the whole word. The runtime multiply also keeps LLVM's loop-idiom pass from
+        // rewriting the store loop in `splat_run` into a per-run memset call, which is what
+        // makes short byte-sized runs slow.
+        word = word.wrapping_mul(u128::MAX / ((1u128 << (8 * size)) - 1));
+    }
+    word
+}
+
 /// Splat `value` into `base[pos..end]` using unconditional chunk-wide stores.
 ///
 /// Always writes at least one full chunk (rounding the run up to a multiple of the chunk
@@ -242,19 +270,41 @@ fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
 /// `max(pos, end) + decode_chunk_len::<T>()` elements.
 #[inline(always)]
 unsafe fn splat_run<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
-    let chunk = const { decode_chunk_len::<T>() };
-    // SAFETY: the caller guarantees the allocation extends one chunk past max(pos, end), so
-    // every store below lands inside it.
-    unsafe {
-        let mut p = base.add(pos);
-        let stop = base.add(end);
-        loop {
-            for i in 0..chunk {
-                p.add(i).write(MaybeUninit::new(value));
+    let size = size_of::<T>();
+    if cfg!(target_endian = "little") && size.is_power_of_two() && size <= 16 {
+        // Fast path: expand the value into a 16-byte word and store it with two unaligned
+        // 16-byte writes per chunk, so even 8-byte elements get full-width vector stores.
+        let word = splat_word(value);
+        // SAFETY: the caller guarantees the allocation extends one chunk
+        // (`decode_chunk_len::<T>() * size == DECODE_CHUNK_BYTES` bytes for these sizes)
+        // past max(pos, end), so every store below lands inside it.
+        unsafe {
+            let mut p = base.add(pos).cast::<u8>();
+            let stop = base.add(end).cast::<u8>();
+            loop {
+                p.cast::<u128>().write_unaligned(word);
+                p.add(16).cast::<u128>().write_unaligned(word);
+                p = p.add(DECODE_CHUNK_BYTES);
+                if p >= stop {
+                    break;
+                }
             }
-            p = p.add(chunk);
-            if p >= stop {
-                break;
+        }
+    } else {
+        let chunk = const { decode_chunk_len::<T>() };
+        // SAFETY: the caller guarantees the allocation extends one chunk past max(pos, end),
+        // so every store below lands inside it.
+        unsafe {
+            let mut p = base.add(pos);
+            let stop = base.add(end);
+            loop {
+                for i in 0..chunk {
+                    p.add(i).write(MaybeUninit::new(value));
+                }
+                p = p.add(chunk);
+                if p >= stop {
+                    break;
+                }
             }
         }
     }
