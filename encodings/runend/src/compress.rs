@@ -273,11 +273,7 @@ unsafe fn fill_run<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
 /// `max(pos, end) + decode_chunk_len::<T>()` elements.
 #[inline(always)]
 unsafe fn splat_run<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
-    let len = end.saturating_sub(pos);
-    if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
-        // SAFETY: pos + len == end elements are in bounds per the caller contract.
-        unsafe { fill_run(base.add(pos), len, value) };
-    } else if size_of::<T>() == 1 {
+    if size_of::<T>() == 1 {
         // For byte-sized elements LLVM's loop-idiom pass turns any plain splat store loop
         // into a memset call per run, which dominates short runs. Store a replicated word
         // whose runtime multiply is opaque to loop-idiom instead.
@@ -289,6 +285,20 @@ unsafe fn splat_run<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, 
             let word = u64::from(byte).wrapping_mul(0x0101_0101_0101_0101);
             let mut p = base.add(pos).cast::<u8>();
             let stop = base.add(end).cast::<u8>();
+            // The first chunk is unconditional: runs up to one chunk finish on one branch.
+            for i in 0..DECODE_CHUNK_BYTES / 8 {
+                p.add(i * 8).cast::<u64>().write_unaligned(word);
+            }
+            p = p.add(DECODE_CHUNK_BYTES);
+            if p >= stop {
+                return;
+            }
+            // Only multi-chunk runs pay for the long-run check; memset wins on large fills.
+            let len = end - pos;
+            if len >= LONG_RUN_FILL_BYTES {
+                base.add(pos).cast::<u8>().write_bytes(byte, len);
+                return;
+            }
             loop {
                 for i in 0..DECODE_CHUNK_BYTES / 8 {
                     p.add(i * 8).cast::<u64>().write_unaligned(word);
@@ -308,6 +318,23 @@ unsafe fn splat_run<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, 
         unsafe {
             let mut p = base.add(pos);
             let stop = base.add(end);
+            // The first chunk is unconditional: runs up to one chunk finish on one branch.
+            for i in 0..chunk {
+                p.add(i).write(MaybeUninit::new(value));
+            }
+            p = p.add(chunk);
+            if p >= stop {
+                return;
+            }
+            // Only multi-chunk runs pay for the long-run check; the out-of-line fill keeps
+            // wide vector stores regardless of register pressure in the calling loop (the
+            // inlined loop below loses them inside the nullable decode arm).
+            let len = end - pos;
+            if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
+                // Refilling from `pos` overlaps the chunk written above, which is harmless.
+                fill_run(base.add(pos), len, value);
+                return;
+            }
             loop {
                 for i in 0..chunk {
                     p.add(i).write(MaybeUninit::new(value));

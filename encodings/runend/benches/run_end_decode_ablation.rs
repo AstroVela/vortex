@@ -17,6 +17,7 @@
 //! - `n3_shipped`: shipped kernel (majority prefill + `fill_range_unchecked` validity)
 
 #![expect(clippy::cast_possible_truncation)]
+#![expect(clippy::unwrap_used)]
 
 use std::cmp::min;
 use std::fmt;
