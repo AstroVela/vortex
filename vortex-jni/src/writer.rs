@@ -32,18 +32,13 @@ use jni::sys::jlong;
 use jni::sys::jobject;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
-use vortex::array::ArrayId;
 use vortex::array::ArrayRef;
-use vortex::array::VTable;
 use vortex::array::scalar::PValue;
 use vortex::array::scalar::Scalar;
 use vortex::array::scalar::ScalarValue;
 use vortex::array::stats::StatsSet;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
-use vortex::dtype::Field as DTypeField;
-use vortex::dtype::FieldPath;
-use vortex::editions::EditionSessionExt;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
@@ -51,7 +46,6 @@ use vortex::expr::stats::Stat;
 use vortex::expr::stats::StatsProvider;
 use vortex::file::CountingVortexWrite;
 use vortex::file::WriteOptionsSessionExt;
-use vortex::file::WriteStrategyBuilder;
 use vortex::file::WriteSummary;
 use vortex::file::multi::parse_uri_or_path;
 use vortex::io::VortexWrite;
@@ -62,9 +56,7 @@ use vortex::io::runtime::Task;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
-use vortex::utils::aliases::hash_set::HashSet;
 use vortex_arrow::ArrowSessionExt;
-use vortex_parquet_variant::ParquetVariant;
 
 use crate::RUNTIME;
 use crate::dtype::import_arrow_schema;
@@ -99,45 +91,6 @@ fn resolve_store(
             .map_err(|_| vortex_err!("invalid object_store path: {}", url.path()))?;
         let store = make_object_store(&url, properties)?;
         Ok(ResolvedStore::ObjectStore(store, path))
-    }
-}
-
-fn write_options_for_schema(
-    session: &VortexSession,
-    write_schema: &DType,
-) -> vortex::file::VortexWriteOptions {
-    let variant_paths = variant_field_paths(write_schema);
-    if variant_paths.is_empty() {
-        return session.write_options();
-    }
-
-    let mut allowed: HashSet<ArrayId> = session.enabled_encoding_ids().into_iter().collect();
-    allowed.insert(ParquetVariant.id());
-
-    let strategy = WriteStrategyBuilder::default().with_allow_encodings(allowed);
-
-    session.write_options().with_strategy(strategy.build())
-}
-
-fn variant_field_paths(dtype: &DType) -> Vec<FieldPath> {
-    let mut paths = Vec::new();
-    collect_variant_field_paths(dtype, FieldPath::root(), &mut paths);
-    paths
-}
-
-fn collect_variant_field_paths(dtype: &DType, path: FieldPath, paths: &mut Vec<FieldPath>) {
-    match dtype {
-        DType::Variant(_) => paths.push(path),
-        DType::Struct(fields, _) => {
-            for (name, field_dtype) in fields.names().iter().zip(fields.fields()) {
-                collect_variant_field_paths(
-                    &field_dtype,
-                    path.clone().push(DTypeField::from(name.clone())),
-                    paths,
-                );
-            }
-        }
-        _ => {}
     }
 }
 
@@ -416,7 +369,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_create(
         let resolved = resolve_store(&file_path, &properties)?;
         let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let stream = ArrayStreamAdapter::new(write_schema.clone(), rx);
-        let write_options = write_options_for_schema(session, &write_schema);
+        let write_options = session.write_options();
 
         let (bytes_written, handle) = match resolved {
             ResolvedStore::Path(path) => {
@@ -494,7 +447,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_createStream(
         let writable = Arc::new(env.new_global_ref(&writable)?);
         let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let stream = ArrayStreamAdapter::new(write_schema.clone(), rx);
-        let write_options = write_options_for_schema(session, &write_schema);
+        let write_options = session.write_options();
 
         let mut write = CountingVortexWrite::new(JavaWrite::new(vm, writable));
         let bytes_written = write.counter();

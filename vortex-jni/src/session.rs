@@ -7,6 +7,10 @@ use jni::EnvUnowned;
 use jni::objects::JClass;
 use jni::sys::jlong;
 use vortex::VortexSessionDefault;
+use vortex::editions::DEFAULT_UNSTABLE_EDITION;
+use vortex::editions::EditionSessionExt;
+use vortex::error::VortexExpect;
+use vortex::error::vortex_err;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -15,9 +19,17 @@ use crate::RUNTIME;
 
 /// Constructs a fresh [`VortexSession`] bound to the JNI-shared tokio runtime and returns
 /// an opaque pointer that Java must pass to [`Java_dev_vortex_jni_NativeSession_free`].
+///
+/// JNI sessions enable the latest unstable edition so that `vortex.parquet.variant`, an
+/// unstable-family encoding registered by [`vortex_parquet_variant::initialize`], stays
+/// writable for variant-typed columns.
 pub(crate) fn new_session() -> Box<VortexSession> {
     let session = VortexSession::default().with_handle(RUNTIME.handle());
     vortex_parquet_variant::initialize(&session);
+    session
+        .enable_edition(DEFAULT_UNSTABLE_EDITION)
+        .map_err(|e| vortex_err!("{e}"))
+        .vortex_expect("default unstable edition is registered");
     Box::new(session)
 }
 
