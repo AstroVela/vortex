@@ -20,6 +20,7 @@ use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::array_session;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
+use crate::arrays::DecimalArray;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListArray;
 use crate::arrays::ListViewArray;
@@ -27,6 +28,7 @@ use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBinArray;
 use crate::assert_arrays_eq;
 use crate::dtype::DType;
+use crate::dtype::DecimalDType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::half::f16;
@@ -337,6 +339,94 @@ fn string_extrema() -> VortexResult<()> {
 }
 
 #[test]
+fn binary_extrema() -> VortexResult<()> {
+    let elements = VarBinArray::from_iter(
+        [
+            Some(b"pear".as_slice()),
+            None,
+            Some(b"apple"),
+            Some(b"zebra"),
+        ],
+        DType::Binary(Nullability::Nullable),
+    )
+    .into_array();
+    let list = ListArray::try_new(
+        elements,
+        buffer![0u32, 3, 4].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let minimum = list.clone().apply(&list_min(root()))?;
+    let maximum = list.apply(&list_max(root()))?;
+    let mut ctx = array_session().create_execution_ctx();
+
+    let expected_min = VarBinArray::from_iter(
+        [Some(b"apple".as_slice()), Some(b"zebra")],
+        DType::Binary(Nullability::Nullable),
+    );
+    let expected_max = VarBinArray::from_iter(
+        [Some(b"pear".as_slice()), Some(b"zebra")],
+        DType::Binary(Nullability::Nullable),
+    );
+    assert_arrays_eq!(minimum, expected_min, &mut ctx);
+    assert_arrays_eq!(maximum, expected_max, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn bool_extrema() -> VortexResult<()> {
+    let elements = BoolArray::from_iter([true, true, false, true]);
+    let list = ListArray::try_new(
+        elements.into_array(),
+        buffer![0u32, 3, 4].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let minimum = list.clone().apply(&list_min(root()))?;
+    let maximum = list.apply(&list_max(root()))?;
+    let mut ctx = array_session().create_execution_ctx();
+
+    let expected_min = BoolArray::from_iter([Some(false), Some(true)]);
+    let expected_max = BoolArray::from_iter([Some(true), Some(true)]);
+    assert_arrays_eq!(minimum, expected_min, &mut ctx);
+    assert_arrays_eq!(maximum, expected_max, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn decimal_extrema() -> VortexResult<()> {
+    let elements = DecimalArray::new(
+        buffer![100i128, 250, 50, 999],
+        DecimalDType::new(10, 2),
+        Validity::NonNullable,
+    )
+    .into_array();
+    let list = ListArray::try_new(
+        elements,
+        buffer![0u32, 3, 4].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let minimum = list.clone().apply(&list_min(root()))?;
+    let maximum = list.apply(&list_max(root()))?;
+    let mut ctx = array_session().create_execution_ctx();
+
+    let expected_min = DecimalArray::new(
+        buffer![50i128, 999],
+        DecimalDType::new(10, 2),
+        Validity::AllValid,
+    );
+    let expected_max = DecimalArray::new(
+        buffer![250i128, 999],
+        DecimalDType::new(10, 2),
+        Validity::AllValid,
+    );
+    assert_arrays_eq!(minimum, expected_min, &mut ctx);
+    assert_arrays_eq!(maximum, expected_max, &mut ctx);
+    Ok(())
+}
+
+#[test]
 fn nan_options() -> VortexResult<()> {
     let elements = PrimitiveArray::from_iter([1.0f64, f64::NAN, 2.0, f64::NAN, f64::NAN]);
     let list = ListArray::try_new(
@@ -439,6 +529,49 @@ fn constant_and_null_list_extrema() -> VortexResult<()> {
         nulls.apply(&list_max(root()))?,
     ] {
         assert_eq!(result.valid_count(&mut ctx)?, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn sliced_and_taken_extrema() -> VortexResult<()> {
+    let list = ListArray::try_new(
+        create_list_elements(),
+        buffer![0u32, 2, 5, 5, 7].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let mut ctx = array_session().create_execution_ctx();
+
+    let sliced = list.slice(1..4)?;
+    let minimum = sliced.apply(&list_min(root()))?;
+    let expected_min = PrimitiveArray::from_option_iter::<i32, _>([Some(3), None, Some(6)]);
+    assert_arrays_eq!(minimum, expected_min, &mut ctx);
+
+    let taken = list.take(buffer![3u64, 0, 2].into_array())?;
+    let maximum = taken.apply(&list_max(root()))?;
+    let expected_max = PrimitiveArray::from_option_iter::<i32, _>([Some(6), Some(2), None]);
+    assert_arrays_eq!(maximum, expected_max, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn empty_array_extrema() -> VortexResult<()> {
+    let elements = PrimitiveArray::from_iter([0i32; 0]);
+    let list = ListArray::try_new(
+        elements.into_array(),
+        buffer![0u32].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let mut ctx = array_session().create_execution_ctx();
+
+    for expression in [list_min(root()), list_max(root())] {
+        let result = list
+            .clone()
+            .apply(&expression)?
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        assert_eq!(result.len(), 0);
     }
     Ok(())
 }
