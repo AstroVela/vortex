@@ -10,9 +10,11 @@ use divan::Bencher;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::dtype::NativePType;
 use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferMut;
+use vortex_runend::compress::runend_decode_primitive;
 use vortex_runend::decompress_bool::runend_decode_bools;
 use vortex_session::VortexSession;
 
@@ -368,6 +370,109 @@ const NULLABLE_BOOL_ARGS: &[NullableBoolBenchArgs] = &[
         validity: ValidityDistribution::MostlyValid,
     },
 ];
+
+#[derive(Clone, Copy)]
+struct PrimitiveBenchArgs {
+    total_length: usize,
+    avg_run_length: usize,
+}
+
+impl fmt::Display for PrimitiveBenchArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.total_length, self.avg_run_length)
+    }
+}
+
+/// Creates primitive test data with fixed-length runs of cycling values.
+fn create_primitive_test_data<T: NativePType + From<u8>>(
+    total_length: usize,
+    avg_run_length: usize,
+    nullable: bool,
+) -> (PrimitiveArray, PrimitiveArray) {
+    let num_runs = total_length / avg_run_length + 1;
+    let mut ends = BufferMut::<u32>::with_capacity(num_runs);
+    let mut values = BufferMut::<T>::with_capacity(num_runs);
+    let mut validity_bits = Vec::with_capacity(num_runs);
+
+    let mut pos = 0usize;
+    let mut run_index = 0usize;
+    while pos < total_length {
+        let run_len = avg_run_length.min(total_length - pos);
+        pos += run_len;
+        ends.push(pos as u32);
+        values.push(T::from((run_index % 251) as u8));
+        validity_bits.push(!run_index.is_multiple_of(10));
+        run_index += 1;
+    }
+
+    let validity = if nullable {
+        Validity::from(BitBuffer::from(validity_bits))
+    } else {
+        Validity::NonNullable
+    };
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        PrimitiveArray::new(values.freeze(), validity),
+    )
+}
+
+const PRIMITIVE_ARGS: &[PrimitiveBenchArgs] = &[
+    PrimitiveBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 2,
+    },
+    PrimitiveBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 4,
+    },
+    PrimitiveBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 8,
+    },
+    PrimitiveBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 16,
+    },
+    PrimitiveBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 64,
+    },
+    PrimitiveBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 1024,
+    },
+];
+
+#[divan::bench(types = [u8, u16, u32, u64], args = PRIMITIVE_ARGS)]
+fn decode_primitive<T: NativePType + From<u8>>(bencher: Bencher, args: PrimitiveBenchArgs) {
+    let PrimitiveBenchArgs {
+        total_length,
+        avg_run_length,
+    } = args;
+    let (ends, values) = create_primitive_test_data::<T>(total_length, avg_run_length, false);
+    bencher
+        .with_inputs(|| (ends.clone(), values.clone(), SESSION.create_execution_ctx()))
+        .bench_refs(|(ends, values, ctx)| {
+            runend_decode_primitive(ends.clone(), values.clone(), 0, total_length, ctx)
+        });
+}
+
+#[divan::bench(types = [u8, u32, u64], args = PRIMITIVE_ARGS)]
+fn decode_primitive_nullable<T: NativePType + From<u8>>(
+    bencher: Bencher,
+    args: PrimitiveBenchArgs,
+) {
+    let PrimitiveBenchArgs {
+        total_length,
+        avg_run_length,
+    } = args;
+    let (ends, values) = create_primitive_test_data::<T>(total_length, avg_run_length, true);
+    bencher
+        .with_inputs(|| (ends.clone(), values.clone(), SESSION.create_execution_ctx()))
+        .bench_refs(|(ends, values, ctx)| {
+            runend_decode_primitive(ends.clone(), values.clone(), 0, total_length, ctx)
+        });
+}
 
 #[divan::bench(args = NULLABLE_BOOL_ARGS)]
 fn decode_bool_nullable(bencher: Bencher, args: NullableBoolBenchArgs) {
