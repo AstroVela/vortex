@@ -80,11 +80,13 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      # Use uvx for ruff to avoid building the Rust extension (saves ~4.5 min)
+      # Use uvx for ruff to avoid building the Rust extension (saves ~4.5 min).
+      # Pinned to the version in uv.lock: unpinned uvx pulls the latest ruff, whose
+      # formatting changes break CI without any change in the repo.
       - name: Python Lint - Format
-        run: uvx ruff format --check .
+        run: uvx ruff@0.14.0 format --check .
       - name: Python Lint - Ruff
-        run: uvx ruff check .
+        run: uvx ruff@0.14.0 check .
       # PyRight needs the project for type information, so use uv run
       - name: Python Lint - PyRight
         env:
