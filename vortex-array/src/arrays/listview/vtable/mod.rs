@@ -6,7 +6,6 @@ use std::hash::Hasher;
 use std::sync::Arc;
 
 use prost::Message;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -26,13 +25,10 @@ use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::with_empty_buffers;
-use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::listview::ListViewData;
-use crate::arrays::listview::array::ELEMENTS_SLOT;
-use crate::arrays::listview::array::NUM_SLOTS;
-use crate::arrays::listview::array::OFFSETS_SLOT;
-use crate::arrays::listview::array::SIZES_SLOT;
-use crate::arrays::listview::array::SLOT_NAMES;
+use crate::arrays::listview::array::ListViewSlots;
+use crate::arrays::listview::array::ListViewSlotsView;
 use crate::arrays::listview::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
@@ -128,19 +124,17 @@ impl VTable for ListView {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "ListViewArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == ListViewSlots::COUNT,
+            "ListViewArray expected {} slots, found {}",
+            ListViewSlots::COUNT,
             slots.len()
         );
-        let elements = slots[ELEMENTS_SLOT]
-            .as_ref()
-            .vortex_expect("ListViewArray elements slot");
-        let offsets = slots[OFFSETS_SLOT]
-            .as_ref()
-            .vortex_expect("ListViewArray offsets slot");
-        let sizes = slots[SIZES_SLOT]
-            .as_ref()
-            .vortex_expect("ListViewArray sizes slot");
+        let ListViewSlotsView {
+            elements,
+            offsets,
+            sizes,
+            ..
+        } = ListViewSlotsView::from_slots(slots);
         vortex_ensure!(
             offsets.len() == len && sizes.len() == len,
             "ListViewArray length {} does not match outer length {}",
@@ -219,7 +213,7 @@ impl VTable for ListView {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        ListViewSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {

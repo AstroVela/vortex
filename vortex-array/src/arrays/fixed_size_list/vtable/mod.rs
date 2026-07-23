@@ -5,7 +5,6 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -26,9 +25,8 @@ use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::with_empty_buffers;
 use crate::arrays::fixed_size_list::FixedSizeListData;
-use crate::arrays::fixed_size_list::array::ELEMENTS_SLOT;
-use crate::arrays::fixed_size_list::array::NUM_SLOTS;
-use crate::arrays::fixed_size_list::array::SLOT_NAMES;
+use crate::arrays::fixed_size_list::array::FixedSizeListSlots;
+use crate::arrays::fixed_size_list::array::FixedSizeListSlotsView;
 use crate::arrays::fixed_size_list::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
@@ -115,16 +113,15 @@ impl VTable for FixedSizeList {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "FixedSizeListArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == FixedSizeListSlots::COUNT,
+            "FixedSizeListArray expected {} slots, found {}",
+            FixedSizeListSlots::COUNT,
             slots.len()
         );
         let DType::FixedSizeList(_, list_size, nullability) = dtype else {
             vortex_bail!("Expected `DType::FixedSizeList`, got {dtype:?}");
         };
-        let elements = slots[ELEMENTS_SLOT]
-            .as_ref()
-            .vortex_expect("FixedSizeListArray elements slot");
+        let elements = FixedSizeListSlotsView::from_slots(slots).elements;
         vortex_ensure!(
             if *list_size == 0 {
                 data.degenerate_len == len
@@ -197,7 +194,7 @@ impl VTable for FixedSizeList {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        FixedSizeListSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {

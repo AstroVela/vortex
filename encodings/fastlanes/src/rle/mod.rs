@@ -3,7 +3,10 @@
 
 mod array;
 pub use array::RLEArrayExt;
+pub use array::RLEArraySlotsExt;
 pub use array::RLEData;
+pub use array::RLESlots;
+pub use array::RLESlotsView;
 
 mod compute;
 mod kernel;

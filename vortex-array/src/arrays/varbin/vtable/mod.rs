@@ -20,11 +20,10 @@ use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
-use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbin::VarBinArraySlotsExt;
 use crate::arrays::varbin::VarBinData;
-use crate::arrays::varbin::array::NUM_SLOTS;
-use crate::arrays::varbin::array::OFFSETS_SLOT;
-use crate::arrays::varbin::array::SLOT_NAMES;
+use crate::arrays::varbin::array::VarBinSlots;
+use crate::arrays::varbin::array::VarBinSlotsView;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
@@ -91,13 +90,12 @@ impl VTable for VarBin {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "VarBinArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == VarBinSlots::COUNT,
+            "VarBinArray expected {} slots, found {}",
+            VarBinSlots::COUNT,
             slots.len()
         );
-        let offsets = slots[OFFSETS_SLOT]
-            .as_ref()
-            .vortex_expect("VarBinArray offsets slot");
+        let offsets = VarBinSlotsView::from_slots(slots).offsets;
         vortex_ensure!(
             offsets.len().saturating_sub(1) == len,
             "VarBinArray length {} does not match outer length {}",
@@ -192,7 +190,7 @@ impl VTable for VarBin {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        VarBinSlots::NAMES[idx].to_string()
     }
 
     fn reduce_parent(

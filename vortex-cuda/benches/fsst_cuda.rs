@@ -34,6 +34,7 @@ use vortex_cuda::arrow::release_device_array;
 use vortex_cuda::executor::CudaArrayExt;
 use vortex_cuda_macros::cuda_available;
 use vortex_cuda_macros::cuda_not_available;
+use vortex_fsst::FSSTArraySlotsExt;
 use vortex_fsst::test_utils::make_fsst_clickbench_urls;
 
 use crate::timed_launch_strategy::TimedLaunchStrategy;
