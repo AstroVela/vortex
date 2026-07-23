@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+# Decimal Add/Sub in filters and projections is pushed into the Vortex scan (aligned through
+# Vortex's coercion pass). Decimal Mul/Div (no Vortex kernels) and arithmetic at the physical
+# type's precision ceiling (where arrow saturates the result precision while Vortex widens it)
+# stay in DataFusion.
+
+include ../setup.slt.no
+
+statement ok
+CREATE EXTERNAL TABLE decimal_arith (
+    id INT NOT NULL,
+    a DECIMAL(9, 2) NOT NULL,
+    b DECIMAL(9, 2) NOT NULL,
+    c DECIMAL(9, 4) NOT NULL,
+    big1 DECIMAL(38, 0) NOT NULL,
+    big2 DECIMAL(38, 0) NOT NULL
+)
+STORED AS vortex
+LOCATION '${WORK_DIR}/decimal_arith/';
+
+statement ok
+INSERT INTO decimal_arith VALUES
+    (1, 10.50, 19.50, 0.0001, 1, 10),
+    (2, 20.00, 10.00, 2.5000, 2, 20),
+    (3, 5.25, 4.75, 1.0000, 3, 30);
+
+# Decimal Add over same-typed operands is pushed into the scan: no FilterExec remains.
+
+query TT
+EXPLAIN SELECT a FROM decimal_arith WHERE a + b = 30.00 ORDER BY a;
+----
+logical_plan
+01)Sort: decimal_arith.a ASC NULLS LAST
+02)--Projection: decimal_arith.a
+03)----Filter: decimal_arith.a + decimal_arith.b = Decimal128(Some(3000),10,2)
+04)------TableScan: decimal_arith projection=[a, b], partial_filters=[decimal_arith.a + decimal_arith.b = Decimal128(Some(3000),10,2)]
+physical_plan
+01)SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={<slt:ignore>}, projection=[a], file_type=vortex, predicate: a@1 + b@2 = Some(3000),10,2
+
+query R
+SELECT a FROM decimal_arith WHERE a + b = 30.00 ORDER BY a;
+----
+10.5
+20
+
+# Decimal Sub is pushed down too.
+
+query TT
+EXPLAIN SELECT a FROM decimal_arith WHERE a - b > 0 ORDER BY a;
+----
+logical_plan
+01)Sort: decimal_arith.a ASC NULLS LAST
+02)--Projection: decimal_arith.a
+03)----Filter: decimal_arith.a - decimal_arith.b > Decimal128(Some(0),10,2)
+04)------TableScan: decimal_arith projection=[a, b], partial_filters=[decimal_arith.a - decimal_arith.b > Decimal128(Some(0),10,2)]
+physical_plan
+01)SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={<slt:ignore>}, projection=[a], file_type=vortex, predicate: a@1 - b@2 > Some(0),10,2
+
+query R
+SELECT a FROM decimal_arith WHERE a - b > 0 ORDER BY a;
+----
+5.25
+20
+
+# Operands with different scales are rescaled inside the pushed-down expression.
+
+query TT
+EXPLAIN SELECT a FROM decimal_arith WHERE a + c > 22.0;
+----
+logical_plan
+01)Projection: decimal_arith.a
+02)--Filter: decimal_arith.a + decimal_arith.c > Decimal128(Some(220000),12,4)
+03)----TableScan: decimal_arith projection=[a, c], partial_filters=[decimal_arith.a + decimal_arith.c > Decimal128(Some(220000),12,4)]
+physical_plan DataSourceExec: file_groups={<slt:ignore>}, projection=[a], file_type=vortex, predicate: a@1 + c@3 > Some(220000),12,4
+
+query R
+SELECT a FROM decimal_arith WHERE a + c > 22.0;
+----
+20
+
+# At the Decimal128 precision ceiling (38) the filter stays in DataFusion (FilterExec remains)
+# and still produces correct results.
+
+query TT
+EXPLAIN SELECT big1 FROM decimal_arith WHERE big1 + big2 = 33;
+----
+logical_plan
+01)Projection: decimal_arith.big1
+02)--Filter: decimal_arith.big1 + decimal_arith.big2 = Decimal128(Some(33),38,0)
+03)----TableScan: decimal_arith projection=[big1, big2], partial_filters=[decimal_arith.big1 + decimal_arith.big2 = Decimal128(Some(33),38,0)]
+physical_plan
+01)FilterExec: big1@0 + big2@1 = Some(33),38,0, projection=[big1@0]
+02)--DataSourceExec: file_groups={<slt:ignore>}, projection=[big1, big2], file_type=vortex
+
+query R
+SELECT big1 FROM decimal_arith WHERE big1 + big2 = 33;
+----
+3
+
+# Decimal Mul has no Vortex kernel; the filter stays in DataFusion.
+
+query TT
+EXPLAIN SELECT a FROM decimal_arith WHERE a * b > 100.0 ORDER BY a;
+----
+logical_plan
+01)Sort: decimal_arith.a ASC NULLS LAST
+02)--Projection: decimal_arith.a
+03)----Filter: decimal_arith.a * decimal_arith.b > Decimal128(Some(1000000),19,4)
+04)------TableScan: decimal_arith projection=[a, b], partial_filters=[decimal_arith.a * decimal_arith.b > Decimal128(Some(1000000),19,4)]
+physical_plan
+01)SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--FilterExec: a@0 * b@1 > Some(1000000),19,4, projection=[a@0]
+03)----DataSourceExec: file_groups={<slt:ignore>}, projection=[a, b], file_type=vortex
+
+query R
+SELECT a FROM decimal_arith WHERE a * b > 100.0 ORDER BY a;
+----
+10.5
+20
+
+# Decimal Add/Sub in projections is pushed into the scan when projection pushdown is enabled.
+# Note the Vortex source splits pushed vs leftover projections internally (in the file opener),
+# so DataFusion's plan shows the full projection on the DataSourceExec either way; the queries
+# below are the regression tests that both variants evaluate correctly.
+
+statement ok
+SET vortex.projection_pushdown = true;
+
+query TT
+EXPLAIN SELECT a + b AS total, a - c AS diff FROM decimal_arith ORDER BY total;
+----
+logical_plan
+01)Sort: total ASC NULLS LAST
+02)--Projection: decimal_arith.a + decimal_arith.b AS total, decimal_arith.a - decimal_arith.c AS diff
+03)----TableScan: decimal_arith projection=[a, b, c]
+physical_plan
+01)SortExec: expr=[total@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={<slt:ignore>}, projection=[a@1 + b@2 as total, a@1 - c@3 as diff], file_type=vortex
+
+query RR
+SELECT a + b AS total, a - c AS diff FROM decimal_arith ORDER BY total;
+----
+10 4.25
+30 10.4999
+30 17.5
+
+# Decimal Mul in a projection is kept out of the Vortex scan and evaluated with DataFusion's
+# expression machinery (hosted in the source's post-scan projector). If the split_projection
+# guard ever leaked decimal Mul into the Vortex scan, this query would error.
+
+query TT
+EXPLAIN SELECT a * b AS product FROM decimal_arith ORDER BY product;
+----
+logical_plan
+01)Sort: product ASC NULLS LAST
+02)--Projection: decimal_arith.a * decimal_arith.b AS product
+03)----TableScan: decimal_arith projection=[a, b]
+physical_plan
+01)SortExec: expr=[product@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={<slt:ignore>}, projection=[a@1 * b@2 as product], file_type=vortex
+
+query R
+SELECT a * b AS product FROM decimal_arith ORDER BY product;
+----
+24.9375
+200
+204.75
+
+statement ok
+SET vortex.projection_pushdown = false;
