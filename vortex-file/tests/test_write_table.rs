@@ -18,38 +18,32 @@ use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::FieldNames;
 use vortex_array::field_path;
-use vortex_array::session::ArraySessionExt;
 use vortex_array::validity::Validity;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_buffer::ByteBuffer;
 use vortex_file::OpenOptionsSessionExt;
-use vortex_file::VortexWriteOptions;
 use vortex_file::WriteOptionsSessionExt;
-use vortex_file::WriteStrategyBuilder;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
+
+mod common;
+
+use common::enable_all_registered_array_encodings;
+
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = vortex_array::array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
 
     vortex_file::register_default_encodings(&session);
+    enable_all_registered_array_encodings(&session);
 
     session
 });
-
-fn all_registered_write_options() -> VortexWriteOptions {
-    let allowed = SESSION.arrays().registry().ids().collect();
-    SESSION.write_options().with_strategy(
-        WriteStrategyBuilder::default()
-            .with_allow_encodings(allowed)
-            .build(),
-    )
-}
 
 #[tokio::test]
 async fn test_file_roundtrip() {
@@ -154,7 +148,8 @@ async fn test_dict_listview_validity_roundtrip() {
         .into_array();
 
     let mut bytes = Vec::new();
-    all_registered_write_options()
+    SESSION
+        .write_options()
         .write(&mut bytes, data.to_array_stream())
         .await
         .expect("write should not fail with fill_null serialization error");
@@ -199,7 +194,8 @@ async fn test_write_empty_nullable_struct_column() {
     .into_array();
 
     let mut bytes = Vec::new();
-    all_registered_write_options()
+    SESSION
+        .write_options()
         .write(&mut bytes, data.to_array_stream())
         .await
         .expect("writing an empty nullable struct column should not panic");

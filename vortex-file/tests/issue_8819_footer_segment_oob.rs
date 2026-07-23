@@ -14,16 +14,18 @@ use std::mem::size_of;
 use std::sync::LazyLock;
 
 use vortex_array::IntoArray;
-use vortex_array::session::ArraySessionExt;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
-use vortex_file::WriteStrategyBuilder;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
+
+mod common;
+
+use common::enable_all_registered_array_encodings;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = vortex_array::array_session()
@@ -31,6 +33,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<RuntimeSession>();
 
     vortex_file::register_default_encodings(&session);
+    enable_all_registered_array_encodings(&session);
 
     session
 });
@@ -40,14 +43,8 @@ async fn open_buffer_rejects_out_of_bounds_footer_segment() {
     // Write a valid file to obtain a well-formed footer.
     let mut buf = ByteBufferMut::empty();
     let array = Buffer::from((0i32..256).collect::<Vec<i32>>()).into_array();
-    let allowed = SESSION.arrays().registry().ids().collect();
     SESSION
         .write_options()
-        .with_strategy(
-            WriteStrategyBuilder::default()
-                .with_allow_encodings(allowed)
-                .build(),
-        )
         .write(&mut buf, array.to_array_stream())
         .await
         .expect("write");

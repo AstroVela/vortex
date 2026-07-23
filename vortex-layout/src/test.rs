@@ -8,8 +8,10 @@ use vortex_session::VortexSession;
 
 use crate::session::LayoutSession;
 
-pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+pub fn test_session() -> VortexSession {
     vortex_array::array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>()
-});
+}
+
+pub static SESSION: LazyLock<VortexSession> = LazyLock::new(test_session);

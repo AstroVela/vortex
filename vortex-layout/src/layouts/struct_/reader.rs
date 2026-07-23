@@ -434,6 +434,7 @@ mod tests {
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::test::SESSION;
+    use crate::test::test_session;
 
     #[fixture]
     fn empty_struct() -> (Arc<dyn SegmentSource>, LayoutRef) {
@@ -447,7 +448,7 @@ mod tests {
         );
         let segments2 = Arc::<TestSegments>::clone(&segments);
         let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             strategy
                 .write_stream(
                     ctx,
@@ -484,7 +485,7 @@ mod tests {
         );
         let segments2 = Arc::<TestSegments>::clone(&segments);
         let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             strategy
                 .write_stream(
                     ctx,
@@ -524,7 +525,7 @@ mod tests {
         );
         let segments2 = Arc::<TestSegments>::clone(&segments);
         let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             strategy
                 .write_stream(
                     ctx,
@@ -569,7 +570,7 @@ mod tests {
         );
         let segments2 = Arc::<TestSegments>::clone(&segments);
         let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             strategy
                 .write_stream(
                     ctx,
@@ -755,19 +756,20 @@ mod tests {
         // Project out the nested struct field.
         // The projection should preserve the nulls of the `b` struct when we select out the
         // child column `c`.
-        let reader = layout
-            .new_reader("".into(), segments, &SESSION, &Default::default())
-            .unwrap();
         let expr = select(
             vec![FieldName::from("c")],
             get_item("b", get_item("a", root())),
         );
-
-        let project = reader
-            .projection_evaluation(&(0..3), &expr, MaskFuture::new_true(3))
-            .unwrap();
-
-        let result = block_on(move |_| project).unwrap();
+        let result = block_on(move |handle| {
+            let session = test_session().with_handle(handle);
+            async move {
+                layout
+                    .new_reader("".into(), segments, &session, &Default::default())?
+                    .projection_evaluation(&(0..3), &expr, MaskFuture::new_true(3))?
+                    .await
+            }
+        })
+        .unwrap();
 
         // The result is a nullable struct (because root.a.b is nullable) with a non-nullable
         // field "c" (because the original field was non-nullable).
@@ -848,7 +850,7 @@ mod tests {
         );
         let segments2 = Arc::<TestSegments>::clone(&segments);
         let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             strategy
                 .write_stream(
                     ctx,
