@@ -230,16 +230,42 @@ fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
     min(end - offset, length).as_()
 }
 
-/// Single-byte-element runs at least this long are filled with an explicit `memset`, which
-/// beats a store loop for large fills; shorter runs use the chunked word stores below to
-/// avoid a libc call per run.
-const BYTE_RUN_MEMSET_THRESHOLD: usize = 256;
+/// Runs at least this many bytes long are filled by [`fill_run`] instead of the inline
+/// chunked stores. The out-of-line fill keeps its own clean codegen (a memset for bytes, an
+/// aligned vector loop otherwise) regardless of register pressure in the calling decode
+/// loop, and its call cost is amortized over the run.
+const LONG_RUN_FILL_BYTES: usize = 256;
 
-/// Splat `value` into `base[pos..end]` using unconditional chunk-wide stores.
+/// Fill `dst[..len]` with `value`.
 ///
-/// Always writes at least one full chunk (rounding the run up to a multiple of the chunk
-/// length), so the overshoot past `end` is written and later either overwritten by the next
-/// run or discarded by the final `set_len`.
+/// Deliberately not inlined: inlining a fill loop into the decode loop leaves its codegen at
+/// the mercy of the surrounding register pressure (the nullable decode arm otherwise loses
+/// its wide vector stores), and for byte-sized elements LLVM's loop-idiom pass would turn an
+/// inline splat loop into a memset call per run even for short runs.
+///
+/// # Safety
+///
+/// `dst` must be valid for writes of `len` elements.
+#[inline(never)]
+unsafe fn fill_run<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
+    unsafe {
+        if size_of::<T>() == 1 {
+            let byte: u8 = std::mem::transmute_copy(&value);
+            dst.cast::<u8>().write_bytes(byte, len);
+        } else {
+            for i in 0..len {
+                dst.add(i).write(MaybeUninit::new(value));
+            }
+        }
+    }
+}
+
+/// Splat `value` into `base[pos..end]`.
+///
+/// Short runs use unconditional chunk-wide stores: they always write at least one full chunk
+/// (rounding the run up to a multiple of the chunk length), so the overshoot past `end` is
+/// written and later either overwritten by the next run or discarded by the final `set_len`.
+/// Long runs dispatch to [`fill_run`] and write exactly `end - pos` elements.
 ///
 /// # Safety
 ///
@@ -247,32 +273,29 @@ const BYTE_RUN_MEMSET_THRESHOLD: usize = 256;
 /// `max(pos, end) + decode_chunk_len::<T>()` elements.
 #[inline(always)]
 unsafe fn splat_run<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
-    if size_of::<T>() == 1 {
+    let len = end.saturating_sub(pos);
+    if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
+        // SAFETY: pos + len == end elements are in bounds per the caller contract.
+        unsafe { fill_run(base.add(pos), len, value) };
+    } else if size_of::<T>() == 1 {
         // For byte-sized elements LLVM's loop-idiom pass turns any plain splat store loop
-        // into a memset call per run, which dominates short runs. Take an explicit memset
-        // only for long runs (where it wins) and otherwise store a replicated word whose
-        // runtime multiply is opaque to loop-idiom.
+        // into a memset call per run, which dominates short runs. Store a replicated word
+        // whose runtime multiply is opaque to loop-idiom instead.
         //
         // SAFETY: size_of::<T>() == 1 in this branch, and the caller guarantees space for
         // one 32-byte chunk past max(pos, end).
         unsafe {
             let byte: u8 = std::mem::transmute_copy(&value);
-            let p = base.add(pos).cast::<u8>();
-            let len = end.saturating_sub(pos);
-            if len >= BYTE_RUN_MEMSET_THRESHOLD {
-                p.write_bytes(byte, len);
-            } else {
-                let word = u64::from(byte).wrapping_mul(0x0101_0101_0101_0101);
-                let mut p = p;
-                let stop = base.add(end).cast::<u8>();
-                loop {
-                    for i in 0..DECODE_CHUNK_BYTES / 8 {
-                        p.add(i * 8).cast::<u64>().write_unaligned(word);
-                    }
-                    p = p.add(DECODE_CHUNK_BYTES);
-                    if p >= stop {
-                        break;
-                    }
+            let word = u64::from(byte).wrapping_mul(0x0101_0101_0101_0101);
+            let mut p = base.add(pos).cast::<u8>();
+            let stop = base.add(end).cast::<u8>();
+            loop {
+                for i in 0..DECODE_CHUNK_BYTES / 8 {
+                    p.add(i * 8).cast::<u64>().write_unaligned(word);
+                }
+                p = p.add(DECODE_CHUNK_BYTES);
+                if p >= stop {
+                    break;
                 }
             }
         }
