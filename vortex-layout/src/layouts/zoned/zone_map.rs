@@ -371,6 +371,9 @@ mod tests {
     use vortex_array::aggregate_fn::fns::bounded_max::BoundedMaxOptions;
     use vortex_array::aggregate_fn::fns::bounded_min::BoundedMin;
     use vortex_array::aggregate_fn::fns::bounded_min::BoundedMinOptions;
+    use vortex_array::aggregate_fn::fns::list_length_min_max::ListLengthMinMax;
+    use vortex_array::aggregate_fn::fns::list_length_min_max::MAX_LENGTH;
+    use vortex_array::aggregate_fn::fns::list_length_min_max::MIN_LENGTH;
     use vortex_array::aggregate_fn::fns::max::Max;
     use vortex_array::aggregate_fn::fns::min::Min;
     use vortex_array::aggregate_fn::fns::nan_count::NanCount;
@@ -390,6 +393,7 @@ mod tests {
     use vortex_array::expr::gt_eq;
     use vortex_array::expr::is_not_null;
     use vortex_array::expr::is_null;
+    use vortex_array::expr::list_length;
     use vortex_array::expr::lit;
     use vortex_array::expr::lt;
     use vortex_array::expr::not_eq;
@@ -401,6 +405,7 @@ mod tests {
     use vortex_array::stats::all_null;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
 
     use crate::layouts::zoned::zone_map::ZoneMap;
     use crate::test::SESSION;
@@ -481,6 +486,40 @@ mod tests {
             BoolArray::from_iter([false, true, true]),
             ctx
         );
+    }
+
+    #[test]
+    fn list_length_min_max_prunes_list_length() -> VortexResult<()> {
+        let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::Nullable));
+        let column_dtype = DType::List(element_dtype, Nullability::Nullable);
+        let list_length_min_max = ListLengthMinMax.bind(EmptyOptions);
+        let length_min_max_values = StructArray::try_new(
+            [MIN_LENGTH, MAX_LENGTH].into(),
+            vec![
+                PrimitiveArray::new(buffer![0u64, 3, 0], Validity::NonNullable).into_array(),
+                PrimitiveArray::new(buffer![2u64, 5, 0], Validity::NonNullable).into_array(),
+            ],
+            3,
+            Validity::from_iter([true, true, false]),
+        )?
+        .into_array();
+        let zone_map = ZoneMap::try_new(
+            column_dtype.clone(),
+            StructArray::from_fields(&[(list_length_min_max.to_string(), length_min_max_values)])?,
+            Arc::new([list_length_min_max]),
+            4,
+            12,
+        )?;
+
+        let predicate = gt(list_length(root()), lit(2u64));
+        let pruning_expr = falsify(&predicate, column_dtype);
+        let mask = zone_map.prune(&pruning_expr, &SESSION)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([true, false, false]),
+            &mut SESSION.create_execution_ctx()
+        );
+        Ok(())
     }
 
     #[test]

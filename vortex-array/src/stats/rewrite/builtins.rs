@@ -11,12 +11,16 @@ use crate::aggregate_fn::EmptyOptions as AggregateEmptyOptions;
 use crate::aggregate_fn::fns::all_non_nan::AllNonNan;
 use crate::aggregate_fn::fns::all_non_null::AllNonNull;
 use crate::aggregate_fn::fns::all_null::AllNull;
+use crate::aggregate_fn::fns::list_length_min_max::ListLengthMinMax;
+use crate::aggregate_fn::fns::list_length_min_max::MAX_LENGTH;
+use crate::aggregate_fn::fns::list_length_min_max::MIN_LENGTH;
 use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::and;
 use crate::expr::and_collect;
 use crate::expr::cast;
 use crate::expr::eq;
+use crate::expr::get_item;
 use crate::expr::gt;
 use crate::expr::gt_eq;
 use crate::expr::lit;
@@ -40,6 +44,7 @@ use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeVariant;
 use crate::scalar_fn::fns::list_contains::ListContains;
+use crate::scalar_fn::fns::list_length::ListLength;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
@@ -616,6 +621,10 @@ fn stat_expr(expr: &Expression, stat: Stat, ctx: &StatsRewriteCtx<'_>) -> Option
         return cast_stat(expr.child(0), dtype, stat, ctx);
     }
 
+    if expr.is::<ListLength>() {
+        return list_length_stat_expr(expr.child(0), stat, ctx);
+    }
+
     let aggregate_fn = stat.aggregate_fn()?;
     // The aggregate may not support the expression's dtype, e.g. min/max over structs,
     // even when the predicate itself is well-typed. Such stats cannot be lowered later,
@@ -625,6 +634,47 @@ fn stat_expr(expr: &Expression, stat: Stat, ctx: &StatsRewriteCtx<'_>) -> Option
         .return_dtype(&input_dtype)
         .is_some()
         .then(|| stat_fn(expr.clone(), aggregate_fn))
+}
+
+fn list_length_stat_expr(
+    list: &Expression,
+    stat: Stat,
+    ctx: &StatsRewriteCtx<'_>,
+) -> Option<Expression> {
+    match ctx.return_dtype(list).ok()? {
+        DType::List(..) => match stat {
+            Stat::Min | Stat::Max => {
+                let field = match stat {
+                    Stat::Min => MIN_LENGTH,
+                    Stat::Max => MAX_LENGTH,
+                    _ => unreachable!(),
+                };
+                Some(get_item(
+                    field,
+                    stat_fn(list.clone(), ListLengthMinMax.bind(AggregateEmptyOptions)),
+                ))
+            }
+            // list_length carries the outer list validity unchanged.
+            Stat::NullCount => stat_expr(list, Stat::NullCount, ctx),
+            Stat::IsConstant
+            | Stat::IsSorted
+            | Stat::IsStrictSorted
+            | Stat::Sum
+            | Stat::UncompressedSizeInBytes
+            | Stat::NaNCount => None,
+        },
+        DType::FixedSizeList(_, size, _) => match stat {
+            Stat::Min | Stat::Max => Some(lit(size as u64)),
+            Stat::NullCount => stat_expr(list, Stat::NullCount, ctx),
+            Stat::IsConstant
+            | Stat::IsSorted
+            | Stat::IsStrictSorted
+            | Stat::Sum
+            | Stat::UncompressedSizeInBytes
+            | Stat::NaNCount => None,
+        },
+        _ => None,
+    }
 }
 
 fn with_non_nan_guards<'a, P: NonNanProof>(
@@ -706,6 +756,9 @@ mod tests {
     use crate::aggregate_fn::AggregateFnVTableExt;
     use crate::aggregate_fn::EmptyOptions as AggregateEmptyOptions;
     use crate::aggregate_fn::fns::all_non_nan::AllNonNan;
+    use crate::aggregate_fn::fns::list_length_min_max::ListLengthMinMax;
+    use crate::aggregate_fn::fns::list_length_min_max::MAX_LENGTH;
+    use crate::aggregate_fn::fns::list_length_min_max::MIN_LENGTH;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -717,12 +770,14 @@ mod tests {
     use crate::expr::col;
     use crate::expr::dynamic;
     use crate::expr::eq;
+    use crate::expr::get_item;
     use crate::expr::gt;
     use crate::expr::gt_eq;
     use crate::expr::is_not_null;
     use crate::expr::is_null;
     use crate::expr::like;
     use crate::expr::list_contains;
+    use crate::expr::list_length;
     use crate::expr::lit;
     use crate::expr::lt;
     use crate::expr::lt_eq;
@@ -757,6 +812,13 @@ mod tests {
                 ("f", DType::Primitive(PType::F32, Nullability::NonNullable)),
                 ("s", DType::Utf8(Nullability::NonNullable)),
                 ("t", DType::Utf8(Nullability::NonNullable)),
+                (
+                    "l",
+                    DType::List(
+                        Arc::new(DType::Primitive(PType::I32, Nullability::Nullable)),
+                        Nullability::Nullable,
+                    ),
+                ),
                 ("n", nested_struct_dtype()),
             ]),
             Nullability::NonNullable,
@@ -827,6 +889,27 @@ mod tests {
             Some(or(
                 lt_eq(stat(col("a"), Stat::Max), lit(10)),
                 gt_eq(stat(col("a"), Stat::Min), lit(50)),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rewrites_list_length_comparison_falsifier() -> VortexResult<()> {
+        let length_min_max = stat_fn(col("l"), ListLengthMinMax.bind(AggregateEmptyOptions));
+
+        assert_eq!(
+            falsify(&gt(list_length(col("l")), lit(2u64)))?,
+            Some(lt_eq(
+                get_item(MAX_LENGTH, length_min_max.clone()),
+                lit(2u64)
+            ))
+        );
+        assert_eq!(
+            falsify(&eq(list_length(col("l")), lit(2u64)))?,
+            Some(or(
+                gt(get_item(MIN_LENGTH, length_min_max.clone()), lit(2u64)),
+                gt(lit(2u64), get_item(MAX_LENGTH, length_min_max)),
             ))
         );
         Ok(())

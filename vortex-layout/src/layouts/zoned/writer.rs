@@ -230,8 +230,11 @@ fn default_zoned_aggregate_fns(dtype: &DType, session: &VortexSession) -> Arc<[A
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
     use vortex_array::aggregate_fn::fns::bounded_min::BoundedMin;
+    use vortex_array::aggregate_fn::fns::list_length_min_max::ListLengthMinMax;
     use vortex_array::aggregate_fn::fns::max::Max;
     use vortex_array::aggregate_fn::fns::min::Min;
     use vortex_array::aggregate_fn::fns::sum::Sum;
@@ -280,6 +283,21 @@ mod tests {
             aggregate_fns
                 .iter()
                 .all(|aggregate_fn| !aggregate_fn.is::<Sum>())
+        );
+    }
+
+    #[test]
+    fn default_aggregates_include_list_length_min_max() {
+        let dtype = DType::List(
+            Arc::new(DType::Primitive(PType::I32, Nullability::Nullable)),
+            Nullability::Nullable,
+        );
+        let aggregate_fns = default_zoned_aggregate_fns(&dtype, &vortex_array::array_session());
+
+        assert!(
+            aggregate_fns
+                .iter()
+                .any(|aggregate_fn| aggregate_fn.is::<ListLengthMinMax>())
         );
     }
 }

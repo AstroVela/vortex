@@ -14,7 +14,9 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::AggregateFnId;
+use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::AggregateFnVTableExt;
 use crate::aggregate_fn::EmptyOptions;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::min_max::MinMaxResult;
@@ -112,6 +114,10 @@ impl AggregateFnVTable for ListLengthMinMax {
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
         matches!(input_dtype, DType::List(..) | DType::FixedSizeList(..))
             .then(list_length_min_max_dtype)
+    }
+
+    fn zone_stat_default(&self, input_dtype: &DType) -> Option<AggregateFnRef> {
+        matches!(input_dtype, DType::List(..)).then(|| self.bind(EmptyOptions))
     }
 
     fn partial_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
