@@ -13,6 +13,7 @@ pub mod first;
 pub mod is_constant;
 pub mod is_sorted;
 pub mod last;
+pub mod list_length_min_max;
 pub mod max;
 pub mod mean;
 pub mod min;

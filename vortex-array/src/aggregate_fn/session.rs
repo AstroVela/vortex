@@ -25,6 +25,7 @@ use crate::aggregate_fn::fns::first::First;
 use crate::aggregate_fn::fns::is_constant::IsConstant;
 use crate::aggregate_fn::fns::is_sorted::IsSorted;
 use crate::aggregate_fn::fns::last::Last;
+use crate::aggregate_fn::fns::list_length_min_max::ListLengthMinMax;
 use crate::aggregate_fn::fns::max::Max;
 use crate::aggregate_fn::fns::min::Min;
 use crate::aggregate_fn::fns::min_max::MinMax;
@@ -96,6 +97,7 @@ impl Default for AggregateFnSession {
         this.register(IsConstant);
         this.register(IsSorted);
         this.register(Last);
+        this.register(ListLengthMinMax);
         this.register(Max);
         this.register(Min);
         this.register(MinMax);
