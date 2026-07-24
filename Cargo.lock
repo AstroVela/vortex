@@ -10293,6 +10293,7 @@ dependencies = [
  "arrow-schema 58.3.0",
  "codspeed-divan-compat",
  "fsst-rs",
+ "onpair",
  "parquet 58.3.0",
  "rand 0.10.2",
  "reqwest 0.13.4",

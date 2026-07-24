@@ -43,17 +43,18 @@ throughput, counted in uncompressed bytes.
 
 Compression ratio (raw / compressed), 32 MiB per corpus:
 
-| dataset | order-0 entropy | huffman (this crate) | zstd-3 | fsst | fsst+huffman |
+| dataset | order-0 entropy | huffman (this crate) | zstd-3 | fsst | fsst+huffman | onpair | onpair+huffman |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clickbench-urls | 5.516 bpb (bound 1.450x) | 1.443x | 11.311x | 1.950x | 2.246x | 3.029x | 3.632x |
+| wikipedia | 5.083 bpb (bound 1.574x) | 1.569x | 2.821x | 1.691x | 1.818x | 1.631x | 1.930x |
+
+Median single-thread decompression throughput (counted in uncompressed bytes), plus
+huffman compression for context:
+
+| dataset | huffman | zstd-3 | fsst | onpair | huffman compress |
 | --- | --- | --- | --- | --- | --- |
-| clickbench-urls | 5.516 bpb (bound 1.450x) | 1.443x | 11.311x | 1.950x | 2.246x |
-| wikipedia | 5.083 bpb (bound 1.574x) | 1.569x | 2.821x | 1.691x | 1.818x |
-
-Median single-thread throughput (counted in uncompressed bytes):
-
-| dataset | huffman decompress | zstd-3 decompress | fsst decompress | huffman compress |
-| --- | --- | --- | --- | --- |
-| clickbench-urls | 969 MB/s | 1.67 GB/s | 930 MB/s | 137 MB/s |
-| wikipedia | 976 MB/s | 802 MB/s | 877 MB/s | 117 MB/s |
+| clickbench-urls | 987 MB/s | 2.02 GB/s | 1.31 GB/s | 8.22 GB/s | 148 MB/s |
+| wikipedia | 996 MB/s | 820 MB/s | 1.17 GB/s | 4.71 GB/s | 122 MB/s |
 
 Observations:
 
@@ -61,13 +62,17 @@ Observations:
   the codec is ratio-optimal for what order-0 entropy coding can do — but that bound
   itself (~1.45–1.57x) is far below zstd, which exploits LZ matches these corpora are
   full of.
-- Stacked on FSST output (`fsst+huffman`), Huffman removes the order-0 redundancy FSST
-  leaves behind: 1.95x → 2.25x on URLs (+15%) and 1.69x → 1.82x on Wikipedia. That
-  stacking, not standalone Huffman, is the promising integration path for Vortex string
-  columns — it keeps FSST's random-access-friendly structure per block while shrinking
+- Stacked on string-codec output, Huffman removes the order-0 redundancy those codecs
+  leave behind: FSST 1.95x → 2.25x (+15%) and OnPair 3.03x → 3.63x (+20%) on URLs;
+  FSST 1.69x → 1.82x and OnPair 1.63x → 1.93x (+18%) on Wikipedia. That stacking, not
+  standalone Huffman, is the promising integration path for Vortex string columns — it
+  keeps the string codec's random-access-friendly per-row structure while shrinking
   storage.
-- Scalar 4-stream decode reaches ~1 GB/s. The PIVCO paper's SIMD decoder reports
-  4.3–4.8 GB/s on real text on Apple M4, which is the motivation for the follow-up port.
+- Scalar 4-stream Huffman decode reaches ~1 GB/s. The PIVCO paper's SIMD decoder
+  reports 4.3–4.8 GB/s on real text on Apple M4, which is the motivation for the
+  follow-up port — at those speeds the entropy stage stops being the scan bottleneck
+  (OnPair bulk-decodes at 4.7–8.2 GB/s here, so today a Huffman stage would dominate
+  a stacked decode).
 
 ## Format
 
