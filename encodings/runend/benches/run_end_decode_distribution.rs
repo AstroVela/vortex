@@ -44,6 +44,7 @@ use decode_variants::decode_v0;
 use decode_variants::decode_v1;
 use decode_variants::decode_v2;
 use decode_variants::decode_v3_byte_splat;
+use decode_variants::decode_v3_elem_fill;
 use decode_variants::make_data;
 
 fn main() {
@@ -54,7 +55,10 @@ const SEED: u64 = 0x5eed;
 const TOTAL_LENGTH: usize = 65_536;
 
 /// Average run length. Uniform run lengths in `1..=(2*avg-1)` have this mean.
-const RUN_LENGTHS: &[usize] = &[2, 4, 8, 16, 32, 64, 256, 1024];
+///
+/// Extends past 1024 so the 2 KiB doubling-fill threshold is crossed for every element width
+/// (u16 needs 1024+ elements, u32 512+, u64 256+).
+const RUN_LENGTHS: &[usize] = &[2, 4, 8, 16, 32, 64, 256, 1024, 4096];
 
 /// Fixed short run length for the density sweep, where per-run validity work is visible.
 const DENSITY_RUN_LENGTH: usize = 8;
@@ -111,7 +115,7 @@ fn nonnull_v2<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
         });
 }
 
-#[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
+#[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
     let (ends, values) = nonnull_data::<T>(avg);
     bencher
@@ -129,10 +133,26 @@ fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
         });
 }
 
+/// The previous long-run fill (element loop, baseline SSE2 width) instead of the shipped
+/// doubling `memcpy`. Identical to `nonnull_v3` below the 2 KiB doubling threshold; above it
+/// the shipped kernel should win.
+#[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
+fn nonnull_v3_elem_fill<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    let (ends, values) = nonnull_data::<T>(avg);
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(|| (ends.clone(), values.clone()))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) =
+                decode_v3_elem_fill(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
+        });
+}
+
 /// The rejected byte word-splat kernel. For widths > 1 this is identical to `nonnull_v3`;
 /// only u8 differs, and there the shipped `nonnull_v3` (generic path) is faster across all run
 /// lengths — which is why the shipped kernel carries no byte special case.
-#[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
+#[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v3_byte_splat<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
     let (ends, values) = nonnull_data::<T>(avg);
     bencher

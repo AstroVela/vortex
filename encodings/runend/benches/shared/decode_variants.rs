@@ -213,6 +213,97 @@ unsafe fn splat_run_byte_splat<T: Copy>(
     }
 }
 
+// ---- PREVIOUS long-run fill: element loop instead of doubling memcpy ----
+//
+// The shipped `fill_run` grows long fills by doubling `copy_nonoverlapping`, reaching the
+// libc's runtime-dispatched (AVX2/ERMS) store width. This variant keeps the structure but
+// fills with the plain element loop, which the compiler emits at baseline SSE2 width.
+// `nonnull_v3` (shipped) vs `nonnull_v3_elem_fill` isolates that change: identical below the
+// 2 KiB doubling threshold, shipped pulls ahead above it.
+
+/// # Safety
+///
+/// `dst` must be valid for writes of `len` elements.
+#[inline(never)]
+unsafe fn fill_run_elems<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
+    unsafe {
+        if size_of::<T>() == 1 {
+            let byte: u8 = std::mem::transmute_copy(&value);
+            dst.cast::<u8>().write_bytes(byte, len);
+        } else {
+            for i in 0..len {
+                dst.add(i).write(MaybeUninit::new(value));
+            }
+        }
+    }
+}
+
+/// # Safety
+///
+/// The allocation behind `base` must have room for at least
+/// `max(pos, end) + decode_chunk_len::<T>()` elements.
+#[inline(always)]
+unsafe fn splat_run_elem_fill<T: Copy>(
+    base: *mut MaybeUninit<T>,
+    pos: usize,
+    end: usize,
+    value: T,
+) {
+    let chunk = const { decode_chunk_len::<T>() };
+    // SAFETY: caller guarantees one chunk of slack past max(pos, end).
+    unsafe {
+        let mut p = base.add(pos);
+        let stop = base.add(end);
+        for i in 0..chunk {
+            p.add(i).write(MaybeUninit::new(value));
+        }
+        p = p.add(chunk);
+        if p >= stop {
+            return;
+        }
+        let len = end - pos;
+        if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
+            fill_run_elems(base.add(pos), len, value);
+            return;
+        }
+        loop {
+            for i in 0..chunk {
+                p.add(i).write(MaybeUninit::new(value));
+            }
+            p = p.add(chunk);
+            if p >= stop {
+                break;
+            }
+        }
+    }
+}
+
+/// Non-nullable decode whose long-run fill uses the element loop (see above).
+pub fn decode_v3_elem_fill<E: IntegerPType, T: NativePType>(
+    run_ends: &[E],
+    values: &[T],
+    length: usize,
+) -> (Buffer<T>, Validity) {
+    let offset_e = E::zero();
+    let length_e = E::from_usize(length).unwrap();
+    let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
+    let base = decoded.spare_capacity_mut().as_mut_ptr();
+    let mut pos = 0usize;
+    for (&end, &value) in run_ends.iter().zip(values) {
+        let end = trim_end(end, offset_e, length_e);
+        assert!(
+            end >= pos,
+            "Runend ends must be monotonic, got {end} after {pos}"
+        );
+        // SAFETY: pos <= end <= length and the buffer has one chunk of padding.
+        unsafe { splat_run_elem_fill(base, pos, end, value) };
+        pos = end;
+    }
+    // SAFETY: every element in 0..pos was initialized above.
+    unsafe { decoded.set_len(pos) };
+    (decoded.into(), Nullability::NonNullable.into())
+}
+
 /// Non-nullable decode using the rejected byte word-splat kernel (see above).
 pub fn decode_v3_byte_splat<E: IntegerPType, T: NativePType>(
     run_ends: &[E],

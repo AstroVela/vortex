@@ -236,11 +236,23 @@ fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
 /// loop, and its call cost is amortized over the run.
 const LONG_RUN_FILL_BYTES: usize = 256;
 
+/// Fills of at least this many bytes grow by doubling `copy_nonoverlapping` instead of an
+/// element loop.
+///
+/// The element loop is compiled against the baseline target features (16-byte SSE2 stores),
+/// whereas `memcpy` is resolved by the libc at runtime to the widest implementation the host
+/// supports (AVX2, or `rep movsb` on ERMS parts). Doubling therefore reaches a store width the
+/// compiled loop cannot, but each `memcpy` costs a call, so it only pays once the run is long
+/// enough to amortize it. Measured crossover is ~2 KiB across u16/u32/u64; below it doubling
+/// is up to 2x slower, at and above it is 1.1-1.4x faster. See `run_end_decode_distribution`.
+const DOUBLING_FILL_BYTES: usize = 2048;
+
 /// Fill `dst[..len]` with `value`, used for long runs.
 ///
 /// Deliberately not inlined: inlining a fill loop into the decode loop leaves its codegen at
 /// the mercy of the surrounding register pressure — inside the nullable decode arm the inline
-/// loop otherwise loses its wide vector stores. Byte-sized elements fill via `memset`.
+/// loop otherwise loses its wide vector stores. Byte-sized elements fill via `memset`, which
+/// the libc already dispatches to the best available implementation at any length.
 ///
 /// # Safety
 ///
@@ -251,10 +263,28 @@ unsafe fn fill_run<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
         if size_of::<T>() == 1 {
             let byte: u8 = std::mem::transmute_copy(&value);
             dst.cast::<u8>().write_bytes(byte, len);
-        } else {
-            for i in 0..len {
+            return;
+        }
+        if len * size_of::<T>() >= DOUBLING_FILL_BYTES {
+            // Seed one cache line by hand, then repeatedly copy the filled prefix onto the
+            // tail. `seed <= len` holds because `seed * size_of::<T>()` is at most 64 while
+            // `len * size_of::<T>()` is at least `DOUBLING_FILL_BYTES`.
+            let seed = (64 / size_of::<T>()).max(1);
+            for i in 0..seed {
                 dst.add(i).write(MaybeUninit::new(value));
             }
+            let mut filled = seed;
+            while filled < len {
+                // `n <= filled` keeps the source `dst[..n]` disjoint from the destination
+                // `dst[filled..filled + n]`, and `filled + n <= len` stays in bounds.
+                let n = filled.min(len - filled);
+                std::ptr::copy_nonoverlapping(dst, dst.add(filled), n);
+                filled += n;
+            }
+            return;
+        }
+        for i in 0..len {
+            dst.add(i).write(MaybeUninit::new(value));
         }
     }
 }
@@ -602,16 +632,18 @@ mod tests {
     /// Decode random runs with `runend_decode_primitive` and compare against a naive
     /// element-by-element reference expansion.
     ///
-    /// Random run lengths cover the byte-element memset threshold on both sides, zero-length
-    /// runs, offsets that partially trim the first run, and a final run overshooting the
-    /// logical length; validity covers non-nullable, mixed, and all-invalid values.
+    /// Random run lengths straddle every length-dependent branch in the kernel: the inline
+    /// chunk stores, the out-of-line long-run fill, and the doubling `memcpy` fill (2 KiB,
+    /// which even the widest tested element type only crosses past ~1024-element runs). Also
+    /// covers zero-length runs, offsets that partially trim the first run, and a final run
+    /// overshooting the logical length; validity covers non-nullable, mixed, and all-invalid.
     fn check_decode_matches_reference<T: NativePType + From<u8>>(seed: u64) -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let mut rng = StdRng::seed_from_u64(seed);
 
-        for &max_run_len in &[3usize, 40, 700] {
+        for &max_run_len in &[3usize, 40, 700, 3000] {
             for nullable in [false, true] {
-                let length = rng.random_range(1..=2000);
+                let length = rng.random_range(1..=5000);
                 let offset = if rng.random_bool(0.5) {
                     rng.random_range(0..50)
                 } else {
