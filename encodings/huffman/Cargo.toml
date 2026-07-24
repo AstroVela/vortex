@@ -1,0 +1,47 @@
+[package]
+name = "vortex-huffman"
+authors = { workspace = true }
+categories = { workspace = true }
+description = "Vortex Huffman byte-entropy encoding (PIVCO-Huffman baseline codec)"
+edition = { workspace = true }
+homepage = { workspace = true }
+include = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+# Experimental: codec + benchmarks only, not yet wired up as a Vortex array encoding.
+publish = false
+# benches/datasets.rs is a helper module shared by the declared bench targets, not a
+# bench target itself.
+autobenches = false
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-error = { workspace = true }
+
+[features]
+# Enables the real-data benchmarks (dataset download + comparison codecs).
+_test-harness = []
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+divan = { workspace = true }
+fsst-rs = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rstest = { workspace = true }
+zip = { workspace = true }
+zstd = { workspace = true }
+
+[[bench]]
+name = "real_data"
+harness = false
+required-features = ["_test-harness"]

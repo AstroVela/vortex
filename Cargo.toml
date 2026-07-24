@@ -54,6 +54,7 @@ members = [
     "encodings/alp",
     "encodings/datetime-parts",
     "encodings/fsst",
+    "encodings/huffman",
     "encodings/pco",
     "encodings/sparse",
     "encodings/zigzag",

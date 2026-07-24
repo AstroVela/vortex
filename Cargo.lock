@@ -10285,6 +10285,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-huffman"
+version = "0.1.0"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-cast 58.3.0",
+ "arrow-schema 58.3.0",
+ "codspeed-divan-compat",
+ "fsst-rs",
+ "parquet 58.3.0",
+ "rand 0.10.2",
+ "reqwest 0.13.4",
+ "rstest",
+ "vortex-error",
+ "zip",
+ "zstd",
+]
+
+[[package]]
 name = "vortex-io"
 version = "0.1.0"
 dependencies = [
