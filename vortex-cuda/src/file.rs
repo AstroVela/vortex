@@ -20,6 +20,7 @@ use vortex::layout::segments::SegmentSource;
 
 use crate::CudaSessionExt;
 use crate::PooledFileReadAt;
+use crate::PooledFileReadAtOptions;
 use crate::layout::register_cuda_layout;
 
 /// Extension trait for opening CUDA-readable files from [`VortexOpenOptions`].
@@ -31,7 +32,10 @@ pub trait CudaOpenOptionsExt {
 
 impl CudaOpenOptionsExt for VortexOpenOptions {
     fn with_cuda(self) -> CudaOpenOptions {
-        CudaOpenOptions { inner: self }
+        CudaOpenOptions {
+            inner: self,
+            read_at_options: PooledFileReadAtOptions::default(),
+        }
     }
 }
 
@@ -41,9 +45,18 @@ impl CudaOpenOptionsExt for VortexOpenOptions {
 /// configured before calling `with_cuda`.
 pub struct CudaOpenOptions {
     inner: VortexOpenOptions,
+    read_at_options: PooledFileReadAtOptions,
 }
 
 impl CudaOpenOptions {
+    /// Configure how the pooled data-plane reader opens and reads the local file.
+    ///
+    /// Footer and zone-map reads continue to use the standard buffered host reader.
+    pub fn with_read_at_options(mut self, options: PooledFileReadAtOptions) -> Self {
+        self.read_at_options = options;
+        self
+    }
+
     /// Open a local Vortex file for CUDA execution.
     ///
     /// The footer and zone-map segments are read through the ordinary host path. All other file
@@ -65,11 +78,12 @@ impl CudaOpenOptions {
         let pool = Arc::clone(cuda_session.pinned_buffer_pool());
         drop(cuda_session);
 
-        let reader = Arc::new(PooledFileReadAt::open(
+        let reader = Arc::new(PooledFileReadAt::open_with_options(
             &path,
             session.handle(),
             pool,
             stream,
+            self.read_at_options,
         )?);
         let data_file = data_options
             .with_footer(footer.clone())
