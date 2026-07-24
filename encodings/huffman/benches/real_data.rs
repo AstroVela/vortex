@@ -12,7 +12,13 @@
 //!
 //! A compression-ratio summary table is printed before the divan timing runs.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 mod datasets;
 
@@ -74,6 +80,9 @@ struct OnPairCorpus {
     codes: Vec<onpair::Token>,
     /// The `codes` child huffman-coded (the stacked layout's code stream).
     codes_huff: Vec<u8>,
+    /// The low and high byte planes of `codes`, each huffman-coded separately.
+    codes_huff_lo: Vec<u8>,
+    codes_huff_hi: Vec<u8>,
     /// The dictionary token bytes huffman-coded.
     dict_huff: Vec<u8>,
     num_rows: usize,
@@ -113,6 +122,10 @@ fn onpair_prepare(data: &[u8]) -> OnPairCorpus {
     assert_eq!(decoded_len, flat.len());
     let code_bytes: Vec<u8> = codes.iter().flat_map(|code| code.to_le_bytes()).collect();
     let codes_huff = vortex_huffman::compress(&code_bytes);
+    let lo_plane: Vec<u8> = codes.iter().map(|code| code.to_le_bytes()[0]).collect();
+    let hi_plane: Vec<u8> = codes.iter().map(|code| code.to_le_bytes()[1]).collect();
+    let codes_huff_lo = vortex_huffman::compress(&lo_plane);
+    let codes_huff_hi = vortex_huffman::compress(&hi_plane);
     let dict_huff = vortex_huffman::compress(dict.bytes());
     // One-time verification that the stacked layout round-trips to the row bytes.
     {
@@ -135,6 +148,8 @@ fn onpair_prepare(data: &[u8]) -> OnPairCorpus {
         dict,
         codes,
         codes_huff,
+        codes_huff_lo,
+        codes_huff_hi,
         dict_huff,
         num_rows: offsets.len() - 1,
         compressed_len,
@@ -225,7 +240,64 @@ fn print_ratio_summary() {
         ("wikipedia", &*WIKI_ONPAIR),
     ] {
         print_onpair_huffman_tree(name, onpair_corpus);
+        print_codes_isolation(name, onpair_corpus);
     }
+}
+
+/// The `codes` child in isolation: what Huffman buys over the primitive encodings
+/// Vortex would otherwise use for a bounded u16 token stream, against the
+/// entropy bounds.
+fn print_codes_isolation(name: &str, corpus: &OnPairCorpus) {
+    let num_codes = corpus.codes.len();
+    let raw_len = num_codes * size_of::<onpair::Token>();
+
+    // The primitive alternative: FastLanes-style bit-packing to the token width.
+    let token_bits = usize::BITS - (corpus.dict.num_tokens() - 1).leading_zeros();
+    let bitpacked_len = (num_codes * token_bits as usize).div_ceil(8);
+
+    // Entropy bounds: per-token (the bound for a token-alphabet entropy coder) and
+    // per-byte-plane (the bound for what the byte-oriented planes can reach).
+    let mut token_hist = vec![0u64; corpus.dict.num_tokens()];
+    for &code in &corpus.codes {
+        token_hist[usize::from(code)] += 1;
+    }
+    let total = num_codes as f64;
+    let token_entropy: f64 = token_hist
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = count as f64 / total;
+            -p * p.log2()
+        })
+        .sum();
+    let token_bound_len = (token_entropy * total / 8.0).ceil() as u64;
+
+    let plane_len = corpus.codes_huff_lo.len() + corpus.codes_huff_hi.len();
+    let per_tok = |len: usize| len as f64 * 8.0 / total;
+    println!("### {name}: codes child in isolation ({num_codes} tokens)\n");
+    println!("| representation | size | bits/token | vs raw u16 |");
+    println!("| --- | --- | --- | --- |");
+    println!("| raw u16 primitive | {raw_len} B | 16.0 | 1.000x |");
+    println!(
+        "| bitpack-{token_bits} (FastLanes-style primitive) | {bitpacked_len} B | {token_bits}.0 | {:.3}x |",
+        raw_len as f64 / bitpacked_len as f64,
+    );
+    println!(
+        "| huffman, interleaved u16-LE bytes | {} B | {:.2} | {:.3}x |",
+        corpus.codes_huff.len(),
+        per_tok(corpus.codes_huff.len()),
+        raw_len as f64 / corpus.codes_huff.len() as f64,
+    );
+    println!(
+        "| huffman, split byte planes | {plane_len} B | {:.2} | {:.3}x |",
+        per_tok(plane_len),
+        raw_len as f64 / plane_len as f64,
+    );
+    println!(
+        "| token-alphabet entropy bound | {token_bound_len} B | {token_entropy:.2} | {:.3}x |",
+        raw_len as f64 / token_bound_len as f64,
+    );
+    println!();
 }
 
 /// The array tree an `onpair+huffman` encoding of the corpus would have in Vortex,
@@ -323,6 +395,51 @@ fn decompress_onpair(bencher: Bencher, dataset: &str) {
                 out.as_mut_slice(),
             )
             .unwrap()
+        });
+}
+
+/// The codes child in isolation: huffman decode of the interleaved u16-LE byte
+/// stream, throughput counted in decoded codes bytes.
+#[divan::bench(args = ["clickbench-urls", "wikipedia"])]
+fn decompress_huffman_codes(bencher: Bencher, dataset: &str) {
+    let corpus = match dataset {
+        "clickbench-urls" => &*URLS_ONPAIR,
+        _ => &*WIKI_ONPAIR,
+    };
+    let raw_len = corpus.codes.len() * size_of::<onpair::Token>();
+    let mut out = vec![0u8; raw_len];
+    bencher.counter(BytesCount::new(raw_len)).bench_local(|| {
+        vortex_huffman::decompress_into(divan::black_box(&corpus.codes_huff), &mut out).unwrap()
+    });
+}
+
+/// The codes child as two huffman-coded byte planes: decode both planes and
+/// reassemble the u16 tokens, throughput counted in decoded codes bytes.
+#[divan::bench(args = ["clickbench-urls", "wikipedia"])]
+fn decompress_huffman_codes_planes(bencher: Bencher, dataset: &str) {
+    let corpus = match dataset {
+        "clickbench-urls" => &*URLS_ONPAIR,
+        _ => &*WIKI_ONPAIR,
+    };
+    let num_codes = corpus.codes.len();
+    let mut lo_plane = vec![0u8; num_codes];
+    let mut hi_plane = vec![0u8; num_codes];
+    let mut codes: Vec<onpair::Token> = Vec::with_capacity(num_codes);
+    bencher
+        .counter(BytesCount::new(num_codes * size_of::<onpair::Token>()))
+        .bench_local(|| {
+            vortex_huffman::decompress_into(divan::black_box(&corpus.codes_huff_lo), &mut lo_plane)
+                .unwrap();
+            vortex_huffman::decompress_into(divan::black_box(&corpus.codes_huff_hi), &mut hi_plane)
+                .unwrap();
+            codes.clear();
+            codes.extend(
+                lo_plane
+                    .iter()
+                    .zip(hi_plane.iter())
+                    .map(|(&lo, &hi)| onpair::Token::from_le_bytes([lo, hi])),
+            );
+            codes.len()
         });
 }
 

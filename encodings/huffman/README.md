@@ -71,27 +71,61 @@ OnPair(utf8, 433421 rows, 31.59 MiB of row bytes)
 ╰─ validity:     all-valid
 ```
 
+### The codes child in isolation: Huffman vs primitive encodings
+
+The stacked tree is dominated by the `codes` child (a u16 token stream, dict-12 so
+values < 4096), and the honest baseline for that child in Vortex is not raw u16 but a
+FastLanes-style 12-bit bit-packed primitive, which decodes at >10 GB/s:
+
+clickbench-urls (5,520,224 tokens):
+
+| representation | size | bits/token | vs raw u16 |
+| --- | --- | --- | --- |
+| raw u16 primitive | 11040448 B | 16.0 | 1.000x |
+| bitpack-12 (FastLanes-style primitive) | 8280336 B | 12.0 | 1.333x |
+| huffman, interleaved u16-LE bytes | 9201966 B | 13.34 | 1.200x |
+| huffman, split byte planes | 8032979 B | 11.64 | 1.374x |
+| token-alphabet entropy bound | 7201596 B | 10.44 | 1.533x |
+
+wikipedia (10,270,440 tokens):
+
+| representation | size | bits/token | vs raw u16 |
+| --- | --- | --- | --- |
+| raw u16 primitive | 20540880 B | 16.0 | 1.000x |
+| bitpack-12 (FastLanes-style primitive) | 15405660 B | 12.0 | 1.333x |
+| huffman, interleaved u16-LE bytes | 17355542 B | 13.52 | 1.184x |
+| huffman, split byte planes | 15288030 B | 11.91 | 1.344x |
+| token-alphabet entropy bound | 13992341 B | 10.90 | 1.468x |
+
+Isolated decode of the codes child runs at ~860 MB/s (interleaved) and ~820 MB/s
+(both planes + u16 reassembly), in codes bytes.
+
 Observations:
 
-- Huffman lands within 0.5% of the order-0 entropy bound on both corpora, confirming
-  the codec is ratio-optimal for what order-0 entropy coding can do — but that bound
-  itself (~1.45–1.57x) is far below zstd, which exploits LZ matches these corpora are
-  full of.
-- Stacked on string-codec output, Huffman removes the order-0 redundancy those codecs
-  leave behind: FSST 1.95x → 2.25x (+15%) and OnPair 3.03x → 3.63x (+20%) on URLs;
-  FSST 1.69x → 1.82x and OnPair 1.63x → 1.93x (+18%) on Wikipedia. That stacking, not
-  standalone Huffman, is the promising integration path for Vortex string columns — it
-  keeps the string codec's random-access-friendly per-row structure while shrinking
-  storage.
-- Stacking costs decode speed with the scalar Huffman: OnPair alone bulk-decodes at
-  8.8 / 4.9 GB/s, stacked it drops to 1.67 GB/s / 976 MB/s — the Huffman stage takes
-  ~80% of the stacked decode time. Notably, on URLs the stack still *dominates FSST
-  alone* (1.9x smaller and ~1.4x faster to decode).
-- Scalar 4-stream Huffman decode reaches ~1 GB/s; the PIVCO paper's SIMD decoder
-  reports ~4.3–4.9 GB/s single-core on real-text and high-entropy inputs (Apple M4).
-  Substituting that for the measured Huffman-stage time projects the stacked decode
-  at roughly 5 GB/s on URLs and ~2.9 GB/s on Wikipedia — i.e. with the PIVCO port the
-  entropy stage would no longer dominate, which is the case for doing it.
+- Standalone Huffman lands within 0.5% of the order-0 entropy bound on both corpora,
+  confirming the codec is ratio-optimal for what order-0 entropy coding can do — but
+  that bound itself (~1.45–1.57x) is far below zstd, which exploits LZ matches these
+  corpora are full of.
+- **The isolation corrects the stacking story.** Byte-oriented Huffman over the
+  interleaved u16 code stream (13.3–13.5 bits/token) *loses* to plain 12-bit
+  bit-packing; most of the apparent "onpair+huffman" gain over the raw-u16 tree was
+  just recovering the packing a primitive encoding gives for free. Splitting the u16
+  into two huffman-coded byte planes fixes the mixed-distribution problem but still
+  only beats bit-packing by ~3% (URLs) / ~1% (Wikipedia) — at ~820 MB/s versus
+  >10 GB/s for bit-unpacking. Recomputing the full tree with bit-packed codes:
+  onpair+bitpack reaches 4.03x / 2.17x, versus 4.16x / 2.19x for onpair+plane-huffman.
+- What *would* move the needle is a token-alphabet entropy coder: the per-token
+  entropy bound is 10.44 / 10.90 bits/token, i.e. +13% / +9% beyond bit-packing
+  (full-tree ~4.6x / ~2.4x). That points at Huffman/FSE over 12-bit symbols — note
+  PIVCO-Huffman ships a u16-symbol encoder (`pivco_huffman_u16enc.h`) — rather than
+  byte-oriented Huffman, for code-stream-shaped children.
+- On the raw text itself the stack still holds: on URLs, onpair+huffman decodes at
+  1.7 GB/s even with the scalar Huffman stage (~80% of stacked decode time) and beats
+  FSST alone on both ratio and speed. The PIVCO paper's SIMD decoder reports
+  ~4.3–4.9 GB/s single-core (Apple M4); substituting that for the measured
+  Huffman-stage time projects stacked decode at roughly 5 GB/s on URLs and ~2.9 GB/s
+  on Wikipedia. A port would target the u16-symbol mode to also capture the
+  token-alphabet ratio headroom above.
 
 ## Format
 
