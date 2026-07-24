@@ -216,19 +216,26 @@ fn expand_array_slots(
 
 /// Generate child index constants from a layout child struct definition.
 ///
-/// Each named field becomes a `usize` index constant, in declaration order, so
-/// layout code can reference its children by name instead of by magic index. The
-/// struct itself is preserved unchanged and co-defines the children and their order.
+/// Each named field carries an explicit `#[slot(N)]` attribute, and the macro
+/// derives a `usize` index constant from it, so layout code references its
+/// children by name instead of by magic index and the index is authoritative
+/// rather than positional. The struct co-defines the children and their order;
+/// the `#[slot(N)]` attributes are stripped from the emitted struct.
 ///
 /// Unlike [`array_slots`], this generates *only* the index constants — no view
 /// struct, accessors, or conversion helpers.
+///
+/// Every field must have exactly one `#[slot(N)]` attribute and the indices must
+/// be unique; violations are compile errors.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[layout_slots]
 /// pub struct DictChildren {
+///     #[slot(0)]
 ///     pub values: LayoutRef,
+///     #[slot(1)]
 ///     pub codes: LayoutRef,
 /// }
 /// ```
@@ -236,7 +243,7 @@ fn expand_array_slots(
 /// # Generated output
 ///
 /// ```ignore
-/// pub struct DictChildren { /* unchanged */ }
+/// pub struct DictChildren { /* unchanged, minus #[slot(..)] */ }
 ///
 /// impl DictChildren {
 ///     pub const VALUES: usize = 0;
@@ -253,35 +260,63 @@ pub fn layout_slots(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_layout_slots(item_struct: ItemStruct) -> syn::Result<proc_macro2::TokenStream> {
-    let fields = match &item_struct.fields {
-        Fields::Named(fields) => &fields.named,
-        _ => {
-            return Err(syn::Error::new(
-                item_struct.span(),
-                "#[layout_slots] requires a struct with named fields",
-            ));
-        }
+fn expand_layout_slots(mut item_struct: ItemStruct) -> syn::Result<proc_macro2::TokenStream> {
+    let struct_ident = item_struct.ident.clone();
+
+    let Fields::Named(fields) = &mut item_struct.fields else {
+        return Err(syn::Error::new(
+            item_struct.span(),
+            "#[layout_slots] requires a struct with named fields",
+        ));
     };
 
-    let struct_ident = &item_struct.ident;
+    let mut idx_consts = Vec::with_capacity(fields.named.len());
+    let mut seen: Vec<(usize, proc_macro2::Span)> = Vec::with_capacity(fields.named.len());
 
-    let idx_consts = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let field_ident = field
-                .ident
-                .as_ref()
-                .ok_or_else(|| syn::Error::new(field.span(), "child fields must be named"))?;
-            let field_name = ident_name(field_ident);
-            let const_ident = format_ident!("{}", to_screaming_snake_case(&field_name));
-            Ok(quote! {
-                #[doc = concat!("Child index for `", #field_name, "`.")]
-                pub const #const_ident: usize = #index;
-            })
-        })
-        .collect::<syn::Result<Vec<_>>>()?;
+    for field in fields.named.iter_mut() {
+        let field_ident = field
+            .ident
+            .clone()
+            .ok_or_else(|| syn::Error::new(field.span(), "child fields must be named"))?;
+        let field_name = ident_name(&field_ident);
+        let const_ident = format_ident!("{}", to_screaming_snake_case(&field_name));
+
+        let mut index: Option<(usize, proc_macro2::Span)> = None;
+        for attr in &field.attrs {
+            if !attr.path().is_ident("slot") {
+                continue;
+            }
+            if index.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate #[slot(..)] on a single field",
+                ));
+            }
+            let lit = attr.parse_args::<syn::LitInt>()?;
+            index = Some((lit.base10_parse::<usize>()?, attr.span()));
+        }
+
+        let (index, span) = index.ok_or_else(|| {
+            syn::Error::new(
+                field_ident.span(),
+                format!("field `{field_name}` is missing its #[slot(N)] attribute"),
+            )
+        })?;
+
+        if let Some((_, prev)) = seen.iter().find(|(existing, _)| *existing == index) {
+            let mut err = syn::Error::new(span, format!("duplicate slot index {index}"));
+            err.combine(syn::Error::new(*prev, "previously used here"));
+            return Err(err);
+        }
+        seen.push((index, span));
+
+        field.attrs.retain(|attr| !attr.path().is_ident("slot"));
+
+        idx_consts.push(quote! {
+            #[doc = concat!("Child index for `", #field_name, "`.")]
+            pub const #const_ident: usize = #index;
+        });
+    }
 
     Ok(quote! {
         #item_struct

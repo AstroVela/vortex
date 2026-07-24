@@ -57,8 +57,10 @@ pub type DictLayout = Layout<Dict>;
 #[layout_slots]
 pub struct DictChildren {
     /// The dictionary values, shared across codes.
+    #[slot(0)]
     pub values: LayoutRef,
     /// The codes mapping each row to a dictionary value.
+    #[slot(1)]
     pub codes: LayoutRef,
 }
 
