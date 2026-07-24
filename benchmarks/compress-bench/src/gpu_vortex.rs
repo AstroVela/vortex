@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::hint::black_box;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,8 @@ use vortex_bench::compress::Compressor;
 use vortex_bench::conversions::parquet_to_vortex_chunks;
 use vortex_cuda::CudaOpenOptionsExt;
 use vortex_cuda::CudaSession;
+#[cfg(target_os = "linux")]
+use vortex_cuda::PooledFileReadAtOptions;
 use vortex_cuda::executor::CudaArrayExt;
 use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
@@ -60,17 +63,17 @@ impl Compressor for GpuVortexCompressor {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
         let start = Instant::now();
-        let file = SESSION
-            .open_options()
-            .with_cuda()
-            .open_path(gpu_file.path())
-            .await?;
+        let open_options = SESSION.open_options().with_cuda();
+        #[cfg(target_os = "linux")]
+        let open_options =
+            open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io());
+        let file = open_options.open_path(gpu_file.path()).await?;
         let mut batches = file.scan()?.into_array_stream()?;
 
         while let Some(batch) = batches.next().await {
             let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
             for field in record.iter_unmasked_fields() {
-                let _canonical = field.clone().execute_cuda(&mut cuda_ctx).await?;
+                black_box(field.clone().execute_cuda(&mut cuda_ctx).await?);
             }
         }
         cuda_ctx.synchronize_stream()?;
