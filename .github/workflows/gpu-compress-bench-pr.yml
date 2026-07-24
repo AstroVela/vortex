@@ -42,10 +42,8 @@ jobs:
           nvidia-smi -q -d Memory
       - name: Build GPU compression benchmark
         shell: bash
-        env:
-          RUSTFLAGS: "-C target-cpu=native"
         run: |
-          cargo build --package compress-bench --profile release_debug \
+          cargo build --locked --package compress-bench --profile release_debug \
             --features cuda,unstable_encodings
       - name: Run GPU compression benchmark
         shell: bash
