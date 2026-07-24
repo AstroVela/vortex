@@ -368,14 +368,15 @@ mod tests {
     use crate::sequence::SequentialArrayStreamExt;
     use crate::sequence::SequentialStreamAdapter;
     use crate::sequence::SequentialStreamExt;
-    use crate::test::SESSION;
+    use crate::test::test_session;
 
     async fn write<S: LayoutStrategy>(strategy: &S, array: ArrayRef) -> VortexResult<LayoutRef> {
         let segments = Arc::new(TestSegments::default());
         let (ptr, eof) = SequenceId::root().split();
         let stream = array.to_array_stream().sequenced(ptr);
+        let session = test_session().with_tokio();
         strategy
-            .write_stream(ArrayContext::empty(), segments, stream, eof, &SESSION)
+            .write_stream(ArrayContext::empty(), segments, stream, eof, &session)
             .await
     }
 
@@ -681,7 +682,7 @@ mod tests {
         );
 
         block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             strategy
                 .write_stream(
                     ctx,
