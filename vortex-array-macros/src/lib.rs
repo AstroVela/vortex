@@ -214,6 +214,84 @@ fn expand_array_slots(
     })
 }
 
+/// Generate child index constants from a layout child struct definition.
+///
+/// Each named field becomes a `usize` index constant, in declaration order, so
+/// layout code can reference its children by name instead of by magic index. The
+/// struct itself is preserved unchanged and co-defines the children and their order.
+///
+/// Unlike [`array_slots`], this generates *only* the index constants — no view
+/// struct, accessors, or conversion helpers.
+///
+/// # Example
+///
+/// ```ignore
+/// #[layout_slots]
+/// pub struct DictChildren {
+///     pub values: LayoutRef,
+///     pub codes: LayoutRef,
+/// }
+/// ```
+///
+/// # Generated output
+///
+/// ```ignore
+/// pub struct DictChildren { /* unchanged */ }
+///
+/// impl DictChildren {
+///     pub const VALUES: usize = 0;
+///     pub const CODES: usize = 1;
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn layout_slots(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item_struct = parse_macro_input!(item as ItemStruct);
+
+    match expand_layout_slots(item_struct) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn expand_layout_slots(item_struct: ItemStruct) -> syn::Result<proc_macro2::TokenStream> {
+    let fields = match &item_struct.fields {
+        Fields::Named(fields) => &fields.named,
+        _ => {
+            return Err(syn::Error::new(
+                item_struct.span(),
+                "#[layout_slots] requires a struct with named fields",
+            ));
+        }
+    };
+
+    let struct_ident = &item_struct.ident;
+
+    let idx_consts = fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let field_ident = field
+                .ident
+                .as_ref()
+                .ok_or_else(|| syn::Error::new(field.span(), "child fields must be named"))?;
+            let field_name = ident_name(field_ident);
+            let const_ident = format_ident!("{}", to_screaming_snake_case(&field_name));
+            Ok(quote! {
+                #[doc = concat!("Child index for `", #field_name, "`.")]
+                pub const #const_ident: usize = #index;
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+
+    Ok(quote! {
+        #item_struct
+
+        impl #struct_ident {
+            #(#idx_consts)*
+        }
+    })
+}
+
 struct SlotField {
     field_ident: Ident,
     field_vis: Visibility,

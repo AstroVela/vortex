@@ -90,6 +90,7 @@ pub use mask_future::*;
 pub use metadata::*;
 pub use smallvec;
 pub use vortex_array_macros::array_slots;
+pub use vortex_array_macros::layout_slots;
 use vortex_session::SessionExt;
 use vortex_session::VortexSession;
 use vortex_session::registry::Context;

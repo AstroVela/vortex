@@ -35,6 +35,7 @@ use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
+use super::DictChildren;
 use super::DictLayout;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
@@ -67,8 +68,8 @@ impl DictReader {
         session: VortexSession,
         ctx: crate::LayoutReaderContext,
     ) -> VortexResult<Self> {
-        let values_layout = layout.child(0)?;
-        let codes_layout = layout.child(1)?;
+        let values_layout = layout.child(DictChildren::VALUES)?;
+        let codes_layout = layout.child(DictChildren::CODES)?;
         let values_len = usize::try_from(values_layout.row_count())?;
         let values = values_layout.new_reader(
             format!("{name}.values").into(),

@@ -11,6 +11,7 @@ use vortex_array::ProstMetadata;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::layout_slots;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -48,6 +49,19 @@ pub struct DictData {
 /// A dictionary values child paired with a codes child.
 pub type DictLayout = Layout<Dict>;
 
+/// Co-defines the children of a [`DictLayout`] and their storage order.
+///
+/// The `#[layout_slots]` attribute derives a `usize` index constant per field
+/// (`DictChildren::VALUES`, `DictChildren::CODES`), so the layout references its
+/// children by name instead of by magic index.
+#[layout_slots]
+pub struct DictChildren {
+    /// The dictionary values, shared across codes.
+    pub values: LayoutRef,
+    /// The codes mapping each row to a dictionary value.
+    pub codes: LayoutRef,
+}
+
 impl VTable for Dict {
     type LayoutData = DictData;
     type Metadata = ProstMetadata<DictLayoutMetadata>;
@@ -80,8 +94,8 @@ impl VTable for Dict {
             .map(Nullability::from)
             .unwrap_or_else(|| args.dtype.nullability());
         let codes_dtype = DType::Primitive(metadata.codes_ptype(), codes_nullable);
-        args.children.child(0, args.dtype)?;
-        let codes = args.children.child(1, &codes_dtype)?;
+        args.children.child(DictChildren::VALUES, args.dtype)?;
+        let codes = args.children.child(DictChildren::CODES, &codes_dtype)?;
         vortex_ensure!(
             codes.row_count() == args.row_count,
             "Dictionary codes row count does not match parent"
@@ -94,16 +108,16 @@ impl VTable for Dict {
 
     fn child_dtype(layout: &Layout<Self>, idx: usize) -> VortexResult<DType> {
         match idx {
-            0 => Ok(layout.dtype().clone()),
-            1 => Ok(layout.codes_dtype.clone()),
+            DictChildren::VALUES => Ok(layout.dtype().clone()),
+            DictChildren::CODES => Ok(layout.codes_dtype.clone()),
             _ => vortex_bail!("Dict child index out of bounds: {idx}"),
         }
     }
 
     fn child_type(_layout: &Layout<Self>, idx: usize) -> LayoutChildType {
         match idx {
-            0 => LayoutChildType::Auxiliary("values".into()),
-            1 => LayoutChildType::Transparent("codes".into()),
+            DictChildren::VALUES => LayoutChildType::Auxiliary("values".into()),
+            DictChildren::CODES => LayoutChildType::Transparent("codes".into()),
             _ => vortex_panic!("Dict child index out of bounds: {idx}"),
         }
     }
