@@ -201,6 +201,35 @@ async fn test_decimal_mul_filter_falls_back() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Unsupported decimal arithmetic nested below casts must keep the complete filter in
+/// DataFusion instead of being accepted and failing during Vortex expression coercion.
+#[tokio::test]
+async fn test_decimal_mul_under_nested_casts_falls_back() -> anyhow::Result<()> {
+    let ctx = TestSessionContext::default();
+    decimal_table(&ctx).await?;
+
+    let sql = "SELECT a FROM tbl WHERE CAST(a + CAST(a * b AS DECIMAL(24, 4)) AS DOUBLE) = 215.25";
+    let result = ctx.session.sql(sql).await?.collect().await?;
+
+    assert_batches_eq!(
+        [
+            "+-------+",
+            "| a     |",
+            "+-------+",
+            "| 10.50 |",
+            "+-------+"
+        ],
+        &result
+    );
+
+    let plan = explain(&ctx, sql).await?;
+    assert!(
+        plan.contains("FilterExec"),
+        "expected DataFusion fallback:\n{plan}"
+    );
+    Ok(())
+}
+
 /// Decimal Add/Sub in projections, with and without projection pushdown.
 #[rstest]
 #[tokio::test]
@@ -257,6 +286,35 @@ async fn test_decimal_mul_projection_falls_back(
             "| 200.0000 |",
             "| 204.7500 |",
             "+----------+",
+        ],
+        &result
+    );
+    Ok(())
+}
+
+/// Falling back on an unsupported subtree must retain columns used by the rest of the
+/// projection expression.
+#[tokio::test]
+async fn test_decimal_mul_nested_in_add_projection_falls_back() -> anyhow::Result<()> {
+    let ctx = TestSessionContext::new(true);
+    decimal_table(&ctx).await?;
+
+    let result = ctx
+        .session
+        .sql("SELECT a + b * c AS mixed FROM tbl ORDER BY mixed")
+        .await?
+        .collect()
+        .await?;
+
+    assert_batches_eq!(
+        [
+            "+-----------+",
+            "| mixed     |",
+            "+-----------+",
+            "| 10.000000 |",
+            "| 10.501950 |",
+            "| 45.000000 |",
+            "+-----------+",
         ],
         &result
     );

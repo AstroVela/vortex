@@ -399,7 +399,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                     && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
                 {
                     scan_projection.extend(
-                        collect_columns(node)
+                        collect_columns(&projection_expr.expr)
                             .into_iter()
                             .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
                     );
@@ -415,7 +415,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                     && !decimal_arithmetic_can_be_pushed_down(binary_expr, input_schema)
                 {
                     scan_projection.extend(
-                        collect_columns(node)
+                        collect_columns(&projection_expr.expr)
                             .into_iter()
                             .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
                     );
@@ -550,9 +550,12 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
 /// This is less restrictive than can_be_pushed_down since it only checks
 /// expression types, not data type support.
 fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if !expression_tree_decimal_arithmetic_ok(expr, schema) {
+        return false;
+    }
+
     // Expression types that convert() handles
-    expr.downcast_ref::<df_expr::BinaryExpr>()
-        .is_some_and(|binary| binary_tree_decimal_arithmetic_ok(binary, schema))
+    expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
         || expr.downcast_ref::<df_expr::Column>().is_some()
         || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
         || expr.downcast_ref::<df_expr::Literal>().is_some()
@@ -569,16 +572,14 @@ fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
         })
 }
 
-/// Walk a [`df_expr::BinaryExpr`] tree checking that every decimal arithmetic node can be
-/// pushed down. Non-binary children are accepted structurally, matching
-/// [`is_convertible_expr`]'s shallow contract.
-fn binary_tree_decimal_arithmetic_ok(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
-    decimal_arithmetic_can_be_pushed_down(binary, schema)
-        && [binary.left(), binary.right()].into_iter().all(|child| {
-            child
-                .downcast_ref::<df_expr::BinaryExpr>()
-                .is_none_or(|b| binary_tree_decimal_arithmetic_ok(b, schema))
-        })
+/// Checks that every decimal arithmetic node in an expression tree can be pushed down.
+fn expression_tree_decimal_arithmetic_ok(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    expr.downcast_ref::<df_expr::BinaryExpr>()
+        .is_none_or(|binary| decimal_arithmetic_can_be_pushed_down(binary, schema))
+        && expr
+            .children()
+            .into_iter()
+            .all(|child| expression_tree_decimal_arithmetic_ok(child, schema))
 }
 
 /// A numeric [`df_expr::BinaryExpr`] over decimals is pushable only when Vortex can reproduce
