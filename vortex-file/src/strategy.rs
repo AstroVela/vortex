@@ -120,14 +120,10 @@ impl WriteStrategyBuilder {
     /// Override the allowed array encodings for file writing.
     ///
     /// The configured flat leaf strategy is wrapped in a [`LayoutStrategyEncodingValidator`]
-    /// that recursively checks every chunk before passing it to the leaf writer.
+    /// that recursively checks every chunk before passing it to the leaf writer. [`build`](Self::build)
+    /// also restricts any [`BtrBlocksCompressorBuilder`] to these encodings, independent of the
+    /// order in which the builder and this policy were configured.
     pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
-        self.compressor = match self.compressor {
-            CompressorConfig::BtrBlocks(builder) => {
-                CompressorConfig::BtrBlocks(builder.retain_allowed_encodings(&allow_encodings))
-            }
-            compressor => compressor,
-        };
         self.allow_encodings = Some(allow_encodings);
         self
     }
@@ -144,13 +140,9 @@ impl WriteStrategyBuilder {
     /// Override the default [`BtrBlocksCompressorBuilder`] used for compression.
     ///
     /// The builder is finalized during [`build`](Self::build), producing two compressors: one for
-    /// data (with `IntDictScheme` excluded) and one for stats.
+    /// data (with `IntDictScheme` excluded) and one for stats. Both are restricted to the
+    /// configured allowed encodings at build time.
     pub fn with_btrblocks_builder(mut self, builder: BtrBlocksCompressorBuilder) -> Self {
-        let builder = if let Some(allow_encodings) = &self.allow_encodings {
-            builder.retain_allowed_encodings(allow_encodings)
-        } else {
-            builder
-        };
         self.compressor = CompressorConfig::BtrBlocks(builder);
         self
     }
@@ -178,6 +170,20 @@ impl WriteStrategyBuilder {
         } else {
             Arc::new(FlatLayoutStrategy::default())
         };
+
+        // Restrict the compressor to the allowed encodings so no compressor derived below (data,
+        // stats, and the defaulted probe compressor) can produce an encoding outside the policy,
+        // regardless of the order in which the builder and the policy were configured.
+        let compressor = match self.compressor {
+            CompressorConfig::BtrBlocks(builder) => CompressorConfig::BtrBlocks(
+                match &self.allow_encodings {
+                    Some(allow_encodings) => builder.retain_allowed_encodings(allow_encodings),
+                    None => builder,
+                },
+            ),
+            opaque => opaque,
+        };
+
         let flat: Arc<dyn LayoutStrategy> = if let Some(allow_encodings) = self.allow_encodings {
             Arc::new(LayoutStrategyEncodingValidator::new(flat, allow_encodings))
         } else {
@@ -193,7 +199,7 @@ impl WriteStrategyBuilder {
         // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
         // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
         // dictionary-encode the integer codes produced by that earlier step.
-        let data_compressor: Arc<dyn CompressorPlugin> = match &self.compressor {
+        let data_compressor: Arc<dyn CompressorPlugin> = match &compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(
                 builder
                     .clone()
@@ -222,7 +228,7 @@ impl WriteStrategyBuilder {
         );
 
         // 2.1. | 3.1. compress stats tables and dict values.
-        let stats_compressor: Arc<dyn CompressorPlugin> = match self.compressor {
+        let stats_compressor: Arc<dyn CompressorPlugin> = match compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
             CompressorConfig::Opaque(compressor) => compressor,
         };
