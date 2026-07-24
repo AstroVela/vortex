@@ -10,7 +10,6 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use futures::stream;
-use smallvec::SmallVec;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -24,6 +23,7 @@ use crate::IntoArray;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
+use crate::array_slots;
 use crate::arrays::Chunked;
 use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
@@ -35,8 +35,17 @@ use crate::stream::ArrayStream;
 use crate::stream::ArrayStreamAdapter;
 use crate::validity::Validity;
 
-pub(super) const CHUNK_OFFSETS_SLOT: usize = 0;
-pub(super) const CHUNKS_OFFSET: usize = 1;
+/// Slot layout of a [`Chunked`] array: `[chunk_offsets, chunks...]`.
+#[array_slots(Chunked)]
+pub struct ChunkedSlots {
+    /// The non-nullable `u64` array of cumulative chunk offsets.
+    pub chunk_offsets: ArrayRef,
+    /// The chunk arrays, each sharing the outer dtype.
+    pub chunks: Vec<ArrayRef>,
+}
+
+pub(super) const CHUNK_OFFSETS_SLOT: usize = ChunkedSlots::CHUNK_OFFSETS;
+pub(super) const CHUNKS_OFFSET: usize = ChunkedSlots::CHUNKS_OFFSET;
 
 #[derive(Clone, Debug)]
 pub struct ChunkedData {
@@ -84,7 +93,8 @@ pub trait ChunkedArrayExt: TypedArrayRef<Chunked> {
         Box::new(self.iter_chunks().filter(|chunk| !chunk.is_empty()))
     }
 
-    fn chunk_offsets(&self) -> &[usize] {
+    /// Returns the cached chunk boundary offsets.
+    fn chunk_offset_values(&self) -> &[usize] {
         &self.chunk_offsets
     }
 
@@ -93,12 +103,12 @@ pub trait ChunkedArrayExt: TypedArrayRef<Chunked> {
             index <= self.as_ref().len(),
             "Index out of bounds of the array"
         );
-        let chunk_offsets = self.chunk_offsets();
-        let index_chunk = chunk_offsets
+        let chunk_offset_values = self.chunk_offset_values();
+        let index_chunk = chunk_offset_values
             .search_sorted(&index, SearchSortedSide::Right)?
             .to_ends_index(self.nchunks() + 1)
             .saturating_sub(1);
-        let chunk_start = chunk_offsets[index_chunk];
+        let chunk_start = chunk_offset_values[index_chunk];
         let index_in_chunk = index - chunk_start;
         Ok((index_chunk, index_in_chunk))
     }
@@ -138,20 +148,14 @@ impl ChunkedData {
         chunk_offsets
     }
 
-    pub(super) fn make_slots(chunk_offsets: &[usize], chunks: &[ArrayRef]) -> ArraySlots {
+    pub(super) fn make_chunk_offsets_array(chunk_offsets: &[usize]) -> ArrayRef {
         let mut chunk_offsets_buf = BufferMut::<u64>::with_capacity(chunk_offsets.len());
         for &offset in chunk_offsets {
             let offset = u64::try_from(offset)
                 .vortex_expect("chunk offset must fit in u64 for serialization");
             unsafe { chunk_offsets_buf.push_unchecked(offset) }
         }
-
-        let mut slots = SmallVec::with_capacity(1 + chunks.len());
-        slots.push(Some(
-            PrimitiveArray::new(chunk_offsets_buf.freeze(), Validity::NonNullable).into_array(),
-        ));
-        slots.extend(chunks.iter().map(|c| Some(c.clone())));
-        slots
+        PrimitiveArray::new(chunk_offsets_buf.freeze(), Validity::NonNullable).into_array()
     }
 
     /// Validates the components that would be used to create a `ChunkedArray`.
@@ -256,10 +260,18 @@ impl Array<Chunked> {
     pub unsafe fn new_unchecked(chunks: Vec<ArrayRef>, dtype: DType) -> Self {
         let len = chunks.iter().map(|chunk| chunk.len()).sum();
         let chunk_offsets = ChunkedData::compute_chunk_offsets(&chunks);
+        // Move `chunks` into the slot storage rather than cloning each `ArrayRef`. The generated
+        // `into_slots` pushes the offsets array then `extend`s the tail, which reserves from the
+        // `Vec`'s exact size hint (a single allocation).
+        let slots = ChunkedSlots {
+            chunk_offsets: ChunkedData::make_chunk_offsets_array(&chunk_offsets),
+            chunks,
+        }
+        .into_slots();
         unsafe {
             Array::from_parts_unchecked(
-                ArrayParts::new(Chunked, dtype, len, ChunkedData::new(chunk_offsets.clone()))
-                    .with_slots(ChunkedData::make_slots(&chunk_offsets, &chunks)),
+                ArrayParts::new(Chunked, dtype, len, ChunkedData::new(chunk_offsets))
+                    .with_slots(slots),
             )
         }
     }

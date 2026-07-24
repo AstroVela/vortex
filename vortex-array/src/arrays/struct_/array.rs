@@ -6,6 +6,7 @@ use std::iter::once;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use vortex_array_macros::array_slots;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -30,10 +31,19 @@ use crate::dtype::StructFields;
 use crate::validity::Validity;
 
 // StructArray has a variable number of slots: [validity?, field_0, ..., field_N]
+/// Slot layout of a [`Struct`] array: `[validity?, fields...]`.
+#[array_slots(Struct)]
+pub struct StructSlots {
+    /// The optional row-level validity child.
+    pub validity: Option<ArrayRef>,
+    /// The field arrays, one per struct field, all sharing the outer length.
+    pub fields: Vec<ArrayRef>,
+}
+
 /// The validity bitmap indicating which struct elements are non-null.
-pub(super) const VALIDITY_SLOT: usize = 0;
+pub(super) const VALIDITY_SLOT: usize = StructSlots::VALIDITY;
 /// The offset at which the struct field arrays begin in the slots vector.
-pub(super) const FIELDS_OFFSET: usize = 1;
+pub(super) const FIELDS_OFFSET: usize = StructSlots::FIELDS_OFFSET;
 
 /// A struct array that stores multiple named fields as columns, similar to a database row.
 ///
@@ -168,9 +178,11 @@ pub(super) fn make_struct_slots(
     validity: &Validity,
     length: usize,
 ) -> ArraySlots {
-    once(validity_to_child(validity, length))
-        .chain(fields.iter().cloned().map(Some))
-        .collect()
+    StructSlots {
+        validity: validity_to_child(validity, length),
+        fields: fields.to_vec(),
+    }
+    .into_slots()
 }
 
 pub trait StructArrayExt: TypedArrayRef<Struct> {
