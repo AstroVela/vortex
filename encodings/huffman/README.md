@@ -49,12 +49,27 @@ Compression ratio (raw / compressed), 32 MiB per corpus:
 | wikipedia | 5.083 bpb (bound 1.574x) | 1.569x | 2.821x | 1.691x | 1.818x | 1.631x | 1.930x |
 
 Median single-thread decompression throughput (counted in uncompressed bytes), plus
-huffman compression for context:
+huffman compression for context. `onpair+huffman` is the full stacked decode:
+huffman-decode the code stream and dictionary, rebuild + widen the dictionary, then
+onpair-decode the rows:
 
-| dataset | huffman | zstd-3 | fsst | onpair | huffman compress |
-| --- | --- | --- | --- | --- | --- |
-| clickbench-urls | 987 MB/s | 2.02 GB/s | 1.31 GB/s | 8.22 GB/s | 148 MB/s |
-| wikipedia | 996 MB/s | 820 MB/s | 1.17 GB/s | 4.71 GB/s | 122 MB/s |
+| dataset | huffman | zstd-3 | fsst | onpair | onpair+huffman | huffman compress |
+| --- | --- | --- | --- | --- | --- | --- |
+| clickbench-urls | 1.01 GB/s | 2.06 GB/s | 1.23 GB/s | 8.76 GB/s | 1.67 GB/s | 148 MB/s |
+| wikipedia | 1.01 GB/s | 893 MB/s | 1.17 GB/s | 4.88 GB/s | 976 MB/s | 128 MB/s |
+
+The stacked `onpair+huffman` array tree the bench models (sizes for the 32 MiB URL
+corpus; the bench prints both datasets' trees):
+
+```text
+OnPair(utf8, 433421 rows, 31.59 MiB of row bytes)
+├─ codes:        Huffman(9.20 MB) over PrimitiveArray<u16> x5520224 (11.04 MB raw)
+├─ dict_bytes:   Huffman(15.8 KB) over token bytes (21.4 KB raw, 4096 tokens)
+├─ dict_offsets: PrimitiveArray<u32> x4097 (16.4 KB)
+├─ row_offsets:  PrimitiveArray<u32> x433422 (excluded from ratio accounting,
+│                like FSST's; FastLanes-bitpacked in practice)
+╰─ validity:     all-valid
+```
 
 Observations:
 
@@ -68,11 +83,15 @@ Observations:
   standalone Huffman, is the promising integration path for Vortex string columns — it
   keeps the string codec's random-access-friendly per-row structure while shrinking
   storage.
-- Scalar 4-stream Huffman decode reaches ~1 GB/s. The PIVCO paper's SIMD decoder
-  reports 4.3–4.8 GB/s on real text on Apple M4, which is the motivation for the
-  follow-up port — at those speeds the entropy stage stops being the scan bottleneck
-  (OnPair bulk-decodes at 4.7–8.2 GB/s here, so today a Huffman stage would dominate
-  a stacked decode).
+- Stacking costs decode speed with the scalar Huffman: OnPair alone bulk-decodes at
+  8.8 / 4.9 GB/s, stacked it drops to 1.67 GB/s / 976 MB/s — the Huffman stage takes
+  ~80% of the stacked decode time. Notably, on URLs the stack still *dominates FSST
+  alone* (1.9x smaller and ~1.4x faster to decode).
+- Scalar 4-stream Huffman decode reaches ~1 GB/s; the PIVCO paper's SIMD decoder
+  reports ~4.3–4.9 GB/s single-core on real-text and high-entropy inputs (Apple M4).
+  Substituting that for the measured Huffman-stage time projects the stacked decode
+  at roughly 5 GB/s on URLs and ~2.9 GB/s on Wikipedia — i.e. with the PIVCO port the
+  entropy stage would no longer dominate, which is the case for doing it.
 
 ## Format
 

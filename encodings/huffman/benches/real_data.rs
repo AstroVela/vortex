@@ -72,6 +72,11 @@ static URLS_FSST: LazyLock<FsstCorpus> = LazyLock::new(|| fsst_prepare(&URLS));
 struct OnPairCorpus {
     dict: onpair::CompactDictionary,
     codes: Vec<onpair::Token>,
+    /// The `codes` child huffman-coded (the stacked layout's code stream).
+    codes_huff: Vec<u8>,
+    /// The dictionary token bytes huffman-coded.
+    dict_huff: Vec<u8>,
+    num_rows: usize,
     compressed_len: usize,
     /// Concatenated decoded rows (the corpus minus its newlines), for verification
     /// and throughput accounting.
@@ -106,9 +111,32 @@ fn onpair_prepare(data: &[u8]) -> OnPairCorpus {
         codes.len() * size_of::<onpair::Token>() + dict.bytes().len() + dict.offsets().len() * 4;
     let decoded_len = onpair::decoded_len(&codes, dict.as_view());
     assert_eq!(decoded_len, flat.len());
+    let code_bytes: Vec<u8> = codes.iter().flat_map(|code| code.to_le_bytes()).collect();
+    let codes_huff = vortex_huffman::compress(&code_bytes);
+    let dict_huff = vortex_huffman::compress(dict.bytes());
+    // One-time verification that the stacked layout round-trips to the row bytes.
+    {
+        use std::mem::MaybeUninit;
+
+        let decoded_code_bytes = vortex_huffman::decompress(&codes_huff).expect("codes round-trip");
+        assert_eq!(decoded_code_bytes, code_bytes);
+        let decoded_dict_bytes = vortex_huffman::decompress(&dict_huff).expect("dict round-trip");
+        let rebuilt =
+            onpair::CompactDictionary::validate(decoded_dict_bytes, dict.offsets().to_vec())
+                .expect("dictionary must validate after round-trip");
+        let mut buf = vec![MaybeUninit::<u8>::uninit(); decoded_len + onpair::DECODE_PADDING];
+        let written = onpair::try_decode_into(&codes, rebuilt.as_view(), buf.as_mut_slice())
+            .expect("stacked decode");
+        assert_eq!(written, flat.len());
+        let decoded: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), written) };
+        assert_eq!(decoded, flat.as_slice());
+    }
     OnPairCorpus {
         dict,
         codes,
+        codes_huff,
+        dict_huff,
+        num_rows: offsets.len() - 1,
         compressed_len,
         decoded_len,
         raw_len: data.len(),
@@ -166,17 +194,13 @@ fn print_ratio_summary() {
         assert_eq!(vortex_huffman::decompress(huff).unwrap(), *raw);
         let entropy = order0_entropy(raw);
         // Entropy-code the FSST/OnPair outputs: the realistic stacking for string
-        // columns. For OnPair, the code stream and dictionary are entropy-coded.
+        // columns. For OnPair, the code stream and dictionary token bytes are each
+        // huffman-coded as separate children (see the array tree below).
         let fsst_concat: Vec<u8> = fsst_corpus.lines.concat();
         let fsst_huff_len = vortex_huffman::compress(&fsst_concat).len();
-        let onpair_bytes: Vec<u8> = onpair_corpus
-            .codes
-            .iter()
-            .flat_map(|code| code.to_le_bytes())
-            .chain(onpair_corpus.dict.bytes().iter().copied())
-            .collect();
-        let onpair_huff_len =
-            vortex_huffman::compress(&onpair_bytes).len() + onpair_corpus.dict.offsets().len() * 4;
+        let onpair_huff_len = onpair_corpus.codes_huff.len()
+            + onpair_corpus.dict_huff.len()
+            + onpair_corpus.dict.offsets().len() * 4;
         println!(
             "| {name} | {entropy:.3} bpb (bound {:.3}x) | {:.3}x ({} B) | {:.3}x ({} B) | {:.3}x ({} B) | {:.3}x ({} B) | {:.3}x ({} B) | {:.3}x ({} B) |",
             8.0 / entropy,
@@ -195,6 +219,54 @@ fn print_ratio_summary() {
         );
     }
     println!();
+
+    for (name, onpair_corpus) in [
+        ("clickbench-urls", &*URLS_ONPAIR),
+        ("wikipedia", &*WIKI_ONPAIR),
+    ] {
+        print_onpair_huffman_tree(name, onpair_corpus);
+    }
+}
+
+/// The array tree an `onpair+huffman` encoding of the corpus would have in Vortex,
+/// with concrete child sizes. Mirrors the children of the `OnPair` array in
+/// `vortex-onpair`, with the two byte-payload children wrapped in Huffman.
+fn print_onpair_huffman_tree(name: &str, corpus: &OnPairCorpus) {
+    let num_tokens = corpus.dict.num_tokens();
+    let code_bytes = corpus.codes.len() * size_of::<onpair::Token>();
+    println!(
+        "### {name}: onpair+huffman array tree ({} rows)\n",
+        corpus.num_rows
+    );
+    println!("```text");
+    println!(
+        "OnPair(utf8, {} rows, {:.2} MiB of row bytes)",
+        corpus.num_rows,
+        corpus.decoded_len as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "├─ codes:        Huffman({} B) over PrimitiveArray<u16> x{} ({} B raw)",
+        corpus.codes_huff.len(),
+        corpus.codes.len(),
+        code_bytes,
+    );
+    println!(
+        "├─ dict_bytes:   Huffman({} B) over token bytes ({} B raw, {num_tokens} tokens)",
+        corpus.dict_huff.len(),
+        corpus.dict.bytes().len(),
+    );
+    println!(
+        "├─ dict_offsets: PrimitiveArray<u32> x{} ({} B)",
+        corpus.dict.offsets().len(),
+        corpus.dict.offsets().len() * 4,
+    );
+    println!(
+        "├─ row_offsets:  PrimitiveArray<u32> x{} (excluded from ratio accounting,",
+        corpus.num_rows + 1,
+    );
+    println!("│                like FSST's; FastLanes-bitpacked in practice)");
+    println!("╰─ validity:     all-valid");
+    println!("```\n");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -251,6 +323,44 @@ fn decompress_onpair(bencher: Bencher, dataset: &str) {
                 out.as_mut_slice(),
             )
             .unwrap()
+        });
+}
+
+/// Full stacked decode: huffman-decode the code stream and dictionary bytes, rebuild
+/// the dictionary (validate + widen), then onpair-decode the rows. This is the whole
+/// per-chunk scan path of the stacked layout; only the output buffers are reused
+/// across iterations.
+#[divan::bench(args = ["clickbench-urls", "wikipedia"])]
+fn decompress_onpair_huffman(bencher: Bencher, dataset: &str) {
+    use std::mem::MaybeUninit;
+
+    use onpair::Dictionary;
+
+    let corpus = match dataset {
+        "clickbench-urls" => &*URLS_ONPAIR,
+        _ => &*WIKI_ONPAIR,
+    };
+    let mut code_bytes = vec![0u8; corpus.codes.len() * size_of::<onpair::Token>()];
+    let mut codes: Vec<onpair::Token> = Vec::with_capacity(corpus.codes.len());
+    let dict_offsets = corpus.dict.offsets().to_vec();
+    let mut out = vec![MaybeUninit::<u8>::uninit(); corpus.decoded_len + onpair::DECODE_PADDING];
+    bencher
+        .counter(BytesCount::new(corpus.decoded_len))
+        .bench_local(|| {
+            vortex_huffman::decompress_into(divan::black_box(&corpus.codes_huff), &mut code_bytes)
+                .unwrap();
+            codes.clear();
+            codes.extend(
+                code_bytes
+                    .chunks_exact(2)
+                    .map(|pair| onpair::Token::from_le_bytes([pair[0], pair[1]])),
+            );
+            let dict_bytes =
+                vortex_huffman::decompress(divan::black_box(&corpus.dict_huff)).unwrap();
+            let dict = onpair::CompactDictionary::validate(dict_bytes, dict_offsets.clone())
+                .expect("dictionary must round-trip");
+            let wide = dict.as_view().to_wide();
+            onpair::try_decode_into(&codes, wide.as_view(), out.as_mut_slice()).unwrap()
         });
 }
 
