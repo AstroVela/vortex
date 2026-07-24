@@ -7,7 +7,6 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use divan::Bencher;
-use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -21,12 +20,6 @@ use vortex_buffer::BufferMut;
 use vortex_runend::compress::runend_decode_primitive;
 use vortex_runend::decompress_bool::runend_decode_bools;
 use vortex_session::VortexSession;
-
-// Decoding allocates its output buffers inside the timed region, so route allocation through
-// vendored mimalloc to keep glibc malloc (which varies across runner images) out of the
-// measured trace.
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();

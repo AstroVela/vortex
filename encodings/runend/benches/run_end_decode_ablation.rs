@@ -25,7 +25,6 @@ use std::mem::MaybeUninit;
 
 use divan::Bencher;
 use itertools::Itertools;
-use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -41,9 +40,6 @@ use vortex_buffer::BufferMut;
 use vortex_mask::Mask;
 use vortex_runend::compress::runend_decode_typed_primitive;
 use vortex_runend::trimmed_ends_iter;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();
