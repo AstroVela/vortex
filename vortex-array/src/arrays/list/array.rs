@@ -33,6 +33,7 @@ use crate::arrays::Primitive;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
+use crate::expr::stats::Stat;
 use crate::legacy_session;
 use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
@@ -205,6 +206,11 @@ impl ListData {
         // We can safely unwrap the DType as primitive now
         let offsets_ptype = offsets.dtype().as_ptype();
         let mut ctx = legacy_session().create_execution_ctx();
+
+        // offsets stats may be malformed, we can't trust them
+        offsets.statistics().clear(Stat::IsSorted);
+        offsets.statistics().clear(Stat::Min);
+        offsets.statistics().clear(Stat::Max);
 
         // Offsets must be sorted (but not strictly sorted, zero-length lists are allowed)
         if let Some(is_sorted) = offsets.statistics().compute_is_sorted(&mut ctx) {

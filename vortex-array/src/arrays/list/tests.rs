@@ -25,7 +25,10 @@ use crate::builders::ListBuilder;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType::I32;
+use crate::expr::stats::Precision;
+use crate::expr::stats::Stat;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 use crate::validity::Validity;
 
 /// A shared session for `List` tests, used to create execution contexts.
@@ -70,6 +73,56 @@ fn test_simple_list_array() {
     assert_eq!(
         Scalar::list(Arc::new(I32.into()), vec![5.into()], Nullability::Nullable),
         list.execute_scalar(2, &mut ctx).unwrap()
+    );
+}
+
+/// https://github.com/vortex-data/vortex/issues/8823
+/// Array can supply invalid stat offsets with IsSorted.
+#[test]
+fn test_malformed_stat() {
+    let elements = buffer![1i32, 2, 3, 4, 5].into_array();
+    let offsets = buffer![0i32, 5, 3].into_array();
+
+    offsets
+        .statistics()
+        .set(Stat::IsSorted, Precision::Exact(ScalarValue::from(true)));
+    offsets
+        .statistics()
+        .set(Stat::Min, Precision::Exact(ScalarValue::from(0i32)));
+    offsets
+        .statistics()
+        .set(Stat::Max, Precision::Exact(ScalarValue::from(5i32)));
+
+    let err = ListArray::try_new(elements, offsets, Validity::NonNullable)
+        .expect_err("unsorted offsets must be rejected");
+    assert!(
+        err.to_string().contains("offsets must be sorted"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A forged min/max that hides a max offset beyond the elements length must also be rejected.
+#[test]
+fn test_rejects_out_of_bounds_offsets_with_forged_min_max_stat() {
+    let elements = buffer![1i32, 2, 3].into_array();
+    let offsets = buffer![0i32, 1, 100].into_array();
+
+    offsets
+        .statistics()
+        .set(Stat::IsSorted, Precision::Exact(ScalarValue::from(true)));
+    offsets
+        .statistics()
+        .set(Stat::Min, Precision::Exact(ScalarValue::from(0i32)));
+    offsets
+        .statistics()
+        .set(Stat::Max, Precision::Exact(ScalarValue::from(3i32)));
+
+    let err = ListArray::try_new(elements, offsets, Validity::NonNullable)
+        .expect_err("out-of-bounds offsets must be rejected");
+    assert!(
+        err.to_string()
+            .contains("beyond the length of the elements array"),
+        "unexpected error: {err}"
     );
 }
 
