@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use vortex_array::EmptyMetadata;
 use vortex_array::dtype::DType;
+use vortex_array::layout_slots;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -45,6 +46,15 @@ pub struct ChunkedData {
 /// A layout partitioned into independently readable row chunks.
 pub type ChunkedLayout = Layout<Chunked>;
 
+/// Co-defines the children of a chunked layout: a single variadic run of chunks,
+/// each sharing the parent dtype.
+#[layout_slots]
+pub struct ChunkedChildren {
+    /// The row chunks, one child per chunk.
+    #[slot(0)]
+    pub chunks: Vec<LayoutRef>,
+}
+
 impl VTable for Chunked {
     type LayoutData = ChunkedData;
     type Metadata = EmptyMetadata;
@@ -75,7 +85,8 @@ impl VTable for Chunked {
     }
 
     fn child_type(layout: &Layout<Self>, idx: usize) -> LayoutChildType {
-        LayoutChildType::Chunk((idx, layout.chunk_offsets[idx]))
+        let chunk = idx - ChunkedChildren::CHUNKS;
+        LayoutChildType::Chunk((chunk, layout.chunk_offsets[idx]))
     }
 
     fn new_reader(

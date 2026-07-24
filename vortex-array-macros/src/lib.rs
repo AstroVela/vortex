@@ -250,6 +250,27 @@ fn expand_array_slots(
 ///     pub const CODES: usize = 1;
 /// }
 /// ```
+///
+/// # Variadic tail
+///
+/// The final field may be a `Vec<LayoutRef>`, declaring that every child from its
+/// `#[slot(N)]` index onward belongs to a homogeneous, variable-length run (e.g. a
+/// chunked layout's chunks). Its constant is the index at which the run begins, and
+/// an extra `FIXED_COUNT` constant records the number of fixed children before it.
+/// A `Vec<..>` field anywhere but last is a compile error.
+///
+/// ```ignore
+/// #[layout_slots]
+/// pub struct ChunkedChildren {
+///     #[slot(0)]
+///     pub chunks: Vec<LayoutRef>,
+/// }
+///
+/// impl ChunkedChildren {
+///     pub const CHUNKS: usize = 0;
+///     pub const FIXED_COUNT: usize = 0;
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn layout_slots(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_struct = parse_macro_input!(item as ItemStruct);
@@ -270,16 +291,26 @@ fn expand_layout_slots(mut item_struct: ItemStruct) -> syn::Result<proc_macro2::
         ));
     };
 
-    let mut idx_consts = Vec::with_capacity(fields.named.len());
-    let mut seen: Vec<(usize, proc_macro2::Span)> = Vec::with_capacity(fields.named.len());
+    let field_count = fields.named.len();
+    let mut idx_consts = Vec::with_capacity(field_count);
+    let mut seen: Vec<(usize, proc_macro2::Span)> = Vec::with_capacity(field_count);
+    let mut fixed_count: Option<usize> = None;
 
-    for field in fields.named.iter_mut() {
+    for (position, field) in fields.named.iter_mut().enumerate() {
         let field_ident = field
             .ident
             .clone()
             .ok_or_else(|| syn::Error::new(field.span(), "child fields must be named"))?;
         let field_name = ident_name(&field_ident);
         let const_ident = format_ident!("{}", to_screaming_snake_case(&field_name));
+        let is_tail = is_vec_type(&field.ty);
+
+        if is_tail && position + 1 != field_count {
+            return Err(syn::Error::new(
+                field_ident.span(),
+                "#[layout_slots] a variadic `Vec<..>` field must be the final field",
+            ));
+        }
 
         let mut index: Option<(usize, proc_macro2::Span)> = None;
         for attr in &field.attrs {
@@ -312,17 +343,32 @@ fn expand_layout_slots(mut item_struct: ItemStruct) -> syn::Result<proc_macro2::
 
         field.attrs.retain(|attr| !attr.path().is_ident("slot"));
 
+        let doc = if is_tail {
+            fixed_count = Some(position);
+            format!("Child index at which the `{field_name}` variadic run begins.")
+        } else {
+            format!("Child index for `{field_name}`.")
+        };
         idx_consts.push(quote! {
-            #[doc = concat!("Child index for `", #field_name, "`.")]
+            #[doc = #doc]
             pub const #const_ident: usize = #index;
         });
     }
+
+    // Only emitted when a variadic tail is present, so fixed-only structs are unchanged.
+    let fixed_count_const = fixed_count.map(|count| {
+        quote! {
+            #[doc = "Number of fixed (non-variadic) children preceding the variadic run."]
+            pub const FIXED_COUNT: usize = #count;
+        }
+    });
 
     Ok(quote! {
         #item_struct
 
         impl #struct_ident {
             #(#idx_consts)*
+            #fixed_count_const
         }
     })
 }
@@ -505,6 +551,19 @@ impl SlotFieldType {
             Self::Optional => quote! { Option<&'a ::vortex_array::ArrayRef> },
         }
     }
+}
+
+fn is_vec_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Path(type_path)
+            if type_path.qself.is_none()
+                && type_path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "Vec")
+    )
 }
 
 fn is_array_ref_type(ty: &Type) -> bool {
