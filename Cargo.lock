@@ -1556,11 +1556,13 @@ dependencies = [
  "lance-bench",
  "parquet 58.3.0",
  "regex",
+ "tempfile",
  "tokio",
  "tracing",
  "vortex",
  "vortex-arrow",
  "vortex-bench",
+ "vortex-cuda",
 ]
 
 [[package]]
