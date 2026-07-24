@@ -113,6 +113,132 @@ unsafe fn splat_run_elements<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end
     }
 }
 
+// ---- REJECTED byte word-splat variant ----
+//
+// Reconstructs the byte special case that an earlier revision of the shipped kernel carried:
+// for `u8`, splat a replicated `0x0101..` word (whose runtime multiply is opaque to LLVM's
+// loop-idiom pass) instead of the generic element chunk stores. It existed to stop the byte
+// path collapsing into a `memset` call per short run.
+//
+// It was removed because the unconditional-first-chunk restructuring already prevents that
+// collapse for short runs, making the word splat redundant *and* measurably slower for u8
+// (the `wrapping_mul` + unaligned `u64` stores lose to the generic 16-byte vector stores).
+// `nonnull_v3` (shipped) vs `nonnull_v3_byte_splat` in `run_end_decode_distribution`
+// reproduces that: for widths > 1 they are identical; for `u8` the shipped path wins.
+
+const LONG_RUN_FILL_BYTES: usize = 256;
+
+#[inline(never)]
+unsafe fn fill_run<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
+    unsafe {
+        if size_of::<T>() == 1 {
+            let byte: u8 = std::mem::transmute_copy(&value);
+            dst.cast::<u8>().write_bytes(byte, len);
+        } else {
+            for i in 0..len {
+                dst.add(i).write(MaybeUninit::new(value));
+            }
+        }
+    }
+}
+
+/// # Safety
+///
+/// The allocation behind `base` must have room for at least
+/// `max(pos, end) + decode_chunk_len::<T>()` elements.
+#[inline(always)]
+unsafe fn splat_run_byte_splat<T: Copy>(
+    base: *mut MaybeUninit<T>,
+    pos: usize,
+    end: usize,
+    value: T,
+) {
+    if size_of::<T>() == 1 {
+        // SAFETY: size_of::<T>() == 1, and the caller guarantees a chunk of slack.
+        unsafe {
+            let byte: u8 = std::mem::transmute_copy(&value);
+            let word = u64::from(byte).wrapping_mul(0x0101_0101_0101_0101);
+            let mut p = base.add(pos).cast::<u8>();
+            let stop = base.add(end).cast::<u8>();
+            for i in 0..DECODE_CHUNK_BYTES / 8 {
+                p.add(i * 8).cast::<u64>().write_unaligned(word);
+            }
+            p = p.add(DECODE_CHUNK_BYTES);
+            if p >= stop {
+                return;
+            }
+            let len = end - pos;
+            if len >= LONG_RUN_FILL_BYTES {
+                base.add(pos).cast::<u8>().write_bytes(byte, len);
+                return;
+            }
+            loop {
+                for i in 0..DECODE_CHUNK_BYTES / 8 {
+                    p.add(i * 8).cast::<u64>().write_unaligned(word);
+                }
+                p = p.add(DECODE_CHUNK_BYTES);
+                if p >= stop {
+                    break;
+                }
+            }
+        }
+    } else {
+        let chunk = const { decode_chunk_len::<T>() };
+        // SAFETY: caller guarantees one chunk of slack past max(pos, end).
+        unsafe {
+            let mut p = base.add(pos);
+            let stop = base.add(end);
+            for i in 0..chunk {
+                p.add(i).write(MaybeUninit::new(value));
+            }
+            p = p.add(chunk);
+            if p >= stop {
+                return;
+            }
+            let len = end - pos;
+            if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
+                fill_run(base.add(pos), len, value);
+                return;
+            }
+            loop {
+                for i in 0..chunk {
+                    p.add(i).write(MaybeUninit::new(value));
+                }
+                p = p.add(chunk);
+                if p >= stop {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Non-nullable decode using the rejected byte word-splat kernel (see above).
+pub fn decode_v3_byte_splat<E: IntegerPType, T: NativePType>(
+    run_ends: &[E],
+    values: &[T],
+    length: usize,
+) -> (Buffer<T>, Validity) {
+    let offset_e = E::zero();
+    let length_e = E::from_usize(length).unwrap();
+    let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
+    let base = decoded.spare_capacity_mut().as_mut_ptr();
+    let mut pos = 0usize;
+    for (&end, &value) in run_ends.iter().zip(values) {
+        let end = trim_end(end, offset_e, length_e);
+        assert!(
+            end >= pos,
+            "Runend ends must be monotonic, got {end} after {pos}"
+        );
+        // SAFETY: pos <= end <= length and the buffer has one chunk of padding.
+        unsafe { splat_run_byte_splat(base, pos, end, value) };
+        pos = end;
+    }
+    // SAFETY: every element in 0..pos was initialized above.
+    unsafe { decoded.set_len(pos) };
+    (decoded.into(), Nullability::NonNullable.into())
+}
+
 // ---- v0: original implementation (verbatim from the pre-change kernel) ----
 
 pub fn decode_v0<T: NativePType>(

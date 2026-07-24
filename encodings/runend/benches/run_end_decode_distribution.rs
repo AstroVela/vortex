@@ -43,6 +43,7 @@ use decode_variants::decode_n2;
 use decode_variants::decode_v0;
 use decode_variants::decode_v1;
 use decode_variants::decode_v2;
+use decode_variants::decode_v3_byte_splat;
 use decode_variants::make_data;
 
 fn main() {
@@ -125,6 +126,22 @@ fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
                 Nullability::NonNullable,
                 TOTAL_LENGTH,
             )
+        });
+}
+
+/// The rejected byte word-splat kernel. For widths > 1 this is identical to `nonnull_v3`;
+/// only u8 differs, and there the shipped `nonnull_v3` (generic path) is faster across all run
+/// lengths — which is why the shipped kernel carries no byte special case.
+#[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
+fn nonnull_v3_byte_splat<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    let (ends, values) = nonnull_data::<T>(avg);
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(|| (ends.clone(), values.clone()))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) =
+                decode_v3_byte_splat(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
         });
 }
 
