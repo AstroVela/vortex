@@ -31,9 +31,10 @@ use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
 use crate::arrays::VarBinViewArray;
+use crate::arrays::decimal::widened_buffer;
 use crate::arrays::extension::ExtensionArrayExt;
-use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
-use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::struct_::StructArrayExt;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
@@ -151,8 +152,8 @@ fn build_values_comparator(
             let rhs = rhs.clone().execute::<DecimalArray>(ctx)?;
             let common = lhs.values_type().max(rhs.values_type());
             crate::match_each_decimal_value_type!(common, |W| {
-                let lhs = super::decimal::widened_buffer::<W>(&lhs);
-                let rhs = super::decimal::widened_buffer::<W>(&rhs);
+                let lhs = widened_buffer::<W>(&lhs);
+                let rhs = widened_buffer::<W>(&rhs);
                 Box::new(move |i: usize, j: usize| lhs[i].cmp(&rhs[j])) as RowComparator
             })
         }

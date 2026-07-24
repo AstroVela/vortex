@@ -10,6 +10,7 @@
 
 mod canonical;
 mod list_view;
+mod offsets;
 
 use std::ffi::CString;
 use std::ffi::c_char;
@@ -30,6 +31,8 @@ pub(crate) use canonical::CanonicalDeviceArrayExport;
 use cudarc::driver::CudaEvent;
 use cudarc::driver::CudaStream;
 use cudarc::runtime::sys::cudaEvent_t;
+pub(crate) use offsets::I32Offsets;
+pub(crate) use offsets::i32_offsets_from_lengths;
 use vortex::array::ArrayRef;
 use vortex::array::arrays::Dict;
 use vortex::array::arrays::FixedSizeList;
@@ -37,9 +40,9 @@ use vortex::array::arrays::List;
 use vortex::array::arrays::ListView;
 use vortex::array::arrays::Struct;
 use vortex::array::arrays::dict::DictArraySlotsExt;
-use vortex::array::arrays::fixed_size_list::FixedSizeListArrayExt;
-use vortex::array::arrays::list::ListArrayExt;
-use vortex::array::arrays::listview::ListViewArrayExt;
+use vortex::array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use vortex::array::arrays::list::ListArraySlotsExt;
+use vortex::array::arrays::listview::ListViewArraySlotsExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::stream::SendableArrayStream;

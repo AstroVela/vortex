@@ -4,14 +4,15 @@
 use std::sync::LazyLock;
 
 use vortex_io::session::RuntimeSession;
+use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
 use crate::session::LayoutSession;
 
-pub fn test_session() -> VortexSession {
+pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| new_session().with_tokio());
+
+pub fn new_session() -> VortexSession {
     vortex_array::array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>()
 }
-
-pub static SESSION: LazyLock<VortexSession> = LazyLock::new(test_session);

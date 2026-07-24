@@ -57,6 +57,7 @@ enum CompressorConfig {
 pub struct WriteStrategyBuilder {
     compressor: CompressorConfig,
     row_block_size: usize,
+    data_block_target_bytes: Option<u64>,
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
     allow_encodings: Option<HashSet<ArrayId>>,
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
@@ -74,6 +75,7 @@ impl Default for WriteStrategyBuilder {
         Self {
             compressor: CompressorConfig::BtrBlocks(BtrBlocksCompressorBuilder::default()),
             row_block_size: 8192,
+            data_block_target_bytes: Some(ONE_MEG),
             field_writers: HashMap::new(),
             allow_encodings: None,
             flat_strategy: None,
@@ -90,6 +92,15 @@ impl WriteStrategyBuilder {
     /// random-access locality.
     pub fn with_row_block_size(mut self, row_block_size: usize) -> Self {
         self.row_block_size = row_block_size;
+        self
+    }
+
+    /// Override the target uncompressed byte size used to coalesce data blocks.
+    ///
+    /// Passing `None` disables byte-size coalescing, so blocks retain the row granularity set by
+    /// [`Self::with_row_block_size`].
+    pub fn with_data_block_target_bytes(mut self, target_bytes: Option<u64>) -> Self {
+        self.data_block_target_bytes = target_bytes;
         self
     }
 
@@ -175,12 +186,12 @@ impl WriteStrategyBuilder {
         // stats, and the defaulted probe compressor) can produce an encoding outside the policy,
         // regardless of the order in which the builder and the policy were configured.
         let compressor = match self.compressor {
-            CompressorConfig::BtrBlocks(builder) => CompressorConfig::BtrBlocks(
-                match &self.allow_encodings {
+            CompressorConfig::BtrBlocks(builder) => {
+                CompressorConfig::BtrBlocks(match &self.allow_encodings {
                     Some(allow_encodings) => builder.retain_allowed_encodings(allow_encodings),
                     None => builder,
-                },
-            ),
+                })
+            }
             opaque => opaque,
         };
 
@@ -220,9 +231,9 @@ impl WriteStrategyBuilder {
                 // sufficient read concurrency for the desired throughput. One megabyte is small
                 // enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object Storage for
                 // High-Performance Analytics", VLDB Vol 16, Iss 11).
-                block_size_minimum: ONE_MEG,
+                block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
                 block_len_multiple: self.row_block_size,
-                block_size_target: Some(ONE_MEG),
+                block_size_target: self.data_block_target_bytes,
                 canonicalize: true,
             },
         );
