@@ -14,6 +14,7 @@ use vortex_array::ProstMetadata;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::layout_slots;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -35,12 +36,23 @@ use crate::VTable;
 use crate::children::OwnedLayoutChildren;
 use crate::segments::SegmentSource;
 
-/// Child index of the elements layout.
-pub const ELEMENTS_CHILD_INDEX: usize = 0;
-/// Child index of the offsets layout.
-pub const OFFSETS_CHILD_INDEX: usize = 1;
-/// Child index of the optional validity layout.
-pub const VALIDITY_CHILD_INDEX: usize = 2;
+/// Co-defines the children of a list layout and their storage order.
+///
+/// The `validity` child is present only when the list dtype is nullable, so a
+/// non-nullable list has [`NUM_CHILDREN_NON_NULLABLE`] children.
+#[layout_slots]
+pub struct ListChildren {
+    /// The list element values.
+    #[slot(0)]
+    pub elements: LayoutRef,
+    /// The per-row offsets into the elements child.
+    #[slot(1)]
+    pub offsets: LayoutRef,
+    /// The optional validity, present only for a nullable list dtype.
+    #[slot(2)]
+    pub validity: LayoutRef,
+}
+
 /// Number of children for a non-nullable list.
 pub const NUM_CHILDREN_NON_NULLABLE: usize = 2;
 
@@ -83,17 +95,19 @@ impl VTable for List {
             .dtype
             .as_list_element_opt()
             .ok_or_else(|| vortex_err!("ListLayout requires a List dtype, got {}", args.dtype))?;
-        args.children.child(ELEMENTS_CHILD_INDEX, elements_dtype)?;
+        args.children
+            .child(ListChildren::ELEMENTS, elements_dtype)?;
         let offsets_dtype = DType::Primitive(metadata.offsets_ptype(), Nullability::NonNullable);
-        let offsets = args.children.child(OFFSETS_CHILD_INDEX, &offsets_dtype)?;
+        let offsets = args.children.child(ListChildren::OFFSETS, &offsets_dtype)?;
         vortex_error::vortex_ensure!(
             offsets.row_count().saturating_sub(1) == args.row_count,
             "List offsets row count does not match parent"
         );
         if args.dtype.is_nullable() {
-            let validity = args
-                .children
-                .child(VALIDITY_CHILD_INDEX, &DType::Bool(Nullability::NonNullable))?;
+            let validity = args.children.child(
+                ListChildren::VALIDITY,
+                &DType::Bool(Nullability::NonNullable),
+            )?;
             vortex_error::vortex_ensure!(
                 validity.row_count() == args.row_count,
                 "List validity row count does not match parent"
@@ -106,16 +120,16 @@ impl VTable for List {
 
     fn child_dtype(layout: &Layout<Self>, idx: usize) -> VortexResult<DType> {
         match idx {
-            ELEMENTS_CHILD_INDEX => layout
+            ListChildren::ELEMENTS => layout
                 .dtype()
                 .as_list_element_opt()
                 .map(|dtype| dtype.as_ref().clone())
                 .ok_or_else(|| vortex_err!("ListLayout requires a List dtype")),
-            OFFSETS_CHILD_INDEX => Ok(DType::Primitive(
+            ListChildren::OFFSETS => Ok(DType::Primitive(
                 layout.offsets_ptype,
                 Nullability::NonNullable,
             )),
-            VALIDITY_CHILD_INDEX if layout.dtype().is_nullable() => {
+            ListChildren::VALIDITY if layout.dtype().is_nullable() => {
                 Ok(DType::Bool(Nullability::NonNullable))
             }
             _ => vortex_bail!("Invalid child index {idx} for ListLayout"),
@@ -124,9 +138,9 @@ impl VTable for List {
 
     fn child_type(layout: &Layout<Self>, idx: usize) -> LayoutChildType {
         match idx {
-            ELEMENTS_CHILD_INDEX => LayoutChildType::Auxiliary("elements".into()),
-            OFFSETS_CHILD_INDEX => LayoutChildType::Auxiliary("offsets".into()),
-            VALIDITY_CHILD_INDEX if layout.dtype().is_nullable() => {
+            ListChildren::ELEMENTS => LayoutChildType::Auxiliary("elements".into()),
+            ListChildren::OFFSETS => LayoutChildType::Auxiliary("offsets".into()),
+            ListChildren::VALIDITY if layout.dtype().is_nullable() => {
                 LayoutChildType::Auxiliary("validity".into())
             }
             _ => vortex_panic!("Invalid child index {idx} for ListLayout"),
@@ -176,19 +190,19 @@ impl Layout<List> {
 
     /// Returns the elements child.
     pub fn elements(&self) -> VortexResult<LayoutRef> {
-        self.child(ELEMENTS_CHILD_INDEX)
+        self.child(ListChildren::ELEMENTS)
     }
 
     /// Returns the offsets child.
     pub fn offsets(&self) -> VortexResult<LayoutRef> {
-        self.child(OFFSETS_CHILD_INDEX)
+        self.child(ListChildren::OFFSETS)
     }
 
     /// Returns the optional validity child.
     pub fn validity(&self) -> VortexResult<Option<LayoutRef>> {
         self.dtype()
             .is_nullable()
-            .then(|| self.child(VALIDITY_CHILD_INDEX))
+            .then(|| self.child(ListChildren::VALIDITY))
             .transpose()
     }
 

@@ -270,6 +270,7 @@ mod test {
     use crate::layouts::zoned::LegacyStatsLayoutEncoding;
     use crate::layouts::zoned::LegacyStatsMetadata;
     use crate::layouts::zoned::Zoned;
+    use crate::layouts::zoned::ZonedChildren;
     use crate::layouts::zoned::writer::ZonedLayoutOptions;
     use crate::layouts::zoned::writer::ZonedStrategy;
     use crate::segments::SegmentSource;
@@ -449,8 +450,10 @@ mod test {
         #[case] expected: [bool; 9],
     ) -> VortexResult<()> {
         let zoned_layout = layout.as_::<Zoned>();
-        let children =
-            OwnedLayoutChildren::layout_children(vec![layout.child(0)?, layout.child(1)?]);
+        let children = OwnedLayoutChildren::layout_children(vec![
+            layout.child(ZonedChildren::DATA)?,
+            layout.child(ZonedChildren::ZONES)?,
+        ]);
         let session = array_session();
         let read_ctx = ReadContext::new([]);
         let build_ctx = LayoutBuildContext {

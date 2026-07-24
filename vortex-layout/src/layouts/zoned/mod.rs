@@ -32,6 +32,7 @@ use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::TryFromBytes;
 use vortex_array::expr::stats::Stat;
+use vortex_array::layout_slots;
 use vortex_array::stats::as_stat_bitset_bytes;
 use vortex_array::stats::stats_from_bitset_bytes;
 use vortex_error::VortexExpect;
@@ -86,6 +87,18 @@ pub type ZonedLayout = Layout<Zoned>;
 /// A legacy `vortex.stats` layout using the same runtime data.
 pub type LegacyStatsLayout = Layout<LegacyStats>;
 
+/// Co-defines the children of a zoned layout and their storage order, shared by
+/// both the [`Zoned`] and [`LegacyStats`] vtables.
+#[layout_slots]
+pub struct ZonedChildren {
+    /// The underlying column data.
+    #[slot(0)]
+    pub data: LayoutRef,
+    /// The per-zone aggregate statistics table.
+    #[slot(1)]
+    pub zones: LayoutRef,
+}
+
 impl VTable for Zoned {
     type LayoutData = ZonedData;
     type Metadata = ZonedMetadata;
@@ -121,11 +134,14 @@ impl VTable for Zoned {
             2,
             "ZonedLayout expects exactly 2 children (data, zones)"
         );
-        vortex_ensure_eq!(args.children.child_row_count(0), args.row_count);
+        vortex_ensure_eq!(
+            args.children.child_row_count(ZonedChildren::DATA),
+            args.row_count
+        );
         let Some(aggregate_fns) =
             try_aggregate_fns_from_specs(&metadata.aggregate_specs, args.session)?
         else {
-            args.children.child(0, args.dtype)?;
+            args.children.child(ZonedChildren::DATA, args.dtype)?;
             return Ok(ZonedData {
                 zone_len: 0,
                 zone_map_schema: ZoneMapSchema::AggregateFns(Arc::new([])),
@@ -134,8 +150,9 @@ impl VTable for Zoned {
         };
         aggregate_specs_from_fns(&aggregate_fns)?;
         let stats_table_dtype = aggregate_stats_table_dtype(args.dtype, &aggregate_fns);
-        args.children.child(0, args.dtype)?;
-        args.children.child(1, &stats_table_dtype)?;
+        args.children.child(ZonedChildren::DATA, args.dtype)?;
+        args.children
+            .child(ZonedChildren::ZONES, &stats_table_dtype)?;
         Ok(ZonedData {
             zone_len: metadata.zone_len as usize,
             zone_map_schema: ZoneMapSchema::AggregateFns(aggregate_fns),
@@ -145,16 +162,16 @@ impl VTable for Zoned {
 
     fn child_dtype(layout: &Layout<Self>, idx: usize) -> VortexResult<DType> {
         match idx {
-            0 => Ok(layout.dtype().clone()),
-            1 => Ok(layout.stats_table_dtype.clone()),
+            ZonedChildren::DATA => Ok(layout.dtype().clone()),
+            ZonedChildren::ZONES => Ok(layout.stats_table_dtype.clone()),
             _ => vortex_bail!("Invalid child index: {idx}"),
         }
     }
 
     fn child_type(_layout: &Layout<Self>, idx: usize) -> LayoutChildType {
         match idx {
-            0 => LayoutChildType::Transparent("data".into()),
-            1 => LayoutChildType::Auxiliary("zones".into()),
+            ZonedChildren::DATA => LayoutChildType::Transparent("data".into()),
+            ZonedChildren::ZONES => LayoutChildType::Auxiliary("zones".into()),
             _ => vortex_panic!("Invalid child index: {}", idx),
         }
     }
@@ -202,8 +219,9 @@ impl VTable for LegacyStats {
                 aggregate_stats_table_dtype(args.dtype, aggregate_fns)
             }
         };
-        args.children.child(0, args.dtype)?;
-        args.children.child(1, &stats_table_dtype)?;
+        args.children.child(ZonedChildren::DATA, args.dtype)?;
+        args.children
+            .child(ZonedChildren::ZONES, &stats_table_dtype)?;
         Ok(ZonedData {
             zone_len: metadata.zone_len as usize,
             zone_map_schema: metadata.zone_map_schema.clone(),
@@ -213,16 +231,16 @@ impl VTable for LegacyStats {
 
     fn child_dtype(layout: &Layout<Self>, idx: usize) -> VortexResult<DType> {
         match idx {
-            0 => Ok(layout.dtype().clone()),
-            1 => Ok(layout.stats_table_dtype.clone()),
+            ZonedChildren::DATA => Ok(layout.dtype().clone()),
+            ZonedChildren::ZONES => Ok(layout.stats_table_dtype.clone()),
             _ => vortex_bail!("Invalid child index: {idx}"),
         }
     }
 
     fn child_type(_layout: &Layout<Self>, idx: usize) -> LayoutChildType {
         match idx {
-            0 => LayoutChildType::Transparent("data".into()),
-            1 => LayoutChildType::Auxiliary("zones".into()),
+            ZonedChildren::DATA => LayoutChildType::Transparent("data".into()),
+            ZonedChildren::ZONES => LayoutChildType::Auxiliary("zones".into()),
             _ => vortex_panic!("Invalid child index: {idx}"),
         }
     }
@@ -248,7 +266,7 @@ impl LegacyStatsLayout {
     ) -> VortexResult<LayoutReaderRef> {
         if self.zone_len == 0 {
             return self
-                .child(0)?
+                .child(ZonedChildren::DATA)?
                 .new_reader(name, segment_source, session, ctx);
         }
 
@@ -263,7 +281,7 @@ impl LegacyStatsLayout {
     }
 
     pub fn nzones(&self) -> usize {
-        usize::try_from(self.children().child_row_count(1))
+        usize::try_from(self.children().child_row_count(ZonedChildren::ZONES))
             .vortex_expect("Invalid number of zones, cannot handle more than usize zones")
     }
 
@@ -335,7 +353,7 @@ impl ZonedLayout {
     ) -> VortexResult<LayoutReaderRef> {
         if self.zone_len == 0 {
             return self
-                .child(0)?
+                .child(ZonedChildren::DATA)?
                 .new_reader(name, segment_source, session, ctx);
         }
 
@@ -350,7 +368,7 @@ impl ZonedLayout {
     }
 
     pub fn nzones(&self) -> usize {
-        usize::try_from(self.children().child_row_count(1))
+        usize::try_from(self.children().child_row_count(ZonedChildren::ZONES))
             .vortex_expect("Invalid number of zones, cannot handle more than usize zones")
     }
 }
