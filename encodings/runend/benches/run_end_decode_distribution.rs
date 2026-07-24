@@ -11,15 +11,30 @@
 //! per-element cost shows up as throughput flat across run length.
 //!
 //! Groups:
-//! - `nonnull_{v0,v1,v2,v3}` — run-length sweep, u8/u32/u64. Isolates the non-null structural
-//!   wins (v0->v1 iterator/bookkeeping, v1->v2 scalar-fill -> chunk stores) and the byte
-//!   word/memset path (v2->v3 on u8) against run length and element width.
-//! - `nullable_{n0,n2,n3}` — run-length sweep, u8/u32/u64 at 90% valid. Isolates the nullable
-//!   structural wins and the majority-prefill validity (n2->n3), including the wide-element
-//!   long-run fill dispatch.
+//! - `nonnull_{v0,v1,v2,v3}` — run-length sweep. Isolates the non-null structural wins
+//!   (v0->v1 iterator/bookkeeping, v1->v2 scalar-fill -> chunk stores) against run length and
+//!   element width.
+//! - `nonnull_v3_{elem_fill,byte_splat}` — alternative fill strategies for the shipped kernel.
+//! - `zeros_v3{,_prev}` / `rand_v3_prev` — byte-uniform versus arbitrary values, isolating the
+//!   `memset` fast path.
+//! - `nullable_{n0,n2,n3}` — run-length sweep at 90% valid. Isolates the nullable structural
+//!   wins and the majority-prefill validity (n2->n3), including the long-run fill dispatch.
 //! - `density_{n0,n2,n3}` — validity-density sweep, u32 at run length 8. Isolates the
 //!   prefill validity win (n2->n3) against validity skew: prefill rewrites only the minority
 //!   runs, so its advantage grows as validity moves away from 50/50.
+//!
+//! # Reading these numbers
+//!
+//! `nonnull_v3` and `zeros_v3` call the real `runend_decode_typed_primitive` across a crate
+//! boundary; every other variant is a copy compiled into this binary and inlines more
+//! aggressively. That difference is worth up to ~40% at short runs *on identical algorithms*,
+//! and it consistently favours the bench-local copies. So:
+//!
+//! - Comparing a bench-local variant against another bench-local variant is apples to apples.
+//! - Comparing `nonnull_v3`/`zeros_v3` against a bench-local variant understates the shipped
+//!   kernel. A win measured that way is a lower bound; a small loss may be the boundary alone.
+//! - To isolate a change cleanly, prefer a *within-function* contrast (the same bench over two
+//!   data distributions, as `zeros_v3` versus `nonnull_v3`), which cancels the effect.
 
 #![expect(clippy::cast_possible_truncation)]
 
@@ -45,7 +60,9 @@ use decode_variants::decode_v1;
 use decode_variants::decode_v2;
 use decode_variants::decode_v3_byte_splat;
 use decode_variants::decode_v3_elem_fill;
+use decode_variants::decode_v3_no_memset;
 use decode_variants::make_data;
+use decode_variants::make_data_values;
 
 fn main() {
     divan::main();
@@ -161,6 +178,63 @@ fn nonnull_v3_byte_splat<T: NativePType + From<u8>>(bencher: Bencher, avg: usize
         .bench_refs(|(ends, values)| {
             let (buf, validity) =
                 decode_v3_byte_splat(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
+        });
+}
+
+// ---- Group A2: byte-uniform values (zeros) vs arbitrary values ----
+//
+// A byte-uniform value fills with `memset`; an arbitrary one takes the doubling path.
+// `zeros_v3` vs `zeros_v3_prev` isolates that fast path, and `rand_v3_prev` vs `nonnull_v3`
+// confirms arbitrary values are unaffected by it.
+
+fn zero_data<T: NativePType + From<u8>>(avg: usize) -> (Buffer<u32>, Buffer<T>) {
+    let (ends, values, _) = make_data_values::<T>(SEED, TOTAL_LENGTH, max_run_len(avg), 1.0, true);
+    (ends, values)
+}
+
+#[divan::bench(types = [u32, u64], args = RUN_LENGTHS)]
+fn zeros_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    let (ends, values) = zero_data::<T>(avg);
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(|| (ends.clone(), values.clone()))
+        .bench_refs(|(ends, values)| {
+            runend_decode_typed_primitive(
+                ends.as_slice(),
+                0,
+                values.as_slice(),
+                Mask::new_true(values.len()),
+                Nullability::NonNullable,
+                TOTAL_LENGTH,
+            )
+        });
+}
+
+#[divan::bench(types = [u32, u64], args = RUN_LENGTHS)]
+fn zeros_v3_prev<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    let (ends, values) = zero_data::<T>(avg);
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(|| (ends.clone(), values.clone()))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) =
+                decode_v3_no_memset(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
+        });
+}
+
+/// Arbitrary (not byte-uniform) values through the pre-`memset` kernel; compare against
+/// `nonnull_v3` to confirm the fast path costs nothing when it does not apply.
+#[divan::bench(types = [u32, u64], args = RUN_LENGTHS)]
+fn rand_v3_prev<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    let (ends, values) = nonnull_data::<T>(avg);
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(|| (ends.clone(), values.clone()))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) =
+                decode_v3_no_memset(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
         });
 }

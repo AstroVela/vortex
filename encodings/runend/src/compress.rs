@@ -247,12 +247,45 @@ const LONG_RUN_FILL_BYTES: usize = 256;
 /// is up to 2x slower, at and above it is 1.1-1.4x faster. See `run_end_decode_distribution`.
 const DOUBLING_FILL_BYTES: usize = 2048;
 
+/// The repeated byte of `value` when all of its bytes are equal, otherwise `None`.
+///
+/// Such a value can be filled with a single `memset`, which writes without reading anything
+/// back and so beats the doubling fill below. The common cases are `0` and all-ones (`-1` for
+/// signed integers), both frequent in real columns.
+///
+/// The comparison is arithmetic on a same-sized integer rather than a walk over `value`'s
+/// bytes, so it never reads padding. Only power-of-two widths up to 8 are recognised; wider
+/// elements (such as binary views) simply take the general path.
+#[inline(always)]
+fn repeated_byte<T: Copy>(value: T) -> Option<u8> {
+    // SAFETY: each branch transmutes `T` to an unsigned integer of exactly the same size.
+    // Every type reaching this function is a primitive or a binary view, none of which have
+    // padding, so all bytes of the source are initialized.
+    unsafe {
+        match size_of::<T>() {
+            1 => Some(std::mem::transmute_copy::<T, u8>(&value)),
+            2 => {
+                let v = std::mem::transmute_copy::<T, u16>(&value);
+                (v == (v & 0xFF) * 0x0101).then(|| v.to_le_bytes()[0])
+            }
+            4 => {
+                let v = std::mem::transmute_copy::<T, u32>(&value);
+                (v == (v & 0xFF) * 0x0101_0101).then(|| v.to_le_bytes()[0])
+            }
+            8 => {
+                let v = std::mem::transmute_copy::<T, u64>(&value);
+                (v == (v & 0xFF) * 0x0101_0101_0101_0101).then(|| v.to_le_bytes()[0])
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Fill `dst[..len]` with `value`, used for long runs.
 ///
 /// Deliberately not inlined: inlining a fill loop into the decode loop leaves its codegen at
 /// the mercy of the surrounding register pressure — inside the nullable decode arm the inline
-/// loop otherwise loses its wide vector stores. Byte-sized elements fill via `memset`, which
-/// the libc already dispatches to the best available implementation at any length.
+/// loop otherwise loses its wide vector stores.
 ///
 /// # Safety
 ///
@@ -260,9 +293,10 @@ const DOUBLING_FILL_BYTES: usize = 2048;
 #[inline(never)]
 unsafe fn fill_run<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
     unsafe {
-        if size_of::<T>() == 1 {
-            let byte: u8 = std::mem::transmute_copy(&value);
-            dst.cast::<u8>().write_bytes(byte, len);
+        // `memset` needs no read traffic and the libc dispatches it well at every length, so
+        // it wins outright whenever the value is byte-uniform. Byte-sized elements always are.
+        if let Some(byte) = repeated_byte(value) {
+            dst.cast::<u8>().write_bytes(byte, len * size_of::<T>());
             return;
         }
         if len * size_of::<T>() >= DOUBLING_FILL_BYTES {
@@ -667,7 +701,15 @@ mod tests {
                     };
                     pos += run_len;
                     ends.push(u32::try_from(pos).vortex_expect("test lengths fit in u32"));
-                    run_values.push(<T as From<u8>>::from(rng.random::<u8>()));
+                    // A quarter of runs take value zero, which is byte-uniform and so routes
+                    // through the `memset` fill for every element width rather than the
+                    // general path taken by arbitrary values.
+                    let byte = if rng.random_bool(0.25) {
+                        0
+                    } else {
+                        rng.random::<u8>()
+                    };
+                    run_values.push(<T as From<u8>>::from(byte));
                     run_valid.push(rng.random_bool(0.9));
                 }
 

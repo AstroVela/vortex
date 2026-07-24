@@ -52,6 +52,20 @@ pub fn make_data<T: NativePType + From<u8>>(
     max_run_len: usize,
     validity_density: f64,
 ) -> (Buffer<u32>, Buffer<T>, BitBuffer) {
+    make_data_values(seed, total_length, max_run_len, validity_density, false)
+}
+
+/// As [`make_data`], but `zero_values` forces every run value to zero.
+///
+/// Zero is byte-uniform, which the decode kernel fills with `memset` instead of the general
+/// path. Real run-end columns carry both kinds of value, so both are benchmarked.
+pub fn make_data_values<T: NativePType + From<u8>>(
+    seed: u64,
+    total_length: usize,
+    max_run_len: usize,
+    validity_density: f64,
+    zero_values: bool,
+) -> (Buffer<u32>, Buffer<T>, BitBuffer) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut ends = BufferMut::<u32>::empty();
     let mut values = BufferMut::<T>::empty();
@@ -62,7 +76,8 @@ pub fn make_data<T: NativePType + From<u8>>(
         let run_len = rng.random_range(1..=max_run_len).min(total_length - pos);
         pos += run_len;
         ends.push(pos as u32);
-        values.push(<T as From<u8>>::from(rng.random::<u8>()));
+        let byte = if zero_values { 0 } else { rng.random::<u8>() };
+        values.push(<T as From<u8>>::from(byte));
         validity.push(rng.random_bool(validity_density));
     }
     (ends.freeze(), values.freeze(), BitBuffer::from(validity))
@@ -212,6 +227,113 @@ unsafe fn splat_run_byte_splat<T: Copy>(
         }
     }
 }
+
+// ---- PREVIOUS fill: doubling memcpy, but no byte-uniform `memset` fast path ----
+//
+// Reconstructs the kernel as it stood before `repeated_byte` was added: byte-sized elements
+// fill with `memset`, every wider element takes the doubling/element path regardless of
+// whether its bytes happen to be identical. `zeros_v3` vs `zeros_v3_prev` isolates the
+// `memset` fast path on byte-uniform values (zero); `rand_v3_prev` vs `nonnull_v3` confirms
+// arbitrary values are unaffected.
+
+/// # Safety
+///
+/// `dst` must be valid for writes of `len` elements.
+#[inline(never)]
+unsafe fn fill_run_no_memset<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
+    unsafe {
+        if size_of::<T>() == 1 {
+            let byte: u8 = std::mem::transmute_copy(&value);
+            dst.cast::<u8>().write_bytes(byte, len);
+            return;
+        }
+        if len * size_of::<T>() >= DOUBLING_FILL_BYTES {
+            let seed = (64 / size_of::<T>()).max(1);
+            for i in 0..seed {
+                dst.add(i).write(MaybeUninit::new(value));
+            }
+            let mut filled = seed;
+            while filled < len {
+                let n = filled.min(len - filled);
+                std::ptr::copy_nonoverlapping(dst, dst.add(filled), n);
+                filled += n;
+            }
+            return;
+        }
+        for i in 0..len {
+            dst.add(i).write(MaybeUninit::new(value));
+        }
+    }
+}
+
+/// # Safety
+///
+/// The allocation behind `base` must have room for at least
+/// `max(pos, end) + decode_chunk_len::<T>()` elements.
+#[inline(always)]
+unsafe fn splat_run_no_memset<T: Copy>(
+    base: *mut MaybeUninit<T>,
+    pos: usize,
+    end: usize,
+    value: T,
+) {
+    let chunk = const { decode_chunk_len::<T>() };
+    // SAFETY: caller guarantees one chunk of slack past max(pos, end).
+    unsafe {
+        let mut p = base.add(pos);
+        let stop = base.add(end);
+        for i in 0..chunk {
+            p.add(i).write(MaybeUninit::new(value));
+        }
+        p = p.add(chunk);
+        if p >= stop {
+            return;
+        }
+        let len = end - pos;
+        if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
+            fill_run_no_memset(base.add(pos), len, value);
+            return;
+        }
+        loop {
+            for i in 0..chunk {
+                p.add(i).write(MaybeUninit::new(value));
+            }
+            p = p.add(chunk);
+            if p >= stop {
+                break;
+            }
+        }
+    }
+}
+
+/// Non-nullable decode without the byte-uniform `memset` fast path (see above).
+pub fn decode_v3_no_memset<E: IntegerPType, T: NativePType>(
+    run_ends: &[E],
+    values: &[T],
+    length: usize,
+) -> (Buffer<T>, Validity) {
+    let offset_e = E::zero();
+    let length_e = E::from_usize(length).unwrap();
+    let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
+    let base = decoded.spare_capacity_mut().as_mut_ptr();
+    let mut pos = 0usize;
+    for (&end, &value) in run_ends.iter().zip(values) {
+        let end = trim_end(end, offset_e, length_e);
+        assert!(
+            end >= pos,
+            "Runend ends must be monotonic, got {end} after {pos}"
+        );
+        // SAFETY: pos <= end <= length and the buffer has one chunk of padding.
+        unsafe { splat_run_no_memset(base, pos, end, value) };
+        pos = end;
+    }
+    // SAFETY: every element in 0..pos was initialized above.
+    unsafe { decoded.set_len(pos) };
+    (decoded.into(), Nullability::NonNullable.into())
+}
+
+/// The doubling threshold, mirrored from the shipped kernel.
+const DOUBLING_FILL_BYTES: usize = 2048;
 
 // ---- PREVIOUS long-run fill: element loop instead of doubling memcpy ----
 //
