@@ -183,7 +183,7 @@ impl VTable for Struct {
             })
             .try_collect()?;
 
-        let slots = make_struct_slots(&field_children, &validity, len);
+        let slots = make_struct_slots(field_children, &validity, len);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, EmptyArrayData).with_slots(slots))
     }
 

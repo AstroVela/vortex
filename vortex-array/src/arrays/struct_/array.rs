@@ -173,13 +173,13 @@ pub struct StructDataParts {
 }
 
 pub(super) fn make_struct_slots(
-    fields: &[ArrayRef],
+    fields: Vec<ArrayRef>,
     validity: &Validity,
     length: usize,
 ) -> ArraySlots {
     StructSlots {
         validity: validity_to_child(validity, length),
-        fields: fields.to_vec(),
+        fields,
     }
     .into_slots()
 }
@@ -264,7 +264,7 @@ impl Array<Struct> {
         let fields: Vec<_> = fields.into_iter().collect();
         let field_dtypes: Vec<_> = fields.iter().map(|d| d.dtype().clone()).collect();
         let dtype = StructFields::new(names, field_dtypes);
-        let slots = make_struct_slots(&fields, &validity, length);
+        let slots = make_struct_slots(fields, &validity, length);
         Array::try_from_parts(
             ArrayParts::new(
                 Struct,
@@ -289,7 +289,7 @@ impl Array<Struct> {
     ) -> Self {
         let fields: Vec<_> = fields.into_iter().collect();
         let outer_dtype = DType::Struct(dtype, validity.nullability());
-        let slots = make_struct_slots(&fields, &validity, length);
+        let slots = make_struct_slots(fields, &validity, length);
         unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(Struct, outer_dtype, length, EmptyArrayData).with_slots(slots),
@@ -306,7 +306,7 @@ impl Array<Struct> {
     ) -> VortexResult<Self> {
         let fields: Vec<_> = fields.into_iter().collect();
         let outer_dtype = DType::Struct(dtype, validity.nullability());
-        let slots = make_struct_slots(&fields, &validity, length);
+        let slots = make_struct_slots(fields, &validity, length);
         Array::try_from_parts(
             ArrayParts::new(Struct, outer_dtype, length, EmptyArrayData).with_slots(slots),
         )
@@ -394,7 +394,7 @@ impl Array<Struct> {
             StructFields::new(FieldNames::default(), Vec::new()),
             crate::dtype::Nullability::NonNullable,
         );
-        let slots = make_struct_slots(&[], &Validity::NonNullable, len);
+        let slots = make_struct_slots(Vec::new(), &Validity::NonNullable, len);
         unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(Struct, dtype, len, EmptyArrayData).with_slots(slots),
