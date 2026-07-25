@@ -359,6 +359,7 @@ impl<'a> Postscript<'a> {
   pub const VT_LAYOUT: ::flatbuffers::VOffsetT = 6;
   pub const VT_STATISTICS: ::flatbuffers::VOffsetT = 8;
   pub const VT_FOOTER: ::flatbuffers::VOffsetT = 10;
+  pub const VT_WASM_KERNELS: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -370,6 +371,7 @@ impl<'a> Postscript<'a> {
     args: &'args PostscriptArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Postscript<'bldr>> {
     let mut builder = PostscriptBuilder::new(_fbb);
+    if let Some(x) = args.wasm_kernels { builder.add_wasm_kernels(x); }
     if let Some(x) = args.footer { builder.add_footer(x); }
     if let Some(x) = args.statistics { builder.add_statistics(x); }
     if let Some(x) = args.layout { builder.add_layout(x); }
@@ -410,6 +412,17 @@ impl<'a> Postscript<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>(Postscript::VT_FOOTER, None)}
   }
+  /// Decoder kernels embedded in the file, one per array encoding id.
+  ///
+  /// A reader that does not have a native decoder for an encoding used by the file may run the
+  /// corresponding kernel instead. A native decoder always supersedes an embedded kernel.
+  #[inline]
+  pub fn wasm_kernels(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<WasmKernelSpec<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<WasmKernelSpec>>>>(Postscript::VT_WASM_KERNELS, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Postscript<'_> {
@@ -422,6 +435,7 @@ impl ::flatbuffers::Verifiable for Postscript<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("layout", Self::VT_LAYOUT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("statistics", Self::VT_STATISTICS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("footer", Self::VT_FOOTER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<WasmKernelSpec>>>>("wasm_kernels", Self::VT_WASM_KERNELS, false)?
      .finish();
     Ok(())
   }
@@ -431,6 +445,7 @@ pub struct PostscriptArgs<'a> {
     pub layout: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
     pub statistics: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
     pub footer: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
+    pub wasm_kernels: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<WasmKernelSpec<'a>>>>>,
 }
 impl<'a> Default for PostscriptArgs<'a> {
   #[inline]
@@ -440,6 +455,7 @@ impl<'a> Default for PostscriptArgs<'a> {
       layout: None,
       statistics: None,
       footer: None,
+      wasm_kernels: None,
     }
   }
 }
@@ -466,6 +482,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> PostscriptBuilder<'a, 'b, A> 
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<PostscriptSegment>>(Postscript::VT_FOOTER, footer);
   }
   #[inline]
+  pub fn add_wasm_kernels(&mut self, wasm_kernels: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<WasmKernelSpec<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Postscript::VT_WASM_KERNELS, wasm_kernels);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> PostscriptBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     PostscriptBuilder {
@@ -487,6 +507,143 @@ impl ::core::fmt::Debug for Postscript<'_> {
       ds.field("layout", &self.layout());
       ds.field("statistics", &self.statistics());
       ds.field("footer", &self.footer());
+      ds.field("wasm_kernels", &self.wasm_kernels());
+      ds.finish()
+  }
+}
+pub enum WasmKernelSpecOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+/// A `WasmKernelSpec` locates a WebAssembly decoder kernel embedded in the file.
+pub struct WasmKernelSpec<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for WasmKernelSpec<'a> {
+  type Inner = WasmKernelSpec<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> WasmKernelSpec<'a> {
+  pub const VT_ID: ::flatbuffers::VOffsetT = 4;
+  pub const VT_ABI_VERSION: ::flatbuffers::VOffsetT = 6;
+  pub const VT_SEGMENT: ::flatbuffers::VOffsetT = 8;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    WasmKernelSpec { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args WasmKernelSpecArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<WasmKernelSpec<'bldr>> {
+    let mut builder = WasmKernelSpecBuilder::new(_fbb);
+    if let Some(x) = args.segment { builder.add_segment(x); }
+    builder.add_abi_version(args.abi_version);
+    if let Some(x) = args.id { builder.add_id(x); }
+    builder.finish()
+  }
+
+
+  /// The array encoding id this kernel decodes, e.g. "fastlanes.bitpacked".
+  #[inline]
+  pub fn id(&self) -> &'a str {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(WasmKernelSpec::VT_ID, None).unwrap()}
+  }
+  /// The host/guest ABI version the kernel was built against.
+  #[inline]
+  pub fn abi_version(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(WasmKernelSpec::VT_ABI_VERSION, Some(0)).unwrap()}
+  }
+  /// Segment containing the `.wasm` module (required).
+  #[inline]
+  pub fn segment(&self) -> PostscriptSegment<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>(WasmKernelSpec::VT_SEGMENT, None).unwrap()}
+  }
+}
+
+impl ::flatbuffers::Verifiable for WasmKernelSpec<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("id", Self::VT_ID, true)?
+     .visit_field::<u32>("abi_version", Self::VT_ABI_VERSION, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<PostscriptSegment>>("segment", Self::VT_SEGMENT, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct WasmKernelSpecArgs<'a> {
+    pub id: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub abi_version: u32,
+    pub segment: Option<::flatbuffers::WIPOffset<PostscriptSegment<'a>>>,
+}
+impl<'a> Default for WasmKernelSpecArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    WasmKernelSpecArgs {
+      id: None, // required field
+      abi_version: 0,
+      segment: None, // required field
+    }
+  }
+}
+
+pub struct WasmKernelSpecBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> WasmKernelSpecBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_id(&mut self, id: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(WasmKernelSpec::VT_ID, id);
+  }
+  #[inline]
+  pub fn add_abi_version(&mut self, abi_version: u32) {
+    self.fbb_.push_slot::<u32>(WasmKernelSpec::VT_ABI_VERSION, abi_version, 0);
+  }
+  #[inline]
+  pub fn add_segment(&mut self, segment: ::flatbuffers::WIPOffset<PostscriptSegment<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<PostscriptSegment>>(WasmKernelSpec::VT_SEGMENT, segment);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> WasmKernelSpecBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    WasmKernelSpecBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<WasmKernelSpec<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, WasmKernelSpec::VT_ID,"id");
+    self.fbb_.required(o, WasmKernelSpec::VT_SEGMENT,"segment");
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for WasmKernelSpec<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("WasmKernelSpec");
+      ds.field("id", &self.id());
+      ds.field("abi_version", &self.abi_version());
+      ds.field("segment", &self.segment());
       ds.finish()
   }
 }

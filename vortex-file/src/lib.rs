@@ -64,6 +64,9 @@
 //! │          Segments          │  serialized array chunks and per-column
 //! │     (data & statistics)    │  statistics, in writer-chosen order
 //! ├────────────────────────────┤
+//! │       Decoder kernels      │  optional; portable decoders for the encodings
+//! │                            │  used by the file, one segment each
+//! ├────────────────────────────┤
 //! │      DType flatbuffer      │  optional; omitted via `exclude_dtype`
 //! ├────────────────────────────┤
 //! │      Layout flatbuffer     │  required; the root Layout tree
@@ -73,7 +76,7 @@
 //! │      Footer flatbuffer     │  required; dictionary-encoded segment map
 //! │                            │  and array/layout/compression/encryption specs
 //! ├────────────────────────────┤
-//! │         Postscript         │  offsets of the four footer segments above;
+//! │         Postscript         │  offsets of the footer segments above;
 //! │                            │  at most 65528 bytes
 //! ├────────────────────────────┤
 //! │     8-byte End of File     │  u16 version, u16 postscript length,
@@ -83,8 +86,9 @@
 //!
 //! The postscript records the offset, length, and alignment of the dtype, layout, statistics, and
 //! footer segments, so a single read of the file tail (defaulting to 64KiB) is enough to locate and
-//! parse the footer. The byte-level format is specified in full at
-//! <https://docs.vortex.dev/specs/file-format.html>.
+//! parse the footer. It also records any [`EmbeddedKernel`]s, each tagged with the array encoding
+//! id it decodes so a reader can skip fetching the ones it does not need. The byte-level format is
+//! specified in full at <https://docs.vortex.dev/specs/file-format.html>.
 //!
 //! A Parquet-style file is realized by nesting a chunked layout of struct layouts of chunked layouts
 //! of flat layouts: the outer chunked layout models row groups and the inner one models pages.

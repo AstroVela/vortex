@@ -142,6 +142,10 @@ impl Deref for CachedId {
 }
 
 /// A registry of items that are keyed by a string identifier.
+///
+/// [`Clone`] is a *handle* clone: both handles share one underlying map, so a
+/// [`register`](Registry::register) through either is visible through both. Use
+/// [`fork`](Registry::fork) when the copy must evolve independently.
 #[derive(Clone, Debug)]
 pub struct Registry<T>(Arc<DashMap<Id, T>>);
 
@@ -177,6 +181,20 @@ impl<T: Clone> Registry<T> {
     /// Find the item with the given ID.
     pub fn find(&self, id: &Id) -> Option<T> {
         self.0.get(id).as_deref().cloned()
+    }
+
+    /// Copy this registry's entries into a new, independent registry.
+    ///
+    /// Unlike [`Clone`], which shares the underlying map, subsequent registrations on either the
+    /// original or the fork are invisible to the other. Use this to scope registrations — for
+    /// example, encodings supplied by one file must not leak into a session shared with others.
+    pub fn fork(&self) -> Self {
+        Self(Arc::new(
+            self.0
+                .iter()
+                .map(|entry| (*entry.key(), entry.value().clone()))
+                .collect(),
+        ))
     }
 
     /// Register a new item, replacing any existing item with the same ID.

@@ -156,6 +156,10 @@ impl VortexOpenOptions {
     ///
     /// If this is provided, then the Vortex file can be opened without performing any I/O.
     /// Once open, the [`Footer`] can be accessed via [`crate::VortexFile::footer`].
+    ///
+    /// Note that this skips reading the postscript, so any decoder kernels the file embeds are not
+    /// loaded. Scanning a file whose encodings this session lacks then fails as it would for any
+    /// unknown encoding; supply a session that can already decode them.
     pub fn with_footer(mut self, footer: Footer) -> Self {
         self.dtype = Some(footer.layout().dtype().clone());
         self.footer = Some(footer);
@@ -213,8 +217,8 @@ impl VortexOpenOptions {
         let cache_layout_reader = self.cache_layout_reader;
         let mut opts = self.with_initial_read_size(0);
 
-        let footer = match opts.footer.take() {
-            Some(footer) => footer,
+        let (footer, session) = match opts.footer.take() {
+            Some(footer) => (footer, opts.session.clone()),
             None => block_on(opts.read_footer(&buffer))?,
         };
 
@@ -222,7 +226,7 @@ impl VortexOpenOptions {
             buffer,
             Arc::clone(footer.segment_map()),
         ));
-        let file = VortexFile::new(footer, segment_source, opts.session);
+        let file = VortexFile::new(footer, segment_source, session);
         Ok(if cache_layout_reader {
             file.with_caching()
         } else {
@@ -244,8 +248,8 @@ impl VortexOpenOptions {
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultMetricsRegistry::default()));
 
-        let footer = if let Some(footer) = self.footer {
-            footer
+        let (footer, session) = if let Some(footer) = self.footer {
+            (footer, self.session.clone())
         } else {
             self.read_footer(&reader).await?
         };
@@ -275,7 +279,7 @@ impl VortexOpenOptions {
             segment_source,
         ));
 
-        let file = VortexFile::new(footer, segment_source, self.session.clone());
+        let file = VortexFile::new(footer, segment_source, session);
         Ok(if self.cache_layout_reader {
             file.with_caching()
         } else {
@@ -283,7 +287,12 @@ impl VortexOpenOptions {
         })
     }
 
-    async fn read_footer(&self, read: &dyn VortexReadAt) -> VortexResult<Footer> {
+    /// Read the footer, returning it alongside the session it was parsed with.
+    ///
+    /// The returned session is not necessarily the one that was passed in: a file that embeds
+    /// decoder kernels for encodings this reader lacks is parsed with a file-scoped session
+    /// carrying those encodings, and scans must use that same session.
+    async fn read_footer(&self, read: &dyn VortexReadAt) -> VortexResult<(Footer, VortexSession)> {
         // Fetch the file size and perform the initial read.
         let file_size = match self.file_size {
             None => read.size().await?,
@@ -328,7 +337,8 @@ impl VortexOpenOptions {
         let initial_offset = file_size - (deserializer.buffer().len() as u64);
         self.populate_initial_segments(initial_offset, deserializer.buffer(), &footer);
 
-        Ok(footer)
+        let session = deserializer.session().clone();
+        Ok((footer, session))
     }
 
     /// Populate segments in the cache that were covered by the initial read.

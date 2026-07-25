@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -20,7 +21,9 @@ use crate::MAGIC_BYTES;
 use crate::MAX_POSTSCRIPT_SIZE;
 use crate::VERSION;
 use crate::footer::file_layout::FooterFlatBufferWriter;
+use crate::footer::kernels::EmbeddedKernel;
 use crate::footer::postscript::Postscript;
+use crate::footer::postscript::PostscriptKernel;
 use crate::footer::postscript::PostscriptSegment;
 
 /// Serializes a [`Footer`] into footer buffers and the trailing postscript/EOF marker.
@@ -28,6 +31,7 @@ pub struct FooterSerializer {
     footer: Footer,
     exclude_dtype: bool,
     offset: u64,
+    wasm_kernels: Vec<EmbeddedKernel>,
 }
 
 impl FooterSerializer {
@@ -36,7 +40,18 @@ impl FooterSerializer {
             footer,
             exclude_dtype: false,
             offset: 0,
+            wasm_kernels: Vec::new(),
         }
+    }
+
+    /// Embed decoder kernels for the encodings used by the file.
+    ///
+    /// Each kernel is written as its own segment and referenced from the postscript by encoding
+    /// id, so a reader lacking a native decoder for that encoding can run the kernel instead. See
+    /// [`EmbeddedKernel`].
+    pub fn with_wasm_kernels(mut self, kernels: impl IntoIterator<Item = EmbeddedKernel>) -> Self {
+        self.wasm_kernels = kernels.into_iter().collect();
+        self
     }
 
     /// Update the offset used to generate absolute segment locations.
@@ -66,6 +81,29 @@ impl FooterSerializer {
     /// This can be helpful for storing some footer data out-of-band to accelerate opening a file.
     pub fn serialize(mut self) -> VortexResult<Vec<ByteBuffer>> {
         let mut buffers = vec![];
+
+        // Kernels go first so that a reader whose initial tail read misses them can pick them up
+        // in the same follow-up read as the rest of the footer segments.
+        let wasm_kernels = std::mem::take(&mut self.wasm_kernels)
+            .into_iter()
+            .map(|kernel| {
+                let module = kernel.module().clone();
+                let length = u32::try_from(module.len())
+                    .map_err(|_| vortex_err!("wasm kernel length exceeds maximum u32"))?;
+                let segment = PostscriptSegment {
+                    offset: self.offset,
+                    length,
+                    alignment: Alignment::none(),
+                };
+                self.offset += u64::from(length);
+                buffers.push(module);
+                Ok(PostscriptKernel {
+                    id: kernel.id().to_string(),
+                    abi_version: kernel.abi_version(),
+                    segment,
+                })
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
 
         let dtype_segment = if self.exclude_dtype {
             None
@@ -111,6 +149,7 @@ impl FooterSerializer {
             layout: layout_segment,
             statistics: statistics_segment,
             footer: footer_segment,
+            wasm_kernels,
         };
         let postscript_buffer = postscript.write_flatbuffer_bytes()?;
         if postscript_buffer.len() > MAX_POSTSCRIPT_SIZE as usize {

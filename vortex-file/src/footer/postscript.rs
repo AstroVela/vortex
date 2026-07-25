@@ -20,6 +20,18 @@ pub(crate) struct Postscript {
     pub(crate) layout: PostscriptSegment,
     pub(crate) statistics: Option<PostscriptSegment>,
     pub(crate) footer: PostscriptSegment,
+    pub(crate) wasm_kernels: Vec<PostscriptKernel>,
+}
+
+/// The location of a decoder kernel embedded in the file, and the encoding it decodes.
+///
+/// The id lives in the postscript rather than the kernel segment so a reader can decide whether it
+/// needs the bytes at all — an encoding it can already decode natively never gets fetched.
+#[derive(Clone)]
+pub(crate) struct PostscriptKernel {
+    pub(crate) id: String,
+    pub(crate) abi_version: u32,
+    pub(crate) segment: PostscriptSegment,
 }
 
 impl FlatBufferRoot for Postscript {}
@@ -43,6 +55,29 @@ impl WriteFlatBuffer for Postscript {
             .map(|ps| ps.write_flatbuffer(fbb))
             .transpose()?;
         let footer = self.footer.write_flatbuffer(fbb)?;
+
+        let wasm_kernels = (!self.wasm_kernels.is_empty())
+            .then(|| {
+                let kernels = self
+                    .wasm_kernels
+                    .iter()
+                    .map(|kernel| {
+                        let id = fbb.create_string(&kernel.id);
+                        let segment = kernel.segment.write_flatbuffer(fbb)?;
+                        Ok(fb::WasmKernelSpec::create(
+                            fbb,
+                            &fb::WasmKernelSpecArgs {
+                                id: Some(id),
+                                abi_version: kernel.abi_version,
+                                segment: Some(segment),
+                            },
+                        ))
+                    })
+                    .collect::<VortexResult<Vec<_>>>()?;
+                Ok::<_, VortexError>(fbb.create_vector(&kernels))
+            })
+            .transpose()?;
+
         Ok(fb::Postscript::create(
             fbb,
             &fb::PostscriptArgs {
@@ -50,6 +85,7 @@ impl WriteFlatBuffer for Postscript {
                 layout: Some(layout),
                 statistics,
                 footer: Some(footer),
+                wasm_kernels,
             },
         ))
     }
@@ -79,10 +115,23 @@ impl ReadFlatBuffer for Postscript {
                 &fb.footer()
                     .ok_or_else(|| vortex_err!("Postscript missing footer segment"))?,
             )?,
+            wasm_kernels: fb
+                .wasm_kernels()
+                .into_iter()
+                .flatten()
+                .map(|kernel| {
+                    Ok(PostscriptKernel {
+                        id: kernel.id().to_string(),
+                        abi_version: kernel.abi_version(),
+                        segment: PostscriptSegment::read_flatbuffer(&kernel.segment())?,
+                    })
+                })
+                .collect::<VortexResult<Vec<_>>>()?,
         })
     }
 }
 
+#[derive(Clone)]
 pub struct PostscriptSegment {
     pub(crate) offset: u64,
     pub(crate) length: u32,

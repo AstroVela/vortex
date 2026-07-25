@@ -52,6 +52,12 @@ The postscript contains the locations of:
 2. a `layout` segment containing the root `Layout`
 3. a `statistics` segment containing file-level per-field statistics (e.g., minima and maxima of each field/column, for whole-file pruning)
 4. a `footer` segment containing a dictionary-encoded _segment map_, and other shared configuration such as compression and encryption schemes
+5. zero or more `wasm_kernels`, each naming an array encoding id and locating a segment holding a portable WebAssembly decoder for it
+
+The kernels let a reader decode an encoding it has no native implementation of. Because the
+encoding id is recorded in the postscript rather than inside the kernel segment, a reader fetches
+a kernel's bytes only for encodings it cannot already decode; a native decoder always supersedes an
+embedded one. Running embedded kernels is opt-in on the reader.
 
 :::{literalinclude} ../../vortex-flatbuffers/flatbuffers/vortex-file/footer.fbs
 :start-after: [postscript]

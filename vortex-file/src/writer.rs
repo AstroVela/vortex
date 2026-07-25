@@ -53,6 +53,7 @@ use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
 use crate::counting::CountingVortexWrite;
+use crate::footer::EmbeddedKernel;
 use crate::footer::FileStatistics;
 use crate::segments::writer::BufferedSegmentSink;
 
@@ -70,6 +71,7 @@ pub struct VortexWriteOptions {
     exclude_dtype: bool,
     max_variable_length_statistics_size: usize,
     file_statistics: Vec<Stat>,
+    wasm_kernels: Vec<EmbeddedKernel>,
 }
 
 /// Extension trait for constructing [`VortexWriteOptions`] from a session.
@@ -83,6 +85,7 @@ pub trait WriteOptionsSessionExt: SessionExt {
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
+            wasm_kernels: Vec::new(),
         }
     }
 }
@@ -97,6 +100,7 @@ impl VortexWriteOptions {
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
+            wasm_kernels: Vec::new(),
         }
     }
 
@@ -123,6 +127,20 @@ impl VortexWriteOptions {
     /// Pass an empty vector to omit file-level statistics.
     pub fn with_file_statistics(mut self, file_statistics: Vec<Stat>) -> Self {
         self.file_statistics = file_statistics;
+        self
+    }
+
+    /// Embed a portable decoder kernel for one of the array encodings used by the file.
+    ///
+    /// A reader that has no native decoder for `kernel`'s encoding — and that has installed an
+    /// [`EmbeddedKernelSession`](crate::EmbeddedKernelSession) loader — will decode through the
+    /// kernel instead of failing on an unknown encoding. Readers that *do* have the native
+    /// encoding never fetch the bytes.
+    ///
+    /// This does not affect how the file's arrays are encoded: the writer still needs the native
+    /// encoding to produce them.
+    pub fn with_wasm_kernel(mut self, kernel: EmbeddedKernel) -> Self {
+        self.wasm_kernels.push(kernel);
         self
     }
 }
@@ -192,6 +210,9 @@ impl VortexWriteOptions {
 
         let segments = Arc::new(BufferedSegmentSink::new(send, position));
 
+        // Taken before the layout future captures `self.strategy`.
+        let wasm_kernels = self.wasm_kernels;
+
         // We spawn the layout future so it is driven in the background while we write the
         // buffer stream, so we don't need to poll it until all buffers have been drained.
         let ctx2 = ctx.clone();
@@ -245,6 +266,7 @@ impl VortexWriteOptions {
             .into_serializer()
             .with_offset(position)
             .with_exclude_dtype(self.exclude_dtype)
+            .with_wasm_kernels(wasm_kernels)
             .serialize()?;
 
         // Update the approx footer size in the footer object, so it can be used for caching and

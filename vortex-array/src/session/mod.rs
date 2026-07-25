@@ -32,6 +32,11 @@ use crate::arrays::Variant;
 
 pub type ArrayRegistry = Registry<ArrayPluginRef>;
 
+/// The array encodings available in a session.
+///
+/// Note that [`Clone`] shares the underlying registry, so a clone is a second handle onto the same
+/// set of encodings rather than an independent copy. Use [`fork`](ArraySession::fork) when
+/// registrations must be scoped — for instance to encodings supplied by a single file.
 #[derive(Clone, Debug)]
 pub struct ArraySession {
     /// The set of registered array encodings.
@@ -47,6 +52,15 @@ impl ArraySession {
 
     pub fn registry(&self) -> &ArrayRegistry {
         &self.registry
+    }
+
+    /// Copy the currently registered encodings into an independent [`ArraySession`].
+    ///
+    /// Encodings registered on the fork are invisible to this session, and vice versa.
+    pub fn fork(&self) -> ArraySession {
+        Self {
+            registry: self.registry.fork(),
+        }
     }
 
     /// Register a new array encoding, replacing any existing encoding with the same ID.
@@ -124,6 +138,7 @@ mod tests {
 
     use crate::ArrayVTable;
     use crate::arrays::Bool;
+    use crate::arrays::Primitive;
     use crate::session::ArraySession;
     use crate::session::ArraySessionExt;
 
@@ -139,5 +154,17 @@ mod tests {
         let session = VortexSession::empty().with_some(ArraySession::empty());
 
         assert!(session.arrays().registry().find(&Bool.id()).is_none());
+    }
+
+    #[test]
+    fn fork_copies_encodings_but_isolates_registrations() {
+        let original = ArraySession::empty();
+        original.register(Bool);
+
+        let forked = original.fork();
+        assert!(forked.registry().find(&Bool.id()).is_some());
+
+        forked.register(Primitive);
+        assert!(original.registry().find(&Primitive.id()).is_none());
     }
 }

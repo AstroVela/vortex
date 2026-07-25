@@ -29,6 +29,21 @@ table Postscript {
     statistics: PostscriptSegment;
     /// Segment containing the 'Footer' flatbuffer (required)
     footer: PostscriptSegment;
+    /// Decoder kernels embedded in the file, one per array encoding id.
+    ///
+    /// A reader that does not have a native decoder for an encoding used by the file may run the
+    /// corresponding kernel instead. A native decoder always supersedes an embedded kernel.
+    wasm_kernels: [WasmKernelSpec];
+}
+
+/// A `WasmKernelSpec` locates a WebAssembly decoder kernel embedded in the file.
+table WasmKernelSpec {
+    /// The array encoding id this kernel decodes, e.g. "fastlanes.bitpacked".
+    id: string (required);
+    /// The host/guest ABI version the kernel was built against.
+    abi_version: uint32;
+    /// Segment containing the `.wasm` module (required).
+    segment: PostscriptSegment (required);
 }
 
 /// A `PostscriptSegment` describes the location of a segment in the file without referencing any
