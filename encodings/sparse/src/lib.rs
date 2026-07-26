@@ -697,7 +697,9 @@ mod test {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::VarBinViewArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::builders::DynVarBinBuilder;
     use vortex_array::builtins::ArrayBuiltins;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
@@ -903,6 +905,46 @@ mod test {
                 .unwrap()
                 .all_true()
         );
+    }
+
+    #[test]
+    fn test_append_utf8_to_dyn_varbin_builder() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = VarBinViewArray::from_iter_nullable_str([Some("patched"), None, Some("last")])
+            .into_array();
+        let fill = Scalar::null(values.dtype().clone());
+        let array = Sparse::try_new(buffer![1u8, 3, 5].into_array(), values, 6, fill).unwrap();
+        let expected = VarBinViewArray::from_iter_nullable_str([
+            None,
+            Some("patched"),
+            None,
+            None,
+            None,
+            Some("last"),
+        ])
+        .into_array();
+        let mut builder =
+            DynVarBinBuilder::with_capacity(array.dtype().clone(), false, array.len());
+        array.append_to_builder(&mut builder, &mut ctx).unwrap();
+        assert_arrays_eq!(builder.finish_into_varbin(), expected, &mut ctx);
+    }
+
+    #[test]
+    fn test_append_utf8_with_duplicate_patch_indices() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = VarBinViewArray::from_iter_str(["first", "second"]).into_array();
+        let array = Sparse::try_new(
+            buffer![1u8, 1].into_array(),
+            values,
+            2,
+            Scalar::utf8("fill".to_string(), Nullability::NonNullable),
+        )
+        .unwrap();
+        let expected = VarBinViewArray::from_iter_str(["fill", "second"]).into_array();
+        let mut builder =
+            DynVarBinBuilder::with_capacity(array.dtype().clone(), false, array.len());
+        array.append_to_builder(&mut builder, &mut ctx).unwrap();
+        assert_arrays_eq!(builder.finish_into_varbin(), expected, &mut ctx);
     }
 
     #[test]
