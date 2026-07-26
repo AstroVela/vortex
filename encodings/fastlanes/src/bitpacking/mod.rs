@@ -12,6 +12,8 @@ pub use array::bitpack_decompress;
 pub use array::unpack_iter;
 
 pub(crate) mod compute;
+pub use compute::compare_limbs::LimbCompare;
+pub use compute::compare_limbs::limbs_lt_constant;
 
 mod plugin;
 mod vtable;

@@ -64,6 +64,10 @@ harness = false
 required-features = ["_test-harness"]
 
 [[bench]]
+name = "limb_compare"
+harness = false
+
+[[bench]]
 name = "bitpack_compare"
 harness = false
 
