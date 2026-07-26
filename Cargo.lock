@@ -10814,6 +10814,7 @@ version = "0.1.0"
 dependencies = [
  "fsst-rs",
  "futures",
+ "rstest",
  "tokio",
  "vortex-array",
  "vortex-buffer",
