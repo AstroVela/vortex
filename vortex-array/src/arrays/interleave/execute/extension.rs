@@ -6,10 +6,12 @@ use vortex_error::VortexResult;
 use super::super::Interleave;
 use super::super::InterleaveArray;
 use super::super::InterleaveArrayExt;
+use super::selectors::validate_interleave;
 use crate::IntoArray;
 use crate::array::Array;
 use crate::arrays::Extension;
 use crate::arrays::ExtensionArray;
+use crate::arrays::Primitive;
 use crate::arrays::extension::ExtensionArrayExt;
 use crate::executor::ExecutionCtx;
 use crate::executor::ExecutionResult;
@@ -21,9 +23,12 @@ pub(super) fn execute(
 ) -> VortexResult<ExecutionResult> {
     let num_values = array.num_values();
     let mut array = array;
+    array = require_child!(array, array.array_indices(), 0 => Primitive);
+    array = require_child!(array, array.row_indices(), 1 => Primitive);
     for i in 0..num_values {
         array = require_child!(array, array.value(i), i + 2 => Extension);
     }
+    validate_interleave(&array)?;
 
     let first = array.value(0).as_::<Extension>();
     let storage = InterleaveArray::try_new(

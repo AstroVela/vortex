@@ -78,8 +78,7 @@ fn gather<A: AsPrimitive<usize>, R: AsPrimitive<usize>>(
         rows,
     )?;
 
-    // SAFETY: `validate_selectors` proved `branches.len() == rows.len() == len`, and for every
-    // `i < len` that `branches[i] < value_bits.len()` and `rows[i] < value_bits[branches[i]].len()`.
+    // SAFETY: `validate_selectors` proved both selector bounds.
     Ok(unsafe { gather_bits(len, value_bits, branches, rows) })
 }
 

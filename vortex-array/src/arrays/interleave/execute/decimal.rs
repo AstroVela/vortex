@@ -14,6 +14,8 @@ use crate::array::Array;
 use crate::arrays::Decimal;
 use crate::arrays::DecimalArray;
 use crate::arrays::Primitive;
+use crate::arrays::decimal::widened_buffer;
+use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
 use crate::executor::ExecutionCtx;
 use crate::executor::ExecutionResult;
@@ -37,9 +39,16 @@ pub(super) fn execute(
 
     let first = array.value(0).as_::<Decimal>();
     let decimal_dtype = first.decimal_dtype();
+    let values_type = (0..num_values)
+        .map(|i| array.value(i).as_::<Decimal>().values_type())
+        .max()
+        .unwrap_or(DecimalType::I8);
+    let values = (0..num_values)
+        .map(|i| array.value(i).as_::<Decimal>().into_owned())
+        .collect::<Vec<_>>();
     let validity = array.as_ref().validity()?;
-    let output = match_each_decimal_value_type!(first.values_type(), |T| {
-        execute_typed::<T>(&array, decimal_dtype, validity)?
+    let output = match_each_decimal_value_type!(values_type, |T| {
+        execute_typed::<T>(&array, &values, decimal_dtype, validity)?
     });
 
     Ok(ExecutionResult::done(output))
@@ -47,12 +56,11 @@ pub(super) fn execute(
 
 fn execute_typed<T: NativeDecimalType>(
     array: &Array<Interleave>,
+    values: &[DecimalArray],
     decimal_dtype: crate::dtype::DecimalDType,
     validity: Validity,
 ) -> VortexResult<ArrayRef> {
-    let value_buffers = (0..array.num_values())
-        .map(|i| array.value(i).as_::<Decimal>().buffer::<T>())
-        .collect::<Vec<_>>();
+    let value_buffers = values.iter().map(widened_buffer::<T>).collect::<Vec<_>>();
     let array_indices = array.array_indices().as_::<Primitive>();
     let row_indices = array.row_indices().as_::<Primitive>();
     let values = match_each_unsigned_integer_ptype!(array_indices.ptype(), |A| {
