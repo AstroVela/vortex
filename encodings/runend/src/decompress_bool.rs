@@ -165,7 +165,14 @@ fn decode_bool_non_nullable(
         return BoolArray::new(decoded.freeze(), nullability.into());
     }
 
-    // Adaptive strategy: prefill with majority value, only flip minority runs
+    // Adaptive strategy: prefill with majority value, only flip minority runs.
+    //
+    // The `value != prefill` test below is a data-dependent branch, so on 50/50 values it
+    // mispredicts about half the time. Dropping it -- filling every run unconditionally, as the
+    // primitive kernel's splat does -- was measured and is worse everywhere: 0.67-0.87x on
+    // 50/50 values and 0.44-0.55x on skewed ones. A bit-range fill costs head and tail masking
+    // around the body, which is dearer than the mispredict, so skipping the majority runs wins
+    // even when the branch is unpredictable. Measure `decode_bool_varied` before revisiting.
     let prefill = values.true_count() > num_runs - values.true_count();
     let mut decoded = BitBufferMut::full(prefill, length);
     let mut current_pos = 0usize;
