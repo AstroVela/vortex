@@ -5,8 +5,10 @@
 //!
 //! * `prefill` is a bench-local mirror of the kernel this crate shipped before the splat: memset
 //!   the output with the majority value, then `fill_range` every run whose value differs.
+//! * `push_splat` is the splat as first written, appending words to a `BufferMut<u64>`.
 //! * `shipped` is `runend_decode_typed_bool`, which picks between that same prefill and the
-//!   splat — accumulate runs into a 64-bit word, store each output word exactly once.
+//!   splat — accumulate runs into a 64-bit word, store each output word exactly once, into a
+//!   buffer sized up front and overwritten by index.
 //!
 //! Run lengths and values are randomised and datasets are rotated across iterations, so the
 //! per-run value branch the prefill kernel depends on cannot be memorised by the predictor.
@@ -57,6 +59,9 @@ fn main() {
 }
 
 const TOTAL_LENGTH: usize = 65_536;
+
+/// Bits per accumulator word, mirroring the kernel.
+const WORD_BITS: usize = u64::BITS as usize;
 
 /// Number of independently-seeded datasets cycled across iterations.
 const DATASETS: usize = 8;
@@ -271,6 +276,132 @@ fn prefill_nullable(bencher: Bencher, args: Args) {
         )
         .into_array()
     });
+}
+
+#[divan::bench(args = ARGS)]
+fn push_splat(bencher: Bencher, args: Args) {
+    let next = rotating(args.avg_run_length, args.skew, false);
+    bencher.with_inputs(&next).bench_values(|d| {
+        BoolArray::new(
+            push_splat_non_nullable(d.ends.as_slice(), &d.values, TOTAL_LENGTH).freeze(),
+            Nullability::NonNullable.into(),
+        )
+        .into_array()
+    });
+}
+
+#[divan::bench(args = ARGS)]
+fn push_splat_nullable(bencher: Bencher, args: Args) {
+    let next = rotating(args.avg_run_length, args.skew, true);
+    bencher.with_inputs(&next).bench_values(|d| {
+        let Mask::Values(mask) = &d.validity else {
+            unreachable!("nullable dataset")
+        };
+        let (decoded, validity) = push_splat_nullable_kernel(
+            d.ends.as_slice(),
+            &d.values,
+            mask.bit_buffer(),
+            TOTAL_LENGTH,
+        );
+        BoolArray::new(decoded.freeze(), Validity::from(validity.freeze())).into_array()
+    });
+}
+
+/// The splat as it was first written, appending to a `BufferMut<u64>` with `push`/`push_n`
+/// instead of overwriting a pre-sized buffer.
+///
+/// This is the variant the shipped kernel replaced. The interesting part is not the append
+/// itself: `push_n` and `slice::fill` lower to the same inlined vector store loop, and the
+/// per-word capacity check merely trades places with a slice bounds check. What the append costs
+/// is inlining — `reserve`'s allocation slow path keeps `append_spanning` above LLVM's inline
+/// budget, so `&mut self` escapes into a call and the accumulator lives on the stack for the
+/// whole loop, at a read-modify-write per short run.
+struct PushSplat {
+    words: BufferMut<u64>,
+    word: u64,
+    bits: usize,
+}
+
+impl PushSplat {
+    fn with_capacity(length: usize) -> Self {
+        Self {
+            words: BufferMut::with_capacity(length.div_ceil(WORD_BITS)),
+            word: 0,
+            bits: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn append_run(&mut self, value: bool, n: usize) {
+        let splat = u64::from(value).wrapping_neg();
+        if self.bits + n < WORD_BITS {
+            self.word |= splat & (((1u64 << n) - 1) << self.bits);
+            self.bits += n;
+            return;
+        }
+        self.append_spanning(splat, n);
+    }
+
+    fn append_spanning(&mut self, splat: u64, n: usize) {
+        self.words.push(self.word | (splat << self.bits));
+        let rest = n - (WORD_BITS - self.bits);
+
+        let whole = rest / WORD_BITS;
+        if whole > 0 {
+            self.words.push_n(splat, whole);
+        }
+
+        let tail = rest % WORD_BITS;
+        self.word = splat & ((1u64 << tail) - 1);
+        self.bits = tail;
+    }
+
+    fn finish(mut self, length: usize) -> BitBufferMut {
+        if self.bits > 0 {
+            self.words.push(self.word);
+        }
+        let words = length.div_ceil(WORD_BITS);
+        if self.words.len() < words {
+            self.words.push_n(0, words - self.words.len());
+        }
+        self.words.truncate(words);
+
+        let mut bytes = self.words.into_byte_buffer();
+        bytes.truncate(length.div_ceil(8));
+        BitBufferMut::from_buffer(bytes, 0, length)
+    }
+}
+
+fn push_splat_non_nullable(run_ends: &[u32], values: &BitBuffer, length: usize) -> BitBufferMut {
+    let mut decoded = PushSplat::with_capacity(length);
+    let mut pos = 0usize;
+    for (i, &end) in run_ends.iter().enumerate() {
+        let end = (end as usize).min(length);
+        decoded.append_run(values.value(i), end.saturating_sub(pos));
+        pos = end;
+    }
+    decoded.finish(length)
+}
+
+fn push_splat_nullable_kernel(
+    run_ends: &[u32],
+    values: &BitBuffer,
+    validity_mask: &BitBuffer,
+    length: usize,
+) -> (BitBufferMut, BitBufferMut) {
+    let mut decoded = PushSplat::with_capacity(length);
+    let mut decoded_validity = PushSplat::with_capacity(length);
+    let mut pos = 0usize;
+    for (i, &end) in run_ends.iter().enumerate() {
+        let end = (end as usize).min(length);
+        let run = end.saturating_sub(pos);
+        pos = end;
+
+        let is_valid = validity_mask.value(i);
+        decoded.append_run(is_valid && values.value(i), run);
+        decoded_validity.append_run(is_valid, run);
+    }
+    (decoded.finish(length), decoded_validity.finish(length))
 }
 
 /// Threshold below which the mirrored kernel appends sequentially instead of prefilling.

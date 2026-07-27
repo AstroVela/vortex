@@ -11,9 +11,12 @@
 //!   runs, where it is up to 4x the prefill.
 //! * *prefill* memsets the whole output with the majority value and then patches only the runs
 //!   that differ. One big memset beats a per-run one, so this stays ahead once runs are long
-//!   enough that the splat pays a `memset` call per run and the patched runs are rare.
+//!   enough that the splat pays a whole-word fill per run and the patched runs are rare.
 //!
-//! See `benches/run_end_decode_bool_ablation.rs` for the A/B the crossover comes from.
+//! See `benches/run_end_decode_bool_ablation.rs` for the A/B both the crossover and the splat's
+//! output-buffer strategy come from.
+
+use std::mem::MaybeUninit;
 
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
@@ -94,24 +97,33 @@ pub fn runend_decode_typed_bool<E: IntegerPType>(
     }
 }
 
-/// A bit sink that builds its output one 64-bit word at a time.
+/// A bit sink that overwrites a pre-sized word buffer, one 64-bit word at a time.
 ///
 /// Bits are accumulated in a register and each word is written to the buffer exactly once, so a
 /// run never reads back what an earlier run stored. Compare a per-run `fill_range`, which
 /// read-modify-writes a partial byte at each end of every run.
-struct BitSplat {
-    words: BufferMut<u64>,
+///
+/// The buffer is allocated once at the exact final word count and written by index. Appending it
+/// with `BufferMut::push`/`push_n` instead keeps the accumulator in memory rather than in
+/// registers and puts the spanning-run path behind an out-of-line call; measured, the index
+/// writes are worth up to 1.9x. See `push_splat` in `benches/run_end_decode_bool_ablation.rs`.
+struct BitSplat<'a> {
+    /// Exactly the output words, written in ascending order and each at most once.
+    words: &'a mut [MaybeUninit<u64>],
+    /// Number of words already written, so `words[..idx]` is initialized.
+    idx: usize,
     /// The word under construction. Bits at and above `bits` are always zero.
     word: u64,
     /// Number of bits already accumulated into `word`, always `< WORD_BITS`.
     bits: usize,
 }
 
-impl BitSplat {
-    /// Creates a sink sized to hold `length` bits without reallocating.
-    fn with_capacity(length: usize) -> Self {
+impl<'a> BitSplat<'a> {
+    /// Creates a sink over the output words, which it initializes in full.
+    fn new(words: &'a mut [MaybeUninit<u64>]) -> Self {
         Self {
-            words: BufferMut::with_capacity(length.div_ceil(WORD_BITS)),
+            words,
+            idx: 0,
             word: 0,
             bits: 0,
         }
@@ -133,16 +145,23 @@ impl BitSplat {
 
     /// Appends a run that reaches at least to the end of the current word.
     ///
-    /// Whole words are memset rather than splatted one at a time.
+    /// Whole words are filled in one pass rather than splatted one at a time.
+    ///
+    /// Inlined on purpose: leaving it out of line spills the accumulator to the stack for the
+    /// whole loop, since `&mut self` escapes into the call. That costs a read-modify-write per
+    /// short run, which is the common case.
+    #[inline]
     fn append_spanning(&mut self, splat: u64, n: usize) {
         // Complete the current word. `self.bits < WORD_BITS`, so the shift is in range, and the
         // run covers every bit from `self.bits` up.
-        self.words.push(self.word | (splat << self.bits));
+        self.words[self.idx] = MaybeUninit::new(self.word | (splat << self.bits));
+        self.idx += 1;
         let rest = n - (WORD_BITS - self.bits);
 
         let whole = rest / WORD_BITS;
         if whole > 0 {
-            self.words.push_n(splat, whole);
+            self.words[self.idx..self.idx + whole].fill(MaybeUninit::new(splat));
+            self.idx += whole;
         }
 
         let tail = rest % WORD_BITS;
@@ -150,21 +169,66 @@ impl BitSplat {
         self.bits = tail;
     }
 
-    /// Flushes the accumulator into a `length`-bit buffer, zero-padding a short tail.
-    fn finish(mut self, length: usize) -> BitBufferMut {
+    /// Flushes the accumulator and zero-fills any words the runs did not reach, leaving every
+    /// word of the output initialized.
+    fn finish(self) {
+        let mut idx = self.idx;
         if self.bits > 0 {
-            self.words.push(self.word);
+            self.words[idx] = MaybeUninit::new(self.word);
+            idx += 1;
         }
-        let words = length.div_ceil(WORD_BITS);
-        if self.words.len() < words {
-            self.words.push_n(0, words - self.words.len());
-        }
-        self.words.truncate(words);
-
-        let mut bytes = self.words.into_byte_buffer();
-        bytes.truncate(length.div_ceil(8));
-        BitBufferMut::from_buffer(bytes, 0, length)
+        self.words[idx..].fill(MaybeUninit::new(0));
     }
+}
+
+/// Splats `length` bits into a fresh buffer, driving `fill` over the sink.
+fn splat_bits(length: usize, fill: impl FnOnce(&mut BitSplat<'_>)) -> BitBufferMut {
+    let n_words = length.div_ceil(WORD_BITS);
+    let mut buf = BufferMut::<u64>::with_capacity(n_words);
+    {
+        let words = &mut buf.spare_capacity_mut()[..n_words];
+        let mut splat = BitSplat::new(words);
+        fill(&mut splat);
+        splat.finish();
+    }
+    // SAFETY: the sink covered exactly `n_words` words and was finished, so every word in
+    // `0..n_words` is initialized, and `n_words` is the capacity requested above.
+    unsafe { buf.set_len(n_words) };
+    into_bits(buf, length)
+}
+
+/// Splats `length` bits into two fresh buffers, driving `fill` over both sinks at once.
+fn splat_bits_pair(
+    length: usize,
+    fill: impl FnOnce(&mut BitSplat<'_>, &mut BitSplat<'_>),
+) -> (BitBufferMut, BitBufferMut) {
+    let n_words = length.div_ceil(WORD_BITS);
+    let mut buf = BufferMut::<u64>::with_capacity(n_words);
+    let mut other = BufferMut::<u64>::with_capacity(n_words);
+    {
+        let words = &mut buf.spare_capacity_mut()[..n_words];
+        let other_words = &mut other.spare_capacity_mut()[..n_words];
+        let mut splat = BitSplat::new(words);
+        let mut other_splat = BitSplat::new(other_words);
+        fill(&mut splat, &mut other_splat);
+        splat.finish();
+        other_splat.finish();
+    }
+    // SAFETY: both sinks covered exactly `n_words` words and were finished, so every word in
+    // `0..n_words` of both buffers is initialized, and `n_words` is the capacity of each.
+    unsafe {
+        buf.set_len(n_words);
+        other.set_len(n_words);
+    }
+    (into_bits(buf, length), into_bits(other, length))
+}
+
+/// Reinterprets initialized words as a `length`-bit buffer. Little-endian only, like the rest of
+/// the crate's bit packing.
+fn into_bits(words: BufferMut<u64>, length: usize) -> BitBufferMut {
+    let mut bytes = words.into_byte_buffer();
+    bytes.truncate(length.div_ceil(8));
+    BitBufferMut::from_buffer(bytes, 0, length)
 }
 
 /// Convert `offset`/`length` into `E` once, outside the per-run loop.
@@ -212,7 +276,9 @@ fn minority_runs(values: &BitBuffer) -> usize {
 /// the splat has to build. So the prefill wins exactly when patches are rarer than that.
 ///
 /// On the `run_end_decode_bool_ablation` grid this picks the faster kernel everywhere except
-/// 8-element runs with 90/10 values, where it gives up 7%.
+/// 8-element runs with 90/10 values, where it gives up 7%. The threshold was derived before the
+/// splat switched to overwriting a pre-sized buffer, which made it 5-45% faster, so it is now
+/// conservative: there are grid points it hands to the prefill that the splat would win.
 fn prefer_splat(patched_runs: usize, buffers: usize, length: usize) -> bool {
     patched_runs * 3 * WORD_BITS >= length * buffers
 }
@@ -238,15 +304,16 @@ fn decode_bool_non_nullable<E: IntegerPType>(
         );
     }
 
-    let mut decoded = BitSplat::with_capacity(length);
-    let mut pos = 0usize;
-    for (i, &end) in run_ends.iter().enumerate() {
-        let end = trim_end(end, offset_e, length_e);
-        decoded.append_run(values.value(i), end.saturating_sub(pos));
-        pos = end;
-    }
+    let decoded = splat_bits(length, |decoded| {
+        let mut pos = 0usize;
+        for (i, &end) in run_ends.iter().enumerate() {
+            let end = trim_end(end, offset_e, length_e);
+            decoded.append_run(values.value(i), end.saturating_sub(pos));
+            pos = end;
+        }
+    });
 
-    BoolArray::new(decoded.finish(length).freeze(), nullability.into())
+    BoolArray::new(decoded.freeze(), nullability.into())
 }
 
 /// Decodes run-end encoded booleans when values may be null (nullable).
@@ -265,25 +332,21 @@ fn decode_bool_nullable<E: IntegerPType>(
         return prefill_bool_nullable(run_ends, offset_e, length_e, values, validity_mask, length);
     }
 
-    let mut decoded = BitSplat::with_capacity(length);
-    let mut decoded_validity = BitSplat::with_capacity(length);
+    let (decoded, decoded_validity) = splat_bits_pair(length, |decoded, decoded_validity| {
+        let mut pos = 0usize;
+        for (i, &end) in run_ends.iter().enumerate() {
+            let end = trim_end(end, offset_e, length_e);
+            let run = end.saturating_sub(pos);
+            pos = end;
 
-    let mut pos = 0usize;
-    for (i, &end) in run_ends.iter().enumerate() {
-        let end = trim_end(end, offset_e, length_e);
-        let run = end.saturating_sub(pos);
-        pos = end;
+            // The decoded bit is the value where valid, and false where null.
+            let is_valid = validity_mask.value(i);
+            decoded.append_run(is_valid && values.value(i), run);
+            decoded_validity.append_run(is_valid, run);
+        }
+    });
 
-        // The decoded bit is the value where valid, and false where null.
-        let is_valid = validity_mask.value(i);
-        decoded.append_run(is_valid && values.value(i), run);
-        decoded_validity.append_run(is_valid, run);
-    }
-
-    BoolArray::new(
-        decoded.finish(length).freeze(),
-        Validity::from(decoded_validity.finish(length).freeze()),
-    )
+    BoolArray::new(decoded.freeze(), Validity::from(decoded_validity.freeze()))
 }
 
 /// Memsets the output with the majority value, then patches the runs that differ.
