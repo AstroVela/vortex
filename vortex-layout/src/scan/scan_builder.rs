@@ -82,6 +82,8 @@ pub struct ScanBuilder<A> {
     /// The row-offset assigned to the first row of the file. Used by the `row_idx` expression,
     /// but not by the scan [`Selection`] which remains relative.
     row_offset: u64,
+    /// Whether projection and filter expressions should be optimized during prepare.
+    optimize_expressions: bool,
 }
 
 impl ScanBuilder<ArrayRef> {
@@ -104,6 +106,7 @@ impl ScanBuilder<ArrayRef> {
             file_stats: None,
             limit: None,
             row_offset: 0,
+            optimize_expressions: true,
         }
     }
 
@@ -146,6 +149,13 @@ impl<A: 'static + Send> ScanBuilder<A> {
     /// Set the projection expression for returned rows.
     pub fn with_projection(mut self, projection: Expression) -> Self {
         self.projection = projection;
+        self
+    }
+
+    /// Configure whether projection and filter expressions are optimized during
+    /// [`prepare`](Self::prepare).
+    pub fn with_expression_optimization(mut self, enabled: bool) -> Self {
+        self.optimize_expressions = enabled;
         self
     }
 
@@ -257,6 +267,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             file_stats: self.file_stats,
             limit: self.limit,
             row_offset: self.row_offset,
+            optimize_expressions: self.optimize_expressions,
             map_fn: Arc::new(move |a| old_map_fn(a).and_then(&map_fn)),
         }
     }
@@ -283,12 +294,19 @@ impl<A: 'static + Send> ScanBuilder<A> {
         ));
 
         // Normalize and simplify the expressions.
-        let projection = self.projection.optimize_recursive(layout_reader.dtype())?;
+        let projection = if self.optimize_expressions {
+            self.projection.optimize_recursive(layout_reader.dtype())?
+        } else {
+            self.projection
+        };
 
-        let filter = self
-            .filter
-            .map(|f| f.optimize_recursive(layout_reader.dtype()))
-            .transpose()?;
+        let filter = if self.optimize_expressions {
+            self.filter
+                .map(|f| f.optimize_recursive(layout_reader.dtype()))
+                .transpose()?
+        } else {
+            self.filter
+        };
 
         // Construct field masks and compute the row splits of the scan.
         let field_mask =
