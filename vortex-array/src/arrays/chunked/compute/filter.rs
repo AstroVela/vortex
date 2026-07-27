@@ -91,7 +91,7 @@ pub(crate) fn chunk_filters(
     array: ArrayView<'_, Chunked>,
     slices: impl Iterator<Item = (usize, usize)>,
 ) -> VortexResult<Vec<ChunkFilter>> {
-    let chunk_offsets = array.chunk_offsets();
+    let chunk_offsets = array.chunk_offset_values();
 
     let mut chunk_filters = vec![ChunkFilter::None; array.nchunks()];
 
@@ -153,7 +153,7 @@ fn filter_indices(
     let mut current_chunk_id = 0;
     let mut chunk_indices = BufferMut::with_capacity(array.nchunks());
 
-    let chunk_offsets = array.chunk_offsets();
+    let chunk_offsets = array.chunk_offset_values();
 
     for set_index in indices {
         let (chunk_id, index) = find_chunk_idx(set_index, chunk_offsets)?;

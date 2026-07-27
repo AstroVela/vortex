@@ -21,7 +21,7 @@ impl MaskKernel for Chunked {
         mask: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let chunk_offsets = array.chunk_offsets();
+        let chunk_offsets = array.chunk_offset_values();
         let new_chunks: Vec<ArrayRef> = array
             .iter_chunks()
             .enumerate()
