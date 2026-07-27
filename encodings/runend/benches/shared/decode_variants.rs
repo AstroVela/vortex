@@ -41,8 +41,55 @@ use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_mask::Mask;
 
-/// Build run-end test data with uniformly-random run lengths (average `(max_run_len + 1) / 2`),
-/// random values, and random run validity at the requested fraction-valid density.
+/// Shape of the run-length distribution.
+///
+/// Every other benchmark here uses [`RunShape::Uniform`], which is a modelling choice worth
+/// stating: it is bounded at `2 * avg`, so it never produces the long tail -- or the pile-up of
+/// very short runs -- that real run-end columns do. The chunked splat writes a whole chunk even
+/// for a one-element run, so a distribution with more short runs charges it more. `shape_*`
+/// exists to check the conclusions against distributions that are not uniform.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RunShape {
+    /// Uniform on `1..=2*avg-1`. Bounded tail, few very short runs.
+    Uniform,
+    /// Geometric with mean `avg`: what iid source values produce. Many length-1 runs, long tail.
+    Geometric,
+    /// Bursty: 90% of runs very short, 10% very long, same mean. Models clustered real data.
+    Bursty,
+}
+
+impl std::fmt::Display for RunShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunShape::Uniform => write!(f, "uniform"),
+            RunShape::Geometric => write!(f, "geometric"),
+            RunShape::Bursty => write!(f, "bursty"),
+        }
+    }
+}
+
+/// Draw one run length with mean `avg` from the given shape.
+fn draw_run_len(rng: &mut StdRng, avg: usize, shape: RunShape) -> usize {
+    match shape {
+        RunShape::Uniform => rng.random_range(1..=(2 * avg - 1).max(1)),
+        RunShape::Geometric => {
+            // Inverse-transform an exponential with mean `avg`; memoryless, unbounded tail.
+            let u: f64 = rng.random_range(f64::EPSILON..1.0);
+            ((-u.ln()) * avg as f64).round().max(1.0) as usize
+        }
+        RunShape::Bursty => {
+            // 90% short, 10% long, arranged to keep the mean at `avg`.
+            if rng.random_bool(0.9) {
+                rng.random_range(1..=avg.div_ceil(4).max(1))
+            } else {
+                rng.random_range(1..=(7 * avg).max(1))
+            }
+        }
+    }
+}
+
+/// Build run-end test data with the given run-length `shape`, random values, and random run
+/// validity at the requested fraction-valid density.
 ///
 /// Randomized so the branch-heavy decode stages are measured against unpredictable inputs
 /// rather than a periodic pattern the predictor can learn.
@@ -53,6 +100,26 @@ pub fn make_data<T: NativePType + From<u8>>(
     validity_density: f64,
 ) -> (Buffer<u32>, Buffer<T>, BitBuffer) {
     make_data_values(seed, total_length, max_run_len, validity_density, false)
+}
+
+/// As [`make_data_values`], but draws run lengths from `shape` with mean `avg_run_len`.
+pub fn make_data_shaped<T: NativePType + From<u8>>(
+    seed: u64,
+    total_length: usize,
+    avg_run_len: usize,
+    shape: RunShape,
+) -> (Buffer<u32>, Buffer<T>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ends = BufferMut::<u32>::empty();
+    let mut values = BufferMut::<T>::empty();
+    let mut pos = 0usize;
+    while pos < total_length {
+        let run_len = draw_run_len(&mut rng, avg_run_len, shape).min(total_length - pos);
+        pos += run_len;
+        ends.push(pos as u32);
+        values.push(<T as From<u8>>::from(rng.random::<u8>()));
+    }
+    (ends.freeze(), values.freeze())
 }
 
 /// As [`make_data`], but `zero_values` forces every run value to zero.

@@ -56,6 +56,7 @@ use vortex_runend::trimmed_ends_iter;
 #[path = "shared/decode_variants.rs"]
 mod decode_variants;
 
+use decode_variants::RunShape;
 use decode_variants::decode_n2;
 use decode_variants::decode_v0;
 use decode_variants::decode_v1;
@@ -64,6 +65,7 @@ use decode_variants::decode_v3_byte_splat;
 use decode_variants::decode_v3_doubling;
 use decode_variants::decode_v3_elem_fill;
 use decode_variants::decode_v3_no_memset;
+use decode_variants::make_data_shaped;
 use decode_variants::make_data_values;
 
 fn main() {
@@ -445,5 +447,111 @@ fn predictor_rotating<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
                 Nullability::NonNullable,
                 TOTAL_LENGTH,
             )
+        });
+}
+
+// ---- Group E: run-length distribution shape ----
+//
+// Everything above draws run lengths uniformly on `1..=2*avg-1`. That is bounded and light on
+// very short runs, which flatters a kernel that writes a whole 32-byte chunk per run however
+// short the run is. These sweep the same averages over a geometric shape (what iid source
+// values produce: many length-1 runs, unbounded tail) and a bursty one (90% very short, 10%
+// very long), to check the structural win is not an artefact of the uniform choice.
+
+#[derive(Clone, Copy)]
+struct ShapeArgs {
+    avg: usize,
+    shape: RunShape,
+}
+
+impl fmt::Display for ShapeArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.avg, self.shape)
+    }
+}
+
+const SHAPE_ARGS: &[ShapeArgs] = &[
+    ShapeArgs {
+        avg: 32,
+        shape: RunShape::Uniform,
+    },
+    ShapeArgs {
+        avg: 32,
+        shape: RunShape::Geometric,
+    },
+    ShapeArgs {
+        avg: 32,
+        shape: RunShape::Bursty,
+    },
+    ShapeArgs {
+        avg: 128,
+        shape: RunShape::Uniform,
+    },
+    ShapeArgs {
+        avg: 128,
+        shape: RunShape::Geometric,
+    },
+    ShapeArgs {
+        avg: 128,
+        shape: RunShape::Bursty,
+    },
+    ShapeArgs {
+        avg: 512,
+        shape: RunShape::Uniform,
+    },
+    ShapeArgs {
+        avg: 512,
+        shape: RunShape::Geometric,
+    },
+    ShapeArgs {
+        avg: 512,
+        shape: RunShape::Bursty,
+    },
+];
+
+fn shaped_rotating<T: NativePType + From<u8>>(
+    args: ShapeArgs,
+) -> impl Fn() -> (Buffer<u32>, Buffer<T>) {
+    let sets: Vec<_> = (0..DATASETS)
+        .map(|k| {
+            make_data_shaped::<T>(
+                SEED.wrapping_add(k.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                TOTAL_LENGTH,
+                args.avg,
+                args.shape,
+            )
+        })
+        .collect();
+    let next = AtomicUsize::new(0);
+    move || {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        sets[i % sets.len()].clone()
+    }
+}
+
+#[divan::bench(types = [u8, u32, u64], args = SHAPE_ARGS)]
+fn shape_v0<T: NativePType + From<u8>>(bencher: Bencher, args: ShapeArgs) {
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(shaped_rotating::<T>(args))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) = decode_v0(
+                trimmed_ends_iter(ends.as_slice(), 0, TOTAL_LENGTH),
+                values.as_slice(),
+                Mask::new_true(values.len()),
+                TOTAL_LENGTH,
+            );
+            PrimitiveArray::new(buf, validity)
+        });
+}
+
+#[divan::bench(types = [u8, u32, u64], args = SHAPE_ARGS)]
+fn shape_v2<T: NativePType + From<u8>>(bencher: Bencher, args: ShapeArgs) {
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(shaped_rotating::<T>(args))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) = decode_v2(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
         });
 }
