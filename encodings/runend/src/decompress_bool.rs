@@ -8,7 +8,9 @@
 //! * *splat* accumulates runs into a 64-bit word and stores each output word exactly once. Head
 //!   and tail masking is paid per output word rather than per run, and the run's value only
 //!   feeds an `AND` mask, so the value-dependent branch disappears. This is the kernel for short
-//!   runs, where it is up to 4x the prefill.
+//!   runs, where it is up to 4x the prefill. It comes in two forms, picked by [`prefer_blend`]:
+//!   one that branches on whether a run reaches the end of the word, and one that paints past
+//!   the run's end and stores every run instead.
 //! * *prefill* memsets the whole output with the majority value and then patches only the runs
 //!   that differ. One big memset beats a per-run one, so this stays ahead once runs are long
 //!   enough that the splat pays a whole-word fill per run and the patched runs are rare.
@@ -40,6 +42,12 @@ use vortex_mask::Mask;
 
 /// Bits per accumulator word.
 const WORD_BITS: usize = u64::BITS as usize;
+
+/// A mask with the low `n` bits set. `n` must be `< WORD_BITS`.
+#[inline(always)]
+fn low_mask(n: usize) -> u64 {
+    (1u64 << n) - 1
+}
 
 /// Decodes run-end encoded boolean values into a flat `BoolArray`.
 pub fn runend_decode_bools(
@@ -171,6 +179,35 @@ impl<'a> BitSplat<'a> {
         self.bits = tail;
     }
 
+    /// Appends `n` copies of `value` with no branch on whether the run ends inside the word.
+    ///
+    /// Paints the run from `bits` to the top of the word and stores unconditionally. Bits at and
+    /// above `bits` are don't-care, so painting past the run's end is free: the next run blends
+    /// over them and [`BitSplat::finish_masked`] clears whatever is left. Storing every run is
+    /// wasted work when runs are short, but there is no boundary test to mispredict — see
+    /// [`prefer_blend`] for where that trade turns over.
+    ///
+    /// Requires one word of slack past the output, since a zero-length run arriving once the
+    /// output is exactly full still stores.
+    #[inline(always)]
+    fn append_blend(&mut self, value: bool, n: usize) {
+        let splat = u64::from(value).wrapping_neg();
+
+        self.word = (self.word & low_mask(self.bits)) | (splat << self.bits);
+        self.words[self.idx] = MaybeUninit::new(self.word);
+
+        let total = self.bits + n;
+        let completed = total / WORD_BITS;
+        // Words after `idx` that this run covers end to end; `idx` itself was just stored.
+        if completed > 1 {
+            self.words[self.idx + 1..self.idx + completed].fill(MaybeUninit::new(splat));
+        }
+        self.idx += completed;
+        // Completing a word leaves the run's tail at the bottom of the next one.
+        self.word = if completed > 0 { splat } else { self.word };
+        self.bits = total % WORD_BITS;
+    }
+
     /// Flushes the accumulator and zero-fills any words the runs did not reach, leaving every
     /// word of the output initialized.
     fn finish(self) {
@@ -180,6 +217,13 @@ impl<'a> BitSplat<'a> {
             idx += 1;
         }
         self.words[idx..].fill(MaybeUninit::new(0));
+    }
+
+    /// [`BitSplat::finish`] for a sink driven by [`BitSplat::append_blend`], masking off the
+    /// don't-care bits the last store painted above `bits`.
+    fn finish_masked(mut self) {
+        self.word &= low_mask(self.bits);
+        self.finish();
     }
 }
 
@@ -273,6 +317,44 @@ impl<'a> BitSplatPair<'a> {
         self.bits = tail;
     }
 
+    /// Appends a run to both sinks with no boundary branch. See [`BitSplat::append_blend`].
+    #[inline(always)]
+    fn append_blend(&mut self, value: bool, is_valid: bool, n: usize) {
+        let splat = u64::from(value).wrapping_neg();
+        let validity_splat = u64::from(is_valid).wrapping_neg();
+
+        // One mask, one shift amount, both words.
+        let keep = low_mask(self.bits);
+        self.word = (self.word & keep) | (splat << self.bits);
+        self.validity_word = (self.validity_word & keep) | (validity_splat << self.bits);
+        self.words[self.idx] = MaybeUninit::new(self.word);
+        self.validity[self.idx] = MaybeUninit::new(self.validity_word);
+
+        let total = self.bits + n;
+        let completed = total / WORD_BITS;
+        if completed > 1 {
+            let span = self.idx + 1..self.idx + completed;
+            self.words[span.clone()].fill(MaybeUninit::new(splat));
+            self.validity[span].fill(MaybeUninit::new(validity_splat));
+        }
+        self.idx += completed;
+        self.word = if completed > 0 { splat } else { self.word };
+        self.validity_word = if completed > 0 {
+            validity_splat
+        } else {
+            self.validity_word
+        };
+        self.bits = total % WORD_BITS;
+    }
+
+    /// [`BitSplatPair::finish`] for a sink driven by [`BitSplatPair::append_blend`].
+    fn finish_masked(mut self) {
+        let keep = low_mask(self.bits);
+        self.word &= keep;
+        self.validity_word &= keep;
+        self.finish();
+    }
+
     /// Flushes both accumulators and zero-fills the words the runs did not reach.
     fn finish(self) {
         let mut idx = self.idx;
@@ -304,6 +386,45 @@ fn splat_bits_pair(
     }
     // SAFETY: the sink covered exactly `n_words` words of each buffer and was finished, so every
     // word in `0..n_words` of both is initialized, and `n_words` is the capacity of each.
+    unsafe {
+        buf.set_len(n_words);
+        validity_buf.set_len(n_words);
+    }
+    (into_bits(buf, length), into_bits(validity_buf, length))
+}
+
+/// [`splat_bits`] for a blend-driven sink, which needs a word of slack past the output.
+fn splat_blend_bits(length: usize, fill: impl FnOnce(&mut BitSplat<'_>)) -> BitBufferMut {
+    let n_words = length.div_ceil(WORD_BITS);
+    let mut buf = BufferMut::<u64>::with_capacity(n_words + 1);
+    {
+        let words = &mut buf.spare_capacity_mut()[..n_words + 1];
+        let mut splat = BitSplat::new(words);
+        fill(&mut splat);
+        splat.finish_masked();
+    }
+    // SAFETY: the sink covered exactly `n_words + 1` words and was finished, so every word in
+    // `0..n_words` is initialized; the slack word is never exposed.
+    unsafe { buf.set_len(n_words) };
+    into_bits(buf, length)
+}
+
+/// [`splat_bits_pair`] for a blend-driven sink; see [`splat_blend_bits`].
+fn splat_blend_bits_pair(
+    length: usize,
+    fill: impl FnOnce(&mut BitSplatPair<'_>),
+) -> (BitBufferMut, BitBufferMut) {
+    let n_words = length.div_ceil(WORD_BITS);
+    let mut buf = BufferMut::<u64>::with_capacity(n_words + 1);
+    let mut validity_buf = BufferMut::<u64>::with_capacity(n_words + 1);
+    {
+        let words = &mut buf.spare_capacity_mut()[..n_words + 1];
+        let validity_words = &mut validity_buf.spare_capacity_mut()[..n_words + 1];
+        let mut splat = BitSplatPair::new(words, validity_words);
+        fill(&mut splat);
+        splat.finish_masked();
+    }
+    // SAFETY: as `splat_blend_bits`, for both buffers.
     unsafe {
         buf.set_len(n_words);
         validity_buf.set_len(n_words);
@@ -386,6 +507,25 @@ fn prefer_splat(patched_runs: usize, buffers: usize, length: usize) -> bool {
     patched_runs * 6 * WORD_BITS >= length * (buffers + 1)
 }
 
+/// Chooses which splat form to use, from the average run length.
+///
+/// The forms differ only in how a run that ends inside a word is handled. The branching form
+/// tests for it and stores once per output word; the blend form paints past the run's end and
+/// stores once per run. Which wins is set by how often a run crosses a word boundary, which for
+/// runs averaging `r` bits is about `r / 64`:
+///
+/// * well below a word the test almost never fires, so it predicts and costs nothing, while the
+///   blend's store fires every run — up to 64 times per word of output;
+/// * from about a quarter of a word up, the test is close enough to a coin flip that its
+///   mispredictions cost more than the redundant stores. Measured, the blend is worth 1.35-1.9x
+///   from there, peaking at 1.7x where runs are half a word.
+///
+/// The nullable kernel crosses over earlier: it does about twice the work per run, so the extra
+/// stores are proportionally cheaper, while a misprediction costs the same.
+fn prefer_blend(num_runs: usize, buffers: usize, length: usize) -> bool {
+    length * 4 * buffers >= num_runs * WORD_BITS
+}
+
 /// Decodes run-end encoded booleans when all values are valid (non-nullable).
 fn decode_bool_non_nullable<E: IntegerPType>(
     run_ends: &[E],
@@ -405,6 +545,10 @@ fn decode_bool_non_nullable<E: IntegerPType>(
             nullability,
             length,
         );
+    }
+
+    if prefer_blend(run_ends.len(), 1, length) {
+        return blend_bool_non_nullable(run_ends, offset_e, length_e, values, nullability, length);
     }
 
     let decoded = splat_bits(length, |decoded| {
@@ -435,6 +579,10 @@ fn decode_bool_nullable<E: IntegerPType>(
         return prefill_bool_nullable(run_ends, offset_e, length_e, values, validity_mask, length);
     }
 
+    if prefer_blend(run_ends.len(), 2, length) {
+        return blend_bool_nullable(run_ends, offset_e, length_e, values, validity_mask, length);
+    }
+
     let (decoded, decoded_validity) = splat_bits_pair(length, |decoded| {
         let mut pos = 0usize;
         for (i, &end) in run_ends.iter().enumerate() {
@@ -447,6 +595,56 @@ fn decode_bool_nullable<E: IntegerPType>(
         }
     });
 
+    BoolArray::new(decoded.freeze(), Validity::from(decoded_validity.freeze()))
+}
+
+/// Splats every run with [`BitSplat::append_blend`].
+///
+/// Out of line on purpose: this is a whole second decode loop, and inlining it beside the
+/// branching one costs the branching loop about 20% in layout and register pressure — measured,
+/// with the branching loop textually unchanged either way.
+#[inline(never)]
+fn blend_bool_non_nullable<E: IntegerPType>(
+    run_ends: &[E],
+    offset_e: E,
+    length_e: E,
+    values: &BitBuffer,
+    nullability: Nullability,
+    length: usize,
+) -> BoolArray {
+    let decoded = splat_blend_bits(length, |decoded| {
+        let mut pos = 0usize;
+        for (i, &end) in run_ends.iter().enumerate() {
+            let run = run_length(end, offset_e, length_e, pos);
+            pos += run;
+            decoded.append_blend(values.value(i), run);
+        }
+    });
+    BoolArray::new(decoded.freeze(), nullability.into())
+}
+
+/// Splats every run into both buffers with [`BitSplatPair::append_blend`]. Out of line for the
+/// same reason as [`blend_bool_non_nullable`].
+#[inline(never)]
+fn blend_bool_nullable<E: IntegerPType>(
+    run_ends: &[E],
+    offset_e: E,
+    length_e: E,
+    values: &BitBuffer,
+    validity_mask: &BitBuffer,
+    length: usize,
+) -> BoolArray {
+    let (decoded, decoded_validity) = splat_blend_bits_pair(length, |decoded| {
+        let mut pos = 0usize;
+        for (i, &end) in run_ends.iter().enumerate() {
+            let run = run_length(end, offset_e, length_e, pos);
+            pos += run;
+
+            // The decoded bit is the value where valid, and false where null.
+            let is_valid = validity_mask.value(i);
+            decoded.append_blend(is_valid && values.value(i), is_valid, run);
+        }
+    });
     BoolArray::new(decoded.freeze(), Validity::from(decoded_validity.freeze()))
 }
 
@@ -523,6 +721,7 @@ mod tests {
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::Nullability;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
     use vortex_error::VortexResult;
@@ -690,6 +889,74 @@ mod tests {
             BitBuffer::from(expected_values),
             Validity::from(BitBuffer::from(expected_validity)),
         );
+        assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    /// The blend form must agree with a naive decode at every run length, including the ones
+    /// [`prefer_blend`] would never send to it. It paints past the end of each run, so the
+    /// interesting failures are bits surviving where a later run should have covered them.
+    #[rstest]
+    fn blend_form_matches_naive(
+        #[values(1, 2, 5, 16, 31, 32, 33, 63, 64, 65, 200)] avg_run_length: usize,
+        #[values(false, true)] nullable: bool,
+        #[values(4096, 4095, 4033)] length: usize,
+    ) -> VortexResult<()> {
+        use rand::RngExt;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let mut rng = StdRng::seed_from_u64(0xB1E4D ^ (avg_run_length as u64) << 8 ^ length as u64);
+
+        let mut ends = Vec::new();
+        let (mut values, mut validity) = (Vec::new(), Vec::new());
+        let (mut want, mut want_valid) = (Vec::new(), Vec::new());
+        let mut pos = 0usize;
+        while pos < length {
+            let run = rng
+                .random_range(1..=(2 * avg_run_length).max(1))
+                .min(length - pos);
+            pos += run;
+            ends.push(pos as u32);
+            let value = rng.random_bool(0.5);
+            let is_valid = !nullable || rng.random_bool(0.7);
+            values.push(value);
+            validity.push(is_valid);
+            want.extend(std::iter::repeat_n(is_valid && value, run));
+            want_valid.extend(std::iter::repeat_n(is_valid, run));
+        }
+
+        let values_buf = BitBuffer::from(values);
+        let validity_buf = BitBuffer::from(validity);
+        let (decoded, expected) = if nullable {
+            (
+                super::blend_bool_nullable::<u32>(
+                    &ends,
+                    0,
+                    length as u32,
+                    &values_buf,
+                    &validity_buf,
+                    length,
+                ),
+                BoolArray::new(
+                    BitBuffer::from(want),
+                    Validity::from(BitBuffer::from(want_valid)),
+                ),
+            )
+        } else {
+            (
+                super::blend_bool_non_nullable::<u32>(
+                    &ends,
+                    0,
+                    length as u32,
+                    &values_buf,
+                    Nullability::NonNullable,
+                    length,
+                ),
+                BoolArray::from(BitBuffer::from(want)),
+            )
+        };
         assert_arrays_eq!(decoded, expected, &mut ctx);
         Ok(())
     }

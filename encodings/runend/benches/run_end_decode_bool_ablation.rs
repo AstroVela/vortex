@@ -8,7 +8,7 @@
 //! * `push_splat` is the splat as first written, appending words to a `BufferMut<u64>`.
 //! * `shipped` is `runend_decode_typed_bool`, which picks between that same prefill and the
 //!   splat — accumulate runs into a 64-bit word, store each output word exactly once, into a
-//!   buffer sized up front and overwritten by index.
+//!   buffer sized up front and overwritten by index — and between the splat's two forms.
 //!
 //! Run lengths and values are randomised and datasets are rotated across iterations, so the
 //! per-run value branch the prefill kernel depends on cannot be memorised by the predictor.
@@ -30,6 +30,18 @@
 //! The splat is worth up to 3.6x while runs are short. The crossover moves in with skew, since a
 //! skewed prefill patches few runs. `prefer_splat` reproduces this table's sign at 25 of the 26
 //! points; the miss is non-nullable 1024/50-50, where it gives up 6%.
+//!
+//! `prefer_blend` picks between the splat's two forms, and was derived the same way — pin the
+//! form and run the grid. Blend over branching, by fastest sample, splat forced:
+//!
+//! ```text
+//! run length      1     2     8    16    32    48    64   128  1024
+//! non-nullable 0.75  0.79  1.02  1.35  1.71  1.39  1.15  0.86  0.74
+//! nullable     0.82  0.88  1.15  1.37  1.71  1.79  1.74  1.89  1.16
+//! ```
+//!
+//! The peak is at half a word, where a run's chance of crossing a word boundary is closest to a
+//! coin flip and the branching form's test mispredicts most.
 
 #![expect(clippy::cast_possible_truncation)]
 
@@ -118,7 +130,15 @@ const ARGS: &[Args] = &[
         skew: Skew::Even,
     },
     Args {
+        avg_run_length: 16,
+        skew: Skew::Even,
+    },
+    Args {
         avg_run_length: 32,
+        skew: Skew::Even,
+    },
+    Args {
+        avg_run_length: 48,
         skew: Skew::Even,
     },
     Args {
