@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -257,6 +258,21 @@ fn writer_test_session() -> VortexResult<VortexSession> {
     Ok(session)
 }
 
+type StrategyFn = fn() -> VortexResult<Arc<dyn LayoutStrategy>>;
+type ArrayFn = fn() -> VortexResult<ArrayRef>;
+
+fn sequential_array() -> VortexResult<ArrayRef> {
+    Ok(sequential_integers().into_array())
+}
+
+fn struct_of_sequential() -> VortexResult<ArrayRef> {
+    Ok(StructArray::from_fields(&[("values", sequential_integers().into_array())])?.into_array())
+}
+
+fn forbidden_array() -> VortexResult<ArrayRef> {
+    forbidden_sequence(65_536)
+}
+
 fn forbidden_sequence(len: usize) -> VortexResult<ArrayRef> {
     Ok(Sequence::try_new_typed(0i32, 1i32, Nullability::NonNullable, len)?.into_array())
 }
@@ -349,119 +365,63 @@ async fn default_strategy_round_trip_uses_only_enabled_encodings() -> VortexResu
     Ok(())
 }
 
-#[tokio::test]
-async fn unrestricted_replacement_builder_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let outcome = round_trip_encodings(
-        &session,
-        Some(WriteStrategyBuilder::default().build()),
-        sequential_integers().into_array(),
-    )
-    .await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_btrblocks_builder_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let strategy = WriteStrategyBuilder::default()
+/// Every way a caller can reach the writer with a strategy that is free to produce an encoding
+/// outside the enabled editions. Each case must be rejected rather than silently written.
+#[rstest]
+#[case::replacement_builder(|| Ok(WriteStrategyBuilder::default().build()), sequential_array)]
+#[case::btrblocks_builder(
+    || Ok(WriteStrategyBuilder::default()
         .with_btrblocks_builder(BtrBlocksCompressorBuilder::default())
-        .build();
-    let outcome =
-        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_opaque_compressor_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let strategy = WriteStrategyBuilder::default()
+        .build()),
+    sequential_array
+)]
+#[case::opaque_compressor(
+    || Ok(WriteStrategyBuilder::default()
         .with_compressor(forbidden_sequence_compressor)
-        .build();
-    let outcome =
-        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_custom_flat_strategy_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let strategy = WriteStrategyBuilder::default()
-        .with_flat_strategy(Arc::new(FlatLayoutStrategy::default()))
-        .build();
-    let outcome =
-        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_custom_field_writer_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let strategy = WriteStrategyBuilder::default()
-        .with_field_writer(field_path!(values), custom_compressing_flat_strategy())
-        .build();
-    let array =
-        StructArray::from_fields(&[("values", sequential_integers().into_array())])?.into_array();
-    let outcome = round_trip_encodings(&session, Some(strategy), array).await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_replacement_strategy_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let outcome = round_trip_encodings(
-        &session,
-        Some(custom_compressing_flat_strategy()),
-        sequential_integers().into_array(),
-    )
-    .await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_replacement_flat_strategy_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let outcome = round_trip_encodings(
-        &session,
-        Some(Arc::new(FlatLayoutStrategy::default())),
-        forbidden_sequence(65_536)?,
-    )
-    .await?;
-    assert_eq!(outcome, WriteOutcome::Rejected);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unrestricted_probe_compressor_is_rejected() -> VortexResult<()> {
-    let session = writer_test_session()?;
-    let strategy = WriteStrategyBuilder::default()
+        .build()),
+    sequential_array
+)]
+#[case::probe_compressor(
+    || Ok(WriteStrategyBuilder::default()
         .with_probe_compressor(forbidden_sequence_compressor)
-        .build();
-    let outcome =
-        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
+        .build()),
+    sequential_array
+)]
+#[case::custom_flat_strategy(
+    || Ok(WriteStrategyBuilder::default()
+        .with_flat_strategy(Arc::new(FlatLayoutStrategy::default()))
+        .build()),
+    sequential_array
+)]
+#[case::custom_field_writer(
+    || Ok(WriteStrategyBuilder::default()
+        .with_field_writer(field_path!(values), custom_compressing_flat_strategy())
+        .build()),
+    struct_of_sequential
+)]
+#[case::replacement_strategy(|| Ok(custom_compressing_flat_strategy()), sequential_array)]
+#[case::replacement_flat_strategy(
+    || Ok(Arc::new(FlatLayoutStrategy::default()) as Arc<dyn LayoutStrategy>),
+    forbidden_array
+)]
+#[tokio::test]
+async fn strategies_outside_the_encoding_policy_are_rejected(
+    #[case] strategy: StrategyFn,
+    #[case] array: ArrayFn,
+) -> VortexResult<()> {
+    let session = writer_test_session()?;
+    let outcome = round_trip_encodings(&session, Some(strategy()?), array()?).await?;
     assert_eq!(outcome, WriteOutcome::Rejected);
     Ok(())
 }
 
+/// A session pinned to an older edition still writes, because the compressor is filtered down to
+/// that edition rather than failing on an encoding the edition lacks.
 #[tokio::test]
 async fn default_writer_filters_compressor_to_enabled_editions() -> VortexResult<()> {
     let session = baseline_core_session()?;
-    let mut buffer = ByteBufferMut::empty();
-
-    session
-        .write_options()
-        .write(
-            &mut buffer,
-            sequential_integers().into_array().to_array_stream(),
-        )
-        .await?;
-
+    let outcome = round_trip_encodings(&session, None, sequential_array()?).await?;
+    assert_eq!(outcome, WriteOutcome::Written);
     Ok(())
 }
 
