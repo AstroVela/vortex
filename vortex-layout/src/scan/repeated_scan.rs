@@ -27,8 +27,11 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
+use crate::scan::plan::PreparedScanPlanRef;
 use crate::scan::splits::Splits;
+use crate::scan::tasks::PlannedTaskContext;
 use crate::scan::tasks::TaskContext;
+use crate::scan::tasks::planned_split_exec;
 use crate::scan::tasks::split_exec;
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
@@ -37,9 +40,7 @@ use crate::scan::tasks::split_exec;
 /// data source.
 pub struct RepeatedScan<A: 'static + Send> {
     session: VortexSession,
-    layout_reader: LayoutReaderRef,
-    projection: Expression,
-    filter: Option<Expression>,
+    execution: ExecutionPlan,
     ordered: bool,
     /// Optionally read a subset of the rows in the file.
     row_range: Option<Range<u64>>,
@@ -55,6 +56,23 @@ pub struct RepeatedScan<A: 'static + Send> {
     limit: Option<u64>,
     /// The dtype of the projected arrays.
     dtype: DType,
+}
+
+enum ExecutionPlan {
+    Legacy {
+        layout_reader: LayoutReaderRef,
+        projection: Expression,
+        filter: Option<Expression>,
+    },
+    Planned {
+        plan: PreparedScanPlanRef,
+        filter: Option<Expression>,
+    },
+}
+
+enum ExecutionTaskContext<A> {
+    Legacy(Arc<TaskContext<A>>),
+    Planned(Arc<PlannedTaskContext<A>>),
 }
 
 impl RepeatedScan<ArrayRef> {
@@ -105,9 +123,43 @@ impl<A: 'static + Send> RepeatedScan<A> {
     ) -> Self {
         Self {
             session,
-            layout_reader,
-            projection,
-            filter,
+            execution: ExecutionPlan::Legacy {
+                layout_reader,
+                projection,
+                filter,
+            },
+            ordered,
+            row_range,
+            selection,
+            splits,
+            concurrency,
+            map_fn,
+            limit,
+            dtype,
+        }
+    }
+
+    /// Construct a repeated scan from a prepared heap-allocated physical plan.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all arguments are needed for scan construction"
+    )]
+    pub fn new_planned(
+        session: VortexSession,
+        plan: PreparedScanPlanRef,
+        filter: Option<Expression>,
+        ordered: bool,
+        row_range: Option<Range<u64>>,
+        selection: Selection,
+        splits: Splits,
+        concurrency: usize,
+        map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
+        limit: Option<u64>,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            session,
+            execution: ExecutionPlan::Planned { plan, filter },
             ordered,
             row_range,
             selection,
@@ -173,12 +225,26 @@ impl<A: 'static + Send> RepeatedScan<A> {
 
         let mut limit = self.limit;
         let mut tasks = Vec::new();
-        let ctx = Arc::new(TaskContext {
-            filter: self.filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
-            reader: Arc::clone(&self.layout_reader),
-            projection: self.projection.clone(),
-            mapper: Arc::clone(&self.map_fn),
-        });
+        let ctx = match &self.execution {
+            ExecutionPlan::Legacy {
+                layout_reader,
+                projection,
+                filter,
+            } => ExecutionTaskContext::Legacy(Arc::new(TaskContext {
+                filter: filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
+                reader: Arc::clone(layout_reader),
+                projection: projection.clone(),
+                mapper: Arc::clone(&self.map_fn),
+            })),
+            ExecutionPlan::Planned { plan, filter } => {
+                ExecutionTaskContext::Planned(Arc::new(PlannedTaskContext {
+                    filter: filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
+                    predicates: plan.predicates().to_vec(),
+                    projection: Arc::clone(plan.projection()),
+                    mapper: Arc::clone(&self.map_fn),
+                }))
+            }
+        };
 
         for range in ranges {
             let row_mask = self.selection.row_mask(&range);
@@ -186,7 +252,14 @@ impl<A: 'static + Send> RepeatedScan<A> {
                 continue;
             }
 
-            tasks.push(split_exec(Arc::clone(&ctx), row_mask, limit.as_mut())?);
+            tasks.push(match &ctx {
+                ExecutionTaskContext::Legacy(ctx) => {
+                    split_exec(Arc::clone(ctx), row_mask, limit.as_mut())?
+                }
+                ExecutionTaskContext::Planned(ctx) => {
+                    planned_split_exec(Arc::clone(ctx), row_mask, limit.as_mut())?
+                }
+            });
             if limit.is_some_and(|l| l == 0) {
                 break;
             }
