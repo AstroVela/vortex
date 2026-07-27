@@ -67,16 +67,20 @@ impl PreparedScanPlan {
 
 /// Returns whether heap-allocated planning is enabled for this process.
 ///
-/// The existing V1 path remains the default on this extraction branch. Set
-/// `VORTEX_SCAN_IMPL=v2` to exercise the planning path with the same execution implementation.
+/// Heap-allocated planning is enabled by default. Set `VORTEX_SCAN_IMPL=v1` to use the legacy
+/// expression-passing path.
 pub fn planned_scan_enabled() -> VortexResult<bool> {
     match std::env::var(SCAN_IMPL_ENV) {
-        Ok(value) => parse_scan_impl(&value),
-        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) => scan_impl_or_default(Some(&value)),
+        Err(std::env::VarError::NotPresent) => scan_impl_or_default(None),
         Err(std::env::VarError::NotUnicode(value)) => {
             vortex_bail!("{SCAN_IMPL_ENV} must be valid unicode, got {value:?}")
         }
     }
+}
+
+fn scan_impl_or_default(value: Option<&str>) -> VortexResult<bool> {
+    value.map_or(Ok(true), parse_scan_impl)
 }
 
 fn parse_scan_impl(value: &str) -> VortexResult<bool> {
@@ -92,6 +96,12 @@ fn parse_scan_impl(value: &str) -> VortexResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_impl_defaults_to_planned() -> VortexResult<()> {
+        assert!(scan_impl_or_default(None)?);
+        Ok(())
+    }
 
     #[test]
     fn scan_impl_accepts_v1_and_v2_values() -> VortexResult<()> {
