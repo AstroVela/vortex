@@ -336,6 +336,26 @@ mod tests {
     }
 
     #[test]
+    fn simplify_failing_cast_hides_error() -> VortexResult<()> {
+        // Casting a null literal to a non-nullable dtype is a genuine error, and the same
+        // cast would fail identically at execution time. Confirm the scalar cast really does
+        // fail.
+        let target = DType::Primitive(PType::F64, Nullability::NonNullable);
+        let null_i32 = Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable));
+        assert!(null_i32.cast(&target).is_err());
+
+        // Yet optimizing `cast(null as f64)` reports success: `simplify_untyped` discards the
+        // error via `.ok()`, so the failure is silently swallowed during optimization.
+        let expr = cast(lit(null_i32), target.clone());
+        let optimized = expr.optimize(&test_harness::struct_dtype());
+        assert!(
+            optimized.is_ok(),
+            "expected the cast error to be hidden, but it surfaced: {optimized:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_display() {
         let expr = cast(
             get_item("value", root()),
