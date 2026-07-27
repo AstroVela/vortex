@@ -76,7 +76,7 @@ where
     A: AsPrimitive<usize>,
     R: AsPrimitive<usize>,
 {
-    let len = validate_selectors(num_values, &value_len, branches, rows)?;
+    let len = validate_selectors(num_values, value_len, branches, rows)?;
     let elements_len = len.checked_mul(list_size).ok_or_else(|| {
         vortex_err!(
             "interleave FixedSizeList output length overflow: {len} lists of size {list_size}"

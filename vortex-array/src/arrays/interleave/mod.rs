@@ -189,9 +189,10 @@ impl Interleave {
         let base_dtype = values[0].dtype();
         let mut nullability = Nullability::NonNullable;
         for value in values {
+            let normalized_dtype = value.dtype().with_nullability(base_dtype.nullability());
             vortex_ensure!(
-                value.dtype().eq_ignore_nullability(base_dtype),
-                "interleave values must share a dtype up to nullability: {} vs {}",
+                &normalized_dtype == base_dtype,
+                "interleave values must share a dtype up to top-level nullability: {} vs {}",
                 base_dtype,
                 value.dtype()
             );
@@ -687,6 +688,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mismatched_nested_nullability() -> VortexResult<()> {
+        let nonnullable = FixedSizeListArray::try_new(
+            PrimitiveArray::from_iter([1i32]).into_array(),
+            1,
+            Validity::NonNullable,
+            1,
+        )?
+        .into_array();
+        let nullable = FixedSizeListArray::try_new(
+            PrimitiveArray::from_option_iter([Some(2i32)]).into_array(),
+            1,
+            Validity::NonNullable,
+            1,
+        )?
+        .into_array();
+        let err = InterleaveArray::try_new(
+            vec![nonnullable, nullable],
+            PrimitiveArray::from_iter([0u32]).into_array(),
+            PrimitiveArray::from_iter([0u32]).into_array(),
+        )
+        .err()
+        .vortex_expect("expected interleave to reject nested nullability mismatch");
+
+        assert!(err.to_string().contains("top-level nullability"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     fn execute_rejects_out_of_bounds_array_index() -> VortexResult<()> {
         let value = BoolArray::from_iter([true]).into_array();
         let array_indices = PrimitiveArray::from_iter([2u32]).into_array();
@@ -726,6 +755,31 @@ mod tests {
     }
 
     #[test]
+    fn fieldless_struct_execution_rejects_out_of_bounds_row_index() -> VortexResult<()> {
+        let value = StructArray::try_new(
+            Default::default(),
+            Vec::<ArrayRef>::new(),
+            1,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let interleaved = InterleaveArray::try_new(
+            vec![value.clone(), value],
+            PrimitiveArray::from_iter([0u32]).into_array(),
+            PrimitiveArray::from_iter([1u32]).into_array(),
+        )?
+        .into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let err = interleaved
+            .execute::<Canonical>(&mut ctx)
+            .err()
+            .vortex_expect("expected execution to reject out-of-bounds row index");
+
+        assert!(err.to_string().contains("row index out of bounds"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     fn interleave_primitive_reorders_and_repeats() -> VortexResult<()> {
         let v0 = PrimitiveArray::from_iter([1u32, 2, 3]).into_array();
         let v1 = PrimitiveArray::from_iter([10u32, 20]).into_array();
@@ -759,7 +813,7 @@ mod tests {
     fn interleave_decimal() -> VortexResult<()> {
         let decimal_dtype = DecimalDType::new(10, 2);
         let v0 = DecimalArray::from_iter([100i64, 250], decimal_dtype).into_array();
-        let v1 = DecimalArray::from_iter([999i64, -125], decimal_dtype).into_array();
+        let v1 = DecimalArray::from_iter([999i128, -125], decimal_dtype).into_array();
         let interleaved = InterleaveArray::try_new(
             vec![v0, v1],
             PrimitiveArray::from_iter([1u32, 0, 1]).into_array(),

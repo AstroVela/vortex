@@ -5,6 +5,28 @@ use num_traits::AsPrimitive;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
+use super::super::Interleave;
+use super::super::InterleaveArrayExt;
+use crate::array::Array;
+use crate::arrays::Primitive;
+use crate::match_each_unsigned_integer_ptype;
+
+pub(super) fn validate_interleave(array: &Array<Interleave>) -> VortexResult<()> {
+    let array_indices = array.array_indices().as_::<Primitive>();
+    let row_indices = array.row_indices().as_::<Primitive>();
+    match_each_unsigned_integer_ptype!(array_indices.ptype(), |A| {
+        match_each_unsigned_integer_ptype!(row_indices.ptype(), |R| {
+            validate_selectors(
+                array.num_values(),
+                |branch| array.value(branch).len(),
+                array_indices.as_slice::<A>(),
+                row_indices.as_slice::<R>(),
+            )
+            .map(|_| ())
+        })
+    })
+}
+
 /// Validates selector lengths and bounds, returning the output length.
 #[inline(always)]
 pub(super) fn validate_selectors<A, R>(
