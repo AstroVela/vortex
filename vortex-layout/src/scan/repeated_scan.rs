@@ -26,8 +26,8 @@ use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
+use crate::ScanPlanRef;
 use crate::scan::filter::FilterExpr;
-use crate::scan::plan::PreparedScanPlanRef;
 use crate::scan::splits::Splits;
 use crate::scan::tasks::PlannedTaskContext;
 use crate::scan::tasks::TaskContext;
@@ -65,7 +65,8 @@ enum ExecutionPlan {
         filter: Option<Expression>,
     },
     Planned {
-        plan: PreparedScanPlanRef,
+        projection: ScanPlanRef,
+        predicates: Vec<ScanPlanRef>,
         filter: Option<Expression>,
     },
 }
@@ -146,7 +147,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
     )]
     pub fn new_planned(
         session: VortexSession,
-        plan: PreparedScanPlanRef,
+        projection: ScanPlanRef,
+        predicates: Vec<ScanPlanRef>,
         filter: Option<Expression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
@@ -159,7 +161,11 @@ impl<A: 'static + Send> RepeatedScan<A> {
     ) -> Self {
         Self {
             session,
-            execution: ExecutionPlan::Planned { plan, filter },
+            execution: ExecutionPlan::Planned {
+                projection,
+                predicates,
+                filter,
+            },
             ordered,
             row_range,
             selection,
@@ -236,14 +242,16 @@ impl<A: 'static + Send> RepeatedScan<A> {
                 projection: projection.clone(),
                 mapper: Arc::clone(&self.map_fn),
             })),
-            ExecutionPlan::Planned { plan, filter } => {
-                ExecutionTaskContext::Planned(Arc::new(PlannedTaskContext {
-                    filter: filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
-                    predicates: plan.predicates().to_vec(),
-                    projection: Arc::clone(plan.projection()),
-                    mapper: Arc::clone(&self.map_fn),
-                }))
-            }
+            ExecutionPlan::Planned {
+                projection,
+                predicates,
+                filter,
+            } => ExecutionTaskContext::Planned(Arc::new(PlannedTaskContext {
+                filter: filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
+                predicates: predicates.clone(),
+                projection: Arc::clone(projection),
+                mapper: Arc::clone(&self.map_fn),
+            })),
         };
 
         for range in ranges {
