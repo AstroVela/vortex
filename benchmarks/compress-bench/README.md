@@ -22,3 +22,7 @@ GPU decompression is opt-in and runs only the existing benchmark names allow-lis
 cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress
 ```
+
+GPU files are read with direct IO (`O_DIRECT`) so repeated iterations measure storage
+bandwidth rather than page-cache hits. Pass `--no-gpu-direct-io` to read through the page
+cache instead. Direct IO is Linux-only, so the flag has no effect on other platforms.

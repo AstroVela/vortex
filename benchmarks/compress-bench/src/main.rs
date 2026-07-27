@@ -72,6 +72,13 @@ struct Args {
     /// This filters the suite to GPU-supported dataset names and runs only Vortex decompression.
     #[arg(long)]
     gpu_decompress: bool,
+    /// Read GPU files through the page cache instead of with direct IO (`O_DIRECT`).
+    ///
+    /// `--gpu-decompress` defaults to direct IO so repeated iterations measure storage
+    /// bandwidth rather than page-cache hits. Direct IO is Linux-only; this flag has no
+    /// effect elsewhere.
+    #[arg(long)]
+    no_gpu_direct_io: bool,
     #[arg(short, long, default_value_t, value_enum)]
     display_format: DisplayFormat,
     #[arg(short, long)]
@@ -110,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         formats,
         ops,
         args.gpu_decompress,
+        !args.no_gpu_direct_io,
         args.display_format,
         args.output_path,
         args.gh_json_v3,
@@ -118,11 +126,22 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Get a compressor for the given format.
-fn get_compressor(format: Format, gpu_decompress: bool) -> Box<dyn Compressor> {
+#[cfg_attr(
+    not(feature = "cuda"),
+    expect(
+        unused_variables,
+        reason = "GPU read options are only consumed by the CUDA compressor"
+    )
+)]
+fn get_compressor(
+    format: Format,
+    gpu_decompress: bool,
+    gpu_direct_io: bool,
+) -> Box<dyn Compressor> {
     if gpu_decompress {
         #[cfg(feature = "cuda")]
         {
-            return Box::new(GpuVortexCompressor);
+            return Box::new(GpuVortexCompressor::new(gpu_direct_io));
         }
         #[cfg(not(feature = "cuda"))]
         unreachable!("GPU feature validation happens before selecting compressors");
@@ -153,6 +172,7 @@ async fn run_compress(
     formats: Vec<Format>,
     ops: Vec<CompressOp>,
     gpu_decompress: bool,
+    gpu_direct_io: bool,
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
     gh_json_v3: Option<PathBuf>,
@@ -234,6 +254,7 @@ async fn run_compress(
             iterations,
             dataset_handle,
             gpu_decompress,
+            gpu_direct_io,
         )
         .await?;
         measurements.push(m);
@@ -277,6 +298,7 @@ async fn run_benchmark_for_dataset(
     iterations: usize,
     dataset_handle: &dyn Dataset,
     gpu_decompress: bool,
+    gpu_direct_io: bool,
 ) -> anyhow::Result<(CompressMeasurements, Vec<v3::V3Record>)> {
     let bench_name = dataset_handle.name();
     let (v3_dataset, v3_variant) = dataset_handle.v3_dataset_dims();
@@ -292,7 +314,7 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, gpu_decompress);
+        let compressor = get_compressor(*format, gpu_decompress, gpu_direct_io);
 
         for op in ops {
             let time = match op {
