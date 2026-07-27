@@ -590,20 +590,26 @@ pub fn decode_n2<E: IntegerPType, T: NativePType>(
     (decoded.into(), Validity::from(decoded_validity.freeze()))
 }
 
-// ---- Bench-local copy of the SHIPPED kernel ----
+// ---- REJECTED doubling fill ----
 //
-// `nonnull_v3` calls the real kernel across a crate boundary, which costs enough to swamp the
-// effect being measured (the u8 rows of that comparison differ by up to 1.8x on byte-identical
-// algorithms). This copy compiles into the bench binary like every other variant here, so
-// `nonnull_v3_local` versus `nonnull_v3_elem_fill` isolates the long-run fill strategy alone.
-// Keep it in step with `compress.rs`.
+// Grows a long fill by seeding a cache line and then repeatedly copying the filled prefix onto
+// the tail, so each copy runs through the libc's runtime-dispatched `memcpy` (AVX2, or `rep
+// movsb` on ERMS parts) rather than the baseline-SSE2 element loop the compiler emits.
+//
+// In isolation, filling fixed-length blocks, that is worth 1.1-1.4x past ~2 KiB. It does not
+// survive contact with real decode: measured against `decode_v3_elem_fill` with both compiled
+// into this binary, over datasets whose run lengths vary and rotate, it is 0.96x median across
+// averages 32-512 -- inside the noise floor, and 0.80x at the average where run lengths
+// straddle the threshold 50/50 and its dispatch branch mispredicts. The isolated win came from
+// fixed run lengths, which both remove that mispredict and let the predictor memorise the
+// pattern. Kept so `nonnull_v3_doubling` reproduces the comparison.
 
-const DOUBLING_FILL_BYTES_LOCAL: usize = 2048;
+const DOUBLING_FILL_BYTES_REJECTED: usize = 2048;
 
 #[inline(never)]
-unsafe fn fill_run_shipped<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
+unsafe fn fill_run_doubling<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
     unsafe {
-        if len * size_of::<T>() >= DOUBLING_FILL_BYTES_LOCAL {
+        if len * size_of::<T>() >= DOUBLING_FILL_BYTES_REJECTED {
             let seed = (64 / size_of::<T>()).max(1);
             for i in 0..seed {
                 dst.add(i).write(MaybeUninit::new(value));
@@ -627,7 +633,7 @@ unsafe fn fill_run_shipped<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value:
 /// The allocation behind `base` must have room for at least
 /// `max(pos, end) + decode_chunk_len::<T>()` elements.
 #[inline(always)]
-unsafe fn splat_run_shipped<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
+unsafe fn splat_run_doubling<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
     let chunk = const { decode_chunk_len::<T>() };
     // SAFETY: caller guarantees one chunk of slack past max(pos, end).
     unsafe {
@@ -642,7 +648,7 @@ unsafe fn splat_run_shipped<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end:
         }
         let len = end - pos;
         if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
-            fill_run_shipped(base.add(pos), len, value);
+            fill_run_doubling(base.add(pos), len, value);
             return;
         }
         loop {
@@ -657,8 +663,8 @@ unsafe fn splat_run_shipped<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end:
     }
 }
 
-/// Bench-local mirror of the shipped non-nullable decode (see above).
-pub fn decode_v3_local<E: IntegerPType, T: NativePType>(
+/// Non-nullable decode using the rejected doubling fill (see above).
+pub fn decode_v3_doubling<E: IntegerPType, T: NativePType>(
     run_ends: &[E],
     values: &[T],
     length: usize,
@@ -675,7 +681,7 @@ pub fn decode_v3_local<E: IntegerPType, T: NativePType>(
             "Runend ends must be monotonic, got {end} after {pos}"
         );
         // SAFETY: pos <= end <= length and the buffer has one chunk of padding.
-        unsafe { splat_run_shipped(base, pos, end, value) };
+        unsafe { splat_run_doubling(base, pos, end, value) };
         pos = end;
     }
     // SAFETY: every element in 0..pos was initialized above.

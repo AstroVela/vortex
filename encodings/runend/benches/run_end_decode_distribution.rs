@@ -61,8 +61,8 @@ use decode_variants::decode_v0;
 use decode_variants::decode_v1;
 use decode_variants::decode_v2;
 use decode_variants::decode_v3_byte_splat;
+use decode_variants::decode_v3_doubling;
 use decode_variants::decode_v3_elem_fill;
-use decode_variants::decode_v3_local;
 use decode_variants::decode_v3_no_memset;
 use decode_variants::make_data_values;
 
@@ -187,23 +187,23 @@ fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
         });
 }
 
-/// Bench-local mirror of the shipped kernel. Compare against `nonnull_v3_elem_fill` (also
-/// bench-local) to isolate the long-run fill strategy without the crate-boundary confound that
-/// makes `nonnull_v3` unusable for that comparison.
+/// The rejected doubling fill. Compare against `nonnull_v3_elem_fill` (also bench-local, so
+/// free of the crate-boundary confound that makes `nonnull_v3` unusable here): the two are
+/// within noise across averages 32-512, which is why the shipped kernel does not double.
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
-fn nonnull_v3_local<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+fn nonnull_v3_doubling<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
         .with_inputs(rotating::<T>(avg, 1.0, false))
         .bench_refs(|(ends, values, _)| {
-            let (buf, validity) = decode_v3_local(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            let (buf, validity) =
+                decode_v3_doubling(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
         });
 }
 
-/// The previous long-run fill (element loop, baseline SSE2 width) instead of the shipped
-/// doubling `memcpy`. Identical to `nonnull_v3` below the 2 KiB doubling threshold; above it
-/// the shipped kernel should win.
+/// The shipped long-run fill strategy (element loop), as a bench-local variant so it can be
+/// compared apples-to-apples against `nonnull_v3_doubling`.
 #[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v3_elem_fill<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
     bencher

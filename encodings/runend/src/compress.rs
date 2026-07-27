@@ -236,22 +236,11 @@ fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
 /// loop, and its call cost is amortized over the run.
 const LONG_RUN_FILL_BYTES: usize = 256;
 
-/// Fills of at least this many bytes grow by doubling `copy_nonoverlapping` instead of an
-/// element loop.
-///
-/// The element loop is compiled against the baseline target features (16-byte SSE2 stores),
-/// whereas `memcpy` is resolved by the libc at runtime to the widest implementation the host
-/// supports (AVX2, or `rep movsb` on ERMS parts). Doubling therefore reaches a store width the
-/// compiled loop cannot, but each `memcpy` costs a call, so it only pays once the run is long
-/// enough to amortize it. Measured crossover is ~2 KiB across u16/u32/u64; below it doubling
-/// is up to 2x slower, at and above it is 1.1-1.4x faster. See `run_end_decode_distribution`.
-const DOUBLING_FILL_BYTES: usize = 2048;
-
 /// The repeated byte of `value` when all of its bytes are equal, otherwise `None`.
 ///
-/// Such a value can be filled with a single `memset`, which writes without reading anything
-/// back and so beats the doubling fill below. The common cases are `0` and all-ones (`-1` for
-/// signed integers), both frequent in real columns.
+/// Such a value can be filled with a single `memset`, which the libc dispatches at runtime to
+/// a wider implementation than the element loop below is compiled for. The common cases are
+/// `0` and all-ones (`-1` for signed integers), both frequent in real columns.
 ///
 /// The comparison is arithmetic on a same-sized integer rather than a walk over `value`'s
 /// bytes, so it never reads padding. Only power-of-two widths up to 8 are recognised; wider
@@ -297,24 +286,6 @@ unsafe fn fill_run<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
         // it wins outright whenever the value is byte-uniform. Byte-sized elements always are.
         if let Some(byte) = repeated_byte(value) {
             dst.cast::<u8>().write_bytes(byte, len * size_of::<T>());
-            return;
-        }
-        if len * size_of::<T>() >= DOUBLING_FILL_BYTES {
-            // Seed one cache line by hand, then repeatedly copy the filled prefix onto the
-            // tail. `seed <= len` holds because `seed * size_of::<T>()` is at most 64 while
-            // `len * size_of::<T>()` is at least `DOUBLING_FILL_BYTES`.
-            let seed = (64 / size_of::<T>()).max(1);
-            for i in 0..seed {
-                dst.add(i).write(MaybeUninit::new(value));
-            }
-            let mut filled = seed;
-            while filled < len {
-                // `n <= filled` keeps the source `dst[..n]` disjoint from the destination
-                // `dst[filled..filled + n]`, and `filled + n <= len` stays in bounds.
-                let n = filled.min(len - filled);
-                std::ptr::copy_nonoverlapping(dst, dst.add(filled), n);
-                filled += n;
-            }
             return;
         }
         for i in 0..len {
