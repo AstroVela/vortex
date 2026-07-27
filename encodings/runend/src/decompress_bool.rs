@@ -6,7 +6,6 @@
 //! Uses an adaptive strategy that pre-fills the buffer with the majority value
 //! (0s or 1s) and only fills the minority runs, minimizing work for skewed distributions.
 
-use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -15,6 +14,7 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::IntegerPType;
 use vortex_array::dtype::Nullability;
 use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::scalar::Scalar;
@@ -22,9 +22,8 @@ use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
+use vortex_error::vortex_panic;
 use vortex_mask::Mask;
-
-use crate::iter::trimmed_ends_iter;
 
 /// Threshold for number of runs below which we use sequential append instead of prefill.
 /// With few runs, the overhead of prefilling the entire buffer dominates.
@@ -61,7 +60,8 @@ pub fn runend_decode_bools(
 
     Ok(match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
         runend_decode_typed_bool(
-            trimmed_ends_iter(ends.as_slice::<E>(), offset, length),
+            ends.as_slice::<E>(),
+            offset,
             &values_buf,
             validity,
             nullability,
@@ -77,8 +77,14 @@ pub fn runend_decode_bools(
 /// - If more false runs: pre-fill with 0s, fill true runs
 ///
 /// This minimizes work for skewed distributions (e.g., sparse validity masks).
-pub fn runend_decode_typed_bool(
-    run_ends: impl Iterator<Item = usize>,
+///
+/// Run ends are taken as a slice and trimmed by `offset` inline. Consuming them through an
+/// iterator chain instead costs about a fifth of decode time: the per-run work here is a
+/// handful of instructions, so `trimmed_ends_iter`'s `map`s plus a `zip_eq` plus a bit-at-a-time
+/// `BitBuffer` iterator are not amortized by anything.
+pub fn runend_decode_typed_bool<E: IntegerPType>(
+    run_ends: &[E],
+    offset: usize,
     values: &BitBuffer,
     values_validity: Mask,
     values_nullability: Nullability,
@@ -86,23 +92,53 @@ pub fn runend_decode_typed_bool(
 ) -> ArrayRef {
     match values_validity {
         Mask::AllTrue(_) => {
-            decode_bool_non_nullable(run_ends, values, values_nullability, length).into_array()
+            decode_bool_non_nullable(run_ends, offset, values, values_nullability, length)
+                .into_array()
         }
         Mask::AllFalse(_) => {
             ConstantArray::new(Scalar::null(DType::Bool(Nullability::Nullable)), length)
                 .into_array()
         }
         Mask::Values(mask) => {
-            decode_bool_nullable(run_ends, values, mask.bit_buffer(), length).into_array()
+            decode_bool_nullable(run_ends, offset, values, mask.bit_buffer(), length).into_array()
         }
     }
+}
+
+/// Convert `offset`/`length` into `E` once, outside the per-run loop.
+#[inline(always)]
+fn trim_bounds<E: IntegerPType>(offset: usize, length: usize) -> (E, E) {
+    let offset_e = E::from_usize(offset).unwrap_or_else(|| {
+        vortex_panic!(
+            "offset {} cannot be converted to {}",
+            offset,
+            std::any::type_name::<E>()
+        )
+    });
+    let length_e = E::from_usize(length).unwrap_or_else(|| {
+        vortex_panic!(
+            "length {} cannot be converted to {}",
+            length,
+            std::any::type_name::<E>()
+        )
+    });
+    (offset_e, length_e)
+}
+
+/// Trim a raw run end down by `offset` and clamp it to `length`.
+#[inline(always)]
+fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
+    if end < offset {
+        vortex_panic!("run end {end} must be >= offset {offset}");
+    }
+    std::cmp::min(end - offset, length).as_()
 }
 
 /// Fast path for few runs with no offset. Uses direct slice access to minimize overhead.
 /// This avoids the `trimmed_ends_iter` iterator chain which adds significant overhead
 /// for small numbers of runs.
 #[inline(always)]
-fn decode_few_runs_no_offset<E: vortex_array::dtype::IntegerPType>(
+fn decode_few_runs_no_offset<E: IntegerPType>(
     ends: &[E],
     values: &BitBuffer,
     validity: Mask,
@@ -148,19 +184,22 @@ fn decode_few_runs_no_offset<E: vortex_array::dtype::IntegerPType>(
 }
 
 /// Decodes run-end encoded booleans when all values are valid (non-nullable).
-fn decode_bool_non_nullable(
-    run_ends: impl Iterator<Item = usize>,
+fn decode_bool_non_nullable<E: IntegerPType>(
+    run_ends: &[E],
+    offset: usize,
     values: &BitBuffer,
     nullability: Nullability,
     length: usize,
 ) -> BoolArray {
     let num_runs = values.len();
+    let (offset_e, length_e) = trim_bounds::<E>(offset, length);
 
     // For few runs, sequential append is faster than prefill + modify
     if num_runs < PREFILL_RUN_THRESHOLD {
         let mut decoded = BitBufferMut::with_capacity(length);
-        for (end, value) in run_ends.zip(values.iter()) {
-            decoded.append_n(value, end - decoded.len());
+        for (i, &end) in run_ends.iter().enumerate() {
+            let end = trim_end(end, offset_e, length_e);
+            decoded.append_n(values.value(i), end - decoded.len());
         }
         return BoolArray::new(decoded.freeze(), nullability.into());
     }
@@ -177,10 +216,11 @@ fn decode_bool_non_nullable(
     let mut decoded = BitBufferMut::full(prefill, length);
     let mut current_pos = 0usize;
 
-    for (end, value) in run_ends.zip_eq(values.iter()) {
-        if end > current_pos && value != prefill {
+    for (i, &end) in run_ends.iter().enumerate() {
+        let end = trim_end(end, offset_e, length_e);
+        if end > current_pos && values.value(i) != prefill {
             // SAFETY: current_pos < end <= length == decoded.len()
-            unsafe { decoded.fill_range_unchecked(current_pos, end, value) };
+            unsafe { decoded.fill_range_unchecked(current_pos, end, values.value(i)) };
         }
         current_pos = end;
     }
@@ -188,17 +228,19 @@ fn decode_bool_non_nullable(
 }
 
 /// Decodes run-end encoded booleans when values may be null (nullable).
-fn decode_bool_nullable(
-    run_ends: impl Iterator<Item = usize>,
+fn decode_bool_nullable<E: IntegerPType>(
+    run_ends: &[E],
+    offset: usize,
     values: &BitBuffer,
     validity_mask: &BitBuffer,
     length: usize,
 ) -> BoolArray {
     let num_runs = values.len();
+    let (offset_e, length_e) = trim_bounds::<E>(offset, length);
 
     // For few runs, sequential append is faster than prefill + modify
     if num_runs < PREFILL_RUN_THRESHOLD {
-        return decode_nullable_sequential(run_ends, values, validity_mask, length);
+        return decode_nullable_sequential(run_ends, offset, values, validity_mask, length);
     }
 
     // Adaptive strategy: prefill each buffer with its majority value
@@ -209,7 +251,9 @@ fn decode_bool_nullable(
     let mut decoded_validity = BitBufferMut::full(prefill_valid, length);
     let mut current_pos = 0usize;
 
-    for (end, (value, is_valid)) in run_ends.zip_eq(values.iter().zip(validity_mask.iter())) {
+    for (i, &end) in run_ends.iter().enumerate() {
+        let end = trim_end(end, offset_e, length_e);
+        let (value, is_valid) = (values.value(i), validity_mask.value(i));
         if end > current_pos {
             // SAFETY: current_pos < end <= length == decoded.len() == decoded_validity.len()
             if is_valid != prefill_valid {
@@ -228,16 +272,20 @@ fn decode_bool_nullable(
 
 /// Sequential decode for few runs - avoids prefill overhead.
 #[inline(always)]
-fn decode_nullable_sequential(
-    run_ends: impl Iterator<Item = usize>,
+fn decode_nullable_sequential<E: IntegerPType>(
+    run_ends: &[E],
+    offset: usize,
     values: &BitBuffer,
     validity_mask: &BitBuffer,
     length: usize,
 ) -> BoolArray {
+    let (offset_e, length_e) = trim_bounds::<E>(offset, length);
     let mut decoded = BitBufferMut::with_capacity(length);
     let mut decoded_validity = BitBufferMut::with_capacity(length);
 
-    for (end, (value, is_valid)) in run_ends.zip(values.iter().zip(validity_mask.iter())) {
+    for (i, &end) in run_ends.iter().enumerate() {
+        let end = trim_end(end, offset_e, length_e);
+        let (value, is_valid) = (values.value(i), validity_mask.value(i));
         let run_len = end - decoded.len();
         if is_valid {
             decoded_validity.append_n(true, run_len);
