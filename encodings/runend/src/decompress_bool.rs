@@ -149,8 +149,10 @@ impl<'a> BitSplat<'a> {
     ///
     /// Inlined on purpose: leaving it out of line spills the accumulator to the stack for the
     /// whole loop, since `&mut self` escapes into the call. That costs a read-modify-write per
-    /// short run, which is the common case.
-    #[inline]
+    /// short run, which is the common case, and `#[inline]` alone is not enough — the crate
+    /// build leaves it out of line even where a smaller bench-local copy of the same code is
+    /// inlined.
+    #[inline(always)]
     fn append_spanning(&mut self, splat: u64, n: usize) {
         // Complete the current word. `self.bits < WORD_BITS`, so the shift is in range, and the
         // run covers every bit from `self.bits` up.
@@ -197,30 +199,116 @@ fn splat_bits(length: usize, fill: impl FnOnce(&mut BitSplat<'_>)) -> BitBufferM
     into_bits(buf, length)
 }
 
-/// Splats `length` bits into two fresh buffers, driving `fill` over both sinks at once.
+/// Two bit sinks advanced in lockstep: the decoded bits and the validity bits of the same runs.
+///
+/// Every run appends the same number of bits to both, so the run length, the word-boundary test,
+/// the head mask and the bit counter are computed once for the pair rather than twice. Driving
+/// two independent [`BitSplat`]s instead costs a second mask chain and a second boundary branch
+/// per run, and the doubled live state spills; measured, fusing them is worth up to 1.4x.
+struct BitSplatPair<'a> {
+    /// Exactly the decoded output words, written in ascending order and each at most once.
+    words: &'a mut [MaybeUninit<u64>],
+    /// Exactly the validity output words, written in step with `words`.
+    validity: &'a mut [MaybeUninit<u64>],
+    /// Number of words already written to each, so `..idx` of both is initialized.
+    idx: usize,
+    /// The decoded word under construction. Bits at and above `bits` are always zero.
+    word: u64,
+    /// The validity word under construction, at the same bit position.
+    validity_word: u64,
+    /// Number of bits already accumulated into both words, always `< WORD_BITS`.
+    bits: usize,
+}
+
+impl<'a> BitSplatPair<'a> {
+    /// Creates a pair of sinks over the two output buffers, which it initializes in full.
+    fn new(words: &'a mut [MaybeUninit<u64>], validity: &'a mut [MaybeUninit<u64>]) -> Self {
+        Self {
+            words,
+            validity,
+            idx: 0,
+            word: 0,
+            validity_word: 0,
+            bits: 0,
+        }
+    }
+
+    /// Appends `n` copies of `value` to the decoded bits and of `is_valid` to the validity bits.
+    #[inline(always)]
+    fn append_run(&mut self, value: bool, is_valid: bool, n: usize) {
+        let splat = u64::from(value).wrapping_neg();
+        let validity_splat = u64::from(is_valid).wrapping_neg();
+        if self.bits + n < WORD_BITS {
+            // `n < WORD_BITS`, so the mask shift is in range. One mask serves both words.
+            let mask = ((1u64 << n) - 1) << self.bits;
+            self.word |= splat & mask;
+            self.validity_word |= validity_splat & mask;
+            self.bits += n;
+            return;
+        }
+        self.append_spanning(splat, validity_splat, n);
+    }
+
+    /// Appends a run that reaches at least to the end of the current word. Inlined for the same
+    /// reason as [`BitSplat::append_spanning`].
+    #[inline(always)]
+    fn append_spanning(&mut self, splat: u64, validity_splat: u64, n: usize) {
+        self.words[self.idx] = MaybeUninit::new(self.word | (splat << self.bits));
+        self.validity[self.idx] =
+            MaybeUninit::new(self.validity_word | (validity_splat << self.bits));
+        self.idx += 1;
+        let rest = n - (WORD_BITS - self.bits);
+
+        let whole = rest / WORD_BITS;
+        if whole > 0 {
+            self.words[self.idx..self.idx + whole].fill(MaybeUninit::new(splat));
+            self.validity[self.idx..self.idx + whole].fill(MaybeUninit::new(validity_splat));
+            self.idx += whole;
+        }
+
+        let tail = rest % WORD_BITS;
+        let mask = (1u64 << tail) - 1;
+        self.word = splat & mask;
+        self.validity_word = validity_splat & mask;
+        self.bits = tail;
+    }
+
+    /// Flushes both accumulators and zero-fills the words the runs did not reach.
+    fn finish(self) {
+        let mut idx = self.idx;
+        if self.bits > 0 {
+            self.words[idx] = MaybeUninit::new(self.word);
+            self.validity[idx] = MaybeUninit::new(self.validity_word);
+            idx += 1;
+        }
+        self.words[idx..].fill(MaybeUninit::new(0));
+        self.validity[idx..].fill(MaybeUninit::new(0));
+    }
+}
+
+/// Splats `length` decoded bits and `length` validity bits into two fresh buffers, driving `fill`
+/// over the fused sink.
 fn splat_bits_pair(
     length: usize,
-    fill: impl FnOnce(&mut BitSplat<'_>, &mut BitSplat<'_>),
+    fill: impl FnOnce(&mut BitSplatPair<'_>),
 ) -> (BitBufferMut, BitBufferMut) {
     let n_words = length.div_ceil(WORD_BITS);
     let mut buf = BufferMut::<u64>::with_capacity(n_words);
-    let mut other = BufferMut::<u64>::with_capacity(n_words);
+    let mut validity_buf = BufferMut::<u64>::with_capacity(n_words);
     {
         let words = &mut buf.spare_capacity_mut()[..n_words];
-        let other_words = &mut other.spare_capacity_mut()[..n_words];
-        let mut splat = BitSplat::new(words);
-        let mut other_splat = BitSplat::new(other_words);
-        fill(&mut splat, &mut other_splat);
+        let validity_words = &mut validity_buf.spare_capacity_mut()[..n_words];
+        let mut splat = BitSplatPair::new(words, validity_words);
+        fill(&mut splat);
         splat.finish();
-        other_splat.finish();
     }
-    // SAFETY: both sinks covered exactly `n_words` words and were finished, so every word in
-    // `0..n_words` of both buffers is initialized, and `n_words` is the capacity of each.
+    // SAFETY: the sink covered exactly `n_words` words of each buffer and was finished, so every
+    // word in `0..n_words` of both is initialized, and `n_words` is the capacity of each.
     unsafe {
         buf.set_len(n_words);
-        other.set_len(n_words);
+        validity_buf.set_len(n_words);
     }
-    (into_bits(buf, length), into_bits(other, length))
+    (into_bits(buf, length), into_bits(validity_buf, length))
 }
 
 /// Reinterprets initialized words as a `length`-bit buffer. Little-endian only, like the rest of
@@ -260,6 +348,18 @@ fn trim_end<E: IntegerPType>(end: E, offset: E, length: E) -> usize {
     std::cmp::min(end - offset, length).as_()
 }
 
+/// Length of the run ending at `end`, given the position the previous run reached.
+///
+/// Saturating, so that run ends which are not strictly increasing yield empty runs rather than
+/// running the output position backwards. The splat sinks are sized to exactly `length` bits, so
+/// a position that could move backwards would let the total appended exceed the buffer and turn
+/// a malformed array into a panic. Run ends are only checked for sortedness under
+/// `debug_assertions`, so a release build does see them.
+#[inline(always)]
+fn run_length<E: IntegerPType>(end: E, offset: E, length: E, pos: usize) -> usize {
+    trim_end(end, offset, length).saturating_sub(pos)
+}
+
 /// Number of runs whose value differs from the majority: exactly the runs the prefill kernel
 /// has to patch after its memset.
 fn minority_runs(values: &BitBuffer) -> usize {
@@ -272,15 +372,18 @@ fn minority_runs(values: &BitBuffer) -> usize {
 /// The splat pays per output word; the prefill pays one memset over the whole output plus one
 /// range fill per patched run, and a range fill is far dearer than a splat step — a partial byte
 /// at each end, a `memset` call, and a data-dependent branch to decide whether to do it at all.
-/// Measured, one patched run costs about what the splat spends on three output words, per buffer
-/// the splat has to build. So the prefill wins exactly when patches are rarer than that.
+/// Measured, one patched run costs about what the splat spends on three output words. So the
+/// prefill wins exactly when patches are rarer than that.
 ///
-/// On the `run_end_decode_bool_ablation` grid this picks the faster kernel everywhere except
-/// 8-element runs with 90/10 values, where it gives up 7%. The threshold was derived before the
-/// splat switched to overwriting a pre-sized buffer, which made it 5-45% faster, so it is now
-/// conservative: there are grid points it hands to the prefill that the splat would win.
+/// A second output buffer does not double the splat's side of that: [`BitSplatPair`] shares the
+/// run length, the word-boundary test and the head mask, so the second buffer adds about half the
+/// cost of the first. Hence `buffers + 1` against a doubled constant rather than `buffers`.
+///
+/// Re-derive by returning a constant from here and running `run_end_decode_bool_ablation` with
+/// each kernel pinned. On that grid this picks the faster kernel at 25 of 26 points; the miss is
+/// non-nullable 1024-element runs with 50/50 values, where it gives up 6%.
 fn prefer_splat(patched_runs: usize, buffers: usize, length: usize) -> bool {
-    patched_runs * 3 * WORD_BITS >= length * buffers
+    patched_runs * 6 * WORD_BITS >= length * (buffers + 1)
 }
 
 /// Decodes run-end encoded booleans when all values are valid (non-nullable).
@@ -307,9 +410,9 @@ fn decode_bool_non_nullable<E: IntegerPType>(
     let decoded = splat_bits(length, |decoded| {
         let mut pos = 0usize;
         for (i, &end) in run_ends.iter().enumerate() {
-            let end = trim_end(end, offset_e, length_e);
-            decoded.append_run(values.value(i), end.saturating_sub(pos));
-            pos = end;
+            let run = run_length(end, offset_e, length_e, pos);
+            pos += run;
+            decoded.append_run(values.value(i), run);
         }
     });
 
@@ -332,17 +435,15 @@ fn decode_bool_nullable<E: IntegerPType>(
         return prefill_bool_nullable(run_ends, offset_e, length_e, values, validity_mask, length);
     }
 
-    let (decoded, decoded_validity) = splat_bits_pair(length, |decoded, decoded_validity| {
+    let (decoded, decoded_validity) = splat_bits_pair(length, |decoded| {
         let mut pos = 0usize;
         for (i, &end) in run_ends.iter().enumerate() {
-            let end = trim_end(end, offset_e, length_e);
-            let run = end.saturating_sub(pos);
-            pos = end;
+            let run = run_length(end, offset_e, length_e, pos);
+            pos += run;
 
             // The decoded bit is the value where valid, and false where null.
             let is_valid = validity_mask.value(i);
-            decoded.append_run(is_valid && values.value(i), run);
-            decoded_validity.append_run(is_valid, run);
+            decoded.append_run(is_valid && values.value(i), is_valid, run);
         }
     });
 
@@ -510,6 +611,22 @@ mod tests {
         expected.extend(std::iter::repeat_n(false, second_run));
         let expected = BoolArray::from(BitBuffer::from(expected));
         assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    /// Run ends are only checked for sortedness under `debug_assertions`, so a release build can
+    /// be handed ends that go backwards. They must decode to something of the right length rather
+    /// than running the splat sink past the end of its buffer.
+    #[test]
+    fn decode_bools_non_monotonic_ends() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let ends = PrimitiveArray::from_iter([100u32, 50, 100]);
+        let values = BoolArray::from(BitBuffer::from(vec![true, false, true]));
+        let decoded =
+            runend_decode_bools(ends, values, 0, 100, &mut ctx)?.execute::<BoolArray>(&mut ctx)?;
+
+        assert_eq!(decoded.len(), 100);
+        assert_eq!(decoded.into_bit_buffer().true_count(), 100);
         Ok(())
     }
 

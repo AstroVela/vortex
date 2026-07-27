@@ -20,17 +20,16 @@
 //! ```text
 //! run length      1     2     8    32    64   128  1024
 //! non-nullable
-//!   50/50      3.70  3.46  2.86  1.25  1.26  0.87  0.61
-//!   90/10         -  1.28  0.93  0.44  0.48  0.49  0.61
+//!   50/50      3.49  3.59  3.22  1.95  2.13  0.92  1.06
+//!   90/10         -  1.37  1.13  0.66  0.77  0.51  0.78
 //! nullable
-//!   50/50      1.97  2.09  1.92  1.21  0.74  0.50  0.63
-//!   90/10         -  1.20  1.14  0.64  0.46  0.47  0.63
+//!   50/50      2.41  2.54  2.40  1.58  1.20  0.96  0.73
+//!   90/10         -  1.46  1.35  0.96  0.73  0.60  0.84
 //! ```
 //!
-//! The splat is worth up to 3.7x while runs are short. The crossover moves in with skew, since
-//! a skewed prefill patches few runs, and in again for nullable input, where the splat builds
-//! two buffers but the prefill still skips both at once. `prefer_splat` reproduces this table's
-//! sign everywhere except non-nullable 8/90-10, where it gives up 7%.
+//! The splat is worth up to 3.6x while runs are short. The crossover moves in with skew, since a
+//! skewed prefill patches few runs. `prefer_splat` reproduces this table's sign at 25 of the 26
+//! points; the miss is non-nullable 1024/50-50, where it gives up 6%.
 
 #![expect(clippy::cast_possible_truncation)]
 
