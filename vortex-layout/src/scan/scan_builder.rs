@@ -18,6 +18,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
 use vortex_array::expr::analysis::referenced_field_paths;
+use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::root;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorAdapter;
@@ -39,8 +40,9 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
+use crate::LayoutReaderScanPlan;
+use crate::ScanPlanRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
-use crate::scan::plan::PreparedScanPlan;
 use crate::scan::plan::planned_scan_enabled;
 use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
@@ -312,14 +314,20 @@ impl<A: 'static + Send> ScanBuilder<A> {
             };
 
         if planned_scan_enabled()? {
-            let plan = Arc::new(PreparedScanPlan::try_new(
-                Arc::clone(&layout_reader),
-                projection,
-                filter.as_ref(),
-            )?);
+            let source: ScanPlanRef =
+                Arc::new(LayoutReaderScanPlan::new(Arc::clone(&layout_reader)));
+            let projection_plan = Arc::clone(&source).apply_expr(projection)?.optimize()?;
+            let predicate_plans = filter
+                .as_ref()
+                .map(conjuncts)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|expr| Arc::clone(&source).apply_expr(expr)?.optimize())
+                .collect::<VortexResult<Vec<_>>>()?;
             return Ok(RepeatedScan::new_planned(
                 self.session.clone(),
-                plan,
+                projection_plan,
+                predicate_plans,
                 filter,
                 self.ordered,
                 self.row_range,

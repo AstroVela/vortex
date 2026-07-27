@@ -15,6 +15,8 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
+use vortex_array::expr::root;
+use vortex_array::expr::transform::replace;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -27,14 +29,22 @@ use crate::segments::SegmentSource;
 /// Shared handle to a stateful layout reader.
 pub type LayoutReaderRef = Arc<dyn LayoutReader>;
 
-/// Shared handle to an expression-bound physical scan plan.
+/// Shared handle to a heap-allocated physical scan plan.
 pub type ScanPlanRef = Arc<dyn ScanPlan>;
 
-/// An expression-bound physical plan executed through the [`LayoutReader`] API.
+/// A heap-allocated physical scan plan.
 ///
-/// Expressions are consumed while constructing the plan. Execution therefore selects a plan and
-/// supplies only its row range and mask.
+/// A source plan represents an instantiated layout. [`apply_expr`](Self::apply_expr) derives
+/// another plan whose root value is the applied expression, and [`optimize`](Self::optimize)
+/// rewrites that derived plan before execution. Execution therefore selects an already-bound plan
+/// and supplies only its row range and mask.
 pub trait ScanPlan: 'static + Send + Sync {
+    /// Apply `expr` to this plan's root value and return the resulting plan.
+    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef>;
+
+    /// Optimize this plan and return the resulting plan.
+    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef>;
+
     /// Returns the name of the underlying layout reader for debugging.
     fn name(&self) -> &Arc<str>;
 
@@ -62,10 +72,11 @@ pub trait ScanPlan: 'static + Send + Sync {
     ) -> VortexResult<ArrayFuture>;
 }
 
-/// Compatibility physical plan that binds one expression to a V1 layout reader.
+/// Compatibility source and expression plan backed by a V1 layout reader.
 ///
-/// This is the execution boundary for the initial planner rollout. Layout-specific physical
-/// planning can replace this node without changing the established split execution loop.
+/// Applying an expression and optimizing it produce new heap-allocated plans. Execution delegates
+/// the resulting expression to the established reader implementation. Layout-specific source plans
+/// can replace this compatibility node without changing the split execution loop.
 pub struct LayoutReaderScanPlan {
     reader: LayoutReaderRef,
     expr: Expression,
@@ -73,8 +84,18 @@ pub struct LayoutReaderScanPlan {
 }
 
 impl LayoutReaderScanPlan {
+    /// Create a source plan for `reader`.
+    pub fn new(reader: LayoutReaderRef) -> Self {
+        let dtype = reader.dtype().clone();
+        Self {
+            reader,
+            expr: root(),
+            dtype,
+        }
+    }
+
     /// Bind `expr` to `reader`.
-    pub fn try_new(reader: LayoutReaderRef, expr: Expression) -> VortexResult<Self> {
+    fn try_new(reader: LayoutReaderRef, expr: Expression) -> VortexResult<Self> {
         let dtype = expr.return_dtype(reader.dtype())?;
         Ok(Self {
             reader,
@@ -85,6 +106,16 @@ impl LayoutReaderScanPlan {
 }
 
 impl ScanPlan for LayoutReaderScanPlan {
+    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef> {
+        let expr = replace(expr, &root(), self.expr.clone());
+        Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
+    }
+
+    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef> {
+        let expr = self.expr.optimize_recursive(self.reader.dtype())?;
+        Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
+    }
+
     fn name(&self) -> &Arc<str> {
         self.reader.name()
     }
@@ -360,5 +391,111 @@ impl LazyReaderChildren {
                 &self.ctx,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::dtype::FieldName;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::dtype::StructFields;
+    use vortex_array::expr::eq;
+    use vortex_array::expr::get_item;
+    use vortex_array::expr::lit;
+
+    use super::*;
+
+    struct TestLayoutReader {
+        name: Arc<str>,
+        dtype: DType,
+    }
+
+    impl TestLayoutReader {
+        fn new() -> Self {
+            Self {
+                name: Arc::from("test"),
+                dtype: DType::Struct(
+                    StructFields::from_iter([(
+                        FieldName::from("a"),
+                        DType::Primitive(PType::I32, Nullability::NonNullable),
+                    )]),
+                    Nullability::NonNullable,
+                ),
+            }
+        }
+    }
+
+    impl LayoutReader for TestLayoutReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            1
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            _split_range: &SplitRange,
+            _splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            unimplemented!("not needed for scan-plan construction")
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            _mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            unimplemented!("not needed for scan-plan construction")
+        }
+
+        fn filter_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            _mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            unimplemented!("not needed for scan-plan construction")
+        }
+
+        fn projection_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            _mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            unimplemented!("not needed for scan-plan construction")
+        }
+    }
+
+    #[test]
+    fn scan_plan_applies_expressions_to_the_current_root() -> VortexResult<()> {
+        let reader: LayoutReaderRef = Arc::new(TestLayoutReader::new());
+        let source: ScanPlanRef = Arc::new(LayoutReaderScanPlan::new(reader));
+
+        let field = Arc::clone(&source)
+            .apply_expr(get_item("a", root()))?
+            .optimize()?;
+        assert_eq!(
+            field.dtype(),
+            &DType::Primitive(PType::I32, Nullability::NonNullable)
+        );
+
+        let predicate = field.apply_expr(eq(root(), lit(1_i32)))?.optimize()?;
+        assert_eq!(predicate.dtype(), &DType::Bool(Nullability::NonNullable));
+
+        Ok(())
     }
 }

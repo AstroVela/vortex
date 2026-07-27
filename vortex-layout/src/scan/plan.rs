@@ -2,68 +2,28 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Heap-allocated physical scan planning over the established layout-reader execution API.
+//!
+//! # Design direction
+//!
+//! Planning should begin with a heap-allocated source plan produced by a layout. Applying an
+//! expression to that source returns another plan, and optimizing that derived plan returns another
+//! plan. Execution receives only a row range and mask; expressions do not cross the
+//! planning/execution boundary.
+//!
+//! A scan retains its existing N+1 decomposition: one independently pushed and optimized plan for
+//! each filter conjunct, plus one independently pushed and optimized projection plan. These plans
+//! must remain separate so their reads can be scheduled concurrently. They are not combined into a
+//! single filter-then-projection operator tree.
+//!
+//! The current [`LayoutReaderScanPlan`](crate::LayoutReaderScanPlan) is a compatibility source plan:
+//! it supports the plan-to-plan API but delegates execution to the existing [`crate::LayoutReader`].
+//! Layout-specific source plans can replace it incrementally.
 
-use std::sync::Arc;
-
-use vortex_array::expr::Expression;
-use vortex_array::expr::forms::conjuncts;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
-use crate::LayoutReaderRef;
-use crate::LayoutReaderScanPlan;
-use crate::ScanPlanRef;
-
 /// Environment variable selecting the scan planning implementation.
 pub const SCAN_IMPL_ENV: &str = "VORTEX_SCAN_IMPL";
-
-/// A request-level physical plan prepared once before split execution.
-pub struct PreparedScanPlan {
-    projection: ScanPlanRef,
-    predicates: Vec<ScanPlanRef>,
-}
-
-/// Shared handle to a prepared request-level physical scan plan.
-pub type PreparedScanPlanRef = Arc<PreparedScanPlan>;
-
-impl PreparedScanPlan {
-    /// Bind a projection and each filter conjunct to heap-allocated physical plan nodes.
-    pub fn try_new(
-        reader: LayoutReaderRef,
-        projection: Expression,
-        filter: Option<&Expression>,
-    ) -> VortexResult<Self> {
-        let projection = Arc::new(LayoutReaderScanPlan::try_new(
-            Arc::clone(&reader),
-            projection,
-        )?) as ScanPlanRef;
-        let predicates = filter
-            .map(conjuncts)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|expr| {
-                Ok(
-                    Arc::new(LayoutReaderScanPlan::try_new(Arc::clone(&reader), expr)?)
-                        as ScanPlanRef,
-                )
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-        Ok(Self {
-            projection,
-            predicates,
-        })
-    }
-
-    /// Returns the bound projection plan.
-    pub fn projection(&self) -> &ScanPlanRef {
-        &self.projection
-    }
-
-    /// Returns one bound plan per filter conjunct.
-    pub fn predicates(&self) -> &[ScanPlanRef] {
-        &self.predicates
-    }
-}
 
 /// Returns whether heap-allocated planning is enabled for this process.
 ///
