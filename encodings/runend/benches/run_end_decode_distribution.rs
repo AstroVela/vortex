@@ -39,6 +39,8 @@
 #![expect(clippy::cast_possible_truncation)]
 
 use std::fmt;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
@@ -61,7 +63,6 @@ use decode_variants::decode_v2;
 use decode_variants::decode_v3_byte_splat;
 use decode_variants::decode_v3_elem_fill;
 use decode_variants::decode_v3_no_memset;
-use decode_variants::make_data;
 use decode_variants::make_data_values;
 
 fn main() {
@@ -71,11 +72,13 @@ fn main() {
 const SEED: u64 = 0x5eed;
 const TOTAL_LENGTH: usize = 65_536;
 
-/// Average run length. Uniform run lengths in `1..=(2*avg-1)` have this mean.
+/// Average run length. Run lengths are drawn uniformly from `1..=(2*avg-1)`, so every point
+/// mixes short and long runs rather than repeating one length; `avg` is only the mean.
 ///
-/// Extends past 1024 so the 2 KiB doubling-fill threshold is crossed for every element width
-/// (u16 needs 1024+ elements, u32 512+, u64 256+).
-const RUN_LENGTHS: &[usize] = &[2, 4, 8, 16, 32, 64, 256, 1024, 4096];
+/// The range brackets the run lengths run-end encoding is actually chosen for, and straddles
+/// the 2 KiB doubling-fill threshold from both sides for each element width (u32 crosses at an
+/// average of 512, u64 at 256).
+const RUN_LENGTHS: &[usize] = &[32, 64, 128, 256, 512];
 
 /// Fixed short run length for the density sweep, where per-run validity work is visible.
 const DENSITY_RUN_LENGTH: usize = 8;
@@ -84,20 +87,56 @@ fn max_run_len(avg: usize) -> usize {
     2 * avg - 1
 }
 
-// ---- Group A: non-nullable run-length sweep ----
+/// Number of independently-seeded datasets cycled across benchmark iterations.
+///
+/// Re-using one dataset replays an identical run-length sequence every iteration, so the branch
+/// predictor learns which runs take each length-dependent branch and the benchmark reports a
+/// predictor state no real decode reaches. Cycling datasets multiplies the pattern length past
+/// what the predictor retains. `predictor_{fixed,rotating}` measures what this is worth; every
+/// other benchmark here rotates.
+const DATASETS: u64 = 16;
 
-fn nonnull_data<T: NativePType + From<u8>>(avg: usize) -> (Buffer<u32>, Buffer<T>) {
-    let (ends, values, _) = make_data::<T>(SEED, TOTAL_LENGTH, max_run_len(avg), 1.0);
-    (ends, values)
+/// Input provider cycling `DATASETS` independently-seeded datasets.
+fn rotating<T: NativePType + From<u8>>(
+    avg: usize,
+    density: f64,
+    zero_values: bool,
+) -> impl Fn() -> (Buffer<u32>, Buffer<T>, BitBuffer) {
+    let sets: Vec<_> = (0..DATASETS)
+        .map(|k| {
+            make_data_values::<T>(
+                SEED.wrapping_add(k.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                TOTAL_LENGTH,
+                max_run_len(avg),
+                density,
+                zero_values,
+            )
+        })
+        .collect();
+    let next = AtomicUsize::new(0);
+    move || {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        sets[i % sets.len()].clone()
+    }
 }
+
+/// Input provider replaying a single dataset, for the `predictor_*` control only.
+fn fixed<T: NativePType + From<u8>>(
+    avg: usize,
+    density: f64,
+) -> impl Fn() -> (Buffer<u32>, Buffer<T>, BitBuffer) {
+    let set = make_data_values::<T>(SEED, TOTAL_LENGTH, max_run_len(avg), density, false);
+    move || set.clone()
+}
+
+// ---- Group A: non-nullable run-length sweep ----
 
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v0<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             let (buf, validity) = decode_v0(
                 trimmed_ends_iter(ends.as_slice(), 0, TOTAL_LENGTH),
                 values.as_slice(),
@@ -110,11 +149,10 @@ fn nonnull_v0<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v1<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             let (buf, validity) = decode_v1(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
         });
@@ -122,11 +160,10 @@ fn nonnull_v1<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v2<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             let (buf, validity) = decode_v2(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
         });
@@ -134,11 +171,10 @@ fn nonnull_v2<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 #[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             runend_decode_typed_primitive(
                 ends.as_slice(),
                 0,
@@ -155,11 +191,10 @@ fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 /// the shipped kernel should win.
 #[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v3_elem_fill<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             let (buf, validity) =
                 decode_v3_elem_fill(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
@@ -171,11 +206,10 @@ fn nonnull_v3_elem_fill<T: NativePType + From<u8>>(bencher: Bencher, avg: usize)
 /// lengths — which is why the shipped kernel carries no byte special case.
 #[divan::bench(types = [u8, u16, u32, u64], args = RUN_LENGTHS)]
 fn nonnull_v3_byte_splat<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             let (buf, validity) =
                 decode_v3_byte_splat(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
@@ -228,11 +262,10 @@ fn zeros_v3_prev<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 /// `nonnull_v3` to confirm the fast path costs nothing when it does not apply.
 #[divan::bench(types = [u32, u64], args = RUN_LENGTHS)]
 fn rand_v3_prev<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values) = nonnull_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone()))
-        .bench_refs(|(ends, values)| {
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
             let (buf, validity) =
                 decode_v3_no_memset(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
             PrimitiveArray::new(buf, validity)
@@ -241,16 +274,11 @@ fn rand_v3_prev<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 // ---- Group B: nullable run-length sweep at 90% valid ----
 
-fn nullable_data<T: NativePType + From<u8>>(avg: usize) -> (Buffer<u32>, Buffer<T>, BitBuffer) {
-    make_data::<T>(SEED, TOTAL_LENGTH, max_run_len(avg), 0.9)
-}
-
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
 fn nullable_n0<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values, validity) = nullable_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone(), validity.clone()))
+        .with_inputs(rotating::<T>(avg, 0.9, false))
         .bench_refs(|(ends, values, validity)| {
             let (buf, decoded_validity) = decode_v0(
                 trimmed_ends_iter(ends.as_slice(), 0, TOTAL_LENGTH),
@@ -264,10 +292,9 @@ fn nullable_n0<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
 fn nullable_n2<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values, validity) = nullable_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone(), validity.clone()))
+        .with_inputs(rotating::<T>(avg, 0.9, false))
         .bench_refs(|(ends, values, validity)| {
             let (buf, decoded_validity) =
                 decode_n2(ends.as_slice(), values.as_slice(), validity, TOTAL_LENGTH);
@@ -277,10 +304,9 @@ fn nullable_n2<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 #[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
 fn nullable_n3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
-    let (ends, values, validity) = nullable_data::<T>(avg);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone(), validity.clone()))
+        .with_inputs(rotating::<T>(avg, 0.9, false))
         .bench_refs(|(ends, values, validity)| {
             runend_decode_typed_primitive(
                 ends.as_slice(),
@@ -295,13 +321,8 @@ fn nullable_n3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
 
 // ---- Group C: validity-density sweep (u32, run length 8) ----
 
-fn density_data(density_pct: u32) -> (Buffer<u32>, Buffer<u32>, BitBuffer) {
-    make_data::<u32>(
-        SEED,
-        TOTAL_LENGTH,
-        max_run_len(DENSITY_RUN_LENGTH),
-        f64::from(density_pct) / 100.0,
-    )
+fn density_inputs(density_pct: u32) -> impl Fn() -> (Buffer<u32>, Buffer<u32>, BitBuffer) {
+    rotating::<u32>(DENSITY_RUN_LENGTH, f64::from(density_pct) / 100.0, false)
 }
 
 #[derive(Clone, Copy)]
@@ -326,10 +347,9 @@ const DENSITIES: &[Density] = &[
 
 #[divan::bench(args = DENSITIES)]
 fn density_n0(bencher: Bencher, density: Density) {
-    let (ends, values, validity) = density_data(density.0);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone(), validity.clone()))
+        .with_inputs(density_inputs(density.0))
         .bench_refs(|(ends, values, validity)| {
             let (buf, decoded_validity) = decode_v0(
                 trimmed_ends_iter(ends.as_slice(), 0, TOTAL_LENGTH),
@@ -343,10 +363,9 @@ fn density_n0(bencher: Bencher, density: Density) {
 
 #[divan::bench(args = DENSITIES)]
 fn density_n2(bencher: Bencher, density: Density) {
-    let (ends, values, validity) = density_data(density.0);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone(), validity.clone()))
+        .with_inputs(density_inputs(density.0))
         .bench_refs(|(ends, values, validity)| {
             let (buf, decoded_validity) =
                 decode_n2(ends.as_slice(), values.as_slice(), validity, TOTAL_LENGTH);
@@ -356,10 +375,9 @@ fn density_n2(bencher: Bencher, density: Density) {
 
 #[divan::bench(args = DENSITIES)]
 fn density_n3(bencher: Bencher, density: Density) {
-    let (ends, values, validity) = density_data(density.0);
     bencher
         .counter(ItemsCount::new(TOTAL_LENGTH))
-        .with_inputs(|| (ends.clone(), values.clone(), validity.clone()))
+        .with_inputs(density_inputs(density.0))
         .bench_refs(|(ends, values, validity)| {
             runend_decode_typed_primitive(
                 ends.as_slice(),
@@ -367,6 +385,49 @@ fn density_n3(bencher: Bencher, density: Density) {
                 values.as_slice(),
                 Mask::from_buffer(validity.clone()),
                 Nullability::Nullable,
+                TOTAL_LENGTH,
+            )
+        });
+}
+
+// ---- Group D: branch-predictor control ----
+//
+// Both benchmarks run the same shipped kernel in the same binary over the same distribution;
+// only the input provider differs. `predictor_fixed` replays one dataset, so the predictor can
+// learn its run-length sequence; `predictor_rotating` cycles `DATASETS` of them, as every other
+// benchmark here does. The gap is the amount a single-dataset benchmark would have flattered
+// the length-dependent branches. Rotating also spreads input reads over more memory, so treat
+// the gap as an upper bound on the predictor component alone.
+
+#[divan::bench(types = [u32, u64], args = RUN_LENGTHS)]
+fn predictor_fixed<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(fixed::<T>(avg, 1.0))
+        .bench_refs(|(ends, values, _)| {
+            runend_decode_typed_primitive(
+                ends.as_slice(),
+                0,
+                values.as_slice(),
+                Mask::new_true(values.len()),
+                Nullability::NonNullable,
+                TOTAL_LENGTH,
+            )
+        });
+}
+
+#[divan::bench(types = [u32, u64], args = RUN_LENGTHS)]
+fn predictor_rotating<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
+            runend_decode_typed_primitive(
+                ends.as_slice(),
+                0,
+                values.as_slice(),
+                Mask::new_true(values.len()),
+                Nullability::NonNullable,
                 TOTAL_LENGTH,
             )
         });
