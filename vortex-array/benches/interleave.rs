@@ -16,6 +16,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use divan::Bencher;
+use half::f16;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::Uniform;
@@ -23,10 +24,15 @@ use rand::prelude::StdRng;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
+use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::InterleaveArray;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::StructArray;
+use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 
 fn main() {
@@ -148,4 +154,107 @@ fn vortex(bencher: Bencher, combo: Combo) {
             )
         })
         .bench_refs(|(array, ctx)| array.clone().execute::<Canonical>(ctx));
+}
+
+#[derive(Clone, Copy)]
+enum PrimitiveKind {
+    F16,
+    U64,
+}
+
+impl Display for PrimitiveKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PrimitiveKind::F16 => "f16",
+            PrimitiveKind::U64 => "u64",
+        })
+    }
+}
+
+fn primitive_inputs(kind: PrimitiveKind) -> (Vec<ArrayRef>, Buffer<u32>, Buffer<u32>) {
+    const BRANCHES: usize = 4;
+
+    let mut rng = StdRng::seed_from_u64(1);
+    let values = (0..BRANCHES)
+        .map(|_| match kind {
+            PrimitiveKind::F16 => PrimitiveArray::from_iter(
+                (0..ARRAY_SIZE).map(|_| f16::from_bits(rng.random::<u16>())),
+            )
+            .into_array(),
+            PrimitiveKind::U64 => {
+                PrimitiveArray::from_iter((0..ARRAY_SIZE).map(|_| rng.random::<u64>())).into_array()
+            }
+        })
+        .collect();
+    let branch = Uniform::new(0u32, u32::try_from(BRANCHES).unwrap()).unwrap();
+    let row = Uniform::new(0u32, u32::try_from(ARRAY_SIZE).unwrap()).unwrap();
+    let array_indices = (0..ARRAY_SIZE).map(|_| rng.sample(branch)).collect();
+    let row_indices = (0..ARRAY_SIZE).map(|_| rng.sample(row)).collect();
+    (values, array_indices, row_indices)
+}
+
+#[divan::bench(args = [PrimitiveKind::F16, PrimitiveKind::U64])]
+fn primitive(bencher: Bencher, kind: PrimitiveKind) {
+    let (values, array_indices, row_indices) = primitive_inputs(kind);
+    let session = array_session();
+    bencher
+        .with_inputs(|| {
+            (
+                InterleaveArray::try_new(
+                    values.clone(),
+                    array_indices.clone().into_array(),
+                    row_indices.clone().into_array(),
+                )
+                .unwrap()
+                .into_array(),
+                session.create_execution_ctx(),
+            )
+        })
+        .bench_refs(|(array, ctx)| array.clone().execute::<Canonical>(ctx));
+}
+
+fn shuffle_chunk(chunk: usize) -> ArrayRef {
+    const ROWS: usize = 4;
+    const DIMENSIONS: usize = 4_096;
+
+    let ids = PrimitiveArray::from_iter((0..ROWS).map(|row| (chunk * ROWS + row) as u64));
+    let vectors = PrimitiveArray::from_iter(
+        (0..ROWS * DIMENSIONS)
+            .map(|value| f16::from_f32((chunk * ROWS * DIMENSIONS + value) as f32)),
+    );
+    let vectors = FixedSizeListArray::new(
+        vectors.into_array(),
+        u32::try_from(DIMENSIONS).unwrap(),
+        Validity::NonNullable,
+        ROWS,
+    );
+    StructArray::new(
+        ["id", "vector"].into(),
+        [ids.into_array(), vectors.into_array()],
+        ROWS,
+        Validity::NonNullable,
+    )
+    .into_array()
+}
+
+#[divan::bench]
+fn shuffle_struct_fsl(bencher: Bencher) {
+    let values = (0..4).map(shuffle_chunk).collect::<Vec<_>>();
+    let array_indices = Buffer::from_iter([3u32, 0, 2, 1]);
+    let row_indices = Buffer::from_iter([1u32, 3, 0, 2]);
+    let session = array_session();
+    bencher
+        .with_inputs(|| {
+            (
+                InterleaveArray::try_new(
+                    values.clone(),
+                    array_indices.clone().into_array(),
+                    row_indices.clone().into_array(),
+                )
+                .unwrap()
+                .into_array(),
+                session.create_execution_ctx(),
+            )
+        })
+        .bench_refs(|(array, ctx)| array.clone().execute::<RecursiveCanonical>(ctx));
 }
