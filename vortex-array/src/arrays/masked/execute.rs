@@ -27,6 +27,7 @@ use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::struct_::StructArrayExt;
 use crate::arrays::union::UnionArrayExt;
+use crate::arrays::union::UnionArraySlotsExt;
 use crate::arrays::variant::VariantArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::executor::ExecutionCtx;
@@ -154,7 +155,7 @@ fn mask_validity_union(array: UnionArray, validity: Validity) -> VortexResult<Un
         .clone()
         .mask(validity.to_array(array.len()))?;
     let variants = array.variants().clone();
-    let children = array.children();
+    let children = array.children().to_vec();
 
     // SAFETY: We're only changing validity, not the data structure.
     Ok(unsafe { UnionArray::new_unchecked(type_ids, variants, children) })
