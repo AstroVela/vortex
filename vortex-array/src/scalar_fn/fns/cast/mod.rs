@@ -158,9 +158,10 @@ impl ScalarFnVTable for Cast {
         let Some(scalar) = expr.child(0).as_opt::<Literal>() else {
             return Ok(None);
         };
-        // A failing cast (e.g. null to a non-nullable dtype) is left in place so the error
-        // surfaces at execution time rather than during optimization.
-        Ok(scalar.cast(target_dtype).ok().map(lit))
+        // Casting a literal is pure and total: a cast that fails here (e.g. null to a
+        // non-nullable dtype) would fail identically at execution time. Surface the error now
+        // rather than swallowing it and leaving the un-foldable cast in place.
+        Ok(Some(lit(scalar.cast(target_dtype)?)))
     }
 
     fn validity(&self, dtype: &DType, expression: &Expression) -> VortexResult<Option<Expression>> {
@@ -224,7 +225,6 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
 
-    use super::Cast;
     use crate::IntoArray;
     use crate::arrays::StructArray;
     use crate::dtype::DType;
@@ -319,24 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn simplify_leaves_failing_cast_unchanged() -> VortexResult<()> {
-        let target = DType::Primitive(PType::F64, Nullability::NonNullable);
-        let expr = cast(
-            lit(Scalar::null(DType::Primitive(
-                PType::I32,
-                Nullability::Nullable,
-            ))),
-            target.clone(),
-        );
-        let optimized = expr.optimize(&test_harness::struct_dtype())?;
-
-        assert!(optimized.as_opt::<Literal>().is_none());
-        assert_eq!(optimized.as_opt::<Cast>(), Some(&target));
-        Ok(())
-    }
-
-    #[test]
-    fn simplify_failing_cast_hides_error() -> VortexResult<()> {
+    fn simplify_failing_cast_returns_error() -> VortexResult<()> {
         // Casting a null literal to a non-nullable dtype is a genuine error, and the same
         // cast would fail identically at execution time. Confirm the scalar cast really does
         // fail.
@@ -344,13 +327,15 @@ mod tests {
         let null_i32 = Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable));
         assert!(null_i32.cast(&target).is_err());
 
-        // Yet optimizing `cast(null as f64)` reports success: `simplify_untyped` discards the
-        // error via `.ok()`, so the failure is silently swallowed during optimization.
-        let expr = cast(lit(null_i32), target.clone());
-        let optimized = expr.optimize(&test_harness::struct_dtype());
+        // Optimizing `cast(null as f64)` must now surface that error rather than swallowing it
+        // and leaving the un-foldable cast in place.
+        let expr = cast(lit(null_i32), target);
+        let err = expr
+            .optimize(&test_harness::struct_dtype())
+            .expect_err("expected the failing cast to surface its error");
         assert!(
-            optimized.is_ok(),
-            "expected the cast error to be hidden, but it surfaced: {optimized:?}"
+            err.to_string().contains("Cannot cast null"),
+            "unexpected error: {err}"
         );
         Ok(())
     }
