@@ -555,3 +555,20 @@ fn shape_v2<T: NativePType + From<u8>>(bencher: Bencher, args: ShapeArgs) {
             PrimitiveArray::new(buf, validity)
         });
 }
+
+/// The shipped kernel's structure (chunk stores plus the long-run fill dispatch), bench-local.
+///
+/// `shape_v2` lacks that dispatch, and at long byte-element runs it loses to `shape_v0` because
+/// `push_n_unchecked` reaches a `memset` there while a pure chunk loop does not. This is the
+/// variant to read for whether the shipped kernel holds up across distribution shapes.
+#[divan::bench(types = [u8, u32, u64], args = SHAPE_ARGS)]
+fn shape_v3<T: NativePType + From<u8>>(bencher: Bencher, args: ShapeArgs) {
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(shaped_rotating::<T>(args))
+        .bench_refs(|(ends, values)| {
+            let (buf, validity) =
+                decode_v3_elem_fill(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
+        });
+}
