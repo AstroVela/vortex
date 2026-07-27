@@ -27,6 +27,98 @@ use crate::segments::SegmentSource;
 /// Shared handle to a stateful layout reader.
 pub type LayoutReaderRef = Arc<dyn LayoutReader>;
 
+/// Shared handle to an expression-bound physical scan plan.
+pub type ScanPlanRef = Arc<dyn ScanPlan>;
+
+/// An expression-bound physical plan executed through the [`LayoutReader`] API.
+///
+/// Expressions are consumed while constructing the plan. Execution therefore selects a plan and
+/// supplies only its row range and mask.
+pub trait ScanPlan: 'static + Send + Sync {
+    /// Returns the name of the underlying layout reader for debugging.
+    fn name(&self) -> &Arc<str>;
+
+    /// Returns the dtype produced by this plan.
+    fn dtype(&self) -> &DType;
+
+    /// Returns the number of rows in this plan's row domain.
+    fn row_count(&self) -> u64;
+
+    /// Returns a mask where all false values are proven false for this plan.
+    fn pruning_evaluation(&self, row_range: &Range<u64>, mask: Mask) -> VortexResult<MaskFuture>;
+
+    /// Evaluates this boolean plan and intersects it with `mask`.
+    fn filter_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<MaskFuture>;
+
+    /// Evaluates this plan over the selected rows.
+    fn projection_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture>;
+}
+
+/// Compatibility physical plan that binds one expression to a V1 layout reader.
+///
+/// This is the execution boundary for the initial planner rollout. Layout-specific physical
+/// planning can replace this node without changing the established split execution loop.
+pub struct LayoutReaderScanPlan {
+    reader: LayoutReaderRef,
+    expr: Expression,
+    dtype: DType,
+}
+
+impl LayoutReaderScanPlan {
+    /// Bind `expr` to `reader`.
+    pub fn try_new(reader: LayoutReaderRef, expr: Expression) -> VortexResult<Self> {
+        let dtype = expr.return_dtype(reader.dtype())?;
+        Ok(Self {
+            reader,
+            expr,
+            dtype,
+        })
+    }
+}
+
+impl ScanPlan for LayoutReaderScanPlan {
+    fn name(&self) -> &Arc<str> {
+        self.reader.name()
+    }
+
+    fn dtype(&self) -> &DType {
+        &self.dtype
+    }
+
+    fn row_count(&self) -> u64 {
+        self.reader.row_count()
+    }
+
+    fn pruning_evaluation(&self, row_range: &Range<u64>, mask: Mask) -> VortexResult<MaskFuture> {
+        self.reader.pruning_evaluation(row_range, &self.expr, mask)
+    }
+
+    fn filter_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<MaskFuture> {
+        self.reader.filter_evaluation(row_range, &self.expr, mask)
+    }
+
+    fn projection_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture> {
+        self.reader
+            .projection_evaluation(row_range, &self.expr, mask)
+    }
+}
+
 /// A row range used when registering natural scan splits.
 ///
 /// Row range is relative to the reader that receives it. Offset is the offset

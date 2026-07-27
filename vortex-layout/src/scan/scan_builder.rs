@@ -40,6 +40,8 @@ use vortex_utils::parallelism::get_available_parallelism;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
+use crate::scan::plan::PreparedScanPlan;
+use crate::scan::plan::planned_scan_enabled;
 use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
@@ -308,6 +310,27 @@ impl<A: 'static + Send> ScanBuilder<A> {
                     &field_mask,
                 )?)
             };
+
+        if planned_scan_enabled()? {
+            let plan = Arc::new(PreparedScanPlan::try_new(
+                Arc::clone(&layout_reader),
+                projection,
+                filter.as_ref(),
+            )?);
+            return Ok(RepeatedScan::new_planned(
+                self.session.clone(),
+                plan,
+                filter,
+                self.ordered,
+                self.row_range,
+                self.selection,
+                splits,
+                self.concurrency,
+                self.map_fn,
+                self.limit,
+                dtype,
+            ));
+        }
 
         Ok(RepeatedScan::new(
             self.session.clone(),
