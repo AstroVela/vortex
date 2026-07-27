@@ -18,6 +18,7 @@ pub mod core;
 mod tests;
 pub mod unstable;
 
+use vortex_array::arrays::patched::use_experimental_patches;
 pub use vortex_edition::Edition;
 pub use vortex_edition::EditionDeclaration;
 pub use vortex_edition::EditionId;
@@ -78,9 +79,16 @@ pub fn enable_default_editions(session: &VortexSession) {
         .map_err(|e| vortex_err!("{e}"))
         .vortex_expect("default core edition is registered");
 
-    #[cfg(feature = "unstable_encodings")]
-    session
-        .enable_edition(DEFAULT_UNSTABLE_EDITION)
-        .map_err(|e| vortex_err!("{e}"))
-        .vortex_expect("default unstable edition is registered");
+    // `vortex.patched` is an unstable encoding selected at runtime rather than at compile time.
+    // Without enabling its edition, `BitPackingScheme` and `ALPScheme` declare an encoding the
+    // writer forbids and are dropped from the compressor, so opting into experimental patches
+    // would silently disable bit-packing and ALP. The writer intersects the enabled editions with
+    // the session's registered encodings, so the rest of the unstable family stays unwritable
+    // unless its crates are also compiled in.
+    if cfg!(feature = "unstable_encodings") || use_experimental_patches() {
+        session
+            .enable_edition(DEFAULT_UNSTABLE_EDITION)
+            .map_err(|e| vortex_err!("{e}"))
+            .vortex_expect("default unstable edition is registered");
+    }
 }

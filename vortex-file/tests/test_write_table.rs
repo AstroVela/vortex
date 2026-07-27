@@ -30,17 +30,13 @@ use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
-mod common;
-
-use common::enable_all_registered_array_encodings;
-
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = vortex_array::array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
 
     vortex_file::register_default_encodings(&session);
-    enable_all_registered_array_encodings(&session);
+    vortex_file::test_harness::enable_all_registered_array_encodings(&session);
 
     session
 });

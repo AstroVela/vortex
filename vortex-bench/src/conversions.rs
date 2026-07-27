@@ -45,7 +45,6 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
-use vortex::file::WriteStrategyBuilder;
 use vortex::layout::LayoutStrategy;
 use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex::layout::layouts::compressed::CompressingStrategy;
@@ -65,6 +64,7 @@ use crate::CompactionStrategy;
 use crate::Format;
 use crate::SESSION;
 use crate::utils::file::idempotent_async;
+use crate::write_strategy_builder;
 
 /// Memory budget per concurrent conversion stream in GB. This is somewhat arbitary.
 const MEMORY_PER_STREAM_GB: u64 = 4;
@@ -196,7 +196,8 @@ fn write_options_for(
         return compaction.apply_options(SESSION.write_options());
     }
 
-    let mut builder = WriteStrategyBuilder::default();
+    let options = SESSION.write_options();
+    let mut builder = write_strategy_builder(&options);
     if matches!(compaction, CompactionStrategy::Compact) {
         builder =
             builder.with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
@@ -204,7 +205,7 @@ fn write_options_for(
     for name in binary_fields {
         builder = builder.with_field_writer(FieldPath::from_name(name), no_dict_layout());
     }
-    SESSION.write_options().with_strategy(builder.build())
+    options.with_strategy(builder.build())
 }
 
 /// A chunked + compressed layout that skips dictionary encoding for opaque `Binary` blobs.

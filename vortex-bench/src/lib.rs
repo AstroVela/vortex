@@ -242,14 +242,25 @@ pub enum CompactionStrategy {
 impl CompactionStrategy {
     pub fn apply_options(&self, options: VortexWriteOptions) -> VortexWriteOptions {
         match self {
-            CompactionStrategy::Compact => options.with_strategy(
-                WriteStrategyBuilder::default()
+            CompactionStrategy::Compact => {
+                let strategy = write_strategy_builder(&options)
                     .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
-                    .build(),
-            ),
+                    .build();
+                options.with_strategy(strategy)
+            }
             CompactionStrategy::Default => options,
         }
     }
+}
+
+/// A strategy builder carrying the same encoding policy as `options`.
+///
+/// A bare [`WriteStrategyBuilder::default`] is unrestricted, so its compressor can pick a scheme
+/// whose encoding the writer then refuses. Seeding the builder from the options makes the
+/// compressor choose within the policy instead of failing the write.
+pub fn write_strategy_builder(options: &VortexWriteOptions) -> WriteStrategyBuilder {
+    WriteStrategyBuilder::default()
+        .with_allow_encodings(options.allow_encodings().iter().copied().collect())
 }
 
 /// CLI argument for selecting which benchmark to run.

@@ -16,12 +16,14 @@ use futures::future::ready;
 use futures::pin_mut;
 use futures::select;
 use vortex_array::ArrayContext;
+use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldPath;
 use vortex_array::expr::stats::Stat;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorExt;
+use vortex_array::session::ArraySessionExt;
 use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::ArrayStream;
 use vortex_array::stream::ArrayStreamAdapter;
@@ -48,6 +50,7 @@ use vortex_session::SessionExt;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 use vortex_utils::aliases::hash_map::HashMap;
+use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::Footer;
 use crate::MAGIC_BYTES;
@@ -61,17 +64,40 @@ use crate::segments::writer::BufferedSegmentSink;
 /// Configure a new writer, which can eventually be used to write an [`ArrayStream`] into a sink
 /// that implements [`VortexWrite`].
 ///
-/// All write strategies are restricted to the encodings in the session's enabled editions.
+/// The writer only emits the encodings permitted by [`with_allow_encodings`][Self::with_allow_encodings],
+/// which defaults to the encodings of the session's enabled editions.
 ///
 /// Construct with [`WriteOptionsSessionExt::write_options`] for normal use so the writer inherits
 /// the session's runtime, array registry, and memory configuration.
 pub struct VortexWriteOptions {
     session: VortexSession,
     strategy: Arc<dyn LayoutStrategy>,
+    allow_encodings: Vec<ArrayId>,
     exclude_dtype: bool,
     max_variable_length_statistics_size: usize,
     file_statistics: Vec<Stat>,
     metadata: HashMap<String, ByteBuffer>,
+}
+
+/// The default writer encoding policy for a session.
+///
+/// Restricting the enabled editions to encodings the session also has registered keeps the writer
+/// from emitting an array the same session could not read back. This matters when an edition
+/// declares an encoding whose crate is behind a disabled Cargo feature, such as `vortex.zstd`
+/// without `vortex-file/zstd`.
+fn default_allow_encodings(session: &VortexSession) -> Vec<ArrayId> {
+    let registered: HashSet<ArrayId> = session.arrays().registry().ids().collect();
+    let mut allowed = session.enabled_encoding_ids();
+    allowed.retain(|id| registered.contains(id));
+    allowed
+}
+
+/// Sort and deduplicate so the written array context is independent of iteration order.
+fn sorted_unique(ids: impl IntoIterator<Item = ArrayId>) -> Vec<ArrayId> {
+    let mut ids: Vec<ArrayId> = ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Extension trait for constructing [`VortexWriteOptions`] from a session.
@@ -86,12 +112,17 @@ impl<S: SessionExt> WriteOptionsSessionExt for S {}
 
 impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
+    ///
+    /// The encoding policy is the intersection of the session's enabled editions and the
+    /// encodings the session can read back, and it is applied to the default write strategy.
     pub fn new(session: VortexSession) -> Self {
+        let allow_encodings = default_allow_encodings(&session);
         let strategy = WriteStrategyBuilder::default()
-            .with_allow_encodings(session.enabled_encoding_ids().into_iter().collect())
+            .with_allow_encodings(allow_encodings.iter().copied().collect())
             .build();
         VortexWriteOptions {
             strategy,
+            allow_encodings,
             session,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
@@ -104,10 +135,32 @@ impl VortexWriteOptions {
     ///
     /// The strategy controls repartitioning, statistics layout, compression, and leaf segment
     /// emission. Use [`WriteStrategyBuilder`] when only a small part of the default strategy needs
-    /// customization. Replacing the strategy does not change the enabled-edition encoding policy.
+    /// customization. Replacing the strategy does not widen the encoding policy: an encoding the
+    /// policy forbids is rejected when the array is serialized.
     pub fn with_strategy(mut self, strategy: Arc<dyn LayoutStrategy>) -> Self {
         self.strategy = strategy;
         self
+    }
+
+    /// Override the array encodings this writer may emit.
+    ///
+    /// Defaults to the session's enabled-edition encodings. This gates the file's
+    /// [`ArrayContext`], so it bounds every strategy, including a replacement passed to
+    /// [`with_strategy`](Self::with_strategy). It does not reconfigure the strategy itself:
+    /// widening the policy for an encoding the caller supplies directly (a session-registered
+    /// encoding outside any edition) also needs
+    /// [`WriteStrategyBuilder::with_allow_encodings`] on the strategy that writes it.
+    pub fn with_allow_encodings(
+        mut self,
+        allow_encodings: impl IntoIterator<Item = ArrayId>,
+    ) -> Self {
+        self.allow_encodings = sorted_unique(allow_encodings);
+        self
+    }
+
+    /// The array encodings this writer may emit, sorted by encoding id.
+    pub fn allow_encodings(&self) -> &[ArrayId] {
+        &self.allow_encodings
     }
 
     /// Exclude the DType from the Vortex file. You must provide the DType to the reader.
@@ -192,10 +245,9 @@ impl VortexWriteOptions {
         // serialised array order is deterministic. The serialisation of arrays are done
         // parallel and with an empty context they can register their encodings to the context
         // in different order, changing the written bytes from run to run.
-        let enabled_encoding_ids = self.session.enabled_encoding_ids();
-        let ctx = ArrayContext::new(enabled_encoding_ids.clone())
-            // Only permit encodings known to the session.
-            .with_valid_ids(enabled_encoding_ids);
+        let ctx = ArrayContext::new(self.allow_encodings.clone())
+            // Only permit the encodings the writer's policy allows.
+            .with_valid_ids(self.allow_encodings.iter().copied());
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();
@@ -598,37 +650,69 @@ impl WriteSummary {
 
 #[cfg(test)]
 mod tests {
-    use vortex_array::ArrayContext;
     use vortex_array::VTable;
     use vortex_array::array_session;
     use vortex_array::arrays::Bool;
     use vortex_array::arrays::Primitive;
     use vortex_edition::Edition;
     use vortex_edition::EditionDeclaration;
+    use vortex_edition::EditionError;
     use vortex_edition::EditionId;
     use vortex_edition::EditionSession;
     use vortex_edition::EditionSessionExt;
 
-    #[test]
-    fn array_context_only_permits_enabled_encodings() -> Result<(), vortex_edition::EditionError> {
-        const EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
-        static DECLARATION: EditionDeclaration = EditionDeclaration {
-            edition: Edition {
-                id: EDITION,
-                min_vortex_version: None,
-            },
-            added: &[&"vortex.primitive"],
-        };
+    use super::*;
 
+    const EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
+
+    /// `vortex.zstd` stands in for an edition encoding whose crate is not compiled in, so the
+    /// session declares it but cannot read it back.
+    static DECLARATION: EditionDeclaration = EditionDeclaration {
+        edition: Edition {
+            id: EDITION,
+            min_vortex_version: None,
+        },
+        added: &[&"vortex.primitive", &"vortex.zstd"],
+    };
+
+    fn test_session() -> Result<VortexSession, EditionError> {
         let session = array_session().with::<EditionSession>();
         session.register_edition(&DECLARATION)?;
         session.enable_edition(EDITION)?;
+        Ok(session)
+    }
 
-        let enabled_encoding_ids = session.enabled_encoding_ids();
-        let ctx =
-            ArrayContext::new(enabled_encoding_ids.clone()).with_valid_ids(enabled_encoding_ids);
+    #[test]
+    fn default_policy_is_enabled_editions_intersected_with_registered_encodings()
+    -> Result<(), EditionError> {
+        let session = test_session()?;
+        assert_eq!(default_allow_encodings(&session), [Primitive.id()]);
+        Ok(())
+    }
+
+    #[test]
+    fn default_policy_gates_the_array_context() -> Result<(), EditionError> {
+        let session = test_session()?;
+        let allow_encodings = VortexWriteOptions::new(session).allow_encodings;
+
+        let ctx = ArrayContext::new(allow_encodings.clone()).with_valid_ids(allow_encodings);
         assert_eq!(ctx.to_ids(), [Primitive.id()]);
         assert!(ctx.intern(&Bool.id()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn with_allow_encodings_overrides_the_default_policy() -> Result<(), EditionError> {
+        let session = test_session()?;
+        let options = VortexWriteOptions::new(session).with_allow_encodings([
+            Primitive.id(),
+            Bool.id(),
+            Primitive.id(),
+        ]);
+
+        // Sorted by encoding id and deduplicated, so the written context does not depend on the
+        // caller's iteration order.
+        assert_eq!(options.allow_encodings, [Bool.id(), Primitive.id()]);
         Ok(())
     }
 }

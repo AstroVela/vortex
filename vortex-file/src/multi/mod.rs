@@ -341,7 +341,7 @@ mod tests {
             .with::<RuntimeSession>()
             .with::<MultiFileSession>();
         crate::register_default_encodings(&session);
-        crate::enable_all_registered_array_encodings(&session);
+        crate::test_harness::enable_all_registered_array_encodings(&session);
 
         let expected = ByteBuffer::copy_from(b"cached metadata");
         let mut output = ByteBufferMut::empty();
@@ -442,7 +442,7 @@ mod tests {
             .with::<RuntimeSession>()
             .with::<MultiFileSession>();
         crate::register_default_encodings(&session);
-        crate::enable_all_registered_array_encodings(&session);
+        crate::test_harness::enable_all_registered_array_encodings(&session);
 
         let mut out_a = ByteBufferMut::empty();
         session

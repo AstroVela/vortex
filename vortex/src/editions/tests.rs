@@ -9,6 +9,7 @@ use vortex_array::IntoArray;
 use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
@@ -155,10 +156,10 @@ fn default_session_enables_the_write_editions() {
     let enabled = session.enabled_editions().editions();
     assert!(enabled.contains(&DEFAULT_CORE_EDITION));
 
-    #[cfg(feature = "unstable_encodings")]
-    assert!(enabled.contains(&DEFAULT_UNSTABLE_EDITION));
-    #[cfg(not(feature = "unstable_encodings"))]
-    assert!(!enabled.contains(&DEFAULT_UNSTABLE_EDITION));
+    // The unstable edition is also enabled by the runtime experimental-patches opt-in, because
+    // `vortex.patched` belongs to it.
+    let expect_unstable = cfg!(feature = "unstable_encodings") || use_experimental_patches();
+    assert_eq!(enabled.contains(&DEFAULT_UNSTABLE_EDITION), expect_unstable);
 }
 
 #[test]
@@ -176,6 +177,40 @@ fn core_edition_ids_are_registered_array_encodings() {
             inclusion.encoding_id
         );
     }
+}
+
+/// Every scheme the default compressor would run must be usable by the default writer.
+///
+/// `WriteStrategyBuilder::build` drops any BtrBlocks scheme that can produce an encoding outside
+/// the writer's policy, so a scheme whose encoding is missing from the enabled editions silently
+/// stops compressing — no error, just worse files, in benchmarks as much as in production. This
+/// pins the two lists together in both feature configurations.
+#[test]
+fn default_session_permits_every_default_btrblocks_scheme() {
+    use vortex_btrblocks::ALL_SCHEMES;
+    use vortex_btrblocks::SchemeExt;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    let allowed: HashSet<_> = session.enabled_encoding_ids().into_iter().collect();
+
+    let dropped: Vec<_> = ALL_SCHEMES
+        .iter()
+        .filter(|scheme| {
+            !scheme
+                .produced_encodings()
+                .iter()
+                .all(|id| allowed.contains(id))
+        })
+        .map(|scheme| scheme.id())
+        .collect();
+
+    assert!(
+        dropped.is_empty(),
+        "default BtrBlocks schemes produce encodings outside the default session's editions, \
+         so the writer would silently drop them: {dropped:?}"
+    );
 }
 
 fn baseline_core_session() -> VortexResult<VortexSession> {
@@ -247,11 +282,24 @@ fn custom_compressing_flat_strategy() -> Arc<dyn LayoutStrategy> {
     ))
 }
 
-async fn assert_round_trip_encodings_are_enabled(
+/// How the writer handled a strategy that could produce an encoding outside the enabled editions.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteOutcome {
+    /// The write failed because the policy forbids an encoding the strategy produced.
+    Rejected,
+    /// The file was written, and everything read back is inside the enabled editions.
+    Written,
+}
+
+/// Write `array`, and assert that whatever reaches the file is inside the enabled editions.
+///
+/// Callers assert the returned outcome, so a writer that refuses everything cannot pass these
+/// tests by never producing a file.
+async fn round_trip_encodings(
     session: &VortexSession,
     strategy: Option<Arc<dyn LayoutStrategy>>,
     array: ArrayRef,
-) -> VortexResult<()> {
+) -> VortexResult<WriteOutcome> {
     let mut buffer = ByteBufferMut::empty();
     let write_options = match strategy {
         Some(strategy) => session.write_options().with_strategy(strategy),
@@ -265,7 +313,7 @@ async fn assert_round_trip_encodings_are_enabled(
         if message.contains("not permitted by ctx")
             || message.contains("normalize forbids encoding")
         {
-            return Ok(());
+            return Ok(WriteOutcome::Rejected);
         }
         return Err(error);
     }
@@ -290,115 +338,115 @@ async fn assert_round_trip_encodings_are_enabled(
         ));
     }
 
-    Ok(())
+    Ok(WriteOutcome::Written)
 }
 
 #[tokio::test]
 async fn default_strategy_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
     let session = writer_test_session()?;
-    assert_round_trip_encodings_are_enabled(&session, None, sequential_integers().into_array())
-        .await
+    let outcome = round_trip_encodings(&session, None, sequential_integers().into_array()).await?;
+    assert_eq!(outcome, WriteOutcome::Written);
+    Ok(())
 }
 
 #[tokio::test]
-async fn replacement_default_builder_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_replacement_builder_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
-    assert_round_trip_encodings_are_enabled(
+    let outcome = round_trip_encodings(
         &session,
         Some(WriteStrategyBuilder::default().build()),
         sequential_integers().into_array(),
     )
-    .await
+    .await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn replacement_btrblocks_builder_round_trip_uses_only_enabled_encodings() -> VortexResult<()>
-{
+async fn unrestricted_btrblocks_builder_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
     let strategy = WriteStrategyBuilder::default()
         .with_btrblocks_builder(BtrBlocksCompressorBuilder::default())
         .build();
-    assert_round_trip_encodings_are_enabled(
-        &session,
-        Some(strategy),
-        sequential_integers().into_array(),
-    )
-    .await
+    let outcome =
+        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn opaque_compressor_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_opaque_compressor_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
     let strategy = WriteStrategyBuilder::default()
         .with_compressor(forbidden_sequence_compressor)
         .build();
-    assert_round_trip_encodings_are_enabled(
-        &session,
-        Some(strategy),
-        sequential_integers().into_array(),
-    )
-    .await
+    let outcome =
+        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn custom_flat_strategy_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_custom_flat_strategy_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
     let strategy = WriteStrategyBuilder::default()
         .with_flat_strategy(Arc::new(FlatLayoutStrategy::default()))
         .build();
-    assert_round_trip_encodings_are_enabled(
-        &session,
-        Some(strategy),
-        sequential_integers().into_array(),
-    )
-    .await
+    let outcome =
+        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn custom_field_writer_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_custom_field_writer_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
     let strategy = WriteStrategyBuilder::default()
         .with_field_writer(field_path!(values), custom_compressing_flat_strategy())
         .build();
     let array =
         StructArray::from_fields(&[("values", sequential_integers().into_array())])?.into_array();
-    assert_round_trip_encodings_are_enabled(&session, Some(strategy), array).await
+    let outcome = round_trip_encodings(&session, Some(strategy), array).await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn replacement_strategy_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_replacement_strategy_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
-    assert_round_trip_encodings_are_enabled(
+    let outcome = round_trip_encodings(
         &session,
         Some(custom_compressing_flat_strategy()),
         sequential_integers().into_array(),
     )
-    .await
+    .await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn replacement_flat_strategy_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_replacement_flat_strategy_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
-    assert_round_trip_encodings_are_enabled(
+    let outcome = round_trip_encodings(
         &session,
         Some(Arc::new(FlatLayoutStrategy::default())),
         forbidden_sequence(65_536)?,
     )
-    .await
+    .await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
-async fn probe_compressor_round_trip_uses_only_enabled_encodings() -> VortexResult<()> {
+async fn unrestricted_probe_compressor_is_rejected() -> VortexResult<()> {
     let session = writer_test_session()?;
     let strategy = WriteStrategyBuilder::default()
         .with_probe_compressor(forbidden_sequence_compressor)
         .build();
-    assert_round_trip_encodings_are_enabled(
-        &session,
-        Some(strategy),
-        sequential_integers().into_array(),
-    )
-    .await
+    let outcome =
+        round_trip_encodings(&session, Some(strategy), sequential_integers().into_array()).await?;
+    assert_eq!(outcome, WriteOutcome::Rejected);
+    Ok(())
 }
 
 #[tokio::test]
@@ -413,6 +461,56 @@ async fn default_writer_filters_compressor_to_enabled_editions() -> VortexResult
             sequential_integers().into_array().to_array_stream(),
         )
         .await?;
+
+    Ok(())
+}
+
+/// The benchmark write path: a default session, mixed column types, and the two strategy shapes
+/// `vortex-bench` builds. Nothing here may hit the encoding policy, otherwise the benchmarks
+/// stop measuring the compressor.
+#[tokio::test]
+async fn default_session_writes_mixed_columns_through_the_bench_strategies() -> VortexResult<()> {
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    let array = StructArray::from_fields(&[
+        ("sequential", sequential_integers().into_array()),
+        (
+            "floats",
+            PrimitiveArray::from_iter((0..65_536).map(|i| f64::from(i) * 1.5)).into_array(),
+        ),
+        (
+            "low_cardinality",
+            PrimitiveArray::from_iter((0..65_536).map(|i| i % 8)).into_array(),
+        ),
+    ])?
+    .into_array();
+
+    let bench_policy: HashSet<_> = session
+        .write_options()
+        .allow_encodings()
+        .iter()
+        .copied()
+        .collect();
+    let strategies = [
+        None,
+        Some(
+            WriteStrategyBuilder::default()
+                .with_allow_encodings(bench_policy.clone())
+                .build(),
+        ),
+        Some(
+            WriteStrategyBuilder::default()
+                .with_allow_encodings(bench_policy)
+                .with_btrblocks_builder(BtrBlocksCompressorBuilder::default())
+                .build(),
+        ),
+    ];
+
+    for strategy in strategies {
+        let outcome = round_trip_encodings(&session, strategy, array.clone()).await?;
+        assert_eq!(outcome, WriteOutcome::Written);
+    }
 
     Ok(())
 }

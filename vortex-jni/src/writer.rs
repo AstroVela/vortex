@@ -44,13 +44,13 @@ use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
 use vortex::dtype::Field as DTypeField;
 use vortex::dtype::FieldPath;
-use vortex::editions::EditionSessionExt;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::expr::stats::Stat;
 use vortex::expr::stats::StatsProvider;
 use vortex::file::CountingVortexWrite;
+use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
 use vortex::file::WriteSummary;
@@ -103,21 +103,33 @@ fn resolve_store(
     }
 }
 
-fn write_strategy_for_schema(
+/// The write options for `write_schema`, along with the strategy they were configured with.
+///
+/// The JNI writer keeps its own handle on the strategy to report `buffered_bytes`, so it builds
+/// one explicitly rather than using the default the options carry.
+fn write_options_for_schema(
     session: &VortexSession,
     write_schema: &DType,
-) -> Arc<dyn LayoutStrategy> {
-    let variant_paths = variant_field_paths(write_schema);
-    if variant_paths.is_empty() {
-        return WriteStrategyBuilder::default().build();
+) -> (VortexWriteOptions, Arc<dyn LayoutStrategy>) {
+    let write_options = session.write_options();
+
+    let mut allowed: HashSet<ArrayId> = write_options.allow_encodings().iter().copied().collect();
+    // `ParquetVariant` is registered by `crate::session::new_session` but belongs to no edition
+    // the session enables, so a schema with Variant fields has to widen the policy explicitly.
+    if !variant_field_paths(write_schema).is_empty() {
+        allowed.insert(ParquetVariant.id());
     }
 
-    let mut allowed: HashSet<ArrayId> = session.enabled_encoding_ids().into_iter().collect();
-    allowed.insert(ParquetVariant.id());
+    let strategy = WriteStrategyBuilder::default()
+        .with_allow_encodings(allowed.clone())
+        .build();
 
-    WriteStrategyBuilder::default()
-        .with_allow_encodings(allowed)
-        .build()
+    (
+        write_options
+            .with_allow_encodings(allowed)
+            .with_strategy(Arc::clone(&strategy)),
+        strategy,
+    )
 }
 
 fn variant_field_paths(dtype: &DType) -> Vec<FieldPath> {
@@ -425,8 +437,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_create(
         let resolved = resolve_store(&file_path, &properties)?;
         let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let stream = ArrayStreamAdapter::new(write_schema.clone(), rx);
-        let strategy = write_strategy_for_schema(session, &write_schema);
-        let write_options = session.write_options().with_strategy(Arc::clone(&strategy));
+        let (write_options, strategy) = write_options_for_schema(session, &write_schema);
 
         let (bytes_written, handle) = match resolved {
             ResolvedStore::Path(path) => {
@@ -506,8 +517,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_createStream(
         let writable = Arc::new(env.new_global_ref(&writable)?);
         let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let stream = ArrayStreamAdapter::new(write_schema.clone(), rx);
-        let strategy = write_strategy_for_schema(session, &write_schema);
-        let write_options = session.write_options().with_strategy(Arc::clone(&strategy));
+        let (write_options, strategy) = write_options_for_schema(session, &write_schema);
 
         let mut write = CountingVortexWrite::new(JavaWrite::new(vm, writable));
         let bytes_written = write.counter();
