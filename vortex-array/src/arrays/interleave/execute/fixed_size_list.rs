@@ -17,7 +17,6 @@ use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::Primitive;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
-use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use crate::executor::ExecutionCtx;
 use crate::executor::ExecutionResult;
 use crate::match_each_unsigned_integer_ptype;
