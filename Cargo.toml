@@ -12,6 +12,7 @@ members = [
     "vortex-flatbuffers",
     "vortex-metrics",
     "vortex-io",
+    "vortex-object-store-opendal",
     "vortex-proto",
     "vortex-array",
     "vortex-arrow",
