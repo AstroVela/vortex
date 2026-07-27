@@ -189,9 +189,10 @@ impl Interleave {
         let base_dtype = values[0].dtype();
         let mut nullability = Nullability::NonNullable;
         for value in values {
+            let normalized_dtype = value.dtype().with_nullability(base_dtype.nullability());
             vortex_ensure!(
-                value.dtype().eq_ignore_nullability(base_dtype),
-                "interleave values must share a dtype up to nullability: {} vs {}",
+                &normalized_dtype == base_dtype,
+                "interleave values must share a dtype up to top-level nullability: {} vs {}",
                 base_dtype,
                 value.dtype()
             );
@@ -454,15 +455,22 @@ fn value_validity_array(value: &ArrayRef) -> VortexResult<ArrayRef> {
 
 #[cfg(test)]
 mod tests {
+    use half::f16;
     use vortex_error::VortexResult;
 
     use super::*;
     use crate::Canonical;
+    use crate::RecursiveCanonical;
     use crate::VortexSessionExecute;
     use crate::array_session;
     use crate::arrays::BoolArray;
+    use crate::arrays::DecimalArray;
+    use crate::arrays::FixedSizeListArray;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::StructArray;
     use crate::assert_arrays_eq;
+    use crate::dtype::DecimalDType;
+    use crate::validity::Validity;
 
     /// Reference (oracle) implementation of the interleave spec, used only to validate the optimized
     /// [execute](super::execute) path. It is intentionally simple and slow: it pulls each output
@@ -680,6 +688,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mismatched_nested_nullability() -> VortexResult<()> {
+        let nonnullable = FixedSizeListArray::try_new(
+            PrimitiveArray::from_iter([1i32]).into_array(),
+            1,
+            Validity::NonNullable,
+            1,
+        )?
+        .into_array();
+        let nullable = FixedSizeListArray::try_new(
+            PrimitiveArray::from_option_iter([Some(2i32)]).into_array(),
+            1,
+            Validity::NonNullable,
+            1,
+        )?
+        .into_array();
+        let err = InterleaveArray::try_new(
+            vec![nonnullable, nullable],
+            PrimitiveArray::from_iter([0u32]).into_array(),
+            PrimitiveArray::from_iter([0u32]).into_array(),
+        )
+        .err()
+        .vortex_expect("expected interleave to reject nested nullability mismatch");
+
+        assert!(err.to_string().contains("top-level nullability"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     fn execute_rejects_out_of_bounds_array_index() -> VortexResult<()> {
         let value = BoolArray::from_iter([true]).into_array();
         let array_indices = PrimitiveArray::from_iter([2u32]).into_array();
@@ -719,17 +755,144 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only implemented for boolean values")]
-    fn non_boolean_value_execution_panics() {
-        // Execution dispatches on the value type: primitive values have no kernel yet.
-        let v0 = PrimitiveArray::from_iter([1u32]).into_array();
-        let v1 = PrimitiveArray::from_iter([2u32]).into_array();
-        let array_indices = PrimitiveArray::from_iter([0u32, 1]).into_array();
-        let row_indices = PrimitiveArray::from_iter([0u32, 0]).into_array();
-        let interleaved = InterleaveArray::try_new(vec![v0, v1], array_indices, row_indices)
-            .vortex_expect("primitive values should construct")
-            .into_array();
+    fn fieldless_struct_execution_rejects_out_of_bounds_row_index() -> VortexResult<()> {
+        let value = StructArray::try_new(
+            Default::default(),
+            Vec::<ArrayRef>::new(),
+            1,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let interleaved = InterleaveArray::try_new(
+            vec![value.clone(), value],
+            PrimitiveArray::from_iter([0u32]).into_array(),
+            PrimitiveArray::from_iter([1u32]).into_array(),
+        )?
+        .into_array();
         let mut ctx = array_session().create_execution_ctx();
-        interleaved.execute::<Canonical>(&mut ctx).ok();
+        let err = interleaved
+            .execute::<Canonical>(&mut ctx)
+            .err()
+            .vortex_expect("expected execution to reject out-of-bounds row index");
+
+        assert!(err.to_string().contains("row index out of bounds"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn interleave_primitive_reorders_and_repeats() -> VortexResult<()> {
+        let v0 = PrimitiveArray::from_iter([1u32, 2, 3]).into_array();
+        let v1 = PrimitiveArray::from_iter([10u32, 20]).into_array();
+        let array_indices = PrimitiveArray::from_iter([0u8, 1, 0, 1, 0]).into_array();
+        let row_indices = PrimitiveArray::from_iter([2u16, 0, 0, 1, 2]).into_array();
+        let interleaved =
+            InterleaveArray::try_new(vec![v0, v1], array_indices, row_indices)?.into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = PrimitiveArray::from_iter([3u32, 10, 1, 20, 3]);
+
+        assert_arrays_eq!(interleaved, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn interleave_nullable_primitive() -> VortexResult<()> {
+        let v0 = PrimitiveArray::from_option_iter([Some(1i64), None]).into_array();
+        let v1 = PrimitiveArray::from_option_iter([None, Some(20i64)]).into_array();
+        let array_indices = PrimitiveArray::from_iter([0u32, 1, 0, 1]).into_array();
+        let row_indices = PrimitiveArray::from_iter([1u32, 1, 0, 0]).into_array();
+        let interleaved =
+            InterleaveArray::try_new(vec![v0, v1], array_indices, row_indices)?.into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = PrimitiveArray::from_option_iter([None, Some(20i64), Some(1), None]);
+
+        assert_arrays_eq!(interleaved, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn interleave_decimal() -> VortexResult<()> {
+        let decimal_dtype = DecimalDType::new(10, 2);
+        let v0 = DecimalArray::from_iter([100i64, 250], decimal_dtype).into_array();
+        let v1 = DecimalArray::from_iter([999i128, -125], decimal_dtype).into_array();
+        let interleaved = InterleaveArray::try_new(
+            vec![v0, v1],
+            PrimitiveArray::from_iter([1u32, 0, 1]).into_array(),
+            PrimitiveArray::from_iter([1u32, 0, 0]).into_array(),
+        )?
+        .into_array();
+        let expected = DecimalArray::from_iter([-125i64, 100, 999], decimal_dtype);
+        let mut ctx = array_session().create_execution_ctx();
+
+        assert_arrays_eq!(interleaved, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn interleave_fixed_width_struct_and_fixed_size_list() -> VortexResult<()> {
+        fn chunk(ids: [u64; 2], elements: [f16; 6]) -> VortexResult<ArrayRef> {
+            let vectors = FixedSizeListArray::try_new(
+                PrimitiveArray::from_iter(elements).into_array(),
+                3,
+                Validity::NonNullable,
+                2,
+            )?
+            .into_array();
+            Ok(StructArray::try_new(
+                ["id", "vector"].into(),
+                vec![PrimitiveArray::from_iter(ids).into_array(), vectors],
+                2,
+                Validity::NonNullable,
+            )?
+            .into_array())
+        }
+
+        let v0 = chunk([10, 11], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0].map(f16::from_f32))?;
+        let v1 = chunk(
+            [20, 21],
+            [7.0, 8.0, 9.0, 10.0, 11.0, 12.0].map(f16::from_f32),
+        )?;
+        let expected = chunk(
+            [21, 10],
+            [10.0, 11.0, 12.0, 1.0, 2.0, 3.0].map(f16::from_f32),
+        )?;
+        let interleaved = InterleaveArray::try_new(
+            vec![v0, v1],
+            PrimitiveArray::from_iter([1u32, 0]).into_array(),
+            PrimitiveArray::from_iter([1u32, 0]).into_array(),
+        )?
+        .into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let actual = interleaved
+            .execute::<RecursiveCanonical>(&mut ctx)?
+            .0
+            .into_array();
+
+        assert!(
+            actual
+                .depth_first_traversal()
+                .all(|array| array.is_canonical())
+        );
+        assert_arrays_eq!(actual, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_execution_rejects_out_of_bounds_row_index() -> VortexResult<()> {
+        let values = vec![
+            PrimitiveArray::from_iter([1u16]).into_array(),
+            PrimitiveArray::from_iter([2u16]).into_array(),
+        ];
+        let array_indices = PrimitiveArray::from_iter([1u32]).into_array();
+        let row_indices = PrimitiveArray::from_iter([1u32]).into_array();
+        let interleaved =
+            InterleaveArray::try_new(values, array_indices, row_indices)?.into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let err = interleaved
+            .execute::<Canonical>(&mut ctx)
+            .err()
+            .vortex_expect("expected primitive execution to reject out-of-bounds row index");
+
+        assert!(err.to_string().contains("row index out of bounds"), "{err}");
+        Ok(())
     }
 }
