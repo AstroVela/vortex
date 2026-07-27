@@ -15,7 +15,6 @@ pub mod writer;
 use std::sync::Arc;
 
 use reader::FixedSizeListReader;
-use vortex_array::DeserializeMetadata;
 use vortex_array::EmptyMetadata;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
@@ -28,78 +27,92 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::LayoutBuildContext;
+use crate::Layout;
 use crate::LayoutChildType;
-use crate::LayoutEncodingRef;
+use crate::LayoutDeserializeArgs;
 use crate::LayoutId;
+use crate::LayoutParts;
 use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
 use crate::LayoutRef;
 use crate::VTable;
 use crate::children::LayoutChildren;
-use crate::segments::SegmentId;
+use crate::children::OwnedLayoutChildren;
 use crate::segments::SegmentSource;
-use crate::vtable;
 
 /// Child index of the `elements` layout.
 pub const ELEMENTS_CHILD_INDEX: usize = 0;
 /// Child index of the `validity` layout, only present when the fixed-size list dtype is nullable.
 pub const VALIDITY_CHILD_INDEX: usize = 1;
 
-vtable!(FixedSizeList);
+/// Fixed-size-list layout vtable.
+#[derive(Clone, Debug)]
+pub struct FixedSizeList;
+
+/// Backwards-compatible name for the fixed-size-list layout plugin.
+pub use FixedSizeList as FixedSizeListLayoutEncoding;
+
+/// A fixed-size-list layout shredded into elements and optional validity children.
+pub type FixedSizeListLayout = Layout<FixedSizeList>;
 
 impl VTable for FixedSizeList {
-    type Layout = FixedSizeListLayout;
-    type Encoding = FixedSizeListLayoutEncoding;
+    type LayoutData = ();
     type Metadata = EmptyMetadata;
 
-    fn id(_encoding: &Self::Encoding) -> LayoutId {
+    fn id(&self) -> LayoutId {
         static ID: CachedId = CachedId::new("vortex.fixed_size_list");
         *ID
     }
 
-    fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
-        LayoutEncodingRef::new_ref(FixedSizeListLayoutEncoding.as_ref())
-    }
-
-    fn row_count(layout: &Self::Layout) -> u64 {
-        layout.row_count
-    }
-
-    fn dtype(layout: &Self::Layout) -> &DType {
-        &layout.dtype
-    }
-
-    fn metadata(_layout: &Self::Layout) -> Self::Metadata {
+    fn metadata(_layout: &Layout<Self>) -> Self::Metadata {
         EmptyMetadata
     }
 
-    fn segment_ids(_layout: &Self::Layout) -> Vec<SegmentId> {
-        vec![]
+    fn deserialize(
+        &self,
+        args: &LayoutDeserializeArgs<'_>,
+        _metadata: &EmptyMetadata,
+    ) -> VortexResult<Self::LayoutData> {
+        FixedSizeListLayout::validate_children(args.dtype, args.row_count, args.children)?;
+
+        let element_dtype = args
+            .dtype
+            .as_fixed_size_list_element_opt()
+            .ok_or_else(|| vortex_err!("FixedSizeListLayout requires a FixedSizeList dtype"))?;
+        args.children.child(ELEMENTS_CHILD_INDEX, element_dtype)?;
+        if args.dtype.is_nullable() {
+            args.children
+                .child(VALIDITY_CHILD_INDEX, &DType::Bool(Nullability::NonNullable))?;
+        }
+        Ok(())
     }
 
-    fn nchildren(layout: &Self::Layout) -> usize {
-        1 + usize::from(layout.dtype.is_nullable())
-    }
-
-    fn child(layout: &Self::Layout, idx: usize) -> VortexResult<LayoutRef> {
-        match (idx, layout.validity.as_ref()) {
-            (ELEMENTS_CHILD_INDEX, _) => Ok(Arc::clone(&layout.elements)),
-            (VALIDITY_CHILD_INDEX, Some(validity)) => Ok(Arc::clone(validity)),
+    fn child_dtype(layout: &Layout<Self>, idx: usize) -> VortexResult<DType> {
+        match idx {
+            ELEMENTS_CHILD_INDEX => layout
+                .dtype()
+                .as_fixed_size_list_element_opt()
+                .map(|dtype| dtype.as_ref().clone())
+                .ok_or_else(|| vortex_err!("FixedSizeListLayout requires a FixedSizeList dtype")),
+            VALIDITY_CHILD_INDEX if layout.dtype().is_nullable() => {
+                Ok(DType::Bool(Nullability::NonNullable))
+            }
             _ => vortex_bail!("Invalid child index {idx} for FixedSizeListLayout"),
         }
     }
 
-    fn child_type(layout: &Self::Layout, idx: usize) -> LayoutChildType {
-        match (idx, layout.validity.is_some()) {
-            (ELEMENTS_CHILD_INDEX, _) => LayoutChildType::Auxiliary("elements".into()),
-            (VALIDITY_CHILD_INDEX, true) => LayoutChildType::Auxiliary("validity".into()),
+    fn child_type(layout: &Layout<Self>, idx: usize) -> LayoutChildType {
+        match idx {
+            ELEMENTS_CHILD_INDEX => LayoutChildType::Auxiliary("elements".into()),
+            VALIDITY_CHILD_INDEX if layout.dtype().is_nullable() => {
+                LayoutChildType::Auxiliary("validity".into())
+            }
             _ => vortex_panic!("Invalid child index {idx} for FixedSizeListLayout"),
         }
     }
 
     fn new_reader(
-        layout: &Self::Layout,
+        layout: &Layout<Self>,
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
         session: &VortexSession,
@@ -113,103 +126,9 @@ impl VTable for FixedSizeList {
             ctx,
         )?))
     }
-
-    fn build(
-        _encoding: &Self::Encoding,
-        dtype: &DType,
-        row_count: u64,
-        _metadata: &<Self::Metadata as DeserializeMetadata>::Output,
-        _segment_ids: Vec<SegmentId>,
-        children: &dyn LayoutChildren,
-        _ctx: &LayoutBuildContext<'_>,
-    ) -> VortexResult<Self::Layout> {
-        validate_children(dtype, row_count, children)?;
-
-        let element_dtype = dtype
-            .as_fixed_size_list_element_opt()
-            .ok_or_else(|| vortex_err!("FixedSizeListLayout requires a FixedSizeList dtype"))?;
-        let elements = children.child(ELEMENTS_CHILD_INDEX, element_dtype)?;
-        let validity = dtype
-            .is_nullable()
-            .then(|| children.child(VALIDITY_CHILD_INDEX, &DType::Bool(Nullability::NonNullable)))
-            .transpose()?;
-
-        Ok(FixedSizeListLayout {
-            row_count,
-            dtype: dtype.clone(),
-            elements,
-            validity,
-        })
-    }
-
-    fn with_children(layout: &mut Self::Layout, children: Vec<LayoutRef>) -> VortexResult<()> {
-        validate_child_count(layout.dtype(), children.len())?;
-
-        let mut iter = children.into_iter();
-        layout.elements = iter
-            .next()
-            .ok_or_else(|| vortex_err!("missing elements child"))?;
-        layout.validity = layout
-            .dtype
-            .is_nullable()
-            .then(|| {
-                iter.next()
-                    .ok_or_else(|| vortex_err!("missing validity child"))
-            })
-            .transpose()?;
-        Ok(())
-    }
 }
 
-fn validate_child_count(dtype: &DType, nchildren: usize) -> VortexResult<()> {
-    let expected = 1 + usize::from(dtype.is_nullable());
-    vortex_ensure!(
-        nchildren == expected,
-        "FixedSizeListLayout expects {expected} children, got {nchildren}"
-    );
-    Ok(())
-}
-
-fn validate_children(
-    dtype: &DType,
-    row_count: u64,
-    children: &dyn LayoutChildren,
-) -> VortexResult<()> {
-    validate_child_count(dtype, children.nchildren())?;
-    let DType::FixedSizeList(_, list_size, _) = dtype else {
-        vortex_bail!("FixedSizeListLayout requires a FixedSizeList dtype, got {dtype}");
-    };
-    let expected_elements = row_count
-        .checked_mul(u64::from(*list_size))
-        .ok_or_else(|| vortex_err!("fixed-size list elements row count overflow"))?;
-    let actual_elements = children.child_row_count(ELEMENTS_CHILD_INDEX);
-    vortex_ensure!(
-        actual_elements == expected_elements,
-        "FixedSizeListLayout elements row count {actual_elements} does not match expected {expected_elements}"
-    );
-    if dtype.is_nullable() {
-        let validity_rows = children.child_row_count(VALIDITY_CHILD_INDEX);
-        vortex_ensure!(
-            validity_rows == row_count,
-            "FixedSizeListLayout validity row count {validity_rows} does not match row count {row_count}"
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-pub struct FixedSizeListLayoutEncoding;
-
-/// Stores a fixed-size list by shredding elements and optional list validity into child layouts.
-#[derive(Clone, Debug)]
-pub struct FixedSizeListLayout {
-    row_count: u64,
-    dtype: DType,
-    elements: LayoutRef,
-    validity: Option<LayoutRef>,
-}
-
-impl FixedSizeListLayout {
+impl Layout<FixedSizeList> {
     /// Construct a fixed-size-list layout from its components.
     ///
     /// # Invariants
@@ -223,34 +142,31 @@ impl FixedSizeListLayout {
         elements: LayoutRef,
         validity: Option<LayoutRef>,
     ) -> Self {
-        Self {
-            row_count,
-            dtype,
-            elements,
-            validity,
-        }
+        let mut child_layouts = vec![elements];
+        child_layouts.extend(validity);
+        let children = OwnedLayoutChildren::layout_children(child_layouts);
+        Self::validate_children(&dtype, row_count, children.as_ref())
+            .vortex_expect("invalid fixed-size-list children");
+        LayoutParts::new(FixedSizeList, dtype, row_count, Vec::new(), children, ()).into_typed()
     }
 
-    /// Number of fixed-size-list rows in this layout.
-    #[inline]
-    pub fn row_count(&self) -> u64 {
-        self.row_count
+    /// Returns the elements child.
+    pub fn elements(&self) -> VortexResult<LayoutRef> {
+        self.child(ELEMENTS_CHILD_INDEX)
     }
 
-    #[inline]
-    pub fn elements(&self) -> &LayoutRef {
-        &self.elements
-    }
-
-    #[inline]
-    pub fn validity(&self) -> Option<&LayoutRef> {
-        self.validity.as_ref()
+    /// Returns the optional validity child.
+    pub fn validity(&self) -> VortexResult<Option<LayoutRef>> {
+        self.dtype()
+            .is_nullable()
+            .then(|| self.child(VALIDITY_CHILD_INDEX))
+            .transpose()
     }
 
     /// The fixed number of elements in each list row.
     #[inline]
     pub fn list_size(&self) -> u32 {
-        match &self.dtype {
+        match self.dtype() {
             DType::FixedSizeList(_, list_size, _) => *list_size,
             _ => vortex_panic!("FixedSizeListLayout dtype must be FixedSizeList"),
         }
@@ -258,8 +174,46 @@ impl FixedSizeListLayout {
 
     /// The dtype of the inner elements column.
     pub fn elements_dtype(&self) -> &DType {
-        self.dtype
+        self.dtype()
             .as_fixed_size_list_element_opt()
             .vortex_expect("FixedSizeListLayout dtype must be FixedSizeList")
+    }
+
+    fn validate_child_count(dtype: &DType, nchildren: usize) -> VortexResult<()> {
+        let expected = 1 + usize::from(dtype.is_nullable());
+        vortex_ensure!(
+            nchildren == expected,
+            "FixedSizeListLayout expects {expected} children, got {nchildren}"
+        );
+        Ok(())
+    }
+
+    fn validate_children(
+        dtype: &DType,
+        row_count: u64,
+        children: &dyn LayoutChildren,
+    ) -> VortexResult<()> {
+        Self::validate_child_count(dtype, children.nchildren())?;
+        let DType::FixedSizeList(element_dtype, list_size, _) = dtype else {
+            vortex_bail!("FixedSizeListLayout requires a FixedSizeList dtype, got {dtype}");
+        };
+        children.child(ELEMENTS_CHILD_INDEX, element_dtype)?;
+        let expected_elements = row_count
+            .checked_mul(u64::from(*list_size))
+            .ok_or_else(|| vortex_err!("fixed-size list elements row count overflow"))?;
+        let actual_elements = children.child_row_count(ELEMENTS_CHILD_INDEX);
+        vortex_ensure!(
+            actual_elements == expected_elements,
+            "FixedSizeListLayout elements row count {actual_elements} does not match expected {expected_elements}"
+        );
+        if dtype.is_nullable() {
+            children.child(VALIDITY_CHILD_INDEX, &DType::Bool(Nullability::NonNullable))?;
+            let validity_rows = children.child_row_count(VALIDITY_CHILD_INDEX);
+            vortex_ensure!(
+                validity_rows == row_count,
+                "FixedSizeListLayout validity row count {validity_rows} does not match row count {row_count}"
+            );
+        }
+        Ok(())
     }
 }

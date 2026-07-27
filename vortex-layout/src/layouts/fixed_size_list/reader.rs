@@ -63,14 +63,14 @@ impl FixedSizeListReader {
         session: VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<Self> {
-        let elements = layout.elements().new_reader(
+        let elements = layout.elements()?.new_reader(
             format!("{name}.elements").into(),
             Arc::clone(&segment_source),
             &session,
             ctx,
         )?;
         let validity = layout
-            .validity()
+            .validity()?
             .map(|v| {
                 v.new_reader(
                     format!("{name}.validity").into(),
