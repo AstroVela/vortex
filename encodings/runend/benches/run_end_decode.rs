@@ -5,6 +5,8 @@
 
 use std::fmt;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use divan::Bencher;
 use rand::RngExt;
@@ -72,6 +74,84 @@ impl fmt::Display for BoolBenchArgs {
             "{}_{}_{}",
             self.total_length, self.avg_run_length, self.distribution
         )
+    }
+}
+
+/// Number of independently-seeded datasets cycled across iterations, so the branch predictor
+/// cannot memorise one run-length/value sequence. See `decode_bool_periodic` for what a single
+/// fixed dataset is worth here.
+const BOOL_DATASETS: u64 = 16;
+
+/// Creates bool test data with *varied* run lengths and *randomised* values.
+///
+/// The periodic generator below fixes every run to the same length and derives values from
+/// `run_index`, which makes the decoder's per-run `value != prefill` branch -- the branch the
+/// whole adaptive-prefill strategy turns on -- perfectly predictable. Real columns are not.
+fn create_bool_test_data_varied(
+    seed: u64,
+    total_length: usize,
+    avg_run_length: usize,
+    distribution: BoolDistribution,
+    validity_density: Option<f64>,
+) -> (PrimitiveArray, BoolArray) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let max_run = (2 * avg_run_length - 1).max(1);
+    let mut ends = BufferMut::<u32>::empty();
+    let mut values = Vec::new();
+    let mut validity_bits = Vec::new();
+
+    let mut pos = 0usize;
+    while pos < total_length {
+        let run_len = rng.random_range(1..=max_run).min(total_length - pos);
+        pos += run_len;
+        ends.push(pos as u32);
+        values.push(match distribution {
+            BoolDistribution::Alternating => rng.random_bool(0.5),
+            BoolDistribution::MostlyTrue => rng.random_bool(0.9),
+            BoolDistribution::MostlyFalse => rng.random_bool(0.1),
+            BoolDistribution::AllTrue => true,
+            BoolDistribution::AllFalse => false,
+        });
+        if let Some(d) = validity_density {
+            validity_bits.push(rng.random_bool(d));
+        }
+    }
+
+    let bools = match validity_density {
+        Some(_) => BoolArray::new(
+            BitBuffer::from(values),
+            Validity::from(BitBuffer::from(validity_bits)),
+        ),
+        None => BoolArray::from(BitBuffer::from(values)),
+    };
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        bools,
+    )
+}
+
+/// Input provider cycling `BOOL_DATASETS` independently-seeded varied datasets.
+fn bool_rotating(
+    total_length: usize,
+    avg_run_length: usize,
+    distribution: BoolDistribution,
+    validity_density: Option<f64>,
+) -> impl Fn() -> (PrimitiveArray, BoolArray) {
+    let sets: Vec<_> = (0..BOOL_DATASETS)
+        .map(|k| {
+            create_bool_test_data_varied(
+                0x5eed_u64.wrapping_add(k.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                total_length,
+                avg_run_length,
+                distribution,
+                validity_density,
+            )
+        })
+        .collect();
+    let next = AtomicUsize::new(0);
+    move || {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        sets[i % sets.len()].clone()
     }
 }
 
@@ -212,6 +292,86 @@ const BOOL_ARGS: &[BoolBenchArgs] = &[
         distribution: BoolDistribution::AllFalse,
     },
 ];
+
+/// Run lengths for the data-realism control, matching the primitive sweep.
+const BOOL_CONTROL_ARGS: &[BoolBenchArgs] = &[
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 32,
+        distribution: BoolDistribution::Alternating,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 64,
+        distribution: BoolDistribution::Alternating,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 128,
+        distribution: BoolDistribution::Alternating,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 256,
+        distribution: BoolDistribution::Alternating,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 512,
+        distribution: BoolDistribution::Alternating,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 32,
+        distribution: BoolDistribution::MostlyTrue,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 128,
+        distribution: BoolDistribution::MostlyTrue,
+    },
+    BoolBenchArgs {
+        total_length: 65_536,
+        avg_run_length: 512,
+        distribution: BoolDistribution::MostlyTrue,
+    },
+];
+
+/// Data-realism control: identical kernel, periodic fixed-length data (one dataset).
+///
+/// Every run is the same length and values come from `run_index`, so the decoder's per-run
+/// `value != prefill` branch is perfectly predictable and the run-length sequence is memorable.
+#[divan::bench(args = BOOL_CONTROL_ARGS)]
+fn decode_bool_periodic(bencher: Bencher, args: BoolBenchArgs) {
+    let (ends, values) =
+        create_bool_test_data(args.total_length, args.avg_run_length, args.distribution);
+    bencher
+        .with_inputs(|| (ends.clone(), values.clone(), SESSION.create_execution_ctx()))
+        .bench_refs(|(ends, values, ctx)| {
+            runend_decode_bools(ends.clone(), values.clone(), 0, args.total_length, ctx)
+        });
+}
+
+/// Data-realism control: identical kernel, varied run lengths and randomised values, rotating
+/// over `BOOL_DATASETS` seeds. The gap to `decode_bool_periodic` is what the periodic generator
+/// was worth -- i.e. how much of the reported bool decode speed is branch prediction.
+#[divan::bench(args = BOOL_CONTROL_ARGS)]
+fn decode_bool_varied(bencher: Bencher, args: BoolBenchArgs) {
+    let next_dataset = bool_rotating(
+        args.total_length,
+        args.avg_run_length,
+        args.distribution,
+        None,
+    );
+    bencher
+        .with_inputs(|| {
+            let (ends, values) = next_dataset();
+            (ends, values, SESSION.create_execution_ctx())
+        })
+        .bench_refs(|(ends, values, ctx)| {
+            runend_decode_bools(ends.clone(), values.clone(), 0, args.total_length, ctx)
+        });
+}
 
 #[divan::bench(args = BOOL_ARGS)]
 fn decode_bool(bencher: Bencher, args: BoolBenchArgs) {
