@@ -143,10 +143,16 @@ fn mask_validity_fixed_size_list(
 fn mask_validity_struct(array: StructArray, validity: Validity) -> VortexResult<StructArray> {
     let len = array.len();
     let new_validity = Validity::and(array.validity()?, validity)?;
-    let fields = array.unmasked_fields();
-    let struct_fields = array.struct_fields();
+    let struct_fields = array.struct_fields().clone();
     // SAFETY: We're only changing validity, not the data structure.
-    Ok(unsafe { StructArray::new_unchecked(fields, struct_fields.clone(), len, new_validity) })
+    Ok(unsafe {
+        StructArray::new_unchecked(
+            array.iter_unmasked_fields().cloned(),
+            struct_fields,
+            len,
+            new_validity,
+        )
+    })
 }
 
 fn mask_validity_union(array: UnionArray, validity: Validity) -> VortexResult<UnionArray> {

@@ -89,11 +89,11 @@ impl<'a> SlotSlice<'a> {
     }
 
     /// Iterate the slots in order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a ArrayRef> + use<'a> {
-        let expect = self.expect;
-        self.slots
-            .iter()
-            .map(move |slot| slot.as_ref().vortex_expect(expect))
+    pub fn iter(&self) -> SlotSliceIter<'a> {
+        SlotSliceIter {
+            inner: self.slots.iter(),
+            expect: self.expect,
+        }
     }
 
     /// Clone every slot into an owned `Vec`.
@@ -109,6 +109,49 @@ impl std::ops::Index<usize> for SlotSlice<'_> {
         self.slots[idx].as_ref().vortex_expect(self.expect)
     }
 }
+
+impl<'a> IntoIterator for SlotSlice<'a> {
+    type Item = &'a ArrayRef;
+    type IntoIter = SlotSliceIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over the present slots of a [`SlotSlice`], yielding `&ArrayRef`.
+#[derive(Clone)]
+pub struct SlotSliceIter<'a> {
+    inner: std::slice::Iter<'a, Option<ArrayRef>>,
+    expect: &'static str,
+}
+
+impl<'a> Iterator for SlotSliceIter<'a> {
+    type Item = &'a ArrayRef;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|slot| slot.as_ref().vortex_expect(self.expect))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for SlotSliceIter<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next_back()
+            .map(|slot| slot.as_ref().vortex_expect(self.expect))
+    }
+}
+
+impl ExactSizeIterator for SlotSliceIter<'_> {}
 
 /// The public API trait for all Vortex arrays.
 ///

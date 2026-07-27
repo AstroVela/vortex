@@ -202,7 +202,7 @@ pub trait StructArrayExt: StructArraySlotsExt {
         child_to_validity(self.validity(), self.nullability())
     }
 
-    fn iter_unmasked_fields(&self) -> impl Iterator<Item = &ArrayRef> + '_ {
+    fn iter_unmasked_fields(&self) -> impl ExactSizeIterator<Item = &ArrayRef> + '_ {
         self.fields().iter()
     }
 
@@ -553,7 +553,7 @@ impl Array<Struct> {
         if struct_validity.definitely_no_nulls() {
             return Self::try_new(
                 self.names().clone(),
-                self.unmasked_fields(),
+                self.iter_unmasked_fields().cloned(),
                 self.len(),
                 new_validity,
             );
