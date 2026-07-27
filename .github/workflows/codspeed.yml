@@ -72,7 +72,8 @@ jobs:
         with:
           enable-sccache: ${{ github.repository == 'vortex-data/vortex' && 'true' || 'false' }}
       - uses: ./.github/actions/system-info
-      - run: |
+      - if: github.repository != 'vortex-data/vortex'
+        run: |
           sudo apt-get update
           sudo apt-get install -y libc6-dbg
       - name: Install Codspeed
