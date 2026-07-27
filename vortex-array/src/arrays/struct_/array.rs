@@ -182,7 +182,11 @@ pub(super) fn make_struct_slots(
     slots
 }
 
-pub trait StructArrayExt: TypedArrayRef<Struct> {
+/// Struct-specific accessors.
+///
+/// Slot accessors (`validity`, `fields`, `slots_view`) live on the generated
+/// [`StructArraySlotsExt`] supertrait; this trait layers struct-specific lookups on top.
+pub trait StructArrayExt: StructArraySlotsExt {
     fn nullability(&self) -> crate::dtype::Nullability {
         match self.as_ref().dtype() {
             DType::Struct(_, nullability) => *nullability,
@@ -195,25 +199,20 @@ pub trait StructArrayExt: TypedArrayRef<Struct> {
     }
 
     fn struct_validity(&self) -> Validity {
-        child_to_validity(
-            self.as_ref().slots()[StructSlots::VALIDITY].as_ref(),
-            self.nullability(),
-        )
+        child_to_validity(self.validity(), self.nullability())
     }
 
     fn iter_unmasked_fields(&self) -> impl Iterator<Item = &ArrayRef> + '_ {
-        self.as_ref().slots()[StructSlots::FIELDS_OFFSET..]
-            .iter()
-            .map(|s| s.as_ref().vortex_expect("StructArray field slot"))
+        self.fields().iter()
     }
 
     fn unmasked_fields(&self) -> Vec<ArrayRef> {
-        self.iter_unmasked_fields().cloned().collect()
+        self.fields().iter().cloned().collect()
     }
 
     fn unmasked_field(&self, idx: usize) -> &ArrayRef {
-        self.as_ref().slots()[StructSlots::FIELDS_OFFSET + idx]
-            .as_ref()
+        self.fields()
+            .get(idx)
             .vortex_expect("StructArray field slot")
     }
 
