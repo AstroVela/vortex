@@ -62,6 +62,7 @@ use decode_variants::decode_v1;
 use decode_variants::decode_v2;
 use decode_variants::decode_v3_byte_splat;
 use decode_variants::decode_v3_elem_fill;
+use decode_variants::decode_v3_local;
 use decode_variants::decode_v3_no_memset;
 use decode_variants::make_data_values;
 
@@ -183,6 +184,20 @@ fn nonnull_v3<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
                 Nullability::NonNullable,
                 TOTAL_LENGTH,
             )
+        });
+}
+
+/// Bench-local mirror of the shipped kernel. Compare against `nonnull_v3_elem_fill` (also
+/// bench-local) to isolate the long-run fill strategy without the crate-boundary confound that
+/// makes `nonnull_v3` unusable for that comparison.
+#[divan::bench(types = [u8, u32, u64], args = RUN_LENGTHS)]
+fn nonnull_v3_local<T: NativePType + From<u8>>(bencher: Bencher, avg: usize) {
+    bencher
+        .counter(ItemsCount::new(TOTAL_LENGTH))
+        .with_inputs(rotating::<T>(avg, 1.0, false))
+        .bench_refs(|(ends, values, _)| {
+            let (buf, validity) = decode_v3_local(ends.as_slice(), values.as_slice(), TOTAL_LENGTH);
+            PrimitiveArray::new(buf, validity)
         });
 }
 

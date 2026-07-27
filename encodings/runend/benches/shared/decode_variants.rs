@@ -589,3 +589,96 @@ pub fn decode_n2<E: IntegerPType, T: NativePType>(
     unsafe { decoded.set_len(pos) };
     (decoded.into(), Validity::from(decoded_validity.freeze()))
 }
+
+// ---- Bench-local copy of the SHIPPED kernel ----
+//
+// `nonnull_v3` calls the real kernel across a crate boundary, which costs enough to swamp the
+// effect being measured (the u8 rows of that comparison differ by up to 1.8x on byte-identical
+// algorithms). This copy compiles into the bench binary like every other variant here, so
+// `nonnull_v3_local` versus `nonnull_v3_elem_fill` isolates the long-run fill strategy alone.
+// Keep it in step with `compress.rs`.
+
+const DOUBLING_FILL_BYTES_LOCAL: usize = 2048;
+
+#[inline(never)]
+unsafe fn fill_run_shipped<T: Copy>(dst: *mut MaybeUninit<T>, len: usize, value: T) {
+    unsafe {
+        if len * size_of::<T>() >= DOUBLING_FILL_BYTES_LOCAL {
+            let seed = (64 / size_of::<T>()).max(1);
+            for i in 0..seed {
+                dst.add(i).write(MaybeUninit::new(value));
+            }
+            let mut filled = seed;
+            while filled < len {
+                let n = filled.min(len - filled);
+                std::ptr::copy_nonoverlapping(dst, dst.add(filled), n);
+                filled += n;
+            }
+            return;
+        }
+        for i in 0..len {
+            dst.add(i).write(MaybeUninit::new(value));
+        }
+    }
+}
+
+/// # Safety
+///
+/// The allocation behind `base` must have room for at least
+/// `max(pos, end) + decode_chunk_len::<T>()` elements.
+#[inline(always)]
+unsafe fn splat_run_shipped<T: Copy>(base: *mut MaybeUninit<T>, pos: usize, end: usize, value: T) {
+    let chunk = const { decode_chunk_len::<T>() };
+    // SAFETY: caller guarantees one chunk of slack past max(pos, end).
+    unsafe {
+        let mut p = base.add(pos);
+        let stop = base.add(end);
+        for i in 0..chunk {
+            p.add(i).write(MaybeUninit::new(value));
+        }
+        p = p.add(chunk);
+        if p >= stop {
+            return;
+        }
+        let len = end - pos;
+        if len * size_of::<T>() >= LONG_RUN_FILL_BYTES {
+            fill_run_shipped(base.add(pos), len, value);
+            return;
+        }
+        loop {
+            for i in 0..chunk {
+                p.add(i).write(MaybeUninit::new(value));
+            }
+            p = p.add(chunk);
+            if p >= stop {
+                break;
+            }
+        }
+    }
+}
+
+/// Bench-local mirror of the shipped non-nullable decode (see above).
+pub fn decode_v3_local<E: IntegerPType, T: NativePType>(
+    run_ends: &[E],
+    values: &[T],
+    length: usize,
+) -> (Buffer<T>, Validity) {
+    let offset_e = E::zero();
+    let length_e = E::from_usize(length).unwrap();
+    let mut decoded = BufferMut::<T>::with_capacity(length + decode_chunk_len::<T>());
+    let base = decoded.spare_capacity_mut().as_mut_ptr();
+    let mut pos = 0usize;
+    for (&end, &value) in run_ends.iter().zip(values) {
+        let end = trim_end(end, offset_e, length_e);
+        assert!(
+            end >= pos,
+            "Runend ends must be monotonic, got {end} after {pos}"
+        );
+        // SAFETY: pos <= end <= length and the buffer has one chunk of padding.
+        unsafe { splat_run_shipped(base, pos, end, value) };
+        pos = end;
+    }
+    // SAFETY: every element in 0..pos was initialized above.
+    unsafe { decoded.set_len(pos) };
+    (decoded.into(), Nullability::NonNullable.into())
+}
