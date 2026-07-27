@@ -56,6 +56,10 @@ name = "run_end_decode_bool_corpus"
 harness = false
 
 [[bench]]
+name = "run_end_decode_bool_ablation"
+harness = false
+
+[[bench]]
 name = "run_end_take"
 harness = false
 
