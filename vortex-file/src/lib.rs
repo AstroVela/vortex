@@ -109,6 +109,8 @@ mod footer;
 pub mod multi;
 mod open;
 mod pruning;
+/// Pull-based (inverted-IO) scanning where the caller performs all reads.
+pub mod pull;
 mod read;
 /// Segment sources, caches, and sinks used by file readers and writers.
 pub mod segments;
