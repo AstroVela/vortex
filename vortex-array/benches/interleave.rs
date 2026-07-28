@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Benchmarks the Vortex [`Interleave`](vortex_array::arrays::Interleave) boolean execute path on a
-//! focused set of configurations:
+//! Benchmarks the Vortex [`Interleave`](vortex_array::arrays::Interleave) execute path on a focused
+//! set of configurations:
 //!
 //! - `round_robin`, 2 children: a merge — `array_index = i % N`, `row_index = i / N`.
 //! - `random`, 2 children: fully random `(array_index, row_index)` per output row.
 //! - `random`, 64 children: the same random gather spread over many value arrays.
 //!
-//! Each is run nullable and non-nullable.
+//! The boolean cases are run nullable and non-nullable. Primitive cases cover four-child random
+//! gathers.
 
 #![expect(clippy::unwrap_used)]
 
@@ -32,6 +33,9 @@ use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::InterleaveArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 
@@ -59,42 +63,42 @@ impl Display for Pattern {
     }
 }
 
-/// A single benchmark configuration: access pattern, branch count, and nullability.
-#[derive(Clone, Copy)]
+/// A single benchmark configuration: data type, access pattern, and branch count.
+#[derive(Clone)]
 struct Combo {
+    dtype: DType,
     pattern: Pattern,
     branches: usize,
-    nullable: bool,
 }
 
 impl Display for Combo {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}/n{}/{}",
-            self.pattern,
-            self.branches,
-            if self.nullable { "null" } else { "nonnull" }
-        )
+        write!(f, "{}/n{}/{}", self.pattern, self.branches, self.dtype)
     }
 }
 
-/// The configurations the benchmark covers: 2-child round-robin, 2-child random, and 64-child
-/// random — each nullable and non-nullable.
+/// The configurations the benchmark covers.
 fn combos() -> Vec<Combo> {
     let mut out = Vec::new();
-    for nullable in [false, true] {
+    for nullability in [Nullability::NonNullable, Nullability::Nullable] {
         for (pattern, branches) in [
             (Pattern::RoundRobin, 2),
             (Pattern::Random, 2),
             (Pattern::Random, 64),
         ] {
             out.push(Combo {
+                dtype: DType::Bool(nullability),
                 pattern,
                 branches,
-                nullable,
             });
         }
+    }
+    for ptype in [PType::F16, PType::U64] {
+        out.push(Combo {
+            dtype: ptype.into(),
+            pattern: Pattern::Random,
+            branches: 4,
+        });
     }
     out
 }
@@ -102,20 +106,30 @@ fn combos() -> Vec<Combo> {
 /// Builds the Vortex value arrays and the `u32` selector buffers for a [`Combo`].
 ///
 /// Seeded only by the combo so a run is deterministic and comparable across revisions.
-fn vortex_inputs(combo: Combo) -> (Vec<ArrayRef>, Buffer<u32>, Buffer<u32>) {
+fn vortex_inputs(combo: &Combo) -> (Vec<ArrayRef>, Buffer<u32>, Buffer<u32>) {
     let mut rng = StdRng::seed_from_u64(0);
-    let bit = Uniform::new(0u8, 2).unwrap();
 
     let values = (0..combo.branches)
-        .map(|_| {
-            if combo.nullable {
+        .map(|_| match &combo.dtype {
+            DType::Bool(Nullability::Nullable) => {
+                let bit = Uniform::new(0u8, 2).unwrap();
                 BoolArray::from_iter(
                     (0..ARRAY_SIZE).map(|_| (rng.sample(bit) == 0).then_some(rng.sample(bit) == 0)),
                 )
                 .into_array()
-            } else {
+            }
+            DType::Bool(Nullability::NonNullable) => {
+                let bit = Uniform::new(0u8, 2).unwrap();
                 BoolArray::from_iter((0..ARRAY_SIZE).map(|_| rng.sample(bit) == 0)).into_array()
             }
+            DType::Primitive(PType::F16, Nullability::NonNullable) => PrimitiveArray::from_iter(
+                (0..ARRAY_SIZE).map(|_| f16::from_bits(rng.random::<u16>())),
+            )
+            .into_array(),
+            DType::Primitive(PType::U64, Nullability::NonNullable) => {
+                PrimitiveArray::from_iter((0..ARRAY_SIZE).map(|_| rng.random::<u64>())).into_array()
+            }
+            dtype => unreachable!("unsupported interleave benchmark dtype: {dtype}"),
         })
         .collect();
 
@@ -137,65 +151,8 @@ fn vortex_inputs(combo: Combo) -> (Vec<ArrayRef>, Buffer<u32>, Buffer<u32>) {
 }
 
 #[divan::bench(args = combos())]
-fn vortex(bencher: Bencher, combo: Combo) {
+fn vortex(bencher: Bencher, combo: &Combo) {
     let (values, array_indices, row_indices) = vortex_inputs(combo);
-    let session = array_session();
-    bencher
-        .with_inputs(|| {
-            (
-                InterleaveArray::try_new(
-                    values.clone(),
-                    array_indices.clone().into_array(),
-                    row_indices.clone().into_array(),
-                )
-                .unwrap()
-                .into_array(),
-                session.create_execution_ctx(),
-            )
-        })
-        .bench_refs(|(array, ctx)| array.clone().execute::<Canonical>(ctx));
-}
-
-#[derive(Clone, Copy)]
-enum PrimitiveKind {
-    F16,
-    U64,
-}
-
-impl Display for PrimitiveKind {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            PrimitiveKind::F16 => "f16",
-            PrimitiveKind::U64 => "u64",
-        })
-    }
-}
-
-fn primitive_inputs(kind: PrimitiveKind) -> (Vec<ArrayRef>, Buffer<u32>, Buffer<u32>) {
-    const BRANCHES: usize = 4;
-
-    let mut rng = StdRng::seed_from_u64(1);
-    let values = (0..BRANCHES)
-        .map(|_| match kind {
-            PrimitiveKind::F16 => PrimitiveArray::from_iter(
-                (0..ARRAY_SIZE).map(|_| f16::from_bits(rng.random::<u16>())),
-            )
-            .into_array(),
-            PrimitiveKind::U64 => {
-                PrimitiveArray::from_iter((0..ARRAY_SIZE).map(|_| rng.random::<u64>())).into_array()
-            }
-        })
-        .collect();
-    let branch = Uniform::new(0u32, u32::try_from(BRANCHES).unwrap()).unwrap();
-    let row = Uniform::new(0u32, u32::try_from(ARRAY_SIZE).unwrap()).unwrap();
-    let array_indices = (0..ARRAY_SIZE).map(|_| rng.sample(branch)).collect();
-    let row_indices = (0..ARRAY_SIZE).map(|_| rng.sample(row)).collect();
-    (values, array_indices, row_indices)
-}
-
-#[divan::bench(args = [PrimitiveKind::F16, PrimitiveKind::U64])]
-fn primitive(bencher: Bencher, kind: PrimitiveKind) {
-    let (values, array_indices, row_indices) = primitive_inputs(kind);
     let session = array_session();
     bencher
         .with_inputs(|| {
