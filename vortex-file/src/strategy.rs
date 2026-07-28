@@ -168,7 +168,7 @@ pub fn writable_encodings(session: &VortexSession) -> HashSet<ArrayId> {
 ///
 /// The set is deliberately not resolved when the strategy is built: enabling an edition mutates
 /// the session, so a set captured at construction time can disagree with the one the writer's
-/// [`ArrayContext`](vortex_array::ArrayContext) enforces, and the write then fails on an encoding
+/// [`ArrayContext`] enforces, and the write then fails on an encoding
 /// the compressor was still allowed to produce. [`LayoutStrategy::write_stream`] receives the
 /// session, which is the point the gate is actually enforced, so it is resolved there.
 ///
