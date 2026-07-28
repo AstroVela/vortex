@@ -188,3 +188,176 @@ fn core_edition_ids_are_registered_array_encodings() {
         );
     }
 }
+
+/// Under the feature set the benchmarks build with, the gate must be a no-op: every encoding in
+/// the writer's allow-list is either covered by an enabled edition or declared by no edition at
+/// all. If this holds, gating cannot change a single byte the benchmarks write, so any file-size
+/// movement they report is pre-existing noise rather than a lost compression scheme.
+#[cfg(all(feature = "files", feature = "unstable_encodings"))]
+#[test]
+fn the_benchmark_feature_set_gates_nothing() {
+    use vortex_file::ALLOWED_ENCODINGS;
+    use vortex_file::writable_encodings;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    assert_eq!(
+        writable_encodings(&session),
+        *ALLOWED_ENCODINGS,
+        "the benchmarks enable both default editions, so nothing may be gated out"
+    );
+}
+
+/// Without `unstable_encodings`, the default session enables only the `core` family, and
+/// `fastlanes.delta` is the sole allow-list entry no core edition declares. Pinning the whole
+/// difference documents exactly what a default writer stops emitting — and shows no compression
+/// scheme is affected, since the delta scheme is itself compiled out in this configuration.
+#[cfg(all(feature = "files", not(feature = "unstable_encodings")))]
+#[test]
+fn a_default_session_gates_out_only_fastlanes_delta() {
+    use vortex_file::ALLOWED_ENCODINGS;
+    use vortex_file::writable_encodings;
+
+    use crate::VortexSessionDefault;
+
+    if use_experimental_patches() {
+        // The experimental flag opts into the unstable edition, which declares `fastlanes.delta`.
+        return;
+    }
+
+    let session = VortexSession::default();
+    let writable = writable_encodings(&session);
+
+    let mut gated: Vec<&str> = ALLOWED_ENCODINGS
+        .iter()
+        .filter(|id| !writable.contains(*id))
+        .map(|id| id.as_str())
+        .collect();
+    gated.sort_unstable();
+    assert_eq!(gated, ["fastlanes.delta"]);
+}
+
+/// A session narrowed to the *baseline* core edition. `CORE_2025_05_0` predates Zstd, Pco,
+/// FastLanes RLE, `vortex.masked`, `vortex.listview` and more, so a large part of the compressor
+/// has to be filtered out — far more than any shipping configuration gates. Enabling an edition
+/// replaces the enabled edition from the same family, so this narrows the default session.
+#[cfg(feature = "files")]
+fn baseline_core_session() -> Result<VortexSession, EditionError> {
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    session.enable_edition(CORE_2025_05_0)?;
+    Ok(session)
+}
+
+/// Every non-canonical encoding in an array tree, including the root. Canonical encodings are
+/// always writable, so only the compressed ones need checking against the allow-list.
+#[cfg(feature = "files")]
+fn compressed_encodings(
+    array: &vortex_array::ArrayRef,
+    into: &mut Vec<vortex_session::registry::Id>,
+) {
+    if !array.is_canonical() {
+        into.push(array.encoding_id());
+    }
+    for child in array.children() {
+        compressed_encodings(&child, into);
+    }
+}
+
+/// The compressor must never produce an encoding the writer would then reject.
+///
+/// This is the property the whole gate rests on: [`retain_allowed_encodings`] filters schemes by
+/// their *declared* [`produced_encodings`], so a scheme that under-declares would survive the
+/// filter, compress into a gated encoding, and make the writer fail the file rather than fall
+/// back. Compressing real data of every canonical kind against a deliberately narrow allow-list
+/// checks those declarations against what the schemes actually emit.
+///
+/// [`retain_allowed_encodings`]: vortex_btrblocks::BtrBlocksCompressorBuilder::retain_allowed_encodings
+/// [`produced_encodings`]: vortex_compressor::Scheme::produced_encodings
+#[cfg(feature = "files")]
+#[test]
+fn a_gated_compressor_never_emits_a_gated_encoding() -> Result<(), Box<dyn std::error::Error>> {
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::VarBinArray;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+
+    use crate::compressor::BtrBlocksCompressorBuilder;
+
+    let session = baseline_core_session()?;
+    let allowed = vortex_file::writable_encodings(&session);
+
+    // Sanity: the narrowed edition really does gate a broad set, or this test proves nothing.
+    for gated in [
+        "vortex.zstd",
+        "vortex.pco",
+        "fastlanes.rle",
+        "vortex.masked",
+    ] {
+        assert!(
+            !allowed.iter().any(|id| id.as_str() == gated),
+            "{gated} must be gated out by the baseline edition"
+        );
+    }
+
+    let arrays: Vec<vortex_array::ArrayRef> = vec![
+        // Tightly clustered ints: FoR + BitPacking territory.
+        PrimitiveArray::new(
+            Buffer::from_iter((0..8192u32).map(|i| 1_000_000 + (i % 16))),
+            Validity::NonNullable,
+        )
+        .into_array(),
+        // Long runs: RunEnd and the RLE schemes.
+        PrimitiveArray::new(
+            Buffer::from_iter((0..8192u64).map(|i| i / 512)),
+            Validity::NonNullable,
+        )
+        .into_array(),
+        // Floats: ALP / ALPRD / Pco territory.
+        PrimitiveArray::new(
+            Buffer::from_iter((0..8192).map(|i| f64::from(i) * 0.125)),
+            Validity::NonNullable,
+        )
+        .into_array(),
+        // Low-cardinality strings: dictionary and FSST territory.
+        VarBinArray::from_iter(
+            (0..8192).map(|i| Some(format!("payload-{}", i % 32))),
+            vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::Nullable),
+        )
+        .into_array(),
+        // Highly compressible bytes: what the compact preset would reach for Zstd on.
+        VarBinArray::from_iter(
+            (0..4096).map(|i| Some(format!("{}{i}", "repetitive-".repeat(16)))),
+            vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::Nullable),
+        )
+        .into_array(),
+        BoolArray::from_iter((0..8192).map(|i| i % 7 == 0)).into_array(),
+    ];
+
+    // `with_compact` is the widest scheme set the writer ever uses, so it is the strongest case.
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .with_compact()
+        .retain_allowed_encodings(&allowed)
+        .build();
+
+    let mut ctx = session.create_execution_ctx();
+    for array in arrays {
+        let compressed = compressor.compress(&array, &mut ctx)?;
+
+        let mut encodings = Vec::new();
+        compressed_encodings(&compressed, &mut encodings);
+        for encoding in encodings {
+            assert!(
+                allowed.contains(&encoding),
+                "the gated compressor produced {encoding}, which the writer would reject; \
+                 a scheme's produced_encodings() is under-declared"
+            );
+        }
+    }
+    Ok(())
+}
