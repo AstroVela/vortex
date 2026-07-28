@@ -36,6 +36,7 @@ use vortex_btrblocks::schemes::integer::IntDictScheme;
 use vortex_bytebool::ByteBool;
 use vortex_datetime_parts::DateTimeParts;
 use vortex_decimal_byte_parts::DecimalByteParts;
+use vortex_edition::EditionSessionExt;
 use vortex_error::VortexExpect;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::Delta;
@@ -63,6 +64,7 @@ use vortex_onpair::OnPair;
 use vortex_pco::Pco;
 use vortex_runend::RunEnd;
 use vortex_sequence::Sequence;
+use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::aliases::hash_set::HashSet;
@@ -131,6 +133,22 @@ pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
 
     allowed
 });
+
+/// The array encodings a writer may emit when writing with `session`: [`ALLOWED_ENCODINGS`]
+/// gated by the session's enabled editions.
+///
+/// An encoding survives the gate when an enabled edition includes it, or when no registered
+/// edition declares it at all — see
+/// [`retain_writable_encodings`](EditionSessionExt::retain_writable_encodings). A session with no
+/// editions registered is therefore not gated and gets [`ALLOWED_ENCODINGS`] unchanged, while the
+/// default Vortex session, which enables only the current `core` edition, loses the encodings
+/// declared solely by `unstable` editions.
+pub fn writable_encodings(session: &VortexSession) -> HashSet<ArrayId> {
+    session
+        .retain_writable_encodings(ALLOWED_ENCODINGS.iter().copied())
+        .into_iter()
+        .collect()
+}
 
 /// How the compressor was configured on [`WriteStrategyBuilder`].
 enum CompressorConfig {
@@ -230,9 +248,31 @@ impl WriteStrategyBuilder {
     /// Override the allowed array encodings for normalization.
     ///
     /// The configured flat leaf strategy is wrapped in a [`LayoutStrategyEncodingValidator`]
-    /// that recursively checks every chunk before passing it to the leaf writer.
+    /// that recursively checks every chunk before passing it to the leaf writer, and the
+    /// compressor's schemes are filtered down to those whose output the allow-list covers.
     pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
         self.allow_encodings = Some(allow_encodings);
+        self
+    }
+
+    /// Gate the allowed array encodings by the editions `session` has enabled for writing.
+    ///
+    /// This removes every allowed encoding that a registered edition declares but the session has
+    /// not enabled, so the file cannot contain an encoding outside the read-compatibility
+    /// guarantee the session opted into. Encodings no registered edition declares are left alone;
+    /// see [`writable_encodings`].
+    ///
+    /// The gate applies to compression as well as validation: [`build`](Self::build) drops every
+    /// compression scheme that could produce a gated-out encoding.
+    pub fn with_session_editions(mut self, session: &VortexSession) -> Self {
+        if let Some(allow_encodings) = self.allow_encodings.take() {
+            self.allow_encodings = Some(
+                session
+                    .retain_writable_encodings(allow_encodings)
+                    .into_iter()
+                    .collect(),
+            );
+        }
         self
     }
 
@@ -277,10 +317,29 @@ impl WriteStrategyBuilder {
         } else {
             Arc::new(FlatLayoutStrategy::default())
         };
-        let flat: Arc<dyn LayoutStrategy> = if let Some(allow_encodings) = self.allow_encodings {
-            Arc::new(LayoutStrategyEncodingValidator::new(flat, allow_encodings))
+        let flat: Arc<dyn LayoutStrategy> = if let Some(allow_encodings) = &self.allow_encodings {
+            Arc::new(LayoutStrategyEncodingValidator::new(
+                flat,
+                allow_encodings.clone(),
+            ))
         } else {
             flat
+        };
+
+        // Filter the compressor to the schemes whose output the allow-list covers. Without this,
+        // a scheme excluded from the allow-list — for instance one only an unstable edition
+        // declares — would compress a chunk into an encoding the validator then rejects, failing
+        // the write instead of choosing the next best scheme. This runs on the finished builder,
+        // so schemes added after construction, including the compact ones from
+        // [`BtrBlocksCompressorBuilder::with_compact`], are filtered too.
+        let compressor = match self.compressor {
+            CompressorConfig::BtrBlocks(builder) => {
+                CompressorConfig::BtrBlocks(match &self.allow_encodings {
+                    Some(allowed) => builder.retain_allowed_encodings(allowed),
+                    None => builder,
+                })
+            }
+            opaque @ CompressorConfig::Opaque(_) => opaque,
         };
 
         // 7. for each chunk create a flat layout
@@ -292,7 +351,7 @@ impl WriteStrategyBuilder {
         // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
         // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
         // dictionary-encode the integer codes produced by that earlier step.
-        let data_compressor: Arc<dyn CompressorPlugin> = match &self.compressor {
+        let data_compressor: Arc<dyn CompressorPlugin> = match &compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(
                 builder
                     .clone()
@@ -321,7 +380,7 @@ impl WriteStrategyBuilder {
         );
 
         // 2.1. | 3.1. compress stats tables and dict values.
-        let stats_compressor: Arc<dyn CompressorPlugin> = match self.compressor {
+        let stats_compressor: Arc<dyn CompressorPlugin> = match compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
             CompressorConfig::Opaque(compressor) => compressor,
         };
@@ -400,5 +459,102 @@ impl WriteStrategyBuilder {
         }
 
         Arc::new(table_strategy)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use vortex_array::array_session;
+    use vortex_edition::Edition;
+    use vortex_edition::EditionDeclaration;
+    use vortex_edition::EditionError;
+    use vortex_edition::EditionId;
+
+    use super::*;
+
+    /// An enabled edition that adds nothing, so nothing it declares is writable beyond what
+    /// other editions contribute.
+    const ENABLED: EditionId = EditionId::new("strategytest", 2026, 1, 0);
+    /// A registered but never enabled edition, whose members must be gated out.
+    const DISABLED: EditionId = EditionId::new("strategydraft", 2026, 1, 0);
+
+    static DECLARATIONS: &[EditionDeclaration] = &[
+        EditionDeclaration {
+            edition: Edition {
+                id: ENABLED,
+                min_vortex_version: Some("0.1.0"),
+            },
+            added: &[&"vortex.primitive"],
+        },
+        EditionDeclaration {
+            edition: Edition {
+                id: DISABLED,
+                min_vortex_version: None,
+            },
+            added: &[&"fastlanes.bitpacked", &"fastlanes.for"],
+        },
+    ];
+
+    /// Register the test editions on `session` and enable the one covering `vortex.primitive`,
+    /// leaving the edition that declares the FastLanes encodings registered but disabled.
+    pub(crate) fn gate_session(session: &VortexSession) -> Result<(), EditionError> {
+        for declaration in DECLARATIONS {
+            session.register_edition(declaration)?;
+        }
+        session.enable_edition(ENABLED)
+    }
+
+    fn gated_session() -> Result<VortexSession, EditionError> {
+        let session = array_session();
+        gate_session(&session)?;
+        Ok(session)
+    }
+
+    #[test]
+    fn writable_encodings_drops_disabled_editions() -> Result<(), EditionError> {
+        let writable = writable_encodings(&gated_session()?);
+
+        assert!(writable.contains(&Primitive.id()), "enabled edition member");
+        assert!(writable.contains(&FSST.id()), "no edition declares FSST");
+        assert!(!writable.contains(&BitPacked.id()));
+        assert!(!writable.contains(&FoR.id()));
+        Ok(())
+    }
+
+    #[test]
+    fn session_editions_gate_the_allow_list() -> Result<(), EditionError> {
+        let builder = WriteStrategyBuilder::default().with_session_editions(&gated_session()?);
+        let allowed = builder
+            .allow_encodings
+            .as_ref()
+            .vortex_expect("default builder sets an allow-list");
+
+        assert!(allowed.contains(&Primitive.id()));
+        assert!(!allowed.contains(&BitPacked.id()));
+        assert!(!allowed.contains(&FoR.id()));
+        Ok(())
+    }
+
+    #[test]
+    fn an_ungated_session_keeps_every_allowed_encoding() {
+        // `array_session` registers no editions, so there is nothing to gate against.
+        let session = array_session();
+        assert_eq!(writable_encodings(&session), *ALLOWED_ENCODINGS);
+
+        let builder = WriteStrategyBuilder::default().with_session_editions(&session);
+        assert_eq!(builder.allow_encodings, Some(ALLOWED_ENCODINGS.clone()));
+    }
+
+    #[test]
+    fn a_custom_allow_list_is_narrowed_not_replaced() -> Result<(), EditionError> {
+        let builder = WriteStrategyBuilder::default()
+            .with_allow_encodings(HashSet::from_iter([Primitive.id(), FoR.id()]))
+            .with_session_editions(&gated_session()?);
+
+        assert_eq!(
+            builder.allow_encodings,
+            Some(HashSet::from_iter([Primitive.id()]))
+        );
+        Ok(())
     }
 }

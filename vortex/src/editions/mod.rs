@@ -11,13 +11,14 @@
 //! The default file writer resolves the session's enabled editions at write time. The
 //! facade enables the newest frozen `core` edition, [`crate::editions::CORE_2026_07_0`], and
 //! additionally enables the latest unstable edition when the `unstable_encodings` feature is
-//! selected.
+//! selected or experimental patched arrays are switched on.
 
 pub mod core;
 #[cfg(test)]
 mod tests;
 pub mod unstable;
 
+use vortex_array::arrays::patched::use_experimental_patches;
 pub use vortex_edition::Edition;
 pub use vortex_edition::EditionDeclaration;
 pub use vortex_edition::EditionId;
@@ -72,15 +73,21 @@ pub fn register_default_editions(session: &VortexSession) {
 /// This selects the newest frozen `core` edition and, when configured, the newest unstable
 /// edition. All declarations must have been registered first with
 /// [`register_default_editions`].
+///
+/// The unstable edition is also enabled when experimental patched arrays are switched on: the
+/// compressor then emits `vortex.patched`, which only the `unstable` family declares, so a
+/// core-only session would gate it — and with it every scheme that produces patches — back out.
 pub fn enable_default_editions(session: &VortexSession) {
     session
         .enable_edition(DEFAULT_CORE_EDITION)
         .map_err(|e| vortex_err!("{e}"))
         .vortex_expect("default core edition is registered");
 
-    #[cfg(feature = "unstable_encodings")]
-    session
-        .enable_edition(DEFAULT_UNSTABLE_EDITION)
-        .map_err(|e| vortex_err!("{e}"))
-        .vortex_expect("default unstable edition is registered");
+    let unstable = cfg!(feature = "unstable_encodings") || use_experimental_patches();
+    if unstable {
+        session
+            .enable_edition(DEFAULT_UNSTABLE_EDITION)
+            .map_err(|e| vortex_err!("{e}"))
+            .vortex_expect("default unstable edition is registered");
+    }
 }

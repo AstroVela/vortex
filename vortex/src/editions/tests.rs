@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_edition::EditionError;
 use vortex_edition::EditionSession;
 use vortex_edition::EditionSessionExt;
@@ -125,10 +126,50 @@ fn default_session_enables_the_write_editions() {
     let enabled = session.enabled_editions().editions();
     assert!(enabled.contains(&DEFAULT_CORE_EDITION));
 
-    #[cfg(feature = "unstable_encodings")]
-    assert!(enabled.contains(&DEFAULT_UNSTABLE_EDITION));
-    #[cfg(not(feature = "unstable_encodings"))]
-    assert!(!enabled.contains(&DEFAULT_UNSTABLE_EDITION));
+    // Experimental patched arrays make the compressor emit `vortex.patched`, which only the
+    // `unstable` family declares, so they enable that edition too.
+    let unstable = cfg!(feature = "unstable_encodings") || use_experimental_patches();
+    assert_eq!(enabled.contains(&DEFAULT_UNSTABLE_EDITION), unstable);
+}
+
+/// The writer's static allow-list is gated by the enabled editions, so a default session must
+/// not be able to write an encoding that only an `unstable` edition declares.
+#[cfg(all(feature = "files", not(feature = "unstable_encodings")))]
+#[test]
+fn the_default_writer_cannot_emit_unstable_encodings() {
+    use vortex_file::writable_encodings;
+
+    use crate::VortexSessionDefault;
+
+    if use_experimental_patches() {
+        // The experimental flag opts the default session into the unstable edition as well.
+        return;
+    }
+
+    let session = VortexSession::default();
+    let writable = writable_encodings(&session);
+    assert!(!writable.is_empty());
+
+    let core: Vec<_> = session
+        .editions()
+        .encodings_in(&DEFAULT_CORE_EDITION)
+        .into_iter()
+        .map(|inclusion| inclusion.encoding_id)
+        .collect();
+
+    for id in &writable {
+        assert!(
+            core.contains(id),
+            "{id} is writable but the enabled core edition does not include it"
+        );
+    }
+    // `fastlanes.delta` is in the writer's static allow-list but only the `unstable` family
+    // declares it, so the gate must have removed it.
+    assert!(
+        writable
+            .iter()
+            .all(|id| id.as_str() != "fastlanes.delta" && id.as_str() != "vortex.patched")
+    );
 }
 
 #[test]

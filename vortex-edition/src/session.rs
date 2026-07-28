@@ -13,6 +13,7 @@ use vortex_session::SessionExt;
 use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_session::registry::Id;
+use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::Edition;
 use crate::EditionDeclaration;
@@ -150,6 +151,17 @@ impl EditionSession {
             .collect()
     }
 
+    /// Every encoding id declared by a registered edition, in encoding id order, regardless of
+    /// which editions are enabled.
+    ///
+    /// This is the set of encodings the edition system speaks for; anything outside it is
+    /// unknown to the registered declarations and therefore ungated by
+    /// [`EditionSessionExt::retain_writable_encodings`].
+    pub fn declared_encodings(&self) -> Vec<Id> {
+        // The map is keyed by encoding id, so the keys are already sorted by it.
+        self.inner.read().inclusions.keys().copied().collect()
+    }
+
     /// Validate all registered declarations. Errors on inclusions referencing undeclared
     /// editions, editions out of chronological order within a family (unversioned drafts
     /// must be newest), malformed version strings, and members requiring a release newer
@@ -279,6 +291,28 @@ pub trait EditionSessionExt: SessionExt {
             .iter()
             .flat_map(|edition| editions.encodings_in(edition))
             .map(|inclusion| inclusion.encoding_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Retain only the encodings this session may write, sorted by encoding id and deduplicated.
+    ///
+    /// An encoding survives when an enabled edition includes it, or when no registered edition
+    /// declares it at all. The second case matters because the edition system only speaks for
+    /// the encodings its declarations describe: a session that registers no editions — or one
+    /// that registers an encoding of its own without declaring an inclusion for it — is not
+    /// gated. An encoding that *is* declared, in an edition the session has not enabled, is
+    /// removed: writing it would put an encoding in the file that the enabled editions'
+    /// read-compatibility guarantee does not cover.
+    fn retain_writable_encodings(&self, encodings: impl IntoIterator<Item = Id>) -> Vec<Id> {
+        let declared: HashSet<Id> = self.editions().declared_encodings().into_iter().collect();
+        let enabled: HashSet<Id> = self.enabled_encoding_ids().into_iter().collect();
+
+        let mut ids: Vec<Id> = encodings
+            .into_iter()
+            .filter(|id| enabled.contains(id) || !declared.contains(id))
             .collect();
         ids.sort_unstable();
         ids.dedup();

@@ -9740,6 +9740,7 @@ version = "0.1.0"
 dependencies = [
  "parking_lot",
  "vortex-session",
+ "vortex-utils",
 ]
 
 [[package]]
@@ -9824,6 +9825,7 @@ dependencies = [
  "vortex-bytebool",
  "vortex-datetime-parts",
  "vortex-decimal-byte-parts",
+ "vortex-edition",
  "vortex-error",
  "vortex-fastlanes",
  "vortex-flatbuffers",

@@ -15,7 +15,6 @@ use futures::future::LocalBoxFuture;
 use futures::future::ready;
 use futures::pin_mut;
 use futures::select;
-use itertools::Itertools;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
@@ -30,6 +29,7 @@ use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::stream::SendableArrayStream;
 use vortex_buffer::ByteBuffer;
+use vortex_edition::EditionSessionExt;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -81,24 +81,21 @@ pub struct VortexWriteOptions {
 pub trait WriteOptionsSessionExt: SessionExt {
     /// Create [`VortexWriteOptions`] for writing to a Vortex file.
     fn write_options(&self) -> VortexWriteOptions {
-        let session = self.session();
-        VortexWriteOptions {
-            strategy: WriteStrategyBuilder::default().build(),
-            session,
-            exclude_dtype: false,
-            file_statistics: PRUNING_STATS.to_vec(),
-            max_variable_length_statistics_size: 64,
-            metadata: HashMap::default(),
-        }
+        VortexWriteOptions::new(self.session())
     }
 }
 impl<S: SessionExt> WriteOptionsSessionExt for S {}
 
 impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
+    ///
+    /// The default write strategy is gated by the session's enabled editions, so the compressor
+    /// only produces — and the writer only accepts — encodings those editions cover.
     pub fn new(session: VortexSession) -> Self {
         VortexWriteOptions {
-            strategy: WriteStrategyBuilder::default().build(),
+            strategy: WriteStrategyBuilder::default()
+                .with_session_editions(&session)
+                .build(),
             session,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
@@ -208,14 +205,26 @@ impl VortexWriteOptions {
         // serialised array order is deterministic. The serialisation of arrays are done
         // parallel and with an empty context they can register their encodings to the context
         // in different order, changing the written bytes from run to run.
-        let ctx = ArrayContext::new(ALLOWED_ENCODINGS.iter().cloned().sorted().collect())
-            // Only permit encodings known to the session.
-            .with_allowed_ids(
-                self.session
-                    .arrays()
-                    .registry()
-                    .read(|map| map.keys().copied().collect()),
-            );
+        //
+        // Both the pre-populated ids and the permitted ids are gated by the session's enabled
+        // editions, so no encoding outside the read-compatibility guarantee the session opted
+        // into can be interned — and therefore serialized — even under a custom write strategy.
+        let registered = self
+            .session
+            .arrays()
+            .registry()
+            .read(|map| map.keys().copied().collect::<Vec<_>>());
+        let ctx = ArrayContext::new(
+            self.session
+                .retain_writable_encodings(ALLOWED_ENCODINGS.iter().copied()),
+        )
+        // Only permit encodings known to the session.
+        .with_allowed_ids(
+            self.session
+                .retain_writable_encodings(registered)
+                .into_iter()
+                .collect(),
+        );
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();

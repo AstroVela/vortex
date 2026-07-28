@@ -87,6 +87,7 @@ use crate::VERSION;
 use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
 use crate::footer::SegmentSpec;
+use crate::strategy::tests::gate_session;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = array_session()
         .with::<LayoutSession>()
@@ -2535,5 +2536,81 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
         .execute::<StructArray>(&mut ctx)?;
 
     assert_eq!(result.len(), 1);
+    Ok(())
+}
+
+/// A session whose registered editions leave `fastlanes.for` and `fastlanes.bitpacked` gated out
+/// of the writer. See [`gate_session`].
+static GATED_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = array_session()
+        .with::<LayoutSession>()
+        .with::<RuntimeSession>();
+
+    crate::register_default_encodings(&session);
+    gate_session(&session).unwrap_or_else(|e| panic!("registering test editions: {e}"));
+
+    session
+});
+
+/// Small, tightly-clustered integers are exactly what FoR and BitPacking compress, so a writer
+/// that only gated the allow-list would reject the compressor's own output. The write must
+/// instead fall back to a scheme the enabled editions cover.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn gated_editions_filter_the_compressor_rather_than_failing_the_write() -> VortexResult<()> {
+    let numbers = PrimitiveArray::new(
+        Buffer::from_iter((0..8192u32).map(|i| 1_000_000 + (i % 16))),
+        Validity::NonNullable,
+    )
+    .into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    GATED_SESSION
+        .write_options()
+        .write(&mut buf, numbers.clone().to_array_stream())
+        .await?;
+
+    let round_tripped = GATED_SESSION
+        .open_options()
+        .open_buffer(buf)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    let mut ctx = GATED_SESSION.create_execution_ctx();
+    assert_arrays_eq!(numbers, round_tripped, &mut ctx);
+    Ok(())
+}
+
+/// The context gate is independent of the strategy: even a strategy whose allow-list still
+/// covers the FastLanes encodings cannot get them into the file, because the writer's
+/// [`ArrayContext`](vortex_array::ArrayContext) refuses to intern an encoding outside the
+/// session's enabled editions.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn the_writer_context_rejects_encodings_outside_the_enabled_editions() -> VortexResult<()> {
+    let numbers = PrimitiveArray::new(
+        Buffer::from_iter((0..8192u32).map(|i| 1_000_000 + (i % 16))),
+        Validity::NonNullable,
+    )
+    .into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    let result = GATED_SESSION
+        .write_options()
+        // An ungated strategy: its allow-list and compressor are the unrestricted defaults.
+        .with_strategy(crate::strategy::WriteStrategyBuilder::default().build())
+        .write(&mut buf, numbers.to_array_stream())
+        .await;
+
+    let error = match result {
+        Ok(_) => panic!("the writer context must reject the gated-out encoding"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("not permitted by ctx"),
+        "unexpected: {error}"
+    );
     Ok(())
 }
