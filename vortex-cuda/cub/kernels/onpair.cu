@@ -42,15 +42,22 @@ __global__ void onpair_batch_offsets_init(OnPairTileState tile_state, int num_ti
 }
 
 // The fused sweep, instantiated for the two code widths OnPair stores (u16
-// natively, u8 when the compressor narrowed the codes). A code outside the
-// dictionary raises `status` to 1 and contributes zero bytes: the host must
-// check the flag before trusting the offsets and before launching the decode
-// kernel, whose dictionary gathers are unchecked.
+// natively, u8 when the compressor narrowed the codes). Tokens outside the
+// visible window `[token_bounds[0], token_bounds[1])` — resolved on device
+// from `codes_offsets` by an earlier launch — contribute zero bytes and are
+// not range-checked, so the offsets come out window-relative and the trailing
+// total is the window's decoded byte count. The window end is clamped to the
+// stream defensively: the bounds are only validated (against the lengths
+// child's total) after this sweep. A window code outside the dictionary
+// raises `status` to 1 and contributes zero bytes: the host must check the
+// flag before trusting the offsets and before launching the decode kernel,
+// whose dictionary gathers are unchecked.
 template <typename CodeT>
 __global__
 __launch_bounds__(ONPAIR_BLOCK_THREADS) void onpair_batch_offsets_sweep(const CodeT *__restrict codes,
                                                                         const uint8_t *__restrict lens,
                                                                         uint32_t dict_size,
+                                                                        const uint64_t *__restrict token_bounds,
                                                                         uint64_t total_tokens,
                                                                         uint64_t *__restrict chunk_offsets,
                                                                         uint32_t *__restrict status,
@@ -60,6 +67,9 @@ __launch_bounds__(ONPAIR_BLOCK_THREADS) void onpair_batch_offsets_sweep(const Co
     const uint32_t warp = threadIdx.x >> 5;
     const int tile_idx = static_cast<int>(blockIdx.x);
     const int64_t batch = (int64_t)tile_idx * ONPAIR_WARPS_PER_BLOCK + (int64_t)warp;
+    const uint64_t token_start = token_bounds[0];
+    const uint64_t bound_end = token_bounds[1];
+    const uint64_t token_end = bound_end < total_tokens ? bound_end : total_tokens;
 
     // Warp-parallel reduction of this batch's decoded size. Code reads are
     // lane-consecutive (coalesced); the length LUT is small and
@@ -70,7 +80,7 @@ __launch_bounds__(ONPAIR_BLOCK_THREADS) void onpair_batch_offsets_sweep(const Co
 #pragma unroll
         for (uint8_t token = 0; token < 4; ++token) {
             const uint64_t i = base + (uint64_t)lane + (uint64_t)(token * 32);
-            if (i < total_tokens) {
+            if (i >= token_start && i < token_end) {
                 const uint32_t code = (uint32_t)codes[i];
                 if (code < dict_size) {
                     batch_bytes += (uint32_t)lens[code];
@@ -152,18 +162,21 @@ extern "C" cudaError_t onpair_batch_offsets_temp_size(size_t *temp_bytes, int64_
 
 // Regenerate the OnPair decode kernel's per-batch output offsets on `stream`
 // in one fused sweep, writing `chunk_offsets[0..num_batches]` where
-// `chunk_offsets[b]` is the decoded byte count preceding batch `b` and
-// `chunk_offsets[num_batches]` is the total. `code_width` selects the code
-// stream's element size in bytes (1 or 2), so narrowed codes never need a
-// widening pass. A code outside the dictionary raises `*status` to 1 and
-// contributes zero bytes; the caller must check the flag before trusting the
-// offsets.
+// `chunk_offsets[b]` is the window-relative decoded byte count preceding
+// batch `b` and `chunk_offsets[num_batches]` is the window total. The visible
+// token window is read on device from `token_bounds[0..2)`; tokens outside it
+// contribute zero bytes and are not range-checked. `code_width` selects the
+// code stream's element size in bytes (1 or 2), so narrowed codes never need
+// a widening pass. A window code outside the dictionary raises `*status` to 1
+// and contributes zero bytes; the caller must check the flag before trusting
+// the offsets.
 extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
                                             size_t temp_bytes,
                                             const void *codes,
                                             uint32_t code_width,
                                             const uint8_t *lens,
                                             uint32_t dict_size,
+                                            const uint64_t *token_bounds,
                                             uint64_t total_tokens,
                                             uint64_t *chunk_offsets,
                                             uint32_t *status,
@@ -194,6 +207,7 @@ extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
             <<<num_tiles, ONPAIR_BLOCK_THREADS, 0, stream>>>(static_cast<const uint8_t *>(codes),
                                                              lens,
                                                              dict_size,
+                                                             token_bounds,
                                                              total_tokens,
                                                              chunk_offsets,
                                                              status,
@@ -205,6 +219,7 @@ extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
             <<<num_tiles, ONPAIR_BLOCK_THREADS, 0, stream>>>(static_cast<const uint16_t *>(codes),
                                                              lens,
                                                              dict_size,
+                                                             token_bounds,
                                                              total_tokens,
                                                              chunk_offsets,
                                                              status,

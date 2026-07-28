@@ -7,19 +7,16 @@
 
 // Support kernels for OnPair GPU decompression. The per-batch output-offsets
 // regeneration lives in the CUB shim (`cub/kernels/onpair.cu`), where the
-// reduction and exclusive scan run as one fused sweep; this module holds the
-// window-bounds and view-construction kernels launched around the decode.
-
-// Tokens per decode batch. Must match `ONPAIR_TOKENS_PER_BATCH` in
-// `cub/kernels/onpair.cu` and `TOKENS_PER_BATCH` in the Rust launch code.
-constexpr uint32_t ONPAIR_TOKENS_PER_BATCH = 128;
+// reduction and exclusive scan run as one fused window-relative sweep; this
+// module holds the token-bounds, validation, and view-construction kernels
+// launched around the decode.
 
 // The token window of this array's rows, resolved entirely on device from the
 // (possibly slice-narrowed, possibly device-resident) `codes_offsets` child:
 // the offsets are nondecreasing, so the window's min and max are its first
 // and last elements. Writes `bounds[0] = codes_offsets[0]` and
 // `bounds[1] = codes_offsets[last]`; a signed negative offset sign-extends
-// huge and fails the host's post-readback range validation.
+// huge and fails the `onpair_validate` range check that gates the decode.
 #define GENERATE_TOKEN_BOUNDS_KERNEL(suffix, OffsetT)                                                        \
     extern "C" __global__ void onpair_token_bounds_##suffix(const OffsetT *__restrict codes_offsets,         \
                                                             uint64_t last,                                   \
@@ -39,68 +36,42 @@ GENERATE_TOKEN_BOUNDS_KERNEL(u16, uint16_t)
 GENERATE_TOKEN_BOUNDS_KERNEL(u32, uint32_t)
 GENERATE_TOKEN_BOUNDS_KERNEL(u64, uint64_t)
 
-// Byte positions of the visible code window's bounds in the full decoded
-// stream. A sliced array keeps its whole `codes` child, so the decode runs
-// over the full stream; each boundary's byte position is the whole-batch
-// prefix from `chunk_offsets` plus a warp reduction over the boundary batch's
-// head `[batch_start, boundary)`. Launched after the offsets sweep and the
-// token-bounds resolution with one 32-thread block per boundary; the token
-// boundaries are read from `bounds[0..2)` (clamped to `total_tokens` so a
-// corrupt offset cannot read out of bounds — the host rejects it after
-// readback) and the byte positions are written to `bounds[2 + blockIdx.x]`.
-// A code outside the dictionary contributes zero bytes (the sweep already
-// raised the status flag the host checks before trusting `bounds`). `CodeT`
-// is the code stream's element type (u16 natively, u8 when the compressor
-// narrowed the codes).
-template <typename CodeT>
-__device__ inline void onpair_window_offsets_body(const CodeT *__restrict codes,
-                                                  const uint8_t *__restrict lens,
-                                                  uint32_t dict_size,
-                                                  const uint64_t *__restrict chunk_offsets,
-                                                  uint64_t total_tokens,
-                                                  uint64_t *__restrict bounds) {
-    const uint64_t requested = bounds[blockIdx.x];
-    const uint64_t boundary = requested < total_tokens ? requested : total_tokens;
-    const uint64_t batch = boundary / ONPAIR_TOKENS_PER_BATCH;
-    const uint64_t batch_base = batch * ONPAIR_TOKENS_PER_BATCH;
-    const uint32_t lane = threadIdx.x & 31u;
-
-    uint32_t partial = 0;
-#pragma unroll
-    for (uint8_t token = 0; token < 4; ++token) {
-        const uint64_t i = batch_base + lane + (uint64_t)(token * 32u);
-        if (i < boundary) {
-            const uint32_t code = (uint32_t)codes[i];
-            if (code < dict_size) {
-                partial += (uint32_t)lens[code];
-            }
-        }
+// Device-side validation of the OnPair decode preconditions, fused into one
+// single-thread launch so the only value the host reads back before the
+// unchecked decode kernel is the status word itself:
+//
+// - the token window read from `codes_offsets` must be nondecreasing and end
+//   within the code stream (status 2);
+// - the window's decoded byte count — the window-relative offsets sweep's
+//   trailing total — must equal the `uncompressed_lengths` sum the host sized
+//   the output buffer with, and a non-empty window must decode to at least
+//   one byte since a conformant dictionary has no zero-length tokens
+//   (status 3).
+//
+// The sweep independently raises status 1 for a window code outside the
+// dictionary. Any nonzero status means the decode kernel must not run.
+extern "C" __global__ void onpair_validate(const uint64_t *__restrict token_bounds,
+                                           const uint64_t *__restrict chunk_offsets,
+                                           uint64_t num_batches,
+                                           uint64_t total_tokens,
+                                           uint64_t lengths_total,
+                                           uint32_t *__restrict status) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
     }
-#pragma unroll
-    for (uint8_t offset = 16; offset > 0; offset >>= 1) {
-        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    const uint64_t token_start = token_bounds[0];
+    const uint64_t token_end = token_bounds[1];
+    if (token_start > token_end || token_end > total_tokens) {
+        atomicMax(status, 2u);
+        return;
     }
-    if (lane == 0) {
-        bounds[2 + blockIdx.x] = chunk_offsets[batch] + (uint64_t)partial;
+    if (token_start != token_end && lengths_total == 0) {
+        atomicMax(status, 3u);
+        return;
     }
-}
-
-extern "C" __global__ void onpair_window_offsets_u8(const uint8_t *__restrict codes,
-                                                    const uint8_t *__restrict lens,
-                                                    uint32_t dict_size,
-                                                    const uint64_t *__restrict chunk_offsets,
-                                                    uint64_t total_tokens,
-                                                    uint64_t *__restrict bounds) {
-    onpair_window_offsets_body<uint8_t>(codes, lens, dict_size, chunk_offsets, total_tokens, bounds);
-}
-
-extern "C" __global__ void onpair_window_offsets_u16(const uint16_t *__restrict codes,
-                                                     const uint8_t *__restrict lens,
-                                                     uint32_t dict_size,
-                                                     const uint64_t *__restrict chunk_offsets,
-                                                     uint64_t total_tokens,
-                                                     uint64_t *__restrict bounds) {
-    onpair_window_offsets_body<uint16_t>(codes, lens, dict_size, chunk_offsets, total_tokens, bounds);
+    if (chunk_offsets[num_batches] != lengths_total) {
+        atomicMax(status, 3u);
+    }
 }
 
 // Arrow/Vortex variable-length view records are 16 bytes. Values up to 12 bytes

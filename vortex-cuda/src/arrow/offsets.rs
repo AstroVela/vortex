@@ -27,6 +27,15 @@ pub(crate) struct I32Offsets {
     pub(crate) total: usize,
 }
 
+/// The outcome of building Arrow `i32` offsets from a length array.
+pub(crate) enum I32OffsetsOutcome {
+    /// The offsets, with the total length sum fitting Arrow's i32 range.
+    Offsets(I32Offsets),
+    /// The length sum exceeds Arrow's i32 offset range. Callers with a wider
+    /// output representation can fall back to it instead of failing.
+    Overflow,
+}
+
 /// Build Arrow-compatible offsets from a canonical integer length array.
 ///
 /// Length conversion, prefix sum, and overflow validation stay on the active CUDA stream. Only the
@@ -36,6 +45,21 @@ pub(crate) async fn i32_offsets_from_lengths(
     lengths: PrimitiveArray,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<I32Offsets> {
+    match try_i32_offsets_from_lengths(lengths, ctx).await? {
+        I32OffsetsOutcome::Offsets(offsets) => Ok(offsets),
+        I32OffsetsOutcome::Overflow => {
+            vortex_bail!("length sum exceeds Arrow i32 offset range")
+        }
+    }
+}
+
+/// Like [`i32_offsets_from_lengths`], but reports a length sum beyond Arrow's
+/// i32 offset range as [`I32OffsetsOutcome::Overflow`] instead of an error. A
+/// negative length is always an error.
+pub(crate) async fn try_i32_offsets_from_lengths(
+    lengths: PrimitiveArray,
+    ctx: &mut CudaExecutionCtx,
+) -> VortexResult<I32OffsetsOutcome> {
     let len = lengths.len();
     let ptype = lengths.ptype();
     let PrimitiveDataParts { buffer, .. } = lengths.into_data_parts();
@@ -50,7 +74,7 @@ async fn i32_offsets_from_lengths_typed<L>(
     lengths: &BufferHandle,
     len: usize,
     ctx: &mut CudaExecutionCtx,
-) -> VortexResult<I32Offsets>
+) -> VortexResult<I32OffsetsOutcome>
 where
     L: NativePType + DeviceRepr + Send + Sync + 'static,
 {
@@ -90,12 +114,12 @@ where
     match Buffer::<u32>::from_byte_buffer(status_bytes)[0] {
         0 => {}
         1 => vortex_bail!("cannot build Arrow offsets from a negative length"),
-        2 => vortex_bail!("length sum exceeds Arrow i32 offset range"),
+        2 => return Ok(I32OffsetsOutcome::Overflow),
         status => vortex_bail!("unexpected Arrow offset status {status}"),
     }
 
-    Ok(I32Offsets {
+    Ok(I32OffsetsOutcome::Offsets(I32Offsets {
         buffer: offsets,
         total: usize::try_from(Buffer::<i32>::from_byte_buffer(total_bytes)[0])?,
-    })
+    }))
 }
