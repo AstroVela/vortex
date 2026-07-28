@@ -35,6 +35,7 @@ use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::optimizer::ArrayOptimizer;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
+use vortex::error::vortex_err;
 use vortex::expr::Expression;
 use vortex::expr::stats::Precision;
 use vortex::file::v2::FileStatsLayoutReader;
