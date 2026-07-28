@@ -266,12 +266,12 @@ thiserror = "2.0.3"
 tokio = { version = "1.52" }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.17"
-vortex-array-macros = { version = "0.1.0", path = "./vortex-array-macros" }
 tracing = { version = "0.1.41", default-features = false }
 tracing-perfetto = "0.1.5"
 tracing-subscriber = "0.3"
 url = "2.5.7"
 uuid = { version = "1.23", features = ["js"] }
+vortex-array-macros = { version = "0.1.0", path = "./vortex-array-macros" }
 wasm-bindgen-futures = "0.4.54"
 wkb = "0.9.2"
 xshell = "0.2.6"
