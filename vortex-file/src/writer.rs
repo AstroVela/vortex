@@ -89,13 +89,12 @@ impl<S: SessionExt> WriteOptionsSessionExt for S {}
 impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
     ///
-    /// The default write strategy is gated by the session's enabled editions, so the compressor
-    /// only produces — and the writer only accepts — encodings those editions cover.
+    /// The default write strategy resolves the session's enabled editions at write time, so the
+    /// file only contains encodings those editions cover, however the session is configured
+    /// between building these options and writing.
     pub fn new(session: VortexSession) -> Self {
         VortexWriteOptions {
-            strategy: WriteStrategyBuilder::default()
-                .with_session_editions(&session)
-                .build(),
+            strategy: WriteStrategyBuilder::default().build(),
             session,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),

@@ -2583,13 +2583,12 @@ async fn gated_editions_filter_the_compressor_rather_than_failing_the_write() ->
     Ok(())
 }
 
-/// The context gate is independent of the strategy: even a strategy whose allow-list still
-/// covers the FastLanes encodings cannot get them into the file, because the writer's
-/// [`ArrayContext`](vortex_array::ArrayContext) refuses to intern an encoding outside the
-/// session's enabled editions.
+/// A strategy built with no knowledge of any session is still gated, because the gate resolves
+/// the session inside `write_stream` rather than when the strategy is built. This is what makes
+/// `with_strategy` callers safe without them having to opt in.
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn the_writer_context_rejects_encodings_outside_the_enabled_editions() -> VortexResult<()> {
+async fn a_session_agnostic_strategy_is_still_gated() -> VortexResult<()> {
     let numbers = PrimitiveArray::new(
         Buffer::from_iter((0..8192u32).map(|i| 1_000_000 + (i % 16))),
         Validity::NonNullable,
@@ -2597,20 +2596,22 @@ async fn the_writer_context_rejects_encodings_outside_the_enabled_editions() -> 
     .into_array();
 
     let mut buf = ByteBufferMut::empty();
-    let result = GATED_SESSION
+    GATED_SESSION
         .write_options()
-        // An ungated strategy: its allow-list and compressor are the unrestricted defaults.
+        // Built without a session anywhere in sight.
         .with_strategy(crate::strategy::WriteStrategyBuilder::default().build())
-        .write(&mut buf, numbers.to_array_stream())
-        .await;
+        .write(&mut buf, numbers.clone().to_array_stream())
+        .await?;
 
-    let error = match result {
-        Ok(_) => panic!("the writer context must reject the gated-out encoding"),
-        Err(error) => error.to_string(),
-    };
-    assert!(
-        error.contains("not permitted by ctx"),
-        "unexpected: {error}"
-    );
+    let round_tripped = GATED_SESSION
+        .open_options()
+        .open_buffer(buf.freeze())?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    let mut ctx = GATED_SESSION.create_execution_ctx();
+    assert_arrays_eq!(numbers, round_tripped, &mut ctx);
     Ok(())
 }

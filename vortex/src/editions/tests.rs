@@ -457,17 +457,11 @@ async fn a_narrowed_edition_still_writes_a_readable_file() -> Result<(), Box<dyn
 
 /// Narrowing the session *after* the write options are built must still produce a valid file.
 ///
-/// This currently fails. [`VortexWriteOptions::new`] snapshots the writable set into the strategy
-/// when the options are built, but the writer's array context recomputes it at write time, so a
-/// session narrowed in between leaves the compressor filtered against the old, wider set and the
-/// context enforcing the new, narrower one. The write then dies with
+/// The writable set is resolved inside `write_stream`, so there is no window in which the
+/// strategy and the writer's array context can disagree about it. Resolving it when the write
+/// options were built used to fail here with
 /// `Array encoding vortex.sequence not permitted by ctx`.
-///
-/// The fix is to stop deriving the writable set at strategy-construction time:
-/// [`LayoutStrategy::write_stream`] already receives the session, so the gate belongs there,
-/// at the point it is enforced.
 #[cfg(feature = "files")]
-#[ignore = "known bug: the strategy snapshots the writable set at construction time"]
 #[tokio::test]
 async fn narrowing_the_session_after_building_write_options()
 -> Result<(), Box<dyn std::error::Error>> {

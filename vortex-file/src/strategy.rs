@@ -7,10 +7,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+use async_trait::async_trait;
+use futures::StreamExt;
 use vortex_alp::ALP;
 use vortex_alp::ALPRD;
+use vortex_array::ArrayContext;
 use vortex_array::ArrayId;
 use vortex_array::VTable;
+use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Bool;
 use vortex_array::arrays::Chunked;
 use vortex_array::arrays::Constant;
@@ -30,6 +34,8 @@ use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::dtype::FieldPath;
+use vortex_array::normalize::NormalizeOptions;
+use vortex_array::normalize::Operation;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::integer::IntDictScheme;
@@ -38,11 +44,13 @@ use vortex_datetime_parts::DateTimeParts;
 use vortex_decimal_byte_parts::DecimalByteParts;
 use vortex_edition::EditionSessionExt;
 use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::Delta;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::RLE;
 use vortex_fsst::FSST;
+use vortex_layout::LayoutRef;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::LayoutStrategyEncodingValidator;
 use vortex_layout::layouts::buffered::BufferedStrategy;
@@ -59,6 +67,11 @@ use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::layouts::table::use_experimental_list_layout;
 use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
 use vortex_layout::layouts::zoned::writer::ZonedStrategy;
+use vortex_layout::segments::SegmentSinkRef;
+use vortex_layout::sequence::SendableSequentialStream;
+use vortex_layout::sequence::SequencePointer;
+use vortex_layout::sequence::SequentialStreamAdapter;
+use vortex_layout::sequence::SequentialStreamExt;
 #[cfg(feature = "unstable_encodings")]
 use vortex_onpair::OnPair;
 use vortex_pco::Pco;
@@ -148,6 +161,87 @@ pub fn writable_encodings(session: &VortexSession) -> HashSet<ArrayId> {
         .retain_writable_encodings(ALLOWED_ENCODINGS.iter().copied())
         .into_iter()
         .collect()
+}
+
+/// Normalizes every chunk down to the encodings the *writing session* may emit, resolved from
+/// the session at write time.
+///
+/// The set is deliberately not resolved when the strategy is built: enabling an edition mutates
+/// the session, so a set captured at construction time can disagree with the one the writer's
+/// [`ArrayContext`](vortex_array::ArrayContext) enforces, and the write then fails on an encoding
+/// the compressor was still allowed to produce. [`LayoutStrategy::write_stream`] receives the
+/// session, which is the point the gate is actually enforced, so it is resolved there.
+///
+/// Gated encodings are executed back to an allowed representation rather than rejected. The
+/// compressor is free to pick any scheme, so a scheme whose output an edition does not cover
+/// costs compression ratio on a narrowed session instead of failing the file.
+struct EditionGatedStrategy {
+    child: Arc<dyn LayoutStrategy>,
+    /// The static allow-list, intersected with the session's writable set at write time.
+    allow_encodings: HashSet<ArrayId>,
+}
+
+impl EditionGatedStrategy {
+    fn new<S: LayoutStrategy>(child: S, allow_encodings: HashSet<ArrayId>) -> Self {
+        Self {
+            child: Arc::new(child),
+            allow_encodings,
+        }
+    }
+}
+
+#[async_trait]
+impl LayoutStrategy for EditionGatedStrategy {
+    async fn write_stream(
+        &self,
+        ctx: ArrayContext,
+        segment_sink: SegmentSinkRef,
+        stream: SendableSequentialStream,
+        eof: SequencePointer,
+        session: &VortexSession,
+    ) -> VortexResult<LayoutRef> {
+        let writable: HashSet<ArrayId> = session
+            .retain_writable_encodings(self.allow_encodings.iter().copied())
+            .into_iter()
+            .collect();
+
+        // Nothing to gate: skip the per-chunk traversal entirely. This is the case for every
+        // session whose enabled editions cover the writer's allow-list, which is all of them
+        // by default.
+        if writable.len() == self.allow_encodings.len() {
+            return self
+                .child
+                .write_stream(ctx, segment_sink, stream, eof, session)
+                .await;
+        }
+
+        let dtype = stream.dtype().clone();
+        let writable = Arc::new(writable);
+        let exec_session = session.clone();
+        let stream = stream.map(move |chunk| {
+            let (sequence_id, chunk) = chunk?;
+            let mut exec_ctx = exec_session.create_execution_ctx();
+            let chunk = chunk.normalize(&mut NormalizeOptions {
+                allowed: &writable,
+                operation: Operation::Execute(&mut exec_ctx),
+            })?;
+            Ok((sequence_id, chunk))
+        });
+
+        self.child
+            .write_stream(
+                ctx,
+                segment_sink,
+                SequentialStreamAdapter::new(dtype, stream).sendable(),
+                eof,
+                session,
+            )
+            .await
+    }
+
+    fn buffered_bytes(&self) -> u64 {
+        self.child.buffered_bytes()
+    }
 }
 
 /// How the compressor was configured on [`WriteStrategyBuilder`].
@@ -248,31 +342,9 @@ impl WriteStrategyBuilder {
     /// Override the allowed array encodings for normalization.
     ///
     /// The configured flat leaf strategy is wrapped in a [`LayoutStrategyEncodingValidator`]
-    /// that recursively checks every chunk before passing it to the leaf writer, and the
-    /// compressor's schemes are filtered down to those whose output the allow-list covers.
+    /// that recursively checks every chunk before passing it to the leaf writer.
     pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
         self.allow_encodings = Some(allow_encodings);
-        self
-    }
-
-    /// Gate the allowed array encodings by the editions `session` has enabled for writing.
-    ///
-    /// This removes every allowed encoding that a registered edition declares but the session has
-    /// not enabled, so the file cannot contain an encoding outside the read-compatibility
-    /// guarantee the session opted into. Encodings no registered edition declares are left alone;
-    /// see [`writable_encodings`].
-    ///
-    /// The gate applies to compression as well as validation: [`build`](Self::build) drops every
-    /// compression scheme that could produce a gated-out encoding.
-    pub fn with_session_editions(mut self, session: &VortexSession) -> Self {
-        if let Some(allow_encodings) = self.allow_encodings.take() {
-            self.allow_encodings = Some(
-                session
-                    .retain_writable_encodings(allow_encodings)
-                    .into_iter()
-                    .collect(),
-            );
-        }
         self
     }
 
@@ -318,28 +390,14 @@ impl WriteStrategyBuilder {
             Arc::new(FlatLayoutStrategy::default())
         };
         let flat: Arc<dyn LayoutStrategy> = if let Some(allow_encodings) = &self.allow_encodings {
-            Arc::new(LayoutStrategyEncodingValidator::new(
-                flat,
+            // The session gate runs first, normalizing away any encoding the writing session's
+            // editions do not cover; the validator then asserts the static allow-list holds.
+            Arc::new(EditionGatedStrategy::new(
+                LayoutStrategyEncodingValidator::new(flat, allow_encodings.clone()),
                 allow_encodings.clone(),
             ))
         } else {
             flat
-        };
-
-        // Filter the compressor to the schemes whose output the allow-list covers. Without this,
-        // a scheme excluded from the allow-list — for instance one only an unstable edition
-        // declares — would compress a chunk into an encoding the validator then rejects, failing
-        // the write instead of choosing the next best scheme. This runs on the finished builder,
-        // so schemes added after construction, including the compact ones from
-        // [`BtrBlocksCompressorBuilder::with_compact`], are filtered too.
-        let compressor = match self.compressor {
-            CompressorConfig::BtrBlocks(builder) => {
-                CompressorConfig::BtrBlocks(match &self.allow_encodings {
-                    Some(allowed) => builder.retain_allowed_encodings(allowed),
-                    None => builder,
-                })
-            }
-            opaque @ CompressorConfig::Opaque(_) => opaque,
         };
 
         // 7. for each chunk create a flat layout
@@ -351,7 +409,7 @@ impl WriteStrategyBuilder {
         // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
         // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
         // dictionary-encode the integer codes produced by that earlier step.
-        let data_compressor: Arc<dyn CompressorPlugin> = match &compressor {
+        let data_compressor: Arc<dyn CompressorPlugin> = match &self.compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(
                 builder
                     .clone()
@@ -380,7 +438,7 @@ impl WriteStrategyBuilder {
         );
 
         // 2.1. | 3.1. compress stats tables and dict values.
-        let stats_compressor: Arc<dyn CompressorPlugin> = match compressor {
+        let stats_compressor: Arc<dyn CompressorPlugin> = match self.compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
             CompressorConfig::Opaque(compressor) => compressor,
         };
@@ -521,40 +579,26 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The builder no longer resolves the session; the gate happens at write time. What the
+    /// builder still owns is the static allow-list, which must stay untouched by any session.
     #[test]
-    fn session_editions_gate_the_allow_list() -> Result<(), EditionError> {
-        let builder = WriteStrategyBuilder::default().with_session_editions(&gated_session()?);
-        let allowed = builder
-            .allow_encodings
-            .as_ref()
-            .vortex_expect("default builder sets an allow-list");
-
-        assert!(allowed.contains(&Primitive.id()));
-        assert!(!allowed.contains(&BitPacked.id()));
-        assert!(!allowed.contains(&FoR.id()));
-        Ok(())
-    }
-
-    #[test]
-    fn an_ungated_session_keeps_every_allowed_encoding() {
-        // `array_session` registers no editions, so there is nothing to gate against.
-        let session = array_session();
-        assert_eq!(writable_encodings(&session), *ALLOWED_ENCODINGS);
-
-        let builder = WriteStrategyBuilder::default().with_session_editions(&session);
+    fn the_builder_allow_list_is_independent_of_any_session() {
+        let builder = WriteStrategyBuilder::default();
         assert_eq!(builder.allow_encodings, Some(ALLOWED_ENCODINGS.clone()));
     }
 
+    /// A custom allow-list is narrowed by the session, not replaced by it: the gate can only
+    /// ever remove encodings the caller already permitted.
     #[test]
-    fn a_custom_allow_list_is_narrowed_not_replaced() -> Result<(), EditionError> {
-        let builder = WriteStrategyBuilder::default()
-            .with_allow_encodings(HashSet::from_iter([Primitive.id(), FoR.id()]))
-            .with_session_editions(&gated_session()?);
+    fn a_custom_allow_list_is_narrowed_by_the_session() -> Result<(), EditionError> {
+        let session = gated_session()?;
+        let custom: HashSet<ArrayId> = HashSet::from_iter([Primitive.id(), FoR.id()]);
+        let writable: HashSet<ArrayId> = session
+            .retain_writable_encodings(custom.iter().copied())
+            .into_iter()
+            .collect();
 
-        assert_eq!(
-            builder.allow_encodings,
-            Some(HashSet::from_iter([Primitive.id()]))
-        );
+        assert_eq!(writable, HashSet::from_iter([Primitive.id()]));
         Ok(())
     }
 }
