@@ -21,6 +21,7 @@ use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::ArrowError;
 use arrow_schema::Field;
+use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use jni::EnvUnowned;
 use jni::objects::JByteArray;
@@ -43,6 +44,7 @@ use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
+use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 
 use crate::POOL;
@@ -318,6 +320,50 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_rowCount(
     });
 }
 
+/// Consume `partition` into Arrow record batches and their schema.
+///
+/// The whole native side of `NativePartition.scanArrow`; the entry point below only wraps the
+/// iterator in an `FFI_ArrowArrayStream`. Also called directly by the `read_boundary` benchmark.
+pub fn partition_record_batches(
+    session: &VortexSession,
+    partition: PartitionRef,
+) -> VortexResult<(
+    SchemaRef,
+    impl Iterator<Item = Result<RecordBatch, ArrowError>> + use<>,
+)> {
+    let array_stream = partition.execute()?;
+    let dtype = array_stream.dtype().clone();
+
+    let schema = Arc::new(session.arrow().to_arrow_schema(&dtype)?);
+    let target = Arc::new(Field::new_struct("", schema.fields().clone(), false));
+    let session = session.clone();
+
+    let iter = RUNTIME
+        .block_on_stream_thread_safe(|handle| {
+            array_stream
+                .map(move |chunk| {
+                    let session = session.clone();
+                    let target = Arc::clone(&target);
+                    handle.spawn(async move {
+                        let chunk = chunk?;
+                        let mut ctx = session.create_execution_ctx();
+                        let arrow = session.arrow().execute_arrow(
+                            chunk,
+                            Some(target.as_ref()),
+                            &mut ctx,
+                        )?;
+                        Ok(RecordBatch::from(arrow.as_struct().clone()))
+                    })
+                })
+                .buffered(POOL.worker_count().max(1))
+        })
+        .map(|result: VortexResult<RecordBatch>| {
+            result.map_err(|e| ArrowError::ExternalError(Box::new(e)))
+        });
+
+    Ok((schema, iter))
+}
+
 /// Consume a partition into the `FFI_ArrowArrayStream` pointed to by `stream_addr`. The
 /// partition pointer is invalidated by this call; Java must not `free` it afterwards.
 ///
@@ -345,36 +391,8 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_scanArrow(
             _ => throw_runtime!("partition already consumed"),
         };
 
-        let array_stream = partition.execute()?;
-        let dtype = array_stream.dtype().clone();
-
         let session = unsafe { session_ref(session_ptr) };
-        let schema = Arc::new(session.arrow().to_arrow_schema(&dtype)?);
-        let target = Arc::new(Field::new_struct("", schema.fields().clone(), false));
-
-        let iter = RUNTIME
-            .block_on_stream_thread_safe(|handle| {
-                array_stream
-                    .map(move |chunk| {
-                        let session = session.clone();
-                        let target = Arc::clone(&target);
-                        handle.spawn(async move {
-                            let chunk = chunk?;
-                            let mut ctx = session.create_execution_ctx();
-                            let arrow = session.arrow().execute_arrow(
-                                chunk,
-                                Some(target.as_ref()),
-                                &mut ctx,
-                            )?;
-                            Ok(RecordBatch::from(arrow.as_struct().clone()))
-                        })
-                    })
-                    .buffered(POOL.worker_count().max(1))
-            })
-            .map(|result: VortexResult<RecordBatch>| {
-                result.map_err(|e| ArrowError::ExternalError(Box::new(e)))
-            });
-
+        let (schema, iter) = partition_record_batches(session, partition)?;
         let reader = RecordBatchIteratorAdapter::new(iter, schema);
         let arrow_stream = FFI_ArrowArrayStream::new(Box::new(reader));
         unsafe {

@@ -30,6 +30,7 @@ use vortex::io::filesystem::FileSystemRef;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
+use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex_arrow::ArrowSessionExt;
 
@@ -84,39 +85,50 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_open(
                 glob_strings.push(uri.to_owned());
             }
         }
-        if glob_strings.is_empty() {
-            return Err(vortex_err!("no paths provided").into());
-        }
-
-        let glob_urls: Vec<Url> = glob_strings
-            .iter()
-            .map(|g| parse_uri_or_path(g.as_str()))
-            .collect::<VortexResult<_>>()?;
-
-        let mut fs_cache: HashMap<Url, FileSystemRef> = HashMap::new();
-        for glob_url in &glob_urls {
-            let base = base_url(glob_url);
-            if !fs_cache.contains_key(&base) {
-                let fs = object_store_fs(glob_url, &properties, session.handle())?;
-                fs_cache.insert(base, fs);
-            }
-        }
-
-        let mut builder = MultiFileDataSource::new(session.clone());
-        for glob_url in &glob_urls {
-            let base = base_url(glob_url);
-            let fs = fs_cache
-                .get(&base)
-                .cloned()
-                .unwrap_or_else(|| unreachable!("fs cached for every base url"));
-            builder = builder.with_glob(glob_url.path(), Some(fs));
-        }
-
-        let inner = RUNTIME
-            .block_on(builder.build())
-            .map(|ds| Arc::new(ds) as DataSourceRef)?;
+        let inner = open_data_source(session, &glob_strings, &properties)?;
         Ok(Box::new(NativeDataSource { inner }).into_raw())
     })
+}
+
+/// Open a data source over `globs`, resolving one object-store filesystem per base URL.
+///
+/// Shared with the `read_boundary` benchmark so it opens its data source exactly as Java does.
+pub fn open_data_source(
+    session: &VortexSession,
+    globs: &[String],
+    properties: &HashMap<String, String>,
+) -> VortexResult<DataSourceRef> {
+    if globs.is_empty() {
+        return Err(vortex_err!("no paths provided"));
+    }
+
+    let glob_urls: Vec<Url> = globs
+        .iter()
+        .map(|g| parse_uri_or_path(g.as_str()))
+        .collect::<VortexResult<_>>()?;
+
+    let mut fs_cache: HashMap<Url, FileSystemRef> = HashMap::new();
+    for glob_url in &glob_urls {
+        let base = base_url(glob_url);
+        if !fs_cache.contains_key(&base) {
+            let fs = object_store_fs(glob_url, properties, session.handle())?;
+            fs_cache.insert(base, fs);
+        }
+    }
+
+    let mut builder = MultiFileDataSource::new(session.clone());
+    for glob_url in &glob_urls {
+        let base = base_url(glob_url);
+        let fs = fs_cache
+            .get(&base)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("fs cached for every base url"));
+        builder = builder.with_glob(glob_url.path(), Some(fs));
+    }
+
+    RUNTIME
+        .block_on(builder.build())
+        .map(|ds| Arc::new(ds) as DataSourceRef)
 }
 
 /// Open a data source over caller-provided `dev.vortex.io.NativeReadable` objects.

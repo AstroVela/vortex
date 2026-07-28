@@ -25,13 +25,14 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
- * Shared synthetic table used by both {@link VortexJniReadBenchmark} and {@link VortexJniBatchDiagnostic} so they
- * measure and inspect the exact same data shape: six columns (2× int64, 2× float64, 2× Utf8View) over {@link #ROWS}
- * rows, with a deterministic fixed seed.
+ * The synthetic table shape shared across the JNI benchmarks: six columns (2× int64, 2× float64, 2× Utf8View) over
+ * {@link #ROWS} rows. {@code id} is sequential, {@code cat} is a periodic low-cardinality column kept non-null so a
+ * {@code cat='alpha'} filter has selectivity exactly {@code 1/|CATS|}, and {@code tag} is high-cardinality with a 10%
+ * null rate to exercise a validity buffer.
  *
- * <p>{@code id} is sequential, {@code cat} is a periodic low-cardinality column kept non-null so a {@code cat='alpha'}
- * filter has selectivity exactly {@code 1/|CATS|}, and {@code tag} is high-cardinality with a 10% null rate to exercise
- * a validity buffer.
+ * <p>{@link #ROWS} and {@link #CATS} must stay in lockstep with the Rust generator in
+ * {@code vortex-jni/benches/jni_bench_data/mod.rs}, whose output {@link VortexJniReadBenchmark} reads.
+ * {@link #writeTable} is used only by {@link VortexJniBatchDiagnostic}, which needs to write at several chunk sizes.
  */
 final class BenchData {
 

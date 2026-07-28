@@ -3,44 +3,35 @@
 
 //! Native "floor" for the `VortexJniReadBenchmark` JMH lanes.
 //!
-//! This reads the SAME canonical `.vortex` file the JMH benchmark reads (see [`canonical`]) and runs
-//! the same lanes — full scan, native projection, and native filter — but entirely in Rust:
-//! `scan -> Arrow RecordBatch`, with no JNI crossing and no Arrow C Data export. Comparing these
-//! numbers against the JMH `ops/s` isolates the cost of the JNI + Arrow C Data boundary from the
-//! underlying format read.
+//! Reads the same canonical file (see [`jni_bench_data`]) on the same [`RUNTIME`]/[`POOL`] statics,
+//! in two variants:
 //!
-//! Like the JMH side, every lane scans the full table and reports the produced row count, so
-//! `ItemsCount::new(ROWS)` makes Divan print **input rows scanned per second** — directly comparable
-//! to JMH's `@OperationsPerInvocation(ROWS)` `ops/s`. Each chunk is materialized to Arrow (forcing
-//! the decode) and the batch row count is taken; no per-value work is done, so the numbers reflect
-//! scan + materialization, not consume-side arithmetic.
+//! - `partitions` calls [`partition_record_batches`], the function the `NativePartition.scanArrow`
+//!   entry point calls, so the gap to the JMH `ops/s` is the JNI crossing and the Arrow C Data
+//!   export and nothing else.
+//! - `scan_builder` reads the same file through `ScanBuilder` with the Arrow conversion mapped
+//!   inside the split tasks, which is how native Rust callers scan. The gap between the two
+//!   variants is what the JNI's partition-at-a-time consumption costs.
 //!
-//! Each lane runs in two modes: single-threaded (no pool workers — the consuming thread drives the
-//! scan, mirroring the JNI default) and `*_pooled` (a background `CurrentThreadWorkerPool` sized to
-//! `available_parallelism() - 1`). The Vortex -> Arrow conversion runs inside the scan's `map`, which
-//! executes on the handle-spawned split tasks, so the pool parallelizes both the decode and the Arrow
-//! conversion. Utf8View columns are downgraded to flat Arrow `Utf8` via a stripped target field,
-//! exactly as the JNI path does, so both benches materialize the same types.
+//! `ItemsCount::new(ROWS)` matches `@OperationsPerInvocation(ROWS)`, and the `*`/`*_pooled` pairs
+//! match the JMH `workerThreads` `0`/`-1` params.
 
 #![expect(clippy::unwrap_used)]
 
-mod canonical;
+mod jni_bench_data;
 
 use std::sync::Arc;
-use std::sync::LazyLock;
 
-use arrow_array::Array;
-use arrow_schema::DataType;
+use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
 use arrow_schema::Field;
 use divan::Bencher;
 use divan::counter::ItemsCount;
-use vortex::VortexSessionDefault;
+use futures::StreamExt;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowSessionExt;
-use vortex::dtype::DType;
+use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::FieldName;
 use vortex::error::VortexResult;
-use vortex::error::vortex_err;
 use vortex::expr::Expression;
 use vortex::expr::get_item;
 use vortex::expr::lit;
@@ -49,23 +40,21 @@ use vortex::expr::select;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
 use vortex::io::runtime::BlockingRuntime;
-use vortex::io::runtime::current::CurrentThreadRuntime;
-use vortex::io::runtime::current::CurrentThreadWorkerPool;
-use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::operators::Operator;
+use vortex::scan::DataSourceRef;
+use vortex::scan::ScanRequest;
+use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
-use vortex::utils::parallelism::get_available_parallelism;
+use vortex::utils::aliases::hash_map::HashMap;
+use vortex_jni::POOL;
+use vortex_jni::RUNTIME;
+use vortex_jni::new_session;
+use vortex_jni::open_data_source;
+use vortex_jni::partition_record_batches;
 
-use crate::canonical::ROWS;
-
-/// Shared current-thread runtime and its background worker pool, mirroring the JNI's static
-/// `RUNTIME`/`POOL`. One long-lived pool is used (it has no `Drop`, so a per-sample pool would leak
-/// worker threads); `set_workers` adjusts the count per lane — `0` for the single-threaded lanes,
-/// `available_parallelism() - 1` for the pooled ones.
-static RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRuntime::new);
-static POOL: LazyLock<CurrentThreadWorkerPool> = LazyLock::new(|| RUNTIME.new_pool());
+use crate::jni_bench_data::ROWS;
 
 fn main() {
     divan::main();
@@ -82,53 +71,71 @@ enum Lane {
     SelectiveFilter,
 }
 
-/// Read state opened once per Divan sample (outside the timed region) and reused across iterations.
+/// Opened once per Divan sample, outside the timed region. Both variants read the same file: the
+/// data source is what Java holds, the [`VortexFile`] is what `ScanBuilder` needs.
 struct Env {
     session: VortexSession,
+    data_source: DataSourceRef,
     file: VortexFile,
 }
 
 impl Env {
     fn open() -> VortexResult<Self> {
-        let path = canonical::default_path();
-        canonical::ensure_canonical(&path)?;
+        let path = jni_bench_data::default_path();
+        jni_bench_data::ensure_canonical(&path)?;
 
-        let session = VortexSession::default().with_handle(RUNTIME.handle());
-        let file = RUNTIME.block_on(
-            session
-                .open_options()
-                .with_layout_reader_cache()
-                .open_path(&path),
-        )?;
-        Ok(Self { session, file })
+        let session = *new_session();
+        let uri = url::Url::from_file_path(&path)
+            .unwrap_or_else(|()| unreachable!("canonical path is absolute"))
+            .to_string();
+        let data_source = open_data_source(&session, &[uri], &HashMap::new())?;
+        let file = RUNTIME.block_on(session.open_options().open_path(&path))?;
+        Ok(Self {
+            session,
+            data_source,
+            file,
+        })
     }
 
-    /// Scan the table for `lane`, materialize each chunk to Arrow, and return the total row count so
-    /// the read is observable without per-value work.
-    ///
-    /// The Vortex -> Arrow conversion runs inside the scan's `map`, which executes within each split
-    /// task spawned on the session's runtime handle — so with pool workers configured the decode AND
-    /// the Arrow conversion run in parallel in the background, rather than inline on this thread.
-    fn run(&self, lane: Lane) -> VortexResult<u64> {
-        let mut builder = self.file.scan()?;
+    /// The native half of the Java `countRows`: one partition at a time, each consumed to
+    /// completion through the JNI's own conversion path.
+    fn run_partitions(&self, lane: Lane) -> VortexResult<u64> {
+        let scan = RUNTIME.block_on(self.data_source.scan(scan_request(lane)))?;
+        let mut partitions = scan.partitions();
+
+        let mut rows = 0u64;
+        while let Some(partition) = RUNTIME.block_on(partitions.next()) {
+            let (_schema, batches) = partition_record_batches(&self.session, partition?)?;
+            for batch in batches {
+                rows += batch?.num_rows() as u64;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The same read as a native caller writes it: the Arrow conversion is the scan's `map`, so it
+    /// runs inside the split tasks rather than behind a second buffered stage.
+    fn run_scan_builder(&self, lane: Lane) -> VortexResult<u64> {
+        let mut builder = self.file.scan()?.with_ordered(false);
         match lane {
-            Lane::Projection => builder = builder.with_projection(project_id_y()),
-            Lane::SelectiveFilter => builder = builder.with_filter(filter_cat_alpha()),
+            Lane::Projection => builder = builder.with_projection(projection_expr()),
+            Lane::SelectiveFilter => builder = builder.with_filter(filter_expr()),
             Lane::FullScan => {}
         }
 
-        // Downgrade Utf8View -> Utf8 (and BinaryView -> Binary), matching the JNI Arrow boundary.
-        let target = stripped_target(&builder.dtype()?)?;
+        let schema = self.session.arrow().to_arrow_schema(&builder.dtype()?)?;
+        let target = Arc::new(Field::new_struct("", schema.fields().clone(), false));
         let session = self.session.clone();
 
         let mut rows = 0u64;
         for batch in builder
             .map(move |array| {
                 let mut ctx = session.create_execution_ctx();
-                let arrow = session
-                    .arrow()
-                    .execute_arrow(array, Some(&target), &mut ctx)?;
-                Ok(arrow.len() as u64)
+                let arrow =
+                    session
+                        .arrow()
+                        .execute_arrow(array, Some(target.as_ref()), &mut ctx)?;
+                Ok(RecordBatch::from(arrow.as_struct().clone()).num_rows() as u64)
             })
             .into_iter(&*RUNTIME)?
         {
@@ -138,90 +145,118 @@ impl Env {
     }
 }
 
-/// Build the Arrow target field for `execute_arrow`, replacing view string/binary types with their
-/// flat equivalents so the materialized types match what the JNI path hands to Java.
-fn stripped_target(dtype: &DType) -> VortexResult<Field> {
-    let schema = dtype.to_arrow_schema()?;
-    let stripped = strip_views(DataType::Struct(schema.fields().clone()));
-    let DataType::Struct(fields) = stripped else {
-        return Err(vortex_err!("scan dtype did not export as an Arrow struct"));
-    };
-    Ok(Field::new_struct("", fields, false))
-}
-
-fn strip_views(data_type: DataType) -> DataType {
-    match data_type {
-        DataType::Utf8View => DataType::Utf8,
-        DataType::BinaryView => DataType::Binary,
-        DataType::Struct(fields) => DataType::Struct(
-            fields
-                .iter()
-                .map(|f| {
-                    Arc::new(Field::new(
-                        f.name(),
-                        strip_views(f.data_type().clone()),
-                        f.is_nullable(),
-                    ))
-                })
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-fn project_id_y() -> Expression {
+fn projection_expr() -> Expression {
     select(vec![FieldName::from("id"), FieldName::from("y")], root())
 }
 
-fn filter_cat_alpha() -> Expression {
+fn filter_expr() -> Expression {
     Binary.new_expr(
         Operator::Eq,
         [get_item(FieldName::from("cat"), root()), lit("alpha")],
     )
 }
 
-/// Background worker count for the pooled lanes: one fewer than the available parallelism (the
-/// consuming thread also drives the executor), at least one.
-fn worker_threads() -> usize {
-    get_available_parallelism()
-        .map(|n| n.saturating_sub(1).max(1))
-        .unwrap_or(1)
+/// What a Java `ScanOptions` produces: all defaults but the projection and filter.
+fn scan_request(lane: Lane) -> ScanRequest {
+    ScanRequest {
+        projection: match lane {
+            Lane::Projection => projection_expr(),
+            _ => root(),
+        },
+        filter: matches!(lane, Lane::SelectiveFilter).then(filter_expr),
+        row_range: None,
+        selection: Selection::All,
+        ordered: false,
+        limit: None,
+        partition_selection: Selection::All,
+        partition_range: None,
+    }
 }
 
-fn run_lane(bencher: Bencher<'_, '_>, lane: Lane, workers: usize) {
-    POOL.set_workers(workers);
+/// `pooled` maps to the JMH `workerThreads` param: `false` is `0`, `true` is `-1`.
+fn run_lane
+    bencher: Bencher<'_, '_>,
+    lane: Lane,
+    pooled: bool,
+    run: fn(&Env, Lane) -> VortexResult<u64>,
+) {
+    if pooled {
+        POOL.set_workers_to_available_parallelism();
+    } else {
+        POOL.set_workers(0);
+    }
     bencher
         .with_inputs(|| Env::open().unwrap())
         .input_counter(|_| ItemsCount::new(ROWS))
-        .bench_refs(move |env| env.run(lane).unwrap());
+        .bench_refs(move |env| run(env, lane).unwrap());
 }
 
-#[divan::bench]
-fn full_scan(bencher: Bencher) {
-    run_lane(bencher, Lane::FullScan, 0);
+/// Through the JNI's own partition consumption — the floor for `VortexJniReadBenchmark`.
+mod partitions {
+    use super::*;
+
+    #[divan::bench]
+    fn full_scan(bencher: Bencher) {
+        run_lane(bencher, Lane::FullScan, false, Env::run_partitions);
+    }
+
+    #[divan::bench]
+    fn projection(bencher: Bencher) {
+        run_lane(bencher, Lane::Projection, false, Env::run_partitions);
+    }
+
+    #[divan::bench]
+    fn selective_filter(bencher: Bencher) {
+        run_lane(bencher, Lane::SelectiveFilter, false, Env::run_partitions);
+    }
+
+    #[divan::bench]
+    fn full_scan_pooled(bencher: Bencher) {
+        run_lane(bencher, Lane::FullScan, true, Env::run_partitions);
+    }
+
+    #[divan::bench]
+    fn projection_pooled(bencher: Bencher) {
+        run_lane(bencher, Lane::Projection, true, Env::run_partitions);
+    }
+
+    #[divan::bench]
+    fn selective_filter_pooled(bencher: Bencher) {
+        run_lane(bencher, Lane::SelectiveFilter, true, Env::run_partitions);
+    }
 }
 
-#[divan::bench]
-fn projection(bencher: Bencher) {
-    run_lane(bencher, Lane::Projection, 0);
-}
+/// Through `ScanBuilder`, as a native Rust caller would scan.
+mod scan_builder {
+    use super::*;
 
-#[divan::bench]
-fn selective_filter(bencher: Bencher) {
-    run_lane(bencher, Lane::SelectiveFilter, 0);
-}
+    #[divan::bench]
+    fn full_scan(bencher: Bencher) {
+        run_lane(bencher, Lane::FullScan, false, Env::run_scan_builder);
+    }
 
-#[divan::bench]
-fn full_scan_pooled(bencher: Bencher) {
-    run_lane(bencher, Lane::FullScan, worker_threads());
-}
+    #[divan::bench]
+    fn projection(bencher: Bencher) {
+        run_lane(bencher, Lane::Projection, false, Env::run_scan_builder);
+    }
 
-#[divan::bench]
-fn projection_pooled(bencher: Bencher) {
-    run_lane(bencher, Lane::Projection, worker_threads());
-}
+    #[divan::bench]
+    fn selective_filter(bencher: Bencher) {
+        run_lane(bencher, Lane::SelectiveFilter, false, Env::run_scan_builder);
+    }
 
-#[divan::bench]
-fn selective_filter_pooled(bencher: Bencher) {
-    run_lane(bencher, Lane::SelectiveFilter, worker_threads());
+    #[divan::bench]
+    fn full_scan_pooled(bencher: Bencher) {
+        run_lane(bencher, Lane::FullScan, true, Env::run_scan_builder);
+    }
+
+    #[divan::bench]
+    fn projection_pooled(bencher: Bencher) {
+        run_lane(bencher, Lane::Projection, true, Env::run_scan_builder);
+    }
+
+    #[divan::bench]
+    fn selective_filter_pooled(bencher: Bencher) {
+        run_lane(bencher, Lane::SelectiveFilter, true, Env::run_scan_builder);
+    }
 }

@@ -13,9 +13,10 @@ use vortex::session::VortexSession;
 
 use crate::RUNTIME;
 
-/// Constructs a fresh [`VortexSession`] bound to the JNI-shared tokio runtime and returns
-/// an opaque pointer that Java must pass to [`Java_dev_vortex_jni_NativeSession_free`].
-pub(crate) fn new_session() -> Box<VortexSession> {
+/// Constructs the [`VortexSession`] every Java `Session.create()` gets: bound to the JNI-shared
+/// runtime, with the extension plugins registered. Java frees it via
+/// [`Java_dev_vortex_jni_NativeSession_free`].
+pub fn new_session() -> Box<VortexSession> {
     let session = VortexSession::default().with_handle(RUNTIME.handle());
     vortex_parquet_variant::initialize(&session);
     vortex_geo::initialize(&session);
