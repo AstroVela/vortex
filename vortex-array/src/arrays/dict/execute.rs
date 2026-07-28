@@ -20,6 +20,8 @@ use crate::arrays::FixedSizeList;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
+use crate::arrays::Map;
+use crate::arrays::MapArray;
 use crate::arrays::NullArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
@@ -49,7 +51,7 @@ pub(crate) fn take_canonical(
         Canonical::Decimal(a) => Canonical::Decimal(take_decimal(&a, codes, ctx)),
         Canonical::VarBinView(a) => Canonical::VarBinView(take_varbinview(&a, codes, ctx)),
         Canonical::List(a) => Canonical::List(take_listview(&a, codes, ctx)),
-        Canonical::Map(_) => vortex_error::vortex_bail!("Map arrays don't support take"),
+        Canonical::Map(a) => Canonical::Map(take_map(&a, codes, ctx)),
         Canonical::FixedSizeList(a) => {
             Canonical::FixedSizeList(take_fixed_size_list(&a, codes, ctx))
         }
@@ -145,6 +147,16 @@ fn take_listview(
         .vortex_expect("take listview execute")
         .vortex_expect("ListView TakeExecute should not return None")
         .as_::<ListView>()
+        .into_owned()
+}
+
+fn take_map(array: &MapArray, codes: &PrimitiveArray, ctx: &mut ExecutionCtx) -> MapArray {
+    let codes_ref = codes.clone().into_array();
+    let array = array.as_view();
+    <Map as TakeExecute>::take(array, &codes_ref, ctx)
+        .vortex_expect("take map execute")
+        .vortex_expect("Map TakeExecute should not return None")
+        .as_::<Map>()
         .into_owned()
 }
 

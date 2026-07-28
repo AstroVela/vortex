@@ -14,5 +14,9 @@ mod vtable;
 pub use vtable::Map;
 pub use vtable::MapArray;
 
+pub(crate) fn initialize(session: &vortex_session::VortexSession) {
+    vtable::initialize(session);
+}
+
 #[cfg(test)]
 mod tests;

@@ -617,3 +617,69 @@ async fn arrow_uuid_extension_roundtrip_nested_struct() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// A Map column imported from Arrow can be written as a Vortex file, scanned through DataFusion,
+/// projected, and exported back to Arrow without changing schema or nested array data.
+#[tokio::test]
+async fn arrow_map_roundtrip_through_persistent_scan() -> anyhow::Result<()> {
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::array::ArrayRef;
+    use datafusion::arrow::array::MapArray;
+    use datafusion::arrow::array::StringViewArray;
+    use datafusion::arrow::array::StructArray as ArrowStructArray;
+    use datafusion::arrow::buffer::NullBuffer;
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::buffer::ScalarBuffer;
+    use datafusion::arrow::datatypes::Field;
+    use datafusion::arrow::datatypes::Fields;
+    use datafusion::arrow::datatypes::Schema;
+
+    let ctx = TestSessionContext::default();
+    let entries_fields = Fields::from(vec![
+        Field::new("key", DataType::Int32, false),
+        Field::new("value", DataType::Utf8View, true),
+    ]);
+    let entries_field = Arc::new(Field::new_struct("entries", entries_fields.clone(), false));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "attrs",
+        DataType::Map(Arc::clone(&entries_field), false),
+        true,
+    )]));
+    let entries = ArrowStructArray::try_new(
+        entries_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 1, 1])) as ArrayRef,
+            Arc::new(StringViewArray::from(vec![
+                Some("one"),
+                None,
+                Some("dup-old"),
+                Some("dup-new"),
+            ])),
+        ],
+        None,
+    )?;
+    let maps = MapArray::try_new(
+        entries_field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 2, 4])),
+        entries,
+        Some(NullBuffer::from_iter([true, false, true, true])),
+        false,
+    )?;
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(maps)])?;
+
+    ctx.write_arrow_batch("maps.vortex", &batch).await?;
+
+    let result = ctx
+        .session
+        .sql("SELECT attrs FROM '/maps.vortex'")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(result.len(), 1);
+    let result_batch = &result[0];
+    assert_eq!(result_batch.schema_ref().as_ref(), schema.as_ref());
+    assert_eq!(result_batch.column(0).to_data(), batch.column(0).to_data());
+
+    Ok(())
+}
