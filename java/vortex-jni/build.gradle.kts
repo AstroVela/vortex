@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import net.ltgt.gradle.errorprone.errorprone
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Exec
-import net.ltgt.gradle.errorprone.errorprone
 import org.gradle.kotlin.dsl.support.serviceOf
 
 plugins {
