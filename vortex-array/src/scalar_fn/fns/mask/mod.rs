@@ -29,9 +29,14 @@ use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ReduceCtx;
+use crate::scalar_fn::ReduceNode;
+use crate::scalar_fn::ReduceNodeRef;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::SimplifyCtx;
+use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::literal::Literal;
 
 /// An expression that masks an input based on a boolean mask.
@@ -96,6 +101,33 @@ impl ScalarFnVTable for Mask {
         }
 
         execute_canonical(input, mask_array, ctx)
+    }
+
+    fn reduce(
+        &self,
+        _options: &Self::Options,
+        node: &dyn ReduceNode,
+        ctx: &dyn ReduceCtx,
+    ) -> VortexResult<Option<ReduceNodeRef>> {
+        let mask = node.child(1);
+        // Expression literals are handled by `simplify`; this path recognizes array metadata.
+        let Some(mask) = mask.as_any().downcast_ref::<ArrayRef>() else {
+            return Ok(None);
+        };
+        let Some(constant) = mask.as_opt::<Constant>() else {
+            return Ok(None);
+        };
+        if constant.scalar().as_bool().value() != Some(true) {
+            return Ok(None);
+        }
+
+        let input = node.child(0);
+        let output_dtype = node.node_dtype()?;
+        if input.node_dtype()? == output_dtype {
+            return Ok(Some(input));
+        }
+
+        ctx.new_node(Cast.bind(output_dtype), &[input]).map(Some)
     }
 
     fn simplify(
@@ -179,15 +211,29 @@ fn execute_canonical(
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use vortex_error::VortexExpect;
+    use vortex_error::VortexResult;
+    use vortex_mask::Mask as VortexMask;
 
+    use crate::IntoArray;
+    use crate::arrays::ConstantArray;
+    use crate::arrays::Filter;
+    use crate::arrays::FilterArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::arrays::ScalarFn;
+    use crate::arrays::scalar_fn::ScalarFnArrayExt;
+    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
     use crate::dtype::DType;
     use crate::dtype::Nullability::Nullable;
     use crate::dtype::PType;
     use crate::expr::lit;
     use crate::expr::mask;
+    use crate::optimizer::ArrayOptimizer;
     use crate::scalar::Scalar;
+    use crate::scalar_fn::EmptyOptions;
+    use crate::scalar_fn::fns::cast::Cast;
+    use crate::scalar_fn::fns::mask::Mask;
 
     #[test]
     fn test_simplify() {
@@ -207,5 +253,47 @@ mod test {
             .vortex_expect("Simplification");
         let expected_null_expr = lit(Scalar::null(DType::Primitive(PType::U32, Nullable)));
         assert_eq!(&simplified_false, &expected_null_expr);
+    }
+
+    #[test]
+    fn constant_true_mask_self_reduces_without_input_mask_rule() -> VortexResult<()> {
+        let input = PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array();
+        let input =
+            FilterArray::new(input, VortexMask::from_iter([true, false, true])).into_array();
+        let mask = ConstantArray::new(true, input.len()).into_array();
+
+        let masked = Mask.try_new_array(input.len(), EmptyOptions, [input, mask])?;
+        assert!(masked.is::<ScalarFn>());
+
+        let optimized = masked.optimize()?;
+        assert!(
+            optimized.is::<Filter>(),
+            "expected the mask to self-reduce to its already-nullable Filter input, got {}",
+            optimized.encoding_id()
+        );
+        assert_eq!(optimized.dtype(), &DType::Primitive(PType::I32, Nullable));
+
+        Ok(())
+    }
+
+    #[test]
+    fn constant_true_mask_self_reduces_to_nullable_cast() -> VortexResult<()> {
+        let input = PrimitiveArray::from_iter([1i32, 2, 3]).into_array();
+        let input =
+            FilterArray::new(input, VortexMask::from_iter([true, false, true])).into_array();
+        let mask = ConstantArray::new(true, input.len()).into_array();
+
+        let masked = Mask.try_new_array(input.len(), EmptyOptions, [input, mask])?;
+        let optimized = masked.optimize()?;
+        let optimized = optimized.as_::<ScalarFn>();
+
+        assert!(
+            optimized.scalar_fn().is::<Cast>(),
+            "expected the mask to self-reduce to a nullable cast, got {}",
+            optimized.scalar_fn().id()
+        );
+        assert_eq!(optimized.dtype(), &DType::Primitive(PType::I32, Nullable));
+
+        Ok(())
     }
 }

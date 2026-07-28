@@ -30,6 +30,7 @@ use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::validity_to_child;
 use crate::array::with_empty_buffers;
+use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::masked::MaskedArrayExt;
 use crate::arrays::masked::MaskedArraySlotsExt;
@@ -38,6 +39,7 @@ use crate::arrays::masked::array::MaskedSlots;
 use crate::arrays::masked::compute::rules::PARENT_RULES;
 use crate::arrays::masked::mask_validity_canonical;
 use crate::buffer::BufferHandle;
+use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::executor::ExecutionCtx;
 use crate::executor::ExecutionResult;
@@ -193,6 +195,21 @@ impl VTable for Masked {
         ))
     }
 
+    fn reduce(array: ArrayView<'_, Self>) -> VortexResult<Option<ArrayRef>> {
+        let Some(mask_child) = array.slots()[MaskedSlots::VALIDITY].as_ref() else {
+            return Ok(None);
+        };
+
+        if mask_child
+            .as_opt::<Constant>()
+            .is_some_and(|constant| constant.scalar().as_bool().value() == Some(true))
+        {
+            return array.child().cast(array.dtype().as_nullable()).map(Some);
+        }
+
+        Ok(None)
+    }
+
     fn reduce_parent(
         array: ArrayView<'_, Self>,
         parent: &ArrayRef,
@@ -200,6 +217,7 @@ impl VTable for Masked {
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
+
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
         MaskedSlots::NAMES[idx].to_string()
     }
