@@ -5,6 +5,7 @@
 
 mod expr;
 mod reader;
+mod repartition;
 pub mod writer;
 
 use std::sync::Arc;

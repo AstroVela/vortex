@@ -12,7 +12,9 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::pin_mut;
 use rstest::rstest;
+use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
@@ -73,10 +75,14 @@ use vortex_flatbuffers::footer as fb;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::DynLayout;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::layouts::list::List;
 use vortex_layout::layouts::zoned::LegacyStats;
 use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
+use vortex_layout::segments::TestSegments;
+use vortex_layout::sequence::SequenceId;
+use vortex_layout::sequence::SequentialArrayStreamExt;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
@@ -1696,6 +1702,46 @@ async fn write_read_roundtrip(array: ArrayRef) -> VortexResult<ArrayRef> {
         .into_array_stream()?
         .read_all()
         .await
+}
+
+/// The full file strategy must preserve list-aware chunks through compression. The first two
+/// sublists together exceed the 1 MiB target, while splitting at exactly 1 MiB would cut the
+/// second sublist in half.
+#[tokio::test]
+async fn list_elements_are_chunked_at_sublist_boundaries() -> VortexResult<()> {
+    fn identity_compressor(array: &ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.clone())
+    }
+
+    let list = ListArray::try_new(
+        PrimitiveArray::from_iter(0..500_000_i32).into_array(),
+        buffer![0u32, 200_000, 300_000, 500_000].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let strategy = crate::strategy::WriteStrategyBuilder::default()
+        .with_list_layout()
+        .with_compressor(identity_compressor)
+        .build();
+    let segments = Arc::new(TestSegments::default());
+    let (ptr, eof) = SequenceId::root().split();
+    let stream = list.to_array_stream().sequenced(ptr);
+
+    let layout = strategy
+        .write_stream(ArrayContext::empty(), segments, stream, eof, &SESSION)
+        .await?;
+    let list = if layout.is::<Zoned>() {
+        layout.child(0)?
+    } else {
+        layout
+    };
+    assert!(list.is::<List>());
+
+    let elements = list.child(0)?;
+    assert_eq!(elements.nchildren(), 2);
+    assert_eq!(elements.child(0)?.row_count(), 300_000);
+    assert_eq!(elements.child(1)?.row_count(), 200_000);
+    Ok(())
 }
 
 /// A `list<list<i32>>` column round-trips through the `TableStrategy` dispatcher, exercising list

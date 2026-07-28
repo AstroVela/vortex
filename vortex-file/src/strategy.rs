@@ -3,6 +3,7 @@
 
 //! This module defines the default layout strategy for a Vortex file.
 
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -272,6 +273,7 @@ impl WriteStrategyBuilder {
     /// Builds the canonical [`LayoutStrategy`] implementation, with the configured overrides
     /// applied.
     pub fn build(self) -> Arc<dyn LayoutStrategy> {
+        let data_block_target_bytes = self.data_block_target_bytes;
         let flat: Arc<dyn LayoutStrategy> = if let Some(flat) = self.flat_strategy {
             flat
         } else {
@@ -305,7 +307,7 @@ impl WriteStrategyBuilder {
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
-            compressing,
+            compressing.clone(),
             RepartitionWriterOptions {
                 // Write stream partitions roughly become segments. Because Vortex never reads less
                 // than one segment, the size of segments and, therefore, partitions, must be small
@@ -313,9 +315,9 @@ impl WriteStrategyBuilder {
                 // sufficient read concurrency for the desired throughput. One megabyte is small
                 // enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object Storage for
                 // High-Performance Analytics", VLDB Vol 16, Iss 11).
-                block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
+                block_size_minimum: data_block_target_bytes.unwrap_or(0),
                 block_len_multiple: self.row_block_size,
-                block_size_target: self.data_block_target_bytes,
+                block_size_target: data_block_target_bytes,
                 canonicalize: true,
             },
         );
@@ -327,25 +329,26 @@ impl WriteStrategyBuilder {
         };
         let compress_then_flat = CompressingStrategy::new(flat, Arc::clone(&stats_compressor));
 
-        // 3. apply dict encoding or fallback
         let probe_compressor = if let Some(probe_compressor) = self.probe_compressor {
             probe_compressor
         } else {
             Arc::clone(&stats_compressor)
         };
-        let dict = DictStrategy::new(
+
+        // 3. apply dict encoding or fallback
+        let leaf = DictStrategy::new(
             coalescing.clone(),
             compress_then_flat.clone(),
             coalescing,
             Default::default(),
-            probe_compressor,
+            Arc::clone(&probe_compressor),
         );
 
         let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
 
         // 2. calculate stats for each row group
         let stats = ZonedStrategy::new(
-            dict,
+            leaf,
             compress_then_flat.clone(),
             ZonedLayoutOptions {
                 block_size: row_block_size,
@@ -368,35 +371,51 @@ impl WriteStrategyBuilder {
 
         // 0. start with splitting columns
         let validity_strategy = CollectStrategy::new(compress_then_flat.clone());
-
-        // Take any field overrides from the builder and apply them to the final strategy.
         let mut table_strategy =
             TableStrategy::new(Arc::new(validity_strategy), Arc::new(repartition))
                 .with_field_writers(self.field_writers);
 
         if self.use_list_layout {
-            // We need a closure here to enable recursive application of list layout.
-            table_strategy = table_strategy.with_list_layout_factory(
-                move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
-                    let zoned = ZonedStrategy::new(
-                        list_layout,
-                        compress_then_flat.clone(),
-                        ZonedLayoutOptions {
-                            block_size: row_block_size,
-                            ..Default::default()
-                        },
-                    );
-                    Arc::new(RepartitionStrategy::new(
-                        zoned,
-                        RepartitionWriterOptions {
-                            block_size_minimum: 0,
-                            block_len_multiple: row_block_size.get(),
-                            block_size_target: None,
-                            canonicalize: false,
-                        },
-                    ))
-                },
-            );
+            let list_repartition_target = data_block_target_bytes.and_then(NonZeroU64::new);
+            // The list writer chooses these element chunk boundaries before decomposition, so
+            // preserve them through dictionary encoding and compression.
+            let list_leaf = Arc::new(DictStrategy::new(
+                compressing.clone(),
+                compress_then_flat.clone(),
+                compressing,
+                Default::default(),
+                probe_compressor,
+            ));
+
+            // The factory is applied recursively to nested lists.
+            table_strategy = table_strategy
+                .with_list_elements_strategy(list_leaf)
+                .with_list_layout_factory(
+                    move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
+                        let list_layout = if let Some(target) = list_repartition_target {
+                            list_layout.with_list_aware_repartition(target)
+                        } else {
+                            list_layout
+                        };
+                        let zoned = ZonedStrategy::new(
+                            list_layout,
+                            compress_then_flat.clone(),
+                            ZonedLayoutOptions {
+                                block_size: row_block_size,
+                                ..Default::default()
+                            },
+                        );
+                        Arc::new(RepartitionStrategy::new(
+                            zoned,
+                            RepartitionWriterOptions {
+                                block_size_minimum: 0,
+                                block_len_multiple: row_block_size.get(),
+                                block_size_target: None,
+                                canonicalize: false,
+                            },
+                        ))
+                    },
+                );
         }
 
         Arc::new(table_strategy)

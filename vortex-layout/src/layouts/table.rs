@@ -47,6 +47,12 @@ pub fn use_experimental_list_layout() -> bool {
 
 type ListLayoutFactory = Arc<dyn Fn(ListLayoutStrategy) -> Arc<dyn LayoutStrategy> + Send + Sync>;
 
+#[derive(Clone, Copy)]
+enum LeafRole {
+    Default,
+    ListElements,
+}
+
 /// A configurable strategy for writing nested tabular data, dispatching each (sub)stream to the
 /// structural writer for its dtype.
 ///
@@ -69,6 +75,11 @@ pub struct TableStrategy {
     validity: Arc<dyn LayoutStrategy>,
     /// The writer for leaf fields, i.e. anything that is not a struct.
     leaf: Arc<dyn LayoutStrategy>,
+    /// Optional leaf strategy used below a list's `elements` child. This lets callers preserve
+    /// list-aware element chunks instead of sending them through a row-oriented leaf pipeline.
+    list_elements: Option<Arc<dyn LayoutStrategy>>,
+    /// Selects which leaf strategy this descended dispatcher uses.
+    leaf_role: LeafRole,
     /// Optional factory applied to each dynamically constructed [`ListLayoutStrategy`].
     /// Its presence also enables list decomposition.
     ///
@@ -100,6 +111,8 @@ impl TableStrategy {
             leaf_writers: Default::default(),
             validity,
             leaf: fallback,
+            list_elements: None,
+            leaf_role: LeafRole::Default,
             list_layout_factory: None,
         }
     }
@@ -159,6 +172,15 @@ impl TableStrategy {
     /// Override the default strategy for leaf columns that don't have overrides.
     pub fn with_default_strategy(mut self, default: Arc<dyn LayoutStrategy>) -> Self {
         self.leaf = default;
+        self
+    }
+
+    /// Override the leaf strategy used for fields descended through a list's `elements` child.
+    ///
+    /// This is useful when the list writer has already partitioned elements at sublist boundaries
+    /// and the ordinary leaf strategy would repartition them again.
+    pub fn with_list_elements_strategy(mut self, strategy: Arc<dyn LayoutStrategy>) -> Self {
+        self.list_elements = Some(strategy);
         self
     }
 
@@ -231,11 +253,24 @@ impl TableStrategy {
     fn list_strategy(&self) -> Option<Arc<dyn LayoutStrategy>> {
         let factory = self.list_layout_factory.as_ref()?;
         let list_layout = ListLayoutStrategy::default()
-            .with_elements(Arc::new(self.descend_clean()))
+            .with_elements(Arc::new(self.descend_list_elements()))
             .with_offsets(Arc::clone(&self.leaf))
             .with_validity(Arc::clone(&self.validity))
-            .with_fallback(Arc::clone(&self.leaf));
+            .with_fallback(self.leaf_strategy());
         Some(factory(list_layout))
+    }
+
+    fn leaf_strategy(&self) -> Arc<dyn LayoutStrategy> {
+        match (self.leaf_role, &self.list_elements) {
+            (LeafRole::ListElements, Some(strategy)) => Arc::clone(strategy),
+            _ => Arc::clone(&self.leaf),
+        }
+    }
+
+    fn descend_list_elements(&self) -> Self {
+        let mut elements = self.descend_clean();
+        elements.leaf_role = LeafRole::ListElements;
+        elements
     }
 
     /// Descend into a subfield, retaining only the overrides that apply beneath it (rebased to be
@@ -256,6 +291,8 @@ impl TableStrategy {
             leaf_writers: new_writers,
             validity: Arc::clone(&self.validity),
             leaf: Arc::clone(&self.leaf),
+            list_elements: self.list_elements.clone(),
+            leaf_role: self.leaf_role,
             list_layout_factory: self.list_layout_factory.clone(),
         }
     }
@@ -267,6 +304,8 @@ impl TableStrategy {
             leaf_writers: HashMap::default(),
             validity: Arc::clone(&self.validity),
             leaf: Arc::clone(&self.leaf),
+            list_elements: self.list_elements.clone(),
+            leaf_role: self.leaf_role,
             list_layout_factory: self.list_layout_factory.clone(),
         }
     }
@@ -319,7 +358,7 @@ impl LayoutStrategy for TableStrategy {
         }
 
         // Leaf: hand off to the leaf strategy.
-        self.leaf
+        self.leaf_strategy()
             .write_stream(ctx, segment_sink, stream, eof, session)
             .await
     }
@@ -353,6 +392,8 @@ mod tests {
     use crate::LayoutRef;
     use crate::LayoutStrategy;
     use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use crate::layouts::collect::CollectStrategy;
+    use crate::layouts::flat::Flat;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::layouts::list::List;
     use crate::layouts::repartition::RepartitionStrategy;
@@ -502,6 +543,85 @@ mod tests {
             ├── [0]: vortex.flat, dtype: u64, segment: 2
             └── [1]: vortex.flat, dtype: u64, segment: 3
         ");
+        Ok(())
+    }
+
+    /// List elements can use a boundary-preserving leaf while offsets retain the ordinary leaf.
+    #[tokio::test]
+    async fn dispatches_list_elements_to_dedicated_strategy() -> VortexResult<()> {
+        let chunk0 = ListArray::try_new(
+            buffer![1i32, 2, 3].into_array(),
+            buffer![0u32, 2, 3].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let chunk1 = ListArray::try_new(
+            buffer![4i32, 5, 6, 7].into_array(),
+            buffer![0u32, 1, 4].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let dtype = chunk0.dtype().clone();
+        let chunked = ChunkedArray::try_new(vec![chunk0, chunk1], dtype)?.into_array();
+
+        let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+        let ordinary_leaf: Arc<dyn LayoutStrategy> =
+            Arc::new(CollectStrategy::new(FlatLayoutStrategy::default()));
+        let list_elements: Arc<dyn LayoutStrategy> =
+            Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()));
+        let dispatcher = TableStrategy::new(flat, ordinary_leaf)
+            .with_list_elements_strategy(list_elements)
+            .with_list_layout();
+        let layout = write(&dispatcher, chunked).await?;
+
+        insta::assert_snapshot!(layout.display_tree(), @r"
+        vortex.list, dtype: list(i32), children: 2
+        ├── elements: vortex.chunked, dtype: i32, children: 2
+        │   ├── [0]: vortex.flat, dtype: i32, segment: 0
+        │   └── [1]: vortex.flat, dtype: i32, segment: 1
+        └── offsets: vortex.flat, dtype: u64, segment: 2
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_list_offsets_keep_the_ordinary_leaf_strategy() -> VortexResult<()> {
+        let inner0 = ListArray::try_new(
+            buffer![1i32, 2, 3].into_array(),
+            buffer![0u32, 2, 3].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let outer0 =
+            ListArray::try_new(inner0, buffer![0u32, 2].into_array(), Validity::NonNullable)?
+                .into_array();
+        let inner1 = ListArray::try_new(
+            buffer![4i32, 5, 6, 7].into_array(),
+            buffer![0u32, 1, 4].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let outer1 =
+            ListArray::try_new(inner1, buffer![0u32, 2].into_array(), Validity::NonNullable)?
+                .into_array();
+        let dtype = outer0.dtype().clone();
+        let chunked = ChunkedArray::try_new(vec![outer0, outer1], dtype)?.into_array();
+
+        let validity: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+        let ordinary_leaf: Arc<dyn LayoutStrategy> =
+            Arc::new(CollectStrategy::new(FlatLayoutStrategy::default()));
+        let list_elements: Arc<dyn LayoutStrategy> =
+            Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()));
+        let dispatcher = TableStrategy::new(validity, ordinary_leaf)
+            .with_list_elements_strategy(list_elements)
+            .with_list_layout();
+        let layout = write(&dispatcher, chunked).await?;
+
+        let inner = layout.child(0)?;
+        assert!(inner.is::<List>());
+        assert_eq!(inner.child(0)?.nchildren(), 2);
+        assert!(inner.child(1)?.is::<Flat>());
+        assert!(layout.child(1)?.is::<Flat>());
         Ok(())
     }
 
