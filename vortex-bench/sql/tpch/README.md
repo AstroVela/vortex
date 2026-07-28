@@ -6,8 +6,8 @@ It stresses scan throughput, filter pushdown, joins, and aggregations over mostl
 and date columns.
 
 The queries in this directory (`q1.sql` ... `q22.sql`) are the standard TPC-H queries.
-Data is generated deterministically by [`tpchgen`](../../src/tpch/tpchgen.rs); the benchmark
-harness lives in [`src/tpch`](../../src/tpch).
+Data is generated deterministically as Parquet via [`tpchgen-cli`](../../src/tpch/tpchgen.rs);
+the benchmark harness lives in [`src/tpch`](../../src/tpch).
 
 ## CI variants
 

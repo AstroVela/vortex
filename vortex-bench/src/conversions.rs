@@ -235,26 +235,28 @@ pub async fn convert_parquet_directory_to_vortex(
     let parquet_path = input_path.join(Format::Parquet.name());
     create_dir_all(&vortex_dir).await?;
 
-    let parquet_inputs = fs::read_dir(&parquet_path)?.collect::<std::io::Result<Vec<_>>>()?;
+    let parquet_inputs = fs::read_dir(&parquet_path)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|path| path.extension().is_some_and(|e| e == "parquet"))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
     trace!(
         "Found {} parquet files in {}",
         parquet_inputs.len(),
         parquet_path.to_str().unwrap()
     );
 
-    let iter = parquet_inputs
-        .iter()
-        .filter(|entry| entry.path().extension().is_some_and(|e| e == "parquet"));
-
     let concurrency = calculate_concurrency();
-    futures::stream::iter(iter)
-        .map(|dir_entry| {
+    futures::stream::iter(parquet_inputs)
+        .map(|parquet_file_path| {
             let filename = {
-                let mut temp = dir_entry.path();
+                let mut temp = parquet_file_path.clone();
                 temp.set_extension("");
                 temp.file_name().unwrap().to_str().unwrap().to_string()
             };
-            let parquet_file_path = parquet_path.join(format!("{filename}.parquet"));
             let output_path = vortex_dir.join(format!("{filename}.{}", format.ext()));
 
             tokio::spawn(

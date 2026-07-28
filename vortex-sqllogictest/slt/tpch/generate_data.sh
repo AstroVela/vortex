@@ -17,7 +17,7 @@ mkdir -p "${DATA_DIR}"
 
 # 1. Generate TPC-H data at scale factor 0.1
 echo "Generating TPC-H data (SF=0.1)..."
-uvx tpchgen-cli -s 0.1 --format=parquet --output-dir "${DATA_DIR}/" 
+uvx --from tpchgen-cli==3.0.0 tpchgen-cli parquet -s 0.1 --output-dir "${DATA_DIR}/" --no-progress
 
 # 2. Convert each parquet file to Vortex format
 for f in "${DATA_DIR}"/*.parquet; do

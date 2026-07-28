@@ -18,9 +18,11 @@ use vortex::expr::col;
 use vortex::expr::pack;
 use vortex::file::OpenOptionsSessionExt;
 
+use crate::CompactionStrategy;
 use crate::Format;
 use crate::IdempotentPath;
 use crate::SESSION;
+use crate::conversions::convert_parquet_directory_to_vortex;
 use crate::datasets::Dataset;
 use crate::tpch::tpchgen::TpchGenOptions;
 use crate::tpch::tpchgen::generate_tpch_tables;
@@ -58,13 +60,12 @@ impl Dataset for TPCHLCommentChunked {
         let scale_factor_dir = base_path.join("1.0");
         let data_dir = scale_factor_dir.join(Format::OnDiskVortex.name());
 
-        // Generate TPC-H CSV data if it doesn't exist
         if !data_dir.exists() {
-            // Use blocking call like TPC-H benchmark does
-            let options = TpchGenOptions::new("1.0".to_string(), scale_factor_dir)
-                .with_format(Format::OnDiskVortex);
-
-            futures::executor::block_on(generate_tpch_tables(options))?;
+            let options = TpchGenOptions::new("1.0".to_string(), scale_factor_dir.clone())
+                .with_format(Format::Parquet);
+            generate_tpch_tables(options).await?;
+            convert_parquet_directory_to_vortex(&scale_factor_dir, CompactionStrategy::Default)
+                .await?;
         }
 
         let mut chunks: Vec<ArrayRef> = vec![];

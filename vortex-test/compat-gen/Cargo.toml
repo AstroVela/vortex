@@ -29,10 +29,7 @@ vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
 vortex-session = { workspace = true }
 
-# TPC-H generation
 arrow-array = { workspace = true }
-tpchgen = { workspace = true }
-tpchgen-arrow = { workspace = true }
 
 # ClickBench parquet reading + writing
 arrow-select = { workspace = true }

@@ -93,8 +93,7 @@ impl Benchmark for TpcHBenchmark {
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", self.data_url.as_str()))?;
 
-        let options = TpchGenOptions::new(self.scale_factor.clone(), base_data_dir)
-            .with_max_file_size_mb(Some(600));
+        let options = TpchGenOptions::new(self.scale_factor.clone(), base_data_dir);
 
         tpchgen::generate_tpch_tables(options).await?;
 

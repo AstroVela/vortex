@@ -8939,20 +8939,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
-name = "tpchgen"
-version = "2.0.2"
-source = "git+https://github.com/clflushopt/tpchgen-rs.git?rev=438e9c2dbc25b2fff82c0efc08b3f13b5707874f#438e9c2dbc25b2fff82c0efc08b3f13b5707874f"
-
-[[package]]
-name = "tpchgen-arrow"
-version = "2.0.2"
-source = "git+https://github.com/clflushopt/tpchgen-rs.git?rev=438e9c2dbc25b2fff82c0efc08b3f13b5707874f#438e9c2dbc25b2fff82c0efc08b3f13b5707874f"
-dependencies = [
- "arrow 58.4.0",
- "tpchgen",
-]
-
-[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9431,8 +9417,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tpchgen",
- "tpchgen-arrow",
  "tracing",
  "tracing-perfetto",
  "tracing-subscriber",
@@ -9523,8 +9507,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "tpchgen",
- "tpchgen-arrow",
  "vortex",
  "vortex-array",
  "vortex-arrow",
