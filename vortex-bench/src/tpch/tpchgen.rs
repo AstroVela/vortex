@@ -194,7 +194,7 @@ mod tests {
     }
 
     fn test_scratch_dir() -> Result<PathBuf> {
-        let path = std::env::temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "vortex-bench-tpchgen-test-{}",
             uuid::Uuid::new_v4()
         ));
