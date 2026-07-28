@@ -34,6 +34,7 @@ use divan::counter::ItemsCount;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex_array::ArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -232,14 +233,24 @@ fn decode_bool_corpus(bencher: Bencher, case: Case) {
     let corpus = corpus(case);
     let length = case.shape.length;
 
+    // Decoded arrays are collected rather than dropped in the loop, and the vector is returned
+    // so divan drops it after the timer stops. Dropping each array as it is produced would put a
+    // deallocation per array inside the measurement, which is not what this benchmark is for.
+    // The vector is allocated by `with_inputs`, outside the timed region, with capacity reserved.
     bencher
         .counter(ItemsCount::new(case.shape.arrays * length))
-        .with_inputs(|| SESSION.create_execution_ctx())
-        .bench_local_refs(|ctx| {
+        .with_inputs(|| {
+            (
+                SESSION.create_execution_ctx(),
+                Vec::with_capacity(case.shape.arrays),
+            )
+        })
+        .bench_local_values(|(mut ctx, mut decoded): (_, Vec<ArrayRef>)| {
             for (ends, values) in &corpus {
-                divan::black_box(
-                    runend_decode_bools(ends.clone(), values.clone(), 0, length, ctx).unwrap(),
+                decoded.push(
+                    runend_decode_bools(ends.clone(), values.clone(), 0, length, &mut ctx).unwrap(),
                 );
             }
+            decoded
         });
 }
