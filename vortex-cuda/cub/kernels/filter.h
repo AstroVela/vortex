@@ -104,9 +104,10 @@ cudaError_t scan_exclusive_sum_i64(void *d_temp,
 // via decoupled look-back, writing `num_batches + 1` offsets whose last
 // element is the total decoded byte count of the visible token window.
 // `token_bounds[0..2)` holds the device-resident window; tokens outside it
-// contribute zero bytes, so the offsets are window-relative. `code_width`
-// selects the code stream's element size in bytes (1 or 2). A window code
-// outside the dictionary raises `*status` to 1 and contributes zero bytes.
+// contribute zero bytes, so the offsets are window-relative, and a window
+// code outside the dictionary contributes zero bytes — inputs are trusted,
+// the guards only bound the sweep's own reads. `code_width` selects the code
+// stream's element size in bytes (1 or 2).
 cudaError_t onpair_batch_offsets_temp_size(size_t *temp_bytes, int64_t num_batches);
 
 cudaError_t onpair_batch_offsets(void *d_temp,
@@ -118,7 +119,6 @@ cudaError_t onpair_batch_offsets(void *d_temp,
                                  const uint64_t *token_bounds,
                                  uint64_t total_tokens,
                                  uint64_t *chunk_offsets,
-                                 uint32_t *status,
                                  int64_t num_batches,
                                  cudaStream_t stream);
 

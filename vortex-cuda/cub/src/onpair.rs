@@ -26,9 +26,10 @@ pub fn batch_offsets_temp_size(num_batches: i64) -> Result<usize, CubError> {
 /// Writes `num_batches + 1` offsets; the last is the total decoded byte count
 /// of the visible token window `[token_bounds[0], token_bounds[1])`, read on
 /// device. Tokens outside the window contribute zero bytes, so the offsets are
-/// window-relative. `code_width` selects the code stream's element size in
-/// bytes (1 or 2). A window code outside the dictionary raises `*status` to 1
-/// and contributes zero bytes.
+/// window-relative, and a window code outside the dictionary contributes zero
+/// bytes — inputs are trusted to be consistent, the guards only bound the
+/// sweep's own reads. `code_width` selects the code stream's element size in
+/// bytes (1 or 2).
 ///
 /// # Safety
 ///
@@ -39,7 +40,6 @@ pub fn batch_offsets_temp_size(num_batches: i64) -> Result<usize, CubError> {
 /// - `lens` must have at least `dict_size` bytes.
 /// - `token_bounds` must have at least 2 `u64` values.
 /// - `chunk_offsets` must have at least `num_batches + 1` `u64` values.
-/// - `status` must point to a valid device `u32`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn batch_offsets(
     d_temp: *mut c_void,
@@ -51,7 +51,6 @@ pub unsafe fn batch_offsets(
     token_bounds: *const u64,
     total_tokens: u64,
     chunk_offsets: *mut u64,
-    status: *mut u32,
     num_batches: i64,
     stream: cudaStream_t,
 ) -> Result<(), CubError> {
@@ -67,7 +66,6 @@ pub unsafe fn batch_offsets(
             token_bounds,
             total_tokens,
             chunk_offsets,
-            status,
             num_batches,
             stream,
         )

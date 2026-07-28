@@ -23,11 +23,11 @@ use crate::CudaExecutionCtx;
 /// reduction and the exclusive scan over the sizes run in a single kernel via
 /// decoupled look-back. The visible token window is read on device from
 /// `token_bounds[0..2)`; tokens outside it contribute zero bytes, so the
-/// offsets come out window-relative. `code_width` selects the code stream's
+/// offsets come out window-relative, and a window code outside the dictionary
+/// contributes zero bytes — inputs are trusted to be consistent, the guards
+/// only bound the sweep's own reads. `code_width` selects the code stream's
 /// element size in bytes (1 or 2). Returns `num_batches + 1` offsets; the
-/// last is the window's total decoded byte count. A window code outside the
-/// dictionary raises `status` to 1; the caller must check the flag before
-/// trusting the offsets.
+/// last is the window's total decoded byte count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn onpair_batch_offsets(
     codes: &BufferHandle,
@@ -37,7 +37,6 @@ pub(crate) fn onpair_batch_offsets(
     token_bounds: &CudaSlice<u64>,
     num_tokens: usize,
     num_batches: usize,
-    status: &mut CudaSlice<u32>,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<CudaSlice<u64>> {
     let num_batches_i64 = i64::try_from(num_batches)?;
@@ -52,7 +51,6 @@ pub(crate) fn onpair_batch_offsets(
     let stream = ctx.stream();
     let stream_ptr = stream.cu_stream() as cudaStream_t;
     let (bounds_ptr, record_bounds) = token_bounds.device_ptr(stream);
-    let (status_ptr, record_status) = status.device_ptr_mut(stream);
     let (offsets_ptr, record_offsets) = chunk_offsets.device_ptr_mut(stream);
     let (temp_ptr, record_temp) = temp.device_ptr_mut(stream);
 
@@ -67,13 +65,12 @@ pub(crate) fn onpair_batch_offsets(
             bounds_ptr as *const u64,
             total_tokens,
             offsets_ptr as *mut u64,
-            status_ptr as *mut u32,
             num_batches_i64,
             stream_ptr,
         )
         .map_err(|err| vortex_err!("CUB onpair_batch_offsets failed: {err}"))
     })?;
-    drop((record_bounds, record_status, record_offsets, record_temp));
+    drop((record_bounds, record_offsets, record_temp));
 
     Ok(chunk_offsets)
 }
@@ -119,13 +116,13 @@ mod tests {
     use crate::session::CudaSession;
 
     /// Upload synthetic codes, lengths, and a token window, regenerate the
-    /// window-relative chunk offsets, and read them back together with the
-    /// status flag. The code width follows the element type.
+    /// window-relative chunk offsets, and read them back. The code width
+    /// follows the element type.
     async fn batch_offsets_roundtrip<C>(
         codes: Vec<C>,
         lens: Vec<u8>,
         window: std::ops::Range<u64>,
-    ) -> VortexResult<(Vec<u64>, u32)>
+    ) -> VortexResult<Vec<u64>>
     where
         C: cudarc::driver::DeviceRepr
             + cudarc::driver::ValidAsZeroBits
@@ -146,10 +143,6 @@ mod tests {
         ctx.stream()
             .memcpy_htod(&[window.start, window.end], &mut bounds)
             .map_err(|e| vortex_err!("Failed to upload token bounds: {e}"))?;
-        let mut status = ctx.device_alloc::<u32>(1)?;
-        ctx.stream()
-            .memset_zeros(&mut status)
-            .map_err(|e| vortex_err!("Failed to zero status flag: {e}"))?;
 
         let offsets = onpair_batch_offsets(
             &codes_dev,
@@ -159,19 +152,12 @@ mod tests {
             &bounds,
             num_tokens,
             num_batches,
-            &mut status,
             &mut ctx,
         )?;
 
-        let offsets = ctx
-            .stream()
+        ctx.stream()
             .clone_dtoh(&offsets)
-            .map_err(|e| vortex_err!("Failed to copy offsets to host: {e}"))?;
-        let status = ctx
-            .stream()
-            .clone_dtoh(&status)
-            .map_err(|e| vortex_err!("Failed to copy status to host: {e}"))?;
-        Ok((offsets, status[0]))
+            .map_err(|e| vortex_err!("Failed to copy offsets to host: {e}"))
     }
 
     /// The window-relative exclusive prefix at 128-token boundaries, plus the
@@ -201,8 +187,7 @@ mod tests {
         let codes: Vec<u16> = (0..100u16).map(|i| i % 16).collect();
         let expected = host_reference(&codes, &lens, 0..100);
 
-        let (offsets, status) = batch_offsets_roundtrip(codes, lens, 0..100).await?;
-        assert_eq!(status, 0);
+        let offsets = batch_offsets_roundtrip(codes, lens, 0..100).await?;
         assert_eq!(offsets, expected);
         Ok(())
     }
@@ -219,8 +204,7 @@ mod tests {
             .collect();
         let expected = host_reference(&codes, &lens, 0..num_tokens);
 
-        let (offsets, status) = batch_offsets_roundtrip(codes, lens, 0..num_tokens).await?;
-        assert_eq!(status, 0);
+        let offsets = batch_offsets_roundtrip(codes, lens, 0..num_tokens).await?;
         assert_eq!(offsets, expected);
         Ok(())
     }
@@ -237,8 +221,7 @@ mod tests {
         let window = 173..(codes.len() as u64 - 95);
         let expected = host_reference(&codes, &lens, window.clone());
 
-        let (offsets, status) = batch_offsets_roundtrip(codes, lens, window).await?;
-        assert_eq!(status, 0);
+        let offsets = batch_offsets_roundtrip(codes, lens, window).await?;
         assert_eq!(offsets, expected);
         Ok(())
     }
@@ -253,30 +236,21 @@ mod tests {
         let widened: Vec<u16> = codes.iter().map(|&c| u16::from(c)).collect();
         let expected = host_reference(&widened, &lens, 0..300);
 
-        let (offsets, status) = batch_offsets_roundtrip(codes, lens, 0..300).await?;
-        assert_eq!(status, 0);
+        let offsets = batch_offsets_roundtrip(codes, lens, 0..300).await?;
         assert_eq!(offsets, expected);
         Ok(())
     }
 
-    /// A window code outside the dictionary raises the status flag and
-    /// contributes zero bytes; the same code outside the window is ignored.
+    /// A code outside the dictionary contributes zero bytes: the guard bounds
+    /// the sweep's own reads, it does not report the inconsistency.
     #[crate::test]
-    async fn test_onpair_batch_offsets_flags_out_of_range_code() -> VortexResult<()> {
+    async fn test_onpair_batch_offsets_out_of_range_code_contributes_zero() -> VortexResult<()> {
         let lens = vec![2u8; 4];
         let mut codes = vec![1u16; 200];
         codes[130] = 9;
 
-        let (offsets, status) =
-            batch_offsets_roundtrip(codes.clone(), lens.clone(), 0..200).await?;
-        assert_eq!(status, 1);
+        let offsets = batch_offsets_roundtrip(codes, lens, 0..200).await?;
         assert_eq!(offsets, vec![0, 256, 256 + 71 * 2]);
-
-        // The corrupt code sits outside this window, so the sweep neither
-        // counts nor flags it.
-        let (offsets, status) = batch_offsets_roundtrip(codes, lens, 0..128).await?;
-        assert_eq!(status, 0);
-        assert_eq!(offsets, vec![0, 256, 256]);
         Ok(())
     }
 }

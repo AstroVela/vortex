@@ -47,22 +47,21 @@ __global__ void onpair_batch_offsets_init(OnPairTileState tile_state, int num_ti
 // from `codes_offsets` by an earlier launch — contribute zero bytes and are
 // not range-checked, so the offsets come out window-relative and the trailing
 // total is the window's decoded byte count. The window end is clamped to the
-// stream defensively: the bounds are only validated (against the lengths
-// child's total) after this sweep. A window code outside the dictionary
-// raises `status` to 1 and contributes zero bytes: the host must check the
-// flag before trusting the offsets and before launching the decode kernel,
-// whose dictionary gathers are unchecked.
+// stream and a window code outside the dictionary contributes zero bytes: the
+// children are trusted to be consistent (validation happens elsewhere), and
+// these guards only keep the sweep's own reads in bounds. The decode kernel
+// applies the identical guards, so its per-batch byte counts always match
+// these offsets.
 template <typename CodeT>
-__global__
-__launch_bounds__(ONPAIR_BLOCK_THREADS) void onpair_batch_offsets_sweep(const CodeT *__restrict codes,
-                                                                        const uint8_t *__restrict lens,
-                                                                        uint32_t dict_size,
-                                                                        const uint64_t *__restrict token_bounds,
-                                                                        uint64_t total_tokens,
-                                                                        uint64_t *__restrict chunk_offsets,
-                                                                        uint32_t *__restrict status,
-                                                                        OnPairTileState tile_state,
-                                                                        int64_t num_batches) {
+__global__ __launch_bounds__(ONPAIR_BLOCK_THREADS) void onpair_batch_offsets_sweep(
+    const CodeT *__restrict codes,
+    const uint8_t *__restrict lens,
+    uint32_t dict_size,
+    const uint64_t *__restrict token_bounds,
+    uint64_t total_tokens,
+    uint64_t *__restrict chunk_offsets,
+    OnPairTileState tile_state,
+    int64_t num_batches) {
     const uint32_t lane = threadIdx.x & 31;
     const uint32_t warp = threadIdx.x >> 5;
     const int tile_idx = static_cast<int>(blockIdx.x);
@@ -84,8 +83,6 @@ __launch_bounds__(ONPAIR_BLOCK_THREADS) void onpair_batch_offsets_sweep(const Co
                 const uint32_t code = (uint32_t)codes[i];
                 if (code < dict_size) {
                     batch_bytes += (uint32_t)lens[code];
-                } else {
-                    atomicMax(status, 1u);
                 }
             }
         }
@@ -165,11 +162,11 @@ extern "C" cudaError_t onpair_batch_offsets_temp_size(size_t *temp_bytes, int64_
 // `chunk_offsets[b]` is the window-relative decoded byte count preceding
 // batch `b` and `chunk_offsets[num_batches]` is the window total. The visible
 // token window is read on device from `token_bounds[0..2)`; tokens outside it
-// contribute zero bytes and are not range-checked. `code_width` selects the
-// code stream's element size in bytes (1 or 2), so narrowed codes never need
-// a widening pass. A window code outside the dictionary raises `*status` to 1
-// and contributes zero bytes; the caller must check the flag before trusting
-// the offsets.
+// contribute zero bytes and are not range-checked, and a window code outside
+// the dictionary contributes zero bytes — the children are trusted to be
+// consistent, the guards only bound the sweep's own reads. `code_width`
+// selects the code stream's element size in bytes (1 or 2), so narrowed codes
+// never need a widening pass.
 extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
                                             size_t temp_bytes,
                                             const void *codes,
@@ -179,7 +176,6 @@ extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
                                             const uint64_t *token_bounds,
                                             uint64_t total_tokens,
                                             uint64_t *chunk_offsets,
-                                            uint32_t *status,
                                             int64_t num_batches,
                                             cudaStream_t stream) {
     if (num_batches <= 0 || num_batches / ONPAIR_WARPS_PER_BLOCK >= INT_MAX) {
@@ -210,7 +206,6 @@ extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
                                                              token_bounds,
                                                              total_tokens,
                                                              chunk_offsets,
-                                                             status,
                                                              tile_state,
                                                              num_batches);
         break;
@@ -222,7 +217,6 @@ extern "C" cudaError_t onpair_batch_offsets(void *d_temp,
                                                              token_bounds,
                                                              total_tokens,
                                                              chunk_offsets,
-                                                             status,
                                                              tile_state,
                                                              num_batches);
         break;

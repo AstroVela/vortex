@@ -8,15 +8,16 @@
 // Support kernels for OnPair GPU decompression. The per-batch output-offsets
 // regeneration lives in the CUB shim (`cub/kernels/onpair.cu`), where the
 // reduction and exclusive scan run as one fused window-relative sweep; this
-// module holds the token-bounds, validation, and view-construction kernels
-// launched around the decode.
+// module holds the token-bounds and view-construction kernels launched around
+// the decode.
 
 // The token window of this array's rows, resolved entirely on device from the
 // (possibly slice-narrowed, possibly device-resident) `codes_offsets` child:
 // the offsets are nondecreasing, so the window's min and max are its first
 // and last elements. Writes `bounds[0] = codes_offsets[0]` and
-// `bounds[1] = codes_offsets[last]`; a signed negative offset sign-extends
-// huge and fails the `onpair_validate` range check that gates the decode.
+// `bounds[1] = codes_offsets[last]`. The consumers clamp and guard these
+// bounds themselves — a corrupt offset (e.g. a signed negative sign-extending
+// huge) yields an empty or garbage window, never an out-of-bounds access.
 #define GENERATE_TOKEN_BOUNDS_KERNEL(suffix, OffsetT)                                                        \
     extern "C" __global__ void onpair_token_bounds_##suffix(const OffsetT *__restrict codes_offsets,         \
                                                             uint64_t last,                                   \
@@ -35,44 +36,6 @@ GENERATE_TOKEN_BOUNDS_KERNEL(u8, uint8_t)
 GENERATE_TOKEN_BOUNDS_KERNEL(u16, uint16_t)
 GENERATE_TOKEN_BOUNDS_KERNEL(u32, uint32_t)
 GENERATE_TOKEN_BOUNDS_KERNEL(u64, uint64_t)
-
-// Device-side validation of the OnPair decode preconditions, fused into one
-// single-thread launch so the only value the host reads back before the
-// unchecked decode kernel is the status word itself:
-//
-// - the token window read from `codes_offsets` must be nondecreasing and end
-//   within the code stream (status 2);
-// - the window's decoded byte count — the window-relative offsets sweep's
-//   trailing total — must equal the `uncompressed_lengths` sum the host sized
-//   the output buffer with, and a non-empty window must decode to at least
-//   one byte since a conformant dictionary has no zero-length tokens
-//   (status 3).
-//
-// The sweep independently raises status 1 for a window code outside the
-// dictionary. Any nonzero status means the decode kernel must not run.
-extern "C" __global__ void onpair_validate(const uint64_t *__restrict token_bounds,
-                                           const uint64_t *__restrict chunk_offsets,
-                                           uint64_t num_batches,
-                                           uint64_t total_tokens,
-                                           uint64_t lengths_total,
-                                           uint32_t *__restrict status) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
-        return;
-    }
-    const uint64_t token_start = token_bounds[0];
-    const uint64_t token_end = token_bounds[1];
-    if (token_start > token_end || token_end > total_tokens) {
-        atomicMax(status, 2u);
-        return;
-    }
-    if (token_start != token_end && lengths_total == 0) {
-        atomicMax(status, 3u);
-        return;
-    }
-    if (chunk_offsets[num_batches] != lengths_total) {
-        atomicMax(status, 3u);
-    }
-}
 
 // Arrow/Vortex variable-length view records are 16 bytes. Values up to 12 bytes
 // are stored inline after the u32 length. Longer values store their first four

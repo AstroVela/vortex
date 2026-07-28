@@ -12,8 +12,20 @@
 // token_bounds[1])` (device-resident, resolved from `codes_offsets`) and
 // writes window-relative output positions from the window-relative
 // `chunk_offsets` sweep, so a sliced array decodes just its own rows into a
-// window-sized buffer. One warp decodes one 128-token batch (4 tokens per
-// lane) in four phases:
+// window-sized buffer.
+//
+// No launch-gating validation precedes this kernel: it re-derives its own
+// memory-safety preconditions from device memory instead, so the host never
+// synchronizes on the codes chain. The window end is clamped to the code
+// stream, dictionary gathers apply the same `code < dict_size` guard as the
+// offsets sweep (keeping every batch's re-derived byte count identical to its
+// `chunk_offsets` entry), and each block exits unless the sweep's window total
+// equals `lengths_total` — the `uncompressed_lengths` sum the output buffer
+// was allocated with. Inconsistent children (a corrupt or hostile file)
+// therefore produce garbage-but-bounded output, never an out-of-bounds
+// access; semantic validation of the children happens elsewhere.
+//
+// One warp decodes one 128-token batch (4 tokens per lane) in four phases:
 //
 // 1. Load   — each lane fetches its 4 codes, their first-8 dictionary bytes
 //             (`dict_s8`), and their lengths.
@@ -72,13 +84,17 @@ struct OnPairTokens {
 
 // Phase 1 — load this lane's 4 (code, dict_s8 bytes, length) triples. Tokens
 // outside the visible window `[token_start, token_end)` load as empty, so the
-// warp scan positions the window's tokens window-relative. `CodeT` is the
-// code stream's element type (u16 natively, u8 when the compressor narrowed
-// the codes).
+// warp scan positions the window's tokens window-relative. A code outside the
+// dictionary also loads as empty — the same guard the offsets sweep applies,
+// so the batch's byte count always matches its `chunk_offsets` entry and the
+// dictionary gathers stay in bounds without a pre-validated launch. `CodeT`
+// is the code stream's element type (u16 natively, u8 when the compressor
+// narrowed the codes).
 template <typename CodeT>
 __device__ inline OnPairTokens onpair_load_tokens(const CodeT *__restrict codes,
                                                   const uint8_t *__restrict dict_s8,
                                                   const uint8_t *__restrict lens,
+                                                  uint32_t dict_size,
                                                   uint64_t base_i,
                                                   uint64_t token_start,
                                                   uint64_t token_end) {
@@ -86,15 +102,16 @@ __device__ inline OnPairTokens onpair_load_tokens(const CodeT *__restrict codes,
 #pragma unroll
     for (uint8_t k = 0; k < 4; ++k) {
         const uint64_t i = base_i + (uint64_t)(k * 32);
+        t.code[k] = 0u;
+        t.lo[k] = make_uint2(0u, 0u);
+        t.len[k] = 0u;
         if (i >= token_start && i < token_end) {
             const uint32_t code = (uint32_t)codes[i];
-            t.code[k] = code;
-            t.lo[k] = *reinterpret_cast<const uint2 *>(dict_s8 + (size_t)code * 8u);
-            t.len[k] = (uint32_t)lens[code];
-        } else {
-            t.code[k] = 0u;
-            t.lo[k] = make_uint2(0u, 0u);
-            t.len[k] = 0u;
+            if (code < dict_size) {
+                t.code[k] = code;
+                t.lo[k] = *reinterpret_cast<const uint2 *>(dict_s8 + (size_t)code * 8u);
+                t.len[k] = (uint32_t)lens[code];
+            }
         }
     }
     return t;
@@ -183,12 +200,14 @@ __device__ inline void onpair_drain(const uint8_t *__restrict s_buf,
     }
 }
 
-// The host launches this kernel only after validating the token window and
-// the offsets sweep's status word, so the window read from `token_bounds` is
-// trusted here: its end never exceeds the code stream and the window-relative
-// `chunk_offsets` position every write inside the window-sized output buffer.
-// Batches entirely outside the window exit immediately; boundary batches load
-// their out-of-window tokens as empty.
+// Nothing gates this kernel's launch; it re-derives its memory-safety
+// preconditions from device memory (see the header comment). The window end
+// clamps to the code stream, and the block exits unless the window-relative
+// sweep total equals `lengths_total`, the size of the output allocation —
+// with the load guards mirroring the sweep, every batch then writes exactly
+// `[chunk_offsets[chunk], chunk_offsets[chunk + 1])`, which the total check
+// pins inside the buffer. Batches entirely outside the window exit
+// immediately; boundary batches load their out-of-window tokens as empty.
 template <typename CodeT>
 __device__ inline void onpair_decode_body(const CodeT *__restrict codes,
                                           const uint64_t *__restrict chunk_offsets,
@@ -196,12 +215,20 @@ __device__ inline void onpair_decode_body(const CodeT *__restrict codes,
                                           const uint8_t *__restrict dict_padded,
                                           const uint8_t *__restrict lens,
                                           uint8_t *__restrict output_bytes,
-                                          const uint64_t *__restrict token_bounds) {
+                                          const uint64_t *__restrict token_bounds,
+                                          uint32_t dict_size,
+                                          uint64_t total_tokens,
+                                          uint64_t lengths_total) {
     const uint32_t lane = threadIdx.x & 31;
     const uint32_t warp_id = threadIdx.x >> 5;
     const uint64_t chunk = (uint64_t)blockIdx.x * (uint64_t)(blockDim.x >> 5) + (uint64_t)warp_id;
     const uint64_t token_start = token_bounds[0];
-    const uint64_t token_end = token_bounds[1];
+    const uint64_t bound_end = token_bounds[1];
+    const uint64_t token_end = bound_end < total_tokens ? bound_end : total_tokens;
+    const uint64_t num_batches = (total_tokens + 127u) / 128u;
+    if (chunk_offsets[num_batches] != lengths_total) {
+        return;
+    }
     const uint64_t batch_base = chunk * 128u;
     if (batch_base >= token_end || batch_base + 128u <= token_start) {
         return;
@@ -210,8 +237,13 @@ __device__ inline void onpair_decode_body(const CodeT *__restrict codes,
     __shared__ __align__(16) uint8_t s_buf_all[WARPS_PER_BLOCK_MAX * WARP_BUF_BYTES];
     uint8_t *s_buf_base = &s_buf_all[warp_id * WARP_BUF_BYTES];
 
-    const OnPairTokens t =
-        onpair_load_tokens(codes, dict_s8, lens, batch_base + (uint64_t)lane, token_start, token_end);
+    const OnPairTokens t = onpair_load_tokens(codes,
+                                              dict_s8,
+                                              lens,
+                                              dict_size,
+                                              batch_base + (uint64_t)lane,
+                                              token_start,
+                                              token_end);
 
     uint32_t excl[4];
     const uint32_t warp_total = onpair_scan_offsets(t.len, lane, excl);
@@ -235,8 +267,20 @@ onpair_shmem_4tpt_split8read_u8(const uint8_t *__restrict codes,
                                 const uint8_t *__restrict dict_padded,
                                 const uint8_t *__restrict lens,
                                 uint8_t *__restrict output_bytes,
-                                const uint64_t *__restrict token_bounds) {
-    onpair_decode_body<uint8_t>(codes, chunk_offsets, dict_s8, dict_padded, lens, output_bytes, token_bounds);
+                                const uint64_t *__restrict token_bounds,
+                                uint32_t dict_size,
+                                uint64_t total_tokens,
+                                uint64_t lengths_total) {
+    onpair_decode_body<uint8_t>(codes,
+                                chunk_offsets,
+                                dict_s8,
+                                dict_padded,
+                                lens,
+                                output_bytes,
+                                token_bounds,
+                                dict_size,
+                                total_tokens,
+                                lengths_total);
 }
 
 extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void
@@ -246,12 +290,18 @@ onpair_shmem_4tpt_split8read_u16(const uint16_t *__restrict codes,
                                  const uint8_t *__restrict dict_padded,
                                  const uint8_t *__restrict lens,
                                  uint8_t *__restrict output_bytes,
-                                 const uint64_t *__restrict token_bounds) {
+                                 const uint64_t *__restrict token_bounds,
+                                 uint32_t dict_size,
+                                 uint64_t total_tokens,
+                                 uint64_t lengths_total) {
     onpair_decode_body<uint16_t>(codes,
                                  chunk_offsets,
                                  dict_s8,
                                  dict_padded,
                                  lens,
                                  output_bytes,
-                                 token_bounds);
+                                 token_bounds,
+                                 dict_size,
+                                 total_tokens,
+                                 lengths_total);
 }
