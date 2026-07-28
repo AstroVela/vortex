@@ -454,6 +454,9 @@ mod test {
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::session::LayoutSession;
+    use vortex_array::expr::stats::Stat;
+    use vortex_array::stats::expr::stat;
+    use vortex_array::stats::expr::sum;
 
     fn session_with_handle(handle: Handle) -> VortexSession {
         array_session()
