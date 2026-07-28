@@ -3,14 +3,15 @@
 
 //! Optimized run-end decoding for boolean arrays.
 //!
-//! Two kernels, picked per array by [`prefer_splat`]:
+//! Two kernels, picked per array by `prefer_splat`:
 //!
 //! * *splat* accumulates runs into a 64-bit word and stores each output word exactly once. Head
 //!   and tail masking is paid per output word rather than per run, and the run's value only
 //!   feeds an `AND` mask, so the value-dependent branch disappears. This is the kernel for short
-//!   runs, where it is up to 4x the prefill. It comes in two forms, picked by [`prefer_blend`]:
+//!   runs, where it is up to 4x the prefill. It comes in two forms, picked by `prefer_blend`:
 //!   one that branches on whether a run reaches the end of the word, and one that paints past
-//!   the run's end and stores every run instead.
+//!   the run's end and stores every run instead, trading a store per run for a branch that
+//!   mispredicts once runs are near a word long.
 //! * *prefill* memsets the whole output with the majority value and then patches only the runs
 //!   that differ. One big memset beats a per-run one, so this stays ahead once runs are long
 //!   enough that the splat pays a whole-word fill per run and the patched runs are rare.
@@ -493,18 +494,17 @@ fn minority_runs(values: &BitBuffer) -> usize {
 /// The splat pays per output word; the prefill pays one memset over the whole output plus one
 /// range fill per patched run, and a range fill is far dearer than a splat step — a partial byte
 /// at each end, a `memset` call, and a data-dependent branch to decide whether to do it at all.
-/// Measured, one patched run costs about what the splat spends on three output words. So the
-/// prefill wins exactly when patches are rarer than that.
+/// So the prefill only wins once patches are rare relative to the output: measured, rarer than
+/// about one per eight output words.
 ///
-/// A second output buffer does not double the splat's side of that: [`BitSplatPair`] shares the
-/// run length, the word-boundary test and the head mask, so the second buffer adds about half the
-/// cost of the first. Hence `buffers + 1` against a doubled constant rather than `buffers`.
+/// The same threshold holds whether one buffer is being built or two: the nullable kernel
+/// doubles the work on both sides of the comparison, since the prefill memsets and patches two
+/// buffers exactly where the splat builds two.
 ///
 /// Re-derive by returning a constant from here and running `run_end_decode_bool_ablation` with
-/// each kernel pinned. On that grid this picks the faster kernel at 25 of 26 points; the miss is
-/// non-nullable 1024-element runs with 50/50 values, where it gives up 6%.
-fn prefer_splat(patched_runs: usize, buffers: usize, length: usize) -> bool {
-    patched_runs * 6 * WORD_BITS >= length * (buffers + 1)
+/// each kernel pinned. On that grid this picks the faster kernel at all 30 points.
+fn prefer_splat(patched_runs: usize, length: usize) -> bool {
+    patched_runs * 8 * WORD_BITS >= length
 }
 
 /// Chooses which splat form to use, from the average run length.
@@ -516,14 +516,15 @@ fn prefer_splat(patched_runs: usize, buffers: usize, length: usize) -> bool {
 ///
 /// * well below a word the test almost never fires, so it predicts and costs nothing, while the
 ///   blend's store fires every run — up to 64 times per word of output;
-/// * from about a quarter of a word up, the test is close enough to a coin flip that its
-///   mispredictions cost more than the redundant stores. Measured, the blend is worth 1.35-1.9x
-///   from there, peaking at 1.7x where runs are half a word.
+/// * from about an eighth of a word up, the test fires often enough to mispredict, and the blend
+///   is worth 1.2-1.5x;
+/// * far above a word the test always fires, so it predicts again, and the blend is left paying
+///   its extra store and arithmetic against a whole-word fill that dominates either way.
 ///
-/// The nullable kernel crosses over earlier: it does about twice the work per run, so the extra
-/// stores are proportionally cheaper, while a misprediction costs the same.
+/// The nullable kernel enters the band later: it does about twice the work per run, so the extra
+/// stores are proportionally dearer, while a misprediction costs the same.
 fn prefer_blend(num_runs: usize, buffers: usize, length: usize) -> bool {
-    length * 4 * buffers >= num_runs * WORD_BITS
+    length >= num_runs * 8 * buffers && length <= num_runs * 4 * WORD_BITS
 }
 
 /// Decodes run-end encoded booleans when all values are valid (non-nullable).
@@ -536,7 +537,7 @@ fn decode_bool_non_nullable<E: IntegerPType>(
 ) -> BoolArray {
     let (offset_e, length_e) = trim_bounds::<E>(offset, length);
 
-    if !prefer_splat(minority_runs(values), 1, length) {
+    if !prefer_splat(minority_runs(values), length) {
         return prefill_bool_non_nullable(
             run_ends,
             offset_e,
@@ -575,7 +576,7 @@ fn decode_bool_nullable<E: IntegerPType>(
 
     // Both buffers are prefilled and patched independently, so both sets of minority runs count.
     let patched_runs = minority_runs(values) + minority_runs(validity_mask);
-    if !prefer_splat(patched_runs, 2, length) {
+    if !prefer_splat(patched_runs, length) {
         return prefill_bool_nullable(run_ends, offset_e, length_e, values, validity_mask, length);
     }
 

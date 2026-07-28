@@ -10,40 +10,43 @@
 //!   splat — accumulate runs into a 64-bit word, store each output word exactly once, into a
 //!   buffer sized up front and overwritten by index — and between the splat's two forms.
 //!
-//! Run lengths and values are randomised and datasets are rotated across iterations, so the
-//! per-run value branch the prefill kernel depends on cannot be memorised by the predictor.
+//! Run lengths are drawn from a normal distribution about the target average and values are
+//! randomised, with datasets rotated across iterations, so neither the per-run value branch the
+//! prefill kernel depends on nor the word-boundary test the splat forms differ over can be
+//! memorised by the predictor. Matches `run_end_decode_bool_corpus`, so the constants derived
+//! here hold for the data CI measures.
 //!
-//! The dispatch in `prefer_splat` comes from running this grid against a build pinned to each
-//! kernel (return a constant from `prefer_splat` to re-derive it). Splat over prefill, by
-//! fastest sample:
+//! Both dispatch constants come from running this grid against a build pinned to each kernel
+//! (return a constant from `prefer_splat` or `prefer_blend` to re-derive them).
 //!
-//! ```text
-//! run length      1     2     8    32    64   128  1024
-//! non-nullable
-//!   50/50      3.49  3.59  3.22  1.95  2.13  0.92  1.06
-//!   90/10         -  1.37  1.13  0.66  0.77  0.51  0.78
-//! nullable
-//!   50/50      2.41  2.54  2.40  1.58  1.20  0.96  0.73
-//!   90/10         -  1.46  1.35  0.96  0.73  0.60  0.84
-//! ```
-//!
-//! The splat is worth up to 3.6x while runs are short. The crossover moves in with skew, since a
-//! skewed prefill patches few runs. `prefer_splat` reproduces this table's sign at 25 of the 26
-//! points; the miss is non-nullable 1024/50-50, where it gives up 6%.
-//!
-//! `prefer_blend` picks between the splat's two forms, and was derived the same way — pin the
-//! form and run the grid. Blend over branching, by fastest sample, splat forced:
+//! Splat over prefill, by fastest sample:
 //!
 //! ```text
 //! run length      1     2     8    16    32    48    64   128  1024
-//! non-nullable 0.75  0.79  1.02  1.35  1.71  1.39  1.15  0.86  0.74
-//! nullable     0.82  0.88  1.15  1.37  1.71  1.79  1.74  1.89  1.16
+//! non-nullable
+//!   50/50      3.57  3.67  3.71  3.75  3.45  3.02  2.91  1.52  0.85
+//!   90/10         -  1.38  1.35     -  1.14     -  0.90  0.74  0.76
+//! nullable
+//!   50/50      2.42  3.17  3.01  3.98  2.96  3.05  2.57  2.18  1.09
+//!   90/10         -  1.85  1.79     -  1.81     -  1.74  1.43  1.10
 //! ```
 //!
-//! The peak is at half a word, where a run's chance of crossing a word boundary is closest to a
-//! coin flip and the branching form's test mispredicts most.
+//! Blend over branching, splat forced:
+//!
+//! ```text
+//! run length      1     2     8    16    32    48    64   128  1024
+//! non-nullable 0.91  0.99  1.18  1.31  1.41  1.43  1.48  1.18  0.93
+//! nullable     0.87  0.90  1.03  1.15  1.27  1.52  1.25  0.94  0.89
+//! ```
+//!
+//! The splat wins wherever the prefill would have runs to patch; it only loses where patches are
+//! rare enough that the prefill is close to a bare memset. The blend wins in a band around a
+//! word: below it the boundary test predicts and its unconditional store is pure cost, above it
+//! the test predicts again and the whole-word fill dominates either way. Together the two
+//! constants pick the faster kernel at all 30 points of the splat grid.
 
 #![expect(clippy::cast_possible_truncation)]
+#![expect(clippy::unwrap_used)]
 
 use std::fmt;
 use std::sync::atomic::AtomicUsize;
@@ -53,6 +56,8 @@ use divan::Bencher;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand_distr::Distribution;
+use rand_distr::Normal;
 use vortex_array::IntoArray;
 use vortex_array::arrays::BoolArray;
 use vortex_array::dtype::Nullability;
@@ -188,7 +193,10 @@ struct Dataset {
 
 fn dataset(seed: u64, avg_run_length: usize, skew: Skew, nullable: bool) -> Dataset {
     let mut rng = StdRng::seed_from_u64(seed);
-    let max_run = (2 * avg_run_length - 1).max(1);
+    // Normal about the target average, matching `run_end_decode_bool_corpus`. A standard
+    // deviation of a third of the mean puts the clamp at one element three sigma out.
+    let mean = avg_run_length as f64;
+    let run_lengths = Normal::new(mean, (mean / 3.0).max(f64::MIN_POSITIVE)).unwrap();
     let p = skew.true_probability();
 
     let mut ends = BufferMut::<u32>::empty();
@@ -197,7 +205,7 @@ fn dataset(seed: u64, avg_run_length: usize, skew: Skew, nullable: bool) -> Data
 
     let mut pos = 0usize;
     while pos < TOTAL_LENGTH {
-        let run = rng.random_range(1..=max_run).min(TOTAL_LENGTH - pos);
+        let run = (run_lengths.sample(&mut rng).round().max(1.0) as usize).min(TOTAL_LENGTH - pos);
         pos += run;
         ends.push(pos as u32);
         values.push(rng.random_bool(p));
