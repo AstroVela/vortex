@@ -10237,6 +10237,7 @@ dependencies = [
  "num-traits",
  "prost 0.14.4",
  "rand 0.10.2",
+ "rand_distr 0.6.0",
  "rstest",
  "vortex-array",
  "vortex-buffer",

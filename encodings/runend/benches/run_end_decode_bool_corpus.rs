@@ -10,10 +10,10 @@
 //! columns are neither.
 //!
 //! So these cases decode a *set* of arrays per sample, each array independently generated from
-//! a fixed seed, with every run length drawn at random around the target average. Nothing about
-//! run boundaries or run values repeats across a sample, and the working set is large enough
-//! that the input does not sit in L1. The seeds are fixed, so the corpus is identical on every
-//! run and in CI.
+//! a fixed seed, with every run length drawn from a normal distribution about the target
+//! average. Nothing about run boundaries or run values repeats across a sample, and the working
+//! set is large enough that the input does not sit in L1. The seeds are fixed, so the corpus is
+//! identical on every run and in CI.
 //!
 //! Two shapes, sized to bracket what a scan sees:
 //!
@@ -34,6 +34,8 @@ use divan::counter::ItemsCount;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand_distr::Distribution;
+use rand_distr::Normal;
 use vortex_array::ArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
@@ -66,6 +68,12 @@ const SKEWED: f64 = 0.9;
 
 /// Fraction of runs that are valid, in the nullable cases.
 const VALID: f64 = 0.9;
+
+/// Standard deviation of the run length, as a fraction of its mean.
+///
+/// A third of the mean puts the clamp at one element three standard deviations out, so it
+/// truncates a negligible tail and the realised mean stays close to the nominal one.
+const RUN_LENGTH_SIGMA: f64 = 1.0 / 3.0;
 
 /// How many arrays of what length make up one sample.
 #[derive(Clone, Copy)]
@@ -181,9 +189,10 @@ type Encoded = (PrimitiveArray, BoolArray);
 /// Builds one array whose runs average `avg_run_length` but are individually random.
 fn encoded_array(seed: u64, length: usize, avg_run_length: usize, mix: Mix) -> Encoded {
     let mut rng = StdRng::seed_from_u64(seed);
-    // Uniform over `1..=2*avg - 1`, so the mean is `avg` but no two runs need be alike and the
-    // decoder cannot hoist the run length out of its loop.
-    let max_run = (2 * avg_run_length - 1).max(1);
+    // Normal about the target average, so runs vary continuously rather than sitting in a flat
+    // band, and the decoder can neither hoist the run length nor learn a bounded one.
+    let mean = avg_run_length as f64;
+    let run_lengths = Normal::new(mean, (mean * RUN_LENGTH_SIGMA).max(f64::MIN_POSITIVE)).unwrap();
     let true_probability = mix.true_probability();
 
     let mut ends = BufferMut::<u32>::with_capacity(length / avg_run_length + 1);
@@ -192,7 +201,8 @@ fn encoded_array(seed: u64, length: usize, avg_run_length: usize, mix: Mix) -> E
 
     let mut pos = 0usize;
     while pos < length {
-        pos += rng.random_range(1..=max_run).min(length - pos);
+        let run = run_lengths.sample(&mut rng).round().max(1.0) as usize;
+        pos += run.min(length - pos);
         ends.push(pos as u32);
         values.push(rng.random_bool(true_probability));
         if let Some(valid) = mix.valid_probability() {
