@@ -282,8 +282,13 @@ fn a_gated_compressor_never_emits_a_gated_encoding() -> Result<(), Box<dyn std::
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::DecimalArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::StructArray;
     use vortex_array::arrays::VarBinArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::DecimalDType;
+    use vortex_array::dtype::Nullability;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
 
@@ -327,17 +332,41 @@ fn a_gated_compressor_never_emits_a_gated_encoding() -> Result<(), Box<dyn std::
         // Low-cardinality strings: dictionary and FSST territory.
         VarBinArray::from_iter(
             (0..8192).map(|i| Some(format!("payload-{}", i % 32))),
-            vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::Nullable),
+            DType::Utf8(Nullability::Nullable),
         )
         .into_array(),
         // Highly compressible bytes: what the compact preset would reach for Zstd on.
         VarBinArray::from_iter(
             (0..4096).map(|i| Some(format!("{}{i}", "repetitive-".repeat(16)))),
-            vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::Nullable),
+            DType::Utf8(Nullability::Nullable),
         )
         .into_array(),
         BoolArray::from_iter((0..8192).map(|i| i % 7 == 0)).into_array(),
+        // Decimals exercise `DecimalScheme`, whose output cascades into a primitive child.
+        DecimalArray::new(
+            Buffer::from_iter((0..8192i128).map(|i| 100_000 + (i % 97))),
+            DecimalDType::new(38, 2),
+            Validity::NonNullable,
+        )
+        .into_array(),
+        // Opaque bytes exercise the binary dictionary and Zstd schemes.
+        VarBinArray::from_iter(
+            (0..4096).map(|i| Some(vec![(i % 251) as u8; 24])),
+            DType::Binary(Nullability::Nullable),
+        )
+        .into_array(),
     ];
+
+    // A struct mixing the above forces the compressor to cascade across schemes, which is where
+    // an under-declared child encoding would otherwise slip through.
+    let nested = StructArray::try_new(
+        ["ints", "strings", "bools"].into(),
+        vec![arrays[0].clone(), arrays[3].clone(), arrays[5].clone()],
+        8192,
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let arrays: Vec<vortex_array::ArrayRef> = arrays.into_iter().chain([nested]).collect();
 
     // `with_compact` is the widest scheme set the writer ever uses, so it is the strongest case.
     let compressor = BtrBlocksCompressorBuilder::default()
@@ -359,5 +388,113 @@ fn a_gated_compressor_never_emits_a_gated_encoding() -> Result<(), Box<dyn std::
             );
         }
     }
+    Ok(())
+}
+
+/// The whole chain end to end: with a narrowed edition the compressor is filtered, the writer's
+/// array context refuses the gated ids, and the validator normalizes each chunk — a file must
+/// still come out, and read back unchanged. This is the case the benchmarks never cover, since
+/// they all build with `unstable_encodings` and enable every default edition.
+#[cfg(feature = "files")]
+#[tokio::test]
+async fn a_narrowed_edition_still_writes_a_readable_file() -> Result<(), Box<dyn std::error::Error>>
+{
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::StructArray;
+    use vortex_array::arrays::VarBinArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::stream::ArrayStreamExt;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+    use vortex_buffer::ByteBufferMut;
+    use vortex_file::OpenOptionsSessionExt;
+    use vortex_file::WriteOptionsSessionExt;
+
+    let session = baseline_core_session()?;
+
+    let table = StructArray::try_new(
+        ["ids", "labels", "flags"].into(),
+        vec![
+            PrimitiveArray::new(
+                Buffer::from_iter((0..8192u64).map(|i| 5_000_000 + (i % 64))),
+                Validity::NonNullable,
+            )
+            .into_array(),
+            VarBinArray::from_iter(
+                (0..8192).map(|i| Some(format!("label-{}", i % 48))),
+                DType::Utf8(Nullability::Nullable),
+            )
+            .into_array(),
+            BoolArray::from_iter((0..8192).map(|i| i % 3 == 0)).into_array(),
+        ],
+        8192,
+        Validity::NonNullable,
+    )?
+    .into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    session
+        .write_options()
+        .write(&mut buf, table.clone().to_array_stream())
+        .await?;
+
+    let round_tripped = session
+        .open_options()
+        .open_buffer(buf.freeze())?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    let mut ctx = session.create_execution_ctx();
+    vortex_array::assert_arrays_eq!(table, round_tripped, &mut ctx);
+    Ok(())
+}
+
+/// Narrowing the session *after* the write options are built must still produce a valid file.
+///
+/// This currently fails. [`VortexWriteOptions::new`] snapshots the writable set into the strategy
+/// when the options are built, but the writer's array context recomputes it at write time, so a
+/// session narrowed in between leaves the compressor filtered against the old, wider set and the
+/// context enforcing the new, narrower one. The write then dies with
+/// `Array encoding vortex.sequence not permitted by ctx`.
+///
+/// The fix is to stop deriving the writable set at strategy-construction time:
+/// [`LayoutStrategy::write_stream`] already receives the session, so the gate belongs there,
+/// at the point it is enforced.
+#[cfg(feature = "files")]
+#[ignore = "known bug: the strategy snapshots the writable set at construction time"]
+#[tokio::test]
+async fn narrowing_the_session_after_building_write_options()
+-> Result<(), Box<dyn std::error::Error>> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+    use vortex_buffer::ByteBufferMut;
+    use vortex_file::WriteOptionsSessionExt;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    // Built while the default (wide) core edition is enabled.
+    let write_options = session.write_options();
+    // ... and only narrowed afterwards.
+    session.enable_edition(CORE_2025_05_0)?;
+
+    let numbers = PrimitiveArray::new(
+        Buffer::from_iter((0..8192u64).map(|i| i / 512)),
+        Validity::NonNullable,
+    )
+    .into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    write_options
+        .write(&mut buf, numbers.to_array_stream())
+        .await?;
     Ok(())
 }
