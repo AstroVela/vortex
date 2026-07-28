@@ -65,34 +65,36 @@ struct ArrowDeviceArrayStream {
 vx_session *vx_cuda_session_new(vx_error **error_out);
 
 /**
- * Open a Vortex file sink configured to produce CUDA-readable files.
+ * Open a Vortex file writer configured to produce CUDA-readable files.
  *
- * Push host-resident arrays and close or abort the returned sink with the standard
- * `vx_array_sink_*` functions. This API configures the on-disk encodings and layout; it does not
+ * Push host-resident arrays and close the returned writer with the standard
+ * `vx_writer_*` functions. This API configures the on-disk encodings and layout; it does not
  * move arrays to the GPU during the write.
  */
-vx_array_sink *vx_cuda_array_sink_open_file(const vx_session *session,
-                                            vx_view path,
-                                            const vx_dtype *dtype,
-                                            vx_error **error_out);
+vx_writer *
+vx_cuda_writer_open(const vx_session *session, vx_view path, const vx_dtype *dtype, vx_error **error_out);
 
 /**
- * Open a CUDA-readable Vortex file sink with a fixed row block size.
+ * Open a CUDA-readable Vortex file writer with a fixed row block size.
  *
  * `block_rows` controls the row granularity of CUDA-flat data blocks. Passing zero uses the default
  * writer strategy: 8,192-row blocks may be coalesced into data blocks targeting 1 MiB. Passing any
  * nonzero value disables this byte-size coalescing, so passing 8,192 is not equivalent to passing
  * zero.
  *
+ * `concurrent_array_limit` is an upper limit on how many pushed arrays may be buffered before
+ * `vx_writer_push` blocks.
+ *
  * Write and scan sizing are independent. To align on-disk row blocks with scan batches, pass the
  * same nonzero value to this function and `vx_cuda_scan_path_arrow_device_stream_batch_rows`; the
  * API does not enforce a match.
  */
-vx_array_sink *vx_cuda_array_sink_open_file_block_rows(const vx_session *session,
-                                                       vx_view path,
-                                                       const vx_dtype *dtype,
-                                                       size_t block_rows,
-                                                       vx_error **error_out);
+vx_writer *vx_cuda_writer_open_block_rows(const vx_session *session,
+                                          vx_view path,
+                                          const vx_dtype *dtype,
+                                          size_t block_rows,
+                                          size_t concurrent_array_limit,
+                                          vx_error **error_out);
 
 /**
  * Options for scanning a CUDA-compatible Vortex file.
@@ -113,7 +115,7 @@ typedef struct vx_cuda_scan_options {
 /**
  * Scan a local CUDA-compatible Vortex file as an Arrow C Device stream.
  *
- * Files written by `vx_cuda_array_sink_open_file` are compatible with this path. Reusing the same
+ * Files written by `vx_cuda_writer_open` are compatible with this path. Reusing the same
  * CUDA session across calls also reuses the pinned host buffers used to stage file reads.
  *
  * On success returns 0 and writes an owned `ArrowDeviceArrayStream` to `out_stream`. The caller
@@ -132,7 +134,7 @@ int vx_cuda_scan_path_arrow_device_stream(const vx_session *session,
  * layout-derived splitting of `vx_cuda_scan_path_arrow_device_stream`.
  *
  * Scan and write sizing are independent. To align scan batches with on-disk row blocks, pass the
- * same nonzero value to this function and `vx_cuda_array_sink_open_file_block_rows`; the API does
+ * same nonzero value to this function and `vx_cuda_writer_open_block_rows`; the API does
  * not enforce a match.
  */
 int vx_cuda_scan_path_arrow_device_stream_batch_rows(const vx_session *session,

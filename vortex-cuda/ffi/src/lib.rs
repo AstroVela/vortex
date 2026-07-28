@@ -36,8 +36,6 @@ use vortex_ffi::ffi_runtime;
 use vortex_ffi::try_or;
 use vortex_ffi::vx_array;
 use vortex_ffi::vx_array_ref;
-use vortex_ffi::vx_array_sink;
-use vortex_ffi::vx_array_sink_open_file_with_strategy;
 use vortex_ffi::vx_dtype;
 use vortex_ffi::vx_error;
 use vortex_ffi::vx_partition;
@@ -46,6 +44,8 @@ use vortex_ffi::vx_session;
 use vortex_ffi::vx_session_new_with;
 use vortex_ffi::vx_session_ref;
 use vortex_ffi::vx_view;
+use vortex_ffi::vx_writer;
+use vortex_ffi::vx_writer_open_with_strategy;
 
 const VX_CUDA_OK: c_int = 0;
 const VX_CUDA_ERR: c_int = 1;
@@ -98,31 +98,31 @@ pub unsafe extern "C-unwind" fn vx_cuda_session_new(
     })
 }
 
-/// Open a Vortex file sink configured to produce CUDA-readable files.
+/// Open a Vortex file writer configured to produce CUDA-readable files.
 ///
-/// Push host-resident arrays and close or abort the returned sink with the standard
-/// `vx_array_sink_*` functions. This function configures the on-disk encodings and layout; it does
+/// Push host-resident arrays and close the returned writer with the standard
+/// `vx_writer_*` functions. This function configures the on-disk encodings and layout; it does
 /// not move arrays to the GPU during the write.
 ///
 /// # Safety
 ///
 /// `session`, `path`, and `dtype` must satisfy the same requirements as
-/// `vx_array_sink_open_file`. If `error_out` is non-null, it must be valid for writing one error
+/// `vx_writer_open`. If `error_out` is non-null, it must be valid for writing one error
 /// pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_cuda_array_sink_open_file(
+pub unsafe extern "C-unwind" fn vx_cuda_writer_open(
     session: *const vx_session,
     path: vx_view,
     dtype: *const vx_dtype,
     error_out: *mut *mut vx_error,
-) -> *mut vx_array_sink {
-    unsafe { vx_cuda_array_sink_open_file_block_rows(session, path, dtype, 0, error_out) }
+) -> *mut vx_writer {
+    unsafe { vx_cuda_writer_open_block_rows(session, path, dtype, 0, 32, error_out) }
 }
 
-/// Open a CUDA-readable Vortex file sink with a fixed row block size.
+/// Open a CUDA-readable Vortex file writer with a fixed row block size.
 ///
 /// `block_rows` controls the row granularity of CUDA-flat data blocks. Passing zero preserves the
-/// default writer strategy used by [`vx_cuda_array_sink_open_file`]. Any nonzero value disables
+/// default writer strategy used by [`vx_cuda_writer_open`]. Any nonzero value disables
 /// byte-size coalescing so data blocks retain the requested row granularity.
 ///
 /// Write and scan sizing are independent. To align on-disk row blocks with scan batches, pass the
@@ -131,16 +131,17 @@ pub unsafe extern "C-unwind" fn vx_cuda_array_sink_open_file(
 /// # Safety
 ///
 /// `session`, `path`, and `dtype` must satisfy the same requirements as
-/// `vx_array_sink_open_file`. If `error_out` is non-null, it must be valid for writing one error
+/// `vx_writer_open_file`. If `error_out` is non-null, it must be valid for writing one error
 /// pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_cuda_array_sink_open_file_block_rows(
+pub unsafe extern "C-unwind" fn vx_cuda_writer_open_block_rows(
     session: *const vx_session,
     path: vx_view,
     dtype: *const vx_dtype,
     block_rows: usize,
+    concurrent_array_limit: usize,
     error_out: *mut *mut vx_error,
-) -> *mut vx_array_sink {
+) -> *mut vx_writer {
     try_or(error_out, ptr::null_mut(), || {
         session_with_cuda(unsafe { vx_session_ref(session) }?)?;
         let mut strategy = WriteStrategyBuilder::default()
@@ -155,7 +156,15 @@ pub unsafe extern "C-unwind" fn vx_cuda_array_sink_open_file_block_rows(
                 .with_row_block_size(block_rows)
                 .with_data_block_target_bytes(None);
         }
-        unsafe { vx_array_sink_open_file_with_strategy(session, path, dtype, strategy.build()) }
+        unsafe {
+            vx_writer_open_with_strategy(
+                session,
+                path,
+                dtype,
+                concurrent_array_limit,
+                strategy.build(),
+            )
+        }
     })
 }
 
@@ -165,7 +174,7 @@ pub unsafe extern "C-unwind" fn vx_cuda_array_sink_open_file_block_rows(
 /// buffers and transferred directly to the GPU.
 ///
 /// The file must use encodings and layouts supported by the CUDA execution path, such as files
-/// written by [`vx_cuda_array_sink_open_file`]. Pinned staging buffers are reused across scans made
+/// written by [`vx_cuda_writer_open`]. Pinned staging buffers are reused across scans made
 /// with the same CUDA session.
 ///
 /// On success returns `0` and writes an owned [`ArrowDeviceArrayStream`] to `out_stream`. The
@@ -204,7 +213,7 @@ pub unsafe extern "C-unwind" fn vx_cuda_scan_path_arrow_device_stream(
 /// layout-derived splitting used by [`vx_cuda_scan_path_arrow_device_stream`].
 ///
 /// Scan and write sizing are independent. To align scan batches with on-disk row blocks, pass the
-/// same nonzero value to this function and [`vx_cuda_array_sink_open_file_block_rows`].
+/// same nonzero value to this function and [`vx_cuda_writer_open_block_rows`].
 ///
 /// # Safety
 ///
