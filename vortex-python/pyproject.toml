@@ -87,5 +87,5 @@ dev = [
     "protobuf>=6.33.5",
 ]
 
-[tool.basedpyright]
-exclude = ["python/vortex/_lib/store/**.pyi"]
+[tool.ty.src]
+exclude = ["python/vortex/_lib/store/**/*.pyi"]

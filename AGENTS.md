@@ -99,7 +99,7 @@ or with a targeted doc/config command, and verify symlink or path changes with `
 For Python binding changes under `vortex-python/`, run the relevant Python lint and type checks:
 
 ```bash
-uv run basedpyright vortex-python
+uv run ty check vortex-python
 uv run ruff check <changed-python-files>
 ```
 

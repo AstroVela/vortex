@@ -10,7 +10,7 @@ not enabled, instantiating :class:`CosStore` raises :class:`ImportError`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     # `vortex._lib.__init__.pyi` declares `CosStore` so type checkers see a real
@@ -26,7 +26,7 @@ else:
         class CosStore:
             """Placeholder; the real implementation requires the ``opendal`` feature."""
 
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
+            def __init__(self, *args: object, **kwargs: object) -> None:
                 raise ImportError(
                     "CosStore requires Vortex to be built with the 'opendal' feature; "
                     + "build with `maturin build --features opendal` "

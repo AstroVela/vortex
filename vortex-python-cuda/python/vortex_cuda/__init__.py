@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
-# pyright: reportAttributeAccessIssue=false, reportMissingModuleSource=false, reportPrivateUsage=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 
 import importlib
 
