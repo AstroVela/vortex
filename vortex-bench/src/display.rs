@@ -30,10 +30,12 @@ pub fn render_table<W: Write, T: ToTable>(
     all_measurements: Vec<T>,
     targets: &[Target],
 ) -> anyhow::Result<()> {
-    // Decompress-only runs (for example `compress-bench --gpu-decompress`) collect no
-    // compression ratios, and callers pass no targets when the baseline format was not
-    // benchmarked. There is no table to draw in either case, and the indexing below would
-    // otherwise panic on the missing baseline.
+    // `all_measurements` is empty for decompress-only runs such as `compress-bench
+    // --gpu-decompress`: every ratio compares vortex against parquet or lance, neither of
+    // which is benchmarked there, so no ratio is recorded even though a baseline target is
+    // still passed. `targets` is instead empty when the caller has no baseline format to
+    // report against. Either way there is no table to draw, and the indexing below would
+    // panic looking up a baseline that has no measurements.
     if all_measurements.is_empty() || targets.is_empty() {
         return Ok(());
     }

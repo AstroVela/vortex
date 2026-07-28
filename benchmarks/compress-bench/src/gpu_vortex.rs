@@ -31,23 +31,7 @@ use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
 
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
-pub struct GpuVortexCompressor {
-    #[cfg_attr(
-        not(target_os = "linux"),
-        expect(dead_code, reason = "direct IO is only available on Linux")
-    )]
-    direct_io: bool,
-}
-
-impl GpuVortexCompressor {
-    /// Creates a GPU compressor, reading the CUDA file with direct IO (`O_DIRECT`) when
-    /// `direct_io` is set.
-    ///
-    /// Direct IO is only available on Linux; the flag is ignored on other platforms.
-    pub fn new(direct_io: bool) -> Self {
-        Self { direct_io }
-    }
-}
+pub struct GpuVortexCompressor;
 
 #[async_trait]
 impl Compressor for GpuVortexCompressor {
@@ -80,12 +64,11 @@ impl Compressor for GpuVortexCompressor {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
         let start = Instant::now();
         let open_options = SESSION.open_options().with_cuda();
+        // Direct IO keeps repeated iterations measuring storage bandwidth rather than
+        // page-cache hits. It is only available on Linux.
         #[cfg(target_os = "linux")]
-        let open_options = if self.direct_io {
-            open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io())
-        } else {
-            open_options
-        };
+        let open_options =
+            open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io());
         let file = open_options.open_path(gpu_file.path()).await?;
         let mut batches = file.scan()?.into_array_stream()?;
 
