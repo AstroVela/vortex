@@ -9979,6 +9979,7 @@ dependencies = [
  "async-fs",
  "async-lock",
  "async-trait",
+ "codspeed-divan-compat",
  "futures",
  "jni",
  "object_store",
