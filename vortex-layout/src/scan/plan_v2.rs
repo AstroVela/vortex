@@ -63,7 +63,7 @@ impl PlanV2 {
 /// Shared handle to a heap-allocated V2 physical scan plan.
 pub type ScanPlanRef = Arc<dyn ScanPlan>;
 
-/// A heap-allocated V2 physical scan plan.
+/// A heap-allocated physical scan plan.
 ///
 /// A source plan represents an instantiated layout. [`apply_expr`](Self::apply_expr) derives
 /// another plan whose root value is the applied expression, and [`optimize`](Self::optimize)
