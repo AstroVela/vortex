@@ -92,15 +92,13 @@ jobs:
         env:
           HEAP_PROFILE_BENCHMARK: ${{ matrix.benchmark.id }}
           HEAP_PROFILE_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAP_PROFILE_ENGINE: "vortex"
-          HEAP_PROFILE_FORMAT: ${{ matrix.benchmark.formats }}
           POLARSIGNALS_CLOUD_TOKEN: ${{ secrets.POLAR_SIGNALS_API_KEY }}
           POLARSIGNALS_PROJECT_ID: "e5d846e1-b54c-46e7-9174-8bf055a3af56"
           RUST_BACKTRACE: full
           VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         run: |
-          scripts/bench-heap-profile.sh python3 scripts/random-access-split.py
+          python3 scripts/random-access-split.py
 
       - name: Run ${{ matrix.benchmark.name }} benchmark
         if: matrix.benchmark.id != 'random-access-bench'

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+import json
 import sys
 import textwrap
 from pathlib import Path
 
+import bench_orchestrator.runner.executor as executor_module
 from bench_orchestrator.config import Benchmark, Engine, Format
 from bench_orchestrator.runner.executor import BenchmarkExecutor
 
@@ -114,3 +116,64 @@ def test_run_streams_logs_without_counting_them(tmp_path: Path) -> None:
 
     assert results == ['{"engine":"duckdb","format":"parquet","query":0}']
     assert streamed == results
+
+
+def test_run_heap_profiles_each_engine_format_separately(tmp_path: Path, monkeypatch) -> None:
+    wrapper = tmp_path / "profile-wrapper.py"
+    wrapper.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import os
+            import sys
+
+            os.execv(sys.argv[1], sys.argv[1:])
+            """
+        ),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    binary = tmp_path / "fake-bench.py"
+    binary.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            format_idx = sys.argv.index("--formats") + 1
+            file_format = sys.argv[format_idx]
+            if "--ingest-jsonl" in sys.argv:
+                ingest_idx = sys.argv.index("--ingest-jsonl") + 1
+                Path(sys.argv[ingest_idx]).write_text(file_format + "\\n", encoding="utf-8")
+
+            print(json.dumps({{
+                "engine": os.environ["HEAP_PROFILE_ENGINE"],
+                "format": os.environ["HEAP_PROFILE_FORMAT"],
+            }}))
+            """
+        ),
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    monkeypatch.setattr(executor_module, "_HEAP_PROFILE_SCRIPT", wrapper)
+    monkeypatch.setenv("POLARSIGNALS_CLOUD_TOKEN", "test-token")
+
+    ingest_output = tmp_path / "results.ingest.jsonl"
+    executor = BenchmarkExecutor(binary, Engine.DUCKDB)
+    results = executor.run(
+        benchmark=Benchmark.CLICKBENCH,
+        formats=[Format.PARQUET, Format.VORTEX],
+        iterations=1,
+        ingest_output=ingest_output,
+    )
+
+    assert [json.loads(result) for result in results] == [
+        {"engine": "duckdb", "format": "parquet"},
+        {"engine": "duckdb", "format": "vortex"},
+    ]
+    assert ingest_output.read_text(encoding="utf-8") == "parquet\nvortex\n"

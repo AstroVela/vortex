@@ -155,8 +155,6 @@ jobs:
         env:
           HEAP_PROFILE_BENCHMARK: ${{ matrix.id }}
           HEAP_PROFILE_COMMIT_SHA: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
-          HEAP_PROFILE_ENGINE: ${{ join(matrix.targets.*.engine, ',') }}
-          HEAP_PROFILE_FORMAT: ${{ join(matrix.targets.*.format, ',') }}
           OTEL_SERVICE_NAME: "vortex-bench"
           OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
           OTEL_EXPORTER_OTLP_ENDPOINT: "${{ (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false) && secrets.OTEL_EXPORTER_OTLP_ENDPOINT || '' }}"
@@ -165,16 +163,15 @@ jobs:
           POLARSIGNALS_CLOUD_TOKEN: ${{ secrets.POLAR_SIGNALS_API_KEY }}
           POLARSIGNALS_PROJECT_ID: "e5d846e1-b54c-46e7-9174-8bf055a3af56"
         run: |
-          scripts/bench-heap-profile.sh \
-            bash scripts/bench-taskset.sh uv run --project bench-orchestrator \
-              vx-bench run "${{ matrix.subcommand }}" \
-              --targets-json '${{ toJSON(matrix.targets) }}' \
-              --output results.json \
-              --ingest-jsonl results.ingest.jsonl \
-              --no-build \
-              --runner "ec2_${{ inputs.machine_type }}" \
-              ${{ matrix.iterations && format('--iterations {0}', matrix.iterations) || '' }} \
-              ${{ matrix.scale_factor && format('--opt scale-factor={0}', matrix.scale_factor) || '' }}
+          bash scripts/bench-taskset.sh uv run --project bench-orchestrator \
+            vx-bench run "${{ matrix.subcommand }}" \
+            --targets-json '${{ toJSON(matrix.targets) }}' \
+            --output results.json \
+            --ingest-jsonl results.ingest.jsonl \
+            --no-build \
+            --runner "ec2_${{ inputs.machine_type }}" \
+            ${{ matrix.iterations && format('--iterations {0}', matrix.iterations) || '' }} \
+            ${{ matrix.scale_factor && format('--opt scale-factor={0}', matrix.scale_factor) || '' }}
 
       - name: Run ${{ matrix.name }} benchmark (remote)
         if: matrix.remote_key != null && (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false)
@@ -183,8 +180,6 @@ jobs:
           AWS_REGION: "us-east-1"
           HEAP_PROFILE_BENCHMARK: ${{ matrix.id }}
           HEAP_PROFILE_COMMIT_SHA: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
-          HEAP_PROFILE_ENGINE: ${{ join(matrix.targets.*.engine, ',') }}
-          HEAP_PROFILE_FORMAT: ${{ join(matrix.targets.*.format, ',') }}
           OTEL_SERVICE_NAME: "vortex-bench"
           OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
           OTEL_EXPORTER_OTLP_ENDPOINT: "${{ (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false) && secrets.OTEL_EXPORTER_OTLP_ENDPOINT || '' }}"
@@ -194,17 +189,16 @@ jobs:
           POLARSIGNALS_PROJECT_ID: "e5d846e1-b54c-46e7-9174-8bf055a3af56"
           REMOTE_STORAGE: "s3://vortex-ci-benchmark-datasets/${{ github.ref_name }}/${{ github.run_id }}/${{ matrix.remote_key }}/"
         run: |
-          scripts/bench-heap-profile.sh \
-            bash scripts/bench-taskset.sh uv run --project bench-orchestrator \
-              vx-bench run "${{ matrix.subcommand }}" \
-              --targets-json '${{ toJSON(matrix.targets) }}' \
-              --output results.json \
-              --ingest-jsonl results.ingest.jsonl \
-              --no-build \
-              --runner "ec2_${{ inputs.machine_type }}" \
-              ${{ matrix.iterations && format('--iterations {0}', matrix.iterations) || '' }} \
-              --opt remote-data-dir="$REMOTE_STORAGE" \
-              ${{ matrix.scale_factor && format('--opt scale-factor={0}', matrix.scale_factor) || '' }}
+          bash scripts/bench-taskset.sh uv run --project bench-orchestrator \
+            vx-bench run "${{ matrix.subcommand }}" \
+            --targets-json '${{ toJSON(matrix.targets) }}' \
+            --output results.json \
+            --ingest-jsonl results.ingest.jsonl \
+            --no-build \
+            --runner "ec2_${{ inputs.machine_type }}" \
+            ${{ matrix.iterations && format('--iterations {0}', matrix.iterations) || '' }} \
+            --opt remote-data-dir="$REMOTE_STORAGE" \
+            ${{ matrix.scale_factor && format('--opt scale-factor={0}', matrix.scale_factor) || '' }}
 
       - name: Capture file sizes
         if: matrix.remote_key == null

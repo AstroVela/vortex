@@ -92,11 +92,22 @@ esac
 
 parca_asset="parca_${parca_version}_Linux_${parca_arch}.tar.gz"
 parca_url="https://github.com/parca-dev/parca/releases/download/v${parca_version}/${parca_asset}"
+parca_cache_dir="$profile_tmp_root/vortex-parca-cache"
+cached_archive_path="$parca_cache_dir/$parca_asset"
 
-curl --fail --location --retry 3 --retry-all-errors \
-    --output "$archive_path" \
-    "$parca_url"
-printf '%s  %s\n' "$parca_sha256" "$archive_path" | sha256sum --check --status -
+mkdir -p "$parca_cache_dir"
+if [[ ! -f "$cached_archive_path" ]] \
+    || ! printf '%s  %s\n' "$parca_sha256" "$cached_archive_path" \
+        | sha256sum --check --status -
+then
+    curl --fail --location --retry 3 --retry-all-errors \
+        --output "$archive_path" \
+        "$parca_url"
+    printf '%s  %s\n' "$parca_sha256" "$archive_path" | sha256sum --check --status -
+    mv "$archive_path" "$cached_archive_path"
+fi
+
+archive_path="$cached_archive_path"
 tar -xzf "$archive_path" -C "$profile_tmp_dir"
 parca_path="$(find "$profile_tmp_dir" -type f -name parca -print -quit)"
 if [[ -z "$parca_path" ]]; then
@@ -137,7 +148,16 @@ YAML
 
 external_labels="branch=$branch;gh_run_id=$run_id;commit_sha=$commit_sha;benchmark=$HEAP_PROFILE_BENCHMARK;engine=$engine;format=$format;gh_job=$job"
 
-"$parca_path" \
+parca_command=("$parca_path")
+if [[ -f /tmp/vortex-benchmark.env ]]; then
+    # shellcheck disable=SC1091
+    source /tmp/vortex-benchmark.env
+    if [[ -n "${HOUSEKEEPING_CPUS:-}" ]] && command -v taskset >/dev/null 2>&1; then
+        parca_command=(taskset --cpu-list "$HOUSEKEEPING_CPUS" "$parca_path")
+    fi
+fi
+
+"${parca_command[@]}" \
     --config-path="$config_path" \
     --store-address=grpc.polarsignals.com:443 \
     --bearer-token-file="$token_path" \

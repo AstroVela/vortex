@@ -3,11 +3,14 @@
 
 """Benchmark binary execution."""
 
+import os
 import selectors
 import subprocess
 from collections import deque
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import final
 
 from rich.console import Console
@@ -16,6 +19,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from ..config import Benchmark, Engine, Format
 
 console = Console()
+_HEAP_PROFILE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "bench-heap-profile.sh"
 
 
 @final
@@ -120,26 +124,91 @@ class BenchmarkExecutor:
         Returns:
             List of JSON lines from the benchmark output
         """
-        cmd = self.build_command(
-            benchmark=benchmark,
-            formats=formats,
-            queries=queries,
-            exclude_queries=exclude_queries,
-            iterations=iterations,
-            options=options,
-            track_memory=track_memory,
-            samply=samply,
-            sample_rate=sample_rate,
-            tracing=tracing,
-            runner=runner,
-            ingest_output=ingest_output,
-        )
+        heap_profiling = bool(os.environ.get("POLARSIGNALS_CLOUD_TOKEN"))
+        format_groups = [[fmt] for fmt in formats] if heap_profiling else [formats]
+        results: list[str] = []
+        ingest_parts: list[Path] = []
 
+        with ExitStack() as stack:
+            ingest_temp_dir = None
+            if ingest_output is not None and len(format_groups) > 1:
+                ingest_temp_dir = Path(stack.enter_context(TemporaryDirectory(prefix="vx-bench-profile-ingest-")))
+
+            for index, command_formats in enumerate(format_groups):
+                command_ingest_output = ingest_output
+                if ingest_temp_dir is not None:
+                    command_ingest_output = ingest_temp_dir / f"{index:02d}-{command_formats[0].value}.jsonl"
+                    ingest_parts.append(command_ingest_output)
+
+                cmd = self.build_command(
+                    benchmark=benchmark,
+                    formats=command_formats,
+                    queries=queries,
+                    exclude_queries=exclude_queries,
+                    iterations=iterations,
+                    options=options,
+                    track_memory=track_memory,
+                    samply=samply,
+                    sample_rate=sample_rate,
+                    tracing=tracing,
+                    runner=runner,
+                    ingest_output=command_ingest_output,
+                )
+                process_env = None
+                if heap_profiling:
+                    process_env = os.environ.copy()
+                    process_env["HEAP_PROFILE_ENGINE"] = self._profile_engine()
+                    process_env["HEAP_PROFILE_FORMAT"] = command_formats[0].value
+                    cmd = [str(_HEAP_PROFILE_SCRIPT), *cmd]
+
+                results.extend(
+                    self._run_command(
+                        cmd,
+                        benchmark=benchmark,
+                        formats=command_formats,
+                        process_env=process_env,
+                        on_result=on_result,
+                    )
+                )
+
+            if ingest_output is not None and ingest_parts:
+                self._combine_ingest_output(ingest_output, ingest_parts)
+
+        return results
+
+    def _profile_engine(self) -> str:
+        if self.backend == Engine.LANCE:
+            return Engine.DATAFUSION.value
+        return self.backend.value
+
+    @staticmethod
+    def _combine_ingest_output(output_path: Path, input_paths: list[Path]) -> None:
+        if output_path.parent != Path():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with output_path.open("w", encoding="utf-8") as output:
+            for input_path in input_paths:
+                if not input_path.exists():
+                    raise RuntimeError(f"ingest output was not written by profiled benchmark: {input_path}")
+                with input_path.open(encoding="utf-8") as input_file:
+                    for line in input_file:
+                        _ = output.write(line)
+
+    def _run_command(
+        self,
+        cmd: list[str],
+        *,
+        benchmark: Benchmark,
+        formats: list[Format],
+        process_env: dict[str, str] | None,
+        on_result: Callable[[str], None] | None,
+    ) -> list[str]:
         if self.verbose:
             console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
 
         results: list[str] = []
         diagnostic_lines: deque[str] = deque(maxlen=200)
+        target = f"{self._profile_engine()}:{','.join(fmt.value for fmt in formats)}"
 
         with Progress(
             SpinnerColumn(),
@@ -147,7 +216,7 @@ class BenchmarkExecutor:
             console=console,
             transient=True,
         ) as progress:
-            _task = progress.add_task(f"Running {self.backend.value} {benchmark.value}...", total=None)
+            _task = progress.add_task(f"Running {target} {benchmark.value}...", total=None)
 
             # Merge stderr into stdout so verbose benchmark logs cannot fill a separate pipe and
             # block the child process before it emits JSON results.
@@ -157,18 +226,19 @@ class BenchmarkExecutor:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=process_env,
             )
 
             assert process.stdout is not None
             selector = selectors.DefaultSelector()
-            selector.register(process.stdout, selectors.EVENT_READ)
+            _ = selector.register(process.stdout, selectors.EVENT_READ)
 
             try:
                 while selector.get_map():
-                    for key, _mask in selector.select(timeout=0.1):
-                        line = key.fileobj.readline()
+                    for _key, _mask in selector.select(timeout=0.1):
+                        line = process.stdout.readline()
                         if line == "":
-                            selector.unregister(key.fileobj)
+                            _ = selector.unregister(process.stdout)
                             continue
 
                         line = line.rstrip()
@@ -192,6 +262,6 @@ class BenchmarkExecutor:
                 diagnostics = "\n".join(diagnostic_lines)
                 if diagnostics:
                     console.print(f"[red]{diagnostics}[/red]")
-                raise RuntimeError(f"Benchmark {self.backend.value} {benchmark.value} failed: {diagnostics}")
+                raise RuntimeError(f"Benchmark {target} {benchmark.value} failed: {diagnostics}")
 
         return results

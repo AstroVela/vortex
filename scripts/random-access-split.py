@@ -9,9 +9,11 @@ then merge the per-combination outputs
 import argparse
 import glob
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BINARY = "target/release_debug/random-access-bench"
@@ -21,6 +23,14 @@ DATASETS = ["taxi", "feature-vectors", "nested-lists", "nested-structs"]
 FORMATS = ["parquet", "lance", "vortex"]
 PATTERNS = ["correlated", "uniform"]
 OPEN_MODES = ["cached", "reopen"]
+
+
+class Args(argparse.Namespace):
+    emit_ingest_records: bool
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emit_ingest_records = False
 
 
 def run_combinations(emit_ingest_records: bool) -> None:
@@ -49,8 +59,14 @@ def run_combinations(emit_ingest_records: bool) -> None:
                     ]
                     if emit_ingest_records:
                         args += ["--ingest-jsonl", str(PARTS_DIR / f"{i}.ingest.jsonl")]
-                    print("+", " ".join(args), flush=True)
-                    subprocess.run(args, check=True)
+
+                    profile_env = os.environ.copy()
+                    profile_env["HEAP_PROFILE_ENGINE"] = "vortex"
+                    profile_env["HEAP_PROFILE_FORMAT"] = fmt
+                    profiled_args = [str(SCRIPT_DIR / "bench-heap-profile.sh"), *args]
+
+                    print("+", " ".join(profiled_args), flush=True)
+                    _ = subprocess.run(profiled_args, check=True, env=profile_env)
                     i += 1
 
 
@@ -62,7 +78,7 @@ the merge to drop the duplicates. Otherwise we could just merge JSONL lines.
 """
 
 
-def merge(pattern: str, key: Callable[[dict], object], out_path: str) -> None:
+def merge(pattern: str, key: Callable[[dict[str, object]], object], out_path: str) -> None:
     seen: set[object] = set()
     lines: list[str] = []
     for path in sorted(glob.glob(pattern)):
@@ -71,22 +87,23 @@ def merge(pattern: str, key: Callable[[dict], object], out_path: str) -> None:
                 line = line.strip()
                 if not line:
                     continue
-                identity = key(json.loads(line))
+                record = cast(dict[str, object], json.loads(line))
+                identity = key(record)
                 if identity in seen:
                     continue
                 seen.add(identity)
                 lines.append(line)
-    Path(out_path).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+    _ = Path(out_path).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    _ = parser.add_argument(
         "--emit-ingest-records",
         action="store_true",
         help="merge --ingest-jsonl records into results.ingest.jsonl",
     )
-    args = parser.parse_args()
+    args = cast(Args, parser.parse_args())
 
     run_combinations(args.emit_ingest_records)
     merge(f"{PARTS_DIR}/*.gh.json", lambda record: record["name"], "results.json")
