@@ -71,13 +71,17 @@ pub use benchmark::TableSpec;
 pub use datasets::BenchmarkDataset;
 pub use output::BenchmarkOutput;
 pub use output::create_output_writer;
+// Keep tikv-jemalloc-sys visible to rustc so its allocator-override symbol references are linked.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+use tikv_jemalloc_sys as _;
 use vortex::VortexSessionDefault;
 pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
 // All benchmarks run with a fixed allocator for consistency. Linux heap-profiling builds use
-// jemalloc because its sampled allocation data can be exported in pprof format.
+// jemalloc because its sampled allocation data can be exported in pprof format. The allocator's
+// override feature also routes linked C and C++ malloc-family calls through this instance.
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

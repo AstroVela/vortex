@@ -85,14 +85,20 @@ wkb = { workspace = true }
 axum = { workspace = true, optional = true }
 jemalloc_pprof = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, features = [
+    "override_allocator_on_supported_platforms",
     "profiling",
-    "unprefixed_malloc_on_supported_platforms",
 ], optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 insta = { workspace = true }
 rstest = { workspace = true }
 
 [features]
-jemalloc = ["dep:axum", "dep:jemalloc_pprof", "dep:tikv-jemallocator"]
+jemalloc = [
+    "dep:axum",
+    "dep:jemalloc_pprof",
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-sys",
+]
 unstable_encodings = ["vortex/unstable_encodings"]

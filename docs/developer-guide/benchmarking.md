@@ -183,6 +183,13 @@ Signals API key and project ID. This scraper is separate from Parca Agent 0.49.0
 to collect CPU profiles with eBPF. Heap profiling changes the allocator and adds sampling and
 scrape overhead, so compare timings only with other jemalloc-profiled runs.
 
+DuckDB normally has a private, namespaced jemalloc for its internal allocator while direct C and
+C++ allocations use the process `malloc` family. A `duckdb-bench` build with the `jemalloc`
+feature compiles DuckDB without that private allocator and overrides the process allocator with
+the profiled `tikv-jemallocator` instance. The first profiling build therefore takes longer than a
+normal build. CI verifies the linked DuckDB library and executable allocator symbols before
+running benchmarks so both allocation paths appear in one heap profile.
+
 To try the CI integration on a pull request, add the `action/benchmark` label, or use
 `action/benchmark-sql` for the smaller SQL matrix. In Polar Signals, select the memory profile and
 the `inuse_space`/`bytes` sample type, then filter by the `benchmark`, `engine`, `format`,

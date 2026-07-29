@@ -54,6 +54,11 @@ vortex-runend = { workspace = true }
 vortex-sequence = { workspace = true }
 wkb = { workspace = true }
 
+[features]
+# Heap-profiled DuckDB binaries need one process-wide allocator. On Linux this makes build.rs
+# compile DuckDB without its private, namespaced jemalloc so the executable can override malloc.
+jemalloc = []
+
 [[bench]]
 name = "bool_export"
 harness = false

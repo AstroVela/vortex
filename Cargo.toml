@@ -265,6 +265,7 @@ tempfile = "3"
 termtree = { version = "1.0" }
 test-with = "=0.16.3"
 thiserror = "2.0.3"
+tikv-jemalloc-sys = "0.7"
 tikv-jemallocator = "0.7"
 tokio = { version = "1.52" }
 tokio-stream = "0.1.17"

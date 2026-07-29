@@ -30,13 +30,27 @@ fn main() {
     #[cfg(not(target_os = "macos"))]
     {
         // Inline the dynamically exported symbol list for non-macos targets.
-        const DLIST: &str = "{\
+        let mut dlist = String::from(
+            "{\
             custom_labels_abi_version;\
             custom_labels_current_set;\
-            };";
+            ",
+        );
+        if std::env::var_os("CARGO_FEATURE_JEMALLOC").is_some() {
+            dlist.push_str(
+                "malloc;\
+                calloc;\
+                realloc;\
+                free;\
+                aligned_alloc;\
+                posix_memalign;\
+                ",
+            );
+        }
+        dlist.push_str("};");
 
         let dlist_path = format!("{}/dlist", std::env::var("OUT_DIR").unwrap());
-        std::fs::write(&dlist_path, DLIST).unwrap();
+        std::fs::write(&dlist_path, dlist).unwrap();
         println!("cargo:rustc-link-arg=-Wl,-rpath,{duckdb_lib},--dynamic-list={dlist_path}")
     }
 }

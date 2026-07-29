@@ -56,7 +56,9 @@ curl --fail --output /tmp/vortex-heap.pb.gz \
 Set `VORTEX_HEAP_PROFILE_ADDR` to override the listen address. The profiler samples one allocation
 per 512 KiB on average. See
 [`rust-jemalloc-pprof`](https://github.com/polarsignals/rust-jemalloc-pprof) for the pprof format
-and allocator requirements.
+and allocator requirements. On Linux, the feature also overrides C and C++ `malloc` calls.
+`duckdb-bench` additionally compiles DuckDB without its private jemalloc so DuckDB's internal and
+direct allocations are captured by the same profile.
 
 ## Common Issues
 

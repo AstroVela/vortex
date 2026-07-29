@@ -37,7 +37,7 @@ vortex-duckdb = { workspace = true }
 
 [features]
 cuda = ["dep:vortex-cuda"]
-jemalloc = ["vortex-bench/jemalloc"]
+jemalloc = ["vortex-bench/jemalloc", "vortex-duckdb/jemalloc"]
 unstable_encodings = ["vortex/unstable_encodings"]
 
 [lints]

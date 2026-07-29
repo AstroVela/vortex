@@ -385,7 +385,7 @@ fn download_prebuilt(version: &DuckDBVersion, library_dir: &Path, target: &str) 
     true
 }
 
-fn build_duckdb(version: &DuckDBVersion, duckdb_repo_dir: &Path) {
+fn build_duckdb(version: &DuckDBVersion, duckdb_repo_dir: &Path, use_system_allocator: bool) {
     if let Err(e) = Command::new("make").arg("--version").output() {
         println!("cargo:error=make is required to build DuckDB: {e}");
         exit(1);
@@ -410,7 +410,7 @@ fn build_duckdb(version: &DuckDBVersion, duckdb_repo_dir: &Path) {
         DuckDBVersion::Commit(_) => "parquet;tpch;tpcds",
     };
 
-    let envs = [
+    let mut envs = vec![
         ("GEN", "ninja"),
         ("DISABLE_SANITIZER", asan_option),
         ("THREADSAN", tsan_option),
@@ -419,6 +419,9 @@ fn build_duckdb(version: &DuckDBVersion, duckdb_repo_dir: &Path) {
         ("ENABLE_UNITTEST_CPP_TESTS", "false"),
         ("BUILD_EXTENSIONS", static_extensions),
     ];
+    if use_system_allocator {
+        envs.push(("BUILD_JEMALLOC", "0"));
+    }
 
     let output = Command::new("make")
         .current_dir(duckdb_repo_dir)
@@ -440,6 +443,7 @@ fn try_build_duckdb(
     library_dir: &Path,
     version: &DuckDBVersion,
     build_type: &str,
+    use_system_allocator: bool,
 ) {
     let repo_dir = source_dir.join(version.archive_inner_dir_name());
     let library_marker = library_dir.join(BUILD_MARKER);
@@ -447,7 +451,7 @@ fn try_build_duckdb(
         return;
     }
 
-    build_duckdb(version, &repo_dir);
+    build_duckdb(version, &repo_dir, use_system_allocator);
     clear_dir(library_dir);
 
     let build_src_dir = repo_dir.join("build").join(build_type).join("src");
@@ -577,6 +581,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/include");
     println!("cargo:rerun-if-env-changed=VX_DUCKDB_DEBUG");
     println!("cargo:rerun-if-env-changed=VX_DUCKDB_SAN");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_JEMALLOC");
     println!("cargo:rerun-if-env-changed=CARGO_HTTP_TIMEOUT");
     println!("cargo:rerun-if-env-changed=HTTP_TIMEOUT");
     println!("cargo:rerun-if-env-changed=TARGET");
@@ -625,6 +630,7 @@ fn main() {
     let duckdb_dir = crate_dir.join("duckdb");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
+    let use_system_allocator = env_true("CARGO_FEATURE_JEMALLOC") && target.contains("-linux-");
     let cache_root = duckdb_cache_root(&out_dir);
     fs::create_dir_all(&cache_root).unwrap();
 
@@ -659,15 +665,31 @@ fn main() {
     drop(fs::remove_dir_all(&duckdb_dir));
     symlink(&source_dir, &duckdb_dir).unwrap();
 
-    println!("cargo:info=building DuckDB in {build_type} mode");
+    let allocator = if use_system_allocator {
+        "system allocator"
+    } else {
+        "default allocator"
+    };
+    println!("cargo:info=building DuckDB in {build_type} mode with {allocator}");
 
     let prebuilt_library_dir = cache_root.join(format!("duckdb-lib-{version}-{target}-prebuilt"));
+    let allocator_suffix = if use_system_allocator {
+        "-system-allocator"
+    } else {
+        ""
+    };
     let source_library_dir = cache_root.join(format!(
-        "duckdb-lib-{version}-{target}-{build_type}{sanitizer_suffix}"
+        "duckdb-lib-{version}-{target}-{build_type}{sanitizer_suffix}{allocator_suffix}"
     ));
 
-    let library_dir = if debug_duckdb {
-        try_build_duckdb(&source_dir, &source_library_dir, &version, build_type);
+    let library_dir = if debug_duckdb || use_system_allocator {
+        try_build_duckdb(
+            &source_dir,
+            &source_library_dir,
+            &version,
+            build_type,
+            use_system_allocator,
+        );
         source_library_dir
     } else {
         match &version {
@@ -683,7 +705,13 @@ fn main() {
                     prebuilt_library_dir
                 } else {
                     println!("cargo:info=DuckDB commit {version} not in R2, building from source");
-                    try_build_duckdb(&source_dir, &source_library_dir, &version, build_type);
+                    try_build_duckdb(
+                        &source_dir,
+                        &source_library_dir,
+                        &version,
+                        build_type,
+                        use_system_allocator,
+                    );
                     source_library_dir
                 }
             }

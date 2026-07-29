@@ -97,6 +97,7 @@ jobs:
             packages+=(--bin lance-bench)
           fi
           cargo build "${packages[@]}" --profile release_debug --features unstable_encodings,jemalloc
+          scripts/check-duckdb-heap-allocator.sh target/release_debug/duckdb-bench
 
       - name: Pre-upload SQL benchmark debuginfo to Polar Signals
         if: inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false

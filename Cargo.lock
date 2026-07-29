@@ -9582,6 +9582,7 @@ dependencies = [
  "sysinfo",
  "tabled",
  "target-lexicon",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",
