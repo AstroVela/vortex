@@ -3,6 +3,7 @@
 
 //! Generic benchmark runner infrastructure to reduce boilerplate across engine-specific benchmarks.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::future::Future;
 use std::io::Write;
@@ -27,7 +28,7 @@ use crate::datasets::normalize_benchmark_runner_id;
 pub enum BenchmarkMode {
     /// Run each query `iterations` times, collecting timing.
     Run { iterations: usize },
-    /// Prepend `EXPLAIN` to each query, print the result, skip timing.
+    /// Explain each query, print the result, and skip timing.
     Explain,
 }
 
@@ -75,6 +76,7 @@ pub struct SqlBenchmarkRunner {
     formats: Vec<Format>,
     memory_tracker: Option<BenchmarkMemoryTracker>,
     hide_progress_bar: bool,
+    explain_sql_prefix: bool,
     doc: &'static str,
     query_measurements: Vec<QueryMeasurement>,
     memory_measurements: Vec<MemoryMeasurement>,
@@ -107,15 +109,33 @@ impl SqlBenchmarkRunner {
             formats,
             memory_tracker,
             hide_progress_bar,
+            explain_sql_prefix: true,
             doc: benchmark.doc_path(),
             query_measurements: Vec::new(),
             memory_measurements: Vec::new(),
         })
     }
 
+    /// Configure whether Explain mode prepends `EXPLAIN` to each query.
+    ///
+    /// This is enabled by default. Disable it for engines that generate explain output directly
+    /// from the original SQL.
+    pub fn with_explain_sql_prefix(mut self, explain_sql_prefix: bool) -> Self {
+        self.explain_sql_prefix = explain_sql_prefix;
+        self
+    }
+
     /// Get the formats to run benchmarks for.
     pub fn formats(&self) -> &[Format] {
         &self.formats
+    }
+
+    fn explain_sql<'a>(&self, query: &'a str) -> Cow<'a, str> {
+        if self.explain_sql_prefix {
+            Cow::Owned(format!("EXPLAIN {query}"))
+        } else {
+            Cow::Borrowed(query)
+        }
     }
 
     /// Call before running a query to start memory tracking.
@@ -287,8 +307,10 @@ impl SqlBenchmarkRunner {
     /// Run (or explain) all queries for all formats synchronously.
     ///
     /// In `Run` mode, executes each query `iterations` times, collecting timing.
-    /// In `Explain` mode, prepends `EXPLAIN` to each query, executes once, and
-    /// prints `R::display()`. No progress bar or timing in Explain mode.
+    /// In `Explain` mode, executes each query once and prints `R::display()`. By default,
+    /// `EXPLAIN` is prepended to each query; use
+    /// [`SqlBenchmarkRunner::with_explain_sql_prefix`] to disable the prefix. No progress bar or
+    /// timing is recorded in Explain mode.
     ///
     /// The `execute` callback returns `(Option<Duration>, R)` where
     /// `Option<Duration>` overrides wall-clock timing, and `R` implements
@@ -339,8 +361,9 @@ impl SqlBenchmarkRunner {
                     let mut ctx = setup(format)?;
 
                     for (query_idx, query) in queries.iter() {
-                        let explain_query = format!("EXPLAIN {query}");
-                        let (_, result) = execute(&mut ctx, *query_idx, format, &explain_query)?;
+                        let explain_query = self.explain_sql(query);
+                        let (_, result) =
+                            execute(&mut ctx, *query_idx, format, explain_query.as_ref())?;
                         println!("=== Q{query_idx} [{format}] ===");
                         println!("{query}");
                         println!();
@@ -428,8 +451,8 @@ impl SqlBenchmarkRunner {
                     let ctx = setup(format).await?;
 
                     for (query_idx, query) in queries.iter() {
-                        let explain_query = format!("EXPLAIN {query}");
-                        let (_, result) = execute(*query_idx, &ctx, &explain_query).await?;
+                        let explain_query = self.explain_sql(query);
+                        let (_, result) = execute(*query_idx, &ctx, explain_query.as_ref()).await?;
                         println!("=== Q{query_idx} [{format}] ===");
                         println!("{query}");
                         println!();
