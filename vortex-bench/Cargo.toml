@@ -81,9 +81,22 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 wkb = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+axum = { workspace = true, optional = true }
+jemalloc_pprof = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, features = [
+    "profiling",
+    "unprefixed_malloc_on_supported_platforms",
+], optional = true }
+
 [dev-dependencies]
 insta = { workspace = true }
 rstest = { workspace = true }
 
 [features]
+jemalloc = [
+    "dep:axum",
+    "dep:jemalloc_pprof",
+    "dep:tikv-jemallocator",
+]
 unstable_encodings = ["vortex/unstable_encodings"]

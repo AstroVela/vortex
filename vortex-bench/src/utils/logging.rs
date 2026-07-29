@@ -89,6 +89,9 @@ pub fn setup_logging_and_tracing_with_format(
         .with(fmt_layer)
         .init();
 
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    crate::heap_profile::start_heap_profile_server()?;
+
     Ok(())
 }
 

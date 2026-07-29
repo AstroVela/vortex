@@ -58,6 +58,7 @@ custom-labels = { workspace = true }
 
 [features]
 cuda = ["dep:vortex-cuda"]
+jemalloc = ["vortex-bench/jemalloc"]
 unstable_encodings = ["vortex/unstable_encodings"]
 
 [lints]

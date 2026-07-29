@@ -163,6 +163,31 @@ Available suites include TPC-H, TPC-DS, ClickBench, FineWeb, and others. Each su
 run against multiple engines (DataFusion, DuckDB) and formats (Parquet, Vortex, Vortex Compact,
 Lance, DuckDB native).
 
+### Heap profiling
+
+Linux benchmark binaries can expose sampled live heap data by enabling the `jemalloc` feature:
+
+```bash
+cargo run -p datafusion-bench --profile release_debug --features jemalloc -- \
+  tpch --formats vortex --queries 1 --iterations 20
+
+curl --fail --output /tmp/vortex-heap.pb.gz \
+  http://127.0.0.1:6060/debug/pprof/allocs
+```
+
+The endpoint reports jemalloc samples in pprof format. CI uses a
+[Parca scraper](https://www.polarsignals.com/docs/setup-scraper) to send the `inuse_space` sample
+type to Polar Signals Cloud. Every five seconds the scraper fetches the localhost endpoint and
+uploads the pprof payload to `grpc.polarsignals.com:443`, authenticated with the existing Polar
+Signals API key and project ID. This scraper is separate from Parca Agent 0.49.0, which continues
+to collect CPU profiles with eBPF. Heap profiling changes the allocator and adds sampling and
+scrape overhead, so compare timings only with other jemalloc-profiled runs.
+
+To try the CI integration on a pull request, add the `action/benchmark` label, or use
+`action/benchmark-sql` for the smaller SQL matrix. In Polar Signals, select the memory profile and
+the `inuse_space`/`bytes` sample type, then filter by the `benchmark`, `commit_sha`, or `gh_run_id`
+labels.
+
 ### Data Generation
 
 Before running SQL benchmarks, test data must be generated:

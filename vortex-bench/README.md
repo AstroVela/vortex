@@ -41,10 +41,22 @@ can be found.
 
 ## Memory allocators
 
-If you don't want to use the default system allocator, there are `"jemalloc"` and `"mimalloc"` features available that
-configure a different allocators at compile time.
+Benchmark binaries use mimalloc by default. On Linux, the `jemalloc` feature switches the shared
+`vortex-bench` allocator to jemalloc, enables sampled heap profiling, and serves pprof data from
+`http://127.0.0.1:6060/debug/pprof/allocs`:
 
-As of this writing, if both are enabled `mimalloc` will be used.
+```bash
+cargo run -p datafusion-bench --profile release_debug --features jemalloc -- \
+  tpch --formats vortex --queries 1 --iterations 20
+
+curl --fail --output /tmp/vortex-heap.pb.gz \
+  http://127.0.0.1:6060/debug/pprof/allocs
+```
+
+Set `VORTEX_HEAP_PROFILE_ADDR` to override the listen address. The profiler samples one allocation
+per 512 KiB on average. See
+[`rust-jemalloc-pprof`](https://github.com/polarsignals/rust-jemalloc-pprof) for the pprof format
+and allocator requirements.
 
 ## Common Issues
 

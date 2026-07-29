@@ -31,6 +31,7 @@ tracing = { workspace = true }
 vortex-bench = { workspace = true }
 
 [features]
+jemalloc = ["vortex-bench/jemalloc"]
 unstable_encodings = ["vortex-bench/unstable_encodings"]
 
 [lib]

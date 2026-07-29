@@ -47,6 +47,8 @@ pub mod datasets;
 pub mod display;
 pub mod downloadable_dataset;
 pub mod fineweb;
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+mod heap_profile;
 pub mod measurements;
 pub mod memory;
 pub mod output;
@@ -74,9 +76,19 @@ pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
-// All benchmarks run with mimalloc for consistency.
+// All benchmarks run with a fixed allocator for consistency. Linux heap-profiling builds use
+// jemalloc because its sampled allocation data can be exported in pprof format.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_tokio();

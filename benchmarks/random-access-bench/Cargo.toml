@@ -26,6 +26,7 @@ tokio = { workspace = true, features = ["full"] }
 vortex-bench = { workspace = true }
 
 [features]
+jemalloc = ["vortex-bench/jemalloc"]
 lance = ["dep:lance-bench"]
 unstable_encodings = ["vortex-bench/unstable_encodings"]
 
