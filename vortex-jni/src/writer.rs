@@ -34,7 +34,6 @@ use jni::sys::jobject;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
 use vortex::array::ArrayRef;
-use vortex::array::VTable;
 use vortex::array::scalar::PValue;
 use vortex::array::scalar::Scalar;
 use vortex::array::scalar::ScalarValue;
@@ -43,12 +42,12 @@ use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
 use vortex::dtype::Field as DTypeField;
 use vortex::dtype::FieldPath;
+use vortex::editions::EditionSessionExt;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::expr::stats::Stat;
 use vortex::expr::stats::StatsProvider;
-use vortex::file::ALLOWED_ENCODINGS;
 use vortex::file::CountingVortexWrite;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
@@ -64,7 +63,6 @@ use vortex::layout::LayoutStrategy;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex_arrow::ArrowSessionExt;
-use vortex_parquet_variant::ParquetVariant;
 
 use crate::RUNTIME;
 use crate::errors::JNIError;
@@ -102,17 +100,17 @@ fn resolve_store(
     }
 }
 
-fn write_strategy_for_schema(write_schema: &DType) -> Arc<dyn LayoutStrategy> {
+fn write_strategy_for_schema(
+    session: &VortexSession,
+    write_schema: &DType,
+) -> Arc<dyn LayoutStrategy> {
     let variant_paths = variant_field_paths(write_schema);
     if variant_paths.is_empty() {
         return WriteStrategyBuilder::default().build();
     }
 
-    let mut allowed = ALLOWED_ENCODINGS.clone();
-    allowed.insert(ParquetVariant.id());
-
     WriteStrategyBuilder::default()
-        .with_allow_encodings(allowed)
+        .with_allow_encodings(session.enabled_encoding_ids().into_iter().collect())
         .build()
 }
 
@@ -423,7 +421,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_create(
         let resolved = resolve_store(&file_path, &properties)?;
         let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let stream = ArrayStreamAdapter::new(write_schema.clone(), rx);
-        let strategy = write_strategy_for_schema(&write_schema);
+        let strategy = write_strategy_for_schema(session, &write_schema);
         let write_options = session
             .write_options()
             .with_strategy(Arc::clone(&strategy))
@@ -512,7 +510,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_createStream(
         let writable = Arc::new(env.new_global_ref(&writable)?);
         let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let stream = ArrayStreamAdapter::new(write_schema.clone(), rx);
-        let strategy = write_strategy_for_schema(&write_schema);
+        let strategy = write_strategy_for_schema(session, &write_schema);
         let write_options = session
             .write_options()
             .with_strategy(Arc::clone(&strategy))
