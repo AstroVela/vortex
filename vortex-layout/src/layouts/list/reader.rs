@@ -35,6 +35,7 @@ use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::layouts::list::ListBlockBoundary;
 use crate::layouts::list::ListLayout;
 use crate::layouts::list::expr::ListChildrenNeeded;
 use crate::layouts::list::expr::get_necessary_list_children;
@@ -372,6 +373,12 @@ fn selected_row_range(mask: &Mask) -> Option<Range<usize>> {
     Some(mask.first()?..mask.last()? + 1)
 }
 
+fn has_enough_block_splits(block_boundaries: &[ListBlockBoundary]) -> bool {
+    block_boundaries.len()
+        >= usize::try_from(MAX_LIST_SPLIT_COUNT)
+            .vortex_expect("Maximum list split count must fit in usize")
+}
+
 fn slice_prefetched_elements(
     elements: ArrayRef,
     prefetched_range: &Range<u64>,
@@ -431,7 +438,7 @@ impl LayoutReader for ListReader {
 
         let row_range = split_range.row_range();
         let block_boundaries = self.layout.block_boundaries();
-        if !block_boundaries.is_empty() {
+        if has_enough_block_splits(block_boundaries) {
             for boundary in block_boundaries {
                 let split = boundary.outer_row_end();
                 if split <= row_range.start {
@@ -453,8 +460,8 @@ impl LayoutReader for ListReader {
 
         // Splits are difficult to calculate because all children live in different row coordinate spaces.
         // List elements typically comprise the majority of the data in a list, and validity/offsets can be treated
-        // as metadata. Legacy list layouts do not carry exact block boundaries, so retain the
-        // element-weighted heuristic for those files.
+        // as metadata. Prefer exact block boundaries when they provide sufficient parallelism;
+        // otherwise retain the element-weighted heuristic to avoid under-filling scan workers.
         //
         // Scan splits must be expressed in the list layout's outer-row space, but the elements child
         // reports its natural boundaries in element-row space. So we translate the element splits using a
@@ -1147,8 +1154,20 @@ mod tests {
         assert_eq!(splits, expected);
     }
 
+    #[test]
+    fn exact_block_splits_require_enough_parallelism() {
+        let boundaries = (1..=MAX_LIST_SPLIT_COUNT)
+            .map(|end| ListBlockBoundary::new(end, end))
+            .collect::<Vec<_>>();
+
+        assert!(!has_enough_block_splits(
+            &boundaries[..boundaries.len() - 1]
+        ));
+        assert!(has_enough_block_splits(&boundaries));
+    }
+
     #[tokio::test]
-    async fn list_uses_exact_input_block_splits() -> VortexResult<()> {
+    async fn list_uses_element_weighted_splits_and_exact_prefetch_boundaries() -> VortexResult<()> {
         let chunk0 = ListArray::try_new(
             PrimitiveArray::from_iter(0..32_i32).into_array(),
             buffer![0u32, 8, 16, 24, 32].into_array(),
@@ -1170,7 +1189,7 @@ mod tests {
             layout.new_reader("".into(), segments, &session, &LayoutReaderContext::new())?;
 
         let splits = SplitBy::Layout.splits(reader.as_ref(), &(0..8), &[FieldMask::All])?;
-        assert_eq!(splits, vec![0, 4, 8]);
+        assert_eq!(splits, vec![0, 2, 8]);
 
         let reader = reader
             .as_any()
