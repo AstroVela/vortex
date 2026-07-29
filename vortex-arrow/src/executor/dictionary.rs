@@ -6,17 +6,21 @@ use std::sync::Arc;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::DictionaryArray;
 use arrow_array::PrimitiveArray;
+use arrow_array::builder::PrimitiveDictionaryBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::new_null_array;
 use arrow_array::types::*;
 use arrow_schema::DataType;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::Chunked;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::DictArray;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::matcher::Matcher;
 use vortex_error::VortexError;
@@ -32,7 +36,7 @@ impl Matcher for ArrowDictExportable {
     type Match<'a> = &'a ArrayRef;
 
     fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
-        (array.is::<Dict>() || array.is::<Constant>()).then_some(array)
+        (array.is::<Dict>() || array.is::<Constant>() || array.is::<Chunked>()).then_some(array)
     }
 }
 
@@ -43,6 +47,14 @@ pub(super) fn to_arrow_dictionary(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
     let array = array.execute_until::<ArrowDictExportable>(ctx)?;
+
+    if let Some(chunked) = array.as_opt::<Chunked>() {
+        if let Some(dictionary) =
+            chunked_to_primitive_dictionary(chunked, codes_type, values_type, ctx)?
+        {
+            return Ok(dictionary);
+        }
+    }
 
     let array = match array.try_downcast::<Dict>() {
         Ok(dict) => return dict_to_dict(dict, codes_type, values_type, ctx),
@@ -61,6 +73,65 @@ pub(super) fn to_arrow_dictionary(
         &DataType::Dictionary(Box::new(codes_type.clone()), Box::new(values_type.clone())),
     )
     .map_err(VortexError::from)
+}
+
+fn chunked_to_primitive_dictionary(
+    array: ArrayView<'_, Chunked>,
+    codes_type: &DataType,
+    values_type: &DataType,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrowArrayRef>> {
+    if !(values_type.is_integer() || values_type.is_floating()) {
+        return Ok(None);
+    }
+
+    macro_rules! build_values {
+        ($value_type:ty, $key_type:ty) => {
+            build_chunked_primitive_dictionary::<$key_type, $value_type>(array, values_type, ctx)
+                .map(Some)
+        };
+    }
+
+    macro_rules! dispatch_values {
+        ($key_type:ty) => {
+            arrow_array::downcast_primitive! {
+                values_type => (build_values, $key_type),
+                _ => Ok(None),
+            }
+        };
+    }
+
+    arrow_array::downcast_integer! {
+        codes_type => (dispatch_values),
+        _ => Ok(None),
+    }
+}
+
+fn build_chunked_primitive_dictionary<K, V>(
+    array: ArrayView<'_, Chunked>,
+    values_type: &DataType,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrowArrayRef>
+where
+    K: ArrowDictionaryKeyType,
+    V: ArrowPrimitiveType,
+{
+    let mut builder = PrimitiveDictionaryBuilder::<K, V>::with_capacity(array.len(), array.len());
+
+    for chunk in array.chunks() {
+        let values = chunk.clone().execute_arrow(Some(values_type), ctx)?;
+        let values = values.as_primitive::<V>();
+        for value in values.iter() {
+            match value {
+                Some(value) => {
+                    builder.append(value)?;
+                }
+                None => builder.append_null(),
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
 }
 
 /// Convert a constant array to a dictionary with a single entry.
@@ -156,6 +227,8 @@ mod tests {
 
     use arrow_array::DictionaryArray as ArrowDictArray;
     use arrow_array::StringArray;
+    use arrow_array::builder::PrimitiveDictionaryBuilder;
+    use arrow_array::types::Int64Type;
     use arrow_array::types::UInt8Type;
     use arrow_array::types::UInt32Type;
     use arrow_schema::DataType;
@@ -164,11 +237,13 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability::Nullable;
+    use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::fns::mask::Mask;
@@ -208,6 +283,30 @@ mod tests {
         .into_array()
     }
 
+    fn chunked_primitive_input() -> vortex_array::ArrayRef {
+        let dtype = DType::Primitive(PType::I64, Nullable);
+        ChunkedArray::try_new(
+            vec![
+                PrimitiveArray::from_option_iter([Some(1i64), None, Some(2)]).into_array(),
+                PrimitiveArray::from_option_iter([Some(2i64), Some(3), None]).into_array(),
+            ],
+            dtype,
+        )
+        .expect("valid chunked primitive input")
+        .into_array()
+    }
+
+    fn chunked_primitive_expected() -> arrow_array::ArrayRef {
+        let mut builder = PrimitiveDictionaryBuilder::<UInt32Type, Int64Type>::new();
+        builder.append_value(1);
+        builder.append_null();
+        builder.append_value(2);
+        builder.append_value(2);
+        builder.append_value(3);
+        builder.append_null();
+        Arc::new(builder.finish())
+    }
+
     #[rstest]
     #[case::constant_null(
         ConstantArray::new(Scalar::null(DType::Utf8(Nullable)), 4).into_array(),
@@ -233,6 +332,11 @@ mod tests {
         [Some("a"), None, Some("a"), Some("b"), Some("a")].into_iter().collect::<VarBinViewArray>().into_array(),
         dict_type(DataType::UInt8, DataType::Utf8),
         Arc::new(vec![Some("a"), None, Some("a"), Some("b"), Some("a")].into_iter().collect::<ArrowDictArray<UInt8Type>>()) as arrow_array::ArrayRef,
+    )]
+    #[case::chunked_primitive(
+        chunked_primitive_input(),
+        dict_type(DataType::UInt32, DataType::Int64),
+        chunked_primitive_expected()
     )]
     fn to_arrow_dictionary(
         #[case] input: vortex_array::ArrayRef,
