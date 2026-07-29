@@ -15,13 +15,11 @@ use parking_lot::RwLock;
 use tracing::trace;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::arrays::StructArray;
-use vortex_array::dtype::FieldPath;
-use vortex_array::dtype::FieldPathSet;
+use vortex_array::dtype::DType;
 use vortex_array::expr::Expression;
-use vortex_array::expr::pruning::checked_pruning_expr;
 use vortex_array::expr::root;
-use vortex_array::expr::stats::Stat;
 use vortex_array::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex_error::SharedVortexResult;
 use vortex_error::VortexExpect;
@@ -30,8 +28,10 @@ use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
+use crate::Layout;
 use crate::LazyReaderChildren;
-use crate::layouts::zoned::ZonedLayout;
+use crate::VTable;
+use crate::layouts::zoned::ZonedData;
 use crate::layouts::zoned::zone_map::ZoneMap;
 
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
@@ -43,26 +43,32 @@ pub(super) struct PruningState {
     zone_count: usize,
     row_count: u64,
     zone_len: u64,
-    present_stats: Arc<[Stat]>,
+    dtype: DType,
+    aggregate_fns: Arc<[AggregateFnRef]>,
     lazy_children: Arc<LazyReaderChildren>,
     session: VortexSession,
-
     pruning_result: LazyLock<DashMap<Expression, Option<SharedPruningResult>>>,
     zone_map: OnceLock<SharedZoneMap>,
     pruning_predicates: LazyLock<Arc<DashMap<Expression, PredicateCache>>>,
 }
 
 impl PruningState {
-    pub(super) fn new(
-        layout: &ZonedLayout,
+    pub(super) fn new<V>(
+        layout: Layout<V>,
+        zone_count: usize,
+        aggregate_fns: Arc<[AggregateFnRef]>,
         lazy_children: Arc<LazyReaderChildren>,
         session: VortexSession,
-    ) -> Self {
+    ) -> Self
+    where
+        V: VTable<LayoutData = ZonedData>,
+    {
         Self {
-            zone_count: layout.nzones(),
+            zone_count,
             row_count: layout.row_count(),
-            zone_len: layout.zone_len() as u64,
-            present_stats: Arc::clone(layout.present_stats()),
+            zone_len: layout.zone_len as u64,
+            dtype: layout.dtype().clone(),
+            aggregate_fns,
             lazy_children,
             session,
             pruning_result: Default::default(),
@@ -119,13 +125,12 @@ impl PruningState {
         self.pruning_predicates
             .entry(expr.clone())
             .or_default()
-            .get_or_init(move || {
-                let available_stats = FieldPathSet::from_iter(
-                    self.present_stats
-                        .iter()
-                        .map(|stat| FieldPath::from_name(stat.name())),
-                );
-                checked_pruning_expr(&expr, &available_stats).map(|(expr, _)| expr)
+            .get_or_init(move || match expr.falsify(&self.dtype, &self.session) {
+                Ok(predicate) => predicate,
+                Err(error) => {
+                    trace!(%expr, %error, "failed to construct stats rewrite predicate");
+                    None
+                }
             })
             .clone()
     }
@@ -147,13 +152,23 @@ impl PruningState {
                 let session = self.session.clone();
                 let zone_len = self.zone_len;
                 let row_count = self.row_count;
+                let dtype = self.dtype.clone();
+                let aggregate_fns = Arc::clone(&self.aggregate_fns);
 
                 async move {
                     let mut ctx = session.create_execution_ctx();
                     let zones_array = zones_eval.await?.execute::<StructArray>(&mut ctx)?;
-                    // SAFETY: zoned layout validation ensures the zones child matches the expected
-                    // stats-table schema for `present_stats`.
-                    Ok(unsafe { ZoneMap::new_unchecked(zones_array, zone_len, row_count) })
+                    // SAFETY: zoned layout validation checked that this zones child was
+                    // written from the same column dtype and aggregate stats-table schema.
+                    Ok(unsafe {
+                        ZoneMap::new_unchecked(
+                            dtype,
+                            zones_array,
+                            aggregate_fns,
+                            zone_len,
+                            row_count,
+                        )
+                    })
                 }
                 .map_err(Arc::new)
                 .boxed()

@@ -59,14 +59,20 @@ pub trait Dataset {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BenchmarkDataset {
+    #[serde(rename = "appian")]
+    Appian,
     #[serde(rename = "tpch")]
     TpcH { scale_factor: String },
     #[serde(rename = "tpcds")]
     TpcDS { scale_factor: String },
     #[serde(rename = "clickbench")]
     ClickBench { flavor: Flavor },
+    #[serde(rename = "clickbench-sorted")]
+    ClickBenchSorted,
     #[serde(rename = "public-bi")]
     PublicBi { name: String },
+    #[serde(rename = "spatialbench")]
+    SpatialBench { scale_factor: String },
     #[serde(rename = "statpopgen")]
     StatPopGen { n_rows: u64 },
     #[serde(rename = "polarsignals")]
@@ -75,19 +81,25 @@ pub enum BenchmarkDataset {
     Fineweb,
     #[serde(rename = "gharchive")]
     GhArchive,
+    #[serde(rename = "vortex")]
+    VortexQueries,
 }
 
 impl BenchmarkDataset {
     pub fn name(&self) -> &str {
         match self {
+            BenchmarkDataset::Appian => "appian",
             BenchmarkDataset::TpcH { .. } => "tpch",
             BenchmarkDataset::TpcDS { .. } => "tpcds",
             BenchmarkDataset::ClickBench { .. } => "clickbench",
+            BenchmarkDataset::ClickBenchSorted => "clickbench-sorted",
             BenchmarkDataset::PublicBi { .. } => "public-bi",
+            BenchmarkDataset::SpatialBench { .. } => "spatialbench",
             BenchmarkDataset::StatPopGen { .. } => "statpopgen",
             BenchmarkDataset::PolarSignals { .. } => "polarsignals",
             BenchmarkDataset::Fineweb => "fineweb",
             BenchmarkDataset::GhArchive => "gharchive",
+            BenchmarkDataset::VortexQueries => "vortex",
         }
     }
 }
@@ -95,26 +107,45 @@ impl BenchmarkDataset {
 impl Display for BenchmarkDataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BenchmarkDataset::Appian => write!(f, "appian"),
             BenchmarkDataset::TpcH { scale_factor } => write!(f, "tpch(sf={scale_factor})"),
             BenchmarkDataset::TpcDS { scale_factor } => write!(f, "tpcds(sf={scale_factor})"),
             BenchmarkDataset::ClickBench { flavor, .. } => match flavor {
                 Flavor::Partitioned => write!(f, "clickbench-partitioned"),
                 Flavor::Single => write!(f, "clickbench-single"),
             },
+            BenchmarkDataset::ClickBenchSorted => write!(f, "clickbench-sorted"),
             BenchmarkDataset::PublicBi { name } => write!(f, "public-bi({name})"),
+            BenchmarkDataset::SpatialBench { scale_factor } => {
+                write!(f, "spatialbench(sf={scale_factor})")
+            }
             BenchmarkDataset::StatPopGen { n_rows } => write!(f, "statpopgen(n_rows={n_rows})"),
             BenchmarkDataset::PolarSignals { n_rows } => {
                 write!(f, "polarsignals(n_rows={n_rows})")
             }
             BenchmarkDataset::Fineweb => write!(f, "fineweb"),
             BenchmarkDataset::GhArchive => write!(f, "gharchive"),
+            BenchmarkDataset::VortexQueries => write!(f, "vortex"),
         }
     }
 }
 
+const APPIAN_TABLES: &[&str] = &[
+    "addressview",
+    "categoryview",
+    "creditcardview",
+    "customerview",
+    "orderitemnovelty_update",
+    "orderitemview",
+    "orderview",
+    "productview",
+    "taxrecordview",
+];
+
 impl BenchmarkDataset {
     pub fn tables(&self) -> &[&'static str] {
         match self {
+            BenchmarkDataset::Appian => APPIAN_TABLES,
             BenchmarkDataset::TpcDS { .. } => &[
                 "call_center",
                 "catalog_sales",
@@ -145,11 +176,15 @@ impl BenchmarkDataset {
                 "customer", "lineitem", "nation", "orders", "part", "partsupp", "region",
                 "supplier",
             ],
-            BenchmarkDataset::ClickBench { .. } | BenchmarkDataset::PublicBi { .. } => todo!(),
+            BenchmarkDataset::ClickBench { .. } | BenchmarkDataset::ClickBenchSorted => &["hits"],
+            BenchmarkDataset::PublicBi { .. } => todo!(),
+            BenchmarkDataset::SpatialBench { .. } => &["trip", "building", "customer", "zone"],
             BenchmarkDataset::StatPopGen { .. } => &["statpopgen"],
             BenchmarkDataset::PolarSignals { .. } => &["stacktraces"],
             BenchmarkDataset::Fineweb => &["fineweb"],
             BenchmarkDataset::GhArchive => &["events"],
+            // See VortexBenchmark::table_specs
+            BenchmarkDataset::VortexQueries => &[],
         }
     }
 }

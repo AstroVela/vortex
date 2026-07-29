@@ -6,14 +6,12 @@ use std::fmt::Formatter;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::dtype::FieldPath;
-use crate::expr::StatsCatalog;
 use crate::expr::expression::Expression;
-use crate::expr::stats::Stat;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
@@ -30,7 +28,8 @@ impl ScalarFnVTable for Root {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.root")
+        static ID: CachedId = CachedId::new("vortex.root");
+        *ID
     }
 
     fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -78,18 +77,8 @@ impl ScalarFnVTable for Root {
         vortex_bail!("Root expression is not executable")
     }
 
-    fn stat_expression(
-        &self,
-        _options: &Self::Options,
-        _expr: &Expression,
-        stat: Stat,
-        catalog: &dyn StatsCatalog,
-    ) -> Option<Expression> {
-        catalog.stats_ref(&FieldPath::root(), stat)
-    }
-
-    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {

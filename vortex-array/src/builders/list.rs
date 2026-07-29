@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use num_traits::AsPrimitive;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -13,18 +14,21 @@ use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-use crate::VortexSessionExecute;
+use crate::array::ArrayView;
+use crate::arrays::List;
 use crate::arrays::ListArray;
-use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::ListView;
+use crate::arrays::ListViewArray;
+use crate::arrays::PrimitiveArray;
+use crate::arrays::list::ListArraySlotsExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::builders::ArrayBuilder;
 use crate::builders::DEFAULT_BUILDER_CAPACITY;
 use crate::builders::LazyBitBufferBuilder;
 use crate::builders::PrimitiveBuilder;
 use crate::builders::builder_with_capacity;
-#[expect(deprecated)]
-use crate::canonical::ToCanonical as _;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::dtype::Nullability;
@@ -95,7 +99,11 @@ impl<O: IntegerPType> ListBuilder<O> {
     ///
     /// Note that the list entry will be non-null but the elements themselves are allowed to be null
     /// (only if the elements [`DType`] in nullable, of course).
-    pub fn append_array_as_list(&mut self, array: &ArrayRef) -> VortexResult<()> {
+    pub fn append_array_as_list(
+        &mut self,
+        array: &ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
         vortex_ensure!(
             array.dtype() == self.element_dtype(),
             "Array dtype {:?} does not match list element dtype {:?}",
@@ -103,7 +111,8 @@ impl<O: IntegerPType> ListBuilder<O> {
             self.element_dtype()
         );
 
-        self.elements_builder.extend_from_array(array);
+        self.elements_builder.reserve_exact(array.len());
+        array.append_to_builder(self.elements_builder.as_mut(), ctx)?;
         self.nulls.append_non_null();
         self.offsets_builder.append_value(
             O::from_usize(self.elements_builder.len())
@@ -167,6 +176,55 @@ impl<O: IntegerPType> ListBuilder<O> {
     }
 }
 
+/// Appends `ListViewArray`-layout lists (`n` offsets and sizes) into a [`ListBuilder`], converting
+/// into the `ListArray` (`n + 1` offsets) layout.
+fn extend_from_listview<O, OffsetType, SizeType>(
+    builder: &mut ListBuilder<O>,
+    new_elements: &ArrayRef,
+    new_offsets: &[OffsetType],
+    new_sizes: &[SizeType],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()>
+where
+    O: IntegerPType,
+    OffsetType: IntegerPType,
+    SizeType: IntegerPType,
+{
+    let num_lists = new_offsets.len();
+    debug_assert_eq!(num_lists, new_sizes.len());
+
+    let total_elements: usize = new_sizes.iter().map(|size| size.as_()).sum();
+    builder.elements_builder.reserve_exact(total_elements);
+
+    let mut curr_offset = builder.elements_builder.len();
+    builder.offsets_builder.reserve_exact(num_lists);
+    let mut offsets_range = builder.offsets_builder.uninit_range(num_lists);
+
+    // We need to append each list individually, converting from `ListViewArray` format to
+    // the `ListArray` format that `ListBuilder` expects.
+    for i in 0..new_offsets.len() {
+        let offset: usize = new_offsets[i].as_();
+        let size: usize = new_sizes[i].as_();
+
+        if size > 0 {
+            let list_elements = new_elements
+                .slice(offset..offset + size)
+                .vortex_expect("list builder slice");
+            list_elements.append_to_builder(builder.elements_builder.as_mut(), ctx)?;
+            curr_offset += size;
+        }
+
+        let new_offset = O::from_usize(curr_offset).vortex_expect("Failed to convert offset");
+
+        offsets_range.set_value(i, new_offset);
+    }
+
+    // SAFETY: We have initialized all `num_lists` values, and since the `offsets` array is
+    // non-nullable, we are done.
+    unsafe { offsets_range.finish() };
+    Ok(())
+}
+
 impl<O: IntegerPType> ArrayBuilder for ListBuilder<O> {
     fn as_any(&self) -> &dyn Any {
         self
@@ -217,82 +275,6 @@ impl<O: IntegerPType> ArrayBuilder for ListBuilder<O> {
         self.append_value(scalar.as_list())
     }
 
-    unsafe fn extend_from_array_unchecked(&mut self, array: &ArrayRef) {
-        #[expect(deprecated)]
-        let list = array.to_listview();
-        if list.is_empty() {
-            return;
-        }
-
-        // Append validity information.
-        self.nulls.append_validity_mask(
-            array
-                .validity()
-                .vortex_expect("validity_mask in extend_from_array_unchecked")
-                .execute_mask(array.len(), &mut LEGACY_SESSION.create_execution_ctx())
-                .vortex_expect("Failed to compute validity mask"),
-        );
-
-        // Note that `ListViewArray` has `n` offsets and sizes, not `n+1` offsets like `ListArray`.
-        let elements = list.elements();
-        #[expect(deprecated)]
-        let offsets = list.offsets().to_primitive();
-        #[expect(deprecated)]
-        let sizes = list.sizes().to_primitive();
-
-        fn extend_inner<O, OffsetType, SizeType>(
-            builder: &mut ListBuilder<O>,
-            new_elements: &ArrayRef,
-            new_offsets: &[OffsetType],
-            new_sizes: &[SizeType],
-        ) where
-            O: IntegerPType,
-            OffsetType: IntegerPType,
-            SizeType: IntegerPType,
-        {
-            let num_lists = new_offsets.len();
-            debug_assert_eq!(num_lists, new_sizes.len());
-
-            let mut curr_offset = builder.elements_builder.len();
-            let mut offsets_range = builder.offsets_builder.uninit_range(num_lists);
-
-            // We need to append each list individually, converting from `ListViewArray` format to
-            // the `ListArray` format that `ListBuilder` expects.
-            for i in 0..new_offsets.len() {
-                let offset: usize = new_offsets[i].as_();
-                let size: usize = new_sizes[i].as_();
-
-                if size > 0 {
-                    let list_elements = new_elements
-                        .slice(offset..offset + size)
-                        .vortex_expect("list builder slice");
-                    builder.elements_builder.extend_from_array(&list_elements);
-                    curr_offset += size;
-                }
-
-                let new_offset =
-                    O::from_usize(curr_offset).vortex_expect("Failed to convert offset");
-
-                offsets_range.set_value(i, new_offset);
-            }
-
-            // SAFETY: We have initialized all `num_lists` values, and since the `offsets` array is
-            // non-nullable, we are done.
-            unsafe { offsets_range.finish() };
-        }
-
-        match_each_integer_ptype!(offsets.ptype(), |OffsetType| {
-            match_each_integer_ptype!(sizes.ptype(), |SizeType| {
-                extend_inner(
-                    self,
-                    elements,
-                    offsets.as_slice::<OffsetType>(),
-                    sizes.as_slice::<SizeType>(),
-                )
-            })
-        })
-    }
-
     fn reserve_exact(&mut self, additional: usize) {
         self.elements_builder.reserve_exact(additional);
         self.offsets_builder.reserve_exact(additional);
@@ -300,18 +282,97 @@ impl<O: IntegerPType> ArrayBuilder for ListBuilder<O> {
     }
 
     unsafe fn set_validity_unchecked(&mut self, validity: Mask) {
-        self.nulls = LazyBitBufferBuilder::new(validity.len());
-        self.nulls.append_validity_mask(validity);
+        self.nulls = LazyBitBufferBuilder::from_validity_mask(validity);
     }
 
     fn finish(&mut self) -> ArrayRef {
         self.finish_into_list().into_array()
     }
 
-    fn finish_into_canonical(&mut self) -> Canonical {
-        #[expect(deprecated)]
-        let listview = self.finish_into_list().into_array().to_listview();
+    fn finish_into_canonical(&mut self, ctx: &mut ExecutionCtx) -> Canonical {
+        let listview = self
+            .finish()
+            .execute::<ListViewArray>(ctx)
+            .vortex_expect("list builder should canonicalize to listview");
         Canonical::List(listview)
+    }
+
+    fn append_list_array(
+        &mut self,
+        array: ArrayView<'_, List>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        if array.is_empty() {
+            return Ok(());
+        }
+
+        self.nulls
+            .append_validity_mask(&array.validity()?.execute_mask(array.len(), ctx)?);
+
+        let num_lists = array.len();
+        let offsets = array.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+        match_each_integer_ptype!(offsets.ptype(), |OffsetType| {
+            let offsets = offsets.as_slice::<OffsetType>();
+            let first: usize = offsets[0].as_();
+            let last: usize = offsets[num_lists].as_();
+
+            // Lists in a `ListArray` are contiguous, so the referenced elements can be appended
+            // in bulk and the offsets rebased onto this builder's elements.
+            let elements_base = self.elements_builder.len();
+            if last > first {
+                self.elements_builder.reserve_exact(last - first);
+                array
+                    .elements()
+                    .slice(first..last)?
+                    .append_to_builder(self.elements_builder.as_mut(), ctx)?;
+            }
+
+            self.offsets_builder.reserve_exact(num_lists);
+            let mut offsets_range = self.offsets_builder.uninit_range(num_lists);
+            for i in 0..num_lists {
+                let end: usize = offsets[i + 1].as_();
+                offsets_range.set_value(
+                    i,
+                    O::from_usize(end - first + elements_base)
+                        .vortex_expect("Failed to convert offset"),
+                );
+            }
+            // SAFETY: We have initialized all `num_lists` values, and since the `offsets` array is
+            // non-nullable, we are done.
+            unsafe { offsets_range.finish() };
+        });
+        Ok(())
+    }
+
+    fn append_listview_array(
+        &mut self,
+        array: ArrayView<'_, ListView>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        if array.is_empty() {
+            return Ok(());
+        }
+
+        self.nulls
+            .append_validity_mask(&array.validity()?.execute_mask(array.len(), ctx)?);
+
+        // Note that `ListViewArray` has `n` offsets and sizes, not `n+1` offsets like `ListArray`.
+        let elements = array.elements();
+        let offsets = array.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+        let sizes = array.sizes().clone().execute::<PrimitiveArray>(ctx)?;
+
+        match_each_integer_ptype!(offsets.ptype(), |OffsetType| {
+            match_each_integer_ptype!(sizes.ptype(), |SizeType| {
+                extend_from_listview(
+                    self,
+                    elements,
+                    offsets.as_slice::<OffsetType>(),
+                    sizes.as_slice::<SizeType>(),
+                    ctx,
+                )?
+            })
+        });
+        Ok(())
     }
 }
 
@@ -323,17 +384,20 @@ mod tests {
     use Nullability::Nullable;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
+    use vortex_error::VortexResult;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
+    use crate::array_session;
     use crate::arrays::ChunkedArray;
+    use crate::arrays::ListViewArray;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::list::ListArrayExt;
+    use crate::arrays::list::ListArraySlotsExt;
     use crate::arrays::listview::ListViewArrayExt;
+    use crate::arrays::listview::ListViewArraySlotsExt;
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
+    use crate::builders::ListViewBuilder;
+    use crate::builders::builder_with_capacity;
     use crate::builders::list::ListArray;
     use crate::builders::list::ListBuilder;
     use crate::dtype::DType;
@@ -383,8 +447,8 @@ mod tests {
         let list = builder.finish();
         assert_eq!(list.len(), 2);
 
-        #[expect(deprecated)]
-        let list_array = list.to_listview();
+        let mut ctx = array_session().create_execution_ctx();
+        let list_array = list.execute::<ListViewArray>(&mut ctx).unwrap();
 
         assert_eq!(list_array.list_elements_at(0).unwrap().len(), 3);
         assert_eq!(list_array.list_elements_at(1).unwrap().len(), 3);
@@ -436,8 +500,8 @@ mod tests {
         let list = builder.finish();
         assert_eq!(list.len(), 3);
 
-        #[expect(deprecated)]
-        let list_array = list.to_listview();
+        let mut ctx = array_session().create_execution_ctx();
+        let list_array = list.execute::<ListViewArray>(&mut ctx).unwrap();
 
         assert_eq!(list_array.list_elements_at(0).unwrap().len(), 3);
         assert_eq!(list_array.list_elements_at(1).unwrap().len(), 0);
@@ -449,18 +513,24 @@ mod tests {
             [Some(vec![0, 1, 2]), None, Some(vec![4, 5])],
             Arc::new(I32.into()),
         )
-        .unwrap();
+        .unwrap()
+        .into_array();
         assert_eq!(list.len(), 3);
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let mut builder = ListBuilder::<O>::with_capacity(Arc::new(I32.into()), Nullable, 18, 9);
-        builder.extend_from_array(&list);
-        builder.extend_from_array(&list);
-        builder.extend_from_array(&list.slice(0..0).unwrap());
-        builder.extend_from_array(&list.slice(1..3).unwrap());
+        list.append_to_builder(&mut builder, &mut ctx).unwrap();
+        list.append_to_builder(&mut builder, &mut ctx).unwrap();
+        list.slice(0..0)
+            .unwrap()
+            .append_to_builder(&mut builder, &mut ctx)
+            .unwrap();
+        list.slice(1..3)
+            .unwrap()
+            .append_to_builder(&mut builder, &mut ctx)
+            .unwrap();
 
-        #[expect(deprecated)]
         let expected = ListArray::from_iter_opt_slow::<O, _, _>(
             [
                 Some(vec![0, 1, 2]),
@@ -475,13 +545,15 @@ mod tests {
             Arc::new(DType::Primitive(I32, NonNullable)),
         )
         .unwrap()
-        .to_listview();
+        .into_array()
+        .execute::<ListViewArray>(&mut ctx)
+        .unwrap();
 
-        let actual = builder.finish_into_canonical().into_listview();
+        let actual = builder.finish_into_canonical(&mut ctx).into_listview();
 
-        assert_arrays_eq!(actual.elements(), expected.elements());
+        assert_arrays_eq!(actual.elements(), expected.elements(), &mut ctx);
 
-        assert_arrays_eq!(actual.offsets(), expected.offsets());
+        assert_arrays_eq!(actual.offsets(), expected.offsets(), &mut ctx);
 
         assert!(
             actual
@@ -491,10 +563,95 @@ mod tests {
                     &expected
                         .validity()
                         .vortex_expect("list validity should be derivable"),
+                    actual.len(),
                     &mut ctx,
                 )
                 .unwrap(),
         );
+    }
+
+    /// `append_to_builder` must handle any list builder kind without assuming the offset/size
+    /// integer types produced by `builder_with_capacity`. It appends a `List`-encoded array and a
+    /// `ListView`-encoded array into `ListViewBuilder`s and `ListBuilder`s with assorted (and
+    /// non-`u64`) offset/size types.
+    #[test]
+    fn test_append_to_builder_any_list_builder() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+
+        let list = ListArray::from_iter_opt_slow::<u64, _, _>(
+            [Some(vec![0, 1, 2]), None, Some(vec![4, 5])],
+            Arc::new(I32.into()),
+        )?
+        .into_array();
+        let listview = list
+            .clone()
+            .execute::<ListViewArray>(&mut ctx)?
+            .into_array();
+        let elem_dtype = || Arc::new(I32.into());
+
+        // `builder_with_capacity` produces a `ListViewBuilder` for `DType::List`; appending the
+        // `List`-encoded array must dispatch into it instead of bailing.
+        let mut listview_builder = builder_with_capacity(list.dtype(), list.len());
+        list.append_to_builder(listview_builder.as_mut(), &mut ctx)?;
+        assert_arrays_eq!(listview_builder.finish(), list, &mut ctx);
+
+        // A `ListViewBuilder` with non-`u64` (including signed) offset and size types must work
+        // for both source encodings.
+        let mut lv_u32_u8 = ListViewBuilder::<u32, u8>::with_capacity(elem_dtype(), Nullable, 8, 4);
+        list.append_to_builder(&mut lv_u32_u8, &mut ctx)?;
+        assert_arrays_eq!(lv_u32_u8.finish(), list, &mut ctx);
+
+        let mut lv_i32_i16 =
+            ListViewBuilder::<i32, i16>::with_capacity(elem_dtype(), Nullable, 8, 4);
+        list.append_to_builder(&mut lv_i32_i16, &mut ctx)?;
+        assert_arrays_eq!(lv_i32_i16.finish(), list, &mut ctx);
+
+        let mut lv_u16_u16 =
+            ListViewBuilder::<u16, u16>::with_capacity(elem_dtype(), Nullable, 8, 4);
+        listview.append_to_builder(&mut lv_u16_u16, &mut ctx)?;
+        assert_arrays_eq!(lv_u16_u16.finish(), list, &mut ctx);
+
+        // Both source encodings appended into `ListBuilder`s with non-`u64` (including signed)
+        // offset types.
+        let mut list_builder = ListBuilder::<u32>::with_capacity(elem_dtype(), Nullable, 8, 4);
+        list.append_to_builder(&mut list_builder, &mut ctx)?;
+        assert_arrays_eq!(list_builder.finish(), list, &mut ctx);
+
+        let mut list_builder_i16 = ListBuilder::<i16>::with_capacity(elem_dtype(), Nullable, 8, 4);
+        listview.append_to_builder(&mut list_builder_i16, &mut ctx)?;
+        assert_arrays_eq!(list_builder_i16.finish(), list, &mut ctx);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_list_arrays_grow_builder() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let dtype: Arc<DType> = Arc::new(I32.into());
+
+        // Enough lists to exceed the offsets capacity of a zero-capacity builder, so appending
+        // must grow the builder rather than panic in `uninit_range`.
+        let lists: Vec<Option<Vec<i32>>> =
+            (0..100).map(|i| (i % 10 != 0).then(|| vec![i])).collect();
+        let source = ListArray::from_iter_opt_slow::<u32, _, _>(lists.clone(), Arc::clone(&dtype))?;
+        let expected = ListArray::from_iter_opt_slow::<u32, _, _>(
+            lists.iter().cloned().chain(lists.iter().cloned()),
+            Arc::clone(&dtype),
+        )?;
+
+        // Appending twice checks growth from a non-empty builder and offset rebasing.
+        let mut builder = ListBuilder::<u32>::with_capacity(Arc::clone(&dtype), Nullable, 0, 0);
+        builder.append_list_array(source.as_view(), &mut ctx)?;
+        builder.append_list_array(source.as_view(), &mut ctx)?;
+        assert_arrays_eq!(builder.finish(), expected, &mut ctx);
+
+        let source_listview = source.into_array().execute::<ListViewArray>(&mut ctx)?;
+        let mut builder = ListBuilder::<u32>::with_capacity(dtype, Nullable, 0, 0);
+        builder.append_listview_array(source_listview.as_view(), &mut ctx)?;
+        builder.append_listview_array(source_listview.as_view(), &mut ctx)?;
+        assert_arrays_eq!(builder.finish(), expected, &mut ctx);
+
+        Ok(())
     }
 
     #[test]
@@ -534,23 +691,28 @@ mod tests {
             DType::List(Arc::new(DType::Primitive(I32, NonNullable)), NonNullable),
         );
 
-        #[expect(deprecated)]
-        let canon_values = chunked_list.unwrap().as_array().to_listview();
+        let mut ctx = array_session().create_execution_ctx();
+        let canon_values = chunked_list
+            .unwrap()
+            .as_array()
+            .clone()
+            .execute::<ListViewArray>(&mut ctx)
+            .unwrap();
 
         assert_eq!(
             one_trailing_unused_element
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_scalar(0, &mut array_session().create_execution_ctx())
                 .unwrap(),
             canon_values
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_scalar(0, &mut array_session().create_execution_ctx())
                 .unwrap()
         );
         assert_eq!(
             second_array
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_scalar(0, &mut array_session().create_execution_ctx())
                 .unwrap(),
             canon_values
-                .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_scalar(1, &mut array_session().create_execution_ctx())
                 .unwrap()
         );
     }
@@ -580,11 +742,11 @@ mod tests {
         let array = builder.finish_into_list();
         assert_eq!(array.len(), 3);
 
+        let mut ctx = array_session().create_execution_ctx();
+
         // Check actual values using scalar_at.
 
-        let scalar0 = array
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap();
+        let scalar0 = array.execute_scalar(0, &mut ctx).unwrap();
         let list0 = scalar0.as_list();
         assert_eq!(list0.len(), 2);
         if let Some(list0_items) = list0.elements() {
@@ -592,9 +754,7 @@ mod tests {
             assert_eq!(list0_items[1].as_primitive().typed_value::<i32>(), Some(2));
         }
 
-        let scalar1 = array
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap();
+        let scalar1 = array.execute_scalar(1, &mut ctx).unwrap();
         let list1 = scalar1.as_list();
         assert_eq!(list1.len(), 3);
         if let Some(list1_items) = list1.elements() {
@@ -603,9 +763,7 @@ mod tests {
             assert_eq!(list1_items[2].as_primitive().typed_value::<i32>(), Some(5));
         }
 
-        let scalar2 = array
-            .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap();
+        let scalar2 = array.execute_scalar(2, &mut ctx).unwrap();
         let list2 = scalar2.as_list();
         assert!(list2.is_null()); // This should be null.
 
@@ -614,21 +772,21 @@ mod tests {
             array
                 .validity()
                 .vortex_expect("list validity should be derivable")
-                .is_valid(0)
+                .execute_is_valid(0, &mut ctx)
                 .unwrap()
         );
         assert!(
             array
                 .validity()
                 .vortex_expect("list validity should be derivable")
-                .is_valid(1)
+                .execute_is_valid(1, &mut ctx)
                 .unwrap()
         );
         assert!(
             !array
                 .validity()
                 .vortex_expect("list validity should be derivable")
-                .is_valid(2)
+                .execute_is_valid(2, &mut ctx)
                 .unwrap()
         );
 
@@ -641,12 +799,13 @@ mod tests {
     #[test]
     fn test_append_array_as_list() {
         let dtype: Arc<DType> = Arc::new(I32.into());
+        let mut ctx = array_session().create_execution_ctx();
         let mut builder =
             ListBuilder::<u32>::with_capacity(Arc::clone(&dtype), NonNullable, 20, 10);
 
         // Append a primitive array as a single list entry.
         let arr1 = buffer![1i32, 2, 3].into_array();
-        builder.append_array_as_list(&arr1).unwrap();
+        builder.append_array_as_list(&arr1, &mut ctx).unwrap();
 
         // Interleave with a list scalar.
         builder
@@ -662,11 +821,11 @@ mod tests {
 
         // Append another primitive array as a single list entry.
         let arr2 = buffer![4i32, 5].into_array();
-        builder.append_array_as_list(&arr2).unwrap();
+        builder.append_array_as_list(&arr2, &mut ctx).unwrap();
 
         // Append an empty array as a single list entry (empty list).
         let arr3 = buffer![0i32; 0].into_array();
-        builder.append_array_as_list(&arr3).unwrap();
+        builder.append_array_as_list(&arr3, &mut ctx).unwrap();
 
         // Interleave with another list scalar (empty list).
         builder
@@ -679,18 +838,24 @@ mod tests {
         // Verify elements array: [1, 2, 3, 10, 11, 4, 5].
         assert_arrays_eq!(
             list.elements(),
-            PrimitiveArray::from_iter([1i32, 2, 3, 10, 11, 4, 5])
+            PrimitiveArray::from_iter([1i32, 2, 3, 10, 11, 4, 5]),
+            &mut ctx
         );
 
         // Verify offsets array.
         assert_arrays_eq!(
             list.offsets(),
-            PrimitiveArray::from_iter([0u32, 3, 5, 7, 7, 7])
+            PrimitiveArray::from_iter([0u32, 3, 5, 7, 7, 7]),
+            &mut ctx
         );
 
         // Test dtype mismatch error.
         let mut builder = ListBuilder::<u32>::with_capacity(dtype, NonNullable, 20, 10);
         let wrong_dtype_arr = buffer![1i64, 2, 3].into_array();
-        assert!(builder.append_array_as_list(&wrong_dtype_arr).is_err());
+        assert!(
+            builder
+                .append_array_as_list(&wrong_dtype_arr, &mut ctx)
+                .is_err()
+        );
     }
 }

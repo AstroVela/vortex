@@ -9,7 +9,33 @@ use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 
-use crate::cpp::*;
+use crate::cpp::DUCKDB_TYPE;
+use crate::cpp::duckdb_array_type_array_size;
+use crate::cpp::duckdb_array_type_child_type;
+use crate::cpp::duckdb_create_array_type;
+use crate::cpp::duckdb_create_decimal_type;
+use crate::cpp::duckdb_create_list_type;
+use crate::cpp::duckdb_create_logical_type;
+use crate::cpp::duckdb_create_struct_type;
+use crate::cpp::duckdb_decimal_scale;
+use crate::cpp::duckdb_decimal_width;
+use crate::cpp::duckdb_destroy_logical_type;
+use crate::cpp::duckdb_geometry_type_get_crs;
+use crate::cpp::duckdb_get_type_id;
+use crate::cpp::duckdb_list_type_child_type;
+use crate::cpp::duckdb_logical_type;
+use crate::cpp::duckdb_map_type_key_type;
+use crate::cpp::duckdb_map_type_value_type;
+use crate::cpp::duckdb_struct_type_child_count;
+use crate::cpp::duckdb_struct_type_child_name;
+use crate::cpp::duckdb_struct_type_child_type;
+use crate::cpp::duckdb_union_type_member_count;
+use crate::cpp::duckdb_union_type_member_name;
+use crate::cpp::duckdb_union_type_member_type;
+use crate::cpp::duckdb_vx_create_geometry;
+use crate::cpp::duckdb_vx_logical_type_copy;
+use crate::cpp::duckdb_vx_logical_type_stringify;
+use crate::cpp::idx_t;
 use crate::duckdb::ddb_string::DDBString;
 use crate::lifetime_wrapper;
 
@@ -127,6 +153,14 @@ impl LogicalType {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_BLOB)
     }
 
+    pub fn uint8() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_UTINYINT)
+    }
+
+    pub fn uint16() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_USMALLINT)
+    }
+
     pub fn uint32() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_UINTEGER)
     }
@@ -137,6 +171,14 @@ impl LogicalType {
 
     pub fn uint128() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT)
+    }
+
+    pub fn int8() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_TINYINT)
+    }
+
+    pub fn int16() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_SMALLINT)
     }
 
     pub fn int32() -> Self {
@@ -174,6 +216,20 @@ impl LogicalType {
     pub fn date() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_DATE)
     }
+
+    /// Creates a DuckDB GEOMETRY logical type with the given CRS (Coordinate Reference System).
+    ///
+    /// Pass `None` for a GEOMETRY with no associated CRS.
+    pub fn geometry_type(crs: Option<&str>) -> VortexResult<Self> {
+        let Ok(crs) = CString::new(crs.unwrap_or("")) else {
+            vortex_bail!("CRS must not contain NUL bytes");
+        };
+        let ptr = unsafe { duckdb_vx_create_geometry(crs.as_ptr()) };
+        if ptr.is_null() {
+            vortex_bail!("Failed to create GEOMETRY logical type");
+        }
+        Ok(unsafe { Self::own(ptr) })
+    }
 }
 
 impl LogicalTypeRef {
@@ -192,6 +248,32 @@ impl LogicalTypeRef {
 
     pub fn is_decimal(&self) -> bool {
         matches!(self.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_DECIMAL)
+    }
+
+    /// True if this type maps to a Vortex Primitive and isn't a floating point
+    pub fn is_primitive_integer(&self) -> bool {
+        matches!(
+            self.as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_TINYINT
+                | DUCKDB_TYPE::DUCKDB_TYPE_SMALLINT
+                | DUCKDB_TYPE::DUCKDB_TYPE_INTEGER
+                | DUCKDB_TYPE::DUCKDB_TYPE_BIGINT
+                | DUCKDB_TYPE::DUCKDB_TYPE_UTINYINT
+                | DUCKDB_TYPE::DUCKDB_TYPE_USMALLINT
+                | DUCKDB_TYPE::DUCKDB_TYPE_UINTEGER
+                | DUCKDB_TYPE::DUCKDB_TYPE_UBIGINT
+        )
+    }
+
+    pub fn geometry_crs(&self) -> Option<DDBString> {
+        unsafe {
+            let c_string = duckdb_geometry_type_get_crs(self.as_ptr());
+            if c_string.is_null() {
+                None
+            } else {
+                Some(DDBString::own(c_string))
+            }
+        }
     }
 
     pub fn array_child_type(&self) -> LogicalType {
@@ -377,6 +459,8 @@ floating_type!(Double, f64);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpp::duckdb_create_map_type;
+    use crate::cpp::duckdb_create_union_type;
 
     #[test]
     fn test_clone_logical_type() {
@@ -526,6 +610,16 @@ mod tests {
 
             assert_eq!(original_child_name, cloned_child_name);
         }
+    }
+
+    #[test]
+    fn test_create_geometry_type() -> VortexResult<()> {
+        let no_crs = LogicalType::geometry_type(None)?;
+        assert_eq!(no_crs.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY);
+
+        let with_crs = LogicalType::geometry_type(Some("EPSG:4326"))?;
+        assert_eq!(with_crs.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY);
+        Ok(())
     }
 
     #[test]

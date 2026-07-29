@@ -31,7 +31,7 @@ impl BoolArray {
             for (idx, value) in indices
                 .as_slice::<I>()
                 .iter()
-                .zip_eq(values.to_bit_buffer().iter())
+                .zip_eq(values.bit_buffer_view().iter())
             {
                 #[allow(clippy::cast_possible_truncation)]
                 own_values.set_to(*idx as usize - offset, value);
@@ -47,22 +47,26 @@ mod tests {
     use vortex_buffer::BitBuffer;
 
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::assert_arrays_eq;
 
     #[test]
     fn patch_sliced_bools() {
+        let mut ctx = array_session().create_execution_ctx();
         let arr = BoolArray::from(BitBuffer::new_set(12));
         let sliced = arr.into_array().slice(4..12).unwrap();
         let expected = BoolArray::from_iter([true; 8]);
-        assert_arrays_eq!(sliced, expected);
+        assert_arrays_eq!(sliced, expected, &mut ctx);
     }
 
     #[test]
     fn patch_sliced_bools_offset() {
+        let mut ctx = array_session().create_execution_ctx();
         let arr = BoolArray::from(BitBuffer::new_set(15));
         let sliced = arr.into_array().slice(4..15).unwrap();
         let expected = BoolArray::from_iter([true; 11]);
-        assert_arrays_eq!(sliced, expected);
+        assert_arrays_eq!(sliced, expected, &mut ctx);
     }
 }

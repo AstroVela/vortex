@@ -9,6 +9,7 @@ mod list_view;
 mod null;
 mod primitive;
 mod struct_;
+mod union;
 mod varbinview;
 
 use std::mem::size_of;
@@ -21,12 +22,15 @@ use list_view::list_view_uncompressed_size_in_bytes;
 use null::null_uncompressed_size_in_bytes;
 use primitive::primitive_uncompressed_size_in_bytes;
 use struct_::struct_uncompressed_size_in_bytes;
+use union::union_uncompressed_size_in_bytes;
 use varbinview::varbinview_uncompressed_size_in_bytes;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
+use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::Canonical;
@@ -63,9 +67,7 @@ pub fn uncompressed_size_in_bytes(array: &ArrayRef, ctx: &mut ExecutionCtx) -> V
 }
 
 fn uncompressed_size_in_bytes_u64(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<u64> {
-    if let Some(Precision::Exact(size_scalar)) =
-        array.statistics().get(Stat::UncompressedSizeInBytes)
-    {
+    if let Precision::Exact(size_scalar) = array.statistics().get(Stat::UncompressedSizeInBytes) {
         return u64::try_from(&size_scalar)
             .map_err(|e| vortex_err!("Failed to convert uncompressed size stat to u64: {e}"));
     }
@@ -102,11 +104,20 @@ impl AggregateFnVTable for UncompressedSizeInBytes {
     type Partial = u64;
 
     fn id(&self) -> AggregateFnId {
-        AggregateFnId::new("vortex.uncompressed_size_in_bytes")
+        static ID: CachedId = CachedId::new("vortex.uncompressed_size_in_bytes");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("UncompressedSizeInBytes is not yet serializable");
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
     }
 
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
@@ -150,17 +161,6 @@ impl AggregateFnVTable for UncompressedSizeInBytes {
         false
     }
 
-    fn try_partial_from_stats(&self, batch: &ArrayRef) -> VortexResult<Option<Scalar>> {
-        let Some(Precision::Exact(size_scalar)) =
-            batch.statistics().get(Stat::UncompressedSizeInBytes)
-        else {
-            return Ok(None);
-        };
-        let size = u64::try_from(&size_scalar)
-            .map_err(|e| vortex_err!("Failed to convert uncompressed size stat to u64: {e}"))?;
-        Ok(Some(Scalar::primitive(size, NonNullable)))
-    }
-
     fn accumulate(
         &self,
         partial: &mut Self::Partial,
@@ -201,6 +201,7 @@ pub(crate) fn canonical_uncompressed_size_in_bytes(
         Canonical::List(array) => list_view_uncompressed_size_in_bytes(array, ctx),
         Canonical::FixedSizeList(array) => fixed_size_list_uncompressed_size_in_bytes(array, ctx),
         Canonical::Struct(array) => struct_uncompressed_size_in_bytes(array, ctx),
+        Canonical::Union(array) => union_uncompressed_size_in_bytes(array, ctx),
         Canonical::Extension(array) => extension_uncompressed_size_in_bytes(array, ctx),
         Canonical::Variant(_) => {
             vortex_bail!("UncompressedSizeInBytes is not supported for Variant arrays")
@@ -235,7 +236,12 @@ pub(crate) fn constant_uncompressed_size_in_bytes(
             let canonical = array.array().clone().execute::<Canonical>(ctx)?;
             return canonical_uncompressed_size_in_bytes(&canonical, ctx);
         }
-        DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+        DType::Union(..) => {
+            todo!(
+                "TODO(connor)[Union]: support constant Union size accounting after constant Union \
+                 canonicalization defines inactive sparse-child placeholders"
+            )
+        }
         DType::Variant(_) => {
             vortex_bail!("UncompressedSizeInBytes is not supported for Variant arrays")
         }
@@ -291,7 +297,9 @@ fn supports_uncompressed_size_in_bytes(dtype: &DType) -> bool {
         DType::Struct(fields, _) => fields
             .fields()
             .all(|field| supports_uncompressed_size_in_bytes(&field)),
-        DType::Union(_) => todo!("TODO(connor)[Union]: unimplemented"),
+        DType::Union(variants, _) => variants
+            .variants()
+            .all(|variant| supports_uncompressed_size_in_bytes(&variant)),
         DType::Variant(_) => false,
         DType::Extension(ext_dtype) => {
             supports_uncompressed_size_in_bytes(ext_dtype.storage_dtype())
@@ -315,12 +323,12 @@ pub(crate) fn packed_bit_buffer_size_in_bytes(len: usize) -> VortexResult<u64> {
 #[cfg(test)]
 mod tests {
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
 
     use crate::ArrayRef;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::Accumulator;
     use crate::aggregate_fn::AggregateFnVTable;
@@ -328,6 +336,7 @@ mod tests {
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
     use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
+    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::ConstantArray;
@@ -338,6 +347,7 @@ mod tests {
     use crate::arrays::NullArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
+    use crate::arrays::UnionArray;
     use crate::arrays::VarBinViewArray;
     use crate::arrays::VariantArray;
     use crate::builders::builder_with_capacity;
@@ -346,6 +356,7 @@ mod tests {
     use crate::dtype::FieldNames;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
+    use crate::dtype::UnionVariants;
     use crate::expr::stats::Precision;
     use crate::expr::stats::Stat;
     use crate::expr::stats::StatsProvider;
@@ -357,14 +368,17 @@ mod tests {
 
     fn materialized_uncompressed_size_in_bytes(array: &ArrayRef) -> u64 {
         let mut builder = builder_with_capacity(array.dtype(), array.len());
-        unsafe {
-            builder.extend_from_array_unchecked(array);
-        }
+        array
+            .append_to_builder(
+                builder.as_mut(),
+                &mut array_session().create_execution_ctx(),
+            )
+            .vortex_expect("appended");
         builder.finish().nbytes()
     }
 
     fn aggregate(array: &ArrayRef) -> VortexResult<u64> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let mut acc =
             Accumulator::try_new(UncompressedSizeInBytes, EmptyOptions, array.dtype().clone())?;
         acc.accumulate(array, &mut ctx)?;
@@ -533,6 +547,26 @@ mod tests {
     }
 
     #[test]
+    fn union_sums_type_ids_and_sparse_children() -> VortexResult<()> {
+        let type_ids = PrimitiveArray::from_iter([5_u8, 9, 5]).into_array();
+        let numbers = PrimitiveArray::from_iter([10_i32, 0, 30]).into_array();
+        let flags = BoolArray::from_iter([false, true, false]).into_array();
+        let expected = aggregate(&type_ids)? + aggregate(&numbers)? + aggregate(&flags)?;
+        let variants = UnionVariants::try_new(
+            ["number", "flag"].into(),
+            vec![
+                DType::Primitive(PType::I32, Nullability::NonNullable),
+                DType::Bool(Nullability::NonNullable),
+            ],
+            vec![5, 9],
+        )?;
+        let array = UnionArray::try_new(type_ids, variants, vec![numbers, flags])?.into_array();
+
+        assert_eq!(aggregate(&array)?, expected);
+        Ok(())
+    }
+
+    #[test]
     fn extension_matches_materialized_size() -> VortexResult<()> {
         let storage = PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array();
         let ext_dtype = Date::new(TimeUnit::Days, Nullability::Nullable).erased();
@@ -548,8 +582,8 @@ mod tests {
     #[test]
     fn variant_stat_is_unsupported() -> VortexResult<()> {
         let child = ConstantArray::new(Scalar::variant(Scalar::from(42i32)), 3).into_array();
-        let array = VariantArray::new(child).into_array();
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let array = VariantArray::try_new(child, None)?.into_array();
+        let mut ctx = array_session().create_execution_ctx();
 
         assert_eq!(
             array
@@ -602,13 +636,13 @@ mod tests {
     #[test]
     fn helper_caches_result() -> VortexResult<()> {
         let array = PrimitiveArray::new(buffer![1i32, 2, 3], Validity::NonNullable).into_array();
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let size = uncompressed_size_in_bytes(&array, &mut ctx)?;
 
         assert_eq!(
             array.statistics().get(Stat::UncompressedSizeInBytes),
-            Some(Precision::exact(u64::try_from(size)?))
+            Precision::exact(u64::try_from(size)?)
         );
         Ok(())
     }

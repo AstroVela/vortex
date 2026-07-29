@@ -1,9 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Vortex's expression language.
+//! Vortex's expression language: scalar operations over [arrays](crate::ArrayRef).
 //!
-//! All expressions are serializable, and own their own wire format.
+//! An [`Expression`] is a tree of scalar operations rooted at a scope (see [`root`]). Expressions
+//! are the common currency of scans: a scan takes a *filter* expression that resolves to a boolean
+//! and a *projection* expression that shapes the output. All expressions are serializable and own
+//! their own wire format, so they can be pushed down to remote sources and reconstructed on workers.
+//!
+//! # Scalar functions
+//!
+//! Each node references a scalar function defined by a
+//! [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable). The vtable declares the function signature,
+//! properties such as strictness, and the logic that executes it over input arrays. Built-in
+//! functions live in [`crate::scalar_fn`]; integration and plugin crates supply additional,
+//! use-case-specific functions.
+//!
+//! # Deferred execution
+//!
+//! Applying an expression to an array does not compute the result eagerly. Instead it builds a
+//! [`ScalarFnArray`](crate::arrays::ScalarFnArray) representing the deferred application, letting
+//! downstream encodings push the computation into compressed data, or fuse several expressions
+//! together, before any data is materialized. The deferred tree is executed toward canonical form
+//! only when a result is actually required.
+//!
+//! # Typing and coercion
+//!
+//! Expressions are strictly typed: an input array's dtype must match the function signature exactly,
+//! so callers perform any required type coercion themselves before building the expression (see the
+//! [`transform`] passes). The one relaxation is null-coercion — for example, equality may compare a
+//! `u32` against a `u32?`, but never a `u32` against an `i32`.
+//!
+//! Filter expressions are decomposed into independent conjuncts with [`split_conjunction`] so that
+//! scans can evaluate and reorder the most selective predicates first.
 //!
 //! The implementation takes inspiration from [Postgres] and [Apache Datafusion].
 //!
@@ -34,7 +63,6 @@ pub(crate) mod field;
 pub mod forms;
 mod optimize;
 pub mod proto;
-pub mod pruning;
 pub mod stats;
 pub mod transform;
 pub mod traversal;
@@ -42,7 +70,6 @@ pub mod traversal;
 pub use analysis::*;
 pub use expression::*;
 pub use exprs::*;
-pub use pruning::StatsCatalog;
 
 pub trait VortexExprExt {
     /// Accumulate all field references from this expression and its children in a set
@@ -79,7 +106,7 @@ fn split_inner(expr: &Expression, exprs: &mut Vec<Expression>) {
 }
 
 /// An expression wrapper that performs pointer equality on child expressions.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExactExpr(pub Expression);
 impl PartialEq for ExactExpr {
     fn eq(&self, other: &Self) -> bool {
@@ -91,7 +118,8 @@ impl Eq for ExactExpr {}
 
 impl Hash for ExactExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
+        self.0.scalar_fn().hash(state);
+        Arc::as_ptr(self.0.children()).hash(state);
     }
 }
 
@@ -121,6 +149,9 @@ pub mod test_harness {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
     use super::*;
     use crate::dtype::DType;
     use crate::dtype::FieldNames;
@@ -160,6 +191,22 @@ mod tests {
         let expr = and(lhs, rhs);
         let conjunction = split_conjunction(&expr);
         assert_eq!(conjunction.len(), 2, "Conjunction is {conjunction:?}");
+    }
+
+    #[test]
+    fn exact_expr_hash_consistent_with_eq() {
+        let state = RandomState::new();
+        let expr = eq(get_item("col1", root()), lit(1));
+
+        // Clones share the children Arc, so they are equal and must hash equally.
+        let a = ExactExpr(expr.clone());
+        let b = ExactExpr(expr);
+        assert_eq!(a, b);
+        assert_eq!(state.hash_one(&a), state.hash_one(&b));
+
+        // Structurally identical expressions built separately are distinct keys.
+        let rebuilt = ExactExpr(eq(get_item("col1", root()), lit(1)));
+        assert_ne!(a, rebuilt);
     }
 
     #[test]
@@ -207,7 +254,7 @@ mod tests {
             "(($.col1 < $.col2) or ($.col1 != $.col2))"
         );
 
-        assert_eq!(not(col1).to_string(), "not($.col1)");
+        assert_eq!(not(col1).to_string(), "vortex.not($.col1)");
 
         assert_eq!(
             select(vec![FieldName::from("col1")], root()).to_string(),

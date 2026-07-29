@@ -12,7 +12,6 @@ use num_enum::TryFromPrimitive;
 
 use crate::dtype::DType;
 use crate::dtype::Nullability::NonNullable;
-use crate::dtype::PType;
 
 mod bound;
 mod precision;
@@ -25,8 +24,11 @@ pub use provider::*;
 pub use stat_bound::*;
 
 use crate::aggregate_fn;
+use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::AggregateFnVTableExt;
 use crate::aggregate_fn::EmptyOptions;
+use crate::aggregate_fn::NumericalAggregateOpts;
 
 #[derive(
     Debug,
@@ -172,7 +174,10 @@ impl Stat {
             Self::Max => data_type.clone(),
             Self::Min if matches!(data_type, DType::Null) => return None,
             Self::Min => data_type.clone(),
-            Self::NullCount => DType::Primitive(PType::U64, NonNullable),
+            Self::NullCount => {
+                return aggregate_fn::fns::null_count::NullCount
+                    .return_dtype(&EmptyOptions, data_type);
+            }
             Self::UncompressedSizeInBytes => {
                 return aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes
                     .return_dtype(&EmptyOptions, data_type);
@@ -182,9 +187,56 @@ impl Stat {
                     .return_dtype(&EmptyOptions, data_type);
             }
             Self::Sum => {
-                return aggregate_fn::fns::sum::Sum.return_dtype(&EmptyOptions, data_type);
+                // Statistics follow NaN-skipping semantics; request it explicitly.
+                return aggregate_fn::fns::sum::Sum
+                    .return_dtype(&NumericalAggregateOpts::skip_nans(), data_type);
             }
         })
+    }
+
+    /// Return the built-in aggregate function corresponding to this statistic, if one exists.
+    pub fn aggregate_fn(&self) -> Option<AggregateFnRef> {
+        // Statistics follow NaN-skipping semantics; request it explicitly rather than the default.
+        Some(match self {
+            Self::Max => aggregate_fn::fns::max::Max.bind(NumericalAggregateOpts::skip_nans()),
+            Self::Min => aggregate_fn::fns::min::Min.bind(NumericalAggregateOpts::skip_nans()),
+            Self::Sum => aggregate_fn::fns::sum::Sum.bind(NumericalAggregateOpts::skip_nans()),
+            Self::NullCount => aggregate_fn::fns::null_count::NullCount.bind(EmptyOptions),
+            Self::NaNCount => aggregate_fn::fns::nan_count::NanCount.bind(EmptyOptions),
+            Self::UncompressedSizeInBytes => {
+                aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes
+                    .bind(EmptyOptions)
+            }
+            Self::IsConstant | Self::IsSorted | Self::IsStrictSorted => return None,
+        })
+    }
+
+    /// Return the statistic represented by `aggregate_fn`, if it has a legacy stat slot.
+    ///
+    /// Min/max/sum statistics skip NaN values, so NaN-including configurations of those
+    /// aggregates have no stat slot.
+    pub fn from_aggregate_fn(aggregate_fn: &AggregateFnRef) -> Option<Self> {
+        if let Some(options) = aggregate_fn.as_opt::<aggregate_fn::fns::sum::Sum>() {
+            return options.skip_nans.then_some(Self::Sum);
+        }
+        if aggregate_fn.is::<aggregate_fn::fns::nan_count::NanCount>() {
+            return Some(Self::NaNCount);
+        }
+        if aggregate_fn.is::<aggregate_fn::fns::null_count::NullCount>() {
+            return Some(Self::NullCount);
+        }
+        if let Some(options) = aggregate_fn.as_opt::<aggregate_fn::fns::min::Min>() {
+            return options.skip_nans.then_some(Self::Min);
+        }
+        if let Some(options) = aggregate_fn.as_opt::<aggregate_fn::fns::max::Max>() {
+            return options.skip_nans.then_some(Self::Max);
+        }
+        if aggregate_fn
+            .is::<aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes>()
+        {
+            return Some(Self::UncompressedSizeInBytes);
+        }
+        None
     }
 
     pub fn name(&self) -> &str {
@@ -216,8 +268,8 @@ impl Display for Stat {
 mod test {
     use enum_iterator::all;
 
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::expr::stats::Stat;
 
@@ -225,7 +277,7 @@ mod test {
     fn min_of_nulls_is_not_panic() {
         let min = PrimitiveArray::from_option_iter::<i32, _>([None, None, None, None])
             .statistics()
-            .compute_as::<i64>(Stat::Min, &mut LEGACY_SESSION.create_execution_ctx());
+            .compute_as::<i64>(Stat::Min, &mut array_session().create_execution_ctx());
 
         assert_eq!(min, None);
     }

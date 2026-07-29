@@ -10,25 +10,25 @@
 //! 3. `Java_dev_vortex_jni_NativePartition_scanArrow` → consumes a partition into an
 //!    `FFI_ArrowArrayStream` that Java imports via Arrow's C Data Interface.
 
+use std::io::Cursor;
 use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
+use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::ArrowError;
-use arrow_schema::DataType;
+use arrow_schema::Field;
 use futures::StreamExt;
 use jni::EnvUnowned;
+use jni::objects::JByteArray;
 use jni::objects::JClass;
 use jni::objects::JLongArray;
 use jni::sys::jboolean;
 use jni::sys::jlong;
-use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
 use vortex::array::stream::SendableArrayStream;
 use vortex::buffer::Buffer;
 use vortex::error::VortexResult;
@@ -43,10 +43,11 @@ use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
+use vortex_arrow::ArrowSessionExt;
 
+use crate::POOL;
 use crate::RUNTIME;
 use crate::data_source::NativeDataSource;
-use crate::dtype::strip_views;
 use crate::errors::try_or_throw;
 use crate::session::session_ref;
 
@@ -74,6 +75,7 @@ fn build_scan_request(
     row_range_begin: jlong,
     row_range_end: jlong,
     selection_idx: &[u64],
+    selection_roaring_bitmap: &[u8],
     selection_include: u8,
     limit: jlong,
     ordered: jboolean,
@@ -94,6 +96,8 @@ fn build_scan_request(
         0 => Selection::All,
         1 => Selection::IncludeByIndex(Buffer::copy_from(selection_idx)),
         2 => Selection::ExcludeByIndex(Buffer::copy_from(selection_idx)),
+        3 => Selection::IncludeRoaring(deserialize_roaring_selection(selection_roaring_bitmap)?),
+        4 => Selection::ExcludeRoaring(deserialize_roaring_selection(selection_roaring_bitmap)?),
         other => vortex_bail!("unknown selection include code: {other}"),
     };
 
@@ -116,6 +120,14 @@ fn build_scan_request(
     })
 }
 
+fn deserialize_roaring_selection(bytes: &[u8]) -> VortexResult<roaring::RoaringTreemap> {
+    if bytes.is_empty() {
+        vortex_bail!("serialized roaring row selection must not be empty");
+    }
+    let cursor = Cursor::new(bytes);
+    Ok(roaring::RoaringTreemap::deserialize_from(cursor)?)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
@@ -127,6 +139,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
     row_range_begin: jlong,
     row_range_end: jlong,
     selection_indices: JLongArray,
+    selection_roaring_bitmap: JByteArray,
     selection_include: jni::sys::jbyte,
     limit: jlong,
     ordered: jboolean,
@@ -150,12 +163,19 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
             out
         };
 
+        let selection_roaring_bitmap: Vec<u8> = if selection_roaring_bitmap.is_null() {
+            Vec::new()
+        } else {
+            env.convert_byte_array(&selection_roaring_bitmap)?
+        };
+
         let request = build_scan_request(
             projection_ptr,
             filter_ptr,
             row_range_begin,
             row_range_end,
             &selection_idx,
+            &selection_roaring_bitmap,
             selection_include as u8,
             limit,
             ordered,
@@ -183,6 +203,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_free(
 pub extern "system" fn Java_dev_vortex_jni_NativeScan_arrowSchema(
     mut env: EnvUnowned,
     _class: JClass,
+    session_ptr: jlong,
     pointer: jlong,
     schema_addr: jlong,
 ) {
@@ -190,11 +211,16 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_arrowSchema(
         if schema_addr == 0 {
             throw_runtime!("null arrow schema address");
         }
+        let session = unsafe { session_ref(session_ptr) };
         let scan = unsafe { &*(pointer as *const NativeScan) };
         let NativeScan::Pending(scan) = scan else {
             throw_runtime!("schema unavailable: scan already started");
         };
-        crate::dtype::export_dtype_to_arrow(scan.dtype(), schema_addr)?;
+        let arrow_schema = session.arrow().to_arrow_schema(scan.dtype())?;
+        let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
+        unsafe {
+            ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+        }
         Ok(())
     });
 }
@@ -213,9 +239,9 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_partitionCount(
             throw_runtime!("partition count unavailable: scan already started");
         };
         let (rows, cardinality) = match scan.partition_count() {
-            Some(Precision::Exact(v)) => (v as jlong, 2),
-            Some(Precision::Inexact(v)) => (v as jlong, 1),
-            None => (0, 0),
+            Precision::Exact(v) => (v as jlong, 2),
+            Precision::Inexact(v) => (v as jlong, 1),
+            Precision::Absent => (0, 0),
         };
         out.set_region(env, 0, &[rows, cardinality])?;
         Ok(())
@@ -283,9 +309,9 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_rowCount(
             throw_runtime!("row count unavailable: partition already started");
         };
         let (rows, cardinality) = match partition.row_count() {
-            Some(Precision::Exact(v)) => (v as jlong, 2),
-            Some(Precision::Inexact(v)) => (v as jlong, 1),
-            None => (0, 0),
+            Precision::Exact(v) => (v as jlong, 2),
+            Precision::Inexact(v) => (v as jlong, 1),
+            Precision::Absent => (0, 0),
         };
         out.set_region(env, 0, &[rows, cardinality])?;
         Ok(())
@@ -322,28 +348,32 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_scanArrow(
         let array_stream = partition.execute()?;
         let dtype = array_stream.dtype().clone();
 
-        let raw_schema = dtype.to_arrow_schema()?;
-        let viewless = strip_views(DataType::Struct(raw_schema.fields().clone()));
-        let fields = match viewless {
-            DataType::Struct(fields) => fields,
-            _ => unreachable!("Vortex DType always exports as a struct"),
-        };
-        let schema = Arc::new(arrow_schema::Schema::new(fields));
-        let data_type = DataType::Struct(schema.fields().clone());
-
         let session = unsafe { session_ref(session_ptr) };
+        let schema = Arc::new(session.arrow().to_arrow_schema(&dtype)?);
+        let target = Arc::new(Field::new_struct("", schema.fields().clone(), false));
 
         let iter = RUNTIME
-            .block_on_stream_thread_safe(|_handle| array_stream)
-            .map(
-                move |chunk: VortexResult<ArrayRef>| -> VortexResult<RecordBatch> {
-                    let chunk: ArrayRef = chunk?;
-                    let mut ctx: ExecutionCtx = session.create_execution_ctx();
-                    let arrow = chunk.execute_arrow(Some(&data_type), &mut ctx)?;
-                    Ok(RecordBatch::from(arrow.as_struct().clone()))
-                },
-            )
-            .map(|result| result.map_err(|e| ArrowError::ExternalError(Box::new(e))));
+            .block_on_stream_thread_safe(|handle| {
+                array_stream
+                    .map(move |chunk| {
+                        let session = session.clone();
+                        let target = Arc::clone(&target);
+                        handle.spawn(async move {
+                            let chunk = chunk?;
+                            let mut ctx = session.create_execution_ctx();
+                            let arrow = session.arrow().execute_arrow(
+                                chunk,
+                                Some(target.as_ref()),
+                                &mut ctx,
+                            )?;
+                            Ok(RecordBatch::from(arrow.as_struct().clone()))
+                        })
+                    })
+                    .buffered(POOL.worker_count().max(1))
+            })
+            .map(|result: VortexResult<RecordBatch>| {
+                result.map_err(|e| ArrowError::ExternalError(Box::new(e)))
+            });
 
         let reader = RecordBatchIteratorAdapter::new(iter, schema);
         let arrow_stream = FFI_ArrowArrayStream::new(Box::new(reader));

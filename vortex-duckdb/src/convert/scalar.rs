@@ -47,6 +47,7 @@ use vortex::scalar::PrimitiveScalar;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue;
 use vortex::scalar::Utf8Scalar;
+use vortex_geo::extension::WellKnownBinary;
 
 use crate::convert::dtype::FromLogicalType;
 use crate::duckdb::LogicalType;
@@ -77,11 +78,14 @@ impl ToDuckDBScalar for Scalar {
             DType::Decimal(..) => self.as_decimal().try_to_duckdb_scalar(),
             DType::Utf8(_) => self.as_utf8().try_to_duckdb_scalar(),
             DType::Binary(_) => self.as_binary().try_to_duckdb_scalar(),
-            DType::List(..) | DType::FixedSizeList(..) | DType::Struct(..) => todo!(),
-            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
-            DType::Variant(_) => {
-                vortex_bail!("Vortex Variant scalars aren't supported in DuckDB")
+            DType::List(..) => vortex_bail!("Vortex List scalars aren't supported"),
+            DType::FixedSizeList(..) => {
+                vortex_bail!("Vortex FixedSizeList scalars aren't supported")
             }
+            DType::Variant(_) => vortex_bail!("Vortex Variant scalars aren't supported"),
+            DType::Struct(..) => vortex_bail!("Vortex Struct scalars aren't supported"),
+            // TODO(connor): Union
+            DType::Union(..) => vortex_bail!("Vortex Union scalars aren't supported"),
             DType::Extension(..) => self.as_extension().try_to_duckdb_scalar(),
         }
     }
@@ -170,9 +174,22 @@ impl ToDuckDBScalar for BinaryScalar<'_> {
 }
 
 impl ToDuckDBScalar for ExtScalar<'_> {
-    /// Converts an extension scalar (primarily temporal types) to a DuckDB value.
+    /// Converts an extension scalar (temporal types or `WellKnownBinary` geometries) to a DuckDB
+    /// value.
     fn try_to_duckdb_scalar(&self) -> VortexResult<Value> {
         let logical_type = LogicalType::try_from(&DType::Extension(self.ext_dtype().clone()))?;
+
+        if let Some(wkb) = self.ext_dtype().metadata_opt::<WellKnownBinary>() {
+            let storage = self.to_storage_scalar();
+            let binary = storage
+                .as_binary_opt()
+                .ok_or_else(|| vortex_err!("WellKnownBinary storage must be a binary scalar"))?;
+            return Ok(match binary.value() {
+                Some(bytes) => Value::new_geometry(bytes.as_slice(), wkb.crs.as_deref())?,
+                None => Value::null(&logical_type),
+            });
+        }
+
         let Some(temporal) = self.ext_dtype().metadata_opt::<AnyTemporal>() else {
             vortex_bail!("Cannot convert non-temporal extension scalar to duckdb value");
         };
@@ -241,6 +258,14 @@ impl TryFrom<Value> for Scalar {
     }
 }
 
+impl TryFrom<Scalar> for Value {
+    type Error = VortexError;
+
+    fn try_from(scalar: Scalar) -> Result<Self, Self::Error> {
+        scalar.try_to_duckdb_scalar()
+    }
+}
+
 impl<'a> TryFrom<&'a ValueRef> for Scalar {
     type Error = VortexError;
 
@@ -267,7 +292,14 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
             ExtractedValue::Float(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::Double(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::Varchar(s) => Ok(Scalar::utf8(s, Nullable)),
-            ExtractedValue::Blob(b) => Ok(Scalar::binary(b, Nullable)),
+            ExtractedValue::Blob(b) => match &dtype {
+                DType::Binary(_) => Ok(Scalar::binary(b, Nullable)),
+                DType::Extension(ext) if ext.is::<WellKnownBinary>() => Ok(Scalar::extension_ref(
+                    ext.clone(),
+                    Scalar::binary(b, Nullable),
+                )),
+                _ => vortex_bail!("Cannot convert DuckDB blob to Vortex scalar of dtype {dtype}"),
+            },
             ExtractedValue::Date(days) => Ok(Scalar::extension::<Date>(
                 TimeUnit::Days,
                 Scalar::try_new(
@@ -351,11 +383,25 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use vortex::dtype::DType;
+    use vortex::dtype::Nullability;
+    use vortex::dtype::PType;
+    use vortex::dtype::extension::ExtDType;
+    use vortex::extension::datetime::Date;
+    use vortex::extension::datetime::Time;
+    use vortex::extension::datetime::TimeUnit;
     use vortex::extension::datetime::Timestamp;
     use vortex::extension::datetime::TimestampOptions;
     use vortex::scalar::Scalar;
+    use vortex::scalar::ScalarValue;
+    use vortex_geo::extension::GeoMetadata;
+    use vortex_geo::extension::WellKnownBinary;
 
     use crate::convert::ToDuckDBScalar;
+    use crate::cpp::DUCKDB_TYPE;
+    use crate::duckdb::ExtractedValue;
+    use crate::duckdb::Value;
 
     #[test]
     fn test_scalar_round_trip() {
@@ -380,13 +426,6 @@ mod tests {
 
     #[test]
     fn test_timestamp_roundtrip() {
-        use vortex::dtype::DType;
-        use vortex::dtype::Nullability;
-        use vortex::dtype::PType;
-        use vortex::extension::datetime::TimeUnit;
-        use vortex::scalar::Scalar;
-        use vortex::scalar::ScalarValue;
-
         #[rustfmt::skip]
         let test_cases = [
             (TimeUnit::Seconds, 1703980800i64),                 // 2023-12-30 16:00:00 UTC
@@ -413,5 +452,193 @@ mod tests {
 
             assert_eq!(original_scalar, roundtrip_scalar);
         }
+    }
+
+    /// Sample WKB bytes for `POINT(1 2)` little-endian.
+    fn sample_wkb() -> Vec<u8> {
+        vec![
+            0x01, // little-endian
+            0x01, 0x00, 0x00, 0x00, // type = 1 (Point)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, // x = 1.0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // y = 2.0
+        ]
+    }
+
+    fn wkb_scalar(crs: Option<&str>, bytes: &[u8]) -> Scalar {
+        Scalar::extension::<WellKnownBinary>(
+            GeoMetadata {
+                crs: crs.map(str::to_string),
+            },
+            Scalar::binary(bytes.to_vec(), Nullability::Nullable),
+        )
+    }
+
+    #[rstest]
+    #[case::with_crs(Some("EPSG:4326"))]
+    #[case::no_crs(None)]
+    #[case::empty_crs(Some(""))]
+    fn test_geometry_value_extract_round_trip(#[case] crs: Option<&str>) {
+        let bytes = sample_wkb();
+        let value = Value::new_geometry(&bytes, crs).unwrap();
+
+        // The constructed value must be a GEOMETRY logical type.
+        assert_eq!(
+            value.logical_type().as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY
+        );
+
+        // Extract back: bytes round-trip exactly.
+        let scalar: Scalar = (&*value).try_into().unwrap();
+        let ext = scalar.as_extension();
+        let storage = ext.to_storage_scalar();
+        let storage_binary = storage.as_binary();
+        assert_eq!(storage_binary.value().unwrap().as_slice(), bytes.as_slice());
+
+        // The extension dtype should be `WellKnownBinary` and CRS should round-trip,
+        // with the documented quirk that `Some("")` collapses to `None` through DuckDB.
+        let metadata = ext.ext_dtype().metadata::<WellKnownBinary>();
+        match crs {
+            Some("") | None => assert_eq!(metadata.crs, None),
+            Some(s) => assert_eq!(metadata.crs.as_deref(), Some(s)),
+        }
+    }
+
+    #[test]
+    fn test_geometry_to_duckdb_scalar_round_trip() {
+        let bytes = sample_wkb();
+        let original = wkb_scalar(Some("EPSG:4326"), &bytes);
+
+        let duckdb_value = original.try_to_duckdb_scalar().unwrap();
+        let roundtrip: Scalar = duckdb_value.try_into().unwrap();
+
+        assert_eq!(original, roundtrip);
+    }
+
+    #[test]
+    fn test_null_geometry_to_duckdb_scalar() {
+        let dtype = ExtDType::<WellKnownBinary>::try_new(
+            GeoMetadata {
+                crs: Some("EPSG:4326".to_string()),
+            },
+            DType::Binary(Nullability::Nullable),
+        )
+        .unwrap()
+        .erased();
+        let original = Scalar::null(DType::Extension(dtype));
+
+        let duckdb_value = original.try_to_duckdb_scalar().unwrap();
+        let roundtrip: Scalar = duckdb_value.try_into().unwrap();
+
+        assert!(roundtrip.is_null());
+        assert_eq!(roundtrip.dtype(), original.dtype());
+    }
+
+    fn timestamp_scalar(unit: TimeUnit, v: i64) -> Scalar {
+        Scalar::extension::<Timestamp>(
+            TimestampOptions { unit, tz: None },
+            Scalar::try_new(
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+                Some(ScalarValue::from(v)),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds, 1_372_723_200, DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_S)]
+    #[case::millis(
+        TimeUnit::Milliseconds,
+        1_372_723_200_123,
+        DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_MS
+    )]
+    #[case::micros(
+        TimeUnit::Microseconds,
+        1_372_723_200_000_000,
+        DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP
+    )]
+    #[case::nanos(
+        TimeUnit::Nanoseconds,
+        1_372_723_200_000_000_123,
+        DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_NS
+    )]
+    fn try_from_timestamp_scalar(
+        #[case] unit: TimeUnit,
+        #[case] raw: i64,
+        #[case] expected: DUCKDB_TYPE,
+    ) {
+        let value = Value::try_from(timestamp_scalar(unit, raw)).unwrap();
+        assert_eq!(value.logical_type().as_type_id(), expected);
+        let extracted = match value.extract() {
+            ExtractedValue::TimestampS(v)
+            | ExtractedValue::TimestampMs(v)
+            | ExtractedValue::Timestamp(v)
+            | ExtractedValue::TimestampNs(v) => v,
+            other => panic!("unexpected extracted value: {other:?}"),
+        };
+        assert_eq!(extracted, raw);
+    }
+
+    #[test]
+    fn try_from_date_scalar() {
+        let scalar = Scalar::extension::<Date>(
+            TimeUnit::Days,
+            Scalar::try_new(
+                DType::Primitive(PType::I32, Nullability::NonNullable),
+                Some(ScalarValue::from(19000i32)),
+            )
+            .unwrap(),
+        );
+        let value = Value::try_from(scalar).unwrap();
+        assert_eq!(
+            value.logical_type().as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_DATE
+        );
+        let ExtractedValue::Date(days) = value.extract() else {
+            panic!("expected date");
+        };
+        assert_eq!(days, 19000);
+    }
+
+    #[test]
+    fn try_from_time_scalar() {
+        let scalar = Scalar::extension::<Time>(
+            TimeUnit::Microseconds,
+            Scalar::try_new(
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+                Some(ScalarValue::from(42_000_000i64)),
+            )
+            .unwrap(),
+        );
+        let value = Value::try_from(scalar).unwrap();
+        assert_eq!(
+            value.logical_type().as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_TIME
+        );
+        let ExtractedValue::Time(micros) = value.extract() else {
+            panic!("expected time");
+        };
+        assert_eq!(micros, 42_000_000);
+    }
+
+    #[test]
+    fn try_from_primitive_i64() {
+        let value = Value::try_from(Scalar::from(1_372_723_200_000_000i64)).unwrap();
+        assert_eq!(
+            value.logical_type().as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_BIGINT
+        );
+    }
+
+    #[test]
+    fn try_from_null_timestamp() {
+        let dtype = timestamp_scalar(TimeUnit::Microseconds, 0)
+            .dtype()
+            .as_nullable();
+        let value = Value::try_from(Scalar::null(dtype)).unwrap();
+        assert_eq!(
+            value.logical_type().as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP
+        );
+        assert!(matches!(value.extract(), ExtractedValue::Null));
     }
 }

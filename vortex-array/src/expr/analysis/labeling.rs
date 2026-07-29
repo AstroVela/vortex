@@ -10,6 +10,9 @@ use crate::expr::traversal::NodeExt;
 use crate::expr::traversal::NodeVisitor;
 use crate::expr::traversal::TraversalOrder;
 
+/// Boolean labels keyed by each expression node in a tree.
+pub type BooleanLabels<'a> = HashMap<&'a Expression, bool>;
+
 /// Label each node in an expression tree using a bottom-up traversal.
 ///
 /// This function separates tree labeling into two distinct steps:
@@ -29,7 +32,6 @@ use crate::expr::traversal::TraversalOrder;
 /// - `merge_child`: Mutable function that folds child labels into an accumulator.
 ///   Takes `(self_label, child_label)` and returns the updated accumulator.
 ///   Called once per child, with the initial accumulator being the node's self-label.
-///
 pub fn label_tree<L: Clone>(
     expr: &Expression,
     self_label: impl Fn(&Expression) -> L,

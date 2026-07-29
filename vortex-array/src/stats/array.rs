@@ -16,6 +16,7 @@ use super::StatsSet;
 use super::StatsSetIntoIter;
 use super::TypedStatsSetRef;
 use crate::ArrayRef;
+use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::is_constant::is_constant;
 use crate::aggregate_fn::fns::is_sorted::is_sorted;
 use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
@@ -104,7 +105,7 @@ impl StatsSetRef<'_> {
         let mut guard = self.array_stats.inner.write();
         for (stat, value) in iter {
             if !value.is_exact() {
-                if !guard.get(*stat).is_some_and(|v| v.is_exact()) {
+                if !guard.get(*stat).is_exact() {
                     guard.set(*stat, value.clone());
                 }
             } else {
@@ -153,15 +154,19 @@ impl StatsSetRef<'_> {
         f(&mut lock.iter())
     }
 
+    /// Returns the value of `stat` by either fetching it from cache if it exists and is [`Precision::Exact`], or falling back to
+    /// computation. The underlying compute kernels will cache the computed stat in the latter case.
     pub fn compute_stat(&self, stat: Stat, ctx: &mut ExecutionCtx) -> VortexResult<Option<Scalar>> {
         // If it's already computed and exact, we can return it.
-        if let Some(Precision::Exact(s)) = self.get(stat) {
+        if let Precision::Exact(s) = self.get(stat) {
             return Ok(Some(s));
         }
 
         Ok(match stat {
-            Stat::Min => min_max(self.dyn_array_ref, ctx)?.map(|MinMaxResult { min, max: _ }| min),
-            Stat::Max => min_max(self.dyn_array_ref, ctx)?.map(|MinMaxResult { min: _, max }| max),
+            Stat::Min => min_max(self.dyn_array_ref, ctx, NumericalAggregateOpts::default())?
+                .map(|MinMaxResult { min, max: _ }| min),
+            Stat::Max => min_max(self.dyn_array_ref, ctx, NumericalAggregateOpts::default())?
+                .map(|MinMaxResult { min: _, max }| max),
             Stat::Sum => {
                 Stat::Sum
                     .dtype(self.dyn_array_ref.dtype())
@@ -281,7 +286,7 @@ impl StatsSetRef<'_> {
 }
 
 impl StatsProvider for StatsSetRef<'_> {
-    fn get(&self, stat: Stat) -> Option<Precision<Scalar>> {
+    fn get(&self, stat: Stat) -> Precision<Scalar> {
         self.array_stats
             .inner
             .read()

@@ -12,6 +12,7 @@ use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
 use vortex_mask::MaskValues;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -31,6 +32,7 @@ use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::SimplifyCtx;
 use crate::scalar_fn::fns::literal::Literal;
+use crate::validity::Validity;
 
 /// An expression that conditionally selects between two arrays based on a boolean mask.
 ///
@@ -46,7 +48,8 @@ impl ScalarFnVTable for Zip {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.zip")
+        static ID: CachedId = CachedId::new("vortex.zip");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -91,19 +94,11 @@ impl ScalarFnVTable for Zip {
 
     fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
         vortex_ensure!(
-            arg_dtypes[0].eq_ignore_nullability(&arg_dtypes[1]),
-            "zip requires if_true and if_false to have the same base type, got {} and {}",
-            arg_dtypes[0],
-            arg_dtypes[1]
-        );
-        vortex_ensure!(
             matches!(arg_dtypes[2], DType::Bool(_)),
             "zip requires mask to be a boolean type, got {}",
             arg_dtypes[2]
         );
-        Ok(arg_dtypes[0]
-            .clone()
-            .union_nullability(arg_dtypes[1].nullability()))
+        zip_return_dtype(&arg_dtypes[0], &arg_dtypes[1])
     }
 
     fn execute(
@@ -120,10 +115,7 @@ impl ScalarFnVTable for Zip {
             .execute::<BoolArray>(ctx)?
             .to_mask_fill_null_false(ctx);
 
-        let return_dtype = if_true
-            .dtype()
-            .clone()
-            .union_nullability(if_false.dtype().nullability());
+        let return_dtype = zip_return_dtype(if_true.dtype(), if_false.dtype())?;
 
         if mask.all_true() {
             return if_true.cast(return_dtype)?.execute(ctx);
@@ -139,7 +131,7 @@ impl ScalarFnVTable for Zip {
             return mask.into_array().zip(if_true, if_false);
         }
 
-        zip_impl(&if_true, &if_false, &mask)
+        zip_impl(&if_true, &if_false, &mask, ctx)
     }
 
     fn simplify(
@@ -163,8 +155,9 @@ impl ScalarFnVTable for Zip {
         Ok(None)
     }
 
-    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
-        true
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        // A null in an unselected branch does not force a null output.
+        false
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {
@@ -176,6 +169,7 @@ pub(crate) fn zip_impl(
     if_true: &ArrayRef,
     if_false: &ArrayRef,
     mask: &Mask,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     assert_eq!(
         if_true.len(),
@@ -183,10 +177,7 @@ pub(crate) fn zip_impl(
         "zip requires arrays to have the same size"
     );
 
-    let return_type = if_true
-        .dtype()
-        .clone()
-        .union_nullability(if_false.dtype().nullability());
+    let return_type = zip_return_dtype(if_true.dtype(), if_false.dtype())?;
 
     if mask.all_true() {
         return if_true.cast(return_type);
@@ -195,13 +186,31 @@ pub(crate) fn zip_impl(
         return if_false.cast(return_type);
     }
 
+    // `append_to_builder` requires exact dtype equality, so normalize branch
+    // nullability to the output dtype before appending slices into the builder.
+    let if_true = if_true.cast(return_type.clone())?;
+    let if_false = if_false.cast(return_type.clone())?;
+
     zip_impl_with_builder(
-        if_true,
-        if_false,
+        &if_true,
+        &if_false,
         mask.values()
             .vortex_expect("zip_impl_with_builder: mask is not all-true or all-false"),
         builder_with_capacity(&return_type, if_true.len()),
+        ctx,
     )
+}
+
+fn zip_return_dtype(if_true: &DType, if_false: &DType) -> VortexResult<DType> {
+    vortex_ensure!(
+        if_true.eq_ignore_nullability(if_false),
+        "zip requires if_true and if_false to have the same base type, got {} and {}",
+        if_true,
+        if_false
+    );
+    Ok(if_true
+        .least_supertype(if_false)
+        .vortex_expect("zip inputs with the same base type must have a common dtype"))
 }
 
 fn zip_impl_with_builder(
@@ -209,21 +218,56 @@ fn zip_impl_with_builder(
     if_false: &ArrayRef,
     mask: &MaskValues,
     mut builder: Box<dyn ArrayBuilder>,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     for (start, end) in mask.slices() {
-        builder.extend_from_array(&if_false.slice(builder.len()..*start)?);
-        builder.extend_from_array(&if_true.slice(*start..*end)?);
+        if builder.len() < *start {
+            if_false
+                .slice(builder.len()..*start)?
+                .append_to_builder(builder.as_mut(), ctx)?;
+        }
+        if_true
+            .slice(*start..*end)?
+            .append_to_builder(builder.as_mut(), ctx)?;
     }
     if builder.len() < if_false.len() {
-        builder.extend_from_array(&if_false.slice(builder.len()..if_false.len())?);
+        if_false
+            .slice(builder.len()..if_false.len())?
+            .append_to_builder(builder.as_mut(), ctx)?;
     }
     Ok(builder.finish())
 }
 
+/// Combine two validities for a row-wise zip: take `if_true`'s validity where `mask` is set and
+/// `if_false`'s where it is not.
+///
+/// That selection is itself a zip over the two boolean validity bitmaps, so it is built as a (lazy)
+/// zip array — reusing the zip machinery rather than re-deriving the mask algebra. Trivial cases
+/// where both sides' validity already agrees skip the zip. `mask` must already be null-filled so the
+/// selection matches the accompanying value selection. Shared by the per-encoding zip kernels (e.g.
+/// `Bool`, `Primitive`) that build their result directly.
+pub(crate) fn zip_validity(
+    if_true: Validity,
+    if_false: Validity,
+    mask: &Mask,
+) -> VortexResult<Validity> {
+    match (&if_true, &if_false) {
+        (Validity::NonNullable, Validity::NonNullable) => return Ok(Validity::NonNullable),
+        (Validity::AllValid, Validity::AllValid) => return Ok(Validity::AllValid),
+        (Validity::AllInvalid, Validity::AllInvalid) => return Ok(Validity::AllInvalid),
+        _ => {}
+    }
+
+    let len = mask.len();
+    let validity = mask
+        .clone()
+        .into_array()
+        .zip(if_true.to_array(len), if_false.to_array(len))?;
+    Ok(Validity::Array(validity))
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow_array::cast::AsArray;
-    use arrow_select::zip::zip as arrow_zip;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
     use vortex_mask::Mask;
@@ -231,14 +275,14 @@ mod tests {
     use super::zip_impl;
     use crate::ArrayRef;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::Struct;
     use crate::arrays::StructArray;
     use crate::arrays::VarBinView;
-    use crate::arrow::ArrowArrayExecutor;
+    use crate::arrays::VarBinViewArray;
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
     use crate::builders::BufferGrowthStrategy;
@@ -272,6 +316,7 @@ mod tests {
 
     #[test]
     fn test_zip_basic() {
+        let mut ctx = array_session().create_execution_ctx();
         let mask = Mask::from_iter([true, false, false, true, false]);
         let if_true = buffer![10, 20, 30, 40, 50].into_array();
         let if_false = buffer![1, 2, 3, 4, 5].into_array();
@@ -279,11 +324,12 @@ mod tests {
         let result = mask.into_array().zip(if_true, if_false).unwrap();
         let expected = buffer![10, 2, 3, 40, 5].into_array();
 
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn test_zip_all_true() {
+        let mut ctx = array_session().create_execution_ctx();
         let mask = Mask::new_true(4);
         let if_true = buffer![10, 20, 30, 40].into_array();
         let if_false =
@@ -293,12 +339,13 @@ mod tests {
         let expected =
             PrimitiveArray::from_option_iter([Some(10), Some(20), Some(30), Some(40)]).into_array();
 
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
         assert_eq!(result.dtype(), if_false.dtype())
     }
 
     #[test]
     fn test_zip_all_false_widens_nullability() {
+        let mut ctx = array_session().create_execution_ctx();
         let mask = Mask::new_false(4);
         let if_true =
             PrimitiveArray::from_option_iter([Some(10), Some(20), Some(30), None]).into_array();
@@ -308,7 +355,7 @@ mod tests {
         let expected =
             PrimitiveArray::from_option_iter([Some(1), Some(2), Some(3), Some(4)]).into_array();
 
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
         assert_eq!(result.dtype(), if_true.dtype());
     }
 
@@ -319,11 +366,13 @@ mod tests {
         let if_false =
             PrimitiveArray::from_option_iter([Some(1), Some(2), Some(3), None]).into_array();
 
-        let result = zip_impl(&if_true, &if_false, &mask)?;
+        let mut ctx = array_session().create_execution_ctx();
+        let result = zip_impl(&if_true, &if_false, &mask, &mut ctx)?;
         assert_arrays_eq!(
             result,
             PrimitiveArray::from_option_iter([Some(10i32), Some(20), Some(30), Some(40)])
-                .into_array()
+                .into_array(),
+            &mut ctx
         );
         assert_eq!(result.dtype(), if_false.dtype());
         Ok(())
@@ -336,10 +385,12 @@ mod tests {
             PrimitiveArray::from_option_iter([Some(10), Some(20), Some(30), None]).into_array();
         let if_false = buffer![1i32, 2, 3, 4].into_array();
 
-        let result = zip_impl(&if_true, &if_false, &mask)?;
+        let mut ctx = array_session().create_execution_ctx();
+        let result = zip_impl(&if_true, &if_false, &mask, &mut ctx)?;
         assert_arrays_eq!(
             result,
-            PrimitiveArray::from_option_iter([Some(1i32), Some(2), Some(3), Some(4)]).into_array()
+            PrimitiveArray::from_option_iter([Some(1i32), Some(2), Some(3), Some(4)]).into_array(),
+            &mut ctx
         );
         assert_eq!(result.dtype(), if_true.dtype());
         Ok(())
@@ -375,7 +426,7 @@ mod tests {
         let mask = Mask::from_indices(len, indices);
         let mask_array = mask.into_array();
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let result = mask_array
             .zip(const1.clone(), const2.clone())?
             .execute::<Columnar>(&mut ctx)?
@@ -435,31 +486,36 @@ mod tests {
         let mask = Mask::from_indices(200, (0..100).filter(|i| i % 3 != 0));
         let mask_array = mask.clone().into_array();
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let zipped = mask_array
-            .zip(if_true.clone(), if_false.clone())
+            .zip(if_true, if_false)
             .unwrap()
             .execute::<ArrayRef>(&mut ctx)
             .unwrap();
         let zipped = zipped.as_opt::<VarBinView>().unwrap();
         assert_eq!(zipped.data_buffers().len(), 2);
 
-        let mut arrow_ctx = LEGACY_SESSION.create_execution_ctx();
-        let expected = arrow_zip(
-            mask.into_array()
-                .execute_arrow(None, &mut arrow_ctx)
-                .unwrap()
-                .as_boolean(),
-            &if_true.execute_arrow(None, &mut arrow_ctx).unwrap(),
-            &if_false.execute_arrow(None, &mut arrow_ctx).unwrap(),
-        )
-        .unwrap();
-
-        let actual = zipped
-            .array()
-            .clone()
-            .execute_arrow(None, &mut arrow_ctx)
-            .unwrap();
-        assert_eq!(actual.as_ref(), expected.as_ref());
+        let true_value = |i: usize| {
+            if i.is_multiple_of(2) {
+                "Hello"
+            } else {
+                "Hello this is a long string that won't be inlined."
+            }
+        };
+        let false_value = |i: usize| {
+            if i.is_multiple_of(2) {
+                "Hello2"
+            } else {
+                "Hello2 this is a long string that won't be inlined."
+            }
+        };
+        let expected = VarBinViewArray::from_iter_str((0..200).map(|i| {
+            if mask.value(i) {
+                true_value(i)
+            } else {
+                false_value(i)
+            }
+        }));
+        assert_arrays_eq!(zipped.array().clone(), expected, &mut ctx);
     }
 }

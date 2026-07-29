@@ -30,7 +30,7 @@ use crate::arrays::VarBinViewArray;
 use crate::arrays::VariantArray;
 use crate::arrays::dict::TakeExecute;
 use crate::arrays::dict::TakeReduce;
-use crate::arrays::variant::VariantArrayExt;
+use crate::arrays::variant::VariantArraySlotsExt;
 
 /// Take from a canonical array using indices (codes), returning a new canonical array.
 ///
@@ -53,13 +53,21 @@ pub(crate) fn take_canonical(
             Canonical::FixedSizeList(take_fixed_size_list(&a, codes, ctx))
         }
         Canonical::Struct(a) => Canonical::Struct(take_struct(&a, codes)),
+        Canonical::Union(_) => {
+            todo!(
+                "TODO(connor)[Union]: implement dictionary execution after Union take supports \
+                 nullable indices and outer null propagation"
+            )
+        }
         Canonical::Extension(a) => Canonical::Extension(take_extension(&a, codes, ctx)),
         Canonical::Variant(a) => {
-            let taken_child = a
-                .child()
-                .take(codes.clone().into_array())
-                .vortex_expect("VariantArray child could not be taken");
-            Canonical::Variant(VariantArray::new(taken_child))
+            let indices = codes.clone().into_array();
+            let taken_core_storage = a.core_storage().take(indices.clone())?;
+            let taken_shredded = a
+                .shredded()
+                .map(|shredded| shredded.take(indices.clone()))
+                .transpose()?;
+            Canonical::Variant(VariantArray::try_new(taken_core_storage, taken_shredded)?)
         }
     })
 }

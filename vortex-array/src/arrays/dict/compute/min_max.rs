@@ -30,9 +30,9 @@ impl DynAggregateKernel for DictMinMaxKernel {
         batch: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<Scalar>> {
-        if !aggregate_fn.is::<MinMax>() {
+        let Some(options) = aggregate_fn.as_opt::<MinMax>() else {
             return Ok(None);
-        }
+        };
 
         let Some(dict) = batch.as_opt::<Dict>() else {
             return Ok(None);
@@ -42,13 +42,13 @@ impl DynAggregateKernel for DictMinMaxKernel {
 
         let result = if dict.has_all_values_referenced() {
             // All values are referenced, compute min/max directly on the values array.
-            min_max(dict.values(), ctx)?
+            min_max(dict.values(), ctx, *options)?
         } else {
             // Filter to only referenced values, then compute min/max.
-            let referenced_mask = dict.compute_referenced_values_mask(true)?;
+            let referenced_mask = dict.compute_referenced_values_mask(true, ctx)?;
             let mask = Mask::from(referenced_mask);
             let filtered_values = dict.values().filter(mask)?;
-            min_max(&filtered_values, ctx)?
+            min_max(&filtered_values, ctx, *options)?
         };
 
         match result {
@@ -60,22 +60,30 @@ impl DynAggregateKernel for DictMinMaxKernel {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::min_max::min_max;
     use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
     use crate::builders::dict::dict_encode;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+
     fn assert_min_max(array: &ArrayRef, expected: Option<(i32, i32)>) -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        match (min_max(array, &mut ctx)?, expected) {
+        let mut ctx = SESSION.create_execution_ctx();
+        match (
+            min_max(array, &mut ctx, NumericalAggregateOpts::default())?,
+            expected,
+        ) {
             (Some(result), Some((expected_min, expected_max))) => {
                 assert_eq!(i32::try_from(&result.min)?, expected_min);
                 assert_eq!(i32::try_from(&result.max)?, expected_max);
@@ -117,7 +125,11 @@ mod tests {
     }
 
     fn dict_single() -> DictArray {
-        dict_encode(&buffer![42i32].into_array()).expect("valid single-value dictionary")
+        dict_encode(
+            &buffer![42i32].into_array(),
+            &mut SESSION.create_execution_ctx(),
+        )
+        .expect("valid single-value dictionary")
     }
 
     fn dict_nullable_codes() -> DictArray {
@@ -132,6 +144,7 @@ mod tests {
         dict_encode(
             &PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None])
                 .into_array(),
+            &mut SESSION.create_execution_ctx(),
         )
         .expect("valid nullable-value dictionary")
     }
@@ -166,7 +179,7 @@ mod tests {
     #[test]
     fn test_sliced_dict() -> VortexResult<()> {
         let reference = PrimitiveArray::from_iter([1, 5, 10, 50, 100]);
-        let dict = dict_encode(&reference.into_array())?;
+        let dict = dict_encode(&reference.into_array(), &mut SESSION.create_execution_ctx())?;
         let sliced = dict.slice(1..3)?;
         assert_min_max(&sliced, Some((5, 10)))
     }

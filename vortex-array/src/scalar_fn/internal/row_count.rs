@@ -21,8 +21,15 @@ use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_session::registry::CachedId;
 
 /// Zero-argument placeholder for the row count of the current evaluation scope.
+///
+/// This is a legacy pruning hack for readers that only have a `null_count`
+/// stat and need to support `is_not_null` pruning. It is currently substituted
+/// by the zoned/file stats pruning paths before execution. New stats rewrites
+/// should prefer boolean `all_null` and `all_non_null` aggregates instead of
+/// depending on this scope-level placeholder.
 ///
 /// This expression *MUST* be replaced with a concrete array before evaluation.
 /// Currently, the rewrite only happens in the context of stats pruning.
@@ -42,7 +49,8 @@ impl ScalarFnVTable for RowCount {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.row_count")
+        static ID: CachedId = CachedId::new("vortex.row_count");
+        *ID
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -75,8 +83,8 @@ impl ScalarFnVTable for RowCount {
         vortex_bail!("RowCount must be substituted before evaluation")
     }
 
-    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {

@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::FilterArrayExt;
+pub use array::FilterArraySlotsExt;
 pub use array::FilterData;
 pub use array::FilterDataParts;
+pub use array::FilterSlots;
+pub use array::FilterSlotsView;
 pub use vtable::FilterArray;
 
 mod execute;
@@ -19,3 +21,7 @@ mod rules;
 
 mod vtable;
 pub use vtable::Filter;
+
+pub(crate) fn initialize(session: &vortex_session::VortexSession) {
+    kernel::initialize(session);
+}

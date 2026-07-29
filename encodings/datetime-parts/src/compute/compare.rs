@@ -202,8 +202,11 @@ fn compare_dtp(
 #[cfg(test)]
 mod test {
     use rstest::rstest;
-    use vortex_array::LEGACY_SESSION;
+    use vortex_array::ArrayRef;
+    use vortex_array::ExecutionCtx;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::fns::sum::sum;
+    use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::dtype::IntegerPType;
@@ -225,9 +228,18 @@ mod test {
                 TimeUnit::Seconds,
                 Some("UTC".into()),
             ),
-            &mut LEGACY_SESSION.create_execution_ctx(),
+            &mut array_session().create_execution_ctx(),
         )
         .expect("Failed to construct DateTimePartsArray from TemporalArray")
+    }
+
+    /// Count the true values in a boolean array using the provided execution context.
+    fn true_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> usize {
+        sum(array, ctx)
+            .unwrap()
+            .as_primitive()
+            .as_::<usize>()
+            .unwrap()
     }
 
     #[rstest]
@@ -236,6 +248,7 @@ mod test {
     #[case(Validity::AllValid, Validity::NonNullable)]
     #[case(Validity::AllValid, Validity::AllValid)]
     fn compare_date_time_parts_eq(#[case] lhs_validity: Validity, #[case] rhs_validity: Validity) {
+        let mut ctx = array_session().create_execution_ctx();
         let lhs = dtp_array_from_timestamp(86400i64, lhs_validity); // January 2, 1970, 00:00:00 UTC
         let rhs = dtp_array_from_timestamp(86400i64, rhs_validity.clone()); // January 2, 1970, 00:00:00 UTC
         let comparison = lhs
@@ -243,14 +256,14 @@ mod test {
             .into_array()
             .binary(rhs.into_array(), Operator::Eq)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
 
         let rhs = dtp_array_from_timestamp(0i64, rhs_validity); // January 1, 1970, 00:00:00 UTC
         let comparison = lhs
             .into_array()
             .binary(rhs.into_array(), Operator::Eq)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 0);
+        assert_eq!(true_count(&comparison, &mut ctx), 0);
     }
 
     #[rstest]
@@ -259,6 +272,7 @@ mod test {
     #[case(Validity::AllValid, Validity::NonNullable)]
     #[case(Validity::AllValid, Validity::AllValid)]
     fn compare_date_time_parts_ne(#[case] lhs_validity: Validity, #[case] rhs_validity: Validity) {
+        let mut ctx = array_session().create_execution_ctx();
         let lhs = dtp_array_from_timestamp(86400i64, lhs_validity); // January 2, 1970, 00:00:00 UTC
         let rhs = dtp_array_from_timestamp(86401i64, rhs_validity.clone()); // January 2, 1970, 00:00:01 UTC
         let comparison = lhs
@@ -266,14 +280,14 @@ mod test {
             .into_array()
             .binary(rhs.into_array(), Operator::NotEq)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
 
         let rhs = dtp_array_from_timestamp(86400i64, rhs_validity); // January 2, 1970, 00:00:00 UTC
         let comparison = lhs
             .into_array()
             .binary(rhs.into_array(), Operator::NotEq)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 0);
+        assert_eq!(true_count(&comparison, &mut ctx), 0);
     }
 
     #[rstest]
@@ -282,6 +296,7 @@ mod test {
     #[case(Validity::AllValid, Validity::NonNullable)]
     #[case(Validity::AllValid, Validity::AllValid)]
     fn compare_date_time_parts_lt(#[case] lhs_validity: Validity, #[case] rhs_validity: Validity) {
+        let mut ctx = array_session().create_execution_ctx();
         let lhs = dtp_array_from_timestamp(0i64, lhs_validity); // January 1, 1970, 01:00:00 UTC
         let rhs = dtp_array_from_timestamp(86400i64, rhs_validity); // January 2, 1970, 00:00:00 UTC
 
@@ -289,7 +304,7 @@ mod test {
             .into_array()
             .binary(rhs.into_array(), Operator::Lt)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
     }
 
     #[rstest]
@@ -298,6 +313,7 @@ mod test {
     #[case(Validity::AllValid, Validity::NonNullable)]
     #[case(Validity::AllValid, Validity::AllValid)]
     fn compare_date_time_parts_gt(#[case] lhs_validity: Validity, #[case] rhs_validity: Validity) {
+        let mut ctx = array_session().create_execution_ctx();
         let lhs = dtp_array_from_timestamp(86400i64, lhs_validity); // January 2, 1970, 02:00:00 UTC
         let rhs = dtp_array_from_timestamp(0i64, rhs_validity); // January 1, 1970, 01:00:00 UTC
 
@@ -305,7 +321,7 @@ mod test {
             .into_array()
             .binary(rhs.into_array(), Operator::Gt)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
     }
 
     #[rstest]
@@ -317,6 +333,7 @@ mod test {
         #[case] lhs_validity: Validity,
         #[case] rhs_validity: Validity,
     ) {
+        let mut ctx = array_session().create_execution_ctx();
         let temporal_array = TemporalArray::new_timestamp(
             PrimitiveArray::new(buffer![0i64], lhs_validity.clone()).into_array(),
             TimeUnit::Seconds,
@@ -339,27 +356,27 @@ mod test {
             .into_array()
             .binary(rhs.clone().into_array(), Operator::Eq)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 0);
+        assert_eq!(true_count(&comparison, &mut ctx), 0);
 
         let comparison = lhs
             .clone()
             .into_array()
             .binary(rhs.clone().into_array(), Operator::NotEq)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
 
         let comparison = lhs
             .clone()
             .into_array()
             .binary(rhs.clone().into_array(), Operator::Lt)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
 
         let comparison = lhs
             .into_array()
             .binary(rhs.into_array(), Operator::Lte)
             .unwrap();
-        assert_eq!(comparison.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&comparison, &mut ctx), 1);
 
         // `CompareOperator::Gt` and `CompareOperator::Gte` only cover the case of all lhs values
         // being larger. Therefore, these cases are not covered by unit tests.

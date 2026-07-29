@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use futures::future::try_join_all;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
-use vortex::array::LEGACY_SESSION;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::DecimalArray;
@@ -23,6 +22,7 @@ use vortex::array::arrays::struct_::StructDataParts;
 use vortex::array::arrays::varbinview::BinaryView;
 use vortex::array::arrays::varbinview::VarBinViewDataParts;
 use vortex::array::buffer::BufferHandle;
+use vortex::array::legacy_session;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
 use vortex::buffer::ByteBuffer;
@@ -38,6 +38,7 @@ pub trait CanonicalCudaExt {
 
 #[async_trait]
 impl CanonicalCudaExt for Canonical {
+    #[allow(clippy::disallowed_methods)]
     async fn into_host(self) -> VortexResult<Self> {
         match self {
             Canonical::Struct(struct_array) => {
@@ -55,7 +56,7 @@ impl CanonicalCudaExt for Canonical {
                     host_fields.push(
                         field
                             .clone()
-                            .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())?
+                            .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
                             .into_host()
                             .await?
                             .into_array(),
@@ -75,11 +76,13 @@ impl CanonicalCudaExt for Canonical {
                 // Also update other method to copy validity to host.
                 let len = bool.len();
                 let validity = bool.validity()?;
-                let BoolDataParts {
-                    bits, offset, len, ..
-                } = bool.into_data().into_parts(len);
+                let BoolDataParts { bits, meta } = bool.into_data().into_parts(len);
 
-                let bits = BitBuffer::new_with_offset(bits.try_into_host()?.await?, offset, len);
+                let bits = BitBuffer::new_with_offset(
+                    bits.try_into_host()?.await?,
+                    meta.len(),
+                    meta.offset(),
+                );
                 Ok(Canonical::Bool(BoolArray::new(bits, validity)))
             }
             Canonical::Primitive(prim) => {
@@ -142,7 +145,7 @@ impl CanonicalCudaExt for Canonical {
                 let host_storage = ext
                     .storage_array()
                     .clone()
-                    .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())?
+                    .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
                     .into_host()
                     .await?
                     .into_array();

@@ -5,14 +5,15 @@ package dev.vortex.api;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import dev.vortex.arrow.ArrowAllocation;
 import dev.vortex.jni.NativeLoader;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import org.apache.arrow.c.ArrowArray;
@@ -21,7 +22,6 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ViewVarCharVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -31,6 +31,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
 public final class TestMinimal {
     static final class Person {
@@ -84,7 +85,8 @@ public final class TestMinimal {
                 Field.notNullable("Salary", ArrowType.Decimal.createDecimal(9, 2, 128)),
                 Field.nullable("State", ArrowType.Utf8View.INSTANCE)));
         Session session = Session.create();
-        try (VortexWriter writer = VortexWriter.create(session, writePath, schema, new HashMap<>(), allocator);
+        try (VortexWriter writer = VortexWriter.builder(session, writePath, schema, allocator)
+                        .build();
                 VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             ViewVarCharVector nameVec = (ViewVarCharVector) root.getVector("Name");
             DecimalVector salaryVec = (DecimalVector) root.getVector("Salary");
@@ -130,6 +132,7 @@ public final class TestMinimal {
         DataSource ds = DataSource.open(session, writePath);
 
         assertEquals(new DataSource.RowCount.Exact(10L), ds.rowCount());
+        assertEquals(new DataSource.ByteSize.Exact(Files.size(tempDir.resolve("minimal.vortex"))), ds.byteSize());
 
         var schema = ds.arrowSchema(allocator);
         assertEquals(
@@ -151,8 +154,8 @@ public final class TestMinimal {
 
         List<Person> people = readAll(ds, options, allocator, batch -> {
             List<Person> results = new ArrayList<>();
-            VarCharVector names = (VarCharVector) batch.getVector("Name");
-            VarCharVector states = (VarCharVector) batch.getVector("State");
+            ViewVarCharVector names = (ViewVarCharVector) batch.getVector("Name");
+            ViewVarCharVector states = (ViewVarCharVector) batch.getVector("State");
             for (int i = 0; i < batch.getRowCount(); i++) {
                 String name = names.isNull(i) ? null : new String(names.get(i), UTF_8);
                 String state = states.isNull(i) ? null : new String(states.get(i), UTF_8);
@@ -180,6 +183,73 @@ public final class TestMinimal {
         assertEquals(List.of(new Person("John", BigDecimal.valueOf(10_000L, 2), "VA")), people);
     }
 
+    @Test
+    public void testSelectionIncludesRows() throws Exception {
+        BufferAllocator allocator = ArrowAllocation.rootAllocator();
+        Session session = Session.create();
+        DataSource ds = DataSource.open(session, writePath);
+
+        List<Person> people = readAll(ds, ScanOptions.includeRows(0, 3, 9), allocator, TestMinimal::readFullBatch);
+        assertEquals(List.of(MINIMAL_DATA.get(0), MINIMAL_DATA.get(3), MINIMAL_DATA.get(9)), people);
+    }
+
+    @Test
+    public void testSelectionExcludesRows() throws Exception {
+        BufferAllocator allocator = ArrowAllocation.rootAllocator();
+        Session session = Session.create();
+        DataSource ds = DataSource.open(session, writePath);
+
+        List<Person> people = readAll(ds, ScanOptions.excludeRows(0, 9), allocator, TestMinimal::readFullBatch);
+        assertEquals(MINIMAL_DATA.subList(1, 9), people);
+    }
+
+    @Test
+    public void testRoaringSelectionIncludesRows() throws Exception {
+        BufferAllocator allocator = ArrowAllocation.rootAllocator();
+        Session session = Session.create();
+        DataSource ds = DataSource.open(session, writePath);
+
+        List<Person> people =
+                readAll(ds, ScanOptions.includeRows(roaringRows(0, 3, 9)), allocator, TestMinimal::readFullBatch);
+        assertEquals(List.of(MINIMAL_DATA.get(0), MINIMAL_DATA.get(3), MINIMAL_DATA.get(9)), people);
+    }
+
+    @Test
+    public void testRoaringSelectionExcludesRows() throws Exception {
+        BufferAllocator allocator = ArrowAllocation.rootAllocator();
+        Session session = Session.create();
+        DataSource ds = DataSource.open(session, writePath);
+
+        List<Person> people =
+                readAll(ds, ScanOptions.excludeRows(roaringRows(0, 9)), allocator, TestMinimal::readFullBatch);
+        assertEquals(MINIMAL_DATA.subList(1, 9), people);
+    }
+
+    @Test
+    public void testSelectionIndicesMustBeSortedAndUnique() {
+        IllegalArgumentException exception =
+                assertThrows(IllegalArgumentException.class, () -> ScanOptions.includeRows(2, 1));
+        assertEquals("selection indices must be sorted ascending and unique", exception.getMessage());
+    }
+
+    @Test
+    public void testSelectionPayloadMustChooseIndicesOrRoaring() {
+        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> ScanOptions.builder()
+                .selectionMode(ScanOptions.SelectionMode.INCLUDE)
+                .selectionIndices(new long[] {0})
+                .selectionRoaringBitmap(new byte[] {1})
+                .build());
+        assertEquals("row selection must use either indices or roaring bitmap, not both", exception.getMessage());
+    }
+
+    @Test
+    public void testSelectionPayloadRequiresMode() {
+        IllegalArgumentException exception = assertThrows(
+                IllegalArgumentException.class,
+                () -> ScanOptions.builder().selectionIndices(new long[] {0}).build());
+        assertEquals("row selection payload requires a selection mode", exception.getMessage());
+    }
+
     private interface BatchReader {
         List<Person> read(VectorSchemaRoot root);
     }
@@ -201,9 +271,9 @@ public final class TestMinimal {
 
     private static List<Person> readFullBatch(VectorSchemaRoot root) {
         List<Person> result = new ArrayList<>();
-        VarCharVector names = (VarCharVector) root.getVector("Name");
+        ViewVarCharVector names = (ViewVarCharVector) root.getVector("Name");
         FieldVector salaries = root.getVector("Salary");
-        VarCharVector states = (VarCharVector) root.getVector("State");
+        ViewVarCharVector states = (ViewVarCharVector) root.getVector("State");
 
         for (int i = 0; i < root.getRowCount(); i++) {
             String name = names.isNull(i) ? null : new String(names.get(i), UTF_8);
@@ -220,5 +290,13 @@ public final class TestMinimal {
             result.add(new Person(name, salary, state));
         }
         return result;
+    }
+
+    private static Roaring64NavigableMap roaringRows(long... rows) {
+        Roaring64NavigableMap bitmap = new Roaring64NavigableMap();
+        for (long row : rows) {
+            bitmap.addLong(row);
+        }
+        return bitmap;
     }
 }

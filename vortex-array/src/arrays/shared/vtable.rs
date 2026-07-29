@@ -11,20 +11,22 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::OperationsVTable;
 use crate::array::VTable;
 use crate::array::ValidityVTable;
+use crate::array::with_empty_buffers;
 use crate::arrays::shared::SharedArrayExt;
 use crate::arrays::shared::SharedData;
-use crate::arrays::shared::array::SLOT_NAMES;
+use crate::arrays::shared::SharedSlots;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::scalar::Scalar;
@@ -39,11 +41,11 @@ pub type SharedArray = Array<Shared>;
 pub struct Shared;
 
 impl ArrayHash for SharedData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {}
 }
 
 impl ArrayEq for SharedData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         true
     }
 }
@@ -64,7 +66,7 @@ impl VTable for Shared {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        let source = slots[0]
+        let source = slots[SharedSlots::SOURCE]
             .as_ref()
             .vortex_expect("SharedArray source slot must be present");
         vortex_error::vortex_ensure!(source.dtype() == dtype, "SharedArray dtype mismatch");
@@ -84,8 +86,16 @@ impl VTable for Shared {
         None
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
+    }
+
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        SharedSlots::NAMES[idx].to_string()
     }
 
     fn serialize(
@@ -104,7 +114,7 @@ impl VTable for Shared {
         _buffers: &[BufferHandle],
         _children: &dyn crate::serde::ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         vortex_error::vortex_bail!("Shared array is not serializable")
     }
 

@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use itertools::Itertools;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BitIterator;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
@@ -428,6 +429,26 @@ impl Mask {
         }
     }
 
+    /// Iterate the mask as one `bool` per element, in order.
+    ///
+    /// Unlike repeatedly calling [`Mask::value`], this advances a single cursor rather than
+    /// recomputing the byte/bit offset for every element, and it does not allocate for the
+    /// all-true / all-false variants. Prefer this for sequential per-element scans.
+    #[inline]
+    pub fn iter(&self) -> MaskBoolIter<'_> {
+        match self {
+            Mask::AllTrue(len) => MaskBoolIter::Repeat {
+                value: true,
+                remaining: *len,
+            },
+            Mask::AllFalse(len) => MaskBoolIter::Repeat {
+                value: false,
+                remaining: *len,
+            },
+            Mask::Values(values) => MaskBoolIter::Bits(values.bit_buffer().iter()),
+        }
+    }
+
     /// Returns the first true index in the mask.
     pub fn first(&self) -> Option<usize> {
         match &self {
@@ -457,7 +478,23 @@ impl Mask {
                 if let Some(slices) = values.slices.get() {
                     return slices.last().map(|(_, end)| end - 1);
                 }
-                values.buffer.set_slices().last().map(|(_, end)| end - 1)
+
+                if values.true_count == 0 {
+                    return None;
+                }
+
+                Some(
+                    values
+                        .buffer
+                        .select(values.true_count - 1)
+                        .unwrap_or_else(|| {
+                            vortex_panic!(
+                                "Rank {} out of bounds for mask with true count {}",
+                                values.true_count - 1,
+                                values.true_count
+                            )
+                        }),
+                )
             }
         }
     }
@@ -473,8 +510,19 @@ impl Mask {
         match &self {
             Self::AllTrue(_) => n,
             Self::AllFalse(_) => unreachable!("no true values in all-false mask"),
-            // TODO(joe): optimize this function
-            Self::Values(values) => values.indices()[n],
+            Self::Values(values) => {
+                if let Some(indices) = values.indices.get() {
+                    return indices[n];
+                }
+
+                values.buffer.select(n).unwrap_or_else(|| {
+                    vortex_panic!(
+                        "Rank {} out of bounds for mask with true count {}",
+                        values.true_count - 1,
+                        values.true_count
+                    )
+                })
+            }
         }
     }
 
@@ -580,23 +628,24 @@ impl Mask {
     /// Given monotonically increasing `indices` in [0, n_rows], returns the
     /// count of valid elements up to each index.
     ///
-    /// This is O(n_rows).
+    /// This is O(n_rows), but the per-gap counts are computed with a SIMD
+    /// popcount over the underlying bit buffer rather than walking bit-by-bit.
     pub fn valid_counts_for_indices(&self, indices: &[usize]) -> Vec<usize> {
         match self {
             Self::AllTrue(_) => indices.to_vec(),
             Self::AllFalse(_) => vec![0; indices.len()],
             Self::Values(values) => {
-                let mut bool_iter = values.bit_buffer().iter();
+                let buffer = values.bit_buffer();
                 let mut valid_counts = Vec::with_capacity(indices.len());
                 let mut valid_count = 0;
-                let mut idx = 0;
+                let mut prev = 0;
                 for &next_idx in indices {
-                    while idx < next_idx {
-                        idx += 1;
-                        valid_count += bool_iter
-                            .next()
-                            .unwrap_or_else(|| vortex_panic!("Row indices exceed array length"))
-                            as usize;
+                    assert!(next_idx <= buffer.len(), "Row indices exceed array length");
+                    // `indices` is monotonically increasing, so each gap is counted once;
+                    // the total work across all gaps scans the prefix `[0, last_idx)` once.
+                    if next_idx > prev {
+                        valid_count += buffer.count_range(prev, next_idx);
+                        prev = next_idx;
                     }
                     valid_counts.push(valid_count);
                 }
@@ -731,11 +780,23 @@ impl MaskValues {
             }
 
             let mut indices = Vec::with_capacity(self.true_count);
-            indices.extend(self.buffer.set_indices());
+            // Word-at-a-time set-bit walk; faster than collecting `set_indices()`,
+            // whose per-`next` iterator state inlines less well (see
+            // `vortex-mask/benches/mask_iteration.rs`).
+            self.buffer.for_each_set_index(|i| indices.push(i));
             debug_assert!(indices.is_sorted());
             assert_eq!(indices.len(), self.true_count);
             indices
         })
+    }
+
+    /// Returns cached index positions when this mask already has them materialized.
+    ///
+    /// Unlike [`Self::indices`], this does not build the index vector from another
+    /// representation.
+    #[inline]
+    pub fn cached_indices(&self) -> Option<&[usize]> {
+        self.indices.get().map(Vec::as_slice)
     }
 
     /// Constructs a slices vector from one of the other representations.
@@ -748,6 +809,15 @@ impl MaskValues {
 
             self.buffer.set_slices().collect()
         })
+    }
+
+    /// Returns cached true-value ranges when this mask already has them materialized.
+    ///
+    /// Unlike [`Self::slices`], this does not build the slice vector from another
+    /// representation.
+    #[inline]
+    pub fn cached_slices(&self) -> Option<&[(usize, usize)]> {
+        self.slices.get().map(Vec::as_slice)
     }
 
     /// Return an iterator over either indices or slices of the mask based on a density threshold.
@@ -768,6 +838,48 @@ pub enum MaskIter<'a> {
     /// Slice of pre-cached slices of a mask.
     Slices(&'a [(usize, usize)]),
 }
+
+/// Iterator yielding one `bool` per element of a [`Mask`], in order.
+///
+/// Created by [`Mask::iter`].
+pub enum MaskBoolIter<'a> {
+    /// An all-true or all-false run.
+    Repeat {
+        /// The constant value yielded by every element of the run.
+        value: bool,
+        /// The number of elements still to yield.
+        remaining: usize,
+    },
+    /// Per-element bits of a [`Mask::Values`] mask.
+    Bits(BitIterator<'a>),
+}
+
+impl Iterator for MaskBoolIter<'_> {
+    type Item = bool;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Repeat { remaining: 0, .. } => None,
+            Self::Repeat { value, remaining } => {
+                *remaining -= 1;
+                Some(*value)
+            }
+            Self::Bits(bits) => bits.next(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self {
+            Self::Repeat { remaining, .. } => *remaining,
+            Self::Bits(bits) => bits.len(),
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for MaskBoolIter<'_> {}
 
 impl From<BitBuffer> for Mask {
     fn from(value: BitBuffer) -> Self {

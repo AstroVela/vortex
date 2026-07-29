@@ -7,21 +7,24 @@ use std::fmt::Formatter;
 use fastlanes::FastLanes;
 use vortex_array::ArrayRef;
 use vortex_array::TypedArrayRef;
+use vortex_array::array_slots;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_unsigned_integer_ptype;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
 pub mod delta_compress;
 pub mod delta_decompress;
 
-/// The base values for each block of deltas.
-pub(super) const BASES_SLOT: usize = 0;
-/// The delta-encoded values relative to the base values.
-pub(super) const DELTAS_SLOT: usize = 1;
-pub(super) const NUM_SLOTS: usize = 2;
-pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["bases", "deltas"];
+#[array_slots(crate::Delta)]
+pub struct DeltaSlots {
+    /// The base values for each block of deltas.
+    #[slot(0)]
+    pub bases: ArrayRef,
+    /// The delta-encoded values relative to the base values.
+    #[slot(1)]
+    pub deltas: ArrayRef,
+}
 
 /// A FastLanes-style delta-encoded array of primitive values.
 ///
@@ -38,8 +41,23 @@ pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["bases", "deltas"];
 /// use vortex_session::VortexSession;
 /// use vortex_fastlanes::Delta;
 ///
-/// let session = VortexSession::empty().with::<ArraySession>();
+/// let session = vortex_array::array_session();
 /// let primitive = PrimitiveArray::from_iter([1_u32, 2, 3, 5, 10, 11]);
+/// let array = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx()).unwrap();
+/// ```
+///
+/// Signed inputs are also supported; deltas across negative values are encoded by
+/// `wrapping_sub` and recovered by `wrapping_add` at decompress time:
+///
+/// ```
+/// use vortex_array::arrays::PrimitiveArray;
+/// use vortex_array::VortexSessionExecute;
+/// use vortex_array::session::ArraySession;
+/// use vortex_session::VortexSession;
+/// use vortex_fastlanes::Delta;
+///
+/// let session = vortex_array::array_session();
+/// let primitive = PrimitiveArray::from_iter([-3_i32, -2, -1, 0, 1, 2]);
 /// let array = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx()).unwrap();
 /// ```
 ///
@@ -73,19 +91,7 @@ impl Display for DeltaData {
     }
 }
 
-pub trait DeltaArrayExt: TypedArrayRef<crate::Delta> {
-    fn bases(&self) -> &ArrayRef {
-        self.as_ref().slots()[BASES_SLOT]
-            .as_ref()
-            .vortex_expect("DeltaArray bases slot")
-    }
-
-    fn deltas(&self) -> &ArrayRef {
-        self.as_ref().slots()[DELTAS_SLOT]
-            .as_ref()
-            .vortex_expect("DeltaArray deltas slot")
-    }
-
+pub trait DeltaArrayExt: DeltaArraySlotsExt {
     fn offset(&self) -> usize {
         self.offset
     }
@@ -101,5 +107,5 @@ impl DeltaData {
 }
 
 pub(crate) fn lane_count(ptype: PType) -> usize {
-    match_each_unsigned_integer_ptype!(ptype, |T| { T::LANES })
+    match_each_unsigned_integer_ptype!(ptype.to_unsigned(), |T| { T::LANES })
 }

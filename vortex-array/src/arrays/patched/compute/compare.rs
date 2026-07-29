@@ -55,9 +55,10 @@ impl CompareKernel for Patched {
 
         let validity = child_to_validity(result.slots()[0].as_ref(), result.dtype().nullability());
         let len = result.len();
-        let BoolDataParts { bits, offset, len } = result.into_data().into_parts(len);
+        let BoolDataParts { bits, meta } = result.into_data().into_parts(len);
 
-        let mut bits = BitBufferMut::from_buffer(bits.unwrap_host().into_mut(), offset, len);
+        let mut bits =
+            BitBufferMut::from_buffer(bits.unwrap_host().into_mut(), meta.offset(), meta.len());
 
         let lane_offsets = lhs.lane_offsets().clone().execute::<PrimitiveArray>(ctx)?;
         let indices = lhs.patch_indices().clone().execute::<PrimitiveArray>(ctx)?;
@@ -162,9 +163,8 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
 
-    use crate::ExecutionCtx;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
+    use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::Patched;
@@ -188,7 +188,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut ctx = ExecutionCtx::new(LEGACY_SESSION.clone());
+        let mut ctx = crate::array_session().create_execution_ctx();
 
         let lhs = Patched::from_array_and_patches(lhs, &patches, &mut ctx)
             .unwrap()
@@ -206,7 +206,7 @@ mod tests {
         let expected =
             BoolArray::from_indices(512, [509, 510, 511], Validity::NonNullable).into_array();
 
-        assert_arrays_eq!(expected, result);
+        assert_arrays_eq!(expected, result, &mut ctx);
     }
 
     #[test]
@@ -221,7 +221,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut ctx = ExecutionCtx::new(LEGACY_SESSION.clone());
+        let mut ctx = crate::array_session().create_execution_ctx();
 
         let lhs = Patched::from_array_and_patches(lhs, &patches, &mut ctx).unwrap();
         // Slice the array so that the first patch should be skipped.
@@ -239,7 +239,7 @@ mod tests {
 
         let expected = BoolArray::from_indices(502, [500, 501], Validity::NonNullable).into_array();
 
-        assert_arrays_eq!(expected, result);
+        assert_arrays_eq!(expected, result, &mut ctx);
     }
 
     #[test]
@@ -258,7 +258,7 @@ mod tests {
             None,
         )?;
 
-        let mut ctx = ExecutionCtx::new(LEGACY_SESSION.clone());
+        let mut ctx = crate::array_session().create_execution_ctx();
         let lhs = Patched::from_array_and_patches(lhs, &patches, &mut ctx)?
             .into_array()
             .try_downcast::<Patched>()
@@ -276,7 +276,7 @@ mod tests {
 
         let expected = BoolArray::from_indices(512, [510], Validity::NonNullable).into_array();
 
-        assert_arrays_eq!(expected, result);
+        assert_arrays_eq!(expected, result, &mut ctx);
         Ok(())
     }
 
@@ -292,7 +292,7 @@ mod tests {
             None,
         )?;
 
-        let mut ctx = ExecutionCtx::new(LEGACY_SESSION.clone());
+        let mut ctx = crate::array_session().create_execution_ctx();
         let lhs = Patched::from_array_and_patches(lhs, &patches, &mut ctx)?
             .into_array()
             .try_downcast::<Patched>()
@@ -310,7 +310,7 @@ mod tests {
 
         let expected = BoolArray::from_indices(10, [7], Validity::NonNullable).into_array();
 
-        assert_arrays_eq!(expected, result);
+        assert_arrays_eq!(expected, result, &mut ctx);
 
         Ok(())
     }

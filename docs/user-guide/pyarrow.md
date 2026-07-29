@@ -66,6 +66,7 @@ The {func}`~vortex.array` function constructs a Vortex array from an Arrow array
 
 ```{doctest} pycon
 >>> import pyarrow as pa
+>>>
 >>> arrow = pa.array([1, 2, None, 3])
 >>> arr = vx.array(arrow)
 >>> arr.dtype
@@ -96,9 +97,9 @@ Struct arrays convert to Arrow tables with {meth}`.Array.to_arrow_table`:
 ... ])
 >>> struct_arr.to_arrow_table()
 pyarrow.Table
-age: int64
 name: string
+age: int64
 ----
-age: [[25,31,33,57]]
 name: [["Joseph","Narendra","Angela","Mikhail"]]
+age: [[25,31,33,57]]
 ```

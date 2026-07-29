@@ -3,14 +3,13 @@
 
 mod kernel;
 
-use std::fmt::Formatter;
-
 pub use kernel::*;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::AnyColumnar;
 use crate::ArrayRef;
@@ -39,7 +38,8 @@ impl ScalarFnVTable for FillNull {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.fill_null")
+        static ID: CachedId = CachedId::new("vortex.fill_null");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -64,19 +64,6 @@ impl ScalarFnVTable for FillNull {
             1 => ChildName::from("fill_value"),
             _ => unreachable!("Invalid child index {} for FillNull expression", child_idx),
         }
-    }
-
-    fn fmt_sql(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "fill_null(")?;
-        expr.child(0).fmt_sql(f)?;
-        write!(f, ", ")?;
-        expr.child(1).fmt_sql(f)?;
-        write!(f, ")")
     }
 
     fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -145,8 +132,9 @@ impl ScalarFnVTable for FillNull {
         Ok(Some(expression.child(1).validity()?))
     }
 
-    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
-        true
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        // This function replaces null input values instead of propagating them.
+        false
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {
@@ -192,6 +180,8 @@ mod tests {
     use vortex_error::VortexExpect;
 
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::assert_arrays_eq;
@@ -221,6 +211,7 @@ mod tests {
 
     #[test]
     fn evaluate() {
+        let mut ctx = array_session().create_execution_ctx();
         let test_array =
             PrimitiveArray::from_option_iter([Some(1i32), None, Some(3), None, Some(5)])
                 .into_array();
@@ -232,11 +223,16 @@ mod tests {
             result.dtype(),
             &DType::Primitive(PType::I32, Nullability::NonNullable)
         );
-        assert_arrays_eq!(result, PrimitiveArray::from_iter([1i32, 42, 3, 42, 5]));
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_iter([1i32, 42, 3, 42, 5]),
+            &mut ctx
+        );
     }
 
     #[test]
     fn evaluate_struct_field() {
+        let mut ctx = array_session().create_execution_ctx();
         let test_array = StructArray::from_fields(&[(
             "a",
             PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array(),
@@ -251,20 +247,21 @@ mod tests {
             result.dtype(),
             &DType::Primitive(PType::I32, Nullability::NonNullable)
         );
-        assert_arrays_eq!(result, PrimitiveArray::from_iter([1i32, 0, 3]));
+        assert_arrays_eq!(result, PrimitiveArray::from_iter([1i32, 0, 3]), &mut ctx);
     }
 
     #[test]
     fn evaluate_non_nullable_input() {
+        let mut ctx = array_session().create_execution_ctx();
         let test_array = buffer![1i32, 2, 3].into_array();
         let expr = fill_null(root(), lit(0i32));
         let result = test_array.apply(&expr).unwrap();
-        assert_arrays_eq!(result, PrimitiveArray::from_iter([1i32, 2, 3]));
+        assert_arrays_eq!(result, PrimitiveArray::from_iter([1i32, 2, 3]), &mut ctx);
     }
 
     #[test]
     fn test_display() {
         let expr = fill_null(get_item("value", root()), lit(0i32));
-        assert_eq!(expr.to_string(), "fill_null($.value, 0i32)");
+        assert_eq!(expr.to_string(), "vortex.fill_null($.value, 0i32)");
     }
 }

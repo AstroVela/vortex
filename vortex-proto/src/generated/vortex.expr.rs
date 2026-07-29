@@ -19,6 +19,13 @@ pub struct AggregateFn {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub metadata: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
+/// Options for numeric aggregate functions (`vortex.sum`, `vortex.min`, `vortex.max`),
+/// controlling how NaN values in floating-point inputs are handled.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NumericalAggregateOpts {
+    #[prost(bool, tag = "1")]
+    pub skip_nans: bool,
+}
 /// Options for `vortex.literal`
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LiteralOpts {
@@ -38,6 +45,43 @@ pub struct PackOpts {
 pub struct GetItemOpts {
     #[prost(string, tag = "1")]
     pub path: ::prost::alloc::string::String,
+}
+/// Options for `vortex.variant_get`
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VariantGetOpts {
+    #[prost(message, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<VariantPathElement>,
+    #[prost(message, optional, tag = "2")]
+    pub dtype: ::core::option::Option<super::dtype::DType>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VariantPathElement {
+    #[prost(oneof = "variant_path_element::Element", tags = "1, 2")]
+    pub element: ::core::option::Option<variant_path_element::Element>,
+}
+/// Nested message and enum types in `VariantPathElement`.
+pub mod variant_path_element {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Element {
+        #[prost(string, tag = "1")]
+        Field(::prost::alloc::string::String),
+        #[prost(uint64, tag = "2")]
+        Index(u64),
+    }
+}
+/// Options for `vortex.json_to_variant`
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JsonToVariantOpts {
+    #[prost(message, repeated, tag = "1")]
+    pub shredding: ::prost::alloc::vec::Vec<ShreddingSpecField>,
+}
+/// One (path, dtype) shredding directive for `vortex.json_to_variant`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShreddingSpecField {
+    #[prost(message, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<VariantPathElement>,
+    #[prost(message, optional, tag = "2")]
+    pub dtype: ::core::option::Option<super::dtype::DType>,
 }
 /// Options for `vortex.binary`
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

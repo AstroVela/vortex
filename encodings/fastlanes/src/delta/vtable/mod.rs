@@ -4,7 +4,6 @@
 use std::hash::Hash;
 use std::hash::Hasher;
 
-use fastlanes::FastLanes;
 use prost::Message;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
@@ -13,19 +12,16 @@ use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
-use vortex_array::Precision;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
-use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::serde::ArrayChildren;
-use vortex_array::smallvec::smallvec;
 use vortex_array::vtable::VTable;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -34,10 +30,10 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::DeltaData;
-use crate::delta::array::BASES_SLOT;
-use crate::delta::array::DELTAS_SLOT;
 use crate::delta::array::DeltaArrayExt;
-use crate::delta::array::SLOT_NAMES;
+use crate::delta::array::DeltaArraySlotsExt;
+use crate::delta::array::DeltaSlots;
+use crate::delta::array::DeltaSlotsView;
 use crate::delta::array::delta_decompress::delta_decompress;
 use crate::delta::array::lane_count;
 use crate::delta_compress;
@@ -60,13 +56,13 @@ pub struct DeltaMetadata {
 }
 
 impl ArrayHash for DeltaData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.offset.hash(state);
     }
 }
 
 impl ArrayEq for DeltaData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.offset == other.offset
     }
 }
@@ -89,13 +85,14 @@ impl VTable for Delta {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        let bases = slots[BASES_SLOT]
-            .as_ref()
-            .vortex_expect("DeltaArray bases slot");
-        let deltas = slots[DELTAS_SLOT]
-            .as_ref()
-            .vortex_expect("DeltaArray deltas slot");
-        validate_parts(bases, deltas, data.offset, dtype, len)
+        let delta_slots = DeltaSlotsView::from_slots(slots);
+        validate_parts(
+            delta_slots.bases,
+            delta_slots.deltas,
+            data.offset,
+            dtype,
+            len,
+        )
     }
 
     fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
@@ -110,6 +107,14 @@ impl VTable for Delta {
         None
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_array::vtable::with_empty_buffers(self, array, buffers)
+    }
+
     fn reduce_parent(
         array: ArrayView<'_, Self>,
         parent: &ArrayRef,
@@ -119,7 +124,7 @@ impl VTable for Delta {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        DeltaSlots::NAMES[idx].to_string()
     }
 
     fn serialize(
@@ -156,7 +161,7 @@ impl VTable for Delta {
         );
         let metadata = DeltaMetadata::decode(metadata)?;
         let ptype = PType::try_from(dtype)?;
-        let lanes = match_each_unsigned_integer_ptype!(ptype, |T| { <T as FastLanes>::LANES });
+        let lanes = lane_count(ptype);
 
         // Compute the length of the bases array
         let deltas_len = usize::try_from(metadata.deltas_len)
@@ -169,7 +174,7 @@ impl VTable for Delta {
         let deltas = children.get(1, dtype, deltas_len)?;
 
         let data = DeltaData::try_new(metadata.offset as usize)?;
-        let slots = smallvec![Some(bases), Some(deltas)];
+        let slots = DeltaSlots { bases, deltas }.into_slots();
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
@@ -192,7 +197,7 @@ impl Delta {
     ) -> VortexResult<DeltaArray> {
         let dtype = bases.dtype().with_nullability(deltas.dtype().nullability());
         let data = DeltaData::try_new(offset)?;
-        let slots = smallvec![Some(bases), Some(deltas)];
+        let slots = DeltaSlots { bases, deltas }.into_slots();
         Array::try_from_parts(ArrayParts::new(Delta, dtype, len, data).with_slots(slots))
     }
 
@@ -227,8 +232,8 @@ fn validate_parts(
     );
 
     vortex_ensure!(
-        bases.dtype().is_unsigned_int(),
-        "DeltaArray: dtype must be an unsigned integer, got {}",
+        bases.dtype().is_int(),
+        "DeltaArray: dtype must be an integer, got {}",
         bases.dtype()
     );
 

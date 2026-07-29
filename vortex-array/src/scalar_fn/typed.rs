@@ -4,8 +4,10 @@
 //! Typed and inner representations of scalar functions.
 //!
 //! - [`ScalarFn<V>`]: The public typed wrapper, parameterized by a concrete [`ScalarFnVTable`].
-//! - [`ScalarFn<V>`]: The private inner struct that holds the vtable + options.
+//! - [`TypedScalarFnInstance<V>`]: The inner struct that holds the vtable + options.
 //! - [`DynScalarFn`]: The private sealed trait for type-erased dispatch (bound, options in self).
+//!
+//! [`ScalarFn<V>`]: crate::arrays::scalar_fn::ScalarFn
 
 use std::any::Any;
 use std::fmt;
@@ -22,8 +24,6 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::expr::Expression;
-use crate::expr::StatsCatalog;
-use crate::expr::stats::Stat;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
@@ -71,7 +71,7 @@ impl<V: ScalarFnVTable> TypedScalarFnInstance<V> {
 
 /// An object-safe, sealed trait for bound scalar function dispatch.
 ///
-/// Options are stored inside the implementing [`ScalarFn<V>`], not passed externally.
+/// Options are stored inside the implementing [`ScalarFn<V>`](crate::arrays::scalar_fn::ScalarFn), not passed externally.
 /// This is the sole trait behind [`ScalarFnRef`]'s `Arc<dyn DynScalarFn>`.
 pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
     fn as_any(&self) -> &dyn Any;
@@ -89,7 +89,7 @@ pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
     ) -> VortexResult<Option<ReduceNodeRef>>;
     fn arity(&self) -> Arity;
     fn child_name(&self, child_idx: usize) -> ChildName;
-    fn is_null_sensitive(&self) -> bool;
+    fn is_strict(&self) -> bool;
     fn is_fallible(&self) -> bool;
 
     // Expression methods — take &Expression for tree traversal
@@ -101,17 +101,6 @@ pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
     ) -> VortexResult<Option<Expression>>;
     fn simplify_untyped(&self, expression: &Expression) -> VortexResult<Option<Expression>>;
     fn validity(&self, expression: &Expression) -> VortexResult<Option<Expression>>;
-    fn stat_falsification(
-        &self,
-        expression: &Expression,
-        catalog: &dyn StatsCatalog,
-    ) -> Option<Expression>;
-    fn stat_expression(
-        &self,
-        expression: &Expression,
-        stat: Stat,
-        catalog: &dyn StatsCatalog,
-    ) -> Option<Expression>;
 
     // Options operations — self-contained
     fn options_serialize(&self) -> VortexResult<Option<Vec<u8>>>;
@@ -195,8 +184,8 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
         V::child_name(&self.vtable, &self.options, child_idx)
     }
 
-    fn is_null_sensitive(&self) -> bool {
-        V::is_null_sensitive(&self.vtable, &self.options)
+    fn is_strict(&self) -> bool {
+        V::is_strict(&self.vtable, &self.options)
     }
 
     fn is_fallible(&self) -> bool {
@@ -221,23 +210,6 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
 
     fn validity(&self, expression: &Expression) -> VortexResult<Option<Expression>> {
         V::validity(&self.vtable, &self.options, expression)
-    }
-
-    fn stat_falsification(
-        &self,
-        expression: &Expression,
-        catalog: &dyn StatsCatalog,
-    ) -> Option<Expression> {
-        V::stat_falsification(&self.vtable, &self.options, expression, catalog)
-    }
-
-    fn stat_expression(
-        &self,
-        expression: &Expression,
-        stat: Stat,
-        catalog: &dyn StatsCatalog,
-    ) -> Option<Expression> {
-        V::stat_expression(&self.vtable, &self.options, expression, stat, catalog)
     }
 
     fn options_serialize(&self) -> VortexResult<Option<Vec<u8>>> {

@@ -18,7 +18,7 @@ impl CastReduce for Dict {
     fn cast(array: ArrayView<'_, Dict>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Can have un-reference null values making the cast of values fail without a possible mask.
         // TODO(joe): optimize this, could look at accessible values and fill_null not those?
-        if !dtype.is_nullable() && !array.values().validity()?.no_nulls() {
+        if !dtype.is_nullable() && !array.values().validity()?.definitely_no_nulls() {
             return Ok(None);
         }
         // Cast the dictionary values to the target type
@@ -46,13 +46,18 @@ impl CastReduce for Dict {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
-    use vortex_buffer::buffer;
+    use std::sync::LazyLock;
 
+    use rstest::rstest;
+    use vortex_buffer::BitBuffer;
+    use vortex_buffer::buffer;
+    use vortex_session::VortexSession;
+
+    use crate::ArrayRef;
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
+    use crate::VortexSessionExecute;
     use crate::arrays::Dict;
+    use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::dict::DictArraySlotsExt;
     use crate::assert_arrays_eq;
@@ -62,11 +67,15 @@ mod tests {
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
+    use crate::validity::Validity;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
 
     #[test]
     fn test_cast_dict_to_wider_type() {
+        let ctx = &mut SESSION.create_execution_ctx();
         let values = buffer![1i32, 2, 3, 2, 1].into_array();
-        let dict = dict_encode(&values).unwrap();
+        let dict = dict_encode(&values, ctx).unwrap();
 
         let casted = dict
             .into_array()
@@ -77,16 +86,15 @@ mod tests {
             &DType::Primitive(PType::I64, Nullability::NonNullable)
         );
 
-        #[expect(deprecated)]
-        let decoded = casted.to_primitive();
-        assert_arrays_eq!(decoded, PrimitiveArray::from_iter([1i64, 2, 3, 2, 1]));
+        let decoded = casted.into_array().execute::<PrimitiveArray>(ctx).unwrap();
+        assert_arrays_eq!(decoded, PrimitiveArray::from_iter([1i64, 2, 3, 2, 1]), ctx);
     }
 
     #[test]
     fn test_cast_dict_nullable() {
         let values =
             PrimitiveArray::from_option_iter([Some(10i32), None, Some(20), Some(10), None]);
-        let dict = dict_encode(&values.into_array()).unwrap();
+        let dict = dict_encode(&values.into_array(), &mut SESSION.create_execution_ctx()).unwrap();
 
         let casted = dict
             .into_array()
@@ -100,9 +108,10 @@ mod tests {
 
     #[test]
     fn test_cast_dict_allvalid_to_nonnullable_and_back() {
+        let ctx = &mut SESSION.create_execution_ctx();
         // Create an AllValid dict array (no nulls)
         let values = buffer![10i32, 20, 30, 40].into_array();
-        let dict = dict_encode(&values).unwrap();
+        let dict = dict_encode(&values, ctx).unwrap();
 
         // Verify initial state - codes should be NonNullable, values should be NonNullable
         assert_eq!(dict.codes().dtype().nullability(), Nullability::NonNullable);
@@ -163,33 +172,30 @@ mod tests {
         );
 
         // Verify values are unchanged
-        #[expect(deprecated)]
-        let original_values = dict.as_array().to_primitive();
-        #[expect(deprecated)]
-        let final_values = back_to_non_nullable.to_primitive();
-        assert_arrays_eq!(original_values, final_values);
+        let original_values = dict.into_array().execute::<PrimitiveArray>(ctx).unwrap();
+
+        let final_values = back_to_non_nullable.execute::<PrimitiveArray>(ctx).unwrap();
+        assert_arrays_eq!(original_values, final_values, ctx);
     }
 
     #[rstest]
-    #[case(dict_encode(&buffer![1i32, 2, 3, 2, 1, 3].into_array()).unwrap().into_array())]
-    #[case(dict_encode(&buffer![100u32, 200, 100, 300, 200].into_array()).unwrap().into_array())]
-    #[case(dict_encode(&PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None]).into_array()).unwrap().into_array())]
-    #[case(dict_encode(&buffer![1.5f32, 2.5, 1.5, 3.5].into_array()).unwrap().into_array())]
-    fn test_cast_dict_conformance(#[case] array: crate::ArrayRef) {
-        test_cast_conformance(&array);
+    #[case(dict_encode(&buffer![1i32, 2, 3, 2, 1, 3].into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    #[case(dict_encode(&buffer![100u32, 200, 100, 300, 200].into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    #[case(dict_encode(&PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None]).into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    #[case(dict_encode(&buffer![1.5f32, 2.5, 1.5, 3.5].into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    fn test_cast_dict_conformance(#[case] array: ArrayRef) {
+        test_cast_conformance(&array, &mut SESSION.create_execution_ctx());
     }
 
     #[test]
     fn test_cast_dict_with_unreferenced_null_values_to_nonnullable() {
-        use crate::arrays::DictArray;
-        use crate::validity::Validity;
-
+        let ctx = &mut SESSION.create_execution_ctx();
         // Create a dict with nullable values that have unreferenced null entries.
         // Values: [1.0, null, 3.0] (index 1 is null but no code points to it)
         // Codes: [0, 2, 0] (only reference indices 0 and 2, never 1)
         let values = PrimitiveArray::new(
             buffer![1.0f64, 0.0f64, 3.0f64],
-            Validity::from(vortex_buffer::BitBuffer::from(vec![true, false, true])),
+            Validity::from(BitBuffer::from(vec![true, false, true])),
         )
         .into_array();
         let codes = buffer![0u32, 2, 0].into_array();
@@ -214,8 +220,6 @@ mod tests {
             casted.dtype(),
             &DType::Primitive(PType::F64, Nullability::NonNullable)
         );
-        #[expect(deprecated)]
-        let casted_prim = casted.to_primitive();
-        assert_arrays_eq!(casted_prim, PrimitiveArray::from_iter([1.0f64, 3.0, 1.0]));
+        assert_arrays_eq!(casted, PrimitiveArray::from_iter([1.0f64, 3.0, 1.0]), ctx);
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Execution logic for [`FilterArray`].
+//! Execution logic for [`super::FilterArray`].
 //!
 //! The main entrypoint is [`execute_filter`] which filters any [`Canonical`] array.
 
@@ -23,20 +23,26 @@ use crate::arrays::Filter;
 use crate::arrays::NullArray;
 use crate::arrays::VariantArray;
 use crate::arrays::extension::ExtensionArrayExt;
-use crate::arrays::filter::FilterArrayExt;
-use crate::arrays::variant::VariantArrayExt;
+use crate::arrays::filter::FilterArraySlotsExt;
+use crate::arrays::variant::VariantArraySlotsExt;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
 
+pub(crate) mod byte_compress;
+
+mod slice;
+mod take;
+
 mod bitbuffer;
-mod bool;
 mod buffer;
+
+mod bool;
 mod decimal;
 mod fixed_size_list;
 mod listview;
 mod primitive;
-mod slice;
 mod struct_;
+mod union;
 mod varbinview;
 
 /// A helper function that lazily filters a [`Validity`] with selection mask values.
@@ -93,6 +99,7 @@ pub(super) fn execute_filter(canonical: Canonical, mask: &Arc<MaskValues>) -> Ca
             Canonical::FixedSizeList(fixed_size_list::filter_fixed_size_list(&a, mask))
         }
         Canonical::Struct(a) => Canonical::Struct(struct_::filter_struct(&a, mask)),
+        Canonical::Union(a) => Canonical::Union(union::filter_union(&a, mask)),
         Canonical::Extension(a) => {
             let filtered_storage = a
                 .storage_array()
@@ -101,11 +108,20 @@ pub(super) fn execute_filter(canonical: Canonical, mask: &Arc<MaskValues>) -> Ca
             Canonical::Extension(ExtensionArray::new(a.ext_dtype().clone(), filtered_storage))
         }
         Canonical::Variant(a) => {
-            let filtered_child = a
-                .child()
-                .filter(Mask::Values(Arc::clone(mask)))
-                .vortex_expect("VariantArray child could not be filtered");
-            Canonical::Variant(VariantArray::new(filtered_child))
+            let filter_mask = Mask::Values(Arc::clone(mask));
+            let filtered_core_storage = a
+                .core_storage()
+                .filter(filter_mask.clone())
+                .vortex_expect("VariantArray core_storage could not be filtered");
+            let filtered_shredded = a.shredded().map(|shredded| {
+                shredded
+                    .filter(filter_mask)
+                    .vortex_expect("VariantArray shredded child could not be filtered")
+            });
+            Canonical::Variant(
+                VariantArray::try_new(filtered_core_storage, filtered_shredded)
+                    .vortex_expect("filtered VariantArray children are row-aligned"),
+            )
         }
     }
 }

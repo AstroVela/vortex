@@ -9,6 +9,8 @@
 
 #[cfg(test)]
 mod tests {
+    use std::f32;
+    use std::f64;
     use std::sync::Arc;
 
     use rstest::rstest;
@@ -37,8 +39,8 @@ mod tests {
             Scalar::primitive(50000u16, Nullability::NonNullable),
             Scalar::primitive(4000000000u32, Nullability::NonNullable),
             Scalar::primitive(18446744073709551615u64, Nullability::NonNullable),
-            Scalar::primitive(std::f32::consts::PI, Nullability::NonNullable),
-            Scalar::primitive(std::f64::consts::E, Nullability::NonNullable),
+            Scalar::primitive(f32::consts::PI, Nullability::NonNullable),
+            Scalar::primitive(f64::consts::E, Nullability::NonNullable),
         ];
 
         for scalar in values {
@@ -250,6 +252,25 @@ mod tests {
         // Verify the data is preserved
         let extracted: ByteBuffer = ByteBuffer::try_from(&round_tripped_binary).unwrap();
         assert_eq!(extracted.as_slice(), &large_binary);
+    }
+
+    // Test that fixed-size list scalars round-trip through protobuf. This is
+    // the path taken by a ConstantArray of a fixed-size list dtype (e.g. a
+    // UUID column stored as fixed_size_list(u8)[16]), whose scalar metadata
+    // is serialized as a protobuf ListValue.
+    #[test]
+    fn test_protobuf_fixed_size_list_round_trip() {
+        let fsl = Scalar::fixed_size_list(
+            Arc::new(DType::Primitive(PType::U8, Nullability::NonNullable)),
+            (0u8..16)
+                .map(|i| Scalar::primitive(i, Nullability::NonNullable))
+                .collect(),
+            Nullability::NonNullable,
+        );
+
+        let pb_fsl = pb::Scalar::from(&fsl);
+        let round_tripped = Scalar::from_proto(&pb_fsl, &SESSION).unwrap();
+        assert_eq!(fsl, round_tripped);
     }
 
     // Test that nullable and non-nullable types are preserved

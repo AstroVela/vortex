@@ -12,7 +12,6 @@ readme = { workspace = true }
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
-publish = false
 
 [lints]
 workspace = true
@@ -26,13 +25,18 @@ parquet-variant = { workspace = true }
 parquet-variant-compute = { workspace = true }
 prost = { workspace = true }
 vortex-array = { workspace = true }
+vortex-arrow = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
+vortex-json = { workspace = true }
 vortex-mask = { workspace = true }
-vortex-proto = { workspace = true }
+vortex-proto = { workspace = true, features = ["expr"] }
 vortex-session = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
-
+vortex-file = { workspace = true, features = ["tokio"] }
+vortex-io = { workspace = true, features = ["tokio"] }
+vortex-layout = { workspace = true }

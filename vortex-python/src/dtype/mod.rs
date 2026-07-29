@@ -34,7 +34,9 @@ use pyo3::pymethods;
 use pyo3::types::PyType;
 use pyo3::wrap_pyfunction;
 use vortex::dtype::DType;
-use vortex::dtype::arrow::FromArrowType;
+use vortex_arrow::ArrowSessionExt;
+use vortex_arrow::ToArrowType;
+use vortex_arrow::TryFromArrowType;
 
 use crate::arrow::FromPyArrow;
 use crate::arrow::ToPyArrow;
@@ -51,6 +53,7 @@ use crate::dtype::utf8::PyUtf8DType;
 use crate::error::PyVortexResult;
 use crate::install_module;
 use crate::python_repr::PythonRepr;
+use crate::session::session;
 
 /// Register DType functions and classes.
 pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
@@ -169,7 +172,11 @@ impl PyDType {
 #[pymethods]
 impl PyDType {
     fn to_arrow_type(&self, py: Python) -> PyVortexResult<Py<PyAny>> {
-        Ok(self.0.to_arrow_dtype()?.to_pyarrow(py)?)
+        Ok(session()
+            .arrow()
+            .to_arrow_field("", &self.0)?
+            .data_type()
+            .to_pyarrow(py)?)
     }
 
     fn to_arrow_schema(&self, py: Python) -> PyVortexResult<Py<PyAny>> {
@@ -184,18 +191,22 @@ impl PyDType {
         self.0.python_repr().to_string()
     }
 
+    /// Return whether this data type allows null values.
+    fn is_nullable(&self) -> bool {
+        self.0.is_nullable()
+    }
+
     /// Construct a Vortex data type from an Arrow data type.
     #[classmethod]
     #[pyo3(signature = (arrow_dtype, *, non_nullable = false))]
     fn from_arrow<'py>(
-        cls: &'py Bound<'py, PyType>,
+        cls: &Bound<'py, PyType>,
         #[pyo3(from_py_with = import_arrow_dtype)] arrow_dtype: DataType,
         non_nullable: bool,
     ) -> PyResult<Bound<'py, PyDType>> {
-        Self::init(
-            cls.py(),
-            DType::from_arrow(&Field::new("_", arrow_dtype, !non_nullable)),
-        )
+        let dtype = DType::try_from_arrow(&Field::new("_", arrow_dtype, !non_nullable))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Self::init(cls.py(), dtype)
     }
 }
 

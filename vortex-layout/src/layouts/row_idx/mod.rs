@@ -3,7 +3,6 @@
 
 mod expr;
 
-use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::ops::BitAnd;
@@ -43,6 +42,8 @@ use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::ArrayFuture;
 use crate::LayoutReader;
+use crate::RowSplits;
+use crate::SplitRange;
 use crate::layouts::partitioned::PartitionedExprEval;
 
 pub struct RowIdxLayoutReader {
@@ -170,10 +171,10 @@ impl LayoutReader for RowIdxLayoutReader {
     fn register_splits(
         &self,
         field_mask: &[FieldMask],
-        row_range: &Range<u64>,
-        splits: &mut BTreeSet<u64>,
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        self.child.register_splits(field_mask, row_range, splits)
+        self.child.register_splits(field_mask, split_range, splits)
     }
 
     fn pruning_evaluation(
@@ -294,7 +295,7 @@ fn row_idx_mask_future(
         let array = idx_array(row_offset, &row_range).into_array();
 
         let mut ctx = session.create_execution_ctx();
-        let result_mask = array.apply(&expr)?.execute::<Mask>(&mut ctx)?;
+        let result_mask = array.apply(&expr)?.null_as_false().execute(&mut ctx)?;
 
         Ok(result_mask.bitand(&mask.await?))
     })
@@ -326,6 +327,7 @@ mod tests {
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray as _;
     use vortex_array::MaskFuture;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::expr::eq;
@@ -345,19 +347,20 @@ mod tests {
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
-    use crate::test::SESSION;
+    use crate::test::new_session;
 
     #[test]
     fn flat_expr_no_row_id() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
-            let ctx = ArrayContext::empty();
+            let session = new_session().with_handle(handle);
+            let mut ctx = session.create_execution_ctx();
+            let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let array = buffer![1..=5].into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    ctx,
+                    array_ctx,
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -369,8 +372,10 @@ mod tests {
             let expr = eq(root(), lit(3i32));
             let result = RowIdxLayoutReader::new(
                 0,
-                layout.new_reader("".into(), segments, &SESSION).unwrap(),
-                SESSION.clone(),
+                layout
+                    .new_reader("".into(), segments, &session, &Default::default())
+                    .unwrap(),
+                session.clone(),
             )
             .projection_evaluation(
                 &(0..layout.row_count()),
@@ -383,7 +388,8 @@ mod tests {
 
             assert_arrays_eq!(
                 result,
-                BoolArray::from_iter([false, false, true, false, false])
+                BoolArray::from_iter([false, false, true, false, false]),
+                &mut ctx
             );
         })
     }
@@ -391,14 +397,15 @@ mod tests {
     #[test]
     fn flat_expr_row_id() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
-            let ctx = ArrayContext::empty();
+            let session = new_session().with_handle(handle);
+            let mut ctx = session.create_execution_ctx();
+            let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let array = buffer![1..=5].into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    ctx,
+                    array_ctx,
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -410,8 +417,10 @@ mod tests {
             let expr = gt(row_idx(), lit(3u64));
             let result = RowIdxLayoutReader::new(
                 0,
-                layout.new_reader("".into(), segments, &SESSION).unwrap(),
-                SESSION.clone(),
+                layout
+                    .new_reader("".into(), segments, &session, &Default::default())
+                    .unwrap(),
+                session.clone(),
             )
             .projection_evaluation(
                 &(0..layout.row_count()),
@@ -424,7 +433,8 @@ mod tests {
 
             assert_arrays_eq!(
                 result,
-                BoolArray::from_iter([false, false, false, false, true])
+                BoolArray::from_iter([false, false, false, false, true]),
+                &mut ctx
             );
         })
     }
@@ -432,14 +442,15 @@ mod tests {
     #[test]
     fn flat_expr_or() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
-            let ctx = ArrayContext::empty();
+            let session = new_session().with_handle(handle);
+            let mut ctx = session.create_execution_ctx();
+            let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let array = buffer![1..=5].into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    ctx,
+                    array_ctx,
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -455,8 +466,10 @@ mod tests {
 
             let result = RowIdxLayoutReader::new(
                 0,
-                layout.new_reader("".into(), segments, &SESSION).unwrap(),
-                SESSION.clone(),
+                layout
+                    .new_reader("".into(), segments, &session, &Default::default())
+                    .unwrap(),
+                session.clone(),
             )
             .projection_evaluation(
                 &(0..layout.row_count()),
@@ -469,7 +482,8 @@ mod tests {
 
             assert_arrays_eq!(
                 result,
-                BoolArray::from_iter([true, false, true, false, true])
+                BoolArray::from_iter([true, false, true, false, true]),
+                &mut ctx
             );
         })
     }

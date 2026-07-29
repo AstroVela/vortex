@@ -3,14 +3,17 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use vortex::array::ArrayId;
 use vortex::array::VortexSessionExecute;
 use vortex::error::VortexResult;
-use vortex::session::Ref;
+use vortex::error::vortex_err;
 use vortex::session::SessionExt;
+use vortex::session::SessionGuard;
 use vortex::session::SessionVar;
 use vortex::utils::aliases::dash_map::DashMap;
 
@@ -20,11 +23,22 @@ use crate::executor::CudaExecute;
 pub use crate::executor::CudaExecutionCtx;
 use crate::initialize_cuda;
 use crate::kernel::KernelLoader;
+use crate::pinned::PinnedByteBufferPool;
 use crate::stream::VortexCudaStream;
 use crate::stream_pool::VortexCudaStreamPool;
 
 /// Default maximum number of streams in the pool.
 const DEFAULT_STREAM_POOL_CAPACITY: usize = 4;
+
+/// Arrow Device layout used when exporting variable-length UTF-8 and binary arrays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VarBinExportLayout {
+    /// Offset-based Arrow `Utf8`/`Binary` with one contiguous values buffer.
+    #[default]
+    VarBin,
+    /// Arrow `Utf8View`/`BinaryView` with 16-byte views and variadic data buffers.
+    VarBinView,
+}
 
 /// CUDA session for GPU accelerated execution.
 ///
@@ -35,8 +49,10 @@ pub struct CudaSession {
     context: Arc<CudaContext>,
     kernels: Arc<DashMap<ArrayId, &'static dyn CudaExecute>>,
     export_device_array: Arc<dyn ExportDeviceArray>,
+    varbin_export_layout: VarBinExportLayout,
     kernel_loader: Arc<KernelLoader>,
     stream_pool: Arc<VortexCudaStreamPool>,
+    pinned_buffer_pool: Arc<PinnedByteBufferPool>,
 }
 
 impl CudaSession {
@@ -54,12 +70,47 @@ impl CudaSession {
             Arc::clone(&context),
             stream_pool_capacity,
         ));
+        let pinned_buffer_pool = Arc::new(PinnedByteBufferPool::new(Arc::clone(&context)));
         Self {
             context,
             kernels: Arc::new(DashMap::default()),
             kernel_loader: Arc::new(KernelLoader::new()),
             export_device_array: Arc::new(CanonicalDeviceArrayExport),
+            varbin_export_layout: VarBinExportLayout::default(),
             stream_pool,
+            pinned_buffer_pool,
+        }
+    }
+
+    /// Selects the Arrow Device layout for variable-length UTF-8 and binary exports.
+    pub fn with_varbin_export_layout(mut self, layout: VarBinExportLayout) -> Self {
+        self.varbin_export_layout = layout;
+        self
+    }
+
+    /// Returns the Arrow Device layout used for variable-length UTF-8 and binary exports.
+    pub fn varbin_export_layout(&self) -> VarBinExportLayout {
+        self.varbin_export_layout
+    }
+
+    /// Creates a default CUDA session using device 0, with all GPU array kernels preloaded.
+    ///
+    /// Unlike [`Default::default`], this returns an error instead of panicking when CUDA cannot be
+    /// initialized.
+    pub fn try_default() -> VortexResult<Self> {
+        // cudarc panics rather than returning an error when the CUDA driver library cannot be
+        // loaded, so catch any unwind here to uphold this constructor's no-panic contract.
+        match catch_unwind(AssertUnwindSafe(|| -> VortexResult<Self> {
+            let context = CudaContext::new(0)
+                .map_err(|err| vortex_err!("failed to initialize CUDA device 0: {err}"))?;
+            let this = Self::new(context);
+            initialize_cuda(&this);
+            Ok(this)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(vortex_err!(
+                "failed to initialize CUDA: the driver library is unavailable"
+            )),
         }
     }
 
@@ -79,6 +130,11 @@ impl CudaSession {
     /// The pool reuses existing streams in round-robin fashion.
     pub fn stream(&self) -> VortexResult<VortexCudaStream> {
         self.stream_pool.stream()
+    }
+
+    /// Returns the session-scoped pool used for staging file reads in pinned host memory.
+    pub fn pinned_buffer_pool(&self) -> &Arc<PinnedByteBufferPool> {
+        &self.pinned_buffer_pool
     }
 
     /// Registers CUDA support for an array encoding.
@@ -140,12 +196,9 @@ impl Default for CudaSession {
     /// # Panics
     ///
     /// Panics if CUDA device 0 cannot be initialized.
+    #[expect(clippy::expect_used)]
     fn default() -> Self {
-        #[expect(clippy::expect_used)]
-        let context = CudaContext::new(0).expect("Failed to initialize CUDA device 0");
-        let this = Self::new(context);
-        initialize_cuda(&this);
-        this
+        Self::try_default().expect("Failed to initialize CUDA device 0")
     }
 }
 
@@ -162,7 +215,7 @@ impl SessionVar for CudaSession {
 /// Extension trait for accessing the CUDA session from a Vortex session.
 pub trait CudaSessionExt: SessionExt {
     /// Returns the CUDA session.
-    fn cuda_session(&self) -> Ref<'_, CudaSession> {
+    fn cuda_session(&self) -> SessionGuard<'_, CudaSession> {
         self.get::<CudaSession>()
     }
 }

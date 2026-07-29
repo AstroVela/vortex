@@ -11,14 +11,16 @@ use vortex::array::ArrayId;
 use vortex::array::ArrayParts;
 use vortex::array::ArrayRef;
 use vortex::array::ArrayView;
+use vortex::array::EqMode;
 use vortex::array::ExecutionCtx;
 use vortex::array::ExecutionResult;
 use vortex::array::OperationsVTable;
-use vortex::array::Precision;
 use vortex::array::VTable;
 use vortex::array::ValidityVTable;
 use vortex::array::buffer::BufferHandle;
+use vortex::array::serde::ArrayChildren;
 use vortex::array::validity::Validity;
+use vortex::array::with_empty_buffers;
 use vortex::dtype::DType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
@@ -36,13 +38,13 @@ pub struct PythonVTable {
 }
 
 impl ArrayHash for PythonArray {
-    fn array_hash<H: std::hash::Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: std::hash::Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         Arc::as_ptr(&self.object).hash(state);
     }
 }
 
 impl ArrayEq for PythonArray {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         Arc::ptr_eq(&self.object, &other.object)
     }
 }
@@ -82,16 +84,12 @@ impl VTable for PythonVTable {
         None
     }
 
-    fn nchildren(_array: ArrayView<'_, Self>) -> usize {
-        0
-    }
-
-    fn child(_array: ArrayView<'_, Self>, idx: usize) -> ArrayRef {
-        vortex_panic!("PythonArray child index {idx} out of bounds")
-    }
-
-    fn child_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        vortex_panic!("PythonArray child_name index {idx} out of bounds")
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
     }
 
     fn serialize(
@@ -107,7 +105,7 @@ impl VTable for PythonVTable {
         _len: usize,
         bytes: &[u8],
         _buffers: &[BufferHandle],
-        _children: &dyn vortex::array::serde::ArrayChildren,
+        _children: &dyn ArrayChildren,
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         _ = bytes;

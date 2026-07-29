@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::collections::BTreeSet;
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
@@ -21,9 +20,11 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
-use crate::LayoutReader;
 use crate::layouts::SharedArrayFuture;
 use crate::layouts::flat::FlatLayout;
+use crate::reader::LayoutReader;
+use crate::reader::RowSplits;
+use crate::reader::SplitRange;
 use crate::segments::SegmentSource;
 
 /// The threshold of mask density below which we will evaluate the expression only over the
@@ -103,10 +104,11 @@ impl LayoutReader for FlatReader {
     fn register_splits(
         &self,
         _field_mask: &[FieldMask],
-        row_range: &Range<u64>,
-        splits: &mut BTreeSet<u64>,
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        splits.insert(row_range.start + self.layout.row_count);
+        split_range.check_bounds(self.layout.row_count())?;
+        splits.push(split_range.root_row_range().end);
         Ok(())
     }
 
@@ -146,21 +148,22 @@ impl LayoutReader for FlatReader {
                 array = array.slice(row_range.clone())?;
             }
 
-            let array_mask = if mask.density() < EXPR_EVAL_THRESHOLD {
+            let mask_density = mask.density();
+            let array_mask = if mask_density < EXPR_EVAL_THRESHOLD {
                 // We have the choice to apply the filter or the expression first, we apply the
                 // expression first so that it can try pushing down itself and then the filter
                 // after this.
                 let array = array.apply(&expr)?;
                 let array = array.filter(mask.clone())?;
                 let mut ctx = session.create_execution_ctx();
-                let array_mask = array.execute::<Mask>(&mut ctx)?;
+                let array_mask = array.null_as_false().execute(&mut ctx)?;
 
                 mask.intersect_by_rank(&array_mask)
             } else {
                 // Run over the full array, with a simpler bitand at the end.
                 let array = array.apply(&expr)?;
                 let mut ctx = session.create_execution_ctx();
-                let array_mask = array.execute::<Mask>(&mut ctx)?;
+                let array_mask = array.null_as_false().execute(&mut ctx)?;
 
                 mask.bitand(&array_mask)
             };
@@ -169,7 +172,7 @@ impl LayoutReader for FlatReader {
                 "Flat mask evaluation {} - {} (mask = {}) => {}",
                 name,
                 expr,
-                mask.density(),
+                mask_density,
                 array_mask.density(),
             );
 
@@ -230,6 +233,7 @@ mod test {
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
@@ -247,20 +251,21 @@ mod test {
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
-    use crate::test::SESSION;
+    use crate::test::new_session;
 
     #[test]
     fn flat_identity() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
-            let ctx = ArrayContext::empty();
+            let session = new_session().with_handle(handle);
+            let mut ctx = session.create_execution_ctx();
+            let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let array =
                 PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    ctx,
+                    array_ctx,
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -274,7 +279,7 @@ mod test {
             );
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)?
+                .new_reader("".into(), segments, &session, &Default::default())?
                 .projection_evaluation(
                     &(0..layout.row_count()),
                     &root(),
@@ -282,7 +287,7 @@ mod test {
                 )?
                 .await?;
 
-            assert_arrays_eq!(result, array);
+            assert_arrays_eq!(result, array, &mut ctx);
 
             Ok(())
         })
@@ -291,8 +296,9 @@ mod test {
     #[test]
     fn flat_expr() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
-            let ctx = ArrayContext::empty();
+            let session = new_session().with_handle(handle);
+            let mut ctx = session.create_execution_ctx();
+            let array_ctx = ArrayContext::empty();
 
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -300,7 +306,7 @@ mod test {
                 PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    ctx,
+                    array_ctx,
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -311,7 +317,7 @@ mod test {
 
             let expr = gt(root(), lit(3i32));
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &session, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -323,22 +329,23 @@ mod test {
                 .unwrap();
 
             let expected = BoolArray::from_iter([false, false, false, true, true].map(Some));
-            assert_arrays_eq!(result, expected);
+            assert_arrays_eq!(result, expected, &mut ctx);
         })
     }
 
     #[test]
     fn flat_unaligned_row_mask() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
-            let ctx = ArrayContext::empty();
+            let session = new_session().with_handle(handle);
+            let mut ctx = session.create_execution_ctx();
+            let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let array =
                 PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    ctx,
+                    array_ctx,
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -348,7 +355,7 @@ mod test {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &session, &Default::default())
                 .unwrap()
                 .projection_evaluation(&(2..4), &root(), MaskFuture::new_true(2))
                 .unwrap()
@@ -356,7 +363,7 @@ mod test {
                 .unwrap();
 
             let expected = PrimitiveArray::new(buffer![3i32, 4], Validity::AllValid).into_array();
-            assert_arrays_eq!(result, expected);
+            assert_arrays_eq!(result, expected, &mut ctx);
         })
     }
 }

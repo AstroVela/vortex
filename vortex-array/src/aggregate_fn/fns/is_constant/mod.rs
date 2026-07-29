@@ -13,7 +13,7 @@ mod varbin;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_mask::Mask;
+use vortex_session::registry::CachedId;
 
 use self::bool::check_bool_constant;
 use self::decimal::check_decimal_constant;
@@ -50,7 +50,6 @@ use crate::scalar_fn::fns::operators::Operator;
 /// Check if two arrays of the same length have equal values at every position (null-safe).
 ///
 /// Two positions are considered equal if they are both null, or both non-null with the same value.
-///
 // TODO(ngates): move this function out when we have any/all aggregate functions.
 fn arrays_value_equal(a: &ArrayRef, b: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
     debug_assert_eq!(a.len(), b.len());
@@ -74,7 +73,7 @@ fn arrays_value_equal(a: &ArrayRef, b: &ArrayRef, ctx: &mut ExecutionCtx) -> Vor
     // Compare values element-wise. Result is null where both inputs are null,
     // true/false where both are valid.
     let eq_result = a.binary(b.clone(), Operator::Eq)?;
-    let eq_result = eq_result.execute::<Mask>(ctx)?;
+    let eq_result = eq_result.null_as_false().execute(ctx)?;
 
     Ok(eq_result.true_count() == valid_count)
 }
@@ -89,7 +88,7 @@ fn arrays_value_equal(a: &ArrayRef, b: &ArrayRef, ctx: &mut ExecutionCtx) -> Vor
 /// 5. Is all valid AND has minimum and maximum statistics that are equal.
 pub fn is_constant(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
     // Short-circuit using cached array statistics.
-    if let Some(Precision::Exact(value)) = array.statistics().get_as::<bool>(Stat::IsConstant) {
+    if let Precision::Exact(value) = array.statistics().get_as::<bool>(Stat::IsConstant) {
         return Ok(value);
     }
 
@@ -133,14 +132,14 @@ pub fn is_constant(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<boo
     }
 
     // We already know here that the array is all valid, so we check for min/max stats.
-    let min = array.statistics().get(Stat::Min);
-    let max = array.statistics().get(Stat::Max);
+    let min_stat = array.statistics().get(Stat::Min);
+    let max_stat = array.statistics().get(Stat::Max);
 
-    if let Some((min, max)) = min.zip(max)
-        && min.is_exact()
+    if let Precision::Exact(min) = min_stat.as_ref()
+        && let Precision::Exact(max) = max_stat.as_ref()
         && min == max
         && (Stat::NaNCount.dtype(array.dtype()).is_none()
-            || array.statistics().get_as::<u64>(Stat::NaNCount) == Some(Precision::exact(0u64)))
+            || array.statistics().get_as::<u64>(Stat::NaNCount) == Precision::exact(0u64))
     {
         array
             .statistics()
@@ -260,7 +259,8 @@ impl AggregateFnVTable for IsConstant {
     type Partial = IsConstantPartial;
 
     fn id(&self) -> AggregateFnId {
-        AggregateFnId::new("vortex.is_constant")
+        static ID: CachedId = CachedId::new("vortex.is_constant");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -404,6 +404,9 @@ impl AggregateFnVTable for IsConstant {
                     Canonical::List(l) => check_listview_constant(l, ctx)?,
                     Canonical::FixedSizeList(f) => check_fixed_size_list_constant(f, ctx)?,
                     Canonical::Null(_) => true,
+                    Canonical::Union(_) => {
+                        todo!("TODO(connor)[Union]: implement IsConstant for Union arrays")
+                    }
                     Canonical::Variant(_) => {
                         vortex_bail!("Variant arrays don't support IsConstant")
                     }
@@ -441,9 +444,9 @@ mod tests {
     use vortex_error::VortexResult;
 
     use crate::IntoArray as _;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::fns::is_constant::is_constant;
+    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::DecimalArray;
@@ -461,7 +464,7 @@ mod tests {
     // Tests migrated from compute/is_constant.rs
     #[test]
     fn is_constant_min_max_no_nan() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let arr = buffer![0, 1].into_array();
         arr.statistics()
@@ -480,7 +483,7 @@ mod tests {
 
     #[test]
     fn is_constant_min_max_with_nan() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let arr = PrimitiveArray::from_iter([0.0, 0.0, f32::NAN]).into_array();
         arr.statistics()
@@ -507,7 +510,7 @@ mod tests {
     }, false)]
     fn test_bool_is_constant(#[case] input: Vec<bool>, #[case] expected: bool) -> VortexResult<()> {
         let array = BoolArray::from_iter(input);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(is_constant(&array.into_array(), &mut ctx)?, expected);
         Ok(())
     }
@@ -527,7 +530,7 @@ mod tests {
         )?
         .into_array();
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert!(is_constant(&chunked, &mut ctx)?);
         Ok(())
     }
@@ -535,7 +538,7 @@ mod tests {
     // Tests migrated from arrays/decimal/compute/is_constant.rs
     #[test]
     fn test_decimal_is_constant() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let array = DecimalArray::new(
             buffer![0i128, 1i128, 2i128],
@@ -556,7 +559,7 @@ mod tests {
     // Tests migrated from arrays/list/compute/is_constant.rs
     #[test]
     fn test_is_constant_nested_list() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let xs = ListArray::try_new(
             buffer![0i32, 1, 0, 1].into_array(),
@@ -614,7 +617,7 @@ mod tests {
             Validity::NonNullable,
         )?;
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(is_constant(&list_array.into_array(), &mut ctx)?, expected);
         Ok(())
     }
@@ -632,7 +635,7 @@ mod tests {
             Validity::NonNullable,
         )?;
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         // Both outer lists contain [[1], [2]], so should be constant
         assert!(is_constant(&outer_list.into_array(), &mut ctx)?);
         Ok(())
@@ -677,7 +680,7 @@ mod tests {
             Validity::NonNullable,
         )?;
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(is_constant(&list_array.into_array(), &mut ctx)?, expected);
         Ok(())
     }

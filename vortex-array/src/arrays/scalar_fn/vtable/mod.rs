@@ -15,18 +15,20 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::ArraySlots;
+use crate::EqMode;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::array::with_empty_buffers;
 use crate::arrays::scalar_fn::array::ScalarFnArrayExt;
 use crate::arrays::scalar_fn::array::ScalarFnData;
 use crate::arrays::scalar_fn::rules::PARENT_RULES;
@@ -55,13 +57,13 @@ pub struct ScalarFn {
 }
 
 impl ArrayHash for ScalarFnData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.scalar_fn().hash(state);
     }
 }
 
 impl ArrayEq for ScalarFnData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.scalar_fn() == other.scalar_fn()
     }
 }
@@ -113,6 +115,14 @@ impl VTable for ScalarFn {
 
     fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
         None
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
     }
 
     fn serialize(
@@ -285,7 +295,8 @@ impl scalar_fn::ScalarFnVTable for ArrayExpr {
     type Options = FakeEq<ArrayRef>;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.array")
+        static ID: CachedId = CachedId::new("vortex.array");
+        *ID
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -325,5 +336,9 @@ impl scalar_fn::ScalarFnVTable for ArrayExpr {
     ) -> VortexResult<Option<Expression>> {
         let validity_array = options.0.validity()?.to_array(options.0.len());
         Ok(Some(ArrayExpr.new_expr(FakeEq(validity_array), [])))
+    }
+
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 }

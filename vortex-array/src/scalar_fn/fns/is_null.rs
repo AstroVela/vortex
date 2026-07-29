@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::fmt::Formatter;
-
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -13,11 +12,6 @@ use crate::arrays::ConstantArray;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
-use crate::expr::Expression;
-use crate::expr::StatsCatalog;
-use crate::expr::eq;
-use crate::expr::lit;
-use crate::expr::stats::Stat;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
@@ -34,7 +28,8 @@ impl ScalarFnVTable for IsNull {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.is_null")
+        static ID: CachedId = CachedId::new("vortex.is_null");
+        *ID
     }
 
     fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -58,17 +53,6 @@ impl ScalarFnVTable for IsNull {
             0 => ChildName::from("input"),
             _ => unreachable!("Invalid child index {} for IsNull expression", child_idx),
         }
-    }
-
-    fn fmt_sql(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "is_null(")?;
-        expr.child(0).fmt_sql(f)?;
-        write!(f, ")")
     }
 
     fn return_dtype(&self, _options: &Self::Options, _arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -95,18 +79,9 @@ impl ScalarFnVTable for IsNull {
         }
     }
 
-    fn stat_falsification(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        catalog: &dyn StatsCatalog,
-    ) -> Option<Expression> {
-        let null_count_expr = expr.child(0).stat_expression(Stat::NullCount, catalog)?;
-        Some(eq(null_count_expr, lit(0u64)))
-    }
-
-    fn is_null_sensitive(&self, _instance: &Self::Options) -> bool {
-        true
+    fn is_strict(&self, _instance: &Self::Options) -> bool {
+        // Null input produces the non-null boolean value `true`.
+        false
     }
 
     fn is_fallible(&self, _instance: &Self::Options) -> bool {
@@ -116,31 +91,35 @@ impl ScalarFnVTable for IsNull {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect as _;
-    use vortex_utils::aliases::hash_map::HashMap;
-    use vortex_utils::aliases::hash_set::HashSet;
+    use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::dtype::DType;
-    use crate::dtype::Field;
-    use crate::dtype::FieldPath;
-    use crate::dtype::FieldPathSet;
     use crate::dtype::Nullability;
     use crate::expr::col;
     use crate::expr::eq;
     use crate::expr::get_item;
     use crate::expr::is_null;
     use crate::expr::lit;
-    use crate::expr::pruning::checked_pruning_expr;
+    use crate::expr::or;
     use crate::expr::root;
-    use crate::expr::stats::Stat;
     use crate::expr::test_harness;
     use crate::scalar::Scalar;
+    use crate::stats::StatsSession;
+    use crate::stats::all_non_null;
+    use crate::stats::null_count;
+
+    static STATS_SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<StatsSession>());
 
     #[test]
     fn dtype() {
@@ -173,7 +152,7 @@ mod tests {
         for (i, expected_value) in expected.iter().enumerate() {
             assert_eq!(
                 result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+                    .execute_scalar(i, &mut array_session().create_execution_ctx())
                     .unwrap(),
                 Scalar::bool(*expected_value, Nullability::NonNullable)
             );
@@ -191,7 +170,7 @@ mod tests {
         for i in 0..result.len() {
             assert_eq!(
                 result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+                    .execute_scalar(i, &mut array_session().create_execution_ctx())
                     .unwrap(),
                 Scalar::bool(false, Nullability::NonNullable)
             );
@@ -211,7 +190,7 @@ mod tests {
         for i in 0..result.len() {
             assert_eq!(
                 result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+                    .execute_scalar(i, &mut array_session().create_execution_ctx())
                     .unwrap(),
                 Scalar::bool(true, Nullability::NonNullable)
             );
@@ -240,7 +219,7 @@ mod tests {
         for (i, expected_value) in expected.iter().enumerate() {
             assert_eq!(
                 result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+                    .execute_scalar(i, &mut array_session().create_execution_ctx())
                     .unwrap(),
                 Scalar::bool(*expected_value, Nullability::NonNullable)
             );
@@ -250,35 +229,28 @@ mod tests {
     #[test]
     fn test_display() {
         let expr = is_null(get_item("name", root()));
-        assert_eq!(expr.to_string(), "is_null($.name)");
+        assert_eq!(expr.to_string(), "vortex.is_null($.name)");
 
         let expr2 = is_null(root());
-        assert_eq!(expr2.to_string(), "is_null($)");
+        assert_eq!(expr2.to_string(), "vortex.is_null($)");
     }
 
     #[test]
-    fn test_is_null_falsification() {
+    fn test_is_null_falsification() -> VortexResult<()> {
         let expr = is_null(col("a"));
 
-        let (pruning_expr, st) = checked_pruning_expr(
-            &expr,
-            &FieldPathSet::from_iter([FieldPath::from_iter([
-                Field::Name("a".into()),
-                Field::Name("null_count".into()),
-            ])]),
-        )
-        .unwrap();
-
-        assert_eq!(&pruning_expr, &eq(col("a_null_count"), lit(0u64)));
         assert_eq!(
-            st.map(),
-            &HashMap::from_iter([(FieldPath::from_name("a"), HashSet::from([Stat::NullCount]))])
+            expr.falsify(&test_harness::struct_dtype(), &STATS_SESSION)?,
+            Some(or(
+                eq(null_count(col("a")), lit(0u64)),
+                all_non_null(col("a")),
+            ))
         );
+        Ok(())
     }
 
     #[test]
-    fn test_is_null_sensitive() {
-        // is_null itself is null-sensitive
-        assert!(is_null(col("a")).signature().is_null_sensitive());
+    fn test_is_null_is_not_strict() {
+        assert!(!is_null(col("a")).signature().is_strict());
     }
 }

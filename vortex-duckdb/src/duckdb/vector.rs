@@ -3,9 +3,8 @@
 
 use std::ffi::CStr;
 use std::ffi::c_void;
-use std::ptr;
+use std::ops::Range;
 
-use bitvec::macros::internal::funty::Fundamental;
 use bitvec::slice::BitSlice;
 use bitvec::view::BitView;
 use vortex::array::dtype::Nullability;
@@ -17,7 +16,6 @@ use vortex::error::vortex_bail;
 use vortex::mask::Mask;
 
 use crate::cpp;
-use crate::cpp::duckdb_vx_error;
 use crate::cpp::idx_t;
 use crate::duckdb::LogicalType;
 use crate::duckdb::LogicalTypeRef;
@@ -61,6 +59,18 @@ impl Vector {
     /// Create a new vector with the given type and capacity.
     pub fn with_capacity(logical_type: &LogicalTypeRef, len: usize) -> Self {
         unsafe { Self::own(cpp::duckdb_create_vector(logical_type.as_ptr(), len as _)) }
+    }
+
+    /// Create a new vector that references other's element range.
+    /// Both vectors share the same buffer.
+    pub fn slice(other: &VectorRef, range: Range<u64>) -> Self {
+        unsafe {
+            Self::own(cpp::duckdb_vx_vector_slice(
+                other.as_ptr(),
+                range.start,
+                range.end,
+            ))
+        }
     }
 }
 
@@ -147,18 +157,18 @@ impl VectorRef {
         !is_valid
     }
 
-    pub unsafe fn set_vector_buffer(&self, buffer: &VectorBufferRef) {
+    pub unsafe fn set_vector_buffer(&mut self, buffer: &VectorBufferRef) {
         unsafe { cpp::duckdb_vx_vector_set_vector_data_buffer(self.as_ptr(), buffer.as_ptr()) }
     }
 
-    pub fn add_string_vector_buffer(&self, buffer: &VectorBufferRef) {
+    pub fn add_string_vector_buffer(&mut self, buffer: &VectorBufferRef) {
         unsafe {
             cpp::duckdb_vx_string_vector_add_vector_data_buffer(self.as_ptr(), buffer.as_ptr())
         }
     }
 
     /// Sets the data pointer for the vector. This is the start of the values array in the vector.
-    pub unsafe fn set_data_ptr<T>(&self, ptr: *mut T) {
+    pub unsafe fn set_data_ptr<T>(&mut self, ptr: *mut T) {
         unsafe { cpp::duckdb_vx_vector_set_data_ptr(self.as_ptr(), ptr as *mut c_void) }
     }
 
@@ -171,7 +181,7 @@ impl VectorRef {
     /// The data pointer must point to a valid `u64` array with at least
     /// `u64_offset + capacity.div_ceil(64)` elements.
     pub(crate) unsafe fn set_validity_data(
-        &self,
+        &mut self,
         u64_offset: usize,
         capacity: usize,
         zero_copy: &ValidityData,
@@ -269,20 +279,6 @@ impl VectorRef {
         }
     }
 
-    pub fn try_to_string(&self, len: u64) -> VortexResult<String> {
-        let mut err: duckdb_vx_error = ptr::null_mut();
-        let debug =
-            unsafe { cpp::duckdb_vector_to_string(self.as_ptr(), len.as_u64(), &raw mut err) };
-        if !err.is_null() {
-            vortex_bail!("{}", unsafe {
-                CStr::from_ptr(cpp::duckdb_vx_error_value(err)).to_string_lossy()
-            })
-        }
-        let string = unsafe { CStr::from_ptr(debug).to_string_lossy() }.to_string();
-        unsafe { cpp::duckdb_free(debug.cast_mut().cast()) };
-        Ok(string)
-    }
-
     pub fn list_vector_reserve(&self, required_capacity: u64) -> VortexResult<()> {
         let state = unsafe { cpp::duckdb_list_vector_reserve(self.as_ptr(), required_capacity) };
         match state {
@@ -305,6 +301,10 @@ impl VectorRef {
 
     pub fn array_vector_get_child_mut(&mut self) -> &mut Self {
         unsafe { Vector::borrow_mut(cpp::duckdb_array_vector_get_child(self.as_ptr())) }
+    }
+
+    pub fn list_vector_get_size(&self) -> u64 {
+        unsafe { cpp::duckdb_list_vector_get_size(self.as_ptr()) }
     }
 
     pub fn list_vector_set_size(&self, size: u64) -> VortexResult<()> {
@@ -383,7 +383,7 @@ impl ValidityRef<'_> {
 
 #[cfg(test)]
 mod tests {
-    use vortex::array::LEGACY_SESSION;
+    use vortex::array::array_session;
     use vortex::mask::Mask;
     use vortex_array::VortexSessionExecute;
 
@@ -420,7 +420,7 @@ mod tests {
         let validity = validity.to_validity();
         assert_eq!(validity.maybe_len(), Some(len));
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(
             validity.execute_mask(len, &mut ctx).unwrap(),
             Mask::from_indices(len, vec![0, 2, 4, 5, 6, 8, 9])
@@ -438,7 +438,11 @@ mod tests {
 
         let validity = vector.validity_ref(len);
         let validity = validity.to_validity();
-        assert!(validity.is_null(0).unwrap());
+        assert!(
+            validity
+                .execute_is_null(0, &mut array_session().create_execution_ctx())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -451,7 +455,11 @@ mod tests {
 
         let validity = vector.validity_ref(len);
         let validity = validity.to_validity();
-        assert!(validity.is_valid(0).unwrap());
+        assert!(
+            validity
+                .execute_is_valid(0, &mut array_session().create_execution_ctx())
+                .unwrap()
+        );
     }
 
     #[test]

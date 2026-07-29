@@ -7,8 +7,10 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
 
+use prost::Message;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
@@ -17,6 +19,7 @@ use crate::ExecutionCtx;
 use crate::aggregate_fn::AggregateFn;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnRef;
+use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::dtype::DType;
 use crate::scalar::Scalar;
 
@@ -66,10 +69,35 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
         Ok(input_dtype.clone())
     }
 
+    /// Return whether this stored aggregate can satisfy `requested`.
+    ///
+    /// The default implementation only treats exactly equal aggregate functions as satisfying the
+    /// request. Approximate pruning aggregates can override this to expose looser-but-sound bounds.
+    fn can_satisfy(
+        &self,
+        options: &Self::Options,
+        requested: &AggregateFnRef,
+    ) -> AggregateFnSatisfaction {
+        if requested
+            .as_opt::<Self>()
+            .is_some_and(|other| other == options)
+        {
+            AggregateFnSatisfaction::Exact
+        } else {
+            AggregateFnSatisfaction::No
+        }
+    }
+
     /// The return [`DType`] of the aggregate.
     ///
     /// Returns `None` if the aggregate function cannot be applied to the input dtype.
     fn return_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType>;
+
+    /// If this aggregate should be computed as a default zone statistic for `input_dtype`, return
+    /// the bound aggregate to store. Default: not a zone-map default.
+    fn zone_stat_default(&self, _input_dtype: &DType) -> Option<AggregateFnRef> {
+        None
+    }
 
     /// DType of the intermediate partial accumulator state.
     ///
@@ -101,25 +129,6 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
     /// Is the partial accumulator state is "saturated", i.e. has it reached a state where the
     /// final result is fully determined.
     fn is_saturated(&self, state: &Self::Partial) -> bool;
-
-    /// Try to derive a partial scalar from the batch's cached statistics, before any
-    /// kernel dispatch or canonicalization.
-    ///
-    /// Returns `Some(partial_scalar)` if the answer can be read directly from `batch.statistics()`,
-    /// otherwise `Ok(None)` to fall through to the rest of dispatch. The returned scalar must
-    /// have the dtype reported by `partial_dtype`.
-    ///
-    /// This is the single place stats-based shortcuts live; encoding kernels must not consult
-    /// stats themselves. Runs first so that an upstream producer who pre-populates the relevant
-    /// stat (e.g. a layout reader hydrating `Stat::UncompressedSizeInBytes` from file metadata)
-    /// can skip both kernel dispatch and decode.
-    ///
-    /// TODO: this hook may be removed once `ArrayStats` stores aggregate partials internally —
-    /// at that point stat-driven shortcuts can be resolved automatically by the dispatch layer
-    /// without each aggregate vtable opting in.
-    fn try_partial_from_stats(&self, _batch: &ArrayRef) -> VortexResult<Option<Scalar>> {
-        Ok(None)
-    }
 
     /// Try to accumulate the raw array before decompression.
     ///
@@ -163,6 +172,73 @@ pub struct EmptyOptions;
 impl Display for EmptyOptions {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "")
+    }
+}
+
+/// Options for aggregate functions over primitive numeric inputs, controlling how NaN values in
+/// floating-point arrays are handled.
+///
+/// When `skip_nans` is `true` (the default), NaN values are treated as missing: they contribute
+/// nothing to `sum`/`min`/`max`/`mean` and are excluded from `count`.
+///
+/// When `skip_nans` is `false`, NaN values participate in the aggregate: `count` includes them,
+/// while any NaN value poisons the result of `sum`/`min`/`max`/`mean` to NaN.
+///
+/// The option has no effect on non-float inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NumericalAggregateOpts {
+    /// Whether NaN values are skipped (treated as missing) during aggregation.
+    pub skip_nans: bool,
+}
+
+impl NumericalAggregateOpts {
+    /// Options that skip NaN values, treating them as missing during aggregation.
+    ///
+    /// This is the default configuration; see [`NumericalAggregateOpts::include_nans`] for the
+    /// NaN-including variant.
+    pub const fn skip_nans() -> Self {
+        Self { skip_nans: true }
+    }
+
+    /// Options that include NaN values in the aggregate: `count` counts them, while any NaN
+    /// poisons the result of `sum`/`min`/`max`/`mean` to NaN.
+    ///
+    /// See [`NumericalAggregateOpts::skip_nans`] for the default NaN-skipping variant.
+    pub const fn include_nans() -> Self {
+        Self { skip_nans: false }
+    }
+
+    /// Serialize these options to protobuf-encoded metadata bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        pb::NumericalAggregateOpts {
+            skip_nans: self.skip_nans,
+        }
+        .encode_to_vec()
+    }
+
+    /// Deserialize these options from protobuf-encoded metadata bytes.
+    pub fn deserialize(metadata: &[u8]) -> VortexResult<Self> {
+        let opts = pb::NumericalAggregateOpts::decode(metadata)?;
+        Ok(Self {
+            skip_nans: opts.skip_nans,
+        })
+    }
+}
+
+impl Default for NumericalAggregateOpts {
+    fn default() -> Self {
+        Self::skip_nans()
+    }
+}
+
+impl Display for NumericalAggregateOpts {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // Only the non-default configuration is displayed, so that aggregates with default
+        // options render identically to their pre-options form, e.g. `vortex.sum()`.
+        if !self.skip_nans {
+            write!(f, "skip_nans=false")?;
+        }
+        Ok(())
     }
 }
 

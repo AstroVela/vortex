@@ -15,10 +15,10 @@ use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
-use vortex_array::Precision;
 use vortex_array::array_slots;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::TemporalArray;
@@ -42,7 +42,6 @@ use vortex_session::registry::CachedId;
 
 use crate::TemporalParts;
 use crate::canonical::decode_to_temporal;
-use crate::compute::kernel::PARENT_KERNELS;
 use crate::compute::rules::PARENT_RULES;
 use crate::split_temporal;
 
@@ -50,11 +49,11 @@ use crate::split_temporal;
 pub type DateTimePartsArray = Array<DateTimeParts>;
 
 impl ArrayHash for DateTimePartsData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {}
 }
 
 impl ArrayEq for DateTimePartsData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         true
     }
 }
@@ -121,6 +120,14 @@ impl VTable for DateTimeParts {
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
         vortex_panic!("DateTimePartsArray buffer_name index {idx} out of bounds")
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_array::vtable::with_empty_buffers(self, array, buffers)
     }
 
     fn serialize(
@@ -200,24 +207,18 @@ impl VTable for DateTimeParts {
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
-    }
 }
 
 #[array_slots(DateTimeParts)]
 pub struct DateTimePartsSlots {
     /// The days component of the datetime, stored as an integer array.
+    #[slot(0)]
     pub days: ArrayRef,
     /// The seconds component of the datetime (within the day).
+    #[slot(1)]
     pub seconds: ArrayRef,
     /// The sub-second component of the datetime.
+    #[slot(2)]
     pub subseconds: ArrayRef,
 }
 

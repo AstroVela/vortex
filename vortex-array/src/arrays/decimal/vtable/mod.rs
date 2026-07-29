@@ -3,7 +3,6 @@
 
 use std::hash::Hasher;
 
-use kernel::PARENT_KERNELS;
 use prost::Message;
 use vortex_buffer::Alignment;
 use vortex_error::VortexResult;
@@ -12,6 +11,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
@@ -20,6 +20,8 @@ use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::decimal::DecimalData;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::builders::DecimalBuilder;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
@@ -34,14 +36,18 @@ use std::hash::Hash;
 
 use vortex_session::registry::CachedId;
 
-use crate::Precision;
+use crate::EqMode;
 use crate::array::ArrayId;
-use crate::arrays::decimal::array::SLOT_NAMES;
+use crate::arrays::decimal::array::DecimalSlots;
 use crate::arrays::decimal::compute::rules::RULES;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
 /// A [`Decimal`]-encoded Vortex array.
 pub type DecimalArray = Array<Decimal>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
 
 // The type of the values can be determined by looking at the type info...right?
 #[derive(prost::Message)]
@@ -51,15 +57,15 @@ pub struct DecimalMetadata {
 }
 
 impl ArrayHash for DecimalData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        self.values.array_hash(state, precision);
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
+        self.values.array_hash(state, accuracy);
         std::mem::discriminant(&self.values_type).hash(state);
     }
 }
 
 impl ArrayEq for DecimalData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        self.values.array_eq(&other.values, precision) && self.values_type == other.values_type
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
+        self.values.array_eq(&other.values, accuracy) && self.values_type == other.values_type
     }
 }
 
@@ -92,6 +98,24 @@ impl VTable for Decimal {
         }
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+        let mut data = array.data().clone();
+        data.values = buffers[0].clone();
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
+    }
+
     fn serialize(
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -121,7 +145,8 @@ impl VTable for Decimal {
             data.len(),
             len
         );
-        let validity = crate::array::child_to_validity(slots[0].as_ref(), *nullability);
+        let validity =
+            crate::array::child_to_validity(slots[DecimalSlots::VALIDITY].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == len,
@@ -140,11 +165,10 @@ impl VTable for Decimal {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         let metadata = DecimalMetadata::decode(metadata)?;
         if buffers.len() != 1 {
             vortex_bail!("Expected 1 buffer, got {}", buffers.len());
@@ -174,15 +198,26 @@ impl VTable for Decimal {
             );
             DecimalData::try_new_handle(values, metadata.values_type(), *decimal_dtype)
         })?;
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        DecimalSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         Ok(ExecutionResult::done(array))
+    }
+
+    fn append_to_builder(
+        array: ArrayView<'_, Self>,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        let Some(builder) = builder.as_any_mut().downcast_mut::<DecimalBuilder>() else {
+            vortex_bail!("append_to_builder for Decimal requires a DecimalBuilder");
+        };
+        builder.append_decimal_array(&array.into_owned(), ctx)
     }
 
     fn reduce_parent(
@@ -191,15 +226,6 @@ impl VTable for Decimal {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }
 
@@ -214,7 +240,8 @@ mod tests {
 
     use crate::ArrayContext;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::Decimal;
     use crate::arrays::DecimalArray;
     use crate::assert_arrays_eq;
@@ -225,6 +252,7 @@ mod tests {
 
     #[test]
     fn test_array_serde() {
+        let session = array_session();
         let array = DecimalArray::new(
             buffer![100i128, 200i128, 300i128, 400i128, 500i128],
             DecimalDType::new(10, 2),
@@ -232,10 +260,10 @@ mod tests {
         );
         let dtype = array.dtype().clone();
 
-        let ctx = ArrayContext::empty();
+        let array_ctx = ArrayContext::empty();
         let out = array
             .into_array()
-            .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
+            .serialize(&array_ctx, &session, &SerializeOptions::default())
             .unwrap();
         // Concat into a single buffer
         let mut concat = ByteBufferMut::empty();
@@ -247,13 +275,15 @@ mod tests {
 
         let parts = SerializedArray::try_from(concat).unwrap();
         let decoded = parts
-            .decode(&dtype, 5, &ReadContext::new(ctx.to_ids()), &LEGACY_SESSION)
+            .decode(&dtype, 5, &ReadContext::new(array_ctx.to_ids()), &session)
             .unwrap();
         assert!(decoded.is::<Decimal>());
     }
 
     #[test]
     fn test_nullable_decimal_serde_roundtrip() {
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
         let array = DecimalArray::new(
             buffer![1234567i32, 0i32, -9999999i32],
             DecimalDType::new(7, 3),
@@ -262,11 +292,11 @@ mod tests {
         let dtype = array.dtype().clone();
         let len = array.len();
 
-        let ctx = ArrayContext::empty();
+        let array_ctx = ArrayContext::empty();
         let out = array
             .clone()
             .into_array()
-            .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
+            .serialize(&array_ctx, &session, &SerializeOptions::default())
             .unwrap();
         let mut concat = ByteBufferMut::empty();
         for buf in out {
@@ -275,14 +305,9 @@ mod tests {
 
         let parts = SerializedArray::try_from(concat.freeze()).unwrap();
         let decoded = parts
-            .decode(
-                &dtype,
-                len,
-                &ReadContext::new(ctx.to_ids()),
-                &LEGACY_SESSION,
-            )
+            .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &session)
             .unwrap();
 
-        assert_arrays_eq!(decoded, array);
+        assert_arrays_eq!(decoded, array, &mut ctx);
     }
 }

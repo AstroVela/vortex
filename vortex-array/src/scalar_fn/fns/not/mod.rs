@@ -3,12 +3,11 @@
 
 mod kernel;
 
-use std::fmt::Formatter;
-
 pub use kernel::*;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -19,7 +18,6 @@ use crate::arrays::ConstantArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
-use crate::expr::Expression;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
@@ -36,7 +34,8 @@ impl ScalarFnVTable for Not {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.not")
+        static ID: CachedId = CachedId::new("vortex.not");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -60,17 +59,6 @@ impl ScalarFnVTable for Not {
             0 => ChildName::from("input"),
             _ => unreachable!("Invalid child index {} for Not expression", child_idx),
         }
-    }
-
-    fn fmt_sql(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "not(")?;
-        expr.child(0).fmt_sql(f)?;
-        write!(f, ")")
     }
 
     fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -110,8 +98,8 @@ impl ScalarFnVTable for Not {
         child.execute::<ArrayRef>(ctx)?.not()
     }
 
-    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {
@@ -121,10 +109,13 @@ impl ScalarFnVTable for Not {
 
 #[cfg(test)]
 mod tests {
+    use vortex_error::VortexResult;
+
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::bool::BoolArrayExt;
+    use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::expr::col;
@@ -135,11 +126,36 @@ mod tests {
     use crate::scalar_fn::fns::not::BoolArray;
 
     #[test]
+    fn is_strict() {
+        assert!(not(root()).signature().is_strict());
+    }
+
+    #[test]
+    fn preserves_nulls() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let input = BoolArray::from_iter([Some(false), None, Some(true)]).into_array();
+
+        let result = input.apply(&not(root()))?;
+
+        assert_arrays_eq!(
+            result,
+            BoolArray::from_iter([Some(true), None, Some(false)]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
     fn invert_booleans() {
+        let mut ctx = array_session().create_execution_ctx();
         let not_expr = not(root());
         let bools = BoolArray::from_iter([false, true, false, false, true, true]);
-        #[expect(deprecated)]
-        let result = bools.into_array().apply(&not_expr).unwrap().to_bool();
+        let result = bools
+            .into_array()
+            .apply(&not_expr)
+            .unwrap()
+            .execute::<BoolArray>(&mut ctx)
+            .unwrap();
         assert_eq!(
             result.to_bit_buffer().iter().collect::<Vec<_>>(),
             vec![true, false, true, true, false, false]
@@ -151,8 +167,8 @@ mod tests {
         let a = not(get_item("a", root()));
         let b = get_item("a", not(root()));
         assert_ne!(a.to_string(), b.to_string());
-        assert_eq!(a.to_string(), "not($.a)");
-        assert_eq!(b.to_string(), "not($).a");
+        assert_eq!(a.to_string(), "vortex.not($.a)");
+        assert_eq!(b.to_string(), "vortex.not($).a");
     }
 
     #[test]

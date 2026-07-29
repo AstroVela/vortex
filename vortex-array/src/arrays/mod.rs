@@ -1,7 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! All the built-in encoding schemes and arrays.
+//! Built-in array encodings.
+//!
+//! Canonical arrays are the default uncompressed representation for a logical dtype:
+//! [`NullArray`], [`BoolArray`], [`PrimitiveArray`], [`DecimalArray`], [`VarBinViewArray`],
+//! [`ListViewArray`], [`FixedSizeListArray`], [`StructArray`], [`UnionArray`],
+//! [`ExtensionArray`], and [`VariantArray`].
+//!
+//! Utility and lazy arrays represent common transformations without immediately materializing
+//! their result. Examples include [`ChunkedArray`] for concatenation, [`ConstantArray`] for repeated
+//! values, [`DictArray`] for dictionary encoding, [`FilterArray`] for masked rows, [`SliceArray`]
+//! for views, and [`ScalarFnArray`] for deferred scalar-function execution.
+//!
+//! Some public arrays are primarily internal building blocks. Their constructors and extension
+//! traits document the stable contract; avoid depending on undocumented slot order or metadata
+//! details.
 
 #[cfg(any(test, feature = "_test-harness"))]
 mod assertions;
@@ -50,6 +64,10 @@ pub mod fixed_size_list;
 pub use fixed_size_list::FixedSizeList;
 pub use fixed_size_list::FixedSizeListArray;
 
+pub mod interleave;
+pub use interleave::Interleave;
+pub use interleave::InterleaveArray;
+
 pub mod list;
 pub use list::List;
 pub use list::ListArray;
@@ -69,6 +87,10 @@ pub use null::NullArray;
 pub mod patched;
 pub use patched::Patched;
 pub use patched::PatchedArray;
+
+pub mod piecewise_sequence;
+pub use piecewise_sequence::PiecewiseSequence;
+pub use piecewise_sequence::PiecewiseSequenceArray;
 
 pub mod primitive;
 pub use primitive::Primitive;
@@ -90,6 +112,10 @@ pub mod struct_;
 pub use struct_::Struct;
 pub use struct_::StructArray;
 
+pub mod union;
+pub use union::Union;
+pub use union::UnionArray;
+
 pub mod varbin;
 pub use varbin::VarBin;
 pub use varbin::VarBinArray;
@@ -101,6 +127,25 @@ pub use varbinview::VarBinViewArray;
 pub mod variant;
 pub use variant::Variant;
 pub use variant::VariantArray;
+use vortex_session::VortexSession;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    bool::initialize(session);
+    chunked::initialize(session);
+    decimal::initialize(session);
+    dict::initialize(session);
+    extension::initialize(session);
+    filter::initialize(session);
+    fixed_size_list::initialize(session);
+    list::initialize(session);
+    listview::initialize(session);
+    patched::initialize(session);
+    primitive::initialize(session);
+    struct_::initialize(session);
+    varbin::initialize(session);
+    varbinview::initialize(session);
+    variant::initialize(session);
+}
 
 #[cfg(feature = "arbitrary")]
 pub mod arbitrary;

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::EmptyMetadata;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::extension::ExtDType;
 use vortex_array::dtype::extension::ExtId;
 use vortex_array::dtype::extension::ExtVTable;
-use vortex_array::extension::EmptyMetadata;
 use vortex_array::scalar::ScalarValue;
 use vortex_error::VortexResult;
+use vortex_session::registry::CachedId;
 
 use crate::types::vector::Vector;
 use crate::types::vector::validate_vector_storage_dtype;
@@ -19,7 +20,8 @@ impl ExtVTable for Vector {
     type NativeValue<'a> = &'a ScalarValue;
 
     fn id(&self) -> ExtId {
-        ExtId::new("vortex.tensor.vector")
+        static ID: CachedId = CachedId::new("vortex.tensor.vector");
+        *ID
     }
 
     fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
@@ -61,12 +63,12 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use vortex_array::EmptyMetadata;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::dtype::extension::ExtDType;
     use vortex_array::dtype::extension::ExtVTable;
-    use vortex_array::extension::EmptyMetadata;
     use vortex_error::VortexResult;
 
     use crate::types::vector::Vector;

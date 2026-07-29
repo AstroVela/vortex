@@ -7,6 +7,8 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use self::primitive::accumulate_primitive;
 use crate::ArrayRef;
@@ -29,10 +31,12 @@ use crate::scalar::ScalarValue;
 
 /// Return the number of NaN values in an array.
 ///
+/// Null values are not NaN and are not counted.
+///
 /// See [`NanCount`] for details.
 pub fn nan_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usize> {
     // Short-circuit using cached array statistics.
-    if let Some(Precision::Exact(nan_count_scalar)) = array.statistics().get(Stat::NaNCount) {
+    if let Precision::Exact(nan_count_scalar) = array.statistics().get(Stat::NaNCount) {
         return usize::try_from(&nan_count_scalar)
             .map_err(|e| vortex_err!("Failed to convert NaN count stat to usize: {e}"));
     }
@@ -72,7 +76,7 @@ pub fn nan_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usize
 /// Count the number of NaN values in an array.
 ///
 /// Only applies to floating-point primitive types. Returns a `u64` count.
-/// If the array is all-invalid, the NaN count is zero.
+/// Null values are not NaN, so if the array is all-invalid, the NaN count is zero.
 #[derive(Clone, Debug)]
 pub struct NanCount;
 
@@ -81,11 +85,20 @@ impl AggregateFnVTable for NanCount {
     type Partial = u64;
 
     fn id(&self) -> AggregateFnId {
-        AggregateFnId::new("vortex.nan_count")
+        static ID: CachedId = CachedId::new("vortex.nan_count");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("NanCount is not yet serializable");
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
     }
 
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
@@ -174,7 +187,6 @@ mod tests {
     use vortex_error::VortexResult;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::Accumulator;
     use crate::aggregate_fn::AggregateFnVTable;
@@ -182,6 +194,7 @@ mod tests {
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::nan_count::NanCount;
     use crate::aggregate_fn::fns::nan_count::nan_count;
+    use crate::array_session;
     use crate::arrays::ChunkedArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
@@ -193,7 +206,7 @@ mod tests {
 
     #[test]
     fn nan_count_multi_batch() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(NanCount, EmptyOptions, dtype)?;
 
@@ -213,7 +226,7 @@ mod tests {
 
     #[test]
     fn nan_count_finish_resets_state() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(NanCount, EmptyOptions, dtype)?;
 
@@ -251,7 +264,7 @@ mod tests {
     #[test]
     fn nan_count_constant_nan() -> VortexResult<()> {
         let array = ConstantArray::new(f64::NAN, 10);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(nan_count(&array.into_array(), &mut ctx)?, 10);
         Ok(())
     }
@@ -259,7 +272,7 @@ mod tests {
     #[test]
     fn nan_count_constant_non_nan() -> VortexResult<()> {
         let array = ConstantArray::new(1.0f64, 10);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(nan_count(&array.into_array(), &mut ctx)?, 0);
         Ok(())
     }
@@ -279,7 +292,7 @@ mod tests {
         let chunk2 = PrimitiveArray::from_option_iter([Some(f64::NAN), Some(f64::NAN), None]);
         let dtype = chunk1.dtype().clone();
         let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(nan_count(&chunked.into_array(), &mut ctx)?, 3);
         Ok(())
     }
@@ -287,7 +300,7 @@ mod tests {
     #[test]
     fn nan_count_all_null() -> VortexResult<()> {
         let p = PrimitiveArray::from_option_iter::<f64, _>([None, None, None]);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(nan_count(&p.into_array(), &mut ctx)?, 0);
         Ok(())
     }

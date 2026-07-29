@@ -13,6 +13,7 @@ use std::fmt::Formatter;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_session::registry::CachedId;
 
 use self::bool::check_bool_sorted;
 use self::decimal::check_decimal_sorted;
@@ -77,7 +78,7 @@ fn is_sorted_impl(array: &ArrayRef, strict: bool, ctx: &mut ExecutionCtx) -> Vor
     };
 
     // Short-circuit using cached array statistics.
-    if let Some(Precision::Exact(value)) = array.statistics().get_as::<bool>(stat) {
+    if let Precision::Exact(value) = array.statistics().get_as::<bool>(stat) {
         return Ok(value);
     }
 
@@ -232,7 +233,8 @@ impl AggregateFnVTable for IsSorted {
     type Partial = IsSortedPartial;
 
     fn id(&self) -> AggregateFnId {
-        AggregateFnId::new("vortex.is_sorted")
+        static ID: CachedId = CachedId::new("vortex.is_sorted");
+        *ID
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -245,7 +247,7 @@ impl AggregateFnVTable for IsSorted {
             | DType::List(..)
             | DType::FixedSizeList(..)
             | DType::Struct(..)
-            | DType::Union(_)
+            | DType::Union(..)
             | DType::Variant(..)
             | DType::Extension(_) => None,
             DType::Bool(_)
@@ -262,7 +264,7 @@ impl AggregateFnVTable for IsSorted {
             | DType::List(..)
             | DType::FixedSizeList(..)
             | DType::Struct(..)
-            | DType::Union(_)
+            | DType::Union(..)
             | DType::Variant(..)
             | DType::Extension(_) => None,
             DType::Bool(_)
@@ -487,7 +489,7 @@ impl AggregateFnVTable for IsSorted {
                 let batch_is_sorted = match c {
                     Canonical::Primitive(p) => check_primitive_sorted(p, partial.strict, ctx)?,
                     Canonical::Bool(b) => check_bool_sorted(b, partial.strict, ctx)?,
-                    Canonical::VarBinView(v) => check_varbinview_sorted(v, partial.strict)?,
+                    Canonical::VarBinView(v) => check_varbinview_sorted(v, partial.strict, ctx)?,
                     Canonical::Decimal(d) => check_decimal_sorted(d, partial.strict, ctx)?,
                     Canonical::Extension(e) => check_extension_sorted(e, partial.strict, ctx)?,
                     Canonical::Null(_) => !partial.strict,
@@ -558,10 +560,10 @@ mod tests {
     use vortex_error::VortexResult;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::fns::is_sorted::is_sorted;
     use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
+    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
     use crate::validity::Validity;
@@ -569,7 +571,7 @@ mod tests {
     // Tests migrated from compute/is_sorted.rs
     #[test]
     fn test_is_sorted() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let arr = PrimitiveArray::new(buffer!(0, 1, 2, 3), Validity::AllValid).into_array();
         assert!(is_sorted(&arr, &mut ctx)?);
@@ -603,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_is_strict_sorted() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
 
         let arr = PrimitiveArray::new(buffer!(0, 1, 2, 3), Validity::AllValid).into_array();
         assert!(is_strict_sorted(&arr, &mut ctx)?);
@@ -640,7 +642,7 @@ mod tests {
     #[case(PrimitiveArray::from_option_iter([None, None, Some(1i32), Some(1)]), true)]
     #[case(PrimitiveArray::from_option_iter([None, Some(5_u8), None]), false)]
     fn test_primitive_is_sorted(#[case] array: PrimitiveArray, #[case] expected: bool) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(
             is_sorted(&array.into_array(), &mut ctx)
                 .vortex_expect("operation should succeed in test"),
@@ -655,7 +657,7 @@ mod tests {
     #[case(PrimitiveArray::from_option_iter([None, None, Some(1i32), Some(1), None]), false)]
     #[case(PrimitiveArray::from_option_iter([None, Some(5_u8), None]), false)]
     fn test_primitive_is_strict_sorted(#[case] array: PrimitiveArray, #[case] expected: bool) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         assert_eq!(
             is_strict_sorted(&array.into_array(), &mut ctx)
                 .vortex_expect("operation should succeed in test"),
@@ -666,16 +668,14 @@ mod tests {
     // Tests migrated from arrays/decimal/compute/is_sorted.rs
     #[test]
     fn test_decimal_is_sorted() -> VortexResult<()> {
-        use arrow_array::types::Decimal128Type;
-        use arrow_cast::parse::parse_decimal;
-
         use crate::arrays::DecimalArray;
         use crate::dtype::DecimalDType;
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let dtype = DecimalDType::new(19, 2);
-        let i100 = parse_decimal::<Decimal128Type>("100.00", dtype.precision(), dtype.scale())?;
-        let i200 = parse_decimal::<Decimal128Type>("200.00", dtype.precision(), dtype.scale())?;
+        // "100.00" and "200.00" at scale 2.
+        let i100 = 10_000i128;
+        let i200 = 20_000i128;
 
         let sorted = buffer![i100, i200, i200];
         let unsorted = buffer![i200, i100, i200];
@@ -691,17 +691,14 @@ mod tests {
 
     #[test]
     fn test_decimal_is_strict_sorted() -> VortexResult<()> {
-        use arrow_array::types::Decimal128Type;
-        use arrow_cast::parse::parse_decimal;
-
         use crate::arrays::DecimalArray;
         use crate::dtype::DecimalDType;
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let dtype = DecimalDType::new(19, 2);
-        let i100 = parse_decimal::<Decimal128Type>("100.00", dtype.precision(), dtype.scale())?;
-        let i200 = parse_decimal::<Decimal128Type>("200.00", dtype.precision(), dtype.scale())?;
-        let i300 = parse_decimal::<Decimal128Type>("300.00", dtype.precision(), dtype.scale())?;
+        let mut ctx = array_session().create_execution_ctx();
+        // "100.00", "200.00" and "300.00" at scale 2.
+        let i100 = 10_000i128;
+        let i200 = 20_000i128;
+        let i300 = 30_000i128;
 
         let strict_sorted = buffer![i100, i200, i300];
         let sorted = buffer![i100, i200, i200];

@@ -4,13 +4,10 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use vortex_array::ArrayContext;
-use vortex_array::ArrayId;
 use vortex_array::dtype::DType;
 use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProvider;
-use vortex_array::normalize::NormalizeOptions;
-use vortex_array::normalize::Operation;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarTruncation;
 use vortex_array::scalar::lower_bound;
@@ -24,11 +21,11 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
-use vortex_utils::aliases::hash_set::HashSet;
 
-use crate::IntoLayout;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
+use crate::children::OwnedLayoutChildren;
+use crate::layouts::chunked::ChunkedLayout;
 use crate::layouts::flat::FlatLayout;
 use crate::layouts::flat::flat_layout_inline_array_node;
 use crate::segments::SegmentSinkRef;
@@ -41,9 +38,6 @@ pub struct FlatLayoutStrategy {
     pub include_padding: bool,
     /// Maximum length of variable length statistics
     pub max_variable_length_statistics_size: usize,
-    /// Optional set of allowed array encodings for normalization.
-    /// If None, then all are allowed.
-    pub allowed_encodings: Option<HashSet<ArrayId>>,
 }
 
 impl Default for FlatLayoutStrategy {
@@ -51,7 +45,6 @@ impl Default for FlatLayoutStrategy {
         Self {
             include_padding: true,
             max_variable_length_statistics_size: 64,
-            allowed_encodings: None,
         }
     }
 }
@@ -68,12 +61,6 @@ impl FlatLayoutStrategy {
         self.max_variable_length_statistics_size = size;
         self
     }
-
-    /// Set the allowed array encodings for normalization.
-    pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
-        self.allowed_encodings = Some(allow_encodings);
-        self
-    }
 }
 
 fn truncate_scalar_stat<F: Fn(Scalar) -> Option<(Scalar, bool)>>(
@@ -81,8 +68,8 @@ fn truncate_scalar_stat<F: Fn(Scalar) -> Option<(Scalar, bool)>>(
     stat: Stat,
     truncation: F,
 ) {
-    if let Some(sv) = statistics.get(stat) {
-        if let Some((truncated_value, truncated)) = truncation(sv.into_inner()) {
+    if let Some(sv) = statistics.get(stat).into_inner() {
+        if let Some((truncated_value, truncated)) = truncation(sv) {
             if truncated && let Some(v) = truncated_value.into_value() {
                 statistics.set(stat, Precision::Inexact(v));
             }
@@ -104,7 +91,13 @@ impl LayoutStrategy for FlatLayoutStrategy {
     ) -> VortexResult<LayoutRef> {
         let ctx = ctx.clone();
         let Some(chunk) = stream.next().await else {
-            vortex_bail!("flat layout needs a single chunk");
+            // an empty input has no segment to write.
+            return Ok(ChunkedLayout::new(
+                0,
+                stream.dtype().clone(),
+                OwnedLayoutChildren::layout_children(vec![]),
+            )
+            .into_layout());
         };
         let (sequence_id, chunk) = chunk?;
 
@@ -150,15 +143,6 @@ impl LayoutStrategy for FlatLayoutStrategy {
             _ => {}
         }
 
-        let chunk = if let Some(allowed) = &self.allowed_encodings {
-            chunk.normalize(&mut NormalizeOptions {
-                allowed,
-                operation: Operation::Error,
-            })?
-        } else {
-            chunk
-        };
-
         let buffers = chunk.serialize(
             &ctx,
             session,
@@ -199,9 +183,9 @@ mod tests {
     use vortex_array::ArrayContext;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::Dict;
     use vortex_array::arrays::DictArray;
@@ -231,11 +215,13 @@ mod tests {
     use vortex_utils::aliases::hash_set::HashSet;
 
     use crate::LayoutStrategy;
+    use crate::LayoutStrategyEncodingValidator;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::test::SESSION;
+    use crate::test::new_session;
 
     // Currently, flat layouts do not force compute stats during write, they only retain
     // pre-computed stats.
@@ -243,7 +229,7 @@ mod tests {
     #[test]
     fn flat_stats() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -260,7 +246,7 @@ mod tests {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -273,7 +259,7 @@ mod tests {
 
             assert_eq!(
                 result.statistics().get_as::<bool>(Stat::IsSorted),
-                Some(Precision::Exact(true))
+                Precision::Exact(true)
             );
         })
     }
@@ -281,7 +267,7 @@ mod tests {
     #[test]
     fn truncates_variable_size_stats() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -311,7 +297,7 @@ mod tests {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -325,16 +311,16 @@ mod tests {
             assert_eq!(
                 result.statistics().get_as::<String>(Stat::Min),
                 // The typo is correct, we need this to be truncated.
-                Some(Precision::Inexact(
+                Precision::Inexact(
                     // spellchecker:ignore-next-line
                     "Another string that's meant to be smaller than the previous valu".to_string()
-                ))
+                )
             );
             assert_eq!(
                 result.statistics().get_as::<String>(Stat::Max),
-                Some(Precision::Inexact(
+                Precision::Inexact(
                     "Long value to test that the statistics are actually truncated, j".to_string()
-                ))
+                )
             );
         })
     }
@@ -342,8 +328,8 @@ mod tests {
     #[test]
     fn struct_array_round_trip() {
         block_on(|handle| async {
-            let mut ctx_exec = LEGACY_SESSION.create_execution_ctx();
-            let session = SESSION.clone().with_handle(handle);
+            let mut ctx_exec = array_session().create_execution_ctx();
+            let session = new_session().with_handle(handle);
             let mut validity_builder = BitBufferMut::with_capacity(2);
             validity_builder.append(true);
             validity_builder.append(false);
@@ -384,7 +370,7 @@ mod tests {
 
             // We should be able to read the array we just wrote.
             let result: ArrayRef = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -429,7 +415,7 @@ mod tests {
     #[test]
     fn flat_invalid_array_fails() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let prim: PrimitiveArray = (0..10).collect();
             let filter = prim.filter(Mask::from_indices(10, vec![2, 3]))?;
 
@@ -441,16 +427,16 @@ mod tests {
                 let (ptr, eof) = SequenceId::root().split();
                 // Disallow all encodings so filter arrays fail normalization immediately.
                 let allowed = HashSet::default();
-                let layout = FlatLayoutStrategy::default()
-                    .with_allow_encodings(allowed)
-                    .write_stream(
-                        ctx,
-                        Arc::<TestSegments>::clone(&segments),
-                        filter.into_array().to_array_stream().sequenced(ptr),
-                        eof,
-                        &session,
-                    )
-                    .await;
+                let layout =
+                    LayoutStrategyEncodingValidator::new(FlatLayoutStrategy::default(), allowed)
+                        .write_stream(
+                            ctx,
+                            Arc::<TestSegments>::clone(&segments),
+                            filter.into_array().to_array_stream().sequenced(ptr),
+                            eof,
+                            &session,
+                        )
+                        .await;
 
                 (layout, segments)
             };
@@ -469,7 +455,7 @@ mod tests {
     #[test]
     fn flat_valid_array_writes() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let codes: PrimitiveArray = (0u32..10).collect();
             let values: PrimitiveArray = (0..10).collect();
             let dict = DictArray::new(codes.into_array(), values.into_array());
@@ -483,16 +469,16 @@ mod tests {
                 // Only allow the dict encoding; canonical primitive children remain permitted.
                 let mut allowed = HashSet::default();
                 allowed.insert(Dict.id());
-                let layout = FlatLayoutStrategy::default()
-                    .with_allow_encodings(allowed)
-                    .write_stream(
-                        ctx,
-                        Arc::<TestSegments>::clone(&segments),
-                        dict.into_array().to_array_stream().sequenced(ptr),
-                        eof,
-                        &session,
-                    )
-                    .await;
+                let layout =
+                    LayoutStrategyEncodingValidator::new(FlatLayoutStrategy::default(), allowed)
+                        .write_stream(
+                            ctx,
+                            Arc::<TestSegments>::clone(&segments),
+                            dict.into_array().to_array_stream().sequenced(ptr),
+                            eof,
+                            &session,
+                        )
+                        .await;
 
                 (layout, segments)
             };

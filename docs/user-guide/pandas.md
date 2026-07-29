@@ -10,6 +10,7 @@ convert:
 ```{doctest} pycon
 >>> import vortex as vx
 >>> import pyarrow.parquet as pq
+>>>
 >>> vx.io.write(pq.read_table("_static/example.parquet"), 'example.vortex')
 >>>
 >>> f = vx.open('example.vortex')
@@ -37,17 +38,18 @@ convert:
 ... {'name': 'Mikhail', 'age': 57},
 ... ])
 >>> struct_arr.to_pandas()
-      age      name
-   0   25    Joseph
-   1   31  Narendra
-   2   33    Angela
-   3   57   Mikhail
+       name  age
+0    Joseph   25
+1  Narendra   31
+2    Angela   33
+3   Mikhail   57
 ```
 
 {func}`~vortex.array` converts from a Pandas DataFrame into a Vortex array:
 
 ```{doctest} pycon
 >>> import pandas as pd
+>>>
 >>> df = pd.DataFrame({'age': [25, 31, 33, 57], 'name': ['Joseph', 'Narendra', 'Angela', 'Mikhail']})
 >>> vx.array(df).to_arrow_table()
 pyarrow.Table

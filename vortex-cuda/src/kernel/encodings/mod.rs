@@ -16,10 +16,13 @@ mod zstd_buffers;
 
 pub(crate) use alp::ALPExecutor;
 pub(crate) use bitpacked::BitPackedExecutor;
+pub(crate) use bitpacked::bitpacked_slice_view;
 pub(crate) use date_time_parts::DateTimePartsExecutor;
 pub(crate) use decimal_byte_parts::DecimalBytePartsExecutor;
 pub(crate) use for_::FoRExecutor;
 pub(crate) use fsst::FSSTExecutor;
+pub(crate) use fsst::FSSTVarBin;
+pub(crate) use fsst::decode_fsst_varbin;
 pub(crate) use runend::RunEndExecutor;
 pub(crate) use sequence::SequenceExecutor;
 pub(crate) use zigzag::ZigZagExecutor;

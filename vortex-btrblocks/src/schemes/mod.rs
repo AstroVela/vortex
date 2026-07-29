@@ -3,7 +3,7 @@
 
 //! Compression scheme implementations.
 
-pub mod bool;
+pub mod binary;
 pub mod float;
 pub mod integer;
 pub mod string;
@@ -13,6 +13,7 @@ pub mod temporal;
 
 pub(crate) mod patches;
 
+use vortex_compressor::builtins::BinaryDictScheme;
 use vortex_compressor::builtins::FloatDictScheme;
 use vortex_compressor::builtins::IntDictScheme;
 use vortex_compressor::builtins::StringDictScheme;
@@ -61,6 +62,10 @@ fn rle_ancestor_exclusions() -> Vec<AncestorExclusion> {
         },
         AncestorExclusion {
             ancestor: StringDictScheme.id(),
+            children: ChildSelection::One(0),
+        },
+        AncestorExclusion {
+            ancestor: BinaryDictScheme.id(),
             children: ChildSelection::One(0),
         },
     ]

@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pd
 import pytest
+import vortex.dataset as vx_dataset
 
 import vortex as vx
 
@@ -36,14 +37,14 @@ def ds(tmpdir_factory) -> vx.dataset.VortexDataset:  # pyright: ignore[reportUnk
 
 def test_schema(ds: pd.Dataset):
     assert ds.schema == pa.schema(
-        [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.string_view())]
+        [("index", pa.int64()), ("string", pa.string_view()), ("bool", pa.bool_()), ("float", pa.float64())]
     )
 
 
 def test_scanner_schema(ds: vx.dataset.VortexDataset):
     scanner = vx.dataset.VortexScanner(ds)
     assert scanner.schema == pa.schema(
-        [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.string_view())]
+        [("index", pa.int64()), ("string", pa.string_view()), ("bool", pa.bool_()), ("float", pa.float64())]
     )
 
 
@@ -69,6 +70,48 @@ def test_to_batches(ds: pd.Dataset):
     assert chunk0.to_struct_array() == pa.array(
         [record(x, columns=["string", "bool"]) for x in range(len(chunk0))], type=schema
     )
+
+
+def test_use_threads_configures_worker_pool(monkeypatch: pytest.MonkeyPatch):
+    current_workers = 3
+    calls: list[int | None] = []
+
+    def fake_worker_threads() -> int:
+        return current_workers
+
+    def fake_set_worker_threads(count: int | None) -> None:
+        nonlocal current_workers
+        calls.append(count)
+        current_workers = 11 if count is None else count
+
+    monkeypatch.setattr(vx_dataset, "_worker_threads", fake_worker_threads)
+    monkeypatch.setattr(vx_dataset, "_set_worker_threads", fake_set_worker_threads)
+
+    with vx_dataset._temporary_worker_threads(True):  # pyright: ignore[reportPrivateUsage]
+        assert current_workers == 11
+
+    assert current_workers == 3
+
+    with vx_dataset._temporary_worker_threads(False):  # pyright: ignore[reportPrivateUsage]
+        assert current_workers == 0
+
+    assert current_workers == 3
+    assert calls == [None, 3, 0, 3]
+
+    calls.clear()
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("x", pa.int64())]),
+        [
+            pa.record_batch([pa.array([1])], names=["x"]),
+            pa.record_batch([pa.array([2])], names=["x"]),
+        ],
+    )
+
+    batches = list(vx_dataset._read_batches_with_temporary_worker_threads(reader, True))  # pyright: ignore[reportPrivateUsage]
+
+    assert [batch.to_pylist() for batch in batches] == [[{"x": 1}], [{"x": 2}]]
+    assert current_workers == 3
+    assert calls == [None, 3]
 
 
 @pytest.mark.parametrize("batch_size", [1234, 8192, 1 << 31])
@@ -154,13 +197,13 @@ def test_duckdb(ds: vx.dataset.VortexDataset):
     tbl = duckdb.execute("select * from ds where string >= '950000' and float < 975.0").arrow().read_all()
     assert len(tbl) == 6176
     assert tbl.schema == pa.schema(
-        [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.utf8())]
+        [("index", pa.int64()), ("string", pa.utf8()), ("bool", pa.bool_()), ("float", pa.float64())]
     )
 
     tbl = duckdb.execute("select * from ds").arrow().read_all()
     assert len(tbl) == 1_000_000
     assert tbl.schema == pa.schema(
-        [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.utf8())]
+        [("index", pa.int64()), ("string", pa.utf8()), ("bool", pa.bool_()), ("float", pa.float64())]
     )
     assert tbl.take([0]).to_pylist()[0] == record(0)
     assert tbl.take([950_000]).to_pylist()[0] == record(950_000)
@@ -174,7 +217,7 @@ def test_fragment_schema(ds: vx.dataset.VortexDataset):
     fragments = ds.get_fragments()
     for i, f in enumerate(fragments):
         assert f.physical_schema == pa.schema(
-            [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.string_view())]
+            [("index", pa.int64()), ("string", pa.string_view()), ("bool", pa.bool_()), ("float", pa.float64())]
         ), (f, i)
 
     assert ds.head(1).to_pylist() == [{"index": 0, "string": "0", "bool": True, "float": 0.0}]

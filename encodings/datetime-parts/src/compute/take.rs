@@ -65,7 +65,7 @@ fn take_datetime_parts(
         .seconds()
         .statistics()
         .get(Stat::Min)
-        .map(|s| s.into_inner())
+        .into_inner()
         .unwrap_or_else(|| Scalar::primitive(0i64, Nullability::NonNullable))
         .cast(array.seconds().dtype())?;
     let taken_seconds = taken_seconds.fill_null(seconds_fill)?;
@@ -74,7 +74,7 @@ fn take_datetime_parts(
         .subseconds()
         .statistics()
         .get(Stat::Min)
-        .map(|s| s.into_inner())
+        .into_inner()
         .unwrap_or_else(|| Scalar::primitive(0i64, Nullability::NonNullable))
         .cast(array.subseconds().dtype())?;
     let taken_subseconds = taken_subseconds.fill_null(subseconds_fill)?;
@@ -96,8 +96,8 @@ impl TakeExecute for DateTimeParts {
 mod tests {
     use rstest::rstest;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::compute::conformance::take::test_take_conformance;
@@ -118,7 +118,7 @@ mod tests {
         ].into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
+    ), &mut array_session().create_execution_ctx()).unwrap())]
     #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         PrimitiveArray::from_option_iter([
             Some(0i64),
@@ -129,13 +129,16 @@ mod tests {
         ]).into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
+    ), &mut array_session().create_execution_ctx()).unwrap())]
     #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         buffer![86_400_000i64].into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
+    ), &mut array_session().create_execution_ctx()).unwrap())]
     fn test_take_datetime_parts_conformance(#[case] array: DateTimePartsArray) {
-        test_take_conformance(&array.into_array());
+        test_take_conformance(
+            &array.into_array(),
+            &mut array_session().create_execution_ctx(),
+        );
     }
 }

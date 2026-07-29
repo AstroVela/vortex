@@ -7,6 +7,7 @@ use arrow_schema::Schema;
 use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
 use vortex::dtype::DType;
+use vortex_arrow::ArrowSession;
 
 /// Calculate the physical Arrow schema for a Vortex file given its DType and the expected logical schema.
 ///
@@ -22,6 +23,7 @@ use vortex::dtype::DType;
 pub fn calculate_physical_schema(
     dtype: &DType,
     reference_logical_schema: &Schema,
+    arrow_session: &ArrowSession,
 ) -> DFResult<Schema> {
     let DType::Struct(struct_dtype, _) = dtype else {
         return Err(exec_datafusion_err!(
@@ -34,32 +36,39 @@ pub fn calculate_physical_schema(
         .iter()
         .zip(struct_dtype.fields())
         .map(|(name, field_dtype)| {
-            let arrow_type = match reference_logical_schema.field_with_name(name.as_ref()).ok() {
+            let logical_field = reference_logical_schema.field_with_name(name.as_ref()).ok();
+            match logical_field {
                 Some(logical_field) => {
-                    calculate_physical_field_type(&field_dtype, logical_field.data_type())?
+                    let arrow_type = calculate_physical_field_type(
+                        &field_dtype,
+                        logical_field.data_type(),
+                        arrow_session,
+                    )?;
+                    Ok(
+                        Field::new(name.as_ref(), arrow_type, field_dtype.is_nullable())
+                            .with_metadata(logical_field.metadata().clone()),
+                    )
                 }
-                None => {
-                    // Field not in logical schema, use default conversion
-                    field_dtype.to_arrow_dtype().map_err(|e| {
-                        exec_datafusion_err!("Failed to convert dtype to arrow: {e}")
-                    })?
-                }
-            };
-
-            Ok(Field::new(
-                name.to_string(),
-                arrow_type,
-                field_dtype.is_nullable(),
-            ))
+                None => arrow_session
+                    .to_arrow_field(name.as_ref(), &field_dtype)
+                    .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}")),
+            }
         })
         .collect::<DFResult<Vec<_>>>()?;
 
-    Ok(Schema::new(fields))
+    Ok(Schema::new_with_metadata(
+        fields,
+        reference_logical_schema.metadata().clone(),
+    ))
 }
 
 /// Calculate the physical Arrow type for a field, preferring the logical type when the
 /// DType doesn't roundtrip cleanly.
-fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFResult<DataType> {
+fn calculate_physical_field_type(
+    dtype: &DType,
+    logical_type: &DataType,
+    arrow_session: &ArrowSession,
+) -> DFResult<DataType> {
     // Check if the logical type is one that doesn't roundtrip through DType
     Ok(match logical_type {
         // Dictionary types lose their encoding when converted to DType
@@ -79,30 +88,41 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
         // RunEndEncoded loses its encoding
         DataType::RunEndEncoded(..) => logical_type.clone(),
 
-        // For struct types, recursively check each field
+        // For struct types, recursively check each field.
         DataType::Struct(logical_fields) => {
-            if let DType::Struct(struct_dtype, _) = dtype {
+            // Walk through any extension layers to reach the underlying struct fields.
+            let mut inner = dtype;
+            while let DType::Extension(ext) = inner {
+                inner = ext.storage_dtype();
+            }
+            if let DType::Struct(struct_dtype, _) = inner {
                 let physical_fields: Vec<Field> = struct_dtype
                     .names()
                     .iter()
                     .zip(struct_dtype.fields())
                     .map(|(name, field_dtype)| {
-                        let arrow_type =
-                            match logical_fields.iter().find(|f| f.name() == name.as_ref()) {
-                                Some(logical_field) => calculate_physical_field_type(
+                        match logical_fields.iter().find(|f| f.name() == name.as_ref()) {
+                            Some(logical_field) => {
+                                let arrow_type = calculate_physical_field_type(
                                     &field_dtype,
                                     logical_field.data_type(),
-                                )?,
-                                None => field_dtype.to_arrow_dtype().map_err(|e| {
+                                    arrow_session,
+                                )?;
+                                Ok(
+                                    Field::new(
+                                        name.as_ref(),
+                                        arrow_type,
+                                        field_dtype.is_nullable(),
+                                    )
+                                    .with_metadata(logical_field.metadata().clone()),
+                                )
+                            }
+                            None => arrow_session
+                                .to_arrow_field(name.as_ref(), &field_dtype)
+                                .map_err(|e| {
                                     exec_datafusion_err!("Failed to convert dtype to arrow: {e}")
-                                })?,
-                            };
-
-                        Ok(Field::new(
-                            name.to_string(),
-                            arrow_type,
-                            field_dtype.is_nullable(),
-                        ))
+                                }),
+                        }
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
@@ -117,8 +137,11 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
         // For list types, recursively check the element type
         DataType::List(logical_elem) | DataType::LargeList(logical_elem) => {
             if let DType::List(elem_dtype, _) = dtype {
-                let physical_elem_type =
-                    calculate_physical_field_type(elem_dtype, logical_elem.data_type())?;
+                let physical_elem_type = calculate_physical_field_type(
+                    elem_dtype,
+                    logical_elem.data_type(),
+                    arrow_session,
+                )?;
                 let physical_field = Field::new(
                     logical_elem.name(),
                     physical_elem_type,
@@ -139,8 +162,11 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
         // For fixed-size list types, recursively check the element type
         DataType::FixedSizeList(logical_elem, size) => {
             if let DType::FixedSizeList(elem_dtype, ..) = dtype {
-                let physical_elem_type =
-                    calculate_physical_field_type(elem_dtype, logical_elem.data_type())?;
+                let physical_elem_type = calculate_physical_field_type(
+                    elem_dtype,
+                    logical_elem.data_type(),
+                    arrow_session,
+                )?;
                 let physical_field = Field::new(
                     logical_elem.name(),
                     physical_elem_type,
@@ -157,8 +183,11 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
         // For list view types, recursively check the element type
         DataType::ListView(logical_elem) | DataType::LargeListView(logical_elem) => {
             if let DType::List(elem_dtype, _) = dtype {
-                let physical_elem_type =
-                    calculate_physical_field_type(elem_dtype, logical_elem.data_type())?;
+                let physical_elem_type = calculate_physical_field_type(
+                    elem_dtype,
+                    logical_elem.data_type(),
+                    arrow_session,
+                )?;
                 let physical_field = Field::new(
                     logical_elem.name(),
                     physical_elem_type,
@@ -175,10 +204,13 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
                 ));
             }
         }
-        // All other types roundtrip cleanly, use the DType's natural conversion
-        _ => dtype
-            .to_arrow_dtype()
-            .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}"))?,
+        // All other types roundtrip cleanly, use the session-aware Arrow Field inference
+        // (canonical for non-extension dtypes, plugin-routed for extensions like UUID).
+        _ => arrow_session
+            .to_arrow_field("", dtype)
+            .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}"))?
+            .data_type()
+            .clone(),
     })
 }
 
@@ -209,13 +241,40 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
 
         // Should preserve the dictionary type from the logical schema
         assert_eq!(
             physical_schema.field(0).data_type(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
         );
+    }
+
+    #[test]
+    fn test_schema_metadata_preserved() -> DFResult<()> {
+        let logical_schema = Schema::new_with_metadata(
+            vec![Field::new("col", DataType::Int32, false)],
+            [("table".to_string(), "metadata".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "col",
+                DType::Primitive(PType::I32, Nullability::NonNullable),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())?;
+
+        assert_eq!(
+            physical_schema.metadata().get("table"),
+            Some(&"metadata".to_string())
+        );
+        Ok(())
     }
 
     #[test]
@@ -239,7 +298,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
 
         assert_eq!(physical_schema.field(0).data_type(), &DataType::Utf8);
         assert_eq!(physical_schema.field(1).data_type(), &DataType::LargeUtf8);
@@ -259,7 +319,7 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let result = calculate_physical_schema(&dtype, &logical_schema);
+        let result = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default());
         assert!(
             result
                 .unwrap_err()
@@ -279,7 +339,7 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let result = calculate_physical_schema(&dtype, &logical_schema);
+        let result = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default());
         assert!(
             result
                 .unwrap_err()
@@ -325,7 +385,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
 
         // Check outer structure
         assert_eq!(physical_schema.fields().len(), 2);
@@ -366,7 +427,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
 
         if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
             assert_eq!(
@@ -385,7 +447,7 @@ mod tests {
 
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
 
-        let result = calculate_physical_schema(&dtype, &logical_schema);
+        let result = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default());
         assert!(result.is_err());
         assert!(
             result
@@ -393,5 +455,88 @@ mod tests {
                 .to_string()
                 .contains("Expected struct dtype")
         );
+    }
+
+    /// Names carrying raw control bytes must reach Arrow byte-for-byte.
+    /// `FieldName`'s `Display` escapes via `escape_debug`, so building the
+    /// field with `to_string` renames `\x08` to the literal five characters
+    /// `\u{8}`. The scanned batch then disagrees with the table schema the
+    /// scan was planned against, and the query fails with "column types must
+    /// match schema types".
+    #[test]
+    fn test_control_byte_column_names_are_not_escaped() {
+        let column_names = ["plain", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(
+            column_names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Utf8, true))
+                .collect::<Fields>(),
+        );
+
+        let dtype = DType::Struct(
+            StructFields::from_iter(
+                column_names
+                    .iter()
+                    .map(|n| (*n, DType::Utf8(Nullability::Nullable))),
+            ),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
+
+        let names: Vec<&str> = physical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, column_names);
+    }
+
+    /// Same, one level down: struct children are built at a separate call
+    /// site in `calculate_physical_field_type`. The children here are
+    /// run-end-encoded dictionaries, so this also covers the branches that
+    /// take the type from the reference schema instead of the `DType`.
+    #[test]
+    fn test_control_byte_struct_field_names_are_not_escaped() {
+        let label_names = ["app", "\u{8}", "check_id\u{10}"];
+        let ree = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new(
+                "values",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            )),
+        );
+        let logical_schema = Schema::new(vec![Field::new_struct(
+            "labels",
+            label_names
+                .iter()
+                .map(|n| Field::new(*n, ree.clone(), true))
+                .collect::<Fields>(),
+            false,
+        )]);
+
+        let labels_dtype = DType::Struct(
+            StructFields::from_iter(
+                label_names
+                    .iter()
+                    .map(|n| (*n, DType::Utf8(Nullability::Nullable))),
+            ),
+            Nullability::NonNullable,
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([("labels", labels_dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
+
+        let DataType::Struct(labels) = physical_schema.field(0).data_type() else {
+            panic!("expected labels to be a struct");
+        };
+        let names: Vec<&str> = labels.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, label_names);
     }
 }

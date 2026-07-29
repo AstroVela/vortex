@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::sync::LazyLock;
 
 use divan::Bencher;
 #[cfg(not(codspeed))]
@@ -12,17 +13,17 @@ use divan::counter::BytesCount;
 use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
+use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
-use vortex::array::LEGACY_SESSION;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::DictArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::TemporalArray;
 use vortex::array::arrays::VarBinArray;
 use vortex::array::arrays::VarBinViewArray;
-use vortex::array::arrays::varbin::VarBinArrayExt;
+use vortex::array::arrays::varbin::VarBinArraySlotsExt;
 use vortex::array::builtins::ArrayBuiltins;
 use vortex::dtype::DType;
 use vortex::dtype::PType;
@@ -35,21 +36,27 @@ use vortex::encodings::datetime_parts::split_temporal;
 use vortex::encodings::fastlanes::BitPacked;
 use vortex::encodings::fastlanes::FoR;
 use vortex::encodings::fastlanes::FoRArrayExt;
+use vortex::encodings::fastlanes::FoRArraySlotsExt;
 use vortex::encodings::fsst::FSST;
 use vortex::encodings::fsst::FSSTArrayExt;
+use vortex::encodings::fsst::FSSTArraySlotsExt;
 use vortex::encodings::fsst::fsst_compress;
 use vortex::encodings::fsst::fsst_train_compressor;
 use vortex::encodings::runend::RunEnd;
-use vortex::encodings::runend::RunEndArrayExt;
+use vortex::encodings::runend::RunEndArraySlotsExt;
 use vortex::error::VortexExpect;
 use vortex::extension::datetime::TimeUnit;
+use vortex_session::VortexSession;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
 
 const NUM_VALUES: u64 = 100_000;
 
@@ -68,11 +75,12 @@ fn with_byte_counter<'a, 'b>(bencher: Bencher<'a, 'b>, bytes: u64) -> Bencher<'a
 
 mod setup {
     use rand::rngs::StdRng;
+    use vortex_array::VortexSessionExecute;
 
     use super::*;
 
     fn setup_primitive_arrays() -> (PrimitiveArray, PrimitiveArray, PrimitiveArray) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut rng = StdRng::seed_from_u64(0);
         let uint_array =
             PrimitiveArray::from_iter((0..NUM_VALUES).map(|_| rng.random_range(42u32..256)));
@@ -95,9 +103,9 @@ mod setup {
 
     /// Create FoR <- BitPacked encoding tree for u64
     pub fn for_bp_u64() -> ArrayRef {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let (uint_array, ..) = setup_primitive_arrays();
-        let compressed = FoR::encode(uint_array).unwrap();
+        let compressed = FoR::encode(uint_array, &mut ctx).unwrap();
         let inner = compressed.encoded();
         let bp = BitPacked::encode(inner, 8, &mut ctx).unwrap();
         FoR::try_new(bp.into_array(), compressed.reference_scalar().clone())
@@ -107,7 +115,7 @@ mod setup {
 
     /// Create ALP <- FoR <- BitPacked encoding tree for f64
     pub fn alp_for_bp_f64() -> ArrayRef {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let (_, _, float_array) = setup_primitive_arrays();
         let alp_compressed = alp_encode(float_array.as_view(), None, &mut ctx).unwrap();
 
@@ -117,7 +125,7 @@ mod setup {
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .unwrap();
-        let for_array = FoR::encode(alp_encoded_prim).unwrap();
+        let for_array = FoR::encode(alp_encoded_prim, &mut ctx).unwrap();
         let inner = for_array.encoded();
         let bp = BitPacked::encode(inner, 8, &mut ctx).unwrap();
         let for_with_bp =
@@ -154,7 +162,7 @@ mod setup {
         let codes_prim = PrimitiveArray::from_iter(codes);
 
         // Compress codes with BitPacked (6 bits should be enough for ~50 unique values)
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let codes_bp = BitPacked::encode(&codes_prim.into_array(), 6, &mut ctx)
             .unwrap()
             .into_array();
@@ -185,7 +193,7 @@ mod setup {
             run_length -= 1;
         }
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let prim_array = PrimitiveArray::from_iter(values);
         let runend = RunEnd::encode(prim_array.into_array(), &mut ctx).unwrap();
 
@@ -195,7 +203,7 @@ mod setup {
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .unwrap();
-        let ends_for = FoR::encode(ends_prim).unwrap();
+        let ends_for = FoR::encode(ends_prim, &mut ctx).unwrap();
         let ends_inner = ends_for.encoded();
         let ends_bp = BitPacked::encode(ends_inner, 8, &mut ctx).unwrap();
         let compressed_ends =
@@ -234,16 +242,10 @@ mod setup {
             .collect();
 
         // Train and compress unique values with FSST
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let unique_varbinview = VarBinViewArray::from_iter_str(unique_strings);
-        let fsst_compressor = fsst_train_compressor(&unique_varbinview);
-        let fsst_values = fsst_compress(
-            &unique_varbinview,
-            unique_varbinview.len(),
-            unique_varbinview.dtype(),
-            &fsst_compressor,
-            &mut ctx,
-        );
+        let mut ctx = SESSION.create_execution_ctx();
+        let unique_varbinview = VarBinViewArray::from_iter_str(unique_strings).into_array();
+        let fsst_compressor = fsst_train_compressor(&unique_varbinview, &mut ctx).unwrap();
+        let fsst_values = fsst_compress(&unique_varbinview, &fsst_compressor, &mut ctx).unwrap();
 
         // Create codes array (random indices into unique values)
         let codes: Vec<u32> = (0..NUM_VALUES)
@@ -273,16 +275,10 @@ mod setup {
             .collect();
 
         // Train and compress unique values with FSST
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let unique_varbinview = VarBinViewArray::from_iter_str(unique_strings);
-        let fsst_compressor = fsst_train_compressor(&unique_varbinview);
-        let fsst = fsst_compress(
-            &unique_varbinview,
-            unique_varbinview.len(),
-            unique_varbinview.dtype(),
-            &fsst_compressor,
-            &mut ctx,
-        );
+        let mut ctx = SESSION.create_execution_ctx();
+        let unique_varbinview = VarBinViewArray::from_iter_str(unique_strings).into_array();
+        let fsst_compressor = fsst_train_compressor(&unique_varbinview, &mut ctx).unwrap();
+        let fsst = fsst_compress(&unique_varbinview, &fsst_compressor, &mut ctx).unwrap();
 
         // Compress the VarBin offsets with BitPacked
         let codes = fsst.codes();
@@ -341,7 +337,7 @@ mod setup {
         let temporal_array = TemporalArray::new_timestamp(ts_array, TimeUnit::Microseconds, None);
 
         // Split into days, seconds, subseconds
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let parts = split_temporal(temporal_array.clone(), &mut ctx).unwrap();
 
         // Compress days with FoR <- BitPacked
@@ -350,7 +346,7 @@ mod setup {
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .unwrap();
-        let days_for = FoR::encode(days_prim).unwrap();
+        let days_for = FoR::encode(days_prim, &mut ctx).unwrap();
         let days_inner = days_for.encoded();
         let days_bp = BitPacked::encode(days_inner, 16, &mut ctx).unwrap();
         let compressed_days =
@@ -364,7 +360,7 @@ mod setup {
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .unwrap();
-        let seconds_for = FoR::encode(seconds_prim).unwrap();
+        let seconds_for = FoR::encode(seconds_prim, &mut ctx).unwrap();
         let seconds_inner = seconds_for.encoded();
         let seconds_bp = BitPacked::encode(seconds_inner, 17, &mut ctx).unwrap();
         let compressed_seconds = FoR::try_new(
@@ -379,7 +375,7 @@ mod setup {
             .subseconds
             .execute::<PrimitiveArray>(&mut ctx)
             .unwrap();
-        let subseconds_for = FoR::encode(subseconds_prim).unwrap();
+        let subseconds_for = FoR::encode(subseconds_prim, &mut ctx).unwrap();
         let subseconds_inner = subseconds_for.encoded();
         let subseconds_bp = BitPacked::encode(subseconds_inner, 20, &mut ctx).unwrap();
         let compressed_subseconds = FoR::try_new(
@@ -454,6 +450,6 @@ fn decompress(bencher: Bencher, setup_fn: SetupFn) {
     let nbytes = compressed.nbytes();
 
     with_byte_counter(bencher, nbytes)
-        .with_inputs(|| (&compressed, LEGACY_SESSION.create_execution_ctx()))
+        .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
         .bench_refs(|(a, ctx)| (**a).clone().execute::<Canonical>(ctx));
 }

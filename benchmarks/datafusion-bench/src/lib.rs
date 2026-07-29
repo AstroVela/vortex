@@ -7,14 +7,13 @@ pub mod tracer;
 use std::sync::Arc;
 
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::file_format::arrow::ArrowFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::provider::DefaultTableFactory;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::cache::DefaultListFilesCache;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
-use datafusion::execution::cache::cache_unit::DefaultFileStatisticsCache;
+use datafusion::execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::prelude::SessionContext;
@@ -37,7 +36,7 @@ pub fn get_session_context() -> SessionContext {
     let file_static_cache = Arc::new(DefaultFileStatisticsCache::default());
     let list_file_cache = Arc::new(DefaultListFilesCache::default());
     let cache_config = CacheManagerConfig::default()
-        .with_files_statistics_cache(Some(file_static_cache))
+        .with_file_statistics_cache(Some(file_static_cache))
         .with_list_files_cache(Some(list_file_cache));
     rt_builder = rt_builder.with_cache_manager(cache_config);
 
@@ -45,10 +44,7 @@ pub fn get_session_context() -> SessionContext {
         .build_arc()
         .expect("could not build runtime environment");
 
-    let factory = VortexFormatFactory::new().with_options(VortexTableOptions {
-        projection_pushdown: true,
-        ..Default::default()
-    });
+    let factory = VortexFormatFactory::new().with_options(vortex_table_options());
 
     let mut session_state_builder = SessionStateBuilder::new()
         .with_config(SessionConfig::from_env().expect("shouldn't fail"))
@@ -112,13 +108,21 @@ pub fn make_object_store(
 pub fn format_to_df_format(format: Format) -> Arc<dyn FileFormat> {
     match format {
         Format::Csv => Arc::new(CsvFormat::default()) as _,
-        Format::Arrow => Arc::new(ArrowFormat),
         Format::Parquet => Arc::new(ParquetFormat::new()),
-        Format::OnDiskVortex | Format::VortexCompact => {
-            Arc::new(VortexFormat::new(SESSION.clone()))
-        }
+        Format::OnDiskVortex | Format::VortexCompact | Format::VortexNative => Arc::new(
+            VortexFormat::new_with_options(SESSION.clone(), vortex_table_options()),
+        ),
         Format::OnDiskDuckDB | Format::Lance => {
             unimplemented!("Format {format} cannot be turned into a DataFusion `FileFormat`")
         }
     }
+}
+
+fn vortex_table_options() -> VortexTableOptions {
+    let mut opts = VortexTableOptions::default();
+
+    opts.predicate_pushdown = true;
+    opts.predicate_pushdown = true;
+
+    opts
 }

@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use itertools::Itertools;
-use kernel::PARENT_KERNELS;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -13,15 +12,18 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::array::Array;
+use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::EmptyArrayData;
 use crate::array::VTable;
 use crate::array::child_to_validity;
-use crate::arrays::struct_::array::FIELDS_OFFSET;
-use crate::arrays::struct_::array::VALIDITY_SLOT;
+use crate::array::with_empty_buffers;
+use crate::arrays::struct_::array::StructSlots;
 use crate::arrays::struct_::array::make_struct_slots;
 use crate::arrays::struct_::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::builders::StructBuilder;
 use crate::dtype::DType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
@@ -35,6 +37,10 @@ use crate::array::ArrayId;
 
 /// A [`Struct`]-encoded Vortex array.
 pub type StructArray = Array<Struct>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
 
 impl VTable for Struct {
     type TypedArrayData = EmptyArrayData;
@@ -70,7 +76,7 @@ impl VTable for Struct {
             );
         }
 
-        let validity = child_to_validity(slots[VALIDITY_SLOT].as_ref(), *nullability);
+        let validity = child_to_validity(slots[StructSlots::VALIDITY].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len()
             && validity_len != len
         {
@@ -81,7 +87,7 @@ impl VTable for Struct {
             );
         }
 
-        let field_slots = &slots[FIELDS_OFFSET..];
+        let field_slots = &slots[StructSlots::FIELDS_OFFSET..];
         if field_slots.is_empty() {
             return Ok(());
         }
@@ -118,6 +124,14 @@ impl VTable for Struct {
         vortex_panic!("StructArray buffer_name index {idx} out of bounds")
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
+    }
+
     fn serialize(
         _array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -134,7 +148,7 @@ impl VTable for Struct {
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         if !metadata.is_empty() {
             vortex_bail!(
                 "StructArray expects empty metadata, got {} bytes",
@@ -169,22 +183,30 @@ impl VTable for Struct {
             .try_collect()?;
 
         let slots = make_struct_slots(&field_children, &validity, len);
-        Ok(
-            crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, EmptyArrayData)
-                .with_slots(slots),
-        )
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, EmptyArrayData).with_slots(slots))
     }
 
     fn slot_name(array: ArrayView<'_, Self>, idx: usize) -> String {
-        if idx == VALIDITY_SLOT {
+        if idx == StructSlots::VALIDITY {
             "validity".to_string()
         } else {
-            array.dtype().as_struct_fields().names()[idx - FIELDS_OFFSET].to_string()
+            array.dtype().as_struct_fields().names()[idx - StructSlots::FIELDS_OFFSET].to_string()
         }
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         Ok(ExecutionResult::done(array))
+    }
+
+    fn append_to_builder(
+        array: ArrayView<'_, Self>,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        let Some(builder) = builder.as_any_mut().downcast_mut::<StructBuilder>() else {
+            vortex_bail!("append_to_builder for Struct requires a StructBuilder");
+        };
+        builder.append_struct_array(&array.into_owned(), ctx)
     }
 
     fn reduce_parent(
@@ -193,15 +215,6 @@ impl VTable for Struct {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }
 

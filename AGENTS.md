@@ -72,6 +72,22 @@ Makefile target is used.
 
 If you touch documentation run doc tests via `cargo test --doc`.
 
+For Python binding changes under `vortex-python/`, run the narrow Python checks that match the
+files touched before broader test suites. Useful checks include:
+
+```bash
+python -m py_compile <changed-python-files>
+uv run --all-packages --reinstall-package vortex-data pytest <changed-python-tests>
+```
+
+If Python docstrings, `docs/api/python/`, or Sphinx configuration change, also run the docs checks
+from a clean Sphinx environment:
+
+```bash
+uv run --all-packages make -C docs clean html
+uv run --all-packages make -C docs clean doctest
+```
+
 ## Linting, Formatting, and Generated Files
 
 Run verification that matches the files changed. Do not run expensive Rust checks for changes that
@@ -80,18 +96,25 @@ with no Rust/API behavior impact. For docs/config-only changes, validate formatt
 or with a targeted doc/config command, and verify symlink or path changes with `ls`, `find`, and
 `git status`.
 
+For Python binding changes under `vortex-python/`, run the relevant Python lint and type checks:
+
+```bash
+uv run basedpyright vortex-python
+uv run ruff check <changed-python-files>
+```
+
+If PyO3 Rust files in `vortex-python/src/` change, include `cargo +nightly fmt --check -p
+vortex-python`. Always finish Python binding work with `git diff --check`.
+
 For Rust code, public API, feature flag, or generated-file changes, run these before stopping:
 
 ```bash
 cargo +nightly fmt --all
-./scripts/public-api.sh
 cargo clippy --all-targets --all-features
 ```
 
 Notes:
 
-- `./scripts/public-api.sh` regenerates all `public-api.lock` files through the `xtask`
-  wrapper. Run it when public Rust APIs may have changed, not for docs-only or agent-only edits.
 - For `.github/` changes, follow `.github/AGENTS.md` and run
   `yamllint --strict -c .yamllint.yaml` on changed workflow files.
 - You can try
@@ -128,6 +151,47 @@ Notes:
   self-explanatory code.
 - Keep public APIs small and consistent with neighboring crates.
 
+## Performance: avoid hidden-cost accessors in hot loops
+
+The most common performance trap in this codebase is calling a *per-element accessor that
+hides non-trivial work* inside an `O(n)` loop, instead of doing the work once over the whole
+chunk. The call site looks like a cheap getter, but each call re-pays a cost that is constant
+(or amortizable) across the loop, making the loop `O(n · k)`.
+
+Watch for these accessors used inside `for i in 0..n { ... }`:
+
+| Per-element accessor (in a loop) | Hidden cost | Bulk replacement |
+| --- | --- | --- |
+| `Validity::is_valid(i)` / `is_null(i)` | for array-backed validity, **allocates an `ExecutionCtx` and runs a scalar lookup per call** | `validity.execute_mask(len, ctx)?` once, then `Mask::value(i)` |
+| `array.scalar_at(i)` / `array.execute_scalar(i, ctx)` | per-element execution through the compute stack | canonicalize once (`execute::<PrimitiveArray>` / `as_slice`) then index |
+| `BitBuffer::value(i)` / `Mask::value(i)` accumulated into a count | recomputes the byte address each call; defeats popcount | `true_count()`, `BitBuffer::count_range(start, end)`, `set_indices()` |
+| `BitIterator::next()` to accumulate a running rank/prefix count | bit-at-a-time | `count_range` over each gap (SIMD popcount) |
+| re-deriving a value inside the loop (e.g. `self.validity()?` each iteration) | re-runs the derivation `n` times | hoist it above the loop |
+
+Decide per site — bulk is not always the answer:
+
+- **Sequential / contiguous access** over an accessor that hides amortizable work → hoist and
+  go bulk (materialize once, then index or iterate the chunk).
+- **Gather over arbitrary indices** → you cannot amortize a per-element *decode*, but you can
+  still materialize the backing buffer once (e.g. `execute_mask`) and then do cheap `O(1)`
+  random reads, avoiding per-call context/allocation.
+- **The accessor is already genuinely `O(1)`** (e.g. reading an already-materialized `Mask`/
+  slice, or a native bitmap) → leave it; bulk would not help.
+
+Even after materializing into a `Mask`/`BitBuffer`, **do not loop with `value(i)` per
+element** to act on each set bit — the per-element branch dominates. Iterate a `u64` word
+at a time with all-set / all-unset fast paths: use [`BitBuffer::for_each_set_index`]. It
+beats `for i in 0..len { if buf.value(i) {..} }` by 2-45x (more at low density) and beats
+collecting `set_indices()` by ~2x at mid/high density, while self-adapting from sparse to
+dense — see `vortex-mask/benches/mask_iteration.rs`. Reach for the cached `indices()` /
+`slices()` representations when you need them more than once; otherwise `for_each_set_index`
+needs no materialization.
+
+When you touch such a loop, back the change with a benchmark (see
+`vortex-array/benches/validity_is_valid.rs` for the `is_valid` case,
+`vortex-mask/benches/valid_counts.rs` for the popcount case, and
+`vortex-mask/benches/mask_iteration.rs` for the per-element-vs-word-vs-sparse comparison).
+
 ## Tests
 
 - Strongly consider `rstest` cases when parameterizing repetitive test logic.
@@ -147,9 +211,6 @@ Notes:
 
 Check new and modified lines against this list before finishing:
 
-- Public API changes without doc comments or refreshed `public-api.lock` files.
-- Running `cargo fmt`, `./scripts/public-api.sh`, or workspace clippy for docs-only, agent-only,
-  symlink-only, or other metadata-only changes.
 - Running broad CI-style commands before trying a narrow local repro.
 - Using `unwrap`, `expect`, or panic-oriented assertions in tests where `VortexResult<()>` and
   `?` would be clearer.
@@ -159,6 +220,9 @@ Check new and modified lines against this list before finishing:
 - Updating expected test output to match buggy behavior without independently verifying the
   intended semantics.
 - Silently reducing the scope of an approved plan when implementation is harder than expected.
+- Calling a hidden-cost per-element accessor (`Validity::is_valid`, `scalar_at`, `BitBuffer::
+  value` accumulation) inside a hot loop instead of materializing once — see
+  "Performance: avoid hidden-cost accessors in hot loops".
 
 ## Summaries
 

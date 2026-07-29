@@ -12,14 +12,16 @@ or other shared resources.
 
 The session is built on two primitives from the `vortex-session` crate:
 
-- **`VortexSession`** -- a cloneable, thread-safe map from Rust `TypeId` to a boxed value. Any
-  type that is `Send + Sync + Debug + 'static` can be stored as a session variable.
-- **`Registry<T>`** -- a concurrent map from string IDs to values of type `T`, used by each
-  component to look up registered plugins at runtime.
+- **`VortexSession`** -- a cloneable, thread-safe map from Rust `TypeId` to a shared
+  (`Arc`-wrapped) value. Any type that is `Clone + Send + Sync + Debug + 'static` can be stored
+  as a session variable.
+- **`ArcSwapMap<K, V>`** -- a concurrent copy-on-write map, used both as the backing store of
+  `VortexSession` itself and (keyed by interned string `Id`s) as the plugin registries each
+  component uses to look up registered plugins at runtime.
 
-Because `VortexSession` is backed by an `Arc<DashMap>`, cloning is cheap and all clones share
-the same state. This makes it safe to hand the session to multiple threads, tasks, or I/O
-operations without coordination.
+Because both primitives are backed by an `ArcSwap`, cloning is cheap and all clones share the
+same state, with lock-free reads and copy-on-write writes. This makes it safe to hand the
+session to multiple threads, tasks, or I/O operations without coordination.
 
 ## Component Registries
 
@@ -95,8 +97,8 @@ all built-in components and encodings:
 let session = VortexSession::default();
 ```
 
-For tests or specialized use-cases, sessions can be assembled from individual components using
-the `.with::<T>()` builder:
+For tests or specialized use-cases, sessions can be assembled from individual components by
+starting from an empty session and chaining the `.with::<T>()` helpers:
 
 ```rust
 let session = VortexSession::empty()

@@ -8,25 +8,30 @@ use std::fmt::Formatter;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::AggregateFnRef;
-use crate::arrays::Chunked;
-use crate::arrays::ChunkedArray;
+use crate::aggregate_fn::fns::all_nan::AllNan;
+use crate::aggregate_fn::fns::all_non_nan::AllNonNan;
+use crate::aggregate_fn::fns::all_non_null::AllNonNull;
+use crate::aggregate_fn::fns::all_null::AllNull;
 use crate::arrays::ConstantArray;
-use crate::arrays::chunked::ChunkedArrayExt;
 use crate::dtype::DType;
 use crate::expr::Expression;
+use crate::expr::stats::Precision;
+use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
+use crate::expr::stats::StatsProviderExt;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
-use crate::stats::legacy::legacy_stat_for_aggregate;
 
 /// Options for the `stat` scalar function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -52,7 +57,7 @@ impl Display for StatOptions {
     }
 }
 
-/// Scalar function that broadcasts a stored aggregate statistic over the input rows.
+/// Scalar function that broadcasts a stored aggregate partial over the input rows.
 ///
 /// The only current consumer is **row-wise pruning**: substituting `stat(col, agg)` into a
 /// predicate produces a cheap, row-aligned approximation whose constant runs let downstream
@@ -67,10 +72,10 @@ impl Display for StatOptions {
 /// yields a constant per chunk; a zone-mapped array would yield a run-end-encoded array,
 /// one run per zone. If the requested stat is not available, the result is a null constant.
 ///
-/// Pruning only makes sense for aggregates that bound individual rows — `min`, `max`,
-/// `has_nulls`, bloom filters, etc. Non-idempotent aggregates like `sum`, `count`, `mean`,
-/// `null_count`, and `nan_count` still produce a meaningful per-chunk value but do **not**
-/// bound any single row.
+/// Pruning only makes sense for aggregates that can prove something about every row in the scope
+/// — `min`, `max`, `all_null`, `all_non_null`, bloom filters, etc. Non-idempotent aggregates like
+/// `sum`, `count`, `mean`, `null_count`, and `nan_count` still produce a meaningful per-chunk
+/// value but do **not** bound any single row.
 #[derive(Clone)]
 pub struct StatFn;
 
@@ -78,7 +83,8 @@ impl ScalarFnVTable for StatFn {
     type Options = StatOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.stat")
+        static ID: CachedId = CachedId::new("vortex.stat");
+        *ID
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -115,32 +121,16 @@ impl ScalarFnVTable for StatFn {
     ) -> VortexResult<ArrayRef> {
         let input = args.get(0)?;
         let dtype = stat_dtype(options.aggregate_fn(), input.dtype())?;
-
-        // Recurse into each chunk so the output keeps per-chunk granularity (one constant
-        // per chunk) instead of collapsing to a single combined stat across the whole array.
-        // Per-chunk granularity is what makes the result useful for pruning: predicates can
-        // drop whole chunks at a time. Without this, we'd lose every chunk boundary as a
-        // pruning opportunity. Other encodings (zone maps, etc.) will need similar
-        // structure-preserving handling once they land.
-        if let Some(chunked) = input.as_opt::<Chunked>() {
-            tracing::trace!(
-                "stat({}) descending into ChunkedArray with {} chunks",
-                options.aggregate_fn(),
-                chunked.nchunks()
-            );
-            let chunks = chunked
-                .iter_chunks()
-                .map(|chunk| stat_array(chunk, options.aggregate_fn(), dtype.clone(), chunk.len()))
-                .collect::<VortexResult<Vec<_>>>()?;
-            return Ok(ChunkedArray::try_new(chunks, dtype)?.into_array());
-        }
-
         stat_array(&input, options.aggregate_fn(), dtype, args.row_count())
+    }
+
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        false
     }
 }
 
 fn stat_dtype(aggregate_fn: &AggregateFnRef, input_dtype: &DType) -> VortexResult<DType> {
-    let Some(dtype) = aggregate_fn.return_dtype(input_dtype) else {
+    let Some(dtype) = aggregate_fn.state_dtype(input_dtype) else {
         vortex_bail!(
             "Aggregate function {} does not support input dtype {}",
             aggregate_fn,
@@ -156,15 +146,50 @@ fn stat_array(
     dtype: DType,
     len: usize,
 ) -> VortexResult<ArrayRef> {
-    let value = legacy_stat_for_aggregate(aggregate_fn)
-        .and_then(|stat| {
-            array
-                .statistics()
-                .with_typed_stats_set(|stats| stats.get(stat))
-        })
-        // We don't mind whether the stat is approxed or not, since these are row-wise bounds
-        .map(|stat| stat.into_inner())
-        .and_then(Scalar::into_value);
+    let value = if aggregate_fn.is::<AllNull>() {
+        let len = u64::try_from(len)?;
+        match array.statistics().get_as::<u64>(Stat::NullCount) {
+            Precision::Exact(count) => Some(count == len),
+            Precision::Inexact(count) => (count < len).then_some(false),
+            Precision::Absent => None,
+        }
+        .map(ScalarValue::Bool)
+    } else if aggregate_fn.is::<AllNonNull>() {
+        match array.statistics().get_as::<u64>(Stat::NullCount) {
+            Precision::Exact(count) => Some(count == 0),
+            Precision::Inexact(0) => Some(true),
+            Precision::Inexact(_) | Precision::Absent => None,
+        }
+        .map(ScalarValue::Bool)
+    } else if aggregate_fn.is::<AllNan>() {
+        let len = u64::try_from(len)?;
+        match array.statistics().get_as::<u64>(Stat::NaNCount) {
+            Precision::Exact(count) => Some(count == len),
+            Precision::Inexact(count) => (count < len).then_some(false),
+            Precision::Absent => None,
+        }
+        .map(ScalarValue::Bool)
+    } else if aggregate_fn.is::<AllNonNan>() {
+        match array.statistics().get_as::<u64>(Stat::NaNCount) {
+            Precision::Exact(count) => Some(count == 0),
+            Precision::Inexact(0) => Some(true),
+            Precision::Inexact(_) | Precision::Absent => None,
+        }
+        .map(ScalarValue::Bool)
+    } else if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
+        array
+            .statistics()
+            .with_typed_stats_set(|stats| stats.get(stat))
+            // We don't mind whether the stat is approxed or not, since these are row-wise bounds.
+            .into_inner()
+            .and_then(Scalar::into_value)
+    } else {
+        tracing::trace!(
+            "No legacy Stat slot for aggregate {}; stat expression will resolve to null",
+            aggregate_fn
+        );
+        None
+    };
 
     let scalar = Scalar::try_new(dtype, value)?;
     Ok(ConstantArray::new(scalar, len).into_array())

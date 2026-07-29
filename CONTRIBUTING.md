@@ -12,7 +12,7 @@ We ask that you read the guidelines below in order to make the process as stream
 >
 > For the full AI policy — including disclosure requirements, review standards for
 > AI-generated PRs, and rules for autonomous agents — see the
-> [contributing guide](https://vortex.dev/project/contributing.html#ai-assistance).
+> [contributing guide](https://docs.vortex.dev/project/contributing#ai-assistance).
 
 ## Code Contributions
 
@@ -59,6 +59,7 @@ At the time of writing, the following individuals serve as Committers (non-votin
 9. Onur Satici
 10. Xinyu Zeng
 11. Alfonso Subiotto
+12. Lorenz Hübschle
 
 ### Maintainers
 
@@ -70,16 +71,20 @@ At the time of writing, the following individuals serve as Committers & Maintain
 4. Robert Kruszewski
 5. Wes McKinney
 6. Will Manning (chair)
+7. Frederic Branczyk
+8. Benjamin Wagner
 
 ## Coding style
 
 Our CI process enforces an extensive set of linter (e.g., `clippy`) rules, as well as language-specific formatters (e.g., `cargo fmt`). Beyond that, we document additional style guidelines in [STYLE.md](STYLE.md).
 
-## Reporting Issues
+## Issues and Questions
 
-Bugs should be filed as [GitHub Issues](https://github.com/vortex-data/vortex/issues). Open-ended
-questions and feature requests should be filed as
-[GitHub Discussions](https://github.com/vortex-data/vortex/discussions).
+Bugs, feature requests, and questions should all be filed as
+[GitHub Issues](https://github.com/vortex-data/vortex/issues/new/choose). We strongly prefer that
+you use one of the provided issue templates rather than opening a blank issue; templates make sure
+we get the information needed to act on your report. For quick questions, the
+[Vortex Slack channel](https://vortex.dev/slack) is also a good option.
 
 ## Developer Certificate of Origin (DCO)
 

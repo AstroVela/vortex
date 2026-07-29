@@ -14,9 +14,11 @@ use vortex::array::ArrayRef;
 use vortex::array::ArrayVTable;
 use vortex::array::arrays::Dict;
 use vortex::array::arrays::Primitive;
+use vortex::array::arrays::ScalarFn;
 use vortex::array::arrays::Slice;
 use vortex::array::arrays::dict::DictArraySlotsExt;
-use vortex::array::arrays::slice::SliceArrayExt;
+use vortex::array::arrays::scalar_fn::ScalarFnArrayExt;
+use vortex::array::arrays::slice::SliceArraySlotsExt;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::patches::Patches;
 use vortex::array::validity::Validity;
@@ -30,14 +32,18 @@ use vortex::encodings::fastlanes::BitPacked;
 use vortex::encodings::fastlanes::BitPackedArrayExt;
 use vortex::encodings::fastlanes::FoR;
 use vortex::encodings::fastlanes::FoRArrayExt;
+use vortex::encodings::fastlanes::FoRArraySlotsExt;
 use vortex::encodings::runend::RunEnd;
 use vortex::encodings::runend::RunEndArrayExt;
+use vortex::encodings::runend::RunEndArraySlotsExt;
 use vortex::encodings::sequence::Sequence;
 use vortex::encodings::zigzag::ZigZag;
-use vortex::encodings::zigzag::ZigZagArrayExt;
+use vortex::encodings::zigzag::ZigZagArraySlotsExt;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
+use vortex::scalar_fn::ScalarFnVTable;
+use vortex::scalar_fn::fns::cast::Cast;
 
 use super::CudaDispatchPlan;
 use super::MaterializedStage;
@@ -52,6 +58,7 @@ use super::tag_to_ptype;
 use crate::CudaBufferExt;
 use crate::CudaExecutionCtx;
 use crate::executor::CudaDispatchMode;
+use crate::kernel::bitpacked_slice_view;
 use crate::kernel::load_patches_to_gpu;
 
 /// A plan whose source buffers have been copied to the device, ready for kernel launch.
@@ -74,6 +81,9 @@ fn is_dyn_dispatch_compatible(array: &ArrayRef) -> bool {
     }
 
     let id = array.encoding_id();
+    if id == Cast.id() {
+        return is_dyn_dispatch_cast_compatible(array);
+    }
     if id == ALP.id() {
         let arr = array.as_::<ALP>();
         return matches!(arr.dtype().as_ptype(), PType::F32 | PType::F64);
@@ -125,6 +135,24 @@ fn is_dyn_dispatch_compatible(array: &ArrayRef) -> bool {
         || id == Sequence.id()
 }
 
+fn is_dyn_dispatch_cast_compatible(array: &ArrayRef) -> bool {
+    let cast = array.as_::<ScalarFn>();
+
+    let Ok(source_ptype) = PType::try_from(cast.child_at(0).dtype()) else {
+        return false;
+    };
+    let Ok(target_ptype) = PType::try_from(cast.scalar_fn().as_::<Cast>()) else {
+        return false;
+    };
+
+    // Implemented as unsigned dictionary-code casts to cuDF's signed index types.
+    // LOAD/BITUNPACK materialize directly into the target-width output type.
+    matches!(
+        (source_ptype, target_ptype),
+        (PType::U8, PType::I16) | (PType::U16, PType::I32) | (PType::U32, PType::I64)
+    )
+}
+
 /// Returns `true` if a registered standalone kernel can decode the entire
 /// `array` tree in a single launch without recursing into `execute_cuda`
 /// for child encodings.
@@ -154,12 +182,13 @@ pub fn has_standalone_kernel(array: &ArrayRef) -> bool {
 
 /// Patch payload attached to the op that consumes it.
 ///
-/// `slice` is a logical output range to apply when materializing the patch descriptor on the GPU.
-/// This lets the planner avoid calling `Patches::slice` when patch metadata may already be device-resident.
+/// `range` is the logical output range to apply when materializing the patch descriptor on the GPU.
+/// This lets the planner avoid calling `Patches::slice` when patch metadata may already be
+/// device-resident.
 #[derive(Clone)]
 struct PlanPatches {
     patches: Patches,
-    slice: Option<Range<usize>>,
+    range: Option<Range<usize>>,
 }
 
 /// An unmaterialized stage: a source op, scalar ops, and optional source buffer reference.
@@ -190,6 +219,11 @@ impl Stage {
             source_buffer_index,
             source_ptype,
         }
+    }
+
+    fn with_source_patches(mut self, source_patches: Option<PlanPatches>) -> Self {
+        self.source_patches = source_patches;
+        self
     }
 }
 
@@ -251,7 +285,7 @@ pub struct FusedPlan {
     /// Shared memory reserved by the non-output stages, in bytes.
     smem_byte_cursor: SmemByteOffset,
     /// Source buffers. `None` entries are placeholder slots for pending subtrees,
-    /// filled by [`materialize_with_subtrees`] before device copy.
+    /// filled by [`Self::materialize_with_subtrees`] before device copy.
     source_buffers: Vec<Option<BufferHandle>>,
     /// Bytes per element of the root (output) array.
     output_elem_bytes: u32,
@@ -409,7 +443,7 @@ impl FusedPlan {
             // Upload source patches (e.g. BitPacked exceptions).
             if let Some(patches) = &stage.source_patches {
                 let (ptr, bufs) =
-                    load_patches_to_gpu(&patches.patches, patches.slice.clone(), ctx).await?;
+                    load_patches_to_gpu(&patches.patches, patches.range.clone(), ctx).await?;
                 source.params.bitunpack.patches_ptr = ptr;
                 device_buffers.extend(bufs);
             }
@@ -419,7 +453,7 @@ impl FusedPlan {
             for (mut op, patches) in stage.scalar_ops.clone() {
                 if let Some(patches) = &patches {
                     let (ptr, bufs) =
-                        load_patches_to_gpu(&patches.patches, patches.slice.clone(), ctx).await?;
+                        load_patches_to_gpu(&patches.patches, patches.range.clone(), ctx).await?;
                     op.params.alp.patches_ptr = ptr;
                     device_buffers.extend(bufs);
                 }
@@ -493,6 +527,8 @@ impl FusedPlan {
             self.walk_slice(array, pending_subtrees)
         } else if id == Sequence.id() {
             self.walk_sequence(array)
+        } else if id == Cast.id() {
+            self.walk_cast(array, pending_subtrees)
         } else {
             vortex_bail!(
                 "Encoding {:?} not supported by dynamic dispatch plan builder",
@@ -503,9 +539,8 @@ impl FusedPlan {
 
     /// SliceArray → resolve the slice via reduce/execute rules.
     ///
-    /// When the plan builder encounters a `SliceArray`, it resolves the slice
-    /// by invoking the child's `reduce_parent`. If that fails (e.g. ALP
-    /// doesn't implement it), we manually slice the child's sub-arrays.
+    /// When the plan builder encounters a `SliceArray`, it first asks the child to reduce the
+    /// slice. If reduction fails, the planner falls back to encoding-specific handling.
     fn walk_slice(
         &mut self,
         array: ArrayRef,
@@ -516,6 +551,30 @@ impl FusedPlan {
 
         if let Some(reduced) = child.reduce_parent(&array, 0)? {
             return self.walk(reduced, pending_subtrees);
+        }
+
+        // BitPacked with patches does not reduce through Slice. Slice the
+        // packed buffer here, and defer patch slicing to CUDA materialization.
+        if child.encoding_id() == BitPacked.id() {
+            let bp = child.as_::<BitPacked>();
+            let offset = slice_arr.data().slice_range().start;
+            let len = array.len();
+            let (packed, bitpacked_offset, patch_range) = bitpacked_slice_view(bp, offset, len)?;
+
+            let source_ptype = ptype_to_tag(PType::try_from(bp.dtype()).map_err(|_| {
+                vortex_err!("BitPacked must have primitive dtype, got {:?}", bp.dtype())
+            })?);
+            let buf_index = self.source_buffers.len();
+            self.source_buffers.push(Some(packed));
+            return Ok(Stage::new(
+                SourceOp::bitunpack(bp.bit_width(), bitpacked_offset),
+                Some(buf_index),
+                source_ptype,
+            )
+            .with_source_patches(bp.patches().map(|patches| PlanPatches {
+                patches,
+                range: Some(patch_range),
+            })));
         }
 
         // ALP doesn't implement reduce_parent. Slice the encoded child here,
@@ -530,7 +589,7 @@ impl FusedPlan {
                 sliced_encoded,
                 alp.patches().map(|patches| PlanPatches {
                     patches,
-                    slice: Some(offset..offset + len),
+                    range: Some(offset..offset + len),
                 }),
                 alp.exponents(),
                 pending_subtrees,
@@ -562,16 +621,15 @@ impl FusedPlan {
         })?);
         let buf_index = self.source_buffers.len();
         self.source_buffers.push(Some(bp.packed().clone()));
-        let mut stage = Stage::new(
+        Ok(Stage::new(
             SourceOp::bitunpack(bp.bit_width(), bp.offset()),
             Some(buf_index),
             source_ptype,
-        );
-        stage.source_patches = bp.patches().map(|patches| PlanPatches {
+        )
+        .with_source_patches(bp.patches().map(|patches| PlanPatches {
             patches,
-            slice: None,
-        });
-        Ok(stage)
+            range: None,
+        })))
     }
 
     fn walk_for(
@@ -629,7 +687,7 @@ impl FusedPlan {
             alp.encoded().clone(),
             alp.patches().map(|patches| PlanPatches {
                 patches,
-                slice: None,
+                range: None,
             }),
             alp.exponents(),
             pending_subtrees,
@@ -695,7 +753,7 @@ impl FusedPlan {
 
     /// Reserve a placeholder buffer slot and record the array as a pending subtree.
     ///
-    /// Called from [`walk`] when [`is_dyn_dispatch_compatible`] rejects a child.
+    /// Called from [`Self::walk`] when [`is_dyn_dispatch_compatible`] rejects a child.
     /// Cases that require a separate kernel dispatch:
     ///
     /// - **F16 primitives** — no reinterpret path in the kernel.
@@ -764,6 +822,21 @@ impl FusedPlan {
         ))
     }
 
+    fn walk_cast(
+        &mut self,
+        array: ArrayRef,
+        pending_subtrees: &mut Vec<ArrayRef>,
+    ) -> VortexResult<Stage> {
+        let cast = array.as_::<ScalarFn>();
+        let target_ptype = ptype_to_tag(cast.scalar_fn().as_::<Cast>().as_ptype());
+        let mut pipeline = self.walk(cast.child_at(0).clone(), pending_subtrees)?;
+        // LOAD/BITUNPACK directly widen into the output type without an additional cast op.
+        pipeline
+            .scalar_ops
+            .push((ScalarOp::cast(target_ptype), None));
+        Ok(pipeline)
+    }
+
     fn walk_runend(
         &mut self,
         array: ArrayRef,
@@ -807,16 +880,45 @@ impl FusedPlan {
         // into smem (reinterpret_cast<T*>), so we must allocate at least
         // output_elem_bytes per element — even if the stage's final ptype
         // is narrower. Otherwise the writes overflow into the next region.
+        let stage_bytes = Self::smem_stage_bytes(&spec, len, self.output_elem_bytes);
+        self.stages.push((spec, smem_byte_offset, len));
+        self.smem_byte_cursor += stage_bytes;
+        smem_byte_offset
+    }
+
+    fn smem_stage_bytes(spec: &Stage, len: u32, output_elem_bytes: u32) -> u32 {
         let final_ptype = spec
             .scalar_ops
             .last()
             .map(|(op, _)| op.output_ptype)
             .unwrap_or(spec.source_ptype);
         let final_elem_bytes = tag_to_ptype(final_ptype).byte_width() as u32;
-        let elem_bytes = final_elem_bytes.max(self.output_elem_bytes);
-        let stage_bytes = len * elem_bytes;
-        self.stages.push((spec, smem_byte_offset, len));
-        self.smem_byte_cursor += stage_bytes;
-        smem_byte_offset
+        len * final_elem_bytes.max(output_elem_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex::array::IntoArray;
+    use vortex::array::arrays::PrimitiveArray;
+    use vortex::array::builtins::ArrayBuiltins;
+    use vortex::dtype::DType;
+    use vortex::dtype::Nullability;
+
+    use super::*;
+
+    #[test]
+    fn cast_to_non_primitive_target_is_not_dyn_dispatch_compatible() -> VortexResult<()> {
+        let cast = PrimitiveArray::from_iter([0u8, 1])
+            .into_array()
+            .cast(DType::Bool(Nullability::NonNullable))?;
+
+        assert!(!is_dyn_dispatch_cast_compatible(&cast));
+        assert!(matches!(
+            DispatchPlan::new(&cast, CudaDispatchMode::DynDispatchOnly)?,
+            DispatchPlan::Unfused
+        ));
+
+        Ok(())
     }
 }

@@ -32,12 +32,12 @@ use tpchgen::generators::SupplierGenerator;
 use tpchgen_arrow::RecordBatchIterator;
 use tracing::info;
 use vortex::array::ArrayRef;
-use vortex::array::arrow::FromArrowArray;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::error::VortexExpect;
 use vortex::file::WriteOptionsSessionExt;
+use vortex_arrow::FromArrowArray;
+use vortex_arrow::FromArrowType;
 
 use crate::CompactionStrategy;
 use crate::Format;
@@ -193,7 +193,7 @@ fn generate_table_files(
     options: TpchGenOptions,
 ) -> Result<Vec<BoxFuture<'static, Result<()>>>> {
     let write_format = match options.format {
-        Format::Parquet | Format::Arrow | Format::OnDiskDuckDB => Format::Parquet,
+        Format::Parquet | Format::OnDiskDuckDB => Format::Parquet,
         Format::OnDiskVortex => Format::OnDiskVortex,
         Format::VortexCompact => Format::VortexCompact,
         f => {

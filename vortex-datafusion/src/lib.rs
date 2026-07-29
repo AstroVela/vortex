@@ -88,14 +88,13 @@ use std::fmt::Debug;
 use datafusion_common::stats::Precision as DFPrecision;
 use vortex::expr::stats::Precision;
 
-mod convert;
+pub mod convert;
 mod persistent;
 pub mod v2;
 
 #[cfg(test)]
 mod tests;
 
-pub use convert::exprs::ExpressionConvertor;
 pub use persistent::*;
 
 /// Extension trait to convert our [`Precision`] to DataFusion's
@@ -119,18 +118,7 @@ where
         match self {
             Precision::Exact(v) => DFPrecision::Exact(v),
             Precision::Inexact(v) => DFPrecision::Inexact(v),
-        }
-    }
-}
-
-impl<T> PrecisionExt<T> for Option<Precision<T>>
-where
-    T: Debug + Clone + PartialEq + Eq + PartialOrd,
-{
-    fn to_df(self) -> DFPrecision<T> {
-        match self {
-            Some(v) => v.to_df(),
-            None => DFPrecision::Absent,
+            Precision::Absent => DFPrecision::Absent,
         }
     }
 }
@@ -153,11 +141,11 @@ mod common_tests {
     use url::Url;
     use vortex::VortexSessionDefault;
     use vortex::array::ArrayRef;
-    use vortex::array::arrow::FromArrowArray;
     use vortex::file::WriteOptionsSessionExt;
     use vortex::io::VortexWrite;
     use vortex::io::object_store::ObjectStoreWrite;
     use vortex::session::VortexSession;
+    use vortex_arrow::FromArrowArray;
 
     use crate::VortexFormatFactory;
     use crate::VortexTableOptions;

@@ -20,6 +20,8 @@ use futures::stream::once;
 use futures::try_join;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Dict;
 use vortex_array::builders::dict::DictConstraints;
@@ -28,7 +30,6 @@ use vortex_array::builders::dict::dict_encoder;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -37,11 +38,11 @@ use vortex_io::kanal_ext::KanalExt;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
-use crate::IntoLayout;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
 use crate::OwnedLayoutChildren;
 use crate::layouts::chunked::ChunkedLayout;
+use crate::layouts::compressed::CompressorPlugin;
 use crate::layouts::dict::DictLayout;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
@@ -106,6 +107,7 @@ pub struct DictStrategy {
     values: Arc<dyn LayoutStrategy>,
     fallback: Arc<dyn LayoutStrategy>,
     options: DictLayoutOptions,
+    probe_compressor: Arc<dyn CompressorPlugin>,
 }
 
 impl DictStrategy {
@@ -114,12 +116,14 @@ impl DictStrategy {
         values: Values,
         fallback: Fallback,
         options: DictLayoutOptions,
+        probe_compressor: Arc<dyn CompressorPlugin>,
     ) -> Self {
         Self {
             codes: Arc::new(codes),
             values: Arc::new(values),
             fallback: Arc::new(fallback),
             options,
+            probe_compressor,
         }
     }
 }
@@ -153,7 +157,9 @@ impl LayoutStrategy for DictStrategy {
             None => true, // empty stream
             Some(chunk) => {
                 let mut exec_ctx = session.create_execution_ctx();
-                let compressed = BtrBlocksCompressor::default().compress(&chunk, &mut exec_ctx)?;
+                let compressed = self
+                    .probe_compressor
+                    .compress_chunk(&chunk, &mut exec_ctx)?;
                 !compressed.is::<Dict>()
             }
         };
@@ -168,7 +174,11 @@ impl LayoutStrategy for DictStrategy {
         // 1. from a chunk stream, create a stream that yields codes
         // followed by a single value chunk when dict constraints are hit.
         // (a1, a2) -> (code(c1), code(c2), values(v1), code(c3), ...)
-        let dict_stream = dict_encode_stream(stream, options.constraints.into());
+        let dict_stream = dict_encode_stream(
+            stream,
+            options.constraints.into(),
+            session.create_execution_ctx(),
+        );
 
         // Wrap up the dict stream to yield pairs of (codes_stream, values_future).
         // Each of these pairs becomes a child dict layout.
@@ -261,6 +271,7 @@ type DictionaryStream = BoxStream<'static, VortexResult<DictionaryChunk>>;
 fn dict_encode_stream(
     input: SendableSequentialStream,
     constraints: DictConstraints,
+    mut exec_ctx: ExecutionCtx,
 ) -> DictionaryStream {
     Box::pin(try_stream! {
         let mut state = DictStreamState {
@@ -280,7 +291,7 @@ fn dict_encode_stream(
             match input.as_mut().peek().await {
                 Some(_) => {
                     let mut labeler = DictChunkLabeler::new(sequence_id);
-                    let chunks = state.encode(&mut labeler, chunk)?;
+                    let chunks = state.encode(&mut labeler, chunk, &mut exec_ctx)?;
                     drop(labeler);
                     for dict_chunk in chunks {
                         yield dict_chunk;
@@ -289,7 +300,7 @@ fn dict_encode_stream(
                 None => {
                     // this is the last element, encode and drain chunks
                     let mut labeler = DictChunkLabeler::new(sequence_id);
-                    let encoded = state.encode(&mut labeler, chunk)?;
+                    let encoded = state.encode(&mut labeler, chunk, &mut exec_ctx)?;
                     let drained = state.drain_values(&mut labeler);
                     drop(labeler);
                     for dict_chunk in encoded.into_iter().chain(drained.into_iter()) {
@@ -311,12 +322,13 @@ impl DictStreamState {
         &mut self,
         labeler: &mut DictChunkLabeler,
         chunk: ArrayRef,
+        exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<Vec<DictionaryChunk>> {
         let mut res = Vec::new();
         let mut to_be_encoded = Some(chunk);
         while let Some(remaining) = to_be_encoded.take() {
             match self.encoder.take() {
-                None => match start_encoding(&self.constraints, &remaining)? {
+                None => match start_encoding(&self.constraints, &remaining, exec_ctx)? {
                     EncodingState::Continue((encoder, encoded)) => {
                         let ptype = encoder.codes_ptype();
                         res.push(labeler.codes(encoded, ptype));
@@ -333,7 +345,7 @@ impl DictStreamState {
                 },
                 Some(encoder) => {
                     let ptype = encoder.codes_ptype();
-                    match encode_chunk(encoder, &remaining)? {
+                    match encode_chunk(encoder, &remaining, exec_ctx)? {
                         EncodingState::Continue((encoder, encoded)) => {
                             res.push(labeler.codes(encoded, ptype));
                             self.encoder = Some(encoder);
@@ -548,16 +560,21 @@ enum EncodingState {
     Done((ArrayRef, ArrayRef, ArrayRef)),
 }
 
-fn start_encoding(constraints: &DictConstraints, chunk: &ArrayRef) -> VortexResult<EncodingState> {
+fn start_encoding(
+    constraints: &DictConstraints,
+    chunk: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<EncodingState> {
     let encoder = dict_encoder(chunk, constraints);
-    encode_chunk(encoder, chunk)
+    encode_chunk(encoder, chunk, ctx)
 }
 
 fn encode_chunk(
     mut encoder: Box<dyn DictEncoder>,
     chunk: &ArrayRef,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<EncodingState> {
-    let encoded = encoder.encode(chunk);
+    let encoded = encoder.encode(chunk, ctx)?.into_array();
     match remainder(chunk, encoded.len())? {
         None => Ok(EncodingState::Continue((encoder, encoded))),
         Some(unencoded) => Ok(EncodingState::Done((encoder.reset(), encoded, unencoded))),
@@ -574,13 +591,18 @@ fn remainder(array: &ArrayRef, encoded_len: usize) -> VortexResult<Option<ArrayR
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use futures::StreamExt;
     use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::builders::dict::DictConstraints;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability::NonNullable;
     use vortex_array::dtype::PType;
+    use vortex_array::session::ArraySession;
+    use vortex_session::VortexSession;
 
     use super::DictionaryTransformer;
     use super::dict_encode_stream;
@@ -588,6 +610,9 @@ mod tests {
     use crate::sequence::SequentialStream;
     use crate::sequence::SequentialStreamAdapter;
     use crate::sequence::SequentialStreamExt;
+
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
     /// Regression test for a bug where the codes stream dtype was hardcoded to U16 instead of
     /// using the actual codes dtype from the array. When `max_len <= 255`, the dict encoder
@@ -613,7 +638,8 @@ mod tests {
         .sendable();
 
         // Encode into dict chunks.
-        let dict_stream = dict_encode_stream(input_stream, constraints);
+        let dict_stream =
+            dict_encode_stream(input_stream, constraints, SESSION.create_execution_ctx());
 
         // Transform into codes/values streams.
         let mut transformer = DictionaryTransformer::new(dict_stream);
@@ -655,7 +681,8 @@ mod tests {
         .sendable();
 
         // Encode into dict chunks.
-        let dict_stream = dict_encode_stream(input_stream, constraints);
+        let dict_stream =
+            dict_encode_stream(input_stream, constraints, SESSION.create_execution_ctx());
 
         // Transform into codes/values streams.
         let mut transformer = DictionaryTransformer::new(dict_stream);

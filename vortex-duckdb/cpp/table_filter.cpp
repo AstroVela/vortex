@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#include "duckdb_vx.h"
+#include "table_filter.h"
+#include <mutex>
 
-#include "duckdb_vx/duckdb_diagnostics.h"
-
-DUCKDB_INCLUDES_BEGIN
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
@@ -13,7 +11,6 @@ DUCKDB_INCLUDES_BEGIN
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
-DUCKDB_INCLUDES_END
 
 using namespace duckdb;
 
@@ -79,12 +76,14 @@ extern "C" void duckdb_vx_table_filter_get_conjunction_and(duckdb_vx_table_filte
 }
 
 // Wrapper to hold the shared pointer for dynamic filter data.
+namespace {
 struct DynamicFilterDataWrapper {
     shared_ptr<DynamicFilterData> data;
 
     explicit DynamicFilterDataWrapper(shared_ptr<DynamicFilterData> d) : data(std::move(d)) {
     }
 };
+} // namespace
 
 extern "C" void duckdb_vx_table_filter_get_dynamic(duckdb_vx_table_filter ffi_filter,
                                                    duckdb_vx_table_filter_dynamic *out) {
@@ -96,7 +95,7 @@ extern "C" void duckdb_vx_table_filter_get_dynamic(duckdb_vx_table_filter ffi_fi
     // Hold the lock while accessing the filter data.
     std::lock_guard<std::mutex> lock(filter.filter_data->lock);
 
-    auto data_wrapper = duckdb::make_uniq<DynamicFilterDataWrapper>(filter.filter_data);
+    auto data_wrapper = make_uniq<DynamicFilterDataWrapper>(filter.filter_data);
     out->data = reinterpret_cast<duckdb_vx_dynamic_filter_data>(data_wrapper.release());
     out->comparison_type = static_cast<duckdb_vx_expr_type>(filter.filter_data->filter->comparison_type);
 }

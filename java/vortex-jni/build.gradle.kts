@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
-import org.gradle.kotlin.dsl.support.serviceOf
+import org.gradle.api.tasks.Copy
+import org.gradle.api.tasks.Exec
 
 plugins {
     `java-library`
     `jvm-test-suite`
-    id("com.gradleup.shadow") version "9.4.1"
+    id("com.gradleup.shadow") version "9.4.2"
 }
 
 dependencies {
@@ -27,6 +28,7 @@ dependencies {
     implementation(libs.guava)
     compileOnly(libs.errorprone.annotations)
     compileOnly(libs.nopen.annotations)
+    api(libs.roaringbitmap)
 
     // Logging
     implementation(libs.slf4j.api)
@@ -48,7 +50,9 @@ mavenPublishing {
     coordinates(groupId = "dev.vortex", artifactId = "vortex-jni", version = "${rootProject.version}")
     publishToMavenCentral()
 
-    signAllPublications()
+    if (!project.hasProperty("skip.signing")) {
+        signAllPublications()
+    }
 
     pom {
         name = "vortex-jni"
@@ -108,37 +112,52 @@ tasks.build {
     dependsOn("shadowJar")
 }
 
-tasks.register("makeTestFiles") {
-    description = "Generate files used by unit tests"
+val rustWorkspaceDir = rootProject.projectDir.absoluteFile.parentFile
+val osName = System.getProperty("os.name").lowercase()
+val osArch = System.getProperty("os.arch").lowercase()
+val osShortName =
+    when {
+        osName.contains("mac") -> "darwin"
+        osName.contains("nix") || osName.contains("nux") -> "linux"
+        osName.contains("win") -> "win"
+        else -> throw GradleException("Unsupported OS for makeTestFiles: $osName")
+    }
+val libExt =
+    when (osShortName) {
+        "darwin" -> ".dylib"
+        "linux" -> ".so"
+        "win" -> ".dll"
+        else -> throw GradleException("Unsupported OS short name: $osShortName")
+    }
+val nativeLibrary = rustWorkspaceDir.resolve("target/debug/libvortex_jni$libExt")
+val nativeLibraryDir = "src/main/resources/native/$osShortName-$osArch"
+
+val buildJniLibrary =
+    tasks.register<Exec>("buildJniLibrary") {
+        description = "Build the JNI library for the host architecture"
+        group = "verification"
+
+        // The publish workflow places release, cross-compiled libs for every supported
+        // architecture before invoking shadowJar; rebuilding the host-arch debug lib
+        // here would overwrite them (linux-aarch64 ends up holding a linux-amd64 .so).
+        onlyIf { System.getenv("VORTEX_SKIP_MAKE_TEST_FILES") != "true" }
+
+        workingDir = rustWorkspaceDir
+        executable = "cargo"
+        args("build", "--package", "vortex-jni")
+    }
+
+tasks.register<Copy>("makeTestFiles") {
+    description = "Stage the JNI library used by unit tests"
     group = "verification"
 
-    doLast {
-        println("makeTestFiles executed")
+    onlyIf { System.getenv("VORTEX_SKIP_MAKE_TEST_FILES") != "true" }
+    dependsOn(buildJniLibrary)
 
-        val execOps = serviceOf<ExecOperations>()
-
-        // Build the JNI lib
-        execOps.exec {
-            workingDir = rootProject.projectDir.absoluteFile.parentFile
-            executable = "cargo"
-            args("build", "--package", "vortex-jni")
-        }
-
-        copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.so")
-            into("$projectDir/src/main/resources/native/linux-amd64")
-        }
-
-        copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.so")
-            into("$projectDir/src/main/resources/native/linux-aarch64")
-        }
-
-        copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.dylib")
-            into("$projectDir/src/main/resources/native/darwin-aarch64")
-        }
-    }
+    // Only populate the host-arch directory so cross-compiled libs for other
+    // architectures (placed by the publish workflow) are preserved.
+    from(nativeLibrary)
+    into(nativeLibraryDir)
 }
 
 tasks.named("processResources").configure {

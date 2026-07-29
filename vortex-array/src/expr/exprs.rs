@@ -4,11 +4,14 @@
 //! Factory functions for creating [`Expression`]s from scalar function vtables.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 use vortex_utils::iter::ReduceBalancedIterExt;
 
+use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
@@ -21,12 +24,14 @@ use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::between::Between;
 use crate::scalar_fn::fns::between::BetweenOptions;
 use crate::scalar_fn::fns::binary::Binary;
+use crate::scalar_fn::fns::byte_length::ByteLength;
 use crate::scalar_fn::fns::case_when::CaseWhen;
 use crate::scalar_fn::fns::case_when::CaseWhenOptions;
 use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::dynamic::DynamicComparison;
 use crate::scalar_fn::fns::dynamic::DynamicComparisonExpr;
 use crate::scalar_fn::fns::dynamic::Rhs;
+use crate::scalar_fn::fns::ext_storage::ExtStorage;
 use crate::scalar_fn::fns::fill_null::FillNull;
 use crate::scalar_fn::fns::get_item::GetItem;
 use crate::scalar_fn::fns::is_not_null::IsNotNull;
@@ -34,6 +39,8 @@ use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeOptions;
 use crate::scalar_fn::fns::list_contains::ListContains;
+use crate::scalar_fn::fns::list_length::ListLength;
+use crate::scalar_fn::fns::list_sum::ListSum;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::mask::Mask;
 use crate::scalar_fn::fns::merge::DuplicateHandling;
@@ -46,22 +53,29 @@ use crate::scalar_fn::fns::pack::PackOptions;
 use crate::scalar_fn::fns::root::Root;
 use crate::scalar_fn::fns::select::FieldSelection;
 use crate::scalar_fn::fns::select::Select;
+use crate::scalar_fn::fns::variant_get::VariantGet;
+use crate::scalar_fn::fns::variant_get::VariantGetOptions;
+use crate::scalar_fn::fns::variant_get::VariantPath;
 use crate::scalar_fn::fns::zip::Zip;
 
-// ---- Root ----
+static ROOT: LazyLock<Expression> = LazyLock::new(|| {
+    Root.try_new_expr(EmptyOptions, vec![])
+        .vortex_expect("Creating root() shouldn't fail")
+});
 
 /// Creates an expression that references the root scope.
 ///
 /// Returns the entire input array as passed to the expression evaluator.
 /// This is commonly used as the starting point for field access and other operations.
 pub fn root() -> Expression {
-    Root.try_new_expr(EmptyOptions, vec![])
-        .vortex_expect("Failed to create Root expression")
+    ROOT.clone()
 }
 
 /// Return whether the expression is a root expression.
 pub fn is_root(expr: &Expression) -> bool {
-    expr.is::<Root>()
+    // root doesn't have any children, and scalar_fns have distinct ids
+    // so we should almost always hit this eq check
+    (expr.scalar_fn().id() == ROOT.scalar_fn().id()) || expr.is::<Root>()
 }
 
 // ---- Literal ----
@@ -111,6 +125,20 @@ pub fn col(field: impl Into<FieldName>) -> Expression {
 /// ```
 pub fn get_item(field: impl Into<FieldName>, child: Expression) -> Expression {
     GetItem.new_expr(field.into(), vec![child])
+}
+
+// ---- VariantGet ----
+
+/// Creates an expression that extracts a path from a Variant expression.
+///
+/// Missing paths, traversal mismatches, and failed casts return null. When `dtype` is `None`,
+/// results are nullable Variant values; otherwise results are nullable values of `dtype`.
+pub fn variant_get(
+    child: Expression,
+    path: impl Into<VariantPath>,
+    dtype: Option<DType>,
+) -> Expression {
+    VariantGet.new_expr(VariantGetOptions::new(path.into(), dtype), vec![child])
 }
 
 // ---- CaseWhen ----
@@ -176,15 +204,17 @@ pub fn nested_case_when(
 /// ```
 /// # use vortex_array::arrays::{BoolArray, PrimitiveArray};
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::validity::Validity;
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{eq, root, lit};
 /// let xs = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 /// let result = xs.into_array().apply(&eq(root(), lit(3))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![false, false, true]).to_bit_buffer(),
 /// );
 /// ```
@@ -201,15 +231,17 @@ pub fn eq(lhs: Expression, rhs: Expression) -> Expression {
 /// ```
 /// # use vortex_array::arrays::{BoolArray, PrimitiveArray};
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{ IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::validity::Validity;
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{root, lit, not_eq};
 /// let xs = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 /// let result = xs.into_array().apply(&not_eq(root(), lit(3))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![true, true, false]).to_bit_buffer(),
 /// );
 /// ```
@@ -226,15 +258,17 @@ pub fn not_eq(lhs: Expression, rhs: Expression) -> Expression {
 /// ```
 /// # use vortex_array::arrays::{BoolArray, PrimitiveArray };
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::validity::Validity;
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{gt_eq, root, lit};
 /// let xs = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 /// let result = xs.into_array().apply(&gt_eq(root(), lit(3))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![false, false, true]).to_bit_buffer(),
 /// );
 /// ```
@@ -251,15 +285,17 @@ pub fn gt_eq(lhs: Expression, rhs: Expression) -> Expression {
 /// ```
 /// # use vortex_array::arrays::{BoolArray, PrimitiveArray };
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::validity::Validity;
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{gt, root, lit};
 /// let xs = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 /// let result = xs.into_array().apply(&gt(root(), lit(2))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![false, false, true]).to_bit_buffer(),
 /// );
 /// ```
@@ -276,15 +312,17 @@ pub fn gt(lhs: Expression, rhs: Expression) -> Expression {
 /// ```
 /// # use vortex_array::arrays::{BoolArray, PrimitiveArray };
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::validity::Validity;
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{root, lit, lt_eq};
 /// let xs = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 /// let result = xs.into_array().apply(&lt_eq(root(), lit(2))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![true, true, false]).to_bit_buffer(),
 /// );
 /// ```
@@ -301,15 +339,17 @@ pub fn lt_eq(lhs: Expression, rhs: Expression) -> Expression {
 /// ```
 /// # use vortex_array::arrays::{BoolArray, PrimitiveArray };
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::validity::Validity;
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{root, lit, lt};
 /// let xs = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 /// let result = xs.into_array().apply(&lt(root(), lit(3))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![true, true, false]).to_bit_buffer(),
 /// );
 /// ```
@@ -326,13 +366,15 @@ pub fn lt(lhs: Expression, rhs: Expression) -> Expression {
 /// ```
 /// # use vortex_array::arrays::BoolArray;
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::expr::{root, lit, or};
 /// let xs = BoolArray::from_iter(vec![true, false, true]);
 /// let result = xs.into_array().apply(&or(root(), lit(false))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![true, false, true]).to_bit_buffer(),
 /// );
 /// ```
@@ -362,13 +404,15 @@ where
 /// ```
 /// # use vortex_array::arrays::BoolArray;
 /// # use vortex_array::arrays::bool::BoolArrayExt;
-/// # use vortex_array::{IntoArray, ToCanonical};
+/// # use vortex_array::IntoArray;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_array::expr::{and, root, lit};
 /// let xs = BoolArray::from_iter(vec![true, false, true]).into_array();
 /// let result = xs.apply(&and(root(), lit(true))).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
 ///
 /// assert_eq!(
-///     result.to_bool().to_bit_buffer(),
+///     result.execute::<BoolArray>(&mut ctx).unwrap().to_bit_buffer(),
 ///     BoolArray::from_iter(vec![true, false, true]).to_bit_buffer(),
 /// );
 /// ```
@@ -391,27 +435,39 @@ where
     iter.into_iter().reduce_balanced(and)
 }
 
+/// The conjunction of an expression's child validities — i.e. the validity of a scalar function
+/// whose result is null exactly when any operand is null.
+///
+/// This is the `ScalarFnVTable::validity` for kernels that propagate nulls and never produce a
+/// null from non-null inputs (comparisons, arithmetic, most geo and tensor ops). Returning it lets
+/// the planner derive the output's null mask without executing the kernel. Yields `None` when the
+/// expression has no children.
+pub fn union_child_validities(expression: &Expression) -> VortexResult<Option<Expression>> {
+    let child_validities = expression
+        .children()
+        .iter()
+        .map(Expression::validity)
+        .collect::<VortexResult<Vec<_>>>()?;
+    Ok(and_collect(child_validities))
+}
+
 /// Create a new [`Binary`] using the [`Add`](Operator::Add) operator.
 ///
 /// ## Example usage
 ///
 /// ```
 /// # use vortex_array::IntoArray;
-/// # use vortex_array::arrow::ArrowArrayExecutor;
-/// # use vortex_array::{LEGACY_SESSION, VortexSessionExecute};
+/// # use vortex_array::arrays::PrimitiveArray;
+/// # use vortex_array::builtins::ArrayBuiltins;
+/// # use vortex_array::{VortexSessionExecute, array_session};
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{checked_add, lit, root};
 /// let xs = buffer![1, 2, 3].into_array();
 /// let result = xs.apply(&checked_add(root(), lit(5))).unwrap();
 ///
-/// let mut ctx = LEGACY_SESSION.create_execution_ctx();
-/// assert_eq!(
-///     &result.execute_arrow(None, &mut ctx).unwrap(),
-///     &buffer![6, 7, 8]
-///         .into_array()
-///         .execute_arrow(None, &mut ctx)
-///         .unwrap()
-/// );
+/// let mut ctx = array_session().create_execution_ctx();
+/// let result = result.execute::<PrimitiveArray>(&mut ctx).unwrap();
+/// assert_eq!(result.as_slice::<i32>(), [6, 7, 8]);
 /// ```
 pub fn checked_add(lhs: Expression, rhs: Expression) -> Expression {
     Binary
@@ -700,4 +756,67 @@ pub fn dynamic(
 /// ```
 pub fn list_contains(list: Expression, value: Expression) -> Expression {
     ListContains.new_expr(EmptyOptions, [list, value])
+}
+
+// ---- ByteLength ----
+
+/// Creates an expression that computes the byte length of each element.
+/// This is akin to ANSI SQL OCTET_LENGTH(), or DuckDB's strlen().
+///
+/// ```rust
+/// # use vortex_array::expr::{byte_length, root};
+/// let expr = byte_length(root());
+/// ```
+pub fn byte_length(input: Expression) -> Expression {
+    ByteLength.new_expr(EmptyOptions, [input])
+}
+
+// ---- ExtStorage ----
+
+/// Creates an expression that extracts the storage values from an extension array.
+///
+/// ```rust
+/// # use vortex_array::expr::{ext_storage, root};
+/// let expr = ext_storage(root());
+/// ```
+pub fn ext_storage(input: Expression) -> Expression {
+    ExtStorage.new_expr(EmptyOptions, [input])
+}
+
+// ---- ListLength ----
+
+/// Creates an expression that computes the number of elements in each list
+/// for `List` and `FixedSizeList` inputs. This is akin to ANSI SQL `CARDINALITY()`,
+/// or DuckDB's `len()`/`array_length()`.
+///
+/// ```rust
+/// # use vortex_array::expr::{list_length, root};
+/// let expr = list_length(root());
+/// ```
+pub fn list_length(input: Expression) -> Expression {
+    ListLength.new_expr(EmptyOptions, [input])
+}
+
+// ---- ListSum ----
+
+/// Creates an expression that sums the elements of each list for `List` and
+/// `FixedSizeList` inputs, akin to DuckDB's `list_sum()`.
+///
+/// Follows SQL `SUM` semantics per list: null lists, empty lists, and lists whose elements are
+/// all null yield null; null elements are skipped; integer and decimal overflow yields a null
+/// value. The result dtype follows `sum`'s widening rules and is always nullable. NaN float
+/// elements are skipped by default; see [`list_sum_opts`] for the NaN-including variant.
+///
+/// ```rust
+/// # use vortex_array::expr::{list_sum, root};
+/// let expr = list_sum(root());
+/// ```
+pub fn list_sum(input: Expression) -> Expression {
+    ListSum.new_expr(NumericalAggregateOpts::default(), [input])
+}
+
+/// Creates a [`list_sum`] expression with explicit [`NumericalAggregateOpts`], controlling
+/// whether NaN float elements are skipped (the default) or poison the list's sum to NaN.
+pub fn list_sum_opts(input: Expression, options: NumericalAggregateOpts) -> Expression {
+    ListSum.new_expr(options, [input])
 }

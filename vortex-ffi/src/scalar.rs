@@ -3,7 +3,6 @@
 
 //! FFI interface for working with Vortex scalar values.
 
-use std::ffi::c_char;
 use std::ptr;
 use std::slice;
 use std::str;
@@ -17,59 +16,38 @@ use vortex::dtype::i256;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
-use vortex::error::vortex_err;
 use vortex::scalar::DecimalValue;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue;
 
+use crate::box_wrapper;
 use crate::dtype::vx_dtype;
 use crate::error::try_or;
 use crate::error::vx_error;
+use crate::string::vx_view;
 
-crate::box_wrapper!(
-    /// A typed scalar value.
-    ///
-    /// A `vx_scalar` represents a single value with an associated `DType`.
-    /// Its value is either null or a `ScalarValue`. Null values are allowed only
-    /// when the associated `DType` allows nulls. Non-null values are represented
-    /// by `ScalarValue` and interpreted using the `DType`.
+box_wrapper!(
+    /// A vx_scalar is a single value with an associated vx_dtype.
+    /// Scalar value may be Null is vx_dtype is nullable.
     Scalar,
     vx_scalar
 );
 
-/// Clone a borrowed scalar handle.
-///
-/// The input scalar handle is not consumed. The returned scalar handle must be
-/// released with vx_scalar_free. Returns NULL when given a NULL scalar handle.
+/// Clone a vx_scalar
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_clone(scalar: *const vx_scalar) -> *mut vx_scalar {
-    if scalar.is_null() {
-        return ptr::null_mut();
-    }
     vx_scalar::new(vx_scalar::as_ref(scalar).clone())
 }
 
-/// Return the data type of a scalar.
-///
-/// The returned data type handle borrows storage from the scalar handle, so its
-/// lifetime is bound to the scalar handle. It MUST NOT be freed separately.
-/// Returns NULL when given a NULL scalar handle.
+/// Return scalar's dtype.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_dtype(scalar: *const vx_scalar) -> *const vx_dtype {
-    if scalar.is_null() {
-        return ptr::null();
-    }
-    vx_dtype::new_ref(vx_scalar::as_ref(scalar).dtype())
+    vx_dtype::new(vx_scalar::as_ref(scalar).dtype().clone())
 }
 
-/// Return whether the scalar is a typed null value.
-///
-/// Returns false when given a NULL scalar handle.
+/// Return whether scalar is a typed null value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_is_null(scalar: *const vx_scalar) -> bool {
-    if scalar.is_null() {
-        return false;
-    }
     vx_scalar::as_ref(scalar).is_null()
 }
 
@@ -159,19 +137,16 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_f16_bits(
 
 /// Create a UTF-8 scalar.
 ///
-/// The byte range is copied into the scalar. A NULL data pointer is allowed only
-/// for an empty byte range. Invalid UTF-8 returns NULL and writes the error
-/// output.
+/// The string bytes are copied into the scalar. Invalid UTF-8 returns NULL and
+/// writes the error output.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_utf8(
-    ptr: *const c_char,
-    len: usize,
+    value: vx_view,
     is_nullable: bool,
     err: *mut *mut vx_error,
 ) -> *mut vx_scalar {
     try_or(err, ptr::null_mut(), || {
-        let bytes = bytes_from_raw(ptr.cast(), len, "utf8")?;
-        let value = str::from_utf8(bytes).map_err(|e| vortex_err!("invalid utf-8: {e}"))?;
+        let value = unsafe { value.as_str() }?;
         Ok(vx_scalar::new(Scalar::utf8(
             value.to_owned(),
             Nullability::from(is_nullable),
@@ -181,9 +156,10 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_utf8(
 
 /// Create a binary scalar.
 ///
-/// The byte range is copied into the scalar. A NULL data pointer is allowed only
-/// for an empty byte range. Passing a NULL data pointer for a non-empty byte
-/// range returns NULL and writes the error output.
+/// The byte range is copied into the scalar. NULL "ptr" is allowed only when
+/// len == 0.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_binary(
     ptr: *const u8,
@@ -202,16 +178,16 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_binary(
 
 /// Create a typed null scalar.
 ///
-/// The data type handle is borrowed, not consumed. The returned scalar uses a
-/// nullable copy of that logical type, regardless of the input type's top-level
-/// nullability. A NULL data type handle returns NULL and writes the error output.
+/// Returned scalar uses a nullable copy of that logical type, regardless of
+/// the input type's top-level nullability.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_null(
     dtype: *const vx_dtype,
     err: *mut *mut vx_error,
 ) -> *mut vx_scalar {
     try_or(err, ptr::null_mut(), || {
-        vortex_ensure!(!dtype.is_null(), "dtype is null");
         Ok(vx_scalar::new(Scalar::null(
             vx_dtype::as_ref(dtype).as_nullable(),
         )))
@@ -220,9 +196,9 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_null(
 
 /// Create a decimal scalar.
 ///
-/// The unscaled value is provided as a signed 8-bit integer. Decimal precision
-/// and scale define the logical decimal type. Invalid decimal metadata or value
-/// overflow returns NULL and writes the error output.
+/// The unscaled value is provided as a signed 8-bit integer.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i8(
     value: i8,
@@ -238,9 +214,9 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i8(
 
 /// Create a decimal scalar.
 ///
-/// The unscaled value is provided as a signed 16-bit integer. Decimal precision
-/// and scale define the logical decimal type. Invalid decimal metadata or value
-/// overflow returns NULL and writes the error output.
+/// The unscaled value is provided as a signed 16-bit integer.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i16(
     value: i16,
@@ -256,9 +232,9 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i16(
 
 /// Create a decimal scalar.
 ///
-/// The unscaled value is provided as a signed 32-bit integer. Decimal precision
-/// and scale define the logical decimal type. Invalid decimal metadata or value
-/// overflow returns NULL and writes the error output.
+/// The unscaled value is provided as a signed 32-bit integer.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i32(
     value: i32,
@@ -274,9 +250,9 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i32(
 
 /// Create a decimal scalar.
 ///
-/// The unscaled value is provided as a signed 64-bit integer. Decimal precision
-/// and scale define the logical decimal type. Invalid decimal metadata or value
-/// overflow returns NULL and writes the error output.
+/// The unscaled value is provided as a signed 64-bit integer.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i64(
     value: i64,
@@ -293,9 +269,9 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i64(
 /// Create a decimal scalar.
 ///
 /// The unscaled value is read from a 16-byte little-endian signed integer
-/// buffer. Decimal precision and scale define the logical decimal type.
-/// Invalid decimal metadata or value overflow returns NULL and writes the error
-/// output.
+/// buffer.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i128_le(
     bytes16: *const u8,
@@ -318,9 +294,9 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i128_le(
 /// Create a decimal scalar.
 ///
 /// The unscaled value is read from a 32-byte little-endian signed integer
-/// buffer. Decimal precision and scale define the logical decimal type.
-/// Invalid decimal metadata or value overflow returns NULL and writes the error
-/// output.
+/// buffer.
+///
+/// Returns NULL and sets "err" on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i256_le(
     bytes32: *const u8,
@@ -342,10 +318,7 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_decimal_i256_le(
 
 /// Create a list scalar.
 ///
-/// The element data type handle is borrowed, not consumed. Child scalar handles
-/// are cloned into the list value, so the caller keeps ownership of the handle
-/// array and each scalar in it. A NULL child handle array is allowed only for an
-/// empty list. Child values are validated against the element logical type.
+/// NULL "elements" are allowed only if len == 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_list(
     element_dtype: *const vx_dtype,
@@ -355,7 +328,6 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_list(
     err: *mut *mut vx_error,
 ) -> *mut vx_scalar {
     try_or(err, ptr::null_mut(), || {
-        vortex_ensure!(!element_dtype.is_null(), "element dtype is null");
         let dtype = DType::List(
             Arc::new(vx_dtype::as_ref(element_dtype).clone()),
             Nullability::from(is_nullable),
@@ -370,30 +342,22 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_list(
 
 /// Create a fixed-size list scalar.
 ///
-/// The element data type handle is borrowed, not consumed. The number of child
-/// scalars becomes the fixed-size list width and must fit in a 32-bit unsigned
-/// integer. Child scalar handles are cloned into the list value, so the caller
-/// keeps ownership of the handle array and each scalar in it. A NULL child
-/// handle array is allowed only for an empty list. Child values are validated
-/// against the element logical type.
+/// NULL "elements" are allowed only if len == 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_fixed_size_list(
     element_dtype: *const vx_dtype,
     elements: *const *const vx_scalar,
-    len: usize,
+    len: u32,
     is_nullable: bool,
     err: *mut *mut vx_error,
 ) -> *mut vx_scalar {
     try_or(err, ptr::null_mut(), || {
-        vortex_ensure!(!element_dtype.is_null(), "element dtype is null");
-        let size = u32::try_from(len)
-            .map_err(|_| vortex_err!("fixed-size list length {len} exceeds u32::MAX"))?;
         let dtype = DType::FixedSizeList(
             Arc::new(vx_dtype::as_ref(element_dtype).clone()),
-            size,
+            len,
             Nullability::from(is_nullable),
         );
-        let values = scalar_values_from_raw(elements, len)?;
+        let values = scalar_values_from_raw(elements, len as usize)?;
         Ok(vx_scalar::new(Scalar::try_new(
             dtype,
             Some(ScalarValue::Tuple(values)),
@@ -403,11 +367,7 @@ pub unsafe extern "C-unwind" fn vx_scalar_new_fixed_size_list(
 
 /// Create a struct scalar.
 ///
-/// The struct data type handle is borrowed, not consumed. Field scalar handles
-/// are cloned into the struct value, so the caller keeps ownership of the handle
-/// array and each scalar in it. Field count and field logical types are validated
-/// against the struct logical type. A NULL field handle array is allowed only for
-/// an empty struct value.
+/// NULL "fields" are allowed only if len == 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_scalar_new_struct(
     struct_dtype: *const vx_dtype,
@@ -522,6 +482,7 @@ mod tests {
     use crate::scalar::vx_scalar_new_u32;
     use crate::scalar::vx_scalar_new_u64;
     use crate::scalar::vx_scalar_new_utf8;
+    use crate::string::vx_view;
     use crate::tests::assert_error;
     use crate::tests::assert_no_error;
 
@@ -593,18 +554,14 @@ mod tests {
             let mut error = ptr::null_mut();
             let value = "literal";
             assert_scalar(
-                vx_scalar_new_utf8(value.as_ptr().cast(), value.len(), false, &raw mut error),
+                vx_scalar_new_utf8(vx_view::from_str(value), false, &raw mut error),
                 Scalar::utf8(value, Nullability::NonNullable),
             );
             assert_no_error(error);
 
             let invalid_utf8 = [0xffu8];
-            let scalar = vx_scalar_new_utf8(
-                invalid_utf8.as_ptr().cast(),
-                invalid_utf8.len(),
-                false,
-                &raw mut error,
-            );
+            let scalar =
+                vx_scalar_new_utf8(vx_view::from_bytes(&invalid_utf8), false, &raw mut error);
             assert!(scalar.is_null());
             assert_error(error);
 
@@ -620,10 +577,12 @@ mod tests {
             vx_dtype_free(dtype);
             assert_no_error(error);
             assert!(vx_scalar_is_null(null_scalar));
+            let scalar_dtype = vx_scalar_dtype(null_scalar);
             assert_eq!(
-                vx_dtype::as_ref(vx_scalar_dtype(null_scalar)),
+                vx_dtype::as_ref(scalar_dtype),
                 &DType::Primitive(PType::I32, Nullability::Nullable)
             );
+            vx_dtype_free(scalar_dtype);
             vx_scalar_free(null_scalar);
         }
     }
@@ -636,7 +595,6 @@ mod tests {
             assert_eq!(vx_scalar::as_ref(cloned), vx_scalar::as_ref(scalar));
             vx_scalar_free(cloned);
             vx_scalar_free(scalar);
-            assert!(vx_scalar_clone(ptr::null()).is_null());
         }
     }
 
@@ -743,11 +701,12 @@ mod tests {
             );
             assert_no_error(error);
 
+            let len = u32::try_from(children.len()).unwrap();
             assert_scalar(
                 vx_scalar_new_fixed_size_list(
                     element_dtype,
                     children.as_ptr(),
-                    children.len(),
+                    len,
                     false,
                     &raw mut error,
                 ),
@@ -774,7 +733,7 @@ mod tests {
             assert!(wrong.is_null());
             assert_error(error);
 
-            let struct_dtype = vx_dtype::new(Arc::new(DType::Struct(
+            let struct_dtype = vx_dtype::new(DType::Struct(
                 StructFields::new(
                     ["flag", "value"].into(),
                     vec![
@@ -783,7 +742,7 @@ mod tests {
                     ],
                 ),
                 Nullability::NonNullable,
-            )));
+            ));
             let flag = vx_scalar_new_bool(true, false);
             let value = vx_scalar_new_i32(10, false);
             let fields = [flag.cast_const(), value.cast_const()];

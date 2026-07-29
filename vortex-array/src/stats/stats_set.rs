@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::type_name;
 use std::fmt::Debug;
 
 use enum_iterator::all;
@@ -103,11 +104,12 @@ impl StatsSet {
     }
 
     /// Get value for a given stat
-    pub fn get(&self, stat: Stat) -> Option<Precision<ScalarValue>> {
+    pub fn get(&self, stat: Stat) -> Precision<ScalarValue> {
         self.values
             .iter()
             .find(|(s, _)| *s == stat)
             .map(|(_, v)| v.clone())
+            .unwrap_or(Precision::Absent)
     }
 
     /// Length of the stats set
@@ -125,21 +127,14 @@ impl StatsSet {
         &self,
         stat: Stat,
         dtype: &DType,
-    ) -> Option<Precision<T>> {
+    ) -> Precision<T> {
         self.get(stat).map(|v| {
-            v.map(|v| {
-                T::try_from(
-                    &Scalar::try_new(dtype.clone(), Some(v))
-                        .vortex_expect("failed to construct a scalar statistic"),
-                )
-                .unwrap_or_else(|err| {
-                    vortex_panic!(
-                        err,
-                        "Failed to get stat {} as {}",
-                        stat,
-                        std::any::type_name::<T>()
-                    )
-                })
+            T::try_from(
+                &Scalar::try_new(dtype.clone(), Some(v))
+                    .vortex_expect("failed to construct a scalar statistic"),
+            )
+            .unwrap_or_else(|err| {
+                vortex_panic!(err, "Failed to get stat {} as {}", stat, type_name::<T>())
             })
         })
     }
@@ -220,16 +215,14 @@ pub struct TypedStatsSetRef<'a, 'b> {
 }
 
 impl StatsProvider for TypedStatsSetRef<'_, '_> {
-    fn get(&self, stat: Stat) -> Option<Precision<Scalar>> {
-        self.values.get(stat).map(|p| {
-            p.map(|sv| {
-                Scalar::try_new(
-                    stat.dtype(self.dtype)
-                        .vortex_expect("Must have valid dtype if value is present"),
-                    Some(sv),
-                )
-                .vortex_expect("failed to construct a scalar statistic")
-            })
+    fn get(&self, stat: Stat) -> Precision<Scalar> {
+        self.values.get(stat).map(|sv| {
+            Scalar::try_new(
+                stat.dtype(self.dtype)
+                    .vortex_expect("Must have valid dtype if value is present"),
+                Some(sv),
+            )
+            .vortex_expect("failed to construct a scalar statistic")
         })
     }
 
@@ -256,16 +249,14 @@ impl MutTypedStatsSetRef<'_, '_> {
 }
 
 impl StatsProvider for MutTypedStatsSetRef<'_, '_> {
-    fn get(&self, stat: Stat) -> Option<Precision<Scalar>> {
-        self.values.get(stat).map(|p| {
-            p.map(|sv| {
-                Scalar::try_new(
-                    stat.dtype(self.dtype)
-                        .vortex_expect("Must have valid dtype if value is present"),
-                    Some(sv),
-                )
-                .vortex_expect("failed to construct a scalar statistic")
-            })
+    fn get(&self, stat: Stat) -> Precision<Scalar> {
+        self.values.get(stat).map(|sv| {
+            Scalar::try_new(
+                stat.dtype(self.dtype)
+                    .vortex_expect("Must have valid dtype if value is present"),
+                Some(sv),
+            )
+            .vortex_expect("failed to construct a scalar statistic")
         })
     }
 
@@ -488,13 +479,12 @@ impl MutTypedStatsSetRef<'_, '_> {
         let self_min = self.get(Stat::Min);
         let other_min = other.get(Stat::Min);
 
-        if let (
-            Some(Precision::Exact(self_const)),
-            Some(Precision::Exact(other_const)),
-            Some(Precision::Exact(self_min)),
-            Some(Precision::Exact(other_min)),
-        ) = (self_const, other_const, self_min, other_min)
-        {
+        if let (Some(self_const), Some(other_const), Some(self_min), Some(other_min)) = (
+            self_const.as_exact(),
+            other_const.as_exact(),
+            self_min.as_exact(),
+            other_min.as_exact(),
+        ) {
             if self_const && other_const && self_min == other_min {
                 self.set(Stat::IsConstant, Precision::exact(true));
             } else {
@@ -518,7 +508,7 @@ impl MutTypedStatsSetRef<'_, '_> {
         stat: Stat,
         cmp: F,
     ) {
-        if (Some(Precision::Exact(true)), Some(Precision::Exact(true)))
+        if (Precision::Exact(true), Precision::Exact(true))
             == (self.get_as(stat), other.get_as(stat))
         {
             // There might be no stat because it was dropped, or it doesn't exist
@@ -526,10 +516,10 @@ impl MutTypedStatsSetRef<'_, '_> {
             // We assume that it was the dropped case since the doesn't exist might imply sorted,
             // but this in-precision is correct.
             if let (Some(self_max), Some(other_min)) = (
-                self.get_scalar_bound::<Max>(),
-                other.get_scalar_bound::<Min>(),
+                self.get_scalar_bound::<Max>().and_then(|v| v.max_value()),
+                other.get_scalar_bound::<Min>().and_then(|v| v.min_value()),
             ) {
-                return if cmp(&self_max.max_value(), &other_min.min_value()) {
+                return if cmp(&self_max, &other_min) {
                     // keep value
                 } else {
                     self.set(stat, Precision::inexact(false));
@@ -552,14 +542,15 @@ impl MutTypedStatsSetRef<'_, '_> {
     }
 
     fn merge_sum_stat(&mut self, stat: Stat, other: &TypedStatsSetRef) {
-        match (self.get_as::<usize>(stat), other.get_as::<usize>(stat)) {
-            (Some(nc1), Some(nc2)) => {
-                self.set(
-                    stat,
-                    nc1.zip(nc2).map(|(nc1, nc2)| ScalarValue::from(nc1 + nc2)),
-                );
-            }
-            _ => self.clear(stat),
+        let merged = self
+            .get_as::<usize>(stat)
+            .zip(other.get_as::<usize>(stat))
+            .map(|(l, r)| ScalarValue::from(l + r));
+
+        if merged.is_absent() {
+            self.clear(stat);
+        } else {
+            self.set(stat, merged);
         }
     }
 }
@@ -570,8 +561,8 @@ mod test {
     use itertools::Itertools;
     use smallvec::smallvec;
 
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -657,12 +648,9 @@ mod test {
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
         assert_eq!(
             first_ref.get_as::<bool>(Stat::IsConstant),
-            Some(Precision::exact(false))
+            Precision::exact(false)
         );
-        assert_eq!(
-            first_ref.get_as::<i32>(Stat::Min),
-            Some(Precision::exact(42))
-        );
+        assert_eq!(first_ref.get_as::<i32>(Stat::Min), Precision::exact(42));
     }
 
     #[test]
@@ -673,7 +661,7 @@ mod test {
         );
 
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert!(first_ref.get(Stat::Min).is_none());
+        assert!(first_ref.get(Stat::Min).is_absent());
     }
 
     #[test]
@@ -684,7 +672,7 @@ mod test {
         );
 
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert!(first_ref.get(Stat::Min).is_none());
+        assert!(first_ref.get(Stat::Min).is_absent());
     }
 
     #[test]
@@ -695,10 +683,7 @@ mod test {
         );
 
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert_eq!(
-            first_ref.get_as::<i32>(Stat::Min),
-            Some(Precision::exact(37))
-        );
+        assert_eq!(first_ref.get_as::<i32>(Stat::Min), Precision::exact(37));
     }
 
     #[test]
@@ -707,7 +692,7 @@ mod test {
             &StatsSet::default(),
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
-        assert!(first.get(Stat::Max).is_none());
+        assert!(first.get(Stat::Max).is_absent());
     }
 
     #[test]
@@ -716,7 +701,7 @@ mod test {
             &StatsSet::of(Stat::Max, Precision::exact(42)),
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
-        assert!(first.get(Stat::Max).is_none());
+        assert!(first.get(Stat::Max).is_absent());
     }
 
     #[test]
@@ -726,10 +711,7 @@ mod test {
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert_eq!(
-            first_ref.get_as::<i32>(Stat::Max),
-            Some(Precision::exact(42))
-        );
+        assert_eq!(first_ref.get_as::<i32>(Stat::Max), Precision::exact(42));
     }
 
     #[test]
@@ -738,10 +720,7 @@ mod test {
         let first = StatsSet::of(Stat::Max, Precision::exact(42i32))
             .merge_ordered(&StatsSet::of(Stat::Max, Precision::inexact(43i32)), &dtype);
         let first_ref = first.as_typed_ref(&dtype);
-        assert_eq!(
-            first_ref.get_as::<i32>(Stat::Max),
-            Some(Precision::inexact(43))
-        );
+        assert_eq!(first_ref.get_as::<i32>(Stat::Max), Precision::inexact(43));
     }
 
     #[test]
@@ -753,7 +732,7 @@ mod test {
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert!(first_ref.get(Stat::Sum).is_none());
+        assert!(first_ref.get(Stat::Sum).is_absent());
     }
 
     #[test]
@@ -765,7 +744,7 @@ mod test {
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert!(first_ref.get(Stat::Sum).is_none());
+        assert!(first_ref.get(Stat::Sum).is_absent());
     }
 
     #[test]
@@ -777,10 +756,7 @@ mod test {
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert_eq!(
-            first_ref.get_as::<i64>(Stat::Sum),
-            Some(Precision::exact(79i64))
-        );
+        assert_eq!(first_ref.get_as::<i64>(Stat::Sum), Precision::exact(79i64));
     }
 
     #[test]
@@ -789,7 +765,7 @@ mod test {
             &StatsSet::default(),
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
-        assert!(first.get(Stat::IsStrictSorted).is_none());
+        assert!(first.get(Stat::IsStrictSorted).is_absent());
     }
 
     #[test]
@@ -798,7 +774,7 @@ mod test {
             &StatsSet::of(Stat::IsStrictSorted, Precision::exact(true)),
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
-        assert!(first.get(Stat::IsStrictSorted).is_none());
+        assert!(first.get(Stat::IsStrictSorted).is_absent());
     }
 
     #[test]
@@ -815,7 +791,7 @@ mod test {
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
         assert_eq!(
             first_ref.get_as::<bool>(Stat::IsStrictSorted),
-            Some(Precision::exact(true))
+            Precision::exact(true)
         );
     }
 
@@ -834,7 +810,7 @@ mod test {
             second.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
         assert_eq!(
             second_ref.get_as::<bool>(Stat::IsStrictSorted),
-            Some(Precision::inexact(false))
+            Precision::inexact(false)
         );
     }
 
@@ -853,7 +829,7 @@ mod test {
             second.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
         assert_eq!(
             second_ref.get_as::<bool>(Stat::IsStrictSorted),
-            Some(Precision::exact(false))
+            Precision::exact(false)
         );
     }
 
@@ -866,7 +842,7 @@ mod test {
             &second,
             &DType::Primitive(PType::I32, Nullability::NonNullable),
         );
-        assert!(first.get(Stat::IsStrictSorted).is_none());
+        assert!(first.get(Stat::IsStrictSorted).is_absent());
     }
 
     #[test]
@@ -883,7 +859,7 @@ mod test {
         let first_ref = first.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
         assert_eq!(
             first_ref.get_as::<bool>(Stat::IsStrictSorted),
-            Some(Precision::exact(true))
+            Precision::exact(true)
         );
     }
 
@@ -897,12 +873,12 @@ mod test {
             .collect_vec();
         array
             .statistics()
-            .compute_all(&all_stats, &mut LEGACY_SESSION.create_execution_ctx())
+            .compute_all(&all_stats, &mut array_session().create_execution_ctx())
             .unwrap();
 
         let stats = array.statistics().to_owned();
         for stat in &all_stats {
-            assert!(stats.get(*stat).is_some(), "Stat {stat} is missing");
+            assert!(!stats.get(*stat).is_absent(), "Stat {stat} is missing");
         }
 
         let merged = stats.clone().merge_unordered(
@@ -911,7 +887,7 @@ mod test {
         );
         for stat in &all_stats {
             assert_eq!(
-                merged.get(*stat).is_some(),
+                !merged.get(*stat).is_absent(),
                 stat.is_commutative(),
                 "Stat {stat} remains after merge_unordered despite not being commutative, or was removed despite being commutative"
             )
@@ -929,11 +905,8 @@ mod test {
             stats_ref.get_as::<i32>(Stat::Max)
         );
         assert_eq!(
-            merged_ref.get_as::<u64>(Stat::NullCount).unwrap(),
-            stats_ref
-                .get_as::<u64>(Stat::NullCount)
-                .unwrap()
-                .map(|s| s * 2)
+            merged_ref.get_as::<u64>(Stat::NullCount),
+            stats_ref.get_as::<u64>(Stat::NullCount).map(|s| s * 2)
         );
     }
 
@@ -947,10 +920,7 @@ mod test {
         );
         let merged_ref =
             merged.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert_eq!(
-            merged_ref.get_as::<i32>(Stat::Min),
-            Some(Precision::exact(5))
-        );
+        assert_eq!(merged_ref.get_as::<i32>(Stat::Min), Precision::exact(5));
     }
 
     #[test]
@@ -961,10 +931,7 @@ mod test {
         );
         let merged_ref =
             merged.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
-        assert_eq!(
-            merged_ref.get_as::<i32>(Stat::Min),
-            Some(Precision::inexact(4))
-        );
+        assert_eq!(merged_ref.get_as::<i32>(Stat::Min), Precision::inexact(4));
     }
 
     #[test]
@@ -981,7 +948,7 @@ mod test {
                 .unwrap();
             assert_eq!(
                 stats_ref.get_as::<bool>(Stat::IsConstant),
-                Some(Precision::exact(true))
+                Precision::exact(true)
             );
         }
 
@@ -997,7 +964,7 @@ mod test {
                 .unwrap();
             assert_eq!(
                 stats_ref.get_as::<bool>(Stat::IsConstant),
-                Some(Precision::exact(true))
+                Precision::exact(true)
             );
         }
 
@@ -1013,7 +980,7 @@ mod test {
                 .unwrap();
             assert_eq!(
                 stats_ref.get_as::<bool>(Stat::IsConstant),
-                Some(Precision::exact(false))
+                Precision::exact(false)
             );
         }
     }
@@ -1060,19 +1027,13 @@ mod test {
             stats1.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
 
         // Min should remain unchanged
-        assert_eq!(
-            stats_ref.get_as::<i32>(Stat::Min),
-            Some(Precision::exact(42))
-        );
+        assert_eq!(stats_ref.get_as::<i32>(Stat::Min), Precision::exact(42));
         // Max should be added
-        assert_eq!(
-            stats_ref.get_as::<i32>(Stat::Max),
-            Some(Precision::exact(100))
-        );
+        assert_eq!(stats_ref.get_as::<i32>(Stat::Max), Precision::exact(100));
         // IsStrictSorted should be added
         assert_eq!(
             stats_ref.get_as::<bool>(Stat::IsStrictSorted),
-            Some(Precision::exact(true))
+            Precision::exact(true)
         );
     }
 
@@ -1102,19 +1063,13 @@ mod test {
             stats1.as_typed_ref(&DType::Primitive(PType::I32, Nullability::NonNullable));
 
         // Min should remain unchanged since it's more restrictive than the inexact value
-        assert_eq!(
-            stats_ref.get_as::<i32>(Stat::Min),
-            Some(Precision::exact(42))
-        );
+        assert_eq!(stats_ref.get_as::<i32>(Stat::Min), Precision::exact(42));
         // Check that max was updated with the exact value
-        assert_eq!(
-            stats_ref.get_as::<i32>(Stat::Max),
-            Some(Precision::exact(90))
-        );
+        assert_eq!(stats_ref.get_as::<i32>(Stat::Max), Precision::exact(90));
         // Check that IsSorted was added
         assert_eq!(
             stats_ref.get_as::<bool>(Stat::IsSorted),
-            Some(Precision::exact(true))
+            Precision::exact(true)
         );
     }
 }

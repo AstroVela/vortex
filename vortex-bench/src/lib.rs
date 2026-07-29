@@ -10,8 +10,10 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use anyhow::bail;
+use appian::AppianBenchmark;
 use clap::ValueEnum;
 use clickbench::ClickBenchBenchmark;
+use clickbench::ClickBenchSortedBenchmark;
 use clickbench::Flavor;
 use fineweb::FinewebBenchmark;
 use itertools::Itertools;
@@ -33,6 +35,10 @@ use vortex::file::VortexWriteOptions;
 use vortex::file::WriteStrategyBuilder;
 use vortex::utils::aliases::hash_map::HashMap;
 
+use crate::spatialbench::SpatialBenchBenchmark;
+use crate::vortex_queries::VortexBenchmark;
+
+pub mod appian;
 pub mod benchmark;
 pub mod clickbench;
 pub mod compress;
@@ -49,12 +55,14 @@ pub mod public_bi;
 pub mod random_access;
 pub mod realnest;
 pub mod runner;
+pub mod spatialbench;
 pub mod statpopgen;
 pub mod tpcds;
 pub mod tpch;
 pub mod utils;
 pub mod v3;
 pub mod vector_dataset;
+pub mod vortex_queries;
 
 pub use benchmark::Benchmark;
 pub use benchmark::TableSpec;
@@ -70,8 +78,11 @@ use vortex::session::VortexSession;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-pub static SESSION: LazyLock<VortexSession> =
-    LazyLock::new(|| VortexSession::default().with_tokio());
+pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = VortexSession::default().with_tokio();
+    vortex_geo::initialize(&session);
+    session
+});
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -130,8 +141,6 @@ impl Display for Target {
 pub enum Format {
     #[clap(name = "csv")]
     Csv,
-    #[clap(name = "arrow")]
-    Arrow,
     #[clap(name = "parquet")]
     Parquet,
     #[clap(name = "vortex")]
@@ -140,6 +149,9 @@ pub enum Format {
     #[clap(name = "vortex-compact")]
     #[serde(rename = "vortex-compact")]
     VortexCompact,
+    #[clap(name = "vortex-geo-native")]
+    #[serde(rename = "vortex-geo-native")]
+    VortexNative,
     #[clap(name = "duckdb")]
     #[serde(rename = "duckdb")]
     OnDiskDuckDB,
@@ -175,10 +187,10 @@ impl Format {
     pub fn name(&self) -> &'static str {
         match self {
             Format::Csv => "csv",
-            Format::Arrow => "arrow",
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex-file-compressed",
             Format::VortexCompact => "vortex-compact",
+            Format::VortexNative => "vortex-geo-native",
             Format::OnDiskDuckDB => "duckdb",
             Format::Lance => "lance",
         }
@@ -187,10 +199,10 @@ impl Format {
     pub fn ext(&self) -> &'static str {
         match self {
             Format::Csv => "csv",
-            Format::Arrow => "arrow",
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex",
             Format::VortexCompact => "vortex",
+            Format::VortexNative => "vortex",
             Format::OnDiskDuckDB => "duckdb",
             Format::Lance => "lance",
         }
@@ -202,7 +214,6 @@ impl Format {
 pub enum Engine {
     #[default]
     Vortex,
-    Arrow,
     #[clap(name = "datafusion")]
     #[serde(rename = "datafusion")]
     DataFusion,
@@ -217,7 +228,6 @@ impl Display for Engine {
             Engine::DataFusion => write!(f, "datafusion"),
             Engine::DuckDB => write!(f, "duckdb"),
             Engine::Vortex => write!(f, "vortex"),
-            Engine::Arrow => write!(f, "arrow"),
         }
     }
 }
@@ -245,8 +255,12 @@ impl CompactionStrategy {
 /// CLI argument for selecting which benchmark to run.
 #[derive(clap::ValueEnum, Clone, Copy)]
 pub enum BenchmarkArg {
+    #[clap(name = "appian")]
+    Appian,
     #[clap(name = "clickbench")]
     ClickBench,
+    #[clap(name = "clickbench-sorted")]
+    ClickBenchSorted,
     #[clap(name = "tpch")]
     TpcH,
     #[clap(name = "tpcds")]
@@ -261,6 +275,10 @@ pub enum BenchmarkArg {
     PolarSignals,
     #[clap(name = "public-bi")]
     PublicBi,
+    #[clap(name = "spatialbench")]
+    SpatialBench,
+    #[clap(name = "vortex")]
+    VortexQueries,
 }
 
 /// Default scale factor for TPC-related benchmarks
@@ -272,10 +290,20 @@ const REMOTE_DATA_KEY: &str = "remote-data-dir";
 /// Factory function to create a benchmark instance from CLI arguments.
 pub fn create_benchmark(b: BenchmarkArg, opts: &Opts) -> anyhow::Result<Box<dyn Benchmark>> {
     match b {
+        BenchmarkArg::Appian => {
+            let remote_data_dir = opts.get_as::<String>(REMOTE_DATA_KEY);
+            let benchmark = AppianBenchmark::with_remote_data_dir(remote_data_dir)?;
+            Ok(Box::new(benchmark) as _)
+        }
         BenchmarkArg::ClickBench => {
             let flavor = opts.get_as::<Flavor>("flavor").unwrap_or_default();
             let remote_data_dir = opts.get_as::<String>(REMOTE_DATA_KEY);
             let benchmark = ClickBenchBenchmark::new(flavor, None, remote_data_dir)?;
+            Ok(Box::new(benchmark) as _)
+        }
+        BenchmarkArg::ClickBenchSorted => {
+            let remote_data_dir = opts.get_as::<String>(REMOTE_DATA_KEY);
+            let benchmark = ClickBenchSortedBenchmark::new(remote_data_dir)?;
             Ok(Box::new(benchmark) as _)
         }
         BenchmarkArg::TpcH => {
@@ -315,6 +343,19 @@ pub fn create_benchmark(b: BenchmarkArg, opts: &Opts) -> anyhow::Result<Box<dyn 
                 anyhow::anyhow!("public-bi benchmark requires --opt dataset=<name>")
             })?;
             let benchmark = PublicBiBenchmark::new(dataset)?;
+            Ok(Box::new(benchmark) as _)
+        }
+        BenchmarkArg::SpatialBench => {
+            let scale_factor = opts.get(SCALE_FACTOR_KEY).unwrap_or(DEFAULT_SCALE_FACTOR);
+            let remote_data_dir = opts.get_as::<String>(REMOTE_DATA_KEY);
+            let benchmark = SpatialBenchBenchmark::new(scale_factor.to_string(), remote_data_dir)?;
+            Ok(Box::new(benchmark) as _)
+        }
+        BenchmarkArg::VortexQueries => {
+            let mut benchmark = VortexBenchmark::new()?;
+            if let Some(query) = opts.get("query") {
+                benchmark = benchmark.with_query(query)?;
+            }
             Ok(Box::new(benchmark) as _)
         }
     }

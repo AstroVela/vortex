@@ -25,8 +25,8 @@ void print_estimate(const char *what, const vx_estimate *estimate) {
 }
 
 void print_error(const char *what, const vx_error *error) {
-    const vx_string *str = vx_error_get_message(error);
-    fprintf(stderr, "%s: %.*s\n", what, (int)vx_string_len(str), vx_string_ptr(str));
+    const vx_view str = vx_error_message(error);
+    fprintf(stderr, "%s: %.*s\n", what, (int)str.len, str.ptr);
 }
 
 struct scan_thread_info {
@@ -162,7 +162,8 @@ int main(int argc, char *argv[]) {
 
     // A datasource is a reference to some files.
     // We can request multiple scans from a data source.
-    vx_data_source_options ds_options = {.paths = paths};
+    vx_view path = vx_view_from_cstr(paths);
+    vx_data_source_options ds_options = {.paths = &path, .paths_len = 1};
     vx_error *error = NULL;
     const vx_data_source *data_source = vx_data_source_new(session, &ds_options, &error);
     if (data_source == NULL) {
@@ -179,7 +180,7 @@ int main(int argc, char *argv[]) {
 
     // A scan is a single traversal of a data source.
     // Here we request a scan without any filters, projections, or limiting.
-    vx_scan_options scan_options = {.max_threads = threads};
+    vx_scan_options scan_options = {0};
     vx_estimate partition_estimate;
     vx_scan *scan = vx_data_source_scan(data_source, &scan_options, &partition_estimate, &error);
     if (scan == NULL) {

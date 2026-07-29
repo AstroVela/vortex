@@ -6,10 +6,13 @@
 //! Vortex encoders must always produce unsigned integer codes; signed codes are only accepted
 //! for external compatibility.
 
+use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::VTable;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::DictArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::dict::DictArrayExt;
@@ -21,18 +24,20 @@ use vortex_error::VortexResult;
 
 use crate::CascadingCompressor;
 use crate::builtins::IntDictScheme;
-use crate::builtins::StringDictScheme;
-use crate::builtins::is_utf8_string;
-use crate::ctx::CompressorContext;
-use crate::estimate::CompressionEstimate;
-use crate::estimate::DeferredEstimate;
-use crate::estimate::EstimateVerdict;
 use crate::scheme::ChildSelection;
+use crate::scheme::CompressionEstimate;
+use crate::scheme::CompressorContext;
+use crate::scheme::DeferredEstimate;
 use crate::scheme::DescendantExclusion;
+use crate::scheme::EstimateVerdict;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
+
+/// Dictionary encoding for low-cardinality string values.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct StringDictScheme;
 
 impl Scheme for StringDictScheme {
     fn scheme_name(&self) -> &'static str {
@@ -40,7 +45,11 @@ impl Scheme for StringDictScheme {
     }
 
     fn matches(&self, canonical: &Canonical) -> bool {
-        is_utf8_string(canonical)
+        canonical.dtype().is_utf8()
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![Dict.id()]
     }
 
     fn stats_options(&self) -> GenerateStatsOptions {
@@ -72,7 +81,7 @@ impl Scheme for StringDictScheme {
         _compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
-        let stats = data.string_stats(exec_ctx);
+        let stats = data.varbinview_stats(exec_ctx);
 
         if stats.value_count() == 0 {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
@@ -98,7 +107,7 @@ impl Scheme for StringDictScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let dict = dict_encode(data.array())?;
+        let dict = dict_encode(data.array(), exec_ctx)?;
 
         // Values = child 0.
         let compressed_values =
@@ -109,7 +118,7 @@ impl Scheme for StringDictScheme {
             .codes()
             .clone()
             .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow()?
+            .narrow(exec_ctx)?
             .into_array();
         let compressed_codes =
             compressor.compress_child(&narrowed_codes, &compress_ctx, self.id(), 1, exec_ctx)?;

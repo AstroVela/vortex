@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use fsst::ESCAPE_CODE;
@@ -19,7 +20,6 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::scalar_fn::fns::like::Like;
 use vortex_array::scalar_fn::fns::like::LikeOptions;
-use vortex_array::session::ArraySession;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
@@ -31,8 +31,11 @@ use crate::FSSTArray;
 use crate::fsst_compress;
 use crate::fsst_train_compressor;
 
-static SESSION: LazyLock<VortexSession> =
-    LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = vortex_array::array_session();
+    crate::initialize(&session);
+    session
+});
 
 /// Helper: make a Symbol from a byte string (up to 8 bytes, zero-padded).
 fn sym(bytes: &[u8]) -> Symbol {
@@ -50,20 +53,63 @@ fn escaped(bytes: &[u8]) -> Vec<u8> {
     codes
 }
 
+fn assert_borrowed_prefix(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Prefix(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected borrowed prefix pattern");
+    };
+    assert!(matches!(actual, Cow::Borrowed(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
+fn assert_owned_prefix(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Prefix(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected owned prefix pattern");
+    };
+    assert!(matches!(actual, Cow::Owned(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
+fn assert_borrowed_contains(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Contains(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected borrowed contains pattern");
+    };
+    assert!(matches!(actual, Cow::Borrowed(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
+fn assert_owned_contains(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Contains(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected owned contains pattern");
+    };
+    assert!(matches!(actual, Cow::Owned(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
 #[test]
-fn test_like_kind_parse() {
-    assert!(matches!(
-        LikeKind::parse(b"http%"),
-        Some(LikeKind::Prefix(b"http"))
-    ));
-    assert!(matches!(
-        LikeKind::parse(b"%needle%"),
-        Some(LikeKind::Contains(b"needle"))
-    ));
-    assert!(matches!(LikeKind::parse(b"%"), Some(LikeKind::Prefix(b""))));
-    // Suffix and underscore patterns are not supported.
+fn test_like_kind_parse_plain_patterns() {
+    assert_borrowed_prefix(b"http%", b"http");
+    assert_borrowed_contains(b"%needle%", b"needle");
+    assert_borrowed_prefix(b"%", b"");
+}
+
+#[test]
+fn test_like_kind_parse_escaped_patterns() {
+    assert_owned_prefix(br"\%%", b"%");
+    assert_owned_prefix(br"\_%", b"_");
+    assert_owned_prefix(br"\\%", b"\\");
+    assert_owned_prefix(br"has\%middle%", b"has%middle");
+    assert_owned_contains(br"%\%%", b"%");
+    assert_owned_contains(br"%\_%", b"_");
+    assert_owned_contains(br"%\\%", b"\\");
+    assert_owned_contains(br"%has\%middle%", b"has%middle");
+}
+
+#[test]
+fn test_like_kind_parse_unsupported_patterns() {
     assert!(LikeKind::parse(b"%suffix").is_none());
     assert!(LikeKind::parse(b"a_c").is_none());
+    assert!(LikeKind::parse(br"%\%").is_none());
+    assert!(LikeKind::parse(br"foo\%bar").is_none());
 }
 
 /// No symbols — all bytes escaped. Simplest case to see the two tables.
@@ -222,20 +268,14 @@ fn test_contains_pushdown_rejects_len_255() {
 // ---------------------------------------------------------------------------
 
 fn make_fsst_str(strings: &[Option<&str>]) -> FSSTArray {
-    let varbin = VarBinArray::from_iter(
+    let array = VarBinArray::from_iter(
         strings.iter().copied(),
         DType::Utf8(Nullability::NonNullable),
-    );
-    let compressor = fsst_train_compressor(&varbin);
-    let len = varbin.len();
-    let dtype = varbin.dtype().clone();
-    fsst_compress(
-        varbin,
-        len,
-        &dtype,
-        &compressor,
-        &mut SESSION.create_execution_ctx(),
     )
+    .into_array();
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = fsst_train_compressor(&array, &mut ctx).unwrap();
+    fsst_compress(&array, &compressor, &mut ctx).unwrap()
 }
 
 fn run_like(array: FSSTArray, pattern_arr: ArrayRef) -> VortexResult<BoolArray> {
@@ -320,6 +360,7 @@ fn test_like_edge_cases(
         ConstantArray::new(pattern, opts.len()).into_array(),
     )?;
     let expected_arr = BoolArray::from_iter(expected.iter().copied());
-    assert_arrays_eq!(&result, &expected_arr);
+    let mut ctx = SESSION.create_execution_ctx();
+    assert_arrays_eq!(&result, &expected_arr, &mut ctx);
     Ok(())
 }

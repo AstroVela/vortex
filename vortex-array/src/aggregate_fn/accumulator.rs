@@ -15,6 +15,9 @@ use crate::aggregate_fn::session::AggregateFnSessionExt;
 use crate::columnar::AnyColumnar;
 use crate::dtype::DType;
 use crate::executor::max_iterations;
+use crate::expr::stats::Precision;
+use crate::expr::stats::Stat;
+use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
 
 /// Reference-counted type-erased accumulator.
@@ -116,22 +119,29 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
             batch.dtype()
         );
 
-        // 0. Stats-driven shortcut: if the aggregate can be derived directly from the batch's
-        //    cached statistics, use that and skip both kernel dispatch and decode. This is the
-        //    only layer that consults `batch.statistics()`; encoding kernels must not.
-        if let Some(result) = self.vtable.try_partial_from_stats(batch)? {
-            vortex_ensure!(
-                result.dtype() == &self.partial_dtype,
-                "Aggregate try_partial_from_stats returned {}, expected {}",
-                result.dtype(),
-                self.partial_dtype,
-            );
-            self.vtable.combine_partials(&mut self.partial, result)?;
+        // 0. Legacy stats bridge: if this aggregate is still cached under a legacy Stat slot,
+        //    consume that exact stat before kernel dispatch or decode.
+        if let Some(stat) = Stat::from_aggregate_fn(&self.aggregate_fn)
+            && let Precision::Exact(partial) = batch.statistics().get(stat)
+        {
+            let partial = if partial.dtype() == &self.partial_dtype {
+                partial
+            } else {
+                vortex_ensure!(
+                    partial.dtype().eq_ignore_nullability(&self.partial_dtype),
+                    "Aggregate {} read legacy stat {} with dtype {}, expected {}",
+                    self.aggregate_fn,
+                    stat,
+                    partial.dtype(),
+                    self.partial_dtype,
+                );
+                partial.cast(&self.partial_dtype)?
+            };
+            self.vtable.combine_partials(&mut self.partial, partial)?;
             return Ok(());
         }
 
         let session = ctx.session().clone();
-        let kernels = &session.aggregate_fns().kernels;
 
         // 1. Kernel registry first: a registered `(encoding, aggregate_fn)` kernel is strictly
         //    more specific than the vtable's `try_accumulate` short-circuit. Checking the
@@ -139,13 +149,9 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         //    `Combined::try_accumulate` always returns true, so a later kernel check would be
         //    unreachable.
         {
-            let kernels_r = kernels.read();
-            let batch_id = batch.encoding_id();
-            let kernel = kernels_r
-                .get(&(batch_id, Some(self.aggregate_fn.id())))
-                .or_else(|| kernels_r.get(&(batch_id, None)))
-                .copied();
-            drop(kernels_r);
+            let kernel = session
+                .aggregate_fns()
+                .find_aggregate_kernel(batch.encoding_id(), self.aggregate_fn.id());
             if let Some(kernel) = kernel
                 && let Some(result) = kernel.aggregate(&self.aggregate_fn, batch, ctx)?
             {
@@ -176,14 +182,9 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                 break;
             }
 
-            let kernels_r = kernels.read();
-            let batch_id = batch.encoding_id();
-            let kernel = kernels_r
-                .get(&(batch_id, Some(self.aggregate_fn.id())))
-                .or_else(|| kernels_r.get(&(batch_id, None)))
-                .copied();
-            drop(kernels_r);
-            if let Some(kernel) = kernel
+            if let Some(kernel) = session
+                .aggregate_fns()
+                .find_aggregate_kernel(batch.encoding_id(), self.aggregate_fn.id())
                 && let Some(result) = kernel.aggregate(&self.aggregate_fn, &batch, ctx)?
             {
                 vortex_ensure!(
@@ -274,7 +275,7 @@ mod tests {
     use crate::aggregate_fn::AggregateFnRef;
     use crate::aggregate_fn::AggregateFnVTable;
     use crate::aggregate_fn::DynAccumulator;
-    use crate::aggregate_fn::EmptyOptions;
+    use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::combined::Combined;
     use crate::aggregate_fn::combined::PairOptions;
     use crate::aggregate_fn::fns::mean::Mean;
@@ -288,7 +289,6 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::scalar::Scalar;
-    use crate::session::ArraySession;
 
     /// Mean partial sentinel `{sum: 42.0, count: 1}` — distinguishable from the
     /// natural fan-out result `{sum: 7.0, count: 1}` that `Combined::try_accumulate`
@@ -336,7 +336,7 @@ mod tests {
     }
 
     fn fresh_session() -> VortexSession {
-        VortexSession::empty().with::<ArraySession>()
+        crate::array_session()
     }
 
     fn dict_of_seven() -> ArrayRef {
@@ -349,7 +349,10 @@ mod tests {
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         Accumulator::try_new(
             Mean::combined(),
-            PairOptions(EmptyOptions, EmptyOptions),
+            PairOptions(
+                NumericalAggregateOpts::default(),
+                NumericalAggregateOpts::default(),
+            ),
             dtype,
         )
     }

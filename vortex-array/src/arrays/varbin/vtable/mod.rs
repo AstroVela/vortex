@@ -11,6 +11,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_session::registry::CachedId;
 
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
@@ -19,11 +20,12 @@ use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
-use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbin::VarBinArraySlotsExt;
 use crate::arrays::varbin::VarBinData;
-use crate::arrays::varbin::array::NUM_SLOTS;
-use crate::arrays::varbin::array::SLOT_NAMES;
+use crate::arrays::varbin::VarBinSlots;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::builders::DynVarBinBuilder;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
@@ -35,16 +37,19 @@ mod operations;
 mod validity;
 
 use canonical::varbin_to_canonical;
-use kernel::PARENT_KERNELS;
 use vortex_session::VortexSession;
 
-use crate::Precision;
+use crate::EqMode;
 use crate::arrays::varbin::compute::rules::PARENT_RULES;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
 
 /// A [`VarBin`]-encoded Vortex array.
 pub type VarBinArray = Array<VarBin>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
 
 #[derive(Clone, prost::Message)]
 pub struct VarBinMetadata {
@@ -53,14 +58,14 @@ pub struct VarBinMetadata {
 }
 
 impl ArrayHash for VarBinData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        self.bytes().array_hash(state, precision);
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
+        self.bytes().array_hash(state, accuracy);
     }
 }
 
 impl ArrayEq for VarBinData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        self.bytes().array_eq(other.bytes(), precision)
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
+        self.bytes().array_eq(other.bytes(), accuracy)
     }
 }
 
@@ -86,11 +91,12 @@ impl VTable for VarBin {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "VarBinArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == VarBinSlots::COUNT,
+            "VarBinArray expected {} slots, found {}",
+            VarBinSlots::COUNT,
             slots.len()
         );
-        let offsets = slots[crate::arrays::varbin::array::OFFSETS_SLOT]
+        let offsets = slots[VarBinSlots::OFFSETS]
             .as_ref()
             .vortex_expect("VarBinArray offsets slot");
         vortex_ensure!(
@@ -120,6 +126,24 @@ impl VTable for VarBin {
         }
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+        let mut data = array.data().clone();
+        data.bytes = buffers[0].clone();
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
+    }
+
     fn serialize(
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -138,11 +162,10 @@ impl VTable for VarBin {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         let metadata = VarBinMetadata::decode(metadata)?;
         let validity = if children.len() == 1 {
             Validity::from(dtype.nullability())
@@ -166,11 +189,11 @@ impl VTable for VarBin {
 
         let data = VarBinData::try_build(offsets.clone(), bytes, dtype.clone(), validity.clone())?;
         let slots = VarBinData::make_slots(offsets, &validity, len);
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        VarBinSlots::NAMES[idx].to_string()
     }
 
     fn reduce_parent(
@@ -181,13 +204,17 @@ impl VTable for VarBin {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
 
-    fn execute_parent(
+    fn append_to_builder(
         array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
+        builder: &mut dyn ArrayBuilder,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    ) -> VortexResult<()> {
+        if let Some(builder) = builder.as_any_mut().downcast_mut::<DynVarBinBuilder>() {
+            return builder.append_varbin(array, ctx);
+        }
+        varbin_to_canonical(array, ctx)?
+            .into_array()
+            .append_to_builder(builder, ctx)
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {

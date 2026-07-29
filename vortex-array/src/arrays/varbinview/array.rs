@@ -17,12 +17,15 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
+use crate::ArrayRef;
 use crate::ArraySlots;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
 use crate::array::child_to_validity;
 use crate::array::validity_to_child;
+use crate::array_slots;
 use crate::arrays::VarBinView;
 use crate::arrays::varbinview::BinaryView;
 use crate::buffer::BufferHandle;
@@ -30,12 +33,15 @@ use crate::builders::ArrayBuilder;
 use crate::builders::VarBinViewBuilder;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
+use crate::legacy_session;
 use crate::validity::Validity;
 
-/// The validity bitmap indicating which elements are non-null.
-pub(super) const VALIDITY_SLOT: usize = 0;
-pub(super) const NUM_SLOTS: usize = 1;
-pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["validity"];
+#[array_slots(VarBinView)]
+pub struct VarBinViewSlots {
+    /// The validity bitmap indicating which elements are non-null.
+    #[slot(0)]
+    pub validity: Option<ArrayRef>,
+}
 
 /// A variable-length binary view array that stores strings and binary data efficiently.
 ///
@@ -307,6 +313,7 @@ impl VarBinViewData {
         Ok(())
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn validate_views<F>(
         views: &Buffer<BinaryView>,
         buffers: &Arc<[ByteBuffer]>,
@@ -316,11 +323,7 @@ impl VarBinViewData {
     where
         F: Fn(&[u8]) -> bool,
     {
-        for (idx, &view) in views.iter().enumerate() {
-            if validity.is_null(idx)? {
-                continue;
-            }
-
+        let validate_view = |idx: usize, view: &BinaryView| -> VortexResult<()> {
             if view.is_inlined() {
                 // Validate the inline bytestring
                 let bytes = &view.as_inlined().data[..view.len() as usize];
@@ -363,6 +366,30 @@ impl VarBinViewData {
                     validator(bytes),
                     InvalidArgument: "view at index {idx}: outlined bytes fails utf-8 validation"
                 );
+            }
+            Ok(())
+        };
+
+        match validity {
+            // Array-backed validity is the only variant that needs an execution context: execute it
+            // into a mask once and zip it with the views, validating only the valid (non-null)
+            // entries.
+            Validity::Array(_) => {
+                let mut ctx = legacy_session().create_execution_ctx();
+                let mask = validity.execute_mask(views.len(), &mut ctx)?;
+                for ((idx, view), valid) in views.iter().enumerate().zip(mask.iter()) {
+                    if valid {
+                        validate_view(idx, view)?;
+                    }
+                }
+            }
+            // Every entry is null, so there is nothing to validate.
+            Validity::AllInvalid => {}
+            // No nulls: validate every view.
+            Validity::NonNullable | Validity::AllValid => {
+                for (idx, view) in views.iter().enumerate() {
+                    validate_view(idx, view)?;
+                }
             }
         }
 
@@ -543,7 +570,7 @@ pub trait VarBinViewArrayExt: TypedArrayRef<VarBinView> {
 
     fn varbinview_validity(&self) -> Validity {
         child_to_validity(
-            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.as_ref().slots()[VarBinViewSlots::VALIDITY].as_ref(),
             self.dtype_parts().1,
         )
     }

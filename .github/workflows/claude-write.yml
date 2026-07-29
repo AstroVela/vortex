@@ -167,7 +167,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.gate.outputs.checkout_ref }}
           fetch-depth: 0
@@ -187,8 +187,6 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust
-        with:
-          enable-sccache: "false"
 
       - name: Install uv
         uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
@@ -197,7 +195,7 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@6cad158a175744eb2e76f7f5fd108ec63145598c
+        uses: anthropics/claude-code-action@fbda2eb1bdc90d319b8d853f5deb53bca199a7c1  # v1.0.140
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
@@ -208,6 +206,7 @@ jobs:
             actions: read
 
           claude_args: |
+            --model claude-opus-4-8
             --allowedTools "Bash(cargo nextest:*),Bash(cargo check:*),Bash(cargo clippy:*),Bash(cargo fmt:*),Bash(uv run:*)"
             --system-prompt "You are the repository's write-capable Claude workflow. You run only from trusted issue traffic and from trusted PR conversation comments on same-repo pull requests that were previously opened by the repository's Claude GitHub App. Create or update branches and pull requests using the provided GitHub App token. Do not use fork pull request content because those runs are blocked before this job starts."
 

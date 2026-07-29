@@ -19,6 +19,7 @@ use vortex_error::VortexResult;
 
 use crate::RunEnd;
 use crate::array::RunEndArrayExt;
+use crate::array::RunEndArraySlotsExt;
 
 pub(super) const RULES: ParentRuleSet<RunEnd> = ParentRuleSet::new(&[
     // CastReduceAdaptor must come before RunEndScalarFnRule so that cast operations are executed
@@ -77,8 +78,7 @@ impl ArrayParentReduceRule<RunEnd> for RunEndScalarFnRule {
         }
 
         let new_values =
-            ScalarFnArray::try_new(parent.scalar_fn().clone(), new_children, values_len)?
-                .into_array();
+            ScalarFnArray::try_new(parent.scalar_fn().clone(), new_children)?.into_array();
 
         Ok(Some(
             unsafe {

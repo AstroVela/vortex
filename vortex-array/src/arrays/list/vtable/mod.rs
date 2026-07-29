@@ -16,23 +16,23 @@ use vortex_session::registry::CachedId;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
-use crate::arrays::list::ListArrayExt;
+use crate::array::with_empty_buffers;
+use crate::arrays::list::ListArraySlotsExt;
 use crate::arrays::list::ListData;
-use crate::arrays::list::array::NUM_SLOTS;
-use crate::arrays::list::array::SLOT_NAMES;
-use crate::arrays::list::compute::PARENT_KERNELS;
+use crate::arrays::list::ListSlots;
 use crate::arrays::list::compute::rules::PARENT_RULES;
 use crate::arrays::listview::list_view_from_list;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
@@ -52,11 +52,11 @@ pub struct ListMetadata {
 }
 
 impl ArrayHash for ListData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {}
 }
 
 impl ArrayEq for ListData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         true
     }
 }
@@ -81,6 +81,14 @@ impl VTable for List {
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
         vortex_panic!("ListArray buffer_name index {idx} out of bounds")
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
     }
 
     fn reduce_parent(
@@ -112,14 +120,15 @@ impl VTable for List {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "ListArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == ListSlots::COUNT,
+            "ListArray expected {} slots, found {}",
+            ListSlots::COUNT,
             slots.len()
         );
-        let elements = slots[crate::arrays::list::array::ELEMENTS_SLOT]
+        let elements = slots[ListSlots::ELEMENTS]
             .as_ref()
             .vortex_expect("ListArray elements slot");
-        let offsets = slots[crate::arrays::list::array::OFFSETS_SLOT]
+        let offsets = slots[ListSlots::OFFSETS]
             .as_ref()
             .vortex_expect("ListArray offsets slot");
         vortex_ensure!(
@@ -181,7 +190,7 @@ impl VTable for List {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        ListSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
@@ -190,13 +199,12 @@ impl VTable for List {
         ))
     }
 
-    fn execute_parent(
+    fn append_to_builder(
         array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
+        builder: &mut dyn ArrayBuilder,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    ) -> VortexResult<()> {
+        builder.append_list_array(array, ctx)
     }
 }
 

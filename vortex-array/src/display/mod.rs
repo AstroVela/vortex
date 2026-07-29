@@ -6,6 +6,7 @@ mod extractors;
 mod tree_display;
 
 use std::fmt::Display;
+use std::iter::repeat_n;
 
 pub use extractor::IndentedFormatter;
 pub use extractor::TreeContext;
@@ -19,8 +20,8 @@ use itertools::Itertools as _;
 pub use tree_display::TreeDisplay;
 
 use crate::ArrayRef;
-use crate::LEGACY_SESSION;
 use crate::VortexSessionExecute;
+use crate::legacy_session;
 
 /// Describe how to convert an array to a string.
 ///
@@ -521,6 +522,7 @@ impl ArrayRef {
         DisplayArrayAs(self, DisplayOptions::TableDisplay)
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn fmt_as(&self, f: &mut std::fmt::Formatter, options: &DisplayOptions) -> std::fmt::Result {
         match options {
             DisplayOptions::MetadataOnly => EncodingSummaryExtractor::write(self, f),
@@ -536,7 +538,7 @@ impl ArrayRef {
                 let is_truncated = self.len() > limit;
 
                 let fmt_scalar = |i| {
-                    self.execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+                    self.execute_scalar(i, &mut legacy_session().create_execution_ctx())
                         .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string())
                 };
                 write!(
@@ -544,10 +546,7 @@ impl ArrayRef {
                     "{opening_brace}{}{closing_brace}",
                     (0..limit.saturating_sub(3))
                         .map(fmt_scalar)
-                        .chain(std::iter::repeat_n(
-                            "...".to_string(),
-                            is_truncated as usize
-                        ))
+                        .chain(repeat_n("...".to_string(), is_truncated as usize))
                         .chain((self.len().saturating_sub(3)..self.len()).map(fmt_scalar))
                         .format(sep)
                 )
@@ -579,18 +578,22 @@ impl ArrayRef {
             }
             #[cfg(feature = "table-display")]
             DisplayOptions::TableDisplay => {
-                #[expect(deprecated)]
-                use crate::canonical::ToCanonical as _;
+                use vortex_mask::Mask;
+
+                use crate::arrays::StructArray;
+                use crate::arrays::struct_::StructArrayExt;
                 use crate::dtype::DType;
 
                 let mut builder = tabled::builder::Builder::default();
+                // Reuse a single execution context across all per-row accesses below.
+                let mut ctx = legacy_session().create_execution_ctx();
 
                 // Special logic for struct arrays.
                 let DType::Struct(sf, _) = self.dtype() else {
                     // For non-struct arrays, simply display a single column table without header.
                     for row_idx in 0..self.len() {
                         let value = self
-                            .execute_scalar(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
+                            .execute_scalar(row_idx, &mut ctx)
                             .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string());
                         builder.push_record([value]);
                     }
@@ -601,24 +604,27 @@ impl ArrayRef {
                     return write!(f, "{table}");
                 };
 
-                #[expect(deprecated)]
-                let struct_ = self.to_struct();
+                let struct_ = match self.clone().execute::<StructArray>(&mut ctx) {
+                    Ok(struct_) => struct_,
+                    Err(e) => return write!(f, "<error: {e}>"),
+                };
                 builder.push_record(sf.names().iter().map(|name| name.to_string()));
 
+                // Resolve validity to a mask once instead of probing it per row.
+                let validity = self
+                    .validity()
+                    .and_then(|v| v.execute_mask(self.len(), &mut ctx))
+                    .unwrap_or_else(|_| Mask::new_false(self.len()));
+
                 for row_idx in 0..self.len() {
-                    if !self
-                        .is_valid(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
-                        .unwrap_or(false)
-                    {
+                    if !validity.value(row_idx) {
                         let null_row = vec!["null".to_string(); sf.names().len()];
                         builder.push_record(null_row);
                     } else {
-                        let mut row = Vec::new();
-                        for field_array in
-                            crate::arrays::struct_::StructArrayExt::iter_unmasked_fields(&struct_)
-                        {
+                        let mut row = Vec::with_capacity(struct_.struct_fields().nfields());
+                        for field_array in StructArrayExt::iter_unmasked_fields(&struct_) {
                             let value = field_array
-                                .execute_scalar(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
+                                .execute_scalar(row_idx, &mut ctx)
                                 .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string());
                             row.push(value);
                         }
@@ -635,10 +641,7 @@ impl ArrayRef {
                 }
 
                 for row_idx in 0..self.len() {
-                    if !self
-                        .is_valid(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
-                        .unwrap_or(false)
-                    {
+                    if !validity.value(row_idx) {
                         table.modify(
                             (1 + row_idx, 0),
                             tabled::settings::Span::column(sf.names().len() as isize),

@@ -22,6 +22,7 @@ use crate::BitPackedArrayExt;
 use crate::FoRArray;
 use crate::bitpack_decompress;
 use crate::r#for::array::FoRArrayExt;
+use crate::r#for::array::FoRArraySlotsExt;
 use crate::unpack_iter::UnpackStrategy;
 use crate::unpack_iter::UnpackedChunks;
 
@@ -109,7 +110,7 @@ pub(crate) fn fused_decompress<
     let mut uninit_range = builder.uninit_range(bp.len());
     unsafe {
         // Append a dense null Mask.
-        uninit_range.append_mask(bp.validity()?.execute_mask(bp.as_ref().len(), ctx)?);
+        uninit_range.append_mask(&bp.validity()?.execute_mask(bp.as_ref().len(), ctx)?);
     }
 
     // SAFETY: `decode_into` will initialize all values in this range.
@@ -119,11 +120,11 @@ pub(crate) fn fused_decompress<
     unpacked.decode_into(uninit_slice);
 
     if let Some(patches) = bp.patches() {
-        bitpack_decompress::apply_patches_to_uninit_range_fn(
+        bitpack_decompress::apply_patches_to_uninit_range(
             &mut uninit_range,
             &patches,
             ctx,
-            |v| v.wrapping_add(&ref_),
+            |v: T| v.wrapping_add(&ref_),
         )?;
     };
 

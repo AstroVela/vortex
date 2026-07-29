@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -16,12 +15,13 @@ use datafusion_common::GetExt;
 use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue as DFScalarValue;
 use datafusion_common::Statistics;
+use datafusion_common::config::ConfigExtension;
 use datafusion_common::config::ConfigField;
-use datafusion_common::config_namespace;
+use datafusion_common::extensions_options;
 use datafusion_common::internal_datafusion_err;
 use datafusion_common::not_impl_err;
 use datafusion_common::parsers::CompressionTypeVariant;
-use datafusion_common::stats::Precision;
+use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
@@ -48,11 +48,10 @@ use vortex::array::memory::MemorySessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex::expr::stats;
+use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
 use vortex::file::EOF_SIZE;
 use vortex::file::MAX_POSTSCRIPT_SIZE;
@@ -63,6 +62,7 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
+use vortex_arrow::ArrowSessionExt;
 
 use super::cache::CachedVortexMetadata;
 use super::sink::VortexSink;
@@ -133,27 +133,62 @@ impl Debug for VortexFormat {
     }
 }
 
-config_namespace! {
+extensions_options! {
     /// Options to configure [`VortexFormat`] and [`VortexSource`].
     ///
-    /// These options are usually set on a [`VortexFormatFactory`] and inherited
-    /// by the `VortexFormat` / `VortexSource` instances created for individual
-    /// tables.
+    /// The API follows DataFusion's built-in Parquet and JSON format factories:
+    /// a format factory may carry customized defaults, the session may carry
+    /// format defaults, and `CREATE EXTERNAL TABLE ... OPTIONS(...)` can
+    /// override individual fields for one table.
+    ///
+    /// [`FileFormatFactory::create`] builds the `VortexTableOptions` copied into
+    /// each [`VortexFormat`] as follows:
+    ///
+    /// 1. If the factory has explicit options from
+    ///    [`VortexFormatFactory::with_options`] or
+    ///    [`VortexFormatFactory::new_with_options`], start from that complete
+    ///    `VortexTableOptions` value. This matches
+    ///    [`ParquetFormatFactory::new_with_options`] and
+    ///    [`JsonFormatFactory::new_with_options`]: factory options replace
+    ///    session defaults; they are not merged with them field-by-field.
+    /// 2. If the factory does not have explicit options, read the session's
+    ///    `vortex` extension at the time `create` is called. This is the value
+    ///    changed by `SET vortex.<option> = ...`.
+    /// 3. If the session has no `vortex` extension, start from
+    ///    `VortexTableOptions::default()`.
+    /// 4. Apply table `OPTIONS(...)` last. Each option overwrites only its
+    ///    matching field, so per-table settings can override either the factory
+    ///    options or the session/default value.
+    ///
+    /// In SQL, session settings use the `vortex.` prefix. Table options use the
+    /// field names directly, the same style as Parquet or JSON table options:
+    ///
+    /// ```text
+    /// SET vortex.predicate_pushdown = false;
+    ///
+    /// CREATE EXTERNAL TABLE t (x BIGINT)
+    /// STORED AS vortex
+    /// LOCATION 's3://bucket/path/'
+    /// OPTIONS(predicate_pushdown 'true');
+    /// ```
     ///
     /// # Example
     ///
     /// ```rust
     /// use vortex_datafusion::{VortexFormatFactory, VortexTableOptions};
     ///
-    /// let factory = VortexFormatFactory::new().with_options(VortexTableOptions {
-    ///     projection_pushdown: true,
-    ///     scan_concurrency: Some(8),
-    ///     ..Default::default()
-    /// });
+    /// let mut options = VortexTableOptions::default();
+    /// options.predicate_pushdown = true;
+    /// options.projection_pushdown = true;
+    /// options.scan_concurrency = Some(8);
+    ///
+    /// let factory = VortexFormatFactory::new().with_options(options);
     /// # let _ = factory;
     /// ```
     ///
     /// [`SessionConfig`]: https://docs.rs/datafusion/latest/datafusion/prelude/struct.SessionConfig.html
+    /// [`ParquetFormatFactory::new_with_options`]: https://docs.rs/datafusion/latest/datafusion/datasource/file_format/parquet/struct.ParquetFormatFactory.html#method.new_with_options
+    /// [`JsonFormatFactory::new_with_options`]: https://docs.rs/datafusion/latest/datafusion/datasource/file_format/json/struct.JsonFormatFactory.html#method.new_with_options
     pub struct VortexTableOptions {
         /// The number of bytes to read when parsing a file footer.
         ///
@@ -165,17 +200,33 @@ config_namespace! {
         /// When enabled, projection expressions may be partially evaluated during
         /// the scan. When disabled, Vortex reads only the referenced columns and
         /// all expressions are evaluated after the scan.
+        ///
+        /// Disabled by default.
         pub projection_pushdown: bool, default = false
+        /// Whether to enable predicate pushdown into the underlying Vortex scan.
+        ///
+        /// When enabled, supported filters are evaluated during the scan. When
+        /// disabled, DataFusion evaluates filters after the scan, while
+        /// `VortexSource` can still use the full predicate for file pruning.
+        ///
+        /// Enabled by default.
+        pub predicate_pushdown: bool, default = true
         /// The intra-partition scan concurrency, controlling the number of row splits to process
         /// concurrently per-thread within each file.
         ///
         /// This does not affect the overall parallelism
         /// across partitions, which is controlled by DataFusion's execution configuration.
+        ///
+        /// Leave as `None` to use Vortex's scan default. Override per session
+        /// with `SET vortex.scan_concurrency = <n>`, or per table with
+        /// `OPTIONS(scan_concurrency '<n>')`.
         pub scan_concurrency: Option<usize>, default = None
     }
 }
 
-impl Eq for VortexTableOptions {}
+impl ConfigExtension for VortexTableOptions {
+    const PREFIX: &'static str = "vortex";
+}
 
 /// Registration entry point for the file-backed Vortex integration.
 ///
@@ -183,9 +234,12 @@ impl Eq for VortexTableOptions {}
 /// DataFusion session, and DataFusion will create [`VortexFormat`] values for
 /// `CREATE EXTERNAL TABLE`, [`ListingTable`], and URL-table scans.
 ///
-/// The factory stores a [`VortexSession`] and default [`VortexTableOptions`].
-/// Those defaults are copied into the formats and sources created for each
-/// table.
+/// The factory stores a [`VortexSession`] and optional factory-level
+/// [`VortexTableOptions`]. When options are set on the factory they act like
+/// customized format defaults, matching DataFusion's Parquet and JSON factory
+/// APIs. Otherwise, `VortexFormatFactory::create` uses the session's `vortex`
+/// options. In both cases, table `OPTIONS(...)` are applied last for the table
+/// being created.
 ///
 /// # Example
 ///
@@ -197,10 +251,11 @@ impl Eq for VortexTableOptions {}
 /// use datafusion_common::GetExt;
 /// use vortex_datafusion::{VortexFormatFactory, VortexTableOptions};
 ///
-/// let factory = Arc::new(VortexFormatFactory::new().with_options(VortexTableOptions {
-///     projection_pushdown: true,
-///     ..Default::default()
-/// }));
+/// let mut options = VortexTableOptions::default();
+/// options.predicate_pushdown = true;
+/// options.projection_pushdown = true;
+///
+/// let factory = Arc::new(VortexFormatFactory::new().with_options(options));
 ///
 /// let mut state_builder = SessionStateBuilder::new()
 ///     .with_default_features()
@@ -228,7 +283,12 @@ impl GetExt for VortexFormatFactory {
 }
 
 impl VortexFormatFactory {
-    /// Creates a factory with a default [`VortexSession`] and default options.
+    /// Creates a factory with a default [`VortexSession`] and no factory-level
+    /// options.
+    ///
+    /// Formats created by this factory start from the session's `vortex`
+    /// options, or from [`VortexTableOptions::default`] if the session does not
+    /// contain them. Table-level `OPTIONS(...)` are still applied last.
     #[expect(
         clippy::new_without_default,
         reason = "FormatFactory defines `default` method, so having `Default` implementation is confusing"
@@ -240,11 +300,13 @@ impl VortexFormatFactory {
         }
     }
 
-    /// Creates a factory with an explicit session and default options.
+    /// Creates a factory with an explicit session and factory-level options.
     ///
-    /// The supplied options become the baseline for every [`VortexFormat`]
-    /// created by this factory. DataFusion may still override them with
-    /// table-level options passed into [`FileFormatFactory::create`].
+    /// The supplied options become the complete starting value for every
+    /// [`VortexFormat`] created by this factory. Session `SET vortex.*` values
+    /// are ignored for these formats, matching DataFusion's built-in
+    /// `new_with_options` factories. Table-level `OPTIONS(...)` are still
+    /// applied last.
     pub fn new_with_options(session: VortexSession, options: VortexTableOptions) -> Self {
         Self {
             session,
@@ -252,20 +314,23 @@ impl VortexFormatFactory {
         }
     }
 
-    /// Overrides the default options for this factory.
+    /// Sets factory-level options.
     ///
-    /// This is the usual way to turn on features such as projection pushdown for
-    /// every table created through the factory.
+    /// This is the usual way to customize Vortex defaults for every table
+    /// created through the factory. These options replace, rather than merge
+    /// with, session `SET vortex.*` values. Table-level `OPTIONS(...)` are still
+    /// applied last.
     ///
     /// # Example
     ///
     /// ```rust
     /// use vortex_datafusion::{VortexFormatFactory, VortexTableOptions};
     ///
-    /// let factory = VortexFormatFactory::new().with_options(VortexTableOptions {
-    ///     projection_pushdown: true,
-    ///     ..Default::default()
-    /// });
+    /// let mut options = VortexTableOptions::default();
+    /// options.predicate_pushdown = true;
+    /// options.projection_pushdown = true;
+    ///
+    /// let factory = VortexFormatFactory::new().with_options(options);
     /// # let _ = factory;
     /// ```
     pub fn with_options(mut self, options: VortexTableOptions) -> Self {
@@ -278,15 +343,34 @@ impl FileFormatFactory for VortexFormatFactory {
     #[expect(clippy::disallowed_types, reason = "required by trait signature")]
     fn create(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         format_options: &std::collections::HashMap<String, String>,
     ) -> DFResult<Arc<dyn FileFormat>> {
-        let mut opts = self.options.clone().unwrap_or_default();
+        // This mirrors DataFusion's Parquet/JSON file-format factories:
+        //
+        // 1. Factory options are a complete customized default when present.
+        // 2. Without factory options, use the session's `vortex` extension
+        //    (`SET vortex.* = ...`), falling back to built-in defaults.
+        // 3. Table-level `CREATE EXTERNAL TABLE ... OPTIONS(...)` values apply
+        //    last. DataFusion prefixes file-format options with `format.`
+        //    before passing them to this factory; SQL users write the field
+        //    name directly, e.g. `OPTIONS(predicate_pushdown 'false')`.
+        let mut opts = self
+            .options
+            .clone()
+            .or_else(|| {
+                state
+                    .config_options()
+                    .extensions
+                    .get::<VortexTableOptions>()
+                    .cloned()
+            })
+            .unwrap_or_default();
         for (key, value) in format_options {
             if let Some(key) = key.strip_prefix("format.") {
-                opts.set(key, value)?;
+                ConfigField::set(&mut opts, key, value)?;
             } else {
-                tracing::trace!("Ignoring options '{key}'");
+                tracing::trace!("Ignoring option '{key}'");
             }
         }
 
@@ -298,10 +382,6 @@ impl FileFormatFactory for VortexFormatFactory {
 
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(VortexFormat::new(self.session.clone()))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -330,10 +410,6 @@ impl VortexFormat {
 
 #[async_trait]
 impl FileFormat for VortexFormat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn compression_type(&self) -> Option<FileCompressionType> {
         None
     }
@@ -378,7 +454,9 @@ impl FileFormat for VortexFormat {
                             .as_any()
                             .downcast_ref::<CachedVortexMetadata>()
                     {
-                        let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
+                        let inferred_schema = session
+                            .arrow()
+                            .to_arrow_schema(cached_vortex.footer().dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -402,7 +480,7 @@ impl FileFormat for VortexFormat {
                     let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
                     cache.put(&object.location, entry);
 
-                    let inferred_schema = vxf.dtype().to_arrow_schema()?;
+                    let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
                 })
                 .map(|f| f.vortex_expect("Failed to spawn infer_schema"))
@@ -497,12 +575,12 @@ impl FileFormat for VortexFormat {
             let Some(file_stats) = file_stats else {
                 // If the file has no column stats, the best we can do is return a row count.
                 return Ok(Statistics {
-                    num_rows: Precision::Exact(
+                    num_rows: DFPrecision::Exact(
                         usize::try_from(row_count)
                             .map_err(|_| vortex_err!("Row count overflow"))
                             .vortex_expect("Row count overflow"),
                     ),
-                    total_byte_size: Precision::Absent,
+                    total_byte_size: DFPrecision::Absent,
                     column_statistics: vec![
                         ColumnStatistics::default();
                         table_schema.fields().len()
@@ -526,13 +604,23 @@ impl FileFormat for VortexFormat {
                 let column_size =
                     stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
 
-                let target_dtype = DType::from_arrow(field.as_ref());
+                let target_dtype =
+                    session
+                        .arrow()
+                        .from_arrow_field(field.as_ref())
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to derive Vortex DType for field {}: {e}",
+                                field.name()
+                            ))
+                        })?;
                 let min = scalar_stat_to_df(
                     Stat::Min,
                     stats_set.get(Stat::Min),
                     stats_dtype,
                     &target_dtype,
                 );
+
                 let max = scalar_stat_to_df(
                     Stat::Max,
                     stats_set.get(Stat::Max),
@@ -546,7 +634,7 @@ impl FileFormat for VortexFormat {
                     null_count: null_count.to_df(),
                     min_value: min.to_df(),
                     max_value: max.to_df(),
-                    sum_value: Precision::Absent,
+                    sum_value: DFPrecision::Absent,
                     distinct_count: is_constant_to_distinct_count(
                         stats_set.get_as::<bool>(
                             Stat::IsConstant,
@@ -559,10 +647,10 @@ impl FileFormat for VortexFormat {
 
             let total_byte_size = column_statistics
                 .iter()
-                .fold(Precision::Exact(0), |acc, cs| acc.add(&cs.byte_size));
+                .fold(DFPrecision::Exact(0), |acc, cs| acc.add(&cs.byte_size));
 
             Ok(Statistics {
-                num_rows: Precision::Exact(
+                num_rows: DFPrecision::Exact(
                     usize::try_from(row_count)
                         .map_err(|_| vortex_err!("Row count overflow"))
                         .vortex_expect("Row count overflow"),
@@ -582,7 +670,6 @@ impl FileFormat for VortexFormat {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let mut source = file_scan_config
             .file_source()
-            .as_any()
             .downcast_ref::<VortexSource>()
             .cloned()
             .ok_or_else(|| internal_datafusion_err!("Expected VortexSource"))?;
@@ -615,32 +702,30 @@ impl FileFormat for VortexFormat {
     }
 
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
-        let mut source = VortexSource::new(table_schema, self.session.clone())
-            .with_projection_pushdown(self.opts.projection_pushdown);
-
-        if let Some(scan_concurrency) = self.opts.scan_concurrency {
-            source = source.with_scan_concurrency(scan_concurrency);
-        }
-
-        Arc::new(source) as _
+        Arc::new(
+            VortexSource::new(table_schema, self.session.clone()).with_options(self.opts.clone()),
+        ) as _
     }
 }
 
 fn scalar_stat_to_df(
     stat: Stat,
-    value: Option<stats::Precision<VortexScalarValue>>,
+    value: Precision<VortexScalarValue>,
     stats_dtype: &DType,
     target_dtype: &DType,
-) -> Option<stats::Precision<DFScalarValue>> {
-    let stat_dtype = stat.dtype(stats_dtype)?;
+) -> Precision<DFScalarValue> {
+    let Some(stat_dtype) = stat.dtype(stats_dtype) else {
+        return Precision::Absent;
+    };
 
-    value?
-        .try_map(|stat_value| {
+    value
+        .map(|stat_value| {
             Scalar::try_new(stat_dtype, Some(stat_value))?
                 .cast(target_dtype)?
                 .try_to_df()
         })
-        .ok()
+        .transpose()
+        .unwrap_or(Precision::Absent)
 }
 
 #[cfg(test)]
@@ -677,7 +762,7 @@ mod tests {
                 (c1 VARCHAR NOT NULL, c2 INT NOT NULL) \
                 STORED AS vortex \
                 LOCATION 'table/' \
-                OPTIONS( footer_initial_read_size_bytes '12345', scan_concurrency '3' );",
+                OPTIONS( footer_initial_read_size_bytes '12345', predicate_pushdown 'false', scan_concurrency '3' );",
             )
             .await?
             .collect()
@@ -689,9 +774,34 @@ mod tests {
     #[test]
     fn format_plumbs_footer_initial_read_size() {
         let mut opts = VortexTableOptions::default();
-        opts.set("footer_initial_read_size_bytes", "12345").unwrap();
+        ConfigField::set(&mut opts, "footer_initial_read_size_bytes", "12345").unwrap();
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+    }
+
+    #[test]
+    fn format_plumbs_source_options() -> anyhow::Result<()> {
+        let opts = VortexTableOptions {
+            projection_pushdown: true,
+            predicate_pushdown: false,
+            scan_concurrency: Some(3),
+            ..Default::default()
+        };
+        let format = VortexFormat::new_with_options(VortexSession::default(), opts.clone());
+        let table_schema = TableSchema::from_file_schema(Arc::new(Schema::empty()));
+
+        let source = format.file_source(table_schema);
+        let source = source
+            .downcast_ref::<VortexSource>()
+            .ok_or_else(|| anyhow::anyhow!("expected VortexSource"))?;
+
+        assert_eq!(
+            source.options().projection_pushdown,
+            opts.projection_pushdown
+        );
+        assert_eq!(source.options().predicate_pushdown, opts.predicate_pushdown);
+        assert_eq!(source.options().scan_concurrency, opts.scan_concurrency);
+        Ok(())
     }
 }

@@ -15,15 +15,17 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
+use crate::ArrayParts;
 use crate::ArrayRef;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::array::unsupported_buffer_replacement;
 use crate::arrays::constant::ConstantData;
 use crate::arrays::constant::compute::rules::PARENT_RULES;
 use crate::arrays::constant::vtable::canonical::constant_canonicalize;
@@ -31,6 +33,7 @@ use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::BoolBuilder;
 use crate::builders::DecimalBuilder;
+use crate::builders::DynVarBinBuilder;
 use crate::builders::NullBuilder;
 use crate::builders::PrimitiveBuilder;
 use crate::builders::VarBinViewBuilder;
@@ -53,13 +56,13 @@ pub type ConstantArray = Array<Constant>;
 pub struct Constant;
 
 impl ArrayHash for ConstantData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.scalar.hash(state);
     }
 }
 
 impl ArrayEq for ConstantData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.scalar == other.scalar
     }
 }
@@ -109,6 +112,14 @@ impl VTable for Constant {
         }
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        unsupported_buffer_replacement(array, buffers)
+    }
+
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
         vortex_panic!("ConstantArray slot_name index {idx} out of bounds")
     }
@@ -131,7 +142,7 @@ impl VTable for Constant {
         buffers: &[BufferHandle],
         _children: &dyn ArrayChildren,
         session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         vortex_ensure!(
             buffers.len() == 1,
             "Expected 1 buffer, got {}",
@@ -144,7 +155,7 @@ impl VTable for Constant {
         let scalar_value = ScalarValue::from_proto_bytes(bytes, dtype, session)?;
         let scalar = Scalar::try_new(dtype.clone(), scalar_value)?;
 
-        Ok(crate::array::ArrayParts::new(
+        Ok(ArrayParts::new(
             self.clone(),
             dtype.clone(),
             len,
@@ -212,22 +223,30 @@ impl VTable for Constant {
                 });
             }
             DType::Utf8(_) => {
-                append_value_or_nulls::<VarBinViewBuilder>(builder, scalar.is_null(), n, |b| {
-                    let typed = scalar.as_utf8();
-                    let value = typed
-                        .value()
-                        .vortex_expect("non-null utf8 scalar must have a value");
-                    b.append_n_values(value.as_bytes(), n);
-                });
+                if let Some(builder) = builder.as_any_mut().downcast_mut::<DynVarBinBuilder>() {
+                    builder.append_scalar_repeated(scalar, n)?;
+                } else {
+                    append_value_or_nulls::<VarBinViewBuilder>(builder, scalar.is_null(), n, |b| {
+                        let value = scalar
+                            .as_utf8()
+                            .value()
+                            .vortex_expect("non-null utf8 scalar must have a value");
+                        b.append_n_values(value.as_bytes(), n);
+                    });
+                }
             }
             DType::Binary(_) => {
-                append_value_or_nulls::<VarBinViewBuilder>(builder, scalar.is_null(), n, |b| {
-                    let typed = scalar.as_binary();
-                    let value = typed
-                        .value()
-                        .vortex_expect("non-null binary scalar must have a value");
-                    b.append_n_values(value, n);
-                });
+                if let Some(builder) = builder.as_any_mut().downcast_mut::<DynVarBinBuilder>() {
+                    builder.append_scalar_repeated(scalar, n)?;
+                } else {
+                    append_value_or_nulls::<VarBinViewBuilder>(builder, scalar.is_null(), n, |b| {
+                        let value = scalar
+                            .as_binary()
+                            .value()
+                            .vortex_expect("non-null binary scalar must have a value");
+                        b.append_n_values(value, n);
+                    });
+                }
             }
             // TODO: add fast paths for DType::Struct, DType::List, DType::FixedSizeList, DType::Extension.
             _ => {
@@ -236,7 +255,7 @@ impl VTable for Constant {
                     .clone()
                     .execute::<Canonical>(ctx)?
                     .into_array();
-                builder.extend_from_array(&canonical);
+                canonical.append_to_builder(builder, ctx)?;
             }
         }
 
@@ -270,7 +289,6 @@ fn append_value_or_nulls<B: ArrayBuilder + 'static>(
 mod tests {
     use rstest::rstest;
     use vortex_error::VortexResult;
-    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
@@ -286,7 +304,7 @@ mod tests {
 
     /// Appends `array` into a fresh builder and asserts the result matches `constant_canonicalize`.
     fn assert_append_matches_canonical(array: ConstantArray) -> VortexResult<()> {
-        let mut ctx = VortexSession::empty().create_execution_ctx();
+        let mut ctx = crate::array_session().create_execution_ctx();
 
         let expected = constant_canonicalize(array.as_view(), &mut ctx)?.into_array();
         let mut builder = builder_with_capacity(array.dtype(), array.len());
@@ -294,13 +312,30 @@ mod tests {
             .into_array()
             .append_to_builder(builder.as_mut(), &mut ctx)?;
         let result = builder.finish();
-        assert_arrays_eq!(&result, &expected);
+        assert_arrays_eq!(&result, &expected, &mut ctx);
         Ok(())
     }
 
     #[test]
     fn test_null_constant_append() -> VortexResult<()> {
         assert_append_matches_canonical(ConstantArray::new(Scalar::null(DType::Null), 5))
+    }
+
+    #[test]
+    fn test_with_buffers_rejects_serialized_scalar_buffer() {
+        let array =
+            ConstantArray::new(Scalar::primitive(42i32, Nullability::NonNullable), 3).into_array();
+        let buffers = array.buffer_handles();
+
+        // SAFETY: the replacement buffers are the array's existing buffers, so the logical values
+        // would be unchanged if the encoding supported buffer replacement.
+        let Err(err) = (unsafe { array.with_buffers(buffers) }) else {
+            panic!("ConstantArray should reject replacing its serialized scalar buffer");
+        };
+        assert!(
+            err.to_string()
+                .contains("does not support in-memory buffer replacement")
+        );
     }
 
     #[rstest]

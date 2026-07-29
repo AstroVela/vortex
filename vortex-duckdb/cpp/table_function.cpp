@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#include "duckdb_vx/data.hpp"
-#include "duckdb_vx/duckdb_diagnostics.h"
-#include "duckdb_vx/error.hpp"
-#include "duckdb_vx/table_function.h"
+#include "data.hpp"
+#include "error.hpp"
+#include "table_function.hpp"
+#include "expr.h"
+#include "vortex_duckdb.h"
+#include "table_function.h"
+#include "vortex.h"
 
-DUCKDB_INCLUDES_BEGIN
 #include "duckdb.h"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
@@ -15,53 +17,35 @@ DUCKDB_INCLUDES_BEGIN
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
-DUCKDB_INCLUDES_END
+#include "duckdb/planner/operator/logical_get.hpp"
 
+using namespace std::string_literals;
 using namespace duckdb;
-using vortex::CData;
-using vortex::IntoErrString;
 constexpr column_t COLUMN_IDENTIFIER_FILE_INDEX = MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
 constexpr column_t COLUMN_IDENTIFIER_FILE_ROW_NUMBER = MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
 
-struct CTableFunctionInfo final : TableFunctionInfo {
-    explicit CTableFunctionInfo(const duckdb_vx_tfunc_vtab_t &vtab) : vtab(vtab) {
-    }
-
-    const duckdb_vx_tfunc_vtab_t vtab;
-};
-
 struct CTableBindData final : FunctionData {
-    CTableBindData(const CTableFunctionInfo &info,
-                   unique_ptr<CData> ffi_data_p,
-                   const vector<LogicalType> &types)
-        : info(info), ffi_data(std::move(ffi_data_p)), types(types) {
+    CTableBindData(unique_ptr<CData> ffi_data_p, const vector<LogicalType> &types)
+        : ffi_data(std::move(ffi_data_p)), types(types) {
     }
     unique_ptr<FunctionData> Copy() const override;
     bool Equals(const FunctionData &other_base) const override;
 
-    // Table function info lives for as long as TableFunction is alive as it's
-    // stored inside TableFunction, so it's safe to store a reference.
-    const CTableFunctionInfo &info;
     unique_ptr<CData> ffi_data;
     vector<LogicalType> types;
 };
 
 unique_ptr<FunctionData> CTableBindData::Copy() const {
-    duckdb_vx_error error_out = nullptr;
-    const auto copied_ffi_data = info.vtab.bind_data_clone(ffi_data->DataPtr(), &error_out);
-    if (error_out) {
-        throw BinderException(IntoErrString(error_out));
-    }
-
+    const auto copied_ffi_data = duckdb_table_function_bind_data_clone(ffi_data->DataPtr());
     auto ffi_data_p = unique_ptr<CData>(reinterpret_cast<CData *>(copied_ffi_data));
-    return make_uniq<CTableBindData>(info, std::move(ffi_data_p), types);
+    return make_uniq<CTableBindData>(std::move(ffi_data_p), types);
 }
 
 bool CTableBindData::Equals(const FunctionData &other_base) const {
     const CTableBindData &other = other_base.Cast<CTableBindData>();
     // if "types" are different, "ffi_data" would also be different as it
     // contains types inside, so omit "types" from comparison.
-    return &info == &other.info && ffi_data.get() == other.ffi_data.get();
+    return ffi_data.get() == other.ffi_data.get();
 }
 
 struct CTableGlobalData final : GlobalTableFunctionState {
@@ -82,12 +66,10 @@ struct CTableLocalData final : LocalTableFunctionState {
     unique_ptr<CData> ffi_data;
 };
 
-double table_scan_progress(ClientContext &,
-                           const FunctionData *bind_data,
-                           const GlobalTableFunctionState *global_state) {
-    auto &bind = bind_data->Cast<CTableBindData>();
+double
+table_scan_progress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *global_state) {
     void *const c_global_state = global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
-    return bind.info.vtab.table_scan_progress(c_global_state);
+    return duckdb_table_function_scan_progress(c_global_state);
 }
 
 static Value &UnwrapValue(duckdb_value value) {
@@ -147,7 +129,7 @@ unique_ptr<BaseStatistics> statistics(ClientContext &, const FunctionData *bind_
     void *const ffi_bind = bind.ffi_data->DataPtr();
 
     duckdb_column_statistics statistics = {};
-    if (!bind.info.vtab.statistics(ffi_bind, column_index, &statistics)) {
+    if (!duckdb_table_function_statistics(ffi_bind, column_index, &statistics)) {
         return {};
     }
 
@@ -190,30 +172,78 @@ struct CTableBindResult {
     vector<string> &names;
 };
 
+// This is a flaw of Duckdb API which doesn't allow passing non-const
+// expressions. We never modify the value on Rust side.
+static duckdb_vx_expr get_ffi_expr(const Expression &expr) {
+    return reinterpret_cast<duckdb_vx_expr>(const_cast<Expression *>(&expr));
+}
+
+bool projection_expression_pushdown(ClientContext &, const TableFunctionProjectionExpressionInput &input) {
+    const auto &bind = input.get.bind_data->Cast<CTableBindData>();
+
+    duckdb_vx_expr ffi_expr = get_ffi_expr(input.expression);
+    void *const ffi_bind = bind.ffi_data->DataPtr();
+    duckdb_vx_error error_out = nullptr;
+
+    const bool ret = duckdb_table_function_pushdown_projection_expression( //
+        ffi_bind,
+        ffi_expr,
+        input.projection_idx,
+        &error_out);
+    if (error_out) {
+        throw BinderException(IntoErrString(error_out));
+    }
+    return ret;
+}
+
+extern "C" {
+idx_t duckdb_vx_aggregate_len(duckdb_vx_agg_input ffi_input) {
+    return reinterpret_cast<const TableFunctionUngroupedAggregateInput *>(ffi_input)->projections.size();
+}
+
+duckdb_vx_expr duckdb_vx_aggregate_at(duckdb_vx_agg_input ffi_input, idx_t i, idx_t *proj_idx) {
+    const auto &input = *reinterpret_cast<const TableFunctionUngroupedAggregateInput *>(ffi_input);
+    const auto &[scan_index, expr] = input.projections[i];
+    *proj_idx = scan_index == COUNT_STAR_PROJ_IDX ? scan_index
+                                                  : input.get.GetColumnIds()[scan_index].GetPrimaryIndex();
+    return get_ffi_expr(expr);
+}
+}
+
+bool aggregate_pushdown(ClientContext &, const TableFunctionUngroupedAggregateInput &input) {
+    const auto &bind = input.get.bind_data->Cast<CTableBindData>();
+    void *const ffi_bind = bind.ffi_data->DataPtr();
+    duckdb_vx_error error_out = nullptr;
+    const auto ffi_input =
+        reinterpret_cast<duckdb_vx_agg_input>(const_cast<TableFunctionUngroupedAggregateInput *>(&input));
+    const bool res = duckdb_table_function_pushdown_projection_aggregates(ffi_bind, ffi_input, &error_out);
+    if (error_out) {
+        throw BinderException(IntoErrString(error_out));
+    }
+    return res;
+}
+
 /**
  * Called for every new query. For example, if there is a VIEW over *.vortex,
  * and after a query another file is added matching the glob, for second query
  * bind() will be called again.
  */
-unique_ptr<FunctionData> c_bind(ClientContext &context,
-                                TableFunctionBindInput &input,
-                                vector<LogicalType> &return_types,
-                                vector<string> &names) {
-    const auto &info = input.table_function.function_info->Cast<CTableFunctionInfo>();
+unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &,
+                                                       TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types,
+                                                       vector<string> &names) {
     CTableBindResult result = {return_types, names};
 
     duckdb_vx_error error_out = nullptr;
-    auto ctx = reinterpret_cast<duckdb_client_context>(&context);
-    auto ffi_bind_data = info.vtab.bind(ctx,
-                                        reinterpret_cast<duckdb_vx_tfunc_bind_input>(&input),
-                                        reinterpret_cast<duckdb_vx_tfunc_bind_result>(&result),
-                                        &error_out);
+    auto ffi_bind_data = duckdb_table_function_bind(reinterpret_cast<duckdb_vx_tfunc_bind_input>(&input),
+                                                    reinterpret_cast<duckdb_vx_tfunc_bind_result>(&result),
+                                                    &error_out);
     if (error_out) {
         throw BinderException(IntoErrString(error_out));
     }
 
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
-    return make_uniq<CTableBindData>(info, std::move(cdata), return_types);
+    return make_uniq<CTableBindData>(std::move(cdata), return_types);
 }
 
 unique_ptr<GlobalTableFunctionState> c_init_global(ClientContext &context, TableFunctionInitInput &input) {
@@ -230,7 +260,7 @@ unique_ptr<GlobalTableFunctionState> c_init_global(ClientContext &context, Table
     };
 
     duckdb_vx_error error_out = nullptr;
-    duckdb_vx_data ffi_global_data = bind.info.vtab.init_global(&ffi_input, &error_out);
+    duckdb_vx_data ffi_global_data = duckdb_table_function_init_global(&ffi_input, &error_out);
     if (error_out) {
         throw BinderException(IntoErrString(error_out));
     }
@@ -241,45 +271,52 @@ unique_ptr<GlobalTableFunctionState> c_init_global(ClientContext &context, Table
 
 unique_ptr<LocalTableFunctionState>
 init_local(ExecutionContext &, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
-    const auto &bind = input.bind_data->Cast<CTableBindData>();
+    const void *const ffi_bind = input.bind_data->Cast<CTableBindData>().ffi_data->DataPtr();
     void *const ffi_global = global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
 
-    duckdb_vx_data ffi_local_data = bind.info.vtab.init_local(ffi_global);
+    duckdb_vx_data ffi_local_data = duckdb_table_function_init_local(ffi_bind, ffi_global);
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_local_data));
     return make_uniq<CTableLocalData>(std::move(cdata));
 }
 
 void function(ClientContext &, TableFunctionInput &input, DataChunk &output) {
-    const auto &bind = input.bind_data->Cast<CTableBindData>();
-
     void *const ffi_global = input.global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
     void *const ffi_local = input.local_state->Cast<CTableLocalData>().ffi_data->DataPtr();
 
     duckdb_data_chunk chunk = reinterpret_cast<duckdb_data_chunk>(&output);
     duckdb_vx_error error_out = nullptr;
-    bind.info.vtab.function(ffi_global, ffi_local, chunk, &error_out);
+    duckdb_table_function_scan(ffi_global, ffi_local, chunk, &error_out);
     if (error_out) {
         throw InvalidInputException(IntoErrString(error_out));
     }
 }
 
-void c_pushdown_complex_filter(ClientContext &,
-                               LogicalGet &,
-                               FunctionData *bind_data,
-                               vector<unique_ptr<Expression>> &filters) {
-    auto &bind = bind_data->Cast<CTableBindData>();
+using FilterVec = vector<unique_ptr<Expression>>;
+
+/*
+ * Table filter pushdown is used for two tasks in duckdb:
+ *
+ * 1. Prune files based on filename or hive partitioning, see Parquet
+ * filter pushdown. We don't use this because we do own file-level pruning in
+ * FileStatsLayoutReader, and we don't support hive partitioning yet.
+ *
+ * 2. Avoid reading unused file data. Filter expressions are pushed to Vortex,
+ * converted to Vortex expressions and used during the scan.
+ * Duckdb pushes a subset of expressions i.e. equality operators, and also
+ * expressions which return true in pushdown_expression.
+ */
+void pushdown_complex_filter(const FunctionData &bind_data, FilterVec &filters) {
+    const auto &bind = bind_data.Cast<CTableBindData>();
     void *const ffi_bind = bind.ffi_data->DataPtr();
     duckdb_vx_error error_out = nullptr;
 
     for (auto iter = filters.begin(); iter != filters.end();) {
         duckdb_vx_expr ffi_expr = reinterpret_cast<duckdb_vx_expr>(iter->get());
 
-        const bool pushed = bind.info.vtab.pushdown_complex_filter(ffi_bind, ffi_expr, &error_out);
+        const bool pushed = duckdb_table_function_pushdown_complex_filter(ffi_bind, ffi_expr, &error_out);
         if (error_out) {
             throw BinderException(IntoErrString(error_out));
         }
-
-        // If the pushdown complex filter returns true, we can remove the filter from the list.
         iter = pushed ? filters.erase(iter) : std::next(iter);
     }
 }
@@ -288,7 +325,7 @@ unique_ptr<NodeStatistics> c_cardinality(ClientContext &, const FunctionData *bi
     auto &bind = bind_data->Cast<CTableBindData>();
 
     duckdb_vx_node_statistics stats = {};
-    bind.info.vtab.cardinality(bind.ffi_data->DataPtr(), &stats);
+    duckdb_table_function_cardinality(bind.ffi_data->DataPtr(), &stats);
 
     auto out = make_uniq<NodeStatistics>();
     out->has_estimated_cardinality = stats.has_estimated_cardinality;
@@ -343,11 +380,10 @@ TablePartitionInfo get_partition_info(ClientContext &, TableFunctionPartitionInp
  * each partition ~ exported array file_index is constant.
  */
 OperatorPartitionData get_partition_data(ClientContext &, TableFunctionGetPartitionInput &input) {
-    auto &bind = input.bind_data->Cast<CTableBindData>();
     void *const ffi_global = input.global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
     void *const ffi_local = input.local_state->Cast<CTableLocalData>().ffi_data->DataPtr();
     duckdb_vx_partition_data partition_data;
-    bind.info.vtab.get_partition_data(ffi_global, ffi_local, &partition_data);
+    duckdb_table_function_get_partition_data(ffi_global, ffi_local, &partition_data);
 
     OperatorPartitionData out(partition_data.partition_index);
 
@@ -376,25 +412,24 @@ InsertionOrderPreservingMap<string> c_to_string(TableFunctionToStringInput &inpu
     InsertionOrderPreservingMap<string> result;
     duckdb_vx_string_map ffi_map = reinterpret_cast<duckdb_vx_string_map>(&result);
     void *const ffi_bind = input.bind_data->Cast<CTableBindData>().ffi_data->DataPtr();
-    const auto &info = static_cast<CTableFunctionInfo &>(*input.table_function.function_info);
-    info.vtab.to_string(ffi_bind, ffi_map);
+    duckdb_table_function_to_string(ffi_bind, ffi_map);
     return result;
 }
 
-extern "C" duckdb_state duckdb_vx_tfunc_register(duckdb_database ffi_db, const duckdb_vx_tfunc_vtab_t *vtab) {
-    D_ASSERT(ffi_db);
-    D_ASSERT(vtab);
-
-    const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
-    DatabaseInstance &db = *wrapper.database->instance;
-    TableFunction tf(vtab->name, {}, function, c_bind, c_init_global, init_local);
+duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter, const std::string &name) {
+    TableFunction tf(name, {}, function, duckdb_vx_table_function_bind, c_init_global, init_local);
 
     tf.projection_pushdown = true;
     tf.filter_pushdown = true;
     tf.filter_prune = true;
     tf.sampling_pushdown = false;
 
-    tf.pushdown_complex_filter = c_pushdown_complex_filter;
+    tf.pushdown_expression = [](auto &, const auto &, Expression &expression) {
+        return duckdb_table_function_pushdown_expression(reinterpret_cast<duckdb_vx_expr>(&expression));
+    };
+    tf.pushdown_complex_filter = [](auto &, auto &, FunctionData *bind_data, FilterVec &filters) {
+        pushdown_complex_filter(*bind_data, filters);
+    };
     tf.cardinality = c_cardinality;
     tf.get_partition_info = get_partition_info;
     tf.get_partition_data = get_partition_data;
@@ -420,12 +455,8 @@ extern "C" duckdb_state duckdb_vx_tfunc_register(duckdb_database ffi_db, const d
         };
     };
 
-    tf.arguments.resize(vtab->parameter_count);
-    for (size_t i = 0; i < vtab->parameter_count; i++) {
-        tf.arguments[i] = *reinterpret_cast<LogicalType *>(vtab->parameters[i]);
-    }
-
-    tf.function_info = make_shared_ptr<CTableFunctionInfo>(*vtab);
+    tf.arguments.resize(1);
+    tf.arguments[0] = parameter;
 
     try {
         auto &system_catalog = Catalog::GetSystemCatalog(db);
@@ -437,6 +468,21 @@ extern "C" duckdb_state duckdb_vx_tfunc_register(duckdb_database ffi_db, const d
         ErrorData data(e);
         DUCKDB_LOG_ERROR(db, "Failed to create Vortex table function:\t" + data.Message());
         return DuckDBError;
+    }
+    return DuckDBSuccess;
+}
+
+extern "C" duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_db) {
+    D_ASSERT(ffi_db);
+    const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
+    DatabaseInstance &db = *wrapper.database->instance;
+
+    for (LogicalType type : {LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)}) {
+        for (const std::string &name : {"read_vortex"s, "vortex_scan"s}) {
+            if (register_table_function(db, type, name) == DuckDBError) {
+                return DuckDBError;
+            }
+        }
     }
     return DuckDBSuccess;
 }
