@@ -16,17 +16,25 @@ fi
 
 : "${POLARSIGNALS_PROJECT_ID:?POLARSIGNALS_PROJECT_ID is required when heap profiling}"
 : "${HEAP_PROFILE_BENCHMARK:?HEAP_PROFILE_BENCHMARK is required when heap profiling}"
+: "${HEAP_PROFILE_ENGINE:?HEAP_PROFILE_ENGINE is required when heap profiling}"
+: "${HEAP_PROFILE_FORMAT:?HEAP_PROFILE_FORMAT is required when heap profiling}"
 
 parca_version="0.28.0"
 commit_sha="${HEAP_PROFILE_COMMIT_SHA:-${GITHUB_SHA:-unknown}}"
 branch="${GITHUB_REF_NAME:-unknown}"
 run_id="${GITHUB_RUN_ID:-local}"
 job="${GITHUB_JOB:-benchmark}"
+engine="$HEAP_PROFILE_ENGINE"
+format="$HEAP_PROFILE_FORMAT"
 
 branch="${branch//;/_}"
 branch="${branch//=/_}"
 job="${job//;/_}"
 job="${job//=/_}"
+engine="${engine//;/_}"
+engine="${engine//=/_}"
+format="${format//;/_}"
+format="${format//=/_}"
 
 profile_tmp_root="${RUNNER_TEMP:-/tmp}"
 profile_tmp_dir="$(mktemp -d "$profile_tmp_root/vortex-heap-profile.XXXXXX")"
@@ -127,7 +135,7 @@ scrape_configs:
           enabled: false
 YAML
 
-external_labels="branch=$branch;gh_run_id=$run_id;commit_sha=$commit_sha;benchmark=$HEAP_PROFILE_BENCHMARK;gh_job=$job"
+external_labels="branch=$branch;gh_run_id=$run_id;commit_sha=$commit_sha;benchmark=$HEAP_PROFILE_BENCHMARK;engine=$engine;format=$format;gh_job=$job"
 
 "$parca_path" \
     --config-path="$config_path" \

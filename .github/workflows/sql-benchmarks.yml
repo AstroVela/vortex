@@ -155,6 +155,8 @@ jobs:
         env:
           HEAP_PROFILE_BENCHMARK: ${{ matrix.id }}
           HEAP_PROFILE_COMMIT_SHA: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          HEAP_PROFILE_ENGINE: ${{ join(matrix.targets.*.engine, ',') }}
+          HEAP_PROFILE_FORMAT: ${{ join(matrix.targets.*.format, ',') }}
           OTEL_SERVICE_NAME: "vortex-bench"
           OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
           OTEL_EXPORTER_OTLP_ENDPOINT: "${{ (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false) && secrets.OTEL_EXPORTER_OTLP_ENDPOINT || '' }}"
@@ -181,6 +183,8 @@ jobs:
           AWS_REGION: "us-east-1"
           HEAP_PROFILE_BENCHMARK: ${{ matrix.id }}
           HEAP_PROFILE_COMMIT_SHA: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          HEAP_PROFILE_ENGINE: ${{ join(matrix.targets.*.engine, ',') }}
+          HEAP_PROFILE_FORMAT: ${{ join(matrix.targets.*.format, ',') }}
           OTEL_SERVICE_NAME: "vortex-bench"
           OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
           OTEL_EXPORTER_OTLP_ENDPOINT: "${{ (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false) && secrets.OTEL_EXPORTER_OTLP_ENDPOINT || '' }}"

@@ -185,8 +185,9 @@ scrape overhead, so compare timings only with other jemalloc-profiled runs.
 
 To try the CI integration on a pull request, add the `action/benchmark` label, or use
 `action/benchmark-sql` for the smaller SQL matrix. In Polar Signals, select the memory profile and
-the `inuse_space`/`bytes` sample type, then filter by the `benchmark`, `commit_sha`, or `gh_run_id`
-labels.
+the `inuse_space`/`bytes` sample type, then filter by the `benchmark`, `engine`, `format`,
+`commit_sha`, or `gh_run_id` labels. The `engine` and `format` values describe all targets covered
+by the profiled command, so multi-engine or multi-format jobs use comma-separated values.
 
 ### Data Generation
 
