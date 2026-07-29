@@ -125,6 +125,7 @@ mod tests {
     use crate::arrays::Primitive;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::ScalarFn;
+    use crate::arrays::scalar_fn::ScalarFnArrayExt;
     use crate::arrays::scalar_fn::ScalarFnFactoryExt;
     use crate::assert_arrays_eq;
     use crate::dtype::Nullability;
@@ -132,12 +133,12 @@ mod tests {
     use crate::optimizer::ArrayOptimizer;
     use crate::scalar::Scalar;
     use crate::scalar_fn::EmptyOptions;
+    use crate::scalar_fn::fns::literal::Literal;
     use crate::scalar_fn::fns::mask::Mask as MaskExpr;
 
-    /// A constant Boolean mask child must take the metadata-only reduction path (pushing into the
-    /// input encoding) rather than surviving as a `ScalarFn` wrapper that falls through to
-    /// execution. Asserting the optimized encoding makes this fail before the adaptor accepts
-    /// `Constant` masks, not just verifying values that could pass through the execution fallback.
+    /// A constant Boolean mask must take the metadata-only self-reduction path rather than survive
+    /// until execution. An all-true mask becomes the nullable input, while an all-false mask
+    /// becomes a typed null literal.
     #[rstest]
     #[case(true)]
     #[case(false)]
@@ -156,16 +157,21 @@ mod tests {
         );
 
         let optimized = masked.optimize()?;
-        assert!(
-            !optimized.is::<ScalarFn>(),
-            "constant mask should not fall through to execution, got {}",
-            optimized.encoding_id()
-        );
-        assert!(
-            optimized.is::<Primitive>(),
-            "constant mask should reduce into the Primitive input, got {}",
-            optimized.encoding_id()
-        );
+        if mask_value {
+            assert!(
+                optimized.is::<Primitive>(),
+                "constant true mask should reduce into the Primitive input, got {}",
+                optimized.encoding_id()
+            );
+        } else {
+            assert!(
+                optimized
+                    .as_opt::<ScalarFn>()
+                    .is_some_and(|array| { array.scalar_fn().is::<Literal>() }),
+                "constant false mask should reduce to a null literal, got {}",
+                optimized.encoding_id()
+            );
+        }
 
         let mut ctx = crate::array_session().create_execution_ctx();
         let expected = if mask_value {
