@@ -1,12 +1,28 @@
-=============
-OpenDAL (COS)
-=============
+==================
+OpenDAL (COS, OSS)
+==================
 
-Vortex can read from and write to Tencent Cloud COS through
+Vortex can read from and write to Tencent Cloud COS and Alibaba Cloud OSS through
 `OpenDAL <https://opendal.apache.org/>`_, which provides native service support.
 
-This store is available only when Vortex is built with the ``opendal`` feature
+These stores are available only when Vortex is built with the ``opendal`` feature
 (e.g. ``maturin develop --features opendal`` or ``cargo build -p vortex-jni --features opendal``).
+
+.. list-table::
+   :header-rows: 1
+
+   * - Scheme
+     - Service
+     - Endpoint variable
+     - Credential variables
+   * - ``cos://``
+     - Tencent Cloud COS
+     - ``COS_ENDPOINT``
+     - ``TENCENTCLOUD_SECRET_ID``, ``TENCENTCLOUD_SECRET_KEY``
+   * - ``oss://``
+     - Alibaba Cloud OSS
+     - ``OSS_ENDPOINT``
+     - ``ALIBABA_CLOUD_ACCESS_KEY_ID``, ``ALIBABA_CLOUD_ACCESS_KEY_SECRET``
 
 :class:`vortex.store.CosStore`
 ==============================
@@ -63,25 +79,15 @@ Or configure explicitly with :class:`~vortex.store.CosStore` and pass it to
    # bucket are not part of the path passed to read_url.
    a = read_url("path/to/dataset.vortex", store=store)
 
-Passing a store object directly
-===============================
+Reading from OSS
+================
 
-``CosStore`` is a concrete store object. You can build one once and pass it
-directly to :func:`vortex.io.read_url` / :func:`vortex.io.write` via the ``store=`` argument,
-exactly like the built-in S3/Azure/GCS stores:
+Alibaba Cloud OSS is reachable by URL. There is no standalone ``OssStore`` class yet, so
+configuration comes from the environment variables OpenDAL's OSS builder reads
+(``ALIBABA_CLOUD_ACCESS_KEY_ID``, ``ALIBABA_CLOUD_ACCESS_KEY_SECRET`` and ``OSS_ENDPOINT``):
 
 .. code-block:: python
 
-   from vortex.io import read_url
-   from vortex.store import CosStore
+   import vortex as vx
 
-   store = CosStore(
-       bucket="my-bucket",
-       endpoint="https://cos.ap-guangzhou.myqcloud.com",
-       secret_id="AKID...",
-       secret_key="...",
-   )
-
-   # When `store=` is supplied, the path is resolved as a key within the store, so the scheme
-   # and bucket are not part of the path passed to read_url.
-   a = read_url("path/to/dataset.vortex", store=store)
+   a = vx.io.read_url("oss://my-bucket/path/to/dataset.vortex")
