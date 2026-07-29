@@ -26,13 +26,10 @@ use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
-use crate::ScanPlanRef;
-use crate::scan::filter::FilterExpr;
+use crate::scan::plan;
+use crate::scan::plan_v2;
+use crate::scan::plan_v2::ScanPlanV2Ref;
 use crate::scan::splits::Splits;
-use crate::scan::tasks::PlannedTaskContext;
-use crate::scan::tasks::TaskContext;
-use crate::scan::tasks::planned_split_exec;
-use crate::scan::tasks::split_exec;
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
 ///
@@ -59,21 +56,13 @@ pub struct RepeatedScan<A: 'static + Send> {
 }
 
 enum ExecutionPlan {
-    Legacy {
-        layout_reader: LayoutReaderRef,
-        projection: Expression,
-        filter: Option<Expression>,
-    },
-    Planned {
-        projection: ScanPlanRef,
-        predicates: Vec<ScanPlanRef>,
-        filter: Option<Expression>,
-    },
+    Plan(plan::Plan),
+    PlanV2(plan_v2::PlanV2),
 }
 
 enum ExecutionTaskContext<A> {
-    Legacy(Arc<TaskContext<A>>),
-    Planned(Arc<PlannedTaskContext<A>>),
+    Plan(Arc<plan::TaskContext<A>>),
+    PlanV2(Arc<plan_v2::TaskContext<A>>),
 }
 
 impl RepeatedScan<ArrayRef> {
@@ -108,7 +97,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         clippy::too_many_arguments,
         reason = "all arguments are needed for scan construction"
     )]
-    pub fn new(
+    pub fn new_plan(
         session: VortexSession,
         layout_reader: LayoutReaderRef,
         projection: Expression,
@@ -124,11 +113,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
     ) -> Self {
         Self {
             session,
-            execution: ExecutionPlan::Legacy {
-                layout_reader,
-                projection,
-                filter,
-            },
+            execution: ExecutionPlan::Plan(plan::Plan::new(layout_reader, projection, filter)),
             ordered,
             row_range,
             selection,
@@ -145,10 +130,10 @@ impl<A: 'static + Send> RepeatedScan<A> {
         clippy::too_many_arguments,
         reason = "all arguments are needed for scan construction"
     )]
-    pub fn new_planned(
+    pub fn new_plan_v2(
         session: VortexSession,
-        projection: ScanPlanRef,
-        predicates: Vec<ScanPlanRef>,
+        projection: ScanPlanV2Ref,
+        predicates: Vec<ScanPlanV2Ref>,
         filter: Option<Expression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
@@ -161,11 +146,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
     ) -> Self {
         Self {
             session,
-            execution: ExecutionPlan::Planned {
-                projection,
-                predicates,
-                filter,
-            },
+            execution: ExecutionPlan::PlanV2(plan_v2::PlanV2::new(projection, predicates, filter)),
             ordered,
             row_range,
             selection,
@@ -232,26 +213,12 @@ impl<A: 'static + Send> RepeatedScan<A> {
         let mut limit = self.limit;
         let mut tasks = Vec::new();
         let ctx = match &self.execution {
-            ExecutionPlan::Legacy {
-                layout_reader,
-                projection,
-                filter,
-            } => ExecutionTaskContext::Legacy(Arc::new(TaskContext {
-                filter: filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
-                reader: Arc::clone(layout_reader),
-                projection: projection.clone(),
-                mapper: Arc::clone(&self.map_fn),
-            })),
-            ExecutionPlan::Planned {
-                projection,
-                predicates,
-                filter,
-            } => ExecutionTaskContext::Planned(Arc::new(PlannedTaskContext {
-                filter: filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
-                predicates: predicates.clone(),
-                projection: Arc::clone(projection),
-                mapper: Arc::clone(&self.map_fn),
-            })),
+            ExecutionPlan::Plan(plan) => {
+                ExecutionTaskContext::Plan(plan.task_context(Arc::clone(&self.map_fn)))
+            }
+            ExecutionPlan::PlanV2(plan_v2) => {
+                ExecutionTaskContext::PlanV2(plan_v2.task_context(Arc::clone(&self.map_fn)))
+            }
         };
 
         for range in ranges {
@@ -261,11 +228,11 @@ impl<A: 'static + Send> RepeatedScan<A> {
             }
 
             tasks.push(match &ctx {
-                ExecutionTaskContext::Legacy(ctx) => {
-                    split_exec(Arc::clone(ctx), row_mask, limit.as_mut())?
+                ExecutionTaskContext::Plan(ctx) => {
+                    plan::split_exec(Arc::clone(ctx), row_mask, limit.as_mut())?
                 }
-                ExecutionTaskContext::Planned(ctx) => {
-                    planned_split_exec(Arc::clone(ctx), row_mask, limit.as_mut())?
+                ExecutionTaskContext::PlanV2(ctx) => {
+                    plan_v2::split_exec(Arc::clone(ctx), row_mask, limit.as_mut())?
                 }
             });
             if limit.is_some_and(|l| l == 0) {

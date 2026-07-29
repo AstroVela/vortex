@@ -40,10 +40,10 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
-use crate::LayoutReaderScanPlan;
-use crate::ScanPlanRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
-use crate::scan::plan::planned_scan_enabled;
+use crate::scan::plan_v2::LayoutReaderScanPlanV2;
+use crate::scan::plan_v2::ScanPlanV2Ref;
+use crate::scan::plan_v2::plan_v2_enabled;
 use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
@@ -313,9 +313,9 @@ impl<A: 'static + Send> ScanBuilder<A> {
                 )?)
             };
 
-        if planned_scan_enabled()? {
-            let source: ScanPlanRef =
-                Arc::new(LayoutReaderScanPlan::new(Arc::clone(&layout_reader)));
+        if plan_v2_enabled()? {
+            let source: ScanPlanV2Ref =
+                Arc::new(LayoutReaderScanPlanV2::new(Arc::clone(&layout_reader)));
             let projection_plan = Arc::clone(&source).apply_expr(projection)?.optimize()?;
             let predicate_plans = filter
                 .as_ref()
@@ -324,7 +324,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
                 .into_iter()
                 .map(|expr| Arc::clone(&source).apply_expr(expr)?.optimize())
                 .collect::<VortexResult<Vec<_>>>()?;
-            return Ok(RepeatedScan::new_planned(
+            return Ok(RepeatedScan::new_plan_v2(
                 self.session.clone(),
                 projection_plan,
                 predicate_plans,
@@ -340,7 +340,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             ));
         }
 
-        Ok(RepeatedScan::new(
+        Ok(RepeatedScan::new_plan(
             self.session.clone(),
             layout_reader,
             projection,
