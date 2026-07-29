@@ -13,6 +13,7 @@ use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::DescendantExclusion;
 use vortex_compressor::scheme::EstimateVerdict;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_fastlanes::RLE;
 
@@ -20,7 +21,7 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
-use crate::schemes::integer::RUN_LENGTH_THRESHOLD;
+use crate::schemes::integer::rle_can_pay_for_itself;
 use crate::schemes::integer::rle_compress;
 use crate::schemes::rle_ancestor_exclusions;
 use crate::schemes::rle_descendant_exclusions;
@@ -66,7 +67,12 @@ impl Scheme for FloatRLEScheme {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
-        if data.float_stats(exec_ctx).average_run_length() < RUN_LENGTH_THRESHOLD {
+        // Floats have no FoR span to narrow the comparison, so measure RLE against the full
+        // type width.
+        let bit_width = u32::try_from(data.array().dtype().as_ptype().bit_width())
+            .vortex_expect("float bit width fits in u32");
+        let stats = data.float_stats(exec_ctx);
+        if !rle_can_pay_for_itself(stats.value_count(), stats.run_count(), bit_width) {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 

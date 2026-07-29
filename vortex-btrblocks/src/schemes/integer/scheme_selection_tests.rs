@@ -9,11 +9,13 @@ use std::sync::LazyLock;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::assert_arrays_eq;
 use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProviderExt;
@@ -22,6 +24,7 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::FoR;
+use vortex_fastlanes::RLE;
 use vortex_runend::RunEnd;
 use vortex_sequence::Sequence;
 use vortex_session::VortexSession;
@@ -154,6 +157,122 @@ fn test_rle_compressed() -> VortexResult<()> {
     Ok(())
 }
 
+/// Wide values whose runs are only two elements long. RunEnd needs a run-end position per run,
+/// which at this run length costs more than the values themselves, but RLE pays for position once
+/// per element rather than once per run and still halves the array. The old fixed
+/// `average_run_length >= 4` gate skipped RLE here and the column fell back to bit-packing,
+/// which cannot shrink full-width scattered values at all.
+#[test]
+fn test_rle_compressed_short_runs_wide_values() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let mut values: Vec<i64> = Vec::new();
+    for i in 0..32_768u64 {
+        // Scatter the run values across the full 64-bit range so neither FoR nor BitPacking can
+        // narrow them, and so Delta's residuals stay wide.
+        let v = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64;
+        values.extend(iter::repeat_n(v, 2));
+    }
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
+    let uncompressed_nbytes = array.clone().into_array().nbytes();
+
+    let btr = BtrBlocksCompressor::default();
+    let compressed = btr.compress(&array.clone().into_array(), &mut ctx)?;
+
+    assert!(
+        contains_rle(&compressed),
+        "expected RLE, got tree:\n{}",
+        compressed.display_tree()
+    );
+    // Halving is the floor: one dictionary entry per two elements. On top of that the index array
+    // costs ~9 bits per element bit-packed, or ~1.4 bits once the unstable Delta cascade turns it
+    // into a run-start bitmap.
+    let bound = if cfg!(feature = "unstable_encodings") {
+        uncompressed_nbytes * 6 / 10
+    } else {
+        uncompressed_nbytes * 7 / 10
+    };
+    assert!(
+        compressed.nbytes() < bound,
+        "expected < {bound} bytes, got {}",
+        compressed.nbytes()
+    );
+    assert_arrays_eq!(compressed, array.into_array(), &mut ctx);
+    Ok(())
+}
+
+/// A one-bit-wide column bit-packs to a single bit per element, which RLE's positional index can
+/// never undercut however long the runs are. It must not be selected, no matter how run-heavy.
+#[test]
+fn test_rle_skipped_for_boolean_like_column() -> VortexResult<()> {
+    let mut values: Vec<i32> = Vec::new();
+    let mut rng = StdRng::seed_from_u64(11u64);
+    let mut value = 0i32;
+    while values.len() < 32_768 {
+        let run_length = 20 + (rng.next_u32() % 40) as usize;
+        values.extend(iter::repeat_n(value, run_length));
+        value ^= 1;
+    }
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
+    let btr = BtrBlocksCompressor::default();
+    let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+    assert!(
+        !contains_rle(&compressed),
+        "RLE cannot beat a 1-bit bit-pack, got tree:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}
+
+/// FastLanes Delta emits `1024 / bit_width` bases per chunk, so the RLE index array has to keep
+/// its natural u16 width: narrowing to u8 doubles the bases for a byte-identical delta payload,
+/// and a u8 index needing a full 8 bits cannot be bit-packed at all.
+#[cfg(feature = "unstable_encodings")]
+#[test]
+fn test_rle_indices_are_not_narrowed_before_delta() -> VortexResult<()> {
+    use vortex_array::dtype::PType;
+    use vortex_error::VortexExpect;
+    use vortex_fastlanes::RLEArraySlotsExt;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    // Runs of exactly 4 put 256 runs in every 1024-element chunk, so the largest chunk-local run
+    // index is 255: the widest value that still narrows to u8, and the one bit-packing refuses.
+    let mut values: Vec<i64> = Vec::new();
+    for i in 0..16_384u64 {
+        values.extend(iter::repeat_n(
+            i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64,
+            4,
+        ));
+    }
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
+
+    let btr = BtrBlocksCompressor::default();
+    let compressed = btr.compress(&array.clone().into_array(), &mut ctx)?;
+
+    let rle = find_rle(&compressed).unwrap_or_else(|| {
+        panic!(
+            "expected an RLE array, got tree:\n{}",
+            compressed.display_tree()
+        )
+    });
+    let rle = rle.as_opt::<RLE>().vortex_expect("checked by find_rle");
+    assert_eq!(rle.indices().dtype().as_ptype(), PType::U16);
+    assert_arrays_eq!(compressed, array.into_array(), &mut ctx);
+    Ok(())
+}
+
+/// Returns the first `RLE` array in the tree, if any.
+fn find_rle(array: &ArrayRef) -> Option<ArrayRef> {
+    if array.is::<RLE>() {
+        return Some(array.clone());
+    }
+    array.children().iter().find_map(find_rle)
+}
+
+/// Returns true if any `RLE` array appears in the tree.
+fn contains_rle(array: &ArrayRef) -> bool {
+    find_rle(array).is_some()
+}
+
 /// A strictly-increasing column with small, irregular steps: not a perfect arithmetic sequence
 /// (so Sequence skips), all-unique with no runs (so RunEnd/Dict skip), and a wide absolute range.
 /// Delta's residuals are far smaller than the FoR span, so Delta should win and round-trip, and
@@ -197,7 +316,7 @@ fn test_delta_compressed() -> VortexResult<()> {
 
 /// Returns true if any `Delta` array appears below an ancestor `Delta` in the tree.
 #[cfg(feature = "unstable_encodings")]
-fn has_nested_delta(array: &vortex_array::ArrayRef, under_delta: bool) -> bool {
+fn has_nested_delta(array: &ArrayRef, under_delta: bool) -> bool {
     use vortex_fastlanes::Delta;
 
     let is_delta = array.is::<Delta>();

@@ -23,6 +23,7 @@ pub use for_::FoRScheme;
 #[cfg(feature = "pco")]
 pub use pco::PcoScheme;
 pub use rle::IntRLEScheme;
+pub(crate) use rle::rle_can_pay_for_itself;
 pub(crate) use rle::rle_compress;
 #[cfg(feature = "unstable_encodings")]
 pub(crate) use rle::try_compress_delta;
@@ -33,9 +34,6 @@ pub use sparse::SparseScheme;
 pub use vortex_compressor::builtins::IntDictScheme;
 pub use vortex_compressor::stats::IntegerStats;
 pub use zigzag::ZigZagScheme;
-
-/// Threshold for the average run length in an array before we consider run-length encoding.
-pub(crate) const RUN_LENGTH_THRESHOLD: u32 = 4;
 
 #[cfg(test)]
 mod scheme_selection_tests;

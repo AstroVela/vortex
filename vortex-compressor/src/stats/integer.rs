@@ -245,6 +245,8 @@ pub struct IntegerStats {
     null_count: u32,
     /// Cache for `validity.true_count()`.
     value_count: u32,
+    /// The number of runs of equal consecutive values.
+    run_count: u32,
     /// The average run length.
     average_run_length: u32,
     /// Type-erased typed statistics.
@@ -300,6 +302,15 @@ impl IntegerStats {
         self.value_count
     }
 
+    /// Returns the number of runs of equal consecutive values.
+    ///
+    /// Unlike [`Self::average_run_length`], which is an integer division and therefore rounds a
+    /// 1.9-element average run down to 1, this is exact. Prefer it when the difference between
+    /// "barely any runs" and "no runs" matters.
+    pub fn run_count(&self) -> u32 {
+        self.run_count
+    }
+
     /// Returns the average run length.
     pub fn average_run_length(&self) -> u32 {
         self.average_run_length
@@ -327,6 +338,7 @@ where
         return Ok(IntegerStats {
             null_count: 0,
             value_count: 0,
+            run_count: 0,
             average_run_length: 0,
             erased: TypedStats {
                 min: T::max_value(),
@@ -341,6 +353,7 @@ where
         return Ok(IntegerStats {
             null_count: u32::try_from(array.len())?,
             value_count: 0,
+            run_count: 0,
             average_run_length: 0,
             erased: TypedStats {
                 min: T::max_value(),
@@ -473,6 +486,7 @@ where
     Ok(IntegerStats {
         null_count,
         value_count,
+        run_count: runs,
         average_run_length: value_count / runs,
         erased: typed.into(),
     })
