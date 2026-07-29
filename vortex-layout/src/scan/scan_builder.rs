@@ -42,7 +42,7 @@ use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
 use crate::scan::plan_v2::LayoutReaderScanPlanV2;
-use crate::scan::plan_v2::ScanPlanV2Ref;
+use crate::scan::plan_v2::ScanPlanRef;
 use crate::scan::plan_v2::plan_v2_enabled;
 use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
@@ -314,7 +314,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             };
 
         if plan_v2_enabled()? {
-            let source: ScanPlanV2Ref =
+            let source: ScanPlanRef =
                 Arc::new(LayoutReaderScanPlanV2::new(Arc::clone(&layout_reader)));
             let projection_plan = Arc::clone(&source).apply_expr(projection)?.optimize()?;
             let predicate_plans = filter

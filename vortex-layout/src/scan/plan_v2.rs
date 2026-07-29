@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! [`ScanPlanV2`] is the migration boundary from [`crate::LayoutReader`] toward a layout planning
-//! system modeled on the array optimizer's optimize/execute split. Because the final execution
-//! abstraction for layouts is not yet known, the first step moves expression application and
-//! optimization onto heap-allocated plans produced by layouts. The current
-//! [`LayoutReaderScanPlanV2`] builds and optimizes those plans, then falls back to
-//! [`crate::LayoutReader`] for execution.
-//!
-//! The next step is to add optimizer rules over PlanV2 trees, analogous to the rules used for
-//! arrays, so layouts can push down and rewrite projections and filters before execution. Once
-//! those rules establish the required plan shapes, a native layout execution API can replace the
-//! LayoutReader fallback incrementally; keeping optimization separate lets that execution boundary
-//! be designed from the plans it must run instead of fixed prematurely.
+// See https://github.com/vortex-data/vortex/issues/9062
 
 use std::ops::BitAnd;
 use std::ops::Range;
@@ -37,15 +26,15 @@ use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
 
 pub(crate) struct PlanV2 {
-    projection: ScanPlanV2Ref,
-    predicates: Vec<ScanPlanV2Ref>,
+    projection: ScanPlanRef,
+    predicates: Vec<ScanPlanRef>,
     filter: Option<Expression>,
 }
 
 impl PlanV2 {
     pub(crate) fn new(
-        projection: ScanPlanV2Ref,
-        predicates: Vec<ScanPlanV2Ref>,
+        projection: ScanPlanRef,
+        predicates: Vec<ScanPlanRef>,
         filter: Option<Expression>,
     ) -> Self {
         Self {
@@ -72,20 +61,20 @@ impl PlanV2 {
 }
 
 /// Shared handle to a heap-allocated V2 physical scan plan.
-pub type ScanPlanV2Ref = Arc<dyn ScanPlanV2>;
+pub type ScanPlanRef = Arc<dyn ScanPlan>;
 
-/// A heap-allocated V2 physical scan plan.
+/// A heap-allocated physical scan plan.
 ///
 /// A source plan represents an instantiated layout. [`apply_expr`](Self::apply_expr) derives
 /// another plan whose root value is the applied expression, and [`optimize`](Self::optimize)
 /// rewrites that derived plan before execution. Execution therefore selects an already-bound plan
 /// and supplies only its row range and mask.
-pub trait ScanPlanV2: 'static + Send + Sync {
+pub trait ScanPlan: 'static + Send + Sync {
     /// Apply `expr` to this plan's root value and return the resulting plan.
-    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanV2Ref>;
+    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef>;
 
     /// Optimize this plan and return the resulting plan.
-    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanV2Ref>;
+    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef>;
 
     /// Returns the name of the underlying layout reader for debugging.
     fn name(&self) -> &Arc<str>;
@@ -146,13 +135,13 @@ impl LayoutReaderScanPlanV2 {
     }
 }
 
-impl ScanPlanV2 for LayoutReaderScanPlanV2 {
-    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanV2Ref> {
+impl ScanPlan for LayoutReaderScanPlanV2 {
+    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef> {
         let expr = replace(expr, &root(), self.expr.clone());
         Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
     }
 
-    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanV2Ref> {
+    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef> {
         let expr = self.expr.optimize_recursive(self.reader.dtype())?;
         Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
     }
@@ -336,8 +325,8 @@ pub(crate) fn split_exec<A: 'static + Send>(
 /// Information needed to execute one split from a V2 physical scan plan.
 pub(crate) struct TaskContext<A> {
     filter: Option<Arc<FilterExpr>>,
-    predicates: Vec<ScanPlanV2Ref>,
-    projection: ScanPlanV2Ref,
+    predicates: Vec<ScanPlanRef>,
+    projection: ScanPlanRef,
     mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
 }
 
@@ -458,7 +447,7 @@ mod tests {
     #[test]
     fn scan_plan_v2_applies_expressions_to_the_current_root() -> VortexResult<()> {
         let reader: LayoutReaderRef = Arc::new(TestLayoutReader::new());
-        let source: ScanPlanV2Ref = Arc::new(LayoutReaderScanPlanV2::new(reader));
+        let source: ScanPlanRef = Arc::new(LayoutReaderScanPlanV2::new(reader));
 
         let field = Arc::clone(&source)
             .apply_expr(get_item("a", root()))?
