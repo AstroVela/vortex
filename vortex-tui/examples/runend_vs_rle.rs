@@ -10,6 +10,10 @@
 //! compresses each block twice, once with RLE excluded and once with RunEnd excluded, and prints
 //! both resulting stacks with their on-disk bytes.
 //!
+//! A third arm runs the unmodified compressor, which has both schemes available and picks between
+//! them from a ~1% sample. Comparing that arm against the better of the two forced arms shows
+//! whether the sampled estimate actually agrees with the compressed sizes it is predicting.
+//!
 //! Only columns where at least one variant actually reaches for RunEnd or RLE are reported.
 //!
 //! Usage: `cargo run --release -p vortex-tui --features unstable_encodings --example runend_vs_rle -- <file.parquet> [block_rows]`
@@ -64,6 +68,8 @@ fn main() -> anyhow::Result<()> {
     let rle_only = BtrBlocksCompressorBuilder::default()
         .exclude_schemes([RunEndScheme.id()])
         .build();
+    // Both available: this is what the shipped compressor does, choosing from a sample.
+    let both = BtrBlocksCompressorBuilder::default().build();
 
     let file = std::fs::File::open(&path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
@@ -112,6 +118,15 @@ fn main() -> anyhow::Result<()> {
             &array_ctx,
         )?;
 
+        let picked = measure(
+            &both,
+            whole.as_array(),
+            block_rows,
+            "fastlanes.rle",
+            &session,
+            &array_ctx,
+        )?;
+
         if !re.uses_target && !rle.uses_target {
             continue;
         }
@@ -121,9 +136,19 @@ fn main() -> anyhow::Result<()> {
         totals[1].0 += rle.disk;
         totals[1].1 += rle.nodes;
 
+        let best = re.disk.min(rle.disk);
         let winner = if rle.disk < re.disk { "RLE" } else { "RunEnd" };
         let pct = 100.0 * (rle.disk as f64 - re.disk as f64) / re.disk.max(1) as f64;
-        println!("=== {name}   winner: {winner} ({pct:+.1}% RLE vs RunEnd)");
+        // How far the sampled estimate landed above the better of the two forced arms.
+        let regret = 100.0 * (picked.disk as f64 - best as f64) / best.max(1) as f64;
+        println!(
+            "=== {name}   smaller: {winner} ({pct:+.1}% RLE vs RunEnd)   estimator picked {} ({regret:+.1}% vs best)",
+            if picked.uses_target {
+                "RLE"
+            } else {
+                "RunEnd/other"
+            }
+        );
         println!(
             "  RunEnd  {:>11} B  nodes={:<4} depth={}  {}",
             re.disk,
@@ -134,6 +159,10 @@ fn main() -> anyhow::Result<()> {
             } else {
                 format!("{} (RunEnd not selected)", re.stack)
             }
+        );
+        println!(
+            "  chosen  {:>11} B  nodes={:<4} depth={}",
+            picked.disk, picked.nodes, picked.depth
         );
         println!(
             "  RLE     {:>11} B  nodes={:<4} depth={}  {}",

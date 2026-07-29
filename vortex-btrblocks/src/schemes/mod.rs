@@ -22,6 +22,7 @@ use vortex_compressor::scheme::ChildSelection;
 use vortex_compressor::scheme::DescendantExclusion;
 use vortex_compressor::scheme::SchemeExt;
 
+use crate::schemes::integer::RunEndScheme;
 use crate::schemes::integer::SparseScheme;
 
 /// Shared descendant exclusion rules for RLE schemes.
@@ -29,17 +30,23 @@ use crate::schemes::integer::SparseScheme;
 /// RLE indices (child 1) and offsets (child 2) are monotonically increasing positions with all
 /// unique values. Dict and Sparse are pointless on such data. Self-exclusion already prevents
 /// RLE on RLE children.
+///
+/// RunEnd is excluded for a different reason: it is not pointless there, it is the *other* way of
+/// encoding the runs we have already committed to encoding. RLE's positional child exists solely
+/// to say where the runs start; re-encoding it with RunEnd nests one run representation inside the
+/// other, which buys little and costs two extra levels of decode. This mirrors [`RunEndScheme`],
+/// which already excludes RLE from its own `ends` child, and makes the two schemes symmetric
+/// rather than letting RLE reach for RunEnd while RunEnd cannot reach for RLE.
 fn rle_descendant_exclusions() -> Vec<DescendantExclusion> {
     vec![
         DescendantExclusion {
             excluded: IntDictScheme.id(),
             children: ChildSelection::Many(&[1, 2]),
         },
-        // TODO(connor): This is wrong for some reason?
-        // DescendantExclusion {
-        //     excluded: RunEndScheme.id(),
-        //     children: ChildSelection::Many(&[1, 2]),
-        // },
+        DescendantExclusion {
+            excluded: RunEndScheme.id(),
+            children: ChildSelection::Many(&[1, 2]),
+        },
         DescendantExclusion {
             excluded: SparseScheme.id(),
             children: ChildSelection::Many(&[1, 2]),
