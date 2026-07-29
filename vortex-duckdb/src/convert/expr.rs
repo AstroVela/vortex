@@ -541,17 +541,20 @@ impl PushedAggregate {
         })
     }
 
-    /// If zone maps store information for this aggregate function, this
-    /// aggregate function, None otherwise.
+    /// If zone maps store information for this aggregate function or we can
+    /// derive existing stats to obtain it, this aggregate function, None
+    /// otherwise.
     ///
-    /// Example: Mean isn't stored in zone maps
+    /// Example: Min is stored in zone mapes
+    /// Example: Mean isn't stored in zone maps, but Mean = Sum / Count
     pub fn zone_map_supply_fn(self) -> Option<AggregateFnRef> {
         let opts = NumericalAggregateOpts::default();
         Some(match self {
             Self::Min => Min.bind(opts),
             Self::Max => Max.bind(opts),
             Self::Sum => Sum.bind(opts),
-            Self::Mean | Self::First | Self::Count => return None,
+            Self::Mean => Mean::combined().bind(PairOptions(opts, opts)),
+            Self::First | Self::Count => return None,
         })
     }
 }

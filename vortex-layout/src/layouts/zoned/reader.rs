@@ -413,6 +413,10 @@ mod test {
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::AggregateFnVTableExt;
+    use vortex_array::aggregate_fn::NumericalAggregateOpts;
+    use vortex_array::aggregate_fn::combined::PairOptions;
+    use vortex_array::aggregate_fn::fns::mean::Mean;
     use vortex_array::array_session;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::PrimitiveArray;
@@ -556,12 +560,26 @@ mod test {
             );
 
             let max_expr = &stat(root(), Stat::Max.aggregate_fn().unwrap());
-            let max = reader.projection_evaluation(range, max_expr, mask)?.await?;
+            let max = reader
+                .projection_evaluation(range, max_expr, mask.clone())?
+                .await?;
             assert_eq!(
                 max.execute_scalar(0, &mut ctx)?
                     .as_primitive()
                     .typed_value::<i32>(),
                 Some(9)
+            );
+
+            let opts = NumericalAggregateOpts::default();
+            let mean_fn = Mean::combined().bind(PairOptions(opts, opts));
+            let mean = reader
+                .projection_evaluation(range, &stat(root(), mean_fn.clone()), mask)?
+                .await?;
+            let mut mean_acc = mean_fn.accumulator(reader.dtype())?;
+            mean_acc.combine_partials(mean.execute_scalar(0, &mut ctx)?)?;
+            assert_eq!(
+                mean_acc.finish()?.as_primitive().typed_value::<f64>(),
+                Some(5.0)
             );
             Ok(())
         })

@@ -12,6 +12,9 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AccumulatorRef;
 use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::aggregate_fn::AggregateFnSatisfaction;
+use vortex_array::aggregate_fn::AggregateFnVTableExt;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::combined::Combined;
 use vortex_array::aggregate_fn::fns::all_nan::AllNan;
 use vortex_array::aggregate_fn::fns::all_non_nan::AllNonNan;
 use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
@@ -19,6 +22,7 @@ use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
 use vortex_array::aggregate_fn::fns::max::Max;
+use vortex_array::aggregate_fn::fns::mean::Mean;
 use vortex_array::aggregate_fn::fns::min::Min;
 use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::aggregate_fn::fns::sum::Sum;
@@ -27,6 +31,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
 use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
@@ -36,6 +41,7 @@ use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::traversal::NodeExt;
 use vortex_array::expr::traversal::Transformed;
+use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::fns::stat::StatFn;
@@ -48,6 +54,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_runend::RunEnd;
 use vortex_session::VortexSession;
@@ -218,7 +225,99 @@ impl ZoneMap {
     }
 
     pub(super) fn supports_zone_partial(&self, aggregate_fn: &AggregateFnRef) -> bool {
-        self.zone_partial_field(aggregate_fn).is_some()
+        if self.zone_partial_field(aggregate_fn).is_some() {
+            return true;
+        }
+        aggregate_fn.is::<Combined<Mean>>() // mean = sum / count
+            && self.stat_column(Stat::Sum).is_some()
+            && self.stat_column(Stat::NullCount).is_some()
+    }
+
+    /// Stored per-zone column for "stat" if present.
+    fn stat_column(&self, stat: Stat) -> Option<&ArrayRef> {
+        let aggregate_fn = stat.aggregate_fn()?;
+        self.array
+            .unmasked_field_by_name_opt(aggregate_fn.to_string())
+    }
+
+    /// Number of rows covered by zones in "range"
+    fn covered_rows(&self, range: Range<usize>) -> u64 {
+        let rows_at = |zone: usize| {
+            (zone as u64)
+                .saturating_mul(self.zone_len)
+                .min(self.row_count)
+        };
+        rows_at(range.end) - rows_at(range.start)
+    }
+
+    /// Sum a stored stat column over "range" or return 0 if absent
+    fn sum_stat_column(
+        &self,
+        stat: Stat,
+        range: Range<usize>,
+        session: &VortexSession,
+    ) -> VortexResult<u64> {
+        let Some(field) = self.stat_column(stat) else {
+            return Ok(0);
+        };
+        let end = range.end.min(self.array.len());
+        if range.start >= end {
+            return Ok(0);
+        }
+        let mut ctx = session.create_execution_ctx();
+        let mut reducer = Sum
+            .bind(NumericalAggregateOpts::default())
+            .accumulator(field.dtype())?;
+        reducer.accumulate(&field.slice(range.start..end)?, &mut ctx)?;
+        Ok(reducer
+            .partial_scalar()?
+            .as_primitive()
+            .typed_value::<u64>()
+            .unwrap_or(0))
+    }
+
+    /// Fold Mean over "range" into "accumulator"
+    fn fold_mean(
+        &self,
+        range: Range<usize>,
+        accumulator: &mut AccumulatorRef,
+        session: &VortexSession,
+    ) -> VortexResult<bool> {
+        let end = range.end.min(self.array.len());
+        if range.start >= end {
+            return Ok(true);
+        }
+        let range = range.start..end;
+
+        let Some(sum_field) = self.stat_column(Stat::Sum) else {
+            return Ok(false);
+        };
+        let mut ctx = session.create_execution_ctx();
+        let mut sum_reducer = Sum
+            .bind(NumericalAggregateOpts::default())
+            .accumulator(sum_field.dtype())?;
+        sum_reducer.accumulate(&sum_field.slice(range.clone())?, &mut ctx)?;
+        let sum_scalar = sum_reducer.partial_scalar()?;
+
+        let null_count = self.sum_stat_column(Stat::NullCount, range.clone(), session)?;
+        let count = self.covered_rows(range).saturating_sub(null_count);
+
+        let mean_dtype = accumulator.partial_scalar()?.dtype().clone();
+        let fields = mean_dtype
+            .as_struct_fields_opt()
+            .ok_or_else(|| vortex_err!("mean dtype is not a struct"))?;
+        let sum_dtype = fields
+            .field_by_index(0)
+            .ok_or_else(|| vortex_err!("mean partial missing sum"))?;
+        let count_dtype = fields
+            .field_by_index(1)
+            .ok_or_else(|| vortex_err!("mean partial missing count"))?;
+
+        let sum = sum_scalar.cast(&sum_dtype)?;
+        let count = Scalar::primitive(count, Nullability::NonNullable).cast(&count_dtype)?;
+        let partial = Scalar::struct_(mean_dtype.clone(), vec![sum, count]);
+        accumulator.combine_partials(partial)?;
+        Ok(true)
     }
 
     /// Fold per-zone partials for "range" into "accumulator".
@@ -235,6 +334,10 @@ impl ZoneMap {
         accumulator: &mut AccumulatorRef,
         session: &VortexSession,
     ) -> VortexResult<bool> {
+        if aggregate_fn.is::<Combined<Mean>>() {
+            return self.fold_mean(range, accumulator, session);
+        }
+
         let Some(field) = self.zone_partial_field(aggregate_fn) else {
             return Ok(false);
         };
