@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 /// This is currently implemented using [`std::thread::available_parallelism`], but might change in the future.
 ///
 /// Returns `None` if the underlying functions fails.
+#[allow(dead_code)]
 pub fn get_available_parallelism() -> Option<usize> {
     #[allow(clippy::disallowed_methods)]
     static PARALLELISM: LazyLock<Option<usize>> =

@@ -6,8 +6,11 @@
 //! Morsel-driven I/O support for Vortex files.
 
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::task::Context;
+use std::task::Poll;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchOptions;
@@ -41,11 +44,14 @@ use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::metrics::MetricBuilder;
 use datafusion_pruning::FilePruner;
+use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::stream;
 use futures::stream::BoxStream;
 use itertools::Itertools;
 use object_store::path::Path;
+use parking_lot::Mutex;
 use tracing::Instrument;
 use vortex::array::VortexSessionExecute;
 use vortex::dtype::FieldMask;
@@ -75,7 +81,6 @@ use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
-use crate::persistent::stream::PrunableStream;
 use crate::reader::VortexReaderFactory;
 
 /// Creates morsel planners for Vortex files.
@@ -319,8 +324,9 @@ enum State {
         vxf: VortexFile,
     },
     PreparedScan {
-        scan: RepeatedScan,
-        file_pruner: Option<FilePruner>,
+        scan: Arc<RepeatedScan>,
+        file_pruner: Option<Arc<Mutex<FilePruner>>>,
+        morsel_ranges: Vec<Option<Range<u64>>>,
         output_schema: SchemaRef,
         session: VortexSession,
         stream_target_field: Field,
@@ -363,6 +369,7 @@ impl State {
             State::PreparedScan {
                 scan,
                 file_pruner,
+                morsel_ranges,
                 output_schema,
                 session,
                 stream_target_field,
@@ -371,6 +378,7 @@ impl State {
             } => Ok(State::PreparedScan {
                 scan,
                 file_pruner,
+                morsel_ranges,
                 output_schema,
                 session,
                 stream_target_field,
@@ -401,6 +409,7 @@ impl std::fmt::Debug for State {
                 .finish(),
             Self::PreparedScan {
                 file_pruner,
+                morsel_ranges,
                 output_schema,
                 stream_target_field,
                 file_location,
@@ -413,6 +422,7 @@ impl std::fmt::Debug for State {
                     "file_pruner",
                     &file_pruner.as_ref().map(|_| "<file_pruner>"),
                 )
+                .field("morsel_ranges", morsel_ranges)
                 .field("output_schema", output_schema)
                 .field("stream_target_field", stream_target_field)
                 .field("file_location", file_location)
@@ -451,18 +461,140 @@ impl std::fmt::Debug for FileOpenState {
 }
 
 struct VortexStreamMorsel {
-    inner: BoxStream<'static, DFResult<RecordBatch>>,
+    scan: Arc<RepeatedScan>,
+    row_range: Option<Range<u64>>,
+    file_pruner: Option<Arc<Mutex<FilePruner>>>,
+    output_schema: SchemaRef,
+    session: VortexSession,
+    stream_target_field: Field,
+    file_location: Path,
+    projector: Projector,
 }
 
 impl std::fmt::Debug for VortexStreamMorsel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VortexStreamMorsel").finish_non_exhaustive()
+        f.debug_struct("VortexStreamMorsel")
+            .field("row_range", &self.row_range)
+            .field(
+                "file_pruner",
+                &self.file_pruner.as_ref().map(|_| "<file_pruner>"),
+            )
+            .field("output_schema", &self.output_schema)
+            .field("stream_target_field", &self.stream_target_field)
+            .field("file_location", &self.file_location)
+            .field("projector", &self.projector)
+            .finish_non_exhaustive()
     }
 }
 
 impl Morsel for VortexStreamMorsel {
     fn into_stream(self: Box<Self>) -> BoxStream<'static, DFResult<RecordBatch>> {
-        self.inner
+        let Self {
+            scan,
+            row_range,
+            file_pruner,
+            output_schema,
+            session,
+            stream_target_field,
+            file_location,
+            projector,
+        } = *self;
+
+        let stream = match scan.execute_array_stream(row_range) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return stream::once(async move {
+                    Err(exec_datafusion_err!(
+                        "Failed to create Vortex stream: {error}"
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let stream = stream
+            // Convert to Arrow inline on the polling thread: DataFusion sources are expected
+            // to do their CPU work inside `poll_next`, and spawning this onto the blocking
+            // pool oversubscribes the CPU.
+            .map(move |chunk| {
+                let mut ctx = session.create_execution_ctx();
+                chunk.and_then(|chunk| {
+                    let arrow_session = ctx.session().clone();
+                    let arrow = arrow_session.arrow().execute_arrow(
+                        chunk,
+                        Some(&stream_target_field),
+                        &mut ctx,
+                    )?;
+                    Ok(RecordBatch::from(arrow.as_struct().clone()))
+                })
+            })
+            .map_err(move |e: VortexError| vortex_file_read_error(&file_location, e))
+            .map(move |batch| {
+                let batch = if projector.projection().as_ref().is_empty() {
+                    batch
+                } else {
+                    batch.and_then(|b| projector.project_batch(&b))
+                }?;
+
+                let (_, columns, row_count) = batch.into_parts();
+                RecordBatch::try_new_with_options(
+                    Arc::clone(&output_schema),
+                    columns,
+                    &RecordBatchOptions::new().with_row_count(Some(row_count)),
+                )
+                .map_err(Into::into)
+            })
+            .boxed();
+
+        if let Some(file_pruner) = file_pruner {
+            SharedPrunableStream::new(file_pruner, stream).boxed()
+        } else {
+            stream
+        }
+    }
+}
+
+struct SharedPrunableStream {
+    file_pruner: Arc<Mutex<FilePruner>>,
+    stream: Option<BoxStream<'static, DFResult<RecordBatch>>>,
+}
+
+impl SharedPrunableStream {
+    fn new(
+        file_pruner: Arc<Mutex<FilePruner>>,
+        stream: BoxStream<'static, DFResult<RecordBatch>>,
+    ) -> Self {
+        Self {
+            file_pruner,
+            stream: Some(stream),
+        }
+    }
+}
+
+impl Stream for SharedPrunableStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let should_prune = {
+            let file_pruner = Arc::clone(&self.file_pruner);
+            let mut file_pruner = file_pruner.lock();
+            file_pruner.should_prune()
+        };
+
+        match should_prune {
+            Ok(true) => {
+                self.stream.take();
+                Poll::Ready(None)
+            }
+            Ok(false) => match self.stream.as_mut() {
+                Some(stream) => stream.poll_next_unpin(cx),
+                None => Poll::Ready(None),
+            },
+            Err(error) => {
+                self.stream.take();
+                Poll::Ready(Some(Err(error)))
+            }
+        }
     }
 }
 
@@ -721,9 +853,8 @@ impl MorselPlanner for VortexMorselPlanner {
                     scan_builder = scan_builder.with_limit(limit);
                 }
 
-                if let Some(concurrency) = scan_concurrency {
-                    scan_builder = scan_builder.with_concurrency(concurrency);
-                }
+                let splits_per_morsel = scan_concurrency.unwrap_or(1).max(1);
+                scan_builder = scan_builder.with_concurrency(1);
 
                 let scan = scan_builder
                     .with_metrics_registry(metrics_registry)
@@ -732,16 +863,30 @@ impl MorselPlanner for VortexMorselPlanner {
                     .with_ordered(has_output_ordering)
                     .prepare()
                     .map_err(|e| exec_datafusion_err!("Failed to prepare Vortex scan: {e}"))?;
+                let morsel_ranges = if scan.has_limit() {
+                    vec![None]
+                } else {
+                    split_ranges_into_morsel_ranges(scan.split_ranges(None), splits_per_morsel)
+                        .into_iter()
+                        .map(Some)
+                        .collect()
+                };
+                if morsel_ranges.is_empty() {
+                    return Ok(None);
+                }
 
                 let stream_target_field =
                     Field::new_struct("", stream_schema.fields().clone(), false);
                 let file_location = file.object_meta.location;
+                let scan = Arc::new(scan);
+                let file_pruner = file_pruner.map(|file_pruner| Arc::new(Mutex::new(file_pruner)));
 
                 Ok(Some(MorselPlan::new().with_planners(vec![Box::new(
                     Self {
                         state: State::PreparedScan {
                             scan,
                             file_pruner,
+                            morsel_ranges,
                             output_schema,
                             session,
                             stream_target_field,
@@ -754,57 +899,30 @@ impl MorselPlanner for VortexMorselPlanner {
             State::PreparedScan {
                 scan,
                 file_pruner,
+                morsel_ranges,
                 output_schema,
                 session,
                 stream_target_field,
                 file_location,
                 projector,
             } => {
-                let stream = scan
-                    .execute_array_stream(None)
-                    .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
-                    // Convert to Arrow inline on the polling thread: DataFusion sources are expected
-                    // to do their CPU work inside `poll_next`, and spawning this onto the blocking
-                    // pool oversubscribes the CPU.
-                    .map(move |chunk| {
-                        let mut ctx = session.create_execution_ctx();
-                        chunk.and_then(|chunk| {
-                            let arrow_session = ctx.session().clone();
-                            let arrow = arrow_session.arrow().execute_arrow(
-                                chunk,
-                                Some(&stream_target_field),
-                                &mut ctx,
-                            )?;
-                            Ok(RecordBatch::from(arrow.as_struct().clone()))
-                        })
+                let morsels = morsel_ranges
+                    .into_iter()
+                    .map(|row_range| {
+                        Box::new(VortexStreamMorsel {
+                            scan: Arc::clone(&scan),
+                            row_range,
+                            file_pruner: file_pruner.as_ref().map(Arc::clone),
+                            output_schema: Arc::clone(&output_schema),
+                            session: session.clone(),
+                            stream_target_field: stream_target_field.clone(),
+                            file_location: file_location.clone(),
+                            projector: projector.clone(),
+                        }) as Box<dyn Morsel>
                     })
-                    .map_err(move |e: VortexError| vortex_file_read_error(&file_location, e))
-                    .map(move |batch| {
-                        let batch = if projector.projection().as_ref().is_empty() {
-                            batch
-                        } else {
-                            batch.and_then(|b| projector.project_batch(&b))
-                        }?;
+                    .collect();
 
-                        let (_, columns, row_count) = batch.into_parts();
-                        RecordBatch::try_new_with_options(
-                            Arc::clone(&output_schema),
-                            columns,
-                            &RecordBatchOptions::new().with_row_count(Some(row_count)),
-                        )
-                        .map_err(Into::into)
-                    })
-                    .boxed();
-
-                let stream = if let Some(file_pruner) = file_pruner {
-                    PrunableStream::new(file_pruner, stream).boxed()
-                } else {
-                    stream
-                };
-
-                Ok(Some(MorselPlan::new().with_morsels(vec![
-                    Box::new(VortexStreamMorsel { inner: stream }) as Box<dyn Morsel>,
-                ])))
+                Ok(Some(MorselPlan::new().with_morsels(morsels)))
             }
             State::Done => Ok(None),
             new_state => Ok(Some(
@@ -812,6 +930,20 @@ impl MorselPlanner for VortexMorselPlanner {
             )),
         }
     }
+}
+
+fn split_ranges_into_morsel_ranges(
+    split_ranges: Vec<Range<u64>>,
+    splits_per_morsel: usize,
+) -> Vec<Range<u64>> {
+    split_ranges
+        .chunks(splits_per_morsel.max(1))
+        .filter_map(|chunk| {
+            let first = chunk.first()?;
+            let last = chunk.last()?;
+            (first.start < last.end).then_some(first.start..last.end)
+        })
+        .collect()
 }
 
 fn natural_split_ranges_for_file(

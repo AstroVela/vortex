@@ -31,7 +31,6 @@ use vortex_io::runtime::Task;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
-use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
@@ -287,7 +286,8 @@ impl RepeatedScan {
         }
     }
 
-    fn split_ranges(&self, row_range: Option<Range<u64>>) -> Vec<Range<u64>> {
+    /// Returns the row ranges this prepared scan will execute for the requested row range.
+    pub fn split_ranges(&self, row_range: Option<Range<u64>>) -> Vec<Range<u64>> {
         let selection_range: Option<Range<u64>> = match &self.selection {
             Selection::IncludeByIndex(buf) if !buf.is_empty() => {
                 Some(buf[0]..buf[buf.len() - 1] + 1)
@@ -343,6 +343,11 @@ impl RepeatedScan {
         }
     }
 
+    /// Returns whether this prepared scan has a row limit.
+    pub fn has_limit(&self) -> bool {
+        self.limit.is_some() || self.row_limit.is_some()
+    }
+
     fn task_context(&self) -> Arc<TaskContext> {
         Arc::new(TaskContext {
             filter: self.filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
@@ -383,12 +388,12 @@ impl RepeatedScan {
         &self,
         row_range: Option<Range<u64>>,
     ) -> VortexResult<ScheduledTaskStream> {
-        let num_workers = get_available_parallelism().unwrap_or(1);
+        // let num_workers = get_available_parallelism().unwrap_or(1);
         let row_limit = self
             .row_limit
             .clone()
             .or_else(|| self.limit.map(RowLimit::new));
-        let concurrency = self.concurrency * num_workers;
+        let concurrency = self.concurrency;
         let handle = self.session.handle();
 
         // With both a filter and a limit we cannot know each split's output row count ahead of
