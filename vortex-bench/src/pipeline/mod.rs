@@ -9,14 +9,23 @@
 //! 3. [`crate::runner::SqlBenchmarkRunner`] runs the queries.
 //!
 //! Stage 1 is idempotent, so a benchmark binary can call it even when a separate `data-gen` run
-//! already produced the data. Stage 2 is engine-specific in *mechanism* — DuckDB creates SQL
-//! views, DataFusion and Lance register table providers — but uniform in *shape*: every engine
-//! resolves the same [`TableSource`] per table.
+//! already produced the data.
+//!
+//! Stage 2 runs a benchmark's checked-in `sql/{dataset_name}/create.sql` on engines that speak
+//! SQL DDL (see [`create_sql`]), so registration is data sitting next to the queries rather than
+//! strings built in Rust. DuckDB and DataFusion both take this path. Registration that no DDL
+//! expresses — Lance's table provider, DataFusion's `VortexTable` scan API — implements
+//! [`TableRegistrar::register`] per [`TableSource`] instead, as does any benchmark whose table
+//! list is only known at runtime.
+
+mod create_sql;
 
 use std::path::Path;
 use std::process::Command;
 
 use arrow_schema::Schema;
+pub use create_sql::CreateScript;
+pub use create_sql::SqlDialect;
 use glob::Pattern;
 use tracing::info;
 use url::Url;
@@ -95,12 +104,16 @@ pub fn generate_duckdb_database(benchmark: &dyn Benchmark, base_path: &Path) -> 
         return Ok(());
     }
 
-    for spec in benchmark.table_specs() {
-        let source = TableSource::resolve(benchmark, spec, Format::Parquet, TableObject::Table)?;
+    let registration = Registration {
+        object: TableObject::Table,
+        load_format: Format::Parquet,
+    };
+
+    for statement in registration_statements(SqlDialect::DuckDb, benchmark, registration)? {
         let output = Command::new("duckdb")
             .arg(&db_path)
             .arg("-c")
-            .arg(source.duckdb_registration_sql())
+            .arg(&statement)
             .output()?;
 
         if !output.status.success() {
@@ -112,6 +125,24 @@ pub fn generate_duckdb_database(benchmark: &dyn Benchmark, base_path: &Path) -> 
     }
 
     Ok(())
+}
+
+/// The statements registering `benchmark`'s tables in `dialect`.
+///
+/// Prefers the benchmark's checked-in `create.sql`, falling back to statements generated from
+/// [`Benchmark::table_specs`] when it has none (or none for this dialect).
+pub fn registration_statements(
+    dialect: SqlDialect,
+    benchmark: &dyn Benchmark,
+    registration: Registration,
+) -> anyhow::Result<Vec<String>> {
+    if let Some(script) = CreateScript::load(benchmark)?
+        && let Some(statements) = script.render(dialect, benchmark, registration)?
+    {
+        return Ok(statements);
+    }
+
+    create_sql::generated_statements(dialect, benchmark, registration)
 }
 
 /// How an engine materializes a benchmark table in its catalog.
@@ -237,18 +268,46 @@ pub trait TableRegistrar {
 
     /// Register a single table into the catalog.
     async fn register(&mut self, source: &TableSource) -> anyhow::Result<()>;
+
+    /// The DDL dialect this engine executes the benchmark's `create.sql` in.
+    ///
+    /// `None` — the default — means the engine registers table providers directly, through
+    /// [`TableRegistrar::register`], and ignores the SQL file.
+    fn dialect(&self) -> Option<SqlDialect> {
+        None
+    }
+
+    /// Execute one statement from the benchmark's `create.sql`.
+    ///
+    /// Only called when [`TableRegistrar::dialect`] returns `Some`.
+    async fn execute_create(&mut self, _statement: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this engine does not execute SQL DDL")
+    }
 }
 
 /// Stage 2: register every table of `benchmark` for `format` into `registrar`'s catalog.
+///
+/// Engines that speak SQL DDL run the benchmark's `create.sql`; the rest register each resolved
+/// [`TableSource`] natively.
 pub async fn register_tables<R: TableRegistrar + ?Sized>(
     registrar: &mut R,
     benchmark: &dyn Benchmark,
     format: Format,
 ) -> anyhow::Result<()> {
+    let registration = registrar.registration(format)?;
+
+    if let Some(dialect) = registrar.dialect() {
+        for statement in registration_statements(dialect, benchmark, registration)? {
+            info!(dialect = %dialect, "{statement}");
+            registrar.execute_create(&statement).await?;
+        }
+        return Ok(());
+    }
+
     let Registration {
         object,
         load_format,
-    } = registrar.registration(format)?;
+    } = registration;
 
     for spec in benchmark.table_specs() {
         let source = TableSource::resolve(benchmark, spec, load_format, object)?;
@@ -267,78 +326,4 @@ pub async fn register_tables<R: TableRegistrar + ?Sized>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tpch::benchmark::TpcHBenchmark;
-
-    fn tpch() -> anyhow::Result<TpcHBenchmark> {
-        TpcHBenchmark::new("1.0".to_string(), None)
-    }
-
-    #[test]
-    fn resolves_pattern_from_benchmark() -> anyhow::Result<()> {
-        let benchmark = tpch()?;
-        let spec = TableSpec::new("lineitem", None);
-        let source =
-            TableSource::resolve(&benchmark, spec, Format::OnDiskVortex, TableObject::View)?;
-
-        assert_eq!(source.glob(), "lineitem_*.vortex");
-        assert!(source.base_dir().ends_with("/vortex-file-compressed"));
-        Ok(())
-    }
-
-    #[test]
-    fn falls_back_to_extension_glob() -> anyhow::Result<()> {
-        let source = TableSource {
-            name: "test",
-            schema: None,
-            base_url: Url::parse("file:///data/parquet/")?,
-            pattern: None,
-            load_format: Format::Parquet,
-            object: TableObject::View,
-        };
-
-        assert_eq!(source.glob(), "*.parquet");
-        assert_eq!(source.base_dir(), "/data/parquet");
-        Ok(())
-    }
-
-    #[test]
-    fn registration_sql_matches_object_kind() -> anyhow::Result<()> {
-        let benchmark = tpch()?;
-        let spec = TableSpec::new("nation", None);
-        let view = TableSource::resolve(&benchmark, spec, Format::Parquet, TableObject::View)?;
-        assert!(
-            view.duckdb_registration_sql()
-                .starts_with("CREATE VIEW IF NOT EXISTS nation AS SELECT * FROM read_parquet('/")
-        );
-        assert!(
-            view.duckdb_registration_sql()
-                .ends_with("/parquet/nation_*.parquet');\n")
-        );
-
-        let spec = TableSpec::new("nation", None);
-        let table = TableSource::resolve(&benchmark, spec, Format::Parquet, TableObject::Table)?;
-        assert!(
-            table
-                .duckdb_registration_sql()
-                .starts_with("CREATE TABLE IF NOT EXISTS nation")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn remote_base_dir_keeps_scheme() -> anyhow::Result<()> {
-        let source = TableSource {
-            name: "test",
-            schema: None,
-            base_url: Url::parse("s3://bucket/tpch/parquet/")?,
-            pattern: None,
-            load_format: Format::Parquet,
-            object: TableObject::View,
-        };
-
-        assert_eq!(source.base_dir(), "s3://bucket/tpch/parquet");
-        Ok(())
-    }
-}
+mod tests;

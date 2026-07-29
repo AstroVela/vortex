@@ -15,6 +15,7 @@ use vortex_bench::Benchmark;
 use vortex_bench::Format;
 use vortex_bench::IdempotentPath;
 use vortex_bench::Registration;
+use vortex_bench::SqlDialect;
 use vortex_bench::TableObject;
 use vortex_bench::TableRegistrar;
 use vortex_bench::TableSource;
@@ -225,6 +226,17 @@ impl TableRegistrar for DuckDbRegistrar<'_> {
         }
     }
 
+    fn dialect(&self) -> Option<SqlDialect> {
+        Some(SqlDialect::DuckDb)
+    }
+
+    async fn execute_create(&mut self, statement: &str) -> Result<()> {
+        self.client.execute_query(statement)?;
+        Ok(())
+    }
+
+    /// Unused: [`DuckDbRegistrar::dialect`] is always `Some`, so registration runs the
+    /// benchmark's `create.sql` rather than registering table by table.
     async fn register(&mut self, source: &TableSource) -> Result<()> {
         self.client
             .execute_query(&source.duckdb_registration_sql())?;

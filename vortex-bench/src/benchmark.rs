@@ -4,6 +4,7 @@
 //! Core benchmark trait and types.
 
 use std::path::Path;
+use std::path::PathBuf;
 
 use arrow_schema::Schema;
 use glob::Pattern;
@@ -92,5 +93,17 @@ pub trait Benchmark: Send + Sync {
         _ = table_name;
         _ = format;
         None
+    }
+
+    /// Path to this benchmark's table-registration DDL, relative to the `vortex-bench` crate root.
+    ///
+    /// Defaults to `sql/{dataset_name}/create.sql`, the companion of the query files in the same
+    /// directory. A benchmark whose tables are only known at runtime — Public BI's per-dataset
+    /// tables, SpatialBench's optional `zone` — has no such file, and registration falls back to
+    /// statements generated from [`Benchmark::table_specs`].
+    fn create_sql_path(&self) -> PathBuf {
+        Path::new("sql")
+            .join(self.dataset_name())
+            .join("create.sql")
     }
 }

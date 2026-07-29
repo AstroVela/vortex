@@ -39,6 +39,7 @@ use vortex_bench::Opt;
 use vortex_bench::Opts;
 use vortex_bench::Registration;
 use vortex_bench::SESSION;
+use vortex_bench::SqlDialect;
 use vortex_bench::TableRegistrar;
 use vortex_bench::TableSource;
 use vortex_bench::create_benchmark;
@@ -242,8 +243,15 @@ fn use_scan_api() -> bool {
     std::env::var("VORTEX_USE_SCAN_API").is_ok_and(|v| v == "1")
 }
 
-/// Registers benchmark tables into a DataFusion `SessionContext`, as `ListingTable`s over the
-/// format's files — or, when the scan API is enabled for a Vortex format, as `VortexTable`s.
+/// Registers benchmark tables into a DataFusion `SessionContext`.
+///
+/// By default this runs the benchmark's `create.sql`: the session registers `VortexFormatFactory`
+/// and a `VORTEX` table factory (see [`datafusion_bench::get_session_context`]), so both
+/// `STORED AS PARQUET` and `STORED AS VORTEX` resolve. DataFusion infers each table's schema from
+/// the files, which is what the pinned `TableSpec` schemas describe.
+///
+/// The scan-API path is not expressible as DDL, so with `VORTEX_USE_SCAN_API=1` registration
+/// falls back to building `VortexTable` providers directly, and the pinned schema is used.
 struct DataFusionRegistrar<'a> {
     session: &'a SessionContext,
 }
@@ -257,6 +265,15 @@ impl TableRegistrar for DataFusionRegistrar<'_> {
             }
             format => Ok(Registration::views_of(format)),
         }
+    }
+
+    fn dialect(&self) -> Option<SqlDialect> {
+        (!use_scan_api()).then_some(SqlDialect::DataFusion)
+    }
+
+    async fn execute_create(&mut self, statement: &str) -> anyhow::Result<()> {
+        self.session.sql(statement).await?.collect().await?;
+        Ok(())
     }
 
     async fn register(&mut self, source: &TableSource) -> anyhow::Result<()> {

@@ -15,17 +15,50 @@ defined in [`src/pipeline.rs`](./src/pipeline.rs):
    format from it. It is idempotent, so it is a no-op when the data is already on disk. CI runs it ahead of time as
    its own step (`vx-bench prepare-data`, the `data-gen` binary), but each benchmark binary calls it too, so running
    a benchmark directly still works.
-2. **Register tables (or views).** Each engine implements `pipeline::TableRegistrar`, and `pipeline::register_tables`
-   drives it once per format, before any query runs. Resolving a table to the files backing it — the format
-   directory, the file glob, the pinned schema — is shared; only the registration itself is engine-specific. DuckDB
-   creates SQL views (or, for the on-disk DuckDB format, tables loaded from Parquet); DataFusion registers a
-   `ListingTable` or a `VortexTable`; Lance registers a `LanceTableProvider`.
+2. **Register tables (or views).** Each benchmark's DDL is checked in as `sql/{benchmark}/create.sql`, the
+   companion of its query files, and `pipeline::register_tables` runs it once per format before any query. See
+   [Table registration](#table-registration) below.
 3. **Run the queries.** `runner::SqlBenchmarkRunner` executes each query, collects timings and memory, and validates
    row counts.
 
-To add an engine, implement `TableRegistrar` for it and pass the registration to `SqlBenchmarkRunner::run_all` (or
-`run_all_async`) as its register stage. To add a benchmark suite, implement `Benchmark`: `table_specs`, `pattern` and
-`format_path` are all stage 2 needs.
+### Table registration
+
+`sql/{benchmark}/create.sql` holds the DDL registering that benchmark's tables, next to the queries that read
+them. The data directory depends on the scale factor and the format under test, so the file is a template; the
+harness substitutes these placeholders before executing it:
+
+| Placeholder | Meaning |
+| --- | --- |
+| `{object}` | `TABLE` or `VIEW`, depending on whether the engine loads the data or reads it in place |
+| `{dir}` | absolute path (or URL) of the directory holding the requested format's files |
+| `{ext}` | file extension of that format: `parquet` or `vortex` |
+| `{read}` | DuckDB reader for that format: `read_parquet` or `read_vortex` |
+| `{format}` | DataFusion `STORED AS` name for that format: `PARQUET` or `VORTEX` |
+
+DuckDB and DataFusion do not share a DDL dialect, so the file carries one section per engine, introduced by an
+`-- @engine <name>` header:
+
+```sql
+-- @engine duckdb
+CREATE {object} IF NOT EXISTS nation AS SELECT * FROM {read}('{dir}/nation_*.{ext}');
+
+-- @engine datafusion
+CREATE EXTERNAL TABLE IF NOT EXISTS nation STORED AS {format} LOCATION '{dir}/nation_*.{ext}';
+```
+
+Statements are split on semicolons, so a comment must never contain one — the same constraint the query files
+carry. `STORED AS VORTEX` works because the benchmark session registers `VortexFormatFactory`; DataFusion infers
+each table's schema from the files rather than using the pinned `TableSpec` schema.
+
+Two paths do not go through `create.sql`, because no DDL expresses them: Lance's `LanceTableProvider`, and
+DataFusion's `VortexTable` scan API under `VORTEX_USE_SCAN_API=1`. Both implement `TableRegistrar::register`
+directly. Benchmarks whose table list is only known at runtime (Public BI, SpatialBench's optional `zone`) have no
+`create.sql`; registration falls back to statements generated from `table_specs()`.
+
+To add an engine, implement `TableRegistrar` — return a `SqlDialect` from `dialect()` to run `create.sql`, or
+implement `register()` to build providers — and pass the registration to `SqlBenchmarkRunner::run_all` (or
+`run_all_async`) as its register stage. To add a benchmark suite, implement `Benchmark` and add a `create.sql`;
+`table_specs`, `pattern` and `format_path` are all the generated fallback needs.
 
 ### `compress.rs`
 

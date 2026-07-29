@@ -4,6 +4,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use url::Url;
@@ -165,6 +166,12 @@ impl Benchmark for ClickBenchSortedBenchmark {
 
     fn table_specs(&self) -> Vec<TableSpec> {
         vec![TableSpec::new("hits", Some(HITS_SCHEMA.clone()))]
+    }
+
+    /// The sorted variant registers the same `hits` table over its own data directory, so it
+    /// shares ClickBench's `create.sql` rather than duplicating it.
+    fn create_sql_path(&self) -> PathBuf {
+        Path::new("sql").join("clickbench").join("create.sql")
     }
 }
 
