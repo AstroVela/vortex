@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_session::VortexSession;
-use vortex_session::registry::Id;
 
 use crate::Edition;
 use crate::EditionDeclaration;
@@ -274,66 +273,4 @@ fn edition_ids_order_within_family_only() {
 #[test]
 fn edition_id_display() {
     assert_eq!(FIRST.to_string(), "test2026.01.0");
-}
-
-#[test]
-fn declared_encodings_covers_every_registered_edition() {
-    let editions = session();
-    let declared = editions.declared_encodings();
-    let declared: Vec<&str> = declared.iter().map(|id| id.as_str()).collect();
-    assert_eq!(declared, ["test.alpha", "test.beta", "test.gamma"]);
-    assert!(EditionSession::empty().declared_encodings().is_empty());
-}
-
-#[test]
-fn retain_writable_encodings_gates_declared_but_disabled_encodings()
--> Result<(), crate::EditionError> {
-    #[expect(clippy::disallowed_methods, reason = "interning test encoding ids")]
-    fn ids(names: &[&str]) -> Vec<Id> {
-        names.iter().map(|name| Id::new(name)).collect()
-    }
-
-    let session = VortexSession::empty().with::<EditionSession>();
-    for declaration in DECLARATIONS {
-        session.register_edition(declaration)?;
-    }
-
-    let candidates = ids(&["test.alpha", "test.gamma", "test.undeclared"]);
-
-    // With no edition enabled, every declared encoding is gated out and undeclared ones survive.
-    let writable = session.retain_writable_encodings(candidates.clone());
-    assert_eq!(
-        writable.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        ["test.undeclared"]
-    );
-
-    // Enabling the first edition admits its members, but not those added by a later one.
-    session.enable_edition(FIRST)?;
-    let writable = session.retain_writable_encodings(candidates.clone());
-    assert_eq!(
-        writable.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        ["test.alpha", "test.undeclared"]
-    );
-
-    session.enable_edition(SECOND)?;
-    let writable = session.retain_writable_encodings(candidates);
-    assert_eq!(
-        writable.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        ["test.alpha", "test.gamma", "test.undeclared"]
-    );
-    Ok(())
-}
-
-#[test]
-fn retain_writable_encodings_is_ungated_without_declarations() {
-    #[expect(clippy::disallowed_methods, reason = "interning test encoding ids")]
-    let candidates: Vec<Id> = ["test.alpha", "test.gamma"].map(Id::new).into();
-
-    // A session that registers no editions has nothing to gate against.
-    let session = VortexSession::empty().with::<EditionSession>();
-    assert_eq!(
-        session.retain_writable_encodings(candidates).len(),
-        2,
-        "a session with no declarations must not gate anything"
-    );
 }

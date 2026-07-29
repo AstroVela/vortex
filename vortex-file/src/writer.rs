@@ -22,7 +22,6 @@ use vortex_array::dtype::FieldPath;
 use vortex_array::expr::stats::Stat;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorExt;
-use vortex_array::session::ArraySessionExt;
 use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::ArrayStream;
 use vortex_array::stream::ArrayStreamAdapter;
@@ -50,7 +49,6 @@ use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 use vortex_utils::aliases::hash_map::HashMap;
 
-use crate::ALLOWED_ENCODINGS;
 use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
@@ -205,25 +203,13 @@ impl VortexWriteOptions {
         // parallel and with an empty context they can register their encodings to the context
         // in different order, changing the written bytes from run to run.
         //
-        // Both the pre-populated ids and the permitted ids are gated by the session's enabled
-        // editions, so no encoding outside the read-compatibility guarantee the session opted
-        // into can be interned — and therefore serialized — even under a custom write strategy.
-        let registered = self
-            .session
-            .arrays()
-            .registry()
-            .read(|map| map.keys().copied().collect::<Vec<_>>());
-        let ctx = ArrayContext::new(
-            self.session
-                .retain_writable_encodings(ALLOWED_ENCODINGS.iter().copied()),
-        )
-        // Only permit encodings known to the session.
-        .with_allowed_ids(
-            self.session
-                .retain_writable_encodings(registered)
-                .into_iter()
-                .collect(),
-        );
+        // The context is built from the session's enabled editions, so no encoding outside the
+        // read-compatibility guarantee the session opted into can be interned — and therefore
+        // serialized — even under a custom write strategy.
+        let enabled_encoding_ids = self.session.enabled_encoding_ids();
+        let ctx = ArrayContext::new(enabled_encoding_ids.clone())
+            // Only permit encodings known to the session.
+            .with_allowed_ids(enabled_encoding_ids.into_iter().collect());
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();

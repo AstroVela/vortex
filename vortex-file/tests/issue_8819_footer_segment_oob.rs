@@ -23,12 +23,16 @@ use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
+mod common;
+
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = vortex_array::array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
 
     vortex_file::register_default_encodings(&session);
+
+    common::enable_all_registered_encodings(&session);
 
     session
 });

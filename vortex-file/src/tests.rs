@@ -56,6 +56,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
+use vortex_array::session::ArraySessionExt;
 use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
@@ -67,6 +68,10 @@ use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
+use vortex_edition::Edition;
+use vortex_edition::EditionId;
+use vortex_edition::EditionInclusion;
+use vortex_edition::EditionSessionExt;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_flatbuffers::footer as fb;
@@ -88,12 +93,46 @@ use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
 use crate::footer::SegmentSpec;
 use crate::strategy::tests::gate_session;
+/// The edition this crate's test session enables.
+const TEST_EDITION: EditionId = EditionId::new("filetest", 2026, 1, 0);
+
+/// Declare and enable an edition covering every encoding `session` has registered.
+///
+/// The writer admits only encodings an enabled edition includes, and the first-party
+/// declarations live in the `vortex` facade, which this crate cannot depend on. A session
+/// assembled here therefore has to declare its own edition to write anything.
+pub(crate) fn enable_all_registered_encodings(session: &VortexSession) {
+    session
+        .editions()
+        .declare_edition(Edition {
+            id: TEST_EDITION,
+            min_vortex_version: Some("0.1.0"),
+        })
+        .expect("test edition is undeclared");
+
+    let registered = session
+        .arrays()
+        .registry()
+        .read(|map| map.keys().copied().collect::<Vec<_>>());
+    for id in registered {
+        session
+            .editions()
+            .declare_inclusion(EditionInclusion::new(&id, TEST_EDITION))
+            .expect("each encoding is registered once");
+    }
+
+    session
+        .enable_edition(TEST_EDITION)
+        .expect("test edition was just declared");
+}
+
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
 
     crate::register_default_encodings(&session);
+    enable_all_registered_encodings(&session);
 
     session
 });

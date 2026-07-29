@@ -141,6 +141,7 @@ mod tests {
             .with::<LayoutSession>()
             .with::<RuntimeSession>();
         crate::register_default_encodings(&session);
+        crate::tests::enable_all_registered_encodings(&session);
         session
     });
 

@@ -150,16 +150,15 @@ pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
 /// The array encodings a writer may emit when writing with `session`: [`ALLOWED_ENCODINGS`]
 /// gated by the session's enabled editions.
 ///
-/// An encoding survives the gate when an enabled edition includes it, or when no registered
-/// edition declares it at all — see
-/// [`retain_writable_encodings`](EditionSessionExt::retain_writable_encodings). A session with no
-/// editions registered is therefore not gated and gets [`ALLOWED_ENCODINGS`] unchanged, while the
-/// default Vortex session, which enables only the current `core` edition, loses the encodings
-/// declared solely by `unstable` editions.
+/// An encoding survives the gate only when an enabled edition includes it. A session that
+/// enables no editions therefore writes nothing; the default Vortex session enables the current
+/// `core` edition and loses the encodings declared solely by `unstable` editions.
 pub fn writable_encodings(session: &VortexSession) -> HashSet<ArrayId> {
-    session
-        .retain_writable_encodings(ALLOWED_ENCODINGS.iter().copied())
-        .into_iter()
+    let enabled: HashSet<ArrayId> = session.enabled_encoding_ids().into_iter().collect();
+    ALLOWED_ENCODINGS
+        .iter()
+        .copied()
+        .filter(|id| enabled.contains(id))
         .collect()
 }
 
@@ -200,9 +199,12 @@ impl LayoutStrategy for EditionGatedStrategy {
         eof: SequencePointer,
         session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
-        let writable: HashSet<ArrayId> = session
-            .retain_writable_encodings(self.allow_encodings.iter().copied())
-            .into_iter()
+        let enabled: HashSet<ArrayId> = session.enabled_encoding_ids().into_iter().collect();
+        let writable: HashSet<ArrayId> = self
+            .allow_encodings
+            .iter()
+            .copied()
+            .filter(|id| enabled.contains(id))
             .collect();
 
         // Nothing to gate: skip the per-chunk traversal entirely. This is the case for every
@@ -542,7 +544,14 @@ pub(crate) mod tests {
                 id: ENABLED,
                 min_vortex_version: Some("0.1.0"),
             },
-            added: &[&"vortex.primitive"],
+            // The structural encodings are what a file is built from, so an edition that did
+            // not cover them could not write at all, gated compression or otherwise.
+            added: &[
+                &"vortex.primitive",
+                &"vortex.struct",
+                &"vortex.chunked",
+                &"vortex.constant",
+            ],
         },
         EditionDeclaration {
             edition: Edition {
@@ -568,14 +577,16 @@ pub(crate) mod tests {
         Ok(session)
     }
 
+    /// Only what an enabled edition includes survives. An encoding no edition mentions at all
+    /// is not writable either: the gate admits, it does not merely exclude.
     #[test]
-    fn writable_encodings_drops_disabled_editions() -> Result<(), EditionError> {
+    fn writable_encodings_keeps_only_enabled_edition_members() -> Result<(), EditionError> {
         let writable = writable_encodings(&gated_session()?);
 
         assert!(writable.contains(&Primitive.id()), "enabled edition member");
-        assert!(writable.contains(&FSST.id()), "no edition declares FSST");
-        assert!(!writable.contains(&BitPacked.id()));
-        assert!(!writable.contains(&FoR.id()));
+        assert!(!writable.contains(&FSST.id()), "no edition declares FSST");
+        assert!(!writable.contains(&BitPacked.id()), "declared, not enabled");
+        assert!(!writable.contains(&FoR.id()), "declared, not enabled");
         Ok(())
     }
 
@@ -593,9 +604,11 @@ pub(crate) mod tests {
     fn a_custom_allow_list_is_narrowed_by_the_session() -> Result<(), EditionError> {
         let session = gated_session()?;
         let custom: HashSet<ArrayId> = HashSet::from_iter([Primitive.id(), FoR.id()]);
-        let writable: HashSet<ArrayId> = session
-            .retain_writable_encodings(custom.iter().copied())
-            .into_iter()
+        let enabled: HashSet<ArrayId> = session.enabled_encoding_ids().into_iter().collect();
+        let writable: HashSet<ArrayId> = custom
+            .iter()
+            .copied()
+            .filter(|id| enabled.contains(id))
             .collect();
 
         assert_eq!(writable, HashSet::from_iter([Primitive.id()]));
