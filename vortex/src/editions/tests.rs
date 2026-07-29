@@ -266,13 +266,16 @@ fn compressed_encodings(
     }
 }
 
-/// The compressor must never produce an encoding the writer would then reject.
+/// A compressor filtered to an allow-list must never produce an encoding outside it.
 ///
-/// This is the property the whole gate rests on: [`retain_allowed_encodings`] filters schemes by
-/// their *declared* [`produced_encodings`], so a scheme that under-declares would survive the
-/// filter, compress into a gated encoding, and make the writer fail the file rather than fall
-/// back. Compressing real data of every canonical kind against a deliberately narrow allow-list
-/// checks those declarations against what the schemes actually emit.
+/// [`retain_allowed_encodings`] filters schemes by their *declared* [`produced_encodings`], so a
+/// scheme that under-declares would survive the filter and compress into an encoding the caller
+/// excluded. Compressing real data of every canonical kind against a deliberately narrow
+/// allow-list checks those declarations against what the schemes actually emit.
+///
+/// The writer does not rely on this filter — it normalizes gated encodings away at write time
+/// instead, so an under-declaring scheme costs compression ratio rather than the file — but the
+/// same narrow allow-list a gated session produces is the strongest input for the check.
 ///
 /// [`retain_allowed_encodings`]: vortex_btrblocks::BtrBlocksCompressorBuilder::retain_allowed_encodings
 /// [`produced_encodings`]: vortex_compressor::Scheme::produced_encodings

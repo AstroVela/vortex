@@ -2552,12 +2552,14 @@ static GATED_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-/// Small, tightly-clustered integers are exactly what FoR and BitPacking compress, so a writer
-/// that only gated the allow-list would reject the compressor's own output. The write must
-/// instead fall back to a scheme the enabled editions cover.
+/// Small, tightly-clustered integers are exactly what FoR and BitPacking compress, so the
+/// compressor reaches for encodings this session's editions gate out. A writer that only
+/// narrowed its array context would then reject the compressor's own output; the gate must
+/// instead normalize the chunk back to an encoding the enabled editions cover, so the write
+/// costs compression ratio rather than failing.
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn gated_editions_filter_the_compressor_rather_than_failing_the_write() -> VortexResult<()> {
+async fn gated_editions_normalize_the_chunk_rather_than_failing_the_write() -> VortexResult<()> {
     let numbers = PrimitiveArray::new(
         Buffer::from_iter((0..8192u32).map(|i| 1_000_000 + (i % 16))),
         Validity::NonNullable,
