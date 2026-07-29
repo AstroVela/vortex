@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Heap-allocated physical scan planning over the established layout-reader execution API.
+//! [`ScanPlanV2`] is the migration boundary from [`crate::LayoutReader`] toward a layout planning
+//! system modeled on the array optimizer's optimize/execute split. Because the final execution
+//! abstraction for layouts is not yet known, the first step moves expression application and
+//! optimization onto heap-allocated plans produced by layouts. The current
+//! [`LayoutReaderScanPlanV2`] builds and optimizes those plans, then falls back to
+//! [`crate::LayoutReader`] for execution.
 //!
-//! # Design direction
-//!
-//! Planning should begin with a heap-allocated source plan produced by a layout. Applying an
-//! expression to that source returns another plan, and optimizing that derived plan returns another
-//! plan. Execution receives only a row range and mask; expressions do not cross the
-//! planning/execution boundary.
-//!
-//! A scan retains its existing N+1 decomposition: one independently pushed and optimized plan for
-//! each filter conjunct, plus one independently pushed and optimized projection plan. These plans
-//! must remain separate so their reads can be scheduled concurrently. They are not combined into a
-//! single filter-then-projection operator tree.
-//!
-//! The current [`LayoutReaderScanPlanV2`] is a compatibility source plan: it supports the
-//! plan-to-plan API but delegates execution to the existing [`crate::LayoutReader`].
-//! Layout-specific source plans can replace it incrementally.
+//! The next step is to add optimizer rules over PlanV2 trees, analogous to the rules used for
+//! arrays, so layouts can push down and rewrite projections and filters before execution. Once
+//! those rules establish the required plan shapes, a native layout execution API can replace the
+//! LayoutReader fallback incrementally; keeping optimization separate lets that execution boundary
+//! be designed from the plans it must run instead of fixed prematurely.
 
 use std::ops::BitAnd;
 use std::ops::Range;
