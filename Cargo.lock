@@ -10135,6 +10135,7 @@ dependencies = [
  "vortex-array",
  "vortex-arrow",
  "vortex-buffer",
+ "vortex-edition",
  "vortex-error",
  "vortex-file",
  "vortex-io",
