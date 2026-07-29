@@ -21,6 +21,7 @@ use datafusion_bench::metrics::MetricsSetExt;
 use datafusion_bench::tracer::get_labelset_from_global;
 use datafusion_bench::tracer::get_static_tracer;
 use datafusion_bench::tracer::set_labels;
+use datafusion_common::TableReference;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::collect;
 use parking_lot::Mutex;
@@ -88,10 +89,9 @@ struct Args {
     #[arg(short)]
     output_path: Option<PathBuf>,
 
-    /// Additionally write v3 JSONL records to this path. See
-    /// `benchmarks-website/planning/02-contracts.md`.
-    #[arg(long)]
-    gh_json_v3: Option<PathBuf>,
+    /// Additionally write benchmark ingest JSONL records to this path.
+    #[arg(long = "ingest-jsonl")]
+    ingest_output: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     show_metrics: bool,
@@ -237,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
             print_metrics(plans.as_ref());
         }
 
-        if let Some(path) = args.gh_json_v3.as_ref() {
+        if let Some(path) = args.ingest_output.as_ref() {
             v3::write_jsonl_to_path(path, &runner.v3_records())?;
         }
 
@@ -266,7 +266,9 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
 
         for table in benchmark.table_specs().iter() {
             let pattern = benchmark.pattern(table.name, format);
-            let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern)?;
+            let table_ref = TableReference::bare(table.name);
+            let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern)?
+                .with_table_ref(table_ref.clone());
 
             let listing_options = ListingOptions::new(Arc::clone(&file_format))
                 .with_session_config_options(session.state().config());
@@ -287,7 +289,7 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
                 ),
             );
 
-            session.register_table(table.name, listing_table)?;
+            session.register_table(table_ref, listing_table)?;
         }
 
         Ok(())
