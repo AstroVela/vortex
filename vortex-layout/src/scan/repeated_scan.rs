@@ -28,7 +28,7 @@ use vortex_utils::parallelism::get_available_parallelism;
 use crate::LayoutReaderRef;
 use crate::scan::plan;
 use crate::scan::plan_v2;
-use crate::scan::plan_v2::ScanPlanV2Ref;
+use crate::scan::plan_v2::ScanPlanRef;
 use crate::scan::splits::Splits;
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
@@ -132,8 +132,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
     )]
     pub fn new_plan_v2(
         session: VortexSession,
-        projection: ScanPlanV2Ref,
-        predicates: Vec<ScanPlanV2Ref>,
+        projection: ScanPlanRef,
+        predicates: Vec<ScanPlanRef>,
         filter: Option<Expression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
