@@ -631,11 +631,13 @@ mod test {
         Ok(())
     }
 
+    type PrepareCall = (Range<u64>, ExpressionPurpose, String);
+
     #[derive(Debug)]
     struct PreparingLayoutReader {
         name: Arc<str>,
         dtype: DType,
-        calls: Arc<Mutex<Vec<(Range<u64>, ExpressionPurpose, String)>>>,
+        calls: Arc<Mutex<Vec<PrepareCall>>>,
     }
 
     impl LayoutReader for PreparingLayoutReader {

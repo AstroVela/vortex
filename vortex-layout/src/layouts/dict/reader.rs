@@ -46,6 +46,9 @@ use crate::SplitRange;
 use crate::layouts::SharedArrayFuture;
 use crate::segments::SegmentSource;
 
+type DictPushdown = (Expression, Option<Expression>);
+type PushdownCacheEntry = Arc<OnceLock<SharedVortexResult<DictPushdown>>>;
+
 pub struct DictReader {
     layout: DictLayout,
     name: Arc<str>,
@@ -58,8 +61,7 @@ pub struct DictReader {
     /// Cache of expression evaluation results on the values array by expression
     values_evals: DashMap<Expression, SharedArrayFuture>,
     /// Cache of projection pushdown splits by exact expression allocation.
-    pushdown_cache:
-        DashMap<ExactExpr, Arc<OnceLock<SharedVortexResult<(Expression, Option<Expression>)>>>>,
+    pushdown_cache: DashMap<ExactExpr, PushdownCacheEntry>,
 
     values: LayoutReaderRef,
     codes: LayoutReaderRef,

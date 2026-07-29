@@ -684,10 +684,12 @@ mod tests {
     use vortex::array::stats::StatsSet;
     use vortex::array::stream::ArrayStreamAdapter;
     use vortex::array::stream::ArrayStreamExt;
+    use vortex::array::stream::SendableArrayStream;
     use vortex::array::validity::Validity;
     use vortex::buffer::buffer;
     use vortex::error::VortexResult;
     use vortex::expr::stats::Precision;
+    use vortex::scan::DataSource as VortexDataSourceTrait;
     use vortex::scan::DataSourceScan;
     use vortex::scan::DataSourceScanRef;
     use vortex::scan::Partition;
@@ -703,7 +705,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl vortex::scan::DataSource for MockDataSource {
+    impl VortexDataSourceTrait for MockDataSource {
         fn dtype(&self) -> &DType {
             &self.dtype
         }
@@ -711,7 +713,7 @@ mod tests {
         async fn scan(&self, _scan_request: ScanRequest) -> VortexResult<DataSourceScanRef> {
             Ok(Box::new(MockScan {
                 dtype: self.dtype.clone(),
-                array: Some(self.array.clone()),
+                array: self.array.clone(),
             }))
         }
 
@@ -722,7 +724,7 @@ mod tests {
 
     struct MockScan {
         dtype: DType,
-        array: Option<ArrayRef>,
+        array: ArrayRef,
     }
 
     impl DataSourceScan for MockScan {
@@ -734,10 +736,10 @@ mod tests {
             Precision::exact(1_usize)
         }
 
-        fn partitions(mut self: Box<Self>) -> PartitionStream {
+        fn partitions(self: Box<Self>) -> PartitionStream {
             let partition = Box::new(MockPartition {
                 dtype: self.dtype.clone(),
-                array: self.array.take().expect("one mock partition"),
+                array: self.array,
             }) as PartitionRef;
             stream::iter([Ok(partition)]).boxed()
         }
@@ -758,14 +760,14 @@ mod tests {
         }
 
         fn row_count(&self) -> Precision<u64> {
-            Precision::exact(self.array.len() as u64)
+            Precision::exact(u64::try_from(self.array.len()).unwrap_or(u64::MAX))
         }
 
         fn byte_size(&self) -> Precision<u64> {
             Precision::Absent
         }
 
-        fn execute(self: Box<Self>) -> VortexResult<vortex::array::stream::SendableArrayStream> {
+        fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
             Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
                 self.dtype,
                 stream::iter([Ok(self.array)]),

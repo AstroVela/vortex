@@ -1041,7 +1041,7 @@ mod tests {
                 PrimitiveArray::from_iter([1i32]).into_array(),
                 PrimitiveArray::from_iter([2i32, 3]).into_array(),
             ],
-            dtype,
+            dtype.clone(),
         )?
         .into_array();
         let mismatched = ChunkedArray::try_new(
@@ -1049,7 +1049,7 @@ mod tests {
                 PrimitiveArray::from_iter([4i32, 5]).into_array(),
                 PrimitiveArray::from_iter([6i32]).into_array(),
             ],
-            dtype.clone(),
+            dtype,
         )?
         .into_array();
         let mismatched_struct = StructArray::try_new(
