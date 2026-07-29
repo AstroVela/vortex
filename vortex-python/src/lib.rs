@@ -22,6 +22,7 @@ pub(crate) mod dtype;
 mod error;
 mod expr;
 mod file;
+mod files;
 mod io;
 mod iter;
 mod object_store;
@@ -80,6 +81,7 @@ fn _lib(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     dtype::init(py, m)?;
     expr::init(py, m)?;
     file::init(py, m)?;
+    files::init(py, m)?;
     io::init(py, m)?;
     iter::init(py, m)?;
     #[cfg(feature = "opendal")]

@@ -43,6 +43,7 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_array::stream::SendableArrayStream;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_mask::Mask;
 use vortex_scan::DataSource;
@@ -304,6 +305,7 @@ impl DataSource for MultiLayoutDataSource {
         Ok(Box::new(MultiLayoutScan {
             session: self.session.clone(),
             dtype,
+            source_dtype: self.dtype.clone(),
             request: scan_request,
             ready,
             deferred,
@@ -320,6 +322,8 @@ impl DataSource for MultiLayoutDataSource {
 struct MultiLayoutScan {
     session: VortexSession,
     dtype: DType,
+    /// The unprojected dtype every child must share, checked as deferred readers open.
+    source_dtype: DType,
     request: ScanRequest,
     ready: VecDeque<LayoutReaderRef>,
     deferred: VecDeque<Arc<dyn LayoutReaderFactory>>,
@@ -345,6 +349,7 @@ impl DataSourceScan for MultiLayoutScan {
         let Self {
             session,
             dtype: _,
+            source_dtype,
             request,
             ready,
             deferred,
@@ -369,26 +374,23 @@ impl DataSourceScan for MultiLayoutScan {
             })
         });
 
+        // A deferred reader is only known to match the source dtype once it opens, so each one is
+        // checked as it arrives rather than yielding chunks whose dtype disagrees with the scan.
         let deferred_stream = if ordered {
+            let source_dtype = source_dtype.clone();
             spawned
                 .buffered(concurrency)
-                .filter_map(|result| async move {
-                    match result {
-                        Ok(Some(reader)) => Some(Ok(reader)),
-                        Ok(None) => None,
-                        Err(e) => Some(Err(e)),
-                    }
+                .filter_map(move |result| {
+                    let checked = check_dtype(result, &source_dtype);
+                    async move { checked }
                 })
                 .boxed()
         } else {
             spawned
                 .buffer_unordered(concurrency)
-                .filter_map(|result| async move {
-                    match result {
-                        Ok(Some(reader)) => Some(Ok(reader)),
-                        Ok(None) => None,
-                        Err(e) => Some(Err(e)),
-                    }
+                .filter_map(move |result| {
+                    let checked = check_dtype(result, &source_dtype);
+                    async move { checked }
                 })
                 .boxed()
         };
@@ -404,6 +406,25 @@ impl DataSourceScan for MultiLayoutScan {
                 Err(e) => stream::once(async move { Err(e) }).boxed(),
             })
             .boxed()
+    }
+}
+
+/// Reject an opened reader whose dtype disagrees with the data source's.
+///
+/// `None` skips the reader, matching the [`LayoutReaderFactory`] contract for pruned sources.
+fn check_dtype(
+    opened: VortexResult<Option<LayoutReaderRef>>,
+    source_dtype: &DType,
+) -> Option<VortexResult<LayoutReaderRef>> {
+    match opened {
+        Ok(Some(reader)) if reader.dtype() != source_dtype => Some(Err(vortex_err!(
+            "all sources in a multi-file scan must share the same dtype, but found {} and {}",
+            source_dtype,
+            reader.dtype()
+        ))),
+        Ok(Some(reader)) => Some(Ok(reader)),
+        Ok(None) => None,
+        Err(e) => Some(Err(e)),
     }
 }
 
