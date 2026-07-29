@@ -7,6 +7,7 @@ use std::iter;
 use std::sync::LazyLock;
 
 use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::ArrayRef;
@@ -31,6 +32,9 @@ use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
 
 use crate::BtrBlocksCompressor;
+use crate::BtrBlocksCompressorBuilder;
+use crate::SchemeExt;
+use crate::schemes::integer::RunEndScheme;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
 #[test]
@@ -175,7 +179,10 @@ fn test_rle_compressed_short_runs_wide_values() -> VortexResult<()> {
     let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
     let uncompressed_nbytes = array.clone().into_array().nbytes();
 
-    let btr = BtrBlocksCompressor::default();
+    // Force the RLE arm: on this data RunEnd is what the sampled estimate would otherwise pick.
+    let btr = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([RunEndScheme.id()])
+        .build();
     let compressed = btr.compress(&array.clone().into_array(), &mut ctx)?;
 
     assert!(
@@ -327,4 +334,43 @@ fn has_nested_delta(array: &ArrayRef, under_delta: bool) -> bool {
         .children()
         .iter()
         .any(|child| has_nested_delta(child, under_delta || is_delta))
+}
+
+/// The RLE scheme delta-encodes its own indices by hand rather than letting the cascade select
+/// `DeltaScheme`, so the hand-built Delta layer has to be recorded in the cascade history. If it
+/// is not, the exclusion rules cannot see it and the cascade delta-encodes the Delta bases again,
+/// producing `rle(indices=delta(bases=delta(..)))`.
+#[cfg(feature = "unstable_encodings")]
+#[test]
+fn test_rle_indices_delta_is_not_nested() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let mut rng = StdRng::seed_from_u64(11u64);
+    let mut values: Vec<i64> = Vec::with_capacity(1 << 15);
+    while values.len() < (1 << 15) {
+        let value = rng.random::<i64>();
+        for _ in 0..rng.random_range(1..=20) {
+            values.push(value);
+        }
+    }
+    values.truncate(1 << 15);
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
+
+    // Force the RLE arm: on this data RunEnd is what the sampled estimate would otherwise pick.
+    let btr = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([RunEndScheme.id()])
+        .build();
+    let compressed = btr.compress(&array.clone().into_array(), &mut ctx)?;
+
+    assert!(
+        contains_rle(&compressed),
+        "expected an RLE array in the tree:\n{}",
+        compressed.display_tree()
+    );
+    assert!(
+        !has_nested_delta(&compressed, false),
+        "Delta was applied more than once in the tree:\n{}",
+        compressed.display_tree()
+    );
+    assert_arrays_eq!(compressed, array.into_array(), &mut ctx);
+    Ok(())
 }

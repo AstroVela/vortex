@@ -118,11 +118,30 @@ impl CompressorContext {
     ///
     /// The `child_index` identifies which child of the scheme is being compressed (e.g. for
     /// Dict: values=0, codes=1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cascade depth is already exhausted. Check [`Self::finished_cascading`]
+    /// first.
     pub(crate) fn descend_with_scheme(mut self, id: SchemeId, child_index: usize) -> Self {
         self.allowed_cascading = self
             .allowed_cascading
             .checked_sub(1)
             .vortex_expect("cannot descend: cascade depth exhausted");
+        self.cascade_history.push((id, child_index));
+        self
+    }
+
+    /// Records an encoding layer that a scheme built by hand, without spending cascade budget.
+    ///
+    /// A scheme that constructs an encoding directly — rather than letting the cascade select
+    /// the scheme that produces it — leaves no trace in the history, so the exclusion rules
+    /// cannot see that layer and may select the same encoding again immediately below it.
+    /// Recording it here makes those rules fire.
+    ///
+    /// Unlike [`Self::descend_with_scheme`] this does not consume a cascade level: the caller
+    /// still descends into the children through the usual path, which accounts for the depth.
+    pub fn with_applied_scheme(mut self, id: SchemeId, child_index: usize) -> Self {
         self.cascade_history.push((id, child_index));
         self
     }

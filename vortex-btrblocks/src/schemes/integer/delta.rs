@@ -68,6 +68,12 @@ impl Default for DeltaScheme {
 /// single-bit gain. This factor encodes that "delta tax".
 const DELTA_PENALTY: f64 = 0.95;
 
+/// Child index of the Delta bases array.
+pub(crate) const DELTA_BASES_CHILD: usize = 0;
+
+/// Child index of the Delta residuals array.
+pub(crate) const DELTA_DELTAS_CHILD: usize = 1;
+
 /// Minimum length before Delta is worth considering (one FastLanes chunk).
 const MIN_DELTA_LEN: usize = 1024;
 
@@ -189,14 +195,14 @@ impl Scheme for DeltaScheme {
             &bases.into_array(),
             &compress_ctx,
             self.id(),
-            0,
+            DELTA_BASES_CHILD,
             exec_ctx,
         )?;
         let compressed_deltas = compressor.compress_child(
             &deltas.into_array(),
             &compress_ctx,
             self.id(),
-            1,
+            DELTA_DELTAS_CHILD,
             exec_ctx,
         )?;
 

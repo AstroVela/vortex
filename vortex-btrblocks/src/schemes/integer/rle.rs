@@ -30,6 +30,12 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 use crate::SchemeExt;
+#[cfg(feature = "unstable_encodings")]
+use crate::schemes::integer::DeltaScheme;
+#[cfg(feature = "unstable_encodings")]
+use crate::schemes::integer::delta::DELTA_BASES_CHILD;
+#[cfg(feature = "unstable_encodings")]
+use crate::schemes::integer::delta::DELTA_DELTAS_CHILD;
 use crate::schemes::rle_ancestor_exclusions;
 use crate::schemes::rle_descendant_exclusions;
 
@@ -191,18 +197,27 @@ pub(crate) fn try_compress_delta(
     let child_primitive = child.clone().execute::<PrimitiveArray>(exec_ctx)?;
     let (bases, deltas) = vortex_fastlanes::delta_compress(&child_primitive, exec_ctx)?;
 
+    // This builds a Delta by hand instead of letting the cascade select DeltaScheme, so the
+    // Delta layer has to be recorded in the history explicitly. Without it the children descend
+    // as if no Delta had been applied, and DeltaScheme's self-exclusion — which is what stops a
+    // delta of a delta — never fires, producing `delta(bases=delta(..), deltas=..)`.
+    let delta_id = DeltaScheme::default().id();
+    let delta_ctx = parent_ctx
+        .clone()
+        .with_applied_scheme(parent_id, child_index);
+
     let compressed_bases = compressor.compress_child(
         &bases.into_array(),
-        parent_ctx,
-        parent_id,
-        child_index,
+        &delta_ctx,
+        delta_id,
+        DELTA_BASES_CHILD,
         exec_ctx,
     )?;
     let compressed_deltas = compressor.compress_child(
         &deltas.into_array(),
-        parent_ctx,
-        parent_id,
-        child_index,
+        &delta_ctx,
+        delta_id,
+        DELTA_DELTAS_CHILD,
         exec_ctx,
     )?;
 
