@@ -16,6 +16,12 @@ header = """
 // clang-format off
 
 #include "duckdb.h"
+
+// Opaque handles from the base Vortex C API (vortex-ffi's vortex.h). Redeclared here so this
+// header stands alone; the definitions are identical, so including both headers is fine.
+typedef struct vx_array vx_array;
+typedef struct vx_expression vx_expression;
+typedef struct vx_session vx_session;
 """
 
 trailer = """

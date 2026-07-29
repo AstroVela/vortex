@@ -7,6 +7,7 @@
 #include "expr.h"
 #include "vortex_duckdb.h"
 #include "table_function.h"
+#include "pull_table_function.h"
 #include "vortex.h"
 
 #include "duckdb.h"
@@ -33,12 +34,16 @@ struct CTableBindData final : FunctionData {
 
     unique_ptr<CData> ffi_data;
     vector<LogicalType> types;
+    // Original glob patterns, used by the pull scan path to list files on the DuckDB side.
+    vector<string> patterns;
 };
 
 unique_ptr<FunctionData> CTableBindData::Copy() const {
     const auto copied_ffi_data = duckdb_table_function_bind_data_clone(ffi_data->DataPtr());
     auto ffi_data_p = unique_ptr<CData>(reinterpret_cast<CData *>(copied_ffi_data));
-    return make_uniq<CTableBindData>(std::move(ffi_data_p), types);
+    auto copy = make_uniq<CTableBindData>(std::move(ffi_data_p), types);
+    copy->patterns = patterns;
+    return copy;
 }
 
 bool CTableBindData::Equals(const FunctionData &other_base) const {
@@ -68,6 +73,9 @@ struct CTableLocalData final : LocalTableFunctionState {
 
 double
 table_scan_progress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *global_state) {
+    if (vortex_pull::is_pull_state(*global_state)) {
+        return vortex_pull::progress(*global_state);
+    }
     void *const c_global_state = global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
     return duckdb_table_function_scan_progress(c_global_state);
 }
@@ -243,7 +251,18 @@ unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &,
     }
 
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
-    return make_uniq<CTableBindData>(std::move(cdata), return_types);
+    auto bind_data = make_uniq<CTableBindData>(std::move(cdata), return_types);
+    if (!input.inputs.empty()) {
+        const Value &globs = input.inputs[0];
+        if (globs.type().id() == LogicalTypeId::VARCHAR) {
+            bind_data->patterns.push_back(StringValue::Get(globs));
+        } else if (globs.type().id() == LogicalTypeId::LIST) {
+            for (const Value &glob : ListValue::GetChildren(globs)) {
+                bind_data->patterns.push_back(StringValue::Get(glob));
+            }
+        }
+    }
+    return bind_data;
 }
 
 unique_ptr<GlobalTableFunctionState> c_init_global(ClientContext &context, TableFunctionInitInput &input) {
@@ -259,6 +278,10 @@ unique_ptr<GlobalTableFunctionState> c_init_global(ClientContext &context, Table
         .client_context = reinterpret_cast<duckdb_client_context>(&context),
     };
 
+    if (auto pull_state = vortex_pull::try_init_global(context, input, bind.patterns, ffi_input)) {
+        return pull_state;
+    }
+
     duckdb_vx_error error_out = nullptr;
     duckdb_vx_data ffi_global_data = duckdb_table_function_init_global(&ffi_input, &error_out);
     if (error_out) {
@@ -271,6 +294,18 @@ unique_ptr<GlobalTableFunctionState> c_init_global(ClientContext &context, Table
 
 unique_ptr<LocalTableFunctionState>
 init_local(ExecutionContext &, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+    if (vortex_pull::is_pull_state(*global_state)) {
+        const duckdb_vx_tfunc_init_input ffi_input = {
+            .bind_data = input.bind_data->Cast<CTableBindData>().ffi_data->DataPtr(),
+            .column_ids = input.column_ids.data(),
+            .column_ids_count = input.column_ids.size(),
+            .projection_ids = input.projection_ids.data(),
+            .projection_ids_count = input.projection_ids.size(),
+            .filters = reinterpret_cast<duckdb_vx_table_filter_set>(input.filters.get()),
+            .client_context = nullptr,
+        };
+        return vortex_pull::init_local(ffi_input);
+    }
     const void *const ffi_bind = input.bind_data->Cast<CTableBindData>().ffi_data->DataPtr();
     void *const ffi_global = global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
 
@@ -280,6 +315,10 @@ init_local(ExecutionContext &, TableFunctionInitInput &input, GlobalTableFunctio
 }
 
 void function(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    if (vortex_pull::is_pull_state(*input.global_state)) {
+        vortex_pull::scan(input, output);
+        return;
+    }
     void *const ffi_global = input.global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
     void *const ffi_local = input.local_state->Cast<CTableLocalData>().ffi_data->DataPtr();
 
@@ -380,6 +419,9 @@ TablePartitionInfo get_partition_info(ClientContext &, TableFunctionPartitionInp
  * each partition ~ exported array file_index is constant.
  */
 OperatorPartitionData get_partition_data(ClientContext &, TableFunctionGetPartitionInput &input) {
+    if (vortex_pull::is_pull_state(*input.global_state)) {
+        return vortex_pull::partition_data(input);
+    }
     void *const ffi_global = input.global_state->Cast<CTableGlobalData>().ffi_data->DataPtr();
     void *const ffi_local = input.local_state->Cast<CTableLocalData>().ffi_data->DataPtr();
     duckdb_vx_partition_data partition_data;

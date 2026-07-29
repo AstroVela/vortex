@@ -535,6 +535,34 @@ fn compile_cpp(duckdb_include_dir: &Path) {
     for e in SOURCE_FILES {
         println!("cargo:rerun-if-changed={e}");
     }
+
+    // The pull scan path and the vortex::cxx C++ API are compiled separately: they resolve
+    // <vortex.h> to vortex-ffi's header, while the sources above resolve it to this crate's
+    // generated one.
+    let Ok(cxx_dir) = fs::read_dir("../lang/cpp/src") else {
+        println!("cargo:error=missing ../lang/cpp/src");
+        exit(1);
+    };
+    let cxx_sources: Vec<_> = cxx_dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "cpp"))
+        .collect();
+    cc::Build::new()
+        .std("c++20")
+        .cpp(true)
+        .flag_if_supported("-fno-gnu-unique")
+        .flag("-isystem")
+        .flag(duckdb_include_dir)
+        .include("../lang/cpp/include")
+        .include("../vortex-ffi/cinclude")
+        .include("cpp/include")
+        .files(&cxx_sources)
+        .file("cpp/pull_table_function.cpp")
+        .compile("vortex-duckdb-pull");
+    println!("cargo:rerun-if-changed=cpp/pull_table_function.cpp");
+    println!("cargo:rerun-if-changed=../lang/cpp/src");
+    println!("cargo:rerun-if-changed=../lang/cpp/include");
+    println!("cargo:rerun-if-changed=../vortex-ffi/cinclude/vortex.h");
 }
 
 /// Generate include/vortex.h from rust sources

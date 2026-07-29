@@ -42,6 +42,14 @@ box_wrapper!(
     Expression,
     vx_expression);
 
+/// Wrap an owned [`Expression`] into a `vx_expression` handle.
+///
+/// A building block for FFI crates layered on top of the base Vortex C API. The caller (or the
+/// C code the handle is passed to) must free it with `vx_expression_free`.
+pub fn vx_expression_new(expression: Expression) -> *mut vx_expression {
+    vx_expression::new(expression)
+}
+
 /// Create a root expression. A root expression, applied to an array in
 /// vx_array_apply, takes the array itself as opposed to functions like
 /// vx_expression_column or vx_expression_select which take the array's parts.

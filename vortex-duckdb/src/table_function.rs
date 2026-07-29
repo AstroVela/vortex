@@ -81,14 +81,14 @@ use crate::projection::extract_schema_from_dtype;
 pub const COUNT_STAR_PROJ_IDX: u64 = u64::MAX;
 
 pub struct TableFunctionBind {
-    data_source: Arc<MultiLayoutDataSource>,
-    filter_exprs: Vec<Expression>,
-    column_fields: Vec<DuckdbField>,
+    pub(crate) data_source: Arc<MultiLayoutDataSource>,
+    pub(crate) filter_exprs: Vec<Expression>,
+    pub(crate) column_fields: Vec<DuckdbField>,
     // There exists at least one non-optional table filter or at least one
     // complex filter is pushed down.
-    has_non_optional_filter: AtomicBool,
+    pub(crate) has_non_optional_filter: AtomicBool,
     // Non-empty iff this scan is aggregate
-    aggregates: Vec<ColumnAggregate>,
+    pub(crate) aggregates: Vec<ColumnAggregate>,
 }
 assert_impl_all!(TableFunctionBind: Send, Clone);
 
@@ -425,7 +425,7 @@ pub fn init_local(
     }
 }
 
-fn convert_result(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<StructArray> {
+pub(crate) fn convert_result(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<StructArray> {
     let array_result = array.optimize_recursive(ctx.session())?;
     Ok(if let Some(array) = array_result.as_opt::<Struct>() {
         array.into_owned()

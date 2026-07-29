@@ -8,10 +8,22 @@
 
 #include "duckdb.h"
 
+// Opaque handles from the base Vortex C API (vortex-ffi's vortex.h). Redeclared here so this
+// header stands alone; the definitions are identical, so including both headers is fine.
+typedef struct vx_array vx_array;
+typedef struct vx_expression vx_expression;
+typedef struct vx_session vx_session;
+
 
 #pragma once
 
 #define COUNT_STAR_PROJ_IDX UINT64_MAX
+
+typedef struct {
+  vx_expression *projection;
+  vx_expression *filter;
+  bool supported;
+} duckdb_vx_pull_plan;
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,6 +105,29 @@ void duckdb_copy_function_copy_to_sink(const void *bind_data,
                                        duckdb_vx_error *error_out);
 
 extern void duckdb_copy_function_copy_to_finalize(void *global_data, duckdb_vx_error *error_out);
+
+extern
+bool duckdb_pull_plan(const duckdb_vx_tfunc_init_input *init_input,
+                      duckdb_vx_pull_plan *plan_out,
+                      duckdb_vx_error *error_out);
+
+extern vx_session *duckdb_vortex_session(void);
+
+extern void *duckdb_pull_cache_new(size_t file_index);
+
+extern void duckdb_pull_cache_free(void *cache);
+
+extern
+void *duckdb_pull_exporter_new(const vx_array *array,
+                               const void *cache,
+                               duckdb_vx_error *error_out);
+
+extern
+bool duckdb_pull_exporter_next(void *exporter,
+                               duckdb_data_chunk output,
+                               duckdb_vx_error *error_out);
+
+extern void duckdb_pull_exporter_free(void *exporter);
 
 #ifdef __cplusplus
 }  // extern "C"

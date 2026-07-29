@@ -154,7 +154,7 @@ pub struct vx_estimate {
     pub estimate: u64,
 }
 
-fn scan_request(opts: *const vx_scan_options) -> VortexResult<ScanRequest> {
+pub(crate) fn scan_request(opts: *const vx_scan_options) -> VortexResult<ScanRequest> {
     if opts.is_null() {
         return Ok(ScanRequest::default());
     }

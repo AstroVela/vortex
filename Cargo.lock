@@ -9723,6 +9723,7 @@ dependencies = [
  "url",
  "vortex",
  "vortex-array",
+ "vortex-ffi",
  "vortex-geo",
  "vortex-runend",
  "vortex-sequence",

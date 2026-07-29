@@ -28,6 +28,7 @@ mod exporter;
 mod ffi;
 mod multi_file;
 mod projection;
+mod pull_ffi;
 mod table_function;
 
 #[rustfmt::skip]

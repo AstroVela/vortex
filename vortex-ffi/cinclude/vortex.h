@@ -349,6 +349,29 @@ typedef enum {
 } vx_scan_selection_include;
 
 /**
+ * The state returned by a pull coroutine step.
+ */
+typedef enum {
+    /**
+     * Reads were issued (possibly zero when the in-flight window is full): perform them and
+     * call `complete` for each, then `advance` again.
+     */
+    VX_PULL_READS = 0,
+    /**
+     * A result is ready (a batch for scans, a footer for footer coroutines).
+     */
+    VX_PULL_BATCH = 1,
+    /**
+     * The coroutine is exhausted.
+     */
+    VX_PULL_DONE = 2,
+    /**
+     * An error occurred; inspect the `vx_error` out-parameter.
+     */
+    VX_PULL_ERROR = 3,
+} vx_pull_state;
+
+/**
  * Arrays are reference-counted handles to owned memory buffers that hold
  * scalars. These buffers can be held in a number of physical encodings to
  * perform lightweight compression that exploits the particular data
@@ -421,11 +444,38 @@ typedef struct vx_error vx_error;
 typedef struct vx_expression vx_expression;
 
 /**
+ * A parsed Vortex file footer: the segment map, layout tree, dtype, and statistics.
+ *
+ * Obtained from a [`vx_pull_footer`] coroutine. Free with [`vx_footer_free`].
+ */
+typedef struct vx_footer vx_footer;
+
+/**
  * A vx_partition is an independent unit of work. Call vx_partition_next
  * repeatedly to retrieve arrays, then free the partition with
  * vx_partition_free.
  */
 typedef struct vx_partition vx_partition;
+
+/**
+ * A per-file pull scanning context: builds the file's reader tree once so many
+ * [`vx_pull_scan`]s (e.g. one per chunk-aligned shard) can reuse it.
+ *
+ * Not thread-safe: scans created from one context must be driven by one thread.
+ */
+typedef struct vx_pull_file vx_pull_file;
+
+/**
+ * A pull coroutine that parses a file footer without Vortex performing any IO.
+ *
+ * Footer reads are sequential, so at most one read is outstanding at a time.
+ */
+typedef struct vx_pull_footer vx_pull_footer;
+
+/**
+ * A pull coroutine that scans a single Vortex file; the caller performs all reads.
+ */
+typedef struct vx_pull_scan vx_pull_scan;
 
 /**
  * A vx_scalar is a single value with an associated vx_dtype.
@@ -563,6 +613,29 @@ typedef struct {
      */
     bool ordered;
 } vx_scan_options;
+
+/**
+ * A byte-range read the caller must perform.
+ *
+ * `dst` points to a buffer of `len` bytes owned by the coroutine that issued this read; it is
+ * valid until the read is completed or the coroutine is freed. Fill it with the bytes at file
+ * offset `offset` and pass `dst` back to the matching `complete` function. `dst` is the
+ * identity of the read: return exactly the pointer you were given.
+ */
+typedef struct {
+    /**
+     * Destination buffer to fill; also the identity of this read.
+     */
+    uint8_t *dst;
+    /**
+     * Absolute file offset to read from.
+     */
+    uint64_t offset;
+    /**
+     * Number of bytes to read.
+     */
+    uint64_t len;
+} vx_pull_read;
 
 #ifdef __cplusplus
 extern "C" {
@@ -1157,6 +1230,150 @@ vx_expression *vx_expression_list_contains(const vx_expression *list, const vx_e
  * The logger will only be installed on the first call.
  */
 void vx_set_log_level(vx_log_level level);
+
+/**
+ * Free a vx_footer
+ */
+void vx_footer_free(const vx_footer *ptr);
+
+/**
+ * Free a vx_pull_footer
+ */
+void vx_pull_footer_free(const vx_pull_footer *ptr);
+
+/**
+ * Free a vx_pull_file
+ */
+void vx_pull_file_free(const vx_pull_file *ptr);
+
+/**
+ * Create a pull scanning context for the file described by "footer".
+ *
+ * On error, returns NULL and sets "err". Free with [`vx_pull_file_free`].
+ */
+vx_pull_file *vx_pull_file_new(const vx_session *session, const vx_footer *footer, vx_error **err);
+
+/**
+ * Create a pull scan over the file of "pull_file", reusing its reader tree.
+ *
+ * See [`vx_pull_scan_new`] for "options" and "max_inflight". On error, returns NULL and
+ * sets "err".
+ */
+vx_pull_scan *vx_pull_file_scan(const vx_pull_file *pull_file,
+                                const vx_scan_options *options,
+                                uint64_t max_inflight,
+                                vx_error **err);
+
+/**
+ * Free a vx_pull_scan
+ */
+void vx_pull_scan_free(const vx_pull_scan *ptr);
+
+/**
+ * Create a footer coroutine for a file of `file_size` bytes.
+ *
+ * On error, returns NULL and sets "err". Free with [`vx_pull_footer_free`].
+ */
+vx_pull_footer *vx_pull_footer_new(const vx_session *session, uint64_t file_size, vx_error **err);
+
+/**
+ * Advance the footer coroutine.
+ *
+ * On VX_PULL_READS writes the single read to perform into "*out_read".
+ * On VX_PULL_BATCH writes an owned footer handle into "*out_footer"; the coroutine is then
+ * exhausted. On error returns VX_PULL_ERROR and sets "err".
+ */
+vx_pull_state vx_pull_footer_advance(vx_pull_footer *footer,
+                                     vx_pull_read *out_read,
+                                     vx_footer **out_footer,
+                                     vx_error **err);
+
+/**
+ * Hand the filled read buffer "dst" back to the footer coroutine.
+ *
+ * Returns 0 on success. On error returns 1 and sets "err".
+ */
+int vx_pull_footer_complete(vx_pull_footer *footer, const uint8_t *dst, vx_error **err);
+
+/**
+ * The dtype of the file described by "footer".
+ *
+ * The caller owns the returned dtype and must free it with vx_dtype_free.
+ */
+vx_dtype *vx_footer_dtype(const vx_footer *footer);
+
+/**
+ * The number of rows in the file described by "footer".
+ */
+uint64_t vx_footer_row_count(const vx_footer *footer);
+
+/**
+ * Returns true if "footer"'s file-level statistics prove that "filter" cannot match any rows
+ * in the file, so the whole file can be skipped. Performs no IO. On error returns false and
+ * sets "err".
+ */
+bool vx_footer_can_prune(const vx_session *session,
+                         const vx_footer *footer,
+                         const vx_expression *filter,
+                         vx_error **err);
+
+/**
+ * Chunk-aligned row split points for sharding a file scan across threads.
+ *
+ * Scans over disjoint row ranges aligned to these points never share data segments for the
+ * fields referenced by "projection"/"filter" (both may be NULL, meaning all fields), so they
+ * can be driven as independent [`vx_pull_scan`]s without reading any segment twice. Performs
+ * no IO.
+ *
+ * Writes at most "capacity" points to "out_points" and the total number of points to
+ * "*out_len"; if "*out_len" exceeds "capacity", call again with a larger buffer. Returns 0 on
+ * success. On error returns 1 and sets "err".
+ */
+int vx_footer_split_points(const vx_session *session,
+                           const vx_footer *footer,
+                           const vx_expression *projection,
+                           const vx_expression *filter,
+                           uint64_t *out_points,
+                           size_t capacity,
+                           size_t *out_len,
+                           vx_error **err);
+
+/**
+ * Create a pull scan of the file described by "footer".
+ *
+ * "options" may be NULL (scan everything); its row_range selects the shard of the file this
+ * scan decodes. "max_inflight" bounds how many reads may be outstanding, which also bounds
+ * destination-buffer memory; pass 0 for no bound.
+ *
+ * On error, returns NULL and sets "err". Free with [`vx_pull_scan_free`].
+ */
+vx_pull_scan *vx_pull_scan_new(const vx_session *session,
+                               const vx_footer *footer,
+                               const vx_scan_options *options,
+                               uint64_t max_inflight,
+                               vx_error **err);
+
+/**
+ * Advance the scan coroutine.
+ *
+ * On VX_PULL_READS writes a pointer to an array of reads into "*out_reads" and its length
+ * into "*out_reads_len"; the array is valid until the next advance or free. A zero length
+ * means the in-flight window is full: complete an outstanding read first.
+ * On VX_PULL_BATCH writes an owned array handle into "*out_batch" (free with vx_array_free).
+ * On error returns VX_PULL_ERROR and sets "err".
+ */
+vx_pull_state vx_pull_scan_advance(vx_pull_scan *scan,
+                                   const vx_pull_read **out_reads,
+                                   size_t *out_reads_len,
+                                   vx_array **out_batch,
+                                   vx_error **err);
+
+/**
+ * Hand a filled read buffer back to the scan. Completions may arrive in any order.
+ *
+ * Returns 0 on success. On error returns 1 and sets "err".
+ */
+int vx_pull_scan_complete(vx_pull_scan *scan, const uint8_t *dst, vx_error **err);
 
 /**
  * Free a vx_scalar

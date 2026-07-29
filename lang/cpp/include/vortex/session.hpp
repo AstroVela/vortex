@@ -26,6 +26,9 @@ public:
 private:
     friend struct detail::Access;
 
+    explicit Session(vx_session *owned) : handle_(owned) {
+    }
+
     struct Deleter {
         void operator()(vx_session *ptr) const noexcept;
     };

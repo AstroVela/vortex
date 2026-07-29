@@ -34,6 +34,29 @@ pub enum SplitBy {
     // UncompressedSize(u64),
 }
 
+/// Row split points registered by the layout tree for `row_range`, without subdividing large
+/// spans.
+///
+/// Unlike [`SplitBy::Layout`], the returned points are exactly the chunk boundaries of the
+/// fields selected by `field_mask`: scans over disjoint ranges aligned to these points never
+/// share data segments for those fields, so they can be driven independently (for example on
+/// different threads) without reading any segment twice.
+pub fn layout_split_points(
+    layout_reader: &dyn LayoutReader,
+    row_range: &Range<u64>,
+    field_mask: &[FieldMask],
+) -> VortexResult<Vec<u64>> {
+    let mut row_splits = RowSplits::new_capacity(128);
+    row_splits.push(row_range.start);
+    row_splits.push(row_range.end);
+    layout_reader.register_splits(
+        field_mask,
+        &SplitRange::root(row_range.clone())?,
+        &mut row_splits,
+    )?;
+    Ok(row_splits.into_sorted_deduped())
+}
+
 impl SplitBy {
     /// Compute the splits for the given layout.
     // TODO(ngates): remove this once layout readers are stream based.
