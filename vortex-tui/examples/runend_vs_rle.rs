@@ -161,8 +161,8 @@ fn main() -> anyhow::Result<()> {
             }
         );
         println!(
-            "  chosen  {:>11} B  nodes={:<4} depth={}",
-            picked.disk, picked.nodes, picked.depth
+            "  chosen  {:>11} B  nodes={:<4} depth={}  {}",
+            picked.disk, picked.nodes, picked.depth, picked.stack
         );
         println!(
             "  RLE     {:>11} B  nodes={:<4} depth={}  {}",
