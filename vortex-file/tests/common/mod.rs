@@ -22,7 +22,11 @@ pub fn enable_all_registered_array_encodings(session: &VortexSession) {
         })
         .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("test edition is valid");
-    for id in session.arrays().registry().ids() {
+    for id in session
+        .arrays()
+        .registry()
+        .read(|map| map.keys().copied().collect::<Vec<_>>())
+    {
         editions
             .declare_inclusion(EditionInclusion::new(&id, TEST_EDITION))
             .map_err(|error| vortex_err!("{error}"))

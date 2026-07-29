@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use fsst::Compressor;
 use fsst::Decompressor;
 use fsst::Symbol;
+use num_traits::AsPrimitive;
 use prost::Message as _;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
@@ -33,11 +34,13 @@ use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::varbin::VarBinArraySlotsExt;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::builders::ArrayBuilder;
+use vortex_array::builders::DynVarBinBuilder;
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::legacy_session;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::VTable;
@@ -56,6 +59,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::canonical::canonicalize_fsst;
+use crate::canonical::fsst_decode_bytes;
 use crate::canonical::fsst_decode_views;
 use crate::rules::RULES;
 
@@ -303,6 +307,25 @@ impl VTable for FSST {
         builder: &mut dyn ArrayBuilder,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
+        if let Some(builder) = builder.as_any_mut().downcast_mut::<DynVarBinBuilder>() {
+            let (bytes, lengths) = fsst_decode_bytes(array, ctx)?;
+            let validity = array
+                .array()
+                .validity()?
+                .execute_mask(array.array().len(), ctx)?;
+            match_each_integer_ptype!(lengths.ptype(), |P| {
+                builder.append_values(
+                    bytes.as_slice(),
+                    lengths.as_slice::<P>().iter().scan(0usize, |end, length| {
+                        *end += AsPrimitive::<usize>::as_(*length);
+                        Some(*end)
+                    }),
+                    &validity,
+                )
+            })?;
+            return Ok(());
+        }
+
         let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() else {
             return array
                 .array()
@@ -341,10 +364,13 @@ impl VTable for FSST {
 #[array_slots(FSST)]
 pub struct FSSTSlots {
     /// Lengths of the original values before compression, can be compressed.
+    #[slot(0)]
     pub uncompressed_lengths: ArrayRef,
     /// The offsets array for the FSST-compressed codes.
+    #[slot(1)]
     pub codes_offsets: ArrayRef,
     /// The validity bitmap for the compressed codes.
+    #[slot(2)]
     pub codes_validity: Option<ArrayRef>,
 }
 
