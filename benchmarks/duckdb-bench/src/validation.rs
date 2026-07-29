@@ -21,7 +21,7 @@ use vortex_bench::tpch::benchmark::TpcHBenchmark;
 ///
 /// Only runs for scale factor 1.0 since reference data is only available for SF=1.
 #[expect(dead_code)]
-pub fn verify_duckdb_tpch_results(
+pub async fn verify_duckdb_tpch_results(
     benchmark: &TpcHBenchmark,
     queries: Vec<usize>,
 ) -> anyhow::Result<()> {
@@ -45,7 +45,9 @@ pub fn verify_duckdb_tpch_results(
     fs::create_dir(&tmp_dir)?;
 
     let duckdb = DuckClient::new_in_memory()?;
-    duckdb.register_tables(benchmark, Format::OnDiskVortex)?;
+    duckdb
+        .register_tables(benchmark, Format::OnDiskVortex)
+        .await?;
 
     let mut query_files = fs::read_dir(query_dir)?
         .filter_map(Result::ok)

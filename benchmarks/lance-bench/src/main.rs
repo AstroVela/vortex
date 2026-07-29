@@ -21,9 +21,14 @@ use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Opt;
 use vortex_bench::Opts;
+use vortex_bench::Registration;
+use vortex_bench::TableObject;
+use vortex_bench::TableRegistrar;
+use vortex_bench::TableSource;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::generate_data;
 use vortex_bench::runner::BenchmarkMode;
 use vortex_bench::runner::BenchmarkQueryResult;
 use vortex_bench::runner::SqlBenchmarkRunner;
@@ -93,10 +98,8 @@ async fn main() -> anyhow::Result<()> {
         args.exclude_queries.as_ref(),
     );
 
-    // Generate base Parquet data first
-    benchmark.generate_base_data().await?;
-
-    // Convert Parquet to Lance format
+    // Stage 1: generate the base Parquet data, then convert it to Lance.
+    generate_data(&*benchmark, [Format::Lance]).await?;
     generate_lance_data(&*benchmark).await?;
 
     let mut runner = SqlBenchmarkRunner::new(
@@ -114,10 +117,16 @@ async fn main() -> anyhow::Result<()> {
             BenchmarkMode::Run {
                 iterations: args.iterations,
             },
-            |_format| async {
-                let session = SessionContext::new();
-                register_lance_tables(&session, &*benchmark).await?;
-                Ok(session)
+            // Stage 2a: build the session context.
+            |_format| async { Ok(SessionContext::new()) },
+            // Stage 2b: register the benchmark's Lance datasets into the session catalog.
+            |session: SessionContext, format| {
+                let benchmark = &*benchmark;
+                async move {
+                    let mut registrar = LanceRegistrar { session: &session };
+                    vortex_bench::register_tables(&mut registrar, benchmark, format).await?;
+                    Ok(session)
+                }
             },
             |_query_idx, session, query| {
                 Box::pin(async move {
@@ -141,16 +150,27 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn register_lance_tables<B: Benchmark + ?Sized>(
-    session: &SessionContext,
-    benchmark: &B,
-) -> anyhow::Result<()> {
-    let benchmark_base = benchmark
-        .data_url()
-        .join(&format!("{}/", Format::Lance.name()))?;
+/// Registers benchmark tables into a DataFusion `SessionContext` as Lance datasets. Each table is
+/// a `{name}.lance` dataset directory rather than a glob of files, so the source's pattern is
+/// unused here.
+struct LanceRegistrar<'a> {
+    session: &'a SessionContext,
+}
 
-    for table in benchmark.table_specs().iter() {
-        let table_path = benchmark_base.join(&format!("{}.lance/", table.name))?;
+#[async_trait::async_trait(?Send)]
+impl TableRegistrar for LanceRegistrar<'_> {
+    fn registration(&self, format: Format) -> anyhow::Result<Registration> {
+        match format {
+            Format::Lance => Ok(Registration {
+                object: TableObject::Table,
+                load_format: Format::Lance,
+            }),
+            format => anyhow::bail!("lance-bench only benchmarks Lance data, got {format}"),
+        }
+    }
+
+    async fn register(&mut self, source: &TableSource) -> anyhow::Result<()> {
+        let table_path = source.base_url.join(&format!("{}.lance/", source.name))?;
 
         let dataset = Dataset::open(table_path.as_str()).await?;
         let provider = LanceTableProvider::new(
@@ -159,10 +179,10 @@ async fn register_lance_tables<B: Benchmark + ?Sized>(
             false, // with_row_addr
         );
 
-        session.register_table(table.name, Arc::new(provider))?;
+        self.session
+            .register_table(source.name, Arc::new(provider))?;
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Wrapper around Lance/DataFusion record batches implementing `BenchmarkQueryResult`.

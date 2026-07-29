@@ -26,6 +26,7 @@ test = false
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 similar = { workspace = true }
 tokio = { workspace = true }

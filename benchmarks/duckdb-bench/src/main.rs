@@ -11,15 +11,14 @@ use duckdb_bench::DuckClient;
 use tokio::runtime::Runtime;
 use vortex::metrics::tracing::set_global_labels;
 use vortex_bench::BenchmarkArg;
-use vortex_bench::CompactionStrategy;
 use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Opt;
 use vortex_bench::Opts;
-use vortex_bench::conversions::convert_parquet_directory_to_vortex;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::generate_data;
 use vortex_bench::runner::BenchmarkMode;
 use vortex_bench::runner::SqlBenchmarkRunner;
 use vortex_bench::runner::filter_queries;
@@ -115,44 +114,12 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("provide a format with --formats");
     }
 
-    // Generate Vortex files from Parquet for any Vortex formats requested
-    if benchmark.data_url().scheme() == "file" {
-        // This is ugly, but otherwise some complicated async interaction might result in a deadlock
-        let runtime = Runtime::new()?;
+    // This is ugly, but otherwise some complicated async interaction might result in a deadlock
+    let runtime = Runtime::new()?;
 
-        runtime.block_on(async {
-            benchmark.generate_base_data().await?;
-
-            let base_path = benchmark
-                .data_url()
-                .to_file_path()
-                .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", benchmark.data_url()))?;
-
-            for format in args.formats.iter().copied() {
-                match format {
-                    Format::OnDiskVortex => {
-                        convert_parquet_directory_to_vortex(
-                            &base_path,
-                            CompactionStrategy::Default,
-                        )
-                        .await?;
-                    }
-                    Format::VortexCompact => {
-                        convert_parquet_directory_to_vortex(
-                            &base_path,
-                            CompactionStrategy::Compact,
-                        )
-                        .await?;
-                    }
-                    // OnDiskDuckDB tables are created during register_tables by loading from Parquet
-                    _ => {}
-                }
-                benchmark.prepare_format(format, &base_path).await?;
-            }
-
-            anyhow::Ok(())
-        })?;
-    }
+    // Stage 1: generate the data. Idempotent, so this is a no-op when `data-gen` already ran.
+    // `OnDiskDuckDB` tables are not loaded here; stage 2 creates them from Parquet.
+    runtime.block_on(generate_data(&*benchmark, args.formats.iter().copied()))?;
 
     let mut runner = SqlBenchmarkRunner::new(
         &*benchmark,
@@ -181,6 +148,7 @@ fn main() -> anyhow::Result<()> {
     runner.run_all(
         &filtered_queries,
         mode,
+        // Stage 2a: open the database.
         |format| {
             let mut ctx = DuckClient::new(
                 &*benchmark,
@@ -189,12 +157,17 @@ fn main() -> anyhow::Result<()> {
                 args.threads,
             )?;
             ctx.set_init_sql(duckdb_init_sql.clone())?;
-            ctx.register_tables(&*benchmark, format)?;
 
             // Duckdb doesn't support octet_length for strings but we need this
             // in ClickBench.
             ctx.execute_query_result("create macro if not exists octet_length(a) as strlen(a)")?;
 
+            Ok(ctx)
+        },
+        // Stage 2b: register the benchmark's tables (or views). DuckDB's catalog is persisted in
+        // the database file, so this is a no-op when a previous run or `data-gen` created them.
+        |ctx: DuckClient, format| {
+            runtime.block_on(ctx.register_tables(&*benchmark, format))?;
             Ok(ctx)
         },
         |ctx, query_idx, format, query| {

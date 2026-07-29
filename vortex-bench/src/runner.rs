@@ -286,6 +286,10 @@ impl SqlBenchmarkRunner {
 
     /// Run (or explain) all queries for all formats synchronously.
     ///
+    /// Per format, this drives the two stages that precede querying: `setup` creates the engine
+    /// context, then `register` registers the benchmark's tables (or views) into it. Both run
+    /// outside the timed loop.
+    ///
     /// In `Run` mode, executes each query `iterations` times, collecting timing.
     /// In `Explain` mode, prepends `EXPLAIN` to each query, executes once, and
     /// prints `R::display()`. No progress bar or timing in Explain mode.
@@ -293,16 +297,18 @@ impl SqlBenchmarkRunner {
     /// The `execute` callback returns `(Option<Duration>, R)` where
     /// `Option<Duration>` overrides wall-clock timing, and `R` implements
     /// `BenchmarkQueryResult`.
-    pub fn run_all<Ctx, R, S, E>(
+    pub fn run_all<Ctx, R, S, G, E>(
         &mut self,
         queries: &[(usize, String)],
         mode: BenchmarkMode,
         mut setup: S,
+        mut register: G,
         mut execute: E,
     ) -> anyhow::Result<()>
     where
         R: BenchmarkQueryResult,
         S: FnMut(Format) -> anyhow::Result<Ctx>,
+        G: FnMut(Ctx, Format) -> anyhow::Result<Ctx>,
         E: FnMut(&mut Ctx, usize, Format, &str) -> anyhow::Result<(Option<Duration>, R)>,
     {
         match mode {
@@ -315,7 +321,7 @@ impl SqlBenchmarkRunner {
                 };
 
                 for format in self.formats.clone() {
-                    let mut ctx = setup(format)?;
+                    let mut ctx = register(setup(format)?, format)?;
 
                     for (query_idx, query) in queries.iter() {
                         let query_idx = *query_idx;
@@ -336,7 +342,7 @@ impl SqlBenchmarkRunner {
             }
             BenchmarkMode::Explain => {
                 for format in self.formats.clone() {
-                    let mut ctx = setup(format)?;
+                    let mut ctx = register(setup(format)?, format)?;
 
                     for (query_idx, query) in queries.iter() {
                         let explain_query = format!("EXPLAIN {query}");
@@ -356,19 +362,22 @@ impl SqlBenchmarkRunner {
 
     /// Run (or explain) all queries for all formats asynchronously.
     ///
-    /// Same semantics as `run_all` but for async execute callbacks.
-    /// Use `Box::pin(async move { ... })` in the closure.
-    pub async fn run_all_async<Ctx, R, S, SFut, E>(
+    /// Same semantics as `run_all` — including the `setup` then `register` stages per format —
+    /// but for async callbacks. Use `Box::pin(async move { ... })` in the closures.
+    pub async fn run_all_async<Ctx, R, S, SFut, G, GFut, E>(
         &mut self,
         queries: &[(usize, String)],
         mode: BenchmarkMode,
         setup: S,
+        register: G,
         mut execute: E,
     ) -> anyhow::Result<()>
     where
         R: BenchmarkQueryResult,
         S: Fn(Format) -> SFut,
         SFut: Future<Output = anyhow::Result<Ctx>>,
+        G: Fn(Ctx, Format) -> GFut,
+        GFut: Future<Output = anyhow::Result<Ctx>>,
         E: for<'c> FnMut(
             usize,
             &'c Ctx,
@@ -387,7 +396,7 @@ impl SqlBenchmarkRunner {
                 };
 
                 for format in self.formats.clone() {
-                    let ctx = setup(format).await?;
+                    let ctx = register(setup(format).await?, format).await?;
 
                     for (query_idx, query) in queries.iter() {
                         let query_idx = *query_idx;
@@ -425,7 +434,7 @@ impl SqlBenchmarkRunner {
             }
             BenchmarkMode::Explain => {
                 for format in self.formats.clone() {
-                    let ctx = setup(format).await?;
+                    let ctx = register(setup(format).await?, format).await?;
 
                     for (query_idx, query) in queries.iter() {
                         let explain_query = format!("EXPLAIN {query}");

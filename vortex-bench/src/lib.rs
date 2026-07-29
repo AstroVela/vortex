@@ -50,6 +50,7 @@ pub mod fineweb;
 pub mod measurements;
 pub mod memory;
 pub mod output;
+pub mod pipeline;
 pub mod polarsignals;
 pub mod public_bi;
 pub mod random_access;
@@ -69,6 +70,12 @@ pub use benchmark::TableSpec;
 pub use datasets::BenchmarkDataset;
 pub use output::BenchmarkOutput;
 pub use output::create_output_writer;
+pub use pipeline::Registration;
+pub use pipeline::TableObject;
+pub use pipeline::TableRegistrar;
+pub use pipeline::TableSource;
+pub use pipeline::generate_data;
+pub use pipeline::register_tables;
 use vortex::VortexSessionDefault;
 pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
@@ -427,47 +434,4 @@ impl FromStr for Opt {
 
         Ok(opt)
     }
-}
-
-/// Generate SQL commands to create DuckDB tables/views from data files.
-///
-/// # Arguments
-/// * `benchmark` - The benchmark providing table specs and patterns
-/// * `base_dir` - Base directory path (without trailing slash)
-/// * `load_format` - The format to load from (determines file extension)
-/// * `object_type` - Either "TABLE" or "VIEW"
-pub fn generate_duckdb_registration_sql<B>(
-    benchmark: &B,
-    base_dir: &str,
-    load_format: Format,
-    object_type: &str,
-) -> Vec<String>
-where
-    B: Benchmark + ?Sized,
-{
-    let extension = load_format.ext();
-    let mut sql_statements = Vec::new();
-
-    for table_spec in benchmark.table_specs() {
-        let name = table_spec.name;
-        let pattern = benchmark
-            .pattern(name, load_format)
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| format!("*.{}", extension));
-
-        tracing::info!(
-            name,
-            base_dir,
-            pattern,
-            format = load_format.name(),
-            "Registering DuckDB {}",
-            object_type.to_lowercase()
-        );
-
-        sql_statements.push(format!(
-            "CREATE {object_type} IF NOT EXISTS {name} AS SELECT * FROM read_{extension}('{base_dir}/{pattern}');\n",
-        ));
-    }
-
-    sql_statements
 }

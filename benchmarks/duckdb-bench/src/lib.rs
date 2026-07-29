@@ -14,7 +14,10 @@ use vortex::error::VortexExpect;
 use vortex_bench::Benchmark;
 use vortex_bench::Format;
 use vortex_bench::IdempotentPath;
-use vortex_bench::generate_duckdb_registration_sql;
+use vortex_bench::Registration;
+use vortex_bench::TableObject;
+use vortex_bench::TableRegistrar;
+use vortex_bench::TableSource;
 use vortex_bench::runner::BenchmarkQueryResult;
 use vortex_duckdb::duckdb::Connection;
 use vortex_duckdb::duckdb::Database;
@@ -173,49 +176,15 @@ impl DuckClient {
         Ok((row_count, Some(query_time)))
     }
 
-    /// Register tables for benchmarks using the internal connection.
-    pub fn register_tables<B: Benchmark + ?Sized>(
+    /// Stage 2 of the benchmark pipeline: register `benchmark`'s tables (or views) for
+    /// `file_format` into this connection's catalog.
+    pub async fn register_tables(
         &self,
-        benchmark: &B,
+        benchmark: &dyn Benchmark,
         file_format: Format,
     ) -> Result<()> {
-        let object_type = match file_format {
-            Format::Parquet
-            | Format::OnDiskVortex
-            | Format::VortexCompact
-            | Format::VortexNative => "VIEW",
-            Format::OnDiskDuckDB => "TABLE",
-            Format::Lance => {
-                anyhow::bail!(
-                    "Lance format is not supported for DuckDB engine. \
-                    Please use lance-bench instead."
-                );
-            }
-            format => anyhow::bail!("Format {format} isn't supported for DuckDB"),
-        };
-
-        // DuckDB loads from parquet for OnDiskDuckDB format
-        let load_format = match file_format {
-            Format::Parquet | Format::OnDiskDuckDB => Format::Parquet,
-            f => f,
-        };
-
-        // Get the base URL for the format's data directory
-        let format_url = benchmark.format_path(load_format, benchmark.data_url())?;
-        let base_dir = format_url.as_str();
-        let base_dir = base_dir
-            .strip_prefix("file://")
-            .unwrap_or(base_dir)
-            .trim_end_matches('/');
-
-        let commands =
-            generate_duckdb_registration_sql(benchmark, base_dir, load_format, object_type);
-
-        for stmt in commands {
-            self.execute_query(&stmt)?;
-        }
-
-        Ok(())
+        let mut registrar = DuckDbRegistrar { client: self };
+        vortex_bench::register_tables(&mut registrar, benchmark, file_format).await
     }
 
     /// Execute a query and return a `DuckQueryResult` wrapper.
@@ -225,6 +194,41 @@ impl DuckClient {
         let result = self.connection().query(query)?;
         let query_time = time_instant.elapsed();
         Ok((Some(query_time), DuckQueryResult(result)))
+    }
+}
+
+/// Registers benchmark tables into a [`DuckClient`]'s catalog as SQL views (or, for the on-disk
+/// DuckDB format, tables loaded from Parquet).
+struct DuckDbRegistrar<'a> {
+    client: &'a DuckClient,
+}
+
+#[async_trait::async_trait(?Send)]
+impl TableRegistrar for DuckDbRegistrar<'_> {
+    fn registration(&self, format: Format) -> Result<Registration> {
+        match format {
+            // Views read the format's own files at query time.
+            Format::Parquet
+            | Format::OnDiskVortex
+            | Format::VortexCompact
+            | Format::VortexNative => Ok(Registration::views_of(format)),
+            // The on-disk database holds its own copy of the data, loaded from Parquet.
+            Format::OnDiskDuckDB => Ok(Registration {
+                object: TableObject::Table,
+                load_format: Format::Parquet,
+            }),
+            Format::Lance => anyhow::bail!(
+                "Lance format is not supported for DuckDB engine. \
+                Please use lance-bench instead."
+            ),
+            format => anyhow::bail!("Format {format} isn't supported for DuckDB"),
+        }
+    }
+
+    async fn register(&mut self, source: &TableSource) -> Result<()> {
+        self.client
+            .execute_query(&source.duckdb_registration_sql())?;
+        Ok(())
     }
 }
 

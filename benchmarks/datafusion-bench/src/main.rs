@@ -32,18 +32,19 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSource as _;
 use vortex::scan::DataSourceRef;
 use vortex_arrow::ToArrowType;
-use vortex_bench::Benchmark;
 use vortex_bench::BenchmarkArg;
-use vortex_bench::CompactionStrategy;
 use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Opt;
 use vortex_bench::Opts;
+use vortex_bench::Registration;
 use vortex_bench::SESSION;
-use vortex_bench::conversions::convert_parquet_directory_to_vortex;
+use vortex_bench::TableRegistrar;
+use vortex_bench::TableSource;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::generate_data;
 use vortex_bench::runner::BenchmarkMode;
 use vortex_bench::runner::BenchmarkQueryResult;
 use vortex_bench::runner::SqlBenchmarkRunner;
@@ -134,29 +135,8 @@ async fn main() -> anyhow::Result<()> {
         args.exclude_queries.as_ref(),
     );
 
-    // Generate Vortex files from Parquet for any Vortex formats requested
-    if benchmark.data_url().scheme() == "file" {
-        benchmark.generate_base_data().await?;
-
-        let base_path = benchmark
-            .data_url()
-            .to_file_path()
-            .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", benchmark.data_url()))?;
-
-        for format in args.formats.iter() {
-            match format {
-                Format::OnDiskVortex => {
-                    convert_parquet_directory_to_vortex(&base_path, CompactionStrategy::Default)
-                        .await?;
-                }
-                Format::VortexCompact => {
-                    convert_parquet_directory_to_vortex(&base_path, CompactionStrategy::Compact)
-                        .await?;
-                }
-                _ => {}
-            }
-        }
-    }
+    // Stage 1: generate the data. Idempotent, so this is a no-op when `data-gen` already ran.
+    generate_data(&*benchmark, args.formats.iter().copied()).await?;
 
     let benchmark_name = benchmark.dataset().to_string();
 
@@ -188,13 +168,22 @@ async fn main() -> anyhow::Result<()> {
         .run_all_async(
             &filtered_queries,
             mode,
+            // Stage 2a: build the session context.
             |format| {
                 let benchmark = &*benchmark;
                 async move {
                     let session = datafusion_bench::get_session_context();
                     datafusion_bench::make_object_store(&session, benchmark.data_url())?;
-                    register_benchmark_tables(&session, benchmark, format).await?;
                     Ok((session, format))
+                }
+            },
+            // Stage 2b: register the benchmark's tables into the session catalog.
+            |ctx: (SessionContext, Format), format| {
+                let benchmark = &*benchmark;
+                async move {
+                    let mut registrar = DataFusionRegistrar { session: &ctx.0 };
+                    vortex_bench::register_tables(&mut registrar, benchmark, format).await?;
+                    Ok(ctx)
                 }
             },
             |query_idx, (session, format), query| {
@@ -253,79 +242,81 @@ fn use_scan_api() -> bool {
     std::env::var("VORTEX_USE_SCAN_API").is_ok_and(|v| v == "1")
 }
 
-async fn register_benchmark_tables<B: Benchmark + ?Sized>(
-    session: &SessionContext,
-    benchmark: &B,
-    format: Format,
-) -> anyhow::Result<()> {
-    if use_scan_api() && matches!(format, Format::OnDiskVortex | Format::VortexCompact) {
-        register_v2_tables(session, benchmark, format).await
-    } else {
-        let benchmark_base = benchmark.data_url().join(&format!("{}/", format.name()))?;
-        let file_format = format_to_df_format(format);
+/// Registers benchmark tables into a DataFusion `SessionContext`, as `ListingTable`s over the
+/// format's files — or, when the scan API is enabled for a Vortex format, as `VortexTable`s.
+struct DataFusionRegistrar<'a> {
+    session: &'a SessionContext,
+}
 
-        for table in benchmark.table_specs().iter() {
-            let pattern = benchmark.pattern(table.name, format);
-            let table_ref = TableReference::bare(table.name);
-            let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern)?
-                .with_table_ref(table_ref.clone());
-
-            let listing_options = ListingOptions::new(Arc::clone(&file_format))
-                .with_session_config_options(session.state().config());
-            let mut config =
-                ListingTableConfig::new(table_url).with_listing_options(listing_options);
-
-            config = match table.schema.as_ref() {
-                Some(schema) => config.with_schema(Arc::new(schema.clone())),
-                None => config.infer_schema(&session.state()).await?,
-            };
-
-            let listing_table = Arc::new(
-                ListingTable::try_new(config)?.with_cache(
-                    session
-                        .runtime_env()
-                        .cache_manager
-                        .get_file_statistic_cache(),
-                ),
-            );
-
-            session.register_table(table_ref, listing_table)?;
+#[async_trait::async_trait(?Send)]
+impl TableRegistrar for DataFusionRegistrar<'_> {
+    fn registration(&self, format: Format) -> anyhow::Result<Registration> {
+        match format {
+            Format::OnDiskDuckDB | Format::Lance => {
+                anyhow::bail!("Format {format} isn't supported for DataFusion")
+            }
+            format => Ok(Registration::views_of(format)),
         }
+    }
 
-        Ok(())
+    async fn register(&mut self, source: &TableSource) -> anyhow::Result<()> {
+        if use_scan_api()
+            && matches!(
+                source.load_format,
+                Format::OnDiskVortex | Format::VortexCompact
+            )
+        {
+            self.register_vortex_table(source).await
+        } else {
+            self.register_listing_table(source).await
+        }
     }
 }
 
-/// Register tables using the V2 `VortexTable` + `MultiFileDataSource` path.
-async fn register_v2_tables<B: Benchmark + ?Sized>(
-    session: &SessionContext,
-    benchmark: &B,
-    format: Format,
-) -> anyhow::Result<()> {
-    let benchmark_base = benchmark.data_url().join(&format!("{}/", format.name()))?;
+impl DataFusionRegistrar<'_> {
+    async fn register_listing_table(&self, source: &TableSource) -> anyhow::Result<()> {
+        let file_format = format_to_df_format(source.load_format);
+        let table_ref = TableReference::bare(source.name);
+        let table_url = ListingTableUrl::try_new(source.base_url.clone(), source.pattern.clone())?
+            .with_table_ref(table_ref.clone());
 
-    for table in benchmark.table_specs().iter() {
-        let pattern = benchmark.pattern(table.name, format);
-        let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern.clone())?;
-        let store = session
+        let listing_options = ListingOptions::new(file_format)
+            .with_session_config_options(self.session.state().config());
+        let mut config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
+
+        config = match source.schema.as_ref() {
+            Some(schema) => config.with_schema(Arc::new(schema.clone())),
+            None => config.infer_schema(&self.session.state()).await?,
+        };
+
+        let listing_table = Arc::new(
+            ListingTable::try_new(config)?.with_cache(
+                self.session
+                    .runtime_env()
+                    .cache_manager
+                    .get_file_statistic_cache(),
+            ),
+        );
+
+        self.session.register_table(table_ref, listing_table)?;
+        Ok(())
+    }
+
+    /// Register a table using the V2 `VortexTable` + `MultiFileDataSource` path.
+    async fn register_vortex_table(&self, source: &TableSource) -> anyhow::Result<()> {
+        let table_url = ListingTableUrl::try_new(source.base_url.clone(), source.pattern.clone())?;
+        let store = self
+            .session
             .state()
             .runtime_env()
             .object_store(table_url.object_store())?;
 
-        let fs: FileSystemRef = Arc::new(ObjectStoreFileSystem::new(
-            Arc::clone(&store),
-            SESSION.handle(),
-        ));
-        let base_prefix = benchmark_base.path().trim_start_matches('/').to_string();
-        let fs = fs.with_prefix(base_prefix);
-
-        let glob_pattern = match &pattern {
-            Some(p) => p.as_str().to_string(),
-            None => format!("*.{}", format.ext()),
-        };
+        let fs: FileSystemRef = Arc::new(ObjectStoreFileSystem::new(store, SESSION.handle()));
+        let base_prefix = source.base_url.path().trim_start_matches('/').to_string();
+        let fs: FileSystemRef = fs.with_prefix(base_prefix);
 
         let multi_ds = MultiFileDataSource::new(SESSION.clone())
-            .with_glob(glob_pattern, Some(fs))
+            .with_glob(source.glob(), Some(fs))
             .build()
             .await?;
 
@@ -333,10 +324,9 @@ async fn register_v2_tables<B: Benchmark + ?Sized>(
         let data_source: DataSourceRef = Arc::new(multi_ds);
 
         let table_provider = Arc::new(VortexTable::new(data_source, SESSION.clone(), arrow_schema));
-        session.register_table(table.name, table_provider)?;
+        self.session.register_table(source.name, table_provider)?;
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Wrapper around DataFusion record batches implementing `BenchmarkQueryResult`.

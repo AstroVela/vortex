@@ -2060,6 +2060,7 @@ name = "datafusion-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "custom-labels",
  "datafusion",
@@ -2915,6 +2916,7 @@ name = "duckdb-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "similar 3.1.1",
  "tokio",
