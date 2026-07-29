@@ -196,18 +196,22 @@ impl VTable for Masked {
     }
 
     fn reduce(array: ArrayView<'_, Self>) -> VortexResult<Option<ArrayRef>> {
+        // No validity child represents AllValid.
         let Some(mask_child) = array.slots()[MaskedSlots::VALIDITY].as_ref() else {
+            return array.child().cast(array.dtype().clone()).map(Some);
+        };
+
+        let Some(constant) = mask_child.as_opt::<Constant>() else {
             return Ok(None);
         };
 
-        if mask_child
-            .as_opt::<Constant>()
-            .is_some_and(|constant| constant.scalar().as_bool().value() == Some(true))
-        {
-            return array.child().cast(array.dtype().as_nullable()).map(Some);
+        match constant.scalar().as_bool().value() {
+            Some(true) => array.child().cast(array.dtype().clone()).map(Some),
+            Some(false) => Ok(Some(
+                ConstantArray::new(Scalar::null(array.dtype().clone()), array.len()).into_array(),
+            )),
+            None => Ok(None),
         }
-
-        Ok(None)
     }
 
     fn reduce_parent(
@@ -235,10 +239,13 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
+    use crate::arrays::Constant;
+    use crate::arrays::ConstantArray;
     use crate::arrays::Masked;
     use crate::arrays::MaskedArray;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::Nullability;
+    use crate::optimizer::ArrayOptimizer;
     use crate::serde::SerializeOptions;
     use crate::serde::SerializedArray;
     use crate::validity::Validity;
@@ -323,6 +330,39 @@ mod tests {
             "MaskedArray execute should produce Nullable dtype"
         );
 
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::without_validity_child(Validity::AllValid)]
+    #[case::with_constant_true_child(Validity::Array(
+        ConstantArray::new(true, 3).into_array()
+    ))]
+    fn reduce_all_valid(#[case] validity: Validity) -> Result<(), VortexError> {
+        let child = PrimitiveArray::from_iter([1i32, 2, 3]).into_array();
+        let masked = MaskedArray::try_new(child, validity)?.into_array();
+
+        let optimized = masked.optimize()?;
+
+        assert!(!optimized.is::<Masked>());
+        assert_eq!(optimized.dtype().nullability(), Nullability::Nullable);
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_all_invalid_preserves_dtype() -> Result<(), VortexError> {
+        let child = PrimitiveArray::from_iter([1i32, 2, 3]).into_array();
+        let masked = MaskedArray::try_new(child, Validity::AllInvalid)?.into_array();
+        let dtype = masked.dtype().clone();
+
+        let optimized = masked.optimize()?;
+
+        assert_eq!(optimized.dtype(), &dtype);
+        assert!(
+            optimized
+                .as_opt::<Constant>()
+                .is_some_and(|constant| { constant.scalar().is_null() })
+        );
         Ok(())
     }
 }

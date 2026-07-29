@@ -117,17 +117,24 @@ impl ScalarFnVTable for Mask {
         let Some(constant) = mask.as_opt::<Constant>() else {
             return Ok(None);
         };
-        if constant.scalar().as_bool().value() != Some(true) {
-            return Ok(None);
-        }
 
-        let input = node.child(0);
-        let output_dtype = node.node_dtype()?;
-        if input.node_dtype()? == output_dtype {
-            return Ok(Some(input));
-        }
+        match constant.scalar().as_bool().value() {
+            Some(true) => {
+                let input = node.child(0);
+                let output_dtype = node.node_dtype()?;
+                if input.node_dtype()? == output_dtype {
+                    return Ok(Some(input));
+                }
 
-        ctx.new_node(Cast.bind(output_dtype), &[input]).map(Some)
+                ctx.new_node(Cast.bind(output_dtype), &[input]).map(Some)
+            }
+            Some(false) => {
+                let output_dtype = node.node_dtype()?;
+                ctx.new_node(Literal.bind(Scalar::null(output_dtype)), &[])
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     fn simplify(
@@ -233,6 +240,7 @@ mod tests {
     use crate::scalar::Scalar;
     use crate::scalar_fn::EmptyOptions;
     use crate::scalar_fn::fns::cast::Cast;
+    use crate::scalar_fn::fns::literal::Literal;
     use crate::scalar_fn::fns::mask::Mask;
 
     #[test]
@@ -293,6 +301,25 @@ mod tests {
             optimized.scalar_fn().id()
         );
         assert_eq!(optimized.dtype(), &DType::Primitive(PType::I32, Nullable));
+
+        Ok(())
+    }
+
+    #[test]
+    fn constant_false_mask_self_reduces_to_null_literal() -> VortexResult<()> {
+        let input = PrimitiveArray::from_iter([1i32, 2, 3]).into_array();
+        let mask = ConstantArray::new(false, input.len()).into_array();
+
+        let masked = Mask.try_new_array(input.len(), EmptyOptions, [input, mask])?;
+        let optimized = masked.optimize()?;
+        let optimized = optimized.as_::<ScalarFn>();
+        let scalar = optimized
+            .scalar_fn()
+            .as_opt::<Literal>()
+            .vortex_expect("expected null literal");
+
+        assert!(scalar.is_null());
+        assert_eq!(scalar.dtype(), &DType::Primitive(PType::I32, Nullable));
 
         Ok(())
     }
