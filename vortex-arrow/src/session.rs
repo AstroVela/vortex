@@ -27,6 +27,7 @@ use std::sync::Arc;
 use arrow_array::Array as _;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
 use arrow_array::make_array;
 use arrow_schema::DataType;
 use arrow_schema::Field;
@@ -39,10 +40,14 @@ use tracing::trace;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::Chunked;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::ListViewArray;
+use vortex_array::arrays::Struct;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::FieldNames;
@@ -475,6 +480,123 @@ impl ArrowSession {
         execute_arrow_naive(array, target.map(|field| field.data_type()), ctx)
     }
 
+    /// Execute a Vortex struct array into one or more Arrow [`RecordBatch`]es.
+    ///
+    /// Existing non-empty child chunks are preserved when the input is either a top-level
+    /// chunked struct or a struct whose fields have identical chunk boundaries. All other
+    /// encodings are converted as one batch. This method never creates row slices to discover
+    /// additional batches.
+    ///
+    /// `target` must be a struct field. Its child fields are retained during conversion so Arrow
+    /// extension metadata continues to participate in exporter dispatch.
+    pub fn execute_record_batches(
+        &self,
+        array: ArrayRef,
+        target: &Field,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Vec<RecordBatch>> {
+        vortex_ensure!(
+            matches!(target.data_type(), DataType::Struct(_)),
+            "Arrow RecordBatch target must be a struct field, got {}",
+            target.data_type()
+        );
+
+        if matches!(array.dtype(), DType::Struct(..))
+            && let Some(chunked) = array.as_opt::<Chunked>()
+        {
+            return chunked
+                .non_empty_chunks()
+                .map(|chunk| self.execute_record_batch(chunk.clone(), target, ctx))
+                .collect();
+        }
+
+        if let Some(struct_array) = array.as_opt::<Struct>()
+            && let Some(batches) = self.execute_aligned_struct_chunks(&struct_array, target, ctx)?
+        {
+            return Ok(batches);
+        }
+
+        Ok(vec![self.execute_record_batch(array, target, ctx)?])
+    }
+
+    fn execute_record_batch(
+        &self,
+        array: ArrayRef,
+        target: &Field,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<RecordBatch> {
+        let arrow = self.execute_arrow(array, Some(target), ctx)?;
+        let arrow = arrow.as_struct();
+        vortex_ensure!(
+            arrow.null_count() == 0,
+            "Cannot convert a struct containing null rows to an Arrow RecordBatch"
+        );
+        Ok(RecordBatch::from(arrow.clone()))
+    }
+
+    /// Returns `None` when the struct cannot be decomposed without slicing or executing a child.
+    fn execute_aligned_struct_chunks<T: StructArrayExt>(
+        &self,
+        array: &T,
+        target: &Field,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Vec<RecordBatch>>> {
+        let Some(chunked_fields) = array
+            .iter_unmasked_fields()
+            .map(|field| field.as_opt::<Chunked>())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(first_chunked) = chunked_fields.first() else {
+            return Ok(None);
+        };
+        let offsets = first_chunked.chunk_offset_values();
+
+        if !chunked_fields
+            .iter()
+            .all(|chunked| chunked.chunk_offset_values() == offsets)
+        {
+            return Ok(None);
+        }
+
+        let validity = array.struct_validity();
+        let validity_chunks = match &validity {
+            Validity::Array(validity_array) => {
+                let Some(chunked) = validity_array.as_opt::<Chunked>() else {
+                    return Ok(None);
+                };
+                if chunked.chunk_offset_values() != offsets {
+                    return Ok(None);
+                }
+                Some(chunked)
+            }
+            Validity::NonNullable | Validity::AllValid | Validity::AllInvalid => None,
+        };
+
+        let mut batches = Vec::with_capacity(first_chunked.nchunks());
+        for chunk_idx in 0..first_chunked.nchunks() {
+            let chunk_len = offsets[chunk_idx + 1] - offsets[chunk_idx];
+            if chunk_len == 0 {
+                continue;
+            }
+
+            let fields = chunked_fields
+                .iter()
+                .map(|field| field.chunk(chunk_idx).clone());
+            let chunk_validity = validity_chunks.as_ref().map_or_else(
+                || validity.clone(),
+                |chunks| Validity::Array(chunks.chunk(chunk_idx).clone()),
+            );
+            let chunk =
+                StructArray::try_new(array.names().clone(), fields, chunk_len, chunk_validity)?
+                    .into_array();
+            batches.push(self.execute_record_batch(chunk, target, ctx)?);
+        }
+
+        Ok(Some(batches))
+    }
+
     /// Decode an Arrow array into a Vortex array.
     ///
     /// Routes through the registered import plugin if `field` carries an Arrow extension
@@ -633,6 +755,9 @@ mod tests {
     use arrow_schema::extension::Uuid as ArrowUuid;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ChunkedArray;
+    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::FieldName;
     use vortex_array::dtype::Nullability;
@@ -763,6 +888,273 @@ mod tests {
         let schema = session.to_arrow_schema(&dtype)?;
         let roundtripped = session.from_arrow_schema(&schema)?;
         assert_eq!(roundtripped, dtype);
+        Ok(())
+    }
+
+    #[test]
+    fn execute_record_batches_non_chunked_struct_is_one_batch() -> VortexResult<()> {
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
+        let array = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [PrimitiveArray::from_iter([1i32, 2, 3]).into_array()],
+            3,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let target = session.to_arrow_field("", array.dtype())?;
+
+        let batches = session.execute_record_batches(array, &target, &mut ctx)?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[1, 2, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execute_record_batches_top_level_chunked_struct_preserves_children() -> VortexResult<()> {
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
+        let first = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [PrimitiveArray::from_iter([1i32, 2]).into_array()],
+            2,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let empty = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [PrimitiveArray::from_iter([] as [i32; 0]).into_array()],
+            0,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let last = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [PrimitiveArray::from_iter([3i32]).into_array()],
+            1,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let dtype = first.dtype().clone();
+        let array = ChunkedArray::try_new([first, empty, last], dtype)?.into_array();
+        let target = session.to_arrow_field("", array.dtype())?;
+
+        let batches = session.execute_record_batches(array, &target, &mut ctx)?;
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[1, 2]
+        );
+        assert_eq!(
+            batches[1]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execute_record_batches_aligned_struct_fields_preserve_chunks() -> VortexResult<()> {
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
+        let a_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let a = ChunkedArray::try_new(
+            [
+                PrimitiveArray::from_iter([1i32, 2]).into_array(),
+                PrimitiveArray::from_iter([3i32]).into_array(),
+            ],
+            a_dtype,
+        )?
+        .into_array();
+        let b_dtype = DType::Bool(Nullability::NonNullable);
+        let b = ChunkedArray::try_new(
+            [
+                BoolArray::from_iter([true, false]).into_array(),
+                BoolArray::from_iter([true]).into_array(),
+            ],
+            b_dtype,
+        )?
+        .into_array();
+        let validity = ChunkedArray::try_new(
+            [
+                BoolArray::from_iter([true, true]).into_array(),
+                BoolArray::from_iter([true]).into_array(),
+            ],
+            DType::Bool(Nullability::NonNullable),
+        )?
+        .into_array();
+        let array = StructArray::try_new(
+            FieldNames::from(["a", "b"]),
+            [a, b],
+            3,
+            Validity::Array(validity),
+        )?
+        .into_array();
+        let target = session.to_arrow_field("", array.dtype())?;
+
+        let batches = session.execute_record_batches(array, &target, &mut ctx)?;
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(batches[0].column(0).null_count(), 0);
+        assert_eq!(batches[1].column(0).null_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn execute_record_batches_unsafe_struct_shapes_fall_back() -> VortexResult<()> {
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let aligned = ChunkedArray::try_new(
+            [
+                PrimitiveArray::from_iter([1i32]).into_array(),
+                PrimitiveArray::from_iter([2i32, 3]).into_array(),
+            ],
+            dtype,
+        )?
+        .into_array();
+        let mismatched = ChunkedArray::try_new(
+            [
+                PrimitiveArray::from_iter([4i32, 5]).into_array(),
+                PrimitiveArray::from_iter([6i32]).into_array(),
+            ],
+            dtype.clone(),
+        )?
+        .into_array();
+        let mismatched_struct = StructArray::try_new(
+            FieldNames::from(["a", "b"]),
+            [aligned.clone(), mismatched],
+            3,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let target = session.to_arrow_field("", mismatched_struct.dtype())?;
+        let batches = session.execute_record_batches(mismatched_struct, &target, &mut ctx)?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+
+        let mixed_struct = StructArray::try_new(
+            FieldNames::from(["a", "b"]),
+            [
+                aligned,
+                PrimitiveArray::from_iter([4i32, 5, 6]).into_array(),
+            ],
+            3,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let target = session.to_arrow_field("", mixed_struct.dtype())?;
+        let batches = session.execute_record_batches(mixed_struct, &target, &mut ctx)?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn execute_record_batches_preserves_nested_extension_metadata() -> VortexResult<()> {
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
+        let mut uuid_field = Field::new("id", DataType::FixedSizeBinary(16), false);
+        uuid_field.try_with_extension_type(ArrowUuid)?;
+        let arrow_array: ArrowArrayRef = Arc::new(FixedSizeBinaryArray::try_from_iter(
+            [
+                *b"0123456789abcdef",
+                *b"fedcba9876543210",
+                *b"0011223344556677",
+            ]
+            .into_iter(),
+        )?);
+        let uuid = session.from_arrow_array(arrow_array, &uuid_field)?;
+        let uuid_dtype = uuid.dtype().clone();
+        let uuid_chunks =
+            ChunkedArray::try_new([uuid.slice(0..2)?, uuid.slice(2..3)?], uuid_dtype)?.into_array();
+        let array = StructArray::try_new(
+            FieldNames::from(["id"]),
+            [uuid_chunks],
+            3,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let target = session.to_arrow_field("", array.dtype())?;
+
+        let batches = session.execute_record_batches(array, &target, &mut ctx)?;
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(has_valid_extension_type::<ArrowUuid>(
+            batches[0].schema().field(0)
+        ));
+        assert_eq!(
+            batches[1].column(0).as_fixed_size_binary().value(0),
+            b"0011223344556677"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execute_record_batches_rejects_non_struct_targets_and_null_rows() -> VortexResult<()> {
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
+        let array = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [PrimitiveArray::from_iter([1i32, 2]).into_array()],
+            2,
+            Validity::AllInvalid,
+        )?
+        .into_array();
+
+        let err = session
+            .execute_record_batches(
+                array.clone(),
+                &Field::new("", DataType::Int32, false),
+                &mut ctx,
+            )
+            .expect_err("non-struct target must fail");
+        assert!(err.to_string().contains("must be a struct field"));
+
+        let target = session.to_arrow_field("", array.dtype())?;
+        let err = session
+            .execute_record_batches(array, &target, &mut ctx)
+            .expect_err("RecordBatch cannot represent top-level null rows");
+        assert!(err.to_string().contains("containing null rows"));
         Ok(())
     }
 

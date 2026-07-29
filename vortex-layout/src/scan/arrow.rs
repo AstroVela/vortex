@@ -5,14 +5,13 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
-use arrow_array::cast::AsArray;
 use arrow_schema::ArrowError;
 use arrow_schema::Field;
 use arrow_schema::SchemaRef;
 use futures::Stream;
 use futures::TryStreamExt;
+use itertools::Either;
 use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
 use vortex_array::VortexSessionExecute;
 use vortex_arrow::ArrowSessionExt;
 use vortex_error::VortexResult;
@@ -37,10 +36,18 @@ impl ScanBuilder<ArrayRef> {
         let iter = self
             .map(move |chunk| {
                 let mut ctx = session.create_execution_ctx();
-                to_record_batch(chunk, &struct_field, &mut ctx)
+                let arrow_session = ctx.session().clone();
+                arrow_session
+                    .arrow()
+                    .execute_record_batches(chunk, &struct_field, &mut ctx)
             })
             .into_iter(runtime)?
-            .map(|result| result.map_err(|e| ArrowError::ExternalError(Box::new(e))));
+            .flat_map(|result| match result {
+                Ok(batches) => Either::Left(batches.into_iter().map(Ok)),
+                Err(error) => Either::Right(std::iter::once(Err(ArrowError::ExternalError(
+                    Box::new(error),
+                )))),
+            });
 
         Ok(RecordBatchIteratorAdapter { iter, schema })
     }
@@ -55,23 +62,18 @@ impl ScanBuilder<ArrayRef> {
         let stream = self
             .map(move |chunk| {
                 let mut ctx = session.create_execution_ctx();
-                to_record_batch(chunk, &struct_field, &mut ctx)
+                let arrow_session = ctx.session().clone();
+                arrow_session
+                    .arrow()
+                    .execute_record_batches(chunk, &struct_field, &mut ctx)
             })
             .into_stream()?
-            .map_err(|e| ArrowError::ExternalError(Box::new(e)));
+            .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok::<_, ArrowError>)))
+            .try_flatten();
 
         Ok(stream)
     }
-}
-
-fn to_record_batch(
-    chunk: ArrayRef,
-    data_type: &Field,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<RecordBatch> {
-    let session = ctx.session().clone();
-    let arrow = session.arrow().execute_arrow(chunk, Some(data_type), ctx)?;
-    Ok(RecordBatch::from(arrow.as_struct().clone()))
 }
 
 /// We create an adapter for record batch iterators that supports clone.
@@ -113,6 +115,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::sync::Arc;
 
     use arrow_array::Array;
@@ -127,12 +130,25 @@ mod tests {
     use arrow_schema::Field;
     use arrow_schema::Schema;
     use vortex_array::ArrayRef;
+    use vortex_array::IntoArray;
+    use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::ChunkedArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::FieldMask;
     use vortex_arrow::FromArrowArray;
     use vortex_error::VortexResult;
+    use vortex_io::runtime::BlockingRuntime;
+    use vortex_io::runtime::single::SingleThreadRuntime;
+    use vortex_mask::Mask;
 
     use super::*;
+    use crate::ArrayFuture;
+    use crate::LayoutReader;
+    use crate::RowSplits;
+    use crate::SplitRange;
     use crate::scan::test::SCAN_SESSION;
+    use crate::scan::test::session_with_handle;
 
     fn create_test_struct_array() -> VortexResult<ArrayRef> {
         // Create Arrow arrays
@@ -165,6 +181,79 @@ mod tests {
         ]))
     }
 
+    #[derive(Debug)]
+    struct ChunkedStructReader {
+        name: Arc<str>,
+        array: ArrayRef,
+    }
+
+    impl LayoutReader for ChunkedStructReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn dtype(&self) -> &DType {
+            self.array.dtype()
+        }
+
+        fn row_count(&self) -> u64 {
+            self.array.len() as u64
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            splits.push(split_range.root_row_range().end);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &vortex_array::expr::Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &vortex_array::expr::Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            Ok(mask)
+        }
+
+        fn projection_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &vortex_array::expr::Expression,
+            _mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            let array = self.array.clone();
+            Ok(Box::pin(async move { Ok(array) }))
+        }
+    }
+
+    fn create_chunked_struct_reader() -> VortexResult<Arc<dyn LayoutReader>> {
+        let array = create_test_struct_array()?;
+        let dtype = array.dtype().clone();
+        let array =
+            ChunkedArray::try_new([array.slice(0..2)?, array.slice(2..4)?], dtype)?.into_array();
+        Ok(Arc::new(ChunkedStructReader {
+            name: Arc::from("chunked-struct"),
+            array,
+        }))
+    }
+
     #[test]
     fn test_record_batch_conversion() -> VortexResult<()> {
         let vortex_array = create_test_struct_array()?;
@@ -172,7 +261,12 @@ mod tests {
         let struct_field = Field::new_struct("", schema.fields().clone(), false);
         let mut ctx = SCAN_SESSION.create_execution_ctx();
 
-        let batch = to_record_batch(vortex_array, &struct_field, &mut ctx)?;
+        let batches =
+            SCAN_SESSION
+                .arrow()
+                .execute_record_batches(vortex_array, &struct_field, &mut ctx)?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 4);
 
@@ -192,6 +286,39 @@ mod tests {
         assert_eq!(name_col.value(2), "Charlie");
         assert!(name_col.is_null(3));
 
+        Ok(())
+    }
+
+    #[test]
+    fn scan_record_batch_adapters_flatten_natural_chunks() -> VortexResult<()> {
+        let schema = create_arrow_schema();
+
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+        let reader = ScanBuilder::new(session, create_chunked_struct_reader()?)
+            .into_record_batch_reader(Arc::clone(&schema), &runtime)?;
+        let batches = reader.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
+
+        let session = session_with_handle(runtime.handle());
+        let stream = ScanBuilder::new(session, create_chunked_struct_reader()?)
+            .into_record_batch_stream(schema)?;
+        let batches = runtime
+            .block_on_stream(stream)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
         Ok(())
     }
 

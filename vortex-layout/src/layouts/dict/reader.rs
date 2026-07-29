@@ -19,6 +19,7 @@ use vortex_array::arrays::SharedArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::Nullability;
+use vortex_array::expr::ExactExpr;
 use vortex_array::expr::Expression;
 use vortex_array::expr::direct_annotations;
 use vortex_array::expr::is_root;
@@ -28,6 +29,7 @@ use vortex_array::expr::root;
 use vortex_array::expr::transform::partition_annotations;
 use vortex_array::optimizer::ArrayOptimizer;
 use vortex_array::scalar_fn::is_negative_cost;
+use vortex_error::SharedVortexResult;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -36,6 +38,7 @@ use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
 use super::DictLayout;
+use crate::ExpressionPurpose;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
@@ -54,6 +57,9 @@ pub struct DictReader {
     values_array: OnceLock<SharedArrayFuture>,
     /// Cache of expression evaluation results on the values array by expression
     values_evals: DashMap<Expression, SharedArrayFuture>,
+    /// Cache of projection pushdown splits by exact expression allocation.
+    pushdown_cache:
+        DashMap<ExactExpr, Arc<OnceLock<SharedVortexResult<(Expression, Option<Expression>)>>>>,
 
     values: LayoutReaderRef,
     codes: LayoutReaderRef,
@@ -94,6 +100,7 @@ impl DictReader {
             values_len,
             values_array: Default::default(),
             values_evals: Default::default(),
+            pushdown_cache: Default::default(),
             values,
             codes,
         })
@@ -163,6 +170,28 @@ impl DictReader {
             })
             .clone()
     }
+
+    fn projection_pushdown(
+        &self,
+        expr: &Expression,
+    ) -> VortexResult<(Expression, Option<Expression>)> {
+        let key = ExactExpr(expr.clone());
+        let cell = match self.pushdown_cache.get(&key) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.pushdown_cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .value(),
+            ),
+        };
+
+        cell.get_or_init(|| {
+            split_expression_for_pushdown(expr.clone(), self.dtype()).map_err(Arc::new)
+        })
+        .clone()
+        .map_err(VortexError::from)
+    }
 }
 
 // On expression pushdown, "inner" is packed as field with this name.
@@ -225,6 +254,26 @@ impl LayoutReader for DictReader {
         self.codes.register_splits(field_mask, split_range, splits)
     }
 
+    fn prepare_expression(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        if purpose == ExpressionPurpose::Projection {
+            self.projection_pushdown(expr)?;
+        }
+
+        let root = root();
+        self.codes
+            .prepare_expression(row_range, &root, ExpressionPurpose::Projection)?;
+        self.values.prepare_expression(
+            &(0..self.values_len as u64),
+            &root,
+            ExpressionPurpose::Projection,
+        )
+    }
+
     fn pruning_evaluation(
         &self,
         _row_range: &Range<u64>,
@@ -282,7 +331,7 @@ impl LayoutReader for DictReader {
             .projection_evaluation(row_range, &root(), mask)
             .map_err(|err| err.with_context("While evaluating projection on codes"))?;
 
-        let (expr_outer, expr_inner) = split_expression_for_pushdown(expr.clone(), self.dtype())?;
+        let (expr_outer, expr_inner) = self.projection_pushdown(expr)?;
 
         let values_eval = if let Some(inner) = expr_inner {
             // "outer" takes a struct field with PUSHDOWN_ANNOTATION name, so

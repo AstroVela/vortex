@@ -78,8 +78,6 @@ use datafusion_common::ColumnStatistics;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
-use datafusion_common::arrow::array::AsArray;
-use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_datasource::source::DataSource;
 use datafusion_execution::SendableRecordBatchStream;
@@ -435,17 +433,20 @@ impl DataSource for VortexDataSource {
                     handle.spawn_cpu(move || {
                         let mut ctx = session.create_execution_ctx();
                         result.and_then(|chunk| {
-                            let arrow = session.arrow().execute_arrow(
+                            session.arrow().execute_record_batches(
                                 chunk,
-                                Some(target_field.as_ref()),
+                                target_field.as_ref(),
                                 &mut ctx,
-                            )?;
-                            Ok(RecordBatch::from(arrow.as_struct().clone()))
+                            )
                         })
                     })
                 })
                 .buffered(num_partitions)
-                .map(|result| result.map_err(|e| DataFusionError::External(Box::new(e))));
+                .map(|result| result.map_err(|e| DataFusionError::External(Box::new(e))))
+                .map_ok(|batches| {
+                    futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>))
+                })
+                .try_flatten();
 
             // Apply leftover projection (expressions that couldn't be pushed into Vortex).
             let stream = if let Some(projector) = leftover_projector {
@@ -663,5 +664,168 @@ fn estimate_to_df_precision(est: &Precision<u64>) -> DFPrecision<usize> {
         Precision::Exact(v) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Precision::Inexact(v) => DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Precision::Absent => DFPrecision::Absent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+
+    use async_trait::async_trait;
+    use datafusion_common::arrow::array::AsArray;
+    use datafusion_execution::TaskContext;
+    use futures::stream;
+    use vortex::VortexSessionDefault;
+    use vortex::array::ArrayRef;
+    use vortex::array::IntoArray;
+    use vortex::array::arrays::ChunkedArray;
+    use vortex::array::arrays::StructArray;
+    use vortex::array::dtype::FieldNames;
+    use vortex::array::stats::StatsSet;
+    use vortex::array::stream::ArrayStreamAdapter;
+    use vortex::array::stream::ArrayStreamExt;
+    use vortex::array::validity::Validity;
+    use vortex::buffer::buffer;
+    use vortex::error::VortexResult;
+    use vortex::expr::stats::Precision;
+    use vortex::scan::DataSourceScan;
+    use vortex::scan::DataSourceScanRef;
+    use vortex::scan::Partition;
+    use vortex::scan::PartitionRef;
+    use vortex::scan::PartitionStream;
+    use vortex::scan::ScanRequest;
+
+    use super::*;
+
+    struct MockDataSource {
+        dtype: DType,
+        array: ArrayRef,
+    }
+
+    #[async_trait]
+    impl vortex::scan::DataSource for MockDataSource {
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        async fn scan(&self, _scan_request: ScanRequest) -> VortexResult<DataSourceScanRef> {
+            Ok(Box::new(MockScan {
+                dtype: self.dtype.clone(),
+                array: Some(self.array.clone()),
+            }))
+        }
+
+        async fn field_statistics(&self, _field_path: &FieldPath) -> VortexResult<StatsSet> {
+            Ok(StatsSet::default())
+        }
+    }
+
+    struct MockScan {
+        dtype: DType,
+        array: Option<ArrayRef>,
+    }
+
+    impl DataSourceScan for MockScan {
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn partition_count(&self) -> Precision<usize> {
+            Precision::exact(1_usize)
+        }
+
+        fn partitions(mut self: Box<Self>) -> PartitionStream {
+            let partition = Box::new(MockPartition {
+                dtype: self.dtype.clone(),
+                array: self.array.take().expect("one mock partition"),
+            }) as PartitionRef;
+            stream::iter([Ok(partition)]).boxed()
+        }
+    }
+
+    struct MockPartition {
+        dtype: DType,
+        array: ArrayRef,
+    }
+
+    impl Partition for MockPartition {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn index(&self) -> usize {
+            0
+        }
+
+        fn row_count(&self) -> Precision<u64> {
+            Precision::exact(self.array.len() as u64)
+        }
+
+        fn byte_size(&self) -> Precision<u64> {
+            Precision::Absent
+        }
+
+        fn execute(self: Box<Self>) -> VortexResult<vortex::array::stream::SendableArrayStream> {
+            Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+                self.dtype,
+                stream::iter([Ok(self.array)]),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn open_flattens_record_batches_from_one_conversion_task() -> anyhow::Result<()> {
+        let first = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [buffer![1i32, 2].into_array()],
+            2,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let second = StructArray::try_new(
+            FieldNames::from(["a"]),
+            [buffer![3i32].into_array()],
+            1,
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let dtype = first.dtype().clone();
+        let array = ChunkedArray::try_new([first, second], dtype.clone())?.into_array();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        let data_source = Arc::new(MockDataSource { dtype, array }) as DataSourceRef;
+        let source = VortexDataSource::builder(data_source, VortexSession::default())
+            .with_arrow_schema(schema)
+            .build()
+            .await?;
+
+        let stream = source.open(0, Arc::new(TaskContext::default()))?;
+        let batches = stream.try_collect::<Vec<_>>().await?;
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[1, 2]
+        );
+        assert_eq!(
+            batches[1]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[3]
+        );
+        Ok(())
     }
 }

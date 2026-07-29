@@ -19,6 +19,7 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
+use crate::ExpressionPurpose;
 use crate::Layout;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
@@ -133,6 +134,19 @@ impl LayoutReader for ZonedReader {
             .register_splits(field_mask, split_range, splits)
     }
 
+    fn prepare_expression(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        if purpose == ExpressionPurpose::Predicate {
+            self.pruning.prepare_predicate(expr);
+        }
+        self.data_child()?
+            .prepare_expression(row_range, expr, purpose)
+    }
+
     fn pruning_evaluation(
         &self,
         row_range: &Range<u64>,
@@ -232,6 +246,8 @@ impl LayoutReader for ZonedReader {
 mod test {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use rstest::fixture;
     use rstest::rstest;
@@ -259,6 +275,7 @@ mod test {
     use vortex_session::VortexSession;
     use vortex_session::registry::ReadContext;
 
+    use crate::ExpressionPurpose;
     use crate::LayoutBuildContext;
     use crate::LayoutRef;
     use crate::LayoutStrategy;
@@ -272,6 +289,7 @@ mod test {
     use crate::layouts::zoned::Zoned;
     use crate::layouts::zoned::writer::ZonedLayoutOptions;
     use crate::layouts::zoned::writer::ZonedStrategy;
+    use crate::segments::SegmentFuture;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
@@ -316,6 +334,51 @@ mod test {
         })
         .unwrap();
         (segments, layout)
+    }
+
+    struct CountingSegmentSource {
+        inner: Arc<dyn SegmentSource>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    impl SegmentSource for CountingSegmentSource {
+        fn request(&self, id: crate::segments::SegmentId) -> SegmentFuture {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            self.inner.request(id)
+        }
+    }
+
+    #[rstest]
+    fn prepare_predicate_does_not_construct_zone_map_io(
+        #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        block_on(|handle| async {
+            let session = session_with_handle(handle);
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingSegmentSource {
+                inner: segments,
+                request_count: Arc::clone(&request_count),
+            });
+            let reader = layout
+                .new_reader("".into(), source, &session, &Default::default())
+                .unwrap();
+            let row_count = layout.row_count();
+            let expr = gt(root(), lit(7));
+
+            reader
+                .prepare_expression(&(0..row_count), &expr, ExpressionPurpose::Predicate)
+                .unwrap();
+            assert_eq!(request_count.load(Ordering::Relaxed), 0);
+
+            let _future = reader
+                .pruning_evaluation(
+                    &(0..row_count),
+                    &expr,
+                    Mask::new_true(row_count.try_into().unwrap()),
+                )
+                .unwrap();
+            assert!(request_count.load(Ordering::Relaxed) > 0);
+        })
     }
 
     #[rstest]

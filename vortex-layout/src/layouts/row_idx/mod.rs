@@ -9,6 +9,10 @@ use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 use Nullability::NonNullable;
 pub use expr::*;
@@ -32,6 +36,8 @@ use vortex_array::expr::transform::PartitionedExpr;
 use vortex_array::expr::transform::partition;
 use vortex_array::expr::transform::replace;
 use vortex_array::scalar::PValue;
+use vortex_error::SharedVortexResult;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
@@ -41,6 +47,7 @@ use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::ArrayFuture;
+use crate::ExpressionPurpose;
 use crate::LayoutReader;
 use crate::RowSplits;
 use crate::SplitRange;
@@ -50,8 +57,10 @@ pub struct RowIdxLayoutReader {
     name: Arc<str>,
     row_offset: u64,
     child: Arc<dyn LayoutReader>,
-    partition_cache: DashMap<ExactExpr, Arc<OnceLock<Partitioning>>>,
+    partition_cache: DashMap<ExactExpr, Arc<OnceLock<SharedVortexResult<Partitioning>>>>,
     session: VortexSession,
+    #[cfg(test)]
+    partition_compute_count: AtomicUsize,
 }
 
 impl RowIdxLayoutReader {
@@ -62,30 +71,32 @@ impl RowIdxLayoutReader {
             child,
             partition_cache: DashMap::with_hasher(Default::default()),
             session,
+            #[cfg(test)]
+            partition_compute_count: AtomicUsize::new(0),
         }
     }
 
     fn partition_expr(&self, expr: &Expression) -> VortexResult<Partitioning> {
         let key = ExactExpr(expr.clone());
+        let cell = match self.partition_cache.get(&key) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.partition_cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .value(),
+            ),
+        };
 
-        // Check cache first with read-only lock.
-        if let Some(entry) = self.partition_cache.get(&key)
-            && let Some(partitioning) = entry.value().get()
-        {
-            return Ok(partitioning.clone());
-        }
-
-        let result = self.compute_partitioning(expr)?;
-
-        self.partition_cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceLock::new()))
-            .get_or_init(|| result.clone());
-
-        Ok(result)
+        cell.get_or_init(|| self.compute_partitioning(expr).map_err(Arc::new))
+            .clone()
+            .map_err(VortexError::from)
     }
 
     fn compute_partitioning(&self, expr: &Expression) -> VortexResult<Partitioning> {
+        #[cfg(test)]
+        self.partition_compute_count.fetch_add(1, Ordering::Relaxed);
+
         // Partition the expression into row idx and child expressions.
         let mut partitioned = partition(expr.clone(), self.dtype(), |expr| {
             if expr.is::<RowIdx>() {
@@ -175,6 +186,41 @@ impl LayoutReader for RowIdxLayoutReader {
         splits: &mut RowSplits,
     ) -> VortexResult<()> {
         self.child.register_splits(field_mask, split_range, splits)
+    }
+
+    fn prepare_expression(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        match &self.partition_expr(expr)? {
+            Partitioning::RowIdx(_) => Ok(()),
+            Partitioning::Child(expr) => self.child.prepare_expression(row_range, expr, purpose),
+            Partitioning::Partitioned(partitioned) => {
+                for ((annotation, expr), dtype) in partitioned
+                    .partition_annotations
+                    .iter()
+                    .zip(partitioned.partitions.iter())
+                    .zip(partitioned.partition_dtypes.iter())
+                {
+                    if annotation == &Partition::Child {
+                        let child_purpose = match purpose {
+                            ExpressionPurpose::Projection => ExpressionPurpose::Projection,
+                            ExpressionPurpose::Predicate
+                                if matches!(dtype, DType::Bool(NonNullable)) =>
+                            {
+                                ExpressionPurpose::Predicate
+                            }
+                            ExpressionPurpose::Predicate => ExpressionPurpose::Projection,
+                        };
+                        self.child
+                            .prepare_expression(row_range, expr, child_purpose)?;
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     fn pruning_evaluation(
@@ -323,6 +369,7 @@ fn row_idx_array_future(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray as _;
@@ -339,6 +386,7 @@ mod tests {
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
 
+    use crate::ExpressionPurpose;
     use crate::LayoutReader;
     use crate::LayoutStrategy;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
@@ -485,6 +533,53 @@ mod tests {
                 BoolArray::from_iter([true, false, true, false, true]),
                 &mut ctx
             );
+        })
+    }
+
+    #[test]
+    fn concurrent_first_access_partitions_once() {
+        block_on(|handle| async {
+            let session = new_session().with_handle(handle);
+            let array_ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
+            let (ptr, eof) = SequenceId::root().split();
+            let array = buffer![1..=5].into_array();
+            let layout = FlatLayoutStrategy::default()
+                .write_stream(
+                    array_ctx,
+                    Arc::<TestSegments>::clone(&segments),
+                    array.to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await
+                .unwrap();
+            let reader = Arc::new(RowIdxLayoutReader::new(
+                0,
+                layout
+                    .new_reader("".into(), segments, &session, &Default::default())
+                    .unwrap(),
+                session,
+            ));
+            let expr = Arc::new(or(eq(root(), lit(3i32)), gt(row_idx(), lit(3u64))));
+
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let reader = Arc::clone(&reader);
+                    let expr = Arc::clone(&expr);
+                    scope.spawn(move || {
+                        reader
+                            .prepare_expression(
+                                &(0..5),
+                                expr.as_ref(),
+                                ExpressionPurpose::Predicate,
+                            )
+                            .unwrap();
+                    });
+                }
+            });
+
+            assert_eq!(reader.partition_compute_count.load(Ordering::Relaxed), 1);
         })
     }
 }

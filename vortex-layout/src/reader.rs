@@ -27,6 +27,18 @@ use crate::segments::SegmentSource;
 /// Shared handle to a stateful layout reader.
 pub type LayoutReaderRef = Arc<dyn LayoutReader>;
 
+/// How a prepared expression will be evaluated by a [`LayoutReader`].
+///
+/// Readers use this distinction to prepare only the derived child expressions needed by
+/// predicate or projection execution. Preparation must not request segments or start data I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpressionPurpose {
+    /// The expression refines a row mask through pruning and filtering.
+    Predicate,
+    /// The expression produces the scan's output array.
+    Projection,
+}
+
 /// A row range used when registering natural scan splits.
 ///
 /// Row range is relative to the reader that receives it. Offset is the offset
@@ -152,6 +164,21 @@ pub trait LayoutReader: 'static + Send + Sync {
         split_range: &SplitRange,
         splits: &mut RowSplits,
     ) -> VortexResult<()>;
+
+    /// Prepare split-invariant expression transformations for the selected row span.
+    ///
+    /// The default implementation is a non-I/O no-op so external readers retain their existing
+    /// lazy behavior. Built-in readers override this to populate expression caches and recursively
+    /// prepare derived child expressions. Direct callers may omit preparation; evaluation methods
+    /// must still initialize the same caches lazily on a miss.
+    fn prepare_expression(
+        &self,
+        _row_range: &Range<u64>,
+        _expr: &Expression,
+        _purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        Ok(())
+    }
 
     /// Returns a mask where all false values are proven to be false in the given expression.
     ///

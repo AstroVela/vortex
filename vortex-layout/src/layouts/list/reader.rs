@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -19,16 +20,21 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::expr::ExactExpr;
 use vortex_array::expr::Expression;
 use vortex_array::expr::root;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
+use vortex_error::SharedVortexResult;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
+use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::ArrayFuture;
+use crate::ExpressionPurpose;
 use crate::LayoutReader;
 use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
@@ -59,6 +65,14 @@ pub struct ListReader {
     elements: LayoutReaderRef,
     offsets: LayoutReaderRef,
     validity: Option<LayoutReaderRef>,
+    expression_plans:
+        Arc<DashMap<ExactExpr, Arc<OnceLock<SharedVortexResult<ListExpressionPlan>>>>>,
+}
+
+#[derive(Clone)]
+struct ListExpressionPlan {
+    children: ListChildrenNeeded,
+    rewritten: Option<Expression>,
 }
 
 impl ListReader {
@@ -100,7 +114,37 @@ impl ListReader {
             elements,
             offsets,
             validity,
+            expression_plans: Default::default(),
         })
+    }
+
+    fn expression_plan(&self, expr: &Expression) -> VortexResult<ListExpressionPlan> {
+        let key = ExactExpr(expr.clone());
+        let cell = match self.expression_plans.get(&key) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => Arc::clone(
+                self.expression_plans
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .value(),
+            ),
+        };
+
+        cell.get_or_init(|| {
+            let children = get_necessary_list_children(expr);
+            let rewritten = match children {
+                ListChildrenNeeded::Validity => Some(rewrite_validity_expr(expr)?),
+                ListChildrenNeeded::OffsetsAndValidity => Some(rewrite_offsets_expr(expr)?),
+                ListChildrenNeeded::All => None,
+            };
+            Ok(ListExpressionPlan {
+                children,
+                rewritten,
+            })
+            .map_err(Arc::new)
+        })
+        .clone()
+        .map_err(VortexError::from)
     }
 
     /// Projection for [`ListChildrenNeeded::Validity`] expressions. Reads only the validity child,
@@ -108,14 +152,12 @@ impl ListReader {
     fn project_validity(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        rewritten: Expression,
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
         let validity_reader = self.validity.clone();
         let nullability = self.layout.dtype().nullability();
         let row_range = row_range.clone();
-        // Evaluate the rewritten expression against the validity bool array (true == valid row).
-        let rewritten = rewrite_validity_expr(expr)?;
 
         Ok(async move {
             let mask = mask.await?;
@@ -255,13 +297,12 @@ impl ListReader {
     fn project_offsets_validity(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        rewritten: Expression,
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
         let offsets = self.fetch_raw_offsets(row_range)?;
         let reader = self.clone();
         let row_range = row_range.clone();
-        let rewritten = rewrite_offsets_expr(expr)?;
 
         Ok(async move {
             let mask = mask.await?;
@@ -403,6 +444,41 @@ impl LayoutReader for ListReader {
         Ok(())
     }
 
+    fn prepare_expression(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        _purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        let plan = self.expression_plan(expr)?;
+        let root = root();
+
+        if let Some(validity) = self.validity.as_ref() {
+            validity.prepare_expression(row_range, &root, ExpressionPurpose::Projection)?;
+        }
+
+        match plan.children {
+            ListChildrenNeeded::Validity => Ok(()),
+            ListChildrenNeeded::OffsetsAndValidity => self.offsets.prepare_expression(
+                &(row_range.start..row_range.end + 1),
+                &root,
+                ExpressionPurpose::Projection,
+            ),
+            ListChildrenNeeded::All => {
+                self.offsets.prepare_expression(
+                    &(row_range.start..row_range.end + 1),
+                    &root,
+                    ExpressionPurpose::Projection,
+                )?;
+                self.elements.prepare_expression(
+                    &(0..self.elements.row_count()),
+                    &root,
+                    ExpressionPurpose::Projection,
+                )
+            }
+        }
+    }
+
     // TODO(mk): handle zones for list elements
     fn pruning_evaluation(
         &self,
@@ -459,11 +535,20 @@ impl LayoutReader for ListReader {
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
         // Read as little as possible based on which list children the expression needs.
-        match get_necessary_list_children(expr) {
-            ListChildrenNeeded::Validity => self.project_validity(row_range, expr, mask),
-            ListChildrenNeeded::OffsetsAndValidity => {
-                self.project_offsets_validity(row_range, expr, mask)
-            }
+        let plan = self.expression_plan(expr)?;
+        match plan.children {
+            ListChildrenNeeded::Validity => self.project_validity(
+                row_range,
+                plan.rewritten
+                    .vortex_expect("validity expression has a rewrite"),
+                mask,
+            ),
+            ListChildrenNeeded::OffsetsAndValidity => self.project_offsets_validity(
+                row_range,
+                plan.rewritten
+                    .vortex_expect("offset expression has a rewrite"),
+                mask,
+            ),
             ListChildrenNeeded::All => self.project_all(row_range, expr, mask),
         }
     }
@@ -1093,6 +1178,28 @@ mod tests {
             self.request_count.fetch_add(1, Ordering::Relaxed);
             self.inner.request(id)
         }
+    }
+
+    #[tokio::test]
+    async fn prepare_expression_requests_no_segments() -> VortexResult<()> {
+        let list = create_basic_list_array(false);
+        let ctx = LayoutReaderContext::new();
+        let (segments, layout, session) = write_layout(&flat_list_strategy(), list).await?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSegmentSource {
+            inner: segments,
+            request_count: Arc::clone(&request_count),
+        });
+        let reader = layout.new_reader("".into(), source, &session, &ctx)?;
+
+        reader.prepare_expression(&(0..3), &root(), ExpressionPurpose::Projection)?;
+        assert_eq!(request_count.load(Ordering::Relaxed), 0);
+
+        reader
+            .projection_evaluation(&(0..3), &root(), MaskFuture::new_true(3))?
+            .await?;
+        assert!(request_count.load(Ordering::Relaxed) > 0);
+        Ok(())
     }
 
     /// The chunked-elements strategy must actually produce a chunked `elements` layout, otherwise

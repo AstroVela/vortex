@@ -30,6 +30,8 @@ use vortex_array::expr::transform::replace;
 use vortex_array::expr::transform::replace_root_fields;
 use vortex_array::scalar_fn::fns::merge::Merge;
 use vortex_array::scalar_fn::fns::pack::Pack;
+use vortex_error::SharedVortexResult;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -39,6 +41,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::ArrayFuture;
+use crate::ExpressionPurpose;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::LazyReaderChildren;
@@ -59,7 +62,7 @@ pub struct StructReader {
     expanded_root_expr: Expression,
 
     field_lookup: Option<HashMap<FieldName, usize>>,
-    partitioned_expr_cache: DashMap<ExactExpr, Arc<OnceLock<Partitioned>>>,
+    partitioned_expr_cache: DashMap<ExactExpr, Arc<OnceLock<SharedVortexResult<Partitioned>>>>,
 }
 
 impl StructReader {
@@ -170,13 +173,9 @@ impl StructReader {
             ),
         };
         // All map guards are dropped here, so partitioning runs outside any shard lock.
-        // Concurrent misses may compute redundantly; `get_or_init` keeps a single winner.
-
-        if let Some(value) = cell.get() {
-            return Ok(value.clone());
-        }
-        let result = self.compute_partitioned_expr(expr)?;
-        Ok(cell.get_or_init(|| result).clone())
+        cell.get_or_init(|| self.compute_partitioned_expr(expr).map_err(Arc::new))
+            .clone()
+            .map_err(VortexError::from)
     }
 
     fn compute_partitioned_expr(&self, expr: Expression) -> VortexResult<Partitioned> {
@@ -261,6 +260,46 @@ impl LayoutReader for StructReader {
             self.field_reader_by_index(idx)?
                 .register_splits(&[mask], split_range, splits)
         })
+    }
+
+    fn prepare_expression(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        if purpose == ExpressionPurpose::Projection
+            && let Some(validity) = self.validity()?
+        {
+            validity.prepare_expression(row_range, &root(), ExpressionPurpose::Projection)?;
+        }
+
+        match &self.partition_expr(expr.clone())? {
+            Partitioned::Single(name, partition) => self
+                .field_reader(name)?
+                .prepare_expression(row_range, partition, purpose),
+            Partitioned::Multi(partitioned) => {
+                for ((name, expr), dtype) in partitioned
+                    .partition_annotations
+                    .iter()
+                    .zip(partitioned.partitions.iter())
+                    .zip(partitioned.partition_dtypes.iter())
+                {
+                    let child_purpose = match purpose {
+                        ExpressionPurpose::Projection => ExpressionPurpose::Projection,
+                        ExpressionPurpose::Predicate
+                            if matches!(dtype, DType::Bool(Nullability::NonNullable)) =>
+                        {
+                            ExpressionPurpose::Predicate
+                        }
+                        ExpressionPurpose::Predicate => ExpressionPurpose::Projection,
+                    };
+                    self.field_reader(name)?
+                        .prepare_expression(row_range, expr, child_purpose)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn pruning_evaluation(

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::cmp;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,6 +39,7 @@ use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
+use crate::ExpressionPurpose;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
@@ -294,6 +296,25 @@ impl<A: 'static + Send> ScanBuilder<A> {
             .map(|f| f.optimize_recursive(layout_reader.dtype()))
             .transpose()?;
 
+        let selected_row_span = selected_row_span(
+            &self.selection,
+            self.row_range.as_ref(),
+            layout_reader.row_count(),
+        );
+        layout_reader.prepare_expression(
+            &selected_row_span,
+            &projection,
+            ExpressionPurpose::Projection,
+        )?;
+        let filter_conjuncts = filter.as_ref().map(conjuncts).unwrap_or_default();
+        for conjunct in &filter_conjuncts {
+            layout_reader.prepare_expression(
+                &selected_row_span,
+                conjunct,
+                ExpressionPurpose::Predicate,
+            )?;
+        }
+
         // Construct field masks and compute the row splits of the scan.
         let field_mask =
             referenced_field_masks(&projection, filter.as_ref(), layout_reader.dtype())?;
@@ -316,13 +337,10 @@ impl<A: 'static + Send> ScanBuilder<A> {
         if plan_v2_enabled()? {
             let source: ScanPlanRef =
                 Arc::new(LayoutReaderScanPlanV2::new(Arc::clone(&layout_reader)));
-            let projection_plan = Arc::clone(&source).apply_expr(projection)?.optimize()?;
-            let predicate_plans = filter
-                .as_ref()
-                .map(conjuncts)
-                .unwrap_or_default()
+            let projection_plan = Arc::clone(&source).apply_expr(projection)?;
+            let predicate_plans = filter_conjuncts
                 .into_iter()
-                .map(|expr| Arc::clone(&source).apply_expr(expr)?.optimize())
+                .map(|expr| Arc::clone(&source).apply_expr(expr))
                 .collect::<VortexResult<Vec<_>>>()?;
             return Ok(RepeatedScan::new_plan_v2(
                 self.session.clone(),
@@ -381,6 +399,34 @@ impl<A: 'static + Send> ScanBuilder<A> {
         let stream = self.into_stream()?;
         Ok(runtime.block_on_stream(stream))
     }
+}
+
+fn selected_row_span(
+    selection: &Selection,
+    row_range: Option<&Range<u64>>,
+    row_count: u64,
+) -> Range<u64> {
+    let base = row_range.cloned().unwrap_or(0..row_count);
+    let selection_span = match selection {
+        Selection::IncludeByIndex(indices) => indices
+            .first()
+            .zip(indices.last())
+            .map(|(&first, &last)| first..last.saturating_add(1)),
+        Selection::IncludeRoaring(indices) => indices
+            .min()
+            .zip(indices.max())
+            .map(|(first, last)| first..last.saturating_add(1)),
+        Selection::All | Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_) => {
+            return base;
+        }
+    };
+
+    let Some(selection_span) = selection_span else {
+        return base.start..base.start;
+    };
+    let start = cmp::max(base.start, selection_span.start);
+    let end = cmp::min(base.end, selection_span.end);
+    start..cmp::max(start, end)
 }
 
 enum LazyScanState<A: 'static + Send> {
@@ -509,6 +555,7 @@ mod test {
     use vortex_array::dtype::PType;
     use vortex_array::dtype::StructFields;
     use vortex_array::expr::Expression;
+    use vortex_array::expr::and;
     use vortex_array::expr::eq;
     use vortex_array::expr::get_item;
     use vortex_array::expr::is_not_null;
@@ -523,6 +570,7 @@ mod test {
     use super::ScanBuilder;
     use super::referenced_field_masks;
     use crate::ArrayFuture;
+    use crate::ExpressionPurpose;
     use crate::LayoutReader;
     use crate::RowSplits;
     use crate::SplitRange;
@@ -580,6 +628,118 @@ mod test {
         let field_masks = referenced_field_masks(&projection, Some(&filter), &nested_dtype())?;
 
         assert_eq!(field_masks, [FieldMask::Prefix(FieldPath::from_name("a"))]);
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct PreparingLayoutReader {
+        name: Arc<str>,
+        dtype: DType,
+        calls: Arc<Mutex<Vec<(Range<u64>, ExpressionPurpose, String)>>>,
+    }
+
+    impl LayoutReader for PreparingLayoutReader {
+        fn name(&self) -> &Arc<str> {
+            &self.name
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            4
+        }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
+        ) -> VortexResult<()> {
+            for split in (split_range.row_range().start + 1)..=split_range.row_range().end {
+                splits.push(split_range.row_offset() + split);
+            }
+            Ok(())
+        }
+
+        fn prepare_expression(
+            &self,
+            row_range: &Range<u64>,
+            expr: &Expression,
+            purpose: ExpressionPurpose,
+        ) -> VortexResult<()> {
+            self.calls
+                .lock()
+                .push((row_range.clone(), purpose, expr.to_string()));
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            Ok(mask)
+        }
+
+        fn projection_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            _mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            unimplemented!("the prepared scan is not executed")
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn prepares_projection_and_each_conjunct_once_for_all_splits() -> VortexResult<()> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::new(PreparingLayoutReader {
+            name: Arc::from("preparing"),
+            dtype: DType::Primitive(PType::I32, Nullability::NonNullable),
+            calls: Arc::clone(&calls),
+        });
+        let filter = and(eq(root(), lit(1_i32)), eq(root(), lit(2_i32)));
+
+        let _scan = ScanBuilder::new(SCAN_SESSION.clone(), reader)
+            .with_projection(root())
+            .with_filter(filter)
+            .with_row_range(1..4)
+            .prepare()?;
+
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|(row_range, ..)| row_range == &(1..4)));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, purpose, _)| *purpose == ExpressionPurpose::Projection)
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, purpose, _)| *purpose == ExpressionPurpose::Predicate)
+                .count(),
+            2
+        );
         Ok(())
     }
 

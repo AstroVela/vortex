@@ -26,6 +26,7 @@ use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
+use crate::ExpressionPurpose;
 use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
 use crate::LazyReaderChildren;
@@ -207,6 +208,19 @@ impl LayoutReader for ChunkedReader {
             );
         }
 
+        Ok(())
+    }
+
+    fn prepare_expression(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        purpose: ExpressionPurpose,
+    ) -> VortexResult<()> {
+        for (chunk_idx, _, chunk_range, _) in self.ranges(row_range) {
+            self.chunk_reader(chunk_idx)?
+                .prepare_expression(&chunk_range, expr, purpose)?;
+        }
         Ok(())
     }
 

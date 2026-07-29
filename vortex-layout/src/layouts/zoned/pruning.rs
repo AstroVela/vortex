@@ -121,6 +121,14 @@ impl PruningState {
             .clone()
     }
 
+    /// Populate only the split-invariant predicate rewrite cache.
+    ///
+    /// This deliberately does not call [`Self::zone_map`] or construct a pruning result future,
+    /// because either action would register zone-map data I/O during scan preparation.
+    pub(super) fn prepare_predicate(&self, expr: &Expression) {
+        self.pruning_predicate(expr.clone());
+    }
+
     fn pruning_predicate(&self, expr: Expression) -> Option<Expression> {
         self.pruning_predicates
             .entry(expr.clone())

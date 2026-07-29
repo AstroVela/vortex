@@ -12,7 +12,6 @@ use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
 use datafusion_common::Statistics;
-use datafusion_common::arrow::array::AsArray;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::PartitionedFile;
@@ -439,12 +438,11 @@ impl FileOpener for VortexOpener {
                 .map(move |chunk| {
                     let mut ctx = session.create_execution_ctx();
                     let arrow_session = ctx.session().clone();
-                    let arrow = arrow_session.arrow().execute_arrow(
+                    arrow_session.arrow().execute_record_batches(
                         chunk,
-                        Some(&stream_target_field),
+                        &stream_target_field,
                         &mut ctx,
-                    )?;
-                    Ok(RecordBatch::from(arrow.as_struct().clone()))
+                    )
                 })
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
@@ -454,6 +452,8 @@ impl FileOpener for VortexOpener {
                         file.object_meta.location
                     ))))
                 })
+                .map_ok(|batches| stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)))
+                .try_flatten()
                 .map(move |batch| {
                     let batch = if projector.projection().as_ref().is_empty() {
                         batch
