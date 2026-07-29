@@ -7,16 +7,19 @@ use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::DictionaryArray;
 use arrow_array::PrimitiveArray;
 use arrow_array::cast::AsArray;
+use arrow_array::new_empty_array;
 use arrow_array::new_null_array;
 use arrow_array::types::*;
 use arrow_schema::DataType;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::Chunked;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::DictArray;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::matcher::Matcher;
 use vortex_error::VortexError;
@@ -32,7 +35,7 @@ impl Matcher for ArrowDictExportable {
     type Match<'a> = &'a ArrayRef;
 
     fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
-        (array.is::<Dict>() || array.is::<Constant>()).then_some(array)
+        (array.is::<Dict>() || array.is::<Chunked>() || array.is::<Constant>()).then_some(array)
     }
 }
 
@@ -50,6 +53,10 @@ pub(super) fn to_arrow_dictionary(
     };
     let array = match array.try_downcast::<Constant>() {
         Ok(constant) => return constant_to_dict(constant, codes_type, values_type, ctx),
+        Err(array) => array,
+    };
+    let array = match array.try_downcast::<Chunked>() {
+        Ok(chunked) => return chunked_to_dict(chunked, codes_type, values_type, ctx),
         Err(array) => array,
     };
 
@@ -83,6 +90,40 @@ fn constant_to_dict(
         .execute_arrow(Some(values_type), ctx)?;
     let codes = zeroed_codes_array(codes_type, len)?;
     make_dict_array(codes_type, codes, values)
+}
+
+/// Convert a chunked array to an Arrow dictionary array by exporting each chunk separately.
+fn chunked_to_dict(
+    array: vortex_array::arrays::ChunkedArray,
+    codes_type: &DataType,
+    values_type: &DataType,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrowArrayRef> {
+    let mut arrow_chunks = Vec::with_capacity(array.nchunks());
+    for chunk in array.non_empty_chunks() {
+        arrow_chunks.push(to_arrow_dictionary(
+            chunk.clone(),
+            codes_type,
+            values_type,
+            ctx,
+        )?);
+    }
+
+    if arrow_chunks.is_empty() {
+        return Ok(new_empty_array(&DataType::Dictionary(
+            Box::new(codes_type.clone()),
+            Box::new(values_type.clone()),
+        )));
+    }
+    if let [arrow_chunk] = arrow_chunks.as_slice() {
+        return Ok(Arc::clone(arrow_chunk));
+    }
+
+    let refs = arrow_chunks
+        .iter()
+        .map(|array| array.as_ref())
+        .collect::<Vec<_>>();
+    Ok(arrow_select::concat::concat(&refs)?)
 }
 
 /// Convert a Vortex dictionary array to an Arrow dictionary array.
