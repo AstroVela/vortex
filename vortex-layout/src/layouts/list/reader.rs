@@ -25,6 +25,7 @@ use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
@@ -220,18 +221,36 @@ impl ListReader {
         let expr = expr.clone();
         let reader = self.clone();
         let offsets_fut = self.fetch_raw_offsets(&selected_row_range)?;
+        let validity_fut = fetch_validity(
+            self.validity.as_ref(),
+            &selected_row_range,
+            MaskFuture::new_true(selected_mask.len()),
+        )?;
+        let element_prefetch_range = self.element_prefetch_range(&selected_row_range);
+        let children_fut = if let Some(prefetch_range) = element_prefetch_range.clone() {
+            let elements_fut = self.fetch_raw_elements(&prefetch_range)?;
+            let session = self.session.clone();
+            async move {
+                let (offsets, elements, validity) =
+                    try_join!(offsets_fut, elements_fut, validity_fut)?;
+                let exact_range = elements_range_from_offsets(&offsets, &session)?;
+                let elements = slice_prefetched_elements(elements, &prefetch_range, &exact_range)?;
+                Ok::<_, vortex_error::VortexError>((offsets, elements, validity, exact_range))
+            }
+            .boxed()
+        } else {
+            let reader = reader.clone();
+            async move {
+                let (offsets, validity) = try_join!(offsets_fut, validity_fut)?;
+                let exact_range = elements_range_from_offsets(&offsets, &reader.session)?;
+                let elements = reader.fetch_raw_elements(&exact_range)?.await?;
+                Ok::<_, vortex_error::VortexError>((offsets, elements, validity, exact_range))
+            }
+            .boxed()
+        };
 
         Ok(async move {
-            let offsets = offsets_fut.await?;
-
-            let elements_range = elements_range_from_offsets(&offsets, &reader.session)?;
-            let elements_fut = reader.fetch_raw_elements(&elements_range)?;
-            let validity_fut = fetch_validity(
-                reader.validity.as_ref(),
-                &selected_row_range,
-                MaskFuture::new_true(selected_mask.len()),
-            )?;
-            let (elements, validity) = try_join!(elements_fut, validity_fut)?;
+            let (offsets, elements, validity, elements_range) = children_fut.await?;
 
             let offsets = rebase_offsets(offsets, elements_range.start)?;
             // SAFETY: the selected offsets remain monotonically increasing, rebasing them against
@@ -312,10 +331,67 @@ impl ListReader {
         self.elements
             .projection_evaluation(row_range, &root(), MaskFuture::new_true(row_count))
     }
+
+    /// Return an element-row envelope known from write-time list block boundaries.
+    ///
+    /// The envelope is used only when the selected outer rows cover at least half of its outer-row
+    /// block span. This keeps the prefetch bounded for narrow selections while allowing broad and
+    /// nested reads to issue their element I/O without waiting for offsets first.
+    fn element_prefetch_range(&self, row_range: &Range<u64>) -> Option<Range<u64>> {
+        let boundaries = self.layout.block_boundaries();
+        if boundaries.is_empty() || row_range.is_empty() {
+            return None;
+        }
+
+        let start_idx =
+            boundaries.partition_point(|boundary| boundary.outer_row_end() <= row_range.start);
+        let end_idx =
+            boundaries.partition_point(|boundary| boundary.outer_row_end() < row_range.end);
+        let end_boundary = *boundaries.get(end_idx)?;
+
+        let outer_start = start_idx
+            .checked_sub(1)
+            .map(|idx| boundaries[idx].outer_row_end())
+            .unwrap_or(0);
+        let element_start = start_idx
+            .checked_sub(1)
+            .map(|idx| boundaries[idx].element_row_end())
+            .unwrap_or(0);
+        let outer_end = end_boundary.outer_row_end();
+        let selected_len = row_range.end - row_range.start;
+        let envelope_len = outer_end - outer_start;
+        if u128::from(selected_len) * 2 < u128::from(envelope_len) {
+            return None;
+        }
+
+        Some(element_start..end_boundary.element_row_end())
+    }
 }
 
 fn selected_row_range(mask: &Mask) -> Option<Range<usize>> {
     Some(mask.first()?..mask.last()? + 1)
+}
+
+fn slice_prefetched_elements(
+    elements: ArrayRef,
+    prefetched_range: &Range<u64>,
+    exact_range: &Range<u64>,
+) -> VortexResult<ArrayRef> {
+    if exact_range.start < prefetched_range.start || exact_range.end > prefetched_range.end {
+        vortex_bail!(
+            "Exact list element range {:?} falls outside prefetched range {:?}",
+            exact_range,
+            prefetched_range
+        );
+    }
+
+    let start = usize::try_from(exact_range.start - prefetched_range.start)?;
+    let end = usize::try_from(exact_range.end - prefetched_range.start)?;
+    if start == 0 && end == elements.len() {
+        Ok(elements)
+    } else {
+        elements.slice(start..end)
+    }
 }
 
 fn create_validity(validity_array: Option<ArrayRef>, nullability: Nullability) -> Validity {
@@ -353,9 +429,32 @@ impl LayoutReader for ListReader {
     ) -> VortexResult<()> {
         split_range.check_bounds(self.layout.row_count())?;
 
+        let row_range = split_range.row_range();
+        let block_boundaries = self.layout.block_boundaries();
+        if !block_boundaries.is_empty() {
+            for boundary in block_boundaries {
+                let split = boundary.outer_row_end();
+                if split <= row_range.start {
+                    continue;
+                }
+                if split >= row_range.end {
+                    break;
+                }
+                splits.push(
+                    split_range
+                        .row_offset()
+                        .checked_add(split)
+                        .vortex_expect("List layout split offset overflow"),
+                );
+            }
+            splits.push(split_range.root_row_range().end);
+            return Ok(());
+        }
+
         // Splits are difficult to calculate because all children live in different row coordinate spaces.
         // List elements typically comprise the majority of the data in a list, and validity/offsets can be treated
-        // as metadata. We therefore want to parallelize the scan based on element work.
+        // as metadata. Legacy list layouts do not carry exact block boundaries, so retain the
+        // element-weighted heuristic for those files.
         //
         // Scan splits must be expressed in the list layout's outer-row space, but the elements child
         // reports its natural boundaries in element-row space. So we translate the element splits using a
@@ -370,7 +469,6 @@ impl LayoutReader for ListReader {
                 &mut element_splits,
             )?;
 
-            let row_range = split_range.row_range();
             let mut last_split = None;
             for element_split in element_splits.into_sorted_deduped() {
                 let Some(split) = map_element_split_to_outer_grid(
@@ -605,6 +703,7 @@ mod tests {
     use rstest::rstest;
     use vortex_array::ArrayContext;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::ListArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
@@ -825,6 +924,16 @@ mod tests {
         ListLayoutStrategy::default()
     }
 
+    fn chunk_preserving_list_strategy() -> ListLayoutStrategy {
+        ListLayoutStrategy::default()
+            .with_elements(Arc::new(ChunkedLayoutStrategy::new(
+                FlatLayoutStrategy::default(),
+            )))
+            .with_offsets(Arc::new(ChunkedLayoutStrategy::new(
+                FlatLayoutStrategy::default(),
+            )))
+    }
+
     fn layout_test_session() -> VortexSession {
         vortex_array::array_session()
             .with::<LayoutSession>()
@@ -1039,29 +1148,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_list_propagates_element_splits() -> VortexResult<()> {
-        let inner = ListArray::try_new(
-            PrimitiveArray::from_iter(0..128_i32).into_array(),
-            PrimitiveArray::from_iter((0..=8_u32).map(|idx| idx * 16)).into_array(),
+    async fn list_uses_exact_input_block_splits() -> VortexResult<()> {
+        let chunk0 = ListArray::try_new(
+            PrimitiveArray::from_iter(0..32_i32).into_array(),
+            buffer![0u32, 8, 16, 24, 32].into_array(),
             Validity::NonNullable,
         )?
         .into_array();
-        let outer = ListArray::try_new(
-            inner,
-            buffer![0u32, 2, 4, 6, 8].into_array(),
+        let chunk1 = ListArray::try_new(
+            PrimitiveArray::from_iter(32..96_i32).into_array(),
+            buffer![0u32, 8, 16, 32, 64].into_array(),
             Validity::NonNullable,
         )?
         .into_array();
+        let dtype = chunk0.dtype().clone();
+        let list = ChunkedArray::try_new(vec![chunk0, chunk1], dtype)?.into_array();
 
-        let inner_strategy =
-            ListLayoutStrategy::default().with_elements(chunked_elements_strategy());
-        let strategy = ListLayoutStrategy::default().with_elements(Arc::new(inner_strategy));
-        let (segments, layout, session) = write_layout(&strategy, outer).await?;
+        let (segments, layout, session) =
+            write_layout(&chunk_preserving_list_strategy(), list).await?;
         let reader =
             layout.new_reader("".into(), segments, &session, &LayoutReaderContext::new())?;
 
-        let splits = SplitBy::Layout.splits(reader.as_ref(), &(0..4), &[FieldMask::All])?;
-        assert_eq!(splits, vec![0, 1, 2, 3, 4]);
+        let splits = SplitBy::Layout.splits(reader.as_ref(), &(0..8), &[FieldMask::All])?;
+        assert_eq!(splits, vec![0, 4, 8]);
+
+        let reader = reader
+            .as_any()
+            .downcast_ref::<ListReader>()
+            .expect("ListReader");
+        assert_eq!(reader.element_prefetch_range(&(0..4)), Some(0..32));
+        assert_eq!(reader.element_prefetch_range(&(4..8)), Some(32..96));
+        assert_eq!(reader.element_prefetch_range(&(1..2)), None);
         Ok(())
     }
 

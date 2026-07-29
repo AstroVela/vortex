@@ -55,6 +55,31 @@ pub use List as ListLayoutEncoding;
 #[derive(Clone, Debug)]
 pub struct ListData {
     offsets_ptype: PType,
+    block_boundaries: Arc<[ListBlockBoundary]>,
+}
+
+/// Cumulative row boundaries for one input block of a structural list layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ListBlockBoundary {
+    outer_row_end: u64,
+    element_row_end: u64,
+}
+
+impl ListBlockBoundary {
+    pub(super) fn new(outer_row_end: u64, element_row_end: u64) -> Self {
+        Self {
+            outer_row_end,
+            element_row_end,
+        }
+    }
+
+    pub(super) fn outer_row_end(self) -> u64 {
+        self.outer_row_end
+    }
+
+    pub(super) fn element_row_end(self) -> u64 {
+        self.element_row_end
+    }
 }
 
 /// A list layout shredded into elements, offsets, and optional validity children.
@@ -70,7 +95,10 @@ impl VTable for List {
     }
 
     fn metadata(layout: &Layout<Self>) -> Self::Metadata {
-        ProstMetadata(ListLayoutMetadata::new(layout.offsets_ptype))
+        ProstMetadata(ListLayoutMetadata::new_with_boundaries(
+            layout.offsets_ptype,
+            &layout.block_boundaries,
+        ))
     }
 
     fn deserialize(
@@ -83,7 +111,7 @@ impl VTable for List {
             .dtype
             .as_list_element_opt()
             .ok_or_else(|| vortex_err!("ListLayout requires a List dtype, got {}", args.dtype))?;
-        args.children.child(ELEMENTS_CHILD_INDEX, elements_dtype)?;
+        let elements = args.children.child(ELEMENTS_CHILD_INDEX, elements_dtype)?;
         let offsets_dtype = DType::Primitive(metadata.offsets_ptype(), Nullability::NonNullable);
         let offsets = args.children.child(OFFSETS_CHILD_INDEX, &offsets_dtype)?;
         vortex_error::vortex_ensure!(
@@ -99,8 +127,18 @@ impl VTable for List {
                 "List validity row count does not match parent"
             );
         }
+        let block_boundaries = metadata
+            .block_boundaries
+            .iter()
+            .map(|boundary| {
+                ListBlockBoundary::new(boundary.outer_row_end, boundary.element_row_end)
+            })
+            .collect::<Vec<_>>();
+        validate_block_boundaries(args.row_count, elements.row_count(), &block_boundaries)?;
+
         Ok(ListData {
             offsets_ptype: metadata.offsets_ptype(),
+            block_boundaries: block_boundaries.into(),
         })
     }
 
@@ -171,8 +209,20 @@ impl Layout<List> {
         offsets: LayoutRef,
         validity: Option<LayoutRef>,
     ) -> Self {
+        Self::new_with_boundaries(dtype, elements, offsets, validity, Vec::new())
+    }
+
+    pub(super) fn new_with_boundaries(
+        dtype: DType,
+        elements: LayoutRef,
+        offsets: LayoutRef,
+        validity: Option<LayoutRef>,
+        block_boundaries: Vec<ListBlockBoundary>,
+    ) -> Self {
         let row_count = offsets.row_count().saturating_sub(1);
         let offsets_ptype = offsets.dtype().as_ptype();
+        validate_block_boundaries(row_count, elements.row_count(), &block_boundaries)
+            .vortex_expect("invalid list block boundaries");
         let mut children = vec![elements, offsets];
         children.extend(validity);
         Self::validate_children(&dtype, children.len()).vortex_expect("invalid list children");
@@ -182,7 +232,10 @@ impl Layout<List> {
             row_count,
             Vec::new(),
             OwnedLayoutChildren::layout_children(children),
-            ListData { offsets_ptype },
+            ListData {
+                offsets_ptype,
+                block_boundaries: block_boundaries.into(),
+            },
         )
         .into_typed()
     }
@@ -209,6 +262,10 @@ impl Layout<List> {
         self.offsets_ptype
     }
 
+    pub(super) fn block_boundaries(&self) -> &[ListBlockBoundary] {
+        &self.block_boundaries
+    }
+
     /// Returns the list element dtype.
     pub fn elements_dtype(&self) -> &DType {
         self.dtype()
@@ -227,12 +284,110 @@ impl Layout<List> {
 pub struct ListLayoutMetadata {
     #[prost(enumeration = "PType", tag = "1")]
     offsets_ptype: i32,
+    #[prost(message, repeated, tag = "2")]
+    block_boundaries: Vec<ListBlockBoundaryMetadata>,
+}
+
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+struct ListBlockBoundaryMetadata {
+    #[prost(uint64, tag = "1")]
+    outer_row_end: u64,
+    #[prost(uint64, tag = "2")]
+    element_row_end: u64,
 }
 
 impl ListLayoutMetadata {
     pub fn new(offsets_ptype: PType) -> Self {
+        Self::new_with_boundaries(offsets_ptype, &[])
+    }
+
+    fn new_with_boundaries(offsets_ptype: PType, block_boundaries: &[ListBlockBoundary]) -> Self {
         let mut metadata = Self::default();
         metadata.set_offsets_ptype(offsets_ptype);
+        metadata.block_boundaries = block_boundaries
+            .iter()
+            .map(|boundary| ListBlockBoundaryMetadata {
+                outer_row_end: boundary.outer_row_end(),
+                element_row_end: boundary.element_row_end(),
+            })
+            .collect();
         metadata
+    }
+}
+
+fn validate_block_boundaries(
+    outer_row_count: u64,
+    element_row_count: u64,
+    block_boundaries: &[ListBlockBoundary],
+) -> VortexResult<()> {
+    let Some(last) = block_boundaries.last() else {
+        return Ok(());
+    };
+
+    vortex_error::vortex_ensure!(
+        block_boundaries[0].outer_row_end != 0,
+        "List block outer-row boundaries must not contain zero"
+    );
+    vortex_error::vortex_ensure!(
+        block_boundaries
+            .windows(2)
+            .all(|pair| pair[0].outer_row_end < pair[1].outer_row_end),
+        "List block outer-row boundaries must be strictly increasing"
+    );
+    vortex_error::vortex_ensure!(
+        block_boundaries
+            .windows(2)
+            .all(|pair| pair[0].element_row_end <= pair[1].element_row_end),
+        "List block element-row boundaries must be non-decreasing"
+    );
+    vortex_error::vortex_ensure_eq!(last.outer_row_end, outer_row_count);
+    vortex_error::vortex_ensure_eq!(last.element_row_end, element_row_count);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::DeserializeMetadata;
+    use vortex_array::SerializeMetadata;
+
+    use super::*;
+
+    #[test]
+    fn block_boundaries_round_trip_through_metadata() -> VortexResult<()> {
+        let boundaries = [
+            ListBlockBoundary::new(8, 21),
+            ListBlockBoundary::new(16, 50),
+        ];
+        let encoded = ProstMetadata(ListLayoutMetadata::new_with_boundaries(
+            PType::U64,
+            &boundaries,
+        ))
+        .serialize();
+        let decoded =
+            <ProstMetadata<ListLayoutMetadata> as DeserializeMetadata>::deserialize(&encoded)?;
+
+        assert_eq!(decoded.offsets_ptype(), PType::U64);
+        assert_eq!(
+            decoded
+                .block_boundaries
+                .iter()
+                .map(|boundary| {
+                    ListBlockBoundary::new(boundary.outer_row_end, boundary.element_row_end)
+                })
+                .collect::<Vec<_>>(),
+            boundaries
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_metadata_has_no_block_boundaries() -> VortexResult<()> {
+        let encoded = ProstMetadata(ListLayoutMetadata::new(PType::U32)).serialize();
+        let decoded =
+            <ProstMetadata<ListLayoutMetadata> as DeserializeMetadata>::deserialize(&encoded)?;
+
+        assert_eq!(decoded.offsets_ptype(), PType::U32);
+        assert!(decoded.block_boundaries.is_empty());
+        Ok(())
     }
 }

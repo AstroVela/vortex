@@ -27,6 +27,7 @@ use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_io::kanal_ext::KanalExt;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
@@ -34,6 +35,7 @@ use vortex_session::VortexSession;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
 use crate::layouts::flat::writer::FlatLayoutStrategy;
+use crate::layouts::list::ListBlockBoundary;
 use crate::layouts::list::ListLayout;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
@@ -196,14 +198,22 @@ impl LayoutStrategy for ListLayoutStrategy {
             })
             .collect();
 
-        let (_, layouts) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
+        let (block_boundaries, layouts) =
+            try_join(fanout_fut, try_join_all(layout_futures)).await?;
         let mut layouts = layouts.into_iter();
         let elements_layout = layouts.next().vortex_expect("elements layout present");
         let offsets_layout = layouts.next().vortex_expect("offsets layout present");
         let validity_layout =
             is_nullable.then(|| layouts.next().vortex_expect("validity layout present"));
 
-        Ok(ListLayout::new(dtype, elements_layout, offsets_layout, validity_layout).into_layout())
+        Ok(ListLayout::new_with_boundaries(
+            dtype,
+            elements_layout,
+            offsets_layout,
+            validity_layout,
+            block_boundaries,
+        )
+        .into_layout())
     }
 
     fn buffered_bytes(&self) -> u64 {
@@ -226,9 +236,11 @@ async fn transpose_list_column(
     elements_tx: kanal::AsyncSender<ChildChunk>,
     offsets_tx: kanal::AsyncSender<ChildChunk>,
     validity_tx: Option<kanal::AsyncSender<ChildChunk>>,
-) -> VortexResult<()> {
+) -> VortexResult<Vec<ListBlockBoundary>> {
     let mut exec_ctx = session.create_execution_ctx();
+    let mut outer_base: u64 = 0;
     let mut element_base: u64 = 0;
+    let mut block_boundaries = Vec::new();
     let mut first = true;
     let mut saw_chunk = false;
     while let Some(chunk) = stream.next().await {
@@ -244,7 +256,15 @@ async fn transpose_list_column(
         let n_elements = elements.len() as u64;
         let row_count = offsets.len().saturating_sub(1);
         let offsets = global_offsets(offsets, element_base, first, &mut exec_ctx)?;
-        element_base += n_elements;
+        element_base = element_base
+            .checked_add(n_elements)
+            .ok_or_else(|| vortex_err!("List element row count overflow"))?;
+        outer_base = outer_base
+            .checked_add(u64::try_from(row_count)?)
+            .ok_or_else(|| vortex_err!("List outer row count overflow"))?;
+        if row_count != 0 {
+            block_boundaries.push(ListBlockBoundary::new(outer_base, element_base));
+        }
         first = false;
 
         if elements_tx
@@ -271,7 +291,7 @@ async fn transpose_list_column(
     if !saw_chunk {
         vortex_bail!("ListLayoutStrategy needs at least one chunk");
     }
-    Ok(())
+    Ok(block_boundaries)
 }
 
 /// Canonicalize a list-dtype array into [`ListDataParts`].
@@ -357,6 +377,16 @@ mod tests {
 
     fn flat_list_strategy() -> ListLayoutStrategy {
         ListLayoutStrategy::default()
+    }
+
+    fn chunk_preserving_list_strategy() -> ListLayoutStrategy {
+        ListLayoutStrategy::default()
+            .with_elements(Arc::new(ChunkedLayoutStrategy::new(
+                FlatLayoutStrategy::default(),
+            )))
+            .with_offsets(Arc::new(ChunkedLayoutStrategy::new(
+                FlatLayoutStrategy::default(),
+            )))
     }
 
     async fn write<S: LayoutStrategy>(strategy: &S, array: ArrayRef) -> VortexResult<LayoutRef> {
@@ -538,6 +568,35 @@ mod tests {
         │   └── offsets: vortex.flat, dtype: u64, segment: 1
         └── offsets: vortex.flat, dtype: u64, segment: 0
         ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_input_block_boundaries() -> VortexResult<()> {
+        let chunk0 = ListArray::try_new(
+            buffer![1i32, 2, 3].into_array(),
+            buffer![0u32, 2, 3].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let chunk1 = ListArray::try_new(
+            buffer![4i32, 5, 6, 7].into_array(),
+            buffer![0u32, 1, 4].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let chunked =
+            ChunkedArray::try_new(vec![chunk0, chunk1], i32_list_dtype(false))?.into_array();
+
+        let layout = write(&chunk_preserving_list_strategy(), chunked).await?;
+        let boundaries = layout
+            .as_::<crate::layouts::list::List>()
+            .block_boundaries();
+
+        assert_eq!(
+            boundaries,
+            [ListBlockBoundary::new(2, 3), ListBlockBoundary::new(4, 7)]
+        );
         Ok(())
     }
 
