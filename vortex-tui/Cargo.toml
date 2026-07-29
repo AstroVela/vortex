@@ -100,5 +100,9 @@ pkg-fmt = "tgz"
 [package.metadata.binstall.overrides.'cfg(target_os = "windows")']
 pkg-fmt = "zip"
 
+[dev-dependencies]
+# Examples reach past the `vortex` facade to drive individual compression schemes.
+vortex-btrblocks = { workspace = true }
+
 [lints]
 workspace = true

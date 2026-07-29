@@ -10386,6 +10386,7 @@ dependencies = [
  "tokio",
  "vortex",
  "vortex-arrow",
+ "vortex-btrblocks",
  "vortex-datafusion",
  "wasm-bindgen",
  "wasm-bindgen-futures",
