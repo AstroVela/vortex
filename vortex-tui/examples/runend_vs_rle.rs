@@ -28,6 +28,8 @@ use vortex::array::Canonical;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ChunkedArray;
+use vortex::array::arrays::PrimitiveArray;
+use vortex::array::match_each_native_ptype;
 use vortex::array::serde::SerializeOptions;
 use vortex::session::VortexSession;
 use vortex_arrow::FromArrowArray;
@@ -136,13 +138,14 @@ fn main() -> anyhow::Result<()> {
         totals[1].0 += rle.disk;
         totals[1].1 += rle.nodes;
 
+        let avg_run = avg_run_len(whole.as_array(), &session)?;
         let best = re.disk.min(rle.disk);
         let winner = if rle.disk < re.disk { "RLE" } else { "RunEnd" };
         let pct = 100.0 * (rle.disk as f64 - re.disk as f64) / re.disk.max(1) as f64;
         // How far the sampled estimate landed above the better of the two forced arms.
         let regret = 100.0 * (picked.disk as f64 - best as f64) / best.max(1) as f64;
         println!(
-            "=== {name}   smaller: {winner} ({pct:+.1}% RLE vs RunEnd)   estimator picked {} ({regret:+.1}% vs best)",
+            "=== {name}   avg_run={avg_run}   smaller: {winner} ({pct:+.1}% RLE vs RunEnd)   estimator picked {} ({regret:+.1}% vs best)",
             if picked.uses_target {
                 "RLE"
             } else {
@@ -182,6 +185,27 @@ fn main() -> anyhow::Result<()> {
         totals[0].0, totals[0].1, totals[1].0, totals[1].1
     );
     Ok(())
+}
+
+/// Average run length of the column, or `-` for dtypes this example does not measure.
+///
+/// This is the property that decides which decode kernel is cheaper: RunEnd walks one splat
+/// fill per run, so it gets faster as runs lengthen, while RLE gathers one index per element
+/// at a cost independent of run structure. Null slots are compared by their stored value.
+fn avg_run_len(array: &ArrayRef, session: &VortexSession) -> anyhow::Result<String> {
+    if !array.dtype().is_primitive() {
+        return Ok("-".to_string());
+    }
+    let mut ctx = session.create_execution_ctx();
+    let primitive = array.clone().execute::<PrimitiveArray>(&mut ctx)?;
+    if primitive.is_empty() {
+        return Ok("-".to_string());
+    }
+    let runs = match_each_native_ptype!(primitive.ptype(), |P| {
+        let values = primitive.as_slice::<P>();
+        1 + values.windows(2).filter(|w| w[0] != w[1]).count()
+    });
+    Ok(format!("{:.1}", primitive.len() as f64 / runs as f64))
 }
 
 fn measure(

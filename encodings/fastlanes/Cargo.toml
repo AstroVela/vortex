@@ -40,6 +40,7 @@ rstest = { workspace = true }
 vortex-alp = { path = "../alp" }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-fastlanes = { path = ".", features = ["_test-harness"] }
+vortex-runend = { workspace = true }
 
 [features]
 _test-harness = ["dep:rand"]
@@ -75,3 +76,7 @@ harness = false
 name = "cast_bitpacked"
 harness = false
 required-features = ["_test-harness"]
+
+[[bench]]
+name = "rle_vs_runend_decode"
+harness = false
