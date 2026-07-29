@@ -7,6 +7,10 @@ use jni::EnvUnowned;
 use jni::objects::JClass;
 use jni::sys::jlong;
 use vortex::VortexSessionDefault;
+use vortex::editions::DEFAULT_UNSTABLE_EDITION;
+use vortex::editions::EditionSessionExt;
+use vortex::error::VortexExpect;
+use vortex::error::vortex_err;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -19,6 +23,13 @@ pub(crate) fn new_session() -> Box<VortexSession> {
     let session = VortexSession::default().with_handle(RUNTIME.handle());
     vortex_parquet_variant::initialize(&session);
     vortex_geo::initialize(&session);
+    // `vortex.parquet.variant` belongs to the `unstable` edition family, so the writer only
+    // accepts it once that family is enabled. The bindings register the encoding
+    // unconditionally, so enable the edition that carries it.
+    session
+        .enable_edition(DEFAULT_UNSTABLE_EDITION)
+        .map_err(|e| vortex_err!("{e}"))
+        .vortex_expect("default unstable edition is registered");
     Box::new(session)
 }
 
