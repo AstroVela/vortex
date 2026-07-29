@@ -94,9 +94,5 @@ insta = { workspace = true }
 rstest = { workspace = true }
 
 [features]
-jemalloc = [
-    "dep:axum",
-    "dep:jemalloc_pprof",
-    "dep:tikv-jemallocator",
-]
+jemalloc = ["dep:axum", "dep:jemalloc_pprof", "dep:tikv-jemallocator"]
 unstable_encodings = ["vortex/unstable_encodings"]
