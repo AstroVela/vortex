@@ -34,15 +34,12 @@ use crate::validity::Validity;
 #[array_slots(Struct)]
 pub struct StructSlots {
     /// The optional row-level validity child.
+    #[slot(0)]
     pub validity: Option<ArrayRef>,
     /// The field arrays, one per struct field, all sharing the outer length.
+    #[slot(1..)]
     pub fields: Vec<ArrayRef>,
 }
-
-/// The validity bitmap indicating which struct elements are non-null.
-pub(super) const VALIDITY_SLOT: usize = StructSlots::VALIDITY;
-/// The offset at which the struct field arrays begin in the slots vector.
-pub(super) const FIELDS_OFFSET: usize = StructSlots::FIELDS_OFFSET;
 
 /// A struct array that stores multiple named fields as columns, similar to a database row.
 ///
@@ -199,13 +196,13 @@ pub trait StructArrayExt: TypedArrayRef<Struct> {
 
     fn struct_validity(&self) -> Validity {
         child_to_validity(
-            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.as_ref().slots()[StructSlots::VALIDITY].as_ref(),
             self.nullability(),
         )
     }
 
     fn iter_unmasked_fields(&self) -> impl Iterator<Item = &ArrayRef> + '_ {
-        self.as_ref().slots()[FIELDS_OFFSET..]
+        self.as_ref().slots()[StructSlots::FIELDS_OFFSET..]
             .iter()
             .map(|s| s.as_ref().vortex_expect("StructArray field slot"))
     }
@@ -215,7 +212,7 @@ pub trait StructArrayExt: TypedArrayRef<Struct> {
     }
 
     fn unmasked_field(&self, idx: usize) -> &ArrayRef {
-        self.as_ref().slots()[FIELDS_OFFSET + idx]
+        self.as_ref().slots()[StructSlots::FIELDS_OFFSET + idx]
             .as_ref()
             .vortex_expect("StructArray field slot")
     }
@@ -262,10 +259,16 @@ impl Array<Struct> {
         length: usize,
         validity: Validity,
     ) -> VortexResult<Self> {
-        let fields: Vec<_> = fields.into_iter().collect();
-        let field_dtypes: Vec<_> = fields.iter().map(|d| d.dtype().clone()).collect();
+        let fields = fields.into_iter();
+        let (lower, _) = fields.size_hint();
+        let mut field_dtypes = Vec::with_capacity(lower);
+        let mut slots = ArraySlots::with_capacity(StructSlots::FIELDS_OFFSET + lower);
+        slots.push(validity_to_child(&validity, length));
+        for field in fields {
+            field_dtypes.push(field.dtype().clone());
+            slots.push(Some(field));
+        }
         let dtype = StructFields::new(names, field_dtypes);
-        let slots = make_struct_slots(&fields, &validity, length);
         Array::try_from_parts(
             ArrayParts::new(
                 Struct,
@@ -288,9 +291,12 @@ impl Array<Struct> {
         length: usize,
         validity: Validity,
     ) -> Self {
-        let fields: Vec<_> = fields.into_iter().collect();
         let outer_dtype = DType::Struct(dtype, validity.nullability());
-        let slots = make_struct_slots(&fields, &validity, length);
+        let fields = fields.into_iter();
+        let (lower, _) = fields.size_hint();
+        let mut slots = ArraySlots::with_capacity(StructSlots::FIELDS_OFFSET + lower);
+        slots.push(validity_to_child(&validity, length));
+        slots.extend(fields.map(Some));
         unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(Struct, outer_dtype, length, EmptyArrayData).with_slots(slots),
@@ -305,9 +311,12 @@ impl Array<Struct> {
         length: usize,
         validity: Validity,
     ) -> VortexResult<Self> {
-        let fields: Vec<_> = fields.into_iter().collect();
         let outer_dtype = DType::Struct(dtype, validity.nullability());
-        let slots = make_struct_slots(&fields, &validity, length);
+        let fields = fields.into_iter();
+        let (lower, _) = fields.size_hint();
+        let mut slots = ArraySlots::with_capacity(StructSlots::FIELDS_OFFSET + lower);
+        slots.push(validity_to_child(&validity, length));
+        slots.extend(fields.map(Some));
         Array::try_from_parts(
             ArrayParts::new(Struct, outer_dtype, length, EmptyArrayData).with_slots(slots),
         )
@@ -405,7 +414,7 @@ impl Array<Struct> {
 
     // TODO(ngates): remove this... it doesn't help to consume self.
     pub fn into_data_parts(self) -> StructDataParts {
-        let fields: Vec<ArrayRef> = self.slots()[FIELDS_OFFSET..]
+        let fields: Vec<ArrayRef> = self.slots()[StructSlots::FIELDS_OFFSET..]
             .iter()
             .map(|s| s.as_ref().vortex_expect("StructArray field slot").clone())
             .collect();
@@ -424,7 +433,7 @@ impl Array<Struct> {
 
         let position = struct_dtype.find(name.as_ref())?;
 
-        let slot_position = FIELDS_OFFSET + position;
+        let slot_position = StructSlots::FIELDS_OFFSET + position;
         let field = self.slots()[slot_position]
             .as_ref()
             .vortex_expect("StructArray field slot")
@@ -460,7 +469,7 @@ impl Array<Struct> {
         let types = struct_dtype.fields().chain(once(array.dtype().clone()));
         let new_fields = StructFields::new(names.collect(), types.collect());
 
-        let children: Vec<ArrayRef> = self.slots()[FIELDS_OFFSET..]
+        let children: Vec<ArrayRef> = self.slots()[StructSlots::FIELDS_OFFSET..]
             .iter()
             .map(|s| s.as_ref().vortex_expect("StructArray field slot").clone())
             .chain(once(array))
@@ -517,10 +526,7 @@ impl Array<Struct> {
             .enumerate()
             .map(|(i, dtype)| {
                 // SAFETY: We establish above that every array has the same type.
-                let chunks = field_arrays_per_chunk
-                    .iter()
-                    .map(|x| x[i].clone())
-                    .collect();
+                let chunks = field_arrays_per_chunk.iter().map(|x| x[i].clone());
                 unsafe { ChunkedArray::new_unchecked(chunks, dtype) }.into_array()
             })
             .collect::<Vec<_>>();
