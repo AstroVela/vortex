@@ -195,6 +195,10 @@ fn main() -> anyhow::Result<()> {
             // in ClickBench.
             ctx.execute_query_result("create macro if not exists octet_length(a) as strlen(a)")?;
 
+            if matches!(args.benchmark, BenchmarkArg::VortexQueries) {
+                validation::verify_vortex_output(&ctx, &filtered_queries, format)?;
+            }
+
             Ok(ctx)
         },
         |ctx, query_idx, format, query| {

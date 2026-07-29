@@ -1,18 +1,70 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! TPC-H result validation against reference data.
+//! Query result validation against golden reference data.
 
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::bail;
 use duckdb_bench::DuckClient;
 use similar::ChangeTag;
 use similar::TextDiff;
 use vortex_bench::Format;
 use vortex_bench::tpch::benchmark::TpcHBenchmark;
+
+/// Verify vortex benchmark query output
+pub fn verify_vortex_output(
+    ctx: &DuckClient,
+    queries: &[(usize, String)],
+    format: Format,
+) -> anyhow::Result<()> {
+    let golden_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vortex-bench/sql/vortex/results/duckdb");
+    let tmp_dir = env::temp_dir().join("vortex-queries-verify");
+    fs::create_dir_all(&tmp_dir)?;
+    let mut mismatches = Vec::new();
+
+    for (query_idx, query) in queries {
+        let golden_path = golden_dir.join(format!("{query_idx}.csv"));
+        if !golden_path.exists() {
+            continue;
+        }
+
+        let stripped = query.trim_end().trim_end_matches(';');
+        let actual_path = tmp_dir.join(format!("{query_idx}.csv"));
+        let write_csv = format!(
+            "COPY (\n{stripped}\n) TO '{}' (HEADER, DELIMITER '|');",
+            actual_path.display()
+        );
+        ctx.execute_query(&write_csv)?;
+
+        let expected = fs::read_to_string(&golden_path)?;
+        let actual = fs::read_to_string(&actual_path)?;
+
+        if expected != actual {
+            let diff = TextDiff::from_lines(&expected, &actual);
+            for change in diff.iter_all_changes() {
+                let sign = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                print!("{sign}{change}");
+            }
+            eprintln!("query {query_idx} output does not match reference for {format}");
+            mismatches.push(*query_idx);
+        }
+    }
+
+    if !mismatches.is_empty() {
+        bail!("vortex output mismatch for {format} on queries {mismatches:?}");
+    }
+
+    Ok(())
+}
 
 /// Verify DuckDB TPC-H results against reference data.
 ///
