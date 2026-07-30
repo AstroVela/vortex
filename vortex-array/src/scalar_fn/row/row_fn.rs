@@ -93,6 +93,19 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// The framework reads the arity, and whether every argument is readable behind a null row, off
     /// this witness before dispatching. A dispatch that visits at a tuple disagreeing with it on
     /// either does not compile.
+    ///
+    /// **Why a witness exists at all**, rather than the framework asking `dispatch`:
+    /// [`arity`](StrictScalarFnVTable::arity),
+    /// [`null_handling`](StrictScalarFnVTable::null_handling) and
+    /// [`is_fallible`](StrictScalarFnVTable::is_fallible) all take only the options, with no input
+    /// dtypes, while `dispatch` needs dtypes to choose. So those three answers **must** be
+    /// dtype-independent, and cannot be read off whichever element types a batch happens to pick.
+    /// The witness is where they are stated once, and the compile-time check on every visit is what
+    /// stops a dispatch from contradicting them.
+    ///
+    /// Naming *types* rather than three constants is deliberate: it means dense-safety and
+    /// fallibility are derived from the element types instead of hand-declared, so the only mistake
+    /// available is a witness that disagrees with the dispatch, which is a build error.
     type ArgsWitness: ElementTuple;
 
     /// The return type paired with [`ArgsWitness`](Self::ArgsWitness): an
