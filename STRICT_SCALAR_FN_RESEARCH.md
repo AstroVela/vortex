@@ -1,0 +1,457 @@
+# A layered authoring API for strict scalar functions
+
+**Status: proposal, feature-complete on this branch.** Most scalar functions in Vortex are
+[strict](https://github.com/vortex-data/vortex/pull/8930): a null input row forces a null output row,
+and non-null outputs depend only on non-null inputs. The null propagation, constant folding, validity
+bookkeeping, and nullability derivation that follow are identical in every implementation, and right
+now each function re-derives them by hand. This branch lifts them out into two authoring traits and
+an open element vocabulary, and ports eleven functions onto them as proof: `byte_length`,
+`list_length`, `not`, `list_sum`, the four `vortex-tensor` functions, and the three `vortex-geo`
+functions.
+
+Every pre-existing test passes unchanged, plus new regression tests for the invariants the framework
+now enforces. Along the way it turned up three problems that are not about the framework, filed as
+#9091, #9090 and #9092 and discussed in
+[Problems to extract](#problems-to-extract-onto-develop).
+
+---
+
+## The design in one screen
+
+```text
+RowFn ──────────blanket──▶ StrictScalarFnVTable ──────blanket──▶ ScalarFnVTable
+(row at a time, types                (null / constant / validity          (full control)
+ chosen per batch)                    lifting for a columnar kernel)
+```
+
+Two authoring traits, one for each axis a strict function actually varies on, plus a third axis (*how
+a row is typed*) factored into an open element vocabulary that neither trait mentions.
+
+### `StrictScalarFnVTable`, the null/validity lifting
+
+Write the structural metadata plus one **columnar** kernel that ignores validity. A blanket impl
+derives:
+
+- `is_strict = true`, and a mirrored `validity` a kernel can answer with the conjunction of its child
+  validities when it never turns a wholly non-null row into a null (see
+  [Strictness is not totality](#strictness-is-not-totality)), so the planner knows which rows are null
+  without executing the function.
+- `return_dtype` = `return_element_dtype` widened to nullable iff any input is nullable, so the
+  strictness dtype contract holds by construction rather than per function.
+- `execute` = the shared cases before the kernel runs: a null-constant input short-circuits to an
+  all-null constant, all-constant inputs evaluate one row and broadcast, and partially-null inputs
+  are handled per `NullHandling` (`Dense` masks after a full pass, `Filter` filters then scatters).
+- Options serde, from `PersistableOptions` on the options type.
+
+This is the layer for a function whose kernel is columnar rather than row-at-a-time: `not` (one `!`
+per 64-bit word), `list_length` (a difference of offset buffers), `list_sum` (a grouped accumulator over
+the elements child), `l2_denorm` (broadcast over flat tensor storage). See
+[Why three concepts and not fewer](#why-three-concepts-and-not-fewer) for why it cannot be folded
+away.
+
+### `RowFn`, one row with element types chosen per batch
+
+Name a witness argument tuple and return type, then in `dispatch` pick the concrete element types for
+a batch and hand the framework a row closure through a rank-2 visitor. A blanket impl derives the
+whole `StrictScalarFnVTable` (and array serde) from it. When the element types are fixed, `dispatch`
+is a single `visit` at those types. When one ID spans several widths (`l2_norm` accepts f16/f32/f64),
+`dispatch` matches on the input dtypes and visits at the chosen width.
+
+Everything structural follows from the argument tuple and return type: arity, per-argument dtype
+validation, the output dtype, null handling, and fallibility. There is nothing for an implementor to
+declare twice or get wrong, because the framework reads it off the types (see
+[Properties, not conventions](#properties-not-conventions)). A constant operand is decoded once and
+read at stride 0, so a broadcast argument costs one decode rather than one per row.
+
+Note that `RowFn` does not *require* totality, it just cannot currently express its absence: every
+`OutputElement` builds an all-valid column, so a row kernel has no way to say "this row is null". One
+`impl OutputElement for Option<T>` would lift that. No function needs it yet, so it is not there.
+
+### The element vocabulary, how a row is typed
+
+`InputElement` and `OutputElement` are open traits. A `NativePType`, `bool`, `Bytes` (a resolved
+`&[u8]`), and `BytesLen` (a length read from a view without resolving it) ship in the framework, and
+`vortex-tensor` adds `TensorRow<T>`, reaching through the extension wrapper into flat storage, in one
+impl in its own crate. Adding `&str`, decimals, or a list row is one impl that every row function
+gains, with no framework change.
+
+---
+
+## Why three concepts and not fewer
+
+The standard applied here: every trait, and every member of every trait, has to have a purpose
+nothing else can provide. Testing each against that standard is what the bulk of this research was.
+
+### `RowFn` and the witnesses are forced, not chosen
+
+A scalar function's *signature*, meaning its arity and fallibility, is a property of
+`(function, options)` with **no input dtypes**: `ScalarFnVTable::arity(&self, options)` and
+`is_fallible(&self, options)`, and `ScalarFnSignature` above them, take none. So any framework that
+derives arity and fallibility from element types has to be able to name element types *without seeing
+dtypes*, which is exactly what `ArgsWitness` / `RetWitness` are. Because `dispatch` *does* see dtypes
+and could choose otherwise, some check has to tie the two together, which is the compile-time witness
+check below. This cost is not a consequence of the rank-2 encoding: **any** design that derives a
+dtype-free signature from per-batch types pays it.
+
+A previous iteration made the width choice a generic-associated-type family generated by a
+`row_family!` macro. Rust cannot abstract over a GAT's bound (`type Args<T: Self::Bound>` is
+rejected), so that approach needed a trait *and* an adapter per width class, hand-written or
+macro-stamped. The rank-2 visitor sidesteps the limit rather than writing around it: the kernel owns
+the width `match`, where `T: Float` appears literally inside a `match_each_*_ptype!` arm, and the
+framework method `RowVisitor::visit<A: ElementTuple, R: ApplyResult>` is generic only over bounds it
+owns. The macro, its family traits, and its generated adapters are all deleted. Note that `dispatch`
+is not even per-*width*: it can pick different element *kinds* per dtype, which no
+bound-parameterized family could.
+
+### `ElementwiseFn` was not forced, so it is gone
+
+An earlier revision had a third trait, `ElementwiseFn`, for the fixed-element-type case: name `Args`
+and `Ret`, write `apply`. It read cleanly, but it failed the standard. `RowFn` already covers the
+fixed case (the dispatch is a single constant `visit`), so `ElementwiseFn` bought roughly seven lines
+on exactly one production function (`byte_length`) at the cost of 114 framework lines and a third
+link in the blanket-impl chain. The probes settled it: of the functions examined, `not` and `list_sum`
+turned out not to be row functions at all, and `list_length` needed the encoding-aware
+`reduce_encoded` hook that `ElementwiseFn` never exposed. So the constituency I expected it to have
+never materialized, and it is deleted. `byte_length` writes a two-line `dispatch` instead.
+
+The one-trait-with-defaults alternative (a single `RowFn` with `dispatch` defaulted to visit the
+witnesses and `apply` defaulted to `unimplemented!()`) was rejected because it converts a compile
+error into a runtime panic: a type implementing neither method compiles, registers, and answers
+signature queries with a plausible shape, then panics on first execution. `dispatch` is therefore
+required.
+
+### `StrictScalarFnVTable` cannot be folded into `RowFn`
+
+`RowFn`'s type surface is *closed*. The output dtype is `OutputElement::element_dtype()`, drawn from
+the finite set of `OutputElement` impls, `ElementTuple` exists only for arities 1 to 3, and the loop
+is one `apply` per row. Three whole classes of strict function are therefore inexpressible as a
+`RowFn` at any cost:
+
+- **Output dtype outside the element set.** `ext_storage`'s output is an extension array's storage
+  dtype, so `vortex.geo.box` is a struct and `vortex.uuid` is a `FixedSizeList(u8,16)`. `vortex-geo`'s
+  zone-map pruning calls `ext_storage` on a `geo.box` statistic, and a row-function port breaks it at
+  plan time.
+- **Variadic arity.** `merge` and `select` take an unbounded number of children, while `RowFn` fixes
+  `Arity::Exact(n <= 3)`.
+- **Sub-row-granular kernels.** `not` negates one 64-bit word at a time, so a row loop over `bool` is
+  ~64x the memory traffic and, measured, 406x slower at a 64Ki batch (see
+  [Measurements](#measurements)).
+
+So the middle layer has a genuine, disjoint constituency: `l2_denorm`, `not`, `list_length`,
+`list_sum`, and prospectively `select`, `merge`, `json_to_variant`. "Just a visitor" collapses three
+concepts to two rather than to one.
+
+### Every remaining member earns its place
+
+A member-by-member audit, with call sites found by grep rather than by guess, turned up nothing
+deletable. The non-obvious cases are worth recording:
+
+- **`RowVisitor::Out`** is what lets one `dispatch` `match` serve both plan time (`Out = DType`,
+  validate and name the output dtype) and run time (`Out = ArrayRef`, decode and run the loop). The
+  alternatives, a `{DType, ArrayRef}` enum unwrapped at each site or two separate dispatch hooks,
+  either add unwrap-panics or duplicate the width `match` in every width-polymorphic function with no
+  compiler check that the two copies agree.
+- **A plan-time visit is unavoidable.** `l2_norm` declares `RetWitness = f64` but dispatches over
+  f16/f32/f64, so the output dtype read off the witness would be wrong for two of three widths. Also
+  `TensorRow<T>::validate` rejects an `f32` column against an `f64` witness, and the visit is what
+  gives cross-argument uniformity for free (`int_max(i16_col, i64_col)` is rejected by
+  `(T, T)::validate`, not by any `dispatch` body, which only inspects `args[0]`).
+- **`ApplyResult` distinct from `OutputElement`** is what lets one trait serve both infallible
+  (`Ret = f64`) and fallible (`Ret = VortexResult<f64>`) kernels without a wrapper. `f64` cannot be
+  simultaneously fallible and infallible, so the fallibility bit lives on the return *shape* rather
+  than on the element.
+
+---
+
+## Properties, not conventions
+
+The framework's real value beyond line count is that two invariants an implementor used to have to
+get right are now derived from the types, so an unsound combination cannot be written.
+
+### Null handling follows from the arguments and the return type
+
+`NullHandling::Dense` runs the kernel over every row including those behind nulls, then masks. It is
+cheaper than filtering and the only option that leaves inputs at their original encoding, so it is
+right whenever it is sound. Soundness needs two things, every argument readable behind a null row and
+an infallible computation, and both are already visible in the types:
+
+```rust
+const fn row_null_handling<A: ElementTuple, R: ApplyResult>() -> NullHandling {
+    if A::DENSE_SAFE && !row_is_fallible::<A, R>() { NullHandling::Dense } else { NullHandling::Filter }
+}
+```
+
+Whether a dense read is safe is a property of the *element*, not of the function: reading a whole
+value out of a flat buffer is safe (`NativePType`, `bool`, `TensorRow`, `BytesLen`), while following a
+stored offset into a data buffer is not (`Bytes`), because arrays only validate the views of their
+*valid* rows. This caught a real bug in this branch's own `byte_length`, see
+[Problems to extract](#problems-to-extract-onto-develop).
+
+### Fallibility comes from the return type *and* the element decode
+
+A function is fallible if its computation can fail (`Ret = VortexResult<T>`) **or** if decoding an
+argument can fail on legal data. The second source is real and was missing: `geo_distance`'s row
+computation cannot fail, but parsing WKB bytes into a geometry can, for a *valid* row holding
+malformed bytes. So `InputElement` carries `DECODE_FALLIBLE`, and fallibility is the disjunction:
+
+```rust
+const fn row_is_fallible<A: ElementTuple, R: ApplyResult>() -> bool { A::DECODE_FALLIBLE || R::FALLIBLE }
+```
+
+`is_fallible` gates dict-value pushdown (`arrays/dict/compute/rules.rs`), which speculatively
+evaluates a function over *unreferenced* dictionary values, so a function that under-reports
+fallibility fails a query on rows it never needed.
+
+### The witness is checked at compile time
+
+Arity, dense-safety and fallibility must not vary between the choices `dispatch` makes, because the
+framework acts on them before dispatching. Since (with `ElementwiseFn` gone) *every* function names
+its element tuple twice, once as `ArgsWitness` and once in the `visit`, the check that the two agree
+is load-bearing, and it is a compile-time `const` assert inside each visit:
+
+```rust
+const fn assert_witness_agrees<F: RowFn, A: ElementTuple, R: ApplyResult>() {
+    assert!(A::ARITY == <F::ArgsWitness as ElementTuple>::ARITY, "…");
+    assert!(A::DENSE_SAFE == <F::ArgsWitness as ElementTuple>::DENSE_SAFE, "…");
+    assert!(row_is_fallible::<A, R>() == row_is_fallible::<F::ArgsWitness, F::RetWitness>(), "…");
+}
+```
+
+Monomorphizing any dispatch arm evaluates it, so even a `match` arm that never runs at a given width
+is checked, and a disagreement fails the build pointing at the exact `visit::<…>` call. It compares
+the raw arity/dense-safety/fallibility rather than the derived `NullHandling`, which collapses
+dense-safety and fallibility together and would miss an arm that flipped both. A `compile_fail`
+doctest pins that a lying witness does not compile. This replaced a runtime check that ran three
+times per array (plan, execute, deserialize).
+
+---
+
+## Strictness is not totality
+
+This is the finding that decides what the middle layer may derive. Note that
+[#9033](https://github.com/vortex-data/vortex/pull/9033) reaches the same conclusion independently and
+documents it on `develop`, so this section is no longer the argument for the finding, just for the API
+that follows from it.
+
+The `is_strict` documentation on `develop` today states a **mask-hoisting law**,
+`f(…, mask(aⱼ, m), …) == mask(f(…, aⱼ, …), m)`, and then asserts as "consequence 1" that output
+validity is the conjunction of input validities. **Consequence 1 does not follow from the law.** It
+needs an extra premise: that the kernel never turns a wholly non-null row into a null. #9033 replaces
+that equality with a one-sided bound, `valid(f(a₁, …, aₖ)) ⊆ valid(a₁) ∧ … ∧ valid(aₖ)`, which is the
+vocabulary this branch now uses.
+
+`list_sum` is the counterexample. Summing a valid *empty* list yields null. It still satisfies the law
+(a null it introduces at a valid row appears identically on both sides of the equation and cancels),
+so it is genuinely strict, but its output validity is *narrower* than its input validity.
+
+Two properties, then, not one:
+
+| property | what needs it |
+| --- | --- |
+| **strict** (null propagation, mask commutation) | mask/filter/dictionary push-down, the thing we actually want |
+| **total** (non-null in implies non-null out) | upgrading the `⊆` bound to `=`, so validity is precomputable |
+
+The old blanket impl derived `validity = union_child_validities` for *every* implementor, which needs
+totality while the trait only requires strictness. Every current implementor happens to be total, so
+nothing was broken, but a partial function joining the layer would get a `validity` that contradicts
+what it computes: `arr.validity()` would report all-valid while `arr.execute()` yields the null, since
+`ValidityVTable<ScalarFn>::validity` evaluates the derived expression. `list_sum` was about to be
+exactly that, and is now ported onto the layer as the first non-total member.
+
+#9033 says a function satisfying the stronger equality "can advertise that through
+`ScalarFnVTable::validity`". That is the same idea as `is_total`, moved from a hand-written method to a
+boolean, because a blanket impl cannot hand-write `validity` per function: it needs the property as
+data in order to decide whether to derive one.
+
+The fix needs no new property. `validity` is mirrored on `StrictScalarFnVTable` alongside `reduce`,
+defaulting to `None`, and a kernel that satisfies the equality answers it with
+`union_child_validities`. The unsound direction is the one that now takes work, and the safe default is
+what a function gets for free.
+
+An earlier revision of this branch instead added an `is_total` method and derived `validity` from it.
+That was strictly worse: it introduced a concept the codebase did not have, in order to compute
+something a function can just say directly. It is gone. The `RowFn` blanket impl answers `validity`
+for every row function, justified by its own output vocabulary (no `OutputElement` is nullable, so no
+row kernel can introduce a null), which keeps the row layer at zero boilerplate.
+
+Note that strictness rather than totality gates membership either way: `is_null` is total but
+disqualified, because it inspects validity and so does not propagate nulls. That is also why the trait
+is not called `TotalFnVTable`.
+
+> **A related latent issue, deliberately not fixed here.** Four functions declare `is_strict = true`
+> and are strict-but-not-total: `get_item` (a nullable field under a non-null struct), `mask`,
+> `variant_get`, `geo_envelope`. None is broken today, since `get_item` leaves `validity` at the
+> default and `mask` overrides it correctly, but any that grows a conjunction-shaped `validity`
+> derivation would be wrong. This predates the branch and belongs in its own investigation.
+
+---
+
+## Problems to extract onto develop
+
+The framework surfaced three problems that are not really about the framework. Each is filed
+separately and I think each should land as its own PR rather than riding in on this one. Note that
+none of them is a live miscompute on `develop` today, which is worth saying plainly, because the
+branch's own commit messages describe fixes to *this branch's* code.
+
+1. **Strict-but-non-total validity derivation ([#9091]).** The `is_strict` documentation presents
+   totality as a consequence of strictness when it is an independent premise (see above). Nothing
+   derives validity from `is_strict` automatically, so nothing is wrong today, but the doc invites the
+   next strict-but-partial function to write `validity: union_child_validities` and be silently wrong.
+   **Superseded by [#9033], which lands the documentation correction on `develop`.** This branch needs
+   nothing beyond that, since it now mirrors `validity` rather than deriving it from a property.
+
+2. **Views behind null rows are unvalidated ([#9090]).** `VarBinViewArray::validate_views` only
+   validates the views of *valid* rows, so a legal array can hold a view behind a null row naming a
+   buffer that does not exist, and resolving it densely panics (`index out of bounds: the len is 1 but
+   the index is 9`). On this branch, expressing byte length as "a function of the row's bytes" quietly
+   changed *what gets decoded* and hit that panic. The fix here reads the length out of the view
+   (`BytesLen`) and never resolves the row, and
+   `test_byte_length_ignores_unresolvable_views_behind_nulls` pins it (verified to panic without the
+   fix). `develop`'s `byte_length` was already immune, since it also read `view.len()`, so the
+   extraction is that regression test rather than a code change. The doc half is also covered by
+   [#9033], which deletes the dense-evaluation "consequence 2" outright rather than narrowing it. That
+   leaves `InputElement::DENSE_SAFE` as the only place the licence is written down, per element rather
+   than as a blanket claim, which is where it belongs.
+
+3. **Bit-at-a-time bool packing ([#9092]).** `OutputElement for bool` used `BitBuffer::from_iter`,
+   where the `Vec<bool>` is already owned and contiguous so `BitBuffer::from` routes to the
+   multiversioned SIMD packer. Measured **6.6 to 7.9x faster** on the packing step, for every
+   bool-returning row function. Note that `OutputElement` only exists on this branch, so the
+   develop-side instance of the same pattern is a different call site:
+   `encodings/sequence/src/compute/compare.rs` builds an n-bit result with a per-row predicate when it
+   already knows the single set index. I have not benchmarked that site.
+
+[#9033]: https://github.com/vortex-data/vortex/pull/9033
+[#9090]: https://github.com/vortex-data/vortex/issues/9090
+[#9091]: https://github.com/vortex-data/vortex/issues/9091
+[#9092]: https://github.com/vortex-data/vortex/issues/9092
+
+---
+
+## Known gaps and future work
+
+Found by the porting probes, left unfixed here because each is a larger change with its own review
+surface. Recorded so they are decisions rather than surprises.
+
+- **~~No constant-operand affordance.~~ Fixed.** A partially-constant call used to decode the constant
+  column in full, so a broadcast operand cost one decode per row (measured: a broadcast query vector
+  cost the same as a genuine column, 234 ms vs 226 ms at 50k x 256). That was what kept the geo
+  functions off `RowFn`, since porting them would have traded one geometry parse for *n*. Each decoded
+  column now carries a stride, 0 for a constant, and the geo functions are row functions.
+- **`NullHandling::Dense` is chosen on safety alone, with no cost input.** For a fixed-width element
+  (`TensorRow`) dense is unambiguously cheaper. For an unbounded-width row (a nested list) the garbage
+  behind a null row need only be *in bounds*, so it can span the whole elements array, which is
+  pathologically O(nulls x elements). No current function hits this, but the choice should consider
+  width.
+- **`OutputElement::build(Vec<Self>)` forces materialization.** A row function's output is always a
+  freshly built `Vec` turned into a `PrimitiveArray`, so it cannot return a `ConstantArray` or a lazy
+  child. This is why `list_length` is a columnar `StrictScalarFnVTable` rather than a `RowFn`, since a
+  row port would materialize one `u64` per row and lose the `FixedSizeList` constant. A columnar output
+  escape that stays inside the framework ("given the decoded columns, can you produce the whole output
+  at once?") would let `list_length`, `byte_length` and `not` share one abstraction.
+- **The missing cell.** The two authoring traits cover *declare-signature-once + row-loop* (`RowFn`)
+  and *hand-write-signature + own-kernel* (`StrictScalarFnVTable`). The cell for
+  *declare-signature-once + own-kernel* is empty, so `not` and `list_length` hand-write five signature
+  methods (`arity`, `child_name`, `return_element_dtype`, `null_handling`, `is_fallible`) that are all
+  mechanically derivable from an element tuple. With two functions now wanting it, a small
+  signature-carrying helper (or making the row `validate_row_args` / `row_null_handling` public) is
+  probably worth doing next. I left it out here to avoid adding a one-user abstraction, but this is the
+  gap I would close first.
+- **No nullable output element, so no non-total `RowFn`.** `OutputElement::build` always produces an
+  all-valid column, so a row kernel cannot return a null from a valid row. `impl OutputElement for
+  Option<T>` is the whole fix. Left out because no function needs it: `list_sum` wants nullable output
+  but is columnar for unrelated reasons (the grouped-accumulator path and the `FixedSizeList`
+  constant).
+- **`InputElement` is an open trait with required consts.** Adding `DECODE_FALLIBLE` broke every
+  out-of-crate element (`TensorRow`) until updated. If elements are a real extension point for other
+  crates, `DENSE_SAFE` / `DECODE_FALLIBLE` should carry conservative defaults.
+- **`DENSE_SAFE`'s doc guidance is subtly wrong for lists.** It says `false` for "any element that
+  follows an offset," but a list element *is* dense-safe, because list arrays validate
+  `offsets[i] + sizes[i] <= elements.len()` for every row including nulls. Following the doc literally
+  would put `list_length` on `Filter` and lose its encoding fast paths.
+
+---
+
+## What the ports bought
+
+Production lines, before and after:
+
+| function | layer | before | after |
+| --- | --- | --- | --- |
+| `byte_length` | `RowFn` (fixed) | n/a | 23 (impl) |
+| `list_length` | `StrictScalarFnVTable` | 189 | 143 |
+| `not` | `StrictScalarFnVTable` | 76 (impl) | 53 (impl) |
+| `list_sum` | `StrictScalarFnVTable` | 78 (impl) | 56 (impl) |
+| `l2_norm` | `RowFn` (width) | 254 | 96 |
+| `inner_product` | `RowFn` (width) | 277 | 112 |
+| `cosine_similarity` | `RowFn` (width) | 309 | 203 |
+| `l2_denorm` | `StrictScalarFnVTable` | 731 | 706 |
+| geo x 3 | `RowFn` (fixed) | 51 each (impl) | 15 each (impl), plus one shared element |
+
+Nothing outside the functions' own crates changed: the `L2DenormScheme` compressor and every
+`ExactScalarFn` matcher are untouched, because the encoding-aware push-downs key off the function
+*type* rather than its vtable layer.
+
+The line-count case does not close on its own. The framework is ~1330 production lines and removes
+~760 across the ported functions, so **net this branch adds lines**, amortizing around the fourteenth
+function against ~20 strict candidates in the tree. To be honest, the case for merging is the marginal
+cost of the *next* function (~15 lines, and the invariants above enforced rather than reviewed), plus
+the correctness the type-derived properties buy, rather than the diff.
+
+---
+
+## Measurements
+
+`vortex-array/benches/byte_length_element.rs`, element choice for `byte_length`, whole-execution
+medians:
+
+| input | `BytesLen` | `Bytes` | |
+| --- | --- | --- | --- |
+| 64Ki non-inlined rows | **206 µs** | 256 µs | 24% faster |
+| 64Ki inlined rows | **207 µs** | 215 µs | 4% faster |
+
+`vortex-array/benches/strict_validity.rs`, how the `Dense` path applies validity, same kernel in both
+arms:
+
+| | `lazy` | `eager` | |
+| --- | --- | --- | --- |
+| 64Ki, one call | **9.0 µs** | 75.3 µs | 8.3x faster |
+| 1Mi, one call | 1.357 ms | 1.357 ms | parity |
+| 64Ki, chain of 3 | **28.3 µs** | 30.6 µs | 7% faster |
+
+`Validity::and` is already lazy, so the conjunction is never materialized to be applied. Only
+`NullHandling::Filter` needs positions, and only it pays for them.
+
+`not`, word-wise kernel against the row loop it would have if it were a `RowFn` (release, identical
+outputs asserted):
+
+| len | word-wise `!` | row loop + `bool::build` |
+| --- | --- | --- |
+| 64Ki | 927 ns | 376 µs (**406x**) |
+| 1Mi | 10.3 µs | 5.83 ms (**569x**) |
+
+This is why `not` is a columnar `StrictScalarFnVTable` rather than a row function.
+
+---
+
+## Rejected alternatives
+
+- **A wrapper type instead of a blanket impl** (`Strict<MyFn>`): forces churn at every call site,
+  meaning matchers, kernel registrations, and expression constructors. The blanket impl means a port
+  edits only the function's own impl block.
+- **A `row_family!` macro, a per-crate GAT family, or a framework GAT family**: three encodings of
+  "element types as a function of the width," all paying for the same limit (the width bound has to
+  appear literally in a GAT), so each width class needed its own trait *and* adapter. The rank-2
+  visitor replaces the whole lineage with one non-generic trait method and no generated code.
+- **`ElementwiseFn` as a third trait**: subsumed by `RowFn` with a constant dispatch, see above.
+- **One `RowFn` with defaulted `dispatch` and `apply`**: converts "define nothing" from a compile
+  error into a runtime panic.
+- **Renaming `StrictScalarFnVTable` to `TotalFnVTable`**: the trait admits non-total members on
+  purpose, so the name would be wrong.
+- **An `is_total` method feeding a derived `validity`**: a new concept to compute what a function can
+  state directly. Mirroring `validity` with a `None` default makes the unsound answer the one that
+  takes work.
+- **Macro-generated per-type constructors**: a bespoke API per function, where the general
+  `ScalarFnFactoryExt::try_new_array` is what every other scalar function already uses.
+- **A separate `FallibleElementwiseFn`**: an associated return type (`ApplyResult`) costs one line per
+  function instead of a whole trait and a spent coherence slot.
