@@ -48,6 +48,7 @@ use vortex_session::registry::CachedId;
 use crate::TileGeometry;
 use crate::geometry::TileBounds;
 use crate::geometry::TileBoundsIter;
+use crate::geometry::geometry_usizes;
 use crate::geometry::tile_bounds;
 use crate::transpose::decode_elements;
 use crate::transpose::encode_elements;
@@ -179,7 +180,9 @@ impl TryFrom<&TiledFixedSizeListMetadata> for TileGeometry {
             .ok_or_else(|| vortex_err!(InvalidArgument: "tile_rows must be nonzero"))?;
         let dimensions = NonZeroU32::new(metadata.tile_dimensions)
             .ok_or_else(|| vortex_err!(InvalidArgument: "tile_dimensions must be nonzero"))?;
-        Ok(Self::new(rows, dimensions))
+        let geometry = Self::new(rows, dimensions);
+        geometry_usizes(geometry)?;
+        Ok(geometry)
     }
 }
 
@@ -195,7 +198,7 @@ impl VTable for TiledFixedSizeList {
 
     fn validate(
         &self,
-        _data: &Self::TypedArrayData,
+        data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -203,6 +206,7 @@ impl VTable for TiledFixedSizeList {
         let DType::FixedSizeList(element_dtype, list_size, nullability) = dtype else {
             vortex_bail!(InvalidArgument: "tiled fixed-size-list dtype must be FixedSizeList, got {dtype}");
         };
+        geometry_usizes(data.geometry)?;
         vortex_ensure!(
             matches!(element_dtype.as_ref(), DType::Primitive(..)),
             InvalidArgument: "tiled fixed-size-list elements must have a primitive dtype, got {element_dtype}"
@@ -412,14 +416,14 @@ pub trait TiledFixedSizeListArrayExt:
 
     /// Returns the number of row tiles needed for the logical array length.
     fn row_tile_count(&self) -> usize {
-        self.as_ref()
-            .len()
-            .div_ceil(self.geometry().rows().get() as usize)
+        let (rows, _) = validated_geometry_usizes(self.geometry());
+        self.as_ref().len().div_ceil(rows)
     }
 
     /// Returns the number of dimension tiles needed for each logical list.
     fn dimension_tile_count(&self) -> usize {
-        (self.list_size() as usize).div_ceil(self.geometry().dimensions().get() as usize)
+        let (_, dimensions) = validated_geometry_usizes(self.geometry());
+        (self.list_size() as usize).div_ceil(dimensions)
     }
 
     /// Returns the bounds for one checked logical tile.
@@ -467,4 +471,11 @@ pub trait TiledFixedSizeListArrayExt:
 impl<T> TiledFixedSizeListArrayExt for T where
     T: TypedArrayRef<TiledFixedSizeList> + TiledFixedSizeListArraySlotsExt
 {
+}
+
+fn validated_geometry_usizes(geometry: TileGeometry) -> (usize, usize) {
+    match geometry_usizes(geometry) {
+        Ok(geometry) => geometry,
+        Err(_) => unreachable!("validated tiled fixed-size-list geometry must fit usize"),
+    }
 }

@@ -430,3 +430,14 @@ fn accepts_degenerate_and_oversized_geometry() -> VortexResult<()> {
     physical_fixture(3, 5, geometry(32, 64))?;
     Ok(())
 }
+
+#[test]
+fn max_usize_representable_geometry_constructs_and_traverses() -> VortexResult<()> {
+    let tiled = physical_fixture(1, 1, geometry(u32::MAX, u32::MAX))?;
+    let bounds: Vec<TileBounds> = tiled.tiles().collect();
+    assert_eq!(bounds.len(), 1);
+    assert_eq!(bounds[0].row_range, 0..1);
+    assert_eq!(bounds[0].dimension_range, 0..1);
+    assert_eq!(bounds[0].physical_range, 0..1);
+    Ok(())
+}

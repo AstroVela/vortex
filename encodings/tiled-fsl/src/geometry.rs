@@ -47,7 +47,8 @@ pub struct TileBounds {
 pub struct TileBoundsIter {
     len: usize,
     list_size: usize,
-    geometry: TileGeometry,
+    rows: usize,
+    dimensions: usize,
     row_tile_count: usize,
     dimension_tile_count: usize,
     next_row_tile: usize,
@@ -62,10 +63,17 @@ impl TileBoundsIter {
         row_tile_count: usize,
         dimension_tile_count: usize,
     ) -> Self {
+        #[allow(
+            clippy::expect_used,
+            reason = "validated tiled fixed-size-list geometry must fit usize"
+        )]
+        let (rows, dimensions) = geometry_usizes(geometry)
+            .expect("validated tiled fixed-size-list geometry must fit usize");
         Self {
             len,
             list_size,
-            geometry,
+            rows,
+            dimensions,
             row_tile_count,
             dimension_tile_count,
             next_row_tile: 0,
@@ -85,7 +93,8 @@ impl Iterator for TileBoundsIter {
         let bounds = tile_bounds_for_validated_array(
             self.len,
             self.list_size,
-            self.geometry,
+            self.rows,
+            self.dimensions,
             self.next_row_tile,
             self.next_dimension_tile,
         );
@@ -110,8 +119,7 @@ pub(crate) fn tile_bounds(
         vortex_bail!(InvalidArgument: "cannot compute tiles for an empty logical extent");
     }
 
-    let rows = geometry.rows().get() as usize;
-    let dimensions = geometry.dimensions().get() as usize;
+    let (rows, dimensions) = geometry_usizes(geometry)?;
     let row_start = row_tile.checked_mul(rows).ok_or_else(|| {
         vortex_error::vortex_err!(InvalidArgument: "row tile index {row_tile} overflows tile geometry")
     })?;
@@ -132,12 +140,11 @@ pub(crate) fn tile_bounds(
 fn tile_bounds_for_validated_array(
     len: usize,
     list_size: usize,
-    geometry: TileGeometry,
+    rows: usize,
+    dimensions: usize,
     row_tile: usize,
     dimension_tile: usize,
 ) -> TileBounds {
-    let rows = geometry.rows().get() as usize;
-    let dimensions = geometry.dimensions().get() as usize;
     let row_tile_count = len.div_ceil(rows);
     let dimension_tile_count = list_size.div_ceil(dimensions);
     // Callers must provide only counters generated from this validated array's geometry.
@@ -151,6 +158,22 @@ fn tile_bounds_for_validated_array(
         Ok(bounds) => bounds,
         Err(_) => unreachable!("validated tiled array has in-range tile bounds"),
     }
+}
+
+pub(crate) fn geometry_usizes(geometry: TileGeometry) -> VortexResult<(usize, usize)> {
+    let rows = usize::try_from(geometry.rows().get()).map_err(|_| {
+        vortex_error::vortex_err!(
+            InvalidArgument: "tile row geometry {} does not fit usize",
+            geometry.rows().get()
+        )
+    })?;
+    let dimensions = usize::try_from(geometry.dimensions().get()).map_err(|_| {
+        vortex_error::vortex_err!(
+            InvalidArgument: "tile dimension geometry {} does not fit usize",
+            geometry.dimensions().get()
+        )
+    })?;
+    Ok((rows, dimensions))
 }
 
 fn tile_bounds_from_starts(
@@ -211,8 +234,7 @@ pub(crate) fn physical_offset(
         );
     }
 
-    let rows = usize::try_from(geometry.rows().get())?;
-    let dimensions = usize::try_from(geometry.dimensions().get())?;
+    let (rows, dimensions) = geometry_usizes(geometry)?;
     let row_tile = row / rows;
     let dimension_tile = dimension / dimensions;
     let bounds = tile_bounds(len, list_size, geometry, row_tile, dimension_tile)?;
