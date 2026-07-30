@@ -22,15 +22,20 @@ use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::NullHandling;
+use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::PersistableOptions;
+use crate::scalar_fn::RowResult;
 use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::SinkResult;
 use crate::scalar_fn::StrictScalarFnVTable;
 use crate::scalar_fn::decode_scalar_fn_array;
 use crate::scalar_fn::encode_children_and_options;
 use crate::scalar_fn::row::execute::execute_row_loop;
+use crate::scalar_fn::row::execute::execute_row_sink;
 use crate::scalar_fn::row::execute::row_is_fallible;
 use crate::scalar_fn::row::execute::row_null_handling;
 use crate::scalar_fn::row::execute::validate_row_args;
+use crate::scalar_fn::row::execute::validate_row_sink;
 use crate::serde::ArrayChildren;
 
 /// A scalar function computed one row at a time.
@@ -108,13 +113,18 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// available is a witness that disagrees with the dispatch, which is a build error.
     type ArgsWitness: ElementTuple;
 
-    /// The return type paired with [`ArgsWitness`](Self::ArgsWitness): an
-    /// [`OutputElement`](crate::scalar_fn::OutputElement), or a [`VortexResult`] of one.
+    /// The return type paired with [`ArgsWitness`](Self::ArgsWitness).
     ///
     /// Together with [`ArgsWitness`](Self::ArgsWitness) this fixes whether the function is fallible,
     /// either from the return type here or from an argument whose decode can fail. The framework
     /// also reads that before dispatching, so it too **must** not vary between the choices.
-    type RetWitness: ApplyResult;
+    ///
+    /// Fallibility is all it fixes, which is why the bound is [`RowResult`] and not
+    /// [`ApplyResult`](crate::scalar_fn::ApplyResult): the output dtype is read off whatever a visit
+    /// chooses, not off the witness, so a returning dispatch names an
+    /// [`OutputElement`](crate::scalar_fn::OutputElement) (or a [`VortexResult`] of one) here while a
+    /// sink-writing one names `()` (or `VortexResult<()>`).
+    type RetWitness: RowResult;
 
     /// Returns the ID of the scalar function.
     fn id(&self) -> ScalarFnId;
@@ -167,20 +177,37 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
 
 /// One use of a [`RowFn`] at concrete element types.
 ///
-/// The framework hands a visitor to [`RowFn::dispatch`], which calls [`visit`](Self::visit) with the
-/// element types it chose: at plan time the visit validates dtypes, at run time it executes the row
-/// loop. Only the framework implements this trait, and a function only ever *calls* `visit`.
+/// The framework hands a visitor to [`RowFn::dispatch`], which calls one of the two visit methods with
+/// the element types it chose: at plan time the visit validates dtypes, at run time it executes the row
+/// loop. Only the framework implements this trait, and a function only ever *calls* a visit.
+///
+/// The two methods differ only in how the row closure delivers its output, and a dispatch picks
+/// whichever fits. Both apply the same witness check.
 pub trait RowVisitor {
     /// What this visit produces.
     type Out;
 
-    /// Visit at argument tuple `A`, with `apply` computing one `R` from one row.
+    /// Visit at argument tuple `A`, with `apply` *returning* one `R` from one row.
     ///
     /// `A` and `R` **must** agree with the [`RowFn`]'s witnesses on arity, dense-safety and
     /// fallibility. A visit that does not is a compile error.
     fn visit<A: ElementTuple, R: ApplyResult>(
         self,
         apply: impl Fn(A::Elems<'_>) -> R,
+    ) -> VortexResult<Self::Out>;
+
+    /// Visit at argument tuple `A`, with `apply` *writing* one row of sink `S` and returning only
+    /// whether that failed.
+    ///
+    /// Use this when an owned value per row is the wrong shape for the output: a row whose width is
+    /// runtime data, or bytes appended to one buffer for the whole batch. See [`OutputSink`].
+    ///
+    /// `A` and `R` **must** agree with the [`RowFn`]'s witnesses on arity, dense-safety and
+    /// fallibility, exactly as for [`visit`](Self::visit). A sink-writing dispatch therefore names
+    /// `()` or `VortexResult<()>` as its [`RetWitness`](RowFn::RetWitness).
+    fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(
+        self,
+        apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<Self::Out>;
 }
 
@@ -193,7 +220,7 @@ pub trait RowVisitor {
 /// Comparing the raw properties rather than the derived [`NullHandling`] is deliberate: null handling
 /// collapses dense-safety and fallibility together, so an arm that flipped both would slip past a
 /// check on the derived value.
-const fn assert_witness_agrees<F: RowFn, A: ElementTuple, R: ApplyResult>() {
+const fn assert_witness_agrees<F: RowFn, A: ElementTuple, R: RowResult>() {
     assert!(
         A::ARITY == <F::ArgsWitness as ElementTuple>::ARITY,
         "dispatch visited a tuple whose arity differs from ArgsWitness",
@@ -227,11 +254,25 @@ impl<F: RowFn> RowVisitor for ValidateRows<'_, F> {
         const { assert_witness_agrees::<F, A, R>() };
         validate_row_args::<A, R>(self.args)
     }
+
+    fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(
+        self,
+        _apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
+    ) -> VortexResult<DType> {
+        const { assert_witness_agrees::<F, A, R>() };
+        validate_row_sink::<A, S>(self.args)
+    }
 }
 
 /// The run-time visit: decode every column once and run the row loop.
 struct ExecuteRows<'a, 'b, F> {
     args: &'a dyn ExecutionArgs,
+
+    /// The input dtypes, which a sink needs to size and name its output column. Carried rather than
+    /// re-derived from `args`, since [`execute_strict`](StrictScalarFnVTable::execute_strict) has
+    /// already collected them to dispatch on.
+    arg_dtypes: &'a [DType],
+
     ctx: &'b mut ExecutionCtx,
 
     /// The visited function, carried only so the witness check can name its witnesses.
@@ -247,6 +288,14 @@ impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     ) -> VortexResult<ArrayRef> {
         const { assert_witness_agrees::<F, A, R>() };
         execute_row_loop::<A, R>(self.args, self.ctx, apply)
+    }
+
+    fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(
+        self,
+        apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
+    ) -> VortexResult<ArrayRef> {
+        const { assert_witness_agrees::<F, A, R>() };
+        execute_row_sink::<A, S, R>(self.args, self.arg_dtypes, self.ctx, apply)
     }
 }
 
@@ -282,9 +331,10 @@ impl<F: RowFn> StrictScalarFnVTable for F {
         row_null_handling::<F::ArgsWitness, F::RetWitness>()
     }
 
-    /// Every [`OutputElement`](crate::scalar_fn::OutputElement) builds an all-valid column, so a row
-    /// kernel cannot turn a wholly non-null row into a null and the output validity is exactly the
-    /// conjunction of the inputs'. Adding a nullable output element would invalidate this.
+    /// Both output forms build an all-valid column, so a row kernel cannot turn a wholly non-null row
+    /// into a null and the output validity is exactly the conjunction of the inputs'. Letting either
+    /// an [`OutputElement`](crate::scalar_fn::OutputElement) or an [`OutputSink`] produce nulls would
+    /// invalidate this.
     fn validity(
         &self,
         _options: &Self::Options,
@@ -321,6 +371,7 @@ impl<F: RowFn> StrictScalarFnVTable for F {
             &arg_dtypes,
             ExecuteRows::<F> {
                 args,
+                arg_dtypes: &arg_dtypes,
                 ctx,
                 row_fn: PhantomData,
             },

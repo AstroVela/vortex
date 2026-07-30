@@ -13,31 +13,34 @@
 //! derived one that the function fits.
 //!
 //! [`RowFn`] is for a kernel whose value at a row is determined by that row alone, and which has to
-//! read every row anyway: `vortex.byte_length`, `vortex.tensor.l2_norm`, `vortex.geo.distance`.
-//! Name the element types and write the row closure, and the rest is derived, including which rows
-//! get visited.
+//! read every row anyway: `vortex.byte_length`, `vortex.tensor.l2_norm`, `vortex.tensor.l2_denorm`,
+//! `vortex.geo.distance`. Name the element types and write the row closure, and the rest is derived,
+//! including which rows get visited.
 //!
 //! Its *input* side is open. [`InputElement::Elem`] is a GAT, so an element can hand the closure
 //! borrowed variable-length data ([`Bytes`] yields `&[u8]`) or drill through a wrapper
 //! (`vortex-tensor`'s `TensorRow` yields a slice of an extension array's storage). Covering a new
 //! type family, a list row included, is one impl.
 //!
-//! The *output* side is what narrows it. [`OutputElement::build`] takes one owned value per row and
-//! [`OutputElement::element_dtype`] takes no arguments, which together rule out three things:
+//! Its *output* side comes in two forms, and a dispatch picks one per visit:
 //!
-//! - **A result that borrows from an input.** A row closure returns an [`ApplyResult`], which is
-//!   `'static`, so a function whose output is a *slice* of its input cannot avoid copying it.
-//!   Trimming strings is the example: the ideal kernel keeps the input's data buffer and writes
-//!   new views over it, copying no bytes, which only a columnar kernel can express.
-//! - **An output dtype that depends on runtime data.** `element_dtype` is a property of the Rust
-//!   type, and a tensor's dtype carries its shape. This one is a signature choice rather than a law,
-//!   since the blanket path already holds the input dtypes when it asks; what actually keeps
-//!   `vortex.tensor.l2_denorm` columnar is `build` taking one owned value per row, which for a tensor
-//!   row means an allocation per row against a kernel that scales the flat buffer in one pass.
-//! - **A null result for a non-null row.** Every output element builds an all-valid column, so
+//! - [`RowVisitor::visit`] takes a closure that **returns** an [`OutputElement`]: one owned value per
+//!   row, whose dtype is fixed by its Rust type. This is the common case.
+//! - [`RowVisitor::visit_into`] takes one that **writes** into an [`OutputSink`], allocated once per
+//!   batch knowing the output dtype and handing out a place to write. That carries what an owned
+//!   per-row value cannot. `vortex.tensor.l2_denorm` writes each row into a slice of one flat buffer,
+//!   so its output width can be runtime data and it allocates once rather than once per row.
+//!
+//! Two things neither form covers, and they are what actually send a function to the trait below:
+//!
+//! - **A result that aliases an input.** Both forms own their output bytes: an element returns them
+//!   and a sink copies them into itself. Trimming strings is the example, where the ideal kernel keeps
+//!   the input's data buffer and writes new views over it, copying no bytes, which only a columnar
+//!   kernel can express.
+//! - **A null result for a non-null row.** Both forms build an all-valid column, so
 //!   `vortex.list.sum` cannot be a row function: a valid empty list sums to null.
 //!
-//! [`StrictScalarFnVTable`] takes the whole column instead. Besides the three cases above, reach for
+//! [`StrictScalarFnVTable`] takes the whole column instead. Besides the two cases above, reach for
 //! it when a row loop *could* express the function but would do avoidable work:
 //!
 //! - **The answer is already an array, or is one value for the whole column.**

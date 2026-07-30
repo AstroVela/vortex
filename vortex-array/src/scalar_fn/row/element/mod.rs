@@ -8,8 +8,10 @@
 //! `vortex-tensor`'s `TensorRow` drills through an extension wrapper into its storage.
 //!
 //! The two directions are deliberately asymmetric. [`InputElement::Elem`] is a GAT, so an input row
-//! can borrow out of the decoded column, while an [`OutputElement`] is one owned value per row. See
-//! [choosing a trait](crate::scalar_fn#choosing-a-trait) for what that rules out.
+//! can borrow out of the decoded column, while an [`OutputElement`] is one owned value per row. When
+//! that owned value is the wrong shape for an output, the row function writes into an
+//! [`OutputSink`](crate::scalar_fn::OutputSink) instead. See
+//! [choosing a trait](crate::scalar_fn#choosing-a-trait) for which to reach for.
 
 use vortex_error::VortexResult;
 
@@ -80,48 +82,12 @@ pub trait OutputElement: 'static + Sized {
     /// The dtype of columns built from this element type. Must be non-nullable: nullability is
     /// derived from the inputs by the strict lifting.
     ///
-    /// Taking no arguments is what confines a row function's output dtype to a property of its Rust
-    /// type, so an output whose dtype depends on runtime data (a tensor, whose dtype carries its
-    /// shape) cannot be an element.
+    /// Taking no arguments confines an element's dtype to a property of its Rust type, so an output
+    /// whose dtype depends on runtime data (a tensor, whose dtype carries its shape) cannot be an
+    /// element. Such an output uses an [`OutputSink`](crate::scalar_fn::OutputSink), whose
+    /// [`sink_dtype`](crate::scalar_fn::OutputSink::sink_dtype) does see the input dtypes.
     fn element_dtype() -> DType;
 
     /// Build a column from one value per row. Called once per batch.
     fn build(values: Vec<Self>) -> ArrayRef;
-}
-
-/// What a row computation may return: an [`OutputElement`] directly, or a [`VortexResult`] of one.
-///
-/// Implementing it for both forms is what lets one row function trait serve infallible and fallible
-/// kernels without a second trait or a wrapper. A kernel returning `f64` and one returning
-/// `VortexResult<f64>` agree on [`Out`](Self::Out) and differ only in
-/// [`FALLIBLE`](Self::FALLIBLE), which is what the framework reads.
-pub trait ApplyResult: 'static {
-    /// The element this computation produces.
-    type Out: OutputElement;
-
-    /// Whether this return type can carry an error.
-    const FALLIBLE: bool;
-
-    /// Convert into a result, so one code path can handle both forms.
-    fn into_result(self) -> VortexResult<Self::Out>;
-}
-
-impl<T: OutputElement> ApplyResult for T {
-    type Out = T;
-
-    const FALLIBLE: bool = false;
-
-    fn into_result(self) -> VortexResult<T> {
-        Ok(self)
-    }
-}
-
-impl<T: OutputElement> ApplyResult for VortexResult<T> {
-    type Out = T;
-
-    const FALLIBLE: bool = true;
-
-    fn into_result(self) -> VortexResult<T> {
-        self
-    }
 }

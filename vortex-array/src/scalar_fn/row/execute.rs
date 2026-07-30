@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The three pieces every row function is built from, whatever its `dispatch` chooses.
+//! The pieces every row function is built from, whatever its `dispatch` chooses.
 //!
 //! These back the blanket impls in [`row_fn`](super::row_fn) and are deliberately not public:
 //! [`RowFn`](crate::scalar_fn::RowFn) is the abstraction, these are its internals.
@@ -17,6 +17,9 @@ use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::NullHandling;
 use crate::scalar_fn::OutputElement;
+use crate::scalar_fn::OutputSink;
+use crate::scalar_fn::RowResult;
+use crate::scalar_fn::SinkResult;
 
 /// Validate the input dtypes of a row function and return its output element dtype.
 ///
@@ -29,13 +32,24 @@ pub(super) fn validate_row_args<A: ElementTuple, R: ApplyResult>(
     Ok(R::Out::element_dtype())
 }
 
+/// Validate the input dtypes of a sink-writing row function and return the dtype its sink builds.
+///
+/// Unlike [`validate_row_args`] the output dtype is a function of the inputs, since that is the point
+/// of a sink: `l2_denorm` reads its output width out of the tensor argument.
+pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
+    args: &[DType],
+) -> VortexResult<DType> {
+    A::validate(args)?;
+    S::sink_dtype(args)
+}
+
 /// The [`NullHandling`] a row function gets, from what its arguments and return type allow.
 ///
 /// [`NullHandling::Dense`] is cheaper and the only option that leaves inputs at their original
 /// encoding, so it is used whenever it is sound: every argument readable behind a null row, and a
 /// row computation that cannot fail. Both conditions are read off the types, so a row function never
 /// declares its null handling.
-pub(super) const fn row_null_handling<A: ElementTuple, R: ApplyResult>() -> NullHandling {
+pub(super) const fn row_null_handling<A: ElementTuple, R: RowResult>() -> NullHandling {
     if A::DENSE_SAFE && !row_is_fallible::<A, R>() {
         NullHandling::Dense
     } else {
@@ -52,7 +66,7 @@ pub(super) const fn row_null_handling<A: ElementTuple, R: ApplyResult>() -> Null
 /// its bytes: a geometry column is fallible however total the kernel over it is.
 ///
 /// [`InputElement::DECODE_FALLIBLE`]: crate::scalar_fn::InputElement::DECODE_FALLIBLE
-pub(super) const fn row_is_fallible<A: ElementTuple, R: ApplyResult>() -> bool {
+pub(super) const fn row_is_fallible<A: ElementTuple, R: RowResult>() -> bool {
     A::DECODE_FALLIBLE || R::FALLIBLE
 }
 
@@ -83,4 +97,36 @@ pub(super) fn execute_row_loop<A: ElementTuple, R: ApplyResult>(
     };
 
     Ok(R::Out::build(values))
+}
+
+/// Decode every input column once, allocate the sink once, then write one row at a time.
+///
+/// The sink lives here rather than in the closure, so `apply` stays [`Fn`] and the loop keeps the
+/// unconditional shape that lets it vectorize. Monomorphic in `A`, `S` and `R`, so `apply` and
+/// [`OutputSink::row`] both inline.
+pub(super) fn execute_row_sink<A: ElementTuple, S: OutputSink, R: SinkResult>(
+    args: &dyn ExecutionArgs,
+    arg_dtypes: &[DType],
+    ctx: &mut ExecutionCtx,
+    apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
+) -> VortexResult<ArrayRef> {
+    let row_count = args.row_count();
+    let mut sink = S::with_capacity(row_count, &S::sink_dtype(arg_dtypes)?)?;
+    let columns = A::decode(args, ctx)?;
+
+    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization. There
+    // `into_result` inlines to `Ok(())` and the unwrap folds away.
+    if R::FALLIBLE {
+        for index in 0..row_count {
+            apply(A::get(&columns, index), sink.row(index)).into_result()?;
+        }
+    } else {
+        for index in 0..row_count {
+            apply(A::get(&columns, index), sink.row(index))
+                .into_result()
+                .vortex_expect("an infallible SinkResult cannot be an error");
+        }
+    }
+
+    sink.finish()
 }

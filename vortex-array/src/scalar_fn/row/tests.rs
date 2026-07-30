@@ -475,6 +475,265 @@ mod decode_fallibility {
     }
 }
 
+/// The sink visit: output written per row rather than returned.
+///
+/// The sink here has the same shape as `vortex-tensor`'s tensor sink, which is what the mechanism was
+/// built for: a per-row handle that is a *slice* of one flat buffer allocated for the whole batch, and
+/// an output dtype read off the input dtypes rather than fixed by a Rust type.
+mod sink {
+    use std::sync::Arc;
+
+    use vortex_buffer::BufferMut;
+    use vortex_error::VortexExpect;
+    use vortex_error::vortex_ensure_eq;
+    use vortex_error::vortex_err;
+
+    use super::*;
+    use crate::arrays::FixedSizeListArray;
+    use crate::dtype::NativePType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
+    use crate::validity::Validity;
+
+    /// Builds a `FixedSizeList<T, W>` column, presenting each row as the `&mut [T]` slice to fill.
+    ///
+    /// Its element dtype comes from the input rather than from `T` alone, so it exercises
+    /// [`OutputSink::sink_dtype`] actually reading `args`.
+    struct SpreadSink<T, const W: usize> {
+        dtype: DType,
+        rows: usize,
+        elements: BufferMut<T>,
+    }
+
+    impl<T: NativePType, const W: usize> OutputSink for SpreadSink<T, W> {
+        type Row<'a> = &'a mut [T];
+
+        fn sink_dtype(args: &[DType]) -> VortexResult<DType> {
+            let element = args.first().ok_or_else(|| {
+                vortex_err!("a spread sink takes its element dtype from its input")
+            })?;
+            <T as InputElement>::validate(element)?;
+            Ok(DType::FixedSizeList(
+                Arc::new(element.as_nonnullable()),
+                u32::try_from(W).vortex_expect("test width fits in u32"),
+                Nullability::NonNullable,
+            ))
+        }
+
+        fn with_capacity(rows: usize, dtype: &DType) -> VortexResult<Self> {
+            Ok(Self {
+                dtype: dtype.clone(),
+                rows,
+                elements: BufferMut::zeroed(rows * W),
+            })
+        }
+
+        fn row(&mut self, index: usize) -> &mut [T] {
+            &mut self.elements.as_mut_slice()[index * W..][..W]
+        }
+
+        fn finish(self) -> VortexResult<ArrayRef> {
+            vortex_ensure_eq!(
+                self.dtype,
+                Self::sink_dtype(&[DType::Primitive(T::PTYPE, self.dtype.nullability())])?,
+                "the sink must build the dtype it named",
+            );
+            Ok(FixedSizeListArray::try_new(
+                PrimitiveArray::new(self.elements.freeze(), Validity::NonNullable).into_array(),
+                u32::try_from(W).vortex_expect("test width fits in u32"),
+                Validity::NonNullable,
+                self.rows,
+            )?
+            .into_array())
+        }
+    }
+
+    /// Broadcasts each input value across a fixed-size list row: `spread(x) == [x, x, x]`.
+    #[derive(Clone)]
+    struct Spread;
+
+    impl RowFn for Spread {
+        type Options = EmptyOptions;
+        type ArgsWitness = (i64,);
+        type RetWitness = ();
+
+        fn id(&self) -> ScalarFnId {
+            static ID: CachedId = CachedId::new("vortex.test.spread");
+            *ID
+        }
+
+        fn arg_name(&self, _idx: usize) -> ChildName {
+            ChildName::from("input")
+        }
+
+        fn dispatch<V: RowVisitor>(
+            &self,
+            _options: &Self::Options,
+            _args: &[DType],
+            visitor: V,
+        ) -> VortexResult<V::Out> {
+            visitor.visit_into::<(i64,), SpreadSink<i64, 3>, ()>(|(x,), out| out.fill(x))
+        }
+    }
+
+    /// The same, but refusing negative inputs, so its row closure returns `VortexResult<()>`.
+    #[derive(Clone)]
+    struct SpreadNonNegative;
+
+    impl RowFn for SpreadNonNegative {
+        type Options = EmptyOptions;
+        type ArgsWitness = (i64,);
+        type RetWitness = VortexResult<()>;
+
+        fn id(&self) -> ScalarFnId {
+            static ID: CachedId = CachedId::new("vortex.test.spread_non_negative");
+            *ID
+        }
+
+        fn arg_name(&self, _idx: usize) -> ChildName {
+            ChildName::from("input")
+        }
+
+        fn dispatch<V: RowVisitor>(
+            &self,
+            _options: &Self::Options,
+            _args: &[DType],
+            visitor: V,
+        ) -> VortexResult<V::Out> {
+            visitor.visit_into::<(i64,), SpreadSink<i64, 3>, VortexResult<()>>(|(x,), out| {
+                if x < 0 {
+                    vortex_bail!("negative input {x}");
+                }
+                out.fill(x);
+                Ok(())
+            })
+        }
+    }
+
+    /// `SpreadSink`'s three-element rows, built from `values`.
+    fn spread_rows(values: impl IntoIterator<Item = Option<i64>>) -> VortexResult<ArrayRef> {
+        let values = values.into_iter().collect::<Vec<_>>();
+        let rows = values.len();
+        let flat = values
+            .iter()
+            .flat_map(|value| [value.unwrap_or(0); 3])
+            .collect::<Vec<_>>();
+        let validity = if values.iter().all(Option::is_some) {
+            Validity::NonNullable
+        } else {
+            Validity::from_iter(values.iter().map(Option::is_some))
+        };
+
+        Ok(FixedSizeListArray::try_new(
+            PrimitiveArray::new(flat, Validity::NonNullable).into_array(),
+            3,
+            validity,
+            rows,
+        )?
+        .into_array())
+    }
+
+    /// The output dtype is the sink's, with its width, and every row holds the written slice.
+    #[test]
+    fn writes_one_row_at_a_time() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let input = buffer![7i64, -2, 0].into_array();
+
+        let result = apply(Spread, [input], &mut ctx)?;
+
+        assert_arrays_eq!(result, spread_rows([Some(7), Some(-2), Some(0)])?, &mut ctx);
+        Ok(())
+    }
+
+    /// A null input row is written densely and masked away afterwards, exactly as on the value path.
+    #[test]
+    fn nulls_are_masked_after_the_sink() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let input = PrimitiveArray::from_option_iter([Some(7i64), None, Some(4)]).into_array();
+
+        let result = apply(Spread, [input], &mut ctx)?;
+
+        assert!(result.dtype().is_nullable());
+        assert_arrays_eq!(result, spread_rows([Some(7), None, Some(4)])?, &mut ctx);
+        Ok(())
+    }
+
+    /// A sink whose closure cannot fail is dense, and one whose closure can is filtered, from the
+    /// return type alone. This is the fact the split of `RetWitness` down to [`RowResult`] preserves.
+    #[test]
+    fn null_handling_follows_from_the_sink_return_type() {
+        assert_eq!(
+            StrictScalarFnVTable::null_handling(&Spread, &EmptyOptions),
+            NullHandling::Dense
+        );
+        assert!(!ScalarFnVTable::is_fallible(&Spread, &EmptyOptions));
+
+        assert_eq!(
+            StrictScalarFnVTable::null_handling(&SpreadNonNegative, &EmptyOptions),
+            NullHandling::Filter
+        );
+        assert!(ScalarFnVTable::is_fallible(
+            &SpreadNonNegative,
+            &EmptyOptions
+        ));
+    }
+
+    /// An error from a writing closure aborts the batch rather than being written into the sink.
+    #[test]
+    fn a_failing_row_propagates() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let input = buffer![1i64, -5, 3].into_array();
+
+        let error = apply(SpreadNonNegative, [input], &mut ctx).unwrap_err();
+
+        assert!(error.to_string().contains("negative input -5"), "{error}");
+        Ok(())
+    }
+
+    /// Being fallible, `SpreadNonNegative` is filtered, so its closure never sees the value behind a
+    /// null row. A negative payload there must therefore not raise.
+    #[test]
+    fn a_failing_row_is_never_reached_behind_a_null() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let input = PrimitiveArray::new(
+            buffer![1i64, -5, 3],
+            Validity::from_iter([true, false, true]),
+        )
+        .into_array();
+
+        let result = apply(SpreadNonNegative, [input], &mut ctx)?;
+
+        assert_arrays_eq!(result, spread_rows([Some(1), None, Some(3)])?, &mut ctx);
+        Ok(())
+    }
+
+    /// The sink names its output dtype from the input, so a wrong input dtype is rejected at plan
+    /// time rather than producing a mis-typed column.
+    #[test]
+    fn the_sink_dtype_validates_its_input() {
+        let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+        assert!(
+            StrictScalarFnVTable::return_element_dtype(&Spread, &EmptyOptions, &[dtype]).is_err()
+        );
+    }
+
+    /// The width the sink declares is the width it builds, over the element dtype it read off the
+    /// input.
+    #[test]
+    fn the_return_dtype_is_the_sinks() -> VortexResult<()> {
+        let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
+        assert_eq!(
+            StrictScalarFnVTable::return_element_dtype(
+                &Spread,
+                &EmptyOptions,
+                std::slice::from_ref(&dtype)
+            )?,
+            DType::FixedSizeList(Arc::new(dtype), 3, Nullability::NonNullable),
+        );
+        Ok(())
+    }
+}
+
 /// Every [`InputElement`] in this crate run through [`assert_element_conforms`].
 ///
 /// Each case feeds an array whose payload *behind the nulls* is deliberately hostile, since a

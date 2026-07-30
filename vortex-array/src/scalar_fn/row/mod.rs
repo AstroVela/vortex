@@ -20,9 +20,14 @@
 //!
 //! [`RowFn`] does not say how a row is *stored*, which is the element's job: `vortex-tensor` adds a
 //! `TensorRow<T>` [`InputElement`] and writes ordinary kernels over it.
+//!
+//! Output comes in two forms, and a dispatch picks one per visit. [`RowVisitor::visit`] takes a
+//! closure that *returns* an [`OutputElement`] per row, which is the common case.
+//! [`RowVisitor::visit_into`] takes one that *writes* its row into an [`OutputSink`], which carries
+//! what an owned per-row value cannot: a runtime-shaped row such as a tensor, or bytes appended to a
+//! buffer shared by the whole batch.
 
 mod element;
-pub use element::ApplyResult;
 pub use element::ArgColumn;
 pub use element::Bytes;
 pub use element::BytesColumn;
@@ -32,6 +37,14 @@ pub use element::InputElement;
 pub use element::OutputElement;
 #[cfg(any(test, feature = "_test-harness"))]
 pub use element::assert_element_conforms;
+
+mod result;
+pub use result::ApplyResult;
+pub use result::RowResult;
+pub use result::SinkResult;
+
+mod sink;
+pub use sink::OutputSink;
 
 mod execute;
 
