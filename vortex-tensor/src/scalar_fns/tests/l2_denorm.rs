@@ -358,6 +358,38 @@ fn l2_denorm_constant_nonunit_norms_scales_vectors() -> VortexResult<()> {
 }
 
 #[test]
+fn l2_denorm_nullable_constant_nonunit_norms_scales_vectors() -> VortexResult<()> {
+    // A constant norm whose *dtype* is nullable, but whose value is not null, still reaches the
+    // constant fast path. Tensor storage elements must stay non-nullable, so the norm has to be cast
+    // to the element dtype before it multiplies the flat buffer; without that the rebuilt
+    // `FixedSizeListArray` carries nullable elements and disagrees with the extension dtype.
+    let normalized = vector_array(3, &[0.6, 0.8, 0.0, 1.0, 0.0, 0.0])?;
+    let norms =
+        ConstantArray::new(Scalar::primitive(5.0f64, Nullability::Nullable), 2).into_array();
+
+    let actual = eval_l2_denorm(normalized, norms)?;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let ext: ExtensionArray = actual.execute(&mut ctx)?;
+    let storage: FixedSizeListArray = ext.storage_array().clone().execute(&mut ctx)?;
+    assert!(
+        !storage.elements().dtype().is_nullable(),
+        "tensor storage elements must stay non-nullable, got {}",
+        storage.elements().dtype(),
+    );
+
+    // The nullable norms argument widens the result itself, which the strict lifting owns.
+    assert!(ext.dtype().is_nullable());
+    for i in 0..ext.len() {
+        assert!(ext.is_valid(i, &mut ctx)?);
+    }
+
+    let elements: PrimitiveArray = storage.elements().clone().execute(&mut ctx)?;
+    assert_close(elements.as_slice::<f64>(), &[3.0, 4.0, 0.0, 5.0, 0.0, 0.0]);
+    Ok(())
+}
+
+#[test]
 fn l2_denorm_constant_nonunit_norms_scales_fixed_shape_tensors() -> VortexResult<()> {
     // The same constant-scaling fast path must also cover multi-dimensional fixed-shape
     // tensors, where the backing elements buffer spans more than one slot per row.
