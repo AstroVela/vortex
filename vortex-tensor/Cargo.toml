@@ -39,3 +39,7 @@ vortex-array = { workspace = true, features = ["_test-harness"] }
 [[bench]]
 name = "l2_norm"
 harness = false
+
+[[bench]]
+name = "l2_denorm"
+harness = false
