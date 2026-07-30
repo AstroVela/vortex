@@ -6,9 +6,9 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
-use vortex_array::dtype::Nullability;
 use vortex_array::match_each_native_ptype;
 use vortex_array::scalar::Scalar;
+use vortex_array::scalar::ScalarValue;
 use vortex_array::vtable::OperationsVTable;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
@@ -37,40 +37,29 @@ impl OperationsVTable<TiledFixedSizeList> for TiledFixedSizeList {
             .elements()
             .take(PrimitiveArray::from_iter(indices).into_array())?
             .execute::<PrimitiveArray>(ctx)?;
-        let element_dtype = row.dtype().clone();
-        let element_nullability = element_dtype.nullability();
         let mask = row.validity()?.execute_mask(row.len(), ctx)?;
 
-        let children = match_each_native_ptype!(row.ptype(), |T| {
+        let tuple_values = match_each_native_ptype!(row.ptype(), |T| {
             let values = row.as_slice::<T>();
             match mask {
                 Mask::AllTrue(_) => values
                     .iter()
                     .copied()
-                    .map(|value| Scalar::primitive(value, element_nullability))
+                    .map(|value| Some(ScalarValue::Primitive(value.into())))
                     .collect(),
-                Mask::AllFalse(_) => (0..values.len())
-                    .map(|_| Scalar::null(element_dtype.clone()))
-                    .collect(),
+                Mask::AllFalse(_) => vec![None; values.len()],
                 Mask::Values(validity) => values
                     .iter()
                     .copied()
                     .zip(validity.bit_buffer().iter())
-                    .map(|(value, is_valid)| {
-                        if is_valid {
-                            Scalar::primitive(value, Nullability::Nullable)
-                        } else {
-                            Scalar::null(element_dtype.clone())
-                        }
-                    })
+                    .map(|(value, is_valid)| is_valid.then(|| ScalarValue::Primitive(value.into())))
                     .collect(),
             }
         });
 
-        Ok(Scalar::fixed_size_list(
-            element_dtype,
-            children,
-            array.dtype().nullability(),
-        ))
+        Scalar::try_new(
+            array.dtype().clone(),
+            Some(ScalarValue::Tuple(tuple_values)),
+        )
     }
 }

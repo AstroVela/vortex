@@ -12,6 +12,7 @@ use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
+use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
@@ -193,6 +194,87 @@ fn independent_outer_and_element_validity_round_trip() -> VortexResult<()> {
 
         let executed = tiled.into_array().execute::<FixedSizeListArray>(&mut ctx)?;
         assert_fsl_equivalent(&canonical.into_array(), &executed.into_array(), &mut ctx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn mixed_validity_round_trip_with_partial_row_and_dimension_tiles() -> VortexResult<()> {
+    let canonical_validity = Validity::from_iter([
+        true, false, false, true, true, false, true, false, true, false, true, true, false, false,
+        true,
+    ]);
+    let expected_physical_validity = Validity::from_iter([
+        true, false, false, true, false, false, true, true, false, true, true, true, false, false,
+        true,
+    ]);
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(Buffer::copy_from([0u16; 15]), canonical_validity.clone()).into_array(),
+        5,
+        Validity::NonNullable,
+        3,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(2, 3), &mut ctx)?;
+
+    assert!(
+        tiled
+            .elements()
+            .validity()?
+            .mask_eq(&expected_physical_validity, 15, &mut ctx,)?
+    );
+    let decoded = tiled.into_array().execute::<FixedSizeListArray>(&mut ctx)?;
+    assert!(
+        decoded
+            .elements()
+            .validity()?
+            .mask_eq(&canonical_validity, 15, &mut ctx,)?
+    );
+    assert_fsl_equivalent(&canonical.into_array(), &decoded.into_array(), &mut ctx)
+}
+
+#[test]
+fn degenerate_arrays_encode_execute_and_zero_width_scalars() -> VortexResult<()> {
+    let zero_rows = FixedSizeListArray::new(
+        PrimitiveArray::from_iter(std::iter::empty::<u8>()).into_array(),
+        5,
+        Validity::NonNullable,
+        0,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled_zero_rows =
+        TiledFixedSizeList::encode(zero_rows.as_view(), geometry(32, 64), &mut ctx)?;
+    let decoded_zero_rows = tiled_zero_rows
+        .into_array()
+        .execute::<FixedSizeListArray>(&mut ctx)?;
+    assert_fsl_equivalent(
+        &zero_rows.into_array(),
+        &decoded_zero_rows.into_array(),
+        &mut ctx,
+    )?;
+
+    let zero_width = FixedSizeListArray::new(
+        PrimitiveArray::from_iter(std::iter::empty::<u8>()).into_array(),
+        0,
+        Validity::NonNullable,
+        3,
+    );
+    let tiled_zero_width =
+        TiledFixedSizeList::encode(zero_width.as_view(), geometry(32, 64), &mut ctx)?;
+    let decoded_zero_width = tiled_zero_width
+        .clone()
+        .into_array()
+        .execute::<FixedSizeListArray>(&mut ctx)?;
+    assert_fsl_equivalent(
+        &zero_width.clone().into_array(),
+        &decoded_zero_width.into_array(),
+        &mut ctx,
+    )?;
+    for row in 0..zero_width.len() {
+        assert_eq!(
+            zero_width.execute_scalar(row, &mut ctx)?,
+            tiled_zero_width.execute_scalar(row, &mut ctx)?,
+        );
     }
     Ok(())
 }
