@@ -17,6 +17,7 @@ use vortex_array::arrays::scalar_fn::ExactScalarFn;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
+use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -123,11 +124,33 @@ impl FlatElements {
     ///
     /// When the source was a constant-backed storage, all indices resolve to the single stored
     /// row.
+    ///
+    /// This re-derives the typed slice on every call, which costs a ptype check and a buffer
+    /// downcast per row. A caller reading every row in a loop should take [`into_buffer`](Self::into_buffer)
+    /// instead and pay that once.
     #[must_use]
     pub fn row<T: NativePType>(&self, i: usize) -> &[T] {
         let row_idx = if self.is_constant { 0 } else { i };
         let slice = self.elems.as_slice::<T>();
         &slice[row_idx * self.list_size..][..self.list_size]
+    }
+
+    /// Elements per row.
+    #[must_use]
+    pub fn list_size(&self) -> usize {
+        self.list_size
+    }
+
+    /// The row stride: `list_size` for a full column, and `0` for constant-backed storage, whose
+    /// single materialized row every index reads.
+    #[must_use]
+    pub fn row_stride(&self) -> usize {
+        if self.is_constant { 0 } else { self.list_size }
+    }
+
+    /// The elements as a typed buffer, checking the ptype once instead of once per row.
+    pub fn into_buffer<T: NativePType>(self) -> Buffer<T> {
+        self.elems.into_buffer::<T>()
     }
 }
 

@@ -459,7 +459,7 @@ strict lifting and the gap is the row layer alone:
 
 | width | sink | pre-port kernel | ratio |
 | --- | --- | --- | --- |
-| 2 | 88.02 / 88.16 µs | 60.19 / 60.45 µs | sink **1.46x slower** |
+| 2 | 88.02 / 88.16 µs | 60.19 / 60.45 µs | sink 1.46x slower *(since fixed, see below)* |
 | 32 | 482.0 / 515.5 µs | 1.175 / 1.014 ms | sink **2.1x faster** |
 | 256 | 10.23 / 10.43 ms | 20.41 / 22.48 ms | sink **2.0x faster** |
 
@@ -470,10 +470,11 @@ vectorizes. The zeroing is not a separate pass at these sizes, since large alloc
 from the allocator. This is a hypothesis consistent with the width scaling rather than something
 profiled.
 
-Width 2 still shows the fixed per-batch cost, at the same 1.4-2x and with the same shape as `l2_norm`'s
-(see "The like-for-like comparison"): it shrinks as width grows, so it is per-batch rather than per-row.
-Since this control shares the strict lifting with the ported version, the width-2 gap here is the **row
-layer's** share of it, which is progress on that open question.
+Width 2 showed the same regression as `l2_norm`'s, and for the same reason: both read tensor rows through
+`TensorRow`, whose `get` re-derived a typed slice per row. Typing the column at decode time took
+`l2_denorm` from 88.0 µs to **48.9 µs** at width 2, ahead of this control rather than behind it. See
+[the like-for-like comparison](#the-like-for-like-comparison-and-the-per-row-cost-that-was-hiding-in-it)
+for the measurement and for the wrong diagnosis it corrects.
 
 The constant-norms fast path moved to `reduce_encoded`, which sees the argument arrays before the row
 loop. It keeps both of its cases (unit norms return the normalized child untouched, any other constant
@@ -801,41 +802,73 @@ right side of the deal.
 
 These figures are near this machine's noise floor and should be re-confirmed on quieter hardware before
 being quoted. The larger measurements in these notes (the 5.7x `like` cache loss, the 8 to 11% `FnMut`
-tax, the 1.4-2x width-2 per-batch cost, the 2x `l2_denorm` sink win) are well clear of it.
+tax, the 2x width-2 per-row cost and its removal, the 2x `l2_denorm` sink win) are well clear of it.
 
-### The like-for-like comparison, and a fixed cost worth chasing
+### The like-for-like comparison, and the per-row cost that was hiding in it
 
 The table above compares the framework against itself, so it isolates the masking pass but says nothing
 about the rest of the machinery. `PrePortL2Norm` in the same benchmark closes that: a bench-local
 `ScalarFnVTable` running the identical arithmetic, indexing the flat slice directly into a `Buffer` and
-attaching validity in one step. `fastest` column, non-nullable, 16384 rows:
+attaching validity in one step.
+
+This measurement found a real defect in the tensor element, and the diagnosis recorded here first was
+wrong in a way worth keeping visible.
+
+**What was measured, and the wrong inference.** `fastest` column, non-nullable, 16384 rows:
 
 | width | framework | pre-port | delta |
 | --- | --- | --- | --- |
-| 2 | 69.44 µs | 32.87 µs | **2.11x slower** |
-| 32 | 276.7 µs | 273.0 µs | +1.4% |
-| 256 | 2.758 ms | 2.802 ms | parity |
+| 2 | 68.85 µs | 32.85 µs | **2.10x slower** |
+| 32 | 266.6 µs | 255.5 µs | +4% |
+| 256 | 2.564 ms | 2.512 ms | +2% |
 
-**The overhead is fixed per batch, not per row.** In absolute terms the gap is 36.6 µs at width 2,
-3.7 µs at 32, and negative at 256. A per-row cost would hold roughly constant per row across widths;
-one that shrinks as total work grows is a constant being amortized. So the framework carries something
-like tens of microseconds of fixed setup that a hand-written kernel does not.
+The gap in absolute terms is 36 µs at width 2 and 11 µs at 32, and the conclusion drawn was "a cost that
+shrinks as total work grows is a constant being amortized, so the framework carries tens of microseconds
+of fixed per-batch setup." That reasoning does not hold. 36 µs over 16384 rows is 2.2 ns/row, which is a
+*per-row* cost; it stops showing at width 32 because the kernel there is memory-bound and absorbs extra
+CPU work in its stalls. Reading "shrinks with width" as "fixed per batch" skipped dividing by the row
+count.
 
-**Where it most likely comes from, and why this is not yet an indictment of the row layer.**
-`PrePortL2Norm` implements `ScalarFnVTable` *directly*, so the engine calls its `execute` and nothing
-else. The framework path first runs the whole strict lifting: collecting inputs, cloning arg dtypes,
-`return_dtype`, the null-constant and all-constant checks, conjoining validities, choosing null
-handling, then `execute_strict`, then `reduce_encoded`'s encoding probe, then `dispatch`'s width match,
-and only then the row loop. Most of that is the *strict* layer rather than the row layer, and some of
-it (constant folding, validity derivation) is work the hand-written kernel simply does not do, not work
-it does faster.
+**The actual cause was one per-row accessor, in the tensor element.** `TensorRow::get` called
+`FlatElements::row::<T>(i)`, which per row re-derived its typed slice: a ptype comparison against the
+stored `PType`, a host-buffer downcast out of the buffer handle, a length division, and then two range
+indexings with a bounds check each. All of it loop-invariant except the offset. This is exactly the
+hidden-cost-accessor pattern the repository guidelines warn about, and it was written into the element
+rather than found in the framework.
 
-So the honest statement is: the framework costs a fixed tens of microseconds per batch, which is
-invisible at production tensor widths and 2x at width 2. Before this goes in a PR description it needs
-decomposing, because "the row layer is slow" and "the strict lifting does more bookkeeping" have very
-different remedies. The cheap next step is a third bench arm implementing `StrictScalarFnVTable` with
-the pre-port kernel body, which shares the lifting but skips the row layer and splits the difference in
-two.
+The fix types the column at decode time instead of per row. `TensorRow<T>` is already generic over `T`,
+so its `Column` can be a `Buffer<T>` plus a stride, and `get` becomes one multiply and one range index
+into a typed slice. `FlatElements` keeps its untyped `row` for the callers that read a handful of rows.
+
+**After, same bench, same run:**
+
+| width | framework | pre-port | delta |
+| --- | --- | --- | --- |
+| 2 | **33.32 µs** | 32.83 µs | **parity, 1.01x** |
+| 32 | **227.4 µs** | 258.9 µs | framework **1.14x faster** |
+| 256 | **2.422 ms** | 2.522 ms | framework **1.04x faster** |
+
+The pre-port column is stable across both runs (32.85 then 32.83 µs at width 2), which is what makes
+this comparison trustworthy; only the framework side moved. `l2_denorm` gained the same way, from
+88.0 µs to 48.9 µs at width 2, since it reads its tensor argument through the same element.
+
+Three things follow.
+
+**The row layer was never the cost.** The 2x was one accessor in one element implementation, and the
+generic machinery around it (the visitor, the witness, the strict lifting's bookkeeping, `reduce_encoded`'s
+probe, the dispatch width match) does not measurably show up at 16384 rows. The planned decomposition
+into "strict lifting versus row layer" is moot: neither was it.
+
+**An element is a performance-critical surface, and nothing in the framework says so.** `InputElement::get`
+is documented as needing to be `O(1)`, which `FlatElements::row` technically was. `O(1)` is the wrong
+contract; the right one is that `get` must not repeat work that is constant across the batch, because it
+is the one function called once per row. `decode` exists precisely to hold that work, and the element
+vocabulary's whole promise (anyone can add an element in their own crate) means this trap is now
+available to every future implementor.
+
+**The framework being generic is what let one fix pay out twice.** `l2_norm`, `inner_product`,
+`cosine_similarity` and `l2_denorm` all read tensor rows through this element, so a single change moved
+all four. That is the case for the shared layer stated in performance terms rather than in line counts.
 
 [`OutputElement::build`]: vortex-array/src/scalar_fn/row/element/mod.rs
 
