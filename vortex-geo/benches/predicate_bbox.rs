@@ -13,7 +13,6 @@ use std::f64::consts::TAU;
 use std::sync::LazyLock;
 
 use divan::Bencher;
-use divan::black_box;
 use divan::counter::ItemsCount;
 use geo::BoundingRect;
 use geo::Contains;
@@ -27,7 +26,7 @@ fn main() {
     divan::main();
 }
 
-const ROWS: usize = 1 << 14;
+const ROWS: usize = 1 << 13;
 const VERTICES: usize = 128;
 
 static QUERY: LazyLock<Geometry<f64>> = LazyLock::new(|| {
@@ -63,38 +62,34 @@ fn ordinate(i: usize) -> f64 {
     (i.wrapping_mul(2_654_435_761) % 10_000) as f64 / 10_000.0
 }
 
-fn exact_intersects(rows: &[Geometry<f64>]) -> usize {
-    rows.iter()
-        .filter(|row| black_box(&*QUERY).intersects(black_box(*row)))
-        .count()
+fn exact_intersects(query: &Geometry<f64>, rows: &[Geometry<f64>]) -> usize {
+    rows.iter().filter(|row| query.intersects(*row)).count()
 }
 
-fn bbox_intersects(rows: &[Geometry<f64>]) -> usize {
-    let query_rect = QUERY.bounding_rect();
+fn bbox_intersects(query: &Geometry<f64>, rows: &[Geometry<f64>]) -> usize {
+    let query_rect = query.bounding_rect();
     rows.iter()
         .filter(|row| {
             let rejected = query_rect
                 .zip(row.bounding_rect())
                 .is_some_and(|(query, row)| !query.intersects(&row));
-            !rejected && black_box(&*QUERY).intersects(black_box(*row))
+            !rejected && query.intersects(*row)
         })
         .count()
 }
 
-fn exact_contains(rows: &[Geometry<f64>]) -> usize {
-    rows.iter()
-        .filter(|row| black_box(&*QUERY).contains(black_box(*row)))
-        .count()
+fn exact_contains(query: &Geometry<f64>, rows: &[Geometry<f64>]) -> usize {
+    rows.iter().filter(|row| query.contains(*row)).count()
 }
 
-fn bbox_contains(rows: &[Geometry<f64>]) -> usize {
-    let query_rect = QUERY.bounding_rect();
+fn bbox_contains(query: &Geometry<f64>, rows: &[Geometry<f64>]) -> usize {
+    let query_rect = query.bounding_rect();
     rows.iter()
         .filter(|row| {
             let rejected = query_rect
                 .zip(row.bounding_rect())
                 .is_some_and(|(query, row)| !query.contains(&row));
-            !rejected && black_box(&*QUERY).contains(black_box(*row))
+            !rejected && query.contains(*row)
         })
         .count()
 }
@@ -103,54 +98,62 @@ fn bbox_contains(rows: &[Geometry<f64>]) -> usize {
 fn intersects_exact_disjoint(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(exact_intersects(&DISJOINT)));
+        .with_inputs(|| (&*QUERY, &*DISJOINT))
+        .bench_refs(|(query, rows)| exact_intersects(query, rows));
 }
 
 #[divan::bench]
 fn intersects_bbox_disjoint(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(bbox_intersects(&DISJOINT)));
+        .with_inputs(|| (&*QUERY, &*DISJOINT))
+        .bench_refs(|(query, rows)| bbox_intersects(query, rows));
 }
 
 #[divan::bench]
 fn intersects_exact_candidate(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(exact_intersects(&CANDIDATES)));
+        .with_inputs(|| (&*QUERY, &*CANDIDATES))
+        .bench_refs(|(query, rows)| exact_intersects(query, rows));
 }
 
 #[divan::bench]
 fn intersects_bbox_candidate(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(bbox_intersects(&CANDIDATES)));
+        .with_inputs(|| (&*QUERY, &*CANDIDATES))
+        .bench_refs(|(query, rows)| bbox_intersects(query, rows));
 }
 
 #[divan::bench]
 fn contains_exact_disjoint(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(exact_contains(&DISJOINT)));
+        .with_inputs(|| (&*QUERY, &*DISJOINT))
+        .bench_refs(|(query, rows)| exact_contains(query, rows));
 }
 
 #[divan::bench]
 fn contains_bbox_disjoint(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(bbox_contains(&DISJOINT)));
+        .with_inputs(|| (&*QUERY, &*DISJOINT))
+        .bench_refs(|(query, rows)| bbox_contains(query, rows));
 }
 
 #[divan::bench]
 fn contains_exact_candidate(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(exact_contains(&CANDIDATES)));
+        .with_inputs(|| (&*QUERY, &*CANDIDATES))
+        .bench_refs(|(query, rows)| exact_contains(query, rows));
 }
 
 #[divan::bench]
 fn contains_bbox_candidate(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(ROWS))
-        .bench(|| black_box(bbox_contains(&CANDIDATES)));
+        .with_inputs(|| (&*QUERY, &*CANDIDATES))
+        .bench_refs(|(query, rows)| bbox_contains(query, rows));
 }
