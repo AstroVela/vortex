@@ -23,7 +23,7 @@ use crate::scalar_fn::ScalarFnId;
 ///
 /// The implementor writes the structural metadata plus one columnar kernel over non-null values, and
 /// a blanket impl derives null propagation, constant folding, nullability, and options serde. See
-/// `not`, `list_length`, `list_sum`, or `vortex-tensor`'s `L2Denorm` for implementations.
+/// `not`, `list_length`, or `list_sum` for implementations.
 ///
 /// Beyond the members here, the blanket impl leaves every optional [`ScalarFnVTable`] method at that
 /// trait's own default. [`reduce`](Self::reduce) and [`validity`](Self::validity) are mirrored,
