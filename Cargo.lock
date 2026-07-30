@@ -6004,8 +6004,9 @@ checksum = "cfe21416a02c693fb9f980befcb230ecc70b0b3d1cc4abf88b9675c4c1457f0c"
 
 [[package]]
 name = "onpair"
-version = "0.1.1"
-source = "git+https://github.com/spiraldb/onpair.git?branch=develop#f5f4bfe1fb7221c42a9f8261c269bdf5bd31052b"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e546e7cd983c9998a5a52e9c7eecaf38e518f2e6fc9c9ec649e8b53748a96bb0"
 dependencies = [
  "hashbrown 0.16.1",
  "rand 0.9.5",
@@ -6530,7 +6531,7 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "044b1fa4f259f4df9ad5078e587b208f5d288a25407575fcddb9face30c7c692"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.8.7",
  "socket2",
  "thiserror 2.0.19",
 ]

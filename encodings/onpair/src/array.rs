@@ -209,8 +209,11 @@ impl OnPairData {
     /// [`dict_view`] relies on this to build an unchecked dictionary view.
     pub(crate) unsafe fn init_dict_offsets(&self, offsets: Buffer<u32>) {
         debug_assert!(
-            CompactDictionaryView::validate_safety(self.dict_bytes().as_slice(), offsets.as_slice())
-                .is_ok(),
+            CompactDictionaryView::validate_safety(
+                self.dict_bytes().as_slice(),
+                offsets.as_slice()
+            )
+            .is_ok(),
             "init_dict_offsets called with a structurally unsafe dictionary"
         );
         let dictionary = unsafe {
