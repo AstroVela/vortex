@@ -123,15 +123,24 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
         visitor: V,
     ) -> VortexResult<V::Out>;
 
-    /// An encoding-aware rewrite, tried on the original input arrays before the row loop.
+    /// An encoding-aware rewrite, tried on the input arrays before the row loop.
     ///
-    /// `Some` skips the row loop entirely, for example by reading stored values back out of a
-    /// wrapper encoding rather than decoding it. The result may be lazy and nullable, but its nulls
-    /// **must** be a subset of the rows the strict lifting will mask.
+    /// `Some` skips the row loop entirely, which makes this the escape hatch for a function that is
+    /// row-shaped in general but has a bulk answer for some encodings: reading stored values back out
+    /// of a wrapper encoding, or handing back a child array whole. The result may be lazy and
+    /// nullable, but its nulls **must** be a subset of the rows the strict lifting will mask, and it
+    /// **must** have one row per row of `args`, which under [`NullHandling::Filter`] is the *filtered*
+    /// count rather than the original one.
     ///
-    /// This only sees original encodings while the function's null handling is
-    /// [`NullHandling::Dense`], which holds as long as every argument is readable behind a null
-    /// row and the row computation is infallible.
+    /// Whether the arrays still carry their original encoding depends on the path above:
+    ///
+    /// - [`NullHandling::Dense`] always passes them through untouched.
+    /// - [`NullHandling::Filter`] passes them through untouched when no row is null, and otherwise
+    ///   hands over filtered copies, which are canonical and so match no encoding fast path.
+    ///
+    /// A non-nullable operand therefore reaches an encoding fast path under either. Note also that
+    /// filtering a constant yields a constant, so a fast path keyed on
+    /// [`as_constant`](ArrayRef::as_constant) still fires even for a filtered batch.
     fn reduce_encoded(
         &self,
         options: &Self::Options,
