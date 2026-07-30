@@ -225,7 +225,7 @@ array APIs, but the semantic surface is:
 
 ```rust
 TiledFixedSizeList::encode(fsl, geometry, ctx)
-TiledFixedSizeList::try_new(elements, dtype, len, geometry, validity)
+TiledFixedSizeList::try_new(elements, list_size, validity, len, geometry)
 
 array.geometry()
 array.elements()
@@ -238,9 +238,12 @@ array.tile(row_tile, dimension_tile)
 `encode` is the normal construction path. It executes the canonical primitive
 child once and transposes values and element validity in bulk.
 
-`try_new` validates structural invariants. Like other encoded-array
-constructors, it cannot prove that caller-provided physical values are the
-correct transpose.
+`try_new` derives the logical fixed-size-list dtype from the element child,
+`list_size`, and outer validity, then validates the remaining structural
+invariants. Avoiding a separately supplied dtype removes redundant state and
+ensures that nullable `take` results derive the correct outer nullability. Like
+other encoded-array constructors, it cannot prove that caller-provided physical
+values are the correct transpose.
 
 `tile` returns a view containing the logical row range, logical dimension
 range, and the corresponding contiguous physical element range. Tile traversal
