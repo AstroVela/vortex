@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+//! Shared helpers for the tensor scalar functions.
+
 use half::f16;
-use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -10,22 +11,16 @@ use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::ScalarFn;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::arrays::scalar_fn::ExactScalarFn;
-use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
-use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
-use vortex_array::dtype::proto::dtype as pb;
-use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_session::VortexSession;
 
 use crate::matcher::AnyTensor;
 use crate::matcher::TensorMatch;
@@ -91,17 +86,19 @@ pub fn validate_tensor_float_input(input_dtype: &DType) -> VortexResult<TensorMa
     Ok(tensor_match)
 }
 
-/// Validates that two arguments of a binary tensor-like operator share the same float tensor
+/// Validates that all arguments of an N-ary tensor-like operator share the same float tensor
 /// dtype (ignoring top-level nullability), returning the shared [`TensorMatch`].
-pub fn validate_binary_tensor_float_inputs<'a>(
-    lhs: &'a DType,
-    rhs: &DType,
-) -> VortexResult<TensorMatch<'a>> {
-    vortex_ensure!(
-        lhs.eq_ignore_nullability(rhs),
-        "binary tensor expression expects inputs to have the same dtype, got {lhs} and {rhs}"
-    );
-    validate_tensor_float_input(lhs)
+pub fn validate_tensor_float_inputs(args: &[DType]) -> VortexResult<TensorMatch<'_>> {
+    let (first, rest) = args
+        .split_first()
+        .ok_or_else(|| vortex_err!("tensor expression expects at least one input"))?;
+    for arg in rest {
+        vortex_ensure!(
+            first.eq_ignore_nullability(arg),
+            "tensor expression expects inputs to have the same dtype, got {first} and {arg}"
+        );
+    }
+    validate_tensor_float_input(first)
 }
 
 /// The flat primitive elements of a tensor storage array, with typed row access.
@@ -155,10 +152,10 @@ pub fn extract_flat_elements(
 
     let fsl: FixedSizeListArray = source.execute(ctx)?;
     let elems: PrimitiveArray = fsl.elements().clone().execute(ctx)?;
+    let dtype = elems.dtype();
     vortex_ensure!(
         !elems.nullability().is_nullable(),
-        "tensor storage elements must be non-nullable, got {}",
-        elems.dtype(),
+        "tensor storage elements must be non-nullable, got {dtype}",
     );
     Ok(FlatElements {
         elems,
@@ -210,71 +207,12 @@ pub fn extract_constant_flat_row(
     let single = ConstantArray::new(constant.scalar().clone(), 1).into_array();
     let fsl: FixedSizeListArray = single.execute(ctx)?;
     let elems: PrimitiveArray = fsl.elements().clone().execute(ctx)?;
+    let dtype = elems.dtype();
     vortex_ensure!(
         !elems.nullability().is_nullable(),
-        "tensor storage elements must be non-nullable, got {}",
-        elems.dtype(),
+        "tensor storage elements must be non-nullable, got {dtype}",
     );
     Ok(FlatRow { elems })
-}
-
-/// Metadata for a serialized binary tensor-op array (shared by [`InnerProduct`] and
-/// [`CosineSimilarity`]). Both operands share the same extension dtype up to nullability
-/// (enforced by their `return_dtype` checks), but their individual nullabilities are lost in the
-/// parent's unioned output, so both are persisted.
-///
-/// [`CosineSimilarity`]: crate::scalar_fns::cosine_similarity::CosineSimilarity
-/// [`InnerProduct`]: crate::scalar_fns::inner_product::InnerProduct
-#[derive(Clone, prost::Message)]
-pub(crate) struct BinaryTensorOpMetadata {
-    #[prost(message, optional, tag = "1")]
-    pub(crate) lhs_dtype: Option<pb::DType>,
-    #[prost(message, optional, tag = "2")]
-    pub(crate) rhs_dtype: Option<pb::DType>,
-}
-
-impl BinaryTensorOpMetadata {
-    /// Encodes the two children of `view` into a [`BinaryTensorOpMetadata`] byte blob.
-    pub(crate) fn encode_from_view<V: ScalarFnVTable>(
-        view: &ScalarFnArrayView<V>,
-    ) -> VortexResult<Vec<u8>> {
-        let scalar_fn_array = view.as_::<ScalarFn>();
-        let lhs_dtype = Some(scalar_fn_array.child_at(0).dtype().try_into()?);
-        let rhs_dtype = Some(scalar_fn_array.child_at(1).dtype().try_into()?);
-        Ok(Self {
-            lhs_dtype,
-            rhs_dtype,
-        }
-        .encode_to_vec())
-    }
-
-    /// Decodes `metadata` and fetches both children from `children` using the decoded dtypes,
-    /// validating that `lhs` and `rhs` are compatible tensor operands.
-    pub(crate) fn decode_children(
-        metadata: &[u8],
-        len: usize,
-        children: &dyn vortex_array::serde::ArrayChildren,
-        session: &VortexSession,
-    ) -> VortexResult<Vec<ArrayRef>> {
-        let metadata = Self::decode(metadata)
-            .map_err(|e| vortex_err!("Failed to decode BinaryTensorOpMetadata: {e}"))?;
-        let lhs_pb = metadata
-            .lhs_dtype
-            .as_ref()
-            .ok_or_else(|| vortex_err!("metadata missing lhs_dtype"))?;
-        let rhs_pb = metadata
-            .rhs_dtype
-            .as_ref()
-            .ok_or_else(|| vortex_err!("metadata missing rhs_dtype"))?;
-
-        let lhs_dtype = DType::from_proto(lhs_pb, session)?;
-        let rhs_dtype = DType::from_proto(rhs_pb, session)?;
-        validate_binary_tensor_float_inputs(&lhs_dtype, &rhs_dtype)?;
-
-        let lhs = children.get(0, &lhs_dtype, len)?;
-        let rhs = children.get(1, &rhs_dtype, len)?;
-        Ok(vec![lhs, rhs])
-    }
 }
 
 #[cfg(test)]
@@ -352,9 +290,9 @@ pub mod test_helpers {
     }
 
     /// Builds a [`ConstantArray`] whose scalar is itself a [`Vector`] extension scalar, broadcast
-    /// to `len` rows. This is the shape produced by an `lit(vector_scalar)` literal expression —
-    /// the constant lives at the extension level rather than inside the FSL storage, in contrast
-    /// to [`Vector::constant_array`].
+    /// to `len` rows. This is the shape produced by an `lit(vector_scalar)` literal expression, where
+    /// the constant lives at the extension level rather than inside the FSL storage, in contrast to
+    /// [`Vector::constant_array`].
     pub fn literal_vector_array<T: NativePType + Into<PValue>>(
         elements: &[T],
         len: usize,
@@ -395,10 +333,10 @@ pub mod test_helpers {
             if a.is_nan() && e.is_nan() {
                 continue;
             }
+            let diff = (a - e).abs();
             assert!(
                 (a - e).abs() < 1e-10,
-                "element {i}: got {a}, expected {e} (diff = {})",
-                (a - e).abs()
+                "element {i}: got {a}, expected {e} (diff = {diff})"
             );
         }
     }
