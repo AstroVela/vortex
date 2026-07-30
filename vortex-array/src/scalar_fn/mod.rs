@@ -30,8 +30,10 @@
 //!   Trimming strings is the example: the ideal kernel keeps the input's data buffer and writes
 //!   new views over it, copying no bytes, which only a columnar kernel can express.
 //! - **An output dtype that depends on runtime data.** `element_dtype` is a property of the Rust
-//!   type, and a tensor's dtype carries its shape, which is what makes `vortex.tensor.l2_denorm`
-//!   columnar.
+//!   type, and a tensor's dtype carries its shape. This one is a signature choice rather than a law,
+//!   since the blanket path already holds the input dtypes when it asks; what actually keeps
+//!   `vortex.tensor.l2_denorm` columnar is `build` taking one owned value per row, which for a tensor
+//!   row means an allocation per row against a kernel that scales the flat buffer in one pass.
 //! - **A null result for a non-null row.** Every output element builds an all-valid column, so
 //!   `vortex.list.sum` cannot be a row function: a valid empty list sums to null.
 //!
