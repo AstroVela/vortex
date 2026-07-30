@@ -22,6 +22,7 @@ use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::dtype::DType;
 use crate::scalar::Scalar;
+use crate::scalar_fn::PersistableOptions;
 
 /// Defines the interface for aggregate function vtables.
 ///
@@ -209,7 +210,7 @@ impl NumericalAggregateOpts {
     }
 
     /// Serialize these options to protobuf-encoded metadata bytes.
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize_proto(&self) -> Vec<u8> {
         pb::NumericalAggregateOpts {
             skip_nans: self.skip_nans,
         }
@@ -217,7 +218,7 @@ impl NumericalAggregateOpts {
     }
 
     /// Deserialize these options from protobuf-encoded metadata bytes.
-    pub fn deserialize(metadata: &[u8]) -> VortexResult<Self> {
+    pub fn deserialize_proto(metadata: &[u8]) -> VortexResult<Self> {
         let opts = pb::NumericalAggregateOpts::decode(metadata)?;
         Ok(Self {
             skip_nans: opts.skip_nans,
@@ -239,6 +240,18 @@ impl Display for NumericalAggregateOpts {
             write!(f, "skip_nans=false")?;
         }
         Ok(())
+    }
+}
+
+/// Lets a scalar function taking these options, such as `list_sum`, inherit its options serde from
+/// the options type rather than writing its own.
+impl PersistableOptions for NumericalAggregateOpts {
+    fn serialize(&self) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(self.serialize_proto()))
+    }
+
+    fn deserialize(metadata: &[u8], _session: &VortexSession) -> VortexResult<Self> {
+        NumericalAggregateOpts::deserialize_proto(metadata)
     }
 }
 

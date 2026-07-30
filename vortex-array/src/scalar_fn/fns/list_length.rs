@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use num_traits::AsPrimitive;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
@@ -16,34 +14,39 @@ use crate::arrays::FixedSizeList;
 use crate::arrays::List;
 use crate::arrays::ListView;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
-use crate::arrays::list::ListArrayExt;
 use crate::arrays::list::ListArraySlotsExt;
-use crate::arrays::listview::ListViewArrayExt;
 use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::expr::Expression;
+use crate::expr::union_child_validities;
 use crate::matcher::Matcher;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::NullHandling;
 use crate::scalar_fn::ScalarFnId;
-use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::StrictScalarFnVTable;
 use crate::scalar_fn::fns::operators::Operator;
 
 /// Number of elements in each list of a `List` or `FixedSizeList` typed array.
 ///
-/// This is computed purely from the list's offsets (`ListArray`), sizes (`ListViewArray`), or
-/// dtype (`FixedSizeListArray`) without reading the element *values*. Validity is carried over
-/// from the original array.
+/// A null list has a null length, and the length of a valid list is a non-null value determined by
+/// that list alone, so this is strict and total.
+///
+/// This is a columnar [`StrictScalarFnVTable`]: the kernel computes lengths purely from the list's
+/// offsets (`ListArray`), sizes (`ListViewArray`), or dtype (`FixedSizeListArray`) without reading
+/// the element *values*, and the strict lifting supplies constant folding, nullability, and validity.
+/// The lengths are read densely, since a list array's offsets are in bounds for every row whether it
+/// is null or not, so the input keeps its original encoding.
 #[derive(Clone)]
 pub struct ListLength;
 
-impl ScalarFnVTable for ListLength {
+impl StrictScalarFnVTable for ListLength {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
@@ -51,129 +54,89 @@ impl ScalarFnVTable for ListLength {
         *ID
     }
 
-    fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(vec![]))
-    }
-
-    fn deserialize(
-        &self,
-        _metadata: &[u8],
-        _session: &VortexSession,
-    ) -> VortexResult<Self::Options> {
-        Ok(EmptyOptions)
-    }
-
     fn arity(&self, _options: &Self::Options) -> Arity {
         Arity::Exact(1)
     }
 
-    fn child_name(&self, _instance: &Self::Options, child_idx: usize) -> ChildName {
+    fn child_name(&self, _options: &Self::Options, child_idx: usize) -> ChildName {
         match child_idx {
             0 => ChildName::from("input"),
             _ => unreachable!("Invalid child index {child_idx} for list_length()"),
         }
     }
 
-    fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
+    fn return_element_dtype(
+        &self,
+        _options: &Self::Options,
+        arg_dtypes: &[DType],
+    ) -> VortexResult<DType> {
         match &arg_dtypes[0] {
-            DType::List(_, nullable) | DType::FixedSizeList(_, _, nullable) => {
-                Ok(DType::Primitive(PType::U64, *nullable))
+            DType::List(..) | DType::FixedSizeList(..) => {
+                Ok(DType::Primitive(PType::U64, Nullability::NonNullable))
             }
             other => vortex_bail!("list_length() requires List or FixedSizeList, got {other}"),
         }
     }
 
-    fn execute(
-        &self,
-        _options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?;
-        let nullability = input.dtype().nullability();
-
-        if let Some(scalar) = input.as_constant() {
-            let len_scalar = scalar_list_length(&scalar, nullability)?;
-            return Ok(ConstantArray::new(len_scalar, args.row_count()).into_array());
-        }
-
-        list_length(&input, nullability, ctx)
-    }
-
-    fn validity(
-        &self,
-        _: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        Ok(Some(expression.child(0).validity()?))
-    }
-
-    fn is_strict(&self, _options: &Self::Options) -> bool {
-        // A null list has a null length, and the length of a valid list is a non-null value
-        // determined by that list alone, with `return_dtype` carrying over the input nullability.
-        true
+    /// A list array's offsets stay in bounds for every row, so lengths can be read densely and the
+    /// lifting masks the nulls afterward, leaving the input at its original encoding.
+    fn null_handling(&self, _options: &Self::Options) -> NullHandling {
+        NullHandling::Dense
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {
         false
     }
-}
 
-fn scalar_list_length(scalar: &Scalar, nullability: Nullability) -> VortexResult<Scalar> {
-    if scalar.is_null() {
-        let dtype = DType::Primitive(PType::U64, Nullability::Nullable);
-        return Ok(Scalar::null(dtype));
+    /// Every valid list has a length, so the output validity is exactly the input's.
+    fn validity(
+        &self,
+        _options: &Self::Options,
+        expression: &Expression,
+    ) -> VortexResult<Option<Expression>> {
+        union_child_validities(expression)
     }
-    let len: u64 = scalar.as_list().len().as_();
-    Ok(Scalar::primitive(len, nullability))
+
+    fn execute_strict(
+        &self,
+        _options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        list_lengths(&args.get(0)?, ctx)
+    }
 }
 
-pub(crate) fn list_length(
-    array: &ArrayRef,
-    nullability: Nullability,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
+/// The per-row list length as a non-nullable `U64` column, ignoring validity (the strict lifting
+/// applies it). Computed from offsets, sizes, or the fixed size without reading element values.
+fn list_lengths(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
     let any_list = array.clone().execute_until::<AnyList>(ctx)?;
 
-    let (lengths, validity) = if let Some(fsl) = any_list.as_opt::<FixedSizeList>() {
-        // The length of fixed-size list is constant, so just need to carry over validity
+    let lengths = if let Some(fsl) = any_list.as_opt::<FixedSizeList>() {
         let size = fsl.list_size() as u64;
-        let lengths =
-            ConstantArray::new(Scalar::primitive(size, Nullability::NonNullable), fsl.len())
-                .into_array();
-        (lengths, fsl.validity()?)
+        ConstantArray::new(Scalar::primitive(size, Nullability::NonNullable), fsl.len())
+            .into_array()
     } else if let Some(lv) = any_list.as_opt::<ListView>() {
-        // Length array is exactly the sizes child
-        (lv.sizes().clone(), lv.listview_validity())
+        lv.sizes().clone()
     } else if let Some(l) = any_list.as_opt::<List>() {
-        let lengths = list_length_from_offsets(l)?;
-        (lengths, l.list_validity())
+        list_length_from_offsets(l)?
     } else {
         let dtype = any_list.dtype();
         vortex_bail!("list_length() requires List, ListView, or FixedSizeList but got {dtype}")
     };
 
-    // Cast to `U64`
-    let len = lengths.len();
-    let lengths = lengths.cast(DType::Primitive(PType::U64, nullability))?;
-
-    // Carry over validity mask for nullable arrays
-    if matches!(nullability, Nullability::Nullable) {
-        lengths.mask(validity.to_array(len))
-    } else {
-        Ok(lengths)
-    }
+    lengths.cast(DType::Primitive(PType::U64, Nullability::NonNullable))
 }
 
 /// Calculate the lengths of `ListArray` elements via the `offsets` child:
 /// `length[i] = offsets[i + 1] - offsets[i]`.
 fn list_length_from_offsets(list: ArrayView<'_, List>) -> VortexResult<ArrayRef> {
     let offsets = list.offsets();
-    let n = offsets.len().saturating_sub(1);
+    let rows = offsets.len().saturating_sub(1);
 
     offsets
         .slice(1..offsets.len())?
-        .binary(offsets.slice(0..n)?, Operator::Sub)
+        .binary(offsets.slice(0..rows)?, Operator::Sub)
 }
 
 /// Matches an `Array<List>`, `Array<ListView>`, or `Array<FixedSizeList>`
@@ -347,6 +310,23 @@ mod tests {
 
         let mut ctx = array_session().create_execution_ctx();
         assert_arrays_eq!(result, PrimitiveArray::from_iter([2u64, 2, 2, 2]), &mut ctx);
+        Ok(())
+    }
+
+    /// A non-nullable fixed-size list has one length for the whole column, so the result stays a
+    /// constant rather than materializing one `u64` per row.
+    #[test]
+    fn test_fixed_size_list_length_stays_constant() -> VortexResult<()> {
+        let fsl = create_fixed_size_list(Validity::NonNullable);
+        let mut ctx = array_session().create_execution_ctx();
+        let result = fsl
+            .apply(&list_length(root()))?
+            .execute::<ArrayRef>(&mut ctx)?;
+        assert_eq!(
+            result.as_constant(),
+            Some(Scalar::primitive(2u64, Nullability::NonNullable)),
+            "expected a constant length column"
+        );
         Ok(())
     }
 
