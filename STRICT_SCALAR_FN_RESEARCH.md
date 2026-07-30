@@ -429,12 +429,40 @@ surface. Recorded so they are decisions rather than surprises.
   at once?") would let `list_length`, `byte_length` and `not` share one abstraction.
 - **The missing cell.** The two authoring traits cover *declare-signature-once + row-loop* (`RowFn`)
   and *hand-write-signature + own-kernel* (`StrictScalarFnVTable`). The cell for
-  *declare-signature-once + own-kernel* is empty, so `not` and `list_length` hand-write five signature
+  *declare-signature-once + own-kernel* is empty, so a columnar function hand-writes five signature
   methods (`arity`, `child_name`, `return_element_dtype`, `null_handling`, `is_fallible`) that are all
-  mechanically derivable from an element tuple. With two functions now wanting it, a small
-  signature-carrying helper (or making the row `validate_row_args` / `row_null_handling` public) is
-  probably worth doing next. I left it out here to avoid adding a one-user abstraction, but this is the
-  gap I would close first.
+  mechanically derivable from an element tuple.
+
+  **It is buildable.** The obvious worry is coherence, since `RowFn` already blanket-impls
+  `StrictScalarFnVTable` and a second blanket impl of the same trait is a hard E0119 conflict. The way
+  through is to layer rather than branch, putting the new trait *between* the two:
+
+  ```text
+  StrictScalarFnVTable  <-blanket-  StrictSignature  <-blanket-  RowFn
+  ```
+
+  One blanket impl per edge, so nothing overlaps, and a columnar function hand-writes `StrictSignature`
+  while a row function reaches it through `RowFn`. Compiling the shape confirms a hand-written impl
+  coexists with the blanket one, including from a *downstream* crate, because within the crate that owns
+  the type rustc can see the blanket impl's bound does not hold. This is not a new trick here:
+  `impl<V: StrictScalarFnVTable> ScalarFnVTable for V` already coexists with `Like`'s and `Between`'s
+  hand-written `ScalarFnVTable` impls the same way.
+
+  **The user count is 3, not 12, and 2 of those need an element first.** Being in the columnar category
+  is not enough: the function's *signature* has to be expressible in the vocabulary, and
+  `element_dtype()` taking no arguments rules out every function whose return dtype is derived from its
+  input at runtime. That is most of them: `mask` returns `arg_dtypes[0].as_nullable()`, `ext_storage`
+  returns `ext_dtype.storage_dtype()`, `get_item` and `select` a projection of the input struct,
+  `variant_get` an options-derived dtype, `binary` a width negotiated between operands. What is left is
+  `not` (`(bool,) -> bool`, usable today), `like` (`(Bytes, Bytes) -> bool`, usable today once `fmt_sql`
+  forwards), and `list_length` (needs a `ListLen` element in the style of `BytesLen`).
+
+  So this is worth building *after* the elements that give it a third user, not before. Against ~140
+  lines of new trait and blanket impl it would save roughly 20 lines per function, which at one usable
+  caller is a wrapper with one impl. The cheap interim is to make `validate_row_args`,
+  `row_null_handling` and `row_is_fallible` public, which turns each hand-written signature method into
+  a one-liner and removes the *logic* duplication (each function currently rolling its own dtype check
+  and asserting rather than deriving its null handling) without adding a layer.
 - **No nullable output element, so no non-total `RowFn`.** `OutputElement::build` always produces an
   all-valid column, so a row kernel cannot return a null from a valid row. `impl OutputElement for
   Option<T>` is the whole fix. Left out because nothing needs it *yet*: `list_sum` would need it, but
