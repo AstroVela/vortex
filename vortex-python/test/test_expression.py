@@ -144,6 +144,34 @@ class TestArrowToVortexWithViews:
         assert str(actual) == str(expected)
 
 
+def test_expr_constructor_smoke():
+    """Every function exposed by vortex.expr builds a printable expression."""
+    c = ve.column("a")
+    exprs = [
+        ve.or_(c == 1, c == 2),
+        ve.between(c, 1, 5, lower_strict=True, upper_strict=True),
+        ve.like(c, "%x%", negated=True, case_insensitive=True),
+        ve.fill_null(c, 0),
+        ve.get_item("f", ve.root()),
+        ve.select(["a", "b"], ve.root()),
+        ve.select_exclude(["a"], ve.root()),
+        ve.pack({"x": c, "y": c}, nullable=True),
+        ve.merge([ve.root(), ve.pack({"x": c})]),
+        ve.case_when(c == 1, ve.literal(vx.int_(), 1), ve.literal(vx.int_(), 0)),
+        ve.case_when(c == 1, ve.literal(vx.int_(), 1)),
+        ve.zip_(c == 1, ve.literal(vx.int_(), 1), ve.literal(vx.int_(), 0)),
+        ve.mask(c, ve.column("m")),
+        ve.list_contains(ve.column("l"), 1),
+        ve.list_length(ve.column("l")),
+        ve.list_sum(ve.column("l")),
+        ve.byte_length(ve.column("s")),
+        ~c,
+        c["x"],
+    ]
+    for expr in exprs:
+        assert str(expr)
+
+
 def test_substrait_typed_null_literal():
     literal: Expression.Literal = Expression.Literal()
     literal.null.i64.nullability = Type.NULLABILITY_NULLABLE

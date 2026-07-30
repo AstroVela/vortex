@@ -27,9 +27,47 @@ the following expression represents the set of rows for which the `age` column l
 
 .. autofunction:: vortex.expr.and_
 
+.. autofunction:: vortex.expr.or_
+
 .. autofunction:: vortex.expr.root
 
 .. autofunction:: vortex.expr.literal
+
+.. autofunction:: vortex.expr.cast
+
+.. autofunction:: vortex.expr.is_null
+
+.. autofunction:: vortex.expr.is_not_null
+
+.. autofunction:: vortex.expr.between
+
+.. autofunction:: vortex.expr.like
+
+.. autofunction:: vortex.expr.fill_null
+
+.. autofunction:: vortex.expr.get_item
+
+.. autofunction:: vortex.expr.select
+
+.. autofunction:: vortex.expr.select_exclude
+
+.. autofunction:: vortex.expr.pack
+
+.. autofunction:: vortex.expr.merge
+
+.. autofunction:: vortex.expr.case_when
+
+.. autofunction:: vortex.expr.zip_
+
+.. autofunction:: vortex.expr.mask
+
+.. autofunction:: vortex.expr.list_contains
+
+.. autofunction:: vortex.expr.list_length
+
+.. autofunction:: vortex.expr.list_sum
+
+.. autofunction:: vortex.expr.byte_length
 
 .. autoclass:: vortex.expr.Expr
    :members:
