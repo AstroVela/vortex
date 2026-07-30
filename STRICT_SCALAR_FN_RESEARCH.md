@@ -329,6 +329,59 @@ branch's own commit messages describe fixes to *this branch's* code.
 
 ---
 
+## Is there anything left to port?
+
+Asked directly: could the remaining hand-written vtables move onto `RowFn` if the element vocabulary
+covered more types? Classifying all ~30 of them says no, and says the vocabulary is not what is
+stopping them.
+
+| blocker | count | members |
+| --- | --- | --- |
+| **Not strict.** `RowFn` implies strict, so these cannot reach it at all. | 12 | `between`, `case_when`, `cast`, `dynamic`, `fill_null`, `is_null`, `is_not_null`, `list_contains`, `pack`, `stat`, `row_size`, `zip` |
+| **The answer already exists in bulk.** Zero-copy child projection, a metadata field, or a vectorized slice kernel. A row loop would be strictly slower. | 12 | `not`, `list_length`, `binary`, `mask`, `ext_storage`, `get_item`, `select`, `merge`, `variant_get`, `geo.envelope`, `json_to_variant`, `row_encode` |
+| **No element rows to read.** Zero-arity, or a type-erasure adapter. | 5 | `literal`, `root`, `row_idx`, `row_count`, `ForeignScalarFnVTable` |
+| **Output side.** Nullable output, or an output dtype that depends on runtime data. | 3 | `list_sum`, `l2_denorm`, `geo.envelope` |
+| **Value-dependent per-batch setup.** | 1 | `like` |
+
+`geo.envelope` is the one function counted twice: its output is a struct-of-four extension type *and*
+its fast paths hand back existing child arrays untouched.
+
+`binary` deserves a note, since on strictness alone it looks portable: only its Kleene `And`/`Or` are
+non-strict, and `is_strict` already varies by operator, so comparison and arithmetic go through the
+strict lifting today. What keeps it columnar is the kernel. `collect_zip_bits` and `LaneZip` run over
+`as_slice()` pairs as tight vectorizable loops, with a separate constant-operand path
+(`collect_bits(lhs, |a| a.is_eq(rhs))`). Routing that through a per-row closure and `ArgColumn::get`
+would give up the slice-level vectorization for nothing.
+
+Three things follow.
+
+**The porting well is dry.** The seven functions already on `RowFn` (`byte_length`, the three tensor
+kernels, the three geo kernels) are the complete set in this repository that wants a row loop. Every
+remaining one is blocked, and forcing any of them onto `RowFn` would cost performance rather than
+save lines.
+
+**Missing elements are not the constraint.** Only `list_contains` would need new input vocabulary, and
+it is independently blocked by non-strictness, so a list element would not unblock a single function
+today. A list *input* element is nonetheless easy (`Bytes` already proves the shape: `Elem<'a>` is a
+GAT, so `&'a [T]` works), and `list_length` could even be a `RowFn` given a `ListLen` element in the
+style of `BytesLen`. It should not be, because its answer is a child array or one constant.
+
+**`like` is a new gap, and the sharpest one.** It is strict, infallible, `(Utf8, Utf8) -> Bool`: on
+signature alone it is the ideal `RowFn`. What blocks it is that `RowFn::dispatch` sees only
+`(options, &[DType])`, deliberately, so that plan time and run time agree. Compiling the LIKE pattern
+once per batch needs the *value* of the constant pattern argument, and there is nowhere in `RowFn` to
+put that. Compiling per row instead would trade one pattern compilation for *n*, the same shape of
+regression the constant-operand stride fixed for geo. Any function whose kernel needs an artifact
+derived from a constant argument (a regex, a compiled matcher, a lookup dictionary) has the same
+problem, so the fix is a per-batch setup hook that sees argument values and produces state the row
+closure captures. `reduce_encoded` sees values, but it replaces the row loop rather than feeding it.
+
+A second, smaller thing blocks `like` too: it renders custom SQL through `fmt_sql`, and neither
+`StrictScalarFnVTable` nor `RowFn` forwards that, so today porting any function with bespoke SQL
+rendering would silently lose it.
+
+---
+
 ## Known gaps and future work
 
 Found by the porting probes, left unfixed here because each is a larger change with its own review
@@ -379,6 +432,27 @@ surface. Recorded so they are decisions rather than surprises.
   Predicates and measurements (`starts_with`, `contains`, `byte_length`) have none of this problem
   and are already the best case for `RowFn`, so the split for a string library falls along the return
   type rather than the argument type.
+
+  **A plain higher-ranked bound does not get there,** which is worth recording because it looks like
+  it should. Writing the visit as `impl for<'a> Fn(A::Elems<'a>) -> R::Elem<'a>` fails with
+  [E0582]: the `Fn` sugar puts `R::Elem<'a>` in an `Output` binding, and rustc requires the bound
+  lifetime to appear *structurally* in the trait's input types before a binding may reference it. An
+  opaque projection `A::Elems<'a>` does not count, even though it plainly mentions `'a`. Three routes
+  around it, measured by compiling each:
+
+  | route | works | cost |
+  | --- | --- | --- |
+  | concrete input type instead of `A::Elems<'a>` | yes | gives up the element abstraction |
+  | custom callable trait with a generic `apply` method | yes | callers write a struct per kernel, not a closure, and the impl must spell `<Bytes as InputElement>::Elem<'a>` rather than `&'a str`, or hit [E0195] |
+  | pass a zero-sized `Row<'a>(PhantomData<&'a ()>)` token beside the row | yes | closures survive, but every row closure grows an ignored parameter |
+
+  The third is the one to build on: the token makes `'a` appear structurally in the `Fn`'s inputs,
+  which satisfies E0582 and lets the `Output` binding reference it, and plain closures still infer.
+  The ignored parameter is a tax on *every* row function though, so the shape to prefer is a second
+  visit method for lending kernels, leaving today's `visit` untouched for the `'static` majority.
+
+  [E0582]: https://doc.rust-lang.org/error_codes/E0582.html
+  [E0195]: https://doc.rust-lang.org/error_codes/E0195.html
 - **`OutputElement::element_dtype()` takes no arguments,** so a row function's output dtype is a
   property of its Rust type and cannot depend on runtime data. This is the other thing keeping
   `l2_denorm` columnar: it returns whole tensor rows, and a tensor's dtype carries its shape.
