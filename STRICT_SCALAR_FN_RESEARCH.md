@@ -870,6 +870,59 @@ available to every future implementor.
 `cosine_similarity` and `l2_denorm` all read tensor rows through this element, so a single change moved
 all four. That is the case for the shared layer stated in performance terms rather than in line counts.
 
+### What the harness actually costs, from the optimized IR
+
+The measurements above say the harness is free at 16384 rows. Reading the post-optimization LLVM IR says
+*why*, and settles whether more `#[inline]` would buy anything. Emitted with
+`cargo rustc --release -p vortex-tensor --lib -- --emit=llvm-ir -Cdebuginfo=0`, reading the `l2_norm` f64
+arm.
+
+**The whole stack is already one function.** `execute_row_loop`, `ElementTuple::get` and the row closure
+have no `define` of their own anywhere in the module. They survive only as basic-block *labels* carrying
+`.exit.i.i.i…` suffixes about sixteen `.i` deep, which is inline-depth notation: the engine's
+`ScalarFnVTable::execute`, `execute_dense`, `execute_strict`, `dispatch`, `RowVisitor::visit`,
+`execute_row_loop`, `A::get` and the closure are all inlined into a single body. Adding `#[inline]`
+anywhere on that path cannot help, because nothing on it is still a call.
+
+**Per batch the harness leaves five calls**, each correctly placed outside the loop: one
+`ArgColumn::decode` per argument, one `tensor_element_ptype` for the width match, one `reduce_encoded`,
+one `OutputElement::build` after the loop exits, and the output allocation.
+
+**Per row it leaves this, and nothing else:**
+
+```llvm
+%row   = phi i64 [ 0, %preheader ], [ %next, %loop_latch ]
+%next  = add nuw i64 %row, 1
+%start = mul i64 %row, %stride            ; ArgColumn's stride, fused with list_size
+%end   = add i64 %start, %list_size
+%ovf   = icmp ult i64 %end, %start        ; the two halves of one slice range check
+%oob   = icmp ugt i64 %end, %len
+br i1 (or %ovf, %oob), label %slice_index_fail, label %body   ; cold side out of line
+%rowp  = getelementptr inbounds nuw double, ptr %elements, i64 %start
+%endp  = getelementptr inbounds nuw i8, ptr %rowp, i64 %list_size_bytes
+...                                        ; element loop, 8x unrolled
+%out   = getelementptr inbounds nuw double, ptr %values, i64 %row
+store double %result, ptr %out
+```
+
+About ten integer ops and one always-taken branch. The element loop underneath is 8x unrolled with a
+serial `fadd` chain (LLVM correctly refuses to reassociate the float sum) terminating on `icmp eq ptr`
+against `%endp`, which is what a hand-written `iter().map(|x| x * x).sum().sqrt()` compiles to: the
+`Elem<'a> = &'a [T]` GAT is fully scalar-replaced, and the slice iterator becomes pointer bumping at
+fixed byte offsets.
+
+**The one removable cost is not worth removing.** The surviving per-row branch is the range check on
+`&elements.as_slice()[start..start + list_size]`. LLVM cannot hoist it because nothing tells it
+`len == rows * list_size`. Eliminating it means `get_unchecked`, and this framework's stated value is
+removing `unsafe` from kernels, so buying back a perfectly-predicted branch with an unchecked index is
+the wrong direction. It is also already hidden: at width 2 the row's `sqrt` alone has longer latency than
+the whole index computation.
+
+LLVM also unswitched the row loop on `list_size == 0` and emitted a zero-width specialization that stores
+`0.0` per row. Harmless, and a sign the loop was simple enough to reason about completely.
+
+
+
 [`OutputElement::build`]: vortex-array/src/scalar_fn/row/element/mod.rs
 
 Production lines, before and after:
