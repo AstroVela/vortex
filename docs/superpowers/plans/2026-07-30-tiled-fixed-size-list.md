@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an experimental Vortex encoding that stores primitive fixed-size-list elements in configurable two-dimensional tiles and preserves that representation through slice, take, and file round-trips.
+**Goal:** Add an experimental Vortex encoding that stores primitive fixed-size-list elements in configurable two-dimensional tiles, preserves useful nondegenerate row operations through Vortex execution, and round-trips through files.
 
 **Architecture:** A new `vortex-tiled-fsl` encoding crate owns tile geometry, the physical child order, transpose/inverse-transpose logic, and generic Vortex operations. The parent retains an ordinary logical `FixedSizeList<Primitive>` dtype, while its one primitive element child can itself use another Vortex encoding; outer validity remains a separate optional child. Vortex file and facade integration are feature-gated behind `unstable_encodings`; SpiralDB-specific scoring remains outside this plan.
 
@@ -15,7 +15,11 @@
 - `TileGeometry.rows` and `TileGeometry.dimensions` are both `NonZeroU32`.
 - Store exactly `len * list_size` physical elements with checked arithmetic and no tail padding.
 - Preserve outer row validity separately and transpose element validity with element values.
-- Preserve the tiled parent and its geometry through `slice` and `take`; neither operation may canonicalize the whole source.
+- Preserve the tiled parent and its geometry for nonempty `slice` results and
+  after executing a nondegenerate `take` with a session that registers the
+  encoding. Empty slices, empty takes, and takes from empty sources may use
+  Vortex's canonical or constant degenerate results. No row operation may
+  canonicalize the whole source.
 - Use canonical `FixedSizeListArray` as the deterministic unit-test and fuzz-test oracle for every tiled operation.
 - Keep production `vortex-tiled-fsl` independent of `vortex-fastlanes`; FastLanes is a dev-only composition dependency.
 - Do not add the encoding to BtrBlocks or any automatic compression strategy.
@@ -238,8 +242,9 @@ git commit -s -m "feat: add tiled fixed-size-list geometry"
 - Produces: `TiledFixedSizeList` and `TiledFixedSizeListArray = Array<TiledFixedSizeList>`.
 - Produces: `TiledFixedSizeList::try_new(elements, list_size, validity, len, geometry)`.
 - Produces: `TiledFixedSizeList::encode(ArrayView<FixedSizeList>, geometry, &mut ExecutionCtx)`.
-- Produces: `TiledFixedSizeListArrayExt::{elements, geometry, list_size, array_validity, row_tile_count, dimension_tile_count, tile, tiles}`.
-- Produces: `TiledFixedSizeListTile` with logical ranges, `physical_range`, and `elements()`.
+- Produces: `TiledFixedSizeListArrayExt::{elements, geometry, list_size, array_validity, row_tile_count, dimension_tile_count, tile, tiles, tile_elements}`.
+- Produces: range-only `TileBounds` traversal—three integer ranges, with no
+  child clone, slice, or allocation per tile.
 - Produces: crate-private `TransposeDirection::{CanonicalToTiled, TiledToCanonical}` and `transpose_validity`.
 - Produces: `initialize(&VortexSession)`.
 
@@ -323,7 +328,10 @@ fn golden_physical_child_and_tiles() -> VortexResult<()> {
         &[0, 10, 1, 11, 2, 12, 20, 21, 22, 3, 13, 4, 14, 23, 24]
     );
     assert_eq!(
-        tiled.tiles().map(|tile| tile.physical_range).collect::<Vec<_>>(),
+        tiled
+            .tiles()
+            .map(|tile| tile.physical_range)
+            .collect::<Vec<_>>(),
         vec![0..6, 6..9, 9..13, 13..15]
     );
     assert_arrays_eq!(canonical, tiled, &mut ctx);
@@ -511,30 +519,80 @@ The VTable `execute` uses `require_child!` to request a canonical primitive
 element child, inverse-transposes it, and returns a canonical
 `FixedSizeListArray`.
 
-- [ ] **Step 5: Implement efficient tile descriptors and scalar access**
+- [ ] **Step 5: Implement range-only tile traversal and scalar access**
 
-Define a descriptor that carries the parent child once and slices only on
-demand:
+Reuse `TileBounds` as the only item yielded by `tile` and `tiles`. A tile must
+not own, clone, or borrow-wrap the physical child. Define one concrete iterator
+whose state is exclusively scalar geometry and counters:
 
 ```rust
-#[derive(Clone, Debug)]
-pub struct TiledFixedSizeListTile {
-    pub row_range: Range<usize>,
-    pub dimension_range: Range<usize>,
-    pub physical_range: Range<usize>,
-    elements: ArrayRef,
+pub struct TileBoundsIter {
+    len: usize,
+    list_size: usize,
+    geometry: TileGeometry,
+    row_tile_count: usize,
+    dimension_tile_count: usize,
+    next_row_tile: usize,
+    next_dimension_tile: usize,
 }
 
-impl TiledFixedSizeListTile {
-    pub fn elements(&self) -> VortexResult<ArrayRef> {
-        self.elements.slice(self.physical_range.clone())
+impl Iterator for TileBoundsIter {
+    type Item = TileBounds;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row_tile_count == 0
+            || self.next_dimension_tile == self.dimension_tile_count
+        {
+            return None;
+        }
+
+        let bounds = tile_bounds_for_validated_array(
+            self.len,
+            self.list_size,
+            self.geometry,
+            self.next_row_tile,
+            self.next_dimension_tile,
+        );
+        self.next_row_tile += 1;
+        if self.next_row_tile == self.row_tile_count {
+            self.next_row_tile = 0;
+            self.next_dimension_tile += 1;
+        }
+        Some(bounds)
     }
 }
+
+pub trait TiledFixedSizeListArrayExt: TiledFixedSizeListArraySlotsExt {
+    fn tile(
+        &self,
+        row_tile: usize,
+        dimension_tile: usize,
+    ) -> VortexResult<TileBounds>;
+    fn tiles(&self) -> TileBoundsIter;
+    fn tile_elements(&self, bounds: &TileBounds) -> VortexResult<ArrayRef> {
+        self.elements().slice(bounds.physical_range.clone())
+    }
+}
+
+impl<T: TiledFixedSizeListArraySlotsExt> TiledFixedSizeListArrayExt for T {}
 ```
 
-`tiles()` must iterate dimension tiles outside row tiles so descriptors arrive
-in physical order. `tile(row_tile, dimension_tile)` uses `tile_bounds` and
-returns an error for invalid indices.
+Implement the hand-written extension trait on top of the generated
+`TiledFixedSizeListArraySlotsExt` trait. `tiles()` initializes
+`TileBoundsIter` from the array's validated length, list size, and geometry.
+The iterator advances row tiles inside dimension tiles, so bounds arrive in
+physical order. A zero row-tile count or zero dimension-tile count yields no
+items. `tile_bounds_for_validated_array` is private and infallible: it uses only
+tile indices generated within the precomputed counts, with `debug_assert!`
+checks documenting that precondition. Factor the range calculation once so this
+helper and checked `tile_bounds` cannot drift. The public `tile(row_tile,
+dimension_tile)` uses the checked entrypoint and returns an error for arbitrary
+invalid indices.
+
+Neither constructing the iterator nor yielding an item performs an `ArrayRef`
+clone, child slice, heap allocation, or dynamic dispatch. `tile_elements` is an
+explicit cold-path convenience for tests and inspection; scoring kernels
+execute `elements()` once and index it with `physical_range`.
 
 Implement `OperationsVTable::scalar_at` by producing the physical indices for
 one selected row, performing one bulk child `take`, and constructing a
@@ -599,7 +657,8 @@ git commit -s -m "feat: add tiled fixed-size-list array"
 - Produces: crate-private `physical_indices_for_rows(source_len, list_size, geometry, rows) -> VortexResult<Buffer<u64>>`.
 - Produces: crate-private `gather_tiled_rows(array, rows, validity) -> VortexResult<TiledFixedSizeListArray>`.
 - Produces: `SliceReduce for TiledFixedSizeList`.
-- Preserves: `TiledFixedSizeList` parent and exact `TileGeometry`.
+- Preserves: `TiledFixedSizeList` parent and exact `TileGeometry` for nonempty
+  output ranges; Vortex's ordinary canonical empty result for `start == stop`.
 
 - [ ] **Step 1: Add failing slice conformance and boundary tests**
 
@@ -619,8 +678,15 @@ fn slice_preserves_encoding_and_values(#[case] range: Range<usize>) -> VortexRes
     let (canonical, tiled, mut ctx) = fixture(65, 129, geometry(32, 64))?;
     let expected = canonical.into_array().slice(range.clone())?;
     let actual = tiled.into_array().slice(range)?;
-    assert!(actual.is::<TiledFixedSizeList>());
-    assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), geometry(32, 64));
+    if actual.is_empty() {
+        assert!(actual.is::<FixedSizeList>());
+    } else {
+        assert!(actual.is::<TiledFixedSizeList>());
+        assert_eq!(
+            actual.as_::<TiledFixedSizeList>().geometry(),
+            geometry(32, 64)
+        );
+    }
     assert_arrays_eq!(expected, actual, &mut ctx);
     Ok(())
 }
@@ -643,8 +709,9 @@ Run:
 cargo test -p vortex-tiled-fsl slice
 ```
 
-Expected: the value fallback may work, but the encoding assertion fails because
-no `SliceReduce` rule is registered.
+Expected: nonempty value fallbacks may work, but their encoding assertion fails
+because no `SliceReduce` rule is registered. The `0..0` case already returns
+Vortex's canonical empty FSL and passes its degenerate-result assertion.
 
 - [ ] **Step 3: Implement output-proportional row gathering**
 
@@ -694,6 +761,10 @@ without conflating their validity semantics.
 4. call `gather_tiled_rows` with the selected rows and sliced validity;
 5. return the resulting tiled array with unchanged geometry.
 
+`ArrayRef::slice` handles `start == stop` before constructing a `SliceArray`, so
+this rule is invoked only for nonempty output. Do not modify that generic
+short-circuit.
+
 Register:
 
 ```rust
@@ -716,7 +787,8 @@ cargo test -p vortex-tiled-fsl slice
 cargo test -p vortex-tiled-fsl
 ```
 
-Expected: slice preserves the tiled parent for every boundary and validity case.
+Expected: every nonempty slice preserves the tiled parent; empty slices remain
+canonical and all cases match canonical FSL logically.
 
 - [ ] **Step 6: Commit slice support**
 
@@ -740,7 +812,10 @@ git commit -s -m "feat: preserve tiled lists through slice"
 - Produces: `TakeExecute for TiledFixedSizeList`.
 - Produces: crate-private `collect_checked_rows<I: IntegerPType>(indices, mask, source_len) -> VortexResult<Vec<Option<usize>>>`.
 - Produces: `kernel::initialize(&VortexSession)` registering `TakeExecuteAdaptor`.
-- Preserves: tiled parent, geometry, requested row order, duplicates, and nullable-index semantics.
+- Preserves after execution: tiled parent and geometry for nonempty takes from a
+  nonempty source, plus requested row order, duplicates, and nullable-index
+  semantics. Empty indices and empty sources retain Vortex's generic
+  canonical/constant short-circuits.
 
 - [ ] **Step 1: Add failing take conformance and explicit preservation tests**
 
@@ -761,7 +836,10 @@ let indices = PrimitiveArray::new(
     buffer![64u32, 1, 1, 32, 0],
     Validity::from_iter([true, true, false, true, true]),
 ).into_array();
-let actual = tiled.into_array().take(indices.clone())?;
+let actual = tiled
+    .into_array()
+    .take(indices.clone())?
+    .execute_until::<TiledFixedSizeList>(&mut ctx)?;
 assert!(actual.is::<TiledFixedSizeList>());
 assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), geometry(32, 64));
 assert_arrays_eq!(canonical.into_array().take(indices)?, actual, &mut ctx);
@@ -770,7 +848,9 @@ assert_arrays_eq!(canonical.into_array().take(indices)?, actual, &mut ctx);
 Also test:
 
 - every integer index PType accepted by Vortex take;
-- all-null indices against an empty source;
+- all-null indices against an empty source, asserting logical equality after
+  execution but not tiled preservation;
+- empty indices against a nonempty source, asserting the canonical empty result;
 - zero-width lists;
 - out-of-bounds valid indices;
 - nullable indices applied to a nonnullable source produce nullable outer FSL;
@@ -784,8 +864,9 @@ Run:
 cargo test -p vortex-tiled-fsl take
 ```
 
-Expected: generic execution does not return a tiled parent because no
-encoding-specific take kernel is registered.
+Expected: `ArrayRef::take` constructs a lazy `DictArray`. Executing it does not
+reach a tiled parent because no encoding-specific take kernel is registered, so
+the explicit `execute_until::<TiledFixedSizeList>` preservation assertion fails.
 
 - [ ] **Step 3: Implement `TakeExecute` with one canonicalization of indices**
 
@@ -839,7 +920,11 @@ impl TakeExecute for TiledFixedSizeList {
 }
 ```
 
-For an empty source, permit only zero output rows or all-null index rows.
+For an empty source, Vortex's generic `TakeExecuteAdaptor` handles zero output
+rows and all-null index rows before calling this implementation. Likewise, it
+handles empty indices against a nonempty source. Those results are canonical or
+constant and are explicitly exempt from tiled preservation. Do not replace the
+generic adaptor solely to retain a meaningless layout on degenerate output.
 
 - [ ] **Step 4: Register the take parent kernel**
 
@@ -867,7 +952,9 @@ cargo test -p vortex-tiled-fsl take
 cargo test -p vortex-tiled-fsl
 ```
 
-Expected: conformance and explicit preservation tests pass.
+Expected: conformance passes; executing each nondegenerate take produces a tiled
+parent with unchanged geometry, while degenerate takes match canonical FSL
+without a tiled assertion.
 
 - [ ] **Step 6: Commit take support**
 
@@ -917,9 +1004,10 @@ fn bitpacked_child_roundtrips_and_remains_tiled_after_row_ops() -> VortexResult<
     let sliced = tiled.clone().into_array().slice(1..64)?;
     assert!(sliced.is::<TiledFixedSizeList>());
 
-    let taken = tiled.into_array().take(
-        PrimitiveArray::from_iter([64u32, 0, 32]).into_array(),
-    )?;
+    let taken = tiled
+        .into_array()
+        .take(PrimitiveArray::from_iter([64u32, 0, 32]).into_array())?
+        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
     assert!(taken.is::<TiledFixedSizeList>());
     Ok(())
 }
@@ -981,7 +1069,9 @@ git commit -s -m "test: cover bitpacked tiled list children"
 - Consumes: `vortex_tiled_fsl::initialize`.
 - Produces: decoder registration under `vortex-file/unstable_encodings`.
 - Produces: `vortex::encodings::tiled_fsl` under `vortex/unstable_encodings`.
-- Proves: explicit experimental writer-edition file round-trip retains the tiled encoding and logical values.
+- Proves: explicit experimental writer-edition file round-trip retains the
+  tiled parent for both raw and FastLanes-bitpacked children, retains the
+  bitpacked child encoding, and preserves logical values.
 
 - [ ] **Step 1: Add a failing feature-gated file round-trip test**
 
@@ -990,24 +1080,43 @@ Create an integration test beginning with:
 ```rust
 #![cfg(feature = "unstable_encodings")]
 #![expect(clippy::tests_outside_test_module)]
+
+mod common;
+
+use common::enable_all_registered_array_encodings;
 ```
 
-Build a tiled FSL as a field in a one-field `StructArray`. Create a session with
-`LayoutSession` and `RuntimeSession`, call
-`vortex_file::register_default_encodings`, then call the existing test helper
-`enable_all_registered_array_encodings` so the writer edition explicitly
-permits the experimental ID. Write with `FlatLayoutStrategy` to avoid automatic
+Build one raw tiled FSL and a second tiled FSL reconstructed around a four-bit
+FastLanes child. Store them as `raw` and `bitpacked` fields in one
+`StructArray`. Create a session with `LayoutSession` and `RuntimeSession`, call
+`vortex_file::register_default_encodings`, then import and call
+`common::enable_all_registered_array_encodings` from
+`vortex-file/tests/common/mod.rs` so the writer edition explicitly permits
+every registered ID. Write with `FlatLayoutStrategy` to avoid automatic
 compression policy.
 
 After scanning one chunk:
 
 ```rust
 let result = chunk.execute::<StructArray>(&mut ctx)?;
-let field = result.unmasked_field(0).clone();
-assert!(field.is::<TiledFixedSizeList>());
+let raw = result.unmasked_field(0).clone();
+let bitpacked = result.unmasked_field(1).clone();
+
+assert!(raw.is::<TiledFixedSizeList>());
+assert!(bitpacked.is::<TiledFixedSizeList>());
 assert_eq!(
-    field.as_::<TiledFixedSizeList>().geometry(),
+    raw.as_::<TiledFixedSizeList>().geometry(),
     geometry(32, 64)
+);
+assert_eq!(
+    bitpacked.as_::<TiledFixedSizeList>().geometry(),
+    geometry(32, 64)
+);
+assert!(
+    bitpacked
+        .as_::<TiledFixedSizeList>()
+        .elements()
+        .is::<vortex_fastlanes::BitPacked>()
 );
 assert_arrays_eq!(input, result, &mut ctx);
 ```
@@ -1069,8 +1178,9 @@ cargo check -p vortex-file --no-default-features
 cargo check -p vortex --features unstable_encodings
 ```
 
-Expected: the file test retains the encoding and values; feature-off builds do
-not compile or register the new crate.
+Expected: the file test retains both tiled parents, retains `BitPacked` beneath
+the composed parent, and preserves values; feature-off builds do not compile or
+register the new crate.
 
 - [ ] **Step 6: Commit unstable integration**
 
@@ -1136,26 +1246,36 @@ nonzero.
 3. every legal `execute_scalar(row)` equals canonical FSL;
 4. `row_tile_count` and `dimension_tile_count` equal independent `div_ceil`
    calculations;
-5. each `tile` and `tiles` element view equals a canonical child `take` built
-   from `row * list_size + dimension`;
+5. each bounds value from `tile` and `tiles` has the expected logical and
+   physical ranges, and `tile_elements(&bounds)` equals a canonical child
+   `take` built from `row * list_size + dimension`;
 6. slices `0..0`, full range, each boundary-adjacent range, and ranges crossing
-   row tiles equal canonical FSL and remain tiled with identical geometry;
+   row tiles equal canonical FSL; nonempty results remain tiled with identical
+   geometry and empty results are canonical;
 7. empty, identity, reverse, duplicated, unsorted, and nullable takes equal
-   canonical FSL and remain tiled with identical geometry.
+   canonical FSL after execution; nondegenerate results become tiled with
+   identical geometry, while empty takes and takes from empty sources use
+   Vortex's ordinary degenerate representation.
 
 Use the existing `assert_fsl_equivalent` helper after every operation:
 
 ```rust
 let expected = canonical.clone().into_array().slice(range.clone())?;
 let actual = tiled.clone().into_array().slice(range)?;
-assert!(actual.is::<TiledFixedSizeList>());
-assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), geometry);
+if actual.is_empty() {
+    assert!(actual.is::<FixedSizeList>());
+} else {
+    assert!(actual.is::<TiledFixedSizeList>());
+    assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), geometry);
+}
 assert_fsl_equivalent(&expected, &actual, &mut ctx)?;
 ```
 
 For tile element views, derive expected indices directly from canonical
 row-major coordinates; do not call `physical_offset`, `tile_bounds`, or another
-tiled helper when constructing the oracle.
+tiled helper when constructing the oracle. Collect representative iterator
+output into an explicitly typed `Vec<TileBounds>` so the test fixes the hot
+iterator's bounds-only item contract at compile time.
 
 - [ ] **Step 3: Run the focused conformance suite**
 
@@ -1199,41 +1319,59 @@ git commit -s -m "test: check tiled lists against canonical FSL"
 
 **Interfaces:**
 - Consumes: the complete tiled array API and Vortex's canonical FSL helpers.
-- Produces: `FuzzTiledFsl`, `TiledFslAction`, and `run_tiled_fsl`.
+- Produces: `FuzzTiledFsl`, `TiledFslAction`, and
+  `run_tiled_fsl(FuzzTiledFsl) -> VortexFuzzResult<()>`.
+- Produces:
+  `deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>>`.
 - Produces: native cargo-fuzz target `tiled_fsl`.
-- Checks: encode/execute, `try_new`, scalar access, tile descriptors and tile element views, slice, take, outer validity, element validity, empty arrays, zero-width lists, and composed operation sequences.
+- Checks: encode/execute, `try_new`, scalar access, tile bounds and tile element
+  views, slice, take, outer validity, element validity, empty arrays, zero-width
+  lists, and composed operation sequences.
 
-- [ ] **Step 1: Add a failing deterministic fuzz-harness smoke test**
+- [ ] **Step 1: Add a non-vacuous deterministic fuzz-harness smoke test**
 
 Add `vortex-tiled-fsl = { workspace = true }` to `fuzz/Cargo.toml`, declare the
-module and public re-exports in `fuzz/src/lib.rs`, and add a unit test that
-calls the currently absent harness with fixed bytes:
+module and public re-exports in `fuzz/src/lib.rs`, and add a unit test beside
+the harness that calls it with explicitly constructed inputs:
 
 ```rust
 #[cfg(test)]
 mod tests {
-    use arbitrary::Arbitrary;
-    use arbitrary::Unstructured;
+    use crate::error::VortexFuzzResult;
 
-    use super::{FuzzTiledFsl, run_tiled_fsl};
+    use super::{deterministic_tiled_fsl_cases, run_tiled_fsl};
 
     #[test]
-    fn deterministic_tiled_fsl_smoke() {
-        let zeros = [0u8; 256];
-        let ones = [0xffu8; 256];
-        let ascending = (0u8..=255).collect::<Vec<_>>();
-        for seed in [
-            zeros.as_slice(),
-            ones.as_slice(),
-            ascending.as_slice(),
-        ] {
-            let mut unstructured = Unstructured::new(seed);
-            if let Ok(input) = FuzzTiledFsl::arbitrary(&mut unstructured) {
-                run_tiled_fsl(input).unwrap();
-            }
+    fn deterministic_tiled_fsl_smoke() -> VortexFuzzResult<()> {
+        let cases = deterministic_tiled_fsl_cases()?;
+        assert_eq!(cases.len(), 3);
+        for input in cases {
+            run_tiled_fsl(input)?;
         }
+        Ok(())
     }
 }
+```
+
+`deterministic_tiled_fsl_cases` constructs exactly:
+
+1. zero rows, zero-width nonnullable `i32`, geometry 128-by-128, with
+   `CheckTiles` and `Reconstruct`;
+2. three rows by five nullable `u16` elements, mixed outer validity, geometry
+   2-by-3, with `CheckTiles`, nullable duplicated `Take`, and `Reconstruct`;
+3. 65 rows by 129 `f32` elements with independently mixed element and outer
+   validity, geometry 32-by-64, with boundary-crossing `Slice`, reverse `Take`,
+   `ScalarAt`, and `CheckTiles`.
+
+Construct values and validity through ordinary `PrimitiveArray` and
+`FixedSizeListArray` constructors, not `Arbitrary`. There is no conditional
+parse or skipped case: the test fails if any fixture cannot be constructed or
+run.
+
+Give the helper this exact signature:
+
+```rust
+fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>>
 ```
 
 - [ ] **Step 2: Run the smoke test and confirm the harness is absent**
@@ -1314,18 +1452,27 @@ fn expected_tile_indices(
 }
 ```
 
-For every descriptor from `tiles()`:
+Execute the canonical FSL outer validity once to a mask. For every bounds value
+from `tiles()`:
 
 - assert logical ranges do not overlap incorrectly and jointly cover every
   row/dimension tile;
 - assert `physical_range.len() == row_range.len() * dimension_range.len()`;
-- take `expected_tile_indices` from the canonical FSL element child;
-- compare those expected values and element validity with `tile.elements()`;
+- build the expected tile by passing clones of `bounds.row_range` and
+  `bounds.dimension_range` to `expected_tile_indices`, then taking those
+  returned indices from the canonical FSL element child;
+- construct tile-relative positions only for coordinates whose outer row is
+  valid, then take those same positions from both the expected tile and
+  `tile_elements(&bounds)`;
+- compare the selected expected and actual values, including element validity;
 - assert physical ranges are adjacent from zero through exactly
   `len * list_size`.
 
 This oracle deliberately derives expected values from canonical row-major
-coordinates and must not call `physical_offset` or `tile_bounds`.
+coordinates and must not call `physical_offset` or `tile_bounds`. It must not
+compare placeholder child values beneath an invalid outer row: canonical
+builders may append defaults there while tiled nullable take may copy source row
+zero, and those physical values are deliberately not part of logical equality.
 
 - [ ] **Step 5: Differentially execute and compose every tiled operation**
 
@@ -1335,18 +1482,25 @@ Normalize action seeds against the current oracle length:
   canonical and tiled scalars.
 - `Slice`: map both seeds into one valid `start..stop`, use
   `array::slice_canonical_array` for the oracle and `tiled.slice` for the
-  candidate, assert logical equality, tiled encoding, and unchanged geometry.
+  candidate, and assert logical equality. A nonempty result must be tiled with
+  unchanged geometry. An empty result must be canonical and ends this composed
+  action sequence after its logical check.
 - `Take`: map every valid seed modulo nonzero `len`, turn every valid seed into
   `None` when `len == 0`, use `array::take_canonical_array` for the oracle and
-  `tiled.take` for the candidate, then assert equality, tiled encoding, and
-  unchanged geometry.
+  `tiled.take` for the candidate. For nonempty indices from a nonempty source,
+  execute the lazy candidate with
+  `execute_until::<TiledFixedSizeList>(&mut ctx)`, then assert equality, tiled
+  encoding, and unchanged geometry. Empty indices or a take from an empty source
+  may execute to Vortex's canonical/constant degenerate result and end the
+  action sequence after logical equality is checked.
 - `Reconstruct`: call `try_new` with the current physical child and parts, then
   assert equality.
 - `CheckTiles`: rerun the independent tile check from Step 4.
 
 After every mutating action, run `assert_array_eq` and compare every legal
-scalar. Return `Ok(false)` only for bytes that cannot generate the bounded
-input; a logical mismatch is an error or panic so libFuzzer records it.
+scalar. `run_tiled_fsl` returns `Ok(())` on success. `Arbitrary` decoding occurs
+before a typed libFuzzer target invokes this function, so malformed bytes do not
+need a second `Ok(false)` rejection channel.
 
 - [ ] **Step 6: Add the native fuzz entrypoint**
 
@@ -1373,8 +1527,7 @@ use vortex_fuzz::{FuzzTiledFsl, run_tiled_fsl};
 
 fuzz_target!(|input: FuzzTiledFsl| -> Corpus {
     match run_tiled_fsl(input) {
-        Ok(true) => Corpus::Keep,
-        Ok(false) => Corpus::Reject,
+        Ok(()) => Corpus::Keep,
         Err(error) => vortex_panic!("{error}"),
     }
 });
@@ -1394,17 +1547,51 @@ cargo +nightly fuzz build --dev --sanitizer=none tiled_fsl
 cargo +nightly fuzz run --dev --sanitizer=none tiled_fsl -- -runs=10000 -max_len=4096
 ```
 
-Expected: the deterministic smoke test passes, the target builds, and 10,000
+Expected: all three deterministic cases run, the target builds, and 10,000
 inputs produce no logical divergence, panic, sanitizer failure, or unbounded
 allocation.
 
 - [ ] **Step 8: Add the target to scheduled fuzzing**
 
-Add a `tiled_fsl_fuzz` job to `.github/workflows/fuzz.yml` using
-`./.github/workflows/run-fuzzer.yml`, target `tiled_fsl`, and four jobs. Add the
-matching `report-tiled-fsl-fuzz-failures` job with the same permissions,
-artifact naming, tokens, branch, and commit fields as the array-operations
-reporter.
+Add these exact jobs to `.github/workflows/fuzz.yml`:
+
+```yaml
+  # ============================================================================
+  # Tiled Fixed-Size List Fuzzer
+  # ============================================================================
+  tiled_fsl_fuzz:
+    name: "Tiled Fixed-Size List Fuzz"
+    uses: ./.github/workflows/run-fuzzer.yml
+    with:
+      fuzz_target: tiled_fsl
+      jobs: 4
+    secrets:
+      R2_FUZZ_ACCESS_KEY_ID: ${{ secrets.R2_FUZZ_ACCESS_KEY_ID }}
+      R2_FUZZ_SECRET_ACCESS_KEY: ${{ secrets.R2_FUZZ_SECRET_ACCESS_KEY }}
+
+  report-tiled-fsl-fuzz-failures:
+    name: "Report Tiled Fixed-Size List Fuzz Failures"
+    needs: tiled_fsl_fuzz
+    if: always() && needs.tiled_fsl_fuzz.outputs.crashes_found == 'true'
+    permissions:
+      issues: write
+      contents: read
+      id-token: write
+      pull-requests: read
+    uses: ./.github/workflows/report-fuzz-crash.yml
+    with:
+      fuzz_target: tiled_fsl
+      crash_file: ${{ needs.tiled_fsl_fuzz.outputs.first_crash_name }}
+      artifact_url: ${{ needs.tiled_fsl_fuzz.outputs.artifact_url }}
+      artifact_name: tiled_fsl-crash-artifacts
+      logs_artifact_name: tiled_fsl-logs
+      branch: ${{ github.ref_name }}
+      commit: ${{ github.sha }}
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+      incident_io_alert_token: ${{ secrets.INCIDENT_IO_ALERT_TOKEN }}
+```
 
 Use `tiled_fsl` consistently as target, fuzz name, corpus key, crash artifact
 prefix, and logs prefix. Do not add `vortex/unstable_encodings`: the target
@@ -1427,7 +1614,8 @@ git commit -s -m "test: fuzz tiled lists against canonical FSL"
 
 **Interfaces:**
 - Consumes: complete public encoding API.
-- Produces: Divan benchmarks named `encode`, `execute`, `slice`, `take`, `traverse_prepared`, and `traverse_end_to_end`.
+- Produces: Divan benchmarks named `encode`, `execute`, `slice`, `take`,
+  `score_canonical`, `score_prepared`, and `score_end_to_end`.
 - Produces: benchmark arguments covering row tiles 32/64, full-width/64-dimension bands, and a 16-row by 4-dimension microtile.
 
 - [ ] **Step 1: Add the benchmark target and compile-failing skeleton**
@@ -1469,7 +1657,7 @@ The argument set must include:
 - geometries 32-by-full, 64-by-full, 32-by-64, 64-by-64, and 16-by-4;
 - boundary fixtures with rows/dimensions one below and one above 32 and 64.
 
-Start with benchmark functions calling the not-yet-written fixture and traversal
+Start with benchmark functions calling the not-yet-written fixture and scoring
 helpers so the target fails to compile.
 
 - [ ] **Step 2: Confirm the benchmark target fails before helper implementation**
@@ -1480,12 +1668,13 @@ Run:
 cargo bench -p vortex-tiled-fsl --bench tiled_fsl --no-run
 ```
 
-Expected: compilation fails on the missing fixture/traversal helpers.
+Expected: compilation fails on the missing fixture and scoring helpers.
 
 - [ ] **Step 3: Implement deterministic raw and bitpacked fixtures**
 
-Use deterministic low-bit `u8` values for bitpacked cases and `f32` values for
-floating-point encode/execute cases. Construct inputs outside timed loops.
+Use deterministic low-bit `u8` values for bitpacked cases, deterministic
+dimension-specific `u8` query weights, and `f32` values for floating-point
+encode/execute cases. Construct inputs and query weights outside timed loops.
 Initialize both `vortex_tiled_fsl` and `vortex_fastlanes` in the benchmark
 session.
 
@@ -1500,26 +1689,64 @@ Measure:
 - `execute`: tiled to canonical FSL;
 - `slice`: a small, a half-width, and a tile-boundary-crossing row range;
 - `take`: sorted sparse and unsorted duplicated row indices;
-- `traverse_prepared`: execute the physical child outside the timed loop, then
-  sum values through `array.tiles()` and each supplied `physical_range`;
-- `traverse_end_to_end`: execute the raw or bitpacked physical child once
-  inside each timed sample, then traverse the same public ranges.
+- `score_canonical`: score the row-major canonical child with one deterministic
+  query weight per dimension;
+- `score_prepared`: execute the tiled physical child outside the timed loop,
+  then perform the identical weighted row accumulation through `array.tiles()`
+  and each supplied `physical_range`;
+- `score_end_to_end`: execute the raw or bitpacked physical child once inside
+  each timed sample, then perform the same tiled scoring kernel.
 
-The representative traversal body is:
+The two scoring bodies are:
 
 ```rust
-fn sum_tiles(array: ArrayView<'_, TiledFixedSizeList>, values: &[u8]) -> u64 {
-    array
-        .tiles()
-        .flat_map(|tile| values[tile.physical_range].iter())
-        .map(|value| u64::from(*value))
-        .sum()
+fn score_canonical(
+    values: &[u8],
+    rows: usize,
+    dimensions: usize,
+    query: &[u8],
+) -> Vec<u64> {
+    let mut scores = vec![0; rows];
+    for (row, score) in scores.iter_mut().enumerate() {
+        let row_values = &values[row * dimensions..(row + 1) * dimensions];
+        *score = row_values
+            .iter()
+            .zip(query)
+            .map(|(&value, &weight)| u64::from(value) * u64::from(weight))
+            .sum();
+    }
+    scores
+}
+
+fn score_tiled(
+    array: ArrayView<'_, TiledFixedSizeList>,
+    values: &[u8],
+    query: &[u8],
+) -> Vec<u64> {
+    let mut scores = vec![0; array.len()];
+    for bounds in array.tiles() {
+        let tile_rows = bounds.row_range.len();
+        for (dimension_offset, dimension) in bounds.dimension_range.clone().enumerate() {
+            let physical_start =
+                bounds.physical_range.start + dimension_offset * tile_rows;
+            let weight = u64::from(query[dimension]);
+            for (row_offset, row) in bounds.row_range.clone().enumerate() {
+                scores[row] +=
+                    u64::from(values[physical_start + row_offset]) * weight;
+            }
+        }
+    }
+    scores
 }
 ```
 
-Use `divan::black_box` on results. Do not call `tile.elements()` per tile in the
-prepared benchmark; the benchmark exists to prove that the public physical
-ranges support one-time child execution.
+Before timing, assert that both bodies return identical scores for every
+fixture and geometry. Use `divan::black_box` on results. Do not call
+`tile_elements` per tile in the prepared benchmark; the benchmark exists to
+prove that range-only traversal supports one-time child execution. A plain sum
+of all physical values is forbidden as a geometry comparison: because the
+physical ranges are adjacent, it degenerates to the same sequential scan for
+every layout and measures only tile-count overhead.
 
 - [ ] **Step 5: Compile and smoke-run representative benchmark filters**
 
@@ -1528,12 +1755,14 @@ Run:
 ```bash
 cargo +nightly fmt --all
 cargo bench -p vortex-tiled-fsl --bench tiled_fsl --no-run
-cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- traverse_prepared
-cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- traverse_end_to_end
+cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- score_canonical
+cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- score_prepared
+cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- score_end_to_end
 ```
 
-Expected: the target compiles and both raw/bitpacked traversal families produce
-measurements for the candidate geometries.
+Expected: the target compiles, the canonical baseline runs, and both
+raw/bitpacked tiled scoring families produce measurements for every candidate
+geometry.
 
 - [ ] **Step 6: Commit benchmarks**
 
@@ -1577,6 +1806,7 @@ cargo clippy -p vortex-tiled-fsl --all-targets --all-features -- -D warnings
 cargo clippy -p vortex-file --all-targets --features unstable_encodings -- -D warnings
 cargo clippy -p vortex-fuzz --bin tiled_fsl --features native -- -D warnings
 cargo clippy --release -p vortex-tiled-fsl --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Expected: no warnings.
@@ -1589,9 +1819,11 @@ Run:
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p vortex-tiled-fsl
 taplo fmt --check
 cargo shear
+yamllint --strict -c .yamllint.yaml .github/workflows/fuzz.yml
 ```
 
-Expected: rustdoc, TOML formatting, and unused-dependency checks pass.
+Expected: rustdoc, TOML formatting, unused-dependency checks, and workflow YAML
+linting pass.
 
 - [ ] **Step 4: Re-run benchmark compilation and capture representative evidence**
 
@@ -1599,18 +1831,25 @@ Run:
 
 ```bash
 cargo bench -p vortex-tiled-fsl --bench tiled_fsl --no-run
-cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- traverse_prepared
-cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- traverse_end_to_end
+cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- score_canonical
+cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- score_prepared
+cargo bench -p vortex-tiled-fsl --bench tiled_fsl -- score_end_to_end
 cargo +nightly fuzz build --dev --sanitizer=none tiled_fsl
 ```
 
 Record, without committing generated artifacts:
 
-- prepared traversal throughput for 32/64-by-full and 32/64-by-64;
-- end-to-end raw versus bitpacked traversal;
+- canonical row-major scoring throughput;
+- prepared tiled scoring throughput for 32/64-by-full, 32/64-by-64, and
+  16-by-4;
+- end-to-end raw versus bitpacked tiled scoring;
 - encode and execute costs for 1,024-by-128 and at least one wider fixture;
-- any geometry that is consistently dominated and can be dropped from the
-  first SpiralDB experiment.
+- the relative overheads that the later SpiralDB scoring benchmark must explain.
+
+Do not eliminate a geometry based on this representation-level proxy. Carry all
+candidate geometries into the first SpiralDB scorer experiment; only the real
+RaBitQ kernel can establish that a geometry is dominated for the target
+workload.
 
 - [ ] **Step 5: Inspect the complete branch diff and repository state**
 

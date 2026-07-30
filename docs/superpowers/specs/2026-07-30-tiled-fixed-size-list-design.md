@@ -48,7 +48,9 @@ machine.
 - Keep every rectangular tile contiguous.
 - Preserve both row-level and element-level validity.
 - Avoid serialized padding for tail tiles.
-- Preserve the tiled parent encoding across `slice` and `take`.
+- Preserve the tiled parent encoding across nonempty `slice` results and after
+  executing nondegenerate `take` results in a session that registers the
+  encoding.
 - Allow the physical child to use another Vortex encoding such as FastLanes.
 - Expose enough tile structure for downstream specialized compute without
   embedding a particular compute algorithm in this crate.
@@ -219,9 +221,7 @@ No tail padding is stored or included in physical child length.
 
 ## Public API
 
-The public surface should be small and follow established Vortex array
-conventions. Exact names may adjust during implementation to match generated
-array APIs, but the semantic surface is:
+The public surface is small and follows established Vortex array conventions:
 
 ```rust
 TiledFixedSizeList::encode(fsl, geometry, ctx)
@@ -234,6 +234,7 @@ array.row_tile_count()
 array.dimension_tile_count()
 array.tile(row_tile, dimension_tile)
 array.tiles()
+array.tile_elements(&bounds)
 ```
 
 `encode` is the normal construction path. It executes the canonical primitive
@@ -246,14 +247,18 @@ ensures that nullable `take` results derive the correct outer nullability. Like
 other encoded-array constructors, it cannot prove that caller-provided physical
 values are the correct transpose.
 
-`tile` returns a view containing the logical row range, logical dimension
-range, the corresponding contiguous `physical_range`, and a convenience view
-of those physical elements. `tiles` visits the same descriptors in physical
-order. A specialized kernel can therefore execute `array.elements()` once and
-index that canonical child with the supplied physical ranges, rather than
-redispatching or slicing once per tile. Consumers never reproduce the offset
-formula themselves. Tile traversal does not know about RaBitQ scoring or any
-other consuming algorithm.
+`tile` returns a range-only `TileBounds` value: the logical row range, logical
+dimension range, and corresponding contiguous `physical_range`. `tiles` visits
+the same bounds in physical order. Neither API clones or owns the physical
+child: a specialized kernel executes `array.elements()` once and indexes that
+canonical child with the supplied physical ranges.
+
+`tile_elements(&bounds)` is a cold-path convenience that slices the physical
+child on demand for inspection and tests. It is deliberately separate from
+`TileBounds`, so hot traversal cannot accidentally perform one `ArrayRef`
+clone, dynamic dispatch, or child slice per tile. Consumers never reproduce
+the offset formula themselves. Tile traversal does not know about RaBitQ
+scoring or any other consuming algorithm.
 
 There is no `with_elements` convenience method. A caller that wants a
 FastLanes-compressed physical child obtains `elements()`, compresses that
@@ -276,12 +281,22 @@ bulk access rather than per-element scalar execution.
 
 ## Slice and take
 
-`slice` and `take` return `TiledFixedSizeList` with the same geometry.
+Nonempty `slice` results return `TiledFixedSizeList` with the same geometry.
+Vortex's generic `ArrayRef::slice` returns a canonical empty array before any
+encoding-specific rule runs when the requested range is empty; the tiled
+encoding follows that ordinary degenerate-result behavior.
 
-They generate the selected rows directly in output tiled order and gather the
-corresponding physical child elements. They do not canonicalize the entire
-source first. Work and temporary index storage are proportional to output
-elements, not source elements.
+`ArrayRef::take` first constructs a lazy `DictArray`. When that expression is
+executed with a session that registers `vortex-tiled-fsl`, nonempty takes from
+a nonempty tiled source execute to `TiledFixedSizeList` with the same geometry.
+The generic take adaptor may return canonical empty or constant results for
+empty indices and empty sources. Those degenerate results are not required to
+retain tiling.
+
+The preserving slice rule and executed take kernel generate selected rows
+directly in output tiled order and gather the corresponding physical child
+elements. They do not canonicalize the entire source first. Work and temporary
+index storage are proportional to output elements, not source elements.
 
 Because dimension bands are outermost, even a row-tile-aligned row slice spans
 multiple disjoint physical bands. The first implementation therefore does not
@@ -310,10 +325,13 @@ work does not silently widen a production writer edition or add the encoding to
 a default compression strategy.
 
 Experimental readers and writers must round-trip files exactly when the feature
-is enabled. Files are not promised to remain readable after changes to the
-experimental metadata or layout. There is no algorithm, arithmetic, padding,
-or layout-version field in the initial metadata; those can be added if and when
-the unstable encoding evolves toward a stable contract.
+is enabled. The file test stores both a raw tiled child and a tiled child whose
+physical primitive array is FastLanes bitpacked, then verifies that both tiled
+parents and the nested bitpacked encoding survive the round-trip. Files are not
+promised to remain readable after changes to the experimental metadata or
+layout. There is no algorithm, arithmetic, padding, or layout-version field in
+the initial metadata; those can be added if and when the unstable encoding
+evolves toward a stable contract.
 
 ## Specialized compute boundary
 
@@ -350,7 +368,8 @@ Vortex tests include:
 - row and dimension tail tiles;
 - tile sizes larger than logical extents;
 - ordered, duplicated, unsorted, and nullable take indices;
-- bounds failures and preservation of geometry through slice and take;
+- bounds failures, preservation of geometry through nonempty slice, and
+  preservation after executing nondegenerate take;
 - malformed logical dtypes, child dtypes, child lengths, validity lengths,
   zero geometry, and overflow;
 - composition with a raw primitive child and, for supported integer dtypes, a
@@ -362,18 +381,23 @@ after execution, and after slice/take combinations.
 
 Deterministic unit conformance uses canonical `FixedSizeListArray` as the oracle
 for every tiled operation: encode/execute, reconstruction through `try_new`,
-scalar access, tile descriptors and element views, slice, and take. The suite
-also runs Vortex's standard array-consistency and take-conformance helpers.
+scalar access, tile bounds and element views, slice, and take. The suite also
+runs Vortex's standard array-consistency and take-conformance helpers.
 Expected tile values are derived independently from canonical row-major
-coordinates rather than from the tiled offset helpers.
+coordinates rather than from the tiled offset helpers. Empty slices, empty
+takes, and takes from empty sources check logical equality without requiring a
+tiled result.
 
 A dedicated cargo-fuzz target generates bounded primitive FSL arrays with
 independent outer and element validity, arbitrary nonzero geometry, empty and
 zero-width cases, and composed scalar/slice/take/tile/reconstruction actions.
-After every action it compares the tiled result with the canonical FSL oracle
-and verifies that slice and take retain the tiled parent and geometry. The
-target is included in scheduled Vortex fuzzing so discovered cases accumulate
-in a persistent corpus.
+After every action it compares the result with the canonical FSL oracle and
+verifies the nondegenerate preservation contract. Physical child comparisons
+exclude coordinates belonging to invalid outer rows, whose placeholder values
+are not logically observable. Degenerate operations may end the composed
+sequence after their logical result is checked. The target is included in
+scheduled Vortex fuzzing so discovered cases accumulate in a persistent
+corpus.
 
 ## Benchmarks
 
@@ -383,7 +407,8 @@ Vortex benchmarks measure:
 - tiled-to-canonical execution;
 - slice;
 - take;
-- direct tile traversal through a small representative arithmetic kernel.
+- direct tile traversal through a row-accumulating weighted-sum kernel, compared
+  with the same arithmetic over canonical row-major FSL.
 
 The benchmark matrix includes:
 
@@ -397,8 +422,16 @@ The benchmark matrix includes:
 - raw primitive children and FastLanes-compressed children for supported
   integer dtypes.
 
-These benchmarks characterize the representation; they do not select a global
-default.
+The traversal kernel multiplies every element by a deterministic
+dimension-specific query weight and accumulates one result per row. This makes
+row and dimension geometry observable while retaining identical arithmetic
+across canonical and tiled inputs. A sequential sum of the physical child is
+not a valid geometry benchmark because every geometry exposes the same
+adjacent `0..len * list_size` ranges.
+
+These benchmarks characterize representation and traversal overhead. They do
+not select a global default or eliminate a geometry before the real SpiralDB
+scoring benchmark.
 
 ## SpiralDB validation
 
