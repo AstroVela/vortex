@@ -25,7 +25,8 @@ RowFn ──────────blanket──▶ StrictScalarFnVTable ──
 ```
 
 Two authoring traits, one for each axis a strict function actually varies on, plus a third axis (*how
-a row is typed*) factored into an open element vocabulary that neither trait mentions.
+a row is typed, and how its output is delivered*) factored into an open element and sink vocabulary that
+neither trait mentions.
 
 ### `StrictScalarFnVTable`, the null/validity lifting
 
@@ -45,9 +46,8 @@ derives:
 
 This is the layer for a function whose kernel is columnar rather than row-at-a-time: `not` (one `!`
 per 64-bit word), `list_length` (a difference of offset buffers), `list_sum` (a grouped accumulator over
-the elements child), `l2_denorm` (broadcast over flat tensor storage). See
-[Why three concepts and not fewer](#why-three-concepts-and-not-fewer) for why it cannot be folded
-away.
+the elements child). See [Why three concepts and not fewer](#why-three-concepts-and-not-fewer) for why it
+cannot be folded away.
 
 ### `RowFn`, one row with element types chosen per batch
 
@@ -63,17 +63,27 @@ declare twice or get wrong, because the framework reads it off the types (see
 [Properties, not conventions](#properties-not-conventions)). A constant operand is decoded once and
 read at stride 0, so a broadcast argument costs one decode rather than one per row.
 
-Note that `RowFn` does not *require* totality, it just cannot currently express its absence: every
-`OutputElement` builds an all-valid column, so a row kernel has no way to say "this row is null". One
-`impl OutputElement for Option<T>` would lift that. No function needs it yet, so it is not there.
+Output takes one of two forms, chosen per visit. `visit` takes a closure that **returns** an
+`OutputElement`, one owned value per row whose dtype is a property of its Rust type. `visit_into` takes
+one that **writes** into an `OutputSink`, allocated once per batch knowing the output dtype and handing
+out a place to write. The sink carries what an owned per-row value cannot: `l2_denorm` writes each row
+into a slice of one flat buffer, so its output width comes from the arguments and it allocates once
+rather than per row. The executor holds the sink and passes the handle in, so the closure stays `Fn`
+and the returning path pays nothing.
+
+Note that `RowFn` does not *require* totality, it just cannot currently express its absence: both output
+forms build an all-valid column, so a row kernel has no way to say "this row is null". An
+`impl OutputElement for Option<T>`, or a sink that can push a null, would lift that, at the cost of
+revisiting the `validity` law that reads the output validity off the inputs. No function needs it yet, so
+it is not there.
 
 ### The element vocabulary, how a row is typed
 
-`InputElement` and `OutputElement` are open traits. A `NativePType`, `bool`, `Bytes` (a resolved
-`&[u8]`), and `BytesLen` (a length read from a view without resolving it) ship in the framework, and
-`vortex-tensor` adds `TensorRow<T>`, reaching through the extension wrapper into flat storage, in one
-impl in its own crate. Adding `&str`, decimals, or a list row is one impl that every row function
-gains, with no framework change.
+`InputElement`, `OutputElement` and `OutputSink` are open traits. A `NativePType`, `bool`, `Bytes` (a
+resolved `&[u8]`), and `BytesLen` (a length read from a view without resolving it) ship in the framework,
+and `vortex-tensor` adds `TensorRow<T>`, reaching through the extension wrapper into flat storage, plus
+`TensorSink<T>` on the output side, in its own crate. Adding `&str`, decimals, or a list row is one impl
+that every row function gains, with no framework change.
 
 ---
 
@@ -137,9 +147,9 @@ is one `apply` per row. Three whole classes of strict function are therefore ine
   ~64x the memory traffic and, measured, 406x slower at a 64Ki batch (see
   [Measurements](#measurements)).
 
-So the middle layer has a genuine, disjoint constituency: `l2_denorm`, `not`, `list_length`,
-`list_sum`, and prospectively `select`, `merge`, `json_to_variant`. "Just a visitor" collapses three
-concepts to two rather than to one.
+So the middle layer has a genuine, disjoint constituency: `not`, `list_length`, `list_sum`, and
+prospectively `select`, `merge`, `json_to_variant`. "Just a visitor" collapses three concepts to two
+rather than to one.
 
 ### Every remaining member earns its place
 
@@ -331,26 +341,26 @@ branch's own commit messages describe fixes to *this branch's* code.
 
 ## Audit: can the four `StrictScalarFnVTable` impls really not be `RowFn`?
 
-There are exactly four in production. Auditing each against the two questions that matter, rather than
-repeating the earlier verdicts, **not one of them is structurally impossible**. Every "cannot" in this
-document was really "cannot with the trait signed as it is today", and the required changes are already
-named elsewhere in these notes. Recording the distinction because it is the difference between a limit
-and a decision.
+There were exactly four in production when this audit ran. Auditing each against the two questions that
+matter, rather than repeating the earlier verdicts, **not one of them was structurally impossible**. Every
+"cannot" in this document was really "cannot with the trait signed as it is today". One of the four,
+`l2_denorm`, has since moved onto `RowFn`, so three remain. Recording the distinction because it is the
+difference between a limit and a decision.
 
 | function | signature expressible? | kernel row-shaped? | what it would take |
 | --- | --- | --- | --- |
 | `not` | **yes**, `(bool,) -> bool`, both elements exist | **no** | nothing. It can be a `RowFn` today and should not be: `!bits` is one `!` per 64-bit word, in place when unshared, against 16k closure calls and a `Vec<bool>` repack |
 | `list_length` | output is a fixed `U64`; input needs a `ListLen` element | **no** | one new element. Still should not: the answer is a child array or one constant |
 | `list_sum` | output is one number per row, so nearly: only the *nullability* is unexpressible | **no** | `impl OutputElement for Option<T>` and a list element, but the kernel is the real blocker |
-| `l2_denorm` | no: output dtype is `arg_dtypes[0]` | yes, per-row scaling | `element_dtype(args)` plus a write-into-buffer output element |
+| `l2_denorm` | **yes, now**: an `OutputSink` names its dtype from the arguments | yes, per-row scaling | **done**, see below |
 
-**A varying output dtype is already supported, and listing it as a blocker was wrong.** `dispatch`
+**A varying output dtype was already supported, and listing it as a blocker was wrong.** `dispatch`
 chooses element types per batch and `return_element_dtype` routes through it, so `R::Out::element_dtype()`
 is already answered per dispatch arm. `l2_norm` relies on this today, visiting `::<(TensorRow<T>,), T>`
 with `T` ranging over the float widths. The compile-time witness check pins only arity, dense-safety and
-fallibility, deliberately leaving the output type free to vary. What `l2_denorm` needs is different and
-narrower: its output dtype depends on the input dtype in a way no *choice of element type* can express,
-because the extension dtype carries a shape.
+fallibility, deliberately leaving the output type free to vary. What `l2_denorm` needed was different and
+narrower: its output dtype depends on the input *dtype* in a way no choice of element type can express,
+because the extension dtype carries a shape. That is what `OutputSink::sink_dtype(args)` supplies.
 
 **`list_sum`'s output side is the easy part; its kernel is not.** One number per row means it needs only
 a nullable output element, no write-into-buffer machinery. But `execute_strict` is not a per-row sum: it
@@ -360,58 +370,124 @@ return when nothing needs masking. Porting it to a row loop would hand-roll the 
 framework, lose the overflow modes that `NumericalAggregateOpts` selects, and trade SIMD popcounts for
 per-row checks. That puts it in the same category as `not`: expressible, and worse.
 
-So `l2_denorm` remains the only one of the four whose kernel actually wants to be a row loop, which is
-why it is the right first target despite needing the larger output-side change.
+So `l2_denorm` was the only one of the four whose kernel actually wants to be a row loop, which is why it
+was the right first target despite needing the larger output-side change.
 
 Two readings follow.
 
 **The honest framing is "can, and here is whether it is worth it."** For `not` and `list_length` the
-answer is a flat no on performance grounds, and those are settled. For `list_sum` and `l2_denorm` the
-answer is yes-with-changes, and the changes are shared: both want `element_dtype` to see the input
-dtypes, which is one signature widening that `validate_row_args` is already positioned to pass through.
+answer is a flat no on performance grounds, and those are settled. For `list_sum` the answer is
+yes-with-changes, and the change it wants is a nullable output, which the sink could supply but which the
+`validity` law argues against (see below).
 
-**`l2_denorm` is the one worth doing**, because its kernel genuinely is per-row scaling and because it
-still carries eight `unsafe` blocks that the port would remove, exactly as it did for the other three
-tensor kernels. The sequence:
+**`l2_denorm` was the one worth doing, and it is done.** Its kernel genuinely is per-row scaling, and
+it carried the `unsafe` the other three tensor ports removed. What it needed was a second visit method
+whose closure *writes* its row instead of returning it, generalized to an `OutputSink` rather than
+hardcoding `&mut [T]`, because the same mechanism covers three gaps recorded separately in these notes:
 
-1. Widen `OutputElement::element_dtype()` to `element_dtype(args: &[DType]) -> VortexResult<DType>`,
-   updating the three existing impls to ignore the argument. Mechanical, but on its own it enables
-   nothing, so it should land together with step 2 rather than alone.
-2. Add a second visit method whose closure *writes* its row instead of returning it. Generalize the
-   sink rather than hardcoding `&mut [T]`, because the same mechanism then covers three gaps recorded
-   separately in these notes:
+- **runtime-shaped output**: the sink is a preallocated flat buffer and the per-row handle a
+  `&mut [T]` slice of it, so `l2_denorm` allocates once per batch rather than once per row. This is what
+  shipped.
+- **`str -> str` without the double copy**: the sink is one growing byte buffer plus views, and
+  `upper`/`lower`/`replace` push into it. Strictly better than the `Cow` output element considered
+  above, which still copies each row once. Not built, but the trait admits it unchanged.
+- **nullable output**: a sink *could* push a null, which would remove the need for
+  `impl OutputElement for Option<T>` as a separate patch. Deliberately **not** taken: both output forms
+  build an all-valid column today, and that is exactly what lets the blanket `validity` return
+  `union_child_validities`. Adding nulls to either form has to come with that law being revisited.
 
-   - **runtime-shaped output**: the sink is a preallocated flat buffer, the per-row handle a
-     `&mut [T]` slice of it, so `l2_denorm` allocates once per batch rather than once per row.
-   - **`str -> str` without the double copy**: the sink is one growing byte buffer plus views, and
-     `upper`/`lower`/`replace` push into it. This is strictly better than the `Cow` output element
-     considered above, which still copies each row once.
-   - **nullable output**: a sink can push a null, which removes the need for
-     `impl OutputElement for Option<T>` as a separate patch.
+### What shipped
 
-   Sketch: an `OutputSink` with `type Row<'a>`, a `with_capacity(rows, &DType)` that can read a width
-   out of the output dtype, a `row(&mut self, index)` handing out the per-row handle, and a `finish()`
-   returning the array.
+```rust
+pub trait OutputSink: 'static + Sized {
+    type Row<'a> where Self: 'a;
+    fn sink_dtype(args: &[DType]) -> VortexResult<DType>;
+    fn with_capacity(rows: usize, dtype: &DType) -> VortexResult<Self>;
+    fn row(&mut self, index: usize) -> Self::Row<'_>;
+    fn finish(self) -> VortexResult<ArrayRef>;
+}
 
-   **The executor threads the sink, not the closure**, so `apply` stays `Fn` and this costs the existing
-   `visit` nothing. That matters: relaxing `visit` itself to `FnMut` was measured at 8 to 11% (see the
-   `like` discussion), and a sink handed in per row avoids captured mutable state entirely.
+fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(
+    self,
+    apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
+) -> VortexResult<Self::Out>;
+```
 
-   One thing to resolve in the design: `RetWitness: ApplyResult` currently carries both *what dtype* and
-   *is it fallible*. A sink visit takes the dtype from the sink type and fallibility from the closure
-   returning `()` or `VortexResult<()>`, so those two roles need separating before this fits.
+**The executor threads the sink, not the closure**, so `apply` stays `Fn` and the existing `visit` pays
+nothing. That was the design constraint, not an accident: relaxing `visit` itself to `FnMut` measured at
+8 to 11% (see the `like` discussion), and a handle passed in per row avoids captured mutable state
+entirely. Measured after the fact, `l2_norm` is unchanged at 69.05 µs against the 69.44 µs recorded
+before the sink landed.
 
-   **Two visit methods do not cover everything, and it is worth being precise about the residue.** They
-   cover every function whose output is *computed* per row, returned or written. What stays columnar is
-   output that *aliases* its input, since `trim` and `substring` want to keep the input's data buffer and
-   rewrite only views, copying nothing, and a sink still copies bytes into itself. Likewise kernels whose
-   natural unit is not a row (`not`'s word-at-a-time negation, `binary`'s slice kernels) gain nothing.
-3. Move the constant-norms fast path to `reduce_encoded`, which already sees argument values.
-4. Benchmark against `vortex-tensor/benches/l2_norm.rs`'s pattern before keeping it, since the whole
-   point is that the row form is not slower.
+**Step 1 of the earlier plan turned out to be unnecessary.** The plan called for widening
+`OutputElement::element_dtype()` to take `args`. It never happened, because `sink_dtype(args)` puts the
+argument-dependence on the *sink* instead, leaving all three existing `OutputElement` impls untouched.
+That is the better split: an element's dtype genuinely is a property of its Rust type, and only the
+thing that needs the arguments asks for them.
 
-Step 2 is also what a `str -> str` string library needs, so it has two prospective users rather than
-one, which is the argument for building it properly rather than special-casing tensors.
+**The `RetWitness` split resolved as predicted.** It carried two roles, *what dtype* and *is it
+fallible*, and only the second is readable before `dispatch` picks a form. So `RowResult` now holds just
+`const FALLIBLE`, with `ApplyResult: RowResult` adding the output element and `SinkResult: RowResult`
+adding nothing but the error, and `RowFn::RetWitness` is bounded by `RowResult`. A returning dispatch
+names `f64` or `VortexResult<f64>`; a writing one names `()` or `VortexResult<()>`. Coherence permits
+this: `impl RowResult for ()` does not overlap `impl<T: OutputElement> RowResult for T` because
+`(): OutputElement` does not hold and no downstream crate can make it hold, the same negative reasoning
+the pre-existing `ApplyResult` impls already relied on.
+
+**A new limit, worth naming.** `sink_dtype` sees the input dtypes but **not** the function's options,
+because `OutputSink` does not know the `RowFn`'s `Options` type. A function whose output dtype depends
+on an option value therefore still drops to `StrictScalarFnVTable`, whose `return_element_dtype` sees
+both. Nothing in the repository needs it, and threading options through later is additive.
+
+### Results
+
+`unsafe` in `l2_denorm.rs` went from 8 blocks to 6. The two removed are the memory-safety ones on the
+kernel path: `FixedSizeListArray::new_unchecked` in the constant-norms path, now `try_new` (the norm is
+cast to the element dtype first, so the product stays non-nullable and the check passes), and
+`PrimitiveArray::new_unchecked` in `build_tensor_array`, now `new`. That second one is an independent
+cleanup rather than something the port forced.
+
+The 6 remaining are not of that kind and are not the row layer's business: four are calls to
+`L2Denorm::new_array_unchecked`, an `unsafe fn` whose contract is the *semantic* unit-norm invariant and
+not memory safety, and two are buffer pushes inside `normalize_as_l2_denorm`, a helper that builds the
+normalized child and is not a scalar function at all.
+
+**Performance: the sink is faster than the kernel it replaced**, which was not the expected outcome.
+`vortex-tensor/benches/l2_denorm.rs`, `fastest` column, both configurations run twice, 16384 rows,
+non-nullable. The control implements `StrictScalarFnVTable` with the pre-port body, so it shares the
+strict lifting and the gap is the row layer alone:
+
+| width | sink | pre-port kernel | ratio |
+| --- | --- | --- | --- |
+| 2 | 88.02 / 88.16 µs | 60.19 / 60.45 µs | sink **1.46x slower** |
+| 32 | 482.0 / 515.5 µs | 1.175 / 1.014 ms | sink **2.1x faster** |
+| 256 | 10.23 / 10.43 ms | 20.41 / 22.48 ms | sink **2.0x faster** |
+
+The likely cause of the win is that the pre-port kernel collected a `flat_map` over rows into a fresh
+`Buffer<T>`, and `flat_map` is not `TrustedLen`, so that `collect` grew the buffer with a capacity check
+per element. The sink allocates once with `BufferMut::zeroed` and each row writes a slice of it, which
+vectorizes. The zeroing is not a separate pass at these sizes, since large allocations come back zeroed
+from the allocator. This is a hypothesis consistent with the width scaling rather than something
+profiled.
+
+Width 2 still shows the fixed per-batch cost, at the same 1.4-2x and with the same shape as `l2_norm`'s
+(see "The like-for-like comparison"): it shrinks as width grows, so it is per-batch rather than per-row.
+Since this control shares the strict lifting with the ported version, the width-2 gap here is the **row
+layer's** share of it, which is progress on that open question.
+
+The constant-norms fast path moved to `reduce_encoded`, which sees the argument arrays before the row
+loop. It keeps both of its cases (unit norms return the normalized child untouched, any other constant
+rewrites the storage elements through one multiply), and it still fires for a filtered batch because
+filtering a constant yields a constant.
+
+**Two visit methods do not cover everything, and it is worth being precise about the residue.** They
+cover every function whose output is *computed* per row, returned or written. What stays columnar is
+output that *aliases* its input, since `trim` and `substring` want to keep the input's data buffer and
+rewrite only views, copying nothing, and a sink still copies bytes into itself. Likewise kernels whose
+natural unit is not a row (`not`'s word-at-a-time negation, `binary`'s slice kernels) gain nothing.
+
+The sink is also what a `str -> str` string library needs, so it has a second prospective user beyond
+tensors, which was the argument for generalizing it rather than special-casing `&mut [T]`.
 
 ---
 
@@ -426,7 +502,7 @@ stopping them.
 | **Not strict.** `RowFn` implies strict, so these cannot reach it at all. | 12 | `between`, `case_when`, `cast`, `dynamic`, `fill_null`, `is_null`, `is_not_null`, `list_contains`, `pack`, `stat`, `row_size`, `zip` |
 | **The answer already exists in bulk.** Zero-copy child projection, a metadata field, or a vectorized slice kernel. A row loop would be strictly slower. | 12 | `not`, `list_length`, `binary`, `mask`, `ext_storage`, `get_item`, `select`, `merge`, `variant_get`, `geo.envelope`, `json_to_variant`, `row_encode` |
 | **No element rows to read.** Zero-arity, or a type-erasure adapter. | 5 | `literal`, `root`, `row_idx`, `row_count`, `ForeignScalarFnVTable` |
-| **Output side.** Nullable output, or an output dtype that depends on runtime data. | 3 | `list_sum`, `l2_denorm`, `geo.envelope` |
+| **Output side.** Nullable output, or an output dtype that depends on runtime data. | 2 | `list_sum`, `geo.envelope` |
 | **Value-dependent per-batch setup.** | 1 | `like` |
 
 `geo.envelope` is the one function counted twice: its output is a struct-of-four extension type *and*
@@ -441,10 +517,10 @@ would give up the slice-level vectorization for nothing.
 
 Three things follow.
 
-**The porting well is dry.** The seven functions already on `RowFn` (`byte_length`, the three tensor
-kernels, the three geo kernels) are the complete set in this repository that wants a row loop. Every
-remaining one is blocked, and forcing any of them onto `RowFn` would cost performance rather than
-save lines.
+**The porting well is dry.** The eight functions on `RowFn` (`byte_length`, the four tensor kernels, the
+three geo kernels) are the complete set in this repository that wants a row loop. Every remaining one is
+blocked, and forcing any of them onto `RowFn` would cost performance rather than save lines. `l2_denorm`
+was the last one the vocabulary was actually keeping out, and the sink let it in.
 
 **Missing elements are not the constraint.** Only `list_contains` would need new input vocabulary, and
 it is independently blocked by non-strictness, so a list element would not unblock a single function
@@ -589,26 +665,30 @@ surface. Recorded so they are decisions rather than surprises.
   The ignored parameter is a tax on *every* row function though, so the shape to prefer is a second
   visit method for lending kernels, leaving today's `visit` untouched for the `'static` majority.
 
+  **Still open, and not what `visit_into` is.** The sink method added since is a second visit method, but
+  for a closure that *writes* rather than one that *lends*: its output is owned by the sink, not borrowed
+  from the row. A lending visit would still need the `Row<'a>` token. The precedent it sets is that
+  adding a third visit method costs the existing ones nothing, which is the same additive shape.
+
   [E0582]: https://doc.rust-lang.org/error_codes/E0582.html
   [E0195]: https://doc.rust-lang.org/error_codes/E0195.html
-- **`OutputElement::element_dtype()` takes no arguments,** so a row function's output dtype is a
-  property of its Rust type and cannot depend on runtime data. This is the other thing keeping
-  `l2_denorm` columnar: it returns whole tensor rows, and a tensor's dtype carries its shape.
+- **~~`OutputElement::element_dtype()` takes no arguments,~~ Resolved, and not the way this predicted.**
+  An element's output dtype is a property of its Rust type and cannot depend on runtime data, which is
+  what kept `l2_denorm` columnar: it returns whole tensor rows, and a tensor's dtype carries its shape.
 
-  **This one is a signature choice, not a law, and calling it a law was wrong.** `l2_denorm`'s
-  `return_element_dtype` just returns `arg_dtypes[0]` with nullability unioned in, and the blanket
-  `RowFn` path already *has* the input dtypes at that point: `validate_row_args` does
-  `A::validate(args)?; Ok(R::Out::element_dtype())`, discarding `args` for the output. Widening to
-  `element_dtype(args: &[DType]) -> VortexResult<DType>` would let a `TensorRowOut<T>` hand back
-  `args[0]`, and `l2_denorm`'s input side needs nothing new at all, since `(TensorRow<T>, T)` are both
-  existing elements.
+  Calling that a law was wrong, and the fix was recorded here as "widen `element_dtype` to take `args`".
+  That is *not* what shipped, and the shipped version is better. `OutputSink::sink_dtype(args)` puts the
+  argument-dependence on the sink, so all three `OutputElement` impls keep their no-argument
+  `element_dtype()` and only the thing that needs the arguments asks for them.
 
-  What still blocks it is the *other* signature. `build(values: Vec<Self>)` with `Self = Vec<T>` means
-  one heap allocation per row and then a flatten, against a columnar kernel that scales the flat
-  storage buffer in a single pass. At 16k rows that is 16k allocations versus zero, and no amount of
-  dtype plumbing fixes it. Making `l2_denorm` a fast row function needs an output element that writes
-  into a preallocated flat buffer (`fn apply(row, out: &mut [T])`) rather than returning an owned row,
-  which is a genuinely different output shape and the thing to design if this is wanted.
+  This gap also named the real blocker correctly: `build(values: Vec<Self>)` with `Self = Vec<T>` means
+  one heap allocation per row and then a flatten, against a columnar kernel that scales the flat storage
+  buffer in a single pass. At 16k rows that is 16k allocations versus zero, and no amount of dtype
+  plumbing fixes it. The prescription it drew, "an output element that writes into a preallocated flat
+  buffer (`fn apply(row, out: &mut [T])`)", is exactly what `OutputSink` is, generalized past `&mut [T]`
+  so a byte buffer works too. See
+  [the audit](#audit-can-the-four-strictscalarfnvtable-impls-really-not-be-rowfn) for what it cost and
+  bought.
 
   Note also what *not* to do on the input side: replacing the generic `TensorRow<T>` with a
   non-generic element whose `Elem<'a>` is an enum over `f16`/`f32`/`f64` would move the width choice
@@ -666,21 +746,32 @@ lengths agree, and the only tool for that is `new_unchecked`. The framework neve
 [`OutputElement::build`] returns a non-nullable column, and the strict lifting applies validity
 afterwards by masking. The invariant stops being asserted and becomes unrepresentable.
 
-Counting production `unsafe` blocks, test modules excluded, gives a clean natural experiment. The
-three functions moved onto the row layer lost all of theirs; `l2_denorm`, which stayed columnar on
-`StrictScalarFnVTable`, kept all of its own:
+Counting production `unsafe` blocks, test modules excluded:
 
 | function | layer it moved to | `unsafe` on `develop` | `unsafe` now |
 | --- | --- | --- | --- |
 | `l2_norm` | `RowFn` | 1 | 0 |
 | `inner_product` | `RowFn` | 3 | 0 |
 | `cosine_similarity` | `RowFn` | 3 | 0 |
-| `l2_denorm` | `StrictScalarFnVTable` | 8 | 8 |
+| `l2_denorm` | `RowFn` (was `StrictScalarFnVTable`) | 8 | 6 |
 
-Same crate, same reviewers, same standards, so the row layer is what removes them rather than the
-strict lifting or the port itself. `develop`'s `l2_norm` also hand-rolled a 25-line constant-array
-fast path that the strict lifting now does generically for every function, and computed its output
-nullability by hand.
+**This started as a controlled experiment and the control has since been ported, so read it in two
+stages.** For most of this branch's life `l2_denorm` stayed on `StrictScalarFnVTable` and held all 8 of
+its blocks while the three functions that moved onto the row layer lost all of theirs. Same crate, same
+reviewers, same standards, so the row layer was what removed them rather than the strict lifting or the
+port itself. That is the inference the control bought, and it is still the argument.
+
+`l2_denorm` then moved onto the row layer too, via `OutputSink`, and dropped to 6. The two it lost are
+exactly the memory-safety ones on its kernel path, which is the pattern the other three showed. Of those
+two, one (`FixedSizeListArray::new_unchecked` in the constant-norms path) is attributable to the port and
+one (`PrimitiveArray::new_unchecked` in `build_tensor_array`) is an independent cleanup noticed along the
+way. Its 6 remaining blocks are a different kind and are not the row layer's business: four call
+`L2Denorm::new_array_unchecked`, an `unsafe fn` guarding the *semantic* unit-norm invariant rather than
+memory safety, and two are buffer pushes in `normalize_as_l2_denorm`, a helper that is not a scalar
+function.
+
+`develop`'s `l2_norm` also hand-rolled a 25-line constant-array fast path that the strict lifting now
+does generically for every function, and computed its output nullability by hand.
 
 This is the justification to carry onto a clean branch. It also bounds the claim: a `vortex-tensor`
 local helper owning the same invariant would remove the same `unsafe`, so what earns the *generic*
@@ -705,8 +796,12 @@ That pass is `O(rows)` while the kernel is `O(rows * width)`, so width amortizes
 | 256 | 2.513 ms | 2.529 ms | +0.6% |
 
 So 1 to 2% on nullable input, worst at the narrowest vector anyone would store, and nothing at all on
-non-nullable input where no mask is applied. Trading that for seven `unsafe` blocks is the right side
-of the deal.
+non-nullable input where no mask is applied. Trading that for eight memory-safety `unsafe` blocks is the
+right side of the deal.
+
+These figures are near this machine's noise floor and should be re-confirmed on quieter hardware before
+being quoted. The larger measurements in these notes (the 5.7x `like` cache loss, the 8 to 11% `FnMut`
+tax, the 1.4-2x width-2 per-batch cost, the 2x `l2_denorm` sink win) are well clear of it.
 
 ### The like-for-like comparison, and a fixed cost worth chasing
 
@@ -755,16 +850,17 @@ Production lines, before and after:
 | `l2_norm` | `RowFn` (width) | 254 | 96 |
 | `inner_product` | `RowFn` (width) | 277 | 112 |
 | `cosine_similarity` | `RowFn` (width) | 309 | 203 |
-| `l2_denorm` | `StrictScalarFnVTable` | 731 | 706 |
+| `l2_denorm` | `RowFn` (width, sink) | 731 | 618 |
 | geo x 3 | `RowFn` (fixed) | 51 each (impl) | 15 each (impl), plus one shared element |
 
 Nothing outside the functions' own crates changed: the `L2DenormScheme` compressor and every
 `ExactScalarFn` matcher are untouched, because the encoding-aware push-downs key off the function
 *type* rather than its vtable layer.
 
-The line-count case does not close on its own. The framework is ~1330 production lines and removes
-~760 across the ported functions, so **net this branch adds lines**, amortizing around the fourteenth
-function against ~20 strict candidates in the tree. To be honest, the case for merging is the marginal
+The line-count case does not close on its own. The framework is ~1670 production lines (up from ~1510
+before the sink, which added `result.rs`, `sink.rs` and a second visit path) and removes ~870 across the
+ported functions, so **net this branch adds lines**, amortizing around the fourteenth function against
+~20 strict candidates in the tree. To be honest, the case for merging is the marginal
 cost of the *next* function (~15 lines, and the invariants above enforced rather than reviewed), plus
 the correctness the type-derived properties buy, rather than the diff.
 
