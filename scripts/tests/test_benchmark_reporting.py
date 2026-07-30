@@ -139,6 +139,192 @@ def test_read_latest_baseline_rows_streams_latest_matching_benchmark_commit(tmp_
     assert len(selected) == 2
 
 
+def test_normalize_ingest_query_measurement_uses_comparison_shape() -> None:
+    compare = load_compare_module()
+
+    rows = compare.normalize_ingest_records(
+        [
+            {
+                "kind": "query_measurement",
+                "commit_sha": "base-sha",
+                "dataset": "tpch",
+                "scale_factor": "10",
+                "query_idx": 1,
+                "storage": "nvme",
+                "engine": "datafusion",
+                "format": "parquet",
+                "value_ns": 100,
+                "all_runtimes_ns": [90, 100, 110],
+            }
+        ]
+    )
+
+    assert rows.to_dict(orient="records") == [
+        {
+            "name": "tpch_q01/datafusion:parquet",
+            "storage": "nvme",
+            "dataset": {
+                "dataset": "tpch",
+                "dataset_variant": None,
+                "scale_factor": "10",
+            },
+            "unit": "ns",
+            "value": 100,
+            "all_runtimes": [90, 100, 110],
+            "commit_id": "base-sha",
+        }
+    ]
+
+
+def test_normalize_ingest_compression_derives_cross_format_ratios() -> None:
+    compare = load_compare_module()
+    records = []
+    for file_format, encode_ns, decode_ns, size_bytes in [
+        ("vortex-file-compressed", 200, 100, 400),
+        ("parquet", 100, 200, 800),
+        ("lance", 400, 50, 200),
+    ]:
+        records.extend(
+            [
+                {
+                    "kind": "compression_time",
+                    "commit_sha": "base-sha",
+                    "dataset": "taxi",
+                    "format": file_format,
+                    "op": "encode",
+                    "value_ns": encode_ns,
+                    "all_runtimes_ns": [encode_ns],
+                },
+                {
+                    "kind": "compression_time",
+                    "commit_sha": "base-sha",
+                    "dataset": "taxi",
+                    "format": file_format,
+                    "op": "decode",
+                    "value_ns": decode_ns,
+                    "all_runtimes_ns": [decode_ns],
+                },
+                {
+                    "kind": "compression_size",
+                    "commit_sha": "base-sha",
+                    "dataset": "taxi",
+                    "format": file_format,
+                    "value_bytes": size_bytes,
+                },
+            ]
+        )
+
+    rows = compare.normalize_ingest_records(records)
+    ratios = {row["name"]: row["value"] for row in rows.to_dict(orient="records") if row["unit"] == "ratio"}
+
+    assert ratios == {
+        "vortex:parquet-zstd size/taxi": 0.5,
+        "vortex:lance size/taxi": 2.0,
+        "vortex:parquet-zstd ratio compress time/taxi": 2.0,
+        "vortex:lance ratio compress time/taxi": 0.5,
+        "vortex:parquet-zstd ratio decompress time/taxi": 0.5,
+        "vortex:lance ratio decompress time/taxi": 2.0,
+    }
+
+
+def test_normalize_ingest_random_access_uses_legacy_display_name() -> None:
+    compare = load_compare_module()
+
+    rows = compare.normalize_ingest_records(
+        [
+            {
+                "kind": "random_access_time",
+                "commit_sha": "base-sha",
+                "dataset": "feature-vectors/correlated",
+                "format": "vortex-file-compressed",
+                "value_ns": 100,
+                "all_runtimes_ns": [90, 100, 110],
+            }
+        ]
+    )
+
+    assert rows.iloc[0]["name"] == ("random-access/feature-vectors/correlated/vortex-tokio-local-disk")
+    assert rows.iloc[0]["storage"] == "nvme"
+    assert rows.iloc[0]["all_runtimes"] == [90, 100, 110]
+
+    legacy_taxi = compare.normalize_ingest_records(
+        [
+            {
+                "kind": "random_access_time",
+                "commit_sha": "base-sha",
+                "dataset": "taxi",
+                "format": "parquet",
+                "value_ns": 100,
+                "all_runtimes_ns": [100],
+            }
+        ]
+    )
+    assert legacy_taxi.iloc[0]["name"] == "random-access/parquet-tokio-local-disk"
+
+
+def test_ingest_cli_uses_legacy_results_only_for_display_metadata(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.ingest.jsonl"
+    pr_path = tmp_path / "pr.ingest.jsonl"
+    metadata_path = tmp_path / "results.json"
+
+    base_records = [
+        query_record_for_compare("base-sha", "parquet", 100),
+        query_record_for_compare("base-sha", "vortex-file-compressed", 80),
+    ]
+    pr_records = [
+        query_record_for_compare("pr-sha", "parquet", 100),
+        query_record_for_compare("pr-sha", "vortex-file-compressed", 70),
+    ]
+    base_path.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in base_records),
+        encoding="utf-8",
+    )
+    pr_path.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in pr_records),
+        encoding="utf-8",
+    )
+    metadata_path.write_text(
+        f"{json.dumps({'commit_id': 'pr-sha', 'doc': 'vortex-bench/sql/tpch/README.md'})}\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(COMPARE_SCRIPT),
+            "--ingest-jsonl",
+            "--metadata",
+            str(metadata_path),
+            str(base_path),
+            str(pr_path),
+            "TPC-H",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("# Benchmarks: TPC-H [📖]")
+    assert "base base-sha" in result.stdout
+    assert "PR pr-sha" in result.stdout
+
+
+def query_record_for_compare(commit: str, file_format: str, value: int) -> dict[str, object]:
+    return {
+        "kind": "query_measurement",
+        "commit_sha": commit,
+        "dataset": "tpch",
+        "scale_factor": "10",
+        "query_idx": 1,
+        "storage": "nvme",
+        "engine": "datafusion",
+        "format": file_format,
+        "value_ns": value,
+        "all_runtimes_ns": [value, value, value],
+    }
+
+
 def test_within_engine_analysis_uses_each_engines_own_parquet_control() -> None:
     compare = load_compare_module()
     rows = [

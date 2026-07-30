@@ -11,12 +11,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+import argparse
 import math
 import os
 import re
-import sys
 from dataclasses import dataclass
 from io import StringIO
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,203 @@ import pandas as pd
 Z_SCORE_99 = 2.5758293035489004
 CONTROL_FORMAT = "parquet"
 FILE_SIZE_METRIC = "file_size"
+VORTEX_FORMAT = "vortex-file-compressed"
+
+
+def read_ingest_records(path: str | Path) -> list[dict[str, Any]]:
+    """Read canonical v3 benchmark records from JSONL."""
+
+    records = []
+    with open(path, encoding="utf-8") as lines:
+        for line_no, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            record = orjson.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"{path}:{line_no}: expected a JSON object")
+            records.append(record)
+    if not records:
+        raise ValueError(f"{path}: no benchmark records")
+    return records
+
+
+def _dataset_label(record: dict[str, Any]) -> str:
+    dataset = str(record["dataset"])
+    variant = record.get("dataset_variant")
+    return dataset if variant is None else f"{dataset}/{variant}"
+
+
+def _comparison_row(
+    record: dict[str, Any],
+    *,
+    name: str,
+    unit: str,
+    value_field: str,
+) -> dict[str, Any]:
+    row = {
+        "name": name,
+        "unit": unit,
+        "value": record[value_field],
+        "commit_id": record["commit_sha"],
+    }
+    if "all_runtimes_ns" in record:
+        row["all_runtimes"] = record["all_runtimes_ns"]
+    return row
+
+
+def _compression_time_name(record: dict[str, Any]) -> str:
+    operation = {"encode": "compress", "decode": "decompress"}.get(record["op"], str(record["op"]))
+    prefix = {
+        VORTEX_FORMAT: "",
+        "parquet": "parquet_rs-zstd ",
+        "lance": "lance ",
+    }.get(record["format"], f"{record['format']} ")
+    return f"{prefix}{operation} time/{_dataset_label(record)}"
+
+
+def _compression_ratio_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Derive the compression ratios intentionally omitted from the v3 facts."""
+
+    time_values: dict[tuple[str, str | None, str, str, str], float] = {}
+    size_values: dict[tuple[str, str | None, str, str], float] = {}
+    for record in records:
+        kind = record.get("kind")
+        if kind == "compression_time":
+            key = (
+                str(record["dataset"]),
+                record.get("dataset_variant"),
+                str(record["op"]),
+                str(record["format"]),
+                str(record["commit_sha"]),
+            )
+            time_values[key] = float(record["value_ns"])
+        elif kind == "compression_size":
+            key = (
+                str(record["dataset"]),
+                record.get("dataset_variant"),
+                str(record["format"]),
+                str(record["commit_sha"]),
+            )
+            size_values[key] = float(record["value_bytes"])
+
+    rows = []
+    groups = sorted(
+        {(dataset, variant, commit) for dataset, variant, _format, commit in size_values},
+        key=lambda group: tuple("" if value is None else str(value) for value in group),
+    )
+    for dataset, variant, commit in groups:
+        label = dataset if variant is None else f"{dataset}/{variant}"
+        vortex_size = size_values.get((dataset, variant, VORTEX_FORMAT, commit))
+        for other_format, comparison_name in (("parquet", "parquet-zstd"), ("lance", "lance")):
+            other_size = size_values.get((dataset, variant, other_format, commit))
+            if vortex_size is not None and other_size not in (None, 0):
+                rows.append(
+                    {
+                        "name": f"vortex:{comparison_name} size/{label}",
+                        "unit": "ratio",
+                        "value": vortex_size / other_size,
+                        "commit_id": commit,
+                    }
+                )
+
+    time_groups = sorted(
+        {(dataset, variant, operation, commit) for dataset, variant, operation, _format, commit in time_values},
+        key=lambda group: tuple("" if value is None else str(value) for value in group),
+    )
+    for dataset, variant, operation, commit in time_groups:
+        label = dataset if variant is None else f"{dataset}/{variant}"
+        vortex_time = time_values.get((dataset, variant, operation, VORTEX_FORMAT, commit))
+        operation_name = {"encode": "compress", "decode": "decompress"}.get(operation, operation)
+        for other_format, comparison_name in (("parquet", "parquet-zstd"), ("lance", "lance")):
+            other_time = time_values.get((dataset, variant, operation, other_format, commit))
+            if vortex_time is not None and other_time not in (None, 0):
+                rows.append(
+                    {
+                        "name": f"vortex:{comparison_name} ratio {operation_name} time/{label}",
+                        "unit": "ratio",
+                        "value": vortex_time / other_time,
+                        "commit_id": commit,
+                    }
+                )
+    return rows
+
+
+def normalize_ingest_records(records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Convert v3 fact records into the comparison reporter's common row shape."""
+
+    rows: list[dict[str, Any]] = []
+    known_kinds = {
+        "query_measurement",
+        "compression_time",
+        "compression_size",
+        "random_access_time",
+        "vector_search_run",
+    }
+    for record in records:
+        kind = record.get("kind")
+        if kind not in known_kinds:
+            raise ValueError(f"unknown benchmark record kind: {kind!r}")
+
+        if kind == "query_measurement":
+            row = _comparison_row(
+                record,
+                name=(f"{record['dataset']}_q{int(record['query_idx']):02}/{record['engine']}:{record['format']}"),
+                unit="ns",
+                value_field="value_ns",
+            )
+            row["storage"] = record["storage"]
+            row["dataset"] = {
+                "dataset": record["dataset"],
+                "dataset_variant": record.get("dataset_variant"),
+                "scale_factor": record.get("scale_factor"),
+            }
+            rows.append(row)
+        elif kind == "compression_time":
+            rows.append(
+                _comparison_row(
+                    record,
+                    name=_compression_time_name(record),
+                    unit="ns",
+                    value_field="value_ns",
+                )
+            )
+        elif kind == "compression_size":
+            rows.append(
+                _comparison_row(
+                    record,
+                    name=f"{record['format']} size/{_dataset_label(record)}",
+                    unit="bytes",
+                    value_field="value_bytes",
+                )
+            )
+        elif kind == "random_access_time":
+            format_extension = {
+                VORTEX_FORMAT: "vortex",
+                "vortex-compact": "vortex",
+            }.get(record["format"], record["format"])
+            dataset_path = "" if record["dataset"] == "taxi" else f"{record['dataset']}/"
+            row = _comparison_row(
+                record,
+                name=f"random-access/{dataset_path}{format_extension}-tokio-local-disk",
+                unit="ns",
+                value_field="value_ns",
+            )
+            row["storage"] = "nvme"
+            rows.append(row)
+        else:
+            rows.append(
+                _comparison_row(
+                    record,
+                    name=(
+                        f"vector-search/{record['dataset']}/{record['layout']}/{record['flavor']}/{record['threshold']}"
+                    ),
+                    unit="ns",
+                    value_field="value_ns",
+                )
+            )
+
+    rows.extend(_compression_ratio_rows(records))
+    return pd.DataFrame(rows)
 
 
 @dataclass
@@ -839,14 +1037,43 @@ def group_sort_key(group_key: tuple[str, str]) -> tuple[int, int, str, str]:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Render a benchmark comparison as Markdown.")
+    parser.add_argument("base", help="Baseline JSONL path.")
+    parser.add_argument("pr", help="Pull-request JSONL path.")
+    parser.add_argument("benchmark_name", nargs="?", default="", help="Benchmark display name.")
+    parser.add_argument(
+        "--ingest-jsonl",
+        action="store_true",
+        help="Read both inputs as canonical v3 ingest records instead of legacy gh-json rows.",
+    )
+    parser.add_argument(
+        "--metadata",
+        help="Optional legacy gh-json path used only for display metadata such as the documentation link.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Render the benchmark comparison markdown used in CI PR comments."""
 
-    benchmark_name = sys.argv[3] if len(sys.argv) > 3 else ""
+    args = parse_args()
+    benchmark_name = args.benchmark_name
 
-    pr = pd.read_json(sys.argv[2], lines=True)
+    if args.ingest_jsonl:
+        base = normalize_ingest_records(read_ingest_records(args.base))
+        pr = normalize_ingest_records(read_ingest_records(args.pr))
+        if args.metadata is not None:
+            metadata = pd.read_json(args.metadata, lines=True)
+            if "doc" in metadata.columns:
+                docs = metadata["doc"].dropna().unique()
+                if len(docs) > 0:
+                    pr["doc"] = docs[0]
+    else:
+        pr = pd.read_json(args.pr, lines=True)
+        base = read_latest_baseline_rows(args.base, pr)
+
     title = format_title(benchmark_name, pr)
-    base = read_latest_baseline_rows(sys.argv[1], pr)
 
     base_commit_id = set(base["commit_id"].unique())
     pr_commit_id = set(pr["commit_id"].unique())

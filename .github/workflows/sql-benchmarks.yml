@@ -191,7 +191,7 @@ jobs:
             ${{ matrix.scale_factor && format('--opt scale-factor={0}', matrix.scale_factor) || '' }}
 
       - name: Capture file sizes
-        if: matrix.remote_key == null
+        if: inputs.mode == 'develop' && matrix.remote_key == null
         shell: bash
         run: |
           uv run --no-project scripts/capture-file-sizes.py \
@@ -201,17 +201,36 @@ jobs:
             -o sizes.json
           cat sizes.json >> results.json
 
+      - name: Configure AWS credentials for RDS baseline (OIDC)
+        if: inputs.mode == 'pr' && github.event.pull_request.head.repo.fork == false
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6
+        with:
+          role-to-assume: ${{ vars.GH_BENCH_INGEST_ROLE_ARN }}
+          aws-region: ${{ vars.RDS_BENCH_REGION }}
+
       - name: Compare results
-        if: inputs.mode == 'pr'
+        if: inputs.mode == 'pr' && github.event.pull_request.head.repo.fork == false
         shell: bash
+        env:
+          RDS_BENCH_INSTANCE_ENDPOINT: ${{ vars.RDS_BENCH_INSTANCE_ENDPOINT }}
+          RDS_BENCH_DB_NAME: ${{ vars.RDS_BENCH_DB_NAME }}
+          AWS_REGION: ${{ vars.RDS_BENCH_REGION }}
         run: |
           set -Eeu -o pipefail -x
 
-          python3 scripts/s3-download.py s3://vortex-ci-benchmark-results/data.json.gz data.json.gz --no-sign-request
-          gzip -d -c data.json.gz > base.json
-
-          uv run --no-project scripts/compare-benchmark-jsons.py base.json results.json "${{ matrix.name }}" \
-            > comment.md
+          curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+            -o "${RUNNER_TEMP}/rds-global-bundle.pem"
+          DSN="postgresql://bench_ingest@${RDS_BENCH_INSTANCE_ENDPOINT}:5432/${RDS_BENCH_DB_NAME}?sslmode=verify-full&sslrootcert=${RUNNER_TEMP}/rds-global-bundle.pem"
+          uv run --no-project scripts/fetch-benchmark-baseline.py results.ingest.jsonl \
+            --postgres "${DSN}" \
+            --region "${AWS_REGION}" \
+            --output base.ingest.jsonl
+          uv run --no-project scripts/compare-benchmark-jsons.py \
+            --ingest-jsonl \
+            --metadata results.json \
+            base.ingest.jsonl \
+            results.ingest.jsonl \
+            "${{ matrix.name }}" > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment PR
