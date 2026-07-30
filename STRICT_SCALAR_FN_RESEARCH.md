@@ -579,13 +579,39 @@ So 1 to 2% on nullable input, worst at the narrowest vector anyone would store, 
 non-nullable input where no mask is applied. Trading that for seven `unsafe` blocks is the right side
 of the deal.
 
-**What this does not measure.** Both columns run through the framework, so it isolates the *masking*
-pass but not the framework's per-row indirection (`ArgColumn::get`'s stride multiply, and collecting
-into `Vec<T>` rather than `Buffer<T>`) against the old kernel's direct `flat.row::<T>(i)`. Doing that
-properly needs the pre-port kernel side by side, which needs `vortex-tensor`'s `pub(crate)` flat-element
-helpers exposed. What bounds the concern meanwhile: width 2 costs 4.2 ns per row for two multiply-adds
-and a `sqrt`, and a `sqrt` alone is most of that, so there is little room left for indirection to hide
-in. Worth closing properly before the clean branch lands.
+### The like-for-like comparison, and a fixed cost worth chasing
+
+The table above compares the framework against itself, so it isolates the masking pass but says nothing
+about the rest of the machinery. `PrePortL2Norm` in the same benchmark closes that: a bench-local
+`ScalarFnVTable` running the identical arithmetic, indexing the flat slice directly into a `Buffer` and
+attaching validity in one step. `fastest` column, non-nullable, 16384 rows:
+
+| width | framework | pre-port | delta |
+| --- | --- | --- | --- |
+| 2 | 69.44 µs | 32.87 µs | **2.11x slower** |
+| 32 | 276.7 µs | 273.0 µs | +1.4% |
+| 256 | 2.758 ms | 2.802 ms | parity |
+
+**The overhead is fixed per batch, not per row.** In absolute terms the gap is 36.6 µs at width 2,
+3.7 µs at 32, and negative at 256. A per-row cost would hold roughly constant per row across widths;
+one that shrinks as total work grows is a constant being amortized. So the framework carries something
+like tens of microseconds of fixed setup that a hand-written kernel does not.
+
+**Where it most likely comes from, and why this is not yet an indictment of the row layer.**
+`PrePortL2Norm` implements `ScalarFnVTable` *directly*, so the engine calls its `execute` and nothing
+else. The framework path first runs the whole strict lifting: collecting inputs, cloning arg dtypes,
+`return_dtype`, the null-constant and all-constant checks, conjoining validities, choosing null
+handling, then `execute_strict`, then `reduce_encoded`'s encoding probe, then `dispatch`'s width match,
+and only then the row loop. Most of that is the *strict* layer rather than the row layer, and some of
+it (constant folding, validity derivation) is work the hand-written kernel simply does not do, not work
+it does faster.
+
+So the honest statement is: the framework costs a fixed tens of microseconds per batch, which is
+invisible at production tensor widths and 2x at width 2. Before this goes in a PR description it needs
+decomposing, because "the row layer is slow" and "the strict lifting does more bookkeeping" have very
+different remedies. The cheap next step is a third bench arm implementing `StrictScalarFnVTable` with
+the pre-port kernel body, which shares the lifting but skips the row layer and splits the difference in
+two.
 
 [`OutputElement::build`]: vortex-array/src/scalar_fn/row/element/mod.rs
 
