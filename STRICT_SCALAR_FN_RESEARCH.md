@@ -229,16 +229,17 @@ times per array (plan, execute, deserialize).
 ## Strictness is not totality
 
 This is the finding that decides what the middle layer may derive. Note that
-[#9033](https://github.com/vortex-data/vortex/pull/9033) reaches the same conclusion independently and
-documents it on `develop`, so this section is no longer the argument for the finding, just for the API
-that follows from it.
+[#9033](https://github.com/vortex-data/vortex/pull/9033) reached the same conclusion independently and
+has since landed, so this section is no longer the argument for the finding, only for the API that
+follows from it.
 
-The `is_strict` documentation on `develop` today states a **mask-hoisting law**,
-`f(…, mask(aⱼ, m), …) == mask(f(…, aⱼ, …), m)`, and then asserts as "consequence 1" that output
+Before #9033, the `is_strict` documentation stated the validity-equivariance law,
+`f(…, mask(aⱼ, m), …) == mask(f(…, aⱼ, …), m)`, and then asserted as "consequence 1" that output
 validity is the conjunction of input validities. **Consequence 1 does not follow from the law.** It
-needs an extra premise: that the kernel never turns a wholly non-null row into a null. #9033 replaces
+needs an extra premise: that the kernel never turns a wholly non-null row into a null. #9033 replaced
 that equality with a one-sided bound, `valid(f(a₁, …, aₖ)) ⊆ valid(a₁) ∧ … ∧ valid(aₖ)`, which is the
-vocabulary this branch now uses.
+vocabulary this branch uses. `docs/strictness-and-validity-pushdown.typ` proves the law and the
+null-propagation reading are the same property, and separates what does not follow from either.
 
 `list_sum` is the counterexample. Summing a valid *empty* list yields null. It still satisfies the law
 (a null it introduces at a valid row appears identically on both sides of the equation and cancels),
@@ -248,7 +249,7 @@ Two properties, then, not one:
 
 | property | what needs it |
 | --- | --- |
-| **strict** (null propagation, mask commutation) | mask/filter/dictionary push-down, the thing we actually want |
+| **strict** (null propagation, equivalently validity equivariance) | every validity push-down, the thing we actually want |
 | **total** (non-null in implies non-null out) | upgrading the `⊆` bound to `=`, so validity is precomputable |
 
 The old blanket impl derived `validity = union_child_validities` for *every* implementor, which needs
