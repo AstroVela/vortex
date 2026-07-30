@@ -5,25 +5,18 @@
 
 use geo::Contains;
 use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::Nullability;
-use vortex_array::expr::Expression;
-use vortex_array::expr::union_child_validities;
-use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::EmptyOptions;
-use vortex_array::scalar_fn::ExecutionArgs;
+use vortex_array::scalar_fn::RowFn;
+use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
-use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
-use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::validate_geometry_operands;
-use crate::scalar_fn::execute::execute_null_propagating;
+use crate::scalar_fn::row::GeometryRow;
 
 /// OGC `ST_Contains` between two native geometry operands, each a column or a constant
 /// literal: true where operand `b` lies completely inside operand `a` (boundary contact alone
@@ -42,62 +35,28 @@ impl GeoContains {
     }
 }
 
-impl ScalarFnVTable for GeoContains {
+impl RowFn for GeoContains {
     type Options = EmptyOptions;
+    type ArgsWitness = (GeometryRow, GeometryRow);
+    type RetWitness = bool;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.geo.contains");
         *ID
     }
 
-    fn serialize(&self, _: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(vec![]))
+    fn arg_name(&self, idx: usize) -> ChildName {
+        ChildName::from(["a", "b"][idx])
     }
 
-    fn deserialize(&self, _: &[u8], _: &VortexSession) -> VortexResult<Self::Options> {
-        Ok(EmptyOptions)
-    }
-
-    fn arity(&self, _: &Self::Options) -> Arity {
-        Arity::Exact(2)
-    }
-
-    fn child_name(&self, _: &Self::Options, child_idx: usize) -> ChildName {
-        match child_idx {
-            0 => ChildName::from("a"),
-            1 => ChildName::from("b"),
-            _ => unreachable!("contains has exactly two children"),
-        }
-    }
-
-    fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
-        validate_geometry_operands(dtypes)?;
-        let nullability = Nullability::from(dtypes.iter().any(DType::is_nullable));
-        Ok(DType::Bool(nullability))
-    }
-
-    fn execute(
+    /// Containment is not symmetric, so `a` is always the container and `b` the contained.
+    fn dispatch<V: RowVisitor>(
         &self,
-        _: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let a = args.get(0)?;
-        let b = args.get(1)?;
-        // Containment is not symmetric: `a` is always the container and `b` the contained.
-        execute_null_propagating(&a, &b, |a, b| a.contains(b), ctx)
-    }
-
-    fn validity(
-        &self,
-        _: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        union_child_validities(expression)
-    }
-
-    fn is_strict(&self, _: &Self::Options) -> bool {
-        true
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        visitor.visit::<(GeometryRow, GeometryRow), bool>(|(a, b)| a.contains(b))
     }
 }
 
