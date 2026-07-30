@@ -2,6 +2,8 @@
 
 mod array;
 mod geometry;
+mod operations;
+mod transpose;
 
 pub use array::*;
 pub use geometry::TileBounds;

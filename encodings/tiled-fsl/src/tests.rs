@@ -4,14 +4,22 @@ use std::sync::LazyLock;
 
 use prost::Message;
 use rstest::rstest;
+use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
+use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::match_each_native_ptype;
 use vortex_array::test_harness::check_metadata;
 use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
@@ -19,6 +27,7 @@ use crate::TileGeometry;
 use crate::TiledFixedSizeList;
 use crate::TiledFixedSizeListArray;
 use crate::TiledFixedSizeListArrayExt;
+use crate::TiledFixedSizeListArraySlotsExt;
 use crate::TiledFixedSizeListMetadata;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
@@ -41,13 +50,163 @@ fn physical_fixture(
 ) -> VortexResult<TiledFixedSizeListArray> {
     let _ = &*SESSION;
     TiledFixedSizeList::try_new(
-        PrimitiveArray::from_iter((0..rows * dimensions as usize).map(|index| index as u16))
-            .into_array(),
+        PrimitiveArray::from_iter(
+            (0..rows * dimensions as usize).map(|index| u16::try_from(index).unwrap_or(u16::MAX)),
+        )
+        .into_array(),
         dimensions,
         Validity::NonNullable,
         rows,
         geometry,
     )
+}
+
+fn fixture(
+    rows: usize,
+    dimensions: u32,
+    geometry: TileGeometry,
+) -> VortexResult<(FixedSizeListArray, TiledFixedSizeListArray, ExecutionCtx)> {
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::from_iter(
+            (0..rows * dimensions as usize)
+                .map(|index| u8::try_from(index % 16).unwrap_or_default()),
+        )
+        .into_array(),
+        dimensions,
+        Validity::NonNullable,
+        rows,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry, &mut ctx)?;
+    Ok((canonical, tiled, ctx))
+}
+
+fn assert_fsl_equivalent(
+    canonical: &ArrayRef,
+    candidate: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    assert_eq!(candidate.dtype(), canonical.dtype());
+    assert_eq!(candidate.len(), canonical.len());
+    assert_arrays_eq!(canonical, candidate, ctx);
+    Ok(())
+}
+
+#[test]
+fn golden_physical_child_and_round_trip() -> VortexResult<()> {
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::from_iter([0u16, 1, 2, 3, 4, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24])
+            .into_array(),
+        5,
+        Validity::NonNullable,
+        3,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(2, 3), &mut ctx)?;
+    let physical = tiled
+        .elements()
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)?;
+    assert_eq!(
+        physical.as_slice::<u16>(),
+        &[0, 10, 1, 11, 2, 12, 20, 21, 22, 3, 13, 4, 14, 23, 24]
+    );
+    assert_fsl_equivalent(&canonical.into_array(), &tiled.into_array(), &mut ctx)
+}
+
+#[test]
+fn all_native_ptypes_round_trip() -> VortexResult<()> {
+    for ptype in [
+        PType::U8,
+        PType::U16,
+        PType::U32,
+        PType::U64,
+        PType::I8,
+        PType::I16,
+        PType::I32,
+        PType::I64,
+        PType::F16,
+        PType::F32,
+        PType::F64,
+    ] {
+        match_each_native_ptype!(ptype, |T| {
+            let canonical = FixedSizeListArray::new(
+                PrimitiveArray::new(Buffer::<T>::zeroed(15), Validity::NonNullable).into_array(),
+                5,
+                Validity::NonNullable,
+                3,
+            );
+            let mut ctx = SESSION.create_execution_ctx();
+            let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(2, 3), &mut ctx)?;
+            assert_fsl_equivalent(&canonical.into_array(), &tiled.into_array(), &mut ctx)
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn independent_outer_and_element_validity_round_trip() -> VortexResult<()> {
+    let cases = [
+        (
+            Validity::NonNullable,
+            Validity::NonNullable,
+            Validity::NonNullable,
+        ),
+        (Validity::AllValid, Validity::AllValid, Validity::AllValid),
+        (
+            Validity::AllInvalid,
+            Validity::AllInvalid,
+            Validity::AllInvalid,
+        ),
+        (
+            Validity::from_iter([true, false, true, true, false, true]),
+            Validity::from_iter([true, false, true]),
+            Validity::from_iter([true, true, false, false, true, true]),
+        ),
+    ];
+
+    for (element_validity, outer_validity, expected_physical_validity) in cases {
+        let canonical = FixedSizeListArray::new(
+            PrimitiveArray::new(
+                Buffer::copy_from([0u16, 1, 10, 11, 20, 21]),
+                element_validity,
+            )
+            .into_array(),
+            2,
+            outer_validity,
+            3,
+        );
+        let mut ctx = SESSION.create_execution_ctx();
+        let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(2, 1), &mut ctx)?;
+
+        assert!(
+            tiled
+                .elements()
+                .validity()?
+                .mask_eq(&expected_physical_validity, 6, &mut ctx,)?
+        );
+        assert!(tiled.array_validity().mask_eq(
+            &canonical.fixed_size_list_validity(),
+            3,
+            &mut ctx,
+        )?);
+
+        let executed = tiled.into_array().execute::<FixedSizeListArray>(&mut ctx)?;
+        assert_fsl_equivalent(&canonical.into_array(), &executed.into_array(), &mut ctx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn scalar_at_matches_canonical_boundaries() -> VortexResult<()> {
+    let (canonical, tiled, mut ctx) = fixture(65, 129, geometry(32, 64))?;
+    for row in [0, 31, 32, 63, 64] {
+        assert_eq!(
+            canonical.execute_scalar(row, &mut ctx)?,
+            tiled.execute_scalar(row, &mut ctx)?,
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -77,8 +236,10 @@ fn rejects_wrong_child_length(
     #[case] dimensions: u32,
     #[case] physical_len: usize,
 ) {
-    let elements =
-        PrimitiveArray::from_iter((0..physical_len).map(|index| index as u16)).into_array();
+    let elements = PrimitiveArray::from_iter(
+        (0..physical_len).map(|index| u16::try_from(index).unwrap_or(u16::MAX)),
+    )
+    .into_array();
     assert!(
         TiledFixedSizeList::try_new(
             elements,

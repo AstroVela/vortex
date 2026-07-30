@@ -19,13 +19,20 @@ use vortex_array::ArrayView;
 use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
+use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
+use vortex_array::arrays::FixedSizeList;
+use vortex_array::arrays::FixedSizeListArray;
+use vortex_array::arrays::Primitive;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
+use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
+use vortex_array::require_child;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
-use vortex_array::vtable::NotSupported;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTable;
 use vortex_array::vtable::child_to_validity;
@@ -39,6 +46,8 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::TileGeometry;
+use crate::transpose::decode_elements;
+use crate::transpose::encode_elements;
 
 /// A tiled fixed-size-list Vortex array.
 pub type TiledFixedSizeListArray = Array<TiledFixedSizeList>;
@@ -113,6 +122,29 @@ impl ArrayEq for TiledFixedSizeListData {
 pub struct TiledFixedSizeList;
 
 impl TiledFixedSizeList {
+    /// Encodes a canonical primitive fixed-size-list array into tiled physical order.
+    pub fn encode(
+        array: ArrayView<'_, FixedSizeList>,
+        geometry: TileGeometry,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<TiledFixedSizeListArray> {
+        let elements = array.elements().clone().execute::<PrimitiveArray>(ctx)?;
+        let tiled_elements = encode_elements(
+            elements.as_view(),
+            array.len(),
+            array.list_size() as usize,
+            geometry,
+            ctx,
+        )?;
+        Self::try_new(
+            tiled_elements.into_array(),
+            array.list_size(),
+            array.fixed_size_list_validity(),
+            array.len(),
+            geometry,
+        )
+    }
+
     /// Constructs a tiled fixed-size-list array from primitive physical elements.
     ///
     /// The physical child must contain exactly `len * list_size` elements in tiled order.
@@ -150,7 +182,7 @@ impl TryFrom<&TiledFixedSizeListMetadata> for TileGeometry {
 
 impl VTable for TiledFixedSizeList {
     type TypedArrayData = TiledFixedSizeListData;
-    type OperationsVTable = NotSupported;
+    type OperationsVTable = Self;
     type ValidityVTable = Self;
 
     fn id(&self) -> ArrayId {
@@ -313,11 +345,38 @@ impl VTable for TiledFixedSizeList {
             })
     }
 
-    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        vortex_bail!(
-            "tiled fixed-size-list execution is not implemented for {} arrays",
-            array.encoding_id()
-        )
+    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        let array = require_child!(
+            array,
+            array.elements(),
+            TiledFixedSizeListSlots::ELEMENTS => Primitive
+        );
+        let elements = array
+            .elements()
+            .clone()
+            .try_downcast::<Primitive>()
+            .map_err(|elements| {
+                vortex_err!(
+                    "tiled fixed-size-list physical child must execute to primitive, got {}",
+                    elements.encoding_id()
+                )
+            })?;
+        let decoded_elements = decode_elements(
+            elements.as_view(),
+            array.len(),
+            array.list_size() as usize,
+            array.geometry(),
+            ctx,
+        )?;
+        Ok(ExecutionResult::done(
+            FixedSizeListArray::new(
+                decoded_elements.into_array(),
+                array.list_size(),
+                array.array_validity(),
+                array.len(),
+            )
+            .into_array(),
+        ))
     }
 }
 
