@@ -15,6 +15,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::Chunked;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Dict;
@@ -94,7 +95,7 @@ fn constant_to_dict(
 
 /// Convert a chunked array to an Arrow dictionary array by exporting each chunk separately.
 fn chunked_to_dict(
-    array: vortex_array::arrays::ChunkedArray,
+    array: ChunkedArray,
     codes_type: &DataType,
     values_type: &DataType,
     ctx: &mut ExecutionCtx,
