@@ -341,8 +341,27 @@ and a decision.
 | --- | --- | --- | --- |
 | `not` | **yes**, `(bool,) -> bool`, both elements exist | **no** | nothing. It can be a `RowFn` today and should not be: `!bits` is one `!` per 64-bit word, in place when unshared, against 16k closure calls and a `Vec<bool>` repack |
 | `list_length` | output is a fixed `U64`; input needs a `ListLen` element | **no** | one new element. Still should not: the answer is a child array or one constant |
-| `list_sum` | no, twice over: dtype varies with the element type, and a valid empty list sums to null | yes | `element_dtype(args)` plus `impl OutputElement for Option<T>` |
+| `list_sum` | output is one number per row, so nearly: only the *nullability* is unexpressible | **no** | `impl OutputElement for Option<T>` and a list element, but the kernel is the real blocker |
 | `l2_denorm` | no: output dtype is `arg_dtypes[0]` | yes, per-row scaling | `element_dtype(args)` plus a write-into-buffer output element |
+
+**A varying output dtype is already supported, and listing it as a blocker was wrong.** `dispatch`
+chooses element types per batch and `return_element_dtype` routes through it, so `R::Out::element_dtype()`
+is already answered per dispatch arm. `l2_norm` relies on this today, visiting `::<(TensorRow<T>,), T>`
+with `T` ranging over the float widths. The compile-time witness check pins only arity, dense-safety and
+fallibility, deliberately leaving the output type free to vary. What `l2_denorm` needs is different and
+narrower: its output dtype depends on the input dtype in a way no *choice of element type* can express,
+because the extension dtype carries a shape.
+
+**`list_sum`'s output side is the easy part; its kernel is not.** One number per row means it needs only
+a nullable output element, no write-into-buffer machinery. But `execute_strict` is not a per-row sum: it
+builds a `GroupedAccumulator` over `Sum`, calls `accumulate_list`, and then `mask_empty_lists` computes
+per-group emptiness with `count_range` popcounts, with all-true and all-none fast paths and an early
+return when nothing needs masking. Porting it to a row loop would hand-roll the shared aggregate
+framework, lose the overflow modes that `NumericalAggregateOpts` selects, and trade SIMD popcounts for
+per-row checks. That puts it in the same category as `not`: expressible, and worse.
+
+So `l2_denorm` remains the only one of the four whose kernel actually wants to be a row loop, which is
+why it is the right first target despite needing the larger output-side change.
 
 Two readings follow.
 
