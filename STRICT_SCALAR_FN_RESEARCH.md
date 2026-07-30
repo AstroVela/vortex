@@ -360,9 +360,28 @@ surface. Recorded so they are decisions rather than surprises.
   gap I would close first.
 - **No nullable output element, so no non-total `RowFn`.** `OutputElement::build` always produces an
   all-valid column, so a row kernel cannot return a null from a valid row. `impl OutputElement for
-  Option<T>` is the whole fix. Left out because no function needs it: `list_sum` wants nullable output
-  but is columnar for unrelated reasons (the grouped-accumulator path and the `FixedSizeList`
+  Option<T>` is the whole fix. Left out because nothing needs it *yet*: `list_sum` would need it, but
+  is columnar for independent reasons too (the grouped-accumulator path and the `FixedSizeList`
   constant).
+- **No borrowed output element, so no zero-copy row function.** A row closure returns an
+  `ApplyResult`, which is `'static`, so its result cannot borrow from the input columns. Note the
+  asymmetry with the input side, where `InputElement::Elem<'a>` is a GAT and borrows freely. Every
+  `str -> str` function therefore copies: `OutputElement for String` allocates one `String` per row
+  and then rebuilds views from them. A string library would hit this on its first `upper`. Two
+  distinct fixes, of increasing scope:
+  - `upper`, `lower` and `replace` genuinely allocate, and want a `Cow<'a, str>` output element. That
+    needs `OutputElement` to grow its own lifetime GAT and `build` to take an iterator rather than a
+    `Vec`, so a borrowed row passes through without a copy and an owned one is built in place.
+  - `trim`, `substring`, `left` and `right` want more than a `Cow` can give. Their result is a
+    *slice* of the input, so the right kernel keeps the input's data buffer entirely and rewrites
+    only the views, copying no bytes. That stays columnar whatever the output element can express.
+
+  Predicates and measurements (`starts_with`, `contains`, `byte_length`) have none of this problem
+  and are already the best case for `RowFn`, so the split for a string library falls along the return
+  type rather than the argument type.
+- **`OutputElement::element_dtype()` takes no arguments,** so a row function's output dtype is a
+  property of its Rust type and cannot depend on runtime data. This is the other thing keeping
+  `l2_denorm` columnar: it returns whole tensor rows, and a tensor's dtype carries its shape.
 - **`InputElement` is an open trait with required consts.** Adding `DECODE_FALLIBLE` broke every
   out-of-crate element (`TensorRow`) until updated. If elements are a real extension point for other
   crates, `DENSE_SAFE` / `DECODE_FALLIBLE` should carry conservative defaults.

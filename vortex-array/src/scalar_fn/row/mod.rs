@@ -3,6 +3,10 @@
 
 //! Defining scalar functions one row at a time.
 //!
+//! This is the most derived of the three scalar function traits, and the right default for a kernel
+//! that has to read every row anyway. See [choosing a trait](crate::scalar_fn#choosing-a-trait) for
+//! when to drop to [`StrictScalarFnVTable`](crate::scalar_fn::StrictScalarFnVTable) instead.
+//!
 //! [`RowFn`] asks for two things: a witness argument tuple and return type, and a
 //! [`dispatch`](RowFn::dispatch) that picks the concrete element types for a batch and visits the
 //! framework with a row closure. Everything structural (arity, dtype checks, null handling,

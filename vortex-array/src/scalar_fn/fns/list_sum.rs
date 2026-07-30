@@ -47,9 +47,10 @@ use crate::validity::Validity;
 /// list *value* rather than row-level nulls, and a valid list may still sum to null (empty, all-null,
 /// or overflow), since strictness is only one-directional.
 ///
-/// This is a columnar [`StrictScalarFnVTable`], and the one ported function that leaves
-/// [`validity`](StrictScalarFnVTable::validity) at its default, since the child conjunction would
-/// claim a valid-but-empty list's row is valid.
+/// Being non-total is also what rules out writing this as a
+/// [`RowFn`](crate::scalar_fn::RowFn), whose output elements are always all-valid. For the same
+/// reason it leaves [`validity`](StrictScalarFnVTable::validity) at its default, since the child
+/// conjunction would claim a valid-but-empty list's row is valid.
 #[derive(Clone)]
 pub struct ListSum;
 
