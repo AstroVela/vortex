@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! What the tensor scalar functions add to the row-function machinery: an element type that reads
-//! a tensor row, and the width rule they share.
+//! What the tensor scalar functions add to the row-function machinery: an element type that reads a
+//! tensor row, a sink that writes one, and the width rule they share.
 
 use std::marker::PhantomData;
 
@@ -15,9 +15,14 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
 use vortex_array::scalar_fn::InputElement;
+use vortex_array::scalar_fn::OutputSink;
+use vortex_array::validity::Validity;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
+use vortex_error::vortex_err;
 
+use crate::scalar_fns::l2_denorm::build_tensor_array;
 use crate::utils::FlatElements;
 use crate::utils::extract_flat_elements;
 use crate::utils::validate_tensor_float_input;
@@ -62,5 +67,73 @@ impl<T: Float + NativePType> InputElement for TensorRow<T> {
 
     fn get(column: &Self::Column, index: usize) -> &[T] {
         column.row::<T>(index)
+    }
+}
+
+/// A sink that builds a tensor column shaped like the function's *first* argument, presenting each
+/// row as the `&mut [T]` slice of the flat buffer to write.
+///
+/// A tensor row is exactly what an [`OutputElement`](vortex_array::scalar_fn::OutputElement) cannot
+/// carry: its dtype is not a property of `T` alone (the shape lives in the extension metadata) and one
+/// owned value per row would mean one allocation per row. Both fall out of writing into a flat buffer
+/// allocated once for the batch.
+pub struct TensorSink<T> {
+    /// The non-nullable tensor extension dtype being built, which [`finish`](OutputSink::finish)
+    /// rebuilds the extension array from.
+    dtype: DType,
+
+    /// Elements per row, the stride into `elements`.
+    list_size: usize,
+
+    /// The row count, kept rather than divided back out of `elements` so a zero-width tensor stays
+    /// unambiguous.
+    rows: usize,
+
+    /// The flat backing buffer for every row, written in place.
+    elements: BufferMut<T>,
+}
+
+impl<T: Float + NativePType> OutputSink for TensorSink<T> {
+    type Row<'a> = &'a mut [T];
+
+    fn sink_dtype(args: &[DType]) -> VortexResult<DType> {
+        let dtype = args
+            .first()
+            .ok_or_else(|| vortex_err!("a tensor sink takes its shape from a tensor argument"))?;
+        let expected = T::PTYPE;
+        vortex_ensure_eq!(
+            validate_tensor_float_input(dtype)?.element_ptype(),
+            expected,
+            "expected a tensor of {expected} elements, got {dtype}",
+        );
+        Ok(dtype.as_nonnullable())
+    }
+
+    fn with_capacity(rows: usize, dtype: &DType) -> VortexResult<Self> {
+        let list_size = validate_tensor_float_input(dtype)?.list_size() as usize;
+
+        // `zeroed` rather than uninitialized spare capacity: the row loop overwrites every element, so
+        // this is only to keep the buffer safely indexable. Large allocations come back zeroed from the
+        // allocator, so it costs no separate pass.
+        Ok(Self {
+            dtype: dtype.clone(),
+            list_size,
+            rows,
+            elements: BufferMut::zeroed(rows * list_size),
+        })
+    }
+
+    fn row(&mut self, index: usize) -> &mut [T] {
+        &mut self.elements.as_mut_slice()[index * self.list_size..][..self.list_size]
+    }
+
+    fn finish(self) -> VortexResult<ArrayRef> {
+        build_tensor_array(
+            self.dtype,
+            self.list_size,
+            self.rows,
+            Validity::NonNullable,
+            self.elements.freeze(),
+        )
     }
 }
