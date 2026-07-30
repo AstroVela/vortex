@@ -10428,6 +10428,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-tiled-fsl"
+version = "0.1.0"
+dependencies = [
+ "vortex-error",
+]
+
+[[package]]
 name = "vortex-tui"
 version = "0.1.0"
 dependencies = [
