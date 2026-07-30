@@ -508,6 +508,28 @@ surface. Recorded so they are decisions rather than surprises.
 - **`OutputElement::element_dtype()` takes no arguments,** so a row function's output dtype is a
   property of its Rust type and cannot depend on runtime data. This is the other thing keeping
   `l2_denorm` columnar: it returns whole tensor rows, and a tensor's dtype carries its shape.
+- **~~The witness carries four scalars through two associated types.~~ Not a gap.** This looked like
+  the framework's weakest joint, since `ArgsWitness` and `RetWitness` are read *only* for `ARITY`,
+  `DENSE_SAFE`, `DECODE_FALLIBLE` and `FALLIBLE`, and for a multi-dispatch function the witness names
+  an arbitrary representative (`L2Norm` says `f64` for no reason a reader can see). The plan was to
+  collapse them into three consts.
+
+  Checking the signatures says no. `arity`, `null_handling` and `is_fallible` on
+  `StrictScalarFnVTable` all take *only* the options, with no input dtypes, while `dispatch` needs
+  dtypes to choose. So those three answers **must** be dtype-independent, which means they cannot be
+  read off whatever element types a batch picks, which is exactly why a separate declaration has to
+  exist. The witness is not redundant bookkeeping; it is the only place those facts can live.
+
+  Given that, types beat consts. With types, dense-safety and fallibility are *derived* from the
+  element types, so the only available mistake is a witness that disagrees with the dispatch, and that
+  is a build error. With three hand-written consts an implementor could state a fact wrongly *and*
+  visit consistently with their mistake. Converting would be a notation change that removes a
+  derivation, not a fragility fix. Left alone, with the reason now recorded on `ArgsWitness` so the
+  next reader does not re-open it.
+
+  What is left of the original complaint is presentational: the arbitrary representative reads oddly.
+  A doc line on each multi-dispatch implementor saying why the width shown is arbitrary is the whole
+  fix.
 - **`InputElement` is an open trait with required consts.** Adding `DECODE_FALLIBLE` broke every
   out-of-crate element (`TensorRow`) until updated. If elements are a real extension point for other
   crates, `DENSE_SAFE` / `DECODE_FALLIBLE` should carry conservative defaults.
