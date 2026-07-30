@@ -11,6 +11,7 @@ use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
+use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_float_ptype;
 use vortex_array::scalar_fn::ChildName;
@@ -18,6 +19,7 @@ use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::scalar_fn::assert_element_conforms;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 use vortex_session::registry::CachedId;
@@ -118,4 +120,20 @@ fn derived_serde_round_trips() -> VortexResult<()> {
     assert_eq!(recovered.dtype(), original.dtype());
     assert_eq!(recovered.len(), original.len());
     Ok(())
+}
+
+/// Runs the out-of-crate [`TensorRow`] element through `vortex-array`'s shared element conformance
+/// check, with `NaN` and infinities sitting behind the null row so a wrong `DENSE_SAFE` would be
+/// read rather than skipped.
+#[test]
+fn tensor_row_element_conforms() -> VortexResult<()> {
+    let mut ctx = crate::tests::SESSION.create_execution_ctx();
+    let arr = tensor_array(&[2], &[3.0, -4.0, f64::NAN, f64::INFINITY])?;
+    let arr = MaskedArray::try_new(arr, Validity::from_iter([true, false]))?.into_array();
+
+    assert_element_conforms::<TensorRow<f64>>(
+        arr,
+        &DType::Primitive(PType::F64, Nullability::NonNullable),
+        &mut ctx,
+    )
 }

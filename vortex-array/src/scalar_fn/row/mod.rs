@@ -30,6 +30,8 @@ pub use element::BytesLen;
 pub use element::ElementTuple;
 pub use element::InputElement;
 pub use element::OutputElement;
+#[cfg(any(test, feature = "_test-harness"))]
+pub use element::assert_element_conforms;
 
 mod execute;
 
