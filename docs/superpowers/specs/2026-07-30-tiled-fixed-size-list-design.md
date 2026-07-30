@@ -233,6 +233,7 @@ array.validity()
 array.row_tile_count()
 array.dimension_tile_count()
 array.tile(row_tile, dimension_tile)
+array.tiles()
 ```
 
 `encode` is the normal construction path. It executes the canonical primitive
@@ -246,8 +247,13 @@ other encoded-array constructors, it cannot prove that caller-provided physical
 values are the correct transpose.
 
 `tile` returns a view containing the logical row range, logical dimension
-range, and the corresponding contiguous physical element range. Tile traversal
-does not know about RaBitQ scoring or any other consuming algorithm.
+range, the corresponding contiguous `physical_range`, and a convenience view
+of those physical elements. `tiles` visits the same descriptors in physical
+order. A specialized kernel can therefore execute `array.elements()` once and
+index that canonical child with the supplied physical ranges, rather than
+redispatching or slicing once per tile. Consumers never reproduce the offset
+formula themselves. Tile traversal does not know about RaBitQ scoring or any
+other consuming algorithm.
 
 There is no `with_elements` convenience method. A caller that wants a
 FastLanes-compressed physical child obtains `elements()`, compresses that
