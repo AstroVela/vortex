@@ -367,14 +367,38 @@ GAT, so `&'a [T]` works), and `list_length` could even be a `RowFn` given a `Lis
 style of `BytesLen`. It should not be, because its answer is a child array or one constant.
 
 **`like` is a new gap, and the sharpest one.** It is strict, infallible, `(Utf8, Utf8) -> Bool`: on
-signature alone it is the ideal `RowFn`. What blocks it is that `RowFn::dispatch` sees only
-`(options, &[DType])`, deliberately, so that plan time and run time agree. Compiling the LIKE pattern
-once per batch needs the *value* of the constant pattern argument, and there is nowhere in `RowFn` to
-put that. Compiling per row instead would trade one pattern compilation for *n*, the same shape of
-regression the constant-operand stride fixed for geo. Any function whose kernel needs an artifact
-derived from a constant argument (a regex, a compiled matcher, a lookup dictionary) has the same
-problem, so the fix is a per-batch setup hook that sees argument values and produces state the row
-closure captures. `reduce_encoded` sees values, but it replaces the row loop rather than feeding it.
+signature alone it is the ideal `RowFn`. Two things block it, and measuring both is what settled where
+it belongs.
+
+Its constant-pattern path is fine. `reduce_encoded` already sees the argument arrays before the row
+loop, so compiling the pattern once and evaluating in bulk has a home, and a constant operand stays
+constant even through a filtered batch. No new hook needed for that case.
+
+Its *per-row* pattern path is what blocks it. That path memoizes the compiled pattern across
+consecutive rows carrying the same one, and a `RowFn` closure is `impl Fn`, so it can hold no such
+state. Defeating the cache costs **5.7x** (`like_per_row_distinct_patterns` 249.1 µs against
+`like_per_row_patterns` 44.03 µs, 2048 rows, same matching work in both), which is the same shape of
+regression the constant-operand stride fixed for geo.
+
+Relaxing the closure to `impl FnMut` would restore the cache, and it compiles as a one-word change.
+It is not free. Measured on `byte_length_element`, `fastest` column, both configurations run twice:
+
+| case | `Fn` | `FnMut` | delta |
+| --- | --- | --- | --- |
+| `long_strings_bytes_len` 4096 | 11.15 µs | 12.08 µs | +8.3% |
+| `long_strings_bytes_len` 65536 | 166.4 µs | 181.7 µs | +9.2% |
+| `long_strings_bytes_slice` 4096 | 14.75 µs | 15.97 µs | +8.3% |
+| `short_strings_bytes_len` 65536 | 166.2 µs | 180.4 µs | +8.5% |
+| `short_strings_bytes_slice` 65536 | 180.9 µs | 200.3 µs | +10.7% |
+
+Capturing the closure by `&mut` inhibits the vectorization the shared capture allows, so `FnMut`
+taxes every row function 8 to 11% to enable state that one function wants. Keep `visit` on `Fn`.
+
+The conclusion is that `like` does not want a row loop at all: its general path needs cross-row state,
+and its fast path is bulk. What it wants is to declare `(Utf8, Utf8) -> Bool` through the element
+vocabulary and keep its own kernel, which is the missing cell below. A per-batch setup hook would not
+have been enough on its own, since the state `like` needs is mutable *across* rows rather than fixed
+before them.
 
 A second, smaller thing blocks `like` too: it renders custom SQL through `fmt_sql`, and neither
 `StrictScalarFnVTable` nor `RowFn` forwards that, so today porting any function with bespoke SQL
