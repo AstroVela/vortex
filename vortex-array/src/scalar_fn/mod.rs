@@ -41,6 +41,9 @@ pub use signature::*;
 mod strict;
 pub use strict::*;
 
+pub mod row;
+pub use row::*;
+
 pub mod fns;
 pub mod internal;
 pub mod session;
