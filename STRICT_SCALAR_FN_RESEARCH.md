@@ -329,6 +329,48 @@ branch's own commit messages describe fixes to *this branch's* code.
 
 ---
 
+## Audit: can the four `StrictScalarFnVTable` impls really not be `RowFn`?
+
+There are exactly four in production. Auditing each against the two questions that matter, rather than
+repeating the earlier verdicts, **not one of them is structurally impossible**. Every "cannot" in this
+document was really "cannot with the trait signed as it is today", and the required changes are already
+named elsewhere in these notes. Recording the distinction because it is the difference between a limit
+and a decision.
+
+| function | signature expressible? | kernel row-shaped? | what it would take |
+| --- | --- | --- | --- |
+| `not` | **yes**, `(bool,) -> bool`, both elements exist | **no** | nothing. It can be a `RowFn` today and should not be: `!bits` is one `!` per 64-bit word, in place when unshared, against 16k closure calls and a `Vec<bool>` repack |
+| `list_length` | output is a fixed `U64`; input needs a `ListLen` element | **no** | one new element. Still should not: the answer is a child array or one constant |
+| `list_sum` | no, twice over: dtype varies with the element type, and a valid empty list sums to null | yes | `element_dtype(args)` plus `impl OutputElement for Option<T>` |
+| `l2_denorm` | no: output dtype is `arg_dtypes[0]` | yes, per-row scaling | `element_dtype(args)` plus a write-into-buffer output element |
+
+Two readings follow.
+
+**The honest framing is "can, and here is whether it is worth it."** For `not` and `list_length` the
+answer is a flat no on performance grounds, and those are settled. For `list_sum` and `l2_denorm` the
+answer is yes-with-changes, and the changes are shared: both want `element_dtype` to see the input
+dtypes, which is one signature widening that `validate_row_args` is already positioned to pass through.
+
+**`l2_denorm` is the one worth doing**, because its kernel genuinely is per-row scaling and because it
+still carries eight `unsafe` blocks that the port would remove, exactly as it did for the other three
+tensor kernels. The sequence:
+
+1. Widen `OutputElement::element_dtype()` to `element_dtype(args: &[DType]) -> VortexResult<DType>`,
+   updating the three existing impls to ignore the argument. Mechanical, but on its own it enables
+   nothing, so it should land together with step 2 rather than alone.
+2. Add a write-into-buffer output element and the visit method that feeds it. This is the real design:
+   the row closure becomes `Fn(A::Elems<'_>, &mut [T])`, the executor preallocates `rows * width` from
+   the output dtype rather than collecting a `Vec` per row, and wraps the flat buffer once at the end.
+   Without this the port allocates once per row and loses to the columnar kernel outright.
+3. Move the constant-norms fast path to `reduce_encoded`, which already sees argument values.
+4. Benchmark against `vortex-tensor/benches/l2_norm.rs`'s pattern before keeping it, since the whole
+   point is that the row form is not slower.
+
+Step 2 is also what a `str -> str` string library needs, so it has two prospective users rather than
+one, which is the argument for building it properly rather than special-casing tensors.
+
+---
+
 ## Is there anything left to port?
 
 Asked directly: could the remaining hand-written vtables move onto `RowFn` if the element vocabulary
