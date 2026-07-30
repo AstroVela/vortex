@@ -71,9 +71,18 @@ pub trait InputElement: 'static {
     fn validate(dtype: &DType) -> VortexResult<()>;
 
     /// Decode `array` into its column representation. Called once per batch.
+    ///
+    /// This is where every per-batch cost belongs: resolving the dtype, downcasting the buffer,
+    /// checking the ptype, and anything else that does not vary by row. [`Column`](Self::Column) is
+    /// the type to widen if that means carrying more, since it is chosen by the element.
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column>;
 
-    /// Read the element at `index`. Must be `O(1)`: it is called in the row loop.
+    /// Read the element at `index`, the one function called once per row.
+    ///
+    /// `O(1)` is necessary but **not sufficient**: this must not repeat work that is constant across
+    /// the batch, however cheap that work looks per call. An `O(1)` ptype check and buffer downcast
+    /// per row cost `l2_norm` 2x at width 2, invisible in the call because it read like a getter. Do
+    /// that work in [`decode`](Self::decode) and leave this an offset computation.
     fn get(column: &Self::Column, index: usize) -> Self::Elem<'_>;
 }
 

@@ -17,13 +17,13 @@ use vortex_array::dtype::PType;
 use vortex_array::scalar_fn::InputElement;
 use vortex_array::scalar_fn::OutputSink;
 use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 
 use crate::scalar_fns::l2_denorm::build_tensor_array;
-use crate::utils::FlatElements;
 use crate::utils::extract_flat_elements;
 use crate::utils::validate_tensor_float_input;
 use crate::utils::validate_tensor_float_inputs;
@@ -38,8 +38,25 @@ pub(crate) fn tensor_element_ptype(args: &[DType]) -> VortexResult<PType> {
 /// elements are `T`, and presents each row as its flat elements, `&[T]`.
 pub struct TensorRow<T>(PhantomData<T>);
 
+/// The decoded form of a [`TensorRow`] column: one flat typed buffer plus the stride to read it at.
+///
+/// Typed at decode time rather than per row. `FlatElements::row` re-derives its typed slice on every
+/// call, which costs a ptype check and a buffer downcast per row; a row loop reads every row, so it
+/// pays that once here instead.
+pub struct TensorRows<T> {
+    /// Every row's elements, back to back.
+    elements: Buffer<T>,
+
+    /// Elements per row, the length of each row slice.
+    list_size: usize,
+
+    /// `list_size` for a full column and `0` for constant-backed storage, so `index * stride` pins a
+    /// constant to its single materialized row without a branch in the loop.
+    stride: usize,
+}
+
 impl<T: Float + NativePType> InputElement for TensorRow<T> {
-    type Column = FlatElements;
+    type Column = TensorRows<T>;
     type Elem<'a> = &'a [T];
 
     // Tensor storage is a fully materialized non-nullable primitive buffer, so the elements behind
@@ -62,11 +79,18 @@ impl<T: Float + NativePType> InputElement for TensorRow<T> {
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
         let list_size = validate_tensor_float_input(array.dtype())?.list_size() as usize;
         let ext: ExtensionArray = array.execute(ctx)?;
-        extract_flat_elements(ext.storage_array(), list_size, ctx)
+        let flat = extract_flat_elements(ext.storage_array(), list_size, ctx)?;
+
+        Ok(TensorRows {
+            list_size: flat.list_size(),
+            stride: flat.row_stride(),
+            elements: flat.into_buffer::<T>(),
+        })
     }
 
     fn get(column: &Self::Column, index: usize) -> &[T] {
-        column.row::<T>(index)
+        let start = index * column.stride;
+        &column.elements.as_slice()[start..start + column.list_size]
     }
 }
 
