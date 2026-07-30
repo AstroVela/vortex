@@ -377,10 +377,35 @@ tensor kernels. The sequence:
 1. Widen `OutputElement::element_dtype()` to `element_dtype(args: &[DType]) -> VortexResult<DType>`,
    updating the three existing impls to ignore the argument. Mechanical, but on its own it enables
    nothing, so it should land together with step 2 rather than alone.
-2. Add a write-into-buffer output element and the visit method that feeds it. This is the real design:
-   the row closure becomes `Fn(A::Elems<'_>, &mut [T])`, the executor preallocates `rows * width` from
-   the output dtype rather than collecting a `Vec` per row, and wraps the flat buffer once at the end.
-   Without this the port allocates once per row and loses to the columnar kernel outright.
+2. Add a second visit method whose closure *writes* its row instead of returning it. Generalize the
+   sink rather than hardcoding `&mut [T]`, because the same mechanism then covers three gaps recorded
+   separately in these notes:
+
+   - **runtime-shaped output**: the sink is a preallocated flat buffer, the per-row handle a
+     `&mut [T]` slice of it, so `l2_denorm` allocates once per batch rather than once per row.
+   - **`str -> str` without the double copy**: the sink is one growing byte buffer plus views, and
+     `upper`/`lower`/`replace` push into it. This is strictly better than the `Cow` output element
+     considered above, which still copies each row once.
+   - **nullable output**: a sink can push a null, which removes the need for
+     `impl OutputElement for Option<T>` as a separate patch.
+
+   Sketch: an `OutputSink` with `type Row<'a>`, a `with_capacity(rows, &DType)` that can read a width
+   out of the output dtype, a `row(&mut self, index)` handing out the per-row handle, and a `finish()`
+   returning the array.
+
+   **The executor threads the sink, not the closure**, so `apply` stays `Fn` and this costs the existing
+   `visit` nothing. That matters: relaxing `visit` itself to `FnMut` was measured at 8 to 11% (see the
+   `like` discussion), and a sink handed in per row avoids captured mutable state entirely.
+
+   One thing to resolve in the design: `RetWitness: ApplyResult` currently carries both *what dtype* and
+   *is it fallible*. A sink visit takes the dtype from the sink type and fallibility from the closure
+   returning `()` or `VortexResult<()>`, so those two roles need separating before this fits.
+
+   **Two visit methods do not cover everything, and it is worth being precise about the residue.** They
+   cover every function whose output is *computed* per row, returned or written. What stays columnar is
+   output that *aliases* its input, since `trim` and `substring` want to keep the input's data buffer and
+   rewrite only views, copying nothing, and a sink still copies bytes into itself. Likewise kernels whose
+   natural unit is not a row (`not`'s word-at-a-time negation, `binary`'s slice kernels) gain nothing.
 3. Move the constant-norms fast path to `reduce_encoded`, which already sees argument values.
 4. Benchmark against `vortex-tensor/benches/l2_norm.rs`'s pattern before keeping it, since the whole
    point is that the row form is not slower.
