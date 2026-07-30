@@ -38,9 +38,12 @@ use crate::scalar_fn::fns::operators::Operator;
 /// A null list has a null length, and the length of a valid list is a non-null value determined by
 /// that list alone, so this is strict and total.
 ///
-/// This is a columnar [`StrictScalarFnVTable`]: the kernel computes lengths purely from the list's
-/// offsets (`ListArray`), sizes (`ListViewArray`), or dtype (`FixedSizeListArray`) without reading
-/// the element *values*, and the strict lifting supplies constant folding, nullability, and validity.
+/// This is a columnar [`StrictScalarFnVTable`] rather than a row function because every length is
+/// already recorded in the list's own metadata: a `ListViewArray`'s sizes child *is* the answer, a
+/// `FixedSizeListArray`'s is one value for the whole column, and a `ListArray`'s is one vectorized
+/// subtraction over its offsets. None of the element *values* are read. A row loop would rebuild all
+/// of that one `u64` at a time.
+///
 /// The lengths are read densely, since a list array's offsets are in bounds for every row whether it
 /// is null or not, so the input keeps its original encoding.
 #[derive(Clone)]

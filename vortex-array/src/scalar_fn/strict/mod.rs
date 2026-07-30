@@ -18,12 +18,17 @@
 //!   partially-null inputs are handled per [`NullHandling`].
 //! - `serialize` and `deserialize` come from [`PersistableOptions`] on the options type.
 //!
+//! A strict function whose kernel is happy to read one row at a time should implement
+//! [`RowFn`] instead, which derives this whole trait in turn. See
+//! [choosing a trait](crate::scalar_fn#choosing-a-trait).
+//!
 //! Functions with options-dependent strictness (`Binary`) or Kleene logic should implement
 //! [`ScalarFnVTable`] directly. Of that trait's optional methods only [`reduce`] and [`validity`] are
 //! mirrored here, because a strict function cannot implement [`ScalarFnVTable`] itself to override
 //! one. Mirror another method when a function actually needs it.
 //!
 //! [`PersistableOptions`]: crate::scalar_fn::PersistableOptions
+//! [`RowFn`]: crate::scalar_fn::RowFn
 //! [`ScalarFnVTable`]: crate::scalar_fn::ScalarFnVTable
 //! [`reduce`]: StrictScalarFnVTable::reduce
 //! [`return_element_dtype`]: StrictScalarFnVTable::return_element_dtype
