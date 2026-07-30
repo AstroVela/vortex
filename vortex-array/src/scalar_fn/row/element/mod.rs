@@ -24,6 +24,11 @@ pub use bytes::Bytes;
 pub use bytes::BytesColumn;
 pub use bytes::BytesLen;
 
+#[cfg(any(test, feature = "_test-harness"))]
+mod conformance;
+#[cfg(any(test, feature = "_test-harness"))]
+pub use conformance::assert_element_conforms;
+
 mod primitive;
 
 mod tuple;

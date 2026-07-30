@@ -559,6 +559,34 @@ placement in `vortex-array` is that `vortex-geo`'s three predicates and `byte_le
 over three different element types. Two downstream crates plus core is the second-caller test met, not
 anticipated.
 
+### What it costs
+
+Removing that `unsafe` is not free, because `new_unchecked` was buying something: the old kernel paired
+its freshly built buffer with the input's validity in one step, so a nullable input cost it nothing
+extra. The framework builds a non-nullable column and the lifting applies validity afterwards, which
+for `Validity::Array` means materializing a mask and running a separate pass.
+
+That pass is `O(rows)` while the kernel is `O(rows * width)`, so width amortizes it. Measured on
+`vortex-tensor/benches/l2_norm.rs`, 16384 rows, `fastest` column:
+
+| width | non-nullable | nullable | cost of the extra pass |
+| --- | --- | --- | --- |
+| 2 | 68.87 µs | 70.44 µs | +2.3% |
+| 32 | 241.4 µs | 243.9 µs | +1.0% |
+| 256 | 2.513 ms | 2.529 ms | +0.6% |
+
+So 1 to 2% on nullable input, worst at the narrowest vector anyone would store, and nothing at all on
+non-nullable input where no mask is applied. Trading that for seven `unsafe` blocks is the right side
+of the deal.
+
+**What this does not measure.** Both columns run through the framework, so it isolates the *masking*
+pass but not the framework's per-row indirection (`ArgColumn::get`'s stride multiply, and collecting
+into `Vec<T>` rather than `Buffer<T>`) against the old kernel's direct `flat.row::<T>(i)`. Doing that
+properly needs the pre-port kernel side by side, which needs `vortex-tensor`'s `pub(crate)` flat-element
+helpers exposed. What bounds the concern meanwhile: width 2 costs 4.2 ns per row for two multiply-adds
+and a `sqrt`, and a `sqrt` alone is most of that, so there is little room left for indirection to hide
+in. Worth closing properly before the clean branch lands.
+
 [`OutputElement::build`]: vortex-array/src/scalar_fn/row/element/mod.rs
 
 Production lines, before and after:
