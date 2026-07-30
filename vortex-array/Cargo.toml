@@ -274,3 +274,7 @@ harness = false
 [[bench]]
 name = "slice_dict_primitive"
 harness = false
+
+[[bench]]
+name = "strict_validity"
+harness = false

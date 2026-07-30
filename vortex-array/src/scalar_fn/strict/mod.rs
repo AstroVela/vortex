@@ -48,9 +48,8 @@ pub enum NullHandling {
     /// Cheapest, and the only option that leaves inputs at their original encoding. Requires that
     /// the function is infallible and total over whatever sits behind a null, which holds for any
     /// flat fixed-width payload since a null row is just unused bytes. Asking for it without meeting
-    /// that is rejected rather than trusted: a fallible function is refused here, and the row layers
-    /// additionally refuse arguments that are not
-    /// [`InputElement::DENSE_SAFE`](crate::scalar_fn::InputElement::DENSE_SAFE).
+    /// that is rejected rather than trusted: a fallible function is refused here rather than being
+    /// taken at its word.
     Dense,
 
     /// Filter the inputs to the rows valid in every input, evaluate those, and scatter the results
