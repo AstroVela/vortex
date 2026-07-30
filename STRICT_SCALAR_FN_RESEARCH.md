@@ -508,6 +508,27 @@ surface. Recorded so they are decisions rather than surprises.
 - **`OutputElement::element_dtype()` takes no arguments,** so a row function's output dtype is a
   property of its Rust type and cannot depend on runtime data. This is the other thing keeping
   `l2_denorm` columnar: it returns whole tensor rows, and a tensor's dtype carries its shape.
+
+  **This one is a signature choice, not a law, and calling it a law was wrong.** `l2_denorm`'s
+  `return_element_dtype` just returns `arg_dtypes[0]` with nullability unioned in, and the blanket
+  `RowFn` path already *has* the input dtypes at that point: `validate_row_args` does
+  `A::validate(args)?; Ok(R::Out::element_dtype())`, discarding `args` for the output. Widening to
+  `element_dtype(args: &[DType]) -> VortexResult<DType>` would let a `TensorRowOut<T>` hand back
+  `args[0]`, and `l2_denorm`'s input side needs nothing new at all, since `(TensorRow<T>, T)` are both
+  existing elements.
+
+  What still blocks it is the *other* signature. `build(values: Vec<Self>)` with `Self = Vec<T>` means
+  one heap allocation per row and then a flatten, against a columnar kernel that scales the flat
+  storage buffer in a single pass. At 16k rows that is 16k allocations versus zero, and no amount of
+  dtype plumbing fixes it. Making `l2_denorm` a fast row function needs an output element that writes
+  into a preallocated flat buffer (`fn apply(row, out: &mut [T])`) rather than returning an owned row,
+  which is a genuinely different output shape and the thing to design if this is wanted.
+
+  Note also what *not* to do on the input side: replacing the generic `TensorRow<T>` with a
+  non-generic element whose `Elem<'a>` is an enum over `f16`/`f32`/`f64` would move the width choice
+  from monomorphization into a branch inside the row loop. That is precisely what
+  `match_each_float_ptype!` plus a generic element exists to avoid, so it would cost every tensor
+  kernel its inner-loop specialization.
 - **~~The witness carries four scalars through two associated types.~~ Not a gap.** This looked like
   the framework's weakest joint, since `ArgsWitness` and `RetWitness` are read *only* for `ARITY`,
   `DENSE_SAFE`, `DECODE_FALLIBLE` and `FALLIBLE`, and for a multi-dispatch function the witness names
