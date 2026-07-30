@@ -520,6 +520,47 @@ surface. Recorded so they are decisions rather than surprises.
 
 ## What the ports bought
 
+**Not line count.** That was the first justification I reached for and it does not hold up: `row/` is
+514 code lines and `strict/` is 269, against roughly 470 lines saved across six kernels. Near
+break-even. Nor is it bug fixes, since none of the three extracted problems is a live miscompute on
+`develop`.
+
+**It is `unsafe`.** Every hand-written kernel in `vortex-tensor` ended the same way:
+
+```rust
+// SAFETY: The buffer length equals `len`, which matches the source validity length.
+Ok(unsafe { PrimitiveArray::new_unchecked(buffer, validity) }.into_array())
+```
+
+A kernel that computes its own values *and* carries its input's validity has to assert that the two
+lengths agree, and the only tool for that is `new_unchecked`. The framework never pairs them:
+[`OutputElement::build`] returns a non-nullable column, and the strict lifting applies validity
+afterwards by masking. The invariant stops being asserted and becomes unrepresentable.
+
+Counting production `unsafe` blocks, test modules excluded, gives a clean natural experiment. The
+three functions moved onto the row layer lost all of theirs; `l2_denorm`, which stayed columnar on
+`StrictScalarFnVTable`, kept all of its own:
+
+| function | layer it moved to | `unsafe` on `develop` | `unsafe` now |
+| --- | --- | --- | --- |
+| `l2_norm` | `RowFn` | 1 | 0 |
+| `inner_product` | `RowFn` | 3 | 0 |
+| `cosine_similarity` | `RowFn` | 3 | 0 |
+| `l2_denorm` | `StrictScalarFnVTable` | 8 | 8 |
+
+Same crate, same reviewers, same standards, so the row layer is what removes them rather than the
+strict lifting or the port itself. `develop`'s `l2_norm` also hand-rolled a 25-line constant-array
+fast path that the strict lifting now does generically for every function, and computed its output
+nullability by hand.
+
+This is the justification to carry onto a clean branch. It also bounds the claim: a `vortex-tensor`
+local helper owning the same invariant would remove the same `unsafe`, so what earns the *generic*
+placement in `vortex-array` is that `vortex-geo`'s three predicates and `byte_length` use it too,
+over three different element types. Two downstream crates plus core is the second-caller test met, not
+anticipated.
+
+[`OutputElement::build`]: vortex-array/src/scalar_fn/row/element/mod.rs
+
 Production lines, before and after:
 
 | function | layer | before | after |
