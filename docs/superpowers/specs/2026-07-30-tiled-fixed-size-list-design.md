@@ -360,6 +360,21 @@ Vortex tests include:
 Property-style differential tests compare canonical values before encoding,
 after execution, and after slice/take combinations.
 
+Deterministic unit conformance uses canonical `FixedSizeListArray` as the oracle
+for every tiled operation: encode/execute, reconstruction through `try_new`,
+scalar access, tile descriptors and element views, slice, and take. The suite
+also runs Vortex's standard array-consistency and take-conformance helpers.
+Expected tile values are derived independently from canonical row-major
+coordinates rather than from the tiled offset helpers.
+
+A dedicated cargo-fuzz target generates bounded primitive FSL arrays with
+independent outer and element validity, arbitrary nonzero geometry, empty and
+zero-width cases, and composed scalar/slice/take/tile/reconstruction actions.
+After every action it compares the tiled result with the canonical FSL oracle
+and verifies that slice and take retain the tiled parent and geometry. The
+target is included in scheduled Vortex fuzzing so discovered cases accumulate
+in a persistent corpus.
+
 ## Benchmarks
 
 Vortex benchmarks measure:
