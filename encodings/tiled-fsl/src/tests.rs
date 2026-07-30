@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -8,6 +9,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
@@ -21,6 +23,7 @@ use vortex_array::match_each_native_ptype;
 use vortex_array::test_harness::check_metadata;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
@@ -92,6 +95,76 @@ fn assert_fsl_equivalent(
     assert_eq!(candidate.len(), canonical.len());
     assert_arrays_eq!(canonical, candidate, ctx);
     Ok(())
+}
+
+#[rstest]
+#[case(0..0)]
+#[case(0..1)]
+#[case(0..31)]
+#[case(0..32)]
+#[case(0..33)]
+#[case(1..64)]
+#[case(31..65)]
+#[case(64..65)]
+fn slice_preserves_encoding_and_values(#[case] range: Range<usize>) -> VortexResult<()> {
+    let (canonical, tiled, mut ctx) = fixture(65, 129, geometry(32, 64))?;
+    let expected = canonical.into_array().slice(range.clone())?;
+    let actual = tiled.into_array().slice(range)?;
+    if actual.is_empty() {
+        assert!(actual.is::<FixedSizeList>());
+    } else {
+        assert!(actual.is::<TiledFixedSizeList>());
+        assert_eq!(
+            actual.as_::<TiledFixedSizeList>().geometry(),
+            geometry(32, 64)
+        );
+    }
+    assert_arrays_eq!(expected, actual, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn slice_preserves_special_cases() -> VortexResult<()> {
+    let cases = [
+        (3, 0, geometry(2, 3), 1..3),
+        (3, 5, geometry(32, 64), 1..3),
+        (4_096, 128, geometry(32, 64), 2_048..2_049),
+    ];
+    for (rows, dimensions, tile_geometry, range) in cases {
+        let (canonical, tiled, mut ctx) = fixture(rows, dimensions, tile_geometry)?;
+        let expected = canonical.into_array().slice(range.clone())?;
+        let actual = tiled.into_array().slice(range.clone())?;
+        assert_fsl_equivalent(&expected, &actual, &mut ctx)?;
+        if !actual.is_empty() {
+            let actual = actual.as_::<TiledFixedSizeList>();
+            assert_eq!(actual.geometry(), tile_geometry);
+            assert_eq!(actual.elements().len(), range.len() * dimensions as usize);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn slice_preserves_mixed_validity() -> VortexResult<()> {
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            buffer![0i32, 1, 10, 11, 20, 21],
+            Validity::from_iter([true, false, true, true, false, true]),
+        )
+        .into_array(),
+        2,
+        Validity::from_iter([true, false, true]),
+        3,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(2, 2), &mut ctx)?;
+    let expected = canonical.into_array().slice(1..3)?;
+    let actual = tiled.into_array().slice(1..3)?;
+    assert_eq!(
+        actual.as_::<TiledFixedSizeList>().geometry(),
+        geometry(2, 2),
+    );
+    assert_fsl_equivalent(&expected, &actual, &mut ctx)
 }
 
 #[test]

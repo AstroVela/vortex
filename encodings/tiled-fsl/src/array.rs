@@ -385,6 +385,14 @@ impl VTable for TiledFixedSizeList {
             .into_array(),
         ))
     }
+
+    fn reduce_parent(
+        array: ArrayView<'_, Self>,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        crate::rules::RULES.evaluate(array, parent, child_idx)
+    }
 }
 
 impl ValidityVTable<TiledFixedSizeList> for TiledFixedSizeList {

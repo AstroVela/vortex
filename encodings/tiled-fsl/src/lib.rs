@@ -1,8 +1,11 @@
 //! Two-dimensional tiled encoding for primitive Vortex fixed-size lists.
 
 mod array;
+mod gather;
 mod geometry;
 mod operations;
+mod rules;
+mod slice;
 mod transpose;
 
 pub use array::*;
