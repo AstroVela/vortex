@@ -7,6 +7,7 @@ mod transpose;
 
 pub use array::*;
 pub use geometry::TileBounds;
+pub use geometry::TileBoundsIter;
 pub use geometry::TileGeometry;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;

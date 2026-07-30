@@ -39,6 +39,65 @@ pub struct TileBounds {
     pub physical_range: Range<usize>,
 }
 
+/// Iterates tiled fixed-size-list bounds in physical storage order.
+///
+/// The iterator stores only scalar geometry and tile counters. Constructing or advancing it does
+/// not access the array's physical child.
+#[derive(Clone, Debug)]
+pub struct TileBoundsIter {
+    len: usize,
+    list_size: usize,
+    geometry: TileGeometry,
+    row_tile_count: usize,
+    dimension_tile_count: usize,
+    next_row_tile: usize,
+    next_dimension_tile: usize,
+}
+
+impl TileBoundsIter {
+    pub(crate) fn new(
+        len: usize,
+        list_size: usize,
+        geometry: TileGeometry,
+        row_tile_count: usize,
+        dimension_tile_count: usize,
+    ) -> Self {
+        Self {
+            len,
+            list_size,
+            geometry,
+            row_tile_count,
+            dimension_tile_count,
+            next_row_tile: 0,
+            next_dimension_tile: 0,
+        }
+    }
+}
+
+impl Iterator for TileBoundsIter {
+    type Item = TileBounds;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row_tile_count == 0 || self.next_dimension_tile == self.dimension_tile_count {
+            return None;
+        }
+
+        let bounds = tile_bounds_for_validated_array(
+            self.len,
+            self.list_size,
+            self.geometry,
+            self.next_row_tile,
+            self.next_dimension_tile,
+        );
+        self.next_row_tile += 1;
+        if self.next_row_tile == self.row_tile_count {
+            self.next_row_tile = 0;
+            self.next_dimension_tile += 1;
+        }
+        Some(bounds)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tile_bounds(
     len: usize,
@@ -51,8 +110,8 @@ pub(crate) fn tile_bounds(
         vortex_bail!(InvalidArgument: "cannot compute tiles for an empty logical extent");
     }
 
-    let rows = usize::try_from(geometry.rows().get())?;
-    let dimensions = usize::try_from(geometry.dimensions().get())?;
+    let rows = geometry.rows().get() as usize;
+    let dimensions = geometry.dimensions().get() as usize;
     let row_start = row_tile.checked_mul(rows).ok_or_else(|| {
         vortex_error::vortex_err!(InvalidArgument: "row tile index {row_tile} overflows tile geometry")
     })?;
@@ -67,12 +126,49 @@ pub(crate) fn tile_bounds(
         );
     }
 
-    let row_end = row_start.checked_add(rows).ok_or_else(|| {
-        vortex_error::vortex_err!(InvalidArgument: "row tile range overflows logical extent")
-    })?.min(len);
-    let dimension_end = dimension_start.checked_add(dimensions).ok_or_else(|| {
-        vortex_error::vortex_err!(InvalidArgument: "dimension tile range overflows logical extent")
-    })?.min(list_size);
+    tile_bounds_from_starts(len, list_size, rows, dimensions, row_start, dimension_start)
+}
+
+fn tile_bounds_for_validated_array(
+    len: usize,
+    list_size: usize,
+    geometry: TileGeometry,
+    row_tile: usize,
+    dimension_tile: usize,
+) -> TileBounds {
+    let rows = geometry.rows().get() as usize;
+    let dimensions = geometry.dimensions().get() as usize;
+    let row_tile_count = len.div_ceil(rows);
+    let dimension_tile_count = list_size.div_ceil(dimensions);
+    // Callers must provide only counters generated from this validated array's geometry.
+    debug_assert!(row_tile < row_tile_count);
+    debug_assert!(dimension_tile < dimension_tile_count);
+    debug_assert!(len.checked_mul(list_size).is_some());
+
+    let row_start = row_tile * rows;
+    let dimension_start = dimension_tile * dimensions;
+    match tile_bounds_from_starts(len, list_size, rows, dimensions, row_start, dimension_start) {
+        Ok(bounds) => bounds,
+        Err(_) => unreachable!("validated tiled array has in-range tile bounds"),
+    }
+}
+
+fn tile_bounds_from_starts(
+    len: usize,
+    list_size: usize,
+    rows: usize,
+    dimensions: usize,
+    row_start: usize,
+    dimension_start: usize,
+) -> VortexResult<TileBounds> {
+    let row_end = row_start
+        .checked_add(rows)
+        .ok_or_else(|| vortex_error::vortex_err!(InvalidArgument: "row tile range overflows logical extent"))?
+        .min(len);
+    let dimension_end = dimension_start
+        .checked_add(dimensions)
+        .ok_or_else(|| vortex_error::vortex_err!(InvalidArgument: "dimension tile range overflows logical extent"))?
+        .min(list_size);
     let row_height = row_end - row_start;
     let dimension_width = dimension_end - dimension_start;
 

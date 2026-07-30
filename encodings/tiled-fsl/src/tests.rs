@@ -24,6 +24,7 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
+use crate::TileBounds;
 use crate::TileGeometry;
 use crate::TiledFixedSizeList;
 use crate::TiledFixedSizeListArray;
@@ -90,6 +91,31 @@ fn assert_fsl_equivalent(
     assert_eq!(candidate.dtype(), canonical.dtype());
     assert_eq!(candidate.len(), canonical.len());
     assert_arrays_eq!(canonical, candidate, ctx);
+    Ok(())
+}
+
+#[test]
+fn tiles_are_range_only_and_in_physical_order() -> VortexResult<()> {
+    let (_, tiled, _) = fixture(3, 5, geometry(2, 3))?;
+    let bounds: Vec<TileBounds> = tiled.tiles().collect();
+    assert_eq!(
+        bounds
+            .iter()
+            .map(|bounds| bounds.physical_range.clone())
+            .collect::<Vec<_>>(),
+        vec![0..6, 6..9, 9..13, 13..15],
+    );
+    assert_eq!(tiled.tile(1, 1)?, bounds[3]);
+    assert_eq!(tiled.tile_elements(&bounds[3])?.len(), 2);
+    assert!(tiled.tile(2, 0).is_err());
+    assert!(tiled.tile(0, 2).is_err());
+    Ok(())
+}
+
+#[test]
+fn degenerate_arrays_have_no_tiles() -> VortexResult<()> {
+    assert_eq!(physical_fixture(0, 5, geometry(2, 3))?.tiles().count(), 0);
+    assert_eq!(physical_fixture(3, 0, geometry(2, 3))?.tiles().count(), 0);
     Ok(())
 }
 

@@ -46,6 +46,9 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::TileGeometry;
+use crate::geometry::TileBounds;
+use crate::geometry::TileBoundsIter;
+use crate::geometry::tile_bounds;
 use crate::transpose::decode_elements;
 use crate::transpose::encode_elements;
 
@@ -417,6 +420,37 @@ pub trait TiledFixedSizeListArrayExt:
     /// Returns the number of dimension tiles needed for each logical list.
     fn dimension_tile_count(&self) -> usize {
         (self.list_size() as usize).div_ceil(self.geometry().dimensions().get() as usize)
+    }
+
+    /// Returns the bounds for one checked logical tile.
+    fn tile(&self, row_tile: usize, dimension_tile: usize) -> VortexResult<TileBounds> {
+        tile_bounds(
+            self.as_ref().len(),
+            self.list_size() as usize,
+            self.geometry(),
+            row_tile,
+            dimension_tile,
+        )
+    }
+
+    /// Returns the logical and physical bounds of every tile in physical storage order.
+    fn tiles(&self) -> TileBoundsIter {
+        TileBoundsIter::new(
+            self.as_ref().len(),
+            self.list_size() as usize,
+            self.geometry(),
+            self.row_tile_count(),
+            self.dimension_tile_count(),
+        )
+    }
+
+    /// Slices the physical child for inspection of one tile's elements.
+    ///
+    /// This is a cold-path convenience; scoring kernels should retain the child once and index it
+    /// with [`TileBounds::physical_range`].
+    #[cold]
+    fn tile_elements(&self, bounds: &TileBounds) -> VortexResult<ArrayRef> {
+        self.elements().slice(bounds.physical_range.clone())
     }
 
     /// Returns the outer-list validity derived from the optional validity slot.
