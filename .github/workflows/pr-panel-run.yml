@@ -1,0 +1,70 @@
+#  SPDX-License-Identifier: Apache-2.0
+#  SPDX-FileCopyrightText: Copyright the Vortex contributors
+#
+# The downstream half of the PR control panel.
+#
+# `pr-panel.yml` dispatches this workflow when a panel button is pressed, handing over
+# the panel state as JSON. Today it only renders that state back to the PR, which is
+# the point: it proves the settings survive the hop into a separate workflow run. This
+# is where a real benchmark run would eventually be launched from.
+
+name: PR Control Panel Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to report back to"
+        required: true
+        type: string
+      state:
+        description: "Panel state as JSON"
+        required: true
+        type: string
+      actions:
+        description: "Comma-separated button actions that triggered this run"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: pr-panel-run-${{ github.event.inputs.pr }}
+  cancel-in-progress: false
+
+permissions: { }
+
+jobs:
+  report:
+    name: Report panel state
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write  # PR conversation comments go through the issues API
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Render the received state
+        working-directory: .github/scripts
+        env:
+          PANEL_STATE: ${{ inputs.state }}
+          PANEL_ACTIONS: ${{ inputs.actions }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -m pr_panel report \
+            --state "$PANEL_STATE" \
+            --actions "$PANEL_ACTIONS" \
+            --run-url "$RUN_URL" \
+            --out "$RUNNER_TEMP/report.md"
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post the report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+        run: |
+          bash .github/scripts/upsert-comment.sh \
+            "$REPO" "$PR" "<!-- vortex-pr-panel-report -->" "$RUNNER_TEMP/report.md"

@@ -166,6 +166,23 @@ jobs:
           uv run --no-project --with pytest --with xxhash \
             pytest scripts/tests/test_measurement_id.py
 
+  # The PR control panel encodes its state in the markdown of a bot comment, so a
+  # render/parse regression silently drops whatever the user clicked. These tests are
+  # pure stdlib and take under a second.
+  pr-panel:
+    name: "PR control panel"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+        with:
+          sync: false
+      - name: Pytest - PR control panel
+        run: |
+          uv run --no-project --with pytest \
+            pytest .github/scripts/tests/test_pr_panel.py
+
   python-cuda-test:
     name: "Python CUDA (test)"
     if: github.repository == 'vortex-data/vortex'

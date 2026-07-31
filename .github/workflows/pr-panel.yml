@@ -1,0 +1,150 @@
+#  SPDX-License-Identifier: Apache-2.0
+#  SPDX-FileCopyrightText: Copyright the Vortex contributors
+#
+# Interactive control panel for pull requests.
+#
+# A markdown task list in a bot comment is the only clickable control GitHub gives us:
+# toggling a checkbox rewrites the comment body, which arrives here as
+# `issue_comment: edited`. This workflow diffs the checkboxes against the state blob
+# embedded in the comment, redraws the comment from canonical state, and dispatches
+# `pr-panel-run.yml` when a button was pressed.
+#
+# Notes for anyone changing this file:
+#
+# - `issue_comment` workflows always run from the *default branch*. Edits here do not
+#   take effect on a PR until they are merged; use `.github/scripts/pr_panel demo` and
+#   the unit tests to iterate locally.
+# - `pull_request_target` is used only so that PRs from forks also get a panel; a fork
+#   PR gets a read-only token under `pull_request`. Nothing here checks out or executes
+#   PR head code, so the elevated token never sees untrusted input.
+# - Edits made with `GITHUB_TOKEN` do not trigger workflows, so redrawing the comment
+#   cannot loop back into this workflow.
+# - Only users with write access can tick a checkbox on someone else's comment, so
+#   GitHub's own permissions are the authorization model.
+
+name: PR Control Panel
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+  issue_comment:
+    types: [edited]
+
+concurrency:
+  # Serialize per PR: two quick clicks must not interleave their read-modify-write of
+  # the comment body. Never cancel, or a click would be silently dropped.
+  group: pr-panel-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: { }
+
+jobs:
+  post:
+    name: Post panel
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write  # PR conversation comments go through the issues API
+      pull-requests: write
+    steps:
+      # Checks out the base branch, never the PR head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Render panel
+        working-directory: .github/scripts
+        run: python3 -m pr_panel render --out "$RUNNER_TEMP/panel.md"
+
+      - name: Post panel comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          bash .github/scripts/upsert-comment.sh \
+            "$REPO" "$PR" "<!-- vortex-pr-panel -->" "$RUNNER_TEMP/panel.md"
+
+  apply:
+    name: Apply click
+    # Only react to edits of a panel comment, and never to our own write-back.
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request
+      && github.event.comment.user.login == 'github-actions[bot]'
+      && github.event.sender.login != 'github-actions[bot]'
+      && contains(github.event.comment.body, '<!-- vortex-pr-panel -->')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write  # dispatch pr-panel-run.yml
+      issues: write  # edit the panel comment
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      # Re-read the body instead of trusting the event payload: if clicks queued up,
+      # the payload is already stale.
+      - name: Fetch current panel body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api "/repos/$REPO/issues/comments/$COMMENT_ID" --jq .body \
+            > "$RUNNER_TEMP/current.md"
+
+      - name: Apply the click
+        id: apply
+        working-directory: .github/scripts
+        env:
+          ACTOR: ${{ github.event.sender.login }}
+        run: |
+          python3 -m pr_panel apply \
+            --body "$RUNNER_TEMP/current.md" \
+            --out "$RUNNER_TEMP/next.md" \
+            --actor "$ACTOR" \
+            --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Redraw the panel
+        if: steps.apply.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          jq -n --rawfile body "$RUNNER_TEMP/next.md" '{body: $body}' \
+            | gh api --silent --method PATCH \
+                "/repos/$REPO/issues/comments/$COMMENT_ID" --input -
+
+      - name: Dispatch the run
+        if: steps.apply.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.repository.default_branch }}
+          PR: ${{ github.event.issue.number }}
+          PANEL_ACTIONS: ${{ steps.apply.outputs.actions }}
+          PANEL_STATE: ${{ steps.apply.outputs.state }}
+        run: |
+          gh api --silent --method POST \
+            "/repos/$REPO/actions/workflows/pr-panel-run.yml/dispatches" \
+            -f "ref=$REF" \
+            -f "inputs[pr]=$PR" \
+            -f "inputs[actions]=$PANEL_ACTIONS" \
+            -f "inputs[state]=$PANEL_STATE"
+
+      - name: Summary
+        env:
+          PANEL_ACTIONS: ${{ steps.apply.outputs.actions }}
+          CHANGED: ${{ steps.apply.outputs.changed }}
+        run: |
+          {
+            echo "### PR control panel"
+            echo ""
+            echo "- redrawn: \`$CHANGED\`"
+            echo "- dispatched: \`${PANEL_ACTIONS:-none}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
