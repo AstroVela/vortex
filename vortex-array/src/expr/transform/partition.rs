@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
+use std::marker::PhantomData;
 
 use itertools::Itertools;
 use vortex_error::VortexExpect;
@@ -20,13 +21,198 @@ use crate::expr::analysis::Annotation;
 use crate::expr::analysis::AnnotationFn;
 use crate::expr::analysis::Annotations;
 use crate::expr::analysis::descendent_annotations;
+use crate::expr::col;
 use crate::expr::get_item;
+use crate::expr::is_root;
 use crate::expr::pack;
-use crate::expr::root;
 use crate::expr::traversal::NodeExt;
 use crate::expr::traversal::NodeRewriter;
 use crate::expr::traversal::Transformed;
 use crate::expr::traversal::TraversalOrder;
+use crate::scalar_fn::fns::get_item::GetItem;
+
+/// Describes how to split expressions over a scope into per-slot partitions.
+///
+/// A *slot* is whatever a sub-expression can be dispatched to — a field of a struct layout, the
+/// row index, the values of a dictionary. Partitioning itself is the same for all of them:
+/// annotate each node with the slots it touches, cut out the maximal subtrees that touch exactly
+/// one slot, and leave behind a root expression that re-assembles their results.
+///
+/// Implementations supply the parts that do differ, all of which have identity defaults:
+///
+/// 1. [`flatten`](Self::flatten) rewrites the expression so that every access to the scope is an
+///    access of a slot. A partitioner whose slots are already addressable in the scope needs no
+///    such stage.
+/// 2. [`slot_name`](Self::slot_name) names a slot within the root expression's scope.
+/// 3. [`step_into`](Self::step_into) rewrites a finished partition into the scope of whatever will
+///    evaluate it.
+pub trait Partitioner {
+    /// Identifies one destination that a sub-expression can be dispatched to.
+    type Slot: Annotation + Display;
+
+    /// The scope that the flattened expression and its partitions are typed against.
+    fn scope(&self) -> &DType;
+
+    /// The slot's field name within the root expression's scope. Must be injective over slots.
+    fn slot_name(&self, slot: &Self::Slot) -> FieldName;
+
+    /// Stage 1: rewrite every access of the scope into an access of a slot. Identity by default.
+    fn flatten(&self, expr: Expression) -> VortexResult<Expression> {
+        Ok(expr)
+    }
+
+    /// Stage 3: rewrite a partition into the scope of whatever evaluates it. Identity by default.
+    fn step_into(&self, expr: Expression, slot: &Self::Slot) -> VortexResult<Expression> {
+        let _ = slot;
+        Ok(expr)
+    }
+
+    /// Whether a slot holding exactly one sub-expression should skip the enclosing `pack`, so the
+    /// root expression references the partition's result directly.
+    ///
+    /// Consumers that rely on results always being packed must leave this `false`.
+    fn unwrap_single_sub_expression(&self) -> bool {
+        false
+    }
+}
+
+/// Partition `expr` over `partitioner`'s slots, annotating each node with the slots that any of
+/// its descendents touch.
+///
+/// Callers needing a different annotation strategy — for example annotating nodes individually
+/// rather than propagating up — should compute the annotations themselves and use
+/// [`partition_with`].
+pub fn partition_annotated<P, F>(
+    partitioner: &P,
+    expr: Expression,
+    annotate: F,
+) -> VortexResult<PartitionedExpr<P::Slot>>
+where
+    P: Partitioner,
+    F: Fn(&Expression) -> Vec<P::Slot>,
+{
+    // Note that the expression is *not* optimized here: where an expression is simplified
+    // changes how finely it splits, so that choice belongs to the partitioner's `flatten`.
+    let expr = partitioner.flatten(expr)?;
+    let annotations = descendent_annotations(&expr, annotate);
+    partition_with(partitioner, &expr, &annotations)
+}
+
+/// Partition `expr` over `partitioner`'s slots using pre-computed `annotations`.
+///
+/// `expr` must already be flattened — that is, it must be the output of
+/// [`Partitioner::flatten`] — since the annotations borrow it.
+pub fn partition_with<P: Partitioner>(
+    partitioner: &P,
+    expr: &Expression,
+    annotations: &Annotations<'_, P::Slot>,
+) -> VortexResult<PartitionedExpr<P::Slot>> {
+    let mut splitter = ExpressionSplitter {
+        partitioner,
+        annotations,
+        slots: Vec::new(),
+        sub_expressions: Vec::new(),
+    };
+    let root = expr.clone().rewrite(&mut splitter)?.value;
+
+    let mut partitions = Vec::with_capacity(splitter.slots.len());
+    let mut partition_names = Vec::with_capacity(splitter.slots.len());
+    let mut partition_dtypes = Vec::with_capacity(splitter.slots.len());
+    let mut unwrapped = HashMap::new();
+
+    for (slot, exprs) in splitter.slots.iter().zip(splitter.sub_expressions.iter()) {
+        let slot_name = partitioner.slot_name(slot);
+
+        // All of a slot's sub-expressions are packed into one expression, so that the slot is
+        // read exactly once. A single sub-expression may skip the pack if the partitioner allows.
+        let partition = match exprs.as_slice() {
+            [only] if partitioner.unwrap_single_sub_expression() => {
+                unwrapped.insert(slot_name.clone(), sub_expression_name(&slot_name, 0));
+                only.clone()
+            }
+            exprs => pack(
+                exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| (sub_expression_name(&slot_name, idx), expr.clone())),
+                Nullability::NonNullable,
+            ),
+        };
+
+        let partition = partition.optimize_recursive(partitioner.scope())?;
+        partition_dtypes.push(partition.return_dtype(partitioner.scope())?);
+        partition_names.push(slot_name);
+        partitions.push(partitioner.step_into(partition, slot)?);
+    }
+
+    let partition_names = FieldNames::from(partition_names);
+    let root_scope = DType::Struct(
+        StructFields::new(partition_names.clone(), partition_dtypes.clone()),
+        Nullability::NonNullable,
+    );
+    let root = unwrap_single(root, &unwrapped);
+
+    Ok(PartitionedExpr {
+        root: root.optimize_recursive(&root_scope)?,
+        partitions: partitions.into_boxed_slice(),
+        partition_names,
+        partition_dtypes: partition_dtypes.into_boxed_slice(),
+        partition_annotations: splitter.slots.into_boxed_slice(),
+    })
+}
+
+/// Each slot may hold several sub-expressions, so each needs a unique name within its pack.
+fn sub_expression_name(slot_name: &FieldName, idx: usize) -> FieldName {
+    FieldName::from(format!("{slot_name}_{idx}"))
+}
+
+/// Rewrite the root expression's references to slots whose partition skipped its pack, replacing
+/// `$.<slot>.<slot>_0` with `$.<slot>`.
+fn unwrap_single(root: Expression, unwrapped: &HashMap<FieldName, FieldName>) -> Expression {
+    if unwrapped.is_empty() {
+        return root;
+    }
+    root.transform_down(|node| {
+        if let Some(field_name) = node.as_opt::<GetItem>()
+            && let Some(slot_field) = node.child(0).as_opt::<GetItem>()
+            && is_root(node.child(0).child(0))
+            && let Some(expected) = unwrapped.get(slot_field)
+            && expected == field_name
+        {
+            return Ok(Transformed {
+                value: col(slot_field.clone()),
+                order: TraversalOrder::Skip,
+                changed: true,
+            });
+        }
+        Ok(Transformed::no(node))
+    })
+    .vortex_expect("unwrap_single is infallible")
+    .into_inner()
+}
+
+/// The partitioner behind [`partition`] and [`partition_annotations`]: slots are named by
+/// converting the annotation into a [`FieldName`], and neither stage 1 nor stage 3 does anything.
+struct FieldNamePartitioner<'a, A> {
+    scope: &'a DType,
+    slot: PhantomData<A>,
+}
+
+impl<A> Partitioner for FieldNamePartitioner<'_, A>
+where
+    A: Annotation + Display,
+    FieldName: From<A>,
+{
+    type Slot = A;
+
+    fn scope(&self) -> &DType {
+        self.scope
+    }
+
+    fn slot_name(&self, slot: &Self::Slot) -> FieldName {
+        FieldName::from(slot.clone())
+    }
+}
 
 /// Partition an expression into sub-expressions that are uniquely associated with an annotation.
 /// A root expression is also returned that can be used to recombine the results of the partitions
@@ -38,6 +224,9 @@ use crate::expr::traversal::TraversalOrder;
 /// of the scope itself. The fix would be for the returned `PartitionedExpr` to include a partition
 /// expression for computing the validity, or to include that expression as part of the root.
 ///
+/// The struct layout works around this with a [`Partitioner`] of its own, which treats the
+/// struct's validity as a slot.
+///
 /// See <https://github.com/vortex-data/vortex/issues/1907>.
 pub fn partition<A: AnnotationFn>(
     expr: Expression,
@@ -48,11 +237,17 @@ where
     A::Annotation: Display,
     FieldName: From<A::Annotation>,
 {
-    // Annotate each expression with the annotations that any of its descendent expressions have.
-    let annotations = descendent_annotations(&expr, annotate_fn);
-    partition_annotations(expr.clone(), scope, annotations)
+    partition_annotated(
+        &FieldNamePartitioner {
+            scope,
+            slot: PhantomData,
+        },
+        expr,
+        annotate_fn,
+    )
 }
 
+/// As [`partition`], but over annotations the caller has already computed.
 pub fn partition_annotations<A>(
     expr: Expression,
     scope: &DType,
@@ -62,51 +257,14 @@ where
     A: Display + Clone + Eq + Hash,
     FieldName: From<A>,
 {
-    // Now we split the original expression into sub-expressions based on the annotations, and
-    // generate a root expression to re-assemble the results.
-    let mut splitter = StructFieldExpressionSplitter::<A>::new(&annotations);
-    let root = expr.rewrite(&mut splitter)?.value;
-
-    let mut partitions = Vec::with_capacity(splitter.sub_expressions.len());
-    let mut partition_annotations = Vec::with_capacity(splitter.sub_expressions.len());
-    let mut partition_dtypes = Vec::with_capacity(splitter.sub_expressions.len());
-
-    for (annotation, exprs) in splitter.sub_expressions.into_iter() {
-        // We pack all sub-expressions for the same annotation into a single expression.
-        let expr = pack(
-            exprs.into_iter().enumerate().map(|(idx, expr)| {
-                (
-                    StructFieldExpressionSplitter::field_name(&annotation, idx),
-                    expr,
-                )
-            }),
-            Nullability::NonNullable,
-        );
-
-        let expr = expr.optimize_recursive(scope)?;
-        let expr_dtype = expr.return_dtype(scope)?;
-
-        partitions.push(expr);
-        partition_annotations.push(annotation);
-        partition_dtypes.push(expr_dtype);
-    }
-
-    let partition_names = partition_annotations
-        .iter()
-        .map(|id| FieldName::from(id.clone()))
-        .collect::<FieldNames>();
-    let root_scope = DType::Struct(
-        StructFields::new(partition_names.clone(), partition_dtypes.clone()),
-        Nullability::NonNullable,
-    );
-
-    Ok(PartitionedExpr {
-        root: root.optimize_recursive(&root_scope)?,
-        partitions: partitions.into_boxed_slice(),
-        partition_names,
-        partition_dtypes: partition_dtypes.into_boxed_slice(),
-        partition_annotations: partition_annotations.into_boxed_slice(),
-    })
+    partition_with(
+        &FieldNamePartitioner {
+            scope,
+            slot: PhantomData,
+        },
+        &expr,
+        &annotations,
+    )
 }
 
 /// The result of partitioning an expression.
@@ -154,48 +312,54 @@ where
     }
 }
 
-#[derive(Debug)]
-struct StructFieldExpressionSplitter<'a, A: Annotation> {
-    annotations: &'a Annotations<'a, A>,
-    sub_expressions: HashMap<A, Vec<Expression>>,
+/// Cuts an expression into the maximal subtrees that each touch exactly one slot.
+struct ExpressionSplitter<'a, P: Partitioner> {
+    partitioner: &'a P,
+    annotations: &'a Annotations<'a, P::Slot>,
+    /// The slots encountered, in the order they were first encountered. Partitions are emitted in
+    /// this order, so that partitioning the same expression twice gives the same plan.
+    slots: Vec<P::Slot>,
+    /// The sub-expressions of each slot in [`Self::slots`], parallel to it.
+    sub_expressions: Vec<Vec<Expression>>,
 }
 
-impl<'a, A: Annotation + Display> StructFieldExpressionSplitter<'a, A> {
-    fn new(annotations: &'a Annotations<'a, A>) -> Self {
-        Self {
-            sub_expressions: HashMap::new(),
-            annotations,
-        }
-    }
+impl<P: Partitioner> ExpressionSplitter<'_, P> {
+    /// Record `expr` as a sub-expression of `slot`, returning the expression that reads its
+    /// result back out of the root scope.
+    fn push(&mut self, slot: &P::Slot, expr: Expression) -> Expression {
+        let slot_idx = self
+            .slots
+            .iter()
+            .position(|s| s == slot)
+            .unwrap_or_else(|| {
+                self.slots.push(slot.clone());
+                self.sub_expressions.push(Vec::new());
+                self.slots.len() - 1
+            });
 
-    /// Each annotation may be associated with multiple sub-expressions, so we need to
-    /// a unique name for each sub-expression.
-    fn field_name(annotation: &A, idx: usize) -> FieldName {
-        format!("{annotation}_{idx}").into()
+        let sub_exprs = &mut self.sub_expressions[slot_idx];
+        let idx = sub_exprs.len();
+        sub_exprs.push(expr);
+
+        let slot_name = self.partitioner.slot_name(slot);
+        get_item(sub_expression_name(&slot_name, idx), col(slot_name))
     }
 }
 
-impl<A: Annotation + Display> NodeRewriter for StructFieldExpressionSplitter<'_, A>
-where
-    FieldName: From<A>,
-{
+impl<P: Partitioner> NodeRewriter for ExpressionSplitter<'_, P> {
     type NodeTy = Expression;
 
     fn visit_down(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
         match self.annotations.get(&node) {
-            // If this expression only accesses a single field, then we can skip the children
-            Some(annotations) if annotations.len() == 1 => {
-                let annotation = annotations
+            // If this expression only touches a single slot, it becomes a partition and we can
+            // skip its children.
+            Some(slots) if slots.len() == 1 => {
+                let slot = slots
                     .iter()
                     .next()
-                    .vortex_expect("expected one field");
-                let sub_exprs = self.sub_expressions.entry(annotation.clone()).or_default();
-                let idx = sub_exprs.len();
-                sub_exprs.push(node.clone());
-                let value = get_item(
-                    StructFieldExpressionSplitter::field_name(annotation, idx),
-                    get_item(FieldName::from(annotation.clone()), root()),
-                );
+                    .vortex_expect("expected one slot")
+                    .clone();
+                let value = self.push(&slot, node.clone());
                 Ok(Transformed {
                     value,
                     changed: true,
@@ -206,10 +370,6 @@ where
             // Otherwise, continue traversing.
             _ => Ok(Transformed::no(node)),
         }
-    }
-
-    fn visit_up(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
-        Ok(Transformed::no(node))
     }
 }
 
