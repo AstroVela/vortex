@@ -72,9 +72,13 @@ impl RowFn for CosineSimilarity {
         visitor: V,
     ) -> VortexResult<V::Out> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
-            visitor.visit::<(TensorRow<T>, TensorRow<T>), T>(|(lhs, rhs)| {
-                cosine_similarity_row(lhs, rhs)
-            })
+            visitor.visit_prepared::<(TensorRow<T>, TensorRow<T>), ConstNorms<T>, T>(
+                |(lhs, rhs)| ConstNorms {
+                    lhs: lhs.map(l2_norm_row),
+                    rhs: rhs.map(l2_norm_row),
+                },
+                |norms, (lhs, rhs)| cosine_similarity_row_prepared(norms, lhs, rhs),
+            )
         })
     }
 
@@ -110,6 +114,73 @@ impl RowFn for CosineSimilarity {
     }
 }
 
+/// Per-batch state for the cosine row kernel: the L2 norm of each operand that is constant for
+/// the batch.
+///
+/// A broadcast query vector holds the same elements in every row, so its norm is the same in
+/// every row too. Computing it in the prepare step hoists an `O(width)` pass and a `sqrt` per row
+/// out of the row loop. `None` marks an operand that varies by row, whose norm the row closure
+/// computes exactly as it did before the hoist.
+struct ConstNorms<T> {
+    /// The norm of the lhs when it is batch-constant.
+    lhs: Option<T>,
+
+    /// The norm of the rhs when it is batch-constant.
+    rhs: Option<T>,
+}
+
+/// The L2 norm of one row, accumulating in the same order as [`cosine_similarity_row`] so a
+/// hoisted norm is bit-identical to the one computed per row.
+fn l2_norm_row<T: Float + NativePType>(v: &[T]) -> T {
+    let mut sum_sq = T::zero();
+    for &x in v {
+        sum_sq = sum_sq + x * x;
+    }
+    sum_sq.sqrt()
+}
+
+/// Computes the cosine similarity of one row, taking any hoisted norm from `norms` and computing
+/// the rest exactly as [`cosine_similarity_row`] does.
+///
+/// Each arm accumulates the same values in the same order as [`cosine_similarity_row`], and the
+/// denominator keeps its lhs-times-rhs order, so the result is bit-identical whether a norm was
+/// hoisted or not. The match costs one predictable branch per row: the arm is the same for the
+/// whole batch.
+fn cosine_similarity_row_prepared<T: Float + NativePType>(
+    norms: &ConstNorms<T>,
+    a: &[T],
+    b: &[T],
+) -> T {
+    match (norms.lhs, norms.rhs) {
+        (None, None) => cosine_similarity_row(a, b),
+        (Some(norm_a), None) => {
+            let mut dot = T::zero();
+            let mut norm_sq_b = T::zero();
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                dot = dot + x * y;
+                norm_sq_b = norm_sq_b + y * y;
+            }
+            cosine_from_parts(dot, norm_a * norm_sq_b.sqrt())
+        }
+        (None, Some(norm_b)) => {
+            let mut dot = T::zero();
+            let mut norm_sq_a = T::zero();
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                dot = dot + x * y;
+                norm_sq_a = norm_sq_a + x * x;
+            }
+            cosine_from_parts(dot, norm_sq_a.sqrt() * norm_b)
+        }
+        (Some(norm_a), Some(norm_b)) => {
+            let mut dot = T::zero();
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                dot = dot + x * y;
+            }
+            cosine_from_parts(dot, norm_a * norm_b)
+        }
+    }
+}
+
 /// Computes the cosine similarity of two equal-length float slices.
 ///
 /// Returns `dot(a, b) / (||a|| * ||b||)`, or `0.0` when either norm is zero.
@@ -123,7 +194,12 @@ fn cosine_similarity_row<T: Float + NativePType>(a: &[T], b: &[T]) -> T {
         norm_sq_b = norm_sq_b + y * y;
     }
 
-    let denom = norm_sq_a.sqrt() * norm_sq_b.sqrt();
+    cosine_from_parts(dot, norm_sq_a.sqrt() * norm_sq_b.sqrt())
+}
+
+/// The shared tail of every cosine arm: `dot / denom`, guarded to `0.0` when the denominator is
+/// zero.
+fn cosine_from_parts<T: Float>(dot: T, denom: T) -> T {
     if denom == T::zero() {
         T::zero()
     } else {

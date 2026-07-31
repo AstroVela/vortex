@@ -4,6 +4,7 @@
 use rstest::rstest;
 use vortex_array::ArrayPlugin;
 use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::MaskedArray;
@@ -11,6 +12,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
+use vortex_array::assert_arrays_eq;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::validity::Validity;
@@ -23,6 +25,7 @@ use crate::types::vector::Vector;
 use crate::utils::test_helpers::assert_close;
 use crate::utils::test_helpers::constant_tensor_array;
 use crate::utils::test_helpers::l2_denorm_array;
+use crate::utils::test_helpers::literal_vector_array;
 use crate::utils::test_helpers::tensor_array;
 use crate::utils::test_helpers::vector_array;
 
@@ -33,6 +36,20 @@ fn eval_cosine_similarity(lhs: ArrayRef, rhs: ArrayRef) -> VortexResult<Vec<f64>
     let mut ctx = SESSION.create_execution_ctx();
     let prim: PrimitiveArray = result.into_array().execute(&mut ctx)?;
     Ok(prim.as_slice::<f64>().to_vec())
+}
+
+/// Like [`eval_cosine_similarity`], but returns the executed array for exact array comparisons.
+fn eval_cosine_similarity_array(
+    lhs: ArrayRef,
+    rhs: ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let scalar_fn = CosineSimilarity.bind(EmptyOptions);
+    let result = ScalarFnArray::try_new(scalar_fn, vec![lhs, rhs])?;
+    Ok(result
+        .into_array()
+        .execute::<PrimitiveArray>(ctx)?
+        .into_array())
 }
 
 #[test]
@@ -435,6 +452,82 @@ fn vector_constant_matches_plain() -> VortexResult<()> {
         &eval_cosine_similarity(lhs, rhs)?,
         &[1.0 / 3.0, 1.0, 2.0 / 3.0, 8.0 / 9.0],
     );
+    Ok(())
+}
+
+/// The literal-constant shape (a [`ConstantArray`] over a [`Vector`] extension scalar, what a
+/// `lit(query)` expression produces) reaches the row loop, unlike an extension-wrapped constant,
+/// which `reduce_encoded` rewrites into `L2Denorm`. There the prepared kernel hoists the query's
+/// norm once per batch, and the result must be exactly the result of expanding the same query
+/// into a full column, which hoists nothing.
+///
+/// [`ConstantArray`]: vortex_array::arrays::ConstantArray
+#[test]
+fn literal_constant_rhs_matches_expanded_column() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let lhs = vector_array(
+        3,
+        &[
+            1.0, 0.0, 0.0, //
+            1.0, 2.0, 2.0, //
+            0.0, 0.0, 1.0, //
+            2.0, 1.0, 2.0, //
+        ],
+    )?;
+    let query = [1.0, 2.0, 2.0];
+
+    let from_constant =
+        eval_cosine_similarity_array(lhs.clone(), literal_vector_array(&query, 4), &mut ctx)?;
+    let from_expanded =
+        eval_cosine_similarity_array(lhs, vector_array(3, &query.repeat(4))?, &mut ctx)?;
+
+    assert_arrays_eq!(from_constant, from_expanded, &mut ctx);
+    Ok(())
+}
+
+/// The mirror of [`literal_constant_rhs_matches_expanded_column`], exercising the hoisted-lhs arm
+/// of the prepared kernel.
+#[test]
+fn literal_constant_lhs_matches_expanded_column() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let rhs = vector_array(
+        3,
+        &[
+            1.0, 0.0, 0.0, //
+            1.0, 2.0, 2.0, //
+            0.0, 0.0, 1.0, //
+            2.0, 1.0, 2.0, //
+        ],
+    )?;
+    let query = [1.0, 2.0, 2.0];
+
+    let from_constant =
+        eval_cosine_similarity_array(literal_vector_array(&query, 4), rhs.clone(), &mut ctx)?;
+    let from_expanded =
+        eval_cosine_similarity_array(vector_array(3, &query.repeat(4))?, rhs, &mut ctx)?;
+
+    assert_arrays_eq!(from_constant, from_expanded, &mut ctx);
+    Ok(())
+}
+
+/// A zero-norm literal constant query must be guarded to `0.0` on every row by the prepared row
+/// kernel, exactly as the unprepared kernel guards it.
+#[test]
+fn literal_constant_zero_norm_query_yields_zero() -> VortexResult<()> {
+    let lhs = vector_array(3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    let rhs = literal_vector_array(&[0.0f64, 0.0, 0.0], 2);
+    assert_close(&eval_cosine_similarity(lhs, rhs)?, &[0.0, 0.0]);
+    Ok(())
+}
+
+/// Two literal constants are folded to a single-row execution by the strict lifting, and that row
+/// still runs the prepared kernel with both norms hoisted.
+#[test]
+fn both_literal_constants() -> VortexResult<()> {
+    let lhs = literal_vector_array(&[1.0f64, 0.0, 0.0], 3);
+    let rhs = literal_vector_array(&[1.0f64, 1.0, 0.0], 3);
+    let expected = 1.0 / 2.0_f64.sqrt();
+    assert_close(&eval_cosine_similarity(lhs, rhs)?, &[expected; 3]);
     Ok(())
 }
 
