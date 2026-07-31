@@ -209,11 +209,27 @@ impl ZoneMap {
             return None;
         }
         let dtype = aggregate_state_dtype(&self.column_dtype, aggregate_fn)?;
-        let field = self
-            .array
-            .unmasked_field_by_name_opt(aggregate_fn.to_string())?;
-        // eq_ignore_nullability returns false for bounded min/max which is
-        // approximate and thus we can't use it
+
+        // We need exact boundaries in zone maps to supply this info as result
+        if self
+            .aggregate_fns
+            .iter()
+            .any(|stored| stored.can_satisfy(aggregate_fn).is_exact())
+            && let Some(field) = self
+                .array
+                .unmasked_field_by_name_opt(aggregate_fn.to_string())
+        {
+            return field.dtype().eq_ignore_nullability(&dtype).then_some(field);
+        }
+
+        // Legacy stats schema, strings always carry inexact stats
+        let stat = Stat::from_aggregate_fn(aggregate_fn)?;
+        if matches!(stat, Stat::Min | Stat::Max)
+            && (self.column_dtype.is_utf8() || self.column_dtype.is_binary())
+        {
+            return None;
+        }
+        let field = self.array.unmasked_field_by_name_opt(stat.name())?;
         field.dtype().eq_ignore_nullability(&dtype).then_some(field)
     }
 
@@ -441,6 +457,7 @@ mod tests {
     use vortex_array::aggregate_fn::fns::min::Min;
     use vortex_array::aggregate_fn::fns::nan_count::NanCount;
     use vortex_array::aggregate_fn::fns::null_count::NullCount;
+    use vortex_array::aggregate_fn::fns::sum::Sum;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::StructArray;
@@ -461,6 +478,7 @@ mod tests {
     use vortex_array::expr::not_eq;
     use vortex_array::expr::root;
     use vortex_array::expr::stats::Stat;
+    use vortex_array::scalar::Scalar;
     use vortex_array::stats::all_nan;
     use vortex_array::stats::all_non_nan;
     use vortex_array::stats::all_non_null;
@@ -547,6 +565,61 @@ mod tests {
             BoolArray::from_iter([false, true, true]),
             ctx
         );
+    }
+
+    #[test]
+    fn bounded_min_max() {
+        let max_bytes = default_bounded_stat_max_bytes();
+        let max = BoundedMax.bind(BoundedMaxOptions { max_bytes });
+        let min = BoundedMin.bind(BoundedMinOptions { max_bytes });
+        let dtype = DType::Utf8(Nullability::NonNullable);
+        let array =
+            StructArray::from_fields(&[(max.to_string(), buffer![0i32].into_array())]).unwrap();
+        let zone_map = unsafe { ZoneMap::new_unchecked(dtype, array, Arc::new([max, min]), 3, 3) };
+        assert!(!zone_map.supports_zone_partial(&Max.bind(NumericalAggregateOpts::skip_nans())));
+        assert!(!zone_map.supports_zone_partial(&Min.bind(NumericalAggregateOpts::skip_nans())));
+    }
+
+    #[test]
+    fn legacy_numeric_min_max_sum() {
+        let max = PrimitiveArray::new(buffer![3i32, 7, 5], Validity::AllValid).into_array();
+        let max_is_truncated = BoolArray::from_iter([false, false, false]).into_array();
+        let min = PrimitiveArray::new(buffer![1i32, 2, 4], Validity::AllValid).into_array();
+        let min_is_truncated = BoolArray::from_iter([false, false, false]).into_array();
+        let sum = PrimitiveArray::new(buffer![6i64, 15, 12], Validity::AllValid).into_array();
+        let array = StructArray::from_fields(&[
+            ("max", max),
+            ("max_is_truncated", max_is_truncated),
+            ("min", min),
+            ("min_is_truncated", min_is_truncated),
+            ("sum", sum),
+        ])
+        .unwrap();
+        let ptype = PType::I32.into();
+        let stats = Arc::new([Stat::Max, Stat::Min, Stat::Sum]);
+        let zone_map = ZoneMap::try_new_legacy(ptype, array, stats, 4, 12).unwrap();
+
+        assert!(zone_map.supports_zone_partial(&Max.bind(NumericalAggregateOpts::skip_nans())));
+        assert!(zone_map.supports_zone_partial(&Min.bind(NumericalAggregateOpts::skip_nans())));
+        assert!(zone_map.supports_zone_partial(&Sum.bind(NumericalAggregateOpts::skip_nans())));
+
+        let sum_fn = Sum.bind(NumericalAggregateOpts::skip_nans());
+        let mut acc = sum_fn.accumulator(&PType::I32.into()).unwrap();
+        assert!(
+            zone_map
+                .fold_zone_partials(&sum_fn, 0..3, &mut acc, &SESSION)
+                .unwrap()
+        );
+        assert_eq!(acc.partial_scalar().unwrap(), Scalar::from(33i64));
+    }
+
+    #[test]
+    fn legacy_string_min_max() {
+        let dtype = DType::Utf8(Nullability::NonNullable);
+        let array = StructArray::from_fields(&[("max", buffer![0i32].into_array())]).unwrap();
+        let zone_map = unsafe { ZoneMap::new_unchecked(dtype, array, Arc::new([]), 3, 3) };
+        assert!(!zone_map.supports_zone_partial(&Max.bind(NumericalAggregateOpts::skip_nans())));
+        assert!(!zone_map.supports_zone_partial(&Min.bind(NumericalAggregateOpts::skip_nans())));
     }
 
     #[test]
