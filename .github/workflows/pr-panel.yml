@@ -169,7 +169,8 @@ jobs:
       github.event_name == 'pull_request'
       && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Must comfortably exceed PREVIEW_WINDOW_SECONDS below.
+    timeout-minutes: 130
     concurrency:
       # A newer push supersedes the window a previous one opened.
       group: pr-panel-preview-${{ github.event.pull_request.number }}
@@ -204,8 +205,12 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Long enough that a reviewer can come back to the PR and still find it live.
+          # Only ever runs on PRs that change the panel.
+          PREVIEW_WINDOW_SECONDS: "7200"
         run: |
-          bash .github/scripts/pr-panel-preview.sh "$REPO" "$PR" 1800 15 \
-            "Clicks are being applied live by [a preview run]($RUN_URL) for the next 30
-            minutes, because \`issue_comment\` workflows only run from the default
-            branch. Once this is merged, clicks apply in seconds with no preview run."
+          bash .github/scripts/pr-panel-preview.sh "$REPO" "$PR" "$PREVIEW_WINDOW_SECONDS" 15 \
+            "Clicks are being applied live by [a preview run]($RUN_URL) for the next
+            $((PREVIEW_WINDOW_SECONDS / 60)) minutes, because \`issue_comment\` workflows
+            only run from the default branch. Once this is merged, clicks apply in
+            seconds with no preview run."
