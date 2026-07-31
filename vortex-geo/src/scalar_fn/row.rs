@@ -12,6 +12,7 @@ use vortex_array::scalar_fn::InputElement;
 use vortex_error::VortexResult;
 
 use crate::extension::geometries;
+use crate::extension::geometries_null_tolerant;
 use crate::extension::validate_geometry_operands;
 
 /// Marker for native geometry input elements: accepts any native geometry column and presents each
@@ -32,6 +33,9 @@ impl InputElement for GeometryRow {
     // Decoding builds a geometry from stored coordinates, and a malformed one in a *valid* row is a
     // domain error rather than an infrastructural failure.
     const DECODE_FALLIBLE: bool = true;
+    // Decoding arrow-exports the column and parses one geometry per row, so filtering the column
+    // first shrinks the decode itself, not just the row loop.
+    const DECODE_SHRINKS_WHEN_FILTERED: bool = true;
 
     fn validate(dtype: &DType) -> VortexResult<()> {
         validate_geometry_operands(std::slice::from_ref(dtype))
@@ -43,6 +47,16 @@ impl InputElement for GeometryRow {
 
     fn get(column: &Self::Column, index: usize) -> &Geometry<f64> {
         &column[index]
+    }
+
+    /// Null rows decode to a placeholder geometry that the branch-and-skip row loop never reads.
+    /// `Point` and `Polygon` columns are covered; other geometry types return `Ok(None)` and the
+    /// batch falls back to the filter strategy.
+    fn decode_null_tolerant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Column>> {
+        geometries_null_tolerant(&array, ctx)
     }
 }
 
