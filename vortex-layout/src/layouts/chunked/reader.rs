@@ -38,6 +38,7 @@ use crate::segments::SegmentSource;
 /// A [`LayoutReader`] for chunked layouts.
 pub struct ChunkedReader {
     layout: ChunkedLayout,
+    dtype: DType,
     name: Arc<str>,
     lazy_children: LazyReaderChildren,
 }
@@ -75,10 +76,39 @@ impl ChunkedReader {
         );
 
         Self {
+            dtype: layout.dtype().clone(),
             layout,
             name,
             lazy_children,
         }
+    }
+
+    pub(crate) fn try_new_with_readers(
+        layout: ChunkedLayout,
+        dtype: DType,
+        name: Arc<str>,
+        children: Vec<LayoutReaderRef>,
+    ) -> VortexResult<Self> {
+        vortex_ensure!(
+            children.len() == layout.nchildren(),
+            "Chunked plan supplied {} readers for {} chunks",
+            children.len(),
+            layout.nchildren()
+        );
+        for (index, child) in children.iter().enumerate() {
+            vortex_ensure!(
+                child.dtype() == &dtype,
+                "Chunk {index} reader dtype {} does not match parent dtype {}",
+                child.dtype(),
+                dtype
+            );
+        }
+        Ok(Self {
+            layout,
+            dtype,
+            name,
+            lazy_children: LazyReaderChildren::from_readers(children),
+        })
     }
 
     /// Return the [`LayoutReader`] for the given chunk.
@@ -166,7 +196,7 @@ impl LayoutReader for ChunkedReader {
     }
 
     fn dtype(&self) -> &DType {
-        self.layout.dtype()
+        &self.dtype
     }
 
     fn row_count(&self) -> u64 {

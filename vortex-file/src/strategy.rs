@@ -119,6 +119,7 @@ pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
     allowed.insert(ZigZag.id());
 
     // Experimental encodings
+
     if use_experimental_patches() {
         allowed.insert(Patched.id());
     }

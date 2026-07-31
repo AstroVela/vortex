@@ -4,18 +4,18 @@
 This is a provisional design, not a description of the current scan planner.
 :::
 
-## Expression scan plan
+## Expression plan
 
 Add a physical plan that applies an expression to the output of another scan plan:
 
 ```rust
-pub struct ExpressionScanPlan {
+pub struct ExpressionPlan {
     expression: Expression,
-    child: ScanPlanRef,
+    child: PlanRef,
 }
 ```
 
-`ExpressionScanPlan` inherits its row domain from `child` and derives its output dtype from
+`ExpressionPlan` inherits its row domain from `child` and derives its output dtype from
 `expression`. Any part of the expression that cannot be pushed down remains in this plan and is
 evaluated over the child's result.
 
@@ -26,13 +26,13 @@ other expression node) and a concrete scan-plan type.
 Composite scan plans expose ordered logical children to this optimizer:
 
 ```text
-StructScanPlan.children = [field(0), ..., field(n - 1), validity?]
-DictScanPlan.children   = [codes, values]
+StructPlan.children = [field(0), ..., field(n - 1), validity?]
+DictPlan.children   = [codes, values]
 ```
 
 ## Pushdown
 
-Optimizing `ExpressionScanPlan(expression, child)` has three phases.
+Optimizing `ExpressionPlan(expression, child)` has three phases.
 
 1. **Annotate dependencies.** Walk the expression and annotate every node with the indices of the
    immediate scan-plan children needed to evaluate it. A registered
@@ -54,7 +54,7 @@ Optimizing `ExpressionScanPlan(expression, child)` has three phases.
    `(expression node, scan plan, child index) -> expression` kernel. For a non-nullable struct,
    `get_item($, "a")` becomes `$` when lowering into field `a`; targeting another field rejects that
    pushdown. When lowering into a struct's validity child, `is_not_null($)` becomes `$` and
-   `is_null($)` becomes `not($)`. The lowered group is installed as an `ExpressionScanPlan` over
+   `is_null($)` becomes `not($)`. The lowered group is installed as an `ExpressionPlan` over
    that child, and pushdown then continues recursively. Every rule must prove equivalence across
    the plan boundary; lowering is not a generic replacement of `$`.
 
@@ -69,7 +69,7 @@ fallback.
 ### Struct without validity
 
 ```text
-plan = StructScanPlan.children = [a, b]
+plan = StructPlan.children = [a, b]
 expr = (get_item($, "a") + 1) * get_item($, "b")
 
 annotations:
@@ -95,7 +95,7 @@ struct-specific rule: it is rebuilt after its `get_item` child is lowered.
 ### Struct with validity
 
 ```text
-plan = StructScanPlan.children = [a, b, validity]
+plan = StructPlan.children = [a, b, validity]
 expr = is_not_null($) && (get_item($, "a") > 0)
 
 annotations:
@@ -162,7 +162,7 @@ residual combination expression, not just scope substitution.
 ### Dictionary
 
 ```text
-plan = DictScanPlan.children = [codes, values]
+plan = DictPlan.children = [codes, values]
 expr = byte_length($)
 
 annotations:
@@ -176,9 +176,9 @@ groups after lowering:
 
 combine = $
 
-result = DictScanPlan.children = [
+result = DictPlan.children = [
   codes,
-  ExpressionScanPlan(byte_length($), values),
+  ExpressionPlan(byte_length($), values),
 ]
 ```
 
@@ -186,8 +186,24 @@ This is valid for the same strict, infallible, negative-cost functions accepted 
 dictionary pushdown. The dictionary plan reuses `codes` and applies the function once to
 `values`.
 
+## Reader materialization
+
+Plans do not own sources, sessions, or readers. A layout first creates a runtime-independent plan;
+only the optimized plan creates the reader tree:
+
+```rust
+let plan = layout.new_plan()?;
+let plan = ExpressionPlan::new_ref(expression, plan)?.optimize()?;
+let reader = plan.new_reader(name, segment_source, session, ctx)?;
+```
+
+Each surviving plan node creates its corresponding reader node. Composite readers are constructed
+from their optimized child plans' readers, never by reopening the original layout children. If
+optimization replaces a `StructPlan` with one of its field plans, materialization therefore creates
+the field reader directly and no stale struct reader remains.
+
 ## Future work
 
-The same optimizer may eventually support `ScanPlan x ScanPlan -> ScanPlan` transforms. Those
+The same optimizer may eventually support `Plan x Plan -> Plan` transforms. Those
 plan-to-plan rewrites are outside the scope of this proposal; this design covers only expression
 and scalar-function pushdown through scan plans.

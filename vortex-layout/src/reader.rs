@@ -217,14 +217,18 @@ impl ArrayFutureExt for ArrayFuture {
 
 /// Lazily constructs and caches child readers while preserving reader context.
 pub struct LazyReaderChildren {
+    source: Option<LazyReaderChildrenSource>,
+    // TODO(ngates): we may want a hash map of some sort here?
+    cache: Vec<OnceCell<LayoutReaderRef>>,
+}
+
+struct LazyReaderChildrenSource {
     children: Arc<dyn LayoutChildren>,
     dtypes: Vec<DType>,
     names: Vec<Arc<str>>,
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
     ctx: LayoutReaderContext,
-    // TODO(ngates): we may want a hash map of some sort here?
-    cache: Vec<OnceCell<LayoutReaderRef>>,
 }
 
 impl LazyReaderChildren {
@@ -242,13 +246,23 @@ impl LazyReaderChildren {
         let nchildren = children.nchildren();
         let cache = (0..nchildren).map(|_| OnceCell::new()).collect();
         Self {
-            children,
-            dtypes,
-            names,
-            segment_source,
-            session,
-            ctx,
+            source: Some(LazyReaderChildrenSource {
+                children,
+                dtypes,
+                names,
+                segment_source,
+                session,
+                ctx,
+            }),
             cache,
+        }
+    }
+
+    /// Create a child-reader collection from readers materialized by optimized child plans.
+    pub(crate) fn from_readers(readers: Vec<LayoutReaderRef>) -> Self {
+        Self {
+            source: None,
+            cache: readers.into_iter().map(OnceCell::with_value).collect(),
         }
     }
 
@@ -259,13 +273,16 @@ impl LazyReaderChildren {
         }
 
         self.cache[idx].get_or_try_init(|| {
-            let dtype = &self.dtypes[idx];
-            let child = self.children.child(idx, dtype)?;
+            let Some(source) = &self.source else {
+                vortex_bail!("Prebuilt child reader {idx} was not initialized")
+            };
+            let dtype = &source.dtypes[idx];
+            let child = source.children.child(idx, dtype)?;
             child.new_reader(
-                Arc::clone(&self.names[idx]),
-                Arc::clone(&self.segment_source),
-                &self.session,
-                &self.ctx,
+                Arc::clone(&source.names[idx]),
+                Arc::clone(&source.segment_source),
+                &source.session,
+                &source.ctx,
             )
         })
     }

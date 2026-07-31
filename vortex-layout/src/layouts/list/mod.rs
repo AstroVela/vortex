@@ -4,7 +4,7 @@
 //! An experimental structural layout for list-typed columns.
 
 mod expr;
-mod reader;
+pub(crate) mod reader;
 pub mod writer;
 
 use std::sync::Arc;
@@ -33,6 +33,8 @@ use crate::LayoutReaderRef;
 use crate::LayoutRef;
 use crate::VTable;
 use crate::children::OwnedLayoutChildren;
+use crate::plan::ListPlan;
+use crate::plan::PlanRef;
 use crate::segments::SegmentSource;
 
 /// Child index of the elements layout.
@@ -160,6 +162,10 @@ impl VTable for List {
             session.clone(),
             ctx,
         )?))
+    }
+
+    fn new_plan(layout: &Layout<Self>) -> VortexResult<PlanRef> {
+        Ok(Arc::new(ListPlan::try_new(layout)?))
     }
 }
 

@@ -26,9 +26,9 @@ use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
+use crate::plan::PlanRef;
 use crate::scan::plan;
 use crate::scan::plan_v2;
-use crate::scan::plan_v2::ScanPlanRef;
 use crate::scan::splits::Splits;
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
@@ -132,8 +132,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
     )]
     pub fn new_plan_v2(
         session: VortexSession,
-        projection: ScanPlanRef,
-        predicates: Vec<ScanPlanRef>,
+        projection: PlanRef,
+        predicates: Vec<PlanRef>,
         filter: Option<Expression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
@@ -143,10 +143,13 @@ impl<A: 'static + Send> RepeatedScan<A> {
         map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
         limit: Option<u64>,
         dtype: DType,
-    ) -> Self {
-        Self {
+    ) -> VortexResult<Self> {
+        let execution = ExecutionPlan::PlanV2(plan_v2::PlanV2::try_new(
+            projection, predicates, filter, &session,
+        )?);
+        Ok(Self {
             session,
-            execution: ExecutionPlan::PlanV2(plan_v2::PlanV2::new(projection, predicates, filter)),
+            execution,
             ordered,
             row_range,
             selection,
@@ -155,7 +158,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
             map_fn,
             limit,
             dtype,
-        }
+        })
     }
 
     pub fn execute(

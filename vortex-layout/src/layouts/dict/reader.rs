@@ -45,6 +45,7 @@ use crate::segments::SegmentSource;
 
 pub struct DictReader {
     layout: DictLayout,
+    dtype: DType,
     name: Arc<str>,
     session: VortexSession,
 
@@ -73,7 +74,6 @@ impl DictReader {
         let codes_layout = layout
             .slot(1)?
             .vortex_expect("DictLayout always has a codes child");
-        let values_len = usize::try_from(values_layout.row_count())?;
         let values = values_layout.new_reader(
             format!("{name}.values").into(),
             Arc::clone(&segment_source),
@@ -87,8 +87,33 @@ impl DictReader {
             &ctx,
         )?;
 
+        Self::try_new_with_readers(layout, name, session, codes, values)
+    }
+
+    pub(crate) fn try_new_with_readers(
+        layout: DictLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        codes: LayoutReaderRef,
+        values: LayoutReaderRef,
+    ) -> VortexResult<Self> {
+        vortex_error::vortex_ensure!(
+            codes.row_count() == layout.row_count(),
+            "Dictionary codes reader has {} rows, expected {}",
+            codes.row_count(),
+            layout.row_count()
+        );
+        vortex_error::vortex_ensure!(
+            codes.dtype() == &layout.codes_dtype,
+            "Dictionary codes reader dtype {} does not match {}",
+            codes.dtype(),
+            layout.codes_dtype
+        );
+        let values_len = usize::try_from(values.row_count())?;
+        let dtype = values.dtype().clone();
         Ok(Self {
             layout,
+            dtype,
             name,
             session,
             values_len,
@@ -209,7 +234,7 @@ impl LayoutReader for DictReader {
     }
 
     fn dtype(&self) -> &DType {
-        self.layout.dtype()
+        &self.dtype
     }
 
     fn row_count(&self) -> u64 {

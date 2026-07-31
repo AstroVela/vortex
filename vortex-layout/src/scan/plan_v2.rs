@@ -3,9 +3,7 @@
 
 // See https://github.com/vortex-data/vortex/issues/9062
 
-use std::any::Any;
 use std::ops::BitAnd;
-use std::ops::Range;
 use std::sync::Arc;
 
 use bit_vec::BitVec;
@@ -13,48 +11,49 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
-use vortex_array::dtype::DType;
-use vortex_array::dtype::Nullability;
 use vortex_array::expr::Expression;
-use vortex_array::expr::get_item;
 use vortex_array::expr::root;
-use vortex_array::expr::transform::replace;
-use vortex_array::scalar_fn::ReduceCtx;
-use vortex_array::scalar_fn::ReduceNode;
-use vortex_array::scalar_fn::ReduceNodeRef;
-use vortex_array::scalar_fn::ScalarFnRef;
-use vortex_array::scalar_fn::ScalarFnVTableExt;
-use vortex_array::scalar_fn::fns::get_item::GetItem;
-use vortex_array::scalar_fn::fns::pack::Pack;
-use vortex_array::scalar_fn::fns::pack::PackOptions;
-use vortex_array::scalar_fn::fns::root::Root;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
 use vortex_scan::row_mask::RowMask;
+use vortex_session::VortexSession;
 
-use crate::ArrayFuture;
 use crate::LayoutReaderRef;
+use crate::plan::PlanRef;
 use crate::scan::filter::FilterExpr;
+use crate::segments::SegmentFuture;
+use crate::segments::SegmentId;
+use crate::segments::SegmentSource;
 
 pub(crate) struct PlanV2 {
-    projection: ScanPlanRef,
-    predicates: Vec<ScanPlanRef>,
+    projection: LayoutReaderRef,
+    predicates: Vec<LayoutReaderRef>,
     filter: Option<Expression>,
 }
 
 impl PlanV2 {
-    pub(crate) fn new(
-        projection: ScanPlanRef,
-        predicates: Vec<ScanPlanRef>,
+    pub(crate) fn try_new(
+        projection: PlanRef,
+        predicates: Vec<PlanRef>,
         filter: Option<Expression>,
-    ) -> Self {
-        Self {
+        session: &VortexSession,
+    ) -> VortexResult<Self> {
+        let segment_source: Arc<dyn SegmentSource> = Arc::new(UnavailableSegmentSource);
+        let ctx = Default::default();
+        let projection =
+            projection.new_reader(Arc::from(""), Arc::clone(&segment_source), session, &ctx)?;
+        let predicates = predicates
+            .iter()
+            .map(|predicate| {
+                predicate.new_reader(Arc::from(""), Arc::clone(&segment_source), session, &ctx)
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+        Ok(Self {
             projection,
             predicates,
             filter,
-        }
+        })
     }
 
     pub(crate) fn task_context<A>(
@@ -70,405 +69,6 @@ impl PlanV2 {
             projection: Arc::clone(&self.projection),
             mapper,
         })
-    }
-}
-
-/// Shared handle to a heap-allocated V2 physical scan plan.
-pub type ScanPlanRef = Arc<dyn ScanPlan>;
-
-/// A heap-allocated physical scan plan.
-///
-/// A source plan represents an instantiated layout. [`apply_expr`](Self::apply_expr) derives
-/// another plan whose root value is the applied expression, and [`optimize`](Self::optimize)
-/// rewrites that derived plan before execution. Execution therefore selects an already-bound plan
-/// and supplies only its row range and mask.
-pub trait ScanPlan: 'static + Send + Sync {
-    /// Return this plan as [`Any`] for plan-specific optimization rules.
-    fn as_any(&self) -> &dyn Any;
-
-    /// Apply `expr` to this plan's root value and return the resulting plan.
-    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef>;
-
-    /// Optimize this plan and return the resulting plan.
-    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef>;
-
-    /// Returns the name of the underlying layout reader for debugging.
-    fn name(&self) -> &Arc<str>;
-
-    /// Returns the dtype produced by this plan.
-    fn dtype(&self) -> &DType;
-
-    /// Returns the number of rows in this plan's row domain.
-    fn row_count(&self) -> u64;
-
-    /// Returns a mask where all false values are proven false for this plan.
-    fn pruning_evaluation(&self, row_range: &Range<u64>, mask: Mask) -> VortexResult<MaskFuture>;
-
-    /// Evaluates this boolean plan and intersects it with `mask`.
-    fn filter_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<MaskFuture>;
-
-    /// Evaluates this plan over the selected rows.
-    fn projection_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<ArrayFuture>;
-}
-
-/// A non-nullable struct plan whose fields can be selected independently.
-///
-/// The struct presents itself to scalar-function reduction as a [`Pack`] over its field plans.
-/// This lets rules such as `GetItem(Pack(...))` reduce directly to a field plan while the
-/// compatibility source remains available for expressions that cannot yet be reduced physically.
-/// Field plans are created only when a reduction selects them, so planning one field does not
-/// construct and discard plans for its siblings.
-pub struct StructScanPlan {
-    source: ScanPlanRef,
-    pack: ScalarFnRef,
-}
-
-impl StructScanPlan {
-    /// Wrap a non-nullable struct source with independently selectable field plans.
-    pub fn try_new(source: ScanPlanRef) -> VortexResult<Self> {
-        let DType::Struct(struct_fields, Nullability::NonNullable) = source.dtype() else {
-            vortex_bail!(
-                "StructScanPlan requires a non-nullable struct source, got {}",
-                source.dtype()
-            );
-        };
-
-        let names = struct_fields.names().clone();
-        let pack = Pack.bind(PackOptions {
-            names,
-            nullability: Nullability::NonNullable,
-        });
-
-        Ok(Self { source, pack })
-    }
-
-    fn field(&self, idx: usize) -> ScanPlanRef {
-        let struct_fields = self
-            .source
-            .dtype()
-            .as_struct_fields_opt()
-            .vortex_expect("StructScanPlan source must have a struct dtype");
-        let name = struct_fields
-            .field_name(idx)
-            .vortex_expect("Pack child must have a matching struct field")
-            .clone();
-        let dtype = struct_fields
-            .field_by_index(idx)
-            .vortex_expect("Pack child must have a matching struct field");
-
-        Arc::new(StructFieldScanPlan {
-            source: Arc::clone(&self.source),
-            name,
-            dtype,
-        })
-    }
-}
-
-impl ScanPlan for StructScanPlan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef> {
-        if expr.is::<GetItem>() && expr.child(0).is::<Root>() {
-            let root = Arc::clone(&self);
-            let root: ScanPlanRef = root;
-            if let Some(reduced) = reduce_expr(&root, &expr)? {
-                return Ok(reduced);
-            }
-        }
-
-        Arc::clone(&self.source).apply_expr(expr)
-    }
-
-    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef> {
-        let source = Arc::clone(&self.source).optimize()?;
-        Ok(Arc::new(Self::try_new(source)?))
-    }
-
-    fn name(&self) -> &Arc<str> {
-        self.source.name()
-    }
-
-    fn dtype(&self) -> &DType {
-        self.source.dtype()
-    }
-
-    fn row_count(&self) -> u64 {
-        self.source.row_count()
-    }
-
-    fn pruning_evaluation(&self, row_range: &Range<u64>, mask: Mask) -> VortexResult<MaskFuture> {
-        self.source.pruning_evaluation(row_range, mask)
-    }
-
-    fn filter_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<MaskFuture> {
-        self.source.filter_evaluation(row_range, mask)
-    }
-
-    fn projection_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<ArrayFuture> {
-        self.source.projection_evaluation(row_range, mask)
-    }
-}
-
-struct StructFieldScanPlan {
-    source: ScanPlanRef,
-    name: vortex_array::dtype::FieldName,
-    dtype: DType,
-}
-
-impl StructFieldScanPlan {
-    fn expr(&self) -> Expression {
-        get_item(self.name.clone(), root())
-    }
-
-    fn applied(&self) -> VortexResult<ScanPlanRef> {
-        Arc::clone(&self.source).apply_expr(self.expr())
-    }
-}
-
-impl ScanPlan for StructFieldScanPlan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef> {
-        let expr = replace(expr, &root(), self.expr());
-        Arc::clone(&self.source).apply_expr(expr)
-    }
-
-    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef> {
-        self.applied()?.optimize()
-    }
-
-    fn name(&self) -> &Arc<str> {
-        self.source.name()
-    }
-
-    fn dtype(&self) -> &DType {
-        &self.dtype
-    }
-
-    fn row_count(&self) -> u64 {
-        self.source.row_count()
-    }
-
-    fn pruning_evaluation(&self, row_range: &Range<u64>, mask: Mask) -> VortexResult<MaskFuture> {
-        self.applied()?.pruning_evaluation(row_range, mask)
-    }
-
-    fn filter_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<MaskFuture> {
-        self.applied()?.filter_evaluation(row_range, mask)
-    }
-
-    fn projection_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<ArrayFuture> {
-        self.applied()?.projection_evaluation(row_range, mask)
-    }
-}
-
-struct ScanPlanReduceNode {
-    plan: ScanPlanRef,
-}
-
-impl ReduceNode for ScanPlanReduceNode {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn node_dtype(&self) -> VortexResult<DType> {
-        Ok(self.plan.dtype().clone())
-    }
-
-    fn scalar_fn(&self) -> Option<&ScalarFnRef> {
-        self.plan
-            .as_any()
-            .downcast_ref::<StructScanPlan>()
-            .map(|plan| &plan.pack)
-    }
-
-    fn child(&self, idx: usize) -> ReduceNodeRef {
-        let plan = self
-            .plan
-            .as_any()
-            .downcast_ref::<StructScanPlan>()
-            .vortex_expect("only StructScanPlan nodes expose reduction children");
-        Arc::new(Self {
-            plan: plan.field(idx),
-        })
-    }
-
-    fn child_count(&self) -> usize {
-        self.plan
-            .as_any()
-            .downcast_ref::<StructScanPlan>()
-            .map_or(0, |plan| plan.source.dtype().as_struct_fields().nfields())
-    }
-}
-
-struct AppliedExprReduceNode {
-    scalar_fn: ScalarFnRef,
-    dtype: DType,
-    child: ReduceNodeRef,
-}
-
-impl ReduceNode for AppliedExprReduceNode {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn node_dtype(&self) -> VortexResult<DType> {
-        Ok(self.dtype.clone())
-    }
-
-    fn scalar_fn(&self) -> Option<&ScalarFnRef> {
-        Some(&self.scalar_fn)
-    }
-
-    fn child(&self, idx: usize) -> ReduceNodeRef {
-        (idx == 0)
-            .then(|| Arc::clone(&self.child))
-            .vortex_expect("GetItem reduction has exactly one child")
-    }
-
-    fn child_count(&self) -> usize {
-        1
-    }
-}
-
-struct ScanPlanReduceCtx;
-
-impl ReduceCtx for ScanPlanReduceCtx {
-    fn new_node(
-        &self,
-        _scalar_fn: ScalarFnRef,
-        _children: &[ReduceNodeRef],
-    ) -> VortexResult<ReduceNodeRef> {
-        vortex_bail!("scan-plan reduction cannot yet create scalar-function plans")
-    }
-}
-
-fn reduce_expr(plan: &ScanPlanRef, expr: &Expression) -> VortexResult<Option<ScanPlanRef>> {
-    let root_node: ReduceNodeRef = Arc::new(ScanPlanReduceNode {
-        plan: Arc::clone(plan),
-    });
-    let node = AppliedExprReduceNode {
-        scalar_fn: expr.scalar_fn().clone(),
-        dtype: expr.return_dtype(plan.dtype())?,
-        child: root_node,
-    };
-
-    let Some(reduced) = expr.scalar_fn().reduce(&node, &ScanPlanReduceCtx)? else {
-        return Ok(None);
-    };
-    let Some(reduced) = reduced.as_any().downcast_ref::<ScanPlanReduceNode>() else {
-        vortex_bail!("scan-plan reduction returned a non-plan node")
-    };
-
-    Ok(Some(Arc::clone(&reduced.plan)))
-}
-
-/// Compatibility V2 source and expression plan backed by a layout reader.
-///
-/// Applying an expression and optimizing it produce new heap-allocated plans. Execution delegates
-/// the resulting expression to the established reader implementation. Layout-specific source plans
-/// can replace this compatibility node without changing the split execution loop.
-pub struct LayoutReaderScanPlanV2 {
-    reader: LayoutReaderRef,
-    expr: Expression,
-    dtype: DType,
-}
-
-impl LayoutReaderScanPlanV2 {
-    /// Create a V2 source plan for `reader`.
-    pub fn new(reader: LayoutReaderRef) -> Self {
-        let dtype = reader.dtype().clone();
-        Self {
-            reader,
-            expr: root(),
-            dtype,
-        }
-    }
-
-    fn try_new(reader: LayoutReaderRef, expr: Expression) -> VortexResult<Self> {
-        let dtype = expr.return_dtype(reader.dtype())?;
-        Ok(Self {
-            reader,
-            expr,
-            dtype,
-        })
-    }
-}
-
-impl ScanPlan for LayoutReaderScanPlanV2 {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef> {
-        let expr = replace(expr, &root(), self.expr.clone());
-        Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
-    }
-
-    fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef> {
-        let expr = self.expr.optimize_recursive(self.reader.dtype())?;
-        Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
-    }
-
-    fn name(&self) -> &Arc<str> {
-        self.reader.name()
-    }
-
-    fn dtype(&self) -> &DType {
-        &self.dtype
-    }
-
-    fn row_count(&self) -> u64 {
-        self.reader.row_count()
-    }
-
-    fn pruning_evaluation(&self, row_range: &Range<u64>, mask: Mask) -> VortexResult<MaskFuture> {
-        self.reader.pruning_evaluation(row_range, &self.expr, mask)
-    }
-
-    fn filter_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<MaskFuture> {
-        self.reader.filter_evaluation(row_range, &self.expr, mask)
-    }
-
-    fn projection_evaluation(
-        &self,
-        row_range: &Range<u64>,
-        mask: MaskFuture,
-    ) -> VortexResult<ArrayFuture> {
-        self.reader
-            .projection_evaluation(row_range, &self.expr, mask)
     }
 }
 
@@ -554,7 +154,7 @@ pub(crate) fn split_exec<A: 'static + Send>(
 
                     dynamic_versions[idx] = filter.dynamic_updates(idx).map(|du| du.version());
                     let conjunct_mask = predicate
-                        .pruning_evaluation(&row_range, mask.clone())?
+                        .pruning_evaluation(&row_range, &root(), mask.clone())?
                         .await?;
                     mask = mask.bitand(&conjunct_mask);
                 }
@@ -572,7 +172,7 @@ pub(crate) fn split_exec<A: 'static + Send>(
                     {
                         dynamic_versions[idx] = Some(version);
                         let conjunct_mask = ctx.predicates[idx]
-                            .pruning_evaluation(&row_range, mask.clone())?
+                            .pruning_evaluation(&row_range, &root(), mask.clone())?
                             .await?;
                         mask = mask.bitand(&conjunct_mask);
                     }
@@ -581,7 +181,7 @@ pub(crate) fn split_exec<A: 'static + Send>(
                     }
 
                     let conjunct_mask = ctx.predicates[idx]
-                        .filter_evaluation(&row_range, MaskFuture::ready(mask))?
+                        .filter_evaluation(&row_range, &root(), MaskFuture::ready(mask))?
                         .await?;
                     filter.report_selectivity(idx, conjunct_mask.density());
                     mask = conjunct_mask;
@@ -592,9 +192,9 @@ pub(crate) fn split_exec<A: 'static + Send>(
         }
     };
 
-    let projection_future = ctx
-        .projection
-        .projection_evaluation(&row_range, filter_mask.clone())?;
+    let projection_future =
+        ctx.projection
+            .projection_evaluation(&row_range, &root(), filter_mask.clone())?;
 
     let mapper = Arc::clone(&ctx.mapper);
     let array_fut = async move {
@@ -613,28 +213,27 @@ pub(crate) fn split_exec<A: 'static + Send>(
 /// Information needed to execute one split from a V2 physical scan plan.
 pub(crate) struct TaskContext<A> {
     filter: Option<Arc<FilterExpr>>,
-    predicates: Vec<ScanPlanRef>,
-    projection: ScanPlanRef,
+    predicates: Vec<LayoutReaderRef>,
+    projection: LayoutReaderRef,
     mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
+}
+
+struct UnavailableSegmentSource;
+
+impl SegmentSource for UnavailableSegmentSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        async move {
+            vortex_bail!(
+                "Compatibility plan unexpectedly requested segment {id:?} while materializing an existing reader"
+            )
+        }
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-
-    use vortex_array::dtype::FieldMask;
-    use vortex_array::dtype::FieldName;
-    use vortex_array::dtype::Nullability;
-    use vortex_array::dtype::PType;
-    use vortex_array::dtype::StructFields;
-    use vortex_array::expr::eq;
-    use vortex_array::expr::get_item;
-    use vortex_array::expr::lit;
-
     use super::*;
-    use crate::LayoutReader;
-    use crate::RowSplits;
-    use crate::SplitRange;
 
     #[test]
     fn scan_impl_accepts_v1_and_v2_values() -> VortexResult<()> {
@@ -650,102 +249,5 @@ mod tests {
     #[test]
     fn scan_impl_rejects_unknown_value() {
         assert!(parse_scan_impl("unknown").is_err());
-    }
-
-    struct TestLayoutReader {
-        name: Arc<str>,
-        dtype: DType,
-    }
-
-    impl TestLayoutReader {
-        fn new() -> Self {
-            Self {
-                name: Arc::from("test"),
-                dtype: DType::Struct(
-                    StructFields::from_iter([(
-                        FieldName::from("a"),
-                        DType::Primitive(PType::I32, Nullability::NonNullable),
-                    )]),
-                    Nullability::NonNullable,
-                ),
-            }
-        }
-    }
-
-    impl LayoutReader for TestLayoutReader {
-        fn name(&self) -> &Arc<str> {
-            &self.name
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn dtype(&self) -> &DType {
-            &self.dtype
-        }
-
-        fn row_count(&self) -> u64 {
-            1
-        }
-
-        fn register_splits(
-            &self,
-            _field_mask: &[FieldMask],
-            _split_range: &SplitRange,
-            _splits: &mut RowSplits,
-        ) -> VortexResult<()> {
-            unimplemented!("not needed for scan-plan construction")
-        }
-
-        fn pruning_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            _mask: Mask,
-        ) -> VortexResult<MaskFuture> {
-            unimplemented!("not needed for scan-plan construction")
-        }
-
-        fn filter_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            _mask: MaskFuture,
-        ) -> VortexResult<MaskFuture> {
-            unimplemented!("not needed for scan-plan construction")
-        }
-
-        fn projection_evaluation(
-            &self,
-            _row_range: &Range<u64>,
-            _expr: &Expression,
-            _mask: MaskFuture,
-        ) -> VortexResult<ArrayFuture> {
-            unimplemented!("not needed for scan-plan construction")
-        }
-    }
-
-    #[test]
-    fn get_item_reduces_to_a_struct_field_scan_plan() -> VortexResult<()> {
-        let reader: LayoutReaderRef = Arc::new(TestLayoutReader::new());
-        let reader_plan: ScanPlanRef = Arc::new(LayoutReaderScanPlanV2::new(reader));
-        let struct_plan = Arc::new(StructScanPlan::try_new(reader_plan)?);
-        let source: ScanPlanRef = struct_plan;
-
-        let field = Arc::clone(&source).apply_expr(get_item("a", root()))?;
-        assert!(field.as_any().is::<StructFieldScanPlan>());
-        assert_eq!(
-            field.dtype(),
-            &DType::Primitive(PType::I32, Nullability::NonNullable)
-        );
-
-        let predicate = field
-            .optimize()?
-            .apply_expr(eq(root(), lit(1_i32)))?
-            .optimize()?;
-        assert_eq!(predicate.dtype(), &DType::Bool(Nullability::NonNullable));
-
-        Ok(())
     }
 }
