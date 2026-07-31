@@ -39,6 +39,11 @@ use crate::expr::traversal::TraversalOrder;
 /// expression for computing the validity, or to include that expression as part of the root.
 ///
 /// See <https://github.com/vortex-data/vortex/issues/1907>.
+///
+/// The struct layout no longer uses this function: it partitions over the validity child as well
+/// as the fields, driven by a per-scalar-function kernel registry. See
+/// `vortex_layout::layouts::struct_::partition`. The remaining callers should be migrated to the
+/// same approach, at which point this function can be replaced by it.
 pub fn partition<A: AnnotationFn>(
     expr: Expression,
     scope: &DType,
