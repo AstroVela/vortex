@@ -8,19 +8,10 @@
 //! into `n + 1` slots, so that the struct's own nullability can be evaluated — and re-applied —
 //! independently of its fields.
 //!
-//! ## Why this is a copy
-//!
-//! This is a specialisation of [`vortex_array::expr::transform::partition`], which only knows how
-//! to partition over the fields of a struct. Treating validity as just another partition requires
-//! changes to every stage of the pipeline: the scope flattening, the annotator, the splitter, and
-//! the "step down" into a child's scope. Rather than generalise the shared implementation (and
-//! risk regressing its other callers) we keep a second copy here.
-//!
-//! TODO(joe): unify this with [`vortex_array::expr::transform::partition`].
-//!
 //! ## How it works
 //!
-//! Partitioning happens in three stages.
+//! The splitting itself is [`vortex_array`]'s, driven through the [`Partitioner`] trait. This
+//! module supplies the three struct-specific stages.
 //!
 //! 1. **Flattening.** Every access to the root scope is rewritten into an access of the *flat
 //!    scope*: a non-nullable struct holding the validity slot plus one slot per field, mirroring
@@ -50,14 +41,10 @@ use std::sync::Arc;
 
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
-use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
 use vortex_array::expr::Expression;
-use vortex_array::expr::analysis::Annotations;
-use vortex_array::expr::analysis::descendent_annotations;
 use vortex_array::expr::col;
-use vortex_array::expr::get_item;
 use vortex_array::expr::is_root;
 use vortex_array::expr::lit;
 use vortex_array::expr::mask;
@@ -65,8 +52,9 @@ use vortex_array::expr::not;
 use vortex_array::expr::pack;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::PartitionedExpr;
+use vortex_array::expr::transform::Partitioner;
+use vortex_array::expr::transform::partition_annotated;
 use vortex_array::expr::traversal::NodeExt;
-use vortex_array::expr::traversal::NodeRewriter;
 use vortex_array::expr::traversal::Transformed;
 use vortex_array::expr::traversal::TraversalOrder;
 use vortex_array::scalar_fn::fns::get_item::GetItem;
@@ -127,8 +115,9 @@ pub(crate) enum StructPartitioned {
 
 /// Partitions expressions over the children of a struct layout.
 pub(crate) struct StructPartitioner {
-    /// The dtype of the struct layout; the scope of any incoming expression.
-    scope: DType,
+    /// The dtype of the struct layout: the scope that incoming expressions are written against,
+    /// before flattening.
+    layout_dtype: DType,
     /// The scope that expressions are flattened into: a non-nullable struct with one field per
     /// child of the struct layout, named by [`StructSlot`] index.
     flat_scope: DType,
@@ -169,7 +158,7 @@ impl StructPartitioner {
         });
 
         Ok(Self {
-            scope: dtype.clone(),
+            layout_dtype: dtype.clone(),
             flat_scope: DType::Struct(
                 StructFields::new(names.into(), dtypes),
                 Nullability::NonNullable,
@@ -177,12 +166,6 @@ impl StructPartitioner {
             nullable,
             field_lookup,
         })
-    }
-
-    /// Each slot may hold several sub-expressions, so each one needs a unique name within the
-    /// pack that makes up its partition.
-    fn sub_expression_name(&self, slot: StructSlot, idx: usize) -> FieldName {
-        FieldName::from(format!("{slot}_{idx}"))
     }
 
     /// The slot addressed by a field of the flat scope, if it is one.
@@ -218,12 +201,9 @@ impl StructPartitioner {
         self.nullable.then(|| self.slot_expr(StructSlot::VALIDITY))
     }
 
-    /// Partition `expr` (defined over [`Self::scope`]) over the children of the struct layout.
+    /// Partition `expr` (defined over [`Self::layout_dtype`]) over the children of the struct layout.
     pub(crate) fn partition(&self, expr: Expression) -> VortexResult<StructPartitioned> {
-        let expr = self.flatten(expr)?.optimize_recursive(&self.flat_scope)?;
-
-        let annotations = descendent_annotations(&expr, |expr: &Expression| self.annotate(expr));
-        let partitioned = self.split(expr.clone(), annotations)?;
+        let partitioned = partition_annotated(self, expr, |expr: &Expression| self.annotate(expr))?;
 
         // A single partition whose root is exactly the partition itself can be delegated straight
         // to the child reader, skipping re-assembly.
@@ -244,7 +224,7 @@ impl StructPartitioner {
     /// The catch-all rule replaces `root()` itself with a reconstruction of the struct from its
     /// children, which is always correct. The remaining rules exist so that expressions that only
     /// need *some* of the children don't end up reading all of them.
-    fn flatten(&self, expr: Expression) -> VortexResult<Expression> {
+    fn flatten_scope(&self, expr: Expression) -> VortexResult<Expression> {
         let replaced = |value: Expression| {
             // The replacement re-introduces `get_item(.., root())` nodes addressing the flat
             // scope, so we must not recurse into it.
@@ -288,7 +268,7 @@ impl StructPartitioner {
                         .iter()
                         .map(|name| {
                             self.field_index(name).ok_or_else(|| {
-                                vortex_err!("Field {name} not found in {}", self.scope)
+                                vortex_err!("Field {name} not found in {}", self.layout_dtype)
                             })
                         })
                         .collect::<VortexResult<_>>()?;
@@ -336,7 +316,7 @@ impl StructPartitioner {
     }
 
     fn fields(&self) -> &StructFields {
-        self.scope
+        self.layout_dtype
             .as_struct_fields_opt()
             .vortex_expect("Struct layout dtype must be a struct")
     }
@@ -363,63 +343,39 @@ impl StructPartitioner {
         }
         vec![]
     }
+}
 
-    /// Stages 2 and 3: split the flattened expression into one partition per slot, then step each
-    /// partition down into the scope of the child that will evaluate it.
-    fn split(
-        &self,
-        expr: Expression,
-        annotations: Annotations<'_, StructSlot>,
-    ) -> VortexResult<PartitionedExpr<StructSlot>> {
-        let mut splitter = SlotSplitter {
-            partitioner: self,
-            annotations: &annotations,
-            slots: Vec::new(),
-            sub_expressions: Vec::new(),
-        };
-        let root_expr = expr.rewrite(&mut splitter)?.value;
+impl Partitioner for StructPartitioner {
+    type Slot = StructSlot;
 
-        let mut partitions = Vec::with_capacity(splitter.slots.len());
-        let mut partition_names = Vec::with_capacity(splitter.slots.len());
-        let mut partition_dtypes = Vec::with_capacity(splitter.slots.len());
-        let mut single_slots = HashMap::new();
+    fn scope(&self) -> &DType {
+        &self.flat_scope
+    }
 
-        for (&slot, exprs) in splitter.slots.iter().zip(splitter.sub_expressions.iter()) {
-            // A slot with a single sub-expression doesn't need to be packed; the root expression
-            // references it directly as `$.<slot>`.
-            let partition = if let [only] = exprs.as_slice() {
-                single_slots.insert(slot_name(slot), self.sub_expression_name(slot, 0));
-                only.clone()
-            } else {
-                pack(
-                    exprs
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, expr)| (self.sub_expression_name(slot, idx), expr.clone())),
-                    Nullability::NonNullable,
-                )
-            };
+    fn slot_name(&self, slot: &Self::Slot) -> FieldName {
+        slot_name(*slot)
+    }
 
-            let partition = partition.optimize_recursive(&self.flat_scope)?;
-            partition_dtypes.push(partition.return_dtype(&self.flat_scope)?);
-            partition_names.push(slot_name(slot));
-            partitions.push(step_into(partition, slot)?);
-        }
+    fn flatten(&self, expr: Expression) -> VortexResult<Expression> {
+        // Simplifying here, rather than before flattening, keeps the slot accesses this stage
+        // introduces from being split apart by the annotator any more finely than necessary.
+        self.flatten_scope(expr)?
+            .optimize_recursive(&self.flat_scope)
+    }
 
-        let partition_names = FieldNames::from(partition_names);
-        let root_scope = DType::Struct(
-            StructFields::new(partition_names.clone(), partition_dtypes.clone()),
-            Nullability::NonNullable,
-        );
-        let root_expr = unpack_single(root_expr, &single_slots);
+    fn step_into(&self, expr: Expression, slot: &Self::Slot) -> VortexResult<Expression> {
+        step_into(expr, *slot)
+    }
 
-        Ok(PartitionedExpr {
-            root: root_expr.optimize_recursive(&root_scope)?,
-            partitions: partitions.into_boxed_slice(),
-            partition_names,
-            partition_dtypes: partition_dtypes.into_boxed_slice(),
-            partition_annotations: splitter.slots.into_boxed_slice(),
-        })
+    /// A slot referenced once is read directly by the root expression: projecting the whole
+    /// struct asks each child for its own root rather than for a one-field pack of it.
+    fn unwrap_single_sub_expression(&self) -> bool {
+        true
+    }
+
+    /// The struct's validity is referenced once per field access, so sharing it matters.
+    fn deduplicate_sub_expressions(&self) -> bool {
+        true
     }
 }
 
@@ -454,97 +410,6 @@ fn step_into(expr: Expression, slot: StructSlot) -> VortexResult<Expression> {
 /// The slot's field name in the flat scope: its index, which no user field name can collide with.
 fn slot_name(slot: StructSlot) -> FieldName {
     FieldName::from(slot.to_string())
-}
-
-/// Splits an expression into sub-expressions, each of which accesses exactly one slot.
-struct SlotSplitter<'a> {
-    partitioner: &'a StructPartitioner,
-    annotations: &'a Annotations<'a, StructSlot>,
-    /// The slots encountered so far, in the order they were first encountered.
-    slots: Vec<StructSlot>,
-    /// The sub-expressions of each slot in [`Self::slots`], parallel to it.
-    sub_expressions: Vec<Vec<Expression>>,
-}
-
-impl SlotSplitter<'_> {
-    /// Record `expr` as a sub-expression of `slot`, returning the expression that reads its
-    /// result back out of the root scope.
-    fn push(&mut self, slot: StructSlot, expr: Expression) -> Expression {
-        let slot_idx = self
-            .slots
-            .iter()
-            .position(|s| *s == slot)
-            .unwrap_or_else(|| {
-                self.slots.push(slot);
-                self.sub_expressions.push(Vec::new());
-                self.slots.len() - 1
-            });
-
-        let sub_exprs = &mut self.sub_expressions[slot_idx];
-        // Identical sub-expressions are evaluated once.
-        let idx = sub_exprs
-            .iter()
-            .position(|e| e == &expr)
-            .unwrap_or_else(|| {
-                sub_exprs.push(expr);
-                sub_exprs.len() - 1
-            });
-
-        // The partition is only packed if the slot has more than one sub-expression; this is
-        // fixed up once splitting is complete and the counts are known.
-        get_item(
-            self.partitioner.sub_expression_name(slot, idx),
-            col(slot_name(slot)),
-        )
-    }
-}
-
-impl NodeRewriter for SlotSplitter<'_> {
-    type NodeTy = Expression;
-
-    fn visit_down(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
-        match self.annotations.get(&node) {
-            // If this expression only accesses a single slot, it becomes a partition.
-            Some(slots) if slots.len() == 1 => {
-                let slot = *slots.iter().next().vortex_expect("expected one slot");
-                let value = self.push(slot, node.clone());
-                Ok(Transformed {
-                    value,
-                    changed: true,
-                    order: TraversalOrder::Skip,
-                })
-            }
-
-            // Otherwise, continue traversing.
-            _ => Ok(Transformed::no(node)),
-        }
-    }
-}
-
-/// Rewrite the root expression's references to slots that ended up with a single sub-expression,
-/// replacing `$.<slot>.<slot>_0` with `$.<slot>`.
-fn unpack_single(
-    root_expr: Expression,
-    single_slots: &HashMap<FieldName, FieldName>,
-) -> Expression {
-    root_expr
-        .transform_down(|node| {
-            if let Some(field_name) = node.as_opt::<GetItem>()
-                && let Some(slot_field) = node.child(0).as_opt::<GetItem>()
-                && is_root(node.child(0).child(0))
-                && let Some(expected) = single_slots.get(slot_field)
-                && expected == field_name
-            {
-                return Ok(Transformed {
-                    value: col(slot_field.clone()),
-                    order: TraversalOrder::Skip,
-                    changed: true,
-                });
-            }
-            Ok(Transformed::no(node))
-        })
-        .vortex_expect("unpack_single is infallible")
-        .into_inner()
 }
 
 #[cfg(test)]

@@ -74,6 +74,12 @@ pub trait Partitioner {
     fn unwrap_single_sub_expression(&self) -> bool {
         false
     }
+
+    /// Whether identical sub-expressions of the same slot should be evaluated once and shared,
+    /// rather than once per reference.
+    fn deduplicate_sub_expressions(&self) -> bool {
+        false
+    }
 }
 
 /// Partition `expr` over `partitioner`'s slots, annotating each node with the slots that any of
@@ -338,8 +344,15 @@ impl<P: Partitioner> ExpressionSplitter<'_, P> {
             });
 
         let sub_exprs = &mut self.sub_expressions[slot_idx];
-        let idx = sub_exprs.len();
-        sub_exprs.push(expr);
+        let existing = self
+            .partitioner
+            .deduplicate_sub_expressions()
+            .then(|| sub_exprs.iter().position(|e| e == &expr))
+            .flatten();
+        let idx = existing.unwrap_or_else(|| {
+            sub_exprs.push(expr);
+            sub_exprs.len() - 1
+        });
 
         let slot_name = self.partitioner.slot_name(slot);
         get_item(sub_expression_name(&slot_name, idx), col(slot_name))
