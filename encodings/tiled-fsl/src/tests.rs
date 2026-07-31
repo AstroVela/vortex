@@ -337,7 +337,24 @@ fn slice_preserves_mixed_validity() -> VortexResult<()> {
 
 #[test]
 fn bitpacked_child_roundtrips_and_remains_tiled_after_row_ops() -> VortexResult<()> {
-    let (canonical, raw_tiled, mut ctx) = fixture(65, 128, geometry(32, 64))?;
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::from_iter((0..65).flat_map(|row| {
+            let row_value = u8::try_from(row / 32).unwrap();
+            (0..128).map(move |dimension| row_value + u8::try_from(dimension % 14).unwrap())
+        }))
+        .into_array(),
+        128,
+        Validity::NonNullable,
+        65,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let raw_tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(32, 64), &mut ctx)?;
+    let first_row = canonical.execute_scalar(0, &mut ctx)?;
+    let last_row = canonical.execute_scalar(64, &mut ctx)?;
+    assert_ne!(first_row, last_row);
+    let expected_sliced = canonical.clone().into_array().slice(1..64)?;
+    let indices = PrimitiveArray::from_iter([64u32, 0, 32]).into_array();
+    let expected_taken = canonical.clone().into_array().take(indices.clone())?;
     vortex_fastlanes::initialize(ctx.session());
     let physical = raw_tiled
         .elements()
@@ -356,12 +373,14 @@ fn bitpacked_child_roundtrips_and_remains_tiled_after_row_ops() -> VortexResult<
 
     let sliced = tiled.clone().into_array().slice(1..64)?;
     assert!(sliced.is::<TiledFixedSizeList>());
+    assert_arrays_eq!(expected_sliced, sliced, &mut ctx);
 
     let taken = tiled
         .into_array()
-        .take(PrimitiveArray::from_iter([64u32, 0, 32]).into_array())?
+        .take(indices)?
         .execute_until::<TiledFixedSizeList>(&mut ctx)?;
     assert!(taken.is::<TiledFixedSizeList>());
+    assert_arrays_eq!(expected_taken, taken, &mut ctx);
     Ok(())
 }
 
