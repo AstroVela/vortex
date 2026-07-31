@@ -24,15 +24,20 @@ report), `nonstrict_survey.md` (the non-strict function survey), and
 
 ## What exists, in dependency order
 
-**`StrictScalarFnVTable`** (`vortex-array/src/scalar_fn/strict/`) lifts a kernel over non-null
-values into a full `ScalarFnVTable`: null propagation, constant folding, nullability widening, and
-options serde. Three columnar functions implement it directly (`not`, `list_length`, `list_sum`).
-
-**`RowFn`** (`vortex-array/src/scalar_fn/row/`) sits above it: an implementor names witness types,
-picks concrete element types per batch in `dispatch`, and hands the framework a row closure. A
-blanket impl derives `StrictScalarFnVTable` and therefore everything below it. Adopters:
+**`RowFn`** (`vortex-array/src/scalar_fn/row/`) is the only authoring trait above
+`ScalarFnVTable`: an implementor names witness types, picks concrete element types per batch in
+`dispatch`, and hands the framework a row closure. One blanket impl,
+`impl<F: RowFn> ScalarFnVTable for F` in `row/row_fn.rs`, derives everything else. Adopters:
 `byte_length`, geo `contains`/`intersects`/`distance`, tensor `l2_norm`/`inner_product`/
 `cosine_similarity`/`l2_denorm`.
+
+**The lifting** (`vortex-array/src/scalar_fn/row/lift.rs`, `pub(super)`) turns that row loop into a
+full `execute`: null propagation, constant folding, nullability widening, output dtype
+reconciliation, and per-batch null-strategy selection. `Batch` carries one batch's facts and its
+`execute` takes the kernel as two closures, one running it over whichever arguments the lifting
+hands over and one trying branch-and-skip over the conjoined mask. This used to be a public
+`StrictScalarFnVTable`, which was deleted; see the last section of the research document for why and
+for what replaced each of its members.
 
 **`RowVisitor`** has three methods. `visit_prepared` is the primitive for returning kernels and
 runs a `prepare` closure once per batch over whichever operands are batch-constant, threading the
@@ -41,15 +46,17 @@ so it monomorphizes to the identical loop; verified by benchmark parity). `visit
 primitive for kernels writing into an `OutputSink`, which exists for outputs whose width is runtime
 data (a tensor row) or that append into one buffer for the batch.
 
-**Adaptive null strategy** is the most recent framework work. The row layer derives `Dense` (run
-over the garbage behind null rows, mask after) or `Filter` (the kernel must never see a null row)
-from element dense-safety and fallibility. `Filter` now names that *contract*, and two mechanisms
-satisfy it: the original filter-and-scatter, and branch-and-skip, which decodes full length
-null-tolerantly and visits only mask-set rows word-at-a-time. The lifting chooses per batch from
-`Mask::true_count` and `InputElement::DECODE_SHRINKS_WHEN_FILTERED`, a defaulted const that is
-`true` only for elements whose decode parses every row (geo geometries). Threshold
+**Adaptive null strategy** is the most recent framework work. `row_null_handling` (in
+`row/execute.rs`) derives `Dense` (run over the garbage behind null rows, mask after) or `Filter`
+(the kernel must never see a null row) from element dense-safety and fallibility. `Filter` names
+that *contract*, and two mechanisms satisfy it: the original filter-and-scatter, and
+branch-and-skip, which decodes full length null-tolerantly and visits only mask-set rows
+word-at-a-time. The lifting chooses per batch from `Mask::true_count` and
+`InputElement::DECODE_SHRINKS_WHEN_FILTERED`, a defaulted const that is `true` only for elements
+whose decode parses every row (geo geometries). Threshold
 `BRANCH_MIN_SURVIVING_FRACTION = 0.75`, with the measured crossover tables cited in its doc
-comment. Function authors write nothing to benefit.
+comment. Function authors write nothing to benefit. To compare or force a strategy from a test or
+benchmark, `execute_row_fn_with_strategy` (test-harness gated) is the only seam.
 
 ## The essential invariants, so you do not break them by accident
 
@@ -67,6 +74,10 @@ comment. Function authors write nothing to benefit.
 - **Both output forms build an all-valid column**, which is what licenses the derived
   `validity() = union_child_validities`. Anything that lets a kernel emit nulls must change that
   derivation in the same commit (see verdict 2 below).
+- **A `RowFn` cannot also implement `ScalarFnVTable`**, since the blanket impl claims the slot.
+  `RowFn` therefore mirrors any `ScalarFnVTable` method an adopter needs to vary. Today that is
+  `validity` and nothing else, and `reduce` was dropped when the strict trait went because no
+  adopter used it. Mirror the next one when a real adopter needs it, not before.
 - **A fallible kernel must never run behind a null row**, which is why fallibility forces the
   `Filter` contract, and why branch-and-skip visits only set bits. The hostile tests (views
   pointing at nonexistent buffers, poison zero divisors behind nulls) exist to catch a regression
@@ -85,39 +96,30 @@ implement `ScalarFnVTable` concerns separately, so requiring array serde separat
 and a generic derivation can come later as its own PR if it ever earns one. Do not re-add it as
 part of the row work.
 
-**The separate strict-lifting PR is off the table, and the trait itself should stop being public.**
-It was measured and reviewed and did not
-justify itself as a standalone change: +798 production lines against -210, no `NullHandling::Filter`
-user among its three ports, mixed benchmark results, and no demonstrated pre-existing bug fixed. A
-local review also made the naming objection that stands: `is_strict` is the semantic property
-`valid(f(x)) ⊆ valid(x)` used for pushdown, while the trait actually demands the *operational*
-property that a kernel may run over garbage or over a filtered copy. Those are independent (`Bytes`
-is strict and not dense-safe). Whatever ships should be named for the lifting contract, not for
-strictness. The plan: fold the lifting into the row layer as private machinery, revert the three
-columnar ports entirely, and extract a public trait later if a second non-row user appears.
+**The separate strict-lifting PR was off the table, and the trait is now deleted.** It was measured
+and reviewed and did not justify itself as a standalone change: +798 production lines against -210,
+no `NullHandling::Filter` user among its three ports, mixed benchmark results, and no demonstrated
+pre-existing bug fixed. A local review also made a naming objection that stood: `is_strict` is the
+semantic property `valid(f(x)) ⊆ valid(x)` used for pushdown, while the trait actually demanded the
+*operational* property that a kernel may run over garbage or over a filtered copy. Those are
+independent (`Bytes` is strict and not dense-safe).
 
-This branch has *not* had that refactor applied: it is the research record, and the trait is still
-public here with its three ports intact. Applying it is the first task of the clean stack, and its
-scope needs stating precisely, because "get rid of the strict trait" has a dangerous misreading.
-What goes away is the trait as *public API* and the three columnar ports (`not`, `list_length` and
-`list_sum` return to their develop bodies, which are already known to be their optimum). What must
-not go away is the lifting *machinery*: `RowFn` depends on all of it, since that is where null
-propagation, constant folding, nullability widening, dtype reconciliation and the
-dense/filter/branch strategy selection live. Concretely: `strict/execute.rs`'s roughly 290 lines
-become private helpers under `row/`; `impl<F: RowFn> ScalarFnVTable for F` replaces the two-hop
-blanket chain, with coherence unchanged (the chain already forbade a manual `ScalarFnVTable` impl on
-the same type, which is why `reduce` and `validity` are mirrored, and the direct impl carries the
-same exclusion and the same mirroring cost); the two branch-strategy hooks currently sitting on the
-public trait (`execute_strict_branch`, `decode_shrinks_when_filtered`) become internal, which is
-where the implementation report wanted them anyway. The 424 lines of strict tests mostly survive,
-since they test lifting semantics that are still the row layer's semantics, exercised through a test
-row function instead of a synthetic strict impl. Options serde needs `RowFn` to delegate
-`serialize`/`deserialize` to its `Options` type directly, after which `NumericalAggregateOpts` never
-needs `PersistableOptions` and the public `serialize_proto`/`deserialize_proto` rename that a
-reviewer objected to disappears rather than needing a fix. Budget roughly a full session: it is
-mechanical but broad.
+So the three columnar ports were reverted (`not`, `list_length` and `list_sum` are back on their
+develop bodies, which are already known to be their optimum) and the trait was deleted rather than
+merely made private: with the ports gone it had exactly one implementor, the blanket impl over
+`RowFn`. The lifting *machinery* stayed, since `RowFn` depends on all of it, and now lives in
+`row/lift.rs` behind `pub(super)`. Do not reintroduce a trait there. If a non-row columnar kernel
+ever wants the lifting, extract one then, named for the lifting contract rather than for
+strictness, with that kernel as its first user.
 
-**`not` stays exactly as it is on develop.** Its `to_bit_buffer()` is a handle clone, and the
+Two things fell out of the deletion. `reduce` was mirrored on the strict trait only because the
+blanket impl occupied the `ScalarFnVTable` slot, and nothing used it, so it is gone; `validity`
+stays mirrored on `RowFn`. And the runtime rejection of `Dense` paired with a fallible kernel is
+gone, because `row_null_handling` derives the pairing from the same witnesses `is_fallible` reads,
+which makes the combination unconstructible; the requirement is documented on
+`NullHandling::Dense`.
+
+**`not` is back exactly as it is on develop.** Its `to_bit_buffer()` is a handle clone, and the
 source array keeps the buffer shared, so in-place negation (a real 19% on uniquely owned buffers)
 is unreachable without redesigning `ExecutionArgs` ownership. Encoded NOT flows through
 `NotReduce` and per-encoding pushdown at 13-24x below canonical cost, so canonicalizing would be a
@@ -129,7 +131,7 @@ bookkeeping (collect inputs, compute the declared dtype, conjoin validity), not 
 allocation; ablations including SmallVec found nothing beneficial, and an earlier
 "-10% at 100 rows" reading did not reproduce uniformly. The only structural answer is to
 monomorphize the prelude over the compile-time arity (`[ArrayRef; N]` from the tuple witness),
-which the row layer can do and the dynamic trait cannot.
+which the row layer can do through its tuple witness.
 
 **Null-visible inputs (non-strict `RowFn` over `Option` elements) are designed and deliberately not
 built.** The survey found no in-tree customer: 13 of 15 non-strict functions are cheap columnar
@@ -142,9 +144,10 @@ of this one. Keep the survey's constraint list; do not build the tier.
 
 ## What to do next, in order
 
-0. **Fold the lifting into the row layer and drop the public strict trait**, per the scope spelled
-   out above. This is the first code task, and doing it before the PR stack is cut means no PR ever
-   has to argue for a public trait that the measurements did not support.
+0. ~~**Fold the lifting into the row layer and drop the public strict trait.**~~ Done, in three
+   commits on this branch: revert the two remaining columnar ports, take the two benchmark control
+   arms off the trait, then delete it. No PR in the stack has to argue for a public trait that the
+   measurements did not support.
 1. **The tracking issue for the row framework.** It is a large addition and needs one. It should
    carry the layering, the measured results, the exclusion taxonomy (why `not`, the Kleene
    functions, `l2_denorm`'s constant path and geo `distance` are all correctly *not* row
@@ -155,9 +158,9 @@ of this one. Keep the survey's constraint list; do not build the tier.
    `l2_denorm`; then the tensor ports; then `visit_prepared` together with the geo ports, which is
    where prepare's 9.1x justifies the API and where branch-and-skip earns its place. Land each API
    surface with its first user.
-3. **Option outputs inside the strict tier**, the one extension with demonstrated in-tree demand:
-   `list_sum` (a valid empty list sums to null) and `variant_get` (missing path yields null) are
-   strict but excluded from `RowFn` today only by the all-valid-output rule. Needs an `Option<T>`
+3. **Option outputs**, the one extension with demonstrated in-tree demand: `list_sum` (a valid
+   empty list sums to null) and `variant_get` (missing path yields null) are strict but excluded
+   from `RowFn` today only by the all-valid-output rule. Needs an `Option<T>`
    output form with a nullable element dtype, a nullability bit on the return witness, and derived
    `validity()` becoming `None` for such functions. `is_strict` stays true.
 
@@ -186,10 +189,13 @@ Verification that matters for changes here:
 
 ```bash
 cargo nextest run -p vortex-array -p vortex-geo -p vortex-tensor
-cargo clippy --all-targets --all-features -p vortex-array -p vortex-geo
+cargo clippy --all-targets --all-features -p vortex-array -p vortex-geo -p vortex-tensor
 cargo +nightly fmt --all
 git diff --check
+cargo build -p vortex -p vortex-file -p vortex-datafusion
 ```
+
+3,596 tests pass across the three crates as of the strict-trait deletion.
 
 Benchmarks are divan; report the `fastest` column from two runs and state the machine, because this
 environment is a shared 4-vCPU VM where filter-heavy arms have shown up to 2.3x run-to-run spread.

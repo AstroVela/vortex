@@ -1348,3 +1348,44 @@ turns out unsupported (cheap encoding check, no in-tree function affected since 
 arrow-exports the full column, and slicing runs of valid rows would blunt Filter's sparse-validity
 advantage enough to retire the threshold for geo; the fallible branch loop pays one `is_none`
 check per set row after the first error because `for_each_set_index` cannot early-return.
+
+## The strict trait, deleted
+
+`StrictScalarFnVTable` is gone. Not made private: deleted, with its lifting kept as private
+machinery under `vortex-array/src/scalar_fn/row/lift.rs`. The chain is now `RowFn` ->
+`ScalarFnVTable`, one blanket impl, no intermediate trait.
+
+Three things converged on that. First, reverting the columnar ports left the trait with exactly one
+implementor, the blanket impl over `RowFn`, and a trait with one impl is indirection rather than
+abstraction. Second, the mirroring tax existed only because that blanket impl occupied the
+`ScalarFnVTable` slot: `reduce` and `validity` were forwarded so a strict function could override
+them despite being unable to implement `ScalarFnVTable` itself. `RowFn` keeps `validity`, because
+all-valid outputs make it the child conjunction, and the `reduce` mirror went with the trait since
+no adopter ever used it. Third, the naming objection a local review raised was real and is now
+moot: `is_strict` names the semantic property `valid(f(x)) ⊆ valid(x)` that pushdown consumes,
+while the trait demanded the *operational* property that a kernel may run over the garbage behind a
+null row or over a filtered copy. Those are independent, `Bytes` being strict and not dense-safe,
+so the trait was named for the wrong one of the two.
+
+What replaced each member: `execute_strict` and `execute_strict_branch` are the two closures
+`Batch::execute` takes, `decode_shrinks_when_filtered` is a `Batch` field read off
+`ElementTuple::DECODE_SHRINKS_WHEN_FILTERED`, `return_element_dtype` is what a visit returns before
+`ScalarFnVTable::return_dtype` widens it, `null_handling` is `row_null_handling` over the witnesses,
+and options serde is `RowFn::Options: PersistableOptions` delegated from the blanket impl.
+`Batch` carries one batch's facts (id, arguments, collected inputs, conjoined validity, declared
+return dtype, null handling, and the decode-shrinks flag) and takes the kernel as closures rather
+than through a trait, which is the point: there is no second implementor to name.
+
+The one behaviour deliberately dropped is the runtime rejection of `Dense` paired with a fallible
+kernel. `row_null_handling` derives the pairing from the same witnesses `is_fallible` reads, so the
+combination cannot be constructed, and the requirement now lives in `NullHandling::Dense`'s doc
+pointing at the derivation. Four tests went with the trait: three described a strict kernel that
+returns nulls of its own (`list_sum`'s shape), which no `RowFn` can be until the `Option` output
+form of open item 3 exists, and one pinned the `reduce` mirror.
+
+`PersistableOptions` survives with `EmptyOptions` as its only implementor, since every row function
+in tree uses it. That is a bound on `RowFn::Options` rather than a speculative trait, and the
+reverted `list_sum` port is what removed its second implementor.
+
+If a non-row columnar kernel ever wants the lifting, extract the trait then, named for the lifting
+contract rather than for strictness, with that kernel as its first user.
