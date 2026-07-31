@@ -8,9 +8,9 @@ use vortex_error::vortex_ensure_eq;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::dtype::DType;
 use crate::arrays::Masked;
 use crate::arrays::masked::MaskedArraySlotsExt;
+use crate::dtype::DType;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::InputElement;
 
