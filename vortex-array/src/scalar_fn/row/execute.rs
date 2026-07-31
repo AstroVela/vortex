@@ -99,6 +99,40 @@ pub(super) fn execute_row_loop<A: ElementTuple, R: ApplyResult>(
     Ok(R::Out::build(values))
 }
 
+/// Decode every input column once, run `prepare` over the batch-constant elements, then compute
+/// one output element per row with the prepared state behind a shared reference.
+///
+/// The state lives here rather than in the closure, so `apply` stays [`Fn`] and the loop keeps the
+/// unconditional shape that lets it vectorize, exactly as in [`execute_row_loop`]. `P` is chosen by
+/// the dispatch and names no column lifetime, so the state owns its data and cannot alias the
+/// columns the loop reads.
+pub(super) fn execute_row_loop_prepared<A: ElementTuple, P, R: ApplyResult>(
+    args: &dyn ExecutionArgs,
+    ctx: &mut ExecutionCtx,
+    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+    apply: impl Fn(&P, A::Elems<'_>) -> R,
+) -> VortexResult<ArrayRef> {
+    let columns = A::decode(args, ctx)?;
+    let state = prepare(A::constants(&columns));
+    let rows = 0..args.row_count();
+
+    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization, exactly as in
+    // [`execute_row_loop`].
+    let values = if R::FALLIBLE {
+        rows.map(|index| apply(&state, A::get(&columns, index)).into_result())
+            .collect::<VortexResult<Vec<_>>>()?
+    } else {
+        rows.map(|index| {
+            apply(&state, A::get(&columns, index))
+                .into_result()
+                .vortex_expect("an infallible ApplyResult cannot be an error")
+        })
+        .collect()
+    };
+
+    Ok(R::Out::build(values))
+}
+
 /// Decode every input column once, allocate the sink once, then write one row at a time.
 ///
 /// The sink lives here rather than in the closure, so `apply` stays [`Fn`] and the loop keeps the
