@@ -1261,15 +1261,16 @@ Filter's total and pure waste. Crossover lands near 50-75% surviving rows for on
 and lower with two (the conjoined fraction shrinks quadratically).
 
 The strategy is invisible to function authors: it slots under the existing derived null handling,
-selectable per batch from `Mask::true_count`, with Filter kept for the sparse tail. The prototype
+selectable per batch from `Mask::true_count`, with Filter kept for the sparse tail. **This is now
+implemented on this branch** (see "Adaptive null strategy, as shipped" below); the rest of this
+section records the prototype evidence that justified it. The prototype
 also validated the two supporting pieces: a null-tolerant `decode_branch` on `InputElement`
 (defaulting to plain decode, correct for bulk canonicalizations) and `OutputElement::garbage()`
 for pre-fill. Production caveats recorded in the prototype report: `reduce_encoded` is not
 consulted on the branch path, sinks fall back to Filter, the toggle must become per-execution and
 cost-based, and geo's null-tolerant decode covered Point and Polygon only, still paying a
-full-length arrow export that a run-slicing decode would shrink. **This is the highest-value
-follow-up after the Option-output extension: `Bytes`-element functions currently pay the Filter
-tax on every nullable batch, and it is mostly recoverable.**
+full-length arrow export that a run-slicing decode would shrink. The prototype's conclusion, since borne out: `Bytes`-element functions were paying the
+Filter tax on every nullable batch, and most of it is recoverable.
 
 ### Adjacent findings, recorded so they are not relearned
 
@@ -1289,3 +1290,61 @@ tax on every nullable batch, and it is mostly recoverable.**
   reading did not reproduce uniformly. The row layer can eventually monomorphize the prelude over
   its compile-time arity (`[ArrayRef; N]` via the tuple witness), which is the only structural
   answer if small batches ever matter.
+
+## Adaptive null strategy, as shipped
+
+Branch-and-skip is implemented as a third null strategy, chosen per batch by the lifting. Nothing
+about a function's definition changes: the row layer already derived `Dense` or `Filter` from the
+element types, and `Filter` now names a *contract* (the kernel never sees a row null in any input)
+rather than a mechanism. Two mechanisms satisfy that contract, and the lifting picks between them
+where the conjoined mask is materialized.
+
+The selection rule needs one fact the framework cannot infer, so elements state it:
+`InputElement::DECODE_SHRINKS_WHEN_FILTERED`, defaulted `false`, is `true` for an element whose
+decode parses every row (geometry from coordinate storage) and `false` for a bulk canonicalization
+(bytes, bools, primitives). Getting it wrong is a performance bug, never a correctness bug.
+`ElementTuple` ORs it across arguments, the witness check pins it like dense-safety and
+fallibility, and the rule is:
+
+```text
+branch-and-skip, UNLESS some argument's decode shrinks when filtered
+                 AND fewer than BRANCH_MIN_SURVIVING_FRACTION (0.75) of rows survive
+```
+
+Two supporting hooks: `InputElement::decode_null_tolerant` (defaults to the ordinary decode, sound
+because the branch loop never resolves an unset row, so hostile bytes behind a null are never
+touched) and `OutputElement::placeholder` (the pre-fill written behind nulls, masked before anyone
+observes it). Geo overrides the decode for Point and Polygon; other geometry types report
+unsupported and the selection falls back to Filter, which is tested rather than asserted in a
+comment. Sinks stay on Dense/Filter, documented at the visitor. `reduce_encoded` runs on the
+branch path over the *original* encodings, which is strictly better for encoding fast paths than
+Filter's canonical copies, and its contract doc now states the row count differs per strategy.
+
+Measured with forced-filter, forced-branch and auto arms, so selection correctness is itself a
+measurement (65,536 rows, divan fastest, two runs, shared 4-vCPU VM):
+
+| workload | 1% | 5% | 10% | 25% | 50% | 90% |
+| --- | --- | --- | --- | --- | --- | --- |
+| `byte_length` at `Bytes`, auto over filter | 5.0x | 5.3x | 5.8x | 4.0x | 4.5x | 6.3x |
+| geo `contains` x const, auto picks | branch | branch | branch | branch | filter | filter |
+| geo `contains` x column, auto picks | branch | branch | branch | filter | filter | filter |
+
+At every mixed density in all three workloads the auto arm sits on the faster forced arm, on both
+sides of the crossover. The single concession the threshold makes is geo's one-nullable-operand
+50%-null case, where branch would have won about 1.1x and the rule sends it to Filter; the
+alternative is a per-element threshold, deliberately deferred until a second per-row-decode
+element exists to calibrate against.
+
+Verified independently of the implementing agent: 3,441 tests pass across vortex-array and
+vortex-geo (17 new: hostile out-of-bounds views behind nulls, a fallible kernel with poison
+divisors behind nulls in one and both operands, conjoined-mask honoring, constant operands, real
+errors still propagating, geo filter-versus-branch agreement, the unsupported-geometry fallback,
+and six selection-rule cases), vortex-tensor's 164 pass unchanged, clippy `--all-targets
+--all-features` is silent on both crates, and fmt and whitespace are clean.
+
+Open items, none blocking: the branch fallback probes `reduce_encoded` twice when the dispatch
+turns out unsupported (cheap encoding check, no in-tree function affected since every
+`reduce_encoded` implementor is a dense-path tensor function); geo's null-tolerant decode still
+arrow-exports the full column, and slicing runs of valid rows would blunt Filter's sparse-validity
+advantage enough to retire the threshold for geo; the fallible branch loop pays one `is_none`
+check per set row after the first error because `for_each_set_index` cannot early-return.
