@@ -1103,7 +1103,9 @@ git commit -s -m "feat: expose tiled list ranges"
 - Produces: crate-private `gather_tiled_rows(array, rows, validity) -> VortexResult<TiledFixedSizeListArray>`.
 - Produces: `SliceReduce for TiledFixedSizeList`.
 - Preserves: `TiledFixedSizeList` parent and exact `TileGeometry` for nonempty
-  output ranges; Vortex's ordinary canonical empty result for `start == stop`.
+  output ranges and for the full `0..0` range of an already-empty tiled source;
+  Vortex's ordinary canonical empty result for an empty slice of a nonempty
+  source.
 
 - [ ] **Step 1: Add failing slice conformance and boundary tests**
 
@@ -1206,8 +1208,9 @@ cargo nextest run -p vortex-tiled-fsl slice
 ```
 
 Expected: nonempty value fallbacks may work, but their encoding assertion fails
-because no `SliceReduce` rule is registered. The `0..0` case already returns
-Vortex's canonical empty FSL and passes its degenerate-result assertion.
+because no `SliceReduce` rule is registered. For the nonempty test source, the
+`0..0` case already returns Vortex's canonical empty FSL and passes its
+degenerate-result assertion.
 
 - [ ] **Step 3: Implement output-proportional row gathering**
 
@@ -1957,7 +1960,8 @@ nonzero.
    `take` built from `row * list_size + dimension`;
 6. slices `0..0`, full range, each boundary-adjacent range, and ranges crossing
    row tiles equal canonical FSL; nonempty results remain tiled with identical
-   geometry and empty results are canonical;
+   geometry, empty slices of nonempty sources are canonical, and the full
+   `0..0` range of an already-empty tiled source retains tiling;
 7. empty, identity, reverse, duplicated, unsorted, and nullable takes equal
    canonical FSL after execution; nondegenerate results become tiled with
    identical geometry, while empty takes and takes from empty sources use
@@ -2235,8 +2239,10 @@ Normalize action seeds against the current oracle length:
 - `Slice`: map both seeds into one valid `start..stop`, use
   `array::slice_canonical_array` for the oracle and `tiled.slice` for the
   candidate, and assert logical equality. A nonempty result must be tiled with
-  unchanged geometry. An empty result must be canonical and ends this composed
-  action sequence after its logical check.
+  unchanged geometry. An empty result from a nonempty source must be canonical
+  and ends this composed action sequence after its logical check. For an
+  already-empty tiled source, `0..0` is the full range and must retain the tiled
+  representation and geometry.
 - `Take`: map every valid seed modulo nonzero `len`, turn every valid seed into
   `None` when `len == 0`, use `array::take_canonical_array` for the oracle and
   `tiled.take` for the candidate. For nonempty indices from a nonempty source,
