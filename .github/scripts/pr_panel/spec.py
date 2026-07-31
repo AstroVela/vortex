@@ -189,16 +189,20 @@ PANEL = Panel(
         Section(
             id="actions",
             title="Actions",
-            help="Momentary buttons. They clear themselves once the click is handled.",
+            help=(
+                "Tick one of these to press it. GitHub strips `<button>` from comments, "
+                "so a checkbox is the only clickable control available — these clear "
+                "themselves once the click is handled."
+            ),
             controls=(
                 Button(
                     id="action.run",
-                    label="**Run** — dispatch a run with the settings above",
+                    label="&nbsp;▶️&nbsp; **RUN BENCHMARKS** — with the settings above",
                     action="run",
                 ),
                 Button(
                     id="action.reset",
-                    label="**Reset** — restore the default settings",
+                    label="&nbsp;♻️&nbsp; **RESET** — restore the default settings",
                     action="reset",
                     dispatches=False,
                     resets=True,
