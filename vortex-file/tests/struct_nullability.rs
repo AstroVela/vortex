@@ -267,6 +267,24 @@ async fn project_nullable_struct(nullable_column: ArrayRef) -> VortexResult<()> 
     Ok(())
 }
 
+/// Projecting the nullable struct column on its own — with no surrounding `pack` or `select` to
+/// hang the nullability on — must still return a nullable struct, not a non-nullable one whose
+/// fields absorbed the nulls.
+#[rstest]
+#[tokio::test]
+async fn project_nullable_struct_unwrapped(nullable_column: ArrayRef) -> VortexResult<()> {
+    let file = write(nullable_column).await?;
+    let result = file.project(col("s")).await?;
+
+    assert_eq!(result.dtype(), &abc(Nullability::Nullable));
+
+    let mut ctx = ctx();
+    assert!(result.execute_scalar(0, &mut ctx)?.is_null());
+    assert!(!result.execute_scalar(1, &mut ctx)?.is_null());
+    assert!(result.execute_scalar(4, &mut ctx)?.is_null());
+    Ok(())
+}
+
 /// `select` over the nullable struct keeps its nullability at the struct level rather than
 /// pushing it into the selected fields.
 #[rstest]
