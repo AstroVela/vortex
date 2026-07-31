@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
 #![cfg(feature = "unstable_encodings")]
 #![expect(clippy::tests_outside_test_module)]
 

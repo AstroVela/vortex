@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
 //! Two-dimensional tiled encoding for primitive Vortex fixed-size lists.
 
 mod array;

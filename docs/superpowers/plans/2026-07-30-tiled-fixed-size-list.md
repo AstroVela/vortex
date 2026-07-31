@@ -2832,13 +2832,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p vortex-tiled-fsl
 cargo test --doc -p vortex-tiled-fsl
 taplo fmt --check
 cargo shear
+reuse lint
 cargo deny check licenses
 cargo audit
 yamllint --strict -c .yamllint.yaml .github/workflows/fuzz.yml
 ```
 
-Expected: rustdoc, doctests, TOML formatting, unused-dependency, license,
-advisory, and workflow YAML checks pass.
+Expected: rustdoc, doctests, TOML formatting, unused-dependency, REUSE
+source-file licensing, cargo-deny dependency licensing, advisory, and workflow
+YAML checks pass.
 
 - [ ] **Step 4: Re-run benchmark compilation and capture selected evidence**
 

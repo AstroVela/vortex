@@ -281,10 +281,10 @@ bulk access rather than per-element scalar execution.
 
 ## Slice and take
 
-Nonempty `slice` results return `TiledFixedSizeList` with the same geometry.
-Vortex's generic `ArrayRef::slice` returns a canonical empty array before any
-encoding-specific rule runs when the requested range is empty; the tiled
-encoding follows that ordinary degenerate-result behavior.
+Nonempty `slice` results return `TiledFixedSizeList` with the same geometry. An
+empty slice of a nonempty source follows Vortex's generic canonical-empty
+behavior. For an already-empty tiled source, `0..0` is the full range and
+retains the source representation.
 
 `ArrayRef::take` first constructs a lazy `DictArray`. When that expression is
 executed with a session that registers `vortex-tiled-fsl`, nonempty takes from
