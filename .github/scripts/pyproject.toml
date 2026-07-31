@@ -25,3 +25,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+# Without this, whether these count as first-party depends on the directory ruff is
+# invoked from, so import order lints flip depending on the caller's cwd.
+known-first-party = ["fuzz_report", "pr_panel"]
