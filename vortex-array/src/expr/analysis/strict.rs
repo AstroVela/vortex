@@ -12,7 +12,9 @@ use crate::expr::Expression;
 pub fn label_strict(expr: &Expression) -> BooleanLabels<'_> {
     label_tree(
         expr,
-        |expr| expr.signature().is_strict(),
+        // Root is strict, so a node with no scalar fn is strict too. Note this is the opposite
+        // default to fallibility above.
+        |expr| expr.signature().is_none_or(|sig| sig.is_strict()),
         |acc, &child| acc & child,
     )
 }

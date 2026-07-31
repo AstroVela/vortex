@@ -183,10 +183,15 @@ fn split_expression_for_pushdown(
 ) -> VortexResult<(Expression, Option<Expression>)> {
     let references_root = label_tree(&expr, is_root, |acc, &child| acc | child);
     let annotations = direct_annotations(&expr, |expr| {
-        let signature = expr.signature();
+        // Root is not a scalar function, and was never pushdown-eligible anyway: its id is not
+        // one of the negative-cost ids.
+        let Some(scalar_fn) = expr.as_scalar() else {
+            return vec![];
+        };
+        let signature = scalar_fn.signature();
         if !signature.is_fallible()
             && signature.is_strict()
-            && is_negative_cost(expr.id())
+            && is_negative_cost(scalar_fn.id())
             && references_root.get(&expr).copied().unwrap_or(true)
         {
             vec![PUSHDOWN_ANNOTATION]

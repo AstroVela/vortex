@@ -3,10 +3,9 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::ops::Deref;
 
 use crate::expr::Expression;
-use crate::scalar_fn::ScalarFnRef;
+use crate::scalar_fn::ChildName;
 
 pub enum DisplayFormat {
     Compact,
@@ -19,11 +18,18 @@ impl Display for DisplayTreeExpr<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         pub use termtree::Tree;
         fn make_tree(expr: &Expression) -> Result<Tree<String>, std::fmt::Error> {
-            let scalar_fn: &ScalarFnRef = expr.deref();
-            let node_name = format!("{}", scalar_fn);
+            let node_name = match expr.as_scalar() {
+                Some(scalar_fn) => format!("{}", scalar_fn),
+                // Preserved verbatim from when Root was a scalar function, so that the tree
+                // rendering does not change with the representation.
+                None => "vortex.root()".to_string(),
+            };
 
             // Get child names for display purposes
-            let child_names = (0..expr.children().len()).map(|i| expr.signature().child_name(i));
+            let child_names = (0..expr.children().len()).map(|i| match expr.signature() {
+                Some(sig) => sig.child_name(i),
+                None => ChildName::from(""),
+            });
             let children = expr.children();
 
             let child_trees: Result<Vec<Tree<String>>, std::fmt::Error> = children

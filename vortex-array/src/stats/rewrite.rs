@@ -135,10 +135,12 @@ fn rewrite(
         &StatsRewriteCtx<'_>,
     ) -> VortexResult<Option<Expression>>,
 ) -> VortexResult<Option<Expression>> {
-    let rules = ctx
-        .session()
-        .stats()
-        .rewrite_rules_for(expr.scalar_fn().id());
+    let scalar_fn = match expr {
+        Expression::Scalar { scalar_fn, .. } => scalar_fn,
+        // The scope alone proves nothing about the rows it contains.
+        Expression::Root => return Ok(None),
+    };
+    let rules = ctx.session().stats().rewrite_rules_for(scalar_fn.id());
     let Some(rules) = rules else {
         return Ok(None);
     };

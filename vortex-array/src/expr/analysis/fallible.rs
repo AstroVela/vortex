@@ -8,7 +8,8 @@ use crate::expr::label_tree;
 pub fn label_is_fallible(expr: &Expression) -> BooleanLabels<'_> {
     label_tree(
         expr,
-        |expr| expr.signature().is_fallible(),
+        // Root is not fallible, so a node with no scalar fn is not fallible either.
+        |expr| expr.signature().is_some_and(|sig| sig.is_fallible()),
         |acc, &child| acc | child,
     )
 }

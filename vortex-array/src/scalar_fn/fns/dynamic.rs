@@ -296,7 +296,7 @@ mod tests {
             root(),
         );
 
-        assert!(!expr.signature().is_strict());
+        assert!(!expr.signature().is_some_and(|sig| sig.is_strict()));
     }
 
     #[test]

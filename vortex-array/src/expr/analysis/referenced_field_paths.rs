@@ -14,7 +14,6 @@ use crate::expr::traversal::FoldUp;
 use crate::expr::traversal::NodeExt;
 use crate::expr::traversal::NodeFolderContext;
 use crate::scalar_fn::fns::get_item::GetItem;
-use crate::scalar_fn::fns::root::Root;
 use crate::scalar_fn::fns::select::Select;
 
 /// Returns the rooted field paths referenced by an expression.
@@ -93,7 +92,7 @@ impl NodeFolderContext for ReferencedFieldPaths<'_> {
         requested: &Self::Context,
         node: &Expression,
     ) -> VortexResult<FoldDownContext<Self::Context, ()>> {
-        if node.is::<Root>() {
+        if node.is_root() {
             self.field_paths.extend(
                 requested
                     .iter()

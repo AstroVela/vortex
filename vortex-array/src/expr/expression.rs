@@ -6,41 +6,48 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
-use std::ops::Deref;
 use std::sync::Arc;
 
-use itertools::Itertools;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
 
 use crate::dtype::DType;
 use crate::expr::display::DisplayTreeExpr;
+use crate::expr::scope::Scope;
+use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::ScalarFnOptions;
 use crate::scalar_fn::ScalarFnRef;
-use crate::scalar_fn::fns::root::Root;
+use crate::scalar_fn::ScalarFnSignature;
+use crate::scalar_fn::ScalarFnVTable;
+
+/// An empty child slice, returned by [`Expression::children`] for childless variants.
+const NO_CHILDREN: &[Expression] = &[];
 
 /// A node in a Vortex expression tree.
 ///
-/// Expressions represent scalar computations that can be performed on data. Each
-/// expression consists of an encoding (vtable), heap-allocated metadata, and child expressions.
+/// Expressions represent scalar computations performed over a scope. Most nodes are a scalar
+/// function applied to child expressions; [`Expression::Root`] is the scope itself.
+///
+/// `Root` is a distinct variant rather than a scalar function because its dtype comes from the
+/// scope rather than from its children, and it is not executable — a scalar function vtable cannot
+/// answer either question honestly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Expression {
-    /// The scalar fn for this node.
-    scalar_fn: ScalarFnRef,
-    /// Any children of this expression.
-    children: Arc<Vec<Expression>>,
-}
-
-impl Deref for Expression {
-    type Target = ScalarFnRef;
-
-    fn deref(&self) -> &Self::Target {
-        &self.scalar_fn
-    }
+pub enum Expression {
+    /// A scalar function applied to child expressions.
+    Scalar {
+        /// The scalar fn for this node.
+        scalar_fn: ScalarFnRef,
+        /// Any children of this expression.
+        children: Arc<Vec<Expression>>,
+    },
+    /// The full scope of the expression evaluation.
+    Root,
 }
 
 impl Expression {
-    /// Create a new expression node from a scalar_fn expression and its children.
+    /// Create a new expression node from a scalar fn and its children.
     pub fn try_new(
         scalar_fn: ScalarFnRef,
         children: impl IntoIterator<Item = Expression>,
@@ -54,62 +61,123 @@ impl Expression {
             children.len()
         );
 
-        Ok(Self {
+        Ok(Self::Scalar {
             scalar_fn,
             children: children.into(),
         })
     }
 
-    /// Returns the scalar fn vtable for this expression.
-    pub fn scalar_fn(&self) -> &ScalarFnRef {
-        &self.scalar_fn
+    /// Whether this expression is the scope root.
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+
+    /// Returns the scalar fn for this expression, or `None` if it is not a scalar node.
+    pub fn as_scalar(&self) -> Option<&ScalarFnRef> {
+        match self {
+            Self::Scalar { scalar_fn, .. } => Some(scalar_fn),
+            Self::Root => None,
+        }
+    }
+
+    /// Returns the id of this expression's scalar fn, or `None` for [`Expression::Root`].
+    pub fn scalar_fn_id(&self) -> Option<ScalarFnId> {
+        self.as_scalar().map(|sf| sf.id())
+    }
+
+    /// Signature information for this expression's scalar fn, or `None` for
+    /// [`Expression::Root`].
+    pub fn signature(&self) -> Option<ScalarFnSignature<'_>> {
+        self.as_scalar().map(|sf| sf.signature())
+    }
+
+    /// The type-erased options for this expression's scalar fn, or `None` for
+    /// [`Expression::Root`].
+    pub fn options(&self) -> Option<ScalarFnOptions<'_>> {
+        self.as_scalar().map(|sf| sf.options())
+    }
+
+    /// Whether this expression's scalar fn is of the given vtable type.
+    pub fn is<V: ScalarFnVTable>(&self) -> bool {
+        self.as_scalar().is_some_and(|sf| sf.is::<V>())
+    }
+
+    /// The typed options for this expression if its scalar fn matches the given vtable type.
+    pub fn as_opt<V: ScalarFnVTable>(&self) -> Option<&V::Options> {
+        self.as_scalar().and_then(|sf| sf.as_opt::<V>())
+    }
+
+    /// The typed options for this expression.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the vtable type does not match.
+    pub fn as_<V: ScalarFnVTable>(&self) -> &V::Options {
+        self.as_opt::<V>()
+            .vortex_expect("Expression options type mismatch")
     }
 
     /// Returns the children of this expression.
-    pub fn children(&self) -> &Arc<Vec<Expression>> {
-        &self.children
+    pub fn children(&self) -> &[Expression] {
+        match self {
+            Self::Scalar { children, .. } => children.as_slice(),
+            Self::Root => NO_CHILDREN,
+        }
     }
 
     /// Returns the n'th child of this expression.
     pub fn child(&self, n: usize) -> &Expression {
-        &self.children[n]
+        &self.children()[n]
     }
 
     /// Replace the children of this expression with the provided new children.
     pub fn with_children(
-        mut self,
+        self,
         children: impl IntoIterator<Item = Expression>,
     ) -> VortexResult<Self> {
         let children = Vec::from_iter(children);
-        vortex_ensure!(
-            self.signature().arity().matches(children.len()),
-            "Expression arity mismatch: expected {} children but got {}",
-            self.signature().arity(),
-            children.len()
-        );
-        self.children = Arc::new(children);
-        Ok(self)
+        match &self {
+            Self::Root => {
+                vortex_ensure!(
+                    children.is_empty(),
+                    "Expression arity mismatch: root expects 0 children but got {}",
+                    children.len()
+                );
+                Ok(Self::Root)
+            }
+            Self::Scalar { scalar_fn, .. } => {
+                vortex_ensure!(
+                    scalar_fn.signature().arity().matches(children.len()),
+                    "Expression arity mismatch: expected {} children but got {}",
+                    scalar_fn.signature().arity(),
+                    children.len()
+                );
+                Ok(Self::Scalar {
+                    scalar_fn: scalar_fn.clone(),
+                    children: children.into(),
+                })
+            }
+        }
     }
 
     /// Computes the return dtype of this expression given the input dtype.
+    ///
+    /// This binds the expression and discards everything but the root dtype. Callers needing types
+    /// at more than one node should use [`Expression::bind`] once and read the dtypes off the bound
+    /// tree instead of calling this repeatedly.
     pub fn return_dtype(&self, scope: &DType) -> VortexResult<DType> {
-        if self.is::<Root>() {
-            return Ok(scope.clone());
-        }
-
-        let dtypes: Vec<_> = self
-            .children
-            .iter()
-            .map(|c| c.return_dtype(scope))
-            .try_collect()?;
-        self.scalar_fn.return_dtype(&dtypes)
+        Ok(self.bind(&Scope::new(scope.clone()))?.dtype().clone())
     }
 
     /// Returns a new expression representing the validity mask output of this expression.
     ///
     /// The returned expression evaluates to a non-nullable boolean array.
     pub fn validity(&self) -> VortexResult<Expression> {
-        self.scalar_fn.validity(self)
+        match self {
+            // The scope is as valid as itself.
+            Self::Root => Ok(Self::Root),
+            Self::Scalar { scalar_fn, .. } => scalar_fn.validity(self),
+        }
     }
 
     /// Returns an expression that proves this predicate is definitely false from stats.
@@ -145,7 +213,10 @@ impl Expression {
     /// Since this is a recursive formatter, it is exposed on the public Expression type.
     /// See fmt_data that is only implemented on the vtable trait.
     pub fn fmt_sql(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.scalar_fn().fmt_sql(self, f)
+        match self {
+            Self::Root => write!(f, "$"),
+            Self::Scalar { scalar_fn, .. } => scalar_fn.fmt_sql(self, f),
+        }
     }
 
     /// Display the expression as a formatted tree structure.
@@ -178,28 +249,6 @@ impl Expression {
     ///
     /// println!("{}", complex_expr.display_tree());
     /// ```
-    ///
-    /// This produces output like:
-    ///
-    /// ```text
-    /// Select(include): {result}
-    /// └── Binary(and)
-    ///     ├── lhs: Not
-    ///     │   └── Binary(=)
-    ///     │       ├── lhs: GetItem(status)
-    ///     │       │   └── Root
-    ///     │       └── rhs: Literal(value: "inactive", dtype: utf8)
-    ///     └── rhs: Binary(and)
-    ///         ├── lhs: Like
-    ///         │   ├── child: GetItem(name)
-    ///         │   │   └── Root
-    ///         │   └── pattern: Literal(value: "%admin%", dtype: utf8)
-    ///         └── rhs: Binary(>)
-    ///             ├── lhs: Cast(target: f64)
-    ///             │   └── GetItem(score)
-    ///             │       └── Root
-    ///             └── rhs: Literal(value: 75f64, dtype: f64)
-    /// ```
     pub fn display_tree(&self) -> impl Display {
         DisplayTreeExpr(self)
     }
@@ -215,13 +264,19 @@ impl Display for Expression {
 /// Iterative drop for expression to avoid stack overflows.
 impl Drop for Expression {
     fn drop(&mut self) {
-        if let Some(children) = Arc::get_mut(&mut self.children) {
-            let mut children_to_drop = std::mem::take(children);
+        let Self::Scalar { children, .. } = self else {
+            return;
+        };
+        let Some(children) = Arc::get_mut(children) else {
+            return;
+        };
 
-            while let Some(mut child) = children_to_drop.pop() {
-                if let Some(expr_children) = Arc::get_mut(&mut child.children) {
-                    children_to_drop.append(expr_children);
-                }
+        let mut children_to_drop = std::mem::take(children);
+        while let Some(mut child) = children_to_drop.pop() {
+            if let Self::Scalar { children, .. } = &mut child
+                && let Some(expr_children) = Arc::get_mut(children)
+            {
+                children_to_drop.append(expr_children);
             }
         }
     }
