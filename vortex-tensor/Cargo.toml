@@ -37,6 +37,10 @@ rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 
 [[bench]]
+name = "cosine_similarity"
+harness = false
+
+[[bench]]
 name = "l2_norm"
 harness = false
 
