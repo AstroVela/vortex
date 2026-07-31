@@ -43,6 +43,9 @@ class PanelState:
     controls: dict[str, Any] = field(default_factory=dict)
     revision: int = 0
     last: dict[str, Any] = field(default_factory=dict)
+    # Free-form banner shown above the controls, e.g. "a run is in progress". Survives
+    # clicks, so whoever set it is the one who clears it.
+    notice: str = ""
 
     def to_json(self) -> str:
         return json.dumps(
@@ -51,6 +54,7 @@ class PanelState:
                 "rev": self.revision,
                 "controls": self.controls,
                 "last": self.last,
+                "notice": self.notice,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -65,6 +69,7 @@ class PanelState:
             controls=dict(raw.get("controls") or {}),
             revision=int(raw.get("rev") or 0),
             last=dict(raw.get("last") or {}),
+            notice=str(raw.get("notice") or ""),
         )
 
 
@@ -157,9 +162,13 @@ def apply_edit(
     *,
     actor: str = "",
     timestamp: str = "",
+    notice: str | None = None,
     panel: Panel = PANEL,
 ) -> ApplyResult:
-    """Interpret an edited panel comment and produce the redrawn body."""
+    """Interpret an edited panel comment and produce the redrawn body.
+
+    ``notice`` replaces the banner; leave it as ``None`` to carry the existing one over.
+    """
     previous = parse_state(body, panel)
     controls, pressed = canonicalize(previous.controls, parse_checkboxes(body), panel)
 
@@ -176,7 +185,12 @@ def apply_edit(
             "at": timestamp,
         }
 
-    state = PanelState(controls=controls, revision=previous.revision + 1, last=last)
+    state = PanelState(
+        controls=controls,
+        revision=previous.revision + 1,
+        last=last,
+        notice=previous.notice if notice is None else notice,
+    )
     new_body = render(state, panel)
     unchanged = _normalize(new_body) == _normalize(body)
     if unchanged:
@@ -193,9 +207,9 @@ def apply_edit(
     )
 
 
-def initial_state(panel: Panel = PANEL) -> PanelState:
+def initial_state(panel: Panel = PANEL, notice: str = "") -> PanelState:
     """State for a panel that has never been clicked."""
-    return PanelState(controls=panel.default_state(), revision=1)
+    return PanelState(controls=panel.default_state(), revision=1, notice=notice)
 
 
 def _normalize(body: str) -> str:
@@ -206,7 +220,12 @@ def _normalize(body: str) -> str:
 
 def render(state: PanelState, panel: Panel = PANEL) -> str:
     """Render canonical state as the full comment body."""
-    out: list[str] = [MARKER, "", f"## {panel.title}", "", panel.blurb, "", _status_line(state), ""]
+    out: list[str] = [MARKER, "", f"## {panel.title}", "", panel.blurb, ""]
+    if state.notice:
+        # Collapse whitespace so a notice wrapped across lines still renders as one
+        # blockquote rather than breaking out of it.
+        out.extend([f"> [!IMPORTANT]\n> {' '.join(state.notice.split())}", ""])
+    out.extend([_status_line(state), ""])
 
     for section in panel.sections:
         out.extend(_render_section(section, state))

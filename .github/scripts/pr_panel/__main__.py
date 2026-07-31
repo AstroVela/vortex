@@ -38,13 +38,18 @@ def _write_output(pairs: dict[str, str]) -> None:
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
-    Path(args.out).write_text(render(initial_state()), encoding="utf-8")
+    Path(args.out).write_text(render(initial_state(notice=args.notice)), encoding="utf-8")
     return 0
 
 
 def _cmd_apply(args: argparse.Namespace) -> int:
     body = Path(args.body).read_text(encoding="utf-8")
-    result = apply_edit(body, actor=args.actor, timestamp=args.timestamp)
+    result = apply_edit(
+        body,
+        actor=args.actor,
+        timestamp=args.timestamp,
+        notice=args.notice,
+    )
     Path(args.out).write_text(result.body, encoding="utf-8")
     _write_output(
         {
@@ -99,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
 
     render_cmd = sub.add_parser("render", help="write a fresh panel body")
     render_cmd.add_argument("--out", required=True)
+    render_cmd.add_argument("--notice", default="", help="banner shown above the controls")
     render_cmd.set_defaults(func=_cmd_render)
 
     apply_cmd = sub.add_parser("apply", help="interpret an edited panel body")
@@ -106,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     apply_cmd.add_argument("--out", required=True, help="file to write the redrawn body to")
     apply_cmd.add_argument("--actor", default="")
     apply_cmd.add_argument("--timestamp", default="")
+    apply_cmd.add_argument(
+        "--notice",
+        default=None,
+        help="replace the banner; omit to carry the existing one over",
+    )
     apply_cmd.set_defaults(func=_cmd_apply)
 
     report_cmd = sub.add_parser("report", help="render received state as a table")

@@ -172,6 +172,31 @@ def test_revision_advances_only_on_visible_change(fresh: str):
     assert apply_edit(click(fresh, "action.run")).state.revision == 2
 
 
+def test_notice_renders_and_survives_clicks(fresh: str):
+    announced = apply_edit(fresh, notice="preview window is open").body
+    assert "> preview window is open" in announced
+
+    clicked = apply_edit(click(announced, "suite.sql"))
+    assert clicked.state.notice == "preview window is open"
+    assert "> preview window is open" in clicked.body
+
+
+def test_notice_is_collapsed_to_one_blockquote_line(fresh: str):
+    body = apply_edit(fresh, notice="wrapped\n   across    lines").body
+
+    assert "> wrapped across lines" in body
+    # A raw newline here would terminate the blockquote and break the panel layout.
+    assert "\n> wrapped" in body and "lines\n" in body
+
+
+def test_notice_can_be_replaced_and_cleared(fresh: str):
+    body = apply_edit(fresh, notice="first").body
+    body = apply_edit(body, notice="second").body
+    assert "> second" in body and "first" not in body
+
+    assert apply_edit(body, notice="").state.notice == ""
+
+
 def test_report_renders_every_non_button_control(fresh: str):
     state = parse_state(click(fresh, "suite.sql")).to_json()
     report = render_report(state, run_url="https://example.invalid/run/1", actions="run")

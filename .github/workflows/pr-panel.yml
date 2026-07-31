@@ -11,12 +11,13 @@
 #
 # Notes for anyone changing this file:
 #
-# - `issue_comment` workflows always run from the *default branch*. Edits here do not
-#   take effect on a PR until they are merged; use `.github/scripts/pr_panel demo` and
-#   the unit tests to iterate locally.
-# - `pull_request_target` is used only so that PRs from forks also get a panel; a fork
-#   PR gets a read-only token under `pull_request`. Nothing here checks out or executes
-#   PR head code, so the elevated token never sees untrusted input.
+# - `issue_comment` workflows always run from the *default branch*. Edits to the apply
+#   path do not reach a PR until they are merged, which is what the `preview` job below
+#   exists to work around.
+# - Same-repo PRs post the panel via `pull_request`, so the panel is rendered by the
+#   PR's own code and can be iterated on before merge. Fork PRs get a read-only token
+#   under `pull_request`, so they are handled by `pull_request_target` instead — which
+#   checks out the base branch and never executes fork code.
 # - Edits made with `GITHUB_TOKEN` do not trigger workflows, so redrawing the comment
 #   cannot loop back into this workflow.
 # - Only users with write access can tick a checkbox on someone else's comment, so
@@ -25,30 +26,35 @@
 name: PR Control Panel
 
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
   pull_request_target:
     types: [opened, reopened]
   issue_comment:
     types: [edited]
-
-concurrency:
-  # Serialize per PR: two quick clicks must not interleave their read-modify-write of
-  # the comment body. Never cancel, or a click would be silently dropped.
-  group: pr-panel-${{ github.event.issue.number || github.event.pull_request.number }}
-  cancel-in-progress: false
 
 permissions: { }
 
 jobs:
   post:
     name: Post panel
-    if: github.event_name == 'pull_request_target'
+    # One of the two PR triggers handles any given PR, never both: `pull_request` for
+    # same-repo branches, `pull_request_target` for forks.
+    if: >-
+      (github.event_name == 'pull_request'
+       && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'pull_request_target'
+          && github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: pr-panel-post-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     permissions:
       issues: write  # PR conversation comments go through the issues API
       pull-requests: write
     steps:
-      # Checks out the base branch, never the PR head.
+      # For `pull_request_target` this is the base branch, never the fork's head.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
@@ -77,6 +83,11 @@ jobs:
       && contains(github.event.comment.body, '<!-- vortex-pr-panel -->')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      # Serialize per PR: two quick clicks must not interleave their read-modify-write
+      # of the comment body. Never cancel, or a click would be silently dropped.
+      group: pr-panel-apply-${{ github.event.issue.number }}
+      cancel-in-progress: false
     permissions:
       actions: write  # dispatch pr-panel-run.yml
       issues: write  # edit the panel comment
@@ -148,3 +159,53 @@ jobs:
             echo "- redrawn: \`$CHANGED\`"
             echo "- dispatched: \`${PANEL_ACTIONS:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  preview:
+    name: Preview clicks
+    # Only for PRs that change the panel itself. Those are exactly the PRs whose apply
+    # path cannot be exercised, because `issue_comment` runs from the default branch.
+    needs: post
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      # A newer push supersedes the window a previous one opened.
+      group: pr-panel-preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check whether this PR touches the panel
+        id: touched
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -Eeuo pipefail
+          if git diff --name-only "$BASE_SHA...HEAD" \
+              | grep -Eq '^\.github/(scripts/pr[-_]panel|workflows/pr-panel)'; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "yes=false" >> "$GITHUB_OUTPUT"
+            echo "Panel unchanged; skipping the preview window." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Watch for clicks
+        if: steps.touched.outputs.yes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          bash .github/scripts/pr-panel-preview.sh "$REPO" "$PR" 1800 15 \
+            "Clicks are being applied live by [a preview run]($RUN_URL) for the next 30
+            minutes, because \`issue_comment\` workflows only run from the default
+            branch. Once this is merged, clicks apply in seconds with no preview run."

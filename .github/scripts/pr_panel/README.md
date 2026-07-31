@@ -64,8 +64,25 @@ Add or change controls in `spec.py`; `panel.py` needs no edits.
   typed into the comment is replaced on the next click.
 - **Redraws are skipped when they would be a no-op.** Ticking a toggle already leaves the
   comment correct, so no write-back happens; only radios and buttons force a redraw.
-- **Deploys lag.** `issue_comment` workflows always run from the default branch, so
-  changes to this panel only take effect on PRs once merged.
+
+## Testing a change to the panel
+
+`issue_comment` and `pull_request_target` workflows always run from the **default
+branch**, so a PR that changes the panel cannot exercise its own apply path. Two things
+close that gap:
+
+- The panel is **posted** by the `pull_request` trigger for same-repo branches, which
+  does run the PR's version of the code. Fork PRs fall back to `pull_request_target`,
+  because a fork gets a read-only token under `pull_request`.
+- Clicks are **applied** by the `preview` job, which runs only on PRs that touch
+  `.github/scripts/pr_panel/**` or `.github/workflows/pr-panel*.yml`. It polls the panel
+  comment for 30 minutes and applies whatever it finds, using `pr-panel-preview.sh`.
+  Everything downstream of "the body changed" is the same code the webhook path runs;
+  only the trigger differs. Push again to reopen the window.
+
+The preview job renders the run report inline rather than dispatching `pr-panel-run.yml`,
+since `workflow_dispatch` also only works from the default branch. That hop is the one
+part of the flow that genuinely cannot be exercised before merge.
 
 ## Working on it locally
 
