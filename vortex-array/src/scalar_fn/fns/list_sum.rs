@@ -6,10 +6,12 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_mask::AllOr;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::AggregateFnVTable;
@@ -20,6 +22,7 @@ use crate::aggregate_fn::GroupedArray;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::sum::Sum;
 use crate::arrays::BoolArray;
+use crate::arrays::ConstantArray;
 use crate::arrays::FixedSizeList;
 use crate::arrays::ListView;
 use crate::builtins::ArrayBuiltins;
@@ -27,9 +30,8 @@ use crate::dtype::DType;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::NullHandling;
 use crate::scalar_fn::ScalarFnId;
-use crate::scalar_fn::StrictScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTable;
 use crate::validity::Validity;
 
 /// Sum of the elements in each list of a `List` or `FixedSizeList` typed array.
@@ -42,24 +44,27 @@ use crate::validity::Validity;
 /// NaN handling for float elements is controlled by [`NumericalAggregateOpts`]: with
 /// `skip_nans` (the default) NaN values contribute nothing, otherwise any NaN poisons the
 /// list's sum to NaN.
-///
-/// A null list sums to null, which is all that strictness requires. Element nulls are part of the
-/// list *value* rather than row-level nulls, and a valid list may still sum to null (empty, all-null,
-/// or overflow), since strictness is only one-directional.
-///
-/// Being non-total is also what rules out writing this as a
-/// [`RowFn`](crate::scalar_fn::RowFn), whose output elements are always all-valid. For the same
-/// reason it leaves [`validity`](StrictScalarFnVTable::validity) at its default, since the child
-/// conjunction would claim a valid-but-empty list's row is valid.
 #[derive(Clone)]
 pub struct ListSum;
 
-impl StrictScalarFnVTable for ListSum {
+impl ScalarFnVTable for ListSum {
     type Options = NumericalAggregateOpts;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.list.sum");
         *ID
+    }
+
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(options.serialize()))
+    }
+
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        NumericalAggregateOpts::deserialize(metadata)
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -73,47 +78,57 @@ impl StrictScalarFnVTable for ListSum {
         }
     }
 
-    fn return_element_dtype(
-        &self,
-        options: &Self::Options,
-        arg_dtypes: &[DType],
-    ) -> VortexResult<DType> {
-        let elem_dtype = list_element_dtype(&arg_dtypes[0])?;
+    fn return_dtype(&self, options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
+        let elem_dtype = match &arg_dtypes[0] {
+            DType::List(elem, _) | DType::FixedSizeList(elem, ..) => elem.as_ref(),
+            other => vortex_bail!("list_sum() requires List or FixedSizeList, got {other}"),
+        };
         Sum.return_dtype(options, elem_dtype)
             .ok_or_else(|| vortex_err!("list_sum() cannot sum elements of type {elem_dtype}"))
     }
 
-    /// A list array's offsets stay in bounds for every row, so the sums can be computed densely and
-    /// the lifting masks the null rows afterward, leaving the input at its original encoding.
-    fn null_handling(&self, _options: &Self::Options) -> NullHandling {
-        NullHandling::Dense
-    }
-
-    fn is_fallible(&self, _options: &Self::Options) -> bool {
-        false
-    }
-
-    fn execute_strict(
+    fn execute(
         &self,
         options: &Self::Options,
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let input = args.get(0)?;
-        let elem_dtype = list_element_dtype(input.dtype())?.clone();
 
-        // `mask_empty_lists` needs access to list elements validity and sizes.
-        let canonical = input.execute::<Canonical>(ctx)?.into_array();
+        let elem_dtype = match input.dtype() {
+            DType::List(elem, _) | DType::FixedSizeList(elem, ..) => elem.as_ref().clone(),
+            other => vortex_bail!("list_sum() requires List or FixedSizeList, got {other}"),
+        };
 
-        list_sum_impl(canonical, elem_dtype, options, ctx)
+        // `mask_empty_lists` needs access to list elements validity and sizes
+        let columnar = input.execute::<Columnar>(ctx)?;
+
+        match columnar {
+            Columnar::Constant(constant) => {
+                // Canonicalize one row of the constant and broadcast its sum.
+                let one_row = ConstantArray::new(constant.scalar().clone(), 1)
+                    .into_array()
+                    .execute::<Canonical>(ctx)?
+                    .into_array();
+                let sum =
+                    list_sum_impl(one_row, elem_dtype, options, ctx)?.execute_scalar(0, ctx)?;
+                Ok(ConstantArray::new(sum, constant.len()).into_array())
+            }
+            Columnar::Canonical(canonical) => {
+                list_sum_impl(canonical.into_array(), elem_dtype, options, ctx)
+            }
+        }
     }
-}
 
-/// The element dtype of a `List` or `FixedSizeList` input, which is what [`Sum`] aggregates over.
-fn list_element_dtype(dtype: &DType) -> VortexResult<&DType> {
-    match dtype {
-        DType::List(elem, _) | DType::FixedSizeList(elem, ..) => Ok(elem.as_ref()),
-        other => vortex_bail!("list_sum() requires List or FixedSizeList, got {other}"),
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        // A null list sums to null, which is all that strictness requires. Element nulls are part
+        // of the list value rather than row-level nulls, and a valid list may still sum to null
+        // (empty, all-null, or overflow) since strictness is only one-directional.
+        true
+    }
+
+    fn is_fallible(&self, _options: &Self::Options) -> bool {
+        false
     }
 }
 

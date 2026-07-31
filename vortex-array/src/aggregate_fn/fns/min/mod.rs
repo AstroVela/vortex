@@ -82,7 +82,7 @@ impl AggregateFnVTable for Min {
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(options.serialize_proto()))
+        Ok(Some(options.serialize()))
     }
 
     fn deserialize(
@@ -90,7 +90,7 @@ impl AggregateFnVTable for Min {
         metadata: &[u8],
         _session: &VortexSession,
     ) -> VortexResult<Self::Options> {
-        NumericalAggregateOpts::deserialize_proto(metadata)
+        NumericalAggregateOpts::deserialize(metadata)
     }
 
     fn return_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
