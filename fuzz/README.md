@@ -15,3 +15,17 @@ input with the command `cargo fuzz run array_ops <path/to/artifact>` or `cargo f
 
 If there are any linking (on macOS) then run `cargo fuzz run --dev --sanitizer=none ...`. `--dev` runs the fuzzer in dev
 profile.
+
+## Tiled fixed-size lists
+
+Run the native differential property target against canonical fixed-size lists:
+
+```shell
+cargo +nightly fuzz run tiled_fsl
+```
+
+Replay one saved crash input:
+
+```shell
+cargo +nightly fuzz run tiled_fsl <path/to/artifact>
+```

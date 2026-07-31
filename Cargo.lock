@@ -9978,6 +9978,7 @@ dependencies = [
  "vortex-row",
  "vortex-runend",
  "vortex-session",
+ "vortex-tiled-fsl",
  "vortex-utils",
 ]
 

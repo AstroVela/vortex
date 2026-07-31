@@ -8,6 +8,7 @@ pub mod compress;
 pub mod error;
 pub mod fsst_like;
 mod row;
+mod tiled_fsl;
 
 // File module only available for native builds (requires vortex-file which uses tokio)
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +35,10 @@ pub use gpu::FuzzCompressGpu;
 pub use gpu::run_compress_gpu;
 pub use row::FuzzRowEncode;
 pub use row::run_row_encode;
+pub use tiled_fsl::FuzzTiledFsl;
+pub use tiled_fsl::TiledFslAction;
+pub use tiled_fsl::deterministic_tiled_fsl_cases;
+pub use tiled_fsl::run_tiled_fsl;
 
 pub const FUZZ_ARRAY_MAX_LEN: usize = 2048;
 pub const FUZZ_FILE_ARRAY_MAX_LEN: usize = 16_384;
