@@ -13,9 +13,11 @@ use futures::future::BoxFuture;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
+use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::replace;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -28,19 +30,19 @@ use crate::scan::filter::FilterExpr;
 pub(crate) struct PlanV2 {
     projection: ScanPlanRef,
     predicates: Vec<ScanPlanRef>,
-    filter: Option<Expression>,
+    filter: Option<Arc<FilterExpr>>,
 }
 
 impl PlanV2 {
     pub(crate) fn new(
         projection: ScanPlanRef,
         predicates: Vec<ScanPlanRef>,
-        filter: Option<Expression>,
+        filter: Option<BoundExpression>,
     ) -> Self {
         Self {
             projection,
             predicates,
-            filter,
+            filter: filter.map(|filter| Arc::new(FilterExpr::new(filter))),
         }
     }
 
@@ -49,10 +51,7 @@ impl PlanV2 {
         mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     ) -> Arc<TaskContext<A>> {
         Arc::new(TaskContext {
-            filter: self
-                .filter
-                .clone()
-                .map(|filter| Arc::new(FilterExpr::new(filter))),
+            filter: self.filter.clone(),
             predicates: self.predicates.clone(),
             projection: Arc::clone(&self.projection),
             mapper,
@@ -110,39 +109,32 @@ pub trait ScanPlan: 'static + Send + Sync {
 /// can replace this compatibility node without changing the split execution loop.
 pub struct LayoutReaderScanPlanV2 {
     reader: LayoutReaderRef,
-    expr: Expression,
-    dtype: DType,
+    expr: BoundExpression,
 }
 
 impl LayoutReaderScanPlanV2 {
     /// Create a V2 source plan for `reader`.
     pub fn new(reader: LayoutReaderRef) -> Self {
-        let dtype = reader.dtype().clone();
-        Self {
-            reader,
-            expr: root(),
-            dtype,
-        }
+        let expr = root()
+            .bind(reader.dtype())
+            .vortex_expect("root must bind against the layout reader dtype");
+        Self { reader, expr }
     }
 
     fn try_new(reader: LayoutReaderRef, expr: Expression) -> VortexResult<Self> {
-        let dtype = expr.return_dtype(reader.dtype())?;
-        Ok(Self {
-            reader,
-            expr,
-            dtype,
-        })
+        let expr = expr.bind(reader.dtype())?;
+        Ok(Self { reader, expr })
     }
 }
 
 impl ScanPlan for LayoutReaderScanPlanV2 {
     fn apply_expr(self: Arc<Self>, expr: Expression) -> VortexResult<ScanPlanRef> {
-        let expr = replace(expr, &root(), self.expr.clone());
+        let expr = replace(expr, &root(), self.expr.unbind());
         Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
     }
 
     fn optimize(self: Arc<Self>) -> VortexResult<ScanPlanRef> {
-        let expr = self.expr.optimize_recursive(self.reader.dtype())?;
+        let expr = self.expr.unbind().optimize_recursive(self.reader.dtype())?;
         Ok(Arc::new(Self::try_new(Arc::clone(&self.reader), expr)?))
     }
 
@@ -151,7 +143,7 @@ impl ScanPlan for LayoutReaderScanPlanV2 {
     }
 
     fn dtype(&self) -> &DType {
-        &self.dtype
+        self.expr.dtype()
     }
 
     fn row_count(&self) -> u64 {
@@ -409,7 +401,7 @@ mod tests {
         fn pruning_evaluation(
             &self,
             _row_range: &Range<u64>,
-            _expr: &Expression,
+            _expr: &BoundExpression,
             _mask: Mask,
         ) -> VortexResult<MaskFuture> {
             unimplemented!("not needed for scan-plan construction")
@@ -418,7 +410,7 @@ mod tests {
         fn filter_evaluation(
             &self,
             _row_range: &Range<u64>,
-            _expr: &Expression,
+            _expr: &BoundExpression,
             _mask: MaskFuture,
         ) -> VortexResult<MaskFuture> {
             unimplemented!("not needed for scan-plan construction")
@@ -427,7 +419,7 @@ mod tests {
         fn projection_evaluation(
             &self,
             _row_range: &Range<u64>,
-            _expr: &Expression,
+            _expr: &BoundExpression,
             _mask: MaskFuture,
         ) -> VortexResult<ArrayFuture> {
             unimplemented!("not needed for scan-plan construction")

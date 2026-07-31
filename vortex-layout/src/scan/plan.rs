@@ -11,7 +11,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
-use vortex_array::expr::Expression;
+use vortex_array::expr::BoundExpression;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_scan::row_mask::RowMask;
@@ -23,16 +23,17 @@ pub type TaskFuture<A> = BoxFuture<'static, VortexResult<A>>;
 
 pub(crate) struct Plan {
     layout_reader: LayoutReaderRef,
-    projection: Expression,
-    filter: Option<Expression>,
+    projection: BoundExpression,
+    filter: Option<Arc<FilterExpr>>,
 }
 
 impl Plan {
     pub(crate) fn new(
         layout_reader: LayoutReaderRef,
-        projection: Expression,
-        filter: Option<Expression>,
+        projection: BoundExpression,
+        filter: Option<BoundExpression>,
     ) -> Self {
+        let filter = filter.map(|filter| Arc::new(FilterExpr::new(filter)));
         Self {
             layout_reader,
             projection,
@@ -45,10 +46,7 @@ impl Plan {
         mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     ) -> Arc<TaskContext<A>> {
         Arc::new(TaskContext {
-            filter: self
-                .filter
-                .clone()
-                .map(|filter| Arc::new(FilterExpr::new(filter))),
+            filter: self.filter.clone(),
             reader: Arc::clone(&self.layout_reader),
             projection: self.projection.clone(),
             mapper,
@@ -191,6 +189,6 @@ pub fn split_exec<A: 'static + Send>(
 pub(crate) struct TaskContext<A> {
     filter: Option<Arc<FilterExpr>>,
     reader: LayoutReaderRef,
-    projection: Expression,
+    projection: BoundExpression,
     mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
 }

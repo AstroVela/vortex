@@ -12,7 +12,7 @@ use itertools::Either;
 use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
-use vortex_array::expr::Expression;
+use vortex_array::expr::BoundExpression;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorAdapter;
 use vortex_array::stream::ArrayStream;
@@ -100,8 +100,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
     pub fn new_plan(
         session: VortexSession,
         layout_reader: LayoutReaderRef,
-        projection: Expression,
-        filter: Option<Expression>,
+        projection: BoundExpression,
+        filter: Option<BoundExpression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
         selection: Selection,
@@ -134,7 +134,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         session: VortexSession,
         projection: ScanPlanRef,
         predicates: Vec<ScanPlanRef>,
-        filter: Option<Expression>,
+        filter: Option<BoundExpression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
         selection: Selection,
