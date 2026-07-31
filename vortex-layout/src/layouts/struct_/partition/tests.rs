@@ -36,17 +36,22 @@ fn scope(nullability: vortex_array::dtype::Nullability) -> DType {
     )
 }
 
-/// The dtype of the child layout that evaluates a slot.
-fn child_dtype(scope: &DType, slot: &StructSlot) -> DType {
-    match slot {
-        StructSlot::Validity => DType::Bool(NonNullable),
-        StructSlot::Field(name) => scope.as_struct_fields_opt().unwrap().field(name).unwrap(),
+/// The dtype of the child layout that evaluates a slot. Slot 0 is the validity, slot `i + 1` is
+/// field `i`.
+fn child_dtype(scope: &DType, slot: StructSlot) -> DType {
+    if slot.is_validity() {
+        return DType::Bool(NonNullable);
     }
+    scope
+        .as_struct_fields_opt()
+        .unwrap()
+        .field_by_index(slot.index() - 1)
+        .unwrap()
 }
 
 fn slots(partitioned: &StructPartitioned) -> Vec<StructSlot> {
     match partitioned {
-        StructPartitioned::Single(slot, _) => vec![slot.clone()],
+        StructPartitioned::Single(slot, _) => vec![*slot],
         StructPartitioned::Multi(partitioned) => partitioned.partition_annotations.to_vec(),
     }
 }
@@ -58,7 +63,7 @@ fn assert_round_trips(scope: &DType, expr: &Expression) -> VortexResult<StructPa
 
     let assembled = match &partitioned {
         StructPartitioned::Single(slot, partition) => {
-            partition.return_dtype(&child_dtype(scope, slot))?
+            partition.return_dtype(&child_dtype(scope, *slot))?
         }
         StructPartitioned::Multi(multi) => {
             for (slot, partition) in multi
@@ -66,7 +71,7 @@ fn assert_round_trips(scope: &DType, expr: &Expression) -> VortexResult<StructPa
                 .iter()
                 .zip(multi.partitions.iter())
             {
-                partition.return_dtype(&child_dtype(scope, slot))?;
+                partition.return_dtype(&child_dtype(scope, *slot))?;
             }
             let root_scope = DType::Struct(
                 StructFields::new(
@@ -113,7 +118,7 @@ fn single_field_is_delegated() -> VortexResult<()> {
     let StructPartitioned::Single(slot, partition) = partitioned else {
         panic!("expected a single partition");
     };
-    assert_eq!(slot, StructSlot::Field("a".into()));
+    assert_eq!(slot, StructSlot::field(0));
     assert_eq!(partition, eq(root(), lit(1)));
     Ok(())
 }
@@ -126,7 +131,7 @@ fn single_field_of_nullable_struct_reads_validity() -> VortexResult<()> {
 
     assert_eq!(
         slots(&partitioned),
-        vec![StructSlot::Field("a".into()), StructSlot::Validity]
+        vec![StructSlot::field(0), StructSlot::VALIDITY]
     );
     Ok(())
 }
@@ -138,7 +143,7 @@ fn single_field_of_nullable_struct_reads_validity() -> VortexResult<()> {
 fn null_check_only_reads_validity(#[case] expr: Expression) -> VortexResult<()> {
     let partitioned = assert_round_trips(&scope(Nullable), &expr)?;
 
-    assert_eq!(slots(&partitioned), vec![StructSlot::Validity]);
+    assert_eq!(slots(&partitioned), vec![StructSlot::VALIDITY]);
     Ok(())
 }
 
@@ -159,9 +164,9 @@ fn root_reads_every_child() -> VortexResult<()> {
     assert_eq!(
         slots(&partitioned),
         vec![
-            StructSlot::Field("a".into()),
-            StructSlot::Field("b".into()),
-            StructSlot::Validity,
+            StructSlot::field(0),
+            StructSlot::field(1),
+            StructSlot::VALIDITY,
         ]
     );
 
@@ -181,17 +186,17 @@ fn select_reads_selected_fields_and_validity() -> VortexResult<()> {
 
     assert_eq!(
         slots(&partitioned),
-        vec![StructSlot::Field("a".into()), StructSlot::Validity]
+        vec![StructSlot::field(0), StructSlot::VALIDITY]
     );
     Ok(())
 }
 
-/// The validity slot needs a name in the flat scope. A struct field may already use that name, in
-/// which case the validity slot has to pick a different one.
+/// Slots are addressed by index in the flat scope, so no user field name can be mistaken for
+/// another slot — not even a field literally named after a slot index.
 #[rstest]
-fn validity_name_avoids_colliding_with_a_field() -> VortexResult<()> {
+fn field_names_cannot_clash_with_slots() -> VortexResult<()> {
     let scope = DType::Struct(
-        StructFields::from_iter([("__validity", i32_()), ("__validity_", i32_())]),
+        StructFields::from_iter([("0", i32_()), ("1", DType::Bool(NonNullable))]),
         Nullable,
     );
 
@@ -200,15 +205,20 @@ fn validity_name_avoids_colliding_with_a_field() -> VortexResult<()> {
         panic!("expected multiple partitions");
     };
 
-    // Every partition name is distinct, so the field named `__validity` still addresses its own
-    // child rather than the validity child.
-    let names = multi.partition_names.iter().collect::<Vec<_>>();
-    assert_eq!(names.len(), 3);
-    assert!(
-        names
-            .iter()
-            .all(|name| names.iter().filter(|other| *other == name).count() == 1),
-        "duplicate partition names: {names:?}"
+    // The field named "0" is slot 1 and the field named "1" is slot 2; the validity is slot 0.
+    assert_eq!(
+        multi.partition_annotations.to_vec(),
+        vec![
+            StructSlot::field(0),
+            StructSlot::field(1),
+            StructSlot::VALIDITY,
+        ]
+    );
+
+    // And `$."0"` addresses the field named "0" — which is slot 1 — not the validity in slot 0.
+    assert_eq!(
+        slots(&assert_round_trips(&scope, &col("0"))?),
+        vec![StructSlot::field(0), StructSlot::VALIDITY]
     );
     Ok(())
 }
@@ -220,7 +230,7 @@ fn repeated_references_are_deduplicated() -> VortexResult<()> {
     let expr = or(eq(col("a"), lit(1)), eq(col("a"), lit(2)));
     let partitioned = assert_round_trips(&scope(NonNullable), &expr)?;
 
-    assert_eq!(slots(&partitioned), vec![StructSlot::Field("a".into())]);
+    assert_eq!(slots(&partitioned), vec![StructSlot::field(0)]);
 
     // `$.a` is referenced twice but the partition is a single expression evaluated once: the
     // whole `or` is pushed into the field's child.
@@ -244,7 +254,7 @@ fn multiple_sub_expressions_are_packed() -> VortexResult<()> {
 
     assert_eq!(
         slots(&partitioned),
-        vec![StructSlot::Field("a".into()), StructSlot::Field("b".into())]
+        vec![StructSlot::field(0), StructSlot::field(1)]
     );
 
     let StructPartitioned::Multi(multi) = &partitioned else {

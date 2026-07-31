@@ -6,7 +6,11 @@
 //! Every expression here is partitioned over the layout's children — one per field, plus the
 //! struct's own validity — and re-assembled by the partitioned root expression.
 //!
-//! [`StructReader`]: super::super::StructReader
+//! The same scenarios are covered end to end, over a serialized Vortex file, by
+//! `vortex-file/tests/struct_nullability.rs`. The two suites are deliberately independent — they
+//! share no fixtures or expectations — so that a change to one side cannot silently move both.
+//!
+//! [`StructReader`]: super::StructReader
 
 use std::sync::Arc;
 

@@ -25,7 +25,7 @@
 //! 1. **Flattening.** Every access to the root scope is rewritten into an access of the *flat
 //!    scope*: a non-nullable struct holding the validity slot plus one slot per field, mirroring
 //!    the layout's children. The struct's nullability is made explicit in the expression itself,
-//!    e.g. `$.a` over a nullable struct becomes `mask($.a, $.__validity)`. See
+//!    e.g. `$.a` over a nullable struct `{a, b}?` becomes `mask($.1, $.0)`. See
 //!    [`StructPartitioner::flatten`].
 //! 2. **Splitting.** The flattened expression is split into one sub-expression per slot, plus a
 //!    root expression that re-assembles them. This mirrors the splitter in `vortex-array`.
@@ -35,6 +35,14 @@
 //! Stage 1 is what makes stages 2 and 3 sound: afterwards, the *only* way an expression can touch
 //! the root scope is `get_item(<slot>, root())`, so stepping down is a total rewrite rather than a
 //! best-effort substitution.
+//!
+//! ## Naming the slots
+//!
+//! The flat scope addresses each child by its [`StructSlot`] index rendered as a field name, not
+//! by the field's own name. Field names are arbitrary user data — any name reserved for validity
+//! could be taken by a real field — whereas slot indices are assigned by the layout, so no user
+//! field name ever appears in the flat scope and a clash is impossible by construction. It also
+//! means a slot resolves to its child reader in `O(1)`, with no name lookup.
 
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -71,27 +79,40 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_map::HashMap;
 
-/// The prefix used to name the validity slot of a struct layout. A suffix is appended if needed
-/// to avoid colliding with a field of the struct.
-const VALIDITY_SLOT_PREFIX: &str = "__validity";
+/// One child of a struct layout, identified by its logical slot index.
+///
+/// Slot 0 is the struct's own validity bitmap (present only when the struct is nullable) and slot
+/// `i + 1` is field `i`. This is the same numbering as
+/// [`slot_to_child`](crate::layouts::struct_::Struct::slot_to_child), so a slot resolves to its
+/// child reader without any name lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StructSlot(usize);
 
-/// One child of a struct layout: either the struct's own validity, or one of its fields.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum StructSlot {
-    /// The struct's own validity bitmap, present only when the struct is nullable.
-    Validity,
-    /// A field of the struct.
-    Field(FieldName),
+impl StructSlot {
+    /// The slot holding the struct's own validity.
+    pub(crate) const VALIDITY: Self = Self(0);
+
+    /// The slot holding field `index` of the struct.
+    pub(crate) const fn field(index: usize) -> Self {
+        Self(index + 1)
+    }
+
+    /// The logical slot index, as understood by the layout.
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+
+    /// Whether this is the validity slot.
+    pub(crate) const fn is_validity(self) -> bool {
+        self.0 == 0
+    }
 }
 
-/// A human-readable label for the slot, used in error messages. This is *not* the slot's name in
-/// the flat scope — see [`StructPartitioner::slot_name`] for that.
+/// The slot's name in the flat scope. Slots are named by index, so a name can never clash with a
+/// field of the struct.
 impl Display for StructSlot {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StructSlot::Validity => write!(f, "<validity>"),
-            StructSlot::Field(name) => write!(f, "{name}"),
-        }
+        write!(f, "{}", self.0)
     }
 }
 
@@ -109,10 +130,13 @@ pub(crate) struct StructPartitioner {
     /// The dtype of the struct layout; the scope of any incoming expression.
     scope: DType,
     /// The scope that expressions are flattened into: a non-nullable struct with one field per
-    /// child of the struct layout.
+    /// child of the struct layout, named by [`StructSlot`] index.
     flat_scope: DType,
-    /// The name of the validity slot in [`Self::flat_scope`], if the struct is nullable.
-    validity_name: Option<FieldName>,
+    /// Whether the struct is nullable, and therefore has a validity slot.
+    nullable: bool,
+    /// Field name to field index, built only for structs wide enough that the linear scan in
+    /// [`StructFields::find`] would be worth avoiding.
+    field_lookup: Option<HashMap<FieldName, usize>>,
 }
 
 impl StructPartitioner {
@@ -122,18 +146,27 @@ impl StructPartitioner {
             .as_struct_fields_opt()
             .ok_or_else(|| vortex_err!("Struct layout dtype must be a struct, got {dtype}"))?;
 
-        let validity_name = dtype
-            .is_nullable()
-            .then(|| unique_validity_name(fields.names()));
+        let nullable = dtype.is_nullable();
 
         let mut names: Vec<FieldName> = Vec::with_capacity(fields.nfields() + 1);
         let mut dtypes: Vec<DType> = Vec::with_capacity(fields.nfields() + 1);
-        if let Some(validity_name) = &validity_name {
-            names.push(validity_name.clone());
+        if nullable {
+            names.push(slot_name(StructSlot::VALIDITY));
             dtypes.push(DType::Bool(Nullability::NonNullable));
         }
-        names.extend(fields.names().iter().cloned());
+        names.extend((0..fields.nfields()).map(|idx| slot_name(StructSlot::field(idx))));
         dtypes.extend(fields.fields());
+
+        // NOTE: This number is arbitrary and likely depends on the longest common prefix of the
+        // field names.
+        let field_lookup = (fields.nfields() > 80).then(|| {
+            fields
+                .names()
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| (name.clone(), idx))
+                .collect()
+        });
 
         Ok(Self {
             scope: dtype.clone(),
@@ -141,42 +174,48 @@ impl StructPartitioner {
                 StructFields::new(names.into(), dtypes),
                 Nullability::NonNullable,
             ),
-            validity_name,
+            nullable,
+            field_lookup,
         })
     }
 
     /// Each slot may hold several sub-expressions, so each one needs a unique name within the
     /// pack that makes up its partition.
-    fn sub_expression_name(&self, slot: &StructSlot, idx: usize) -> FieldName {
-        FieldName::from(format!("{}_{idx}", self.slot_name(slot)))
+    fn sub_expression_name(&self, slot: StructSlot, idx: usize) -> FieldName {
+        FieldName::from(format!("{slot}_{idx}"))
     }
 
-    /// The flat scope's field name for a slot.
-    fn slot_name(&self, slot: &StructSlot) -> FieldName {
-        match slot {
-            StructSlot::Validity => self
-                .validity_name
-                .clone()
-                .vortex_expect("Validity slot only exists for nullable structs"),
-            StructSlot::Field(name) => name.clone(),
-        }
-    }
-
-    /// The slot addressed by a field of the flat scope.
+    /// The slot addressed by a field of the flat scope, if it is one.
     fn name_slot(&self, name: &FieldName) -> Option<StructSlot> {
-        if self.validity_name.as_ref() == Some(name) {
-            return Some(StructSlot::Validity);
+        let slot = StructSlot(name.as_ref().parse::<usize>().ok()?);
+        self.contains(slot).then_some(slot)
+    }
+
+    /// Whether this layout actually has the given slot.
+    fn contains(&self, slot: StructSlot) -> bool {
+        if slot.is_validity() {
+            self.nullable
+        } else {
+            slot.index() <= self.fields().nfields()
         }
-        self.scope
-            .as_struct_fields_opt()
-            .vortex_expect("Struct layout dtype must be a struct")
-            .find(name)
-            .map(|_| StructSlot::Field(name.clone()))
+    }
+
+    /// The index of a field of the struct, by name.
+    fn field_index(&self, name: &FieldName) -> Option<usize> {
+        match &self.field_lookup {
+            Some(lookup) => lookup.get(name).copied(),
+            None => self.fields().find(name),
+        }
+    }
+
+    /// An expression referencing a slot within the flat scope.
+    fn slot_expr(&self, slot: StructSlot) -> Expression {
+        col(slot_name(slot))
     }
 
     /// An expression referencing the struct's validity within the flat scope.
     fn validity_expr(&self) -> Option<Expression> {
-        self.validity_name.as_ref().map(|name| col(name.clone()))
+        self.nullable.then(|| self.slot_expr(StructSlot::VALIDITY))
     }
 
     /// Partition `expr` (defined over [`Self::scope`]) over the children of the struct layout.
@@ -192,7 +231,7 @@ impl StructPartitioner {
             && partitioned.root == col(partitioned.partition_names[0].clone())
         {
             return Ok(StructPartitioned::Single(
-                partitioned.partition_annotations[0].clone(),
+                partitioned.partition_annotations[0],
                 partitioned.partitions[0].clone(),
             ));
         }
@@ -220,15 +259,19 @@ impl StructPartitioner {
             .transform_down(|node| {
                 // `$` — the struct itself. Rebuild it from all of its children.
                 if is_root(&node) {
-                    return replaced(self.reconstruct(self.field_names().iter().cloned()));
+                    return replaced(self.reconstruct(0..self.fields().nfields()));
                 }
 
                 // `$.a` — a field of the struct. `get_item` intersects the struct's validity with
                 // the field's, which the `mask` makes explicit.
+                //
+                // An unknown field name is left alone: the `root` rule then rebuilds the struct
+                // underneath it, so the missing field is reported against the original scope.
                 if let Some(field_name) = node.as_opt::<GetItem>()
                     && is_root(node.child(0))
+                    && let Some(field_index) = self.field_index(field_name)
                 {
-                    let field = col(field_name.clone());
+                    let field = self.slot_expr(StructSlot::field(field_index));
                     return replaced(match self.validity_expr() {
                         Some(validity) => mask(field, validity),
                         None => field,
@@ -240,8 +283,16 @@ impl StructPartitioner {
                 if let Some(selection) = node.as_opt::<Select>()
                     && is_root(node.child(0))
                 {
-                    let included = selection.normalize_to_included_fields(self.field_names())?;
-                    return replaced(self.reconstruct(included.into_iter()));
+                    let included = selection.normalize_to_included_fields(self.fields().names())?;
+                    let indices: Vec<usize> = included
+                        .iter()
+                        .map(|name| {
+                            self.field_index(name).ok_or_else(|| {
+                                vortex_err!("Field {name} not found in {}", self.scope)
+                            })
+                        })
+                        .collect::<VortexResult<_>>()?;
+                    return replaced(self.reconstruct(indices));
                 }
 
                 // `is_null($)` / `is_not_null($)` — the struct's own validity, which is exactly
@@ -264,10 +315,18 @@ impl StructPartitioner {
             .into_inner())
     }
 
-    /// Rebuild a (possibly nullable) struct of the given fields from the flat scope.
-    fn reconstruct(&self, names: impl Iterator<Item = FieldName>) -> Expression {
+    /// Rebuild a (possibly nullable) struct of the given fields from the flat scope. The fields
+    /// are addressed by slot, but keep their own names in the rebuilt struct.
+    fn reconstruct(&self, field_indices: impl IntoIterator<Item = usize>) -> Expression {
         let packed = pack(
-            names.map(|name| (name.clone(), col(name))),
+            field_indices.into_iter().map(|idx| {
+                let name = self
+                    .fields()
+                    .field_name(idx)
+                    .vortex_expect("Field index is in bounds")
+                    .clone();
+                (name, self.slot_expr(StructSlot::field(idx)))
+            }),
             Nullability::NonNullable,
         );
         match self.validity_expr() {
@@ -276,11 +335,10 @@ impl StructPartitioner {
         }
     }
 
-    fn field_names(&self) -> &FieldNames {
+    fn fields(&self) -> &StructFields {
         self.scope
             .as_struct_fields_opt()
             .vortex_expect("Struct layout dtype must be a struct")
-            .names()
     }
 
     /// Annotate an expression node with the slots it accesses directly.
@@ -297,10 +355,10 @@ impl StructPartitioner {
         }
         if is_root(expr) {
             return self
-                .validity_name
-                .iter()
-                .map(|_| StructSlot::Validity)
-                .chain(self.field_names().iter().cloned().map(StructSlot::Field))
+                .nullable
+                .then_some(StructSlot::VALIDITY)
+                .into_iter()
+                .chain((0..self.fields().nfields()).map(StructSlot::field))
                 .collect();
         }
         vec![]
@@ -326,11 +384,11 @@ impl StructPartitioner {
         let mut partition_dtypes = Vec::with_capacity(splitter.slots.len());
         let mut single_slots = HashMap::new();
 
-        for (slot, exprs) in splitter.slots.iter().zip(splitter.sub_expressions.iter()) {
+        for (&slot, exprs) in splitter.slots.iter().zip(splitter.sub_expressions.iter()) {
             // A slot with a single sub-expression doesn't need to be packed; the root expression
             // references it directly as `$.<slot>`.
             let partition = if let [only] = exprs.as_slice() {
-                single_slots.insert(self.slot_name(slot), self.sub_expression_name(slot, 0));
+                single_slots.insert(slot_name(slot), self.sub_expression_name(slot, 0));
                 only.clone()
             } else {
                 pack(
@@ -344,8 +402,8 @@ impl StructPartitioner {
 
             let partition = partition.optimize_recursive(&self.flat_scope)?;
             partition_dtypes.push(partition.return_dtype(&self.flat_scope)?);
-            partition_names.push(self.slot_name(slot));
-            partitions.push(self.step_into(partition, slot)?);
+            partition_names.push(slot_name(slot));
+            partitions.push(step_into(partition, slot)?);
         }
 
         let partition_names = FieldNames::from(partition_names);
@@ -363,46 +421,39 @@ impl StructPartitioner {
             partition_annotations: splitter.slots.into_boxed_slice(),
         })
     }
-
-    /// Stage 3: rewrite a partition from the flat scope into the scope of `slot`'s child layout,
-    /// by replacing `$.<slot>` with `$`.
-    fn step_into(&self, expr: Expression, slot: &StructSlot) -> VortexResult<Expression> {
-        let slot_name = self.slot_name(slot);
-        Ok(expr
-            .transform_down(|node| {
-                if let Some(field_name) = node.as_opt::<GetItem>()
-                    && is_root(node.child(0))
-                {
-                    if *field_name != slot_name {
-                        vortex_bail!(
-                            "Partition for slot {slot_name} unexpectedly accesses field \
-                             {field_name}"
-                        );
-                    }
-                    return Ok(Transformed {
-                        value: root(),
-                        order: TraversalOrder::Skip,
-                        changed: true,
-                    });
-                }
-                if is_root(&node) {
-                    vortex_bail!(
-                        "Partition for slot {slot_name} accesses the struct scope directly"
-                    );
-                }
-                Ok(Transformed::no(node))
-            })?
-            .into_inner())
-    }
 }
 
-/// Pick a name for the validity slot that cannot collide with a field of the struct.
-fn unique_validity_name(field_names: &FieldNames) -> FieldName {
-    let mut name = FieldName::from(VALIDITY_SLOT_PREFIX);
-    while field_names.iter().any(|field| *field == name) {
-        name = FieldName::from(format!("{name}_"));
-    }
-    name
+/// Stage 3: rewrite a partition from the flat scope into the scope of `slot`'s child layout, by
+/// replacing `$.<slot>` with `$`.
+fn step_into(expr: Expression, slot: StructSlot) -> VortexResult<Expression> {
+    let slot_name = slot_name(slot);
+    Ok(expr
+        .transform_down(|node| {
+            if let Some(field_name) = node.as_opt::<GetItem>()
+                && is_root(node.child(0))
+            {
+                if *field_name != slot_name {
+                    vortex_bail!(
+                        "Partition for slot {slot_name} unexpectedly accesses slot {field_name}"
+                    );
+                }
+                return Ok(Transformed {
+                    value: root(),
+                    order: TraversalOrder::Skip,
+                    changed: true,
+                });
+            }
+            if is_root(&node) {
+                vortex_bail!("Partition for slot {slot_name} accesses the struct scope directly");
+            }
+            Ok(Transformed::no(node))
+        })?
+        .into_inner())
+}
+
+/// The slot's field name in the flat scope: its index, which no user field name can collide with.
+fn slot_name(slot: StructSlot) -> FieldName {
+    FieldName::from(slot.to_string())
 }
 
 /// Splits an expression into sub-expressions, each of which accesses exactly one slot.
@@ -418,13 +469,13 @@ struct SlotSplitter<'a> {
 impl SlotSplitter<'_> {
     /// Record `expr` as a sub-expression of `slot`, returning the expression that reads its
     /// result back out of the root scope.
-    fn push(&mut self, slot: &StructSlot, expr: Expression) -> Expression {
+    fn push(&mut self, slot: StructSlot, expr: Expression) -> Expression {
         let slot_idx = self
             .slots
             .iter()
-            .position(|s| s == slot)
+            .position(|s| *s == slot)
             .unwrap_or_else(|| {
-                self.slots.push(slot.clone());
+                self.slots.push(slot);
                 self.sub_expressions.push(Vec::new());
                 self.slots.len() - 1
             });
@@ -443,7 +494,7 @@ impl SlotSplitter<'_> {
         // fixed up once splitting is complete and the counts are known.
         get_item(
             self.partitioner.sub_expression_name(slot, idx),
-            col(self.partitioner.slot_name(slot)),
+            col(slot_name(slot)),
         )
     }
 }
@@ -455,7 +506,7 @@ impl NodeRewriter for SlotSplitter<'_> {
         match self.annotations.get(&node) {
             // If this expression only accesses a single slot, it becomes a partition.
             Some(slots) if slots.len() == 1 => {
-                let slot = slots.iter().next().vortex_expect("expected one slot");
+                let slot = *slots.iter().next().vortex_expect("expected one slot");
                 let value = self.push(slot, node.clone());
                 Ok(Transformed {
                     value,

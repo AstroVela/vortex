@@ -8,20 +8,17 @@ use std::sync::OnceLock;
 use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
-use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
-use vortex_array::dtype::StructFields;
 use vortex_array::expr::ExactExpr;
 use vortex_array::expr::Expression;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
-use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::ArrayFuture;
+use crate::LayoutChildType;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::LazyReaderChildren;
@@ -43,7 +40,6 @@ pub struct StructReader {
     /// Partitions expressions over the children of this struct layout, including its validity.
     partitioner: StructPartitioner,
 
-    field_lookup: Option<HashMap<FieldName, usize>>,
     partitioned_expr_cache: DashMap<ExactExpr, Arc<OnceLock<StructPartitioned>>>,
 }
 
@@ -56,16 +52,6 @@ impl StructReader {
         ctx: crate::LayoutReaderContext,
     ) -> VortexResult<Self> {
         let struct_dt = layout.struct_fields();
-
-        // NOTE: This number is arbitrary and likely depends on the longest common prefix of field names
-        let field_lookup = (struct_dt.nfields() > 80).then(|| {
-            struct_dt
-                .names()
-                .iter()
-                .enumerate()
-                .map(|(i, n)| (n.clone(), i))
-                .collect()
-        });
 
         let nullable = layout.dtype().is_nullable();
         let extra = nullable as usize;
@@ -98,53 +84,39 @@ impl StructReader {
             session,
             partitioner,
             lazy_children,
-            field_lookup,
             partitioned_expr_cache: Default::default(),
         })
     }
 
-    /// Return the [`StructFields`] of this layout.
-    fn struct_fields(&self) -> &StructFields {
-        self.layout.struct_fields()
-    }
-
-    /// Return the child reader for the field.
-    fn field_reader(&self, name: &FieldName) -> VortexResult<&LayoutReaderRef> {
-        let idx = self
-            .field_lookup
-            .as_ref()
-            .and_then(|lookup| lookup.get(name).copied())
-            .or_else(|| self.struct_fields().find(name))
-            .ok_or_else(|| vortex_err!("Field {} not found in struct layout", name))?;
-        self.field_reader_by_index(idx)
-    }
-
     /// Return the child reader for the field, by index.
     fn field_reader_by_index(&self, idx: usize) -> VortexResult<&LayoutReaderRef> {
-        // Field `idx` always occupies slot `idx + 1`; the layout maps that to a dense child index,
-        // accounting for the validity slot when the struct is nullable.
-        let child_index = self
-            .layout
-            .slot_to_child(idx + 1)
-            .vortex_expect("struct field slot is always present");
-        self.lazy_children.get(child_index)
+        self.slot_reader(StructSlot::field(idx))
     }
 
     /// Return the reader for the struct validity, if present
     fn validity(&self) -> VortexResult<Option<&LayoutReaderRef>> {
         self.layout
-            .slot_to_child(0)
+            .slot_to_child(StructSlot::VALIDITY.index())
             .map(|child_index| self.lazy_children.get(child_index))
             .transpose()
     }
 
     /// Return the child reader that evaluates the given partition slot.
-    fn slot_reader(&self, slot: &StructSlot) -> VortexResult<&LayoutReaderRef> {
-        match slot {
-            StructSlot::Validity => self
-                .validity()?
-                .ok_or_else(|| vortex_err!("Struct layout {} has no validity child", self.name())),
-            StructSlot::Field(name) => self.field_reader(name),
+    fn slot_reader(&self, slot: StructSlot) -> VortexResult<&LayoutReaderRef> {
+        // Partition slots are the layout's own slot indices, so this is a direct lookup: the
+        // layout maps the slot to a dense child index, accounting for the validity slot.
+        let child_index = self.layout.slot_to_child(slot.index()).ok_or_else(|| {
+            vortex_err!("Struct layout {} has no child for slot {slot}", self.name())
+        })?;
+        self.lazy_children.get(child_index)
+    }
+
+    /// A human-readable name for a slot, used only in error messages.
+    fn slot_label(&self, slot: StructSlot) -> String {
+        match self.layout.slot_type(slot.index()) {
+            Some(LayoutChildType::Field(name)) => name.to_string(),
+            Some(LayoutChildType::Auxiliary(name)) => name.to_string(),
+            _ => slot.to_string(),
         }
     }
 
@@ -221,10 +193,13 @@ impl LayoutReader for StructReader {
         // Partition the expression into expressions that can be evaluated over individual children
         match &self.partition_expr(expr.clone())? {
             StructPartitioned::Single(slot, partition) => self
-                .slot_reader(slot)?
+                .slot_reader(*slot)?
                 .pruning_evaluation(row_range, partition, mask)
                 .map_err(|err| {
-                    err.with_context(format!("While evaluating pruning filter partition {slot}"))
+                    err.with_context(format!(
+                        "While evaluating pruning filter partition {}",
+                        self.slot_label(*slot)
+                    ))
                 }),
             StructPartitioned::Multi(_) => {
                 // TODO(ngates): if all partitions are boolean, we can use a pruning evaluation. Otherwise
@@ -243,26 +218,33 @@ impl LayoutReader for StructReader {
         // Partition the expression into expressions that can be evaluated over individual children
         match &self.partition_expr(expr.clone())? {
             StructPartitioned::Single(slot, partition) => self
-                .slot_reader(slot)?
+                .slot_reader(*slot)?
                 .filter_evaluation(row_range, partition, mask)
                 .map_err(|err| {
-                    err.with_context(format!("While evaluating filter partition {slot}"))
+                    err.with_context(format!(
+                        "While evaluating filter partition {}",
+                        self.slot_label(*slot)
+                    ))
                 }),
             StructPartitioned::Multi(partitioned) => Arc::clone(partitioned).into_mask_future(
                 mask,
                 |slot, expr, mask| {
-                    self.slot_reader(slot)?
+                    self.slot_reader(*slot)?
                         .filter_evaluation(row_range, expr, mask)
                         .map_err(|err| {
-                            err.with_context(format!("While evaluating filter partition {slot}"))
+                            err.with_context(format!(
+                                "While evaluating filter partition {}",
+                                self.slot_label(*slot)
+                            ))
                         })
                 },
                 |slot, expr, mask| {
-                    self.slot_reader(slot)?
+                    self.slot_reader(*slot)?
                         .projection_evaluation(row_range, expr, mask)
                         .map_err(|err| {
                             err.with_context(format!(
-                                "While evaluating projection partition {slot}"
+                                "While evaluating projection partition {}",
+                                self.slot_label(*slot)
                             ))
                         })
                 },
@@ -283,15 +265,18 @@ impl LayoutReader for StructReader {
         // already places it exactly where the semantics of the expression require it.
         match &self.partition_expr(expr.clone())? {
             StructPartitioned::Single(slot, partition) => self
-                .slot_reader(slot)?
+                .slot_reader(*slot)?
                 .projection_evaluation(row_range, partition, mask_fut)
                 .map_err(|err| {
-                    err.with_context(format!("While evaluating projection partition {slot}"))
+                    err.with_context(format!(
+                        "While evaluating projection partition {}",
+                        self.slot_label(*slot)
+                    ))
                 }),
 
             StructPartitioned::Multi(partitioned) => {
                 Arc::clone(partitioned).into_array_future(mask_fut, |slot, expr, mask| {
-                    self.slot_reader(slot)?
+                    self.slot_reader(*slot)?
                         .projection_evaluation(row_range, expr, mask)
                         .map_err(|err| {
                             err.with_context(format!(
