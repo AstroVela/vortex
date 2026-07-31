@@ -16,6 +16,7 @@ use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::arbitrary::ArbitraryArray;
@@ -310,6 +311,7 @@ fn execute_action(
             assert_scalar_eq(&expected, &actual, step)?;
         }
         TiledFslAction::Slice { start, stop } => {
+            let source_is_empty = canonical.is_empty();
             let first = usize::from(start).min(usize::from(stop));
             let last = usize::from(start).max(usize::from(stop));
             let start = first % (canonical.len() + 1);
@@ -318,6 +320,17 @@ fn execute_action(
             *tiled = fuzz(tiled.clone().slice(start..stop))?;
             assert_array_eq(canonical, tiled, step, ctx)?;
             if tiled.is_empty() {
+                if source_is_empty {
+                    fuzz(assert_tiled_geometry(tiled, geometry))?;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                fuzz((|| {
+                    vortex_ensure!(
+                        tiled.is::<FixedSizeList>(),
+                        "expected an empty slice of a nonempty source to be canonical FSL"
+                    );
+                    Ok(())
+                })())?;
                 return Ok(ControlFlow::Break(()));
             }
             fuzz(assert_tiled_geometry(tiled, geometry))?;
@@ -379,7 +392,7 @@ pub fn run_tiled_fsl(input: FuzzTiledFsl) -> VortexFuzzResult<()> {
             .execute::<FixedSizeListArray>(&mut ctx)
             .map(IntoArray::into_array),
     )?;
-    let canonical_fsl = canonical.as_::<vortex_array::arrays::FixedSizeList>();
+    let canonical_fsl = canonical.as_::<FixedSizeList>();
     let mut tiled = fuzz(TiledFixedSizeList::encode(
         canonical_fsl,
         input.geometry,
@@ -484,7 +497,12 @@ pub fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>> {
         FuzzTiledFsl {
             canonical: zero_by_zero,
             geometry: geometry(128, 128),
-            actions: vec![TiledFslAction::CheckTiles, TiledFslAction::Reconstruct],
+            actions: vec![
+                TiledFslAction::CheckTiles,
+                TiledFslAction::Slice { start: 0, stop: 0 },
+                TiledFslAction::CheckTiles,
+                TiledFslAction::Reconstruct,
+            ],
         },
         FuzzTiledFsl {
             canonical: nullable_u16,
@@ -513,9 +531,51 @@ pub fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::FixedSizeList;
+    use vortex_tiled_fsl::TiledFixedSizeList;
+    use vortex_tiled_fsl::TiledFixedSizeListArrayExt;
+
+    use super::TILED_FSL_SESSION;
+    use super::TiledFslAction;
     use super::deterministic_tiled_fsl_cases;
+    use super::execute_action;
+    use super::fuzz;
     use super::run_tiled_fsl;
     use crate::error::VortexFuzzResult;
+
+    #[test]
+    #[expect(clippy::result_large_err)]
+    fn empty_full_range_slice_continues_with_tiled_geometry() -> VortexFuzzResult<()> {
+        let mut cases = deterministic_tiled_fsl_cases()?;
+        let input = cases.remove(0);
+        let geometry = input.geometry;
+        let mut canonical = input.canonical;
+        let mut ctx = TILED_FSL_SESSION.create_execution_ctx();
+        let mut tiled = fuzz(TiledFixedSizeList::encode(
+            canonical.as_::<FixedSizeList>(),
+            geometry,
+            &mut ctx,
+        ))?
+        .into_array();
+
+        let control = execute_action(
+            TiledFslAction::Slice { start: 0, stop: 0 },
+            &mut canonical,
+            &mut tiled,
+            geometry,
+            0,
+            &mut ctx,
+        )?;
+
+        assert_eq!(control, ControlFlow::Continue(()));
+        assert!(tiled.is::<TiledFixedSizeList>());
+        assert_eq!(tiled.as_::<TiledFixedSizeList>().geometry(), geometry);
+        Ok(())
+    }
 
     #[test]
     #[expect(clippy::result_large_err)]

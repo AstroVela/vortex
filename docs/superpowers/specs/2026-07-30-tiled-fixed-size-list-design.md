@@ -48,9 +48,9 @@ machine.
 - Keep every rectangular tile contiguous.
 - Preserve both row-level and element-level validity.
 - Avoid serialized padding for tail tiles.
-- Preserve the tiled parent encoding across nonempty `slice` results and after
-  executing nondegenerate `take` results in a session that registers the
-  encoding.
+- Preserve the tiled parent encoding across nonempty `slice` results, the full
+  `0..0` slice of an already-empty tiled source, and executed nondegenerate
+  `take` results in a session that registers the encoding.
 - Allow the physical child to use another Vortex encoding such as FastLanes.
 - Expose enough tile structure for downstream specialized compute without
   embedding a particular compute algorithm in this crate.
@@ -368,8 +368,9 @@ Vortex tests include:
 - row and dimension tail tiles;
 - tile sizes larger than logical extents;
 - ordered, duplicated, unsorted, and nullable take indices;
-- bounds failures, preservation of geometry through nonempty slice, and
-  preservation after executing nondegenerate take;
+- bounds failures, preservation of geometry through nonempty slices and the
+  full `0..0` slice of an already-empty tiled source, and preservation after
+  executing nondegenerate take;
 - malformed logical dtypes, child dtypes, child lengths, validity lengths,
   zero geometry, and overflow;
 - composition with a raw primitive child and, for supported integer dtypes, a
@@ -384,20 +385,22 @@ for every tiled operation: encode/execute, reconstruction through `try_new`,
 scalar access, tile bounds and element views, slice, and take. The suite also
 runs Vortex's standard array-consistency and take-conformance helpers.
 Expected tile values are derived independently from canonical row-major
-coordinates rather than from the tiled offset helpers. Empty slices, empty
-takes, and takes from empty sources check logical equality without requiring a
-tiled result.
+coordinates rather than from the tiled offset helpers. Empty slices of
+nonempty sources require canonical results, while the full `0..0` slice of an
+already-empty tiled source requires the original tiled representation and
+geometry. Empty takes and takes from empty sources check logical equality
+without requiring a tiled result.
 
 A dedicated cargo-fuzz target generates bounded primitive FSL arrays with
 independent outer and element validity, arbitrary nonzero geometry, empty and
 zero-width cases, and composed scalar/slice/take/tile/reconstruction actions.
 After every action it compares the result with the canonical FSL oracle and
-verifies the nondegenerate preservation contract. Physical child comparisons
+verifies the applicable preservation contract. Physical child comparisons
 exclude coordinates belonging to invalid outer rows, whose placeholder values
-are not logically observable. Degenerate operations may end the composed
-sequence after their logical result is checked. The target is included in
-scheduled Vortex fuzzing so discovered cases accumulate in a persistent
-corpus.
+are not logically observable. Empty slices of nonempty sources and degenerate
+takes may end the composed sequence after their logical result is checked. The
+target is included in scheduled Vortex fuzzing so discovered cases accumulate
+in a persistent corpus.
 
 ## Benchmarks
 

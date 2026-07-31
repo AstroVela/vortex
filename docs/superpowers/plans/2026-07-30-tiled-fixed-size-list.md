@@ -15,11 +15,12 @@
 - `TileGeometry.rows` and `TileGeometry.dimensions` are both `NonZeroU32`.
 - Store exactly `len * list_size` physical elements with checked arithmetic and no tail padding.
 - Preserve outer row validity separately and transpose element validity with element values.
-- Preserve the tiled parent and its geometry for nonempty `slice` results and
-  after executing a nondegenerate `take` with a session that registers the
-  encoding. Empty slices, empty takes, and takes from empty sources may use
-  Vortex's canonical or constant degenerate results. No row operation may
-  canonicalize the whole source.
+- Preserve the tiled parent and its geometry for nonempty `slice` results, the
+  full `0..0` slice of an already-empty tiled source, and an executed
+  nondegenerate `take` in a session that registers the encoding. Empty slices
+  of nonempty sources are canonical; empty takes and takes from empty sources
+  may use Vortex's canonical or constant degenerate results. No row operation
+  may canonicalize the whole source.
 - Use canonical `FixedSizeListArray` as the deterministic unit-test and fuzz-test oracle for every tiled operation.
 - Keep production `vortex-tiled-fsl` independent of `vortex-fastlanes`; FastLanes is a dev-only composition dependency.
 - Do not add the encoding to BtrBlocks or any automatic compression strategy.
@@ -1260,9 +1261,10 @@ without conflating their validity semantics.
 4. call `gather_tiled_rows` with the selected rows and sliced validity;
 5. return the resulting tiled array with unchanged geometry.
 
-`ArrayRef::slice` handles `start == stop` before constructing a `SliceArray`, so
-this rule is invoked only for nonempty output. Do not modify that generic
-short-circuit.
+`ArrayRef::slice` returns a full-range slice before applying its canonical-empty
+short-circuit. Thus `0..0` retains an already-empty tiled source, while an empty
+slice of a nonempty source is canonical. This rule is invoked only for nonempty
+output. Do not modify those generic short-circuits.
 
 Register:
 
@@ -1286,8 +1288,9 @@ cargo nextest run -p vortex-tiled-fsl slice
 cargo nextest run -p vortex-tiled-fsl
 ```
 
-Expected: every nonempty slice preserves the tiled parent; empty slices remain
-canonical and all cases match canonical FSL logically.
+Expected: every nonempty slice and the full `0..0` slice of an already-empty
+tiled source preserve the tiled parent; empty slices of nonempty sources are
+canonical, and all cases match canonical FSL logically.
 
 - [ ] **Step 6: Commit slice support**
 
@@ -1970,9 +1973,13 @@ nonzero.
 Use the existing `assert_fsl_equivalent` helper after every operation:
 
 ```rust
+let source_is_empty = canonical.is_empty();
 let expected = canonical.clone().into_array().slice(range.clone())?;
 let actual = tiled.clone().into_array().slice(range)?;
-if actual.is_empty() {
+if source_is_empty {
+    assert!(actual.is::<TiledFixedSizeList>());
+    assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), geometry);
+} else if actual.is_empty() {
     assert!(actual.is::<FixedSizeList>());
 } else {
     assert!(actual.is::<TiledFixedSizeList>());
@@ -2286,6 +2293,7 @@ fn execute_action(
             assert_scalar_eq(&expected, &actual, step)?;
         }
         TiledFslAction::Slice { start, stop } => {
+            let source_is_empty = canonical.is_empty();
             let first = usize::from(start).min(usize::from(stop));
             let last = usize::from(start).max(usize::from(stop));
             let start = first % (canonical.len() + 1);
@@ -2295,6 +2303,17 @@ fn execute_action(
             *tiled = fuzz(tiled.clone().slice(start..stop))?;
             assert_array_eq(canonical, tiled, step, ctx)?;
             if tiled.is_empty() {
+                if source_is_empty {
+                    fuzz(assert_tiled_geometry(tiled, geometry))?;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                fuzz((|| {
+                    vortex_ensure!(
+                        tiled.is::<FixedSizeList>(),
+                        "expected an empty slice of a nonempty source to be canonical FSL"
+                    );
+                    Ok(())
+                })())?;
                 return Ok(ControlFlow::Break(()));
             }
             fuzz(assert_tiled_geometry(tiled, geometry))?;
