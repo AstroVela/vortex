@@ -9,7 +9,10 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
+use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayParts;
+use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_float_ptype;
@@ -18,9 +21,11 @@ use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::scalar_fns::inner_product::InnerProduct;
@@ -30,6 +35,7 @@ use crate::scalar_fns::row::TensorRow;
 #[cfg(test)]
 use crate::scalar_fns::row::probe;
 use crate::scalar_fns::row::tensor_element_ptype;
+use crate::utils::BinaryTensorOpMetadata;
 use crate::utils::extract_l2_denorm_children;
 
 /// Cosine similarity between two columns.
@@ -110,6 +116,32 @@ impl RowFn for CosineSimilarity {
             }
             DenormOrientation::Neither => Ok(None),
         }
+    }
+}
+
+impl ScalarFnArrayVTable for CosineSimilarity {
+    fn serialize(
+        &self,
+        view: &ScalarFnArrayView<Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(BinaryTensorOpMetadata::encode_from_view(view)?))
+    }
+
+    fn deserialize(
+        &self,
+        _dtype: &DType,
+        len: usize,
+        metadata: &[u8],
+        children: &dyn ArrayChildren,
+        session: &VortexSession,
+    ) -> VortexResult<ScalarFnArrayParts<Self>> {
+        let reconstructed =
+            BinaryTensorOpMetadata::decode_children(metadata, len, children, session)?;
+        Ok(ScalarFnArrayParts {
+            options: EmptyOptions,
+            children: reconstructed,
+        })
     }
 }
 

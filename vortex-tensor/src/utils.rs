@@ -4,6 +4,7 @@
 //! Shared helpers for the tensor scalar functions.
 
 use half::f16;
+use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -11,17 +12,23 @@ use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::ScalarFn;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::arrays::scalar_fn::ExactScalarFn;
+use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
+use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::proto::dtype as pb;
+use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_session::VortexSession;
 
 use crate::matcher::AnyTensor;
 use crate::matcher::TensorMatch;
@@ -100,6 +107,65 @@ pub fn validate_tensor_float_inputs(args: &[DType]) -> VortexResult<TensorMatch<
         );
     }
     validate_tensor_float_input(first)
+}
+
+/// Metadata for a serialized binary tensor-op array (shared by [`InnerProduct`] and
+/// [`CosineSimilarity`]). Both operands share the same extension dtype up to nullability
+/// (enforced by their `return_dtype` checks), but their individual nullabilities are lost in the
+/// parent's unioned output, so both are persisted.
+///
+/// [`CosineSimilarity`]: crate::scalar_fns::cosine_similarity::CosineSimilarity
+/// [`InnerProduct`]: crate::scalar_fns::inner_product::InnerProduct
+#[derive(Clone, prost::Message)]
+pub(crate) struct BinaryTensorOpMetadata {
+    #[prost(message, optional, tag = "1")]
+    pub(crate) lhs_dtype: Option<pb::DType>,
+    #[prost(message, optional, tag = "2")]
+    pub(crate) rhs_dtype: Option<pb::DType>,
+}
+
+impl BinaryTensorOpMetadata {
+    /// Encodes the two children of `view` into a [`BinaryTensorOpMetadata`] byte blob.
+    pub(crate) fn encode_from_view<V: ScalarFnVTable>(
+        view: &ScalarFnArrayView<V>,
+    ) -> VortexResult<Vec<u8>> {
+        let scalar_fn_array = view.as_::<ScalarFn>();
+        let lhs_dtype = Some(scalar_fn_array.child_at(0).dtype().try_into()?);
+        let rhs_dtype = Some(scalar_fn_array.child_at(1).dtype().try_into()?);
+        Ok(Self {
+            lhs_dtype,
+            rhs_dtype,
+        }
+        .encode_to_vec())
+    }
+
+    /// Decodes `metadata` and fetches both children from `children` using the decoded dtypes,
+    /// validating that `lhs` and `rhs` are compatible tensor operands.
+    pub(crate) fn decode_children(
+        metadata: &[u8],
+        len: usize,
+        children: &dyn vortex_array::serde::ArrayChildren,
+        session: &VortexSession,
+    ) -> VortexResult<Vec<ArrayRef>> {
+        let metadata = Self::decode(metadata)
+            .map_err(|e| vortex_err!("Failed to decode BinaryTensorOpMetadata: {e}"))?;
+        let lhs_pb = metadata
+            .lhs_dtype
+            .as_ref()
+            .ok_or_else(|| vortex_err!("metadata missing lhs_dtype"))?;
+        let rhs_pb = metadata
+            .rhs_dtype
+            .as_ref()
+            .ok_or_else(|| vortex_err!("metadata missing rhs_dtype"))?;
+
+        let lhs_dtype = DType::from_proto(lhs_pb, session)?;
+        let rhs_dtype = DType::from_proto(rhs_pb, session)?;
+        validate_tensor_float_inputs(&[lhs_dtype.clone(), rhs_dtype.clone()])?;
+
+        let lhs = children.get(0, &lhs_dtype, len)?;
+        let rhs = children.get(1, &rhs_dtype, len)?;
+        Ok(vec![lhs, rhs])
+    }
 }
 
 /// The flat primitive elements of a tensor storage array, with typed row access.

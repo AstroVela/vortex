@@ -53,9 +53,9 @@ cannot be folded away.
 
 Name a witness argument tuple and return type, then in `dispatch` pick the concrete element types for
 a batch and hand the framework a row closure through a rank-2 visitor. A blanket impl derives the
-whole `StrictScalarFnVTable` (and array serde) from it. When the element types are fixed, `dispatch`
-is a single `visit` at those types. When one ID spans several widths (`l2_norm` accepts f16/f32/f64),
-`dispatch` matches on the input dtypes and visits at the chosen width.
+whole `StrictScalarFnVTable` from it. When the element types are fixed, `dispatch` is a single
+`visit` at those types. When one ID spans several widths (`l2_norm` accepts f16/f32/f64), `dispatch`
+matches on the input dtypes and visits at the chosen width.
 
 Everything structural follows from the argument tuple and return type: arity, per-argument dtype
 validation, the output dtype, null handling, and fallibility. There is nothing for an implementor to

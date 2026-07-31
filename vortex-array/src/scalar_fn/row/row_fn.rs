@@ -7,13 +7,9 @@ use std::marker::PhantomData;
 
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
-use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::arrays::scalar_fn::ScalarFnArrayView;
-use crate::arrays::scalar_fn::plugin::ScalarFnArrayParts;
-use crate::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
 use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::union_child_validities;
@@ -29,8 +25,6 @@ use crate::scalar_fn::RowResult;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::SinkResult;
 use crate::scalar_fn::StrictScalarFnVTable;
-use crate::scalar_fn::decode_scalar_fn_array;
-use crate::scalar_fn::encode_children_and_options;
 use crate::scalar_fn::row::execute::execute_row_loop_branch;
 use crate::scalar_fn::row::execute::execute_row_loop_prepared;
 use crate::scalar_fn::row::execute::execute_row_sink;
@@ -38,16 +32,15 @@ use crate::scalar_fn::row::execute::row_is_fallible;
 use crate::scalar_fn::row::execute::row_null_handling;
 use crate::scalar_fn::row::execute::validate_row_args;
 use crate::scalar_fn::row::execute::validate_row_sink;
-use crate::serde::ArrayChildren;
 
 /// A scalar function computed one row at a time.
 ///
 /// An implementor names a representative argument tuple and return type as witnesses, then in
 /// [`dispatch`](Self::dispatch) picks the concrete element types for a batch and hands the framework
 /// a row closure. Everything structural (arity, dtype validation, the return dtype, null handling,
-/// fallibility, execution, and array serde) is derived through the blanket impls, so the
-/// implementing type *is* the scalar function, with no wrapper. See `byte_length` for a function at
-/// fixed element types, or `vortex-tensor`'s `L2Norm` for one that dispatches over widths.
+/// fallibility, and execution) is derived through the blanket impls, so the implementing type *is*
+/// the scalar function, with no wrapper. See `byte_length` for a function at fixed element types,
+/// or `vortex-tensor`'s `L2Norm` for one that dispatches over widths.
 ///
 /// The witnesses name one representative choice, and the arity, dense-safety and fallibility read off
 /// them steer the framework *before* `dispatch` runs. They therefore **must** not vary between
@@ -255,7 +248,7 @@ pub trait RowVisitor {
 
 /// Compile-time check that a dispatched `(A, R)` agrees with `F`'s witnesses on everything the
 /// framework reads *without* input dtypes, and therefore before dispatching: the arity (which the
-/// expression layer and array serde use), and the dense-safety and fallibility that decide null
+/// expression layer uses), and the dense-safety and fallibility that decide null
 /// handling. Evaluated by monomorphizing a [`visit`](RowVisitor::visit), so even a dispatch arm that
 /// never runs is checked.
 ///
@@ -507,35 +500,5 @@ impl<F: RowFn> StrictScalarFnVTable for F {
 
     fn decode_shrinks_when_filtered(&self, _options: &Self::Options) -> bool {
         F::ArgsWitness::DECODE_SHRINKS_WHEN_FILTERED
-    }
-}
-
-/// Every [`RowFn`] can be persisted as an array: all child dtypes are stored, since the output
-/// dtype generally cannot recover them, then re-validated through the function's own dtype rules.
-impl<F: RowFn> ScalarFnArrayVTable for F {
-    fn serialize(
-        &self,
-        view: &ScalarFnArrayView<Self>,
-        _session: &VortexSession,
-    ) -> VortexResult<Option<Vec<u8>>> {
-        encode_children_and_options(view, F::ArgsWitness::ARITY).map(Some)
-    }
-
-    fn deserialize(
-        &self,
-        _dtype: &DType,
-        len: usize,
-        metadata: &[u8],
-        children: &dyn ArrayChildren,
-        session: &VortexSession,
-    ) -> VortexResult<ScalarFnArrayParts<Self>> {
-        decode_scalar_fn_array(
-            self,
-            F::ArgsWitness::ARITY,
-            len,
-            metadata,
-            children,
-            session,
-        )
     }
 }

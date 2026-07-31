@@ -11,6 +11,7 @@
 use num_traits::Float;
 use num_traits::ToPrimitive;
 use num_traits::Zero;
+use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -20,16 +21,22 @@ use vortex_array::arrays::Extension;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::ScalarFn as ScalarFnArrayEncoding;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::scalar_fn::ExactScalarFn;
+use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
+use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
+use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayParts;
+use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
+use vortex_array::dtype::proto::dtype as pb;
 use vortex_array::match_each_float_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
@@ -40,6 +47,7 @@ use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_array::scalar_fn::fns::operators::Operator;
+use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
@@ -48,6 +56,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::matcher::AnyTensor;
@@ -210,6 +219,64 @@ impl RowFn for L2Denorm {
         };
 
         execute_l2_denorm_constant_norms(args[0].clone(), norm_scalar, norm_value, ctx).map(Some)
+    }
+}
+
+/// Metadata for a serialized [`L2Denorm`] array: both children's full [`DType`]s. The parent's
+/// dtype is `normalized.union_nullability(norms.nullability())`, which loses both children's
+/// individual nullabilities, so we persist them directly.
+#[derive(Clone, prost::Message)]
+pub(super) struct L2DenormMetadata {
+    #[prost(message, optional, tag = "1")]
+    normalized_dtype: Option<pb::DType>,
+    #[prost(message, optional, tag = "2")]
+    norms_dtype: Option<pb::DType>,
+}
+
+impl ScalarFnArrayVTable for L2Denorm {
+    fn serialize(
+        &self,
+        view: &ScalarFnArrayView<Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
+        let scalar_fn_array = view.as_::<ScalarFnArrayEncoding>();
+        let normalized_dtype = Some(scalar_fn_array.child_at(0).dtype().try_into()?);
+        let norms_dtype = Some(scalar_fn_array.child_at(1).dtype().try_into()?);
+        Ok(Some(
+            L2DenormMetadata {
+                normalized_dtype,
+                norms_dtype,
+            }
+            .encode_to_vec(),
+        ))
+    }
+
+    fn deserialize(
+        &self,
+        _dtype: &DType,
+        len: usize,
+        metadata: &[u8],
+        children: &dyn ArrayChildren,
+        session: &VortexSession,
+    ) -> VortexResult<ScalarFnArrayParts<Self>> {
+        let metadata = L2DenormMetadata::decode(metadata)
+            .map_err(|e| vortex_err!("Failed to decode L2DenormMetadata: {e}"))?;
+        let normalized_pb = metadata
+            .normalized_dtype
+            .as_ref()
+            .ok_or_else(|| vortex_err!("L2DenormMetadata missing normalized_dtype"))?;
+        let norms_pb = metadata
+            .norms_dtype
+            .as_ref()
+            .ok_or_else(|| vortex_err!("L2DenormMetadata missing norms_dtype"))?;
+        let normalized_dtype = DType::from_proto(normalized_pb, session)?;
+        let norms_dtype = DType::from_proto(norms_pb, session)?;
+        let normalized = children.get(0, &normalized_dtype, len)?;
+        let norms = children.get(1, &norms_dtype, len)?;
+        Ok(ScalarFnArrayParts {
+            options: EmptyOptions,
+            children: vec![normalized, norms],
+        })
     }
 }
 

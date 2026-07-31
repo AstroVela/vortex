@@ -10,7 +10,7 @@
 //! [`RowFn`] asks for two things: a witness argument tuple and return type, and a
 //! [`dispatch`](RowFn::dispatch) that picks the concrete element types for a batch and visits the
 //! framework with a row closure. Everything structural (arity, dtype checks, null handling,
-//! fallibility, constants, validity, array serde) is derived from the witnesses and from whatever
+//! fallibility, constants, and validity) is derived from the witnesses and from whatever
 //! `dispatch` visits.
 //!
 //! When the element types are fixed, `dispatch` is a single visit at those types. When one function

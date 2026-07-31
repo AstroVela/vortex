@@ -80,9 +80,6 @@ use crate::scalar_fn::fns::literal::Literal;
 mod vtable;
 pub use vtable::*;
 
-mod array_metadata;
-pub use array_metadata::*;
-
 mod plugin;
 pub use plugin::*;
 

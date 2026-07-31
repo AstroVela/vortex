@@ -2,13 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use num_traits::Float;
-use vortex_array::ArrayPlugin;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::MaskedArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
-use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
@@ -30,8 +28,8 @@ use crate::utils::test_helpers::assert_close;
 use crate::utils::test_helpers::tensor_array;
 
 /// The marginal cost of a new tensor scalar function is this entire definition. Everything else
-/// (null propagation, constants, validity, f16/f32/f64 dispatch, dtype checks, array serde,
-/// constructors) is derived.
+/// (null propagation, constants, validity, f16/f32/f64 dispatch, dtype checks, and constructors) is
+/// derived.
 #[derive(Clone, Debug, Default)]
 struct L1Norm;
 
@@ -96,29 +94,6 @@ fn derived_fn_dispatches_at_input_width() -> VortexResult<()> {
         .try_new_array(1, EmptyOptions, [tensor_array(&[2], &[3.0f64, -4.0])?])?
         .execute(&mut ctx)?;
     assert_eq!(f64_result.ptype(), PType::F64);
-    Ok(())
-}
-
-#[test]
-fn derived_serde_round_trips() -> VortexResult<()> {
-    let child = tensor_array(&[2], &[3.0, -4.0])?;
-    let original = L1Norm.try_new_array(child.len(), EmptyOptions, [child.clone()])?;
-
-    let plugin = ScalarFnArrayPlugin::new(L1Norm);
-    let metadata = plugin
-        .serialize(&original, &crate::tests::SESSION)?
-        .expect("derived serialize must produce metadata");
-    let recovered = plugin.deserialize(
-        original.dtype(),
-        original.len(),
-        &metadata,
-        &[],
-        &[child],
-        &crate::tests::SESSION,
-    )?;
-
-    assert_eq!(recovered.dtype(), original.dtype());
-    assert_eq!(recovered.len(), original.len());
     Ok(())
 }
 
