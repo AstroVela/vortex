@@ -66,7 +66,10 @@ read at stride 0, so a broadcast argument costs one decode rather than one per r
 Output takes one of two forms, chosen per visit. `visit` takes a closure that **returns** an
 `OutputElement`, one owned value per row whose dtype is a property of its Rust type. `visit_into` takes
 one that **writes** into an `OutputSink`, allocated once per batch knowing the output dtype and handing
-out a place to write. The sink carries what an owned per-row value cannot: `l2_denorm` writes each row
+out a place to write. Orthogonally, `visit_prepared` runs a once-per-batch prepare step over the
+element values of whichever operands are constant for the batch, and threads its result to every row
+by shared reference; plain `visit` is that with unit state (see
+[Constant compute](#constant-compute-the-last-quadrant-of-the-lifting)). The sink carries what an owned per-row value cannot: `l2_denorm` writes each row
 into a slice of one flat buffer, so its output width comes from the arguments and it allocates once
 rather than per row. The executor holds the sink and passes the handle in, so the closure stays `Fn`
 and the returning path pays nothing.
@@ -492,6 +495,161 @@ tensors, which was the argument for generalizing it rather than special-casing `
 
 ---
 
+## Constant compute: the last quadrant of the lifting
+
+The lifting's constant handling was complete on the data side and absent on the compute side. A
+null-constant input short-circuits, all-constant inputs fold to one row, and a constant operand is
+decoded once and read at stride 0. What nothing owned was kernel computation that depends only on a
+constant argument: `cosine_similarity(rows, query)` with a broadcast query re-accumulated
+`norm(query)`, an O(width) pass plus a sqrt, once per row, and the geo predicates rebuilt the
+constant side's topology graph, R-tree, or bounding box once per row. `cosine_similarity` escaped
+partially by hand-writing a `reduce_encoded` rewrite, and the survey found that rewrite already
+wrong for the literal shape, which is the argument for framework ownership stated as a correctness
+fact: one hand-written constant path per function is one place per function to rot on
+encoding-normalization details.
+
+### Where the hook can live, and where it cannot
+
+The hoist needs three things at once: knowing which arguments are constant, having their decoded
+values, and a typed place for the function to compute from them. Constness is a per-batch value
+fact (a RunEnd slice landing inside one run, a per-chunk compression decision), so:
+
+- **`dispatch` cannot see it.** It runs at plan time and run time and must choose identical element
+  types at both; values do not exist at plan time.
+- **Element types cannot encode it.** A `Const<E>` wrapper element would need value-aware dispatch
+  to be chosen, splitting plan/run monomorphizations in exactly the way the witness deliberately
+  does not pin, and costing 2^arity dispatch arms. The salvageable half of the idea,
+  framework-internal value-driven specialization, already exists as the stride-0 `ArgColumn`.
+- **The closure cannot memoize it.** An `unsync::OnceCell` capture compiles under `Fn`, but without
+  constness information it is wrong (it would cache row 0 of a varying operand), and with that
+  information it saves nothing over a prepare step while planting an unhoistable load inside the
+  loop.
+
+That leaves one point: inside the visit, after decode, where `ArgColumn` already knows each
+column's stride. `ElementTuple` gains `ConstElems<'a>`, the element tuple with every slot wrapped
+in `Option` (`Some` iff that operand is batch-constant), and the visitor gains:
+
+```rust
+fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
+    self,
+    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+    apply: impl Fn(&P, A::Elems<'_>) -> R,
+) -> VortexResult<Self::Out>;
+```
+
+`prepare` runs once per batch; its result reaches every row by `&P`, so `apply` stays `Fn` and the
+loop keeps the shape the FnMut measurement forbids changing. `P` names no column lifetime, so
+prepared state provably cannot alias the columns the loop reads. Plain `visit` is now a *provided*
+method, `visit_prepared` with unit state: the ZST erases under monomorphization (measured, l2_norm
+non_nullable at 33.38 us against the 32.83 us hand-written control, parity), the duplicate row loop
+is deleted, and the visitor's method count grows with genuine axes (how output is delivered) rather
+than with feature combinations.
+
+`prepare` is infallible in v1: it refines values the row loop could compute itself, and fallibility
+is read off the witnesses before dispatch, so a failing prepare would have nowhere to be declared.
+The extension (prepare returning `VortexResult<P>`, riding the existing fallibility axis) is
+documented next to the method and deliberately unbuilt, because no adopter needs it.
+
+Three boundary facts worth stating because they will bite someone:
+
+- **Prepare must never be load-bearing for validation.** An empty batch decodes every operand as
+  non-constant (there is no row 0 to slice), so a prepare that validated its constant would
+  silently not run. Validation belongs to `validate` and the dtype rules.
+- **What counts as a batch constant is wider than the constant encoding.** The stride-0 decode sees
+  one level through two wrappers that spell "the same value in every row" without being it:
+  `MaskedArray(ConstantArray)`, how the compressor spells an all-same-with-nulls chunk (sound
+  because the lifting owns validity entirely, so the value the loop reads behind a null row is
+  unobservable), and `Extension` over constant storage, the shape extension builders produce before
+  `ExtensionConstantRule` normalizes it.
+- **`P` having no `Send`/`Sync` bound is load-bearing.** geo's `PreparedGeometry` carries
+  `Rc`/`RefCell` and could not be prepared state otherwise. The flip side, recorded so it is a
+  decision rather than a surprise: adding such bounds later (a parallel row loop, say) is a
+  breaking change to real adopters, not a relaxation.
+
+### What it bought, measured
+
+**cosine_similarity, and a lesson in ILP.** The closure accumulated the rhs norm per element and
+sqrt'd it per row, a third of the arithmetic plus one of two sqrts. Hoisting it moved the benchmark
+by only ~5% at width 32 and ~3% at 256 (16384 rows, fastest column), far under the flop count,
+because the loop is latency-bound on the serial dot-product FMA chain (FP reassociation is illegal)
+and the removed accumulation was executing in the chain's spare ILP slots. The measurable saving is
+the hoisted sqrt. The row is bit-identical either way, each arm accumulating in the same order as
+the unprepared kernel.
+
+The lesson generalizes and is the honest scoping of the feature: **"removes an O(width) pass per
+row" is not "saves time" when that pass rides in ILP slack.** The work that collects the full
+saving is work that extends the dependency chain: parses, tree builds, prepared structures. Which
+is exactly what the geo numbers then showed.
+
+**The geo predicates, where the win lives.** `contains` substitutes an owned
+`PreparedGeometry<'static>` of the constant operand (r-tree plus self-noded topology, built lazily
+inside `P` through a `OnceCell` so point-row batches never pay for it) into relate exactly where
+geo routes `Contains` through relate, argument order preserved including the `MultiPolygon`
+reversal; direct pairings keep geo's own algorithms untouched. `intersects` hoists the constant
+side's `bounding_rect` and replays geo's own disjoint-bboxes early-out, gated to fire only where
+geo makes exactly that comparison first. `distance` was investigated and left alone: geo builds
+R-trees for both sides inside a private helper on every call, so there is no seam to reuse one, and
+the finding is recorded as a doc comment on its dispatch. 16384 rows, fastest column, two runs:
+
+| arm | before | after | change |
+| --- | --- | --- | --- |
+| contains, constant x polygons, overlapping | 457.5 / 458.0 ms | 50.88 / 50.00 ms | **9.1x** |
+| contains, constant x polygons, disjoint | 7.04 / 7.05 ms | 3.97 / 3.74 ms | **1.9x** |
+| contains, constant x points (direct route) | 3.15 / 3.08 ms | 3.22 / 3.15 ms | unchanged |
+| contains, column x column | 3.56 / 6.29 ms | 3.68 / 6.40 ms | unchanged |
+| intersects, polygons disjoint x constant | 6.81 / 6.72 ms | 3.20 / 3.14 ms | **2.1x** |
+| intersects, polygons overlapping x constant | 9.57 / 9.48 ms | 9.87 / 9.63 ms | 1-3% slower, accepted |
+| intersects, points and column x column arms | 3.20 / 5.98 ms | 3.21 / 5.92 ms | unchanged |
+
+The overlapping-intersects arm is the disclosed tradeoff: the hoisted bbox check is an early-out,
+so where it rarely fires the row pays for it. The port was an out-of-sample test of the API and
+passed it: **zero framework changes were needed**, matching the element vocabulary's earlier record
+(`TensorRow`, `GeometryRow`, `TensorSink`, each added in its own crate).
+
+**Deleting the hand-written path made its shape faster.** With `Extension`-over-constant visible to
+the stride-0 decode, cosine's `reduce_encoded` constant routing (manufacture an `L2Denorm` from a
+constant operand, answer through the denorm paths) became deletable. Its shape then sped up:
+
+| width | through the deleted rewrite | through the row loop + prepare |
+| --- | --- | --- |
+| 2 | 118.8 us | **63.08 us** |
+| 32 | 554.0 us | **377.9 us** |
+| 256 | 5.159 ms | **3.007 ms** |
+
+Both constant spellings now measure identically (63.08 vs 62.72 us at width 2). The hand-written
+fast path was 1.5-1.9x slower than the framework path that replaced it, on top of having missed the
+literal shape entirely. That is the dedup argument in its strongest form: not fewer lines, but
+fewer wrong ones.
+
+### The one unenforceable thing
+
+The design's benefit rests on LLVM treating the per-row branch on the prepared `Option` as
+loop-invariant. Three outcomes exist per call site: unswitched (intended), if-converted (both arms
+computed, the hoist silently evaporates while staying correct), or retained (a branch in a cheap
+scalar kernel can block vectorization). For every real adopter the hoisted work is a loop or a
+parse, which cannot be speculated, so the worst case degrades to one predicted branch per row, the
+same cost class as the bounds check kept over `unsafe`. It is still a hope rather than a contract,
+and the convention that polices it is stated in the trait-choice guide: every adopter lands with a
+constant/non-constant benchmark pair, and the non-constant arm must not move.
+
+### Rejected alongside
+
+- **`Const<E>` wrapper elements**: needs value-aware dispatch; splits plan/run; 2^arity dispatch
+  arms. Dead on the purity invariant.
+- **Closure-internal `OnceCell` memoization**: wrong without constness plumbing, redundant with it.
+  Distinct from the `OnceCell` *inside `P`* that contains uses, which is constness-aware and only
+  defers an expensive build.
+- **Plan-time currying through `reduce`** (folding a Literal into Options as a compiled variant):
+  the only design that amortizes across batches, deferred because `PersistableOptions` admits only
+  the source value, it misses every run-time-only constant, and re-currying bifurcates function
+  identity, silently detaching encoding kernels keyed on the original function. Revisit only if
+  per-batch prepare cost ever measures as material.
+- **`visit_prepared_into`** (sink plus prepare): no user. `l2_denorm`'s constant case is a bulk
+  answer in `reduce_encoded`, not a prepared loop. The asymmetry is deliberate and cheap to fix
+  when a user appears.
+
+---
+
 ## Is there anything left to port?
 
 Asked directly: could the remaining hand-written vtables move onto `RowFn` if the element vocabulary
@@ -574,11 +732,12 @@ rendering would silently lose it.
 Found by the porting probes, left unfixed here because each is a larger change with its own review
 surface. Recorded so they are decisions rather than surprises.
 
-- **~~No constant-operand affordance.~~ Fixed.** A partially-constant call used to decode the constant
-  column in full, so a broadcast operand cost one decode per row (measured: a broadcast query vector
-  cost the same as a genuine column, 234 ms vs 226 ms at 50k x 256). That was what kept the geo
-  functions off `RowFn`, since porting them would have traded one geometry parse for *n*. Each decoded
-  column now carries a stride, 0 for a constant, and the geo functions are row functions.
+- **~~No constant-operand affordance.~~ Fixed twice over.** A partially-constant call used to decode
+  the constant column in full, so a broadcast operand cost one decode per row (measured: a broadcast
+  query vector cost the same as a genuine column, 234 ms vs 226 ms at 50k x 256). That was what kept
+  the geo functions off `RowFn`. Each decoded column now carries a stride, 0 for a constant, and the
+  geo functions are row functions. Constant *compute* was the remaining half, closed by
+  `visit_prepared` (see [Constant compute](#constant-compute-the-last-quadrant-of-the-lifting)).
 - **`NullHandling::Dense` is chosen on safety alone, with no cost input.** For a fixed-width element
   (`TensorRow`) dense is unambiguously cheaper. For an unbounded-width row (a nested list) the garbage
   behind a null row need only be *in bounds*, so it can span the whole elements array, which is
