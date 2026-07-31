@@ -3,9 +3,11 @@
 mod array;
 mod gather;
 mod geometry;
+mod kernel;
 mod operations;
 mod rules;
 mod slice;
+mod take;
 mod transpose;
 
 pub use array::*;
@@ -18,6 +20,7 @@ use vortex_session::VortexSession;
 /// Registers the tiled fixed-size-list array encoding in `session`.
 pub fn initialize(session: &VortexSession) {
     session.arrays().register(TiledFixedSizeList);
+    kernel::initialize(session);
 }
 
 #[cfg(test)]
