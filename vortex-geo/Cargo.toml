@@ -49,5 +49,9 @@ harness = false
 name = "binary_predicates"
 harness = false
 
+[[bench]]
+name = "null_strategies"
+harness = false
+
 [lints]
 workspace = true

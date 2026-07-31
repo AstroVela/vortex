@@ -280,5 +280,10 @@ name = "byte_length_element"
 harness = false
 
 [[bench]]
+name = "null_strategy_bytes"
+harness = false
+required-features = ["_test-harness"]
+
+[[bench]]
 name = "strict_validity"
 harness = false
