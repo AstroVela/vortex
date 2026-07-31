@@ -98,14 +98,18 @@ impl<V: StrictScalarFnVTable> ScalarFnVTable for V {
             return Ok(all_null(result_dtype, row_count));
         }
 
-        // All inputs constant (and non-null): evaluate a single row and broadcast.
+        // All inputs constant (and non-null): evaluate a single row and broadcast. Reconciling the
+        // row's dtype before reading the scalar keeps this path on the same kernel/declaration
+        // agreement check as the dense and filter paths, rather than letting `cast` paper over a
+        // disagreement.
         if row_count > 0 && inputs.iter().all(|input| input.as_constant().is_some()) {
             let one_row = inputs
                 .iter()
                 .map(|input| input.slice(0..1))
                 .collect::<VortexResult<Vec<_>>>()?;
             let result = self.execute_strict(options, &VecExecutionArgs::new(one_row, 1), ctx)?;
-            let scalar = result.execute_scalar(0, ctx)?.cast(&result_dtype)?;
+            let result = with_return_dtype(result, result_dtype)?;
+            let scalar = result.execute_scalar(0, ctx)?;
             return Ok(ConstantArray::new(scalar, row_count).into_array());
         }
 
