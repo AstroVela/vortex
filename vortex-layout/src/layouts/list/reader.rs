@@ -54,6 +54,7 @@ const MAX_LIST_SPLIT_COUNT: u64 = 64;
 #[derive(Clone)]
 pub struct ListReader {
     layout: ListLayout,
+    dtype: DType,
     name: Arc<str>,
     session: VortexSession,
     elements: LayoutReaderRef,
@@ -93,8 +94,52 @@ impl ListReader {
             })
             .transpose()?;
 
+        Self::try_new_with_readers(layout, name, session, elements, offsets, validity)
+    }
+
+    pub(crate) fn try_new_with_readers(
+        layout: ListLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        elements: LayoutReaderRef,
+        offsets: LayoutReaderRef,
+        validity: Option<LayoutReaderRef>,
+    ) -> VortexResult<Self> {
+        vortex_error::vortex_ensure!(
+            offsets.dtype() == &DType::Primitive(layout.offsets_ptype(), Nullability::NonNullable),
+            "List offsets reader has unexpected dtype {}",
+            offsets.dtype()
+        );
+        vortex_error::vortex_ensure!(
+            offsets.row_count().saturating_sub(1) == layout.row_count(),
+            "List offsets reader has {} rows, expected {}",
+            offsets.row_count(),
+            layout.row_count() + 1
+        );
+        vortex_error::vortex_ensure!(
+            validity.is_some() == layout.dtype().is_nullable(),
+            "List validity reader presence does not match parent nullability"
+        );
+        if let Some(validity) = &validity {
+            vortex_error::vortex_ensure!(
+                validity.dtype() == &DType::Bool(Nullability::NonNullable),
+                "List validity reader has unexpected dtype {}",
+                validity.dtype()
+            );
+            vortex_error::vortex_ensure!(
+                validity.row_count() == layout.row_count(),
+                "List validity reader has {} rows, expected {}",
+                validity.row_count(),
+                layout.row_count()
+            );
+        }
+        let dtype = DType::List(
+            Arc::new(elements.dtype().clone()),
+            layout.dtype().nullability(),
+        );
         Ok(Self {
             layout,
+            dtype,
             name,
             session,
             elements,
@@ -112,7 +157,7 @@ impl ListReader {
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
         let validity_reader = self.validity.clone();
-        let nullability = self.layout.dtype().nullability();
+        let nullability = self.dtype.nullability();
         let row_range = row_range.clone();
         // Evaluate the rewritten expression against the validity bool array (true == valid row).
         let rewritten = rewrite_validity_expr(expr)?;
@@ -170,7 +215,7 @@ impl ListReader {
     fn project_all_full(&self, expr: &Expression) -> VortexResult<ArrayFuture> {
         let row_count = self.layout.row_count();
         let elements_row_count = self.elements.row_count();
-        let nullability = self.layout.dtype().nullability();
+        let nullability = self.dtype.nullability();
         let expr = expr.clone();
 
         let offsets_fut = self.fetch_raw_offsets(&(0..row_count))?;
@@ -207,7 +252,7 @@ impl ListReader {
     ) -> VortexResult<ArrayFuture> {
         // Crop to the smallest contiguous row range containing every selected list.
         let Some(selected_rows) = selected_row_range(&mask) else {
-            let empty = Canonical::empty(self.layout.dtype()).into_array();
+            let empty = Canonical::empty(&self.dtype).into_array();
             let expr = expr.clone();
             return Ok(async move { empty.apply(&expr) }.boxed());
         };
@@ -216,7 +261,7 @@ impl ListReader {
         let selected_row_range = (row_range.start + u64::try_from(selected_rows.start)?)
             ..(row_range.start + u64::try_from(selected_rows.end)?);
 
-        let nullability = self.layout.dtype().nullability();
+        let nullability = self.dtype.nullability();
         let expr = expr.clone();
         let reader = self.clone();
         let offsets_fut = self.fetch_raw_offsets(&selected_row_range)?;
@@ -266,7 +311,7 @@ impl ListReader {
         Ok(async move {
             let mask = mask.await?;
             let row_count = usize::try_from(row_range.end - row_range.start)?;
-            let nullability = reader.layout.dtype().nullability();
+            let nullability = reader.dtype.nullability();
 
             let validity_mask = if mask.all_true() {
                 MaskFuture::new_true(row_count)
@@ -338,7 +383,7 @@ impl LayoutReader for ListReader {
     }
 
     fn dtype(&self) -> &DType {
-        self.layout.dtype()
+        &self.dtype
     }
 
     fn row_count(&self) -> u64 {

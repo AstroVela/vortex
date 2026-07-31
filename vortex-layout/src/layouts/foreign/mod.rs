@@ -18,6 +18,7 @@ use crate::LayoutEncodingId;
 use crate::LayoutEncodingRef;
 use crate::LayoutReaderRef;
 use crate::LayoutRef;
+use crate::plan::PlanRef;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 
@@ -173,6 +174,13 @@ impl DynLayout for ForeignLayout {
     ) -> VortexResult<LayoutReaderRef> {
         vortex_bail!(
             "Cannot read unknown layout encoding '{}'",
+            self.encoding.id()
+        )
+    }
+
+    fn dyn_new_plan(&self) -> VortexResult<PlanRef> {
+        vortex_bail!(
+            "Cannot plan unknown layout encoding '{}'",
             self.encoding.id()
         )
     }

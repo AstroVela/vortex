@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::any::Any;
+use std::ops::Range;
+use std::sync::Arc;
+
+use vortex_array::MaskFuture;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldMask;
+use vortex_array::expr::Expression;
+use vortex_array::expr::is_root;
+use vortex_array::expr::root;
+use vortex_array::expr::transform::replace;
+use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_mask::Mask;
+use vortex_session::VortexSession;
+
+use crate::ArrayFuture;
+use crate::LayoutReader;
+use crate::LayoutReaderRef;
+use crate::RowSplits;
+use crate::SplitRange;
+use crate::plan::Plan;
+use crate::plan::PlanRef;
+use crate::segments::SegmentSource;
+
+/// A physical plan that applies an expression to the output of `child`.
+pub struct ExpressionPlan {
+    expression: Expression,
+    child: PlanRef,
+    dtype: DType,
+}
+
+impl ExpressionPlan {
+    /// Creates an expression plan and validates its output dtype.
+    pub fn try_new(expression: Expression, child: PlanRef) -> VortexResult<Self> {
+        let dtype = expression.return_dtype(child.dtype())?;
+        Ok(Self {
+            expression,
+            child,
+            dtype,
+        })
+    }
+
+    /// Creates a shared expression plan.
+    pub fn new_ref(expression: Expression, child: PlanRef) -> VortexResult<PlanRef> {
+        if let Some(inner) = child.as_any().downcast_ref::<Self>() {
+            let expression = replace(expression, &root(), inner.expression.clone());
+            return Ok(Arc::new(Self::try_new(
+                expression,
+                Arc::clone(&inner.child),
+            )?));
+        }
+        Ok(Arc::new(Self::try_new(expression, child)?))
+    }
+
+    /// Returns the expression evaluated by this plan.
+    pub fn expression(&self) -> &Expression {
+        &self.expression
+    }
+
+    /// Returns the child plan supplying the expression root.
+    pub fn child_plan(&self) -> &PlanRef {
+        &self.child
+    }
+}
+
+impl Plan for ExpressionPlan {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn optimize(&self) -> VortexResult<PlanRef> {
+        let child = self.child.optimize()?;
+        let expression = self.expression.optimize_recursive(child.dtype())?;
+        if is_root(&expression) {
+            return Ok(child);
+        }
+        Self::new_ref(expression, child)
+    }
+
+    fn new_reader(
+        &self,
+        name: Arc<str>,
+        segment_source: Arc<dyn SegmentSource>,
+        session: &VortexSession,
+        ctx: &crate::LayoutReaderContext,
+    ) -> VortexResult<LayoutReaderRef> {
+        Ok(Arc::new(ExpressionReader::try_new(
+            self.expression.clone(),
+            self.child.new_reader(name, segment_source, session, ctx)?,
+        )?))
+    }
+
+    fn dtype(&self) -> &DType {
+        &self.dtype
+    }
+
+    fn row_count(&self) -> u64 {
+        self.child.row_count()
+    }
+
+    fn child_count(&self) -> usize {
+        1
+    }
+
+    fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
+        if index != 0 {
+            vortex_bail!("Expression plan has no child {index}")
+        }
+        Ok(Some(Arc::clone(&self.child)))
+    }
+}
+
+/// A reader that binds an expression to the output of another reader.
+pub(crate) struct ExpressionReader {
+    expression: Expression,
+    child: LayoutReaderRef,
+    dtype: DType,
+}
+
+impl ExpressionReader {
+    fn try_new(expression: Expression, child: LayoutReaderRef) -> VortexResult<Self> {
+        let dtype = expression.return_dtype(child.dtype())?;
+        Ok(Self {
+            expression,
+            child,
+            dtype,
+        })
+    }
+
+    fn compose(&self, expression: &Expression) -> Expression {
+        replace(expression.clone(), &root(), self.expression.clone())
+    }
+}
+
+impl LayoutReader for ExpressionReader {
+    fn name(&self) -> &Arc<str> {
+        self.child.name()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn dtype(&self) -> &DType {
+        &self.dtype
+    }
+
+    fn row_count(&self) -> u64 {
+        self.child.row_count()
+    }
+
+    fn register_splits(
+        &self,
+        _field_mask: &[FieldMask],
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
+    ) -> VortexResult<()> {
+        // Mapping output field masks back through an arbitrary expression is an optimization. All
+        // child fields is conservative and preserves the child's natural split boundaries.
+        self.child
+            .register_splits(&[FieldMask::All], split_range, splits)
+    }
+
+    fn pruning_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        expression: &Expression,
+        mask: Mask,
+    ) -> VortexResult<MaskFuture> {
+        self.child
+            .pruning_evaluation(row_range, &self.compose(expression), mask)
+    }
+
+    fn filter_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        expression: &Expression,
+        mask: MaskFuture,
+    ) -> VortexResult<MaskFuture> {
+        self.child
+            .filter_evaluation(row_range, &self.compose(expression), mask)
+    }
+
+    fn projection_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        expression: &Expression,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture> {
+        self.child
+            .projection_evaluation(row_range, &self.compose(expression), mask)
+    }
+}

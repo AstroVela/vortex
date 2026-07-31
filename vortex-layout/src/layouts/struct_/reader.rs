@@ -32,6 +32,7 @@ use vortex_array::scalar_fn::fns::merge::Merge;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -50,6 +51,7 @@ use crate::segments::SegmentSource;
 
 pub struct StructReader {
     layout: StructLayout,
+    dtype: DType,
     name: Arc<str>,
     lazy_children: LazyReaderChildren,
     session: VortexSession,
@@ -71,17 +73,6 @@ impl StructReader {
         ctx: crate::LayoutReaderContext,
     ) -> VortexResult<Self> {
         let struct_dt = layout.struct_fields();
-
-        // NOTE: This number is arbitrary and likely depends on the longest common prefix of field names
-        let field_lookup = (struct_dt.nfields() > 80).then(|| {
-            struct_dt
-                .names()
-                .iter()
-                .enumerate()
-                .map(|(i, n)| (n.clone(), i))
-                .collect()
-        });
-
         let nullable = layout.dtype().is_nullable();
         let extra = nullable as usize;
 
@@ -103,25 +94,116 @@ impl StructReader {
             ctx,
         );
 
-        // Create an expanded root expression that contains all fields of the struct.
+        Ok(Self::new_with_children(
+            layout.dtype().clone(),
+            layout,
+            name,
+            session,
+            lazy_children,
+        ))
+    }
+
+    pub(crate) fn try_new_with_readers(
+        layout: StructLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        fields: Vec<LayoutReaderRef>,
+        validity: Option<LayoutReaderRef>,
+    ) -> VortexResult<Self> {
+        vortex_ensure!(
+            fields.len() == layout.struct_fields().nfields(),
+            "Struct plan supplied {} field readers for {} fields",
+            fields.len(),
+            layout.struct_fields().nfields()
+        );
+        for (index, reader) in fields.iter().enumerate() {
+            vortex_ensure!(
+                reader.row_count() == layout.row_count(),
+                "Struct field {index} reader has {} rows, expected {}",
+                reader.row_count(),
+                layout.row_count()
+            );
+        }
+        vortex_ensure!(
+            validity.is_some() == layout.dtype().is_nullable(),
+            "Struct validity reader presence does not match parent nullability"
+        );
+        if let Some(validity) = &validity {
+            vortex_ensure!(
+                validity.dtype() == &DType::Bool(Nullability::NonNullable),
+                "Struct validity reader has unexpected dtype {}",
+                validity.dtype()
+            );
+            vortex_ensure!(
+                validity.row_count() == layout.row_count(),
+                "Struct validity reader has {} rows, expected {}",
+                validity.row_count(),
+                layout.row_count()
+            );
+        }
+
+        let dtype = DType::Struct(
+            StructFields::from_iter(
+                layout
+                    .struct_fields()
+                    .names()
+                    .iter()
+                    .zip(fields.iter())
+                    .map(|(name, reader)| (name.clone(), reader.dtype().clone())),
+            ),
+            layout.dtype().nullability(),
+        );
+
+        let mut children = Vec::with_capacity(fields.len() + usize::from(validity.is_some()));
+        children.extend(validity);
+        children.extend(fields);
+        Ok(Self::new_with_children(
+            dtype,
+            layout,
+            name,
+            session,
+            LazyReaderChildren::from_readers(children),
+        ))
+    }
+
+    fn new_with_children(
+        dtype: DType,
+        layout: StructLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        lazy_children: LazyReaderChildren,
+    ) -> Self {
+        let struct_dt = dtype
+            .as_struct_fields_opt()
+            .vortex_expect("StructReader dtype must be a struct");
+        // NOTE: This number is arbitrary and likely depends on the longest common prefix of field names
+        let field_lookup = (struct_dt.nfields() > 80).then(|| {
+            struct_dt
+                .names()
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.clone(), i))
+                .collect()
+        });
         let expanded_root_expr = replace_root_fields(root(), struct_dt);
 
-        // This is where we need to do some complex things with the scan in order to split it into
-        // different scans for different fields.
-        Ok(Self {
+        Self {
             layout,
+            dtype,
             name,
             session,
             expanded_root_expr,
             lazy_children,
             field_lookup,
             partitioned_expr_cache: Default::default(),
-        })
+        }
     }
 
     /// Return the [`StructFields`] of this layout.
     fn struct_fields(&self) -> &StructFields {
-        self.layout.struct_fields()
+        self.dtype
+            .as_struct_fields_opt()
+            .vortex_expect("StructReader dtype must be a struct")
     }
 
     /// Return the child reader for the field.
@@ -236,7 +318,7 @@ impl LayoutReader for StructReader {
     }
 
     fn dtype(&self) -> &DType {
-        self.layout.dtype()
+        &self.dtype
     }
 
     fn row_count(&self) -> u64 {

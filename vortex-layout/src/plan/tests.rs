@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::sync::Arc;
+
+use vortex_array::ArrayContext;
+use vortex_array::IntoArray;
+use vortex_array::MaskFuture;
+use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::assert_arrays_eq;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
+use vortex_array::dtype::StructFields;
+use vortex_array::expr::eq;
+use vortex_array::expr::get_item;
+use vortex_array::expr::gt;
+use vortex_array::expr::lit;
+use vortex_array::expr::root;
+use vortex_array::validity::Validity;
+use vortex_buffer::buffer;
+use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+use vortex_io::runtime::single::block_on;
+use vortex_io::session::RuntimeSessionExt;
+use vortex_session::registry::ReadContext;
+
+use super::*;
+use crate::LayoutReaderRef;
+use crate::LayoutRef;
+use crate::LayoutStrategy;
+use crate::OwnedLayoutChildren;
+use crate::layouts::chunked::ChunkedLayout;
+use crate::layouts::chunked::reader::ChunkedReader;
+use crate::layouts::dict::DictLayout;
+use crate::layouts::dict::reader::DictReader;
+use crate::layouts::flat::FlatLayout;
+use crate::layouts::flat::reader::FlatReader;
+use crate::layouts::flat::writer::FlatLayoutStrategy;
+use crate::layouts::list::ListLayout;
+use crate::layouts::list::reader::ListReader;
+use crate::layouts::struct_::StructLayout;
+use crate::layouts::struct_::reader::StructReader;
+use crate::segments::SegmentId;
+use crate::segments::SegmentSource;
+use crate::segments::TestSegments;
+use crate::sequence::SequenceId;
+use crate::sequence::SequentialArrayStreamExt;
+use crate::test::new_session;
+
+fn primitive(ptype: PType, nullability: Nullability) -> DType {
+    DType::Primitive(ptype, nullability)
+}
+
+fn flat(row_count: u64, dtype: DType, segment: u32) -> LayoutRef {
+    FlatLayout::new(
+        row_count,
+        dtype,
+        SegmentId::from(segment),
+        ReadContext::new([]),
+    )
+    .into_layout()
+}
+
+fn make_plan(layout: LayoutRef) -> VortexResult<PlanRef> {
+    layout.new_plan()
+}
+
+fn make_reader(plan: &PlanRef) -> VortexResult<LayoutReaderRef> {
+    let segments: Arc<dyn SegmentSource> = Arc::new(TestSegments::default());
+    plan.new_reader(
+        Arc::from("root"),
+        segments,
+        &new_session(),
+        &Default::default(),
+    )
+}
+
+#[test]
+fn flat_plan_has_no_children_and_materializes_flat_reader() -> VortexResult<()> {
+    let plan = make_plan(flat(3, primitive(PType::I32, Nullability::NonNullable), 0))?;
+
+    assert!(plan.as_any().is::<FlatPlan>());
+    assert_eq!(plan.child_count(), 0);
+    assert!(plan.child(0).is_err());
+    assert!(make_reader(&plan)?.as_any().is::<FlatReader>());
+    Ok(())
+}
+
+#[test]
+fn chunked_plan_exposes_chunks_and_materializes_chunked_reader() -> VortexResult<()> {
+    let dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = ChunkedLayout::new(
+        3,
+        dtype.clone(),
+        OwnedLayoutChildren::layout_children(vec![flat(2, dtype.clone(), 0), flat(1, dtype, 1)]),
+    )
+    .into_layout();
+    let plan = make_plan(layout)?;
+
+    assert!(plan.as_any().is::<ChunkedPlan>());
+    assert_eq!(plan.child_count(), 2);
+    assert_eq!(
+        plan.child(0)?
+            .ok_or_else(|| vortex_err!("missing first chunk"))?
+            .row_count(),
+        2
+    );
+    assert_eq!(
+        plan.child(1)?
+            .ok_or_else(|| vortex_err!("missing second chunk"))?
+            .row_count(),
+        1
+    );
+    assert!(make_reader(&plan)?.as_any().is::<ChunkedReader>());
+    Ok(())
+}
+
+#[test]
+fn dict_plan_orders_codes_before_values_and_materializes_dict_reader() -> VortexResult<()> {
+    let values_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let codes_dtype = primitive(PType::U8, Nullability::NonNullable);
+    let layout = DictLayout::new(
+        flat(2, values_dtype.clone(), 0),
+        flat(3, codes_dtype.clone(), 1),
+    )
+    .into_layout();
+    let plan = make_plan(layout)?;
+
+    assert!(plan.as_any().is::<DictPlan>());
+    assert_eq!(plan.child_count(), 2);
+    assert_eq!(
+        plan.child(0)?
+            .ok_or_else(|| vortex_err!("missing codes"))?
+            .dtype(),
+        &codes_dtype
+    );
+    assert_eq!(
+        plan.child(1)?
+            .ok_or_else(|| vortex_err!("missing values"))?
+            .dtype(),
+        &values_dtype
+    );
+    assert!(make_reader(&plan)?.as_any().is::<DictReader>());
+    Ok(())
+}
+
+#[test]
+fn list_plan_has_stable_optional_validity_slot() -> VortexResult<()> {
+    let element_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let offsets_dtype = primitive(PType::U32, Nullability::NonNullable);
+    let non_nullable = ListLayout::new(
+        DType::List(Arc::new(element_dtype.clone()), Nullability::NonNullable),
+        flat(3, element_dtype.clone(), 0),
+        flat(3, offsets_dtype.clone(), 1),
+        None,
+    )
+    .into_layout();
+    let plan = make_plan(non_nullable)?;
+
+    assert!(plan.as_any().is::<ListPlan>());
+    assert_eq!(plan.child_count(), 3);
+    assert_eq!(
+        plan.child(0)?
+            .ok_or_else(|| vortex_err!("missing elements"))?
+            .dtype(),
+        &element_dtype
+    );
+    assert_eq!(
+        plan.child(1)?
+            .ok_or_else(|| vortex_err!("missing offsets"))?
+            .dtype(),
+        &offsets_dtype
+    );
+    assert!(plan.child(2)?.is_none());
+    assert!(make_reader(&plan)?.as_any().is::<ListReader>());
+
+    let nullable = ListLayout::new(
+        DType::List(Arc::new(element_dtype.clone()), Nullability::Nullable),
+        flat(3, element_dtype, 2),
+        flat(3, offsets_dtype, 3),
+        Some(flat(2, DType::Bool(Nullability::NonNullable), 4)),
+    )
+    .into_layout();
+    let nullable_plan = make_plan(nullable)?;
+    assert_eq!(
+        nullable_plan
+            .child(2)?
+            .ok_or_else(|| vortex_err!("missing validity"))?
+            .dtype(),
+        &DType::Bool(Nullability::NonNullable)
+    );
+    Ok(())
+}
+
+#[test]
+fn struct_plan_orders_fields_before_optional_validity() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let fields = StructFields::from_iter([("a", field_dtype.clone()), ("b", field_dtype.clone())]);
+    let non_nullable = StructLayout::new(
+        3,
+        DType::Struct(fields.clone(), Nullability::NonNullable),
+        vec![
+            flat(3, field_dtype.clone(), 0),
+            flat(3, field_dtype.clone(), 1),
+        ],
+    )
+    .into_layout();
+    let plan = make_plan(non_nullable)?;
+
+    assert!(plan.as_any().is::<StructPlan>());
+    assert_eq!(plan.child_count(), 3);
+    assert_eq!(
+        plan.child(0)?
+            .ok_or_else(|| vortex_err!("missing field a"))?
+            .dtype(),
+        &field_dtype
+    );
+    assert_eq!(
+        plan.child(1)?
+            .ok_or_else(|| vortex_err!("missing field b"))?
+            .dtype(),
+        &field_dtype
+    );
+    assert!(plan.child(2)?.is_none());
+    assert!(make_reader(&plan)?.as_any().is::<StructReader>());
+
+    let nullable = StructLayout::new(
+        3,
+        DType::Struct(fields, Nullability::Nullable),
+        vec![
+            flat(3, DType::Bool(Nullability::NonNullable), 2),
+            flat(3, field_dtype.clone(), 3),
+            flat(3, field_dtype, 4),
+        ],
+    )
+    .into_layout();
+    let nullable_plan = make_plan(nullable)?;
+    assert_eq!(
+        nullable_plan
+            .child(2)?
+            .ok_or_else(|| vortex_err!("missing validity"))?
+            .dtype(),
+        &DType::Bool(Nullability::NonNullable)
+    );
+    Ok(())
+}
+
+#[test]
+fn expression_plan_composes_and_materializes_expression_reader() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = StructLayout::new(
+        1,
+        DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![flat(1, field_dtype.clone(), 0)],
+    )
+    .into_layout();
+    let source = make_plan(layout)?;
+
+    let field = ExpressionPlan::new_ref(get_item("a", root()), Arc::clone(&source))?;
+    assert!(field.as_any().is::<ExpressionPlan>());
+    assert_eq!(field.dtype(), &field_dtype);
+
+    let predicate = ExpressionPlan::new_ref(eq(root(), lit(1_i32)), field)?.optimize()?;
+    assert_eq!(predicate.dtype(), &DType::Bool(Nullability::NonNullable));
+    let expression = predicate
+        .as_any()
+        .downcast_ref::<ExpressionPlan>()
+        .ok_or_else(|| vortex_err!("optimized plan is not an expression plan"))?;
+    assert_eq!(
+        expression.expression(),
+        &eq(get_item("a", root()), lit(1_i32))
+    );
+    assert!(
+        make_reader(&predicate)?
+            .as_any()
+            .is::<plans::ExpressionReader>()
+    );
+    Ok(())
+}
+
+#[test]
+fn optimized_plan_materializes_and_executes() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = new_session().with_handle(handle);
+        let mut execution = session.create_execution_ctx();
+        let segments = Arc::new(TestSegments::default());
+        let (sequence, eof) = SequenceId::root().split();
+        let array = PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
+        let layout = FlatLayoutStrategy::default()
+            .write_stream(
+                ArrayContext::empty(),
+                Arc::<TestSegments>::clone(&segments),
+                array.to_array_stream().sequenced(sequence),
+                eof,
+                &session,
+            )
+            .await?;
+
+        let plan = layout.new_plan()?;
+        let plan = ExpressionPlan::new_ref(gt(root(), lit(3_i32)), plan)?.optimize()?;
+        let reader = plan.new_reader(Arc::from("root"), segments, &session, &Default::default())?;
+        let result = reader
+            .projection_evaluation(
+                &(0..reader.row_count()),
+                &root(),
+                MaskFuture::new_true(usize::try_from(reader.row_count())?),
+            )?
+            .await?;
+
+        let expected = BoolArray::from_iter([false, false, false, true, true].map(Some));
+        assert_arrays_eq!(result, expected, &mut execution);
+        Ok(())
+    })
+}

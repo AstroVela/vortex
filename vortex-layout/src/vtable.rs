@@ -19,6 +19,8 @@ use crate::LayoutId;
 use crate::LayoutParts;
 use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
+use crate::plan::LayoutPlan;
+use crate::plan::PlanRef;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 
@@ -113,4 +115,12 @@ pub trait VTable: 'static + Clone + Send + Sync + Debug {
         session: &VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef>;
+
+    /// Construct a physical plan for this layout.
+    ///
+    /// The default is an opaque layout plan. Layouts can override this to expose logical children
+    /// to plan optimization.
+    fn new_plan(layout: &Layout<Self>) -> VortexResult<PlanRef> {
+        Ok(Arc::new(LayoutPlan::new(layout.to_layout())))
+    }
 }
