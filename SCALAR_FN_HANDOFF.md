@@ -1,8 +1,13 @@
 # Handoff: the row scalar-function framework
 
 Written at the end of a long session, for whoever picks this up next. The companion document
-`STRICT_SCALAR_FN_RESEARCH.md` (1,300+ lines) is the full design record with derivations and
-measurements; this file is the orientation and the plan. Read this first, then that.
+`STRICT_SCALAR_FN_RESEARCH.md` is the full design record with derivations, measured tables, and the
+alternatives that were rejected and why; this file is the orientation and the plan. Read this first,
+then that. Both are working notes that live on this branch only: they are not meant to land in the
+pull-request stack, and the tracking issue is their public form.
+
+Nothing here is a proposal yet. This branch is where the design was worked out and measured, and the
+plan below turns it into small reviewable pull requests cut fresh from develop.
 
 ## Where the work lives
 
@@ -73,7 +78,7 @@ benchmark, `execute_row_fn_with_strategy` (test-harness gated) is the only seam.
   Adding bounds later is a breaking change.
 - **Both output forms build an all-valid column**, which is what licenses the derived
   `validity() = union_child_validities`. Anything that lets a kernel emit nulls must change that
-  derivation in the same commit (see verdict 2 below).
+  derivation in the same commit (this is what step 3 of the plan below is about).
 - **A `RowFn` cannot also implement `ScalarFnVTable`**, since the blanket impl claims the slot.
   `RowFn` therefore mirrors any `ScalarFnVTable` method an adopter needs to vary. Today that is
   `validity` and nothing else, and `reduce` was dropped when the strict trait went because no
@@ -119,6 +124,15 @@ gone, because `row_null_handling` derives the pairing from the same witnesses `i
 which makes the combination unconstructible; the requirement is documented on
 `NullHandling::Dense`.
 
+**`NumericalAggregateOpts::serialize`/`deserialize` keep their original names, and nothing should
+make them implement `PersistableOptions` again.** Porting `list_sum` had forced that impl, whose
+trait methods collided with the inherent ones, and the resulting rename to `serialize_proto`/
+`deserialize_proto` broke public source compatibility for downstream callers. A reviewer flagged it
+and suggested forwarding aliases; reverting the port removed the cause instead, which is why the
+original names are back with no aliases and no deprecation. Note the collision was never a compile
+error (inherent methods win method resolution), so if some future change does need both,
+fully-qualified calls are enough and a rename is not.
+
 **`not` is back exactly as it is on develop.** Its `to_bit_buffer()` is a handle clone, and the
 source array keeps the buffer shared, so in-place negation (a real 19% on uniquely owned buffers)
 is unreachable without redesigning `ExecutionArgs` ownership. Encoded NOT flows through
@@ -162,7 +176,12 @@ of this one. Keep the survey's constraint list; do not build the tier.
    empty list sums to null) and `variant_get` (missing path yields null) are strict but excluded
    from `RowFn` today only by the all-valid-output rule. Needs an `Option<T>`
    output form with a nullable element dtype, a nullability bit on the return witness, and derived
-   `validity()` becoming `None` for such functions. `is_strict` stays true.
+   `validity()` becoming `None` for such functions. `is_strict` stays true. Three tests were
+   deleted with the strict trait for exactly this gap, since they used a synthetic kernel returning
+   null for a valid row: `a_non_total_kernel_declines_precomputed_validity`,
+   `a_non_total_kernel_is_still_strict` and `a_non_total_kernel_keeps_its_own_nulls`, recoverable
+   from `git show a605e5779^:vortex-array/src/scalar_fn/strict/tests.rs`. Restore them as row
+   functions when this lands.
 
 Known open items, none blocking: the branch fallback probes `reduce_encoded` twice when a dispatch
 turns out unsupported; geo's null-tolerant decode still arrow-exports the full column, and slicing
@@ -171,6 +190,13 @@ geo; the fallible branch loop pays one `is_none` check per set row after the fir
 `for_each_set_index` cannot early-return; sinks stay on dense/filter; the 0.75 threshold is global
 and should become per-element only when a second per-row-decode element exists to calibrate
 against.
+
+Two loose ends from the deletion, both cheap. The reworked benchmark control arms in
+`vortex-array/benches/strict_validity.rs` and `vortex-tensor/benches/l2_denorm.rs` compile and were
+reasoned through, but were never run in release, because disk was down to a few GB against a 23 GB
+`target`. Run both before quoting their numbers anywhere. And commit `72e01f96c` (the first version
+of this file) is pushed unsigned, so GitHub shows it unverified; every commit after it is signed, and
+fixing it needs a force-push, which is blocked.
 
 Also worth an issue on its own, unrelated to this work: `Between::validity` declares the strict
 three-way conjunction while its fallback execute path joins two comparisons with Kleene AND, so
@@ -196,6 +222,13 @@ cargo build -p vortex -p vortex-file -p vortex-datafusion
 ```
 
 3,596 tests pass across the three crates as of the strict-trait deletion.
+
+**`origin/develop` in this container is stale, and it will bite you.** It predates the
+`is_null_sensitive` to `is_strict` rename (upstream #8930), so restoring a file from it yields a body
+that does not compile against this branch. This branch is based on `e58fb5861`. To recover a
+function's pre-port body, use the commit before the port instead: `24d1933e1^` for `not`,
+`list_length` and `list_sum`. More generally, prefer `git log --oneline <base>..HEAD` over any
+assumption about what develop contains, and `git fetch origin develop` before comparing against it.
 
 Benchmarks are divan; report the `fastest` column from two runs and state the machine, because this
 environment is a shared 4-vCPU VM where filter-heavy arms have shown up to 2.3x run-to-run spread.
