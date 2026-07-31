@@ -3,7 +3,10 @@
 
 //! `ST_Intersects`: OGC intersection test between two native geometries.
 
+use geo::BoundingRect;
 use geo::Intersects;
+use geo_types::Geometry;
+use geo_types::Rect;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
@@ -17,6 +20,8 @@ use vortex_error::VortexResult;
 use vortex_session::registry::CachedId;
 
 use crate::scalar_fn::row::GeometryRow;
+#[cfg(test)]
+use crate::scalar_fn::row::probe;
 
 /// OGC `ST_Intersects` (not disjoint; boundary contact counts) between two native geometry
 /// operands, each a column or a constant literal.
@@ -54,7 +59,105 @@ impl RowFn for GeoIntersects {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(GeometryRow, GeometryRow), bool>(|(a, b)| a.intersects(b))
+        visitor.visit_prepared::<(GeometryRow, GeometryRow), ConstBboxes, bool>(
+            |(a, b)| {
+                #[cfg(test)]
+                probe::record(a.is_some(), b.is_some());
+                ConstBboxes::new(a, b)
+            },
+            |bboxes, (a, b)| intersects_row_prepared(bboxes, a, b),
+        )
+    }
+}
+
+/// Per-batch state for the intersects row kernel: the bounding rect of each operand that is
+/// constant for the batch.
+///
+/// geo opens many intersects pairings with `has_disjoint_bboxes`, an early-out that folds
+/// [`bounding_rect`] over both operands. For a batch-constant operand that fold recomputes the
+/// same rect every row, so it is hoisted here and [`intersects_row_prepared`] replays the
+/// comparison with the hoisted value. `None` marks an operand that varies by row or has no
+/// bounding rect (an empty geometry); both mean no early-out, exactly as `has_disjoint_bboxes`
+/// treats a missing rect.
+///
+/// [`bounding_rect`]: BoundingRect::bounding_rect
+struct ConstBboxes {
+    /// The bounding rect of operand `a` when it is batch-constant.
+    a: Option<Rect<f64>>,
+
+    /// The bounding rect of operand `b` when it is batch-constant.
+    b: Option<Rect<f64>>,
+}
+
+impl ConstBboxes {
+    fn new(a: Option<&Geometry<f64>>, b: Option<&Geometry<f64>>) -> Self {
+        Self {
+            a: a.and_then(BoundingRect::bounding_rect),
+            b: b.and_then(BoundingRect::bounding_rect),
+        }
+    }
+}
+
+/// Computes one row of intersects, spending any bounding rect hoisted into `bboxes`.
+///
+/// Where geo's own dispatch for the pairing opens with `has_disjoint_bboxes`, the same comparison
+/// runs here first with the constant side's rect already folded, returning `false` on a miss
+/// exactly as geo would. The fall-through delegates to the unchanged `a.intersects(b)`, which
+/// refolds both rects internally, so a batch where every row overlaps pays one extra
+/// `bounding_rect` fold over the row operand; the win concentrates where most rows are disjoint,
+/// the usual spatial-filter shape.
+fn intersects_row_prepared(bboxes: &ConstBboxes, a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
+    let disjoint = match (bboxes.a, bboxes.b) {
+        (None, None) => false,
+        (Some(bbox_a), Some(bbox_b)) => {
+            intersects_opens_with_bbox_check(a, b) && !bbox_a.intersects(&bbox_b)
+        }
+        (Some(bbox_a), None) => {
+            intersects_opens_with_bbox_check(a, b)
+                && b.bounding_rect()
+                    .is_some_and(|bbox_b| !bbox_a.intersects(&bbox_b))
+        }
+        (None, Some(bbox_b)) => {
+            intersects_opens_with_bbox_check(a, b)
+                && a.bounding_rect()
+                    .is_some_and(|bbox_a| !bbox_a.intersects(&bbox_b))
+        }
+    };
+
+    if disjoint {
+        return false;
+    }
+
+    a.intersects(b)
+}
+
+/// Whether geo's `a.intersects(b)` opens with `has_disjoint_bboxes(a, b)` before any other work.
+///
+/// The hoisted early-out in [`intersects_row_prepared`] **must** be pure common-subexpression
+/// elimination: it may fire only where geo itself compares exactly these two bounding rects
+/// first, so that hoisting cannot change the verdict on any input, NaN coordinates included.
+/// From geo 0.31's dispatch:
+///
+/// - `MultiPoint` iterates its points before anything else, so no whole-operand rect is ever
+///   compared, whatever the other side is.
+/// - `MultiLineString`, `MultiPolygon` and `GeometryCollection` open with the check against any
+///   operand (their blanket impls), whichever side they are on.
+/// - `LineString` opens with the check against everything except `MultiPoint`.
+/// - `Polygon` x `Polygon` opens with the check.
+/// - Every other pairing opens with a direct algorithm (coordinate position, segment orientation)
+///   or converts `Rect`/`Triangle` to a fresh polygon whose rect geo then folds itself, and must
+///   keep the unhoisted path.
+fn intersects_opens_with_bbox_check(a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
+    use Geometry as G;
+
+    match (a, b) {
+        (G::MultiPoint(_), _) => false,
+        (G::MultiLineString(_) | G::MultiPolygon(_) | G::GeometryCollection(_), _) => true,
+        (_, G::MultiLineString(_) | G::MultiPolygon(_) | G::GeometryCollection(_)) => true,
+        (G::LineString(_), G::MultiPoint(_)) => false,
+        (G::LineString(_), _) | (_, G::LineString(_)) => true,
+        (G::Polygon(_), G::Polygon(_)) => true,
+        _ => false,
     }
 }
 
@@ -63,7 +166,9 @@ mod tests {
     use geo_types::Coord;
     use geo_types::Geometry;
     use geo_types::LineString;
+    use geo_types::MultiPoint;
     use geo_types::MultiPolygon;
+    use geo_types::Point;
     use geo_types::Polygon;
     use rstest::rstest;
     use vortex_array::ArrayRef;
@@ -87,8 +192,10 @@ mod tests {
     use wkb::writer::WriteOptions;
 
     use super::GeoIntersects;
+    use crate::scalar_fn::row::probe::assert_prepared_agrees_with_columns;
     use crate::test_harness::nullable_point_column;
     use crate::test_harness::point_column;
+    use crate::test_harness::rect_column;
 
     /// A rectangle polygon with corners `(x0, y0)` and `(x1, y1)`, no holes.
     fn rect_polygon(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
@@ -367,5 +474,85 @@ mod tests {
         let result = GeoIntersects.return_dtype(&EmptyOptions, &[geo, numeric]);
         assert!(result.is_err());
         Ok(())
+    }
+
+    // The prepared-vs-expanded agreement grid: every constant arrangement of a pairing must
+    // return exactly what the fully expanded columns return.
+
+    /// A point geometry.
+    fn point(x: f64, y: f64) -> Geometry {
+        Geometry::Point(Point::new(x, y))
+    }
+
+    /// A linestring geometry through `coords`.
+    fn line(coords: Vec<(f64, f64)>) -> Geometry {
+        Geometry::LineString(LineString::from(coords))
+    }
+
+    /// A multipoint geometry over `coords`.
+    fn multipoint(coords: Vec<(f64, f64)>) -> Geometry {
+        Geometry::MultiPoint(MultiPoint::from(coords))
+    }
+
+    /// Constant arrangements agree with expanded columns across the pairing classes the prepared
+    /// kernel treats differently: bbox-prechecked pairs (polygon x polygon, linestring x
+    /// anything, multipolygon blankets), direct pairs (points), the excluded `MultiPoint` route,
+    /// and an empty geometry whose bounding rect does not exist.
+    #[rstest]
+    #[case::polygons_overlapping(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), rect_polygon(2.0, 2.0, 6.0, 6.0).into())]
+    #[case::polygons_touching_edge(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), rect_polygon(4.0, 0.0, 8.0, 4.0).into())]
+    #[case::polygons_touching_corner(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), rect_polygon(4.0, 4.0, 8.0, 8.0).into())]
+    #[case::polygons_disjoint(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), rect_polygon(20.0, 20.0, 24.0, 24.0).into())]
+    #[case::polygons_nested(rect_polygon(0.0, 0.0, 8.0, 8.0).into(), rect_polygon(2.0, 2.0, 4.0, 4.0).into())]
+    #[case::polygon_x_point_inside(donut(), point(2.0, 2.0))]
+    #[case::polygon_x_point_on_boundary(donut(), point(0.0, 5.0))]
+    #[case::polygon_x_point_in_hole(donut(), point(5.0, 5.0))]
+    #[case::point_outside_x_polygon(point(20.0, 20.0), donut())]
+    #[case::points_equal(point(1.0, 1.0), point(1.0, 1.0))]
+    #[case::points_distinct(point(1.0, 1.0), point(2.0, 1.0))]
+    #[case::linestring_crossing_polygon(line(vec![(-2.0, -2.0), (2.0, 2.0)]), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
+    #[case::linestring_disjoint_polygon(line(vec![(-2.0, -2.0), (-6.0, -6.0)]), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
+    #[case::linestring_in_polygon_hole(line(vec![(4.5, 4.5), (5.5, 5.5)]), donut())]
+    #[case::linestrings_crossing(line(vec![(0.0, 0.0), (4.0, 4.0)]), line(vec![(0.0, 4.0), (4.0, 0.0)]))]
+    #[case::linestrings_disjoint(line(vec![(0.0, 0.0), (4.0, 4.0)]), line(vec![(10.0, 10.0), (14.0, 14.0)]))]
+    #[case::empty_linestring_x_polygon(line(vec![]), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
+    #[case::multipoint_straddling_polygon(multipoint(vec![(2.0, 2.0), (20.0, 20.0)]), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
+    #[case::multipoint_outside_polygon(multipoint(vec![(20.0, 20.0), (30.0, 30.0)]), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
+    #[case::multipolygon_disjoint_polygon(
+        Geometry::MultiPolygon(MultiPolygon::new(vec![
+            rect_polygon(0.0, 0.0, 2.0, 2.0),
+            rect_polygon(10.0, 10.0, 12.0, 12.0),
+        ])),
+        rect_polygon(20.0, 20.0, 24.0, 24.0).into()
+    )]
+    fn constant_operands_agree_with_columns(
+        #[case] a: Geometry,
+        #[case] b: Geometry,
+    ) -> VortexResult<()> {
+        assert_prepared_agrees_with_columns(
+            GeoIntersects::try_new_array,
+            geometry_constant(&a, 3)?,
+            geometry_constant(&b, 3)?,
+        )
+    }
+
+    /// `Rect` has no WKB form, so its constant comes from a one-row rect column; the pairing
+    /// takes the route excluded from the bbox early-out (geo converts the rect to a fresh
+    /// polygon first) and must agree like the rest.
+    #[test]
+    fn rect_operand_agrees_with_columns() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let rect_scalar = rect_column(vec![(0.0, 0.0, 4.0, 4.0)])?.execute_scalar(0, &mut ctx)?;
+        let rect_constant = ConstantArray::new(rect_scalar, 3).into_array();
+        let polygon_constant =
+            geometry_constant(&Geometry::Polygon(rect_polygon(2.0, 2.0, 6.0, 6.0)), 3)?;
+
+        assert_prepared_agrees_with_columns(
+            GeoIntersects::try_new_array,
+            rect_constant,
+            polygon_constant,
+        )
     }
 }
