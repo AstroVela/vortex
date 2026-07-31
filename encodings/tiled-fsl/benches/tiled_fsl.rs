@@ -15,6 +15,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::FixedSizeListArray;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::validity::Validity;
@@ -31,6 +32,7 @@ use vortex_tiled_fsl::TiledFixedSizeListArraySlotsExt;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
+    assert_fixture_matrix();
     divan::main();
 }
 
@@ -235,17 +237,76 @@ fn tile_geometry(args: Args) -> TileGeometry {
     )
 }
 
+fn fixture_value(row: usize, dimension: usize, _dimensions: usize) -> u8 {
+    // Advancing one row changes every coordinate by 5 modulo 16, regardless of row width.
+    ((row * 5 + dimension * 3) & 0x0f) as u8
+}
+
+fn representative_rows(args: Args) -> (Vec<u8>, Vec<u8>) {
+    (
+        (0..args.dimensions)
+            .map(|dimension| fixture_value(0, dimension, args.dimensions))
+            .collect(),
+        (0..args.dimensions)
+            .map(|dimension| fixture_value(1, dimension, args.dimensions))
+            .collect(),
+    )
+}
+
+fn assert_fixture_matrix() {
+    let mut indistinct_widths = args()
+        .into_iter()
+        .filter_map(|args| {
+            let (first, second) = representative_rows(args);
+            (first == second).then_some(args.dimensions)
+        })
+        .collect::<Vec<_>>();
+    indistinct_widths.sort_unstable();
+    indistinct_widths.dedup();
+    assert!(
+        indistinct_widths.is_empty(),
+        "adjacent fixture rows are identical for dimensions {indistinct_widths:?}",
+    );
+}
+
+fn assert_adjacent_payloads_distinct(array: &FixedSizeListArray, args: Args) {
+    if args.rows < 2 {
+        return;
+    }
+    let elements = array.elements().as_::<Primitive>();
+    let values = elements.as_slice::<u8>();
+    assert_ne!(
+        &values[..args.dimensions],
+        &values[args.dimensions..args.dimensions * 2],
+        "adjacent canonical rows are identical for {args}",
+    );
+}
+
+fn assert_adjacent_scores_distinct(values: &[u8], args: Args, query: &[u8]) {
+    if args.rows < 2 {
+        return;
+    }
+    let scores =
+        scoring::score_canonical(&values[..args.dimensions * 2], 2, args.dimensions, query);
+    assert_ne!(
+        scores[0], scores[1],
+        "adjacent canonical row scores are identical for {args}",
+    );
+}
+
 fn canonical_u8(args: Args) -> FixedSizeListArray {
-    FixedSizeListArray::new(
-        PrimitiveArray::from_iter(
-            (0..args.rows * args.dimensions)
-                .map(|index| ((index * 17 + index / args.dimensions) & 0x0f) as u8),
-        )
+    let array = FixedSizeListArray::new(
+        PrimitiveArray::from_iter((0..args.rows).flat_map(|row| {
+            (0..args.dimensions)
+                .map(move |dimension| fixture_value(row, dimension, args.dimensions))
+        }))
         .into_array(),
         u32::try_from(args.dimensions).unwrap(),
         Validity::NonNullable,
         args.rows,
-    )
+    );
+    assert_adjacent_payloads_distinct(&array, args);
+    array
 }
 
 fn query(args: Args) -> Vec<u8> {
@@ -336,6 +397,7 @@ fn assert_scores_equal(
         .elements()
         .clone()
         .execute::<PrimitiveArray>(ctx)?;
+    assert_adjacent_scores_distinct(canonical_values.as_slice::<u8>(), args, query);
     assert_eq!(
         scoring::score_canonical(
             canonical_values.as_slice::<u8>(),
@@ -419,6 +481,7 @@ fn score_canonical(bencher: Bencher, args: Args) {
         .execute::<PrimitiveArray>(&mut ctx)
         .unwrap();
     let query = query(args);
+    assert_adjacent_scores_distinct(values.as_slice::<u8>(), args, &query);
     bencher.bench(|| {
         divan::black_box(scoring::score_canonical(
             values.as_slice::<u8>(),
