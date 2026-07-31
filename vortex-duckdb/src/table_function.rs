@@ -41,6 +41,7 @@ use vortex::file::v2::FileStatsLayoutReader;
 use vortex::io::kanal_ext::KanalExt as _;
 use vortex::io::runtime::BlockingRuntime as _;
 use vortex::io::runtime::current::ThreadSafeIterator;
+use vortex::io::runtime::current::TryRecv;
 use vortex::layout::scan::multi::MultiLayoutChild;
 use vortex::layout::scan::multi::MultiLayoutDataSource;
 use vortex::metrics::tracing::get_global_labels;
@@ -131,6 +132,7 @@ impl<'a> TableInitInput<'a> {
 
 type ScanItem = VortexResult<(ArrayRef, Arc<ConversionCache>)>;
 type DataSourceIterator = ThreadSafeIterator<ScanItem>;
+type ScanItemFuture = BoxFuture<'static, Option<ScanItem>>;
 
 pub struct TableFunctionGlobal {
     iterator: DataSourceIterator,
@@ -158,8 +160,10 @@ pub struct TableFunctionLocal {
     exporter: Option<ArrayExporter>,
     partition_index: u64,
     file_index: usize,
-    // Aggregate scan accumulated partials. Empty for non-aggregate scan
+    /// Aggregate scan accumulated partials. Empty for non-aggregate scan
     partials: Vec<Box<dyn DynAccumulator>>,
+    /// In progress next item
+    pending: Option<ScanItemFuture>,
 }
 
 pub struct PartitionData {
@@ -422,6 +426,7 @@ pub fn init_local(
         partition_index: 0,
         file_index: 0,
         partials,
+        pending: None,
     }
 }
 
@@ -443,11 +448,43 @@ fn convert_result(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Struc
     })
 }
 
+/// Write aggregation output row to "chunk"
+fn finalize_aggregate(
+    global_state: &TableFunctionGlobal,
+    chunk: &mut DataChunkRef,
+) -> VortexResult<()> {
+    // 0 means we're the last thread, u64::MAX means output is written.
+    // is_err() means CAS didn't succeed
+    if global_state
+        .pending
+        .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let mut accumulators = global_state.partials.lock();
+    let row_count = global_state.row_count.load(Ordering::Acquire) as i64;
+    let mut accum_iter = accumulators.iter_mut();
+    for (idx, aggregate) in global_state.aggregates.iter().enumerate() {
+        let value = match aggregate {
+            ColumnAggregate::Real { .. } => {
+                let accum = accum_iter.next().vortex_expect("partial for real agg");
+                Value::try_from(accum.finish()?)?
+            }
+            ColumnAggregate::CountStar => Value::from(row_count),
+        };
+        chunk.get_vector_mut(idx).reference_value(&value);
+    }
+    chunk.set_len(1);
+    Ok(())
+}
+
 fn scan_aggregate(
     local_state: &mut TableFunctionLocal,
     global_state: &TableFunctionGlobal,
     chunk: &mut DataChunkRef,
-) -> VortexResult<()> {
+) -> VortexResult<ScanResult> {
     let aggregates_len = global_state.aggregates.len();
     // seen[k] = output column for requested column k.
     // If min(x), max(x), avg(y) are requested, seen = { 0: 0, 1: 1}
@@ -468,32 +505,13 @@ fn scan_aggregate(
 
     let mut ctx = SESSION.create_execution_ctx();
     loop {
-        let Some(result) = local_state.iterator.next() else {
-            // 0 means we're the last thread, u64::MAX means output is written.
-            // is_err() means CAS didn't succeed
-            if global_state
-                .pending
-                .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-            {
-                return Ok(());
+        let result = match poll_next_item(local_state) {
+            NextItem::Ready(item) => item,
+            NextItem::BlockedOnIO => return Ok(ScanResult::BlockedOnIO),
+            NextItem::None => {
+                finalize_aggregate(global_state, chunk)?;
+                return Ok(ScanResult::Exported);
             }
-
-            let mut accumulators = global_state.partials.lock();
-            let row_count = global_state.row_count.load(Ordering::Acquire) as i64;
-            let mut accum_iter = accumulators.iter_mut();
-            for (idx, aggregate) in global_state.aggregates.iter().enumerate() {
-                let value = match aggregate {
-                    ColumnAggregate::Real { .. } => {
-                        let accum = accum_iter.next().vortex_expect("partial for real agg");
-                        Value::try_from(accum.finish()?)?
-                    }
-                    ColumnAggregate::CountStar => Value::from(row_count),
-                };
-                chunk.get_vector_mut(idx).reference_value(&value);
-            }
-            chunk.set_len(1);
-            return Ok(());
         };
         let array = convert_result(result?.0, &mut ctx)?;
 
@@ -517,11 +535,65 @@ fn scan_aggregate(
     }
 }
 
+enum NextItem {
+    Ready(ScanItem),
+    None,
+    BlockedOnIO,
+}
+
+/// Poll next item without blocking caller thread
+fn poll_next_item(local_state: &mut TableFunctionLocal) -> NextItem {
+    if let Some(future) = local_state.pending.as_mut() {
+        let mut ctx = Context::from_waker(std::task::Waker::noop());
+        return match future.poll_unpin(&mut ctx) {
+            Poll::Ready(item) => {
+                local_state.pending = None;
+                if let Some(item) = item {
+                    NextItem::Ready(item)
+                } else {
+                    NextItem::None
+                }
+            }
+            Poll::Pending => NextItem::BlockedOnIO,
+        };
+    }
+
+    match local_state.iterator.try_recv() {
+        TryRecv::Item(item) => NextItem::Ready(item),
+        TryRecv::Closed => NextItem::None,
+        TryRecv::Empty => {
+            let rx = local_state.iterator.receiver();
+            local_state.pending = Some(Box::pin(async move { rx.recv().await.ok() }));
+            NextItem::BlockedOnIO
+        }
+    }
+}
+
+/// Finish array receive started by scan()
+pub fn wait_and_fetch(local_state: &mut TableFunctionLocal) {
+    if let Some(mut future) = local_state.pending.take() {
+        // Duckdb calls this on a background task thread pool which is separate
+        // from table function processing pool. This call therefore doesn't
+        // block the query worker
+        let item = RUNTIME.block_on(&mut future);
+        // When this assignment is happening, thread related to "local_state"
+        // is suspended. It will be resumed only when wait_and_fetch returns
+        // so there's no race condition
+        local_state.pending = Some(Box::pin(std::future::ready(item)));
+    };
+}
+
+#[derive(PartialEq, Eq)]
+pub enum ScanResult {
+    Exported,
+    BlockedOnIO,
+}
+
 pub fn scan(
     local_state: &mut TableFunctionLocal,
     global_state: &TableFunctionGlobal,
     chunk: &mut DataChunkRef,
-) -> VortexResult<()> {
+) -> VortexResult<ScanResult> {
     if !local_state.partials.is_empty() {
         return scan_aggregate(local_state, global_state, chunk);
     }
@@ -529,10 +601,11 @@ pub fn scan(
     loop {
         if local_state.exporter.is_none() {
             let mut ctx = SESSION.create_execution_ctx();
-            let Some(result) = local_state.iterator.next() else {
-                return Ok(());
+            let (array_result, conversion_cache) = match poll_next_item(local_state) {
+                NextItem::Ready(item) => item?,
+                NextItem::None => return Ok(ScanResult::Exported),
+                NextItem::BlockedOnIO => return Ok(ScanResult::BlockedOnIO),
             };
-            let (array_result, conversion_cache) = result?;
             local_state.file_index = conversion_cache.file_index;
             let array_result = convert_result(array_result, &mut ctx)?;
 
@@ -576,7 +649,7 @@ pub fn scan(
             .reference_value(&Value::from(local_state.file_index as u64));
     }
 
-    Ok(())
+    Ok(ScanResult::Exported)
 }
 
 /// Scan progress as a percentage (0.0–100.0).

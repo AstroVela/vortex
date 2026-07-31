@@ -30,6 +30,7 @@ use crate::duckdb::TableInitInput;
 use crate::duckdb::try_or;
 use crate::duckdb::try_or_null;
 use crate::table_function::Cardinality;
+use crate::table_function::ScanResult;
 use crate::table_function::TableFunctionBind;
 use crate::table_function::TableFunctionGlobal;
 use crate::table_function::TableFunctionLocal;
@@ -45,6 +46,7 @@ use crate::table_function::scan;
 use crate::table_function::statistics;
 use crate::table_function::table_scan_progress;
 use crate::table_function::to_string;
+use crate::table_function::wait_and_fetch;
 
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn duckdb_table_function_to_string(
@@ -148,7 +150,7 @@ unsafe extern "C-unwind" fn duckdb_table_function_scan(
     local_init_data: *mut c_void,
     output: cpp::duckdb_data_chunk,
     error_out: *mut cpp::duckdb_vx_error,
-) {
+) -> bool {
     let global_init_data = unsafe { global_init_data.cast::<TableFunctionGlobal>().as_ref() }
         .vortex_expect("global_init_data null pointer");
     let local_init_data = unsafe { local_init_data.cast::<TableFunctionLocal>().as_mut() }
@@ -156,17 +158,24 @@ unsafe extern "C-unwind" fn duckdb_table_function_scan(
     let data_chunk = unsafe { DataChunk::borrow_mut(output) };
 
     match scan(local_init_data, global_init_data, data_chunk) {
-        Ok(()) => {
-            // The data chunk is already filled by the function.
-            // No need to do anything here.
+        Ok(result) => result == ScanResult::BlockedOnIO,
+        Err(e) => {
+            unsafe {
+                error_out.write(cpp::duckdb_vx_error_create(
+                    e.to_string().as_ptr().cast(),
+                    e.to_string().len(),
+                ));
+            }
+            false
         }
-        Err(e) => unsafe {
-            error_out.write(cpp::duckdb_vx_error_create(
-                e.to_string().as_ptr().cast(),
-                e.to_string().len(),
-            ));
-        },
     }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn duckdb_table_function_wait_and_fetch(local_init_data: *mut c_void) {
+    let local_init_data = unsafe { local_init_data.cast::<TableFunctionLocal>().as_mut() }
+        .vortex_expect("local_init_data null pointer");
+    wait_and_fetch(local_init_data);
 }
 
 #[unsafe(no_mangle)]

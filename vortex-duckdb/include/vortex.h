@@ -48,10 +48,12 @@ bool duckdb_table_function_pushdown_projection_aggregates(void *bind_data,
                                                           duckdb_vx_error *error_out);
 
 extern
-void duckdb_table_function_scan(void *global_init_data,
+bool duckdb_table_function_scan(void *global_init_data,
                                 void *local_init_data,
                                 duckdb_data_chunk output,
                                 duckdb_vx_error *error_out);
+
+extern void duckdb_table_function_wait_and_fetch(void *local_init_data);
 
 extern bool duckdb_table_function_pushdown_expression(duckdb_vx_expr expr);
 
