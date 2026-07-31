@@ -3,16 +3,15 @@
 
 //! What the [`OutputSink`] row layer costs `l2_denorm` relative to its hand-written kernel.
 //!
-//! Both sides here implement [`StrictScalarFnVTable`], so the strict lifting is common to them and the
-//! gap is the row layer alone. That is the difference from `l2_norm.rs`, whose control is a full
-//! [`ScalarFnVTable`](vortex_array::scalar_fn::ScalarFnVTable) and so measures the lifting and the row
-//! layer together.
-//!
 //! The two kernels differ in exactly one way. The pre-port one builds its output by collecting a
 //! `flat_map` over rows into a fresh [`Buffer`], never touching an element twice. The sink allocates a
 //! zeroed buffer once and each row writes its own slice of it in place, which trades that iterator
 //! chain for indexed writes into memory the allocator already zeroed. This measures whether the trade
 //! is free.
+//!
+//! The pre-port side is a full [`ScalarFnVTable`](vortex_array::scalar_fn::ScalarFnVTable) and so
+//! hand-writes the null handling that the row lifting derives for the ported one, but it hand-writes
+//! the same two steps the lifting takes, so both sides pay them.
 //!
 //! Norms are a real column rather than a constant, since a constant norm is answered by
 //! `reduce_encoded` and never reaches either row loop.
@@ -32,6 +31,7 @@ use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
+use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::expr::Expression;
 use vortex_array::expr::union_child_validities;
@@ -39,9 +39,8 @@ use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ExecutionArgs;
-use vortex_array::scalar_fn::NullHandling;
 use vortex_array::scalar_fn::ScalarFnId;
-use vortex_array::scalar_fn::StrictScalarFnVTable;
+use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
@@ -124,12 +123,14 @@ fn nullable(bencher: Bencher, width: usize) {
 
 /// The kernel as it was written before the port, specialized to `f64`.
 ///
-/// This is a [`StrictScalarFnVTable`], exactly as production `L2Denorm` was, so it shares the strict
-/// lifting with the ported version and differs only in how the row loop delivers its output.
+/// This is a full [`ScalarFnVTable`], exactly as `l2_norm.rs`'s control is, and hand-writes the null
+/// handling that production `L2Denorm` derives: conjoin the input validities, build the values
+/// all-valid, and mask them with the conjunction. That is what the lifting does around a dense
+/// kernel, so the arms stay comparable.
 #[derive(Clone)]
 struct PrePortL2Denorm;
 
-impl StrictScalarFnVTable for PrePortL2Denorm {
+impl ScalarFnVTable for PrePortL2Denorm {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
@@ -148,16 +149,8 @@ impl StrictScalarFnVTable for PrePortL2Denorm {
         }
     }
 
-    fn return_element_dtype(
-        &self,
-        _options: &Self::Options,
-        arg_dtypes: &[DType],
-    ) -> VortexResult<DType> {
-        Ok(arg_dtypes[0].clone())
-    }
-
-    fn null_handling(&self, _options: &Self::Options) -> NullHandling {
-        NullHandling::Dense
+    fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
+        Ok(arg_dtypes[0].union_nullability(arg_dtypes[1].nullability()))
     }
 
     fn validity(
@@ -168,11 +161,15 @@ impl StrictScalarFnVTable for PrePortL2Denorm {
         union_child_validities(expression)
     }
 
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
+    }
+
     fn is_fallible(&self, _options: &Self::Options) -> bool {
         false
     }
 
-    fn execute_strict(
+    fn execute(
         &self,
         _options: &Self::Options,
         args: &dyn ExecutionArgs,
@@ -185,6 +182,7 @@ impl StrictScalarFnVTable for PrePortL2Denorm {
         let output_dtype = normalized_ref
             .dtype()
             .union_nullability(norms_ref.dtype().nullability());
+        let conjoined = normalized_ref.validity()?.and(norms_ref.validity()?)?;
         let validity = if output_dtype.is_nullable() {
             Validity::AllValid
         } else {
@@ -216,10 +214,19 @@ impl StrictScalarFnVTable for PrePortL2Denorm {
             row_count,
         )?;
 
-        Ok(
+        let denormalized =
             ExtensionArray::new(output_dtype.as_extension().clone(), storage.into_array())
-                .into_array(),
-        )
+                .into_array();
+
+        // The one thing the lifting used to add for this kernel, and still adds for the ported one:
+        // mask the all-valid output with the conjoined input validity. Both arms therefore pay the
+        // same masking pass, which leaves the output construction as the only difference.
+        match conjoined {
+            Validity::Array(valid) => denormalized.mask(valid),
+            // Nothing to mask: these inputs are either wholly non-nullable or wholly valid, and
+            // never wholly invalid.
+            Validity::NonNullable | Validity::AllValid | Validity::AllInvalid => Ok(denormalized),
+        }
     }
 }
 

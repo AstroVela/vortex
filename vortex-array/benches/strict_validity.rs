@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Benchmarks how the strict lifting applies validity to a `NullHandling::Dense` kernel.
+//! Benchmarks how the row lifting applies validity to a dense kernel.
 //!
 //! Both arms run the same kernel over the same nullable input and differ only in how the output's
 //! nulls are restored:
 //!
-//! - `lazy` is what [`StrictScalarFnVTable`] does: conjoin the input validities (itself lazy) and
-//!   hand the resulting boolean array straight to `mask`.
+//! - `lazy` is what the lifting behind [`RowFn`] does: conjoin the input validities (itself lazy)
+//!   and hand the resulting boolean array straight to `mask`.
 //! - `eager` is the strategy it replaced: materialize the conjunction into a `Mask`, copy it into a
 //!   `BitBuffer`, wrap that in a `BoolArray`, and mask with it.
 //!
@@ -30,7 +30,6 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::expr::Expression;
 use vortex_array::expr::union_child_validities;
@@ -38,10 +37,10 @@ use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ExecutionArgs;
-use vortex_array::scalar_fn::NullHandling;
+use vortex_array::scalar_fn::RowFn;
+use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
-use vortex_array::scalar_fn::StrictScalarFnVTable;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
@@ -68,58 +67,44 @@ fn doubled(input: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
     Ok(PrimitiveArray::new(values, Validity::NonNullable).into_array())
 }
 
-/// Dense strict function: the lifting decides how validity is applied. It runs the same kernel as
-/// [`EagerDouble`], so the two differ only in that.
+/// Dense row function: the lifting decides how validity is applied.
+///
+/// Its [`reduce_encoded`](RowFn::reduce_encoded) answers with [`doubled`] before the row loop is
+/// reached, so this arm runs exactly the kernel [`EagerDouble`] runs and the two differ only in
+/// validity. The row closure below is what makes it a [`RowFn`] at all, and never executes.
 #[derive(Clone)]
 struct LazyDouble;
 
-impl StrictScalarFnVTable for LazyDouble {
+impl RowFn for LazyDouble {
     type Options = EmptyOptions;
+    type ArgsWitness = (i32,);
+    type RetWitness = i32;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.lazy_double");
         *ID
     }
 
-    fn arity(&self, _options: &Self::Options) -> Arity {
-        Arity::Exact(1)
-    }
-
-    fn child_name(&self, _options: &Self::Options, _child_idx: usize) -> ChildName {
+    fn arg_name(&self, _idx: usize) -> ChildName {
         ChildName::from("input")
     }
 
-    fn return_element_dtype(
+    fn dispatch<V: RowVisitor>(
         &self,
         _options: &Self::Options,
         _args: &[DType],
-    ) -> VortexResult<DType> {
-        Ok(DType::Primitive(PType::I32, Nullability::NonNullable))
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        visitor.visit::<(i32,), i32>(|(value,)| value.wrapping_mul(2))
     }
 
-    fn null_handling(&self, _options: &Self::Options) -> NullHandling {
-        NullHandling::Dense
-    }
-
-    fn validity(
+    fn reduce_encoded(
         &self,
         _options: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        union_child_validities(expression)
-    }
-
-    fn is_fallible(&self, _options: &Self::Options) -> bool {
-        false
-    }
-
-    fn execute_strict(
-        &self,
-        _options: &Self::Options,
-        args: &dyn ExecutionArgs,
+        args: &[ArrayRef],
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        doubled(&args.get(0)?, ctx)
+    ) -> VortexResult<Option<ArrayRef>> {
+        doubled(&args[0], ctx).map(Some)
     }
 }
 
