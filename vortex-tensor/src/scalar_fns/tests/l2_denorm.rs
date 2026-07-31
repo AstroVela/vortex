@@ -378,7 +378,7 @@ fn l2_denorm_nullable_constant_nonunit_norms_scales_vectors() -> VortexResult<()
         storage.elements().dtype(),
     );
 
-    // The nullable norms argument widens the result itself, which the strict lifting owns.
+    // The nullable norms argument widens the result itself, which the row lifting owns.
     assert!(ext.dtype().is_nullable());
     for i in 0..ext.len() {
         assert!(ext.is_valid(i, &mut ctx)?);

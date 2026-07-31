@@ -3,9 +3,9 @@
 
 //! Defining scalar functions one row at a time.
 //!
-//! This is the most derived of the three scalar function traits, and the right default for a kernel
-//! that has to read every row anyway. See [choosing a trait](crate::scalar_fn#choosing-a-trait) for
-//! when to drop to [`StrictScalarFnVTable`](crate::scalar_fn::StrictScalarFnVTable) instead.
+//! This is the derived way to write a scalar function, and the right default for a kernel that has
+//! to read every row anyway. See [choosing a trait](crate::scalar_fn#choosing-a-trait) for when to
+//! drop to [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable) instead.
 //!
 //! [`RowFn`] asks for two things: a witness argument tuple and return type, and a
 //! [`dispatch`](RowFn::dispatch) that picks the concrete element types for a batch and visits the
@@ -32,7 +32,7 @@
 //! returns reaches every row by shared reference, so work that depends only on a constant argument
 //! runs once per batch instead of once per row.
 //!
-//! Null handling is derived and executed by the strict lifting, never by the row closure, which
+//! Null handling is derived and executed by the [lifting](lift), never by the row closure, which
 //! only ever computes rows valid in every argument. A batch with a mixed validity mask executes by
 //! one of two strategies, selected per batch: *branch-and-skip* (decode the unfiltered columns
 //! null-tolerantly via [`InputElement::decode_null_tolerant`], compute only the valid rows a word
@@ -65,9 +65,16 @@ pub use sink::OutputSink;
 
 mod execute;
 
+mod lift;
+pub use lift::NullHandling;
+#[cfg(any(test, feature = "_test-harness"))]
+pub use lift::NullStrategy;
+
 mod row_fn;
 pub use row_fn::RowFn;
 pub use row_fn::RowVisitor;
+#[cfg(any(test, feature = "_test-harness"))]
+pub use row_fn::execute_row_fn_with_strategy;
 
 #[cfg(test)]
 mod tests;

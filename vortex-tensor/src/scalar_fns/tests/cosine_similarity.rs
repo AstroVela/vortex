@@ -530,7 +530,7 @@ fn literal_constant_zero_norm_query_yields_zero() -> VortexResult<()> {
     Ok(())
 }
 
-/// Two literal constants are folded to a single-row execution by the strict lifting, and that row
+/// Two literal constants are folded to a single-row execution by the row lifting, and that row
 /// still runs the prepared kernel with both norms hoisted.
 #[test]
 fn both_literal_constants() -> VortexResult<()> {

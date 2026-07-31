@@ -1,0 +1,482 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! Lifting a kernel over non-null values into a full [`ScalarFnVTable::execute`].
+//!
+//! A [`RowFn`] hands the framework a kernel that only ever computes rows valid in every argument.
+//! Everything between that kernel and [`ScalarFnVTable::execute`] lives here: null propagation,
+//! constant folding, nullability widening, output dtype reconciliation, and the per-batch choice
+//! between the two mechanisms that satisfy [`NullHandling::Filter`].
+//!
+//! This is machinery, not an interface. It takes the kernel as a pair of closures rather than a
+//! trait because the one trait that ever occupied the slot (a public `StrictScalarFnVTable`, with
+//! [`RowFn`] blanket-implementing it) never found a second implementor, and the indirection cost
+//! more than it explained. Extract a trait if and when a non-row user appears.
+//!
+//! [`RowFn`]: crate::scalar_fn::RowFn
+//! [`ScalarFnVTable::execute`]: crate::scalar_fn::ScalarFnVTable::execute
+
+use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
+use vortex_mask::AllOr;
+use vortex_mask::Mask;
+
+use crate::ArrayRef;
+use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::arrays::BoolArray;
+use crate::arrays::ConstantArray;
+use crate::arrays::PrimitiveArray;
+use crate::builtins::ArrayBuiltins;
+use crate::dtype::DType;
+use crate::scalar::Scalar;
+use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::VecExecutionArgs;
+use crate::validity::Validity;
+
+/// How the lifting shows a kernel the rows that are null in some input.
+///
+/// A row function never declares this: [`row_null_handling`] derives it from the element types the
+/// function's witnesses name.
+///
+/// [`row_null_handling`]: super::execute::row_null_handling
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NullHandling {
+    /// Evaluate every row, including rows behind nulls, then mask the result.
+    ///
+    /// Cheapest: no filtering, no scattering, and the inputs keep their original encoding.
+    /// Requires that the kernel is infallible and total over whatever sits behind a null, which
+    /// holds for any flat fixed-width payload since a null row is just unused bytes. Both halves of
+    /// that requirement are read off the element types rather than trusted: a fallible kernel, or
+    /// one over an argument that is not
+    /// [`InputElement::DENSE_SAFE`](crate::scalar_fn::InputElement::DENSE_SAFE), gets
+    /// [`Filter`](Self::Filter) instead.
+    Dense,
+
+    /// Never evaluate a row that is null in some input: the kernel only ever sees valid rows.
+    ///
+    /// Always sound. It is what a fallible kernel gets, and what an argument gets when decoding a
+    /// row behind a null could itself fail (a dictionary code or string view only meaningful for
+    /// valid rows).
+    ///
+    /// `Filter` names that *contract*, not a mechanism. A batch whose mask is mixed executes by one
+    /// of two strategies, selected per batch by the lifting and invisible to the kernel: filter the
+    /// inputs to the valid rows, evaluate those, and scatter the results back; or, when the kernel
+    /// supports it (every [`RowFn`](crate::scalar_fn::RowFn) with a returning dispatch does),
+    /// branch-and-skip, which evaluates only the valid rows over the *unfiltered* inputs and masks
+    /// the result.
+    ///
+    /// Encoding-aware kernels see original encodings under branch-and-skip but *filtered copies*
+    /// under the filter strategy, and filtering only pushes through an extension array or a
+    /// `ScalarFnArray` with at most one non-constant child. With two or more, the filter stays on
+    /// top, so `array.is::<ExactScalarFn<Foo>>()` stops matching and the kernel silently takes its
+    /// generic path.
+    Filter,
+}
+
+/// One batch of inputs, with everything the lifting reads off them before the kernel runs.
+pub(super) struct Batch<'a> {
+    /// The function being executed, named in the errors this raises.
+    id: ScalarFnId,
+
+    /// The arguments as the execution layer handed them over. Every path but the filter strategy
+    /// gives the kernel these untouched, so it sees the original encodings.
+    args: &'a dyn ExecutionArgs,
+
+    /// The input columns, collected once: constant folding inspects them and the filter strategy
+    /// filters them.
+    inputs: Vec<ArrayRef>,
+
+    /// The conjoined input validity, so a row of the output is valid iff it is valid in every
+    /// input. Conjoining is lazy, and nothing materializes it unless the null handling asks.
+    validity: Validity,
+
+    /// The dtype the function declares for these inputs, which the kernel's output is reconciled
+    /// against. Already widened to nullable if any input is nullable.
+    result_dtype: DType,
+
+    /// How the kernel sees rows that are null in some input.
+    null_handling: NullHandling,
+
+    /// Whether any argument's decode does per-row work whose cost shrinks when the inputs are
+    /// filtered first, which is the one input to the per-batch strategy choice that comes from the
+    /// function rather than from the mask.
+    decode_shrinks_when_filtered: bool,
+}
+
+impl<'a> Batch<'a> {
+    /// Collect `args` and read the lifting's facts off them, `return_dtype` being the function's
+    /// declared return dtype for the input dtypes it is handed.
+    ///
+    /// **Not** for a nullary function: with no inputs there is no validity to propagate and no
+    /// per-row work to fold, and the all-constant check below would vacuously pass.
+    pub(super) fn new(
+        id: ScalarFnId,
+        args: &'a dyn ExecutionArgs,
+        return_dtype: impl FnOnce(&[DType]) -> VortexResult<DType>,
+        null_handling: NullHandling,
+        decode_shrinks_when_filtered: bool,
+    ) -> VortexResult<Self> {
+        let inputs = (0..args.num_inputs())
+            .map(|i| args.get(i))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        let arg_dtypes = inputs
+            .iter()
+            .map(|input| input.dtype().clone())
+            .collect::<Vec<_>>();
+        let result_dtype = return_dtype(&arg_dtypes)?;
+
+        let mut validity = Validity::NonNullable;
+        for input in &inputs {
+            validity = validity.and(input.validity()?)?;
+        }
+
+        Ok(Self {
+            id,
+            args,
+            inputs,
+            validity,
+            result_dtype,
+            null_handling,
+            decode_shrinks_when_filtered,
+        })
+    }
+
+    /// Run `kernel` over this batch, adding everything the kernel does not do: the null-constant
+    /// short circuit, the all-constant fold, and the null handling.
+    ///
+    /// `kernel` computes the whole column from the arguments it is handed. Those are this batch's
+    /// arguments untouched, except under the filter strategy, where they are filtered copies, and
+    /// in the all-constant fold, where they are one row each. What it may assume:
+    ///
+    /// - No input is a null constant, and the inputs are not all constant.
+    /// - Under [`NullHandling::Filter`], every row of every input is valid.
+    /// - Under [`NullHandling::Dense`], rows behind nulls hold arbitrary values, and their results
+    ///   are discarded.
+    ///
+    /// Either way the kernel can ignore input validity, and its output **must** equal
+    /// `return_dtype` up to nullability. A kernel that returns nulls of its own keeps them, unioned
+    /// with the ones the lifting applies, which requires its declared dtype to be nullable.
+    ///
+    /// `branch` computes only the rows set in the conjoined mask, over the *unfiltered* arguments,
+    /// writing an arbitrary placeholder everywhere else; `Ok(None)` means it cannot for these
+    /// inputs, which sends the batch to the filter strategy. It is only ever called with a mixed
+    /// mask, and it **must not** run its row computation (nor any per-row fallible decode) on an
+    /// unset row, since those rows hold arbitrary values and a fallible kernel would spuriously
+    /// fail on them.
+    pub(super) fn execute(
+        &self,
+        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        // Strictness: any null-constant input forces an all-null result without evaluating the
+        // kernel.
+        if self
+            .inputs
+            .iter()
+            .any(|input| input.as_constant().is_some_and(|scalar| scalar.is_null()))
+        {
+            return Ok(self.all_null());
+        }
+
+        // All inputs constant, and by the guard above non-null.
+        if self.args.row_count() > 0
+            && self
+                .inputs
+                .iter()
+                .all(|input| input.as_constant().is_some())
+        {
+            return self.broadcast_one_row(kernel, ctx);
+        }
+
+        match self.null_handling {
+            NullHandling::Dense => self.execute_dense(kernel, ctx),
+            NullHandling::Filter => self.execute_filtered(kernel, branch, ctx),
+        }
+    }
+
+    /// Evaluate a single row of all-constant inputs and broadcast its value.
+    ///
+    /// Reconciling the row's dtype before reading the scalar keeps this path on the same
+    /// kernel/declaration agreement check as the dense and filter paths, rather than letting `cast`
+    /// paper over a disagreement.
+    fn broadcast_one_row(
+        &self,
+        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let one_row = self
+            .inputs
+            .iter()
+            .map(|input| input.slice(0..1))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        let result = kernel(&VecExecutionArgs::new(one_row, 1), ctx)?;
+        let scalar = self.with_return_dtype(result)?.execute_scalar(0, ctx)?;
+
+        Ok(ConstantArray::new(scalar, self.args.row_count()).into_array())
+    }
+
+    /// Run the kernel over every row, including the rows behind nulls, then mask its result.
+    ///
+    /// This is the [`NullHandling::Dense`] path. The arguments reach the kernel untouched, so the
+    /// inputs keep their original encoding, and the conjoined validity is handed to `mask` as an
+    /// array rather than materialized into a [`Mask`] first.
+    fn execute_dense(
+        &self,
+        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        // Every row is null, so the kernel has nothing to contribute.
+        if matches!(self.validity, Validity::AllInvalid) {
+            return Ok(self.all_null());
+        }
+
+        let values = kernel(self.args, ctx)?;
+
+        match self.validity.clone() {
+            Validity::NonNullable | Validity::AllValid => self.with_return_dtype(values),
+            Validity::Array(valid) => self.with_return_dtype(values.mask(valid)?),
+            // Handled by the guard above, before the kernel ran.
+            Validity::AllInvalid => Ok(self.all_null()),
+        }
+    }
+
+    /// The [`NullHandling::Filter`] path: materialize the conjoined validity once, take the
+    /// all-true and all-false shortcuts, and pick a strategy per batch for a mixed mask.
+    ///
+    /// Two strategies can execute a mixed mask, and neither is visible to the kernel:
+    ///
+    /// - **Branch-and-skip** ([`execute_branched`](Self::execute_branched)): hand the *unfiltered*
+    ///   arguments plus the mask to `branch`, which computes only the valid rows, then mask the
+    ///   full-length result exactly as the dense path does. This skips the filter and the scatter
+    ///   entirely, at the price of decoding full-length columns.
+    /// - **Filter** ([`filter_and_scatter`](Self::filter_and_scatter)): filter every input down to
+    ///   the conjoined-valid rows, run the kernel over those, and scatter its results back into a
+    ///   null-padded output. Always available, never encoding-preserving.
+    ///
+    /// Branch-and-skip is preferred whenever [`branch_beats_filter`] says so, and the filter
+    /// strategy is also the fallback for a kernel with no branch execution.
+    fn execute_filtered(
+        &self,
+        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let valid = self
+            .validity
+            .clone()
+            .execute_mask(self.args.row_count(), ctx)?;
+
+        // Check all-true before all-false: an empty mask is both, and must not be treated as
+        // all-null (a zero-length non-nullable execution keeps its non-nullable dtype).
+        if valid.all_true() {
+            return self.with_return_dtype(kernel(self.args, ctx)?);
+        }
+
+        if valid.all_false() {
+            return Ok(self.all_null());
+        }
+
+        if branch_beats_filter(self.decode_shrinks_when_filtered, &valid)
+            && let Some(result) = self.execute_branched(branch, &valid, ctx)?
+        {
+            return Ok(result);
+        }
+
+        self.filter_and_scatter(kernel, &valid, ctx)
+    }
+
+    /// Try the branch-and-skip strategy for a mixed mask: the kernel computes only the rows set in
+    /// `valid` over the unfiltered inputs, and the full-length result is masked exactly as the
+    /// dense path masks. `Ok(None)` means the kernel has no branch execution for these inputs, and
+    /// the caller falls back to [`filter_and_scatter`](Self::filter_and_scatter).
+    fn execute_branched(
+        &self,
+        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        valid: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let Some(values) = branch(valid, ctx)? else {
+            return Ok(None);
+        };
+
+        let mask = BoolArray::new(valid.to_bit_buffer(), Validity::NonNullable).into_array();
+        self.with_return_dtype(values.mask(mask)?).map(Some)
+    }
+
+    /// The filter strategy for a mixed mask: filter every input down to the rows set in `valid`,
+    /// run the kernel over those, and scatter its results back into a null-padded output.
+    fn filter_and_scatter(
+        &self,
+        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        valid: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let filtered = self
+            .inputs
+            .iter()
+            .map(|input| input.filter(valid.clone()))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        let values = kernel(&VecExecutionArgs::new(filtered, valid.true_count()), ctx)?;
+
+        self.with_return_dtype(self.scatter_valid(values, valid)?)
+    }
+
+    /// An all-null result of the function's declared return dtype.
+    fn all_null(&self) -> ArrayRef {
+        ConstantArray::new(
+            Scalar::null(self.result_dtype.clone()),
+            self.args.row_count(),
+        )
+        .into_array()
+    }
+
+    /// Reconcile the kernel's output dtype with the function's declared return dtype.
+    ///
+    /// The kernel may ignore nullability, so a nullability difference is cast away. Any other
+    /// difference means the declared dtype and the kernel disagree, which is a bug worth naming
+    /// rather than silently casting away.
+    fn with_return_dtype(&self, values: ArrayRef) -> VortexResult<ArrayRef> {
+        vortex_ensure!(
+            values.dtype().eq_ignore_nullability(&self.result_dtype),
+            "the {} kernel produced {} but the function declares {}",
+            self.id,
+            values.dtype(),
+            self.result_dtype,
+        );
+
+        if values.dtype() == &self.result_dtype {
+            Ok(values)
+        } else {
+            values.cast(self.result_dtype.clone())
+        }
+    }
+
+    /// Scatter `values` (one per set bit of `valid`, in order) back to the positions of the set
+    /// bits, producing an array of length `valid.len()` that is null at every unset position.
+    fn scatter_valid(&self, values: ArrayRef, valid: &Mask) -> VortexResult<ArrayRef> {
+        vortex_ensure_eq!(
+            values.len(),
+            valid.true_count(),
+            "the {} kernel produced {} rows for {} filtered rows",
+            self.id,
+            values.len(),
+            valid.true_count(),
+        );
+
+        let AllOr::Some(slices) = valid.slices() else {
+            // The caller handles the all-true and all-false masks.
+            vortex_bail!("scatter_valid requires a mixed mask");
+        };
+
+        // Gather indices: row i of the output reads values[rank(i)]. Rows behind nulls read index
+        // 0, and any in-bounds index would do since they are masked out below (values is non-empty
+        // here).
+        let mut indices = vec![0u64; valid.len()];
+        let mut rank = 0u64;
+        for &(start, end) in slices {
+            for index in &mut indices[start..end] {
+                *index = rank;
+                rank += 1;
+            }
+        }
+        let indices = PrimitiveArray::new(indices, Validity::NonNullable).into_array();
+
+        let scattered = values.take(indices)?;
+        let mask = BoolArray::new(valid.to_bit_buffer(), Validity::NonNullable).into_array();
+        scattered.mask(mask)
+    }
+}
+
+/// The minimum surviving-row fraction (`true_count / len` of the conjoined mask) at which
+/// branch-and-skip is still chosen for a function whose decode shrinks when filtered.
+///
+/// From the branch-and-skip measurements (65536 rows, divan fastest of 100 samples, two runs on a
+/// shared 4-vCPU VM). A kernel with a *bulk* decode never lost under branch: `byte_length` over
+/// the `Bytes` element ran 1.8-5.9x faster than filter at every null density from 1% to 90%, so
+/// such kernels skip this check entirely. A kernel with a *per-row* decode (geo `contains`, which
+/// arrow-exports and parses one geometry per row) pays that decode over the full column under
+/// branch but only over the survivors under filter, so filter wins once validity is sparse:
+///
+/// - polygons CONTAINS constant point: branch won 1.07-1.18x at 1-50% nulls; filter won 1.38x at
+///   90% nulls (10% of rows surviving).
+/// - polygons CONTAINS points, independent nulls on both: branch won up to ~10% null density
+///   (~81% surviving); filter won 1.2x at ~56% surviving, 1.9x at ~25%, 11.3x at ~1%.
+///
+/// The measured crossover sits between ~56% and ~81% surviving rows. 0.75 keeps the branch wins
+/// at dense validity (the two-nullable-operand case included) and sends every batch where filter
+/// measurably dominated to filter; the one concession is the single-operand 50%-null case, at
+/// exactly 50% surviving, where branch's ~1.1x edge is given up for filter.
+pub(super) const BRANCH_MIN_SURVIVING_FRACTION: f64 = 0.75;
+
+/// Whether the branch-and-skip strategy should be preferred over filtering for the mixed mask
+/// `valid`: always, unless a per-row decode would shrink under filter
+/// (`decode_shrinks_when_filtered`) and fewer than [`BRANCH_MIN_SURVIVING_FRACTION`] of the rows
+/// survive.
+pub(super) fn branch_beats_filter(decode_shrinks_when_filtered: bool, valid: &Mask) -> bool {
+    if !decode_shrinks_when_filtered {
+        return true;
+    }
+
+    valid.true_count() as f64 >= valid.len() as f64 * BRANCH_MIN_SURVIVING_FRACTION
+}
+
+/// Which null strategy a forced execution takes for a mixed validity mask.
+///
+/// A test and benchmark seam: pinning a strategy is how the two are compared and how their
+/// agreement is asserted. Production execution selects per batch inside the lifting and never
+/// names one. See [`execute_row_fn_with_strategy`](super::execute_row_fn_with_strategy).
+#[cfg(any(test, feature = "_test-harness"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NullStrategy {
+    /// Filter the inputs down to the conjoined-valid rows, run the kernel, and scatter back.
+    Filter,
+
+    /// Decode the unfiltered inputs null-tolerantly, compute only the conjoined-valid rows, and
+    /// mask the full-length result.
+    BranchAndSkip,
+}
+
+#[cfg(any(test, feature = "_test-harness"))]
+impl Batch<'_> {
+    /// Execute this batch with a forced null strategy, bypassing the per-batch selection.
+    ///
+    /// A test and benchmark seam only. It mirrors [`execute_filtered`](Self::execute_filtered)
+    /// (conjoined validity, the all-true and all-false shortcuts, output dtype reconciliation) but
+    /// takes the strategy from the caller instead of the selection rule, and it skips the
+    /// null-constant and all-constant folds, so do not pass such inputs. `Ok(None)` means
+    /// [`NullStrategy::BranchAndSkip`] was forced on a kernel with no branch execution, which the
+    /// caller reports rather than silently falling back.
+    pub(super) fn execute_with_strategy(
+        &self,
+        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        strategy: NullStrategy,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let valid = self
+            .validity
+            .clone()
+            .execute_mask(self.args.row_count(), ctx)?;
+
+        if valid.all_true() {
+            return self.with_return_dtype(kernel(self.args, ctx)?).map(Some);
+        }
+
+        if valid.all_false() {
+            return Ok(Some(self.all_null()));
+        }
+
+        match strategy {
+            NullStrategy::Filter => self.filter_and_scatter(kernel, &valid, ctx).map(Some),
+            NullStrategy::BranchAndSkip => self.execute_branched(branch, &valid, ctx),
+        }
+    }
+}

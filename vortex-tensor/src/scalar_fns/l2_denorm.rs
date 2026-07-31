@@ -214,7 +214,7 @@ impl RowFn for L2Denorm {
         );
 
         let Some(norm_value) = norm_scalar.value() else {
-            // A null constant never reaches the kernel: the strict lifting short-circuits it.
+            // A null constant never reaches the kernel: the row lifting short-circuits it.
             return Ok(None);
         };
 
@@ -282,7 +282,7 @@ impl ScalarFnArrayVTable for L2Denorm {
 
 /// Optimized execution when the norms array is constant.
 ///
-/// The result carries the normalized child's own dtype and validity, which the strict lifting then
+/// The result carries the normalized child's own dtype and validity, which the row lifting then
 /// widens and masks exactly as it does the row loop's output.
 fn execute_l2_denorm_constant_norms(
     normalized_ref: ArrayRef,

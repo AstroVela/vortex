@@ -9,8 +9,8 @@
 //!
 //! # Choosing a trait
 //!
-//! Three traits reach this vtable, each deriving more of it than the last. Implement the most
-//! derived one that the function fits.
+//! Two traits reach this vtable, and [`RowFn`] derives the whole of [`ScalarFnVTable`] from a row
+//! closure. Implement `RowFn` when the function fits it, and `ScalarFnVTable` when it does not.
 //!
 //! [`RowFn`] is for a kernel whose value at a row is determined by that row alone, and which has to
 //! read every row anyway: `vortex.byte_length`, `vortex.tensor.l2_norm`, `vortex.tensor.l2_denorm`,
@@ -48,7 +48,8 @@
 //! it when decoding a column does expensive per-row work (parsing a geometry), so sparse batches
 //! keep the filter strategy's shrunken decode.
 //!
-//! Two things neither form covers, and they are what actually send a function to the trait below:
+//! Two things neither output form covers, and they are what actually send a function to
+//! [`ScalarFnVTable`]:
 //!
 //! - **A result that aliases an input.** Both forms own their output bytes: an element returns them
 //!   and a sink copies them into itself. Trimming strings is the example, where the ideal kernel keeps
@@ -57,18 +58,19 @@
 //! - **A null result for a non-null row.** Both forms build an all-valid column, so
 //!   `vortex.list.sum` cannot be a row function: a valid empty list sums to null.
 //!
-//! [`StrictScalarFnVTable`] takes the whole column instead. Besides the two cases above, reach for
-//! it when a row loop *could* express the function but would do avoidable work:
+//! [`ScalarFnVTable`] takes the whole column instead, and everything a row function gets derived is
+//! then hand-written: null propagation, constant folding, nullability, validity, and options serde.
+//! Besides the two cases above and the functions that are simply not strict (Kleene logic, or a
+//! strictness that depends on the options), reach for it when a row loop *could* express the
+//! function but would do avoidable work:
 //!
 //! - **The answer is already an array, or is one value for the whole column.**
 //!   `vortex.list.length` hands back a `ListViewArray`'s sizes child, and a single `ConstantArray`
 //!   for a `FixedSizeListArray`. A row loop would rebuild that one `u64` at a time, even given a
 //!   list-length element in the style of [`BytesLen`].
 //! - **A row is not the natural unit of work.** `vortex.not` is one `!` per 64-bit word, in place
-//!   when the bit buffer is unshared, against 64 loop iterations and 64 bit writes.
-//!
-//! [`ScalarFnVTable`] itself is for a function that is not unconditionally strict, such as Kleene
-//! logic, or one whose strictness depends on its options.
+//!   when the bit buffer is unshared, against 64 loop iterations and 64 bit writes, and its
+//!   encoding-aware fallback pushes the inversion down instead of canonicalizing.
 
 use vortex_session::registry::Id;
 
@@ -97,9 +99,6 @@ pub use options::*;
 
 mod signature;
 pub use signature::*;
-
-mod strict;
-pub use strict::*;
 
 mod row;
 pub use row::*;

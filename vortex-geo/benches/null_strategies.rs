@@ -5,7 +5,7 @@
 //! the selection threshold exists for.
 //!
 //! Arms: `filter` and `branch` force one strategy through the test-harness seam
-//! ([`execute_strict_with_strategy`]); `auto` executes the full pipeline and lets the per-batch
+//! ([`execute_row_fn_with_strategy`]); `auto` executes the full pipeline and lets the per-batch
 //! selection choose, which should track the faster forced arm on both sides of the crossover
 //! (branch at dense validity, filter at sparse).
 //!
@@ -30,7 +30,7 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::MaskedArray;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::NullStrategy;
-use vortex_array::scalar_fn::execute_strict_with_strategy;
+use vortex_array::scalar_fn::execute_row_fn_with_strategy;
 use vortex_array::validity::Validity;
 use vortex_geo::scalar_fn::contains::GeoContains;
 use vortex_geo::test_harness::geo_session;
@@ -125,7 +125,7 @@ fn bench_contains(bencher: Bencher, a: ArrayRef, b: ArrayRef, strategy: Option<N
                 .into_array()
                 .execute::<Canonical>(&mut ctx)
                 .unwrap(),
-            Some(strategy) => execute_strict_with_strategy(
+            Some(strategy) => execute_row_fn_with_strategy(
                 &GeoContains,
                 &EmptyOptions,
                 vec![a.clone(), b.clone()],

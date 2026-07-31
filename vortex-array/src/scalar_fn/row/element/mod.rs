@@ -54,7 +54,8 @@ pub trait InputElement: 'static {
     /// since the value is garbage but the read cannot fault.
     ///
     /// [`NullHandling::Dense`](crate::scalar_fn::NullHandling::Dense) requires this of every
-    /// argument, and the row layers reject the combination when it does not hold.
+    /// argument, and the row layer derives [`Filter`](crate::scalar_fn::NullHandling::Filter)
+    /// instead when it does not hold.
     const DENSE_SAFE: bool;
 
     /// Whether [`decode`](Self::decode) can fail on *legal* input data.
@@ -75,7 +76,7 @@ pub trait InputElement: 'static {
     /// decoding everyone. `false`, the default, for a bulk canonicalization (bytes, bools,
     /// primitives), whose decode is a memcpy-shaped pass that filtering barely shrinks.
     ///
-    /// The strict lifting reads this when it picks a null strategy for a batch with a mixed
+    /// The lifting reads this when it picks a null strategy for a batch with a mixed
     /// validity mask: filtering the inputs first only pays off when it shrinks a per-row decode,
     /// so an element that leaves this `false` always takes the cheaper branch-and-skip strategy.
     /// Getting it wrong is a performance bug, never a correctness bug.
@@ -124,7 +125,7 @@ pub trait InputElement: 'static {
 /// An element type that a row computation can produce, buildable into an all-valid column.
 pub trait OutputElement: 'static + Sized {
     /// The dtype of columns built from this element type. Must be non-nullable: nullability is
-    /// derived from the inputs by the strict lifting.
+    /// derived from the inputs by the lifting.
     ///
     /// Taking no arguments confines an element's dtype to a property of its Rust type, so an output
     /// whose dtype depends on runtime data (a tensor, whose dtype carries its shape) cannot be an
@@ -138,7 +139,7 @@ pub trait OutputElement: 'static + Sized {
     /// An arbitrary value of this element, pre-filled into the output slots that the
     /// branch-and-skip null strategy skips.
     ///
-    /// The value is never observable: the strict lifting masks every slot holding it before the
+    /// The value is never observable: the lifting masks every slot holding it before the
     /// result escapes. It only has to be cheap to construct and legal to
     /// [`build`](Self::build) with.
     fn placeholder() -> Self;

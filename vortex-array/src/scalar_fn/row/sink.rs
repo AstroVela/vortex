@@ -37,7 +37,7 @@ pub trait OutputSink: 'static + Sized {
 
     /// The dtype of the column this sink builds, given the function's input dtypes.
     ///
-    /// Must be non-nullable: nullability is derived from the inputs by the strict lifting, which
+    /// Must be non-nullable: nullability is derived from the inputs by the lifting, which
     /// widens the result and masks the null rows itself.
     fn sink_dtype(args: &[DType]) -> VortexResult<DType>;
 

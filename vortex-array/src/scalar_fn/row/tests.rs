@@ -22,6 +22,7 @@ use crate::assert_arrays_eq;
 use crate::dtype::DType;
 use crate::expr::root;
 use crate::scalar::Scalar;
+use crate::scalar_fn::row::execute::row_null_handling;
 use crate::scalar_fn::*;
 
 /// Builds `scalar_fn` over `args` and executes it end to end, which is what every test below does.
@@ -217,25 +218,229 @@ fn fallible_apply_never_sees_rows_behind_nulls() -> VortexResult<()> {
     Ok(())
 }
 
+/// The [`NullHandling`] the framework derives for `F`, which no other API exposes: a row function
+/// never declares one.
+fn null_handling<F: RowFn>() -> NullHandling {
+    row_null_handling::<F::ArgsWitness, F::RetWitness>()
+}
+
 /// Neither `Dense` nor `Filter` is ever written down: the arguments and the return type decide.
 /// `Dense` is chosen whenever it is sound, because it is cheaper and preserves input encodings.
 #[test]
 fn null_handling_follows_from_args_and_ret() {
     // Primitive arguments, infallible: nothing behind a null row can fault.
-    assert_eq!(
-        StrictScalarFnVTable::null_handling(&Hypot, &EmptyOptions),
-        NullHandling::Dense
-    );
+    assert_eq!(null_handling::<Hypot>(), NullHandling::Dense);
     // `Bytes` resolves a view into a data buffer, which is only meaningful for valid rows.
-    assert_eq!(
-        StrictScalarFnVTable::null_handling(&Shout, &EmptyOptions),
-        NullHandling::Filter
-    );
+    assert_eq!(null_handling::<Shout>(), NullHandling::Filter);
     // Fallible: a garbage row could raise an error of its own.
-    assert_eq!(
-        StrictScalarFnVTable::null_handling(&CheckedDiv, &EmptyOptions),
-        NullHandling::Filter
-    );
+    assert_eq!(null_handling::<CheckedDiv>(), NullHandling::Filter);
+}
+
+/// What the lifting adds around every row loop: null propagation, constant folding, nullability
+/// widening, and options serde, none of which a row function writes.
+///
+/// The kernel is the same wrapping addition either way, and only its argument element decides which
+/// null-handling path the lifting takes, so every case here runs both.
+mod lifting {
+    use super::*;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
+
+    /// An `i32` element that is [dense-safe] iff `DENSE`, and otherwise the plain `i32` element in
+    /// every respect. Dense-safety is what decides the null-handling path, so a pair of these is
+    /// how one kernel gets run under both.
+    ///
+    /// [dense-safe]: InputElement::DENSE_SAFE
+    struct MaybeDenseI32<const DENSE: bool>;
+
+    impl<const DENSE: bool> InputElement for MaybeDenseI32<DENSE> {
+        type Column = <i32 as InputElement>::Column;
+        type Elem<'a> = i32;
+
+        const DENSE_SAFE: bool = DENSE;
+        const DECODE_FALLIBLE: bool = false;
+
+        fn validate(dtype: &DType) -> VortexResult<()> {
+            <i32 as InputElement>::validate(dtype)
+        }
+
+        fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+            <i32 as InputElement>::decode(array, ctx)
+        }
+
+        fn get(column: &Self::Column, index: usize) -> i32 {
+            <i32 as InputElement>::get(column, index)
+        }
+    }
+
+    /// Wrapping addition over two [`MaybeDenseI32`] columns.
+    #[derive(Clone)]
+    struct Add<const DENSE: bool>;
+
+    impl<const DENSE: bool> RowFn for Add<DENSE> {
+        type Options = EmptyOptions;
+        type ArgsWitness = (MaybeDenseI32<DENSE>, MaybeDenseI32<DENSE>);
+        type RetWitness = i32;
+
+        fn id(&self) -> ScalarFnId {
+            if DENSE {
+                static ID: CachedId = CachedId::new("vortex.test.add.dense");
+                *ID
+            } else {
+                static ID: CachedId = CachedId::new("vortex.test.add.filter");
+                *ID
+            }
+        }
+
+        fn arg_name(&self, idx: usize) -> ChildName {
+            ChildName::from(["lhs", "rhs"][idx])
+        }
+
+        fn dispatch<V: RowVisitor>(
+            &self,
+            _options: &Self::Options,
+            _args: &[DType],
+            visitor: V,
+        ) -> VortexResult<V::Out> {
+            visitor.visit::<(MaybeDenseI32<DENSE>, MaybeDenseI32<DENSE>), i32>(|(lhs, rhs)| {
+                lhs.wrapping_add(rhs)
+            })
+        }
+    }
+
+    /// Adds `lhs` to `rhs` under both null-handling paths and asserts each result equals
+    /// `expected`, which is what every case below does.
+    ///
+    /// Forcing a *strategy* within the filter contract is a separate axis, covered in
+    /// [`null_strategies`](super::null_strategies).
+    fn assert_add(lhs: ArrayRef, rhs: ArrayRef, expected: ArrayRef) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+
+        let dense = apply(Add::<true>, [lhs.clone(), rhs.clone()], &mut ctx)?;
+        let filtered = apply(Add::<false>, [lhs, rhs], &mut ctx)?;
+
+        assert_eq!(null_handling::<Add<true>>(), NullHandling::Dense);
+        assert_eq!(null_handling::<Add<false>>(), NullHandling::Filter);
+        assert_arrays_eq!(dense, expected, &mut ctx);
+        assert_arrays_eq!(filtered, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn no_nulls() -> VortexResult<()> {
+        assert_add(
+            PrimitiveArray::from_iter([1i32, 2, 3]).into_array(),
+            PrimitiveArray::from_iter([10i32, 20, 30]).into_array(),
+            PrimitiveArray::from_iter([11i32, 22, 33]).into_array(),
+        )
+    }
+
+    #[test]
+    fn nulls_propagate() -> VortexResult<()> {
+        assert_add(
+            PrimitiveArray::from_option_iter([Some(1i32), None, Some(3), None]).into_array(),
+            PrimitiveArray::from_option_iter([Some(10i32), Some(20), None, None]).into_array(),
+            PrimitiveArray::from_option_iter([Some(11i32), None, None, None]).into_array(),
+        )
+    }
+
+    /// Strictness: a null constant makes the whole output null without the kernel running at all.
+    #[test]
+    fn null_constant_short_circuits() -> VortexResult<()> {
+        let null = Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable));
+
+        assert_add(
+            PrimitiveArray::from_iter([1i32, 2, 3]).into_array(),
+            ConstantArray::new(null, 3).into_array(),
+            PrimitiveArray::from_option_iter([Option::<i32>::None, None, None]).into_array(),
+        )
+    }
+
+    /// All-constant inputs evaluate one row and broadcast it.
+    #[test]
+    fn all_constants_broadcast() -> VortexResult<()> {
+        assert_add(
+            ConstantArray::new(Scalar::from(2i32), 4).into_array(),
+            ConstantArray::new(Scalar::from(40i32), 4).into_array(),
+            PrimitiveArray::from_iter([42i32, 42, 42, 42]).into_array(),
+        )
+    }
+
+    #[test]
+    fn mixed_constant_and_column() -> VortexResult<()> {
+        assert_add(
+            PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array(),
+            ConstantArray::new(Scalar::from(10i32), 3).into_array(),
+            PrimitiveArray::from_option_iter([Some(11i32), None, Some(13)]).into_array(),
+        )
+    }
+
+    /// An empty batch is neither all-valid nor all-null, and a zero-length non-nullable execution
+    /// keeps its non-nullable dtype.
+    #[test]
+    fn empty_input_keeps_dtype() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let empty = || PrimitiveArray::from_iter(Vec::<i32>::new()).into_array();
+
+        let result = apply(Add::<false>, [empty(), empty()], &mut ctx)?;
+
+        assert_eq!(result.len(), 0);
+        assert!(!result.dtype().is_nullable());
+        Ok(())
+    }
+
+    /// The output element dtype is non-nullable, and the lifting widens it iff an input is
+    /// nullable, which is what makes strictness's dtype contract hold by construction.
+    #[test]
+    fn return_dtype_unions_nullability() -> VortexResult<()> {
+        let non_nullable = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let nullable = non_nullable.as_nullable();
+
+        assert_eq!(
+            ScalarFnVTable::return_dtype(
+                &Add::<true>,
+                &EmptyOptions,
+                &[non_nullable.clone(), non_nullable.clone()]
+            )?,
+            non_nullable
+        );
+        assert_eq!(
+            ScalarFnVTable::return_dtype(
+                &Add::<true>,
+                &EmptyOptions,
+                &[non_nullable, nullable.clone()]
+            )?,
+            nullable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_fn_is_strict() {
+        assert!(ScalarFnVTable::is_strict(&Add::<true>, &EmptyOptions));
+    }
+
+    /// Both output forms build an all-valid column, so the output validity is exactly the child
+    /// conjunction and the planner never has to execute the function to learn which rows are null.
+    #[test]
+    fn validity_is_the_child_conjunction() -> VortexResult<()> {
+        let expr = Add::<true>.new_expr(EmptyOptions, [root(), root()]);
+
+        assert!(ScalarFnVTable::validity(&Add::<true>, &EmptyOptions, &expr)?.is_some());
+        Ok(())
+    }
+
+    /// Options serde comes from [`PersistableOptions`], so a row function needs none of its own.
+    #[test]
+    fn options_round_trip_without_per_function_serde() -> VortexResult<()> {
+        let metadata = ScalarFnVTable::serialize(&Add::<true>, &EmptyOptions)?
+            .expect("EmptyOptions is serializable");
+
+        let options = ScalarFnVTable::deserialize(&Add::<true>, &metadata, &array_session())?;
+
+        assert_eq!(options, EmptyOptions);
+        Ok(())
+    }
 }
 
 /// A [`RowFn`] choosing its element types per batch: `max(a, b)` over whichever integer width the
@@ -470,7 +675,7 @@ mod prepared {
 
     /// A masked constant (the same value in every row, some rows null, how the compressor spells
     /// an all-same-with-nulls chunk) is a batch constant too: the wrapper carries only validity,
-    /// which the strict lifting owns, so `prepare` sees the child's value and the null rows stay
+    /// which the lifting owns, so `prepare` sees the child's value and the null rows stay
     /// null in the result.
     #[test]
     fn a_masked_constant_operand_is_seen_as_constant() -> VortexResult<()> {
@@ -508,7 +713,7 @@ mod prepared {
         Ok(())
     }
 
-    /// Two constant operands are folded to a single-row execution by the strict lifting, and that
+    /// Two constant operands are folded to a single-row execution by the lifting, and that
     /// row still goes through `prepare`, seeing both constants.
     #[test]
     fn all_constant_operands_fold_and_still_prepare() -> VortexResult<()> {
@@ -616,7 +821,7 @@ mod decode_fallibility {
     #[test]
     fn a_fallible_decode_forces_filtering() {
         assert_eq!(
-            StrictScalarFnVTable::null_handling(&TotalKernelOverParsedInput, &EmptyOptions),
+            null_handling::<TotalKernelOverParsedInput>(),
             NullHandling::Filter
         );
     }
@@ -809,16 +1014,10 @@ mod sink {
     /// return type alone. This is the fact the split of `RetWitness` down to [`RowResult`] preserves.
     #[test]
     fn null_handling_follows_from_the_sink_return_type() {
-        assert_eq!(
-            StrictScalarFnVTable::null_handling(&Spread, &EmptyOptions),
-            NullHandling::Dense
-        );
+        assert_eq!(null_handling::<Spread>(), NullHandling::Dense);
         assert!(!ScalarFnVTable::is_fallible(&Spread, &EmptyOptions));
 
-        assert_eq!(
-            StrictScalarFnVTable::null_handling(&SpreadNonNegative, &EmptyOptions),
-            NullHandling::Filter
-        );
+        assert_eq!(null_handling::<SpreadNonNegative>(), NullHandling::Filter);
         assert!(ScalarFnVTable::is_fallible(
             &SpreadNonNegative,
             &EmptyOptions
@@ -859,9 +1058,7 @@ mod sink {
     #[test]
     fn the_sink_dtype_validates_its_input() {
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
-        assert!(
-            StrictScalarFnVTable::return_element_dtype(&Spread, &EmptyOptions, &[dtype]).is_err()
-        );
+        assert!(ScalarFnVTable::return_dtype(&Spread, &EmptyOptions, &[dtype]).is_err());
     }
 
     /// The width the sink declares is the width it builds, over the element dtype it read off the
@@ -870,11 +1067,7 @@ mod sink {
     fn the_return_dtype_is_the_sinks() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
         assert_eq!(
-            StrictScalarFnVTable::return_element_dtype(
-                &Spread,
-                &EmptyOptions,
-                std::slice::from_ref(&dtype)
-            )?,
+            ScalarFnVTable::return_dtype(&Spread, &EmptyOptions, std::slice::from_ref(&dtype))?,
             DType::FixedSizeList(Arc::new(dtype), 3, Nullability::NonNullable),
         );
         Ok(())
@@ -903,7 +1096,7 @@ mod null_strategies {
     ) -> VortexResult<ArrayRef> {
         let rows = args.first().map_or(0, |arg| arg.len());
 
-        Ok(execute_strict_with_strategy(
+        Ok(execute_row_fn_with_strategy(
             scalar_fn,
             &EmptyOptions,
             args.to_vec(),
@@ -1033,8 +1226,10 @@ mod null_strategies {
 
         use vortex_buffer::Buffer;
         use vortex_error::vortex_err;
+        use vortex_mask::Mask;
 
         use super::*;
+        use crate::scalar_fn::row::lift::branch_beats_filter;
 
         thread_local! {
             /// What the last varying-column decode did: `(null_tolerant, rows)`. Thread-local so
@@ -1252,6 +1447,29 @@ mod null_strategies {
                 &mut ctx
             );
             Ok(())
+        }
+
+        /// The rule itself, at and around the threshold, without going through an execution.
+        ///
+        /// [`BRANCH_MIN_SURVIVING_FRACTION`]: crate::scalar_fn::row::lift::BRANCH_MIN_SURVIVING_FRACTION
+        #[rstest]
+        #[case::bulk_dense_mask(false, 99, 100, true)]
+        #[case::bulk_sparse_mask(false, 1, 100, true)]
+        #[case::per_row_dense_mask(true, 99, 100, true)]
+        #[case::per_row_at_threshold(true, 75, 100, true)]
+        #[case::per_row_below_threshold(true, 74, 100, false)]
+        #[case::per_row_sparse_mask(true, 10, 100, false)]
+        fn selects_branch_per_the_measured_rule(
+            #[case] decode_shrinks_when_filtered: bool,
+            #[case] true_count: usize,
+            #[case] len: usize,
+            #[case] expect_branch: bool,
+        ) {
+            let valid = Mask::from_indices(len, 0..true_count);
+            assert_eq!(
+                branch_beats_filter(decode_shrinks_when_filtered, &valid),
+                expect_branch,
+            );
         }
     }
 }

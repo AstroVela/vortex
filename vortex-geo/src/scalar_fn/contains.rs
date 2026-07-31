@@ -301,7 +301,7 @@ mod tests {
     use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::NullStrategy;
     use vortex_array::scalar_fn::ScalarFnVTable;
-    use vortex_array::scalar_fn::execute_strict_with_strategy;
+    use vortex_array::scalar_fn::execute_row_fn_with_strategy;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
     use vortex_error::VortexResult;
@@ -576,7 +576,7 @@ mod tests {
         strategy: NullStrategy,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        Ok(execute_strict_with_strategy(
+        Ok(execute_row_fn_with_strategy(
             &GeoContains,
             &EmptyOptions,
             vec![a.clone(), b.clone()],

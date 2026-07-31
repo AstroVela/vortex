@@ -5,7 +5,7 @@
 //! (which is not dense-safe, so it executes under `NullHandling::Filter`).
 //!
 //! Arms: `filter` and `branch` force one strategy through the test-harness seam
-//! ([`execute_strict_with_strategy`]); `auto` executes the full pipeline and lets the per-batch
+//! ([`execute_row_fn_with_strategy`]); `auto` executes the full pipeline and lets the per-batch
 //! selection choose. `Bytes` decodes in bulk, so the selection should track the `branch` arm at
 //! every mixed density. Null densities run 0/1/5/10/25/50/90 percent over 65536 rows of
 //! non-inlined strings, nulls placed by a seeded splitmix hash.
@@ -33,7 +33,7 @@ use vortex_array::scalar_fn::NullStrategy;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
-use vortex_array::scalar_fn::execute_strict_with_strategy;
+use vortex_array::scalar_fn::execute_row_fn_with_strategy;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -118,7 +118,7 @@ fn bench_len(bencher: Bencher, density: usize, strategy: Option<NullStrategy>) {
                 .unwrap()
                 .execute::<Canonical>(&mut ctx)
                 .unwrap(),
-            Some(strategy) => execute_strict_with_strategy(
+            Some(strategy) => execute_row_fn_with_strategy(
                 &LenFromSlice,
                 &EmptyOptions,
                 vec![input.clone()],

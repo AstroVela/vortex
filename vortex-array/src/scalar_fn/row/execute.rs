@@ -26,8 +26,8 @@ use crate::scalar_fn::SinkResult;
 
 /// Validate the input dtypes of a row function and return its output element dtype.
 ///
-/// [`StrictScalarFnVTable`](crate::scalar_fn::StrictScalarFnVTable) widens the result to nullable
-/// iff any input is nullable, so this ignores nullability.
+/// The lifting widens the result to nullable iff any input is nullable, so this ignores
+/// nullability.
 pub(super) fn validate_row_args<A: ElementTuple, R: ApplyResult>(
     args: &[DType],
 ) -> VortexResult<DType> {
@@ -116,8 +116,8 @@ pub(super) fn execute_row_loop_prepared<A: ElementTuple, P, R: ApplyResult>(
 /// values and a fallible kernel would spuriously fail on them. Iteration is a word at a time via
 /// [`BitBuffer::for_each_set_index`] rather than a per-row `valid.value(i)` branch.
 ///
-/// Returns `Ok(None)` when some argument cannot decode null-tolerantly, in which case the strict
-/// lifting falls back to the filter strategy.
+/// Returns `Ok(None)` when some argument cannot decode null-tolerantly, in which case the lifting
+/// falls back to the filter strategy.
 ///
 /// [`BitBuffer::for_each_set_index`]: vortex_buffer::BitBuffer::for_each_set_index
 pub(super) fn execute_row_loop_branch<A: ElementTuple, P, R: ApplyResult>(
@@ -133,8 +133,8 @@ pub(super) fn execute_row_loop_branch<A: ElementTuple, P, R: ApplyResult>(
     let state = prepare(A::constants(&columns));
 
     let AllOr::Some(valid) = valid.bit_buffer() else {
-        // The strict lifting takes the all-true and all-false shortcuts before choosing a
-        // strategy, so a degenerate mask here is a bug in the lifting.
+        // The lifting takes the all-true and all-false shortcuts before choosing a strategy, so a
+        // degenerate mask here is a bug in the lifting.
         vortex_bail!("execute_row_loop_branch requires a mixed mask");
     };
 

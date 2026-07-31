@@ -60,9 +60,9 @@ impl<'a> ScalarFnOptions<'a> {
 
 /// The options of a scalar function, together with how to persist them.
 ///
-/// This lives on the options type rather than on every function that uses it, so a function carrying
-/// options needs no serde of its own. [`EmptyOptions`] already implements it, as does
-/// `NumericalAggregateOpts`.
+/// This lives on the options type rather than on every function that uses it, so a
+/// [`RowFn`](super::RowFn) carrying options needs no serde of its own. [`EmptyOptions`] already
+/// implements it, which is what every row function in tree uses.
 pub trait PersistableOptions:
     'static + Sized + Send + Sync + Clone + Debug + Display + PartialEq + Eq + Hash
 {

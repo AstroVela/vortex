@@ -54,8 +54,8 @@ impl<T: InputElement> ArgColumn<T> {
     /// [`InputElement::decode_null_tolerant`]. `Ok(None)` means the element cannot, and the
     /// caller falls back to the filter strategy.
     ///
-    /// A constant operand still takes the ordinary decode: the strict lifting short-circuits
-    /// null constants before any strategy runs, so a constant reaching here is non-null.
+    /// A constant operand still takes the ordinary decode: the lifting short-circuits null
+    /// constants before any strategy runs, so a constant reaching here is non-null.
     fn decode_null_tolerant(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<Self>> {
         if let Some(constant) = batch_constant(&array)
             && !array.is_empty()
@@ -90,7 +90,7 @@ impl<T: InputElement> ArgColumn<T> {
 ///
 /// - [`Masked`], how the compressor spells an all-same-with-nulls chunk: the child carries the
 ///   value, the wrapper carries only validity. Reading the child's value for a null row is sound
-///   here because the strict lifting owns validity entirely; the row loop's output behind a null
+///   here because the lifting owns validity entirely; the row loop's output behind a null
 ///   row is masked away (dense) or never computed (filter), so which value the loop read there
 ///   cannot be observed. An all-null constant never reaches decode at all, since the lifting
 ///   short-circuits it to an all-null result first.
@@ -148,8 +148,8 @@ pub trait ElementTuple: 'static {
     ///
     /// The expression layer checks the count against [`Arity`](crate::scalar_fn::Arity) before it
     /// builds a call, but this is also the entry point of the public
-    /// [`return_element_dtype`](crate::scalar_fn::StrictScalarFnVTable::return_element_dtype), so
-    /// the count is enforced here rather than assumed.
+    /// [`return_dtype`](crate::scalar_fn::ScalarFnVTable::return_dtype), so the count is enforced
+    /// here rather than assumed.
     fn validate(dtypes: &[DType]) -> VortexResult<()>;
 
     /// Decode every input column once. Called once per batch.

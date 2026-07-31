@@ -6,7 +6,7 @@
 //! Before the port, the kernel built its values buffer and paired it with the input's validity in one
 //! step (`PrimitiveArray::new_unchecked(buffer, validity)`), so a nullable input cost it nothing extra.
 //! The framework cannot do that: [`OutputElement::build`] returns a *non-nullable* column and the
-//! strict lifting applies validity afterwards, which for `Validity::Array` means materializing a mask
+//! row lifting applies validity afterwards, which for `Validity::Array` means materializing a mask
 //! and running a separate `mask` pass over the result.
 //!
 //! The non-nullable case is therefore the like-for-like comparison against the old kernel, and the
