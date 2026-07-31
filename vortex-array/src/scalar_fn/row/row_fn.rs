@@ -31,6 +31,7 @@ use crate::scalar_fn::StrictScalarFnVTable;
 use crate::scalar_fn::decode_scalar_fn_array;
 use crate::scalar_fn::encode_children_and_options;
 use crate::scalar_fn::row::execute::execute_row_loop;
+use crate::scalar_fn::row::execute::execute_row_loop_prepared;
 use crate::scalar_fn::row::execute::execute_row_sink;
 use crate::scalar_fn::row::execute::row_is_fallible;
 use crate::scalar_fn::row::execute::row_null_handling;
@@ -177,12 +178,13 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
 
 /// One use of a [`RowFn`] at concrete element types.
 ///
-/// The framework hands a visitor to [`RowFn::dispatch`], which calls one of the two visit methods with
+/// The framework hands a visitor to [`RowFn::dispatch`], which calls one of the visit methods with
 /// the element types it chose: at plan time the visit validates dtypes, at run time it executes the row
 /// loop. Only the framework implements this trait, and a function only ever *calls* a visit.
 ///
-/// The two methods differ only in how the row closure delivers its output, and a dispatch picks
-/// whichever fits. Both apply the same witness check.
+/// The methods differ only in how the row closure delivers its output and in whether a per-batch
+/// prepare step runs before the loop, and a dispatch picks whichever fits. All apply the same
+/// witness check.
 pub trait RowVisitor {
     /// What this visit produces.
     type Out;
@@ -194,6 +196,34 @@ pub trait RowVisitor {
     fn visit<A: ElementTuple, R: ApplyResult>(
         self,
         apply: impl Fn(A::Elems<'_>) -> R,
+    ) -> VortexResult<Self::Out>;
+
+    /// Visit at argument tuple `A`, with a `prepare` step run once per batch before the row loop.
+    ///
+    /// `prepare` receives [`A::ConstElems`](ElementTuple::ConstElems): the element value of every
+    /// argument whose operand is constant for the batch, and `None` for each one that varies by
+    /// row. Whatever it returns is handed to every `apply` call by shared reference, so work that
+    /// depends only on a constant argument (the norm of a broadcast query vector, say) is paid
+    /// once per batch instead of once per row. `apply` stays [`Fn`] and the state arrives behind
+    /// `&P`, which keeps the row loop's shape identical to [`visit`](Self::visit).
+    ///
+    /// Constness is invisible to [`RowFn::dispatch`], which sees only dtypes: the same dispatch
+    /// serves a batch where an operand is constant and one where it is not, and `prepare` finds
+    /// out which at run time. At plan time neither closure runs.
+    ///
+    /// `prepare` is infallible by design: it refines values the row loop could compute itself,
+    /// and fallibility is read off the witnesses *before* dispatch, so a failing prepare would
+    /// have nowhere to be declared. A fallible-prepare variant (`prepare` returning
+    /// `VortexResult<P>`, surfaced through the witnesses so it forces
+    /// [`is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible) and
+    /// [`NullHandling::Filter`]) is a possible extension, deliberately left out of this method.
+    ///
+    /// `A` and `R` **must** agree with the [`RowFn`]'s witnesses on arity, dense-safety and
+    /// fallibility, exactly as for [`visit`](Self::visit).
+    fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
+        self,
+        prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        apply: impl Fn(&P, A::Elems<'_>) -> R,
     ) -> VortexResult<Self::Out>;
 
     /// Visit at argument tuple `A`, with `apply` *writing* one row of sink `S` and returning only
@@ -255,6 +285,15 @@ impl<F: RowFn> RowVisitor for ValidateRows<'_, F> {
         validate_row_args::<A, R>(self.args)
     }
 
+    fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
+        self,
+        _prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        _apply: impl Fn(&P, A::Elems<'_>) -> R,
+    ) -> VortexResult<DType> {
+        const { assert_witness_agrees::<F, A, R>() };
+        validate_row_args::<A, R>(self.args)
+    }
+
     fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(
         self,
         _apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
@@ -288,6 +327,15 @@ impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     ) -> VortexResult<ArrayRef> {
         const { assert_witness_agrees::<F, A, R>() };
         execute_row_loop::<A, R>(self.args, self.ctx, apply)
+    }
+
+    fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
+        self,
+        prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        apply: impl Fn(&P, A::Elems<'_>) -> R,
+    ) -> VortexResult<ArrayRef> {
+        const { assert_witness_agrees::<F, A, R>() };
+        execute_row_loop_prepared::<A, P, R>(self.args, self.ctx, prepare, apply)
     }
 
     fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(

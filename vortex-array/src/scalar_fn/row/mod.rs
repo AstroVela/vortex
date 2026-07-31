@@ -26,6 +26,11 @@
 //! [`RowVisitor::visit_into`] takes one that *writes* its row into an [`OutputSink`], which carries
 //! what an owned per-row value cannot: a runtime-shaped row such as a tensor, or bytes appended to a
 //! buffer shared by the whole batch.
+//!
+//! [`RowVisitor::visit_prepared`] adds a per-batch prepare step to the returning form: it is handed
+//! the element value of every argument whose operand is constant for the batch, and whatever it
+//! returns reaches every row by shared reference, so work that depends only on a constant argument
+//! runs once per batch instead of once per row.
 
 mod element;
 pub use element::ArgColumn;

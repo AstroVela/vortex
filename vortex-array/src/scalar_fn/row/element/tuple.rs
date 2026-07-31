@@ -47,6 +47,14 @@ impl<T: InputElement> ArgColumn<T> {
     fn get(&self, index: usize) -> T::Elem<'_> {
         T::get(&self.column, index * self.stride)
     }
+
+    /// The single decoded element of a constant operand, or `None` for a real column.
+    ///
+    /// `Some` exactly when [`decode`](Self::decode) collapsed the operand to its one distinct row,
+    /// in which case the value returned is the element every row of the batch reads.
+    fn constant(&self) -> Option<T::Elem<'_>> {
+        (self.stride == 0).then(|| T::get(&self.column, 0))
+    }
 }
 
 /// Tuples of [`InputElement`]s forming the typed argument list a [`RowFn`](crate::scalar_fn::RowFn)
@@ -57,6 +65,16 @@ pub trait ElementTuple: 'static {
 
     /// The borrowed row of element values.
     type Elems<'a>;
+
+    /// The batch-constant element values: [`Elems`](Self::Elems) with every argument wrapped in
+    /// `Option`.
+    ///
+    /// `Some` marks an argument whose operand is constant for the batch and carries the element
+    /// every row reads; `None` marks one that varies by row. This is what
+    /// [`visit_prepared`](crate::scalar_fn::RowVisitor::visit_prepared) hands to its prepare
+    /// closure, so a kernel can hoist work that depends only on a constant argument out of the
+    /// row loop.
+    type ConstElems<'a>;
 
     /// The number of arguments.
     const ARITY: usize;
@@ -76,6 +94,9 @@ pub trait ElementTuple: 'static {
 
     /// Read the row of elements at `index`. Must be `O(1)`: it is called in the row loop.
     fn get(columns: &Self::Columns, index: usize) -> Self::Elems<'_>;
+
+    /// Read the batch-constant elements out of the decoded columns. Called once per batch.
+    fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
 }
 
 macro_rules! element_tuple {
@@ -83,6 +104,7 @@ macro_rules! element_tuple {
         impl<$($t: InputElement),+> ElementTuple for ($($t,)+) {
             type Columns = ($(ArgColumn<$t>,)+);
             type Elems<'a> = ($($t::Elem<'a>,)+);
+            type ConstElems<'a> = ($(Option<$t::Elem<'a>>,)+);
 
             const ARITY: usize = $arity;
             const DENSE_SAFE: bool = $($t::DENSE_SAFE &&)+ true;
@@ -102,6 +124,10 @@ macro_rules! element_tuple {
 
             fn get(columns: &Self::Columns, index: usize) -> Self::Elems<'_> {
                 ($(columns.$idx.get(index),)+)
+            }
+
+            fn constants(columns: &Self::Columns) -> Self::ConstElems<'_> {
+                ($(columns.$idx.constant(),)+)
             }
         }
     };

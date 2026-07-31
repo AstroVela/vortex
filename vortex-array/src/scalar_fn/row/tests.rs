@@ -398,6 +398,127 @@ mod constant_operands {
     }
 }
 
+/// The prepared visit: per-batch state computed once from the batch-constant operands, handed to
+/// every row by shared reference.
+mod prepared {
+    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    /// Which operands the last `prepare` saw as constant, as a bitmask (bit 0 for `x`, bit 1 for
+    /// `y`). Sound as a global because each test binary runs one test per process.
+    static SEEN_CONSTANTS: AtomicU8 = AtomicU8::new(u8::MAX);
+
+    /// `sqrt(x^2 + y^2)` through [`RowVisitor::visit_prepared`]: the square of any constant
+    /// operand is hoisted out of the row loop, and recorded in [`SEEN_CONSTANTS`].
+    #[derive(Clone)]
+    struct PreparedHypot;
+
+    impl RowFn for PreparedHypot {
+        type Options = EmptyOptions;
+        type ArgsWitness = (f64, f64);
+        type RetWitness = f64;
+
+        fn id(&self) -> ScalarFnId {
+            static ID: CachedId = CachedId::new("vortex.test.prepared_hypot");
+            *ID
+        }
+
+        fn arg_name(&self, idx: usize) -> ChildName {
+            ChildName::from(["x", "y"][idx])
+        }
+
+        fn dispatch<V: RowVisitor>(
+            &self,
+            _options: &Self::Options,
+            _args: &[DType],
+            visitor: V,
+        ) -> VortexResult<V::Out> {
+            visitor.visit_prepared::<(f64, f64), (Option<f64>, Option<f64>), f64>(
+                |(x, y)| {
+                    SEEN_CONSTANTS.store(
+                        u8::from(x.is_some()) | (u8::from(y.is_some()) << 1),
+                        Ordering::Relaxed,
+                    );
+                    (x.map(|x| x * x), y.map(|y| y * y))
+                },
+                |&(x_sq, y_sq), (x, y)| (x_sq.unwrap_or(x * x) + y_sq.unwrap_or(y * y)).sqrt(),
+            )
+        }
+    }
+
+    /// A constant operand reaches `prepare` as `Some`, and the result is identical to the same
+    /// value expanded into a full column, which reaches `prepare` as `None`.
+    #[test]
+    fn a_constant_operand_matches_its_expanded_column() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let x = buffer![3.0f64, 5.0, 8.0].into_array();
+
+        let constant = ConstantArray::new(Scalar::from(4.0f64), 3).into_array();
+        let from_constant = apply(PreparedHypot, [x.clone(), constant], &mut ctx)?;
+        assert_eq!(SEEN_CONSTANTS.load(Ordering::Relaxed), 0b10);
+
+        let expanded = buffer![4.0f64, 4.0, 4.0].into_array();
+        let from_expanded = apply(PreparedHypot, [x, expanded], &mut ctx)?;
+        assert_eq!(SEEN_CONSTANTS.load(Ordering::Relaxed), 0b00);
+
+        assert_arrays_eq!(from_constant, from_expanded, &mut ctx);
+        Ok(())
+    }
+
+    /// With no constant operand every `ConstElems` slot is `None` and the loop computes exactly
+    /// what [`RowVisitor::visit`] would.
+    #[test]
+    fn all_varying_operands_prepare_nothing() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let x = buffer![3.0f64, 5.0].into_array();
+        let y = buffer![4.0f64, 12.0].into_array();
+
+        let result = apply(PreparedHypot, [x, y], &mut ctx)?;
+
+        assert_eq!(SEEN_CONSTANTS.load(Ordering::Relaxed), 0b00);
+        assert_arrays_eq!(result, PrimitiveArray::from_iter([5.0f64, 13.0]), &mut ctx);
+        Ok(())
+    }
+
+    /// Two constant operands are folded to a single-row execution by the strict lifting, and that
+    /// row still goes through `prepare`, seeing both constants.
+    #[test]
+    fn all_constant_operands_fold_and_still_prepare() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let x = ConstantArray::new(Scalar::from(3.0f64), 4).into_array();
+        let y = ConstantArray::new(Scalar::from(4.0f64), 4).into_array();
+
+        let result = apply(PreparedHypot, [x, y], &mut ctx)?;
+
+        assert_eq!(SEEN_CONSTANTS.load(Ordering::Relaxed), 0b11);
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_iter([5.0f64, 5.0, 5.0, 5.0]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    /// Null rows pass through the prepared path exactly as through [`RowVisitor::visit`].
+    #[test]
+    fn nulls_propagate_through_the_prepared_path() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let x = PrimitiveArray::from_option_iter([Some(3.0f64), None, Some(8.0)]).into_array();
+        let y = ConstantArray::new(Scalar::from(4.0f64), 3).into_array();
+
+        let result = apply(PreparedHypot, [x, y], &mut ctx)?;
+
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(5.0f64), None, Some((80.0f64).sqrt())]),
+            &mut ctx
+        );
+        Ok(())
+    }
+}
+
 /// Fallibility has two sources, the return type and an argument whose decode can fail on legal data,
 /// and the framework has to derive it from both.
 mod decode_fallibility {
