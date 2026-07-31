@@ -70,35 +70,6 @@ pub(super) const fn row_is_fallible<A: ElementTuple, R: RowResult>() -> bool {
     A::DECODE_FALLIBLE || R::FALLIBLE
 }
 
-/// Decode every input column once, then compute one output element per row.
-///
-/// Monomorphic in `A` and `R`, so `apply` inlines and the loop is free to auto-vectorize.
-pub(super) fn execute_row_loop<A: ElementTuple, R: ApplyResult>(
-    args: &dyn ExecutionArgs,
-    ctx: &mut ExecutionCtx,
-    apply: impl Fn(A::Elems<'_>) -> R,
-) -> VortexResult<ArrayRef> {
-    let columns = A::decode(args, ctx)?;
-    let rows = 0..args.row_count();
-
-    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization. The infallible
-    // arm must not collect through `Result`, which would cost the loop its unconditional shape;
-    // there `into_result` inlines to `Ok(value)` and the unwrap folds away.
-    let values = if R::FALLIBLE {
-        rows.map(|index| apply(A::get(&columns, index)).into_result())
-            .collect::<VortexResult<Vec<_>>>()?
-    } else {
-        rows.map(|index| {
-            apply(A::get(&columns, index))
-                .into_result()
-                .vortex_expect("an infallible ApplyResult cannot be an error")
-        })
-        .collect()
-    };
-
-    Ok(R::Out::build(values))
-}
-
 /// Decode every input column once, run `prepare` over the batch-constant elements, then compute
 /// one output element per row with the prepared state behind a shared reference.
 ///

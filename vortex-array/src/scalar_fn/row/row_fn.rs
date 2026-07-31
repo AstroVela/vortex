@@ -30,7 +30,6 @@ use crate::scalar_fn::SinkResult;
 use crate::scalar_fn::StrictScalarFnVTable;
 use crate::scalar_fn::decode_scalar_fn_array;
 use crate::scalar_fn::encode_children_and_options;
-use crate::scalar_fn::row::execute::execute_row_loop;
 use crate::scalar_fn::row::execute::execute_row_loop_prepared;
 use crate::scalar_fn::row::execute::execute_row_sink;
 use crate::scalar_fn::row::execute::row_is_fallible;
@@ -191,12 +190,21 @@ pub trait RowVisitor {
 
     /// Visit at argument tuple `A`, with `apply` *returning* one `R` from one row.
     ///
+    /// This is [`visit_prepared`](Self::visit_prepared) with nothing to prepare: the unit state is
+    /// zero-sized, so the derived call monomorphizes to the same row loop and the derivation is
+    /// not overridable.
+    ///
     /// `A` and `R` **must** agree with the [`RowFn`]'s witnesses on arity, dense-safety and
     /// fallibility. A visit that does not is a compile error.
     fn visit<A: ElementTuple, R: ApplyResult>(
         self,
         apply: impl Fn(A::Elems<'_>) -> R,
-    ) -> VortexResult<Self::Out>;
+    ) -> VortexResult<Self::Out>
+    where
+        Self: Sized,
+    {
+        self.visit_prepared::<A, (), R>(|_| (), move |&(), elems| apply(elems))
+    }
 
     /// Visit at argument tuple `A`, with a `prepare` step run once per batch before the row loop.
     ///
@@ -277,14 +285,6 @@ struct ValidateRows<'a, F> {
 impl<F: RowFn> RowVisitor for ValidateRows<'_, F> {
     type Out = DType;
 
-    fn visit<A: ElementTuple, R: ApplyResult>(
-        self,
-        _apply: impl Fn(A::Elems<'_>) -> R,
-    ) -> VortexResult<DType> {
-        const { assert_witness_agrees::<F, A, R>() };
-        validate_row_args::<A, R>(self.args)
-    }
-
     fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
         self,
         _prepare: impl FnOnce(A::ConstElems<'_>) -> P,
@@ -320,14 +320,6 @@ struct ExecuteRows<'a, 'b, F> {
 
 impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     type Out = ArrayRef;
-
-    fn visit<A: ElementTuple, R: ApplyResult>(
-        self,
-        apply: impl Fn(A::Elems<'_>) -> R,
-    ) -> VortexResult<ArrayRef> {
-        const { assert_witness_agrees::<F, A, R>() };
-        execute_row_loop::<A, R>(self.args, self.ctx, apply)
-    }
 
     fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
         self,
