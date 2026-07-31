@@ -9,9 +9,9 @@
 //! 1. configuration is resolved out of environment variables case-insensitively, matching how the
 //!    various `Store::from_env` builders behave (see
 //!    <https://github.com/apache/arrow-rs-object-store/issues/529>);
-//! 2. schemes that `object_store` does not recognize natively — `hf://`, served by the crate's
-//!    `huggingface` module, and the OpenDAL-backed `cos://` and `oss://`, served by the crate's
-//!    `opendal` module under the matching service feature.
+//! 2. schemes that `object_store` does not recognize natively — the OpenDAL-backed `cos://`,
+//!    `oss://` and `hf://` — are served by the crate's `opendal` module under the matching
+//!    service feature.
 
 use std::sync::Arc;
 
@@ -22,6 +22,11 @@ use object_store::registry::ObjectStoreRegistry;
 use parking_lot::RwLock;
 use url::Url;
 use vortex_utils::aliases::hash_map::HashMap;
+
+#[cfg(feature = "hf")]
+use crate::opendal::HF_SCHEME;
+#[cfg(feature = "hf")]
+use crate::opendal::hf::make_hf_store_for_url;
 
 #[derive(Debug, Default)]
 struct PathEntry {
@@ -102,7 +107,7 @@ enum EnvSource {
 
 impl EnvSource {
     /// Case-insensitive lookup of a single configuration variable.
-    #[cfg(any(feature = "cos", feature = "oss"))]
+    #[cfg(any(feature = "cos", feature = "oss", feature = "hf"))]
     fn lookup(&self, key: &str) -> Option<String> {
         match self {
             EnvSource::Process => std::env::var(key).ok(),
@@ -219,11 +224,15 @@ impl Registry {
     /// the one caching rule in [`Registry::resolve`]: a scheme says where its store is rooted, and
     /// the registry decides how to cache it.
     fn build_store(&self, to_resolve: &Url) -> object_store::Result<(Arc<dyn ObjectStore>, Path)> {
-        // `hf://` is not recognized by `object_store` either. The store is rooted at a repository
-        // revision on the Hub, so the path within it is what remains after the repository, and the
-        // registry caches one client per revision.
-        if crate::huggingface::supports_scheme(to_resolve.scheme()) {
-            return crate::huggingface::make_hf_store(to_resolve, &self.env.normalized_vars());
+        // The Hub store is rooted at a repository revision rather than at the URL authority, so
+        // unlike the bucket-style schemes below it reports its own key: the path *inside* the
+        // repository. The registry then caches one client per revision. This has to come before
+        // the generic OpenDAL branch, which would take the whole URL path as the key.
+        #[cfg(feature = "hf")]
+        if to_resolve.scheme() == HF_SCHEME {
+            return Ok(make_hf_store_for_url(to_resolve, &HashMap::new(), |key| {
+                self.env.lookup(key)
+            })?);
         }
 
         // OpenDAL-backed schemes (Tencent COS, Alibaba OSS) are not recognized by `object_store`,
@@ -252,7 +261,7 @@ fn url_key(url: &Url) -> &str {
 /// Returns the non-empty segments of a path
 ///
 /// Note: We don't use [`Url::path_segments`] as we only want non-empty paths
-pub(crate) fn path_segments(s: &str) -> impl Iterator<Item = &str> {
+fn path_segments(s: &str) -> impl Iterator<Item = &str> {
     s.split('/').filter(|x| !x.is_empty())
 }
 

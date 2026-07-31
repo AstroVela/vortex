@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! OpenDAL-backed [`object_store::ObjectStore`] implementations for cloud providers that are not
-//! natively supported by the `object_store` crate: Tencent Cloud COS and Alibaba Cloud OSS.
+//! natively supported by the `object_store` crate: Tencent Cloud COS, Alibaba Cloud OSS and the
+//! HuggingFace Hub.
 //!
 //! OpenDAL exposes each service as an `Operator`. We adapt an `Operator` into an
 //! `object_store::ObjectStore` via the `object_store_opendal::OpendalStore` bridge, which is built
@@ -10,13 +11,14 @@
 //! these services through its existing `ObjectStoreFileSystem` abstraction.
 //!
 //! Callers that dispatch on a URL scheme should ask [`supports_scheme`] rather than comparing
-//! against [`COS_SCHEME`] / [`OSS_SCHEME`] themselves, so that enabling another service does not
+//! against the per-service scheme constants themselves, so that enabling another service does not
 //! require touching every call site.
 //!
 //! # Cargo features
 //!
 //! * `cos` — Tencent Cloud COS, the `cos://` scheme.
 //! * `oss` — Alibaba Cloud OSS, the `oss://` scheme.
+//! * `hf` — the HuggingFace Hub, the `hf://` scheme.
 //!
 //! With a single service enabled the module still compiles: [`supports_scheme`] returns `false`
 //! for every scheme it does not serve and [`make_opendal_store`] reports
@@ -32,15 +34,17 @@
 
 #[cfg(feature = "cos")]
 mod cos;
+#[cfg(feature = "hf")]
+pub(crate) mod hf;
 #[cfg(feature = "oss")]
 mod oss;
 
 use std::sync::Arc;
 
-#[cfg(any(feature = "cos", feature = "oss"))]
+#[cfg(any(feature = "cos", feature = "oss", feature = "hf"))]
 use ::opendal::Operator;
 use object_store::ObjectStore;
-#[cfg(any(feature = "cos", feature = "oss"))]
+#[cfg(any(feature = "cos", feature = "oss", feature = "hf"))]
 use tracing::warn;
 use url::Url;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -51,6 +55,12 @@ pub use crate::opendal::cos::COS_SCHEME;
 pub use crate::opendal::cos::CosConfig;
 #[cfg(feature = "cos")]
 pub use crate::opendal::cos::make_cos_store;
+#[cfg(feature = "hf")]
+pub use crate::opendal::hf::HF_SCHEME;
+#[cfg(feature = "hf")]
+pub use crate::opendal::hf::HfConfig;
+#[cfg(feature = "hf")]
+pub use crate::opendal::hf::make_hf_store;
 #[cfg(feature = "oss")]
 pub use crate::opendal::oss::OSS_SCHEME;
 #[cfg(feature = "oss")]
@@ -66,6 +76,8 @@ pub enum OpenDALStoreError {
     UnsupportedScheme(String),
     /// A required configuration value (bucket and/or endpoint) was missing.
     MissingConfig(&'static str),
+    /// The URL was not of the shape the scheme requires.
+    InvalidUrl(String),
     /// The OpenDAL builder rejected the provided configuration.
     Build(::opendal::Error),
 }
@@ -79,6 +91,10 @@ impl std::fmt::Display for OpenDALStoreError {
             OpenDALStoreError::MissingConfig(k) => {
                 write!(f, "missing required OpenDAL store configuration: {k}")
             }
+            OpenDALStoreError::InvalidUrl(url) => write!(
+                f,
+                "malformed OpenDAL store URL '{url}': expected hf://<datasets|models|spaces>/<org>/<name>[@revision][/path]"
+            ),
             OpenDALStoreError::Build(e) => write!(f, "failed to build OpenDAL store: {e}"),
         }
     }
@@ -99,6 +115,8 @@ impl From<OpenDALStoreError> for object_store::Error {
 pub const SUPPORTED_SCHEMES: &[&str] = &[
     #[cfg(feature = "cos")]
     COS_SCHEME,
+    #[cfg(feature = "hf")]
+    HF_SCHEME,
     #[cfg(feature = "oss")]
     OSS_SCHEME,
 ];
@@ -116,7 +134,10 @@ pub fn supports_scheme(scheme: &str) -> bool {
     SUPPORTED_SCHEMES.contains(&scheme)
 }
 
-/// Build an [`object_store::ObjectStore`] for an OpenDAL-backed URL (`cos://`, `oss://`).
+/// Build an [`object_store::ObjectStore`] for an OpenDAL-backed URL (`cos://`, `oss://`, `hf://`).
+///
+/// A Hub store is rooted at a repository revision rather than at the URL authority, so callers
+/// resolving an `hf://` URL to a store *and a key* should use [`hf::make_hf_store_for_url`].
 ///
 /// `properties` are per-request configuration overrides (matching the `HashMap<String, String>`
 /// passed through the JNI/Python layers). Missing values fall back to the environment variables
@@ -150,6 +171,10 @@ where
         COS_SCHEME => make_cos_store(cos::url_and_properties_to_config(
             url, properties, env_lookup,
         )?),
+        #[cfg(feature = "hf")]
+        HF_SCHEME => {
+            make_hf_store(hf::url_and_properties_to_config(url, properties, env_lookup)?.0)
+        }
         #[cfg(feature = "oss")]
         OSS_SCHEME => make_oss_store(oss::url_and_properties_to_config(
             url, properties, env_lookup,
@@ -174,7 +199,7 @@ fn env_var_lookup(key: &str) -> Option<String> {
 }
 
 /// Take `key` from `properties`, falling back to `env_lookup(env_var)`.
-#[cfg(any(feature = "cos", feature = "oss"))]
+#[cfg(any(feature = "cos", feature = "oss", feature = "hf"))]
 pub(crate) fn property_or_env<F>(
     properties: &HashMap<String, String>,
     key: &str,
@@ -188,7 +213,7 @@ where
 }
 
 /// Log a warning for every property key the service does not recognize.
-#[cfg(any(feature = "cos", feature = "oss"))]
+#[cfg(any(feature = "cos", feature = "oss", feature = "hf"))]
 pub(crate) fn warn_on_unknown_properties(properties: &HashMap<String, String>, known: &[&str]) {
     for key in properties.keys() {
         if !known.contains(&key.as_str()) {

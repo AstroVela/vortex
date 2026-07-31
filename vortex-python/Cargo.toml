@@ -22,7 +22,7 @@ workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["extension-module", "tui"]
+default = ["extension-module", "tui", "hf"]
 # Enable this feature when building the standalone Python extension.
 # Disable it when using vortex-python as a library dependency to avoid
 # duplicate PyInit__lib symbols.
@@ -31,6 +31,9 @@ tui = ["dep:tokio", "dep:vortex-tui"]
 # OpenDAL-backed object stores (Tencent COS, Alibaba OSS) for `cos://` and `oss://` URLs. Pulls in
 # `opendal`, so it is opt-in.
 opendal = ["vortex-cloud/opendal", "vortex/opendal"]
+# The HuggingFace Hub (`hf://`). On by default: Hub URLs are the documented way to read Vortex
+# files from the Hub, so they should resolve without a custom build.
+hf = ["dep:vortex-cloud", "vortex-cloud/hf", "vortex/hf"]
 
 [dependencies]
 arrow-array = { workspace = true }

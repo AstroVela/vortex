@@ -44,6 +44,7 @@ jni = { workspace = true, features = ["invocation"] }
 # Enable OpenDAL-backed object stores (Tencent COS, Alibaba OSS) for `cos://` and `oss://` URLs.
 # This pulls in the `opendal` dependency, so it is opt-in.
 opendal = ["vortex-cloud/opendal"]
+hf = ["vortex-cloud/hf"]
 
 [lib]
 crate-type = ["cdylib"]

@@ -149,6 +149,7 @@ fn test_registered_store_wins_over_build() -> Result<(), Box<dyn std::error::Err
 /// `hf://` must resolve through the registry rather than falling through to `parse_url_opts`,
 /// which does not recognize it. The store is rooted at the repository revision, so two files in
 /// one repository share a client and each reports only its own path within that repository.
+#[cfg(feature = "hf")]
 #[test]
 fn test_resolve_hf_url_shares_client_per_repo() -> Result<(), Box<dyn std::error::Error>> {
     let registry = registry();
@@ -166,6 +167,7 @@ fn test_resolve_hf_url_shares_client_per_repo() -> Result<(), Box<dyn std::error
 
 /// A revision is part of the store's root, so two revisions of one repository — and two different
 /// repositories — must not share a client.
+#[cfg(feature = "hf")]
 #[test]
 fn test_resolve_hf_url_separates_revisions_and_repos() -> Result<(), Box<dyn std::error::Error>> {
     let registry = registry();
@@ -181,6 +183,7 @@ fn test_resolve_hf_url_separates_revisions_and_repos() -> Result<(), Box<dyn std
 /// A percent-encoded revision is one raw URL segment but decodes to several path parts. The
 /// registry's segment-count subtraction must not underflow on it, on either the build-and-cache
 /// branch or the cached-store branch.
+#[cfg(feature = "hf")]
 #[test]
 fn test_resolve_hf_url_percent_encoded_revision() -> Result<(), Box<dyn std::error::Error>> {
     let registry = registry();
@@ -195,17 +198,34 @@ fn test_resolve_hf_url_percent_encoded_revision() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Only dataset repositories are addressable, so a model-style `hf://<org>/<name>` URL must be
-/// rejected by our builder rather than silently mis-resolved or handed to `parse_url_opts`.
+/// Model and Space repositories resolve too, each rooted at its own repository.
+#[cfg(feature = "hf")]
 #[test]
-fn test_resolve_hf_url_rejects_non_dataset_repo() -> Result<(), Box<dyn std::error::Error>> {
+fn test_resolve_hf_url_repo_types() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = registry();
+    let (dataset, path) = registry.resolve(&Url::parse("hf://datasets/org/name/f.vortex")?)?;
+    assert_eq!(path.as_ref(), "f.vortex");
+    let (model, _) = registry.resolve(&Url::parse("hf://models/org/name/f.vortex")?)?;
+    let (space, _) = registry.resolve(&Url::parse("hf://spaces/org/name/f.vortex")?)?;
+
+    // Each repository type is a distinct root, so none of them share a client.
+    assert!(!Arc::ptr_eq(&dataset, &model));
+    assert!(!Arc::ptr_eq(&dataset, &space));
+    Ok(())
+}
+
+/// The repository type comes from the URL authority, so a bare `hf://<org>/<name>` is ambiguous
+/// with it and must be rejected rather than silently mis-resolved or handed to `parse_url_opts`.
+#[cfg(feature = "hf")]
+#[test]
+fn test_resolve_hf_url_rejects_bare_repo_id() -> Result<(), Box<dyn std::error::Error>> {
     let err = registry()
         .resolve(&Url::parse("hf://org/name/train.vortex")?)
-        .expect_err("only dataset repositories are supported");
+        .expect_err("the repository type must be named explicitly");
 
     assert!(
-        err.to_string().contains("hf://datasets/"),
-        "unexpected error for a non-dataset repository: {err}"
+        err.to_string().contains("hf://"),
+        "unexpected error for a bare repository id: {err}"
     );
     Ok(())
 }

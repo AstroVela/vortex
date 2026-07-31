@@ -9,11 +9,9 @@
 //! * `Registry` resolves a URL to a store, caching one client per bucket. It reads configuration
 //!   out of environment variables case-insensitively, matching how the `object_store` `from_env`
 //!   builders behave.
-//! * `huggingface` resolves `hf://datasets/...` URLs to the Hugging Face Hub `resolve` endpoint,
-//!   so a Vortex file in a Hub repository is scanned in place rather than downloaded.
-//! * `opendal` supplies stores for cloud services the `object_store` crate does not implement
-//!   natively — Tencent Cloud COS and Alibaba Cloud OSS — bridged through
-//!   `object_store_opendal`.
+//! * `opendal` supplies stores for services the `object_store` crate does not implement natively —
+//!   Tencent Cloud COS, Alibaba Cloud OSS, and the HuggingFace Hub (`hf://`, which reads and lists
+//!   Hub repositories in place) — bridged through `object_store_opendal`.
 //!
 //! Every Vortex language binding resolves URLs through this one crate, so a scheme added here is
 //! reachable from Python, Java and DuckDB alike.
@@ -24,17 +22,16 @@
 //! # Cargo features
 //!
 //! * `registry` — the `Registry`, plus the natively-supported cloud backends (S3, Azure, GCS,
-//!   HTTP) it resolves URLs to, and the `hf://` scheme built on top of the HTTP backend.
+//!   HTTP) it resolves URLs to.
 //! * `cos` — Tencent Cloud COS, the `cos://` scheme.
 //! * `oss` — Alibaba Cloud OSS, the `oss://` scheme.
+//! * `hf` — the HuggingFace Hub, the `hf://` scheme.
 //! * `opendal` — every OpenDAL-backed service above.
 //!
 //! The `registry` feature picks up whichever OpenDAL services are enabled, so a consumer that
 //! turns on `oss` gets `oss://` resolution without touching its own scheme matching.
 
-#[cfg(feature = "registry")]
-pub mod huggingface;
-#[cfg(any(feature = "cos", feature = "oss"))]
+#[cfg(any(feature = "cos", feature = "oss", feature = "hf"))]
 pub mod opendal;
 #[cfg(feature = "registry")]
 mod registry;
