@@ -189,15 +189,17 @@ fn conformance_take_indices(rows: usize) -> VortexResult<Vec<ArrayRef>> {
 fn assert_scalar_conformance(
     canonical: &FixedSizeListArray,
     tiled: &TiledFixedSizeListArray,
+    tile_geometry: TileGeometry,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
-    if tiled.is_empty() {
+    if canonical.is_empty() {
         return Ok(());
     }
 
-    let tile_rows = usize::try_from(tiled.geometry().rows().get())?;
-    let mut scalar_rows = vec![0, tiled.len() - 1];
-    for boundary in (tile_rows..tiled.len()).step_by(tile_rows) {
+    let rows = canonical.len();
+    let tile_rows = usize::try_from(tile_geometry.rows().get())?;
+    let mut scalar_rows = vec![0, rows - 1];
+    for boundary in (tile_rows..rows).step_by(tile_rows) {
         scalar_rows.extend([boundary - 1, boundary]);
     }
     scalar_rows.sort_unstable();
@@ -214,25 +216,24 @@ fn assert_scalar_conformance(
 fn assert_tile_conformance(
     canonical: &FixedSizeListArray,
     tiled: &TiledFixedSizeListArray,
+    tile_geometry: TileGeometry,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
-    let rows = tiled.len();
-    let dimensions = usize::try_from(tiled.list_size())?;
-    let tile_geometry = tiled.geometry();
+    let rows = canonical.len();
+    let dimensions = usize::try_from(canonical.list_size())?;
     let tile_rows = usize::try_from(tile_geometry.rows().get())?;
     let tile_dimensions = usize::try_from(tile_geometry.dimensions().get())?;
-    assert_eq!(tiled.row_tile_count(), rows.div_ceil(tile_rows));
-    assert_eq!(
-        tiled.dimension_tile_count(),
-        dimensions.div_ceil(tile_dimensions)
-    );
+    let expected_row_tile_count = rows.div_ceil(tile_rows);
+    let expected_dimension_tile_count = dimensions.div_ceil(tile_dimensions);
+    assert_eq!(tiled.row_tile_count(), expected_row_tile_count);
+    assert_eq!(tiled.dimension_tile_count(), expected_dimension_tile_count);
 
     let expected_bounds = expected_tile_bounds(rows, dimensions, tile_geometry)?;
     let actual_bounds: Vec<TileBounds> = tiled.tiles().collect();
     assert_eq!(actual_bounds, expected_bounds);
     for (dimension_tile, dimension_bounds) in (0..dimensions).step_by(tile_dimensions).enumerate() {
         for (row_tile, row_bounds) in (0..rows).step_by(tile_rows).enumerate() {
-            let expected = &expected_bounds[dimension_tile * tiled.row_tile_count() + row_tile];
+            let expected = &expected_bounds[dimension_tile * expected_row_tile_count + row_tile];
             assert_eq!(tiled.tile(row_tile, dimension_tile)?, *expected);
 
             let indices = expected
@@ -263,26 +264,21 @@ fn assert_tile_conformance(
 fn assert_slice_conformance(
     canonical: &FixedSizeListArray,
     tiled: &TiledFixedSizeListArray,
+    tile_geometry: TileGeometry,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
-    let tile_rows = usize::try_from(tiled.geometry().rows().get())?;
-    for range in boundary_slice_ranges(tiled.len(), tile_rows) {
+    let tile_rows = usize::try_from(tile_geometry.rows().get())?;
+    for range in boundary_slice_ranges(canonical.len(), tile_rows) {
         let expected = canonical.clone().into_array().slice(range.clone())?;
         let actual = tiled.clone().into_array().slice(range)?;
-        if tiled.is_empty() {
+        if canonical.is_empty() {
             assert!(actual.is::<TiledFixedSizeList>());
-            assert_eq!(
-                actual.as_::<TiledFixedSizeList>().geometry(),
-                tiled.geometry()
-            );
+            assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), tile_geometry);
         } else if actual.is_empty() {
             assert!(actual.is::<FixedSizeList>());
         } else {
             assert!(actual.is::<TiledFixedSizeList>());
-            assert_eq!(
-                actual.as_::<TiledFixedSizeList>().geometry(),
-                tiled.geometry()
-            );
+            assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), tile_geometry);
         }
         assert_fsl_equivalent(&expected, &actual, ctx)?;
     }
@@ -292,17 +288,15 @@ fn assert_slice_conformance(
 fn assert_take_oracle_conformance(
     canonical: &FixedSizeListArray,
     tiled: &TiledFixedSizeListArray,
+    tile_geometry: TileGeometry,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
-    for indices in conformance_take_indices(tiled.len())? {
+    for indices in conformance_take_indices(canonical.len())? {
         let expected = canonical.clone().into_array().take(indices.clone())?;
         let actual = tiled.clone().into_array().take(indices)?;
-        let actual = if !tiled.is_empty() && !actual.is_empty() {
+        let actual = if !canonical.is_empty() && !actual.is_empty() {
             let actual = actual.execute_until::<TiledFixedSizeList>(ctx)?;
-            assert_eq!(
-                actual.as_::<TiledFixedSizeList>().geometry(),
-                tiled.geometry()
-            );
+            assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), tile_geometry);
             actual
         } else if actual.is_empty() {
             let actual = actual.execute_until::<FixedSizeList>(ctx)?;
@@ -324,6 +318,7 @@ fn assert_tiled_conformance_case(
 ) -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
     let tiled = TiledFixedSizeList::encode(canonical.as_view(), tile_geometry, &mut ctx)?;
+    assert_eq!(tiled.geometry(), tile_geometry);
 
     let encoded = tiled
         .clone()
@@ -334,9 +329,9 @@ fn assert_tiled_conformance_case(
 
     let reconstructed = TiledFixedSizeList::try_new(
         tiled.elements().clone(),
-        tiled.list_size(),
-        tiled.array_validity(),
-        tiled.len(),
+        canonical.list_size(),
+        canonical.fixed_size_list_validity(),
+        canonical.len(),
         tile_geometry,
     )?;
     assert_fsl_equivalent(
@@ -345,10 +340,10 @@ fn assert_tiled_conformance_case(
         &mut ctx,
     )?;
 
-    assert_scalar_conformance(canonical, &tiled, &mut ctx)?;
-    assert_tile_conformance(canonical, &tiled, &mut ctx)?;
-    assert_slice_conformance(canonical, &tiled, &mut ctx)?;
-    assert_take_oracle_conformance(canonical, &tiled, &mut ctx)
+    assert_scalar_conformance(canonical, &tiled, tile_geometry, &mut ctx)?;
+    assert_tile_conformance(canonical, &tiled, tile_geometry, &mut ctx)?;
+    assert_slice_conformance(canonical, &tiled, tile_geometry, &mut ctx)?;
+    assert_take_oracle_conformance(canonical, &tiled, tile_geometry, &mut ctx)
 }
 
 #[test]
