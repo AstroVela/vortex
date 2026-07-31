@@ -5,6 +5,7 @@ use rstest::rstest;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_mask::Mask;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
@@ -421,4 +422,29 @@ fn reduce_reaches_a_strict_function() -> VortexResult<()> {
 
     assert_eq!(twice.optimize(&scope)?, once);
     Ok(())
+}
+
+/// The per-batch strategy selection for a mixed mask: branch-and-skip unless a per-row decode
+/// would shrink under filter and fewer than [`BRANCH_MIN_SURVIVING_FRACTION`] of the rows
+/// survive.
+///
+/// [`BRANCH_MIN_SURVIVING_FRACTION`]: super::execute::BRANCH_MIN_SURVIVING_FRACTION
+#[rstest]
+#[case::bulk_dense_mask(false, 99, 100, true)]
+#[case::bulk_sparse_mask(false, 1, 100, true)]
+#[case::per_row_dense_mask(true, 99, 100, true)]
+#[case::per_row_at_threshold(true, 75, 100, true)]
+#[case::per_row_below_threshold(true, 74, 100, false)]
+#[case::per_row_sparse_mask(true, 10, 100, false)]
+fn selects_branch_per_the_measured_rule(
+    #[case] decode_shrinks_when_filtered: bool,
+    #[case] true_count: usize,
+    #[case] len: usize,
+    #[case] expect_branch: bool,
+) {
+    let valid = Mask::from_indices(len, 0..true_count);
+    assert_eq!(
+        super::execute::branch_beats_filter(decode_shrinks_when_filtered, &valid),
+        expect_branch,
+    );
 }

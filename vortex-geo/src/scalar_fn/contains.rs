@@ -292,13 +292,16 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ConstantArray;
+    use vortex_array::arrays::MaskedArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar_fn::EmptyOptions;
+    use vortex_array::scalar_fn::NullStrategy;
     use vortex_array::scalar_fn::ScalarFnVTable;
+    use vortex_array::scalar_fn::execute_strict_with_strategy;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
     use vortex_error::VortexResult;
@@ -307,8 +310,10 @@ mod tests {
 
     use super::GeoContains;
     use crate::scalar_fn::row::probe::assert_prepared_agrees_with_columns;
+    use crate::test_harness::linestring_column;
     use crate::test_harness::nullable_point_column;
     use crate::test_harness::point_column;
+    use crate::test_harness::polygon_column;
 
     /// A rectangle polygon with corners `(x0, y0)` and `(x1, y1)`, no holes.
     fn rect_polygon(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
@@ -538,6 +543,117 @@ mod tests {
         let expected =
             BoolArray::new(BitBuffer::from_iter([false, false]), Validity::AllInvalid).into_array();
         assert_arrays_eq!(contains, expected, &mut ctx);
+        Ok(())
+    }
+
+    /// A nullable polygon column: unit squares at `centers`, the rows where `nulls` is true
+    /// masked out, spelled as `Masked` over non-nullable storage.
+    fn nullable_squares(centers: &[(f64, f64)], nulls: &[bool]) -> VortexResult<ArrayRef> {
+        let squares = centers
+            .iter()
+            .map(|&(x, y)| {
+                vec![vec![
+                    (x - 1.0, y - 1.0),
+                    (x + 1.0, y - 1.0),
+                    (x + 1.0, y + 1.0),
+                    (x - 1.0, y + 1.0),
+                    (x - 1.0, y - 1.0),
+                ]]
+            })
+            .collect();
+        let polygons = polygon_column(squares)?;
+
+        Ok(
+            MaskedArray::try_new(polygons, Validity::from_iter(nulls.iter().map(|n| !n)))?
+                .into_array(),
+        )
+    }
+
+    /// Executes `GeoContains(a, b)` with a forced null strategy, canonicalized.
+    fn contains_forced(
+        a: &ArrayRef,
+        b: &ArrayRef,
+        strategy: NullStrategy,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        Ok(execute_strict_with_strategy(
+            &GeoContains,
+            &EmptyOptions,
+            vec![a.clone(), b.clone()],
+            a.len(),
+            strategy,
+            ctx,
+        )?
+        .execute::<Canonical>(ctx)?
+        .into_array())
+    }
+
+    /// The branch-and-skip and filter strategies, plus the automatic per-batch selection, must
+    /// return identical arrays for nullable geometry operands: `Masked` polygons against nullable
+    /// points, with independent nulls conjoined.
+    #[test]
+    fn branch_matches_filter_for_nullable_geometries() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let centers = [(0.0, 0.0), (5.0, 5.0), (0.5, -0.2), (9.0, 9.0), (0.0, 1.0)];
+        let nulls = [false, true, false, false, true];
+        let polygons = nullable_squares(&centers, &nulls)?;
+        let points = nullable_point_column(vec![
+            Some((0.0, 0.0)),
+            Some((5.0, 5.0)),
+            None,
+            Some((0.0, 0.0)),
+            Some((0.0, 1.0)),
+        ])?;
+
+        let filtered = contains_forced(&polygons, &points, NullStrategy::Filter, &mut ctx)?;
+        let branched = contains_forced(&polygons, &points, NullStrategy::BranchAndSkip, &mut ctx)?;
+        let auto = GeoContains::try_new_array(polygons, points)?
+            .into_array()
+            .execute::<Canonical>(&mut ctx)?
+            .into_array();
+
+        assert_arrays_eq!(branched, filtered, &mut ctx);
+        assert_arrays_eq!(auto, filtered, &mut ctx);
+        Ok(())
+    }
+
+    /// Geometry types without a null-tolerant decode refuse the branch strategy: forcing it is an
+    /// error, and the automatic selection (which prefers branch at this density) silently falls
+    /// back to filtering with the correct result.
+    #[test]
+    fn unsupported_geometry_falls_back_to_filter() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        // Four rows with one null: 75% surviving, so the selection prefers branch.
+        let lines = MaskedArray::try_new(
+            linestring_column(vec![
+                vec![(0.0, 0.0), (4.0, 4.0)],
+                vec![(0.0, 0.0), (1.0, 1.0)],
+                vec![(2.0, 2.0), (3.0, 3.0)],
+                vec![(0.0, 4.0), (4.0, 0.0)],
+            ])?,
+            Validity::from_iter([true, false, true, true]),
+        )?
+        .into_array();
+        let point = geometry_constant(&Geometry::Point(Point::new(2.0, 2.0)), 4)?;
+
+        let error = contains_forced(&lines, &point, NullStrategy::BranchAndSkip, &mut ctx)
+            .expect_err("a linestring column with nulls has no branch decode");
+        assert!(
+            error.to_string().contains("branch-and-skip"),
+            "unexpected error: {error}"
+        );
+
+        let filtered = contains_forced(&lines, &point, NullStrategy::Filter, &mut ctx)?;
+        let auto = GeoContains::try_new_array(lines, point)?
+            .into_array()
+            .execute::<Canonical>(&mut ctx)?
+            .into_array();
+
+        assert_arrays_eq!(auto, filtered, &mut ctx);
         Ok(())
     }
 
