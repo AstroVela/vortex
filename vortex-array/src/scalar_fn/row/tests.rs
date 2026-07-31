@@ -441,8 +441,7 @@ mod prepared {
         ) -> VortexResult<V::Out> {
             visitor.visit_prepared::<(f64, f64), (Option<f64>, Option<f64>), f64>(
                 |(x, y)| {
-                    SEEN_CONSTANTS
-                        .set(u8::from(x.is_some()) | (u8::from(y.is_some()) << 1));
+                    SEEN_CONSTANTS.set(u8::from(x.is_some()) | (u8::from(y.is_some()) << 1));
                     (x.map(|x| x * x), y.map(|y| y * y))
                 },
                 |&(x_sq, y_sq), (x, y)| (x_sq.unwrap_or(x * x) + y_sq.unwrap_or(y * y)).sqrt(),
