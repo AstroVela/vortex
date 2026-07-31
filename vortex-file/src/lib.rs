@@ -196,6 +196,8 @@ pub fn register_default_encodings(session: &VortexSession) {
 
     #[cfg(feature = "unstable_encodings")]
     vortex_tensor::initialize(session);
+    #[cfg(feature = "unstable_encodings")]
+    vortex_tiled_fsl::initialize(session);
 }
 
 #[cfg(test)]

@@ -281,6 +281,12 @@ pub mod encodings {
         pub use vortex_sparse::*;
     }
 
+    #[cfg(feature = "unstable_encodings")]
+    /// Experimental two-dimensional tiled fixed-size-list encoding.
+    pub mod tiled_fsl {
+        pub use vortex_tiled_fsl::*;
+    }
+
     /// Zig-zag integer transform encoding.
     pub mod zigzag {
         pub use vortex_zigzag::*;
