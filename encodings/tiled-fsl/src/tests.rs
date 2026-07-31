@@ -97,6 +97,19 @@ fn assert_fsl_equivalent(
     Ok(())
 }
 
+#[test]
+fn physical_indices_reject_overflowing_output_cardinality() {
+    assert!(
+        crate::gather::physical_indices_for_rows(
+            1,
+            usize::MAX,
+            geometry(1, 1),
+            &[Some(0), Some(0)],
+        )
+        .is_err()
+    );
+}
+
 #[rstest]
 #[case(0..0)]
 #[case(0..1)]

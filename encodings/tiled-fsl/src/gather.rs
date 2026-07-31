@@ -8,6 +8,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 
 use crate::TileBoundsIter;
 use crate::TileGeometry;
@@ -29,6 +30,13 @@ pub(crate) fn physical_indices_for_rows(
         source_len != 0 || rows.is_empty(),
         "nonempty tiled row gather requires a nonempty source"
     );
+    rows.len().checked_mul(list_size).ok_or_else(|| {
+        vortex_err!(
+            InvalidArgument:
+            "output row count {} times list size {list_size} overflows usize",
+            rows.len()
+        )
+    })?;
 
     let (tile_rows, tile_dimensions) = geometry_usizes(geometry)?;
     let row_tile_count = rows.len().div_ceil(tile_rows);
