@@ -4,6 +4,7 @@
 //! The strict scalar function contract.
 
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -86,6 +87,50 @@ pub trait StrictScalarFnVTable: 'static + Sized + Clone + Send + Sync {
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef>;
+
+    /// Evaluate the kernel over the full-length, *unfiltered* inputs, computing only the rows set
+    /// in `valid` and writing an arbitrary placeholder to every other output slot.
+    ///
+    /// This is the branch-and-skip null strategy, which the lifting may pick for a batch with a
+    /// mixed validity mask instead of literally filtering (see [`NullHandling::Filter`]). The
+    /// contract mirrors [`execute_strict`](Self::execute_strict), except that the inputs still
+    /// contain their null rows: the kernel **must not** run its row computation (nor any per-row
+    /// fallible decode) on a row unset in `valid`, because such rows hold arbitrary values and a
+    /// fallible kernel would spuriously fail on them. The caller masks the result with `valid`
+    /// afterwards, exactly as the dense path does, so the placeholders are never observed.
+    ///
+    /// `valid` is guaranteed mixed (neither all-true nor all-false). The default returns
+    /// `Ok(None)`: this kernel has no branch execution, and the lifting uses the filter strategy.
+    /// The hook lives on this trait, rather than the machinery staying inside the lifting,
+    /// because only the implementor knows how to compute a subset of rows; the row layer
+    /// overrides it once for every [`RowFn`](crate::scalar_fn::RowFn), and a hand-written strict
+    /// function normally leaves it alone.
+    fn execute_strict_branch(
+        &self,
+        options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        valid: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        _ = (options, args, valid, ctx);
+        Ok(None)
+    }
+
+    /// Whether this function's per-batch decode does per-row work whose cost shrinks
+    /// proportionally when the inputs are filtered first.
+    ///
+    /// This is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`] aggregated over the arguments,
+    /// which is how the row layer answers it. It steers the per-batch choice between the
+    /// branch-and-skip and filter strategies, so it is only consulted when
+    /// [`execute_strict_branch`](Self::execute_strict_branch) is implemented; a function that
+    /// leaves that at its default leaves this alone too.
+    ///
+    /// [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]:
+    ///     crate::scalar_fn::InputElement::DECODE_SHRINKS_WHEN_FILTERED
+    fn decode_shrinks_when_filtered(&self, options: &Self::Options) -> bool {
+        _ = options;
+        false
+    }
 
     /// An expression for the output validity, or `None` to read it off the executed result. See
     /// [`ScalarFnVTable::validity`] for more information.

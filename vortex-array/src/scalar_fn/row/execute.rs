@@ -8,6 +8,9 @@
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_mask::AllOr;
+use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -102,6 +105,69 @@ pub(super) fn execute_row_loop_prepared<A: ElementTuple, P, R: ApplyResult>(
     };
 
     Ok(R::Out::build(values))
+}
+
+/// Decode every column null-tolerantly, then run the row loop only over the rows set in `valid`,
+/// leaving a placeholder in every other output slot.
+///
+/// This is the branch-and-skip null strategy's row loop. The caller masks the built column with
+/// `valid` afterwards, so the placeholders are never observed; what matters is that `apply` (and
+/// any per-row fallible decode) never runs for an unset row, since those rows hold arbitrary
+/// values and a fallible kernel would spuriously fail on them. Iteration is a word at a time via
+/// [`BitBuffer::for_each_set_index`] rather than a per-row `valid.value(i)` branch.
+///
+/// Returns `Ok(None)` when some argument cannot decode null-tolerantly, in which case the strict
+/// lifting falls back to the filter strategy.
+///
+/// [`BitBuffer::for_each_set_index`]: vortex_buffer::BitBuffer::for_each_set_index
+pub(super) fn execute_row_loop_branch<A: ElementTuple, P, R: ApplyResult>(
+    args: &dyn ExecutionArgs,
+    valid: &Mask,
+    ctx: &mut ExecutionCtx,
+    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+    apply: impl Fn(&P, A::Elems<'_>) -> R,
+) -> VortexResult<Option<ArrayRef>> {
+    let Some(columns) = A::decode_null_tolerant(args, ctx)? else {
+        return Ok(None);
+    };
+    let state = prepare(A::constants(&columns));
+
+    let AllOr::Some(valid) = valid.bit_buffer() else {
+        // The strict lifting takes the all-true and all-false shortcuts before choosing a
+        // strategy, so a degenerate mask here is a bug in the lifting.
+        vortex_bail!("execute_row_loop_branch requires a mixed mask");
+    };
+
+    let mut values: Vec<R::Out> = Vec::with_capacity(args.row_count());
+    values.resize_with(args.row_count(), R::Out::placeholder);
+
+    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization, exactly as in
+    // [`execute_row_loop_prepared`].
+    if R::FALLIBLE {
+        // `for_each_set_index` cannot early-return, so the first error is remembered and the
+        // remaining set rows are skipped cheaply; the success path pays only the `is_none` check.
+        let mut error = None;
+        valid.for_each_set_index(|index| {
+            if error.is_none() {
+                match apply(&state, A::get(&columns, index)).into_result() {
+                    Ok(value) => values[index] = value,
+                    Err(e) => error = Some(e),
+                }
+            }
+        });
+
+        if let Some(error) = error {
+            return Err(error);
+        }
+    } else {
+        valid.for_each_set_index(|index| {
+            values[index] = apply(&state, A::get(&columns, index))
+                .into_result()
+                .vortex_expect("an infallible ApplyResult cannot be an error");
+        });
+    }
+
+    Ok(Some(R::Out::build(values)))
 }
 
 /// Decode every input column once, allocate the sink once, then write one row at a time.

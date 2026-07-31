@@ -31,6 +31,18 @@
 //! the element value of every argument whose operand is constant for the batch, and whatever it
 //! returns reaches every row by shared reference, so work that depends only on a constant argument
 //! runs once per batch instead of once per row.
+//!
+//! Null handling is derived and executed by the strict lifting, never by the row closure, which
+//! only ever computes rows valid in every argument. A batch with a mixed validity mask executes by
+//! one of two strategies, selected per batch: *branch-and-skip* (decode the unfiltered columns
+//! null-tolerantly via [`InputElement::decode_null_tolerant`], compute only the valid rows a word
+//! of the mask at a time, mask the result) whenever it can, and *filter* (shrink every input to
+//! the surviving rows, compute, scatter back) when an argument has no null-tolerant decode for its
+//! array or when a per-row decode makes filtering cheaper at sparse validity. Authors do nothing;
+//! an element whose decode does expensive per-row work opts its sparse batches back into filtering
+//! by setting [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]. Sink dispatches
+//! ([`RowVisitor::visit_into`]) always use the dense or filter paths: a sink has no notion of a
+//! skipped row.
 
 mod element;
 pub use element::ArgColumn;

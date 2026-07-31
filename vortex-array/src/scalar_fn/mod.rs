@@ -40,6 +40,14 @@
 //! empty batch decodes every operand as non-constant, so a prepare that validated its constant
 //! would silently not run.
 //!
+//! Null handling is derived too, null-strategy selection included: a nullable batch runs densely
+//! (compute every row, mask after), by branch-and-skip (decode full length, compute only the
+//! conjoined-valid rows, mask after), or by filtering (shrink the inputs to the valid rows,
+//! compute, scatter back), and the framework picks per batch. Function authors do nothing. The one
+//! input to that choice an element controls is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]: set
+//! it when decoding a column does expensive per-row work (parsing a geometry), so sparse batches
+//! keep the filter strategy's shrunken decode.
+//!
 //! Two things neither form covers, and they are what actually send a function to the trait below:
 //!
 //! - **A result that aliases an input.** Both forms own their output bytes: an element returns them

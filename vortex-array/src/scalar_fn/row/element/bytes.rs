@@ -115,4 +115,8 @@ impl OutputElement for String {
     fn build(values: Vec<Self>) -> ArrayRef {
         VarBinViewArray::from_iter_str(values).into_array()
     }
+
+    fn placeholder() -> Self {
+        String::new()
+    }
 }

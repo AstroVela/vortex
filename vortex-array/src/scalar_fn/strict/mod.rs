@@ -36,6 +36,10 @@
 //! [strict]: crate::scalar_fn::ScalarFnVTable::is_strict
 
 mod execute;
+#[cfg(any(test, feature = "_test-harness"))]
+pub use execute::NullStrategy;
+#[cfg(any(test, feature = "_test-harness"))]
+pub use execute::execute_strict_with_strategy;
 
 mod vtable;
 pub use vtable::StrictScalarFnVTable;
@@ -50,23 +54,30 @@ mod tests;
 pub enum NullHandling {
     /// Evaluate every row, including rows behind nulls, then mask the result.
     ///
-    /// Cheapest, and the only option that leaves inputs at their original encoding. Requires that
-    /// the function is infallible and total over whatever sits behind a null, which holds for any
-    /// flat fixed-width payload since a null row is just unused bytes. Asking for it without meeting
-    /// that is rejected rather than trusted: a fallible function is refused here, and the row layers
-    /// additionally refuse arguments that are not
+    /// Cheapest: no filtering, no scattering, and the inputs keep their original encoding.
+    /// Requires that the function is infallible and total over whatever sits behind a null, which
+    /// holds for any flat fixed-width payload since a null row is just unused bytes. Asking for it
+    /// without meeting that is rejected rather than trusted: a fallible function is refused here,
+    /// and the row layers additionally refuse arguments that are not
     /// [`InputElement::DENSE_SAFE`](crate::scalar_fn::InputElement::DENSE_SAFE).
     Dense,
 
-    /// Filter the inputs to the rows valid in every input, evaluate those, and scatter the results
-    /// back.
+    /// Never evaluate a row that is null in some input: the kernel only ever sees valid rows.
     ///
     /// Always sound. Use it when the function is fallible, or when decoding a row behind a null
     /// could itself fail (a dictionary code or string view only meaningful for valid rows).
     ///
-    /// Not for encoding-aware kernels: the inputs are *filtered copies*, and filtering only pushes
-    /// through an extension array or a `ScalarFnArray` with at most one non-constant child. With
-    /// two or more, the filter stays on top, so `array.is::<ExactScalarFn<Foo>>()` stops matching
-    /// once any row is null and the kernel silently takes its generic path.
+    /// `Filter` names that contract, not a mechanism. A batch whose mask is mixed executes by one
+    /// of two strategies, selected per batch by the lifting and invisible to the kernel: filter
+    /// the inputs to the valid rows, evaluate those, and scatter the results back; or, when the
+    /// kernel supports it (every [`RowFn`](crate::scalar_fn::RowFn) with a returning dispatch
+    /// does), branch-and-skip, which evaluates only the valid rows over the *unfiltered* inputs
+    /// and masks the result.
+    ///
+    /// Encoding-aware kernels see original encodings under branch-and-skip but *filtered copies*
+    /// under the filter strategy, and filtering only pushes through an extension array or a
+    /// `ScalarFnArray` with at most one non-constant child. With two or more, the filter stays on
+    /// top, so `array.is::<ExactScalarFn<Foo>>()` stops matching and the kernel silently takes
+    /// its generic path.
     Filter,
 }

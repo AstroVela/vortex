@@ -6,6 +6,7 @@
 use std::marker::PhantomData;
 
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
@@ -30,6 +31,7 @@ use crate::scalar_fn::SinkResult;
 use crate::scalar_fn::StrictScalarFnVTable;
 use crate::scalar_fn::decode_scalar_fn_array;
 use crate::scalar_fn::encode_children_and_options;
+use crate::scalar_fn::row::execute::execute_row_loop_branch;
 use crate::scalar_fn::row::execute::execute_row_loop_prepared;
 use crate::scalar_fn::row::execute::execute_row_sink;
 use crate::scalar_fn::row::execute::row_is_fallible;
@@ -152,14 +154,16 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// row-shaped in general but has a bulk answer for some encodings: reading stored values back out
     /// of a wrapper encoding, or handing back a child array whole. The result may be lazy and
     /// nullable, but its nulls **must** be a subset of the rows the strict lifting will mask, and it
-    /// **must** have one row per row of `args`, which under [`NullHandling::Filter`] is the *filtered*
-    /// count rather than the original one.
+    /// **must** have one row per row of `args`, which on the filter strategy is the *filtered* count
+    /// rather than the original one.
     ///
     /// Whether the arrays still carry their original encoding depends on the path above:
     ///
     /// - [`NullHandling::Dense`] always passes them through untouched.
-    /// - [`NullHandling::Filter`] passes them through untouched when no row is null, and otherwise
-    ///   hands over filtered copies, which are canonical and so match no encoding fast path.
+    /// - [`NullHandling::Filter`] passes them through untouched when no row is null. For a mixed
+    ///   mask, the branch-and-skip strategy also passes them through untouched (full length, the
+    ///   result masked afterwards), while the filter strategy hands over filtered copies, which
+    ///   are canonical and so match no encoding fast path.
     ///
     /// A non-nullable operand therefore reaches an encoding fast path under either. Note also that
     /// filtering a constant yields a constant, so a fast path keyed on
@@ -269,6 +273,12 @@ const fn assert_witness_agrees<F: RowFn, A: ElementTuple, R: RowResult>() {
          behind a null row",
     );
     assert!(
+        A::DECODE_SHRINKS_WHEN_FILTERED
+            == <F::ArgsWitness as ElementTuple>::DECODE_SHRINKS_WHEN_FILTERED,
+        "dispatch visited an argument that differs from ArgsWitness in whether its decode \
+         shrinks when filtered",
+    );
+    assert!(
         row_is_fallible::<A, R>() == row_is_fallible::<F::ArgsWitness, F::RetWitness>(),
         "dispatch visited types whose fallibility differs from the witnesses",
     );
@@ -336,6 +346,47 @@ impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     ) -> VortexResult<ArrayRef> {
         const { assert_witness_agrees::<F, A, R>() };
         execute_row_sink::<A, S, R>(self.args, self.arg_dtypes, self.ctx, apply)
+    }
+}
+
+/// The run-time visit for the branch-and-skip null strategy: compute only the conjoined-valid
+/// rows over unfiltered columns.
+///
+/// `Ok(None)` means the visit cannot take that strategy (a sink dispatch, or an argument with no
+/// null-tolerant decode for its array), and the strict lifting falls back to the filter strategy.
+struct ExecuteRowsBranch<'a, 'b, F> {
+    args: &'a dyn ExecutionArgs,
+
+    /// The conjoined validity, materialized by the strict lifting and guaranteed mixed.
+    valid: &'a Mask,
+
+    ctx: &'b mut ExecutionCtx,
+
+    /// The visited function, carried only so the witness check can name its witnesses.
+    row_fn: PhantomData<F>,
+}
+
+impl<F: RowFn> RowVisitor for ExecuteRowsBranch<'_, '_, F> {
+    type Out = Option<ArrayRef>;
+
+    fn visit_prepared<A: ElementTuple, P, R: ApplyResult>(
+        self,
+        prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        apply: impl Fn(&P, A::Elems<'_>) -> R,
+    ) -> VortexResult<Option<ArrayRef>> {
+        const { assert_witness_agrees::<F, A, R>() };
+        execute_row_loop_branch::<A, P, R>(self.args, self.valid, self.ctx, prepare, apply)
+    }
+
+    fn visit_into<A: ElementTuple, S: OutputSink, R: SinkResult>(
+        self,
+        _apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
+    ) -> VortexResult<Option<ArrayRef>> {
+        const { assert_witness_agrees::<F, A, R>() };
+        // Sink dispatches stay on the dense and filter paths: a sink is allocated for a known row
+        // count and has no notion of a skipped row, so `None` sends the batch to the filter
+        // strategy. See the module docs.
+        Ok(None)
     }
 }
 
@@ -416,6 +467,46 @@ impl<F: RowFn> StrictScalarFnVTable for F {
                 row_fn: PhantomData,
             },
         )
+    }
+
+    fn execute_strict_branch(
+        &self,
+        options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        valid: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let inputs = (0..args.num_inputs())
+            .map(|i| args.get(i))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        // The encoding-aware rewrite runs before the row loop exactly as in
+        // [`execute_strict`](StrictScalarFnVTable::execute_strict). Here it sees the original
+        // (unfiltered) encodings, and its full-length result is masked by the caller like any
+        // other branch result.
+        if let Some(reduced) = self.reduce_encoded(options, &inputs, ctx)? {
+            return Ok(Some(reduced));
+        }
+
+        let arg_dtypes = inputs
+            .iter()
+            .map(|input| input.dtype().clone())
+            .collect::<Vec<_>>();
+
+        self.dispatch(
+            options,
+            &arg_dtypes,
+            ExecuteRowsBranch::<F> {
+                args,
+                valid,
+                ctx,
+                row_fn: PhantomData,
+            },
+        )
+    }
+
+    fn decode_shrinks_when_filtered(&self, _options: &Self::Options) -> bool {
+        F::ArgsWitness::DECODE_SHRINKS_WHEN_FILTERED
     }
 }
 

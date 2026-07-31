@@ -50,6 +50,25 @@ impl<T: InputElement> ArgColumn<T> {
         })
     }
 
+    /// Like [`decode`](Self::decode), but a varying column decodes null-tolerantly through
+    /// [`InputElement::decode_null_tolerant`]. `Ok(None)` means the element cannot, and the
+    /// caller falls back to the filter strategy.
+    ///
+    /// A constant operand still takes the ordinary decode: the strict lifting short-circuits
+    /// null constants before any strategy runs, so a constant reaching here is non-null.
+    fn decode_null_tolerant(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<Self>> {
+        if let Some(constant) = batch_constant(&array)
+            && !array.is_empty()
+        {
+            return Ok(Some(Self {
+                column: T::decode(constant.slice(0..1)?, ctx)?,
+                stride: 0,
+            }));
+        }
+
+        Ok(T::decode_null_tolerant(array, ctx)?.map(|column| Self { column, stride: 1 }))
+    }
+
     /// Read the element at `index`, which for a constant operand is always its single row.
     fn get(&self, index: usize) -> T::Elem<'_> {
         T::get(&self.column, index * self.stride)
@@ -122,6 +141,9 @@ pub trait ElementTuple: 'static {
     /// Whether *any* argument is [`InputElement::DECODE_FALLIBLE`].
     const DECODE_FALLIBLE: bool;
 
+    /// Whether *any* argument is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`].
+    const DECODE_SHRINKS_WHEN_FILTERED: bool;
+
     /// Validate the input dtypes, including that `dtypes` has exactly `ARITY` entries.
     ///
     /// The expression layer checks the count against [`Arity`](crate::scalar_fn::Arity) before it
@@ -132,6 +154,13 @@ pub trait ElementTuple: 'static {
 
     /// Decode every input column once. Called once per batch.
     fn decode(args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<Self::Columns>;
+
+    /// Decode every input column once, tolerating null rows, or `Ok(None)` when some argument
+    /// cannot. Called once per batch by the branch-and-skip null strategy.
+    fn decode_null_tolerant(
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Columns>>;
 
     /// Read the row of elements at `index`. Must be `O(1)`: it is called in the row loop.
     fn get(columns: &Self::Columns, index: usize) -> Self::Elems<'_>;
@@ -150,6 +179,8 @@ macro_rules! element_tuple {
             const ARITY: usize = $arity;
             const DENSE_SAFE: bool = $($t::DENSE_SAFE &&)+ true;
             const DECODE_FALLIBLE: bool = $($t::DECODE_FALLIBLE ||)+ false;
+            const DECODE_SHRINKS_WHEN_FILTERED: bool =
+                $($t::DECODE_SHRINKS_WHEN_FILTERED ||)+ false;
 
             fn validate(dtypes: &[DType]) -> VortexResult<()> {
                 vortex_ensure_eq!(
@@ -169,6 +200,18 @@ macro_rules! element_tuple {
                 ctx: &mut ExecutionCtx,
             ) -> VortexResult<Self::Columns> {
                 Ok(($(ArgColumn::<$t>::decode(args.get($idx)?, ctx)?,)+))
+            }
+
+            fn decode_null_tolerant(
+                args: &dyn ExecutionArgs,
+                ctx: &mut ExecutionCtx,
+            ) -> VortexResult<Option<Self::Columns>> {
+                Ok(Some((
+                    $(match ArgColumn::<$t>::decode_null_tolerant(args.get($idx)?, ctx)? {
+                        Some(column) => column,
+                        None => return Ok(None),
+                    },)+
+                )))
             }
 
             fn get(columns: &Self::Columns, index: usize) -> Self::Elems<'_> {

@@ -50,4 +50,8 @@ impl OutputElement for bool {
         // bit at a time, which measures 6.6-7.9x slower on the packing step alone.
         BoolArray::new(BitBuffer::from(values), Validity::NonNullable).into_array()
     }
+
+    fn placeholder() -> Self {
+        false
+    }
 }

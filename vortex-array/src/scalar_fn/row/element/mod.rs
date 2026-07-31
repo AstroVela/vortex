@@ -67,6 +67,20 @@ pub trait InputElement: 'static {
     /// computation is.
     const DECODE_FALLIBLE: bool;
 
+    /// Whether [`decode`](Self::decode) does per-row work whose cost shrinks proportionally when
+    /// the column is filtered to fewer rows first.
+    ///
+    /// `true` for an element whose decode *parses* every row (a geometry built from coordinate
+    /// storage): decoding only the survivors of a sparse validity mask is genuinely cheaper than
+    /// decoding everyone. `false`, the default, for a bulk canonicalization (bytes, bools,
+    /// primitives), whose decode is a memcpy-shaped pass that filtering barely shrinks.
+    ///
+    /// The strict lifting reads this when it picks a null strategy for a batch with a mixed
+    /// validity mask: filtering the inputs first only pays off when it shrinks a per-row decode,
+    /// so an element that leaves this `false` always takes the cheaper branch-and-skip strategy.
+    /// Getting it wrong is a performance bug, never a correctness bug.
+    const DECODE_SHRINKS_WHEN_FILTERED: bool = false;
+
     /// Validate that `dtype` is an acceptable input column dtype for this element type.
     fn validate(dtype: &DType) -> VortexResult<()>;
 
@@ -76,6 +90,27 @@ pub trait InputElement: 'static {
     /// checking the ptype, and anything else that does not vary by row. [`Column`](Self::Column) is
     /// the type to widen if that means carrying more, since it is chosen by the element.
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column>;
+
+    /// Decode `array` *without* assuming every row is valid, or `Ok(None)` when this element
+    /// cannot for this particular array.
+    ///
+    /// The ordinary [`decode`](Self::decode) only ever sees all-valid inputs, so an element whose
+    /// decode does per-row work (parsing a geometry) may fail on, or produce nonsense for, a null
+    /// row. This variant **must** tolerate null rows by writing an arbitrary placeholder into
+    /// their column slots; the caller guarantees [`get`](Self::get) is never called for such a
+    /// row. It is what the branch-and-skip null strategy decodes with.
+    ///
+    /// The default forwards to `decode`, which is sound for every element whose decode is a bulk
+    /// canonicalization rather than per-row parsing: hostile bytes behind a null row are only
+    /// dangerous to *resolve*, and the branch-and-skip row loop never resolves them. Return
+    /// `Ok(None)` rather than an error when an array has no null-tolerant decode; the lifting
+    /// falls back to the filter strategy.
+    fn decode_null_tolerant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Column>> {
+        Self::decode(array, ctx).map(Some)
+    }
 
     /// Read the element at `index`, the one function called once per row.
     ///
@@ -99,4 +134,12 @@ pub trait OutputElement: 'static + Sized {
 
     /// Build a column from one value per row. Called once per batch.
     fn build(values: Vec<Self>) -> ArrayRef;
+
+    /// An arbitrary value of this element, pre-filled into the output slots that the
+    /// branch-and-skip null strategy skips.
+    ///
+    /// The value is never observable: the strict lifting masks every slot holding it before the
+    /// result escapes. It only has to be cheap to construct and legal to
+    /// [`build`](Self::build) with.
+    fn placeholder() -> Self;
 }
