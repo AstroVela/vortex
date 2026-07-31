@@ -26,6 +26,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
@@ -332,6 +333,36 @@ fn slice_preserves_mixed_validity() -> VortexResult<()> {
         geometry(2, 2),
     );
     assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
+fn bitpacked_child_roundtrips_and_remains_tiled_after_row_ops() -> VortexResult<()> {
+    let (canonical, raw_tiled, mut ctx) = fixture(65, 128, geometry(32, 64))?;
+    vortex_fastlanes::initialize(ctx.session());
+    let physical = raw_tiled
+        .elements()
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)?;
+    let bitpacked = bitpack_encode(&physical, 4, None, &mut ctx)?.into_array();
+    let tiled = TiledFixedSizeList::try_new(
+        bitpacked,
+        128,
+        raw_tiled.array_validity(),
+        65,
+        geometry(32, 64),
+    )?;
+
+    assert_arrays_eq!(canonical, tiled, &mut ctx);
+
+    let sliced = tiled.clone().into_array().slice(1..64)?;
+    assert!(sliced.is::<TiledFixedSizeList>());
+
+    let taken = tiled
+        .into_array()
+        .take(PrimitiveArray::from_iter([64u32, 0, 32]).into_array())?
+        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
+    assert!(taken.is::<TiledFixedSizeList>());
+    Ok(())
 }
 
 #[test]
