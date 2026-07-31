@@ -49,6 +49,12 @@ impl RowFn for GeoDistance {
         ChildName::from(["a", "b"][idx])
     }
 
+    /// Deliberately a plain visit, not a prepared one: a batch-constant operand offers nothing
+    /// sound to hoist. geo computes linestring and polygon distances through its private
+    /// `nearest_neighbour_distance`, which builds the R*-trees for *both* sides inside each call,
+    /// and the point pairings are single expressions; reusing a tree across rows would mean
+    /// reimplementing geo's internals. A batch where both operands are constant already folds to
+    /// a single-row execution before the row loop.
     fn dispatch<V: RowVisitor>(
         &self,
         _options: &Self::Options,
