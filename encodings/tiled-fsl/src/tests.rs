@@ -6,7 +6,6 @@ use std::sync::LazyLock;
 use prost::Message;
 use rstest::rstest;
 use vortex_array::ArrayRef;
-use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -27,6 +26,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::TileBounds;
@@ -110,6 +110,11 @@ fn physical_indices_reject_overflowing_output_cardinality() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn collect_checked_rows_rejects_mismatched_mask_length() {
+    assert!(crate::take::collect_checked_rows(&[0u32, 1], &Mask::new_true(1), 2).is_err());
 }
 
 #[test]
@@ -232,31 +237,18 @@ fn take_zero_width_lists() -> VortexResult<()> {
 }
 
 #[test]
-fn take_rejects_out_of_bounds_valid_index() -> VortexResult<()> {
-    let (_, tiled, mut ctx) = fixture(3, 5, geometry(2, 3))?;
-    let indices = PrimitiveArray::from_iter([3u32]).into_array();
-    assert!(
-        tiled
-            .into_array()
-            .take(indices)?
-            .execute::<Canonical>(&mut ctx)
-            .is_err()
-    );
-    Ok(())
+fn collect_checked_rows_rejects_out_of_bounds_valid_index() {
+    assert!(crate::take::collect_checked_rows(&[3u32], &Mask::new_true(1), 3).is_err());
 }
 
 #[test]
-fn take_rejects_negative_valid_index() -> VortexResult<()> {
-    let (_, tiled, mut ctx) = fixture(3, 5, geometry(2, 3))?;
-    let indices = PrimitiveArray::from_iter([-1i64]).into_array();
-    assert!(
-        tiled
-            .into_array()
-            .take(indices)?
-            .execute::<Canonical>(&mut ctx)
-            .is_err()
-    );
-    Ok(())
+fn collect_checked_rows_rejects_negative_valid_index() {
+    assert!(crate::take::collect_checked_rows(&[-1i64], &Mask::new_true(1), 3).is_err());
+}
+
+#[test]
+fn collect_checked_rows_rejects_u64_max() {
+    assert!(crate::take::collect_checked_rows(&[u64::MAX], &Mask::new_true(1), 3).is_err());
 }
 
 #[test]

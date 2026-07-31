@@ -12,6 +12,7 @@ use vortex_array::dtype::IntegerPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 
@@ -24,6 +25,13 @@ pub(crate) fn collect_checked_rows<I: IntegerPType>(
     mask: &Mask,
     source_len: usize,
 ) -> VortexResult<Vec<Option<usize>>> {
+    vortex_ensure!(
+        indices.len() == mask.len(),
+        InvalidArgument:
+        "index count {} does not match validity mask length {}",
+        indices.len(),
+        mask.len()
+    );
     let mut rows = Vec::with_capacity(indices.len());
     for (&index, is_valid) in indices.iter().zip(mask.iter()) {
         if !is_valid {
