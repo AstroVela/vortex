@@ -24,6 +24,7 @@ use vortex_array::EmptyMetadata;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
@@ -101,4 +102,24 @@ fn column_x_column(bencher: Bencher, width: usize) {
 #[divan::bench(args = WIDTHS)]
 fn column_x_constant(bencher: Bencher, width: usize) {
     bench_cosine(bencher, vectors(width, 0), constant_vector(width));
+}
+
+/// One query vector as an extension array over constant storage, the other spelling of a
+/// broadcast operand (what `Vector::constant_array` builds before `ExtensionConstantRule`
+/// normalizes it).
+fn ext_constant_vector(width: usize) -> ArrayRef {
+    let ext_dtype = vectors(width, 0).dtype().as_extension().clone();
+    let element_dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+    let children: Vec<Scalar> = (0..width)
+        .map(|i| Scalar::primitive(((i % 97) as f64) - 48.0, Nullability::NonNullable))
+        .collect();
+    let fsl_scalar = Scalar::fixed_size_list(element_dtype, children, Nullability::NonNullable);
+    ExtensionArray::new(ext_dtype, ConstantArray::new(fsl_scalar, ROWS).into_array()).into_array()
+}
+
+/// The rhs is the same broadcast query as `column_x_constant`, spelled as an extension array over
+/// constant storage rather than a top-level constant.
+#[divan::bench(args = WIDTHS)]
+fn column_x_ext_constant(bencher: Bencher, width: usize) {
+    bench_cosine(bencher, vectors(width, 0), ext_constant_vector(width));
 }

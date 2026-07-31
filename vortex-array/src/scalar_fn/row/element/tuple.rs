@@ -8,7 +8,9 @@ use vortex_error::vortex_ensure_eq;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::arrays::Extension;
 use crate::arrays::Masked;
+use crate::arrays::extension::ExtensionArrayExt;
 use crate::arrays::masked::MaskedArraySlotsExt;
 use crate::dtype::DType;
 use crate::scalar_fn::ExecutionArgs;
@@ -64,22 +66,32 @@ impl<T: InputElement> ArgColumn<T> {
 
 /// The array whose every row holds one distinct value, when `array` is constant for the batch.
 ///
-/// Beyond the constant encoding itself this sees one level through [`Masked`], which is how the
-/// compressor spells "the same value in every row, some rows null": the masked child carries the
-/// value, the wrapper carries only validity. Reading the child's value for a null row is sound
-/// here because the strict lifting owns validity entirely; the row loop's output behind a null
-/// row is masked away (dense) or never computed (filter), so which value the loop read there
-/// cannot be observed. An all-null constant never reaches decode at all, since the lifting
-/// short-circuits it to an all-null result first.
+/// Beyond the constant encoding itself this sees one level through two wrappers that spell "the
+/// same value in every row" without being the constant encoding:
+///
+/// - [`Masked`], how the compressor spells an all-same-with-nulls chunk: the child carries the
+///   value, the wrapper carries only validity. Reading the child's value for a null row is sound
+///   here because the strict lifting owns validity entirely; the row loop's output behind a null
+///   row is masked away (dense) or never computed (filter), so which value the loop read there
+///   cannot be observed. An all-null constant never reaches decode at all, since the lifting
+///   short-circuits it to an all-null result first.
+/// - [`Extension`] over constant storage, the shape an extension-typed builder produces before
+///   `ExtensionConstantRule` normalizes it to a top-level constant. Every row wraps the same
+///   storage value, so the whole array (sliced to one row, keeping its extension dtype) is the
+///   constant.
 fn batch_constant(array: &ArrayRef) -> Option<ArrayRef> {
     if array.as_constant().is_some() {
         return Some(array.clone());
     }
 
+    if let Some(masked) = array.as_opt::<Masked>() {
+        return Some(masked.child().clone()).filter(|child| child.as_constant().is_some());
+    }
+
     array
-        .as_opt::<Masked>()
-        .map(|masked| masked.child().clone())
-        .filter(|child| child.as_constant().is_some())
+        .as_opt::<Extension>()
+        .is_some_and(|ext| ext.storage_array().as_constant().is_some())
+        .then(|| array.clone())
 }
 
 /// Tuples of [`InputElement`]s forming the typed argument list a [`RowFn`](crate::scalar_fn::RowFn)

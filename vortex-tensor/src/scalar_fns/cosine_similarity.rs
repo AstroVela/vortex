@@ -25,9 +25,10 @@ use vortex_session::registry::CachedId;
 
 use crate::scalar_fns::inner_product::InnerProduct;
 use crate::scalar_fns::l2_denorm::DenormOrientation;
-use crate::scalar_fns::l2_denorm::try_build_constant_l2_denorm;
 use crate::scalar_fns::l2_norm::L2Norm;
 use crate::scalar_fns::row::TensorRow;
+#[cfg(test)]
+use crate::scalar_fns::row::probe;
 use crate::scalar_fns::row::tensor_element_ptype;
 use crate::utils::extract_l2_denorm_children;
 
@@ -73,9 +74,13 @@ impl RowFn for CosineSimilarity {
     ) -> VortexResult<V::Out> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
             visitor.visit_prepared::<(TensorRow<T>, TensorRow<T>), ConstNorms<T>, T>(
-                |(lhs, rhs)| ConstNorms {
-                    lhs: lhs.map(l2_norm_row),
-                    rhs: rhs.map(l2_norm_row),
+                |(lhs, rhs)| {
+                    #[cfg(test)]
+                    probe::record(lhs.is_some(), rhs.is_some());
+                    ConstNorms {
+                        lhs: lhs.map(l2_norm_row),
+                        rhs: rhs.map(l2_norm_row),
+                    }
                 },
                 |norms, (lhs, rhs)| cosine_similarity_row_prepared(norms, lhs, rhs),
             )
@@ -95,14 +100,8 @@ impl RowFn for CosineSimilarity {
         args: &[ArrayRef],
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let mut lhs = args[0].clone();
-        let mut rhs = args[1].clone();
-        if let Some(sfn) = try_build_constant_l2_denorm(&lhs, lhs.len(), ctx)? {
-            lhs = sfn.into_array();
-        }
-        if let Some(sfn) = try_build_constant_l2_denorm(&rhs, rhs.len(), ctx)? {
-            rhs = sfn.into_array();
-        }
+        let lhs = args[0].clone();
+        let rhs = args[1].clone();
 
         match DenormOrientation::classify(&lhs, &rhs) {
             DenormOrientation::Both { lhs, rhs } => cosine_both_denorm(lhs, rhs, ctx).map(Some),

@@ -20,6 +20,7 @@ use vortex_error::VortexResult;
 
 use crate::scalar_fns::cosine_similarity::CosineSimilarity;
 use crate::scalar_fns::l2_denorm::L2Denorm;
+use crate::scalar_fns::row::probe;
 use crate::tests::SESSION;
 use crate::types::vector::Vector;
 use crate::utils::test_helpers::assert_close;
@@ -435,9 +436,12 @@ fn constant_self_similarity_nonunit() -> VortexResult<()> {
     Ok(())
 }
 
+/// An extension array over constant storage (what [`Vector::constant_array`] builds) is a batch
+/// constant like any other: the row layer sees through the wrapper, so `prepare` hoists its norm
+/// exactly as it does for the literal shape. This used to be intercepted by a hand-written
+/// `reduce_encoded` rewrite into `L2Denorm`, deleted in favor of the framework path.
 #[test]
 fn vector_constant_matches_plain() -> VortexResult<()> {
-    // Exercise the `Vector` extension variant through the new pre-pass.
     let lhs = Vector::constant_array(&[1.0, 2.0, 2.0], 4)?;
     let rhs = vector_array(
         3,
@@ -448,9 +452,15 @@ fn vector_constant_matches_plain() -> VortexResult<()> {
             2.0, 1.0, 2.0, //
         ],
     )?;
+
     assert_close(
         &eval_cosine_similarity(lhs, rhs)?,
         &[1.0 / 3.0, 1.0, 2.0 / 3.0, 8.0 / 9.0],
+    );
+    assert_eq!(
+        probe::SEEN_CONSTANTS.get(),
+        0b01,
+        "the extension-over-constant lhs must reach prepare as a batch constant",
     );
     Ok(())
 }
