@@ -330,15 +330,18 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::Nullability;
     use vortex_array::expr::eq;
     use vortex_array::expr::gt;
     use vortex_array::expr::lit;
     use vortex_array::expr::or;
+    use vortex_array::expr::pack;
     use vortex_array::expr::root;
     use vortex_buffer::buffer;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
 
+    use super::Partitioning;
     use crate::LayoutReader;
     use crate::LayoutStrategy;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
@@ -348,6 +351,122 @@ mod tests {
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::test::new_session;
+
+    /// A reader over a five-element `i32` layout. Partitioning only consults the child's dtype,
+    /// so no data is read.
+    fn reader() -> RowIdxLayoutReader {
+        block_on(|handle| async move {
+            let session = new_session().with_handle(handle);
+            let segments = Arc::new(TestSegments::default());
+            let (ptr, eof) = SequenceId::root().split();
+            let layout = FlatLayoutStrategy::default()
+                .write_stream(
+                    ArrayContext::empty().into(),
+                    Arc::<TestSegments>::clone(&segments),
+                    buffer![1..=5].into_array().to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await
+                .unwrap();
+            Ok::<_, vortex_error::VortexError>(RowIdxLayoutReader::new(
+                0,
+                layout
+                    .new_reader("".into(), segments, &session, &Default::default())
+                    .unwrap(),
+                session.clone(),
+            ))
+        })
+        .unwrap()
+    }
+
+    /// An expression that never mentions the row index is handed to the child untouched.
+    #[test]
+    fn partitions_child_only() {
+        let expr = eq(root(), lit(3i32));
+        match reader().partition_expr(&expr).unwrap() {
+            Partitioning::Child(child) => assert_eq!(child, expr),
+            _ => panic!("expected a child-only partitioning"),
+        }
+    }
+
+    /// An expression that only mentions the row index is stepped down into the row index's own
+    /// scope, replacing `row_idx()` with `$`.
+    #[test]
+    fn partitions_row_idx_only() {
+        let expr = eq(row_idx(), lit(3u64));
+        match reader().partition_expr(&expr).unwrap() {
+            Partitioning::RowIdx(stepped) => assert_eq!(stepped, eq(root(), lit(3u64))),
+            _ => panic!("expected a row-idx-only partitioning"),
+        }
+    }
+
+    /// An expression spanning both is split into two partitions, each a `pack` of that
+    /// partition's sub-expressions. The packed shape gives every partition a struct dtype, which
+    /// is what `PartitionedExprEval` dispatches on.
+    #[test]
+    fn partitions_across_row_idx_and_child() {
+        let expr = or(eq(row_idx(), lit(0u64)), eq(root(), lit(3i32)));
+        match reader().partition_expr(&expr).unwrap() {
+            Partitioning::Partitioned(partitioned) => {
+                assert_eq!(partitioned.partitions.len(), 2);
+
+                let names = partitioned.partition_names.clone();
+                assert!(names.iter().any(|name| *name == "row_idx"), "{names:?}");
+                assert!(names.iter().any(|name| *name == "child"), "{names:?}");
+
+                assert!(
+                    partitioned
+                        .partition_dtypes
+                        .iter()
+                        .all(|dtype| dtype.is_struct()),
+                    "packed partitions have struct dtypes: {:?}",
+                    partitioned.partition_dtypes
+                );
+
+                // The row index partition is stepped down into its own scope: `row_idx()` becomes
+                // `$`, and the predicate is packed under a per-sub-expression name.
+                let row_idx_partition = partitioned
+                    .partition_names
+                    .iter()
+                    .position(|name| *name == "row_idx")
+                    .map(|idx| &partitioned.partitions[idx])
+                    .unwrap();
+                assert_eq!(
+                    row_idx_partition,
+                    &pack(
+                        [("row_idx_0", eq(root(), lit(0u64)))],
+                        Nullability::NonNullable
+                    )
+                );
+            }
+            _ => panic!("expected a partitioning across both"),
+        }
+    }
+
+    /// Two distinct sub-expressions over the same partition are packed together, so the child is
+    /// still read once.
+    #[test]
+    fn partitions_pack_multiple_sub_expressions() {
+        let expr = or(
+            eq(row_idx(), lit(0u64)),
+            or(eq(root(), lit(3i32)), gt(row_idx(), lit(9u64))),
+        );
+        match reader().partition_expr(&expr).unwrap() {
+            Partitioning::Partitioned(partitioned) => {
+                assert_eq!(partitioned.partitions.len(), 2);
+                let row_idx_dtype = partitioned
+                    .partition_names
+                    .iter()
+                    .position(|name| *name == "row_idx")
+                    .map(|idx| &partitioned.partition_dtypes[idx])
+                    .unwrap();
+                // Both row-index predicates live in one partition.
+                assert_eq!(row_idx_dtype.as_struct_fields().nfields(), 2);
+            }
+            _ => panic!("expected a partitioning across both"),
+        }
+    }
 
     #[test]
     fn flat_expr_no_row_id() {
