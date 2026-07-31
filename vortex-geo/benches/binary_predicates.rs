@@ -16,6 +16,7 @@
 
 #![expect(clippy::unwrap_used)]
 
+use std::f64::consts::TAU;
 use std::sync::LazyLock;
 
 use divan::Bencher;
@@ -55,7 +56,7 @@ fn query_ring(cx: f64, cy: f64) -> Vec<(f64, f64)> {
     let n = 128;
     (0..=n)
         .map(|i| {
-            let theta = (i % n) as f64 / n as f64 * std::f64::consts::TAU;
+            let theta = (i % n) as f64 / n as f64 * TAU;
             (cx + 100.0 * theta.cos(), cy + 100.0 * theta.sin())
         })
         .collect()
