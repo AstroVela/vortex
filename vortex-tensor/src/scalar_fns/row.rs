@@ -164,3 +164,23 @@ impl<T: Float + NativePType> OutputSink for TensorSink<T> {
         )
     }
 }
+
+/// Test-only probe recording which operands the last `prepare` step saw as batch-constant, so a
+/// test can assert its inputs took the stride-0 decode path rather than merely producing the right
+/// values through the varying path.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Bitmask of the constant operands the last `prepare` saw (bit 0 for the lhs, bit 1 for
+        /// the rhs). Thread-local rather than a process global so concurrent tests in one process
+        /// (plain `cargo test`) cannot race it; execution runs on the calling thread.
+        pub(crate) static SEEN_CONSTANTS: Cell<u8> = const { Cell::new(u8::MAX) };
+    }
+
+    /// Record which operands `prepare` saw as constant.
+    pub(crate) fn record(lhs_constant: bool, rhs_constant: bool) {
+        SEEN_CONSTANTS.set(u8::from(lhs_constant) | (u8::from(rhs_constant) << 1));
+    }
+}
