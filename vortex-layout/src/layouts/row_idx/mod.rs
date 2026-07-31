@@ -29,7 +29,8 @@ use vortex_array::expr::Expression;
 use vortex_array::expr::is_root;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::PartitionedExpr;
-use vortex_array::expr::transform::partition;
+use vortex_array::expr::transform::Partitioner;
+use vortex_array::expr::transform::partition_annotated;
 use vortex_array::expr::transform::replace;
 use vortex_array::scalar::PValue;
 use vortex_error::VortexExpect;
@@ -87,17 +88,24 @@ impl RowIdxLayoutReader {
 
     fn compute_partitioning(&self, expr: &Expression) -> VortexResult<Partitioning> {
         // Partition the expression into row idx and child expressions.
-        let mut partitioned = partition(expr.clone(), self.dtype(), |expr| {
-            if expr.is::<RowIdx>() {
-                vec![Partition::RowIdx]
-            } else if is_root(expr) {
-                vec![Partition::Child]
-            } else {
-                vec![]
-            }
-        })?;
+        let partitioned = partition_annotated(
+            &RowIdxPartitioner {
+                scope: self.dtype().clone(),
+            },
+            expr.clone(),
+            |expr| {
+                if expr.is::<RowIdx>() {
+                    vec![Partition::RowIdx]
+                } else if is_root(expr) {
+                    vec![Partition::Child]
+                } else {
+                    vec![]
+                }
+            },
+        )?;
 
-        // If there's only a single partition, we can directly return the expression.
+        // If there's only a single partition, we can directly return the expression, stepped into
+        // the scope that will evaluate it.
         if partitioned.partitions.len() == 1 {
             return Ok(match &partitioned.partition_annotations[0] {
                 Partition::RowIdx => {
@@ -107,14 +115,35 @@ impl RowIdxLayoutReader {
             });
         }
 
-        // Replace the row_idx expression with the root expression in the row_idx partition.
-        partitioned.partitions = partitioned
-            .partitions
-            .into_iter()
-            .map(|p| replace(p, &row_idx(), root()))
-            .collect();
-
         Ok(Partitioning::Partitioned(Arc::new(partitioned)))
+    }
+}
+
+/// Splits expressions into the part that reads the row index and the part that reads the child.
+///
+/// Both partitions are evaluated against a scope this reader already has — the child's dtype for
+/// [`Partition::Child`], and the row index itself for [`Partition::RowIdx`] — so the only stage
+/// needed is stepping the row index partition down, replacing `row_idx()` with `$`.
+struct RowIdxPartitioner {
+    scope: DType,
+}
+
+impl Partitioner for RowIdxPartitioner {
+    type Slot = Partition;
+
+    fn scope(&self) -> &DType {
+        &self.scope
+    }
+
+    fn slot_name(&self, slot: &Self::Slot) -> FieldName {
+        FieldName::from(slot.name())
+    }
+
+    fn step_into(&self, expr: Expression, slot: &Self::Slot) -> VortexResult<Expression> {
+        Ok(match slot {
+            Partition::RowIdx => replace(expr, &row_idx(), root()),
+            Partition::Child => expr,
+        })
     }
 }
 
