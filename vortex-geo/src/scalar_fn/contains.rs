@@ -3,7 +3,12 @@
 
 //! `ST_Contains`: OGC containment test between two native geometries.
 
+use std::cell::OnceCell;
+
 use geo::Contains;
+use geo::PreparedGeometry;
+use geo::Relate;
+use geo_types::Geometry;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
@@ -17,6 +22,8 @@ use vortex_error::VortexResult;
 use vortex_session::registry::CachedId;
 
 use crate::scalar_fn::row::GeometryRow;
+#[cfg(test)]
+use crate::scalar_fn::row::probe;
 
 /// OGC `ST_Contains` between two native geometry operands, each a column or a constant
 /// literal: true where operand `b` lies completely inside operand `a` (boundary contact alone
@@ -56,7 +63,216 @@ impl RowFn for GeoContains {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(GeometryRow, GeometryRow), bool>(|(a, b)| a.contains(b))
+        visitor.visit_prepared::<(GeometryRow, GeometryRow), ConstOperands, bool>(
+            |(a, b)| {
+                #[cfg(test)]
+                probe::record(a.is_some(), b.is_some());
+                ConstOperands {
+                    a: a.map(PreparedOperand::new),
+                    b: b.map(PreparedOperand::new),
+                }
+            },
+            |operands, (a, b)| contains_row_prepared(operands, a, b),
+        )
+    }
+}
+
+/// Per-batch state for the contains row kernel: the prepared form of whichever operand is
+/// constant for the batch. `None` marks an operand that varies by row.
+struct ConstOperands {
+    /// Operand `a` (the container) when it is batch-constant.
+    a: Option<PreparedOperand>,
+
+    /// Operand `b` (the contained) when it is batch-constant.
+    b: Option<PreparedOperand>,
+}
+
+/// One batch-constant operand: the geometry cloned out of its decoded column (the state must not
+/// borrow from the columns), plus its [`PreparedGeometry`], built on the first row whose pairing
+/// routes through relate.
+///
+/// The build is lazy because preparation (self-noding the topology graph plus an R*-tree over the
+/// edges) costs `O(edges log edges)` and pays off only on relate-routed pairings; a batch of
+/// point rows against a constant polygon never touches it, and preparing a large constant eagerly
+/// would charge such a batch for nothing.
+struct PreparedOperand {
+    /// The constant's decoded geometry, owned so [`prepared`](Self::prepared) can be `'static`.
+    geometry: Geometry<f64>,
+
+    /// The lazily built prepared form of [`geometry`](Self::geometry).
+    prepared: OnceCell<PreparedGeometry<'static, Geometry<f64>, f64>>,
+}
+
+impl PreparedOperand {
+    fn new(geometry: &Geometry<f64>) -> Self {
+        Self {
+            geometry: geometry.clone(),
+            prepared: OnceCell::new(),
+        }
+    }
+
+    /// The prepared geometry, built on first use.
+    fn get(&self) -> &PreparedGeometry<'static, Geometry<f64>, f64> {
+        self.prepared
+            .get_or_init(|| PreparedGeometry::from(self.geometry.clone()))
+    }
+}
+
+/// How geo's `a.contains(b)` computes its verdict for a pairing.
+enum ContainsRoute {
+    /// `a.relate(b).is_contains()`.
+    ForwardRelate,
+
+    /// `b.relate(a).is_within()`, how geo phrases relate for `MultiPolygon` containers.
+    ReversedRelate,
+
+    /// A direct algorithm (coordinate position, point arithmetic); nothing to prepare.
+    Direct,
+}
+
+/// The route geo 0.31's `Contains` dispatch takes for `a.contains(b)`.
+///
+/// The prepared substitution in [`contains_row_prepared`] **must** run relate exactly where geo
+/// runs relate, with the same argument order, because geo's direct algorithms are not everywhere
+/// bit-identical to a relate matrix query (they resolve degenerate and boundary cases with
+/// different arithmetic). The relate rows below transcribe geo's `impl_contains_from_relate!`
+/// lists per container type; everything else, notably every `Point`/`MultiPoint` contained side
+/// and every `Point` container, is direct.
+fn contains_route(a: &Geometry<f64>, b: &Geometry<f64>) -> ContainsRoute {
+    use Geometry as G;
+
+    match (a, b) {
+        // Line contains [Polygon, MultiLineString, MultiPolygon, GeometryCollection, Rect,
+        // Triangle].
+        (
+            G::Line(_),
+            G::Polygon(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        )
+        // LineString contains [Polygon, MultiPoint, MultiLineString, MultiPolygon,
+        // GeometryCollection, Rect, Triangle].
+        | (
+            G::LineString(_),
+            G::Polygon(_)
+            | G::MultiPoint(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        )
+        // MultiLineString contains everything except Point.
+        | (
+            G::MultiLineString(_),
+            G::Line(_)
+            | G::LineString(_)
+            | G::Polygon(_)
+            | G::MultiPoint(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        )
+        // MultiPoint contains [Line, LineString, Polygon, MultiLineString, MultiPolygon,
+        // GeometryCollection, Rect, Triangle].
+        | (
+            G::MultiPoint(_),
+            G::Line(_)
+            | G::LineString(_)
+            | G::Polygon(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        )
+        // Polygon contains everything except Point and MultiPoint.
+        | (
+            G::Polygon(_),
+            G::Line(_)
+            | G::LineString(_)
+            | G::Polygon(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        )
+        // Rect contains [Line, LineString, MultiPoint, MultiLineString, MultiPolygon,
+        // GeometryCollection, Triangle]; Rect contains Rect and Polygon are direct.
+        | (
+            G::Rect(_),
+            G::Line(_)
+            | G::LineString(_)
+            | G::MultiPoint(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Triangle(_),
+        )
+        // Triangle and GeometryCollection contain everything except Point.
+        | (
+            G::Triangle(_) | G::GeometryCollection(_),
+            G::Line(_)
+            | G::LineString(_)
+            | G::Polygon(_)
+            | G::MultiPoint(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        ) => ContainsRoute::ForwardRelate,
+
+        // MultiPolygon contains everything except Point and MultiPoint, phrased reversed.
+        (
+            G::MultiPolygon(_),
+            G::Line(_)
+            | G::LineString(_)
+            | G::Polygon(_)
+            | G::MultiLineString(_)
+            | G::MultiPolygon(_)
+            | G::GeometryCollection(_)
+            | G::Rect(_)
+            | G::Triangle(_),
+        ) => ContainsRoute::ReversedRelate,
+
+        _ => ContainsRoute::Direct,
+    }
+}
+
+/// Computes one row of contains, substituting a prepared graph for a constant operand on the
+/// pairings geo itself answers through relate.
+///
+/// [`PreparedGeometry`] carries the operand's self-noded topology graph and edge R*-tree, so a
+/// relate against it skips rebuilding both and reads its bounding rect from cache; geo asserts
+/// the cached graph equal to a freshly built one (its `swap_arg_index` test), which is what makes
+/// the substitution result-preserving. Direct pairings and the no-constant batch call the
+/// unchanged `a.contains(b)`.
+fn contains_row_prepared(operands: &ConstOperands, a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
+    if operands.a.is_none() && operands.b.is_none() {
+        return a.contains(b);
+    }
+
+    match contains_route(a, b) {
+        ContainsRoute::Direct => a.contains(b),
+        ContainsRoute::ForwardRelate => match (&operands.a, &operands.b) {
+            (Some(const_a), Some(const_b)) => const_a.get().relate(const_b.get()).is_contains(),
+            (Some(const_a), None) => const_a.get().relate(b).is_contains(),
+            (None, Some(const_b)) => a.relate(const_b.get()).is_contains(),
+            (None, None) => a.contains(b),
+        },
+        ContainsRoute::ReversedRelate => match (&operands.a, &operands.b) {
+            (Some(const_a), Some(const_b)) => const_b.get().relate(const_a.get()).is_within(),
+            (Some(const_a), None) => b.relate(const_a.get()).is_within(),
+            (None, Some(const_b)) => const_b.get().relate(a).is_within(),
+            (None, None) => a.contains(b),
+        },
     }
 }
 
@@ -64,6 +280,8 @@ impl RowFn for GeoContains {
 mod tests {
     use geo_types::Geometry;
     use geo_types::LineString;
+    use geo_types::MultiPoint;
+    use geo_types::MultiPolygon;
     use geo_types::Point;
     use geo_types::Polygon;
     use rstest::rstest;
@@ -88,6 +306,7 @@ mod tests {
     use wkb::writer::WriteOptions;
 
     use super::GeoContains;
+    use crate::scalar_fn::row::probe::assert_prepared_agrees_with_columns;
     use crate::test_harness::nullable_point_column;
     use crate::test_harness::point_column;
 
@@ -330,5 +549,67 @@ mod tests {
         let result = GeoContains.return_dtype(&EmptyOptions, &[geo, numeric]);
         assert!(result.is_err());
         Ok(())
+    }
+
+    // The prepared-vs-expanded agreement grid: every constant arrangement of a pairing must
+    // return exactly what the fully expanded columns return.
+
+    /// A point geometry.
+    fn point(x: f64, y: f64) -> Geometry {
+        Geometry::Point(Point::new(x, y))
+    }
+
+    /// A linestring geometry through `coords`.
+    fn line(coords: Vec<(f64, f64)>) -> Geometry {
+        Geometry::LineString(LineString::from(coords))
+    }
+
+    /// A multipoint geometry over `coords`.
+    fn multipoint(coords: Vec<(f64, f64)>) -> Geometry {
+        Geometry::MultiPoint(MultiPoint::from(coords))
+    }
+
+    /// A two-part multipolygon: `4x4` squares at the origin and at `(10, 10)`.
+    fn two_part_multipolygon() -> Geometry {
+        Geometry::MultiPolygon(MultiPolygon::new(vec![
+            rect_polygon(0.0, 0.0, 4.0, 4.0),
+            rect_polygon(10.0, 10.0, 14.0, 14.0),
+        ]))
+    }
+
+    /// Constant arrangements agree with expanded columns across the routes the prepared kernel
+    /// distinguishes: forward relate (polygon and linestring containers), reversed relate
+    /// (multipolygon containers), and the direct pairings (a point on either side, polygon over
+    /// multipoint), including boundary contact, crossing, disjoint and empty cases.
+    #[rstest]
+    #[case::polygon_nested_polygon(rect_polygon(0.0, 0.0, 8.0, 8.0).into(), rect_polygon(2.0, 2.0, 4.0, 4.0).into())]
+    #[case::polygon_touching_from_inside(rect_polygon(0.0, 0.0, 8.0, 8.0).into(), rect_polygon(0.0, 2.0, 2.0, 4.0).into())]
+    #[case::polygon_overlapping_polygon(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), rect_polygon(2.0, 2.0, 6.0, 6.0).into())]
+    #[case::polygon_disjoint_polygon(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), rect_polygon(20.0, 20.0, 24.0, 24.0).into())]
+    #[case::polygon_x_point_inside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(2.0, 2.0))]
+    #[case::polygon_x_point_on_boundary(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(0.0, 2.0))]
+    #[case::polygon_x_point_outside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(20.0, 20.0))]
+    #[case::polygon_x_linestring_inside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![(1.0, 1.0), (2.0, 2.0)]))]
+    #[case::polygon_x_linestring_on_boundary(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![(0.0, 1.0), (0.0, 3.0)]))]
+    #[case::polygon_x_linestring_crossing(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![(-2.0, 2.0), (2.0, 2.0)]))]
+    #[case::polygon_x_empty_linestring(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![]))]
+    #[case::polygon_x_multipoint_inside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), multipoint(vec![(1.0, 1.0), (2.0, 2.0)]))]
+    #[case::polygon_x_multipoint_on_boundary(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), multipoint(vec![(0.0, 1.0), (0.0, 3.0)]))]
+    #[case::linestring_x_multipoint_on_line(line(vec![(0.0, 0.0), (4.0, 4.0)]), multipoint(vec![(1.0, 1.0), (2.0, 2.0)]))]
+    #[case::multipolygon_x_polygon_in_one_part(two_part_multipolygon(), rect_polygon(1.0, 1.0, 3.0, 3.0).into())]
+    #[case::multipolygon_x_polygon_straddling(two_part_multipolygon(), rect_polygon(3.0, 3.0, 11.0, 11.0).into())]
+    #[case::multipolygon_x_polygon_disjoint(two_part_multipolygon(), rect_polygon(20.0, 20.0, 24.0, 24.0).into())]
+    #[case::multipolygon_x_point_inside(two_part_multipolygon(), point(11.0, 11.0))]
+    #[case::point_x_point_equal(point(1.0, 1.0), point(1.0, 1.0))]
+    #[case::point_x_polygon(point(2.0, 2.0), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
+    fn constant_operands_agree_with_columns(
+        #[case] a: Geometry,
+        #[case] b: Geometry,
+    ) -> VortexResult<()> {
+        assert_prepared_agrees_with_columns(
+            GeoContains::try_new_array,
+            geometry_constant(&a, 3)?,
+            geometry_constant(&b, 3)?,
+        )
     }
 }
