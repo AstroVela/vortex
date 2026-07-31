@@ -9,6 +9,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::Constant;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -16,8 +17,11 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::assert_arrays_eq;
+use vortex_array::compute::conformance::consistency::test_array_consistency;
+use vortex_array::compute::conformance::filter::test_filter_conformance;
 use vortex_array::compute::conformance::take::test_take_conformance;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_native_ptype;
@@ -97,6 +101,389 @@ fn assert_fsl_equivalent(
     assert_eq!(candidate.dtype(), canonical.dtype());
     assert_eq!(candidate.len(), canonical.len());
     assert_arrays_eq!(canonical, candidate, ctx);
+    Ok(())
+}
+
+fn encode_fixture<T: NativePType>(
+    values: Buffer<T>,
+    element_validity: Validity,
+    list_size: u32,
+    outer_validity: Validity,
+    len: usize,
+    geometry: TileGeometry,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(values, element_validity).into_array(),
+        list_size,
+        outer_validity,
+        len,
+    );
+    Ok(TiledFixedSizeList::encode(canonical.as_view(), geometry, ctx)?.into_array())
+}
+
+fn expected_tile_bounds(
+    rows: usize,
+    dimensions: usize,
+    tile_geometry: TileGeometry,
+) -> VortexResult<Vec<TileBounds>> {
+    let tile_rows = usize::try_from(tile_geometry.rows().get())?;
+    let tile_dimensions = usize::try_from(tile_geometry.dimensions().get())?;
+    let mut physical_cursor = 0;
+    let mut bounds = Vec::new();
+
+    for dimension_start in (0..dimensions).step_by(tile_dimensions) {
+        let dimension_end = dimension_start
+            .saturating_add(tile_dimensions)
+            .min(dimensions);
+        for row_start in (0..rows).step_by(tile_rows) {
+            let row_end = row_start.saturating_add(tile_rows).min(rows);
+            let tile_len = (row_end - row_start) * (dimension_end - dimension_start);
+            bounds.push(TileBounds {
+                row_range: row_start..row_end,
+                dimension_range: dimension_start..dimension_end,
+                physical_range: physical_cursor..physical_cursor + tile_len,
+            });
+            physical_cursor += tile_len;
+        }
+    }
+
+    Ok(bounds)
+}
+
+fn boundary_slice_ranges(rows: usize, tile_rows: usize) -> Vec<Range<usize>> {
+    let mut ranges = vec![0..0, 0..rows];
+    for boundary in (tile_rows..rows).step_by(tile_rows) {
+        ranges.extend([
+            0..boundary - 1,
+            0..boundary,
+            0..boundary + 1,
+            boundary - 1..boundary,
+            boundary..boundary + 1,
+            boundary - 1..boundary + 1,
+        ]);
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    ranges
+}
+
+fn conformance_take_indices(rows: usize) -> VortexResult<Vec<ArrayRef>> {
+    let row_count = u32::try_from(rows)?;
+    let mut cases = vec![PrimitiveArray::from_iter::<[u32; 0]>([]).into_array()];
+    if rows == 0 {
+        cases.push(PrimitiveArray::from_option_iter([None::<u32>]).into_array());
+        return Ok(cases);
+    }
+
+    cases.extend([
+        PrimitiveArray::from_iter(0..row_count).into_array(),
+        PrimitiveArray::from_iter((0..row_count).rev()).into_array(),
+        PrimitiveArray::from_iter([0, row_count - 1, 0]).into_array(),
+        PrimitiveArray::from_iter([row_count - 1, 0, row_count / 2]).into_array(),
+        PrimitiveArray::from_option_iter([Some(row_count - 1), None, Some(0)]).into_array(),
+    ]);
+    Ok(cases)
+}
+
+fn assert_scalar_conformance(
+    canonical: &FixedSizeListArray,
+    tiled: &TiledFixedSizeListArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    if tiled.is_empty() {
+        return Ok(());
+    }
+
+    let tile_rows = usize::try_from(tiled.geometry().rows().get())?;
+    let mut scalar_rows = vec![0, tiled.len() - 1];
+    for boundary in (tile_rows..tiled.len()).step_by(tile_rows) {
+        scalar_rows.extend([boundary - 1, boundary]);
+    }
+    scalar_rows.sort_unstable();
+    scalar_rows.dedup();
+    for row in scalar_rows {
+        assert_eq!(
+            canonical.execute_scalar(row, ctx)?,
+            tiled.execute_scalar(row, ctx)?,
+        );
+    }
+    Ok(())
+}
+
+fn assert_tile_conformance(
+    canonical: &FixedSizeListArray,
+    tiled: &TiledFixedSizeListArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    let rows = tiled.len();
+    let dimensions = usize::try_from(tiled.list_size())?;
+    let tile_geometry = tiled.geometry();
+    let tile_rows = usize::try_from(tile_geometry.rows().get())?;
+    let tile_dimensions = usize::try_from(tile_geometry.dimensions().get())?;
+    assert_eq!(tiled.row_tile_count(), rows.div_ceil(tile_rows));
+    assert_eq!(
+        tiled.dimension_tile_count(),
+        dimensions.div_ceil(tile_dimensions)
+    );
+
+    let expected_bounds = expected_tile_bounds(rows, dimensions, tile_geometry)?;
+    let actual_bounds: Vec<TileBounds> = tiled.tiles().collect();
+    assert_eq!(actual_bounds, expected_bounds);
+    for (dimension_tile, dimension_bounds) in (0..dimensions).step_by(tile_dimensions).enumerate() {
+        for (row_tile, row_bounds) in (0..rows).step_by(tile_rows).enumerate() {
+            let expected = &expected_bounds[dimension_tile * tiled.row_tile_count() + row_tile];
+            assert_eq!(tiled.tile(row_tile, dimension_tile)?, *expected);
+
+            let indices = expected
+                .dimension_range
+                .clone()
+                .flat_map(|dimension| {
+                    expected
+                        .row_range
+                        .clone()
+                        .map(move |row| row * dimensions + dimension)
+                })
+                .map(u64::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            let expected_elements = canonical
+                .elements()
+                .clone()
+                .take(PrimitiveArray::from_iter(indices).into_array())?;
+            let actual_elements = tiled.tile_elements(expected)?;
+            assert_arrays_eq!(expected_elements, actual_elements, ctx);
+
+            assert_eq!(dimension_bounds, expected.dimension_range.start);
+            assert_eq!(row_bounds, expected.row_range.start);
+        }
+    }
+    Ok(())
+}
+
+fn assert_slice_conformance(
+    canonical: &FixedSizeListArray,
+    tiled: &TiledFixedSizeListArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    let tile_rows = usize::try_from(tiled.geometry().rows().get())?;
+    for range in boundary_slice_ranges(tiled.len(), tile_rows) {
+        let expected = canonical.clone().into_array().slice(range.clone())?;
+        let actual = tiled.clone().into_array().slice(range)?;
+        if tiled.is_empty() {
+            assert!(actual.is::<TiledFixedSizeList>());
+            assert_eq!(
+                actual.as_::<TiledFixedSizeList>().geometry(),
+                tiled.geometry()
+            );
+        } else if actual.is_empty() {
+            assert!(actual.is::<FixedSizeList>());
+        } else {
+            assert!(actual.is::<TiledFixedSizeList>());
+            assert_eq!(
+                actual.as_::<TiledFixedSizeList>().geometry(),
+                tiled.geometry()
+            );
+        }
+        assert_fsl_equivalent(&expected, &actual, ctx)?;
+    }
+    Ok(())
+}
+
+fn assert_take_oracle_conformance(
+    canonical: &FixedSizeListArray,
+    tiled: &TiledFixedSizeListArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    for indices in conformance_take_indices(tiled.len())? {
+        let expected = canonical.clone().into_array().take(indices.clone())?;
+        let actual = tiled.clone().into_array().take(indices)?;
+        let actual = if !tiled.is_empty() && !actual.is_empty() {
+            let actual = actual.execute_until::<TiledFixedSizeList>(ctx)?;
+            assert_eq!(
+                actual.as_::<TiledFixedSizeList>().geometry(),
+                tiled.geometry()
+            );
+            actual
+        } else if actual.is_empty() {
+            let actual = actual.execute_until::<FixedSizeList>(ctx)?;
+            assert!(actual.is::<FixedSizeList>());
+            actual
+        } else {
+            let actual = actual.execute_until::<Constant>(ctx)?;
+            assert!(actual.is::<Constant>());
+            actual
+        };
+        assert_fsl_equivalent(&expected, &actual, ctx)?;
+    }
+    Ok(())
+}
+
+fn assert_tiled_conformance_case(
+    canonical: &FixedSizeListArray,
+    tile_geometry: TileGeometry,
+) -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), tile_geometry, &mut ctx)?;
+
+    let encoded = tiled
+        .clone()
+        .into_array()
+        .execute::<FixedSizeListArray>(&mut ctx)?
+        .into_array();
+    assert_fsl_equivalent(&canonical.clone().into_array(), &encoded, &mut ctx)?;
+
+    let reconstructed = TiledFixedSizeList::try_new(
+        tiled.elements().clone(),
+        tiled.list_size(),
+        tiled.array_validity(),
+        tiled.len(),
+        tile_geometry,
+    )?;
+    assert_fsl_equivalent(
+        &canonical.clone().into_array(),
+        &reconstructed.into_array(),
+        &mut ctx,
+    )?;
+
+    assert_scalar_conformance(canonical, &tiled, &mut ctx)?;
+    assert_tile_conformance(canonical, &tiled, &mut ctx)?;
+    assert_slice_conformance(canonical, &tiled, &mut ctx)?;
+    assert_take_oracle_conformance(canonical, &tiled, &mut ctx)
+}
+
+#[test]
+fn standard_harness_conformance() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let fixtures = vec![
+        encode_fixture(
+            buffer![0u8, 1, 2, 3, 4, 5],
+            Validity::NonNullable,
+            2,
+            Validity::NonNullable,
+            3,
+            geometry(2, 2),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![0i32, 1, 2, 3, 4, 5],
+            Validity::NonNullable,
+            2,
+            Validity::from_iter([true, false, true]),
+            3,
+            geometry(2, 2),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+            Validity::from_iter([true, false, true, true, false, true]),
+            2,
+            Validity::NonNullable,
+            3,
+            geometry(2, 2),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0],
+            Validity::from_iter([true, false, true, true, false, true]),
+            2,
+            Validity::from_iter([true, false, true]),
+            3,
+            geometry(2, 2),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![0u8; 0],
+            Validity::NonNullable,
+            5,
+            Validity::NonNullable,
+            0,
+            geometry(32, 64),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![0u8; 0],
+            Validity::NonNullable,
+            0,
+            Validity::NonNullable,
+            65,
+            geometry(32, 64),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![7u8; 65 * 129],
+            Validity::NonNullable,
+            129,
+            Validity::NonNullable,
+            65,
+            geometry(32, 64),
+            &mut ctx,
+        )?,
+        encode_fixture(
+            buffer![7u8; 3 * 5],
+            Validity::NonNullable,
+            5,
+            Validity::NonNullable,
+            3,
+            geometry(32, 64),
+            &mut ctx,
+        )?,
+    ];
+
+    for tiled in fixtures {
+        test_array_consistency(&tiled, &mut ctx);
+        test_filter_conformance(&tiled, &mut ctx);
+        test_take_conformance(&tiled, &mut ctx);
+    }
+
+    let (_, raw_tiled, _) = fixture(65, 128, geometry(32, 64))?;
+    vortex_fastlanes::initialize(ctx.session());
+    let physical = raw_tiled
+        .elements()
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)?;
+    let bitpacked = bitpack_encode(&physical, 4, None, &mut ctx)?.into_array();
+    let bitpacked_tiled = TiledFixedSizeList::try_new(
+        bitpacked,
+        128,
+        raw_tiled.array_validity(),
+        65,
+        geometry(32, 64),
+    )?
+    .into_array();
+    test_array_consistency(&bitpacked_tiled, &mut ctx);
+    test_filter_conformance(&bitpacked_tiled, &mut ctx);
+    test_take_conformance(&bitpacked_tiled, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn canonical_oracle_conformance_matrix() -> VortexResult<()> {
+    const ROW_COUNTS: &[usize] = &[0, 1, 15, 16, 31, 32, 33, 63, 64, 65];
+    const DIMENSION_COUNTS: &[u32] = &[0, 1, 3, 4, 63, 64, 65, 129];
+
+    for &rows in ROW_COUNTS {
+        for &dimensions in DIMENSION_COUNTS {
+            let dimension_count = usize::try_from(dimensions)?;
+            let values = (0..rows * dimension_count)
+                .map(u16::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            let canonical = FixedSizeListArray::new(
+                PrimitiveArray::new(Buffer::from(values), Validity::NonNullable).into_array(),
+                dimensions,
+                Validity::NonNullable,
+                rows,
+            );
+            let full_width = dimensions.max(1);
+            for tile_geometry in [
+                geometry(16, 4),
+                geometry(32, 64),
+                geometry(64, 64),
+                geometry(64, full_width),
+            ] {
+                assert_tiled_conformance_case(&canonical, tile_geometry)?;
+            }
+        }
+    }
     Ok(())
 }
 
