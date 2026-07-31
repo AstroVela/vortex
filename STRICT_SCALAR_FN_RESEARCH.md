@@ -1166,3 +1166,126 @@ This is why `not` is a columnar `StrictScalarFnVTable` rather than a row functio
   `ScalarFnFactoryExt::try_new_array` is what every other scalar function already uses.
 - **A separate `FallibleElementwiseFn`**: an associated return type (`ApplyResult`) costs one line per
   function instead of a whole trait and a spent coherence slot.
+
+## Null strategies and the non-strict frontier
+
+The question that opened this chapter: with the strict trait retiring into a private lifting under
+`RowFn`, could the row framework also serve non-strict functions, where the kernel sees each input
+as an `Option` and owns null semantics itself? The prior expectation was "probably not useful or
+performant, but worth establishing why." The answer splits into three verdicts, one per axis, and
+the investigation surfaced a fourth result nobody asked for that is worth more than the question.
+
+Method: a survey of every non-strict `ScalarFnVTable` impl in the workspace plus every consumer of
+`is_strict` and `validity()`, and a working prototype (worktree branch `proto/null-strategies`,
+2,034-line diff, not for merging) that implemented both a branch-and-skip execution strategy and a
+`Nullable<E>` input element, benchmarked on 65,536-row batches at null densities from 0% to 90%.
+All 435 vortex-array scalar_fn tests and 223 vortex-geo tests pass with the prototype strategy both
+off and on, including new hostile tests (out-of-bounds views and poison divisors behind null rows)
+proving the kernel never runs behind a null.
+
+### Verdict 1: null-visible inputs have no customer, and now we know the price
+
+The survey found 15 non-strict functions. Thirteen are cheap columnar mask algebra or pure
+structure. The canonical case is Kleene `AND`: a fused kernel computing values and validity
+together at roughly six bitwise ops per 64 rows, with validity `(lv & rv) | (lv & !l) | (rv & !r)`.
+The prototype measured a row-function Kleene `AND` over `(Nullable<bool>, Nullable<bool>)` against
+it: **250x to 1,030x slower** depending on density. That is the honest price of spelling bitwise
+logic one row at a time, and no framework design recovers it.
+
+The remaining two, `RowEncode` and `RowSize` in vortex-row, are the only genuinely expensive
+null-visible per-row kernels in the tree, and they are excluded by something the Option tier does
+not touch: they are variadic over heterogeneous column types with a shared per-row write cursor,
+which the fixed-arity tuple witness cannot express. Null-visible inputs alone unlock nothing.
+
+Four functions (Kleene `AND`/`OR`, `zip`, `case_when`, `list_contains`) have **value-dependent
+output validity**: `false AND null` is a *valid* `false`. For these no validity expression over
+child validities exists even in principle, so the lifting's derivations (validity expression, mask
+motion, dictionary push-down eligibility) are unavailable by definition rather than by
+implementation gap. Any future Option-input tier must let the kernel author value and validity
+together, which is to say it must be a different trait, not a mode of this one.
+
+What `is_strict = false` forfeits is exactly enumerable: the dictionary values push-down
+(`arrays/dict/compute/rules.rs`), the dict-layout below-decode push-down
+(`vortex-layout/src/layouts/dict/reader.rs`), and, when `validity()` is also `None`, lazy validity
+on an unexecuted `ScalarFnArray` degrades to executing the kernel to read its nulls. Nothing in
+vortex-scan, vortex-file, or the engine integrations consumes strictness.
+
+Mechanically, `Nullable<E>` works exactly as sketched: `Elem<'a> = Option<E::Elem<'a>>`, decode
+materializes the validity mask once, `get(i)` consults it, `DENSE_SAFE = true` by construction.
+Niche packing is free for every by-reference element (`Option<&[u8]>`, `Option<&str>`,
+`Option<&[T]>`, `Option<&Geometry>`, `Option<bool>` all compile-time asserted same-size) and
+doubles every by-value primitive, which are precisely the elements that were already dense-safe
+and never needed a strategy. The prototype's geo `contains` over `(Nullable<GeometryRow>, const)`
+tracked branch-and-skip within 2-8%, so the shape is viable for a kernel that wants null
+visibility for semantic reasons. Nothing in the tree does. **Do not build it; keep the survey's
+constraint list for whenever a real variadic or null-visible demand shows up.**
+
+### Verdict 2: Option outputs inside the strict tier are the real demand
+
+Strictness is a subset bound, `valid(out) ⊆ valid(in)`, so a kernel that turns a valid row into a
+null is still strict, and the strict lifting already keeps kernel-produced nulls, unioned with the
+lifted ones. What excludes such functions from `RowFn` today is only the all-valid-output rule on
+`OutputElement`. Two in-tree functions are shaped exactly like this: `list_sum` (a valid empty
+list sums to null; the module doc names it as the canonical exclusion) and `variant_get`
+(expensive per-row path traversal where a missing path yields null). The extension is small and
+local: an `Option<T>` output form whose element dtype is nullable and whose build sets validity,
+`RetWitness` gaining a nullability bit alongside `FALLIBLE`, and the derived `validity()` moving
+from `union_child_validities` to `None` for such functions, which costs them lazy validity but is
+already the status quo for both named candidates. `is_strict` stays `true`. **This is the piece
+worth building.**
+
+### Verdict 3: branch-and-skip, the result nobody asked for
+
+Today the derived null handling is binary: `Dense` (run over garbage, mask after) when every
+element is dense-safe and the kernel infallible, else `Filter` (filter every input to the
+conjoined-valid rows, run, scatter back). The prototype added the missing third strategy:
+materialize the conjoined mask once, run over the *unfiltered* inputs visiting only set rows
+word-at-a-time (`BitBuffer::for_each_set_index`), pre-fill the output with garbage, mask exactly
+as Dense does. Fallible kernels stay sound because apply never runs behind a null.
+
+Measured against Filter at 65,536 rows (divan fastest, two runs):
+
+| workload | 1% nulls | 10% | 25% | 50% | 90% |
+| --- | --- | --- | --- | --- | --- |
+| `byte_length` at `Bytes` (cheap kernel) | branch 1.8x | 2.6x | 3.8x | 4.7x | **5.9x** |
+| geo `contains`, one nullable operand | branch 1.07x | 1.11x | 1.18x | 1.11x | filter 1.38x |
+| geo `contains`, two nullable operands | branch 1.06x | even | filter 1.2x | filter 1.9x | filter 11.3x |
+
+For the cheap kernel Filter never wins: at even 1% nulls, filtering the input plus scattering the
+output costs more than the entire branch-side loop. For the expensive kernel the governing
+quantity is the **surviving-row fraction**: branch pays O(n) decode regardless, Filter pays
+O(survivors) decode plus filter and scatter. Geo's ablation makes the mechanism explicit: filter
+plus scatter are under 4% of `contains`' total, so Filter's entire advantage at sparse validity is
+the shrunken arrow-export-and-parse, while for `byte_length` those same two steps are 20-40% of
+Filter's total and pure waste. Crossover lands near 50-75% surviving rows for one nullable operand
+and lower with two (the conjoined fraction shrinks quadratically).
+
+The strategy is invisible to function authors: it slots under the existing derived null handling,
+selectable per batch from `Mask::true_count`, with Filter kept for the sparse tail. The prototype
+also validated the two supporting pieces: a null-tolerant `decode_branch` on `InputElement`
+(defaulting to plain decode, correct for bulk canonicalizations) and `OutputElement::garbage()`
+for pre-fill. Production caveats recorded in the prototype report: `reduce_encoded` is not
+consulted on the branch path, sinks fall back to Filter, the toggle must become per-execution and
+cost-based, and geo's null-tolerant decode covered Point and Polygon only, still paying a
+full-length arrow export that a run-slicing decode would shrink. **This is the highest-value
+follow-up after the Option-output extension: `Bytes`-element functions currently pay the Filter
+tax on every nullable batch, and it is mostly recoverable.**
+
+### Adjacent findings, recorded so they are not relearned
+
+- `Between::validity` declares the strict three-way conjunction while its fallback execute path
+  joins two comparisons with Kleene `AND`; with per-row nullable bounds the lazy validity and the
+  executed result disagree (a valid `false` reported as null). Pre-existing on develop,
+  independent of this work, slated-for-removal expression; deserves an issue.
+- `not` is already at the optimum reachable through the current ownership model: `to_bit_buffer()`
+  is a handle clone, the source array keeps the buffer shared, so in-place negation (a real 19% on
+  uniquely owned buffers) is unreachable without redesigning `ExecutionArgs` ownership. Encoded
+  NOT flows through `NotReduce` (Constant, Sparse) and generic per-encoding push-down (Dictionary,
+  RunEnd) at 13-24x below canonical cost; `NotKernel` has no implementations and looks like dead
+  code. The three columnar ports of the retired strict trait revert entirely.
+- The strict lifting's small-batch overhead is generic prelude bookkeeping (collect inputs,
+  compute the declared dtype, conjoin validity), not any single avoidable allocation; ablations
+  including SmallVec found nothing independently beneficial, and the earlier -10%-at-100-rows
+  reading did not reproduce uniformly. The row layer can eventually monomorphize the prelude over
+  its compile-time arity (`[ArrayRef; N]` via the tuple witness), which is the only structural
+  answer if small batches ever matter.
