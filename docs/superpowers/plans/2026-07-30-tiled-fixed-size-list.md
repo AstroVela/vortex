@@ -1661,14 +1661,21 @@ git commit -s -m "test: cover bitpacked tiled list children"
 - Create: `vortex-file/tests/tiled_fsl.rs`
 - Modify: `vortex/Cargo.toml:20-105`
 - Modify: `vortex/src/lib.rs:235-285`
+- Create: `vortex/src/editions/unstable/v2026_07.rs`
+- Modify: `vortex/src/editions/unstable/mod.rs`
+- Modify: `vortex/src/editions/mod.rs`
+- Modify: `vortex/src/editions/tests.rs`
 
 **Interfaces:**
 - Consumes: `vortex_tiled_fsl::initialize`.
 - Produces: decoder registration under `vortex-file/unstable_encodings`.
 - Produces: `vortex::encodings::tiled_fsl` under `vortex/unstable_encodings`.
+- Produces: writer permission in the default unstable edition without changing a
+  frozen `core` edition.
 - Proves: explicit experimental writer-edition file round-trip retains the
   tiled parent for both raw and FastLanes-bitpacked children, retains the
   bitpacked child encoding, and preserves logical values.
+- Proves: the ordinary default unstable session permits tiled FSL output.
 
 - [ ] **Step 1: Add a failing feature-gated file round-trip test**
 
@@ -1746,8 +1753,10 @@ In `register_default_encodings`:
 vortex_tiled_fsl::initialize(session);
 ```
 
-Do not declare inclusion in a production edition. The integration test's test
-edition is the only new writer permission.
+Keep the private permissive test edition: it remains useful for exhaustive
+nested round-trips. Also declare tiled FSL in the next unstable edition and add
+an ordinary-default-session test to prove the normal writer policy. Do not add
+tiled FSL to a frozen `core` edition.
 
 - [ ] **Step 4: Wire the optional facade dependency and re-export**
 

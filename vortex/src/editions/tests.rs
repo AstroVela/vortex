@@ -161,6 +161,22 @@ fn default_session_enables_the_write_editions() {
     assert!(!enabled.contains(&DEFAULT_UNSTABLE_EDITION));
 }
 
+#[cfg(feature = "unstable_encodings")]
+#[test]
+fn default_unstable_edition_permits_tiled_fixed_size_list() {
+    use vortex_array::VTable as _;
+    use vortex_tiled_fsl::TiledFixedSizeList;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    assert!(
+        session
+            .enabled_encoding_ids()
+            .contains(&TiledFixedSizeList.id())
+    );
+}
+
 #[test]
 fn core_edition_ids_are_registered_array_encodings() {
     use vortex_array::session::ArraySessionExt;
