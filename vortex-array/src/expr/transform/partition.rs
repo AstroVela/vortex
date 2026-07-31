@@ -221,6 +221,7 @@ mod tests {
     use super::*;
     use crate::dtype::DType;
     use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::Nullability::Nullable;
     use crate::dtype::PType::I32;
     use crate::dtype::StructFields;
     use crate::expr::analysis::make_free_field_annotator;
@@ -232,6 +233,7 @@ mod tests {
     use crate::expr::pack;
     use crate::expr::root;
     use crate::expr::transform::replace::replace_root_fields;
+    use crate::scalar_fn::fns::pack::Pack;
 
     #[fixture]
     fn dtype() -> DType {
@@ -249,6 +251,119 @@ mod tests {
             ]),
             NonNullable,
         )
+    }
+
+    /// The same shape as [`dtype`], but with a nullable root struct.
+    #[fixture]
+    fn nullable_dtype(dtype: DType) -> DType {
+        let DType::Struct(fields, _) = dtype else {
+            unreachable!("fixture is a struct")
+        };
+        DType::Struct(fields, Nullable)
+    }
+
+    /// Re-assemble a partitioning and return the dtype it produces, after checking that every
+    /// partition can be evaluated in the scope it will be dispatched to.
+    ///
+    /// This partitioner does not step partitions down into a child scope — that is left to the
+    /// caller — so every partition is evaluated in the original `scope`.
+    fn assembled_dtype(partitioned: &PartitionedExpr<FieldName>, scope: &DType) -> DType {
+        for partition in partitioned.partitions.iter() {
+            partition
+                .return_dtype(scope)
+                .vortex_expect("partition must type-check in the scope it is evaluated in");
+        }
+        let root_scope = DType::Struct(
+            StructFields::new(
+                partitioned.partition_names.clone(),
+                partitioned.partition_dtypes.to_vec(),
+            ),
+            NonNullable,
+        );
+        partitioned
+            .root
+            .return_dtype(&root_scope)
+            .vortex_expect("root must type-check over the partition results")
+    }
+
+    fn partition_expanded(expr: Expression, scope: &DType) -> PartitionedExpr<FieldName> {
+        let fields = scope
+            .as_struct_fields_opt()
+            .vortex_expect("scope is a struct");
+        let expanded = replace_root_fields(expr, fields)
+            .optimize_recursive(scope)
+            .vortex_expect("optimize");
+        partition(expanded, scope, make_free_field_annotator(fields)).vortex_expect("partition")
+    }
+
+    /// Over a non-nullable scope, partitioning preserves the expression's dtype.
+    #[rstest]
+    #[case(root())]
+    #[case(col("b"))]
+    #[case(get_item("x", col("a")))]
+    #[case(and(get_item("x", col("a")), get_item("y", col("a"))))]
+    #[case(pack([("b", col("b")), ("c", col("c"))], NonNullable))]
+    fn round_trips_dtype_over_non_nullable_scope(dtype: DType, #[case] expr: Expression) {
+        let expected = expr.return_dtype(&dtype).unwrap();
+        let partitioned = partition_expanded(expr, &dtype);
+        assert_eq!(assembled_dtype(&partitioned, &dtype), expected);
+    }
+
+    /// Over a *nullable* scope this partitioner drops the struct's own validity: it has no
+    /// partition for it, so the re-assembled expression reports a non-nullable struct where the
+    /// original reports a nullable one.
+    ///
+    /// This is the known unsoundness described on [`partition`]; the struct layout works around it
+    /// with its own partitioner. See <https://github.com/vortex-data/vortex/issues/1907>.
+    #[rstest]
+    fn drops_validity_over_nullable_scope(nullable_dtype: DType) {
+        let expr = root();
+        let expected = expr.return_dtype(&nullable_dtype).unwrap();
+        assert!(expected.is_nullable());
+
+        let partitioned = partition_expanded(expr, &nullable_dtype);
+        let assembled = assembled_dtype(&partitioned, &nullable_dtype);
+
+        assert!(
+            !assembled.is_nullable(),
+            "expected the known-unsound behaviour: validity is dropped, got {assembled}"
+        );
+        // ...and the nullability is pushed down into the fields instead.
+        assert!(
+            assembled
+                .as_struct_fields()
+                .field("b")
+                .unwrap()
+                .is_nullable()
+        );
+    }
+
+    /// Each partition is a `pack` of that annotation's sub-expressions, and the root reads results
+    /// back out by index. Several consumers depend on this shape.
+    #[rstest]
+    fn partitions_are_packed_by_annotation(dtype: DType) {
+        let expr = and(get_item("x", col("a")), col("b"));
+        let partitioned = partition_expanded(expr, &dtype);
+
+        assert_eq!(partitioned.partitions.len(), 2);
+        for (name, partition) in partitioned
+            .partition_names
+            .iter()
+            .zip(partitioned.partitions.iter())
+        {
+            assert!(
+                partition.is::<Pack>(),
+                "partition {name} should be a pack, got {partition}"
+            );
+        }
+        assert!(
+            partitioned
+                .partition_dtypes
+                .iter()
+                .all(|dtype| dtype.is_struct()),
+            "packed partitions have struct dtypes: {:?}",
+            partitioned.partition_dtypes
+        );
     }
 
     #[rstest]
