@@ -5,38 +5,49 @@ mod kernel;
 
 pub use kernel::*;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_bail;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::Bool;
 use crate::arrays::BoolArray;
+use crate::arrays::ConstantArray;
+use crate::arrays::bool::BoolArrayExt;
+use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
-use crate::dtype::Nullability;
+use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::NullHandling;
 use crate::scalar_fn::ScalarFnId;
-use crate::scalar_fn::StrictScalarFnVTable;
-use crate::validity::Validity;
+use crate::scalar_fn::ScalarFnVTable;
 
 /// Expression that logically inverts boolean values.
-///
-/// This is a [`StrictScalarFnVTable`] rather than a row function: the kernel is one `!` per
-/// *word* of the packed bit buffer, not one per row. Null propagation, constant folding, validity
-/// and options serde come from the strict lifting; `execute_strict` only has to negate bits.
 #[derive(Clone)]
 pub struct Not;
 
-impl StrictScalarFnVTable for Not {
+impl ScalarFnVTable for Not {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.not");
         *ID
+    }
+
+    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -46,45 +57,53 @@ impl StrictScalarFnVTable for Not {
     fn child_name(&self, _options: &Self::Options, child_idx: usize) -> ChildName {
         match child_idx {
             0 => ChildName::from("input"),
-            _ => unreachable!("Invalid child index {child_idx} for Not expression"),
+            _ => unreachable!("Invalid child index {} for Not expression", child_idx),
         }
     }
 
-    fn return_element_dtype(
-        &self,
-        _options: &Self::Options,
-        arg_dtypes: &[DType],
-    ) -> VortexResult<DType> {
-        vortex_ensure!(
-            matches!(arg_dtypes[0], DType::Bool(_)),
-            "Not expression expects a boolean child, got: {}",
-            arg_dtypes[0],
-        );
-        Ok(DType::Bool(Nullability::NonNullable))
+    fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
+        let child_dtype = &arg_dtypes[0];
+        if !matches!(child_dtype, DType::Bool(_)) {
+            vortex_bail!(
+                "Not expression expects a boolean child, got: {}",
+                child_dtype
+            );
+        }
+        Ok(child_dtype.clone())
     }
 
-    fn null_handling(&self, _options: &Self::Options) -> NullHandling {
-        NullHandling::Dense
+    fn execute(
+        &self,
+        _data: &Self::Options,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let child = args.get(0)?;
+
+        // For constant boolean
+        if let Some(scalar) = child.as_constant() {
+            let value = match scalar.as_bool().value() {
+                Some(b) => Scalar::bool(!b, child.dtype().nullability()),
+                None => Scalar::null(child.dtype().clone()),
+            };
+            return Ok(ConstantArray::new(value, args.row_count()).into_array());
+        }
+
+        // For boolean array
+        if let Some(bool) = child.as_opt::<Bool>() {
+            return Ok(BoolArray::new(!bool.to_bit_buffer(), bool.validity()?).into_array());
+        }
+
+        // Otherwise, execute and try again
+        child.execute::<ArrayRef>(ctx)?.not()
+    }
+
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {
         false
-    }
-
-    fn execute_strict(
-        &self,
-        _options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?;
-        // The strict lifting applies the input's validity to whatever we return, so keeping the
-        // input's declared nullability here saves it a cast node.
-        let nullability = input.dtype().nullability();
-        // One `!` per `u64` word, and in place when the bits are not shared. Executing into
-        // `BoolArray` is a downcast when the input is already canonical.
-        let bits = input.execute::<BoolArray>(ctx)?.into_bit_buffer();
-        Ok(BoolArray::new(!bits, Validity::from(nullability)).into_array())
     }
 }
 
@@ -92,7 +111,6 @@ impl StrictScalarFnVTable for Not {
 mod tests {
     use vortex_error::VortexResult;
 
-    use super::BoolArray;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
@@ -105,6 +123,7 @@ mod tests {
     use crate::expr::not;
     use crate::expr::root;
     use crate::expr::test_harness;
+    use crate::scalar_fn::fns::not::BoolArray;
 
     #[test]
     fn is_strict() {
