@@ -48,7 +48,7 @@ use vortex_array::aggregate_fn::NumericalAggregateOpts;
 use vortex_array::aggregate_fn::fns::all_non_distinct::all_non_distinct;
 use vortex_array::aggregate_fn::fns::min_max::MinMaxResult;
 use vortex_array::aggregate_fn::fns::min_max::min_max;
-use vortex_array::aggregate_fn::fns::sum::sum;
+use vortex_array::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::arbitrary::ArbitraryArray;

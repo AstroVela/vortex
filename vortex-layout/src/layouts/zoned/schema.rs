@@ -208,7 +208,7 @@ mod tests {
             &[
                 Max.bind(NumericalAggregateOpts::skip_nans()),
                 Min.bind(NumericalAggregateOpts::skip_nans()),
-                Sum.bind(NumericalAggregateOpts::skip_nans()),
+                Sum.bind(Sum::zero_on_empty(NumericalAggregateOpts::skip_nans())),
             ],
         );
 
@@ -217,7 +217,8 @@ mod tests {
             &[
                 Max.bind(NumericalAggregateOpts::skip_nans()).to_string(),
                 Min.bind(NumericalAggregateOpts::skip_nans()).to_string(),
-                Sum.bind(NumericalAggregateOpts::skip_nans()).to_string(),
+                Sum.bind(Sum::zero_on_empty(NumericalAggregateOpts::skip_nans()))
+                    .to_string(),
             ]
         );
     }

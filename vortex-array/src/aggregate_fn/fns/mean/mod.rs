@@ -38,7 +38,7 @@ pub fn mean(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     let mut acc = Accumulator::try_new(
         Mean::combined(),
         PairOptions(
-            NumericalAggregateOpts::default(),
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
             NumericalAggregateOpts::default(),
         ),
         array.dtype().clone(),
@@ -305,7 +305,7 @@ mod tests {
         let keep_nans = NumericalAggregateOpts::include_nans();
         let mut acc = Accumulator::try_new(
             Mean::combined(),
-            PairOptions(keep_nans, keep_nans),
+            PairOptions(Sum::zero_on_empty(keep_nans), keep_nans),
             array.dtype().clone(),
         )?;
         acc.accumulate(&array, &mut ctx)?;
@@ -397,7 +397,7 @@ mod tests {
         let mut acc = Accumulator::try_new(
             Mean::combined(),
             PairOptions(
-                NumericalAggregateOpts::default(),
+                Sum::zero_on_empty(NumericalAggregateOpts::default()),
                 NumericalAggregateOpts::default(),
             ),
             dtype,

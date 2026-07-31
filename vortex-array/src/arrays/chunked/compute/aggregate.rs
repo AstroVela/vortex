@@ -61,7 +61,7 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let mut acc = Accumulator::try_new(
             Sum,
-            NumericalAggregateOpts::default(),
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
             batch.dtype().clone(),
         )?;
         acc.accumulate(batch, &mut ctx)?;

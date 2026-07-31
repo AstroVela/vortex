@@ -4,7 +4,7 @@
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray as _;
-use vortex_array::aggregate_fn::fns::sum::sum;
+use vortex_array::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 

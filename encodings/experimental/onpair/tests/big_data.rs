@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::aggregate_fn::fns::sum::sum;
+use vortex_array::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;

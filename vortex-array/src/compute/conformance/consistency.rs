@@ -1002,7 +1002,7 @@ fn test_slice_aggregate_consistency(array: &ArrayRef, ctx: &mut ExecutionCtx) {
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::min_max::min_max;
     use crate::aggregate_fn::fns::nan_count::nan_count;
-    use crate::aggregate_fn::fns::sum::sum;
+    use crate::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
     use crate::dtype::DType;
 
     let len = array.len();

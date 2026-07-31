@@ -23,7 +23,7 @@ use vortex_array::aggregate_fn::NumericalAggregateOpts;
 use vortex_array::aggregate_fn::fns::is_constant::is_constant;
 use vortex_array::aggregate_fn::fns::min_max::min_max;
 use vortex_array::aggregate_fn::fns::null_count::null_count;
-use vortex_array::aggregate_fn::fns::sum::sum;
+use vortex_array::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builtins::ArrayBuiltins;

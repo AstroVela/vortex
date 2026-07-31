@@ -26,6 +26,15 @@ pub struct NumericalAggregateOpts {
     #[prost(bool, tag = "1")]
     pub skip_nans: bool,
 }
+/// Options for `vortex.sum`. Field 1 deliberately matches NumericalAggregateOpts so metadata
+/// written before SumOptions existed remains decodable as zero-on-empty.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SumOptions {
+    #[prost(bool, tag = "1")]
+    pub skip_nans: bool,
+    #[prost(bool, optional, tag = "2")]
+    pub null_on_empty: ::core::option::Option<bool>,
+}
 /// Options for `vortex.literal`
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LiteralOpts {

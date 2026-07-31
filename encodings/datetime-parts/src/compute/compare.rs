@@ -205,7 +205,7 @@ mod test {
     use vortex_array::ArrayRef;
     use vortex_array::ExecutionCtx;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::aggregate_fn::fns::sum::sum;
+    use vortex_array::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
     use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;

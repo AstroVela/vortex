@@ -510,10 +510,10 @@ impl PushedAggregate {
         Ok(match self {
             Self::Min => Box::new(Accumulator::try_new(Min, opts, dtype)?),
             Self::Max => Box::new(Accumulator::try_new(Max, opts, dtype)?),
-            Self::Sum => Box::new(Accumulator::try_new(Sum, opts, dtype)?),
+            Self::Sum => Box::new(Accumulator::try_new(Sum, Sum::zero_on_empty(opts), dtype)?),
             Self::Mean => Box::new(Accumulator::try_new(
                 Mean::combined(),
-                PairOptions(opts, opts),
+                PairOptions(Sum::zero_on_empty(opts), opts),
                 dtype,
             )?),
             Self::First => Box::new(Accumulator::try_new(First, AggregateEmptyOptions, dtype)?),

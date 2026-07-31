@@ -23,7 +23,7 @@ use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
 use crate::aggregate_fn::fns::min_max::MinMaxResult;
 use crate::aggregate_fn::fns::min_max::min_max;
 use crate::aggregate_fn::fns::nan_count::nan_count;
-use crate::aggregate_fn::fns::sum::sum;
+use crate::aggregate_fn::fns::sum::sum_zero_on_empty;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
@@ -173,7 +173,7 @@ impl StatsSetRef<'_> {
                     .is_some()
                     .then(|| {
                         // Sum is supported for this dtype.
-                        sum(self.dyn_array_ref, ctx)
+                        sum_zero_on_empty(self.dyn_array_ref, ctx)
                     })
                     .transpose()?
             }

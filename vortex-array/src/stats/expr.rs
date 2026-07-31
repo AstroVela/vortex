@@ -37,7 +37,10 @@ pub fn min_max(expr: Expression) -> Expression {
 /// Creates `stat(expr, sum)`, returning a nullable sum statistic.
 pub fn sum(expr: Expression) -> Expression {
     // Statistics follow NaN-skipping semantics; request it explicitly rather than via the default.
-    stat(expr, Sum.bind(NumericalAggregateOpts::skip_nans()))
+    stat(
+        expr,
+        Sum.bind(Sum::zero_on_empty(NumericalAggregateOpts::skip_nans())),
+    )
 }
 
 /// Creates `stat(expr, null_count)`, returning a nullable null-count statistic.

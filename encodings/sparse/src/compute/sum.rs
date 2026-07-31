@@ -70,6 +70,7 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::aggregate_fn::fns::sum::sum;
+    use vortex_array::aggregate_fn::fns::sum::sum_zero_on_empty;
     use vortex_array::scalar::Scalar;
     use vortex_array::session::ArraySessionExt;
     use vortex_buffer::buffer;
@@ -94,13 +95,22 @@ mod tests {
 
     fn check(array: SparseArray) -> VortexResult<Scalar> {
         let arr = array.into_array();
-        let kernel_result = sum(&arr, &mut SESSION.create_execution_ctx())?;
-        let canonical_result = sum(&arr, &mut CANONICAL_SESSION.create_execution_ctx())?;
+        let zero_kernel_result = sum_zero_on_empty(&arr, &mut SESSION.create_execution_ctx())?;
+        let zero_canonical_result =
+            sum_zero_on_empty(&arr, &mut CANONICAL_SESSION.create_execution_ctx())?;
         assert_eq!(
-            kernel_result, canonical_result,
-            "kernel and canonical sum paths disagree"
+            zero_kernel_result, zero_canonical_result,
+            "zero-on-empty kernel and canonical sum paths disagree"
         );
-        Ok(kernel_result)
+
+        let default_kernel_result = sum(&arr, &mut SESSION.create_execution_ctx())?;
+        let default_canonical_result = sum(&arr, &mut CANONICAL_SESSION.create_execution_ctx())?;
+        assert_eq!(
+            default_kernel_result, default_canonical_result,
+            "default kernel and canonical sum paths disagree"
+        );
+
+        Ok(zero_kernel_result)
     }
 
     #[rstest]

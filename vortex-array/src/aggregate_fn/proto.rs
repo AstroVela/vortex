@@ -182,14 +182,31 @@ mod tests {
         #[case] options: NumericalAggregateOpts,
     ) -> VortexResult<()> {
         let session = crate::array_session();
-        let agg_fn = Sum.bind(options);
+        for sum_options in [Sum::zero_on_empty(options), Sum::options(options)] {
+            let agg_fn = Sum.bind(sum_options);
+            let proto = agg_fn.serialize_proto()?;
+            let buf = proto.encode_to_vec();
+            let decoded = pb::AggregateFn::decode(buf.as_slice())?;
+            let round_tripped = AggregateFnRef::from_proto(&decoded, &session)?;
 
-        let proto = agg_fn.serialize_proto()?;
-        let buf = proto.encode_to_vec();
-        let decoded = pb::AggregateFn::decode(buf.as_slice())?;
-        let round_tripped = AggregateFnRef::from_proto(&decoded, &session)?;
+            assert_eq!(round_tripped, agg_fn);
+        }
+        Ok(())
+    }
 
-        assert_eq!(round_tripped, agg_fn);
+    #[test]
+    fn legacy_sum_options_decode_as_zero_on_empty() -> VortexResult<()> {
+        let session = crate::array_session();
+        let numerical = NumericalAggregateOpts::skip_nans();
+        let proto = pb::AggregateFn {
+            id: Sum.id().to_string(),
+            metadata: Some(numerical.serialize()),
+        };
+
+        let decoded = AggregateFnRef::from_proto(&proto, &session)?;
+
+        assert_eq!(decoded, Sum.bind(Sum::zero_on_empty(numerical)));
+        assert_ne!(decoded, Sum.bind(Sum::options(numerical)));
         Ok(())
     }
 

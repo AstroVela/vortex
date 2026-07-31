@@ -188,8 +188,9 @@ impl Stat {
             }
             Self::Sum => {
                 // Statistics follow NaN-skipping semantics; request it explicitly.
-                return aggregate_fn::fns::sum::Sum
-                    .return_dtype(&NumericalAggregateOpts::skip_nans(), data_type);
+                let options =
+                    aggregate_fn::fns::sum::Sum::zero_on_empty(NumericalAggregateOpts::skip_nans());
+                return aggregate_fn::fns::sum::Sum.return_dtype(&options, data_type);
             }
         })
     }
@@ -200,7 +201,9 @@ impl Stat {
         Some(match self {
             Self::Max => aggregate_fn::fns::max::Max.bind(NumericalAggregateOpts::skip_nans()),
             Self::Min => aggregate_fn::fns::min::Min.bind(NumericalAggregateOpts::skip_nans()),
-            Self::Sum => aggregate_fn::fns::sum::Sum.bind(NumericalAggregateOpts::skip_nans()),
+            Self::Sum => aggregate_fn::fns::sum::Sum.bind(
+                aggregate_fn::fns::sum::Sum::zero_on_empty(NumericalAggregateOpts::skip_nans()),
+            ),
             Self::NullCount => aggregate_fn::fns::null_count::NullCount.bind(EmptyOptions),
             Self::NaNCount => aggregate_fn::fns::nan_count::NanCount.bind(EmptyOptions),
             Self::UncompressedSizeInBytes => {
@@ -216,8 +219,10 @@ impl Stat {
     /// Min/max/sum statistics skip NaN values, so NaN-including configurations of those
     /// aggregates have no stat slot.
     pub fn from_aggregate_fn(aggregate_fn: &AggregateFnRef) -> Option<Self> {
-        if let Some(options) = aggregate_fn.as_opt::<aggregate_fn::fns::sum::Sum>() {
-            return options.skip_nans.then_some(Self::Sum);
+        if let Some(options) = aggregate_fn.as_opt::<aggregate_fn::fns::sum::Sum>()
+            && !options.empty_is_null()
+        {
+            return options.skip_nans().then_some(Self::Sum);
         }
         if aggregate_fn.is::<aggregate_fn::fns::nan_count::NanCount>() {
             return Some(Self::NaNCount);

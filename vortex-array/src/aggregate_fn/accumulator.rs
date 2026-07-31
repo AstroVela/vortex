@@ -350,7 +350,7 @@ mod tests {
         Accumulator::try_new(
             Mean::combined(),
             PairOptions(
-                NumericalAggregateOpts::default(),
+                Sum::zero_on_empty(NumericalAggregateOpts::default()),
                 NumericalAggregateOpts::default(),
             ),
             dtype,

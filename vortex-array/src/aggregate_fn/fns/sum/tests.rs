@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Tests for [`StandardSum`]-specific behavior: the `{sum, overflowed}` state algebra, the
-//! null-for-zero-valid-values rule across input kinds, NaN and overflow handling, cached-statistic
-//! consumption, and grouped aggregation. Plain summation arithmetic is covered by the shared
-//! kernels' tests in [`super::super::sum`].
+//! Tests for the default [`Sum`] behavior: the `{sum, overflowed}` state algebra, the
+//! null-for-zero-valid-values rule across input kinds, NaN and overflow handling,
+//! cached-statistic consumption, and grouped aggregation.
 
 use rstest::rstest;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 
+use super::Sum;
+use super::sum;
+use super::sum_zero_on_empty;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
 use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::AggregateFnVTableExt;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::DynGroupedAccumulator;
 use crate::aggregate_fn::GroupedAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
-use crate::aggregate_fn::fns::standard_sum::StandardSum;
-use crate::aggregate_fn::fns::standard_sum::standard_sum;
-use crate::aggregate_fn::fns::sum::sum;
 use crate::array_session;
 use crate::arrays::BoolArray;
 use crate::arrays::ChunkedArray;
@@ -46,9 +46,31 @@ use crate::validity::Validity;
 
 /// Sum an array with explicit [`NumericalAggregateOpts`] (test-only helper).
 fn sum_with_options(arr: &ArrayRef, options: NumericalAggregateOpts) -> VortexResult<Scalar> {
-    let mut acc = Accumulator::try_new(StandardSum, options, arr.dtype().clone())?;
+    let mut acc = Accumulator::try_new(Sum, Sum::options(options), arr.dtype().clone())?;
     acc.accumulate(arr, &mut array_session().create_execution_ctx())?;
     acc.finish()
+}
+
+#[test]
+fn empty_behavior_is_an_option_with_one_sum_id() {
+    let numerical = NumericalAggregateOpts::default();
+    let null_options = Sum::options(numerical);
+    let zero_options = Sum::zero_on_empty(numerical);
+    let null_sum = Sum.bind(null_options);
+    let zero_sum = Sum.bind(zero_options);
+
+    assert_eq!(null_sum.id(), zero_sum.id());
+    assert_ne!(null_sum, zero_sum);
+
+    let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+    assert!(matches!(
+        Sum.partial_dtype(&null_options, &input_dtype),
+        Some(DType::Struct(..))
+    ));
+    assert!(matches!(
+        Sum.partial_dtype(&zero_options, &input_dtype),
+        Some(DType::Primitive(..))
+    ));
 }
 
 // State algebra: the `{sum, overflowed}` monoid.
@@ -58,8 +80,8 @@ fn sum_state_empty_is_null() -> VortexResult<()> {
     // A state that never saw a valid value finalizes to null, and combining empty states
     // stays empty.
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
-    let empty = StandardSum.to_scalar(&state)?;
+    let mut state = Sum.empty_partial(&Sum::options(NumericalAggregateOpts::default()), &dtype)?;
+    let empty = Sum.to_scalar(&state)?;
     let fields = empty.as_struct();
     assert!(fields.field("sum").is_some_and(|sum| sum.is_null()));
     assert_eq!(
@@ -68,8 +90,8 @@ fn sum_state_empty_is_null() -> VortexResult<()> {
             .and_then(|overflowed| overflowed.as_bool().value()),
         Some(false)
     );
-    StandardSum.combine_partials(&mut state, empty)?;
-    assert!(StandardSum.finalize_scalar(&state)?.is_null());
+    Sum.combine_partials(&mut state, empty)?;
+    assert!(Sum.finalize_scalar(&state)?.is_null());
     Ok(())
 }
 
@@ -78,14 +100,14 @@ fn sum_state_empty_is_identity() -> VortexResult<()> {
     // Combining an empty state into a non-empty state changes nothing: `{null, false}` is the
     // identity of the `{sum, overflowed}` monoid.
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
-    StandardSum.combine_partials(&mut state, Scalar::primitive(100i64, Nullable))?;
+    let mut state = Sum.empty_partial(&Sum::options(NumericalAggregateOpts::default()), &dtype)?;
+    Sum.combine_partials(&mut state, Scalar::primitive(100i64, Nullable))?;
 
-    let empty = StandardSum
-        .to_scalar(&StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?)?;
-    StandardSum.combine_partials(&mut state, empty)?;
+    let empty = Sum
+        .to_scalar(&Sum.empty_partial(&Sum::options(NumericalAggregateOpts::default()), &dtype)?)?;
+    Sum.combine_partials(&mut state, empty)?;
 
-    let result = StandardSum.finalize_scalar(&state)?;
+    let result = Sum.finalize_scalar(&state)?;
     assert_eq!(result.as_primitive().typed_value::<i64>(), Some(100));
     Ok(())
 }
@@ -94,10 +116,11 @@ fn sum_state_empty_is_identity() -> VortexResult<()> {
 fn sum_state_overflow_sets_flag_and_poisons() -> VortexResult<()> {
     // Overflow sets the flag and poisons the merge even when combined with later values.
     let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
-    let mut overflowed = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
-    StandardSum.combine_partials(&mut overflowed, Scalar::primitive(i64::MAX, Nullable))?;
-    StandardSum.combine_partials(&mut overflowed, Scalar::primitive(1i64, Nullable))?;
-    let overflowed = StandardSum.to_scalar(&overflowed)?;
+    let mut overflowed =
+        Sum.empty_partial(&Sum::options(NumericalAggregateOpts::default()), &dtype)?;
+    Sum.combine_partials(&mut overflowed, Scalar::primitive(i64::MAX, Nullable))?;
+    Sum.combine_partials(&mut overflowed, Scalar::primitive(1i64, Nullable))?;
+    let overflowed = Sum.to_scalar(&overflowed)?;
     let fields = overflowed.as_struct();
     assert!(fields.field("sum").is_some_and(|sum| sum.is_null()));
     assert_eq!(
@@ -107,12 +130,12 @@ fn sum_state_overflow_sets_flag_and_poisons() -> VortexResult<()> {
         Some(true)
     );
 
-    let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
-    StandardSum.combine_partials(&mut state, Scalar::primitive(5i64, Nullable))?;
-    StandardSum.combine_partials(&mut state, overflowed)?;
-    StandardSum.combine_partials(&mut state, Scalar::primitive(7i64, Nullable))?;
+    let mut state = Sum.empty_partial(&Sum::options(NumericalAggregateOpts::default()), &dtype)?;
+    Sum.combine_partials(&mut state, Scalar::primitive(5i64, Nullable))?;
+    Sum.combine_partials(&mut state, overflowed)?;
+    Sum.combine_partials(&mut state, Scalar::primitive(7i64, Nullable))?;
 
-    assert!(StandardSum.finalize_scalar(&state)?.is_null());
+    assert!(Sum.finalize_scalar(&state)?.is_null());
     Ok(())
 }
 
@@ -123,7 +146,8 @@ fn sum_state_overflow_sets_flag_and_poisons() -> VortexResult<()> {
 #[case::f64(DType::Primitive(PType::F64, Nullability::NonNullable))]
 #[case::bool(DType::Bool(Nullability::NonNullable))]
 fn sum_empty_is_null(#[case] dtype: DType) -> VortexResult<()> {
-    let mut acc = Accumulator::try_new(StandardSum, NumericalAggregateOpts::default(), dtype)?;
+    let mut acc =
+        Accumulator::try_new(Sum, Sum::options(NumericalAggregateOpts::default()), dtype)?;
     assert!(acc.finish()?.is_null());
     Ok(())
 }
@@ -141,7 +165,7 @@ fn sum_empty_is_null(#[case] dtype: DType) -> VortexResult<()> {
         .into_array()
 )]
 fn sum_all_null_is_null(#[case] array: ArrayRef) -> VortexResult<()> {
-    let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
+    let result = sum(&array, &mut array_session().create_execution_ctx())?;
     assert!(result.is_null());
     Ok(())
 }
@@ -151,23 +175,25 @@ fn sum_all_nan_is_zero_not_null() -> VortexResult<()> {
     // NaNs are valid values: with the default `skip_nans` they contribute nothing, but
     // the sum is a genuine `0.0`, unlike an all-null array whose sum is null.
     let arr = PrimitiveArray::new(buffer![f64::NAN, f64::NAN], Validity::NonNullable).into_array();
-    let result = standard_sum(&arr, &mut array_session().create_execution_ctx())?;
+    let result = sum(&arr, &mut array_session().create_execution_ctx())?;
     assert_eq!(result.as_primitive().typed_value::<f64>(), Some(0.0));
     Ok(())
 }
 
 #[test]
-fn sum_is_zero_while_standard_sum_is_null() -> VortexResult<()> {
-    // The persisted statistic keeps the Sum semantics (zero for all-null) that zone
-    // and chunk merging require, while the StandardSum applies the null-for-empty rule.
+fn sum_zero_on_empty_is_zero_while_sum_is_null() -> VortexResult<()> {
+    // The persisted statistic keeps the explicit zero-on-empty semantics that zone and chunk
+    // merging require, while the default Sum applies the null-for-empty rule.
     let mut ctx = array_session().create_execution_ctx();
     let arr = PrimitiveArray::from_option_iter([None::<i32>, None, None]).into_array();
     assert_eq!(
-        sum(&arr, &mut ctx)?.as_primitive().typed_value::<i64>(),
+        sum_zero_on_empty(&arr, &mut ctx)?
+            .as_primitive()
+            .typed_value::<i64>(),
         Some(0)
     );
-    // The cached Sum statistic must not leak through StandardSum's cache short-circuit.
-    assert!(standard_sum(&arr, &mut ctx)?.is_null());
+    // The cached zero-on-empty statistic must not leak through Sum's cache short-circuit.
+    assert!(sum(&arr, &mut ctx)?.is_null());
     Ok(())
 }
 
@@ -195,8 +221,8 @@ fn sum_is_zero_while_standard_sum_is_null() -> VortexResult<()> {
     DType::Decimal(DecimalDType::new(20, 2), Nullable)
 )]
 fn sum_return_dtype_widens(#[case] input: DType, #[case] expected: DType) {
-    let dtype = StandardSum
-        .return_dtype(&NumericalAggregateOpts::default(), &input)
+    let dtype = Sum
+        .return_dtype(&Sum::options(NumericalAggregateOpts::default()), &input)
         .unwrap();
     assert_eq!(dtype, expected);
 }
@@ -207,7 +233,7 @@ fn sum_return_dtype_widens(#[case] input: DType, #[case] expected: DType) {
 #[test]
 fn sum_primitive_with_nulls() -> VortexResult<()> {
     let arr = PrimitiveArray::from_option_iter([Some(2i32), None, Some(4)]).into_array();
-    let result = standard_sum(&arr, &mut array_session().create_execution_ctx())?;
+    let result = sum(&arr, &mut array_session().create_execution_ctx())?;
     assert_eq!(result.as_primitive().typed_value::<i64>(), Some(6));
     Ok(())
 }
@@ -215,7 +241,7 @@ fn sum_primitive_with_nulls() -> VortexResult<()> {
 #[test]
 fn sum_bool_with_nulls() -> VortexResult<()> {
     let arr = BoolArray::from_iter([Some(true), None, Some(true), Some(false)]);
-    let result = standard_sum(
+    let result = sum(
         &arr.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -230,7 +256,7 @@ fn sum_decimal_with_nulls() -> VortexResult<()> {
         DecimalDType::new(4, 2),
         Validity::from_iter([true, false, true, true]),
     );
-    let result = standard_sum(
+    let result = sum(
         &decimal.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -245,7 +271,7 @@ fn sum_decimal_with_nulls() -> VortexResult<()> {
 #[test]
 fn sum_constant() -> VortexResult<()> {
     let array = ConstantArray::new(5u64, 10).into_array();
-    let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
+    let result = sum(&array, &mut array_session().create_execution_ctx())?;
     assert_eq!(result, 50u64.into());
     Ok(())
 }
@@ -253,7 +279,7 @@ fn sum_constant() -> VortexResult<()> {
 #[test]
 fn sum_constant_false_is_zero_not_null() -> VortexResult<()> {
     let array = ConstantArray::new(false, 10).into_array();
-    let result = standard_sum(&array, &mut array_session().create_execution_ctx())?;
+    let result = sum(&array, &mut array_session().create_execution_ctx())?;
     assert_eq!(result.as_primitive().typed_value::<u64>(), Some(0));
     Ok(())
 }
@@ -262,7 +288,8 @@ fn sum_constant_false_is_zero_not_null() -> VortexResult<()> {
 fn sum_multi_batch_and_finish_resets() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let mut acc = Accumulator::try_new(StandardSum, NumericalAggregateOpts::default(), dtype)?;
+    let mut acc =
+        Accumulator::try_new(Sum, Sum::options(NumericalAggregateOpts::default()), dtype)?;
 
     let batch1 = PrimitiveArray::new(buffer![10i32, 20], Validity::NonNullable).into_array();
     acc.accumulate(&batch1, &mut ctx)?;
@@ -288,7 +315,7 @@ fn sum_chunked_floats_with_nulls() -> VortexResult<()> {
     let dtype = chunk1.dtype().clone();
     let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
 
-    let result = standard_sum(
+    let result = sum(
         &chunked.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -302,7 +329,7 @@ fn sum_chunked_all_nulls_is_null() -> VortexResult<()> {
     let chunk2 = PrimitiveArray::from_option_iter::<f32, _>(vec![None, None]);
     let dtype = chunk1.dtype().clone();
     let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
-    let result = standard_sum(
+    let result = sum(
         &chunked.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -325,7 +352,7 @@ fn sum_chunked_empty_chunks() -> VortexResult<()> {
         dtype,
     )?;
 
-    let result = standard_sum(
+    let result = sum(
         &chunked.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -342,7 +369,7 @@ fn sum_chunked_value_survives_empty_chunk() -> VortexResult<()> {
     let dtype = chunk1.dtype().clone();
     let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
 
-    let result = standard_sum(
+    let result = sum(
         &chunked.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -356,7 +383,7 @@ fn sum_chunked_value_survives_empty_chunk() -> VortexResult<()> {
 fn sum_f64_with_nan_and_nulls() -> VortexResult<()> {
     let arr = PrimitiveArray::from_option_iter([Some(1.0f64), None, Some(f64::NAN), Some(3.0)])
         .into_array();
-    let result = standard_sum(&arr, &mut array_session().create_execution_ctx())?;
+    let result = sum(&arr, &mut array_session().create_execution_ctx())?;
     assert_eq!(result.as_primitive().typed_value::<f64>(), Some(4.0));
     Ok(())
 }
@@ -391,7 +418,7 @@ fn sum_uses_cached_stat_sum() -> VortexResult<()> {
         .set(Stat::Sum, Precision::Exact(ScalarValue::from(42.0f64)));
     arr.statistics()
         .set(Stat::NullCount, Precision::Exact(ScalarValue::from(0u64)));
-    let result = standard_sum(&arr, &mut array_session().create_execution_ctx())?;
+    let result = sum(&arr, &mut array_session().create_execution_ctx())?;
     assert_eq!(result.as_primitive().typed_value::<f64>(), Some(42.0));
     Ok(())
 }
@@ -430,13 +457,13 @@ fn sum_f64_with_infinity() -> VortexResult<()> {
         Validity::NonNullable,
     )
     .into_array();
-    let acc = standard_sum(&batch, &mut array_session().create_execution_ctx())?;
+    let acc = sum(&batch, &mut array_session().create_execution_ctx())?;
     // INFINITY + NEG_INFINITY = NaN, which is treated as saturated
     assert!(acc.as_primitive().typed_value::<f64>().unwrap().is_nan());
 
     let mut acc = Accumulator::try_new(
-        StandardSum,
-        NumericalAggregateOpts::default(),
+        Sum,
+        Sum::options(NumericalAggregateOpts::default()),
         DType::Primitive(PType::F64, Nullability::NonNullable),
     )?;
     acc.accumulate(&batch, &mut array_session().create_execution_ctx())?;
@@ -449,7 +476,8 @@ fn sum_f64_with_infinity() -> VortexResult<()> {
 #[test]
 fn sum_checked_overflow_is_null_and_saturates() -> VortexResult<()> {
     let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
-    let mut acc = Accumulator::try_new(StandardSum, NumericalAggregateOpts::default(), dtype)?;
+    let mut acc =
+        Accumulator::try_new(Sum, Sum::options(NumericalAggregateOpts::default()), dtype)?;
     assert!(!acc.is_saturated());
 
     let batch = PrimitiveArray::new(buffer![i64::MAX, 1i64], Validity::NonNullable).into_array();
@@ -472,7 +500,7 @@ fn sum_decimal_i256_overflow() -> VortexResult<()> {
         Validity::AllValid,
     );
 
-    let result = standard_sum(
+    let result = sum(
         &decimal.into_array(),
         &mut array_session().create_execution_ctx(),
     )?;
@@ -489,20 +517,23 @@ fn sum_decimal_near_precision_boundary() -> VortexResult<()> {
     // Native type for precision 14 is I64 (max precision 18), so 14 < 18.
     // Use combine_partials to push state near (but under) 10^14.
     let input_dtype = DType::Decimal(DecimalDType::new(4, 0), Nullability::NonNullable);
-    let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &input_dtype)?;
+    let mut state = Sum.empty_partial(
+        &Sum::options(NumericalAggregateOpts::default()),
+        &input_dtype,
+    )?;
 
     let near_limit = Scalar::decimal(
         DecimalValue::from(99_999_999_999_990i64),
         DecimalDType::new(14, 0),
         Nullable,
     );
-    StandardSum.combine_partials(&mut state, near_limit)?;
+    Sum.combine_partials(&mut state, near_limit)?;
 
     // Add a small value that keeps us just under 10^14.
     let small = Scalar::decimal(DecimalValue::from(9i64), DecimalDType::new(14, 0), Nullable);
-    StandardSum.combine_partials(&mut state, small)?;
+    Sum.combine_partials(&mut state, small)?;
 
-    let result = StandardSum.finalize_scalar(&state)?;
+    let result = Sum.finalize_scalar(&state)?;
     assert!(!result.is_null());
     assert_eq!(
         result.as_decimal().decimal_value(),
@@ -523,23 +554,26 @@ fn sum_decimal_precision_overflow_within_i256(
     // exactly ±10^14 fails fits_in_precision even though i256 arithmetic does not
     // overflow. This tests the precision-based saturation path in combine_partials.
     let input_dtype = DType::Decimal(DecimalDType::new(4, 0), Nullability::NonNullable);
-    let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &input_dtype)?;
+    let mut state = Sum.empty_partial(
+        &Sum::options(NumericalAggregateOpts::default()),
+        &input_dtype,
+    )?;
 
     let near_limit = Scalar::decimal(
         DecimalValue::from(near_limit),
         DecimalDType::new(14, 0),
         Nullable,
     );
-    StandardSum.combine_partials(&mut state, near_limit)?;
+    Sum.combine_partials(&mut state, near_limit)?;
 
     let one_more = Scalar::decimal(
         DecimalValue::from(one_more),
         DecimalDType::new(14, 0),
         Nullable,
     );
-    StandardSum.combine_partials(&mut state, one_more)?;
+    Sum.combine_partials(&mut state, one_more)?;
 
-    let result = StandardSum.finalize_scalar(&state)?;
+    let result = Sum.finalize_scalar(&state)?;
     assert!(result.is_null());
     assert_eq!(
         result.dtype(),
@@ -556,20 +590,23 @@ fn sum_decimal_accumulate_precision_overflow() -> VortexResult<()> {
     // that pushes it over.
     let input_dtype = DType::Decimal(DecimalDType::new(27, 0), Nullability::NonNullable);
     let return_dtype = DecimalDType::new(37, 0);
-    let mut state = StandardSum.empty_partial(&NumericalAggregateOpts::default(), &input_dtype)?;
+    let mut state = Sum.empty_partial(
+        &Sum::options(NumericalAggregateOpts::default()),
+        &input_dtype,
+    )?;
 
     // Set state to 10^37 - 1 via combine_partials.
     let near_limit_val: i128 = 10i128.pow(37) - 1;
     let near_limit = Scalar::decimal(DecimalValue::from(near_limit_val), return_dtype, Nullable);
-    StandardSum.combine_partials(&mut state, near_limit)?;
+    Sum.combine_partials(&mut state, near_limit)?;
 
     // Now accumulate a real i128 array with a single element = 1 to overflow precision.
     let decimal = DecimalArray::new(buffer![1i128], DecimalDType::new(27, 0), Validity::AllValid);
     let columnar = crate::Columnar::Canonical(crate::Canonical::Decimal(decimal));
     let mut ctx = array_session().create_execution_ctx();
-    StandardSum.accumulate(&mut state, &columnar, &mut ctx)?;
+    Sum.accumulate(&mut state, &columnar, &mut ctx)?;
 
-    let result = StandardSum.finalize_scalar(&state)?;
+    let result = Sum.finalize_scalar(&state)?;
     assert!(result.is_null());
     Ok(())
 }
@@ -578,8 +615,8 @@ fn sum_decimal_accumulate_precision_overflow() -> VortexResult<()> {
 
 fn run_grouped_sum(groups: &ArrayRef, elem_dtype: &DType) -> VortexResult<ArrayRef> {
     let mut acc = GroupedAccumulator::try_new(
-        StandardSum,
-        NumericalAggregateOpts::default(),
+        Sum,
+        Sum::options(NumericalAggregateOpts::default()),
         elem_dtype.clone(),
     )?;
     let mut ctx = array_session().create_execution_ctx();
@@ -600,8 +637,8 @@ fn grouped_sum_partial_distinguishes_empty_overflow_and_null_group() -> VortexRe
     )?
     .into_array();
     let mut acc = GroupedAccumulator::try_new(
-        StandardSum,
-        NumericalAggregateOpts::default(),
+        Sum,
+        Sum::options(NumericalAggregateOpts::default()),
         DType::Primitive(PType::I64, Nullable),
     )?;
     acc.accumulate_list(&groups, &mut ctx)?;
@@ -752,8 +789,11 @@ fn grouped_sum_all_nan_is_zero_not_null() -> VortexResult<()> {
 fn grouped_sum_finish_resets() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let elem_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let mut acc =
-        GroupedAccumulator::try_new(StandardSum, NumericalAggregateOpts::default(), elem_dtype)?;
+    let mut acc = GroupedAccumulator::try_new(
+        Sum,
+        Sum::options(NumericalAggregateOpts::default()),
+        elem_dtype,
+    )?;
 
     let elements1 = PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
     let groups1 = FixedSizeListArray::try_new(elements1, 2, Validity::NonNullable, 2)?;

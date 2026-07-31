@@ -189,7 +189,7 @@ mod tests {
     use crate::aggregate_fn::DynAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::sum::Sum;
-    use crate::aggregate_fn::fns::sum::sum;
+    use crate::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
     use crate::array_session;
     use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
@@ -291,7 +291,11 @@ mod tests {
     #[test]
     fn sum_empty_produces_zero() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let mut acc = Accumulator::try_new(Sum, NumericalAggregateOpts::default(), dtype)?;
+        let mut acc = Accumulator::try_new(
+            Sum,
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
+            dtype,
+        )?;
         let result = acc.finish()?;
         assert_eq!(result.as_primitive().typed_value::<i64>(), Some(0));
         Ok(())
@@ -300,7 +304,11 @@ mod tests {
     #[test]
     fn sum_empty_f64_produces_zero() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
-        let mut acc = Accumulator::try_new(Sum, NumericalAggregateOpts::default(), dtype)?;
+        let mut acc = Accumulator::try_new(
+            Sum,
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
+            dtype,
+        )?;
         let result = acc.finish()?;
         assert_eq!(result.as_primitive().typed_value::<f64>(), Some(0.0));
         Ok(())
@@ -350,7 +358,7 @@ mod tests {
         arr: &crate::ArrayRef,
         options: NumericalAggregateOpts,
     ) -> VortexResult<Scalar> {
-        let mut acc = Accumulator::try_new(Sum, options, arr.dtype().clone())?;
+        let mut acc = Accumulator::try_new(Sum, Sum::zero_on_empty(options), arr.dtype().clone())?;
         acc.accumulate(arr, &mut array_session().create_execution_ctx())?;
         acc.finish()
     }
@@ -425,7 +433,7 @@ mod tests {
 
         let mut acc = Accumulator::try_new(
             Sum,
-            NumericalAggregateOpts::default(),
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
             DType::Primitive(PType::F64, Nullability::NonNullable),
         )?;
         acc.accumulate(&batch, &mut array_session().create_execution_ctx())?;
@@ -444,7 +452,11 @@ mod tests {
     #[test]
     fn sum_checked_overflow_is_saturated() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I64, Nullability::NonNullable);
-        let mut acc = Accumulator::try_new(Sum, NumericalAggregateOpts::default(), dtype)?;
+        let mut acc = Accumulator::try_new(
+            Sum,
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
+            dtype,
+        )?;
         assert!(!acc.is_saturated());
 
         let batch =

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
@@ -16,10 +18,16 @@ use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::GroupRanges;
 use crate::aggregate_fn::GroupedArray;
 use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
+use crate::arrays::BoolArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::StructArray;
+use crate::dtype::FieldName;
+use crate::dtype::FieldNames;
 use crate::dtype::NativePType;
+use crate::dtype::Nullability;
 use crate::match_each_native_ptype;
+use crate::validity::Validity;
 
 /// Encoding-specific grouped [`Sum`] kernel for primitive element arrays.
 #[derive(Debug)]
@@ -35,7 +43,7 @@ impl DynGroupedAggregateKernel for PrimitiveGroupedSumEncodingKernel {
         let Some(options) = aggregate_fn.as_opt::<Sum>() else {
             return Ok(None);
         };
-        try_grouped_sum(groups, ctx, options.skip_nans)
+        try_grouped_sum(groups, ctx, options.skip_nans(), options.empty_is_null())
     }
 }
 
@@ -49,6 +57,7 @@ pub(super) fn try_grouped_sum(
     groups: &GroupedArray,
     ctx: &mut ExecutionCtx,
     skip_nans: bool,
+    null_on_empty: bool,
 ) -> VortexResult<Option<ArrayRef>> {
     if !groups.elements().is::<Primitive>() {
         return Ok(None);
@@ -57,17 +66,27 @@ pub(super) fn try_grouped_sum(
     let group_ranges = groups.group_ranges(ctx)?;
     let group_validity = groups.group_validity(ctx)?;
 
-    Ok(Some(grouped_sum(
-        &elements,
-        &group_ranges,
-        &group_validity,
-        ctx,
-        skip_nans,
-    )?))
+    if null_on_empty {
+        Ok(Some(grouped_sum::<true>(
+            &elements,
+            &group_ranges,
+            &group_validity,
+            ctx,
+            skip_nans,
+        )?))
+    } else {
+        Ok(Some(grouped_sum::<false>(
+            &elements,
+            &group_ranges,
+            &group_validity,
+            ctx,
+            skip_nans,
+        )?))
+    }
 }
 
 /// Sum each group described by `group_ranges` (element `(offset, size)` pairs), one sum per group.
-fn grouped_sum(
+fn grouped_sum<const NULL_ON_EMPTY: bool>(
     elements: &PrimitiveArray,
     group_ranges: &GroupRanges,
     group_validity: &Mask,
@@ -80,54 +99,77 @@ fn grouped_sum(
         .execute_mask(elements.as_ref().len(), ctx)?;
     let all_valid = matches!(elem_mask.slices(), AllOr::All);
 
-    let result = match_each_native_ptype!(elements.ptype(),
+    let (sums, overflowed) = match_each_native_ptype!(elements.ptype(),
         unsigned: |T| {
             let values = elements.as_slice::<T>();
-            collect_sums::<T, u64>(values, group_ranges, group_validity, &elem_mask, all_valid,
-                sum_unsigned_all)
+            collect_sums::<T, u64, NULL_ON_EMPTY>(
+                values, group_ranges, group_validity, &elem_mask, all_valid, sum_unsigned_all)
         },
         signed: |T| {
             let values = elements.as_slice::<T>();
-            collect_sums::<T, i64>(values, group_ranges, group_validity, &elem_mask, all_valid,
-                sum_signed_all)
+            collect_sums::<T, i64, NULL_ON_EMPTY>(
+                values, group_ranges, group_validity, &elem_mask, all_valid, sum_signed_all)
         },
         floating: |T| {
             let values = elements.as_slice::<T>();
-            collect_sums::<T, f64>(values, group_ranges, group_validity, &elem_mask, all_valid,
+            collect_sums::<T, f64, NULL_ON_EMPTY>(
+                values, group_ranges, group_validity, &elem_mask, all_valid,
                 |acc, slice| { sum_float_all(acc, slice, skip_nans); false })
         }
     );
 
-    Ok(result.into_array())
+    if NULL_ON_EMPTY {
+        let Some(overflowed) = overflowed else {
+            unreachable!("null-on-empty grouped sum records overflow state")
+        };
+        Ok(StructArray::try_new(
+            FieldNames::from_iter([FieldName::from("sum"), FieldName::from("overflowed")]),
+            vec![
+                sums.into_array(),
+                BoolArray::new(overflowed, Validity::NonNullable).into_array(),
+            ],
+            group_validity.len(),
+            Validity::from_mask(group_validity.clone(), Nullability::Nullable),
+        )?
+        .into_array())
+    } else {
+        Ok(sums.into_array())
+    }
 }
 
-/// Reduce each group's element slice into a nullable sum. A group is null when the group
-/// itself is invalid, or when summing it overflows (`sum_run` returns `true`).
-fn collect_sums<T: NativePType, A: NativePType + Default>(
+/// Reduce each group's element slice into a nullable sum and optional overflow bitmap.
+fn collect_sums<T: NativePType, A: NativePType + Default, const NULL_ON_EMPTY: bool>(
     values: &[T],
     group_ranges: &GroupRanges,
     group_validity: &Mask,
     elem_mask: &Mask,
     all_valid: bool,
     sum_run: impl Fn(&mut A, &[T]) -> bool,
-) -> PrimitiveArray {
+) -> (PrimitiveArray, Option<BitBuffer>) {
+    let mut overflowed = NULL_ON_EMPTY.then(|| BitBufferMut::with_capacity(group_ranges.len()));
     let sums = group_ranges.iter().enumerate().map(|(i, (offset, size))| {
         if !group_validity.value(i) {
+            if let Some(overflowed) = &mut overflowed {
+                overflowed.append(false);
+            }
             return None;
         }
         let mut acc = A::default();
-        let overflow = if all_valid {
-            sum_run(&mut acc, &values[offset..offset + size])
+        let (overflow, any_valid) = if all_valid {
+            (sum_run(&mut acc, &values[offset..offset + size]), size > 0)
         } else {
             sum_masked_group(&mut acc, values, offset, size, elem_mask, &sum_run)
         };
-        (!overflow).then_some(acc)
+        if let Some(overflowed) = &mut overflowed {
+            overflowed.append(overflow);
+        }
+        (!overflow && (!NULL_ON_EMPTY || any_valid)).then_some(acc)
     });
-    PrimitiveArray::from_option_iter(sums)
+    let sums = PrimitiveArray::from_option_iter(sums);
+    (sums, overflowed.map(BitBufferMut::freeze))
 }
 
-/// Sum the valid elements of a single group, using the contiguous valid runs of the element mask
-/// intersected with the group's `[offset, offset + size)` range.
+/// Sum valid runs in one group, returning `(overflow, any_valid)`.
 fn sum_masked_group<T: NativePType, A>(
     acc: &mut A,
     values: &[T],
@@ -135,17 +177,17 @@ fn sum_masked_group<T: NativePType, A>(
     size: usize,
     elem_mask: &Mask,
     sum_run: &impl Fn(&mut A, &[T]) -> bool,
-) -> bool {
+) -> (bool, bool) {
     match elem_mask.slice(offset..offset + size).slices() {
-        AllOr::All => sum_run(acc, &values[offset..offset + size]),
-        AllOr::None => false,
+        AllOr::All => (sum_run(acc, &values[offset..offset + size]), size > 0),
+        AllOr::None => (false, false),
         AllOr::Some(runs) => {
             for &(start, end) in runs {
                 if sum_run(acc, &values[offset + start..offset + end]) {
-                    return true;
+                    return (true, true);
                 }
             }
-            false
+            (false, !runs.is_empty())
         }
     }
 }
@@ -164,7 +206,7 @@ mod tests {
     use crate::aggregate_fn::GroupedAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::sum::Sum;
-    use crate::aggregate_fn::fns::sum::sum;
+    use crate::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
     use crate::array_session;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListViewArray;
@@ -181,7 +223,7 @@ mod tests {
     fn grouped_sum_actual(groups: &ArrayRef, elem_dtype: &DType) -> VortexResult<ArrayRef> {
         let mut acc = GroupedAccumulator::try_new(
             Sum,
-            NumericalAggregateOpts::default(),
+            Sum::zero_on_empty(NumericalAggregateOpts::default()),
             elem_dtype.clone(),
         )?;
         acc.accumulate_list(groups, &mut array_session().create_execution_ctx())?;
@@ -200,7 +242,10 @@ mod tests {
 
         let mut ctx = array_session().create_execution_ctx();
         let sum_dtype = Sum
-            .partial_dtype(&NumericalAggregateOpts::default(), elem_dtype)
+            .partial_dtype(
+                &Sum::zero_on_empty(NumericalAggregateOpts::default()),
+                elem_dtype,
+            )
             .expect("sum partial dtype");
         let mut builder = builder_with_capacity(&sum_dtype, ranges.len());
         for (i, &(offset, size)) in ranges.iter().enumerate() {
@@ -368,8 +413,11 @@ mod tests {
         let elem_dtype = DType::Primitive(PType::F64, NonNullable);
         let groups = listview(elements, &[(0, 3), (3, 2)], &[true, true])?;
 
-        let mut acc =
-            GroupedAccumulator::try_new(Sum, NumericalAggregateOpts::include_nans(), elem_dtype)?;
+        let mut acc = GroupedAccumulator::try_new(
+            Sum,
+            Sum::zero_on_empty(NumericalAggregateOpts::include_nans()),
+            elem_dtype,
+        )?;
         acc.accumulate_list(&groups, &mut array_session().create_execution_ctx())?;
         let actual = acc.finish()?;
 

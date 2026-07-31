@@ -32,6 +32,13 @@ message NumericalAggregateOpts {
   bool skip_nans = 1;
 }
 
+// Options for `vortex.sum`. Field 1 deliberately matches NumericalAggregateOpts so metadata
+// written before SumOptions existed remains decodable as zero-on-empty.
+message SumOptions {
+  bool skip_nans = 1;
+  optional bool null_on_empty = 2;
+}
+
 // Options for `vortex.literal`
 message LiteralOpts {
   vortex.scalar.Scalar value = 1;

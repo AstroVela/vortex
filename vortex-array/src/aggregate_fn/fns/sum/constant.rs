@@ -93,7 +93,7 @@ mod tests {
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::aggregate_fn::fns::sum::sum;
+    use crate::aggregate_fn::fns::sum::sum_zero_on_empty as sum;
     use crate::array_session;
     use crate::arrays::ConstantArray;
     use crate::dtype::DType;
