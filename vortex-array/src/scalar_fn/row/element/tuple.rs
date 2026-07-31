@@ -4,10 +4,13 @@
 //! Argument lists built from [`InputElement`]s, and the per-argument decode behind them.
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure_eq;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
+use crate::arrays::Masked;
+use crate::arrays::masked::MaskedArraySlotsExt;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::InputElement;
 
@@ -30,9 +33,11 @@ impl<T: InputElement> ArgColumn<T> {
     /// Decode one input column, collapsing a constant operand to its single distinct row.
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
         // An empty input has no row 0 to slice, and its row loop runs zero times either way.
-        if array.as_constant().is_some() && !array.is_empty() {
+        if let Some(constant) = batch_constant(&array)
+            && !array.is_empty()
+        {
             return Ok(Self {
-                column: T::decode(array.slice(0..1)?, ctx)?,
+                column: T::decode(constant.slice(0..1)?, ctx)?,
                 stride: 0,
             });
         }
@@ -55,6 +60,26 @@ impl<T: InputElement> ArgColumn<T> {
     fn constant(&self) -> Option<T::Elem<'_>> {
         (self.stride == 0).then(|| T::get(&self.column, 0))
     }
+}
+
+/// The array whose every row holds one distinct value, when `array` is constant for the batch.
+///
+/// Beyond the constant encoding itself this sees one level through [`Masked`], which is how the
+/// compressor spells "the same value in every row, some rows null": the masked child carries the
+/// value, the wrapper carries only validity. Reading the child's value for a null row is sound
+/// here because the strict lifting owns validity entirely; the row loop's output behind a null
+/// row is masked away (dense) or never computed (filter), so which value the loop read there
+/// cannot be observed. An all-null constant never reaches decode at all, since the lifting
+/// short-circuits it to an all-null result first.
+fn batch_constant(array: &ArrayRef) -> Option<ArrayRef> {
+    if array.as_constant().is_some() {
+        return Some(array.clone());
+    }
+
+    array
+        .as_opt::<Masked>()
+        .map(|masked| masked.child().clone())
+        .filter(|child| child.as_constant().is_some())
 }
 
 /// Tuples of [`InputElement`]s forming the typed argument list a [`RowFn`](crate::scalar_fn::RowFn)
@@ -85,8 +110,12 @@ pub trait ElementTuple: 'static {
     /// Whether *any* argument is [`InputElement::DECODE_FALLIBLE`].
     const DECODE_FALLIBLE: bool;
 
-    /// Validate the input dtypes. `dtypes` has exactly `ARITY` entries (checked by the
-    /// expression layer against [`Arity`](crate::scalar_fn::Arity)).
+    /// Validate the input dtypes, including that `dtypes` has exactly `ARITY` entries.
+    ///
+    /// The expression layer checks the count against [`Arity`](crate::scalar_fn::Arity) before it
+    /// builds a call, but this is also the entry point of the public
+    /// [`return_element_dtype`](crate::scalar_fn::StrictScalarFnVTable::return_element_dtype), so
+    /// the count is enforced here rather than assumed.
     fn validate(dtypes: &[DType]) -> VortexResult<()>;
 
     /// Decode every input column once. Called once per batch.
@@ -111,6 +140,14 @@ macro_rules! element_tuple {
             const DECODE_FALLIBLE: bool = $($t::DECODE_FALLIBLE ||)+ false;
 
             fn validate(dtypes: &[DType]) -> VortexResult<()> {
+                vortex_ensure_eq!(
+                    dtypes.len(),
+                    $arity,
+                    "expected {} argument dtypes, got {}",
+                    $arity,
+                    dtypes.len(),
+                );
+
                 $($t::validate(&dtypes[$idx])?;)+
                 Ok(())
             }
