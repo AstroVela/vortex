@@ -55,7 +55,8 @@ Optimizing `ExpressionScanPlan(expression, child)` has three phases.
    `get_item($, "a")` becomes `$` when lowering into field `a`; targeting another field rejects that
    pushdown. When lowering into a struct's validity child, `is_not_null($)` becomes `$` and
    `is_null($)` becomes `not($)`. The lowered group is installed as an `ExpressionScanPlan` over
-   that child, and pushdown then continues recursively.
+   that child, and pushdown then continues recursively. Every rule must prove equivalence across
+   the plan boundary; lowering is not a generic replacement of `$`.
 
 The combination expression is retained above the grouped child plans. Missing kernels or failed
 lowering leave the affected expression at the current level, preserving the generic execution
@@ -88,7 +89,8 @@ combine = @a * @b
 ```
 
 The current non-nullable struct shape can therefore install `$ + 1` over child `a`, read child
-`b` directly, and evaluate only the multiplication above the grouped results.
+`b` directly, and evaluate only the multiplication above the grouped results. The `+` needs no
+struct-specific rule: it is rebuilt after its `get_item` child is lowered.
 
 ### Struct with validity
 
@@ -98,7 +100,7 @@ expr = is_not_null($) && (get_item($, "a") > 0)
 
 annotations:
   is_not_null($)        -> {validity}
-  get_item($, "a")     -> {a, validity}
+  get_item($, "a")      -> {a, validity}
   get_item($, "a") > 0 -> {a, validity}
   expr                  -> {a, validity}
 
@@ -111,8 +113,51 @@ groups after lowering:
 combine = @valid && (get_item($, "a") > 0)
 ```
 
-`is_not_null($)` moves to the validity child. `get_item($, "a")` remains above the struct because
-masking the field requires both `a` and `validity`.
+The direct `is_not_null($) -> $` lowering is valid because `$` on the validity child is exactly the
+top-level struct validity. The analogous direct lowering of `get_item` is not valid:
+
+```text
+get_item(nullable_struct, "a") = mask(a, validity)
+
+invalid lowering:
+  get_item($, "a") -> $
+
+counterexample:
+  a = 7, validity = false
+  get_item(nullable_struct, "a") = null
+  lowered result                 = 7
+```
+
+The singleton rule prevents this mistake: `get_item($, "a")` is annotated with `{a, validity}` and
+therefore remains above the struct. A stronger validity-aware rule may lower a strict function by
+factoring out the mask:
+
+```text
+(get_item($, "a") + 1)
+  = mask(a, validity) + 1
+  = mask(a + 1, validity)
+
+groups after lowering:
+  @a     = $ + 1
+  @valid = $
+
+combine = mask(@a, @valid)
+```
+
+This requires `+` to be strict. It must also be infallible, or execute under `@valid`, so that
+evaluating values hidden by the mask cannot introduce a new error. Non-strict functions require
+different combination expressions:
+
+```text
+is_not_null(get_item($, "a"))
+  = @valid && is_not_null(@a)
+
+is_null(get_item($, "a"))
+  = !@valid || is_null(@a)
+```
+
+Lowering through validity is therefore a proven factorization into child expressions and a
+residual combination expression, not just scope substitution.
 
 ### Dictionary
 
