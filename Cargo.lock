@@ -10434,6 +10434,8 @@ dependencies = [
 name = "vortex-tiled-fsl"
 version = "0.1.0"
 dependencies = [
+ "codspeed-divan-compat",
+ "mimalloc",
  "prost 0.14.4",
  "rstest",
  "vortex-array",
