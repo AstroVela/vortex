@@ -135,6 +135,9 @@ impl<T: Float + NativePType> OutputSink for TensorSink<T> {
 
     fn with_capacity(rows: usize, dtype: &DType) -> VortexResult<Self> {
         let list_size = validate_tensor_float_input(dtype)?.list_size() as usize;
+        let total = rows.checked_mul(list_size).ok_or_else(|| {
+            vortex_err!("tensor sink of {rows} rows x {list_size} elements overflows usize")
+        })?;
 
         // `zeroed` rather than uninitialized spare capacity: the row loop overwrites every element, so
         // this is only to keep the buffer safely indexable. Large allocations come back zeroed from the
@@ -143,7 +146,7 @@ impl<T: Float + NativePType> OutputSink for TensorSink<T> {
             dtype: dtype.clone(),
             list_size,
             rows,
-            elements: BufferMut::zeroed(rows * list_size),
+            elements: BufferMut::zeroed(total),
         })
     }
 
