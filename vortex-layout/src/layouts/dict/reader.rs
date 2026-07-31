@@ -718,13 +718,23 @@ mod tests {
     }
 
     fn test_apply(original: Expression, outer: Expression, inner: Expression) -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
         let array = VarBinArray::from_iter(
             [Some("abc"), Some("def"), None],
             DType::Utf8(Nullability::Nullable),
         )
         .into_array();
+        test_apply_on(array, original, outer, inner)
+    }
 
+    /// The property every split must satisfy: applying `inner` to the values and then `outer` to
+    /// the result must equal applying the original expression directly.
+    fn test_apply_on(
+        array: ArrayRef,
+        original: Expression,
+        outer: Expression,
+        inner: Expression,
+    ) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
         let pushed = array.clone().apply(&pack(
             [(PUSHDOWN_ANNOTATION, inner)],
             Nullability::NonNullable,
@@ -733,6 +743,24 @@ mod tests {
         let expected = array.apply(&original)?;
         assert_arrays_eq!(actual, expected, &mut ctx);
         Ok(())
+    }
+
+    /// A two-field struct, for splits that push down more than one sub-expression.
+    fn two_field_struct() -> (DType, ArrayRef) {
+        let a = VarBinArray::from_iter(
+            [Some("abc"), Some("def"), None],
+            DType::Utf8(Nullability::Nullable),
+        )
+        .into_array();
+        let b = VarBinArray::from_iter(
+            [Some("a%"), Some("z%"), None],
+            DType::Utf8(Nullability::Nullable),
+        )
+        .into_array();
+        let array = StructArray::from_fields([("a", a), ("b", b)].as_slice())
+            .vortex_expect("struct is well formed")
+            .into_array();
+        (array.dtype().clone(), array)
     }
 
     #[test]
@@ -766,6 +794,41 @@ mod tests {
         assert_eq!(outer, pushed_ref(0));
         assert_eq!(inner, pushed_inner([byte_length(root())]));
         test_apply(expr, outer, inner)
+    }
+
+    /// Two distinct pushdown-able sub-expressions under one annotation are packed together, and
+    /// the outer expression reads each back by index.
+    #[test]
+    fn split_expr_multiple_pushdowns() -> VortexResult<()> {
+        let (dtype, array) = two_field_struct();
+        // `like` is fallible so it stays outer, but both of its `get_item` arguments push down.
+        let expr = like(get_item("a", root()), get_item("b", root()));
+        let (outer, inner) = split_expression_for_pushdown(expr.clone(), &dtype)?;
+        let inner = inner.unwrap();
+
+        assert_eq!(
+            inner,
+            pushed_inner([get_item("a", root()), get_item("b", root())])
+        );
+        assert_eq!(outer, like(pushed_ref(0), pushed_ref(1)));
+        test_apply_on(array, expr, outer, inner)
+    }
+
+    /// The same sub-expression referenced twice is currently pushed down twice, once per
+    /// reference, rather than being evaluated once and shared.
+    #[test]
+    fn split_expr_repeated_pushdown() -> VortexResult<()> {
+        let (dtype, array) = two_field_struct();
+        let expr = like(get_item("a", root()), get_item("a", root()));
+        let (outer, inner) = split_expression_for_pushdown(expr.clone(), &dtype)?;
+        let inner = inner.unwrap();
+
+        assert_eq!(
+            inner,
+            pushed_inner([get_item("a", root()), get_item("a", root())])
+        );
+        assert_eq!(outer, like(pushed_ref(0), pushed_ref(1)));
+        test_apply_on(array, expr, outer, inner)
     }
 
     #[test]
