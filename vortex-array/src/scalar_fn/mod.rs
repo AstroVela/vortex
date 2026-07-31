@@ -31,6 +31,15 @@
 //!   per-row value cannot. `vortex.tensor.l2_denorm` writes each row into a slice of one flat buffer,
 //!   so its output width can be runtime data and it allocates once rather than once per row.
 //!
+//! When part of the kernel's work depends only on an operand that is constant for the batch (the
+//! norm of a broadcast query vector, a prepared form of a constant geometry), visit through
+//! [`RowVisitor::visit_prepared`] and do that work in its once-per-batch prepare step. Reach for it
+//! when the hoisted work is a loop, a parse, or a structure build; arithmetic that merely overlaps
+//! the row's own dependency chain measures as free either way, so land every adopter with a
+//! constant/non-constant benchmark pair. Prepare **must not** be load-bearing for validation: an
+//! empty batch decodes every operand as non-constant, so a prepare that validated its constant
+//! would silently not run.
+//!
 //! Two things neither form covers, and they are what actually send a function to the trait below:
 //!
 //! - **A result that aliases an input.** Both forms own their output bytes: an element returns them
