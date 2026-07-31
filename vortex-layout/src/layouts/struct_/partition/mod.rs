@@ -71,7 +71,7 @@ use vortex_utils::aliases::hash_map::HashMap;
 ///
 /// Slot 0 is the struct's own validity bitmap (present only when the struct is nullable) and slot
 /// `i + 1` is field `i`. This is the same numbering as
-/// [`slot_to_child`](crate::layouts::struct_::Struct::slot_to_child), so a slot resolves to its
+/// [`slot_to_child`](crate::VTable::slot_to_child), so a slot resolves to its
 /// child reader without any name lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct StructSlot(usize);
