@@ -9,8 +9,9 @@
 //! 1. configuration is resolved out of environment variables case-insensitively, matching how the
 //!    various `Store::from_env` builders behave (see
 //!    <https://github.com/apache/arrow-rs-object-store/issues/529>);
-//! 2. schemes that `object_store` does not recognize natively — the OpenDAL-backed `cos://` and
-//!    `oss://` — are served by the crate's `opendal` module under the matching service feature.
+//! 2. schemes that `object_store` does not recognize natively — `hf://`, served by the crate's
+//!    `huggingface` module, and the OpenDAL-backed `cos://` and `oss://`, served by the crate's
+//!    `opendal` module under the matching service feature.
 
 use std::sync::Arc;
 
@@ -218,6 +219,13 @@ impl Registry {
     /// the one caching rule in [`Registry::resolve`]: a scheme says where its store is rooted, and
     /// the registry decides how to cache it.
     fn build_store(&self, to_resolve: &Url) -> object_store::Result<(Arc<dyn ObjectStore>, Path)> {
+        // `hf://` is not recognized by `object_store` either. The store is rooted at a repository
+        // revision on the Hub, so the path within it is what remains after the repository, and the
+        // registry caches one client per revision.
+        if crate::huggingface::supports_scheme(to_resolve.scheme()) {
+            return crate::huggingface::make_hf_store(to_resolve, &self.env.normalized_vars());
+        }
+
         // OpenDAL-backed schemes (Tencent COS, Alibaba OSS) are not recognized by `object_store`,
         // so build them from OpenDAL's own environment-variable configuration (e.g.
         // `TENCENTCLOUD_SECRET_ID`). The operator is rooted at the bucket, which lives in the URL
@@ -244,7 +252,7 @@ fn url_key(url: &Url) -> &str {
 /// Returns the non-empty segments of a path
 ///
 /// Note: We don't use [`Url::path_segments`] as we only want non-empty paths
-fn path_segments(s: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn path_segments(s: &str) -> impl Iterator<Item = &str> {
     s.split('/').filter(|x| !x.is_empty())
 }
 

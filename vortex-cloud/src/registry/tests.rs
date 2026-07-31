@@ -146,6 +146,70 @@ fn test_registered_store_wins_over_build() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// `hf://` must resolve through the registry rather than falling through to `parse_url_opts`,
+/// which does not recognize it. The store is rooted at the repository revision, so two files in
+/// one repository share a client and each reports only its own path within that repository.
+#[test]
+fn test_resolve_hf_url_shares_client_per_repo() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = registry();
+    let a = Url::parse("hf://datasets/org/name/data/train.vortex")?;
+    let b = Url::parse("hf://datasets/org/name/validation.vortex")?;
+
+    let (store_a, path_a) = registry.resolve(&a)?;
+    let (store_b, path_b) = registry.resolve(&b)?;
+
+    assert!(Arc::ptr_eq(&store_a, &store_b));
+    assert_eq!(path_a.as_ref(), "data/train.vortex");
+    assert_eq!(path_b.as_ref(), "validation.vortex");
+    Ok(())
+}
+
+/// A revision is part of the store's root, so two revisions of one repository — and two different
+/// repositories — must not share a client.
+#[test]
+fn test_resolve_hf_url_separates_revisions_and_repos() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = registry();
+    let (main, _) = registry.resolve(&Url::parse("hf://datasets/org/name/train.vortex")?)?;
+    let (dev, _) = registry.resolve(&Url::parse("hf://datasets/org/name@dev/train.vortex")?)?;
+    let (other, _) = registry.resolve(&Url::parse("hf://datasets/org/other/train.vortex")?)?;
+
+    assert!(!Arc::ptr_eq(&main, &dev));
+    assert!(!Arc::ptr_eq(&main, &other));
+    Ok(())
+}
+
+/// A percent-encoded revision is one raw URL segment but decodes to several path parts. The
+/// registry's segment-count subtraction must not underflow on it, on either the build-and-cache
+/// branch or the cached-store branch.
+#[test]
+fn test_resolve_hf_url_percent_encoded_revision() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = registry();
+    let url = Url::parse("hf://datasets/org/name@refs%2Fconvert%2Fparquet/dir/file.vortex")?;
+
+    let (first, path) = registry.resolve(&url)?;
+    assert_eq!(path.as_ref(), "dir/file.vortex");
+
+    let (second, path) = registry.resolve(&url)?;
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(path.as_ref(), "dir/file.vortex");
+    Ok(())
+}
+
+/// Only dataset repositories are addressable, so a model-style `hf://<org>/<name>` URL must be
+/// rejected by our builder rather than silently mis-resolved or handed to `parse_url_opts`.
+#[test]
+fn test_resolve_hf_url_rejects_non_dataset_repo() -> Result<(), Box<dyn std::error::Error>> {
+    let err = registry()
+        .resolve(&Url::parse("hf://org/name/train.vortex")?)
+        .expect_err("only dataset repositories are supported");
+
+    assert!(
+        err.to_string().contains("hf://datasets/"),
+        "unexpected error for a non-dataset repository: {err}"
+    );
+    Ok(())
+}
+
 /// The OpenDAL-backed schemes must resolve through the registry rather than falling through to
 /// `parse_url_opts`, which does not recognize them. Without an endpoint the build fails, but the
 /// error must come from the OpenDAL builder ("missing required OpenDAL store configuration"), not

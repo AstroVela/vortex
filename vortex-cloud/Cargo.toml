@@ -17,6 +17,7 @@ categories = { workspace = true }
 all-features = true
 
 [dependencies]
+http = { workspace = true, optional = true }
 object_store = { workspace = true, features = ["fs"] }
 object_store_opendal = { workspace = true, optional = true }
 opendal = { workspace = true, optional = true }
@@ -25,11 +26,15 @@ tracing = { workspace = true, optional = true }
 url = { workspace = true }
 vortex-utils = { workspace = true }
 
+[dev-dependencies]
+rstest = { workspace = true }
+
 [features]
 default = []
 # The URL -> ObjectStore registry, plus the cloud backends it resolves URLs to. Kept optional so
 # that a consumer needing only an OpenDAL store does not pull in the native cloud backends.
 registry = [
+    "dep:http",
     "dep:parking_lot",
     "object_store/aws",
     "object_store/azure",

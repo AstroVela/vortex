@@ -9576,10 +9576,12 @@ dependencies = [
 name = "vortex-cloud"
 version = "0.1.0"
 dependencies = [
+ "http",
  "object_store",
  "object_store_opendal",
  "opendal",
  "parking_lot",
+ "rstest",
  "tracing",
  "url",
  "vortex-utils",
