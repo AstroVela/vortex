@@ -18,6 +18,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.catalog.SessionConfigSupport;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableProvider;
 import org.apache.spark.sql.connector.expressions.Expressions;
@@ -36,8 +37,14 @@ import scala.Option;
  * <p>This class is automatically registered so it can be discovered by the Spark runtime. For reading:
  * {@link org.apache.spark.sql.SparkSession#read} and specify the format as "vortex". For writing:
  * {@link org.apache.spark.sql.Dataset#write} and specify the format as "vortex".
+ *
+ * <p>Session configurations prefixed with {@code spark.datasource.vortex.} are propagated into the read and write
+ * options of every Vortex scan and write in that Spark session, with the prefix stripped. For example, setting
+ * {@code spark.datasource.vortex.vortex.workerThreads=8} has the same effect as passing
+ * {@code .option("vortex.workerThreads", "8")} on each read or write. Options passed explicitly take precedence over
+ * session configurations.
  */
-public final class VortexDataSourceV2 implements TableProvider, DataSourceRegister {
+public final class VortexDataSourceV2 implements TableProvider, DataSourceRegister, SessionConfigSupport {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final String PATH_KEY = "path";
@@ -201,6 +208,19 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
      */
     @Override
     public String shortName() {
+        return "vortex";
+    }
+
+    /**
+     * Returns the session-configuration prefix for this data source.
+     *
+     * <p>Spark forwards every session configuration under {@code spark.datasource.vortex.} into the options of reads
+     * and writes on this data source, with the prefix stripped.
+     *
+     * @return the key prefix "vortex"
+     */
+    @Override
+    public String keyPrefix() {
         return "vortex";
     }
 
