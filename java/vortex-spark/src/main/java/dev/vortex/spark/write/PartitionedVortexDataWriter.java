@@ -29,6 +29,7 @@ import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.Literal;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.BinaryType;
@@ -135,6 +136,23 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
             writers.put(partitionPath, writer);
         }
         writer.write(dataProjection.apply(row));
+    }
+
+    /** Reports this task's write metrics aggregated across all partition writers. */
+    @Override
+    public CustomTaskMetric[] currentMetricsValues() {
+        long rows = 0;
+        long bytes = 0;
+        for (VortexDataWriter writer : writers.values()) {
+            rows += writer.recordCount();
+            bytes += writer.bytesWritten();
+        }
+        return new CustomTaskMetric[] {
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.FILES_WRITTEN, writers.size()),
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.PARTITIONS_WRITTEN, writers.size()),
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.ROWS_WRITTEN, rows),
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.BYTES_BUFFERED, bytes)
+        };
     }
 
     @Override
