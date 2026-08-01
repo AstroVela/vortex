@@ -217,7 +217,7 @@ impl<'a> Batch<'a> {
             .collect::<VortexResult<Vec<_>>>()?;
 
         let result = kernel(&VecExecutionArgs::new(one_row, 1), ctx)?;
-        let scalar = self.with_return_dtype(result)?.execute_scalar(0, ctx)?;
+        let scalar = self.with_return_dtype(result, 1)?.execute_scalar(0, ctx)?;
 
         Ok(ConstantArray::new(scalar, self.args.row_count()).into_array())
     }
@@ -240,8 +240,12 @@ impl<'a> Batch<'a> {
         let values = kernel(self.args, ctx)?;
 
         match self.validity.clone() {
-            Validity::NonNullable | Validity::AllValid => self.with_return_dtype(values),
-            Validity::Array(valid) => self.with_return_dtype(values.mask(valid)?),
+            Validity::NonNullable | Validity::AllValid => {
+                self.with_return_dtype(values, self.args.row_count())
+            }
+            Validity::Array(valid) => {
+                self.with_return_dtype(values.mask(valid)?, self.args.row_count())
+            }
             // Handled by the guard above, before the kernel ran.
             Validity::AllInvalid => Ok(self.all_null()),
         }
@@ -276,7 +280,7 @@ impl<'a> Batch<'a> {
         // Check all-true before all-false: an empty mask is both, and must not be treated as
         // all-null (a zero-length non-nullable execution keeps its non-nullable dtype).
         if valid.all_true() {
-            return self.with_return_dtype(kernel(self.args, ctx)?);
+            return self.with_return_dtype(kernel(self.args, ctx)?, self.args.row_count());
         }
 
         if valid.all_false() {
@@ -307,7 +311,8 @@ impl<'a> Batch<'a> {
         };
 
         let mask = BoolArray::new(valid.to_bit_buffer(), Validity::NonNullable).into_array();
-        self.with_return_dtype(values.mask(mask)?).map(Some)
+        self.with_return_dtype(values.mask(mask)?, valid.len())
+            .map(Some)
     }
 
     /// The filter strategy for a mixed mask: filter every input down to the rows set in `valid`,
@@ -326,7 +331,7 @@ impl<'a> Batch<'a> {
 
         let values = kernel(&VecExecutionArgs::new(filtered, valid.true_count()), ctx)?;
 
-        self.with_return_dtype(self.scatter_valid(values, valid)?)
+        self.with_return_dtype(self.scatter_valid(values, valid)?, valid.len())
     }
 
     /// An all-null result of the function's declared return dtype.
@@ -343,20 +348,8 @@ impl<'a> Batch<'a> {
     /// The kernel may ignore nullability, so a nullability difference is cast away. Any other
     /// difference means the declared dtype and the kernel disagree, which is a bug worth naming
     /// rather than silently casting away.
-    fn with_return_dtype(&self, values: ArrayRef) -> VortexResult<ArrayRef> {
-        vortex_ensure!(
-            values.dtype().eq_ignore_nullability(&self.result_dtype),
-            "the {} kernel produced {} but the function declares {}",
-            self.id,
-            values.dtype(),
-            self.result_dtype,
-        );
-
-        if values.dtype() == &self.result_dtype {
-            Ok(values)
-        } else {
-            values.cast(self.result_dtype.clone())
-        }
+    fn with_return_dtype(&self, values: ArrayRef, expected_len: usize) -> VortexResult<ArrayRef> {
+        reconcile_return(self.id, &self.result_dtype, expected_len, values)
     }
 
     /// Scatter `values` (one per set bit of `valid`, in order) back to the positions of the set
@@ -392,6 +385,32 @@ impl<'a> Batch<'a> {
         let scattered = values.take(indices)?;
         let mask = BoolArray::new(valid.to_bit_buffer(), Validity::NonNullable).into_array();
         scattered.mask(mask)
+    }
+}
+
+/// Validate the row count and reconcile nullability against a row function's declared dtype.
+pub(super) fn reconcile_return(
+    id: ScalarFnId,
+    result_dtype: &DType,
+    expected_len: usize,
+    values: ArrayRef,
+) -> VortexResult<ArrayRef> {
+    vortex_ensure_eq!(
+        values.len(),
+        expected_len,
+        "the {id} kernel produced {} rows for {expected_len} input rows",
+        values.len(),
+    );
+    vortex_ensure!(
+        values.dtype().eq_ignore_nullability(result_dtype),
+        "the {id} kernel produced {} but the function declares {result_dtype}",
+        values.dtype(),
+    );
+
+    if values.dtype() == result_dtype {
+        Ok(values)
+    } else {
+        values.cast(result_dtype.clone())
     }
 }
 
@@ -467,7 +486,9 @@ impl Batch<'_> {
             .execute_mask(self.args.row_count(), ctx)?;
 
         if valid.all_true() {
-            return self.with_return_dtype(kernel(self.args, ctx)?).map(Some);
+            return self
+                .with_return_dtype(kernel(self.args, ctx)?, self.args.row_count())
+                .map(Some);
         }
 
         if valid.all_false() {

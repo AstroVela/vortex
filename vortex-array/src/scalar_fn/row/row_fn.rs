@@ -40,6 +40,7 @@ use crate::scalar_fn::row::execute::row_null_handling;
 use crate::scalar_fn::row::execute::validate_row_args;
 use crate::scalar_fn::row::execute::validate_row_sink;
 use crate::scalar_fn::row::lift::Batch;
+use crate::scalar_fn::row::lift::reconcile_return;
 
 /// A scalar function computed one row at a time.
 ///
@@ -531,7 +532,9 @@ impl<F: RowFn> ScalarFnVTable for F {
     ) -> VortexResult<ArrayRef> {
         // Nullary functions have no input values that could be null, so there is nothing to lift.
         if args.num_inputs() == 0 {
-            return execute_rows(self, options, args, ctx);
+            let result_dtype = ScalarFnVTable::return_dtype(self, options, &[])?;
+            let values = execute_rows(self, options, args, ctx)?;
+            return reconcile_return(RowFn::id(self), &result_dtype, args.row_count(), values);
         }
 
         lift_batch(self, options, args)?.execute(

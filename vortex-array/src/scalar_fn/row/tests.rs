@@ -293,6 +293,57 @@ mod nullable_outputs {
     }
 }
 
+#[derive(Clone)]
+struct WrongLength;
+
+impl RowFn for WrongLength {
+    type Options = EmptyOptions;
+    type ArgsWitness = (i64,);
+    type RetWitness = i64;
+
+    fn id(&self) -> ScalarFnId {
+        static ID: CachedId = CachedId::new("vortex.test.wrong_length");
+        *ID
+    }
+
+    fn arg_name(&self, _idx: usize) -> ChildName {
+        ChildName::from("input")
+    }
+
+    fn dispatch<V: RowVisitor>(
+        &self,
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        visitor.visit::<(i64,), i64>(|(value,)| value)
+    }
+
+    fn reduce_encoded(
+        &self,
+        _options: &Self::Options,
+        _args: &[ArrayRef],
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        Ok(Some(PrimitiveArray::from_iter([0i64]).into_array()))
+    }
+}
+
+#[test]
+fn kernel_result_length_is_validated() {
+    let mut ctx = array_session().create_execution_ctx();
+    let input = buffer![1i64, 2, 3].into_array();
+
+    let error = apply(WrongLength, [input], &mut ctx).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("produced 1 rows for 3 input rows"),
+        "{error}"
+    );
+}
+
 #[test]
 fn ret_type_decides_fallibility() {
     assert!(!ScalarFnVTable::is_fallible(&Hypot, &EmptyOptions));
