@@ -67,20 +67,36 @@ fn geometry(rows: u32, dimensions: u32) -> TileGeometry {
 
 #[test]
 fn bitmap_validity_follows_value_permutation() -> VortexResult<()> {
-    let canonical = PrimitiveArray::new(
-        buffer![10u16, 11, 20, 21],
-        Validity::from_iter([true, false, true, true]),
+    let canonical_validity = Validity::from_iter([true, false, true, true]);
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(buffer![10u16, 11, 20, 21], canonical_validity.clone()).into_array(),
+        2,
+        Validity::NonNullable,
+        2,
     );
     let mut ctx = SESSION.create_execution_ctx();
 
-    let tiled = encode_elements(canonical.as_view(), 2, 2, geometry(2, 2), &mut ctx)?;
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(2, 2), &mut ctx)?;
 
-    assert_eq!(tiled.as_slice::<u16>(), &[10, 20, 11, 21]);
-    assert!(tiled.validity()?.mask_eq(
+    let tiled_elements = tiled
+        .elements()
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)?;
+    assert_eq!(tiled_elements.as_slice::<u16>(), &[10, 20, 11, 21]);
+    assert!(tiled.elements().validity()?.mask_eq(
         &Validity::from_iter([true, true, false, true]),
         4,
         &mut ctx,
     )?);
+
+    let decoded = tiled.into_array().execute::<FixedSizeListArray>(&mut ctx)?;
+    assert!(
+        decoded
+            .elements()
+            .validity()?
+            .mask_eq(&canonical_validity, 4, &mut ctx,)?
+    );
+    assert_fsl_equivalent(&canonical.into_array(), &decoded.into_array(), &mut ctx)?;
     Ok(())
 }
 
