@@ -10,14 +10,17 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
+import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.Statistics;
 import org.apache.spark.sql.connector.read.SupportsReportStatistics;
+import org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering;
 import org.apache.spark.sql.connector.read.colstats.ColumnStatistics;
 import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.types.StructType;
@@ -32,13 +35,18 @@ import org.apache.spark.sql.types.StructType;
  * listing did not return a size for one or more files the file-byte total is extrapolated before Spark scaling is
  * applied.
  */
-public final class VortexScan implements Scan, SupportsReportStatistics {
+public final class VortexScan implements Scan, SupportsReportStatistics, SupportsRuntimeV2Filtering {
 
     private final List<String> paths;
     private final List<Column> tableColumns;
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final Set<String> partitionColumnNames;
+
+    // Runtime (e.g. dynamic partition pruning) predicates on partition columns. Spark installs
+    // them through filter(Predicate[]) after the scan was built and then re-plans the batch.
+    private Predicate[] runtimeFilters = new Predicate[0];
 
     private volatile Statistics cachedStatistics;
 
@@ -50,18 +58,21 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      * @param tableColumns the full table columns before projection pushdown
      * @param readColumns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; {@code null} or empty means no pushdown
+     * @param partitionColumnNames names of Hive-style partition columns encoded in the file paths
      */
     public VortexScan(
             List<String> paths,
             List<Column> tableColumns,
             List<Column> readColumns,
             Predicate[] pushedPredicates,
-            Map<String, String> formatOptions) {
+            Map<String, String> formatOptions,
+            Set<String> partitionColumnNames) {
         this.paths = paths;
         this.tableColumns = tableColumns;
         this.readColumns = readColumns;
         this.formatOptions = formatOptions;
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.partitionColumnNames = Set.copyOf(partitionColumnNames);
     }
 
     /**
@@ -93,7 +104,26 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      */
     @Override
     public Batch toBatch() {
-        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates);
+        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates, runtimeFilters);
+    }
+
+    /**
+     * Reports the Hive-style partition columns as filterable attributes for runtime filtering (for example dynamic
+     * partition pruning during a join). Spark only supplies runtime predicates that reference these columns.
+     */
+    @Override
+    public NamedReference[] filterAttributes() {
+        return partitionColumnNames.stream().map(Expressions::column).toArray(NamedReference[]::new);
+    }
+
+    /**
+     * Installs runtime predicates on partition columns. Spark calls this after query start, once the values of the
+     * pruning subquery are known, and then re-plans this scan's batch; files whose partition values definitively fail
+     * the predicates are skipped. Predicates that cannot be evaluated against partition values keep the file.
+     */
+    @Override
+    public void filter(Predicate[] predicates) {
+        this.runtimeFilters = predicates == null ? new Predicate[0] : predicates.clone();
     }
 
     /**

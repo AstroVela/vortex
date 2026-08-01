@@ -12,6 +12,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -29,6 +30,7 @@ public final class VortexBatchExec implements Batch {
     private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final Predicate[] runtimeFilters;
     private List<String> resolvedPaths;
 
     /**
@@ -38,13 +40,19 @@ public final class VortexBatchExec implements Batch {
      * @param columns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
+     * @param runtimeFilters runtime predicates on partition columns used to skip whole files during planning
      */
     public VortexBatchExec(
-            List<String> paths, List<Column> columns, Map<String, String> formatOptions, Predicate[] pushedPredicates) {
+            List<String> paths,
+            List<Column> columns,
+            Map<String, String> formatOptions,
+            Predicate[] pushedPredicates,
+            Predicate[] runtimeFilters) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.runtimeFilters = runtimeFilters == null ? new Predicate[0] : runtimeFilters.clone();
     }
 
     /**
@@ -52,7 +60,8 @@ public final class VortexBatchExec implements Batch {
      *
      * <p>Directory-like entries are expanded to concrete {@code .vortex} files. Each resolved file becomes its own
      * {@link VortexFilePartition}; the partition carries the paths the reader should open, the requested schema, and
-     * any Hive-style partition values parsed out of the path.
+     * any Hive-style partition values parsed out of the path. Files whose partition values definitively fail the
+     * runtime filters are skipped entirely.
      */
     @Override
     public InputPartition[] planInputPartitions() {
@@ -60,9 +69,13 @@ public final class VortexBatchExec implements Batch {
         return resolvedPaths.stream()
                 .map(path -> {
                     Map<String, String> partVals = PartitionPathUtils.parsePartitionValues(path);
+                    if (!PartitionPredicateEvaluator.matches(partVals, runtimeFilters)) {
+                        return null;
+                    }
                     return new VortexFilePartition(
                             List.of(path), readSchema, formatOptions, ImmutableMap.copyOf(partVals));
                 })
+                .filter(Objects::nonNull)
                 .toArray(InputPartition[]::new);
     }
 
