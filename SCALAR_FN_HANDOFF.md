@@ -10,7 +10,8 @@ The design is now proposed publicly, in three issues that Connor wrote by hand a
 this file wherever they disagree:
 
 - **Epic 9128, Row-oriented scalar functions.** Goals, motivation (the `Hypot` walkthrough of
-  everything an author has to get right today), non-goals, and the preliminary performance numbers.
+  everything an author has to get right today), non-goals, and the current benchmark/codegen
+  record in its [follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802).
   Status is *Proposed*, and it links this branch and its diffshub comparison as the prototype, so
   the branch is now publicly referenced: do not rewrite or delete it.
 - **9129, Define the `RowFn` API.** The author-facing surface, with the trait sketches and worked
@@ -24,6 +25,14 @@ request there as it lands; that is the intended record of progress.
 
 This branch is where the design was worked out and measured, and the plan below turns it into small
 reviewable pull requests cut fresh from develop.
+
+## Current benchmark and codegen record
+
+The [issue #9128 benchmark and codegen follow-up](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802)
+is the authoritative current comparison. It states the machine and harness, reports two-run
+fastest and median results, documents the control-arm limitations, and includes representative
+generated LLVM IR and assembly. Older shared-VM numbers in this handoff remain historical context,
+not the current branch-versus-develop record.
 
 ## Where the work lives
 
@@ -200,8 +209,8 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
    Implementation history: row core plus `byte_length`; then `OutputSink` plus `l2_denorm`; then
    `l2_norm` and `inner_product` on the plain visit; then `visit_prepared` with both of its users,
    `cosine_similarity` and geo; then adaptive execution and its benches. Land each API surface with
-   its first user, which is why `visit_prepared` travels with geo rather than with cosine (geo's
-   9.1x carries the API, cosine's few percent does not) and why adaptive execution comes after geo
+   its first user, which is why `visit_prepared` travels with geo rather than with cosine (the
+   prepared-geometry win carries the API, cosine's few percent does not) and why adaptive execution comes after geo
    (geo is its only production beneficiary, since every other adopter is dense-safe). Two of 9129's
    steps are already satisfied on this branch and only need carrying over: serialized metadata of
    migrated functions is preserved (the per-function array serde described above), and the "when to
@@ -336,10 +345,9 @@ lifting's small-batch prelude cost discussed above.
 
 ## Loose ends, and issues worth filing separately
 
-Two loose ends from the deletion, both cheap. The reworked benchmark control arms in
-`vortex-array/benches/strict_validity.rs` and `vortex-tensor/benches/l2_denorm.rs` compile and were
-reasoned through, but were never run in release, because disk was down to a few GB against a 23 GB
-`target`. Run both before quoting their numbers anywhere. And commit `72e01f96c` (the first version
+The reworked benchmark control arms in `vortex-array/benches/strict_validity.rs` and
+`vortex-tensor/benches/l2_denorm.rs` have now been run in release; use the [issue #9128 follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802), rather than
+the historical figures in this document, when quoting their results. Commit `72e01f96c` (the first version
 of this file) is pushed unsigned, so GitHub shows it unverified; every commit after it is signed, and
 fixing it needs a force-push, which is blocked.
 
@@ -376,8 +384,8 @@ function's pre-port body, use the commit before the port instead: `24d1933e1^` f
 assumption about what develop contains, and `git fetch origin develop` before comparing against it.
 
 Benchmarks are divan (aliased to `codspeed-divan-compat`, so they also run in CI); report `fastest`
-and `median` from at least two runs and state the machine, because this environment is a shared
-4-vCPU VM where filter-heavy arms have shown up to 2.3x run-to-run spread. Any new bench must be
+and `median` from at least two runs and state the machine. The historical measurements here used a
+shared 4-vCPU VM; the current 7950X comparison is recorded in the [issue #9128 follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802). Any new bench must be
 registered as a `[[bench]]` with `harness = false` in the crate's `Cargo.toml`. Per-adopter
 benchmarks with constant and non-constant arms are the convention, and where a claim is "as fast as
 the hand-written version", put both arms in one binary rather than comparing across builds. Disk is tight:

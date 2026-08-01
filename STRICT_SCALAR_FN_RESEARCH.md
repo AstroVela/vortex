@@ -16,6 +16,18 @@ now enforces. Along the way it turned up three problems that are not about the f
 
 ---
 
+## Current benchmark and codegen record
+
+The authoritative current comparison is the [benchmark and codegen follow-up on issue #9128](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802). It records the
+machine, harness, two-run fastest and median results, control limitations, and representative LLVM
+IR/assembly in folded sections. It supersedes the older shared-VM performance figures in these
+notes for claims about the current branch versus `develop`.
+
+The historical measurements below remain because they explain design decisions and experiments made
+while building the prototype; they are not the current before/after performance record.
+
+---
+
 ## The design in one screen
 
 ```text
