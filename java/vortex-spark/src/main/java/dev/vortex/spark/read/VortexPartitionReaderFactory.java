@@ -34,6 +34,7 @@ public final class VortexPartitionReaderFactory implements PartitionReaderFactor
     private final ImmutableMap<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
     private final ImmutableSet<String> metadataColumnNames;
+    private final VortexTableSample tableSample;
     private final int limit;
 
     public VortexPartitionReaderFactory(
@@ -41,11 +42,13 @@ public final class VortexPartitionReaderFactory implements PartitionReaderFactor
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
             Set<String> metadataColumnNames,
+            VortexTableSample tableSample,
             int limit) {
         this.dataColumnNames = ImmutableList.copyOf(dataColumnNames);
         this.formatOptions = ImmutableMap.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.metadataColumnNames = ImmutableSet.copyOf(metadataColumnNames);
+        this.tableSample = tableSample;
         this.limit = limit;
     }
 
@@ -59,7 +62,7 @@ public final class VortexPartitionReaderFactory implements PartitionReaderFactor
         NativeRuntime.setWorkerThreads(Integer.parseInt(formatOptions.getOrDefault("vortex.workerThreads", "4")));
         VortexFilePartition spark = (VortexFilePartition) partition;
         return new VortexPartitionReader(
-                spark, dataColumnNames, formatOptions, pushedPredicates, metadataColumnNames, limit);
+                spark, dataColumnNames, formatOptions, pushedPredicates, metadataColumnNames, tableSample, limit);
     }
 
     @Override

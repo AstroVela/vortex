@@ -47,6 +47,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     private final Predicate[] pushedPredicates;
     private final Set<String> partitionColumnNames;
     private final Set<String> metadataColumnNames;
+    private final VortexTableSample tableSample;
     private final int limit;
 
     // Runtime (e.g. dynamic partition pruning) predicates on partition columns. Spark installs
@@ -65,6 +66,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
      * @param pushedPredicates predicates pushed down by Spark; {@code null} or empty means no pushdown
      * @param partitionColumnNames names of Hive-style partition columns encoded in the file paths
      * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
+     * @param tableSample the pushed-down Bernoulli table sample, or {@code null} when the scan is unsampled
      * @param limit maximum row count each partition reader should return, or {@link #NO_LIMIT}
      */
     public VortexScan(
@@ -75,6 +77,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
             Map<String, String> formatOptions,
             Set<String> partitionColumnNames,
             Set<String> metadataColumnNames,
+            VortexTableSample tableSample,
             int limit) {
         this.paths = paths;
         this.tableColumns = tableColumns;
@@ -83,6 +86,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.partitionColumnNames = Set.copyOf(partitionColumnNames);
         this.metadataColumnNames = Set.copyOf(metadataColumnNames);
+        this.tableSample = tableSample;
         this.limit = limit;
     }
 
@@ -102,8 +106,12 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     @Override
     public String description() {
         return String.format(
-                "VortexScan{paths=%s, columns=%s, pushedPredicates=%s%s}",
-                paths, readColumns, Arrays.toString(pushedPredicates), limit == NO_LIMIT ? "" : ", limit=" + limit);
+                "VortexScan{paths=%s, columns=%s, pushedPredicates=%s%s%s}",
+                paths,
+                readColumns,
+                Arrays.toString(pushedPredicates),
+                tableSample == null ? "" : ", sample=" + tableSample,
+                limit == NO_LIMIT ? "" : ", limit=" + limit);
     }
 
     /**
@@ -116,7 +124,8 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     @Override
     public Batch toBatch() {
         return new VortexBatchExec(
-                paths, readColumns, formatOptions, pushedPredicates, runtimeFilters, metadataColumnNames, limit);
+                paths, readColumns, formatOptions, pushedPredicates, runtimeFilters, metadataColumnNames, tableSample,
+                limit);
     }
 
     /**

@@ -32,6 +32,7 @@ public final class VortexBatchExec implements Batch {
     private final Predicate[] pushedPredicates;
     private final Predicate[] runtimeFilters;
     private final Set<String> metadataColumnNames;
+    private final VortexTableSample tableSample;
     private final int limit;
     private List<String> resolvedPaths;
 
@@ -44,6 +45,7 @@ public final class VortexBatchExec implements Batch {
      *     time
      * @param runtimeFilters runtime predicates on partition columns used to skip whole files during planning
      * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
+     * @param tableSample the pushed-down Bernoulli table sample, or {@code null} when the scan is unsampled
      * @param limit maximum row count each partition reader should return, or {@link VortexScan#NO_LIMIT}
      */
     public VortexBatchExec(
@@ -53,6 +55,7 @@ public final class VortexBatchExec implements Batch {
             Predicate[] pushedPredicates,
             Predicate[] runtimeFilters,
             Set<String> metadataColumnNames,
+            VortexTableSample tableSample,
             int limit) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
@@ -60,6 +63,7 @@ public final class VortexBatchExec implements Batch {
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.runtimeFilters = runtimeFilters == null ? new Predicate[0] : runtimeFilters.clone();
         this.metadataColumnNames = Set.copyOf(metadataColumnNames);
+        this.tableSample = tableSample;
         this.limit = limit;
     }
 
@@ -95,7 +99,7 @@ public final class VortexBatchExec implements Batch {
                 .filter(name -> !partitionColumns.contains(name) && !metadataColumnNames.contains(name))
                 .collect(Collectors.toList());
         return new VortexPartitionReaderFactory(
-                dataColumnNames, formatOptions, pushedPredicates, metadataColumnNames, limit);
+                dataColumnNames, formatOptions, pushedPredicates, metadataColumnNames, tableSample, limit);
     }
 
     private List<String> resolvePaths() {
