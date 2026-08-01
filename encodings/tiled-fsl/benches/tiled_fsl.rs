@@ -436,6 +436,23 @@ fn assert_scores_equal(
         scoring::score_tiled(tiled.as_view(), tiled_values, query),
         "canonical and tiled scores differ for {args}",
     );
+
+    if tiled.is_full_width() && args.rows > 2 {
+        let range = 1..args.rows - 1;
+        let canonical = canonical.into_array().slice(range.clone())?;
+        let canonical = canonical.execute::<FixedSizeListArray>(ctx)?;
+        let canonical_elements = canonical.elements();
+        let canonical_primitive = canonical_elements.as_::<Primitive>();
+        let canonical_values = canonical_primitive.as_slice::<u8>();
+        let tiled = tiled.clone().into_array().slice(range)?;
+        let tiled = tiled.as_::<TiledFixedSizeList>();
+        let tiled_values = tiled.elements().clone().execute::<PrimitiveArray>(ctx)?;
+        assert_eq!(
+            scoring::score_canonical(canonical_values, canonical.len(), args.dimensions, query,),
+            scoring::score_tiled(tiled, tiled_values.as_slice::<u8>(), query),
+            "canonical and tiled view scores differ for {args}",
+        );
+    }
     Ok(())
 }
 
@@ -754,9 +771,11 @@ mod scoring {
     ) -> Vec<u64> {
         let mut scores = vec![0; array.len()];
         for bounds in array.tiles() {
-            let tile_rows = bounds.row_range.len();
+            let retained_rows = bounds.physical_range.len() / bounds.dimension_range.len();
             for (dimension_offset, dimension) in bounds.dimension_range.clone().enumerate() {
-                let physical_start = bounds.physical_range.start + dimension_offset * tile_rows;
+                let physical_start = bounds.physical_range.start
+                    + dimension_offset * retained_rows
+                    + bounds.rows_within_tile.start;
                 let weight = u64::from(query[dimension]);
                 for (row_offset, row) in bounds.row_range.clone().enumerate() {
                     scores[row] += u64::from(values[physical_start + row_offset]) * weight;

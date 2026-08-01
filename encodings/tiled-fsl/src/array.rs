@@ -275,6 +275,19 @@ impl VTable for TiledFixedSizeList {
             data.row_offset,
             data.backing_rows
         );
+        if len > 0 {
+            let remainder = logical_end % tile_rows;
+            let max_backing_rows = if remainder == 0 {
+                logical_end
+            } else {
+                logical_end.saturating_add(tile_rows - remainder)
+            };
+            vortex_ensure!(
+                data.backing_rows <= max_backing_rows,
+                InvalidArgument: "tiled fixed-size-list backing rows {} exceeds the retained tile extent {max_backing_rows}",
+                data.backing_rows
+            );
+        }
         if *list_size == 0 || (*list_size as usize) > tile_dimensions {
             vortex_ensure!(
                 data.row_offset == 0 && data.backing_rows == len,

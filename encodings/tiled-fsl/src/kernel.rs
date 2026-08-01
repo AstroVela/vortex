@@ -17,6 +17,7 @@ use vortex_array::arrays::slice::SliceKernel;
 use vortex_array::builders::builder_with_capacity;
 use vortex_array::optimizer::kernels::ArrayKernelsExt;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
 
 use crate::TiledFixedSizeList;
@@ -40,6 +41,11 @@ impl SliceKernel for TiledFixedSizeList {
         range: Range<usize>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
+        // Span planning below uses geometry relative to a complete, zero-offset backing array.
+        vortex_ensure!(
+            array.row_offset() == 0 && array.backing_rows() == array.len(),
+            InvalidArgument: "tiled fixed-size-list slice kernel requires a non-view array"
+        );
         let (tile_rows, _) = geometry_usizes(array.geometry())?;
         let retained_start = range.start / tile_rows * tile_rows;
         let retained_end = range.end.div_ceil(tile_rows) * tile_rows;

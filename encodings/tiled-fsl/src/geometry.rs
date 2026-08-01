@@ -39,7 +39,10 @@ pub struct TileBounds {
     pub row_range: Range<usize>,
     /// The logical dimensions contained by this tile.
     pub dimension_range: Range<usize>,
-    /// The contiguous, unpadded physical values occupied by this tile.
+    /// The contiguous retained physical values for this tile.
+    ///
+    /// For a row view, this may include hidden boundary rows; [`Self::rows_within_tile`] identifies
+    /// the visible portion.
     pub physical_range: Range<usize>,
     /// The visible rows, relative to the beginning of the retained physical tile.
     pub rows_within_tile: Range<usize>,

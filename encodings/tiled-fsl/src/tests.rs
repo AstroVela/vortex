@@ -28,6 +28,7 @@ use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::piecewise_sequence::array::PiecewiseSequenceArraySlotsExt;
+use vortex_array::arrays::slice::SliceKernel;
 use vortex_array::arrays::slice::SliceReduce;
 use vortex_array::assert_arrays_eq;
 use vortex_array::buffer::BufferHandle;
@@ -942,6 +943,22 @@ fn multi_slab_slice_kernel_matches_canonical() -> VortexResult<()> {
 }
 
 #[test]
+fn slice_kernel_rejects_row_views() -> VortexResult<()> {
+    let (_, tiled, mut ctx) = fixture(200, 128, geometry(64, 128))?;
+    let view = tiled.into_array().slice(10..150)?;
+
+    let error = <TiledFixedSizeList as SliceKernel>::slice(
+        view.as_::<TiledFixedSizeList>(),
+        1..2,
+        &mut ctx,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("requires a non-view array"));
+    Ok(())
+}
+
+#[test]
 fn aligned_multi_slab_slice_uses_one_exact_run_per_slab() -> VortexResult<()> {
     let (_, tiled, mut ctx) = fixture(256, 1_536, geometry(64, 64))?;
 
@@ -1509,42 +1526,32 @@ fn deserialize_test_metadata(
     Ok(())
 }
 
-#[test]
-fn deserialize_rejects_backing_extent_overflow() {
+#[rstest]
+#[case::backing_extent_overflow(2, 0, u64::MAX, 1, 2, 0, "backing")]
+#[case::window_outside_backing(1, 1, 2, 2, 1, 2, "row window 1..3 exceeds 2 backing rows")]
+#[case::excess_retained_tiles(1, 1, 128, 1, 1, 128, "exceeds the retained tile extent")]
+fn deserialize_rejects_malformed_row_view_metadata(
+    #[case] tile_dimensions: u32,
+    #[case] row_offset: u32,
+    #[case] backing_rows: u64,
+    #[case] len: usize,
+    #[case] list_size: u32,
+    #[case] element_len: usize,
+    #[case] expected_error: &str,
+) {
     let error = deserialize_test_metadata(
         TiledFixedSizeListMetadata {
             tile_rows: 64,
-            tile_dimensions: 2,
-            row_offset: 0,
-            backing_rows: u64::MAX,
+            tile_dimensions,
+            row_offset,
+            backing_rows,
         },
-        1,
-        2,
-        PrimitiveArray::from_iter(std::iter::empty::<u16>()).into_array(),
+        len,
+        list_size,
+        PrimitiveArray::from_iter((0..element_len).map(|_| 0u16)).into_array(),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("backing"));
-}
-
-#[test]
-fn deserialize_rejects_window_outside_backing_rows() {
-    let error = deserialize_test_metadata(
-        TiledFixedSizeListMetadata {
-            tile_rows: 64,
-            tile_dimensions: 1,
-            row_offset: 1,
-            backing_rows: 2,
-        },
-        2,
-        1,
-        PrimitiveArray::from_iter([10u16, 20]).into_array(),
-    )
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("row window 1..3 exceeds 2 backing rows")
-    );
+    assert!(error.to_string().contains(expected_error));
 }
 
 #[test]
