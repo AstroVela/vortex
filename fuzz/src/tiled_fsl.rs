@@ -11,7 +11,9 @@ use std::sync::LazyLock;
 
 use arbitrary::Arbitrary;
 use arbitrary::Unstructured;
+use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayVTable;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -19,18 +21,23 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::Slice;
 use vortex_array::arrays::arbitrary::ArbitraryArray;
 use vortex_array::arrays::arbitrary::ArbitraryArrayConfig;
 use vortex_array::arrays::arbitrary::ArbitraryWith;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_tiled_fsl::TileGeometry;
 use vortex_tiled_fsl::TiledFixedSizeList;
@@ -58,6 +65,7 @@ pub enum TiledFslAction {
     Slice { start: u16, stop: u16 },
     Take(Vec<Option<u16>>),
     Reconstruct,
+    ReconstructSerde,
 }
 
 #[derive(Debug)]
@@ -97,7 +105,7 @@ impl<'a> Arbitrary<'a> for FuzzTiledFsl {
         let action_count = u.int_in_range(1usize..=8)?;
         let mut actions = Vec::with_capacity(action_count);
         for _ in 0..action_count {
-            actions.push(match u.int_in_range(0u8..=4)? {
+            actions.push(match u.int_in_range(0u8..=5)? {
                 0 => TiledFslAction::CheckTiles,
                 1 => TiledFslAction::ScalarAt(u.arbitrary()?),
                 2 => TiledFslAction::Slice {
@@ -113,6 +121,7 @@ impl<'a> Arbitrary<'a> for FuzzTiledFsl {
                     TiledFslAction::Take(seeds)
                 }
                 4 => TiledFslAction::Reconstruct,
+                5 => TiledFslAction::ReconstructSerde,
                 _ => unreachable!("action tag is bounded"),
             });
         }
@@ -139,6 +148,61 @@ fn assert_tiled_geometry(array: &ArrayRef, expected: TileGeometry) -> VortexResu
         vortex_bail!("expected geometry {expected:?}, found {actual:?}");
     }
     Ok(())
+}
+
+struct SerializedChildren(Vec<ArrayRef>);
+
+impl ArrayChildren for SerializedChildren {
+    fn get(&self, index: usize, dtype: &DType, len: usize) -> VortexResult<ArrayRef> {
+        let child = self
+            .0
+            .as_slice()
+            .get(index)
+            .ok_or_else(|| vortex_err!(InvalidArgument: "missing serialized child {index}"))?;
+        vortex_ensure!(
+            child.dtype() == dtype && child.len() == len,
+            InvalidArgument:
+            "serialized child {index} has dtype {} and len {}, expected {dtype} and {len}",
+            child.dtype(),
+            child.len()
+        );
+        Ok(child.clone())
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+fn reconstruct_serde(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    let tiled = array.as_::<TiledFixedSizeList>();
+    let expected_row_offset = tiled.row_offset();
+    let expected_backing_rows = tiled.backing_rows();
+    let metadata = <TiledFixedSizeList as ArrayVTable>::serialize(tiled, ctx.session())?
+        .ok_or_else(|| vortex_err!("tiled fixed-size list did not serialize metadata"))?;
+    let children = SerializedChildren(array.slots().iter().flatten().cloned().collect());
+    let parts = <TiledFixedSizeList as ArrayVTable>::deserialize(
+        &TiledFixedSizeList,
+        array.dtype(),
+        array.len(),
+        &metadata,
+        &[] as &[BufferHandle],
+        &children,
+        ctx.session(),
+    )?;
+    let reconstructed = Array::<TiledFixedSizeList>::try_from_parts(parts)?.into_array();
+    let reconstructed_tiled = reconstructed.as_::<TiledFixedSizeList>();
+    vortex_ensure!(
+        reconstructed_tiled.row_offset() == expected_row_offset,
+        "serde changed row offset from {expected_row_offset} to {}",
+        reconstructed_tiled.row_offset()
+    );
+    vortex_ensure!(
+        reconstructed_tiled.backing_rows() == expected_backing_rows,
+        "serde changed backing rows from {expected_backing_rows} to {}",
+        reconstructed_tiled.backing_rows()
+    );
+    Ok(reconstructed)
 }
 
 fn expected_tile_indices(
@@ -299,7 +363,9 @@ fn execute_action(
 ) -> VortexFuzzResult<ControlFlow<()>> {
     match action {
         TiledFslAction::CheckTiles => {
-            check_tiles(canonical, tiled, step, ctx)?;
+            if tiled.is::<TiledFixedSizeList>() {
+                check_tiles(canonical, tiled, step, ctx)?;
+            }
         }
         TiledFslAction::ScalarAt(seed) => {
             if canonical.is_empty() {
@@ -312,16 +378,20 @@ fn execute_action(
         }
         TiledFslAction::Slice { start, stop } => {
             let source_is_empty = canonical.is_empty();
+            let source_len = canonical.len();
+            let source_is_tiled = tiled.is::<TiledFixedSizeList>();
+            let source_is_full_width =
+                source_is_tiled && tiled.as_::<TiledFixedSizeList>().is_full_width();
             let first = usize::from(start).min(usize::from(stop));
             let last = usize::from(start).max(usize::from(stop));
             let start = first % (canonical.len() + 1);
             let stop = start + last % (canonical.len() - start + 1);
             *canonical = fuzz(slice_canonical_array(canonical, start, stop, ctx))?;
             *tiled = fuzz(tiled.clone().slice(start..stop))?;
-            assert_array_eq(canonical, tiled, step, ctx)?;
             if tiled.is_empty() {
                 if source_is_empty {
                     fuzz(assert_tiled_geometry(tiled, geometry))?;
+                    assert_array_eq(canonical, tiled, step, ctx)?;
                     return Ok(ControlFlow::Continue(()));
                 }
                 fuzz((|| {
@@ -331,9 +401,25 @@ fn execute_action(
                     );
                     Ok(())
                 })())?;
+                assert_array_eq(canonical, tiled, step, ctx)?;
                 return Ok(ControlFlow::Break(()));
             }
-            fuzz(assert_tiled_geometry(tiled, geometry))?;
+            let tile_rows = geometry.rows().get() as usize;
+            let aligned_multi_slab =
+                start % tile_rows == 0 && (stop % tile_rows == 0 || stop == source_len);
+            if source_is_tiled && (source_is_full_width || aligned_multi_slab) {
+                fuzz(assert_tiled_geometry(tiled, geometry))?;
+            } else {
+                fuzz((|| {
+                    vortex_ensure!(
+                        tiled.is::<Slice>(),
+                        "expected a non-preserving slice to remain a lazy Slice, found {}",
+                        tiled.encoding_id()
+                    );
+                    Ok(())
+                })())?;
+            }
+            assert_array_eq(canonical, tiled, step, ctx)?;
         }
         TiledFslAction::Take(seeds) => {
             let source_is_empty = canonical.is_empty();
@@ -361,7 +447,13 @@ fn execute_action(
             return Ok(ControlFlow::Break(()));
         }
         TiledFslAction::Reconstruct => {
+            if !tiled.is::<TiledFixedSizeList>() {
+                return Ok(ControlFlow::Continue(()));
+            }
             let array = tiled.as_::<TiledFixedSizeList>();
+            if array.row_offset() != 0 || array.backing_rows() != array.len() {
+                return Ok(ControlFlow::Continue(()));
+            }
             *tiled = fuzz(TiledFixedSizeList::try_new(
                 array.elements().clone(),
                 array.list_size(),
@@ -370,6 +462,14 @@ fn execute_action(
                 geometry,
             ))?
             .into_array();
+            assert_array_eq(canonical, tiled, step, ctx)?;
+        }
+        TiledFslAction::ReconstructSerde => {
+            if !tiled.is::<TiledFixedSizeList>() {
+                return Ok(ControlFlow::Continue(()));
+            }
+            *tiled = fuzz(reconstruct_serde(tiled, ctx))?;
+            fuzz(assert_tiled_geometry(tiled, geometry))?;
             assert_array_eq(canonical, tiled, step, ctx)?;
         }
     }
@@ -486,6 +586,30 @@ pub fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>> {
     )
     .into_array();
 
+    let full_width_row_view = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter((0..200 * 128).map(|index| index as u32)),
+            Validity::from_iter((0..200 * 128).map(|index| index % 11 != 0)),
+        )
+        .into_array(),
+        128,
+        Validity::from_iter((0..200).map(|row| row % 7 != 0)),
+        200,
+    )
+    .into_array();
+
+    let multi_slab_slices = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter((0..200 * 129).map(|index| index as u32)),
+            Validity::from_iter((0..200 * 129).map(|index| index % 13 != 0)),
+        )
+        .into_array(),
+        129,
+        Validity::from_iter((0..200).map(|row| row % 5 != 0)),
+        200,
+    )
+    .into_array();
+
     Ok(vec![
         FuzzTiledFsl {
             canonical: zero_by_zero,
@@ -517,6 +641,43 @@ pub fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>> {
                 TiledFslAction::Take(vec![Some(2), Some(1), Some(0)]),
                 TiledFslAction::ScalarAt(1),
                 TiledFslAction::CheckTiles,
+            ],
+        },
+        FuzzTiledFsl {
+            canonical: full_width_row_view,
+            geometry: geometry(64, 128),
+            actions: vec![
+                TiledFslAction::CheckTiles,
+                TiledFslAction::Slice {
+                    start: 10,
+                    stop: 150,
+                },
+                TiledFslAction::ScalarAt(53),
+                TiledFslAction::ScalarAt(54),
+                TiledFslAction::ReconstructSerde,
+                TiledFslAction::Slice {
+                    start: 60,
+                    stop: 70,
+                },
+                TiledFslAction::ScalarAt(9),
+                TiledFslAction::Take(vec![Some(9), None, Some(0)]),
+            ],
+        },
+        FuzzTiledFsl {
+            canonical: multi_slab_slices,
+            geometry: geometry(64, 64),
+            actions: vec![
+                TiledFslAction::CheckTiles,
+                TiledFslAction::Slice {
+                    start: 64,
+                    stop: 192,
+                },
+                TiledFslAction::ReconstructSerde,
+                TiledFslAction::ScalarAt(63),
+                TiledFslAction::Slice { start: 1, stop: 66 },
+                TiledFslAction::ScalarAt(0),
+                TiledFslAction::Slice { start: 1, stop: 64 },
+                TiledFslAction::Take(vec![Some(62), None, Some(0)]),
             ],
         },
     ])
@@ -574,7 +735,7 @@ mod tests {
     #[expect(clippy::result_large_err)]
     fn deterministic_tiled_fsl_smoke() -> VortexFuzzResult<()> {
         let cases = deterministic_tiled_fsl_cases()?;
-        assert_eq!(cases.len(), 3);
+        assert_eq!(cases.len(), 5);
         for input in cases {
             run_tiled_fsl(input)?;
         }

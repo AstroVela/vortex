@@ -236,6 +236,108 @@ fn assert_fsl_equivalent(
     Ok(())
 }
 
+fn assert_array_tree_validity(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+    for descendant in array.depth_first_traversal() {
+        descendant.validity()?.execute_mask(descendant.len(), ctx)?;
+    }
+    Ok(())
+}
+
+fn mixed_validity_fixture(
+    rows: usize,
+    dimensions: u32,
+    tile_geometry: TileGeometry,
+) -> VortexResult<(FixedSizeListArray, TiledFixedSizeListArray, ExecutionCtx)> {
+    let element_count = rows
+        .checked_mul(usize::try_from(dimensions)?)
+        .ok_or_else(|| vortex_err!("mixed-validity fixture extent overflows usize"))?;
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter((0..element_count).map(|index| index as u32)),
+            Validity::from_iter((0..element_count).map(|index| index % 11 != 0)),
+        )
+        .into_array(),
+        dimensions,
+        Validity::from_iter((0..rows).map(|row| row % 7 != 0)),
+        rows,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), tile_geometry, &mut ctx)?;
+    Ok((canonical, tiled, ctx))
+}
+
+#[rstest]
+#[case(128, 128, 10, 150, 60, 70, true)]
+#[case(129, 64, 64, 192, 1, 65, true)]
+#[case(129, 64, 1, 130, 1, 64, false)]
+fn row_view_path_conformance(
+    #[case] dimensions: u32,
+    #[case] tile_dimensions: u32,
+    #[case] start: usize,
+    #[case] stop: usize,
+    #[case] nested_start: usize,
+    #[case] nested_stop: usize,
+    #[case] expect_tiled: bool,
+) -> VortexResult<()> {
+    let tile_geometry = geometry(64, tile_dimensions);
+    let (canonical, tiled, mut ctx) = mixed_validity_fixture(200, dimensions, tile_geometry)?;
+    let expected = canonical.clone().into_array().slice(start..stop)?;
+    let actual = tiled.into_array().slice(start..stop)?;
+
+    assert_eq!(actual.is::<TiledFixedSizeList>(), expect_tiled);
+    assert_eq!(actual.is::<Slice>(), !expect_tiled);
+
+    let tile_boundary = 64 - start % 64;
+    let mut probes = vec![0, actual.len() - 1];
+    if tile_boundary < actual.len() {
+        probes.extend([tile_boundary - 1, tile_boundary]);
+    }
+    for row in probes {
+        assert_eq!(
+            expected.execute_scalar(row, &mut ctx)?,
+            actual.execute_scalar(row, &mut ctx)?,
+        );
+    }
+
+    let nested_expected = expected.clone().slice(nested_start..nested_stop)?;
+    let nested_actual = actual.clone().slice(nested_start..nested_stop)?;
+    if dimensions == 128 {
+        assert!(nested_actual.is::<TiledFixedSizeList>());
+        assert_eq!(start + nested_start..start + nested_stop, 70..80);
+    } else {
+        assert!(nested_actual.is::<Slice>());
+    }
+    assert_fsl_equivalent(&nested_expected, &nested_actual, &mut ctx)?;
+
+    let indices =
+        PrimitiveArray::from_option_iter([Some(u64::try_from(actual.len() - 1)?), None, Some(0)])
+            .into_array();
+    assert_arrays_eq!(
+        expected.clone().take(indices.clone())?,
+        actual.clone().take(indices)?,
+        &mut ctx
+    );
+
+    assert!(
+        actual
+            .validity()?
+            .mask_eq(&expected.validity()?, actual.len(), &mut ctx,)?
+    );
+    let expected_fsl = expected.execute::<FixedSizeListArray>(&mut ctx)?;
+    let actual_fsl = actual.clone().execute::<FixedSizeListArray>(&mut ctx)?;
+    assert!(actual_fsl.elements().validity()?.mask_eq(
+        &expected_fsl.elements().validity()?,
+        actual_fsl.elements().len(),
+        &mut ctx,
+    )?);
+    assert_array_tree_validity(&actual, &mut ctx)?;
+    assert_fsl_equivalent(
+        &expected_fsl.into_array(),
+        &actual_fsl.into_array(),
+        &mut ctx,
+    )
+}
+
 fn encode_fixture<T: NativePType>(
     values: Buffer<T>,
     element_validity: Validity,
