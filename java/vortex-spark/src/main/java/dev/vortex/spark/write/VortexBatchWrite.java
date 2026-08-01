@@ -3,6 +3,7 @@
 
 package dev.vortex.spark.write;
 
+import com.google.common.collect.ImmutableList;
 import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
@@ -15,11 +16,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.spark.sql.connector.distributions.Distribution;
+import org.apache.spark.sql.connector.distributions.Distributions;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.Expressions;
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.SortDirection;
+import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.write.BatchWrite;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
 import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
+import org.apache.spark.sql.connector.write.RequiresDistributionAndOrdering;
 import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
@@ -31,8 +40,12 @@ import org.slf4j.LoggerFactory;
  *
  * <p>This class coordinates the distributed write operation across Spark executors, handling the creation of data
  * writers and managing commits/aborts.
+ *
+ * <p>Partitioned writes request a clustered distribution and in-task ordering on the identity partition columns (see
+ * {@link RequiresDistributionAndOrdering}), so all rows of one Hive partition arrive in a single task and each
+ * partition directory receives one file per write instead of one file per (task, partition) pair.
  */
-public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
+public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistributionAndOrdering, Serializable {
 
     private static final Logger log = LoggerFactory.getLogger(VortexBatchWrite.class);
     private final String outputPath;
@@ -42,6 +55,8 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
     // Resolved eagerly so that Spark Transform objects (Scala case classes that are not
     // Java-serializable) never reach the DataWriterFactory serialization boundary.
     private final PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms;
+    // Top-level identity partition column names, used to request a clustered write distribution.
+    private final ImmutableList<String> identityPartitionColumns;
 
     /**
      * Creates a new VortexBatchWrite.
@@ -63,6 +78,47 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
         this.options = options;
         this.overwrite = overwrite;
         this.resolvedTransforms = PartitionedVortexDataWriter.resolveTransforms(partitionTransforms, schema);
+        this.identityPartitionColumns = identityPartitionColumns(partitionTransforms);
+    }
+
+    private static ImmutableList<String> identityPartitionColumns(Transform[] partitionTransforms) {
+        ImmutableList.Builder<String> names = ImmutableList.builder();
+        for (Transform transform : partitionTransforms) {
+            if ("identity".equals(transform.name())) {
+                for (NamedReference ref : transform.references()) {
+                    if (ref.fieldNames().length == 1) {
+                        names.add(ref.fieldNames()[0]);
+                    }
+                }
+            }
+        }
+        return names.build();
+    }
+
+    /**
+     * Requests that rows be clustered by the identity partition columns, so every Hive partition is written by exactly
+     * one task. Non-identity transforms (years/months/days/hours/bucket) are not used for clustering because their
+     * evaluation requires a Spark function catalog; unpartitioned writes leave the distribution unspecified.
+     */
+    @Override
+    public Distribution requiredDistribution() {
+        if (identityPartitionColumns.isEmpty()) {
+            return Distributions.unspecified();
+        }
+        Expression[] clustering =
+                identityPartitionColumns.stream().map(Expressions::column).toArray(Expression[]::new);
+        return Distributions.clustered(clustering);
+    }
+
+    /**
+     * Requests an in-task sort on the identity partition columns, so a task writing several partitions sees each
+     * partition's rows contiguously and keeps only one file open at a time.
+     */
+    @Override
+    public SortOrder[] requiredOrdering() {
+        return identityPartitionColumns.stream()
+                .map(name -> Expressions.sort(Expressions.column(name), SortDirection.ASCENDING))
+                .toArray(SortOrder[]::new);
     }
 
     /**
