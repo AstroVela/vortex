@@ -182,7 +182,11 @@ fn default_unstable_edition_permits_tiled_fixed_size_list() {
 fn unstable_encoding_registration_does_not_depend_on_files() {
     use vortex_array::VTable as _;
     use vortex_array::array_session;
+    use vortex_array::dtype::extension::ExtVTable as _;
+    use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
+    use vortex_tensor::fixed_shape_tensor::FixedShapeTensor;
+    use vortex_tensor::vector::Vector;
     use vortex_tiled_fsl::TiledFixedSizeList;
 
     let session = array_session();
@@ -192,6 +196,13 @@ fn unstable_encoding_registration_does_not_depend_on_files() {
             .arrays()
             .registry()
             .contains_key(&TiledFixedSizeList.id())
+    );
+    assert!(session.dtypes().registry().contains_key(&Vector.id()));
+    assert!(
+        session
+            .dtypes()
+            .registry()
+            .contains_key(&FixedShapeTensor.id())
     );
 }
 

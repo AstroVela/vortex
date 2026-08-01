@@ -21,6 +21,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -64,9 +65,13 @@ fn row_distinguishing_input() -> VortexResult<FixedSizeListArray> {
         })
         .collect::<VortexResult<Vec<_>>>()?;
     Ok(FixedSizeListArray::new(
-        PrimitiveArray::from_iter(values).into_array(),
+        PrimitiveArray::new(
+            Buffer::from(values),
+            Validity::from_iter((0..ROWS * DIMENSIONS as usize).map(|index| index % 13 != 0)),
+        )
+        .into_array(),
         DIMENSIONS,
-        Validity::NonNullable,
+        Validity::from_iter((0..ROWS).map(|row| row % 7 != 0)),
         ROWS,
     ))
 }
@@ -81,7 +86,7 @@ async fn unstable_tiled_fixed_size_lists_roundtrip_through_files() -> VortexResu
 
     let mut ctx = session.create_execution_ctx();
     let canonical = row_distinguishing_input()?;
-    let expected_geometry = geometry(32, 64)?;
+    let expected_geometry = geometry(64, DIMENSIONS)?;
     let raw = TiledFixedSizeList::encode(canonical.as_view(), expected_geometry, &mut ctx)?;
     let physical = raw.elements().clone().execute::<PrimitiveArray>(&mut ctx)?;
     let bitpacked = bitpack_encode(&physical, 4, None, &mut ctx)?.into_array();
@@ -94,8 +99,11 @@ async fn unstable_tiled_fixed_size_lists_roundtrip_through_files() -> VortexResu
     )?;
     let input = StructArray::new(
         FieldNames::from(["raw", "bitpacked"]),
-        vec![raw.into_array(), bitpacked.into_array()],
-        ROWS,
+        vec![
+            raw.into_array().slice(10..60)?,
+            bitpacked.into_array().slice(10..60)?,
+        ],
+        50,
         Validity::NonNullable,
     )
     .into_array();
@@ -132,11 +140,32 @@ async fn unstable_tiled_fixed_size_lists_roundtrip_through_files() -> VortexResu
         bitpacked.as_::<TiledFixedSizeList>().geometry(),
         expected_geometry
     );
+    assert_eq!(raw.as_::<TiledFixedSizeList>().row_offset(), 10);
+    assert_eq!(raw.as_::<TiledFixedSizeList>().backing_rows(), 64);
+    assert_eq!(bitpacked.as_::<TiledFixedSizeList>().row_offset(), 10);
+    assert_eq!(bitpacked.as_::<TiledFixedSizeList>().backing_rows(), 64);
     assert!(
         bitpacked
             .as_::<TiledFixedSizeList>()
             .elements()
             .is::<vortex_fastlanes::BitPacked>()
+    );
+    assert!(
+        bitpacked
+            .as_::<TiledFixedSizeList>()
+            .elements()
+            .dtype()
+            .is_nullable()
+    );
+    assert!(
+        bitpacked
+            .as_::<TiledFixedSizeList>()
+            .array_validity()
+            .mask_eq(
+                &Validity::from_iter((10..60).map(|row| row % 7 != 0)),
+                50,
+                &mut ctx,
+            )?
     );
     assert_arrays_eq!(input, result, &mut ctx);
     Ok(())

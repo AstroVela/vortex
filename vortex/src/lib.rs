@@ -308,6 +308,7 @@ pub trait VortexSessionDefault {
 
 #[cfg(feature = "unstable_encodings")]
 fn register_unstable_encodings(session: &VortexSession) {
+    vortex_tensor::initialize(session);
     vortex_tiled_fsl::initialize(session);
 }
 

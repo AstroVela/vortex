@@ -28,6 +28,7 @@ use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::piecewise_sequence::array::PiecewiseSequenceArraySlotsExt;
 use vortex_array::arrays::slice::SliceReduce;
 use vortex_array::assert_arrays_eq;
+use vortex_array::buffer::BufferHandle;
 use vortex_array::compute::conformance::consistency::test_array_consistency;
 use vortex_array::compute::conformance::filter::test_filter_conformance;
 use vortex_array::compute::conformance::take::test_take_conformance;
@@ -37,11 +38,13 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_native_ptype;
 use vortex_array::optimizer::kernels::ArrayKernelsExt;
+use vortex_array::serde::ArrayChildren;
 use vortex_array::test_harness::check_metadata;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_session::VortexSession;
@@ -1482,8 +1485,94 @@ fn tiled_fsl_metadata() {
         &TiledFixedSizeListMetadata {
             tile_rows: 32,
             tile_dimensions: 64,
+            row_offset: u32::MAX,
+            backing_rows: u64::MAX,
         }
         .encode_to_vec(),
+    );
+}
+
+struct TestArrayChildren(Vec<ArrayRef>);
+
+impl ArrayChildren for TestArrayChildren {
+    fn get(&self, index: usize, dtype: &DType, len: usize) -> VortexResult<ArrayRef> {
+        let child = self
+            .0
+            .as_slice()
+            .get(index)
+            .ok_or_else(|| vortex_err!(InvalidArgument: "missing test child {index}"))?;
+        if child.dtype() != dtype || child.len() != len {
+            return Err(vortex_err!(InvalidArgument:
+                "test child {index} has dtype {} and length {}, expected {dtype} and {len}",
+                child.dtype(), child.len()
+            ));
+        }
+        Ok(child.clone())
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+fn deserialize_test_metadata(
+    metadata: TiledFixedSizeListMetadata,
+    len: usize,
+    list_size: u32,
+    elements: ArrayRef,
+) -> VortexResult<()> {
+    let dtype = DType::FixedSizeList(
+        Arc::new(elements.dtype().clone()),
+        list_size,
+        Nullability::NonNullable,
+    );
+    <TiledFixedSizeList as vortex_array::VTable>::deserialize(
+        &TiledFixedSizeList,
+        &dtype,
+        len,
+        &metadata.encode_to_vec(),
+        &[] as &[BufferHandle],
+        &TestArrayChildren(vec![elements]),
+        &SESSION,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn deserialize_rejects_backing_extent_overflow() {
+    let error = deserialize_test_metadata(
+        TiledFixedSizeListMetadata {
+            tile_rows: 64,
+            tile_dimensions: 2,
+            row_offset: 0,
+            backing_rows: u64::MAX,
+        },
+        1,
+        2,
+        PrimitiveArray::from_iter(std::iter::empty::<u16>()).into_array(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("backing"));
+}
+
+#[test]
+fn deserialize_rejects_window_outside_backing_rows() {
+    let error = deserialize_test_metadata(
+        TiledFixedSizeListMetadata {
+            tile_rows: 64,
+            tile_dimensions: 1,
+            row_offset: 1,
+            backing_rows: 2,
+        },
+        2,
+        1,
+        PrimitiveArray::from_iter([10u16, 20]).into_array(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("row window 1..3 exceeds 2 backing rows")
     );
 }
 
@@ -1534,6 +1623,8 @@ fn rejects_zero_geometry_metadata() {
     let metadata = TiledFixedSizeListMetadata {
         tile_rows: 0,
         tile_dimensions: 64,
+        row_offset: 0,
+        backing_rows: 0,
     };
     assert!(TileGeometry::try_from(&metadata).is_err());
 }

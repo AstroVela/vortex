@@ -64,6 +64,12 @@ pub struct TiledFixedSizeListMetadata {
     /// The nonzero dimension capacity of each physical tile.
     #[prost(uint32, tag = "2")]
     pub tile_dimensions: u32,
+    /// The logical row offset within the first retained physical tile.
+    #[prost(uint32, tag = "3")]
+    pub row_offset: u32,
+    /// The number of rows represented by the retained physical child.
+    #[prost(uint64, tag = "4")]
+    pub backing_rows: u64,
 }
 
 #[array_slots(TiledFixedSizeList)]
@@ -333,10 +339,18 @@ impl VTable for TiledFixedSizeList {
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
+        let row_offset = u32::try_from(array.row_offset()).map_err(|error| {
+            vortex_err!(InvalidArgument: "tiled fixed-size-list row offset cannot be serialized as u32: {error}")
+        })?;
+        let backing_rows = u64::try_from(array.backing_rows()).map_err(|error| {
+            vortex_err!(InvalidArgument: "tiled fixed-size-list backing row count cannot be serialized as u64: {error}")
+        })?;
         Ok(Some(
             TiledFixedSizeListMetadata {
                 tile_rows: array.geometry.rows().get(),
                 tile_dimensions: array.geometry.dimensions().get(),
+                row_offset,
+                backing_rows,
             }
             .encode_to_vec(),
         ))
@@ -364,6 +378,12 @@ impl VTable for TiledFixedSizeList {
 
         let metadata = TiledFixedSizeListMetadata::decode(metadata)?;
         let geometry = TileGeometry::try_from(&metadata)?;
+        let row_offset = usize::try_from(metadata.row_offset).map_err(|error| {
+            vortex_err!(InvalidArgument: "tiled fixed-size-list row offset cannot be represented as usize: {error}")
+        })?;
+        let backing_rows = usize::try_from(metadata.backing_rows).map_err(|error| {
+            vortex_err!(InvalidArgument: "tiled fixed-size-list backing row count cannot be represented as usize: {error}")
+        })?;
         let DType::FixedSizeList(element_dtype, list_size, nullability) = dtype else {
             vortex_bail!(InvalidArgument: "tiled fixed-size-list dtype must be FixedSizeList, got {dtype}");
         };
@@ -371,8 +391,10 @@ impl VTable for TiledFixedSizeList {
             matches!(element_dtype.as_ref(), DType::Primitive(..)),
             InvalidArgument: "tiled fixed-size-list elements must have a primitive dtype, got {element_dtype}"
         );
-        let physical_len = len.checked_mul(*list_size as usize).ok_or_else(|| {
-            vortex_err!(InvalidArgument: "tiled fixed-size-list length {len} times list size {list_size} overflows usize")
+        let physical_len = backing_rows
+            .checked_mul(*list_size as usize)
+            .ok_or_else(|| {
+                vortex_err!(InvalidArgument: "tiled fixed-size-list backing rows {backing_rows} times list size {list_size} overflows usize")
         })?;
         let elements = children.get(0, element_dtype.as_ref(), physical_len)?;
         let validity = match children.len() {
@@ -380,18 +402,18 @@ impl VTable for TiledFixedSizeList {
             2 => Validity::Array(children.get(1, &Validity::DTYPE, len)?),
             _ => unreachable!("validated tiled fixed-size-list child count"),
         };
-        let slots = TiledFixedSizeListData::make_slots(&elements, &validity, len);
-        Ok(ArrayParts::new(
-            self.clone(),
-            dtype.clone(),
+        let array = Self::try_new_view(
+            elements,
+            *list_size,
+            validity,
             len,
-            TiledFixedSizeListData {
-                geometry,
-                row_offset: 0,
-                backing_rows: len,
-            },
-        )
-        .with_slots(slots))
+            geometry,
+            row_offset,
+            backing_rows,
+        )?;
+        array.try_into_parts().map_err(|_| {
+            vortex_err!(InvalidArgument: "deserialized tiled fixed-size-list array is unexpectedly shared")
+        })
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
