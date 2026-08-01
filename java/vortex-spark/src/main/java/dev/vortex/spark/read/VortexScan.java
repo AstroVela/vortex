@@ -10,6 +10,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.NamedReference;
@@ -39,6 +40,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final Set<String> metadataColumnNames;
 
     private volatile Statistics cachedStatistics;
 
@@ -50,18 +52,21 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      * @param tableColumns the full table columns before projection pushdown
      * @param readColumns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; {@code null} or empty means no pushdown
+     * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
      */
     public VortexScan(
             List<String> paths,
             List<Column> tableColumns,
             List<Column> readColumns,
             Predicate[] pushedPredicates,
-            Map<String, String> formatOptions) {
+            Map<String, String> formatOptions,
+            Set<String> metadataColumnNames) {
         this.paths = paths;
         this.tableColumns = tableColumns;
         this.readColumns = readColumns;
         this.formatOptions = formatOptions;
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.metadataColumnNames = Set.copyOf(metadataColumnNames);
     }
 
     /**
@@ -93,7 +98,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      */
     @Override
     public Batch toBatch() {
-        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates);
+        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates, metadataColumnNames);
     }
 
     /**

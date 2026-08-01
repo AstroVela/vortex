@@ -7,12 +7,17 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
+import dev.vortex.spark.read.VortexMetadataColumns;
 import dev.vortex.spark.read.VortexScanBuilder;
 import dev.vortex.spark.write.VortexWriteBuilder;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.spark.sql.connector.catalog.CatalogV2Util;
+import org.apache.spark.sql.connector.catalog.MetadataColumn;
+import org.apache.spark.sql.connector.catalog.SupportsMetadataColumns;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.Table;
@@ -25,7 +30,7 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 /** Spark V2 {@link Table} of Vortex files that supports both reading and writing. */
-public final class VortexTable implements Table, SupportsRead, SupportsWrite {
+public final class VortexTable implements Table, SupportsRead, SupportsWrite, SupportsMetadataColumns {
     private static final String SHORT_NAME = "vortex";
 
     private final ImmutableList<String> paths;
@@ -123,5 +128,18 @@ public final class VortexTable implements Table, SupportsRead, SupportsWrite {
     @Override
     public Set<TableCapability> capabilities() {
         return ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE, TableCapability.TRUNCATE);
+    }
+
+    /**
+     * Returns the metadata columns of this table: {@code _file} (file path) and {@code _pos} (row position within the
+     * file). A metadata column is withheld when the table schema already contains a column with the same name, in which
+     * case the data column shadows it.
+     */
+    @Override
+    public MetadataColumn[] metadataColumns() {
+        Set<String> schemaFieldNames = Stream.of(schema.fieldNames()).collect(Collectors.toSet());
+        return Arrays.stream(VortexMetadataColumns.all())
+                .filter(column -> !schemaFieldNames.contains(column.name()))
+                .toArray(MetadataColumn[]::new);
     }
 }

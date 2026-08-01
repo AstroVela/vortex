@@ -29,6 +29,7 @@ public final class VortexBatchExec implements Batch {
     private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final Set<String> metadataColumnNames;
     private List<String> resolvedPaths;
 
     /**
@@ -38,13 +39,19 @@ public final class VortexBatchExec implements Batch {
      * @param columns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
+     * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
      */
     public VortexBatchExec(
-            List<String> paths, List<Column> columns, Map<String, String> formatOptions, Predicate[] pushedPredicates) {
+            List<String> paths,
+            List<Column> columns,
+            Map<String, String> formatOptions,
+            Predicate[] pushedPredicates,
+            Set<String> metadataColumnNames) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.metadataColumnNames = Set.copyOf(metadataColumnNames);
     }
 
     /**
@@ -71,9 +78,9 @@ public final class VortexBatchExec implements Batch {
         List<String> files = resolvedPaths != null ? resolvedPaths : resolvePaths();
         Set<String> partitionColumns = collectPartitionColumnNames(files);
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
-                .filter(name -> !partitionColumns.contains(name))
+                .filter(name -> !partitionColumns.contains(name) && !metadataColumnNames.contains(name))
                 .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates);
+        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates, metadataColumnNames);
     }
 
     private List<String> resolvePaths() {

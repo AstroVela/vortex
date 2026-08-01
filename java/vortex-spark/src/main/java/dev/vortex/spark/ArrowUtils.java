@@ -87,6 +87,12 @@ public final class ArrowUtils {
             case Int: {
                 ArrowType.Int intType = (ArrowType.Int) dt;
                 if (!intType.getIsSigned()) {
+                    if (intType.getBitWidth() == 64) {
+                        // Spark has no unsigned types. Unsigned 64-bit values surface from Vortex's
+                        // row-index expression (used for the _pos metadata column), whose values are
+                        // far below 2^63, so mapping to long is safe.
+                        return DataTypes.LongType;
+                    }
                     throw new UnsupportedOperationException("Unsupported Arrow unsigned integer type: " + dt);
                 }
                 switch (intType.getBitWidth()) {
