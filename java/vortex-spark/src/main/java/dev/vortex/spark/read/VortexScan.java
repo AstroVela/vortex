@@ -19,6 +19,7 @@ import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
+import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.Statistics;
@@ -237,6 +238,15 @@ public final class VortexScan
     @Override
     public ColumnarSupportMode columnarSupportMode() {
         return ColumnarSupportMode.SUPPORTED;
+    }
+
+    /**
+     * Declares the custom metrics Vortex scan tasks report: files read, native splits processed, Arrow batches decoded,
+     * and rows produced. Spark sums the per-task values and shows them in the SQL UI.
+     */
+    @Override
+    public CustomMetric[] supportedCustomMetrics() {
+        return VortexScanMetrics.supportedMetrics();
     }
 
     /**

@@ -27,6 +27,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
@@ -58,6 +59,11 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
     private boolean currentBatchLoaded;
     private boolean exhausted;
 
+    private final long filesRead;
+    private long splitsProcessed;
+    private long batchesRead;
+    private long rowsRead;
+
     VortexPartitionReader(
             VortexFilePartition spark,
             List<String> dataColumnNames,
@@ -69,6 +75,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         this.spark = spark;
         this.allocator = ArrowAllocation.rootAllocator();
         this.metadataColumnNames = metadataColumnNames;
+        this.filesRead = spark.paths().size();
 
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
@@ -171,6 +178,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
                 try {
                     if (currentReader.loadNextBatch()) {
                         currentBatchLoaded = true;
+                        batchesRead++;
                         return true;
                     }
                 } catch (IOException e) {
@@ -184,7 +192,19 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             }
             currentPartition = scan.next();
             currentReader = currentPartition.scanArrow(allocator);
+            splitsProcessed++;
         }
+    }
+
+    /** Reports this task's scan metrics; Spark polls this while the task runs and sums values across tasks. */
+    @Override
+    public CustomTaskMetric[] currentMetricsValues() {
+        return new CustomTaskMetric[] {
+            VortexScanMetrics.taskMetric(VortexScanMetrics.FILES_READ, filesRead),
+            VortexScanMetrics.taskMetric(VortexScanMetrics.SPLITS_PROCESSED, splitsProcessed),
+            VortexScanMetrics.taskMetric(VortexScanMetrics.BATCHES_READ, batchesRead),
+            VortexScanMetrics.taskMetric(VortexScanMetrics.ROWS_READ, rowsRead)
+        };
     }
 
     @Override
@@ -202,6 +222,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         }
 
         int rowCount = root.getRowCount();
+        rowsRead += rowCount;
         Map<String, String> partVals = spark.partitionValues();
         if (partVals.isEmpty() && metadataColumnNames.isEmpty()) {
             ColumnVector[] vectors = new ColumnVector[root.getFieldVectors().size()];
