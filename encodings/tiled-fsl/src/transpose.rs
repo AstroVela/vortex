@@ -14,7 +14,9 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
 
+use crate::TileBoundsIter;
 use crate::TileGeometry;
+use crate::geometry::geometry_usizes;
 use crate::geometry::tile_bounds;
 
 #[expect(
@@ -80,10 +82,7 @@ pub(crate) fn encode_elements(
     })
 }
 
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "complexity is attributed to native-type dispatch macro expansion"
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_elements(
     elements: ArrayView<'_, Primitive>,
     len: usize,
@@ -91,17 +90,42 @@ pub(crate) fn decode_elements(
     geometry: TileGeometry,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let expected_len = len.checked_mul(list_size);
+    decode_visible_elements(elements, len, list_size, geometry, 0, len, ctx)
+}
+
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "complexity is attributed to native-type dispatch macro expansion"
+)]
+pub(crate) fn decode_visible_elements(
+    elements: ArrayView<'_, Primitive>,
+    len: usize,
+    list_size: usize,
+    geometry: TileGeometry,
+    row_offset: usize,
+    backing_rows: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let expected_len = backing_rows.checked_mul(list_size);
     vortex_ensure!(
         expected_len == Some(elements.len()),
-        InvalidArgument:
-        "physical child length {} does not match logical extent ({len}, {list_size})",
+        InvalidArgument: "physical child length {} does not match retained extent ({backing_rows}, {list_size})",
         elements.len()
     );
+    let (tile_rows, tile_dimensions) = geometry_usizes(geometry)?;
+    let row_tile_count = if len == 0 {
+        0
+    } else {
+        (row_offset + len).div_ceil(tile_rows)
+    };
+    let dimension_tile_count = list_size.div_ceil(tile_dimensions);
 
     match_each_native_ptype!(elements.ptype(), |T| {
         let source = elements.as_slice::<T>();
-        let mut output = BufferMut::<T>::zeroed(elements.len());
+        let output_len = len.checked_mul(list_size).ok_or_else(|| {
+            vortex_error::vortex_err!(InvalidArgument: "logical length {len} times list size {list_size} overflows usize")
+        })?;
+        let mut output = BufferMut::<T>::zeroed(output_len);
         let (source_validity, preserved_validity) = match elements.validity()? {
             validity @ Validity::Array(_) => match validity.execute_mask(elements.len(), ctx)? {
                 Mask::Values(values) => (Some(values), None),
@@ -117,22 +141,30 @@ pub(crate) fn decode_elements(
         };
         let mut output_validity = source_validity
             .as_ref()
-            .map(|_| BitBufferMut::new_unset(elements.len()));
-        for dimension_tile in 0..list_size.div_ceil(usize::try_from(geometry.dimensions().get())?) {
-            for row_tile in 0..len.div_ceil(usize::try_from(geometry.rows().get())?) {
-                let bounds = tile_bounds(len, list_size, geometry, row_tile, dimension_tile)?;
-                let mut physical = bounds.physical_range.start;
-                for dimension in bounds.dimension_range {
-                    for row in bounds.row_range.clone() {
-                        let canonical = row * list_size + dimension;
-                        output[canonical] = source[physical];
-                        if let (Some(source_validity), Some(output_validity)) =
-                            (&source_validity, &mut output_validity)
-                        {
-                            output_validity.set_to(canonical, source_validity.value(physical));
-                        }
-                        physical += 1;
+            .map(|_| BitBufferMut::new_unset(output_len));
+        for bounds in TileBoundsIter::new_view(
+            len,
+            list_size,
+            geometry,
+            row_offset,
+            backing_rows,
+            row_tile_count,
+            dimension_tile_count,
+        ) {
+            let retained_rows = bounds.physical_range.len() / bounds.dimension_range.len();
+            for (dimension_offset, dimension) in bounds.dimension_range.clone().enumerate() {
+                let mut physical = bounds.physical_range.start
+                    + dimension_offset * retained_rows
+                    + bounds.rows_within_tile.start;
+                for row in bounds.row_range.clone() {
+                    let canonical = row * list_size + dimension;
+                    output[canonical] = source[physical];
+                    if let (Some(source_validity), Some(output_validity)) =
+                        (&source_validity, &mut output_validity)
+                    {
+                        output_validity.set_to(canonical, source_validity.value(physical));
                     }
+                    physical += 1;
                 }
             }
         }

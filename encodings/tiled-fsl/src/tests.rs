@@ -39,6 +39,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_session::VortexSession;
 
@@ -785,11 +786,11 @@ fn slice_uses_compact_piecewise_indices() -> VortexResult<()> {
 #[test]
 fn slice_preserves_special_cases() -> VortexResult<()> {
     let cases = [
-        (3, 0, geometry(2, 3), 1..3),
-        (3, 5, geometry(32, 64), 1..3),
-        (4_096, 128, geometry(32, 64), 2_048..2_049),
+        (3, 0, geometry(2, 3), 1..3, 0),
+        (3, 5, geometry(32, 64), 1..3, 15),
+        (4_096, 128, geometry(32, 64), 2_048..2_049, 128),
     ];
-    for (rows, dimensions, tile_geometry, range) in cases {
+    for (rows, dimensions, tile_geometry, range, expected_elements) in cases {
         let (canonical, tiled, mut ctx) = fixture(rows, dimensions, tile_geometry)?;
         let expected = canonical.into_array().slice(range.clone())?;
         let actual = tiled.into_array().slice(range.clone())?;
@@ -797,7 +798,7 @@ fn slice_preserves_special_cases() -> VortexResult<()> {
         if !actual.is_empty() {
             let actual = actual.as_::<TiledFixedSizeList>();
             assert_eq!(actual.geometry(), tile_geometry);
-            assert_eq!(actual.elements().len(), range.len() * dimensions as usize);
+            assert_eq!(actual.elements().len(), expected_elements);
         }
     }
     Ok(())
@@ -823,6 +824,106 @@ fn slice_preserves_mixed_validity() -> VortexResult<()> {
         actual.as_::<TiledFixedSizeList>().geometry(),
         geometry(2, 2),
     );
+    assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
+fn full_width_unaligned_slice_is_offset_view() -> VortexResult<()> {
+    let (canonical, tiled, mut ctx) = fixture(200, 128, geometry(64, 128))?;
+    let expected = canonical.into_array().slice(10..150)?;
+    let actual = tiled.into_array().slice(10..150)?;
+    let sliced = actual.as_::<TiledFixedSizeList>();
+
+    assert_eq!(sliced.row_offset(), 10);
+    assert_eq!(sliced.len(), 140);
+    assert_eq!(sliced.backing_rows(), 192);
+    assert_eq!(sliced.elements().len(), 192 * 128);
+    assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
+fn nested_full_width_slices_rebase_and_trim() -> VortexResult<()> {
+    let (canonical, tiled, mut ctx) = fixture(200, 128, geometry(64, 128))?;
+    let expected = canonical.into_array().slice(70..80)?;
+    let actual = tiled.into_array().slice(10..150)?.slice(60..70)?;
+    let sliced = actual.as_::<TiledFixedSizeList>();
+
+    assert_eq!(sliced.row_offset(), 6);
+    assert_eq!(sliced.len(), 10);
+    assert_eq!(sliced.backing_rows(), 64);
+    assert_eq!(sliced.elements().len(), 64 * 128);
+    assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
+fn full_width_slice_preserves_nullable_bitpacked_child() -> VortexResult<()> {
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter(
+                (0..200 * 128).map(|index| u16::try_from(index % 16).unwrap_or_default()),
+            ),
+            Validity::from_iter((0..200 * 128).map(|index| index % 11 != 0)),
+        )
+        .into_array(),
+        128,
+        Validity::from_iter((0..200).map(|row| row % 7 != 0)),
+        200,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let raw_tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(64, 128), &mut ctx)?;
+    vortex_fastlanes::initialize(ctx.session());
+    let physical = raw_tiled
+        .elements()
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)?;
+    let bitpacked = bitpack_encode(&physical, 4, None, &mut ctx)?.into_array();
+    let tiled = TiledFixedSizeList::try_new(
+        bitpacked,
+        128,
+        raw_tiled.array_validity(),
+        200,
+        geometry(64, 128),
+    )?;
+
+    let expected = canonical.into_array().slice(10..150)?;
+    let actual = tiled.into_array().slice(10..150)?;
+    let sliced = actual.as_::<TiledFixedSizeList>();
+
+    assert!(sliced.elements().is::<BitPacked>());
+    assert!(sliced.elements().validity()?.mask_eq(
+        &raw_tiled.elements().validity()?.slice(0..192 * 128)?,
+        192 * 128,
+        &mut ctx,
+    )?);
+    assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
+fn full_width_slice_keeps_complete_interior_tiles() -> VortexResult<()> {
+    let (_, tiled, _) = fixture(200, 128, geometry(64, 128))?;
+    let actual = tiled.into_array().slice(10..150)?;
+    let sliced = actual.as_::<TiledFixedSizeList>();
+    let tiles: Vec<TileBounds> = sliced.tiles().collect();
+
+    assert_eq!(tiles[0].row_range, 0..54);
+    assert_eq!(tiles[1].row_range, 54..118);
+    assert_eq!(tiles[2].row_range, 118..140);
+    assert!(!tiles[0].is_full_tile());
+    assert!(tiles[1].is_full_tile());
+    assert!(!tiles[2].is_full_tile());
+    Ok(())
+}
+
+#[test]
+fn zero_width_nonempty_slice_preserves_tiled() -> VortexResult<()> {
+    let (canonical, tiled, mut ctx) = fixture(3, 0, geometry(64, 128))?;
+    let expected = canonical.into_array().slice(1..3)?;
+    let actual = tiled.into_array().slice(1..3)?;
+    let sliced = actual.as_::<TiledFixedSizeList>();
+
+    assert_eq!(sliced.row_offset(), 0);
+    assert_eq!(sliced.backing_rows(), 2);
+    assert_eq!(sliced.elements().len(), 0);
     assert_fsl_equivalent(&expected, &actual, &mut ctx)
 }
 

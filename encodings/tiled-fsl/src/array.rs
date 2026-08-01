@@ -49,7 +49,7 @@ use crate::TileGeometry;
 use crate::geometry::TileBounds;
 use crate::geometry::TileBoundsIter;
 use crate::geometry::geometry_usizes;
-use crate::transpose::decode_elements;
+use crate::transpose::decode_visible_elements;
 use crate::transpose::encode_elements;
 
 /// A tiled fixed-size-list Vortex array.
@@ -419,11 +419,13 @@ impl VTable for TiledFixedSizeList {
                     elements.encoding_id()
                 )
             })?;
-        let decoded_elements = decode_elements(
+        let decoded_elements = decode_visible_elements(
             elements.as_view(),
             array.len(),
             array.list_size() as usize,
             array.geometry(),
+            array.row_offset(),
+            array.backing_rows(),
             ctx,
         )?;
         Ok(ExecutionResult::done(
