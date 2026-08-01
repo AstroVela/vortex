@@ -142,15 +142,26 @@ pub(crate) fn decode_visible_elements(
         let mut output_validity = source_validity
             .as_ref()
             .map(|_| BitBufferMut::new_unset(output_len));
-        for bounds in TileBoundsIter::new_view(
-            len,
-            list_size,
-            geometry,
-            row_offset,
-            backing_rows,
-            row_tile_count,
-            dimension_tile_count,
-        ) {
+        let bounds = if row_offset == 0 && backing_rows == len {
+            TileBoundsIter::new(
+                len,
+                list_size,
+                geometry,
+                row_tile_count,
+                dimension_tile_count,
+            )
+        } else {
+            TileBoundsIter::new_view(
+                len,
+                list_size,
+                geometry,
+                row_offset,
+                backing_rows,
+                row_tile_count,
+                dimension_tile_count,
+            )
+        };
+        for bounds in bounds {
             let retained_rows = bounds.physical_range.len() / bounds.dimension_range.len();
             for (dimension_offset, dimension) in bounds.dimension_range.clone().enumerate() {
                 let mut physical = bounds.physical_range.start

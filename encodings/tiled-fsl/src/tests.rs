@@ -14,16 +14,19 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PiecewiseSequence;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::Slice;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::piecewise_sequence::array::PiecewiseSequenceArraySlotsExt;
+use vortex_array::arrays::slice::SliceReduce;
 use vortex_array::assert_arrays_eq;
 use vortex_array::compute::conformance::consistency::test_array_consistency;
 use vortex_array::compute::conformance::filter::test_filter_conformance;
@@ -398,12 +401,17 @@ fn assert_slice_conformance(
     let tile_rows = usize::try_from(tile_geometry.rows().get())?;
     for range in boundary_slice_ranges(canonical.len(), tile_rows) {
         let expected = canonical.clone().into_array().slice(range.clone())?;
-        let actual = tiled.clone().into_array().slice(range)?;
+        let actual = tiled.clone().into_array().slice(range.clone())?;
         if canonical.is_empty() {
             assert!(actual.is::<TiledFixedSizeList>());
             assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), tile_geometry);
         } else if actual.is_empty() {
             assert!(actual.is::<FixedSizeList>());
+        } else if !tiled.is_full_width()
+            && (range.start % tile_rows != 0
+                || (range.end % tile_rows != 0 && range.end != tiled.len()))
+        {
+            assert!(actual.is::<Slice>());
         } else {
             assert!(actual.is::<TiledFixedSizeList>());
             assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), tile_geometry);
@@ -749,18 +757,22 @@ fn nullable_take_makes_outer_dtype_nullable() -> VortexResult<()> {
 #[case(1..64)]
 #[case(31..65)]
 #[case(64..65)]
-fn slice_preserves_encoding_and_values(#[case] range: Range<usize>) -> VortexResult<()> {
+fn slice_chooses_tiled_only_for_aligned_multi_slab_ranges(
+    #[case] range: Range<usize>,
+) -> VortexResult<()> {
     let (canonical, tiled, mut ctx) = fixture(65, 129, geometry(32, 64))?;
     let expected = canonical.into_array().slice(range.clone())?;
-    let actual = tiled.into_array().slice(range)?;
+    let actual = tiled.into_array().slice(range.clone())?;
     if actual.is_empty() {
         assert!(actual.is::<FixedSizeList>());
-    } else {
+    } else if range.start % 32 == 0 && (range.end % 32 == 0 || range.end == 65) {
         assert!(actual.is::<TiledFixedSizeList>());
         assert_eq!(
             actual.as_::<TiledFixedSizeList>().geometry(),
             geometry(32, 64)
         );
+    } else {
+        assert!(actual.is::<Slice>());
     }
     assert_arrays_eq!(expected, actual, &mut ctx);
     Ok(())
@@ -769,7 +781,7 @@ fn slice_preserves_encoding_and_values(#[case] range: Range<usize>) -> VortexRes
 #[test]
 fn slice_uses_compact_piecewise_indices() -> VortexResult<()> {
     let (_, tiled, _) = fixture(65, 129, geometry(32, 64))?;
-    let sliced = tiled.into_array().slice(1..64)?;
+    let sliced = tiled.into_array().slice(0..64)?;
     let sliced_tiled = sliced.as_::<TiledFixedSizeList>();
     let elements = sliced_tiled.elements();
     let dict = elements.as_::<Dict>();
@@ -795,7 +807,9 @@ fn slice_preserves_special_cases() -> VortexResult<()> {
         let expected = canonical.into_array().slice(range.clone())?;
         let actual = tiled.into_array().slice(range.clone())?;
         assert_fsl_equivalent(&expected, &actual, &mut ctx)?;
-        if !actual.is_empty() {
+        if rows == 4_096 {
+            assert!(actual.is::<Slice>());
+        } else if !actual.is_empty() {
             let actual = actual.as_::<TiledFixedSizeList>();
             assert_eq!(actual.geometry(), tile_geometry);
             assert_eq!(actual.elements().len(), expected_elements);
@@ -825,6 +839,85 @@ fn slice_preserves_mixed_validity() -> VortexResult<()> {
         geometry(2, 2),
     );
     assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
+fn aligned_multi_slab_slice_stays_tiled() -> VortexResult<()> {
+    let (_, tiled, _) = fixture(256, 1_536, geometry(64, 64))?;
+
+    let aligned = tiled.into_array().slice(64..192)?;
+
+    assert!(aligned.is::<TiledFixedSizeList>());
+    let aligned_tiled = aligned.as_::<TiledFixedSizeList>();
+    let elements = aligned_tiled.elements();
+    assert!(elements.is::<Dict>());
+    assert!(elements.as_::<Dict>().codes().is::<PiecewiseSequence>());
+    Ok(())
+}
+
+#[test]
+fn unaligned_multi_slab_slice_stays_lazy_until_execution() -> VortexResult<()> {
+    let million_rows = TiledFixedSizeList::try_new(
+        ConstantArray::new(0u8, 1_000_000 * 1_536).into_array(),
+        1_536,
+        Validity::NonNullable,
+        1_000_000,
+        geometry(64, 64),
+    )?;
+    assert!(
+        <TiledFixedSizeList as SliceReduce>::slice(million_rows.as_view(), 1..130)?.is_none(),
+        "unaligned reduction must make an O(1) decision without scalar-run metadata"
+    );
+
+    let (_, tiled, _) = fixture(256, 1_536, geometry(64, 64))?;
+    let unaligned = tiled.into_array().slice(1..130)?;
+    assert!(unaligned.is::<Slice>());
+    Ok(())
+}
+
+#[test]
+fn multi_slab_slice_kernel_matches_canonical() -> VortexResult<()> {
+    let rows = 256;
+    let list_size = 1_536;
+    let element_count = rows * list_size;
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter((0..element_count).map(|index| index as u32)),
+            Validity::from_iter((0..element_count).map(|index| index % 11 != 0)),
+        )
+        .into_array(),
+        list_size as u32,
+        Validity::from_iter((0..rows).map(|row| row % 7 != 0)),
+        rows,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(64, 64), &mut ctx)?;
+    let expected = canonical.into_array().slice(1..130)?;
+
+    let unaligned = tiled.into_array().slice(1..130)?;
+    assert!(unaligned.is::<Slice>());
+    let executed = unaligned.execute::<FixedSizeListArray>(&mut ctx)?;
+
+    assert_eq!(executed.len(), 129);
+    assert_eq!(executed.elements().len(), 129 * 1_536);
+    assert_arrays_eq!(expected, executed, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn multi_slab_window_has_one_run_per_slab() -> VortexResult<()> {
+    let (_, tiled, _) = fixture(256, 1_536, geometry(64, 64))?;
+
+    let retained = tiled.into_array().slice(0..192)?;
+    let retained_tiled = retained.as_::<TiledFixedSizeList>();
+    let elements = retained_tiled.elements();
+    let dict = elements.as_::<Dict>();
+    let codes = dict.codes().as_::<PiecewiseSequence>();
+
+    assert_eq!(codes.len(), 192 * 1_536);
+    assert_eq!(codes.starts().len(), 24);
+    assert_eq!(codes.lengths().len(), 24);
+    Ok(())
 }
 
 #[test]
@@ -964,7 +1057,7 @@ fn bitpacked_child_roundtrips_through_row_ops() -> VortexResult<()> {
     assert_arrays_eq!(canonical, tiled, &mut ctx);
 
     let sliced = tiled.clone().into_array().slice(1..64)?;
-    assert!(sliced.is::<TiledFixedSizeList>());
+    assert!(sliced.is::<Slice>());
     assert_arrays_eq!(expected_sliced, sliced, &mut ctx);
 
     let taken = tiled

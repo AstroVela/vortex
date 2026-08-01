@@ -17,8 +17,8 @@ use crate::geometry::geometry_usizes;
 
 impl SliceReduce for TiledFixedSizeList {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        let validity = array.array_validity().slice(range.clone())?;
         if array.list_size() == 0 {
+            let validity = array.array_validity().slice(range.clone())?;
             return Ok(Some(
                 TiledFixedSizeList::try_new_view(
                     array.elements().clone(),
@@ -34,6 +34,7 @@ impl SliceReduce for TiledFixedSizeList {
         }
 
         if array.is_full_width() {
+            let validity = array.array_validity().slice(range.clone())?;
             let (tile_rows, _) = geometry_usizes(array.geometry())?;
             let list_size = array.list_size() as usize;
             let absolute_start = array.row_offset() + range.start;
@@ -57,6 +58,13 @@ impl SliceReduce for TiledFixedSizeList {
             ));
         }
 
+        let (tile_rows, _) = geometry_usizes(array.geometry())?;
+        if range.start % tile_rows != 0 || (range.end % tile_rows != 0 && range.end != array.len())
+        {
+            return Ok(None);
+        }
+
+        let validity = array.array_validity().slice(range.clone())?;
         Ok(Some(
             gather_tiled_slice(array, range, validity)?.into_array(),
         ))
