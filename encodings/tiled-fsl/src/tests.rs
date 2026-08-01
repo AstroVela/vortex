@@ -968,6 +968,20 @@ fn physical_slab_span_plan_bounds_partial_dimension_and_row_tails() -> VortexRes
 }
 
 #[test]
+fn small_full_width_slice_retains_oversized_backing_tile() -> VortexResult<()> {
+    let (canonical, tiled, mut ctx) = fixture(3, 5, geometry(32, 64))?;
+    let expected = canonical.into_array().slice(1..3)?;
+    let actual = tiled.into_array().slice(1..3)?;
+
+    assert!(actual.is::<TiledFixedSizeList>());
+    let sliced = actual.as_::<TiledFixedSizeList>();
+    assert_eq!(sliced.row_offset(), 1);
+    assert_eq!(sliced.backing_rows(), 3);
+    assert_eq!(sliced.elements().len(), 15);
+    assert_fsl_equivalent(&expected, &actual, &mut ctx)
+}
+
+#[test]
 fn full_width_unaligned_slice_is_offset_view() -> VortexResult<()> {
     let (canonical, tiled, mut ctx) = fixture(200, 128, geometry(64, 128))?;
     let expected = canonical.into_array().slice(10..150)?;
