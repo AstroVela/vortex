@@ -5,7 +5,6 @@
 
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -213,18 +212,6 @@ fn reconstruct_serde(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<A
     Ok(reconstructed)
 }
 
-fn expected_tile_indices(
-    list_size: usize,
-    rows: Range<usize>,
-    dimensions: Range<usize>,
-) -> ArrayRef {
-    PrimitiveArray::from_iter(dimensions.flat_map(|dimension| {
-        rows.clone()
-            .map(move |row| (row * list_size + dimension) as u64)
-    }))
-    .into_array()
-}
-
 #[expect(clippy::result_large_err)]
 fn check_tiles(
     canonical: &ArrayRef,
@@ -245,10 +232,23 @@ fn check_tiles(
     let list_size = canonical_fsl.list_size() as usize;
     let tile_rows = tiled_fsl.geometry().rows().get() as usize;
     let tile_dimensions = tiled_fsl.geometry().dimensions().get() as usize;
-    let expected_row_tile_count = rows.div_ceil(tile_rows);
+    let row_offset = tiled_fsl.row_offset();
+    let backing_rows = tiled_fsl.backing_rows();
+    let logical_end = fuzz(row_offset.checked_add(rows).ok_or_else(
+        || vortex_err!(InvalidArgument: "row offset plus length overflows logical extent"),
+    ))?;
+    let expected_row_tile_count = if rows == 0 {
+        0
+    } else {
+        logical_end.div_ceil(tile_rows)
+    };
     let expected_dimension_tile_count = list_size.div_ceil(tile_dimensions);
 
     fuzz((|| {
+        vortex_ensure!(
+            logical_end <= backing_rows,
+            "logical row window {row_offset}..{logical_end} exceeds {backing_rows} backing rows"
+        );
         vortex_ensure!(
             tiled_fsl.row_tile_count() == expected_row_tile_count,
             "row tile count mismatch: expected {expected_row_tile_count}, found {}",
@@ -273,15 +273,22 @@ fn check_tiles(
     for (tile_index, bounds) in tiled_fsl.tiles().enumerate() {
         let dimension_tile = tile_index / expected_row_tile_count;
         let row_tile = tile_index % expected_row_tile_count;
-        let row_start = row_tile * tile_rows;
-        let row_end = row_start.saturating_add(tile_rows).min(rows);
+        let retained_row_start = row_tile * tile_rows;
+        let retained_row_end = retained_row_start
+            .saturating_add(tile_rows)
+            .min(backing_rows);
+        let retained_row_count = retained_row_end - retained_row_start;
+        let visible_row_start = retained_row_start.max(row_offset);
+        let visible_row_end = retained_row_end.min(logical_end);
+        let expected_rows = (visible_row_start - row_offset)..(visible_row_end - row_offset);
+        let expected_rows_within_tile =
+            (visible_row_start - retained_row_start)..(visible_row_end - retained_row_start);
         let dimension_start = dimension_tile * tile_dimensions;
         let dimension_end = dimension_start
             .saturating_add(tile_dimensions)
             .min(list_size);
-        let physical_len = (row_end - row_start) * (dimension_end - dimension_start);
+        let physical_len = retained_row_count * (dimension_end - dimension_start);
         let expected_physical_end = physical_cursor + physical_len;
-        let expected_rows = row_start..row_end;
         let expected_dimensions = dimension_start..dimension_end;
         let expected_physical = physical_cursor..expected_physical_end;
 
@@ -301,44 +308,60 @@ fn check_tiles(
                 bounds.dimension_range
             );
             vortex_ensure!(
+                bounds.rows_within_tile == expected_rows_within_tile,
+                "tile {tile_index} visible rows mismatch: expected {expected_rows_within_tile:?}, found {:?}",
+                bounds.rows_within_tile
+            );
+            vortex_ensure!(
                 bounds.physical_range == expected_physical,
                 "tile {tile_index} physical range mismatch: expected {expected_physical:?}, found {:?}",
                 bounds.physical_range
             );
             vortex_ensure!(
-                bounds.physical_range.len()
-                    == bounds.row_range.len() * bounds.dimension_range.len(),
-                "tile {tile_index} physical cardinality mismatch"
+                bounds.physical_range.len() == retained_row_count * bounds.dimension_range.len(),
+                "tile {tile_index} retained physical cardinality mismatch"
+            );
+            vortex_ensure!(
+                bounds.rows_within_tile.len() == bounds.row_range.len()
+                    && bounds.rows_within_tile.end <= retained_row_count,
+                "tile {tile_index} visible rows exceed its retained physical rows"
             );
             Ok(())
         })())?;
 
-        let expected_tile = fuzz(canonical_fsl.elements().clone().take(expected_tile_indices(
-            list_size,
-            expected_rows.clone(),
-            expected_dimensions.clone(),
-        )))?;
         let actual_tile = fuzz(tiled_fsl.tile_elements(&bounds))?;
-        let selected_positions = expected_dimensions
-            .clone()
-            .flat_map(|dimension| {
-                let expected_row_start = expected_rows.start;
-                let expected_row_count = expected_rows.len();
-                let expected_dimension_start = expected_dimensions.start;
-                expected_rows.clone().filter_map({
-                    let outer_mask = &outer_mask;
-                    move |row| {
-                        outer_mask.value(row).then_some(
-                            (dimension - expected_dimension_start) * expected_row_count
-                                + (row - expected_row_start),
-                        )
-                    }
-                })
+        let selected_expected_positions = expected_dimensions.clone().flat_map(|dimension| {
+            expected_rows.clone().filter_map({
+                let outer_mask = &outer_mask;
+                move |row| {
+                    outer_mask
+                        .value(row)
+                        .then_some((row * list_size + dimension) as u64)
+                }
             })
-            .map(|position| position as u64);
-        let selection = PrimitiveArray::from_iter(selected_positions).into_array();
-        let selected_expected = fuzz(expected_tile.take(selection.clone()))?;
-        let selected_actual = fuzz(actual_tile.take(selection))?;
+        });
+        let selected_actual_positions =
+            expected_dimensions
+                .clone()
+                .enumerate()
+                .flat_map(|(dimension_offset, _)| {
+                    expected_rows.clone().filter_map({
+                        let outer_mask = &outer_mask;
+                        let visible_start = bounds.rows_within_tile.start;
+                        let logical_start = bounds.row_range.start;
+                        move |row| {
+                            outer_mask.value(row).then_some(
+                                (dimension_offset * retained_row_count + visible_start + row
+                                    - logical_start) as u64,
+                            )
+                        }
+                    })
+                });
+        let expected_selection =
+            PrimitiveArray::from_iter(selected_expected_positions).into_array();
+        let actual_selection = PrimitiveArray::from_iter(selected_actual_positions).into_array();
+        let selected_expected = fuzz(canonical_fsl.elements().clone().take(expected_selection))?;
+        let selected_actual = fuzz(actual_tile.take(actual_selection))?;
         assert_array_eq(&selected_expected, &selected_actual, step, ctx)?;
 
         physical_cursor = expected_physical_end;
@@ -352,9 +375,9 @@ fn check_tiles(
             expected_row_tile_count * expected_dimension_tile_count
         );
         vortex_ensure!(
-            physical_cursor == rows * list_size,
+            physical_cursor == backing_rows * list_size,
             "physical tile ranges cover {physical_cursor} values, expected {}",
-            rows * list_size
+            backing_rows * list_size
         );
         Ok(())
     })())
@@ -413,8 +436,8 @@ fn execute_action(
                 return Ok(ControlFlow::Break(()));
             }
             let tile_rows = geometry.rows().get() as usize;
-            let aligned_multi_slab =
-                start % tile_rows == 0 && (stop % tile_rows == 0 || stop == source_len);
+            let aligned_multi_slab = start.is_multiple_of(tile_rows)
+                && (stop.is_multiple_of(tile_rows) || stop == source_len);
             if source_is_tiled && (source_is_full_width || aligned_multi_slab) {
                 fuzz(assert_tiled_geometry(tiled, geometry))?;
             } else {
@@ -660,13 +683,16 @@ pub fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>> {
                     start: 10,
                     stop: 150,
                 },
+                TiledFslAction::CheckTiles,
                 TiledFslAction::ScalarAt(53),
                 TiledFslAction::ScalarAt(54),
                 TiledFslAction::ReconstructSerde,
+                TiledFslAction::CheckTiles,
                 TiledFslAction::Slice {
                     start: 60,
                     stop: 70,
                 },
+                TiledFslAction::CheckTiles,
                 TiledFslAction::ScalarAt(9),
                 TiledFslAction::Take(vec![Some(9), None, Some(0)]),
             ],
