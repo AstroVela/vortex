@@ -250,9 +250,10 @@ fn mixed_validity_fixture(
     let element_count = rows
         .checked_mul(usize::try_from(dimensions)?)
         .ok_or_else(|| vortex_err!("mixed-validity fixture extent overflows usize"))?;
+    let element_count_u32 = u32::try_from(element_count)?;
     let canonical = FixedSizeListArray::new(
         PrimitiveArray::new(
-            Buffer::from_iter((0..element_count).map(|index| index as u32)),
+            Buffer::from_iter(0..element_count_u32),
             Validity::from_iter((0..element_count).map(|index| index % 11 != 0)),
         )
         .into_array(),
@@ -280,7 +281,7 @@ fn row_view_path_conformance(
 ) -> VortexResult<()> {
     let tile_geometry = geometry(64, tile_dimensions);
     let (canonical, tiled, mut ctx) = mixed_validity_fixture(200, dimensions, tile_geometry)?;
-    let expected = canonical.clone().into_array().slice(start..stop)?;
+    let expected = canonical.into_array().slice(start..stop)?;
     let actual = tiled.into_array().slice(start..stop)?;
 
     assert_eq!(actual.is::<TiledFixedSizeList>(), expect_tiled);
@@ -847,7 +848,7 @@ fn slice_chooses_tiled_only_for_aligned_multi_slab_ranges(
     let actual = tiled.into_array().slice(range.clone())?;
     if actual.is_empty() {
         assert!(actual.is::<FixedSizeList>());
-    } else if range.start % 32 == 0 && (range.end % 32 == 0 || range.end == 65) {
+    } else if range.start.is_multiple_of(32) && (range.end.is_multiple_of(32) || range.end == 65) {
         assert!(actual.is::<TiledFixedSizeList>());
         assert_eq!(
             actual.as_::<TiledFixedSizeList>().geometry(),
@@ -866,12 +867,14 @@ fn large_unaligned_full_width_slice_retains_two_boundary_tiles() -> VortexResult
     let dimensions = 128;
     let tile_rows = 64;
     let range = 123_457..124_458;
+    let dimensions_u32 = u32::try_from(dimensions)?;
+    let tile_rows_u32 = u32::try_from(tile_rows)?;
     let tiled = TiledFixedSizeList::try_new(
         ConstantArray::new(0u8, rows * dimensions).into_array(),
-        dimensions as u32,
+        dimensions_u32,
         Validity::NonNullable,
         rows,
-        geometry(tile_rows as u32, dimensions as u32),
+        geometry(tile_rows_u32, dimensions_u32),
     )?;
 
     let sliced = tiled.into_array().slice(range.clone())?;
@@ -906,13 +909,15 @@ fn multi_slab_slice_kernel_matches_canonical() -> VortexResult<()> {
     let rows = 256;
     let list_size = 1_536;
     let element_count = rows * list_size;
+    let element_count_u32 = u32::try_from(element_count)?;
+    let list_size_u32 = u32::try_from(list_size)?;
     let canonical = FixedSizeListArray::new(
         PrimitiveArray::new(
-            Buffer::from_iter((0..element_count).map(|index| index as u32)),
+            Buffer::from_iter(0..element_count_u32),
             Validity::from_iter((0..element_count).map(|index| index % 11 != 0)),
         )
         .into_array(),
-        list_size as u32,
+        list_size_u32,
         Validity::from_iter((0..rows).map(|row| row % 7 != 0)),
         rows,
     );

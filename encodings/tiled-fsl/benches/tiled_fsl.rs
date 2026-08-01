@@ -546,7 +546,7 @@ mod slice_execute {
         let mut ctx = SESSION.create_execution_ctx();
         let tiled = raw_tiled(args, &mut ctx).unwrap();
         let expected = canonical.into_array().slice(range.clone()).unwrap();
-        let lazy_slice = tiled.clone().into_array().slice(range).unwrap();
+        let lazy_slice = tiled.into_array().slice(range).unwrap();
         let executed = lazy_slice
             .clone()
             .execute::<FixedSizeListArray>(&mut ctx)
@@ -597,9 +597,9 @@ mod tile_iteration {
             None => (canonical, tiled),
         };
         assert_arrays_eq!(expected, tiled, &mut ctx);
-        let tiled = tiled.as_::<TiledFixedSizeList>().clone();
+        let tiled = tiled.as_::<TiledFixedSizeList>();
 
-        bencher.with_inputs(|| tiled.clone()).bench_values(|array| {
+        bencher.with_inputs(|| tiled).bench_values(|array| {
             divan::black_box(
                 array
                     .tiles()

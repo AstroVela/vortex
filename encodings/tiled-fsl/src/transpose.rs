@@ -12,6 +12,7 @@ use vortex_buffer::BitBufferMut;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_mask::Mask;
 
 use crate::TileBoundsIter;
@@ -74,10 +75,12 @@ pub(crate) fn encode_elements(
                 }
             }
         }
-        let validity = output_validity
-            .map(|validity| Validity::from(validity.freeze()))
-            .or(preserved_validity)
-            .expect("validity must be preserved or transposed");
+        let validity = match output_validity {
+            Some(validity) => Validity::from(validity.freeze()),
+            None => preserved_validity.ok_or_else(
+                || vortex_err!(InvalidArgument: "validity must be preserved or transposed"),
+            )?,
+        };
         Ok(PrimitiveArray::new(output.freeze(), validity))
     })
 }
@@ -123,7 +126,7 @@ pub(crate) fn decode_visible_elements(
     match_each_native_ptype!(elements.ptype(), |T| {
         let source = elements.as_slice::<T>();
         let output_len = len.checked_mul(list_size).ok_or_else(|| {
-            vortex_error::vortex_err!(InvalidArgument: "logical length {len} times list size {list_size} overflows usize")
+            vortex_err!(InvalidArgument: "logical length {len} times list size {list_size} overflows usize")
         })?;
         let mut output = BufferMut::<T>::zeroed(output_len);
         let (source_validity, preserved_validity) = match elements.validity()? {
@@ -179,10 +182,12 @@ pub(crate) fn decode_visible_elements(
                 }
             }
         }
-        let validity = output_validity
-            .map(|validity| Validity::from(validity.freeze()))
-            .or(preserved_validity)
-            .expect("validity must be preserved or transposed");
+        let validity = match output_validity {
+            Some(validity) => Validity::from(validity.freeze()),
+            None => preserved_validity.ok_or_else(
+                || vortex_err!(InvalidArgument: "validity must be preserved or transposed"),
+            )?,
+        };
         Ok(PrimitiveArray::new(output.freeze(), validity))
     })
 }

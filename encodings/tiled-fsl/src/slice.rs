@@ -59,7 +59,8 @@ impl SliceReduce for TiledFixedSizeList {
         }
 
         let (tile_rows, _) = geometry_usizes(array.geometry())?;
-        if range.start % tile_rows != 0 || (range.end % tile_rows != 0 && range.end != array.len())
+        if !range.start.is_multiple_of(tile_rows)
+            || (!range.end.is_multiple_of(tile_rows) && range.end != array.len())
         {
             return Ok(None);
         }

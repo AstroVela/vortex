@@ -6,6 +6,7 @@ use std::ops::Range;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 
 /// The number of logical rows and dimensions in a physical tile.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -174,7 +175,6 @@ impl Iterator for TileBoundsIter {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tile_bounds(
     len: usize,
     list_size: usize,
@@ -199,17 +199,17 @@ pub(crate) fn tile_bounds_view(
     }
 
     let (rows, dimensions) = geometry_usizes(geometry)?;
-    let logical_end = row_offset.checked_add(len).ok_or_else(|| {
-        vortex_error::vortex_err!(InvalidArgument: "row offset plus length overflows logical extent")
-    })?;
+    let logical_end = row_offset.checked_add(len).ok_or_else(
+        || vortex_err!(InvalidArgument: "row offset plus length overflows logical extent"),
+    )?;
     if row_offset >= rows || logical_end > backing_rows {
         vortex_bail!(InvalidArgument: "invalid tiled fixed-size-list row window");
     }
-    let row_start = row_tile.checked_mul(rows).ok_or_else(|| {
-        vortex_error::vortex_err!(InvalidArgument: "row tile index {row_tile} overflows tile geometry")
-    })?;
+    let row_start = row_tile.checked_mul(rows).ok_or_else(
+        || vortex_err!(InvalidArgument: "row tile index {row_tile} overflows tile geometry"),
+    )?;
     let dimension_start = dimension_tile.checked_mul(dimensions).ok_or_else(|| {
-        vortex_error::vortex_err!(InvalidArgument: "dimension tile index {dimension_tile} overflows tile geometry")
+        vortex_err!(InvalidArgument: "dimension tile index {dimension_tile} overflows tile geometry")
     })?;
 
     if row_start >= logical_end
@@ -272,13 +272,13 @@ fn tile_bounds_for_validated_array(
 
 pub(crate) fn geometry_usizes(geometry: TileGeometry) -> VortexResult<(usize, usize)> {
     let rows = usize::try_from(geometry.rows().get()).map_err(|_| {
-        vortex_error::vortex_err!(
+        vortex_err!(
             InvalidArgument: "tile row geometry {} does not fit usize",
             geometry.rows().get()
         )
     })?;
     let dimensions = usize::try_from(geometry.dimensions().get()).map_err(|_| {
-        vortex_error::vortex_err!(
+        vortex_err!(
             InvalidArgument: "tile dimension geometry {} does not fit usize",
             geometry.dimensions().get()
         )
@@ -301,16 +301,18 @@ fn tile_bounds_from_starts(
     } = layout;
     let retained_row_end = row_start
         .checked_add(rows)
-        .ok_or_else(|| vortex_error::vortex_err!(InvalidArgument: "row tile range overflows logical extent"))?
+        .ok_or_else(|| vortex_err!(InvalidArgument: "row tile range overflows logical extent"))?
         .min(backing_rows);
-    let logical_end = row_offset.checked_add(len).ok_or_else(
-        || vortex_error::vortex_err!(InvalidArgument: "row window overflows logical extent"),
-    )?;
+    let logical_end = row_offset
+        .checked_add(len)
+        .ok_or_else(|| vortex_err!(InvalidArgument: "row window overflows logical extent"))?;
     let visible_row_start = row_start.max(row_offset);
     let visible_row_end = retained_row_end.min(logical_end);
     let dimension_end = dimension_start
         .checked_add(dimensions)
-        .ok_or_else(|| vortex_error::vortex_err!(InvalidArgument: "dimension tile range overflows logical extent"))?
+        .ok_or_else(
+            || vortex_err!(InvalidArgument: "dimension tile range overflows logical extent"),
+        )?
         .min(list_size);
     let retained_row_height = retained_row_end - row_start;
     let dimension_width = dimension_end - dimension_start;
@@ -322,17 +324,13 @@ fn tile_bounds_from_starts(
                 .checked_mul(dimension_width)
                 .and_then(|rows| offset.checked_add(rows))
         })
-        .ok_or_else(
-            || vortex_error::vortex_err!(InvalidArgument: "tile physical offset overflows usize"),
-        )?;
+        .ok_or_else(|| vortex_err!(InvalidArgument: "tile physical offset overflows usize"))?;
     let physical_len = retained_row_height
         .checked_mul(dimension_width)
-        .ok_or_else(
-            || vortex_error::vortex_err!(InvalidArgument: "tile physical length overflows usize"),
-        )?;
-    let physical_end = physical_start.checked_add(physical_len).ok_or_else(
-        || vortex_error::vortex_err!(InvalidArgument: "tile physical range overflows usize"),
-    )?;
+        .ok_or_else(|| vortex_err!(InvalidArgument: "tile physical length overflows usize"))?;
+    let physical_end = physical_start
+        .checked_add(physical_len)
+        .ok_or_else(|| vortex_err!(InvalidArgument: "tile physical range overflows usize"))?;
 
     let rows_within_tile = (visible_row_start - row_start)..(visible_row_end - row_start);
     let full_tile = rows_within_tile.start == 0 && rows_within_tile.end == rows;
@@ -345,7 +343,6 @@ fn tile_bounds_from_starts(
     ))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn physical_offset(
     len: usize,
     list_size: usize,
@@ -373,9 +370,9 @@ pub(crate) fn physical_offset_view(
     }
 
     let (rows, dimensions) = geometry_usizes(geometry)?;
-    let physical_row = row_offset.checked_add(row).ok_or_else(
-        || vortex_error::vortex_err!(InvalidArgument: "physical row overflows usize"),
-    )?;
+    let physical_row = row_offset
+        .checked_add(row)
+        .ok_or_else(|| vortex_err!(InvalidArgument: "physical row overflows usize"))?;
     let row_tile = physical_row / rows;
     let dimension_tile = dimension / dimensions;
     let bounds = tile_bounds_view(
@@ -394,13 +391,13 @@ pub(crate) fn physical_offset_view(
     bounds
         .physical_range
         .start
-        .checked_add(dimension_within_tile.checked_mul(row_height).ok_or_else(
-            || vortex_error::vortex_err!(InvalidArgument: "dimension offset overflows usize"),
-        )?)
-        .and_then(|offset| offset.checked_add(row_within_tile))
-        .ok_or_else(
-            || vortex_error::vortex_err!(InvalidArgument: "physical offset overflows usize"),
+        .checked_add(
+            dimension_within_tile
+                .checked_mul(row_height)
+                .ok_or_else(|| vortex_err!(InvalidArgument: "dimension offset overflows usize"))?,
         )
+        .and_then(|offset| offset.checked_add(row_within_tile))
+        .ok_or_else(|| vortex_err!(InvalidArgument: "physical offset overflows usize"))
 }
 
 #[cfg(test)]
