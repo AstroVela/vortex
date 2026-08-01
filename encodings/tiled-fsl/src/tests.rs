@@ -3,11 +3,13 @@
 
 use std::num::NonZeroU32;
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
 use prost::Message;
 use rstest::rstest;
+use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayVTable;
 use vortex_array::ExecutionCtx;
@@ -39,15 +41,19 @@ use vortex_array::dtype::PType;
 use vortex_array::match_each_native_ptype;
 use vortex_array::optimizer::kernels::ArrayKernelsExt;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::serde::SerializeOptions;
+use vortex_array::serde::SerializedArray;
 use vortex_array::test_harness::check_metadata;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_session::VortexSession;
+use vortex_session::registry::ReadContext;
 
 use crate::TileBounds;
 use crate::TileGeometry;
@@ -1539,6 +1545,49 @@ fn deserialize_rejects_window_outside_backing_rows() {
             .to_string()
             .contains("row window 1..3 exceeds 2 backing rows")
     );
+}
+
+#[test]
+fn serialized_array_rejects_validity_child_for_nonnullable_dtype_without_panicking()
+-> VortexResult<()> {
+    let tiled = TiledFixedSizeList::try_new(
+        PrimitiveArray::from_iter([10u16, 20]).into_array(),
+        1,
+        Validity::AllInvalid,
+        2,
+        geometry(2, 1),
+    )?;
+    let array_context = ArrayContext::empty();
+    let serialized =
+        tiled
+            .into_array()
+            .serialize(&array_context, &SESSION, &SerializeOptions::default())?;
+    let mut bytes = ByteBufferMut::empty();
+    for buffer in serialized {
+        bytes.extend_from_slice(buffer.as_ref());
+    }
+    let serialized = SerializedArray::try_from(bytes.freeze())?;
+    let nonnullable_dtype =
+        DType::FixedSizeList(Arc::new(PType::U16.into()), 1, Nullability::NonNullable);
+    let read_context = ReadContext::new(array_context.to_ids());
+
+    let decoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        serialized.decode(&nonnullable_dtype, 2, &read_context, &SESSION)
+    }));
+    let result = match decoded {
+        Ok(result) => result,
+        Err(_) => return Err(vortex_err!("malformed tiled FSL decode panicked")),
+    };
+    let error = match result {
+        Ok(_) => return Err(vortex_err!("malformed tiled FSL decode succeeded")),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cannot have an outer validity child")
+    );
+    Ok(())
 }
 
 #[test]

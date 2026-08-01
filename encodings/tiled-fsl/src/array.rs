@@ -391,6 +391,10 @@ impl VTable for TiledFixedSizeList {
             matches!(element_dtype.as_ref(), DType::Primitive(..)),
             InvalidArgument: "tiled fixed-size-list elements must have a primitive dtype, got {element_dtype}"
         );
+        vortex_ensure!(
+            nullability.is_nullable() || children.len() == 1,
+            InvalidArgument: "non-nullable tiled fixed-size-list dtype cannot have an outer validity child"
+        );
         let physical_len = backing_rows
             .checked_mul(*list_size as usize)
             .ok_or_else(|| {
@@ -411,6 +415,11 @@ impl VTable for TiledFixedSizeList {
             row_offset,
             backing_rows,
         )?;
+        vortex_ensure!(
+            array.dtype() == dtype,
+            InvalidArgument: "deserialized tiled fixed-size-list dtype {} does not match supplied dtype {dtype}",
+            array.dtype()
+        );
         array.try_into_parts().map_err(|_| {
             vortex_err!(InvalidArgument: "deserialized tiled fixed-size-list array is unexpectedly shared")
         })
