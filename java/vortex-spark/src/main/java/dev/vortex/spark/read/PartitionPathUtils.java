@@ -107,4 +107,34 @@ public final class PartitionPathUtils {
         }
         return vec;
     }
+
+    /**
+     * Converts a partition value string to Spark's internal (catalyst) representation for the given type, using the
+     * same parsing rules as {@link #createConstantVector}. Returns {@code null} for missing values and
+     * {@code __HIVE_DEFAULT_PARTITION__}.
+     */
+    public static Object toCatalystValue(DataType type, String value) {
+        if (value == null || HIVE_DEFAULT_PARTITION.equals(value)) {
+            return null;
+        }
+        if (type instanceof StringType) {
+            return UTF8String.fromString(value);
+        } else if (type instanceof IntegerType || type instanceof DateType) {
+            return Integer.parseInt(value);
+        } else if (type instanceof LongType || type instanceof TimestampType || type instanceof TimestampNTZType) {
+            return Long.parseLong(value);
+        } else if (type instanceof ShortType) {
+            return Short.parseShort(value);
+        } else if (type instanceof ByteType) {
+            return Byte.parseByte(value);
+        } else if (type instanceof BooleanType) {
+            return Boolean.parseBoolean(value);
+        } else if (type instanceof FloatType) {
+            return Float.parseFloat(value);
+        } else if (type instanceof DoubleType) {
+            return Double.parseDouble(value);
+        } else {
+            return UTF8String.fromString(value);
+        }
+    }
 }

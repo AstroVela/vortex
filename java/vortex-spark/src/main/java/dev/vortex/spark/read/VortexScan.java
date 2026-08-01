@@ -6,23 +6,31 @@ package dev.vortex.spark.read;
 import dev.vortex.api.DataSource;
 import dev.vortex.api.Session;
 import dev.vortex.spark.VortexSparkSession;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
 import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
+import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportPartitioning;
 import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering;
 import org.apache.spark.sql.connector.read.colstats.ColumnStatistics;
+import org.apache.spark.sql.connector.read.partitioning.KeyGroupedPartitioning;
+import org.apache.spark.sql.connector.read.partitioning.Partitioning;
+import org.apache.spark.sql.connector.read.partitioning.UnknownPartitioning;
 import org.apache.spark.sql.internal.SQLConf;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /**
@@ -35,7 +43,8 @@ import org.apache.spark.sql.types.StructType;
  * listing did not return a size for one or more files the file-byte total is extrapolated before Spark scaling is
  * applied.
  */
-public final class VortexScan implements Scan, SupportsReportStatistics, SupportsRuntimeV2Filtering {
+public final class VortexScan
+        implements Scan, SupportsReportStatistics, SupportsRuntimeV2Filtering, SupportsReportPartitioning {
 
     /** Sentinel meaning "no LIMIT pushed into this scan". */
     public static final int NO_LIMIT = -1;
@@ -49,12 +58,14 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     private final Set<String> metadataColumnNames;
     private final VortexTableSample tableSample;
     private final int limit;
+    private final StructType partitionSchema;
 
     // Runtime (e.g. dynamic partition pruning) predicates on partition columns. Spark installs
     // them through filter(Predicate[]) after the scan was built and then re-plans the batch.
     private Predicate[] runtimeFilters = new Predicate[0];
 
     private volatile Statistics cachedStatistics;
+    private volatile Partitioning cachedPartitioning;
 
     /**
      * Creates a new VortexScan for the specified file paths and columns. The caller is responsible for passing
@@ -68,6 +79,8 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
      * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
      * @param tableSample the pushed-down Bernoulli table sample, or {@code null} when the scan is unsampled
      * @param limit maximum row count each partition reader should return, or {@link #NO_LIMIT}
+     * @param partitionSchema schema of the identity partition columns in table-partitioning order; empty when the
+     *     table is unpartitioned
      */
     public VortexScan(
             List<String> paths,
@@ -78,7 +91,8 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
             Set<String> partitionColumnNames,
             Set<String> metadataColumnNames,
             VortexTableSample tableSample,
-            int limit) {
+            int limit,
+            StructType partitionSchema) {
         this.paths = paths;
         this.tableColumns = tableColumns;
         this.readColumns = readColumns;
@@ -88,6 +102,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
         this.metadataColumnNames = Set.copyOf(metadataColumnNames);
         this.tableSample = tableSample;
         this.limit = limit;
+        this.partitionSchema = partitionSchema;
     }
 
     /**
@@ -124,8 +139,15 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     @Override
     public Batch toBatch() {
         return new VortexBatchExec(
-                paths, readColumns, formatOptions, pushedPredicates, runtimeFilters, metadataColumnNames, tableSample,
-                limit);
+                paths,
+                readColumns,
+                formatOptions,
+                pushedPredicates,
+                runtimeFilters,
+                metadataColumnNames,
+                tableSample,
+                limit,
+                partitionSchema);
     }
 
     /**
@@ -145,6 +167,64 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     @Override
     public void filter(Predicate[] predicates) {
         this.runtimeFilters = predicates == null ? new Predicate[0] : predicates.clone();
+    }
+
+    /**
+     * Reports how the scan output is partitioned. When the table has Hive-style identity partition columns and the scan
+     * output still contains all of them, the scan reports a {@link KeyGroupedPartitioning} on those columns with one
+     * partition per distinct partition-value combination; Spark can then use storage-partitioned execution
+     * (shuffle-free joins and aggregations, gated behind {@code spark.sql.sources.v2.bucketing.enabled}). Otherwise the
+     * partitioning is unknown.
+     */
+    @Override
+    public Partitioning outputPartitioning() {
+        Partitioning local = cachedPartitioning;
+        if (local != null) {
+            return local;
+        }
+        synchronized (this) {
+            if (cachedPartitioning == null) {
+                cachedPartitioning = computePartitioning();
+            }
+            return cachedPartitioning;
+        }
+    }
+
+    private Partitioning computePartitioning() {
+        if (partitionSchema.isEmpty() || !readColumnsContainPartitionColumns()) {
+            return new UnknownPartitioning(0);
+        }
+        Session session = VortexSparkSession.get(formatOptions);
+        List<String> resolvedPaths = VortexBatchExec.resolveVortexPaths(session, paths, formatOptions);
+        Set<List<Object>> distinctKeys = new HashSet<>();
+        for (String path : resolvedPaths) {
+            Map<String, String> values = PartitionPathUtils.parsePartitionValues(path);
+            List<Object> key = new ArrayList<>(partitionSchema.fields().length);
+            for (StructField field : partitionSchema.fields()) {
+                key.add(PartitionPathUtils.toCatalystValue(field.dataType(), values.get(field.name())));
+            }
+            distinctKeys.add(key);
+        }
+        if (distinctKeys.isEmpty()) {
+            return new UnknownPartitioning(0);
+        }
+        Expression[] clustering = Arrays.stream(partitionSchema.fieldNames())
+                .map(Expressions::identity)
+                .toArray(Expression[]::new);
+        return new KeyGroupedPartitioning(clustering, distinctKeys.size());
+    }
+
+    private boolean readColumnsContainPartitionColumns() {
+        Set<String> readNames = new HashSet<>();
+        for (Column column : readColumns) {
+            readNames.add(column.name());
+        }
+        for (String name : partitionSchema.fieldNames()) {
+            if (!readNames.contains(name)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

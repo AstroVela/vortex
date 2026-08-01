@@ -47,6 +47,7 @@ public final class VortexScanBuilder
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
     private final Set<String> partitionColumnNames;
+    private final List<String> orderedPartitionColumnNames;
     private Predicate[] pushedPredicates = new Predicate[0];
     private int limit = VortexScan.NO_LIMIT;
     private int pushedCountColumns = 0;
@@ -71,6 +72,7 @@ public final class VortexScanBuilder
         this.readColumns = new ArrayList<>();
         this.formatOptions = options;
         this.partitionColumnNames = collectPartitionColumnNames(partitionTransforms);
+        this.orderedPartitionColumnNames = orderedIdentityPartitionColumns(partitionTransforms);
     }
 
     /**
@@ -147,7 +149,8 @@ public final class VortexScanBuilder
                 partitionColumnNames,
                 metadataColumnNames(),
                 tableSample,
-                limit);
+                limit,
+                partitionSchema());
     }
 
     /**
@@ -262,6 +265,23 @@ public final class VortexScanBuilder
     }
 
     /**
+     * Schema of the identity partition columns in table-partitioning order, resolved against the table columns. Used to
+     * report a key-grouped partitioning; empty for unpartitioned tables.
+     */
+    private StructType partitionSchema() {
+        StructType schema = new StructType();
+        for (String name : orderedPartitionColumnNames) {
+            for (Column column : tableColumns) {
+                if (column.name().equals(name)) {
+                    schema = schema.add(name, column.dataType(), column.nullable());
+                    break;
+                }
+            }
+        }
+        return schema;
+    }
+
+    /**
      * Prunes the columns to only include those specified in the required schema.
      *
      * <p>This method clears the current column list and replaces it with columns derived from the required schema.
@@ -309,6 +329,25 @@ public final class VortexScanBuilder
     @Override
     public Predicate[] pushedPredicates() {
         return Arrays.copyOf(pushedPredicates, pushedPredicates.length);
+    }
+
+    private static List<String> orderedIdentityPartitionColumns(Transform[] transforms) {
+        List<String> names = new ArrayList<>();
+        if (transforms == null) {
+            return names;
+        }
+        for (Transform transform : transforms) {
+            if (!"identity".equals(transform.name())) {
+                continue;
+            }
+            for (NamedReference ref : transform.references()) {
+                String[] parts = ref.fieldNames();
+                if (parts.length == 1 && !names.contains(parts[0])) {
+                    names.add(parts[0]);
+                }
+            }
+        }
+        return names;
     }
 
     private static Set<String> collectPartitionColumnNames(Transform[] transforms) {
