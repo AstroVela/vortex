@@ -52,7 +52,8 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             VortexFilePartition spark,
             List<String> dataColumnNames,
             Map<String, String> formatOptions,
-            Predicate[] pushedPredicates) {
+            Predicate[] pushedPredicates,
+            int limit) {
         this.spark = spark;
         this.allocator = ArrowAllocation.rootAllocator();
 
@@ -66,6 +67,9 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         }
         if (pushedPredicates != null && pushedPredicates.length > 0) {
             buildFilterExpression(pushedPredicates).ifPresent(options::filter);
+        }
+        if (limit >= 0) {
+            options.limit(limit);
         }
         scan = dataSource.scan(options.build());
     }
