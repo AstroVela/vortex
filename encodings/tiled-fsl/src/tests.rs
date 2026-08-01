@@ -965,7 +965,7 @@ fn large_unaligned_full_width_slice_retains_two_boundary_tiles() -> VortexResult
     let rows = 1_000_000;
     let dimensions = 128;
     let tile_rows = 64;
-    let range = 1..rows - 1;
+    let range = 123_457..124_458;
     let tiled = TiledFixedSizeList::try_new(
         ConstantArray::new(0u8, rows * dimensions).into_array(),
         dimensions as u32,
@@ -978,7 +978,9 @@ fn large_unaligned_full_width_slice_retains_two_boundary_tiles() -> VortexResult
     let sliced = sliced.as_::<TiledFixedSizeList>();
 
     assert_eq!(sliced.len(), range.len());
+    assert_eq!(sliced.row_offset(), 1);
     assert!(sliced.backing_rows() <= range.len() + 2 * tile_rows);
+    assert!(sliced.backing_rows() < rows);
     Ok(())
 }
 
