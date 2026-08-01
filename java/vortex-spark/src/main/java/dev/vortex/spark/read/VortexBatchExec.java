@@ -15,12 +15,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /** Execution source for batch scans of Vortex file tables. */
@@ -29,6 +32,7 @@ public final class VortexBatchExec implements Batch {
     private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final StructType partitionSchema;
     private List<String> resolvedPaths;
 
     /**
@@ -38,13 +42,20 @@ public final class VortexBatchExec implements Batch {
      * @param columns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
+     * @param partitionSchema schema of the identity partition columns in table-partitioning order; empty when the table
+     *     is unpartitioned
      */
     public VortexBatchExec(
-            List<String> paths, List<Column> columns, Map<String, String> formatOptions, Predicate[] pushedPredicates) {
+            List<String> paths,
+            List<Column> columns,
+            Map<String, String> formatOptions,
+            Predicate[] pushedPredicates,
+            StructType partitionSchema) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.partitionSchema = partitionSchema;
     }
 
     /**
@@ -61,9 +72,29 @@ public final class VortexBatchExec implements Batch {
                 .map(path -> {
                     Map<String, String> partVals = PartitionPathUtils.parsePartitionValues(path);
                     return new VortexFilePartition(
-                            List.of(path), readSchema, formatOptions, ImmutableMap.copyOf(partVals));
+                            List.of(path),
+                            readSchema,
+                            formatOptions,
+                            ImmutableMap.copyOf(partVals),
+                            partitionKey(partVals));
                 })
                 .toArray(InputPartition[]::new);
+    }
+
+    /**
+     * The file's typed partition values in table-partitioning order, used by Spark to group input partitions for
+     * storage-partitioned execution; {@code null} for unpartitioned tables.
+     */
+    private InternalRow partitionKey(Map<String, String> partitionValues) {
+        if (partitionSchema.isEmpty()) {
+            return null;
+        }
+        Object[] values = new Object[partitionSchema.fields().length];
+        for (int i = 0; i < values.length; i++) {
+            StructField field = partitionSchema.fields()[i];
+            values[i] = PartitionPathUtils.toCatalystValue(field.dataType(), partitionValues.get(field.name()));
+        }
+        return new GenericInternalRow(values);
     }
 
     @Override
