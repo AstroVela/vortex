@@ -116,12 +116,16 @@ public final class VortexTable implements Table, SupportsRead, SupportsWrite {
     /**
      * Returns the capabilities supported by this table.
      *
-     * <p>Vortex tables support batch reading and batch writing.
+     * <p>Vortex tables support batch reads, batch writes, truncation, and dynamic partition overwrite.
      *
-     * @return a set containing TableCapability.BATCH_READ and BATCH_WRITE
+     * @return the set of supported table capabilities
      */
     @Override
     public Set<TableCapability> capabilities() {
-        return ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE, TableCapability.TRUNCATE);
+        return ImmutableSet.of(
+                TableCapability.BATCH_READ,
+                TableCapability.BATCH_WRITE,
+                TableCapability.TRUNCATE,
+                TableCapability.OVERWRITE_DYNAMIC);
     }
 }

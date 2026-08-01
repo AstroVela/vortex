@@ -4,6 +4,7 @@
 package dev.vortex.spark.write;
 
 import com.google.common.collect.ImmutableList;
+import dev.vortex.api.Session;
 import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
@@ -11,9 +12,13 @@ import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.connector.distributions.Distribution;
@@ -47,11 +52,21 @@ import org.slf4j.LoggerFactory;
  */
 public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistributionAndOrdering, Serializable {
 
+    /** How the write treats data already present at the output path. */
+    enum Mode {
+        /** Keep existing files; only add new ones. */
+        APPEND,
+        /** Delete every existing file under the output path before writing. */
+        TRUNCATE,
+        /** At commit, replace previous files only in partition directories that received new data. */
+        DYNAMIC_OVERWRITE
+    }
+
     private static final Logger log = LoggerFactory.getLogger(VortexBatchWrite.class);
     private final String outputPath;
     private final StructType schema;
     private final Map<String, String> options;
-    private final boolean overwrite;
+    private final Mode mode;
     // Resolved eagerly so that Spark Transform objects (Scala case classes that are not
     // Java-serializable) never reach the DataWriterFactory serialization boundary.
     private final PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms;
@@ -64,19 +79,19 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
      * @param outputPath the base path where Vortex files will be written
      * @param schema the schema of the data to write
      * @param options additional write options
-     * @param overwrite whether to overwrite existing files
+     * @param mode how to treat data already present at the output path
      * @param partitionTransforms partition transforms (may be empty)
      */
     VortexBatchWrite(
             String outputPath,
             StructType schema,
             Map<String, String> options,
-            boolean overwrite,
+            Mode mode,
             Transform[] partitionTransforms) {
         this.outputPath = outputPath;
         this.schema = schema;
         this.options = options;
-        this.overwrite = overwrite;
+        this.mode = mode;
         this.resolvedTransforms = PartitionedVortexDataWriter.resolveTransforms(partitionTransforms, schema);
         this.identityPartitionColumns = identityPartitionColumns(partitionTransforms);
     }
@@ -152,8 +167,9 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
      */
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
-        // Handle overwrite cleanup BEFORE writing starts
-        if (overwrite) {
+        // Handle truncate cleanup BEFORE writing starts. Dynamic overwrite defers all deletion
+        // to commit(), once the set of partitions that received new data is known.
+        if (mode == Mode.TRUNCATE) {
             var session = VortexSparkSession.get(options);
             var uris = NativeFiles.listFiles(session, outputPath, options);
             // Deleting the existing files is destructive and happens before the new data is written:
@@ -187,7 +203,9 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
     /**
      * Commits the entire write job after all tasks complete successfully.
      *
-     * <p>This finalizes the write operation and ensures all Vortex files are properly written.
+     * <p>This finalizes the write operation and ensures all Vortex files are properly written. For dynamic partition
+     * overwrite, the previous files of every partition directory that received new data are deleted here, once the new
+     * files are fully written; partitions that received no data are left untouched.
      *
      * @param messages commit messages from all successful write tasks
      */
@@ -195,8 +213,48 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
     public void commit(WriterCommitMessage[] messages) {
         List<String> writtenFiles = extractFilePaths(messages);
 
+        if (mode == Mode.DYNAMIC_OVERWRITE) {
+            replaceDynamicPartitions(writtenFiles);
+        }
+
         if (!writtenFiles.isEmpty()) {
             log.info("Successfully wrote {} Vortex files to {}", writtenFiles.size(), outputPath);
+        }
+    }
+
+    /**
+     * Deletes the pre-existing files of every directory that received new files. Files are compared by name within
+     * their directory, so URI scheme differences between the writer paths and the listing cannot cause false
+     * mismatches. New files are already durable at this point; a failure here can leave old files behind but never lose
+     * new data.
+     */
+    private void replaceDynamicPartitions(List<String> writtenFiles) {
+        Map<String, Set<String>> newFileNamesByDir = new HashMap<>();
+        for (String file : writtenFiles) {
+            int slash = file.lastIndexOf('/');
+            newFileNamesByDir
+                    .computeIfAbsent(file.substring(0, slash), dir -> new HashSet<>())
+                    .add(file.substring(slash + 1));
+        }
+
+        Session session = VortexSparkSession.get(options);
+        List<String> toDelete = new ArrayList<>();
+        for (Map.Entry<String, Set<String>> entry : newFileNamesByDir.entrySet()) {
+            for (String existing : NativeFiles.listFiles(session, entry.getKey(), options)) {
+                String name = existing.substring(existing.lastIndexOf('/') + 1);
+                if (!entry.getValue().contains(name)) {
+                    toDelete.add(existing);
+                }
+            }
+        }
+        if (!toDelete.isEmpty()) {
+            log.info(
+                    "Dynamic partition overwrite: deleting {} replaced file(s) across {} partition director(ies) "
+                            + "under {}",
+                    toDelete.size(),
+                    newFileNamesByDir.size(),
+                    outputPath);
+            NativeFiles.delete(session, toDelete.toArray(new String[0]), options);
         }
     }
 
