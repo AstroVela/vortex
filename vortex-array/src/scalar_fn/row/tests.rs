@@ -344,6 +344,97 @@ fn kernel_result_length_is_validated() {
     );
 }
 
+#[derive(Clone)]
+struct FortyTwo;
+
+impl RowFn for FortyTwo {
+    type Options = EmptyOptions;
+    type ArgsWitness = ();
+    type RetWitness = i64;
+
+    fn id(&self) -> ScalarFnId {
+        static ID: CachedId = CachedId::new("vortex.test.forty_two");
+        *ID
+    }
+
+    fn arg_name(&self, _idx: usize) -> ChildName {
+        ChildName::from("unused")
+    }
+
+    fn dispatch<V: RowVisitor>(
+        &self,
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        visitor.visit::<(), i64>(|()| 42)
+    }
+}
+
+#[test]
+fn nullary_row_fn_executes_requested_rows() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let result = FortyTwo
+        .try_new_array(3, EmptyOptions, [])?
+        .execute::<Canonical>(&mut ctx)?;
+
+    assert_arrays_eq!(result, PrimitiveArray::from_iter([42i64; 3]), &mut ctx);
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SumFour;
+
+impl RowFn for SumFour {
+    type Options = EmptyOptions;
+    type ArgsWitness = (i64, i64, i64, i64);
+    type RetWitness = i64;
+
+    fn id(&self) -> ScalarFnId {
+        static ID: CachedId = CachedId::new("vortex.test.sum_four");
+        *ID
+    }
+
+    fn arg_name(&self, idx: usize) -> ChildName {
+        ChildName::from(["a", "b", "c", "d"][idx])
+    }
+
+    fn dispatch<V: RowVisitor>(
+        &self,
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        visitor.visit::<(i64, i64, i64, i64), i64>(|(a, b, c, d)| a + b + c + d)
+    }
+}
+
+#[test]
+fn four_argument_row_fn_executes() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let result = apply(
+        SumFour,
+        [
+            buffer![1i64, 2].into_array(),
+            buffer![10i64, 20].into_array(),
+            buffer![100i64, 200].into_array(),
+            buffer![1000i64, 2000].into_array(),
+        ],
+        &mut ctx,
+    )?;
+
+    assert_arrays_eq!(result, PrimitiveArray::from_iter([1111i64, 2222]), &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn tuples_are_supported_through_arity_twelve() {
+    type TwelveI64s = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
+
+    assert_eq!(<() as ElementTuple>::ARITY, 0);
+    assert_eq!(<TwelveI64s as ElementTuple>::ARITY, 12);
+}
+
 #[test]
 fn ret_type_decides_fallibility() {
     assert!(!ScalarFnVTable::is_fallible(&Hypot, &EmptyOptions));

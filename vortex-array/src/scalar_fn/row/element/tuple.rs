@@ -114,7 +114,7 @@ pub(in crate::scalar_fn::row) fn batch_constant(array: &ArrayRef) -> Option<Arra
 }
 
 /// Tuples of [`InputElement`]s forming the typed argument list a [`RowFn`](crate::scalar_fn::RowFn)
-/// visits with.
+/// visits with. Implemented for `()` and tuples of one through twelve elements.
 pub trait ElementTuple: 'static {
     /// The decoded column representations.
     type Columns;
@@ -167,6 +167,42 @@ pub trait ElementTuple: 'static {
 
     /// Read the batch-constant elements out of the decoded columns. Called once per batch.
     fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
+}
+
+impl ElementTuple for () {
+    type Columns = ();
+    type Elems<'a> = ();
+    type ConstElems<'a> = ();
+
+    const ARITY: usize = 0;
+    const DENSE_SAFE: bool = true;
+    const DECODE_FALLIBLE: bool = false;
+    const DECODE_SHRINKS_WHEN_FILTERED: bool = false;
+
+    fn validate(dtypes: &[DType]) -> VortexResult<()> {
+        vortex_ensure_eq!(
+            dtypes.len(),
+            0,
+            "expected 0 argument dtypes, got {}",
+            dtypes.len(),
+        );
+        Ok(())
+    }
+
+    fn decode(_args: &dyn ExecutionArgs, _ctx: &mut ExecutionCtx) -> VortexResult<Self::Columns> {
+        Ok(())
+    }
+
+    fn decode_null_tolerant(
+        _args: &dyn ExecutionArgs,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Columns>> {
+        Ok(Some(()))
+    }
+
+    fn get(_columns: &Self::Columns, _index: usize) -> Self::Elems<'_> {}
+
+    fn constants(_columns: &Self::Columns) -> Self::ConstElems<'_> {}
 }
 
 macro_rules! element_tuple {
@@ -228,3 +264,12 @@ macro_rules! element_tuple {
 element_tuple!(1; A:0);
 element_tuple!(2; A:0, B:1);
 element_tuple!(3; A:0, B:1, C:2);
+element_tuple!(4; A:0, B:1, C:2, D:3);
+element_tuple!(5; A:0, B:1, C:2, D:3, E:4);
+element_tuple!(6; A:0, B:1, C:2, D:3, E:4, F:5);
+element_tuple!(7; A:0, B:1, C:2, D:3, E:4, F:5, G:6);
+element_tuple!(8; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7);
+element_tuple!(9; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8);
+element_tuple!(10; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9);
+element_tuple!(11; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10);
+element_tuple!(12; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11);
