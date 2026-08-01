@@ -101,16 +101,15 @@ pub trait InputElement: 'static {
     /// their column slots; the caller guarantees [`get`](Self::get) is never called for such a
     /// row. It is what the branch-and-skip null strategy decodes with.
     ///
-    /// The default forwards to `decode`, which is sound for every element whose decode is a bulk
-    /// canonicalization rather than per-row parsing: hostile bytes behind a null row are only
-    /// dangerous to *resolve*, and the branch-and-skip row loop never resolves them. Return
-    /// `Ok(None)` rather than an error when an array has no null-tolerant decode; the lifting
-    /// falls back to the filter strategy.
+    /// The conservative default is `Ok(None)`. Elements whose decode is safe over null payloads
+    /// must opt in explicitly, typically by forwarding to [`decode`](Self::decode). Return
+    /// `Ok(None)` rather than an error when an array has no null-tolerant decode; the lifting falls
+    /// back to the filter strategy.
     fn decode_null_tolerant(
-        array: ArrayRef,
-        ctx: &mut ExecutionCtx,
+        _array: ArrayRef,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<Self::Column>> {
-        Self::decode(array, ctx).map(Some)
+        Ok(None)
     }
 
     /// Read the element at `index`, the one function called once per row.

@@ -42,6 +42,13 @@ impl<T: NativePType> InputElement for T {
         Ok(array.execute::<PrimitiveArray>(ctx)?.into_buffer::<T>())
     }
 
+    fn decode_null_tolerant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Column>> {
+        Self::decode(array, ctx).map(Some)
+    }
+
     fn get(column: &Self::Column, index: usize) -> T {
         column[index]
     }

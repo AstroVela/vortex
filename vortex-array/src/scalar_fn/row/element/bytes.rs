@@ -58,6 +58,13 @@ impl InputElement for Bytes {
         Ok(BytesColumn { array, buffers })
     }
 
+    fn decode_null_tolerant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Column>> {
+        Self::decode(array, ctx).map(Some)
+    }
+
     fn get(column: &Self::Column, index: usize) -> &[u8] {
         let view = &column.array.views()[index];
         if view.is_inlined() {
@@ -91,6 +98,13 @@ impl InputElement for BytesLen {
 
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
         array.execute::<VarBinViewArray>(ctx)
+    }
+
+    fn decode_null_tolerant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Column>> {
+        Self::decode(array, ctx).map(Some)
     }
 
     fn get(column: &Self::Column, index: usize) -> usize {

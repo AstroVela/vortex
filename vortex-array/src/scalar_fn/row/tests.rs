@@ -1482,8 +1482,8 @@ mod null_strategies {
             Ok(())
         }
 
-        /// An i64 element with no null-tolerant decode: `decode_null_tolerant` refuses, so the
-        /// batch must fall back to the filter strategy even though the selection preferred
+        /// An i64 element that omits `decode_null_tolerant`: the conservative default refuses, so
+        /// the batch must fall back to the filter strategy even though the selection preferred
         /// branch.
         struct RefusesNullTolerant;
 
@@ -1501,13 +1501,6 @@ mod null_strategies {
             fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
                 LAST_DECODE.set(Some((false, array.len())));
                 <i64 as InputElement>::decode(array, ctx)
-            }
-
-            fn decode_null_tolerant(
-                _array: ArrayRef,
-                _ctx: &mut ExecutionCtx,
-            ) -> VortexResult<Option<Self::Column>> {
-                Ok(None)
             }
 
             fn get(column: &Self::Column, index: usize) -> i64 {
