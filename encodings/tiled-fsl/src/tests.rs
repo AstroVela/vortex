@@ -49,6 +49,8 @@ use crate::TiledFixedSizeListArray;
 use crate::TiledFixedSizeListArrayExt;
 use crate::TiledFixedSizeListArraySlotsExt;
 use crate::TiledFixedSizeListMetadata;
+use crate::transpose::decode_elements;
+use crate::transpose::encode_elements;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = vortex_array::array_session();
@@ -61,6 +63,71 @@ fn geometry(rows: u32, dimensions: u32) -> TileGeometry {
         NonZeroU32::new(rows).unwrap(),
         NonZeroU32::new(dimensions).unwrap(),
     )
+}
+
+#[test]
+fn bitmap_validity_follows_value_permutation() -> VortexResult<()> {
+    let canonical = PrimitiveArray::new(
+        buffer![10u16, 11, 20, 21],
+        Validity::from_iter([true, false, true, true]),
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+
+    let tiled = encode_elements(canonical.as_view(), 2, 2, geometry(2, 2), &mut ctx)?;
+
+    assert_eq!(tiled.as_slice::<u16>(), &[10, 20, 11, 21]);
+    assert!(tiled.validity()?.mask_eq(
+        &Validity::from_iter([true, true, false, true]),
+        4,
+        &mut ctx,
+    )?);
+    Ok(())
+}
+
+#[test]
+fn constant_validity_forms_round_trip() -> VortexResult<()> {
+    for validity in [
+        Validity::NonNullable,
+        Validity::AllValid,
+        Validity::AllInvalid,
+    ] {
+        let canonical = PrimitiveArray::new(buffer![10u16, 11, 20, 21], validity.clone());
+        let mut ctx = SESSION.create_execution_ctx();
+
+        let tiled = encode_elements(canonical.as_view(), 2, 2, geometry(2, 2), &mut ctx)?;
+        assert!(same_validity_form(tiled.validity()?, &validity));
+
+        let decoded = decode_elements(tiled.as_view(), 2, 2, geometry(2, 2), &mut ctx)?;
+        assert_eq!(decoded.as_slice::<u16>(), canonical.as_slice::<u16>());
+        assert!(same_validity_form(
+            decoded.validity()?,
+            &canonical.validity()?
+        ));
+    }
+    Ok(())
+}
+
+fn same_validity_form(actual: Validity, expected: &Validity) -> bool {
+    matches!(
+        (actual, expected),
+        (Validity::NonNullable, Validity::NonNullable)
+            | (Validity::AllValid, Validity::AllValid)
+            | (Validity::AllInvalid, Validity::AllInvalid)
+    )
+}
+
+#[test]
+fn encode_elements_rejects_mismatched_extent() {
+    let elements = PrimitiveArray::from_iter([10u16, 11, 20]);
+    let mut ctx = SESSION.create_execution_ctx();
+
+    let error = encode_elements(elements.as_view(), 2, 2, geometry(2, 2), &mut ctx).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("physical child length 3 does not match logical extent (2, 2)")
+    );
 }
 
 fn physical_fixture(
