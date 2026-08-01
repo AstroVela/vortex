@@ -9,10 +9,12 @@ use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::FixedSizeListArray;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::Slice;
 use vortex_array::arrays::slice::SliceExecuteAdaptor;
 use vortex_array::arrays::slice::SliceKernel;
+use vortex_array::builders::builder_with_capacity;
 use vortex_array::optimizer::kernels::ArrayKernelsExt;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
@@ -20,7 +22,7 @@ use vortex_session::VortexSession;
 use crate::TiledFixedSizeList;
 use crate::TiledFixedSizeListArrayExt;
 use crate::TiledFixedSizeListArraySlotsExt;
-use crate::gather::gather_physical_row_tile_span;
+use crate::gather::plan_physical_row_tile_spans;
 use crate::geometry::geometry_usizes;
 use crate::transpose::decode_visible_elements;
 
@@ -44,13 +46,18 @@ impl SliceKernel for TiledFixedSizeList {
         let retained_end = retained_end.min(array.len());
         let retained_range = retained_start..retained_end;
         let retained_rows = retained_range.len();
-        let indices = gather_physical_row_tile_span(array, retained_range)?;
-        let elements = array
-            .elements()
-            .take(indices)?
-            .execute::<PrimitiveArray>(ctx)?;
+        let retained_element_count = retained_rows * array.list_size() as usize;
+        let mut elements = builder_with_capacity(array.elements().dtype(), retained_element_count);
+        for span in plan_physical_row_tile_spans(array, retained_range)? {
+            let span_elements = array
+                .elements()
+                .slice(span)?
+                .execute::<PrimitiveArray>(ctx)?;
+            span_elements.append_to_builder(elements.as_mut(), ctx)?;
+        }
+        let elements = elements.finish();
         let decoded = decode_visible_elements(
-            elements.as_view(),
+            elements.as_::<Primitive>(),
             range.len(),
             array.list_size() as usize,
             array.geometry(),

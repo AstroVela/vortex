@@ -21,6 +21,42 @@ use crate::TiledFixedSizeListArraySlotsExt;
 use crate::geometry::geometry_usizes;
 use crate::geometry::physical_offset;
 
+/// Plans one contiguous physical child span per dimension slab for a row-tile-aligned range.
+pub(crate) fn plan_physical_row_tile_spans(
+    array: ArrayView<'_, TiledFixedSizeList>,
+    range: Range<usize>,
+) -> VortexResult<Vec<Range<usize>>> {
+    let list_size = array.list_size() as usize;
+    let geometry = array.geometry();
+    let (_, tile_dimensions) = geometry_usizes(geometry)?;
+    let dimension_slab_count = list_size.div_ceil(tile_dimensions);
+    let mut spans = Vec::with_capacity(dimension_slab_count);
+
+    for dimension_start in (0..list_size).step_by(tile_dimensions) {
+        let dimension_width = list_size.min(dimension_start + tile_dimensions) - dimension_start;
+        let start = physical_offset(
+            array.len(),
+            list_size,
+            geometry,
+            range.start,
+            dimension_start,
+        )?;
+        let length = range.len().checked_mul(dimension_width).ok_or_else(|| {
+            vortex_err!(
+                InvalidArgument:
+                "row span {} times dimension width {dimension_width} overflows usize",
+                range.len()
+            )
+        })?;
+        let end = start.checked_add(length).ok_or_else(
+            || vortex_err!(InvalidArgument: "physical row-tile span overflows usize"),
+        )?;
+        spans.push(start..end);
+    }
+
+    Ok(spans)
+}
+
 /// Builds one contiguous physical-index run for each dimension slab in a row-tile-aligned span.
 pub(crate) fn gather_physical_row_tile_span(
     array: ArrayView<'_, TiledFixedSizeList>,
@@ -34,30 +70,14 @@ pub(crate) fn gather_physical_row_tile_span(
             range.len()
         )
     })?;
-    let geometry = array.geometry();
-    let (_, tile_dimensions) = geometry_usizes(geometry)?;
-    let dimension_slab_count = list_size.div_ceil(tile_dimensions);
+    let spans = plan_physical_row_tile_spans(array, range)?;
+    let dimension_slab_count = spans.len();
     let mut starts = Vec::<u64>::with_capacity(dimension_slab_count);
     let mut lengths = Vec::<u64>::with_capacity(dimension_slab_count);
 
-    for dimension_start in (0..list_size).step_by(tile_dimensions) {
-        let dimension_width = list_size.min(dimension_start + tile_dimensions) - dimension_start;
-        starts.push(u64::try_from(physical_offset(
-            array.len(),
-            list_size,
-            geometry,
-            range.start,
-            dimension_start,
-        )?)?);
-        lengths.push(u64::try_from(
-            range.len().checked_mul(dimension_width).ok_or_else(|| {
-                vortex_err!(
-                    InvalidArgument:
-                    "row span {} times dimension width {dimension_width} overflows usize",
-                    range.len()
-                )
-            })?,
-        )?);
+    for span in spans {
+        starts.push(u64::try_from(span.start)?);
+        lengths.push(u64::try_from(span.len())?);
     }
 
     Ok(PiecewiseSequenceArray::try_new(

@@ -921,6 +921,16 @@ fn multi_slab_window_has_one_run_per_slab() -> VortexResult<()> {
 }
 
 #[test]
+fn physical_slab_span_plan_bounds_partial_dimension_and_row_tails() -> VortexResult<()> {
+    let (_, tiled, _) = fixture(130, 130, geometry(64, 64))?;
+
+    let spans = crate::gather::plan_physical_row_tile_spans(tiled.as_view(), 64..130)?;
+
+    assert_eq!(spans, vec![4_096..8_320, 12_416..16_640, 16_768..16_900]);
+    Ok(())
+}
+
+#[test]
 fn full_width_unaligned_slice_is_offset_view() -> VortexResult<()> {
     let (canonical, tiled, mut ctx) = fixture(200, 128, geometry(64, 128))?;
     let expected = canonical.into_array().slice(10..150)?;
