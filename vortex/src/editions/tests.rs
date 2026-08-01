@@ -181,7 +181,6 @@ fn default_unstable_edition_permits_tiled_fixed_size_list() {
 #[test]
 fn unstable_encoding_registration_does_not_depend_on_files() {
     use vortex_array::VTable as _;
-    use vortex_array::array_session;
     use vortex_array::dtype::extension::ExtVTable as _;
     use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
@@ -189,8 +188,9 @@ fn unstable_encoding_registration_does_not_depend_on_files() {
     use vortex_tensor::vector::Vector;
     use vortex_tiled_fsl::TiledFixedSizeList;
 
-    let session = array_session();
-    crate::register_unstable_encodings(&session);
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
     assert!(
         session
             .arrays()
