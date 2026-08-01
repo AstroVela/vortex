@@ -31,6 +31,7 @@ public final class VortexBatchExec implements Batch {
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
     private final Predicate[] runtimeFilters;
+    private final Set<String> metadataColumnNames;
     private final int limit;
     private List<String> resolvedPaths;
 
@@ -42,6 +43,7 @@ public final class VortexBatchExec implements Batch {
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
      * @param runtimeFilters runtime predicates on partition columns used to skip whole files during planning
+     * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
      * @param limit maximum row count each partition reader should return, or {@link VortexScan#NO_LIMIT}
      */
     public VortexBatchExec(
@@ -50,12 +52,14 @@ public final class VortexBatchExec implements Batch {
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
             Predicate[] runtimeFilters,
+            Set<String> metadataColumnNames,
             int limit) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.runtimeFilters = runtimeFilters == null ? new Predicate[0] : runtimeFilters.clone();
+        this.metadataColumnNames = Set.copyOf(metadataColumnNames);
         this.limit = limit;
     }
 
@@ -88,9 +92,10 @@ public final class VortexBatchExec implements Batch {
         List<String> files = resolvedPaths != null ? resolvedPaths : resolvePaths();
         Set<String> partitionColumns = collectPartitionColumnNames(files);
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
-                .filter(name -> !partitionColumns.contains(name))
+                .filter(name -> !partitionColumns.contains(name) && !metadataColumnNames.contains(name))
                 .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates, limit);
+        return new VortexPartitionReaderFactory(
+                dataColumnNames, formatOptions, pushedPredicates, metadataColumnNames, limit);
     }
 
     private List<String> resolvePaths() {

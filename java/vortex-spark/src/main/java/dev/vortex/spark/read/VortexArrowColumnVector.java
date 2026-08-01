@@ -304,6 +304,8 @@ public class VortexArrowColumnVector extends ColumnVector {
             accessor = new VortexArrowColumnVector.IntAccessor(intVector);
         } else if (vector instanceof BigIntVector bigIntVector) {
             accessor = new VortexArrowColumnVector.LongAccessor(bigIntVector);
+        } else if (vector instanceof UInt8Vector uInt8Vector) {
+            accessor = new VortexArrowColumnVector.UnsignedLongAccessor(uInt8Vector);
         } else if (vector instanceof Float4Vector float4Vector) {
             accessor = new VortexArrowColumnVector.FloatAccessor(float4Vector);
         } else if (vector instanceof Float8Vector float8Vector) {
@@ -497,6 +499,22 @@ public class VortexArrowColumnVector extends ColumnVector {
         private final BigIntVector accessor;
 
         LongAccessor(BigIntVector vector) {
+            super(vector);
+            this.accessor = vector;
+        }
+
+        @Override
+        final long getLong(int rowId) {
+            return accessor.get(rowId);
+        }
+    }
+
+    @Open
+    static class UnsignedLongAccessor extends VortexArrowColumnVector.ArrowVectorAccessor {
+
+        private final UInt8Vector accessor;
+
+        UnsignedLongAccessor(UInt8Vector vector) {
             super(vector);
             this.accessor = vector;
         }

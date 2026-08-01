@@ -142,6 +142,7 @@ public final class VortexScanBuilder
                 pushedPredicates,
                 this.formatOptions,
                 partitionColumnNames,
+                metadataColumnNames(),
                 limit);
     }
 
@@ -164,7 +165,6 @@ public final class VortexScanBuilder
     @Override
     public boolean isPartiallyPushed() {
         return true;
->>>>>>> claude/spark-datasource-extensions-pmk8mc-limit-pushdown
     }
 
     /**
@@ -219,6 +219,27 @@ public final class VortexScanBuilder
             }
         }
         return false;
+    }
+
+    /**
+     * Names of the requested read columns that are served as metadata columns ({@code _file}, {@code _pos}) rather than
+     * read from file data. A name only counts as a metadata column when the table schema does not contain it — a data
+     * or partition column with the same name shadows the metadata column.
+     */
+    private Set<String> metadataColumnNames() {
+        Set<String> tableColumnNames = new HashSet<>();
+        for (Column column : tableColumns) {
+            tableColumnNames.add(column.name());
+        }
+        Set<String> names = new HashSet<>();
+        for (Column column : readColumns) {
+            String name = column.name();
+            if ((VortexMetadataColumns.FILE_PATH.equals(name) || VortexMetadataColumns.ROW_POSITION.equals(name))
+                    && !tableColumnNames.contains(name)) {
+                names.add(name);
+            }
+        }
+        return names;
     }
 
     /**

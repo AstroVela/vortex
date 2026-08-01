@@ -3,6 +3,7 @@
 
 package dev.vortex.spark.read;
 
+import com.google.common.collect.Iterables;
 import dev.vortex.api.DataSource;
 import dev.vortex.api.Expression;
 import dev.vortex.api.Partition;
@@ -16,11 +17,14 @@ import dev.vortex.relocated.org.apache.arrow.vector.ipc.ArrowReader;
 import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.PartitionReader;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
@@ -35,6 +39,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
     private final VortexFilePartition spark;
     private final BufferAllocator allocator;
+    private final Set<String> metadataColumnNames;
 
     // Held so the DataSource/Scan stay reachable even if the JVM-wide singleton is
     // ever reset during a task; the actual native session is owned by
@@ -53,18 +58,17 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             List<String> dataColumnNames,
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
+            Set<String> metadataColumnNames,
             int limit) {
         this.spark = spark;
         this.allocator = ArrowAllocation.rootAllocator();
+        this.metadataColumnNames = metadataColumnNames;
 
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
 
         var options = ScanOptions.builder();
-        if (!dataColumnNames.isEmpty()) {
-            Expression projection = Expression.select(dataColumnNames.toArray(new String[0]), Expression.root());
-            options.projection(projection);
-        }
+        buildProjection(dataColumnNames).ifPresent(options::projection);
         if (pushedPredicates != null && pushedPredicates.length > 0) {
             buildFilterExpression(pushedPredicates).ifPresent(options::filter);
         }
@@ -72,6 +76,37 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             options.limit(limit);
         }
         scan = dataSource.scan(options.build());
+    }
+
+    /**
+     * Builds the scan's projection expression. Without metadata columns this is a plain field selection. When the
+     * {@code _pos} metadata column is requested, the projection instead packs the data columns and the row-index
+     * expression into a struct, in the order the fields appear in the requested read schema, so that the Arrow output
+     * lines up with the batch assembly in {@link #get()}. The {@code _file} column needs nothing from the scan; it is
+     * materialized as a per-file constant.
+     */
+    private Optional<Expression> buildProjection(List<String> dataColumnNames) {
+        if (!metadataColumnNames.contains(VortexMetadataColumns.ROW_POSITION)) {
+            if (dataColumnNames.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(Expression.select(dataColumnNames.toArray(new String[0]), Expression.root()));
+        }
+
+        List<String> fieldNames = new ArrayList<>();
+        List<Expression> fields = new ArrayList<>();
+        for (StructField field : spark.readSchema().fields()) {
+            String name = field.name();
+            if (VortexMetadataColumns.ROW_POSITION.equals(name) && metadataColumnNames.contains(name)) {
+                fieldNames.add(name);
+                fields.add(Expression.rowIdx());
+            } else if (dataColumnNames.contains(name)) {
+                fieldNames.add(name);
+                fields.add(Expression.column(name));
+            }
+        }
+        return Optional.of(Expression.pack(
+                fieldNames.toArray(new String[0]), fields.toArray(new Expression[0]), /* nullable= */ false));
     }
 
     private static Optional<Expression> buildFilterExpression(Predicate[] predicates) {
@@ -128,7 +163,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
 
         int rowCount = root.getRowCount();
         Map<String, String> partVals = spark.partitionValues();
-        if (partVals.isEmpty()) {
+        if (partVals.isEmpty() && metadataColumnNames.isEmpty()) {
             ColumnVector[] vectors = new ColumnVector[root.getFieldVectors().size()];
             for (int i = 0; i < vectors.length; i++) {
                 vectors[i] = new VortexArrowColumnVector(root.getFieldVectors().get(i));
@@ -141,10 +176,18 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         int dataIdx = 0;
         for (int i = 0; i < fields.length; i++) {
             StructField field = fields[i];
-            String partValue = partVals.get(field.name());
-            if (partValue != null) {
+            String name = field.name();
+            if (VortexMetadataColumns.FILE_PATH.equals(name) && metadataColumnNames.contains(name)) {
+                combined[i] = PartitionPathUtils.createConstantVector(
+                        rowCount, DataTypes.StringType, Iterables.getOnlyElement(spark.paths()));
+                continue;
+            }
+            String partValue = partVals.get(name);
+            if (partValue != null && !metadataColumnNames.contains(name)) {
                 combined[i] = PartitionPathUtils.createConstantVector(rowCount, field.dataType(), partValue);
             } else {
+                // Data columns and the _pos metadata column both come from the Arrow output, in
+                // read-schema order (see buildProjection).
                 combined[i] = new VortexArrowColumnVector(root.getFieldVectors().get(dataIdx++));
             }
         }

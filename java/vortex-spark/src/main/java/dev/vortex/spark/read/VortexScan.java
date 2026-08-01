@@ -46,6 +46,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
     private final Set<String> partitionColumnNames;
+    private final Set<String> metadataColumnNames;
     private final int limit;
 
     // Runtime (e.g. dynamic partition pruning) predicates on partition columns. Spark installs
@@ -63,6 +64,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
      * @param readColumns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; {@code null} or empty means no pushdown
      * @param partitionColumnNames names of Hive-style partition columns encoded in the file paths
+     * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
      * @param limit maximum row count each partition reader should return, or {@link #NO_LIMIT}
      */
     public VortexScan(
@@ -72,6 +74,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
             Predicate[] pushedPredicates,
             Map<String, String> formatOptions,
             Set<String> partitionColumnNames,
+            Set<String> metadataColumnNames,
             int limit) {
         this.paths = paths;
         this.tableColumns = tableColumns;
@@ -79,6 +82,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
         this.formatOptions = formatOptions;
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.partitionColumnNames = Set.copyOf(partitionColumnNames);
+        this.metadataColumnNames = Set.copyOf(metadataColumnNames);
         this.limit = limit;
     }
 
@@ -111,7 +115,8 @@ public final class VortexScan implements Scan, SupportsReportStatistics, Support
      */
     @Override
     public Batch toBatch() {
-        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates, runtimeFilters, limit);
+        return new VortexBatchExec(
+                paths, readColumns, formatOptions, pushedPredicates, runtimeFilters, metadataColumnNames, limit);
     }
 
     /**
