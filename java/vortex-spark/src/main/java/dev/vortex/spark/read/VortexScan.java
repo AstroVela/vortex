@@ -39,6 +39,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final VortexTableSample tableSample;
 
     private volatile Statistics cachedStatistics;
 
@@ -50,18 +51,21 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      * @param tableColumns the full table columns before projection pushdown
      * @param readColumns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; {@code null} or empty means no pushdown
+     * @param tableSample the pushed-down Bernoulli table sample, or {@code null} when the scan is unsampled
      */
     public VortexScan(
             List<String> paths,
             List<Column> tableColumns,
             List<Column> readColumns,
             Predicate[] pushedPredicates,
-            Map<String, String> formatOptions) {
+            Map<String, String> formatOptions,
+            VortexTableSample tableSample) {
         this.paths = paths;
         this.tableColumns = tableColumns;
         this.readColumns = readColumns;
         this.formatOptions = formatOptions;
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.tableSample = tableSample;
     }
 
     /**
@@ -80,8 +84,11 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
     @Override
     public String description() {
         return String.format(
-                "VortexScan{paths=%s, columns=%s, pushedPredicates=%s}",
-                paths, readColumns, Arrays.toString(pushedPredicates));
+                "VortexScan{paths=%s, columns=%s, pushedPredicates=%s%s}",
+                paths,
+                readColumns,
+                Arrays.toString(pushedPredicates),
+                tableSample == null ? "" : ", sample=" + tableSample);
     }
 
     /**
@@ -93,7 +100,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      */
     @Override
     public Batch toBatch() {
-        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates);
+        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates, tableSample);
     }
 
     /**

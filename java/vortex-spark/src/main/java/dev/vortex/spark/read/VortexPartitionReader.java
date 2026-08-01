@@ -15,15 +15,20 @@ import dev.vortex.relocated.org.apache.arrow.vector.VectorSchemaRoot;
 import dev.vortex.relocated.org.apache.arrow.vector.ipc.ArrowReader;
 import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
+import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
 /**
  * Per-{@link VortexFilePartition} columnar reader.
@@ -52,7 +57,8 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             VortexFilePartition spark,
             List<String> dataColumnNames,
             Map<String, String> formatOptions,
-            Predicate[] pushedPredicates) {
+            Predicate[] pushedPredicates,
+            VortexTableSample tableSample) {
         this.spark = spark;
         this.allocator = ArrowAllocation.rootAllocator();
 
@@ -67,7 +73,41 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         if (pushedPredicates != null && pushedPredicates.length > 0) {
             buildFilterExpression(pushedPredicates).ifPresent(options::filter);
         }
+        if (tableSample != null) {
+            options.selectionRoaringBitmap(sampleSelection(tableSample));
+            options.selectionMode(ScanOptions.SelectionMode.INCLUDE_ROARING);
+        }
         scan = dataSource.scan(options.build());
+    }
+
+    /**
+     * Draws the sampled row positions for this partition's files as a serialized Roaring bitmap. The pseudo-random
+     * sequence is seeded from the sampling seed and the file paths, so the same seed always selects the same rows.
+     * Sampling is applied to the file's original row positions, before any pushed filter, matching SQL TABLESAMPLE
+     * semantics.
+     */
+    private byte[] sampleSelection(VortexTableSample tableSample) {
+        if (!(dataSource.rowCount() instanceof DataSource.RowCount.Exact exact)) {
+            throw new IllegalStateException(
+                    "cannot sample " + spark.paths() + ": the exact file row count is not available");
+        }
+        Random random =
+                new Random(tableSample.seed() ^ String.join(",", spark.paths()).hashCode());
+        Roaring64NavigableMap selection = new Roaring64NavigableMap();
+        for (long row = 0; row < exact.value(); row++) {
+            double draw = random.nextDouble();
+            if (draw >= tableSample.lowerBound() && draw < tableSample.upperBound()) {
+                selection.addLong(row);
+            }
+        }
+        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                DataOutputStream output = new DataOutputStream(bytes)) {
+            selection.serializePortable(output);
+            output.flush();
+            return bytes.toByteArray();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     private static Optional<Expression> buildFilterExpression(Predicate[] predicates) {

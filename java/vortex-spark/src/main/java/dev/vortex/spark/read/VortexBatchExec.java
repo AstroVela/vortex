@@ -29,6 +29,7 @@ public final class VortexBatchExec implements Batch {
     private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final VortexTableSample tableSample;
     private List<String> resolvedPaths;
 
     /**
@@ -38,13 +39,19 @@ public final class VortexBatchExec implements Batch {
      * @param columns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
+     * @param tableSample the pushed-down Bernoulli table sample, or {@code null} when the scan is unsampled
      */
     public VortexBatchExec(
-            List<String> paths, List<Column> columns, Map<String, String> formatOptions, Predicate[] pushedPredicates) {
+            List<String> paths,
+            List<Column> columns,
+            Map<String, String> formatOptions,
+            Predicate[] pushedPredicates,
+            VortexTableSample tableSample) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.tableSample = tableSample;
     }
 
     /**
@@ -73,7 +80,7 @@ public final class VortexBatchExec implements Batch {
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
                 .filter(name -> !partitionColumns.contains(name))
                 .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates);
+        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates, tableSample);
     }
 
     private List<String> resolvePaths() {

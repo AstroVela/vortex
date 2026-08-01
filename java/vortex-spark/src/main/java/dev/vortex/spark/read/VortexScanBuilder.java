@@ -23,19 +23,24 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
+import org.apache.spark.sql.connector.read.SupportsPushDownTableSample;
 import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructType;
 
 /** Spark V2 {@link ScanBuilder} for table scans over Vortex files. */
 public final class VortexScanBuilder
-        implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters {
+        implements ScanBuilder,
+                SupportsPushDownRequiredColumns,
+                SupportsPushDownV2Filters,
+                SupportsPushDownTableSample {
     private final ImmutableList.Builder<String> paths;
     private final List<Column> tableColumns;
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
     private final Set<String> partitionColumnNames;
     private Predicate[] pushedPredicates = new Predicate[0];
+    private VortexTableSample tableSample;
 
     /** Creates a new VortexScanBuilder with empty paths and columns. */
     public VortexScanBuilder(Map<String, String> formatOptions) {
@@ -124,7 +129,23 @@ public final class VortexScanBuilder
                 List.copyOf(this.tableColumns),
                 List.copyOf(this.readColumns),
                 pushedPredicates,
-                this.formatOptions);
+                this.formatOptions,
+                tableSample);
+    }
+
+    /**
+     * Accepts a Bernoulli (without replacement) TABLESAMPLE. Each partition reader draws a deterministic pseudo-random
+     * value per row, seeded by the sampling seed and the file path, and pushes the accepted row positions into the
+     * native scan as a row selection, so skipped rows are never decoded. Sampling with replacement is rejected and left
+     * for Spark to evaluate.
+     */
+    @Override
+    public boolean pushTableSample(double lowerBound, double upperBound, boolean withReplacement, long seed) {
+        if (withReplacement) {
+            return false;
+        }
+        this.tableSample = new VortexTableSample(lowerBound, upperBound, seed);
+        return true;
     }
 
     /**
