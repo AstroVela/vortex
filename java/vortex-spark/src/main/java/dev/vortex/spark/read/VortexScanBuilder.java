@@ -22,6 +22,7 @@ import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
 import org.apache.spark.sql.types.DataType;
@@ -29,13 +30,14 @@ import org.apache.spark.sql.types.StructType;
 
 /** Spark V2 {@link ScanBuilder} for table scans over Vortex files. */
 public final class VortexScanBuilder
-        implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters {
+        implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters, SupportsPushDownLimit {
     private final ImmutableList.Builder<String> paths;
     private final List<Column> tableColumns;
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
     private final Set<String> partitionColumnNames;
     private Predicate[] pushedPredicates = new Predicate[0];
+    private int limit = VortexScan.NO_LIMIT;
 
     /** Creates a new VortexScanBuilder with empty paths and columns. */
     public VortexScanBuilder(Map<String, String> formatOptions) {
@@ -125,7 +127,30 @@ public final class VortexScanBuilder
                 List.copyOf(this.readColumns),
                 pushedPredicates,
                 this.formatOptions,
-                partitionColumnNames);
+                partitionColumnNames,
+                limit);
+    }
+
+    /**
+     * Accepts a LIMIT to push into the scan. The limit is applied by each partition reader after any pushed filter, so
+     * every Spark input partition returns at most {@code limit} rows.
+     *
+     * @return always {@code true}; the pushdown is reported as partial via {@link #isPartiallyPushed()}
+     */
+    @Override
+    public boolean pushLimit(int limit) {
+        this.limit = limit;
+        return true;
+    }
+
+    /**
+     * Reports the LIMIT pushdown as partial: a scan may span several files, each of which enforces the limit
+     * independently, so Spark must still apply the global limit on top.
+     */
+    @Override
+    public boolean isPartiallyPushed() {
+        return true;
+>>>>>>> claude/spark-datasource-extensions-pmk8mc-limit-pushdown
     }
 
     /**

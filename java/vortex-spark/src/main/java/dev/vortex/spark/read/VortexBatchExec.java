@@ -31,6 +31,7 @@ public final class VortexBatchExec implements Batch {
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
     private final Predicate[] runtimeFilters;
+    private final int limit;
     private List<String> resolvedPaths;
 
     /**
@@ -41,18 +42,21 @@ public final class VortexBatchExec implements Batch {
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
      * @param runtimeFilters runtime predicates on partition columns used to skip whole files during planning
+     * @param limit maximum row count each partition reader should return, or {@link VortexScan#NO_LIMIT}
      */
     public VortexBatchExec(
             List<String> paths,
             List<Column> columns,
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
-            Predicate[] runtimeFilters) {
+            Predicate[] runtimeFilters,
+            int limit) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.runtimeFilters = runtimeFilters == null ? new Predicate[0] : runtimeFilters.clone();
+        this.limit = limit;
     }
 
     /**
@@ -86,7 +90,7 @@ public final class VortexBatchExec implements Batch {
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
                 .filter(name -> !partitionColumns.contains(name))
                 .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates);
+        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates, limit);
     }
 
     private List<String> resolvePaths() {
