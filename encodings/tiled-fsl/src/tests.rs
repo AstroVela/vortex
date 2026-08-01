@@ -9,16 +9,21 @@ use std::sync::LazyLock;
 use prost::Message;
 use rstest::rstest;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayVTable;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
+use vortex_array::arrays::PiecewiseSequence;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use vortex_array::arrays::piecewise_sequence::array::PiecewiseSequenceArraySlotsExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::compute::conformance::consistency::test_array_consistency;
 use vortex_array::compute::conformance::filter::test_filter_conformance;
@@ -28,13 +33,13 @@ use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_native_ptype;
+use vortex_array::optimizer::kernels::ArrayKernelsExt;
 use vortex_array::test_harness::check_metadata;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::bitpack_compress::bitpack_encode;
-use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::TileBounds;
@@ -291,16 +296,14 @@ fn assert_slice_conformance(
 fn assert_take_oracle_conformance(
     canonical: &FixedSizeListArray,
     tiled: &TiledFixedSizeListArray,
-    tile_geometry: TileGeometry,
+    _tile_geometry: TileGeometry,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
     for indices in conformance_take_indices(canonical.len())? {
         let expected = canonical.clone().into_array().take(indices.clone())?;
         let actual = tiled.clone().into_array().take(indices)?;
         let actual = if !canonical.is_empty() && !actual.is_empty() {
-            let actual = actual.execute_until::<TiledFixedSizeList>(ctx)?;
-            assert_eq!(actual.as_::<TiledFixedSizeList>().geometry(), tile_geometry);
-            actual
+            actual.execute_until::<FixedSizeList>(ctx)?
         } else if actual.is_empty() {
             let actual = actual.execute_until::<FixedSizeList>(ctx)?;
             assert!(actual.is::<FixedSizeList>());
@@ -486,31 +489,22 @@ fn canonical_oracle_conformance_matrix() -> VortexResult<()> {
 }
 
 #[test]
-fn physical_indices_reject_overflowing_output_cardinality() {
-    assert!(
-        crate::gather::physical_indices_for_rows(
-            1,
-            usize::MAX,
-            geometry(1, 1),
-            &[Some(0), Some(0)],
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn collect_checked_rows_rejects_mismatched_mask_length() {
-    assert!(crate::take::collect_checked_rows(&[0u32, 1], &Mask::new_true(1), 2).is_err());
-}
-
-#[test]
 fn take_conformance() {
     let (_, tiled, mut ctx) = fixture(65, 129, geometry(32, 64)).unwrap();
     test_take_conformance(&tiled.into_array(), &mut ctx);
 }
 
 #[test]
-fn take_preserves_encoding_geometry_order_duplicates_and_nulls() -> VortexResult<()> {
+fn arbitrary_take_does_not_force_tiled_preservation() {
+    assert!(
+        !SESSION
+            .kernels()
+            .has_execute_parent(Dict.id(), TiledFixedSizeList.id())
+    );
+}
+
+#[test]
+fn take_falls_back_and_preserves_order_duplicates_and_nulls() -> VortexResult<()> {
     let (canonical, tiled, mut ctx) = fixture(65, 129, geometry(32, 64))?;
     let indices = PrimitiveArray::new(
         buffer![64u32, 1, 1, 32, 0],
@@ -520,12 +514,7 @@ fn take_preserves_encoding_geometry_order_duplicates_and_nulls() -> VortexResult
     let actual = tiled
         .into_array()
         .take(indices.clone())?
-        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
-    assert!(actual.is::<TiledFixedSizeList>());
-    assert_eq!(
-        actual.as_::<TiledFixedSizeList>().geometry(),
-        geometry(32, 64)
-    );
+        .execute_until::<FixedSizeList>(&mut ctx)?;
     assert_arrays_eq!(canonical.into_array().take(indices)?, actual, &mut ctx);
     Ok(())
 }
@@ -537,10 +526,10 @@ fn assert_take_indices(indices: ArrayRef) -> VortexResult<()> {
     let actual = tiled
         .into_array()
         .take(indices)?
-        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
+        .execute_until::<FixedSizeList>(&mut ctx)?;
     assert_eq!(
-        actual.as_::<TiledFixedSizeList>().elements().len(),
-        index_count * 5,
+        actual.as_::<FixedSizeList>().elements().len(),
+        index_count * 5
     );
     assert_fsl_equivalent(&expected, &actual, &mut ctx)
 }
@@ -559,7 +548,7 @@ fn take_accepts_all_integer_index_ptypes() -> VortexResult<()> {
 }
 
 #[test]
-fn take_preserves_outer_and_element_validity() -> VortexResult<()> {
+fn take_fallback_preserves_outer_and_element_validity() -> VortexResult<()> {
     let canonical = FixedSizeListArray::new(
         PrimitiveArray::new(
             buffer![0i32, 1, 10, 11, 20, 21],
@@ -578,12 +567,8 @@ fn take_preserves_outer_and_element_validity() -> VortexResult<()> {
     let actual = tiled
         .into_array()
         .take(indices)?
-        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
-    assert_eq!(
-        actual.as_::<TiledFixedSizeList>().geometry(),
-        geometry(2, 2),
-    );
-    assert_eq!(actual.as_::<TiledFixedSizeList>().elements().len(), 8);
+        .execute_until::<FixedSizeList>(&mut ctx)?;
+    assert_eq!(actual.as_::<FixedSizeList>().elements().len(), 8);
     assert_fsl_equivalent(&expected, &actual, &mut ctx)
 }
 
@@ -617,24 +602,9 @@ fn take_zero_width_lists() -> VortexResult<()> {
     let actual = tiled
         .into_array()
         .take(indices)?
-        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
-    assert_eq!(actual.as_::<TiledFixedSizeList>().elements().len(), 0);
+        .execute_until::<FixedSizeList>(&mut ctx)?;
+    assert_eq!(actual.as_::<FixedSizeList>().elements().len(), 0);
     assert_fsl_equivalent(&expected, &actual, &mut ctx)
-}
-
-#[test]
-fn collect_checked_rows_rejects_out_of_bounds_valid_index() {
-    assert!(crate::take::collect_checked_rows(&[3u32], &Mask::new_true(1), 3).is_err());
-}
-
-#[test]
-fn collect_checked_rows_rejects_negative_valid_index() {
-    assert!(crate::take::collect_checked_rows(&[-1i64], &Mask::new_true(1), 3).is_err());
-}
-
-#[test]
-fn collect_checked_rows_rejects_u64_max() {
-    assert!(crate::take::collect_checked_rows(&[u64::MAX], &Mask::new_true(1), 3).is_err());
 }
 
 #[test]
@@ -644,9 +614,9 @@ fn nullable_take_makes_outer_dtype_nullable() -> VortexResult<()> {
     let actual = tiled
         .into_array()
         .take(indices)?
-        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
+        .execute_until::<FixedSizeList>(&mut ctx)?;
     assert!(actual.dtype().is_nullable());
-    assert_eq!(actual.as_::<TiledFixedSizeList>().elements().len(), 10);
+    assert_eq!(actual.as_::<FixedSizeList>().elements().len(), 10);
     Ok(())
 }
 
@@ -673,6 +643,23 @@ fn slice_preserves_encoding_and_values(#[case] range: Range<usize>) -> VortexRes
         );
     }
     assert_arrays_eq!(expected, actual, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn slice_uses_compact_piecewise_indices() -> VortexResult<()> {
+    let (_, tiled, _) = fixture(65, 129, geometry(32, 64))?;
+    let sliced = tiled.into_array().slice(1..64)?;
+    let sliced_tiled = sliced.as_::<TiledFixedSizeList>();
+    let elements = sliced_tiled.elements();
+    let dict = elements.as_::<Dict>();
+
+    assert!(dict.codes().is::<PiecewiseSequence>());
+    let codes = dict.codes().as_::<PiecewiseSequence>();
+    assert!(
+        codes.starts().len() <= 3 * 129,
+        "slice indices must scale with physical runs rather than scalar count"
+    );
     Ok(())
 }
 
@@ -721,7 +708,7 @@ fn slice_preserves_mixed_validity() -> VortexResult<()> {
 }
 
 #[test]
-fn bitpacked_child_roundtrips_and_remains_tiled_after_row_ops() -> VortexResult<()> {
+fn bitpacked_child_roundtrips_through_row_ops() -> VortexResult<()> {
     let canonical = FixedSizeListArray::new(
         PrimitiveArray::from_iter((0..65).flat_map(|row| {
             let row_value = u8::try_from(row / 32).unwrap();
@@ -763,8 +750,7 @@ fn bitpacked_child_roundtrips_and_remains_tiled_after_row_ops() -> VortexResult<
     let taken = tiled
         .into_array()
         .take(indices)?
-        .execute_until::<TiledFixedSizeList>(&mut ctx)?;
-    assert!(taken.is::<TiledFixedSizeList>());
+        .execute_until::<FixedSizeList>(&mut ctx)?;
     assert_arrays_eq!(expected_taken, taken, &mut ctx);
     Ok(())
 }

@@ -306,6 +306,11 @@ pub trait VortexSessionDefault {
     fn default() -> VortexSession;
 }
 
+#[cfg(feature = "unstable_encodings")]
+fn register_unstable_encodings(session: &VortexSession) {
+    vortex_tiled_fsl::initialize(session);
+}
+
 impl VortexSessionDefault for VortexSession {
     fn default() -> VortexSession {
         let session = VortexSession::empty()
@@ -321,6 +326,8 @@ impl VortexSessionDefault for VortexSession {
         vortex_arrow::initialize(&session);
         editions::register_default_editions(&session);
         editions::enable_default_editions(&session);
+        #[cfg(feature = "unstable_encodings")]
+        register_unstable_encodings(&session);
 
         // `MultiFileSession` holds a `moka` cache whose clock reads `std::time::Instant::now()`
         // when constructed. `Instant` is unsupported on `wasm32` and panics with "time not

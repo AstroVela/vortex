@@ -177,6 +177,24 @@ fn default_unstable_edition_permits_tiled_fixed_size_list() {
     );
 }
 
+#[cfg(feature = "unstable_encodings")]
+#[test]
+fn unstable_encoding_registration_does_not_depend_on_files() {
+    use vortex_array::VTable as _;
+    use vortex_array::array_session;
+    use vortex_array::session::ArraySessionExt as _;
+    use vortex_tiled_fsl::TiledFixedSizeList;
+
+    let session = array_session();
+    crate::register_unstable_encodings(&session);
+    assert!(
+        session
+            .arrays()
+            .registry()
+            .contains_key(&TiledFixedSizeList.id())
+    );
+}
+
 #[test]
 fn core_edition_ids_are_registered_array_encodings() {
     use vortex_array::session::ArraySessionExt;

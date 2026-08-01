@@ -356,16 +356,9 @@ fn execute_action(
             };
             *canonical = fuzz(take_canonical_array(canonical, &indices, ctx))?;
             let lazy = fuzz(tiled.clone().take(index_array))?;
-            *tiled = if indices.is_empty() || source_is_empty {
-                fuzz(lazy.execute::<Canonical>(ctx))?.into_array()
-            } else {
-                fuzz(lazy.execute_until::<TiledFixedSizeList>(ctx))?
-            };
+            *tiled = fuzz(lazy.execute::<Canonical>(ctx))?.into_array();
             assert_array_eq(canonical, tiled, step, ctx)?;
-            if indices.is_empty() || source_is_empty {
-                return Ok(ControlFlow::Break(()));
-            }
-            fuzz(assert_tiled_geometry(tiled, geometry))?;
+            return Ok(ControlFlow::Break(()));
         }
         TiledFslAction::Reconstruct => {
             let array = tiled.as_::<TiledFixedSizeList>();

@@ -14,6 +14,7 @@ use mimalloc::MiMalloc;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
@@ -465,7 +466,7 @@ fn take(bencher: Bencher, args: TakeArgs) {
                 array
                     .take(indices)
                     .unwrap()
-                    .execute_until::<TiledFixedSizeList>(&mut ctx)
+                    .execute_until::<FixedSizeList>(&mut ctx)
                     .unwrap(),
             )
         });

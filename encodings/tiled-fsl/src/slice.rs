@@ -11,14 +11,13 @@ use vortex_error::VortexResult;
 
 use crate::TiledFixedSizeList;
 use crate::TiledFixedSizeListArrayExt;
-use crate::gather::gather_tiled_rows;
+use crate::gather::gather_tiled_slice;
 
 impl SliceReduce for TiledFixedSizeList {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        let rows = range.clone().map(Some).collect::<Vec<_>>();
-        let validity = array.array_validity().slice(range)?;
+        let validity = array.array_validity().slice(range.clone())?;
         Ok(Some(
-            gather_tiled_rows(array, &rows, validity)?.into_array(),
+            gather_tiled_slice(array, range, validity)?.into_array(),
         ))
     }
 }
