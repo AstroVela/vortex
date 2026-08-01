@@ -190,6 +190,11 @@ public final class VortexScanBuilder
         if (pushedPredicates.length > 0) {
             return false;
         }
+        if (tableSample != null || limit != VortexScan.NO_LIMIT) {
+            // A pushed TABLESAMPLE or LIMIT changes the row set; footer row counts no longer
+            // describe the scan output, so counts must fall back to a regular scan.
+            return false;
+        }
         if (aggregation.groupByExpressions().length > 0) {
             return false;
         }

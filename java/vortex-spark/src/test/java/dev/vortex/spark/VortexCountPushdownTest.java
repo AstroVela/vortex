@@ -155,6 +155,20 @@ public final class VortexCountPushdownTest {
     }
 
     @Test
+    @DisplayName("count() over a pushed TABLESAMPLE falls back and respects the sample")
+    public void testCountOverSampleFallsBack() {
+        Dataset<Row> readDf = writeAndRead("count_sampled", 2000, 2);
+
+        Dataset<Row> counted =
+                readDf.sample(0.5, 42L).agg(functions.count(functions.lit(1)).as("cnt"));
+        assertFalse(
+                counted.queryExecution().executedPlan().toString().contains("VortexCountScan"),
+                "a sampled count cannot be answered from footer metadata");
+        long count = counted.collectAsList().get(0).getLong(0);
+        assertTrue(count > 600 && count < 1400, "a 50% sample of 2000 rows should be near 1000, got " + count);
+    }
+
+    @Test
     @DisplayName("count() over a directory with no Vortex files returns 0, not null")
     public void testCountEmptyDirectory() throws IOException {
         Path emptyDir = tempDir.resolve("count_empty");
