@@ -6,8 +6,24 @@ alternatives that were rejected and why; this file is the orientation and the pl
 then that. Both are working notes that live on this branch only: they are not meant to land in the
 pull-request stack, and the tracking issue is their public form.
 
-Nothing here is a proposal yet. This branch is where the design was worked out and measured, and the
-plan below turns it into small reviewable pull requests cut fresh from develop.
+The design is now proposed publicly, in three issues that Connor wrote by hand and that supersede
+this file wherever they disagree:
+
+- **Epic 9128, Row-oriented scalar functions.** Goals, motivation (the `Hypot` walkthrough of
+  everything an author has to get right today), non-goals, and the preliminary performance numbers.
+  Status is *Proposed*, and it links this branch and its diffshub comparison as the prototype, so
+  the branch is now publicly referenced: do not rewrite or delete it.
+- **9129, Define the `RowFn` API.** The author-facing surface, with the trait sketches and worked
+  `Hypot` and `CosineSimilarity` examples. Its Steps list is the API work plan.
+- **9130, Execute `RowFn` over Vortex arrays.** The private lifting, the two null-handling
+  contracts, and adaptive execution. Its Steps list is the machinery work plan. Marked WIP because
+  the mechanics may optimize further.
+
+Both tracking issues end with an "Implementation history" section reading "None yet". Add each pull
+request there as it lands; that is the intended record of progress.
+
+This branch is where the design was worked out and measured, and the plan below turns it into small
+reviewable pull requests cut fresh from develop.
 
 ## Where the work lives
 
@@ -147,14 +163,21 @@ allocation; ablations including SmallVec found nothing beneficial, and an earlie
 monomorphize the prelude over the compile-time arity (`[ArrayRef; N]` from the tuple witness),
 which the row layer can do through its tuple witness.
 
-**Null-visible inputs (non-strict `RowFn` over `Option` elements) are designed and deliberately not
-built.** The survey found no in-tree customer: 13 of 15 non-strict functions are cheap columnar
-mask algebra, and a prototype row-function Kleene AND measured 250-1030x slower than the in-tree
-fused word kernel. The two genuinely expensive null-visible kernels (`RowEncode`/`RowSize`) are
-blocked by variadic heterogeneous arity, not by nullability. Four functions have value-dependent
-output validity (`false AND null` is a valid `false`), for which no validity expression over child
-validities exists even in principle, so such kernels belong to a different trait rather than a mode
-of this one. Keep the survey's constraint list; do not build the tier.
+**Non-strict functions are out of scope, and the epic settles it.** Epic 9128 states the framework
+will focus solely on strict functions, because the semantics around non-strict ones are complicated
+enough that extending an already-somewhat-complicated API is probably not worth it. The research
+backs that from the other direction: the survey found no in-tree customer for null-visible inputs,
+since 13 of 15 non-strict functions are cheap columnar mask algebra, and a prototype row-function
+Kleene AND measured 250-1030x slower than the in-tree fused word kernel. The two genuinely expensive
+null-visible kernels (`RowEncode`/`RowSize`) are blocked by variadic heterogeneous arity, not by
+nullability. Four functions have value-dependent output validity (`false AND null` is a valid
+`false`), for which no validity expression over child validities exists even in principle. Keep the
+survey's constraint list for reference; do not build the tier. Note this is a different question
+from nullable *outputs* (step 3 below), which stay strict and are an explicit goal of the epic.
+
+The epic's non-goals also match the exclusion taxonomy the research arrived at independently:
+`RowFn` is not for columnar or zero-copy kernels (`not`, `list_length`), kernels with state shared
+across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `case_when`).
 
 ## What to do next, in order
 
@@ -162,16 +185,17 @@ of this one. Keep the survey's constraint list; do not build the tier.
    commits on this branch: revert the two remaining columnar ports, take the two benchmark control
    arms off the trait, then delete it. No PR in the stack has to argue for a public trait that the
    measurements did not support.
-1. **The tracking issue for the row framework.** It is a large addition and needs one. It should
-   carry the layering, the measured results, the exclusion taxonomy (why `not`, the Kleene
-   functions, `l2_denorm`'s constant path and geo `distance` are all correctly *not* row
-   functions), the adaptive-strategy story, and the open items below as checkboxes. Draft prose in
-   Connor's voice with the `connor-voice` skill and let him read it before posting.
-2. **The PR stack**, cut fresh from current develop, each with the lifting private inside the row
-   layer and each linking the issue: row core plus `byte_length`; then `OutputSink` plus
-   `l2_denorm`; then the tensor ports; then `visit_prepared` together with the geo ports, which is
-   where prepare's 9.1x justifies the API and where branch-and-skip earns its place. Land each API
-   surface with its first user.
+1. ~~**Write the tracking issue.**~~ Done, by hand: epic 9128 with sub-issues 9129 and 9130. Their
+   Steps checklists are the authoritative work plan; read them before planning a change, and answer
+   their unresolved questions with evidence from this branch where it exists.
+2. **The PR stack**, cut fresh from current develop, each linking 9129 or 9130 and recorded in that
+   issue's Implementation history: row core plus `byte_length`; then `OutputSink` plus `l2_denorm`;
+   then the tensor ports; then `visit_prepared` together with the geo ports, which is where
+   prepare's 9.1x justifies the API and where branch-and-skip earns its place. Land each API surface
+   with its first user. Two of 9129's steps are already satisfied on this branch and only need
+   carrying over: serialized metadata of migrated functions is preserved (the per-function array
+   serde described above), and the "when to use `RowFn`" guidance is written in
+   `vortex-array/src/scalar_fn/mod.rs`.
 3. **Option outputs**, the one extension with demonstrated in-tree demand: `list_sum` (a valid
    empty list sums to null) and `variant_get` (missing path yields null) are strict but excluded
    from `RowFn` today only by the all-valid-output rule. Needs an `Option<T>`
@@ -183,13 +207,39 @@ of this one. Keep the survey's constraint list; do not build the tier.
    from `git show a605e5779^:vortex-array/src/scalar_fn/strict/tests.rs`. Restore them as row
    functions when this lands.
 
-Known open items, none blocking: the branch fallback probes `reduce_encoded` twice when a dispatch
-turns out unsupported; geo's null-tolerant decode still arrow-exports the full column, and slicing
-runs of valid rows would blunt filter's sparse-validity advantage enough to retire the threshold for
-geo; the fallible branch loop pays one `is_none` check per set row after the first error because
-`for_each_set_index` cannot early-return; sinks stay on dense/filter; the 0.75 threshold is global
-and should become per-element only when a second per-row-decode element exists to calibrate
-against.
+## What the tracking issues ask that this branch has not answered
+
+Four of their unresolved questions are genuinely open, and two of them this branch never considered:
+
+- **Are `InputElement`, `OutputElement` and `OutputSink` public downstream extension points, or only
+  cross-crate extension points within Vortex?** (9128, 9129.) This branch treats them as
+  Vortex-internal: `vortex-tensor` and `vortex-geo` implement them, nothing outside does. It matters
+  because a downstream implementor makes every associated constant a compatibility surface, and
+  three already carry defaults chosen for internal convenience (`DECODE_SHRINKS_WHEN_FILTERED` is
+  `false`, `decode_null_tolerant` forwards to `decode`). If they go public, audit which defaults are
+  the *safe* answer rather than the common one.
+- **Does `OutputSink::sink_dtype` need access to function options?** (9129.) Today it takes only the
+  input dtypes, which is what lets a tensor row's runtime width come from its arguments. No adopter
+  wants options there yet, so the question is whether option-dependent output dtypes can stay
+  unsupported initially.
+- **What benchmark set and regression threshold gate replacing a hand-written implementation?**
+  (9130.) This branch has no policy, only precedent: per-adopter divan benchmarks with constant and
+  non-constant arms, `fastest` of two runs, and one accepted regression (1 to 3% on the
+  always-overlapping `intersects` arm, taken for a 2.1x win on the disjoint arm). Worth turning that
+  precedent into a stated rule.
+- **Do sinks need branch-and-skip, and are nullable outputs required for v1?** (9128, 9129, 9130.)
+  Sinks currently stay on dense and filter because a sink has no skipped-row representation;
+  nullable outputs are step 3 above.
+
+9130's three non-blocking follow-ups are the same items this branch recorded, so they need no
+separate tracking here: the double `reduce_encoded` probe when branch execution is unsupported, the
+global 75% threshold pending a second per-row-decode element, and the fallible branch loop's
+inability to stop iterating at the first error. Two more of the same kind that the issues do not
+mention: geo's null-tolerant decode still arrow-exports the full column, where slicing runs of valid
+rows would blunt filter's sparse-validity advantage enough to retire the threshold for geo, and the
+lifting's small-batch prelude cost discussed above.
+
+## Loose ends, and issues worth filing separately
 
 Two loose ends from the deletion, both cheap. The reworked benchmark control arms in
 `vortex-array/benches/strict_validity.rs` and `vortex-tensor/benches/l2_denorm.rs` compile and were
