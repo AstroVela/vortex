@@ -188,14 +188,24 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
 1. ~~**Write the tracking issue.**~~ Done, by hand: epic 9128 with sub-issues 9129 and 9130. Their
    Steps checklists are the authoritative work plan; read them before planning a change, and answer
    their unresolved questions with evidence from this branch where it exists.
-2. **The PR stack**, cut fresh from current develop, each linking 9129 or 9130 and recorded in that
-   issue's Implementation history: row core plus `byte_length`; then `OutputSink` plus `l2_denorm`;
-   then the tensor ports; then `visit_prepared` together with the geo ports, which is where
-   prepare's 9.1x justifies the API and where branch-and-skip earns its place. Land each API surface
-   with its first user. Two of 9129's steps are already satisfied on this branch and only need
-   carrying over: serialized metadata of migrated functions is preserved (the per-function array
-   serde described above), and the "when to use `RowFn`" guidance is written in
-   `vortex-array/src/scalar_fn/mod.rs`.
+2. **Settle adaptive execution.** This is the next design task, ahead of any porting, because it is
+   the least settled thing in the proposal and design churn invalidates measurement. 9130 marks it
+   WIP; the threshold is a global const calibrated on a shared VM whose noisiest arms are the ones
+   that determine it; and the open question is not just the number but the *shape*. See "Settling
+   adaptive execution" below for the specific questions to answer.
+3. **Land the baseline benchmarks on develop, in parallel with step 2.** Independent of the design
+   work, and required before any porting PR can show a comparison. See "The measurement plan"
+   below.
+4. **The PR stack**, cut fresh from develop, each linking 9129 or 9130 and recorded in that issue's
+   Implementation history: row core plus `byte_length`; then `OutputSink` plus `l2_denorm`; then
+   `l2_norm` and `inner_product` on the plain visit; then `visit_prepared` with both of its users,
+   `cosine_similarity` and geo; then adaptive execution and its benches. Land each API surface with
+   its first user, which is why `visit_prepared` travels with geo rather than with cosine (geo's
+   9.1x carries the API, cosine's few percent does not) and why adaptive execution comes after geo
+   (geo is its only production beneficiary, since every other adopter is dense-safe). Two of 9129's
+   steps are already satisfied on this branch and only need carrying over: serialized metadata of
+   migrated functions is preserved (the per-function array serde described above), and the "when to
+   use `RowFn`" guidance is written in `vortex-array/src/scalar_fn/mod.rs`.
 3. **Option outputs**, the one extension with demonstrated in-tree demand: `list_sum` (a valid
    empty list sums to null) and `variant_get` (missing path yields null) are strict but excluded
    from `RowFn` today only by the all-valid-output rule. Needs an `Option<T>`
@@ -206,6 +216,91 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
    `a_non_total_kernel_is_still_strict` and `a_non_total_kernel_keeps_its_own_nulls`, recoverable
    from `git show a605e5779^:vortex-array/src/scalar_fn/strict/tests.rs`. Restore them as row
    functions when this lands.
+
+## Settling adaptive execution
+
+What exists works and is tested, and the numbers on this branch are real. What is unsettled is
+whether the *selection rule* is the right shape, and that question should be answered before the
+porting PRs, because every later measurement is taken through it.
+
+The rule today: for a mixed validity mask, use branch-and-skip unless some argument's element sets
+`DECODE_SHRINKS_WHEN_FILTERED` and fewer than 75% of rows survive, in which case filter and scatter.
+One boolean per element, one global threshold, no other inputs. The questions:
+
+- **Is a global const the right shape at all?** The alternatives are a per-element threshold (each
+  element knows its own decode-to-kernel cost ratio), or a small cost model comparing estimated
+  decode work over all rows against decode over survivors plus filter and scatter. The measured
+  crossover sat between 56% and 81% surviving rows for *one* element type, which is a single
+  calibration point: a second per-row-decode element could easily want a different number, and that
+  is the argument for moving the knob onto the element.
+- **Should batch size be an input?** Filter's cost is dominated by allocation and copying, which
+  does not amortize on small batches, while branch's cost is proportional to the full column. The
+  crossover therefore probably moves with row count, and nothing measures that yet. The small-batch
+  sweep in the measurement plan below feeds this directly.
+- **Is the rule right with more than one nullable per-row-decode argument?** The flag is ORed across
+  arguments, but with independent nulls the conjoined surviving fraction falls roughly quadratically,
+  and the measurements did show the crossover moving down in that case (branch won only to about 10%
+  null density with two nullable operands, versus 50% with one). One threshold against the conjoined
+  fraction may already handle this correctly; confirm rather than assume.
+- **Does the crossover hold across architectures?** It trades memory-bandwidth-bound work against
+  compute-bound work, so x86 and Apple Silicon need not agree. Partly blocked on hardware, and the
+  answer decides whether a fixed number is defensible at all.
+- **Do sinks need branch-and-skip?** They stay on dense and filter today because a sink has no
+  skipped-row representation. Resolving this needs either a pre-filled sink row or a sparse writer,
+  or a documented decision that sinks keep filtering.
+- **Is the strategy observable in production?** The only seam today is test-harness gated. A session
+  option, or tracing the chosen strategy, may be wanted for debugging a slow query.
+- Plus the recorded follow-up: avoid probing `reduce_encoded` twice when branch execution turns out
+  unsupported.
+
+## The measurement plan
+
+The repo runs CodSpeed on every pull request, and the workspace aliases `divan` to
+`codspeed-divan-compat`, so every registered bench is measured against a develop baseline
+automatically and behaves as ordinary divan when run locally. That makes CI the most credible source
+for the no-regression claim, since it is the team's own process rather than anyone's laptop.
+
+**The constraint that shapes everything: CodSpeed compares a pull request against develop for the
+same benchmark name.** A benchmark introduced in the same change it measures has no baseline and
+produces no comparison. Every benchmark on this branch is new, and develop currently has no
+benchmark for any tensor or geo scalar function at all, so the baselines have to land first, as their
+own pull request against develop.
+
+That baseline pull request is purely additive test tooling, uncontroversial, valuable to the project
+on its own, and a chance to get the team to agree on what counts as evidence before any design
+debate. It should cover the current develop implementations of: tensor `l2_norm`, `l2_denorm`,
+`inner_product` and `cosine_similarity`; geo `contains` and `intersects`, each with non-nullable and
+nullable arms; and `byte_length`. Two rules make it work:
+
+- **Exercise the functions through the public expression and execution API only.** The versions on
+  this branch reference framework internals (forced-strategy seams, hand-written control arms
+  implementing `ScalarFnVTable`), which cannot exist on develop. A bench that goes through the
+  public path is also the only kind that keeps measuring the same thing before and after a port.
+- **Identical benchmark and arm names on both sides**, or CodSpeed cannot line them up.
+
+Arms that compare framework strategies against each other (forced filter versus forced branch versus
+auto) cannot be baselined, because they need machinery that does not exist on develop. That is fine:
+their claim is "auto tracks the faster forced arm", an internal comparison rather than a before and
+after, so they land with adaptive execution.
+
+**Adaptive execution is less entangled with the other measurements than it looks.** Every adopter
+except geo is dense-safe and infallible, so it takes the dense path and never reaches strategy
+selection at all: `l2_norm`, `l2_denorm`, `inner_product`, `cosine_similarity`, and `byte_length` (which
+ships at `BytesLen`) are unaffected no matter what the rule becomes. Only geo's nullable batches are
+affected, which is why the geo baseline needs both nullable and non-nullable arms: it keeps the
+port's parity claim separable from adaptive execution's win. So steps 2 and 3 above genuinely can run
+in parallel.
+
+Priority for wall-clock runs on real hardware, highest first: parity for the dense-path adopters (all
+four already have in-binary hand-written control arms, which is the credible form: same compiler,
+same run, arms side by side); then the crossover sweep across 0 to 90% null density; then the
+headline wins (geo `contains` prepared, `byte_length` adaptive); then a small-batch sweep from 100 to
+1M rows, which is both the known weak spot and an input to the batch-size question above. Report
+`fastest` and `median` from at least two runs with machine metadata, since `fastest` alone reads as a
+cherry-picked minimum. Expect cosine's small prepare win to shrink or vanish on a wider machine: the
+explanation for why it was only a few percent is that the hoisted arithmetic rode in spare slots of a
+latency-bound FMA chain, and a machine with more slack removes even that. Better to drop the claim
+ourselves than have a reviewer find it.
 
 ## What the tracking issues ask that this branch has not answered
 
@@ -280,9 +375,12 @@ function's pre-port body, use the commit before the port instead: `24d1933e1^` f
 `list_length` and `list_sum`. More generally, prefer `git log --oneline <base>..HEAD` over any
 assumption about what develop contains, and `git fetch origin develop` before comparing against it.
 
-Benchmarks are divan; report the `fastest` column from two runs and state the machine, because this
-environment is a shared 4-vCPU VM where filter-heavy arms have shown up to 2.3x run-to-run spread.
-Per-adopter benchmarks with constant and non-constant arms are the convention. Disk is tight:
+Benchmarks are divan (aliased to `codspeed-divan-compat`, so they also run in CI); report `fastest`
+and `median` from at least two runs and state the machine, because this environment is a shared
+4-vCPU VM where filter-heavy arms have shown up to 2.3x run-to-run spread. Any new bench must be
+registered as a `[[bench]]` with `harness = false` in the crate's `Cargo.toml`. Per-adopter
+benchmarks with constant and non-constant arms are the convention, and where a claim is "as fast as
+the hand-written version", put both arms in one binary rather than comparing across builds. Disk is tight:
 build narrowly and delete `target/debug` subdirectories on ENOSPC. If cargo fails with exactly
 `sccache: error: Operation not permitted`, rerun that command with a `RUSTC_WRAPPER=` prefix.
 
