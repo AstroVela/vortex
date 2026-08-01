@@ -6,6 +6,7 @@ package dev.vortex.spark.write;
 import java.util.Map;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
+import org.apache.spark.sql.connector.write.SupportsDynamicOverwrite;
 import org.apache.spark.sql.connector.write.SupportsTruncate;
 import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriteBuilder;
@@ -16,13 +17,13 @@ import org.apache.spark.sql.connector.write.WriteBuilder;
  * <p>This class is responsible for creating BatchWrite instances that execute the actual write operations to create
  * Vortex files from Spark DataFrames.
  */
-public final class VortexWriteBuilder implements WriteBuilder, SupportsTruncate {
+public final class VortexWriteBuilder implements WriteBuilder, SupportsTruncate, SupportsDynamicOverwrite {
 
     private final String paths;
     private final LogicalWriteInfo writeInfo;
     private final Map<String, String> options;
     private final Transform[] partitionTransforms;
-    private boolean truncate = false;
+    private VortexBatchWrite.Mode mode = VortexBatchWrite.Mode.APPEND;
 
     /**
      * Creates a new VortexWriteBuilder.
@@ -47,7 +48,7 @@ public final class VortexWriteBuilder implements WriteBuilder, SupportsTruncate 
      */
     @Override
     public Write build() {
-        return new VortexBatchWrite(paths, writeInfo.schema(), options, truncate, partitionTransforms);
+        return new VortexBatchWrite(paths, writeInfo.schema(), options, mode, partitionTransforms);
     }
 
     /**
@@ -59,7 +60,19 @@ public final class VortexWriteBuilder implements WriteBuilder, SupportsTruncate 
      */
     @Override
     public WriteBuilder truncate() {
-        this.truncate = true;
+        this.mode = VortexBatchWrite.Mode.TRUNCATE;
+        return this;
+    }
+
+    /**
+     * Configures the write operation to dynamically overwrite partitions: at commit time, only the partition
+     * directories that received new data have their previous files removed; untouched partitions are preserved.
+     *
+     * @return this builder for method chaining
+     */
+    @Override
+    public WriteBuilder overwriteDynamicPartitions() {
+        this.mode = VortexBatchWrite.Mode.DYNAMIC_OVERWRITE;
         return this;
     }
 }
