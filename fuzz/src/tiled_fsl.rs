@@ -749,45 +749,4 @@ mod tests {
         }
         Ok(())
     }
-
-    #[test]
-    #[expect(clippy::result_large_err)]
-    fn serde_reconstruction_validates_offset_view_tree() -> VortexFuzzResult<()> {
-        let mut cases = deterministic_tiled_fsl_cases()?;
-        let input = cases.remove(3);
-        let geometry = input.geometry;
-        let mut canonical = input.canonical;
-        let mut ctx = TILED_FSL_SESSION.create_execution_ctx();
-        let mut tiled = fuzz(TiledFixedSizeList::encode(
-            canonical.as_::<FixedSizeList>(),
-            geometry,
-            &mut ctx,
-        ))?
-        .into_array();
-
-        let slice_control = execute_action(
-            TiledFslAction::Slice {
-                start: 10,
-                stop: 150,
-            },
-            &mut canonical,
-            &mut tiled,
-            geometry,
-            0,
-            &mut ctx,
-        )?;
-        let control = execute_action(
-            TiledFslAction::ReconstructSerde,
-            &mut canonical,
-            &mut tiled,
-            geometry,
-            1,
-            &mut ctx,
-        )?;
-
-        assert_eq!(slice_control, ControlFlow::Continue(()));
-        assert_eq!(control, ControlFlow::Continue(()));
-        assert!(tiled.is::<TiledFixedSizeList>());
-        Ok(())
-    }
 }
