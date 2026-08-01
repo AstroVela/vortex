@@ -178,6 +178,121 @@ fn display_names_the_function_id() {
     assert_eq!(expr.to_string(), "vortex.test.hypot($, $)");
 }
 
+mod nullable_outputs {
+    use super::*;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
+
+    struct NullableI64(i64);
+
+    impl OutputElement for NullableI64 {
+        fn element_dtype() -> DType {
+            DType::Primitive(PType::I64, Nullability::Nullable)
+        }
+
+        fn build(values: Vec<Self>) -> ArrayRef {
+            PrimitiveArray::from_option_iter(values.into_iter().map(|value| Some(value.0)))
+                .into_array()
+        }
+
+        fn placeholder() -> Self {
+            Self(0)
+        }
+    }
+
+    struct NullableSink;
+
+    impl OutputSink for NullableSink {
+        type Row<'a> = ();
+
+        fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
+            Ok(DType::Primitive(PType::I64, Nullability::Nullable))
+        }
+
+        fn with_capacity(_rows: usize, _dtype: &DType) -> VortexResult<Self> {
+            Ok(Self)
+        }
+
+        fn row(&mut self, _index: usize) -> Self::Row<'_> {}
+
+        fn finish(self) -> VortexResult<ArrayRef> {
+            Ok(PrimitiveArray::from_option_iter(Vec::<Option<i64>>::new()).into_array())
+        }
+    }
+
+    #[derive(Clone)]
+    struct NullableElementFn;
+
+    impl RowFn for NullableElementFn {
+        type Options = EmptyOptions;
+        type ArgsWitness = (i64,);
+        type RetWitness = NullableI64;
+
+        fn id(&self) -> ScalarFnId {
+            static ID: CachedId = CachedId::new("vortex.test.nullable_element");
+            *ID
+        }
+
+        fn arg_name(&self, _idx: usize) -> ChildName {
+            ChildName::from("input")
+        }
+
+        fn dispatch<V: RowVisitor>(
+            &self,
+            _options: &Self::Options,
+            _args: &[DType],
+            visitor: V,
+        ) -> VortexResult<V::Out> {
+            visitor.visit::<(i64,), NullableI64>(|(value,)| NullableI64(value))
+        }
+    }
+
+    #[derive(Clone)]
+    struct NullableSinkFn;
+
+    impl RowFn for NullableSinkFn {
+        type Options = EmptyOptions;
+        type ArgsWitness = (i64,);
+        type RetWitness = ();
+
+        fn id(&self) -> ScalarFnId {
+            static ID: CachedId = CachedId::new("vortex.test.nullable_sink");
+            *ID
+        }
+
+        fn arg_name(&self, _idx: usize) -> ChildName {
+            ChildName::from("input")
+        }
+
+        fn dispatch<V: RowVisitor>(
+            &self,
+            _options: &Self::Options,
+            _args: &[DType],
+            visitor: V,
+        ) -> VortexResult<V::Out> {
+            visitor.visit_into::<(i64,), NullableSink, ()>(|_, ()| {})
+        }
+    }
+
+    #[test]
+    fn nullable_element_dtype_is_rejected() {
+        let input = DType::Primitive(PType::I64, Nullability::NonNullable);
+        let error =
+            ScalarFnVTable::return_dtype(&NullableElementFn, &EmptyOptions, &[input]).unwrap_err();
+
+        assert!(error.to_string().contains("non-nullable dtype"), "{error}");
+    }
+
+    #[test]
+    fn nullable_sink_dtype_is_rejected() {
+        let input = DType::Primitive(PType::I64, Nullability::NonNullable);
+        let error =
+            ScalarFnVTable::return_dtype(&NullableSinkFn, &EmptyOptions, &[input]).unwrap_err();
+
+        assert!(error.to_string().contains("non-nullable dtype"), "{error}");
+    }
+}
+
 #[test]
 fn ret_type_decides_fallibility() {
     assert!(!ScalarFnVTable::is_fallible(&Hypot, &EmptyOptions));

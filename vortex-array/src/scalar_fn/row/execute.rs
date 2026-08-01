@@ -9,6 +9,7 @@
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
@@ -32,7 +33,12 @@ pub(super) fn validate_row_args<A: ElementTuple, R: ApplyResult>(
     args: &[DType],
 ) -> VortexResult<DType> {
     A::validate(args)?;
-    Ok(R::Out::element_dtype())
+    let dtype = R::Out::element_dtype();
+    vortex_ensure!(
+        !dtype.is_nullable(),
+        "row output elements must declare a non-nullable dtype, got {dtype}",
+    );
+    Ok(dtype)
 }
 
 /// Validate the input dtypes of a sink-writing row function and return the dtype its sink builds.
@@ -43,7 +49,12 @@ pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
     args: &[DType],
 ) -> VortexResult<DType> {
     A::validate(args)?;
-    S::sink_dtype(args)
+    let dtype = S::sink_dtype(args)?;
+    vortex_ensure!(
+        !dtype.is_nullable(),
+        "row output sinks must declare a non-nullable dtype, got {dtype}",
+    );
+    Ok(dtype)
 }
 
 /// The [`NullHandling`] a row function gets, from what its arguments and return type allow.
