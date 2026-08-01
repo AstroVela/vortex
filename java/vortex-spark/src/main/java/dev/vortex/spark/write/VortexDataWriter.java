@@ -36,6 +36,7 @@ import java.util.List;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters;
 import org.apache.spark.sql.catalyst.util.ArrayData;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.ArrayType;
@@ -154,6 +155,26 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
         if (batchRows.size() >= batchSize) {
             writeBatch();
         }
+    }
+
+    /** Rows accepted by this writer so far. */
+    long recordCount() {
+        return recordCount;
+    }
+
+    /** Arrow buffer bytes handed to the native writer so far, before Vortex compression. */
+    long bytesWritten() {
+        return bytesWritten;
+    }
+
+    /** Reports this task's write metrics; Spark polls this while the task runs and sums values across tasks. */
+    @Override
+    public CustomTaskMetric[] currentMetricsValues() {
+        return new CustomTaskMetric[] {
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.FILES_WRITTEN, 1L),
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.ROWS_WRITTEN, recordCount),
+            VortexWriteMetrics.taskMetric(VortexWriteMetrics.BYTES_BUFFERED, bytesWritten)
+        };
     }
 
     /** Writes the current batch of rows to the Vortex file. */

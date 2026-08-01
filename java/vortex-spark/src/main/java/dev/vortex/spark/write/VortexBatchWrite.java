@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.write.BatchWrite;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
 import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
@@ -74,6 +75,15 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
     @Override
     public BatchWrite toBatch() {
         return this;
+    }
+
+    /**
+     * Declares the custom metrics Vortex write tasks report: files written, partition directories written, rows
+     * written, and Arrow bytes buffered. Spark sums the per-task values and shows them in the SQL UI.
+     */
+    @Override
+    public CustomMetric[] supportedCustomMetrics() {
+        return VortexWriteMetrics.supportedMetrics();
     }
 
     /**
