@@ -7,6 +7,8 @@ import com.google.common.collect.ImmutableList;
 import dev.vortex.api.Session;
 import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.VortexSparkSession;
+import dev.vortex.spark.read.PartitionPathUtils;
+import dev.vortex.spark.read.PartitionPredicateEvaluator;
 import java.io.IOException;
 import java.io.Serializable;
 import java.nio.file.Files;
@@ -29,6 +31,7 @@ import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.SortDirection;
 import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.write.BatchWrite;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
@@ -59,7 +62,9 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
         /** Delete every existing file under the output path before writing. */
         TRUNCATE,
         /** At commit, replace previous files only in partition directories that received new data. */
-        DYNAMIC_OVERWRITE
+        DYNAMIC_OVERWRITE,
+        /** Delete the files of partitions matching the overwrite predicates before writing. */
+        OVERWRITE_BY_FILTER
     }
 
     private static final Logger log = LoggerFactory.getLogger(VortexBatchWrite.class);
@@ -67,6 +72,7 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
     private final StructType schema;
     private final Map<String, String> options;
     private final Mode mode;
+    private final Predicate[] overwritePredicates;
     // Resolved eagerly so that Spark Transform objects (Scala case classes that are not
     // Java-serializable) never reach the DataWriterFactory serialization boundary.
     private final PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms;
@@ -80,6 +86,8 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
      * @param schema the schema of the data to write
      * @param options additional write options
      * @param mode how to treat data already present at the output path
+     * @param overwritePredicates partition predicates selecting the files to replace (only for
+     *     {@link Mode#OVERWRITE_BY_FILTER})
      * @param partitionTransforms partition transforms (may be empty)
      */
     VortexBatchWrite(
@@ -87,11 +95,13 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
             StructType schema,
             Map<String, String> options,
             Mode mode,
+            Predicate[] overwritePredicates,
             Transform[] partitionTransforms) {
         this.outputPath = outputPath;
         this.schema = schema;
         this.options = options;
         this.mode = mode;
+        this.overwritePredicates = overwritePredicates == null ? new Predicate[0] : overwritePredicates.clone();
         this.resolvedTransforms = PartitionedVortexDataWriter.resolveTransforms(partitionTransforms, schema);
         this.identityPartitionColumns = identityPartitionColumns(partitionTransforms);
     }
@@ -167,11 +177,21 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
      */
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
-        // Handle truncate cleanup BEFORE writing starts. Dynamic overwrite defers all deletion
-        // to commit(), once the set of partitions that received new data is known.
-        if (mode == Mode.TRUNCATE) {
-            var session = VortexSparkSession.get(options);
-            var uris = NativeFiles.listFiles(session, outputPath, options);
+        // Handle truncate and overwrite-by-filter cleanup BEFORE writing starts. Dynamic
+        // overwrite defers all deletion to commit(), once the set of partitions that received
+        // new data is known.
+        if (mode == Mode.TRUNCATE || mode == Mode.OVERWRITE_BY_FILTER) {
+            Session session = VortexSparkSession.get(options);
+            List<String> uris = NativeFiles.listFiles(session, outputPath, options);
+            if (mode == Mode.OVERWRITE_BY_FILTER) {
+                // Only replace files whose partition values definitively match every predicate.
+                // canOverwrite() already restricted the predicates to decidable partition
+                // predicates, so nothing that should be replaced can be missed here.
+                uris = uris.stream()
+                        .filter(uri -> PartitionPredicateEvaluator.definitelyMatches(
+                                PartitionPathUtils.parsePartitionValues(uri), overwritePredicates))
+                        .collect(Collectors.toList());
+            }
             // Deleting the existing files is destructive and happens before the new data is written:
             // if the subsequent write fails, abort() only removes the newly written files and cannot
             // restore what was deleted here. Log loudly so operators can see what was removed.

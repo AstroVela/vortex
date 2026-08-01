@@ -116,7 +116,8 @@ public final class VortexTable implements Table, SupportsRead, SupportsWrite {
     /**
      * Returns the capabilities supported by this table.
      *
-     * <p>Vortex tables support batch reads, batch writes, truncation, and dynamic partition overwrite.
+     * <p>Vortex tables support batch reads, batch writes, truncation, dynamic partition overwrite, and overwrite by
+     * partition-column filter.
      *
      * @return the set of supported table capabilities
      */
@@ -126,6 +127,7 @@ public final class VortexTable implements Table, SupportsRead, SupportsWrite {
                 TableCapability.BATCH_READ,
                 TableCapability.BATCH_WRITE,
                 TableCapability.TRUNCATE,
-                TableCapability.OVERWRITE_DYNAMIC);
+                TableCapability.OVERWRITE_DYNAMIC,
+                TableCapability.OVERWRITE_BY_FILTER);
     }
 }
