@@ -19,7 +19,10 @@ use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use vortex_array::arrays::slice::SliceReduce;
+use vortex_array::assert_arrays_eq;
 use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_session::VortexSession;
@@ -345,6 +348,30 @@ fn canonical_f32(args: Args) -> FixedSizeListArray {
     )
 }
 
+fn canonical_nullable_f32(args: Args) -> FixedSizeListArray {
+    let element_count = args.rows * args.dimensions;
+    FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter(
+                (0..element_count).map(|index| ((index * 17) % 1_009) as f32 / 1_009.0),
+            ),
+            Validity::from_iter((0..element_count).map(|index| index % 11 != 0)),
+        )
+        .into_array(),
+        u32::try_from(args.dimensions).unwrap(),
+        Validity::NonNullable,
+        args.rows,
+    )
+}
+
+fn assert_tiled_matches(
+    canonical: &FixedSizeListArray,
+    tiled: &TiledFixedSizeListArray,
+    ctx: &mut ExecutionCtx,
+) {
+    assert_arrays_eq!(canonical, tiled, ctx);
+}
+
 fn tiled_score_fixture(
     args: ScoreArgs,
     ctx: &mut ExecutionCtx,
@@ -412,30 +439,175 @@ fn assert_scores_equal(
     Ok(())
 }
 
-#[divan::bench(args = args())]
-fn encode(bencher: Bencher, args: Args) {
-    let canonical = canonical_f32(args);
-    bencher
-        .with_inputs(|| SESSION.create_execution_ctx())
-        .bench_values(|mut ctx| {
-            divan::black_box(
-                TiledFixedSizeList::encode(canonical.as_view(), tile_geometry(args), &mut ctx)
-                    .unwrap(),
-            )
-        });
+mod encode {
+    use super::*;
+
+    #[divan::bench(args = args())]
+    fn non_nullable(bencher: Bencher, args: Args) {
+        bench_encode(bencher, args, canonical_f32(args));
+    }
+
+    #[divan::bench(args = args())]
+    fn nullable_bitmap(bencher: Bencher, args: Args) {
+        bench_encode(bencher, args, canonical_nullable_f32(args));
+    }
+
+    fn bench_encode(bencher: Bencher, args: Args, canonical: FixedSizeListArray) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let oracle =
+            TiledFixedSizeList::encode(canonical.as_view(), tile_geometry(args), &mut ctx).unwrap();
+        assert_tiled_matches(&canonical, &oracle, &mut ctx);
+
+        bencher
+            .with_inputs(|| SESSION.create_execution_ctx())
+            .bench_values(|mut ctx| {
+                divan::black_box(
+                    TiledFixedSizeList::encode(canonical.as_view(), tile_geometry(args), &mut ctx)
+                        .unwrap(),
+                )
+            });
+    }
 }
 
-#[divan::bench(args = args())]
-fn execute(bencher: Bencher, args: Args) {
-    let mut ctx = SESSION.create_execution_ctx();
-    let tiled =
-        TiledFixedSizeList::encode(canonical_f32(args).as_view(), tile_geometry(args), &mut ctx)
+mod execute {
+    use super::*;
+
+    #[divan::bench(args = args())]
+    fn non_nullable(bencher: Bencher, args: Args) {
+        bench_execute(bencher, args, canonical_f32(args));
+    }
+
+    #[divan::bench(args = args())]
+    fn nullable_bitmap(bencher: Bencher, args: Args) {
+        bench_execute(bencher, args, canonical_nullable_f32(args));
+    }
+
+    fn bench_execute(bencher: Bencher, args: Args, canonical: FixedSizeListArray) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let tiled =
+            TiledFixedSizeList::encode(canonical.as_view(), tile_geometry(args), &mut ctx).unwrap();
+        assert_tiled_matches(&canonical, &tiled, &mut ctx);
+
+        bencher
+            .with_inputs(|| (tiled.clone().into_array(), SESSION.create_execution_ctx()))
+            .bench_values(|(array, mut ctx)| {
+                divan::black_box(array.execute::<FixedSizeListArray>(&mut ctx).unwrap())
+            });
+    }
+}
+
+mod slice_reduce {
+    use super::*;
+
+    #[divan::bench(args = [1_024usize, 1_000_000])]
+    fn full_width_unaligned(bencher: Bencher, rows: usize) {
+        let args = Args {
+            rows,
+            dimensions: 1,
+            tile_rows: 64,
+            tile_dimensions: TileDimensions::Full,
+        };
+        let canonical = canonical_u8(args);
+        let mut ctx = SESSION.create_execution_ctx();
+        let tiled = raw_tiled(args, &mut ctx).unwrap();
+        let range = 1..rows - 1;
+        let expected = canonical.into_array().slice(range.clone()).unwrap();
+        let reduced = <TiledFixedSizeList as SliceReduce>::slice(tiled.as_view(), range.clone())
+            .unwrap()
             .unwrap();
-    bencher
-        .with_inputs(|| (tiled.clone().into_array(), SESSION.create_execution_ctx()))
-        .bench_values(|(array, mut ctx)| {
-            divan::black_box(array.execute::<FixedSizeListArray>(&mut ctx).unwrap())
+        assert_arrays_eq!(expected, reduced, &mut ctx);
+
+        bencher
+            .with_inputs(|| (tiled.clone(), range.clone()))
+            .bench_values(|(array, range)| {
+                divan::black_box(
+                    <TiledFixedSizeList as SliceReduce>::slice(array.as_view(), range)
+                        .unwrap()
+                        .unwrap(),
+                )
+            });
+    }
+}
+
+mod slice_execute {
+    use super::*;
+
+    #[divan::bench(args = [SliceKind::Small, SliceKind::Half])]
+    fn multi_slab_unaligned(bencher: Bencher, kind: SliceKind) {
+        let args = Args {
+            rows: 16_384,
+            dimensions: 128,
+            tile_rows: 64,
+            tile_dimensions: TileDimensions::Fixed(64),
+        };
+        let slice_args = SliceArgs { args, kind };
+        let range = slice_range(slice_args);
+        let canonical = canonical_u8(args);
+        let mut ctx = SESSION.create_execution_ctx();
+        let tiled = raw_tiled(args, &mut ctx).unwrap();
+        let expected = canonical.into_array().slice(range.clone()).unwrap();
+        let lazy_slice = tiled.clone().into_array().slice(range).unwrap();
+        let executed = lazy_slice
+            .clone()
+            .execute::<FixedSizeListArray>(&mut ctx)
+            .unwrap();
+        assert_arrays_eq!(expected, executed, &mut ctx);
+
+        bencher
+            .with_inputs(|| (lazy_slice.clone(), SESSION.create_execution_ctx()))
+            .bench_values(|(array, mut ctx)| {
+                divan::black_box(array.execute::<FixedSizeListArray>(&mut ctx).unwrap())
+            });
+    }
+}
+
+mod tile_iteration {
+    use super::*;
+
+    #[divan::bench]
+    fn full_view(bencher: Bencher) {
+        bench_view(bencher, None);
+    }
+
+    #[divan::bench]
+    fn prefix_boundary(bencher: Bencher) {
+        bench_view(bencher, Some(1..64));
+    }
+
+    #[divan::bench]
+    fn two_boundaries(bencher: Bencher) {
+        bench_view(bencher, Some(1..127));
+    }
+
+    fn bench_view(bencher: Bencher, range: Option<Range<usize>>) {
+        let args = Args {
+            rows: 1_024,
+            dimensions: 128,
+            tile_rows: 64,
+            tile_dimensions: TileDimensions::Full,
+        };
+        let canonical = canonical_u8(args).into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+        let tiled = raw_tiled(args, &mut ctx).unwrap().into_array();
+        let (expected, tiled) = match range {
+            Some(range) => (
+                canonical.slice(range.clone()).unwrap(),
+                tiled.slice(range).unwrap(),
+            ),
+            None => (canonical, tiled),
+        };
+        assert_arrays_eq!(expected, tiled, &mut ctx);
+        let tiled = tiled.as_::<TiledFixedSizeList>().clone();
+
+        bencher.with_inputs(|| tiled.clone()).bench_values(|array| {
+            divan::black_box(
+                array
+                    .tiles()
+                    .map(|tile| tile.physical_range.len())
+                    .sum::<usize>(),
+            )
         });
+    }
 }
 
 #[divan::bench(args = slice_args())]

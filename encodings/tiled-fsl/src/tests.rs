@@ -961,7 +961,29 @@ fn aligned_multi_slab_slice_stays_tiled() -> VortexResult<()> {
 }
 
 #[test]
-fn unaligned_multi_slab_slice_stays_lazy_until_execution() -> VortexResult<()> {
+fn large_unaligned_full_width_slice_retains_two_boundary_tiles() -> VortexResult<()> {
+    let rows = 1_000_000;
+    let dimensions = 128;
+    let tile_rows = 64;
+    let range = 1..rows - 1;
+    let tiled = TiledFixedSizeList::try_new(
+        ConstantArray::new(0u8, rows * dimensions).into_array(),
+        dimensions as u32,
+        Validity::NonNullable,
+        rows,
+        geometry(tile_rows as u32, dimensions as u32),
+    )?;
+
+    let sliced = tiled.into_array().slice(range.clone())?;
+    let sliced = sliced.as_::<TiledFixedSizeList>();
+
+    assert_eq!(sliced.len(), range.len());
+    assert!(sliced.backing_rows() <= range.len() + 2 * tile_rows);
+    Ok(())
+}
+
+#[test]
+fn large_unaligned_multi_slab_slice_allocates_no_reduce_metadata() -> VortexResult<()> {
     let million_rows = TiledFixedSizeList::try_new(
         ConstantArray::new(0u8, 1_000_000 * 1_536).into_array(),
         1_536,
@@ -969,11 +991,16 @@ fn unaligned_multi_slab_slice_stays_lazy_until_execution() -> VortexResult<()> {
         1_000_000,
         geometry(64, 64),
     )?;
+
     assert!(
         <TiledFixedSizeList as SliceReduce>::slice(million_rows.as_view(), 1..130)?.is_none(),
         "unaligned reduction must make an O(1) decision without scalar-run metadata"
     );
+    Ok(())
+}
 
+#[test]
+fn unaligned_multi_slab_slice_stays_lazy_until_execution() -> VortexResult<()> {
     let (_, tiled, _) = fixture(256, 1_536, geometry(64, 64))?;
     let unaligned = tiled.into_array().slice(1..130)?;
     assert!(unaligned.is::<Slice>());
