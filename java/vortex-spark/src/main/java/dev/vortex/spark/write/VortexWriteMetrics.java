@@ -25,9 +25,9 @@ public final class VortexWriteMetrics {
     public static final String ROWS_WRITTEN = "rowsWritten";
 
     /**
-     * Arrow buffer bytes flushed to the native writer, before Vortex compression. Spark collects the final task
-     * metrics just before {@code DataWriter.commit()}, so rows still buffered in the last partial batch are not
-     * reflected in this metric.
+     * Arrow buffer bytes flushed to the native writer, before Vortex compression. Spark collects the final task metrics
+     * just before {@code DataWriter.commit()}, so rows still buffered in the last partial batch are not reflected in
+     * this metric.
      */
     public static final String BYTES_BUFFERED = "bytesBuffered";
 

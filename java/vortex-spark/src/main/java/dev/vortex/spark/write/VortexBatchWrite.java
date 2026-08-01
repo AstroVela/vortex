@@ -39,6 +39,7 @@ import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
 import org.apache.spark.sql.connector.write.RequiresDistributionAndOrdering;
 import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
+import org.apache.spark.sql.connector.write.streaming.StreamingWrite;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -165,6 +166,16 @@ public final class VortexBatchWrite implements Write, BatchWrite, RequiresDistri
     @Override
     public CustomMetric[] supportedCustomMetrics() {
         return VortexWriteMetrics.supportedMetrics();
+    }
+
+    /**
+     * Returns the streaming variant of this write. Epochs append files named after (partition, task, epoch); when the
+     * write was configured to truncate (streaming Complete output mode), each epoch commit removes the files of earlier
+     * epochs so the output always reflects the latest result.
+     */
+    @Override
+    public StreamingWrite toStreaming() {
+        return new VortexStreamingWrite(outputPath, schema, options, mode == Mode.TRUNCATE, resolvedTransforms);
     }
 
     /**

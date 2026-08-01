@@ -80,8 +80,8 @@ public final class VortexScan
      * @param metadataColumnNames the read columns served as metadata columns rather than read from file data
      * @param tableSample the pushed-down Bernoulli table sample, or {@code null} when the scan is unsampled
      * @param limit maximum row count each partition reader should return, or {@link #NO_LIMIT}
-     * @param partitionSchema schema of the identity partition columns in table-partitioning order; empty when the
-     *     table is unpartitioned
+     * @param partitionSchema schema of the identity partition columns in table-partitioning order; empty when the table
+     *     is unpartitioned
      */
     public VortexScan(
             List<String> paths,
