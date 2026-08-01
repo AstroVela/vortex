@@ -70,11 +70,13 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
     private final int partitionId;
     private final long taskId;
 
+    private final String fileName;
+
     private final Map<String, VortexDataWriter> writers = new HashMap<>();
     private boolean closed = false;
 
     /**
-     * Creates a new PartitionedVortexDataWriter.
+     * Creates a new PartitionedVortexDataWriter with the default {@code part-<partition>-<task>.vortex} file name.
      *
      * @param baseOutputUri the base output path
      * @param schema the full schema of the data
@@ -90,6 +92,29 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
             ResolvedTransform[] resolvedTransforms,
             int partitionId,
             long taskId) {
+        this(
+                baseOutputUri,
+                schema,
+                options,
+                resolvedTransforms,
+                partitionId,
+                taskId,
+                String.format("part-%05d-%d.vortex", partitionId, taskId));
+    }
+
+    /**
+     * Creates a new PartitionedVortexDataWriter writing the given file name inside each partition directory (used by
+     * streaming writes, whose names carry the epoch).
+     */
+    PartitionedVortexDataWriter(
+            String baseOutputUri,
+            StructType schema,
+            CaseInsensitiveStringMap options,
+            ResolvedTransform[] resolvedTransforms,
+            int partitionId,
+            long taskId,
+            String fileName) {
+        this.fileName = fileName;
         this.baseOutputUri = baseOutputUri.endsWith("/") ? baseOutputUri : baseOutputUri + "/";
         this.options = options;
         this.partitionId = partitionId;
@@ -200,7 +225,6 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
     }
 
     private VortexDataWriter createWriterForPartition(String partitionPath) {
-        String fileName = String.format("part-%05d-%d.vortex", partitionId, taskId);
         String fileUri = baseOutputUri + partitionPath + "/" + fileName;
         logger.debug("Creating writer for partition path: {}", fileUri);
         return new VortexDataWriter(fileUri, dataSchema, options);
