@@ -98,7 +98,7 @@ impl<T: InputElement> ArgColumn<T> {
 ///   `ExtensionConstantRule` normalizes it to a top-level constant. Every row wraps the same
 ///   storage value, so the whole array (sliced to one row, keeping its extension dtype) is the
 ///   constant.
-fn batch_constant(array: &ArrayRef) -> Option<ArrayRef> {
+pub(in crate::scalar_fn::row) fn batch_constant(array: &ArrayRef) -> Option<ArrayRef> {
     if array.as_constant().is_some() {
         return Some(array.clone());
     }

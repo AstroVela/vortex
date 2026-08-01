@@ -128,6 +128,30 @@ fn constant_non_null_input_yields_constant_output() -> VortexResult<()> {
     Ok(())
 }
 
+/// An extension array over constant storage is folded just like a top-level constant instead of
+/// recomputing the same norm once per row.
+#[test]
+fn extension_backed_constant_yields_constant_output() -> VortexResult<()> {
+    let input = Vector::constant_array(&[3.0f64, 4.0], 4)?;
+
+    let scalar_fn = L2Norm.bind(EmptyOptions);
+    let result = ScalarFnArray::try_new(scalar_fn, vec![input])?.into_array();
+    let mut ctx = SESSION.create_execution_ctx();
+    let output = result.execute_until::<Constant>(&mut ctx)?;
+
+    let constant = output
+        .as_opt::<Constant>()
+        .expect("L2Norm over constant-backed extension storage must produce a constant output");
+    assert_eq!(constant.len(), 4);
+    let norm = constant
+        .scalar()
+        .as_primitive()
+        .as_::<f64>()
+        .expect("norm scalar must be a non-null primitive");
+    assert_close(&[norm], &[5.0]);
+    Ok(())
+}
+
 /// A constant input whose scalar is null should short-circuit to a null [`ConstantArray`] of
 /// the correct primitive dtype and length.
 #[test]

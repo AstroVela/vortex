@@ -35,6 +35,7 @@ use crate::scalar::Scalar;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::VecExecutionArgs;
+use crate::scalar_fn::row::element::batch_constant;
 use crate::validity::Validity;
 
 /// How the lifting shows a kernel the rows that are null in some input.
@@ -184,12 +185,14 @@ impl<'a> Batch<'a> {
             return Ok(self.all_null());
         }
 
-        // All inputs constant, and by the guard above non-null.
+        // All inputs constant, and their conjoined validity proves every row non-null. This sees
+        // through extension and masked wrappers just like argument decoding does.
         if self.args.row_count() > 0
+            && self.validity.definitely_no_nulls()
             && self
                 .inputs
                 .iter()
-                .all(|input| input.as_constant().is_some())
+                .all(|input| batch_constant(input).is_some())
         {
             return self.broadcast_one_row(kernel, ctx);
         }

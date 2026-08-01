@@ -36,6 +36,7 @@ mod primitive;
 mod tuple;
 pub use tuple::ArgColumn;
 pub use tuple::ElementTuple;
+pub(super) use tuple::batch_constant;
 
 /// An element type that can be read row-wise out of an input column.
 pub trait InputElement: 'static {
