@@ -190,7 +190,7 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
 /// The methods differ only in how the row closure delivers its output and in whether a per-batch
 /// prepare step runs before the loop, and a dispatch picks whichever fits. All apply the same
 /// witness check.
-pub trait RowVisitor {
+pub trait RowVisitor: private::Sealed {
     /// What this visit produces.
     type Out;
 
@@ -296,6 +296,8 @@ struct ValidateRows<'a, F> {
     row_fn: PhantomData<F>,
 }
 
+impl<F> private::Sealed for ValidateRows<'_, F> {}
+
 impl<F: RowFn> RowVisitor for ValidateRows<'_, F> {
     type Out = DType;
 
@@ -330,6 +332,8 @@ struct ExecuteRows<'a, 'b, F> {
     /// The visited function, carried only so the witness check can name its witnesses.
     row_fn: PhantomData<F>,
 }
+
+impl<F> private::Sealed for ExecuteRows<'_, '_, F> {}
 
 impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     type Out = ArrayRef;
@@ -369,6 +373,8 @@ struct ExecuteRowsBranch<'a, 'b, F> {
     row_fn: PhantomData<F>,
 }
 
+impl<F> private::Sealed for ExecuteRowsBranch<'_, '_, F> {}
+
 impl<F: RowFn> RowVisitor for ExecuteRowsBranch<'_, '_, F> {
     type Out = Option<ArrayRef>;
 
@@ -391,6 +397,10 @@ impl<F: RowFn> RowVisitor for ExecuteRowsBranch<'_, '_, F> {
         // strategy. See the module docs.
         Ok(None)
     }
+}
+
+mod private {
+    pub trait Sealed {}
 }
 
 /// The kernel the lifting runs: the encoding-aware rewrite if it answers, otherwise the row loop
