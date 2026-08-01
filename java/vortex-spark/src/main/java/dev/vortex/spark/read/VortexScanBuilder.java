@@ -19,9 +19,14 @@ import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.connector.expressions.aggregate.AggregateFunc;
+import org.apache.spark.sql.connector.expressions.aggregate.Aggregation;
+import org.apache.spark.sql.connector.expressions.aggregate.Count;
+import org.apache.spark.sql.connector.expressions.aggregate.CountStar;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.read.SupportsPushDownAggregates;
 import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
@@ -30,7 +35,11 @@ import org.apache.spark.sql.types.StructType;
 
 /** Spark V2 {@link ScanBuilder} for table scans over Vortex files. */
 public final class VortexScanBuilder
-        implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters, SupportsPushDownLimit {
+        implements ScanBuilder,
+                SupportsPushDownRequiredColumns,
+                SupportsPushDownV2Filters,
+                SupportsPushDownLimit,
+                SupportsPushDownAggregates {
     private final ImmutableList.Builder<String> paths;
     private final List<Column> tableColumns;
     private final List<Column> readColumns;
@@ -38,6 +47,7 @@ public final class VortexScanBuilder
     private final Set<String> partitionColumnNames;
     private Predicate[] pushedPredicates = new Predicate[0];
     private int limit = VortexScan.NO_LIMIT;
+    private int pushedCountColumns = 0;
 
     /** Creates a new VortexScanBuilder with empty paths and columns. */
     public VortexScanBuilder(Map<String, String> formatOptions) {
@@ -121,6 +131,10 @@ public final class VortexScanBuilder
         // Allow empty columns for operations like count() that don't need actual column data
         // If no columns are specified, we'll read the minimal schema needed
 
+        if (pushedCountColumns > 0) {
+            return new VortexCountScan(paths, this.formatOptions, pushedCountColumns);
+        }
+
         return new VortexScan(
                 paths,
                 List.copyOf(this.tableColumns),
@@ -151,6 +165,60 @@ public final class VortexScanBuilder
     public boolean isPartiallyPushed() {
         return true;
 >>>>>>> claude/spark-datasource-extensions-pmk8mc-limit-pushdown
+    }
+
+    /**
+     * Accepts aggregations that count rows: any combination of {@code COUNT(*)} and {@code COUNT(col)} over
+     * non-nullable data columns, without grouping. Every accepted aggregate evaluates to the file row count recorded in
+     * the Vortex footer, so the scan can answer from metadata without decoding any data. The pushdown is partial (see
+     * {@link SupportsPushDownAggregates#supportCompletePushDown}): the scan emits one count per file and Spark sums
+     * them.
+     *
+     * <p>Rejected cases fall back to a regular scan: grouped aggregations, distinct counts, counts of nullable or
+     * partition columns (their null counts are not recorded), other aggregate functions, and scans that already pushed
+     * predicates (the footer count does not reflect filtering).
+     */
+    @Override
+    public boolean pushAggregation(Aggregation aggregation) {
+        if (pushedPredicates.length > 0) {
+            return false;
+        }
+        if (aggregation.groupByExpressions().length > 0) {
+            return false;
+        }
+        AggregateFunc[] funcs = aggregation.aggregateExpressions();
+        if (funcs.length == 0) {
+            return false;
+        }
+        for (AggregateFunc func : funcs) {
+            if (func instanceof CountStar) {
+                continue;
+            }
+            if (func instanceof Count count && !count.isDistinct() && isNonNullableDataColumn(count.column())) {
+                continue;
+            }
+            return false;
+        }
+        this.pushedCountColumns = funcs.length;
+        return true;
+    }
+
+    private boolean isNonNullableDataColumn(org.apache.spark.sql.connector.expressions.Expression expression) {
+        if (!(expression instanceof NamedReference ref) || ref.fieldNames().length != 1) {
+            return false;
+        }
+        String name = ref.fieldNames()[0];
+        if (partitionColumnNames.contains(name)) {
+            // Partition values may be null (__HIVE_DEFAULT_PARTITION__), and null counts for them
+            // are not recorded anywhere, so COUNT(partitionColumn) cannot be answered from metadata.
+            return false;
+        }
+        for (Column column : tableColumns) {
+            if (column.name().equals(name)) {
+                return !column.nullable();
+            }
+        }
+        return false;
     }
 
     /**
