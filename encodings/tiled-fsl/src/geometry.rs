@@ -40,6 +40,32 @@ pub struct TileBounds {
     pub dimension_range: Range<usize>,
     /// The contiguous, unpadded physical values occupied by this tile.
     pub physical_range: Range<usize>,
+    /// The visible rows, relative to the beginning of the retained physical tile.
+    pub rows_within_tile: Range<usize>,
+    full_tile: bool,
+}
+
+impl TileBounds {
+    pub(crate) fn new(
+        row_range: Range<usize>,
+        dimension_range: Range<usize>,
+        physical_range: Range<usize>,
+        rows_within_tile: Range<usize>,
+        full_tile: bool,
+    ) -> Self {
+        Self {
+            row_range,
+            dimension_range,
+            physical_range,
+            rows_within_tile,
+            full_tile,
+        }
+    }
+
+    /// Returns whether the logical view selects every row in a full-height physical tile.
+    pub fn is_full_tile(&self) -> bool {
+        self.full_tile
+    }
 }
 
 /// Iterates tiled fixed-size-list bounds in physical storage order.
@@ -52,10 +78,22 @@ pub struct TileBoundsIter {
     list_size: usize,
     rows: usize,
     dimensions: usize,
+    row_offset: usize,
+    backing_rows: usize,
     row_tile_count: usize,
     dimension_tile_count: usize,
     next_row_tile: usize,
     next_dimension_tile: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TileLayout {
+    len: usize,
+    list_size: usize,
+    rows: usize,
+    dimensions: usize,
+    row_offset: usize,
+    backing_rows: usize,
 }
 
 impl TileBoundsIter {
@@ -63,6 +101,26 @@ impl TileBoundsIter {
         len: usize,
         list_size: usize,
         geometry: TileGeometry,
+        row_tile_count: usize,
+        dimension_tile_count: usize,
+    ) -> Self {
+        Self::new_view(
+            len,
+            list_size,
+            geometry,
+            0,
+            len,
+            row_tile_count,
+            dimension_tile_count,
+        )
+    }
+
+    pub(crate) fn new_view(
+        len: usize,
+        list_size: usize,
+        geometry: TileGeometry,
+        row_offset: usize,
+        backing_rows: usize,
         row_tile_count: usize,
         dimension_tile_count: usize,
     ) -> Self {
@@ -77,6 +135,8 @@ impl TileBoundsIter {
             list_size,
             rows,
             dimensions,
+            row_offset,
+            backing_rows,
             row_tile_count,
             dimension_tile_count,
             next_row_tile: 0,
@@ -94,10 +154,14 @@ impl Iterator for TileBoundsIter {
         }
 
         let bounds = tile_bounds_for_validated_array(
-            self.len,
-            self.list_size,
-            self.rows,
-            self.dimensions,
+            TileLayout {
+                len: self.len,
+                list_size: self.list_size,
+                rows: self.rows,
+                dimensions: self.dimensions,
+                row_offset: self.row_offset,
+                backing_rows: self.backing_rows,
+            },
             self.next_row_tile,
             self.next_dimension_tile,
         );
@@ -118,11 +182,29 @@ pub(crate) fn tile_bounds(
     row_tile: usize,
     dimension_tile: usize,
 ) -> VortexResult<TileBounds> {
+    tile_bounds_view(len, list_size, geometry, 0, len, row_tile, dimension_tile)
+}
+
+pub(crate) fn tile_bounds_view(
+    len: usize,
+    list_size: usize,
+    geometry: TileGeometry,
+    row_offset: usize,
+    backing_rows: usize,
+    row_tile: usize,
+    dimension_tile: usize,
+) -> VortexResult<TileBounds> {
     if len == 0 || list_size == 0 {
         vortex_bail!(InvalidArgument: "cannot compute tiles for an empty logical extent");
     }
 
     let (rows, dimensions) = geometry_usizes(geometry)?;
+    let logical_end = row_offset.checked_add(len).ok_or_else(|| {
+        vortex_error::vortex_err!(InvalidArgument: "row offset plus length overflows logical extent")
+    })?;
+    if row_offset >= rows || logical_end > backing_rows {
+        vortex_bail!(InvalidArgument: "invalid tiled fixed-size-list row window");
+    }
     let row_start = row_tile.checked_mul(rows).ok_or_else(|| {
         vortex_error::vortex_err!(InvalidArgument: "row tile index {row_tile} overflows tile geometry")
     })?;
@@ -130,25 +212,50 @@ pub(crate) fn tile_bounds(
         vortex_error::vortex_err!(InvalidArgument: "dimension tile index {dimension_tile} overflows tile geometry")
     })?;
 
-    if row_start >= len || dimension_start >= list_size {
+    if row_start >= logical_end
+        || row_start
+            .checked_add(rows)
+            .is_none_or(|end| end <= row_offset)
+        || dimension_start >= list_size
+    {
         vortex_bail!(
             InvalidArgument:
             "tile ({row_tile}, {dimension_tile}) is outside logical extent ({len}, {list_size})"
         );
     }
 
-    tile_bounds_from_starts(len, list_size, rows, dimensions, row_start, dimension_start)
+    tile_bounds_from_starts(
+        TileLayout {
+            len,
+            list_size,
+            rows,
+            dimensions,
+            row_offset,
+            backing_rows,
+        },
+        row_start,
+        dimension_start,
+    )
 }
 
 fn tile_bounds_for_validated_array(
-    len: usize,
-    list_size: usize,
-    rows: usize,
-    dimensions: usize,
+    layout: TileLayout,
     row_tile: usize,
     dimension_tile: usize,
 ) -> TileBounds {
-    let row_tile_count = len.div_ceil(rows);
+    let TileLayout {
+        len,
+        list_size,
+        rows,
+        dimensions,
+        row_offset,
+        ..
+    } = layout;
+    let row_tile_count = if len == 0 {
+        0
+    } else {
+        (row_offset + len).div_ceil(rows)
+    };
     let dimension_tile_count = list_size.div_ceil(dimensions);
     // Callers must provide only counters generated from this validated array's geometry.
     debug_assert!(row_tile < row_tile_count);
@@ -157,7 +264,7 @@ fn tile_bounds_for_validated_array(
 
     let row_start = row_tile * rows;
     let dimension_start = dimension_tile * dimensions;
-    match tile_bounds_from_starts(len, list_size, rows, dimensions, row_start, dimension_start) {
+    match tile_bounds_from_starts(layout, row_start, dimension_start) {
         Ok(bounds) => bounds,
         Err(_) => unreachable!("validated tiled array has in-range tile bounds"),
     }
@@ -180,26 +287,36 @@ pub(crate) fn geometry_usizes(geometry: TileGeometry) -> VortexResult<(usize, us
 }
 
 fn tile_bounds_from_starts(
-    len: usize,
-    list_size: usize,
-    rows: usize,
-    dimensions: usize,
+    layout: TileLayout,
     row_start: usize,
     dimension_start: usize,
 ) -> VortexResult<TileBounds> {
-    let row_end = row_start
+    let TileLayout {
+        len,
+        list_size,
+        rows,
+        dimensions,
+        row_offset,
+        backing_rows,
+    } = layout;
+    let retained_row_end = row_start
         .checked_add(rows)
         .ok_or_else(|| vortex_error::vortex_err!(InvalidArgument: "row tile range overflows logical extent"))?
-        .min(len);
+        .min(backing_rows);
+    let logical_end = row_offset.checked_add(len).ok_or_else(
+        || vortex_error::vortex_err!(InvalidArgument: "row window overflows logical extent"),
+    )?;
+    let visible_row_start = row_start.max(row_offset);
+    let visible_row_end = retained_row_end.min(logical_end);
     let dimension_end = dimension_start
         .checked_add(dimensions)
         .ok_or_else(|| vortex_error::vortex_err!(InvalidArgument: "dimension tile range overflows logical extent"))?
         .min(list_size);
-    let row_height = row_end - row_start;
+    let retained_row_height = retained_row_end - row_start;
     let dimension_width = dimension_end - dimension_start;
 
     let physical_start = dimension_start
-        .checked_mul(len)
+        .checked_mul(backing_rows)
         .and_then(|offset| {
             row_start
                 .checked_mul(dimension_width)
@@ -208,18 +325,24 @@ fn tile_bounds_from_starts(
         .ok_or_else(
             || vortex_error::vortex_err!(InvalidArgument: "tile physical offset overflows usize"),
         )?;
-    let physical_len = row_height.checked_mul(dimension_width).ok_or_else(
-        || vortex_error::vortex_err!(InvalidArgument: "tile physical length overflows usize"),
-    )?;
+    let physical_len = retained_row_height
+        .checked_mul(dimension_width)
+        .ok_or_else(
+            || vortex_error::vortex_err!(InvalidArgument: "tile physical length overflows usize"),
+        )?;
     let physical_end = physical_start.checked_add(physical_len).ok_or_else(
         || vortex_error::vortex_err!(InvalidArgument: "tile physical range overflows usize"),
     )?;
 
-    Ok(TileBounds {
-        row_range: row_start..row_end,
-        dimension_range: dimension_start..dimension_end,
-        physical_range: physical_start..physical_end,
-    })
+    let rows_within_tile = (visible_row_start - row_start)..(visible_row_end - row_start);
+    let full_tile = rows_within_tile.start == 0 && rows_within_tile.end == rows;
+    Ok(TileBounds::new(
+        (visible_row_start - row_offset)..(visible_row_end - row_offset),
+        dimension_start..dimension_end,
+        physical_start..physical_end,
+        rows_within_tile,
+        full_tile,
+    ))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -227,6 +350,18 @@ pub(crate) fn physical_offset(
     len: usize,
     list_size: usize,
     geometry: TileGeometry,
+    row: usize,
+    dimension: usize,
+) -> VortexResult<usize> {
+    physical_offset_view(len, list_size, geometry, 0, len, row, dimension)
+}
+
+pub(crate) fn physical_offset_view(
+    len: usize,
+    list_size: usize,
+    geometry: TileGeometry,
+    row_offset: usize,
+    backing_rows: usize,
     row: usize,
     dimension: usize,
 ) -> VortexResult<usize> {
@@ -238,12 +373,24 @@ pub(crate) fn physical_offset(
     }
 
     let (rows, dimensions) = geometry_usizes(geometry)?;
-    let row_tile = row / rows;
+    let physical_row = row_offset.checked_add(row).ok_or_else(
+        || vortex_error::vortex_err!(InvalidArgument: "physical row overflows usize"),
+    )?;
+    let row_tile = physical_row / rows;
     let dimension_tile = dimension / dimensions;
-    let bounds = tile_bounds(len, list_size, geometry, row_tile, dimension_tile)?;
-    let row_within_tile = row - bounds.row_range.start;
+    let bounds = tile_bounds_view(
+        len,
+        list_size,
+        geometry,
+        row_offset,
+        backing_rows,
+        row_tile,
+        dimension_tile,
+    )?;
+    let row_within_tile = physical_row - row_tile * rows;
     let dimension_within_tile = dimension - bounds.dimension_range.start;
-    let row_height = bounds.row_range.end - bounds.row_range.start;
+    let dimension_width = bounds.dimension_range.len();
+    let row_height = bounds.physical_range.len() / dimension_width;
     bounds
         .physical_range
         .start

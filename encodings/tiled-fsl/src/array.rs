@@ -49,7 +49,6 @@ use crate::TileGeometry;
 use crate::geometry::TileBounds;
 use crate::geometry::TileBoundsIter;
 use crate::geometry::geometry_usizes;
-use crate::geometry::tile_bounds;
 use crate::transpose::decode_elements;
 use crate::transpose::encode_elements;
 
@@ -82,6 +81,8 @@ pub struct TiledFixedSizeListSlots {
 #[derive(Clone, Debug)]
 pub struct TiledFixedSizeListData {
     geometry: TileGeometry,
+    row_offset: usize,
+    backing_rows: usize,
 }
 
 impl TiledFixedSizeListData {
@@ -102,9 +103,11 @@ impl Display for TiledFixedSizeListData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "tile_rows: {}, tile_dimensions: {}",
+            "tile_rows: {}, tile_dimensions: {}, row_offset: {}, backing_rows: {}",
             self.geometry.rows(),
-            self.geometry.dimensions()
+            self.geometry.dimensions(),
+            self.row_offset,
+            self.backing_rows
         )
     }
 }
@@ -112,12 +115,16 @@ impl Display for TiledFixedSizeListData {
 impl ArrayHash for TiledFixedSizeListData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.geometry.hash(state);
+        self.row_offset.hash(state);
+        self.backing_rows.hash(state);
     }
 }
 
 impl ArrayEq for TiledFixedSizeListData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.geometry == other.geometry
+            && self.row_offset == other.row_offset
+            && self.backing_rows == other.backing_rows
     }
 }
 
@@ -159,12 +166,28 @@ impl TiledFixedSizeList {
         len: usize,
         geometry: TileGeometry,
     ) -> VortexResult<TiledFixedSizeListArray> {
+        Self::try_new_view(elements, list_size, validity, len, geometry, 0, len)
+    }
+
+    pub(crate) fn try_new_view(
+        elements: ArrayRef,
+        list_size: u32,
+        validity: Validity,
+        len: usize,
+        geometry: TileGeometry,
+        row_offset: usize,
+        backing_rows: usize,
+    ) -> VortexResult<TiledFixedSizeListArray> {
         let dtype = DType::FixedSizeList(
             Arc::new(elements.dtype().clone()),
             list_size,
             validity.nullability(),
         );
-        let data = TiledFixedSizeListData { geometry };
+        let data = TiledFixedSizeListData {
+            geometry,
+            row_offset,
+            backing_rows,
+        };
         let slots = TiledFixedSizeListData::make_slots(&elements, &validity, len);
         Array::try_from_parts(
             ArrayParts::new(TiledFixedSizeList, dtype, len, data).with_slots(slots),
@@ -206,7 +229,7 @@ impl VTable for TiledFixedSizeList {
         let DType::FixedSizeList(element_dtype, list_size, nullability) = dtype else {
             vortex_bail!(InvalidArgument: "tiled fixed-size-list dtype must be FixedSizeList, got {dtype}");
         };
-        geometry_usizes(data.geometry)?;
+        let (tile_rows, tile_dimensions) = geometry_usizes(data.geometry)?;
         vortex_ensure!(
             matches!(element_dtype.as_ref(), DType::Primitive(..)),
             InvalidArgument: "tiled fixed-size-list elements must have a primitive dtype, got {element_dtype}"
@@ -232,9 +255,33 @@ impl VTable for TiledFixedSizeList {
             element_dtype
         );
 
-        let expected_len = len.checked_mul(*list_size as usize).ok_or_else(|| {
-            vortex_err!(InvalidArgument: "tiled fixed-size-list length {len} times list size {list_size} overflows usize")
+        vortex_ensure!(
+            data.row_offset < tile_rows,
+            InvalidArgument: "tiled fixed-size-list row offset {} must be less than tile rows {tile_rows}",
+            data.row_offset
+        );
+        let logical_end = data.row_offset.checked_add(len).ok_or_else(|| {
+            vortex_err!(InvalidArgument: "tiled fixed-size-list row offset {} plus length {len} overflows usize", data.row_offset)
         })?;
+        vortex_ensure!(
+            logical_end <= data.backing_rows,
+            InvalidArgument: "tiled fixed-size-list row window {}..{logical_end} exceeds {} backing rows",
+            data.row_offset,
+            data.backing_rows
+        );
+        if *list_size == 0 || (*list_size as usize) > tile_dimensions {
+            vortex_ensure!(
+                data.row_offset == 0 && data.backing_rows == len,
+                InvalidArgument: "tiled fixed-size-list zero-width and multi-slab arrays require row offset 0 and backing rows equal to length {len}"
+            );
+        }
+
+        let expected_len = data
+            .backing_rows
+            .checked_mul(*list_size as usize)
+            .ok_or_else(|| {
+                vortex_err!(InvalidArgument: "tiled fixed-size-list backing rows {} times list size {list_size} overflows usize", data.backing_rows)
+            })?;
         vortex_ensure!(
             elements.len() == expected_len,
             InvalidArgument: "tiled fixed-size-list physical child length {} does not match expected {expected_len}",
@@ -338,7 +385,11 @@ impl VTable for TiledFixedSizeList {
             self.clone(),
             dtype.clone(),
             len,
-            TiledFixedSizeListData { geometry },
+            TiledFixedSizeListData {
+                geometry,
+                row_offset: 0,
+                backing_rows: len,
+            },
         )
         .with_slots(slots))
     }
@@ -414,6 +465,22 @@ pub trait TiledFixedSizeListArrayExt:
         self.geometry
     }
 
+    /// Returns the logical row offset within the first retained physical tile.
+    fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    /// Returns the number of rows represented by the retained physical child.
+    fn backing_rows(&self) -> usize {
+        self.backing_rows
+    }
+
+    /// Returns whether every logical row is stored in a single dimension slab.
+    fn is_full_width(&self) -> bool {
+        let (_, dimensions) = validated_geometry_usizes(self.geometry());
+        self.list_size() as usize <= dimensions
+    }
+
     /// Returns the number of elements in each logical fixed-size list.
     fn list_size(&self) -> u32 {
         match self.as_ref().dtype() {
@@ -425,7 +492,11 @@ pub trait TiledFixedSizeListArrayExt:
     /// Returns the number of row tiles needed for the logical array length.
     fn row_tile_count(&self) -> usize {
         let (rows, _) = validated_geometry_usizes(self.geometry());
-        self.as_ref().len().div_ceil(rows)
+        if self.as_ref().is_empty() {
+            0
+        } else {
+            (self.row_offset() + self.as_ref().len()).div_ceil(rows)
+        }
     }
 
     /// Returns the number of dimension tiles needed for each logical list.
@@ -436,10 +507,12 @@ pub trait TiledFixedSizeListArrayExt:
 
     /// Returns the bounds for one checked logical tile.
     fn tile(&self, row_tile: usize, dimension_tile: usize) -> VortexResult<TileBounds> {
-        tile_bounds(
+        crate::geometry::tile_bounds_view(
             self.as_ref().len(),
             self.list_size() as usize,
             self.geometry(),
+            self.row_offset(),
+            self.backing_rows(),
             row_tile,
             dimension_tile,
         )
@@ -447,10 +520,12 @@ pub trait TiledFixedSizeListArrayExt:
 
     /// Returns the logical and physical bounds of every tile in physical storage order.
     fn tiles(&self) -> TileBoundsIter {
-        TileBoundsIter::new(
+        TileBoundsIter::new_view(
             self.as_ref().len(),
             self.list_size() as usize,
             self.geometry(),
+            self.row_offset(),
+            self.backing_rows(),
             self.row_tile_count(),
             self.dimension_tile_count(),
         )

@@ -17,7 +17,7 @@ use vortex_mask::Mask;
 use crate::TiledFixedSizeList;
 use crate::TiledFixedSizeListArrayExt;
 use crate::TiledFixedSizeListArraySlotsExt;
-use crate::geometry::physical_offset;
+use crate::geometry::physical_offset_view;
 
 impl OperationsVTable<TiledFixedSizeList> for TiledFixedSizeList {
     fn scalar_at(
@@ -28,8 +28,15 @@ impl OperationsVTable<TiledFixedSizeList> for TiledFixedSizeList {
         let list_size = array.list_size() as usize;
         let indices = (0..list_size)
             .map(|dimension| {
-                let offset =
-                    physical_offset(array.len(), list_size, array.geometry(), index, dimension)?;
+                let offset = physical_offset_view(
+                    array.len(),
+                    list_size,
+                    array.geometry(),
+                    array.row_offset(),
+                    array.backing_rows(),
+                    index,
+                    dimension,
+                )?;
                 Ok(u64::try_from(offset)?)
             })
             .collect::<VortexResult<Buffer<u64>>>()?;

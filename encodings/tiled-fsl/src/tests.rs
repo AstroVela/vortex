@@ -164,6 +164,40 @@ fn physical_fixture(
     )
 }
 
+fn offset_view_fixture() -> VortexResult<(ArrayRef, TiledFixedSizeListArray, ExecutionCtx)> {
+    offset_view_fixture_with_backing_rows(192)
+}
+
+fn offset_view_fixture_with_backing_rows(
+    backing_rows: usize,
+) -> VortexResult<(ArrayRef, TiledFixedSizeListArray, ExecutionCtx)> {
+    let dimensions = 8u32;
+    let element_count = backing_rows * dimensions as usize;
+    let canonical = FixedSizeListArray::new(
+        PrimitiveArray::new(
+            Buffer::from_iter((0..element_count).map(|index| u16::try_from(index).unwrap())),
+            Validity::from_iter((0..element_count).map(|index| index % 11 != 0)),
+        )
+        .into_array(),
+        dimensions,
+        Validity::AllValid,
+        backing_rows,
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let tiled = TiledFixedSizeList::encode(canonical.as_view(), geometry(64, 8), &mut ctx)?;
+    let oracle = canonical.clone().into_array().slice(10..138)?;
+    let view = TiledFixedSizeList::try_new_view(
+        tiled.elements().clone(),
+        dimensions,
+        canonical.fixed_size_list_validity().slice(10..138)?,
+        128,
+        geometry(64, 8),
+        10,
+        backing_rows,
+    )?;
+    Ok((oracle, view, ctx))
+}
+
 fn fixture(
     rows: usize,
     dimensions: u32,
@@ -230,11 +264,13 @@ fn expected_tile_bounds(
         for row_start in (0..rows).step_by(tile_rows) {
             let row_end = row_start.saturating_add(tile_rows).min(rows);
             let tile_len = (row_end - row_start) * (dimension_end - dimension_start);
-            bounds.push(TileBounds {
-                row_range: row_start..row_end,
-                dimension_range: dimension_start..dimension_end,
-                physical_range: physical_cursor..physical_cursor + tile_len,
-            });
+            bounds.push(TileBounds::new(
+                row_start..row_end,
+                dimension_start..dimension_end,
+                physical_cursor..physical_cursor + tile_len,
+                0..row_end - row_start,
+                row_end - row_start == tile_rows,
+            ));
             physical_cursor += tile_len;
         }
     }
@@ -854,6 +890,137 @@ fn tiles_are_range_only_and_in_physical_order() -> VortexResult<()> {
     assert!(tiled.tile(2, 0).is_err());
     assert!(tiled.tile(0, 2).is_err());
     Ok(())
+}
+
+#[test]
+fn offset_view_tiles_expose_boundary_fragments() -> VortexResult<()> {
+    let (_, view, _) = offset_view_fixture()?;
+    assert_eq!(view.row_offset(), 10);
+    assert_eq!(view.backing_rows(), 192);
+    assert!(view.is_full_width());
+
+    let tiles = view.tiles().collect::<Vec<_>>();
+    assert_eq!(tiles[0].row_range, 0..54);
+    assert_eq!(tiles[0].rows_within_tile, 10..64);
+    assert!(!tiles[0].is_full_tile());
+    assert_eq!(tiles[1].row_range, 54..118);
+    assert_eq!(tiles[1].rows_within_tile, 0..64);
+    assert!(tiles[1].is_full_tile());
+    assert_eq!(tiles[2].row_range, 118..128);
+    assert_eq!(tiles[2].rows_within_tile, 0..10);
+    Ok(())
+}
+
+#[test]
+fn offset_view_has_complete_interior_tiles() -> VortexResult<()> {
+    let (_, view, _) = offset_view_fixture_with_backing_rows(138)?;
+    let tiles = view.tiles().collect::<Vec<_>>();
+
+    assert_eq!(tiles.len(), 3);
+    assert_eq!(tiles[0].physical_range, 0..512);
+    assert_eq!(tiles[1].physical_range, 512..1024);
+    assert_eq!(tiles[2].physical_range, 1024..1104);
+    assert_eq!(view.tile_elements(&tiles[0])?.len(), 512);
+    assert_eq!(view.tile_elements(&tiles[1])?.len(), 512);
+    assert_eq!(view.tile_elements(&tiles[2])?.len(), 80);
+    assert!(!tiles[2].is_full_tile());
+    Ok(())
+}
+
+#[test]
+fn scalar_at_uses_row_offset() -> VortexResult<()> {
+    let (oracle, view, mut ctx) = offset_view_fixture()?;
+
+    for row in [0, 53, 54, 127] {
+        assert_eq!(
+            oracle.execute_scalar(row, &mut ctx)?,
+            view.execute_scalar(row, &mut ctx)?,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_view_metadata_is_rejected() {
+    let elements = |rows: usize, dimensions: usize| {
+        PrimitiveArray::from_iter(
+            (0..rows * dimensions).map(|index| u16::try_from(index).unwrap_or(u16::MAX)),
+        )
+        .into_array()
+    };
+
+    assert!(
+        TiledFixedSizeList::try_new_view(
+            elements(2, 1),
+            1,
+            Validity::NonNullable,
+            1,
+            geometry(64, 1),
+            2,
+            2,
+        )
+        .is_err()
+    );
+    assert!(
+        TiledFixedSizeList::try_new_view(
+            elements(3, 5),
+            5,
+            Validity::NonNullable,
+            2,
+            geometry(64, 3),
+            1,
+            3,
+        )
+        .is_err()
+    );
+    assert!(
+        TiledFixedSizeList::try_new_view(
+            elements(6, 2),
+            2,
+            Validity::NonNullable,
+            5,
+            geometry(64, 2),
+            1,
+            7,
+        )
+        .is_err()
+    );
+    assert!(
+        TiledFixedSizeList::try_new_view(
+            elements(0, 2),
+            2,
+            Validity::NonNullable,
+            0,
+            geometry(64, 2),
+            0,
+            usize::MAX,
+        )
+        .is_err()
+    );
+    assert!(
+        TiledFixedSizeList::try_new_view(
+            elements(64, 1),
+            1,
+            Validity::NonNullable,
+            0,
+            geometry(64, 1),
+            64,
+            64,
+        )
+        .is_err()
+    );
+    assert!(
+        TiledFixedSizeList::try_new_view(
+            elements(3, 0),
+            0,
+            Validity::NonNullable,
+            2,
+            geometry(64, 3),
+            1,
+            3,
+        )
+        .is_err()
+    );
 }
 
 #[test]
