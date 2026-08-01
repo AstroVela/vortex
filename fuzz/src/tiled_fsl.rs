@@ -174,6 +174,13 @@ impl ArrayChildren for SerializedChildren {
     }
 }
 
+fn validate_array_tree(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+    for descendant in array.depth_first_traversal() {
+        descendant.validity()?.execute_mask(descendant.len(), ctx)?;
+    }
+    Ok(())
+}
+
 fn reconstruct_serde(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
     let tiled = array.as_::<TiledFixedSizeList>();
     let expected_row_offset = tiled.row_offset();
@@ -202,6 +209,7 @@ fn reconstruct_serde(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<A
         "serde changed backing rows from {expected_backing_rows} to {}",
         reconstructed_tiled.backing_rows()
     );
+    validate_array_tree(&reconstructed, ctx)?;
     Ok(reconstructed)
 }
 
@@ -739,6 +747,47 @@ mod tests {
         for input in cases {
             run_tiled_fsl(input)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::result_large_err)]
+    fn serde_reconstruction_validates_offset_view_tree() -> VortexFuzzResult<()> {
+        let mut cases = deterministic_tiled_fsl_cases()?;
+        let input = cases.remove(3);
+        let geometry = input.geometry;
+        let mut canonical = input.canonical;
+        let mut ctx = TILED_FSL_SESSION.create_execution_ctx();
+        let mut tiled = fuzz(TiledFixedSizeList::encode(
+            canonical.as_::<FixedSizeList>(),
+            geometry,
+            &mut ctx,
+        ))?
+        .into_array();
+
+        let slice_control = execute_action(
+            TiledFslAction::Slice {
+                start: 10,
+                stop: 150,
+            },
+            &mut canonical,
+            &mut tiled,
+            geometry,
+            0,
+            &mut ctx,
+        )?;
+        let control = execute_action(
+            TiledFslAction::ReconstructSerde,
+            &mut canonical,
+            &mut tiled,
+            geometry,
+            1,
+            &mut ctx,
+        )?;
+
+        assert_eq!(slice_control, ControlFlow::Continue(()));
+        assert_eq!(control, ControlFlow::Continue(()));
+        assert!(tiled.is::<TiledFixedSizeList>());
         Ok(())
     }
 }
