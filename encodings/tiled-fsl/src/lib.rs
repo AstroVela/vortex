@@ -7,6 +7,7 @@ mod array;
 mod gather;
 mod geometry;
 mod kernel;
+mod mask;
 mod operations;
 mod rules;
 mod slice;

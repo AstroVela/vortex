@@ -32,6 +32,7 @@ use vortex_array::arrays::slice::SliceKernel;
 use vortex_array::arrays::slice::SliceReduce;
 use vortex_array::assert_arrays_eq;
 use vortex_array::buffer::BufferHandle;
+use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::compute::conformance::consistency::test_array_consistency;
 use vortex_array::compute::conformance::filter::test_filter_conformance;
 use vortex_array::compute::conformance::take::test_take_conformance;
@@ -40,6 +41,7 @@ use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_native_ptype;
+use vortex_array::optimizer::ArrayOptimizer;
 use vortex_array::optimizer::kernels::ArrayKernelsExt;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::serde::SerializeOptions;
@@ -180,6 +182,27 @@ fn physical_fixture(
 
 fn offset_view_fixture() -> VortexResult<TiledFixedSizeListArray> {
     offset_view_fixture_with_backing_rows(192)
+}
+
+#[test]
+fn mask_preserves_row_view_metadata_and_encoding() -> VortexResult<()> {
+    let view = offset_view_fixture()?;
+    let mask = Validity::from_iter((0..view.len()).map(|row| row % 5 != 2)).to_array(view.len());
+    let masked = view.clone().into_array().mask(mask)?.optimize()?;
+
+    assert!(masked.is::<TiledFixedSizeList>());
+    let masked = masked.try_downcast::<TiledFixedSizeList>().unwrap();
+    assert_eq!(masked.row_offset(), view.row_offset());
+    assert_eq!(masked.backing_rows(), view.backing_rows());
+    assert_eq!(masked.elements().len(), view.elements().len());
+
+    let mut ctx = SESSION.create_execution_ctx();
+    assert!(masked.array_validity().mask_eq(
+        &Validity::from_iter((0..view.len()).map(|row| row % 5 != 2)),
+        view.len(),
+        &mut ctx,
+    )?);
+    Ok(())
 }
 
 fn offset_view_fixture_with_backing_rows(
