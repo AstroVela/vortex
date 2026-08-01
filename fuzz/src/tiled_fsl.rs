@@ -634,21 +634,21 @@ pub fn deterministic_tiled_fsl_cases() -> VortexFuzzResult<Vec<FuzzTiledFsl>> {
             geometry: geometry(2, 3),
             actions: vec![
                 TiledFslAction::CheckTiles,
-                TiledFslAction::Take(vec![Some(2), None, Some(2), Some(0)]),
                 TiledFslAction::Reconstruct,
+                TiledFslAction::Take(vec![Some(2), None, Some(2), Some(0)]),
             ],
         },
         FuzzTiledFsl {
             canonical: nullable_f32,
             geometry: geometry(32, 64),
             actions: vec![
+                TiledFslAction::CheckTiles,
                 TiledFslAction::Slice {
                     start: 31,
                     stop: 38,
                 },
-                TiledFslAction::Take(vec![Some(2), Some(1), Some(0)]),
                 TiledFslAction::ScalarAt(1),
-                TiledFslAction::CheckTiles,
+                TiledFslAction::Take(vec![Some(2), Some(1), Some(0)]),
             ],
         },
         FuzzTiledFsl {
