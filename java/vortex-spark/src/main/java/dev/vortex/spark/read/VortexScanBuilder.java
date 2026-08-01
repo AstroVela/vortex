@@ -124,7 +124,8 @@ public final class VortexScanBuilder
                 List.copyOf(this.tableColumns),
                 List.copyOf(this.readColumns),
                 pushedPredicates,
-                this.formatOptions);
+                this.formatOptions,
+                partitionColumnNames);
     }
 
     /**
