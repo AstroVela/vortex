@@ -212,8 +212,7 @@ public final class VortexScanBuilder
      * </ul>
      *
      * <p>Rejected cases fall back to a regular scan: grouped aggregations, distinct aggregates, aggregates over
-     * partition or nested columns, {@code MIN}/{@code MAX} over floating point columns (Spark orders NaN above every
-     * value, Vortex does not), {@code SUM} over longs (Spark wraps on overflow, Vortex returns null), unsupported
+     * partition or nested columns, {@code SUM} over longs (Spark wraps on overflow, Vortex returns null), unsupported
      * column types, and scans that already pushed a TABLESAMPLE or LIMIT (neither strategy reflects them).
      */
     @Override
@@ -320,8 +319,8 @@ public final class VortexScanBuilder
     }
 
     /**
-     * Types whose native min/max ordering matches Spark's. Floating point columns are excluded because Spark orders NaN
-     * above every other value while Vortex does not define a total order over NaNs.
+     * Types with a native min/max whose ordering matches Spark's. For floating point columns the native side recovers
+     * Spark's NaN-is-largest ordering by pairing a NaN-skipping min/max with a NaN count.
      */
     private static boolean isMinMaxSupported(DataType type) {
         return type instanceof BooleanType
@@ -329,6 +328,8 @@ public final class VortexScanBuilder
                 || type instanceof ShortType
                 || type instanceof IntegerType
                 || type instanceof LongType
+                || type instanceof FloatType
+                || type instanceof DoubleType
                 || type instanceof DateType
                 || type instanceof TimestampType
                 || type instanceof TimestampNTZType

@@ -220,14 +220,84 @@ public final class VortexAggregatePushdownTest {
     }
 
     @Test
+    @DisplayName("MIN/MAX over NaN-free float columns push down")
+    public void testFloatMinMaxPushdown() {
+        Dataset<Row> readDf = writeAndRead("agg_float", 2);
+
+        Dataset<Row> agg = readDf.agg(functions.min("ratio"), functions.max("ratio"));
+        assertNativeAggregate(agg);
+        Row row = agg.collectAsList().get(0);
+        assertEquals(0.0, row.getDouble(0));
+        assertEquals(49.5, row.getDouble(1));
+    }
+
+    @Test
+    @DisplayName("Float MIN/MAX and SUM follow Spark's NaN semantics: NaN orders largest and poisons sums")
+    public void testFloatNaNSemantics() {
+        // Rows i in [0, 20): value is null when i % 5 == 0, NaN when i % 5 == 1, otherwise i.
+        List<Row> data = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            Double d = i % 5 == 0 ? null : i % 5 == 1 ? Double.NaN : (double) i;
+            Float f = i % 5 == 0 ? null : i % 5 == 1 ? Float.NaN : (float) i;
+            data.add(RowFactory.create(i, d, f));
+        }
+        StructType schema = DataTypes.createStructType(List.of(
+                DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                DataTypes.createStructField("d", DataTypes.DoubleType, true),
+                DataTypes.createStructField("f", DataTypes.FloatType, true)));
+        Path outputPath = tempDir.resolve("agg_nan");
+        spark.createDataFrame(data, schema)
+                .repartition(2)
+                .write()
+                .format("vortex")
+                .option("path", outputPath.toUri().toString())
+                .mode(SaveMode.Overwrite)
+                .save();
+        Dataset<Row> readDf = spark.read()
+                .format("vortex")
+                .option("path", outputPath.toUri().toString())
+                .load();
+
+        // NaN is the largest value for max; min skips it while other values exist; sums poison to NaN.
+        Dataset<Row> agg = readDf.agg(
+                functions.min("d"),
+                functions.max("d"),
+                functions.sum("d"),
+                functions.count(readDf.col("d")),
+                functions.min("f"),
+                functions.max("f"));
+        assertNativeAggregate(agg);
+        Row row = agg.collectAsList().get(0);
+        assertEquals(2.0, row.getDouble(0));
+        assertEquals(Double.NaN, row.getDouble(1));
+        assertEquals(Double.NaN, row.getDouble(2));
+        assertEquals(16L, row.getLong(3));
+        assertEquals(2.0f, row.getFloat(4));
+        assertEquals(Float.NaN, row.getFloat(5));
+
+        // A slice whose only non-null values are NaN: min and max are both NaN.
+        Dataset<Row> allNaN = readDf.filter(readDf.col("id").isin(1, 6, 11, 16))
+                .agg(functions.min("d"), functions.max("d"), functions.min("f"));
+        assertNativeAggregate(allNaN);
+        Row nanRow = allNaN.collectAsList().get(0);
+        assertEquals(Double.NaN, nanRow.getDouble(0));
+        assertEquals(Double.NaN, nanRow.getDouble(1));
+        assertEquals(Float.NaN, nanRow.getFloat(2));
+
+        // A NaN-free slice keeps ordinary values even though the column contains NaNs elsewhere.
+        Dataset<Row> noNaN = readDf.filter(readDf.col("id").isin(2, 3, 4))
+                .agg(functions.min("d"), functions.max("d"), functions.sum("d"));
+        assertNativeAggregate(noNaN);
+        Row plainRow = noNaN.collectAsList().get(0);
+        assertEquals(2.0, plainRow.getDouble(0));
+        assertEquals(4.0, plainRow.getDouble(1));
+        assertEquals(9.0, plainRow.getDouble(2));
+    }
+
+    @Test
     @DisplayName("Semantics Vortex cannot match fall back to a regular scan and stay correct")
     public void testUnsupportedAggregatesFallBack() {
         Dataset<Row> readDf = writeAndRead("agg_fallback", 2);
-
-        // Spark orders NaN above all other doubles; Vortex does not, so float min/max must not push.
-        Dataset<Row> minDouble = readDf.agg(functions.min("ratio"));
-        assertNoNativeAggregate(minDouble);
-        assertEquals(0.0, minDouble.collectAsList().get(0).getDouble(0));
 
         // Spark wraps on long-sum overflow; Vortex saturates to null, so sum(long) must not push.
         Dataset<Row> sumLong = readDf.agg(functions.sum("big"));

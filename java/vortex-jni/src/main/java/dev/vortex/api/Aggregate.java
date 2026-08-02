@@ -12,8 +12,9 @@ import java.util.Objects;
  *
  * <p>Null handling follows SQL semantics: {@code MIN}/{@code MAX}/{@code SUM} ignore null values and return null when
  * every value is null (or the source is empty); {@code COUNT} counts non-null values and {@code COUNT_STAR} counts
- * rows, both returning a non-null 64-bit integer. For floating point columns NaN values are aggregated like ordinary
- * values rather than skipped.
+ * rows, both returning a non-null 64-bit integer. Floating point NaN values follow Spark/Java ordering and arithmetic:
+ * {@code MIN}/{@code MAX} order NaN above every other value, {@code SUM} propagates NaN, and {@code COUNT} counts NaN
+ * as an ordinary non-null value.
  */
 public final class Aggregate {
     /** The kind of aggregate function. Codes must match the native side. */
