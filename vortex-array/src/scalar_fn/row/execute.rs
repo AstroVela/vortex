@@ -43,8 +43,8 @@ pub(super) fn validate_row_args<A: ElementTuple, R: ApplyResult>(
 
 /// Validate the input dtypes of a sink-writing row function and return the dtype its sink builds.
 ///
-/// Unlike [`validate_row_args`] the output dtype is a function of the inputs, since that is the point
-/// of a sink: `l2_denorm` reads its output width out of the tensor argument.
+/// Unlike [`validate_row_args`] the output dtype may be a function of the inputs. A sink can also
+/// own a batch-wide builder, such as the shared byte and view buffers of a future string transform.
 pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
     args: &[DType],
 ) -> VortexResult<DType> {

@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--SPDX-FileCopyrightText: Copyright the Vortex contributors -->
+
 # Handoff: the row scalar-function framework
 
 Written at the end of a long session, for whoever picks this up next. The companion document
@@ -25,6 +28,25 @@ request there as it lands; that is the intended record of progress.
 
 This branch is where the design was worked out and measured, and the plan below turns it into small
 reviewable pull requests cut fresh from develop.
+
+## Architecture update: `L2Denorm` is an encoding
+
+The original prototype used `L2Denorm` as the first production `OutputSink` adopter. That
+classification has since been rejected: its normalized child and authoritative stored norms form a
+physical representation with cross-value invariants, so it belongs in a dedicated tensor encoding,
+not behind `RowFn`. A separate agent is preparing that encoding as the new bottom PR in the stack.
+
+This changes the staging argument for sinks, not the sink design itself. Once `L2Denorm` moves,
+`visit_into` and `OutputSink` have no current production consumer. They still cover an important
+future class that `OutputElement` cannot: builder-backed outputs such as `upper`, `lower`, and
+`replace`, which should append all rows into one string buffer rather than allocate an owned string
+per row. Do not infer from the missing first adopter that sinks are unnecessary.
+
+For the initial RowFn PRs, prefer omitting `visit_into`, `OutputSink`, `SinkResult`, and `TensorSink`
+unless another production consumer lands with them. Preserve the design and measurements in the
+research document, and track the additive sink API in issue 9129 so a future string-library PR can
+add it without redesigning `RowFn`. Before cutting the stack, update issue 9129's examples and Steps
+so they no longer present `L2Denorm` as the reason to stabilize the sink surface.
 
 ## Current benchmark and codegen record
 
@@ -57,9 +79,10 @@ report), `nonstrict_survey.md` (the non-strict function survey), and
 **`RowFn`** (`vortex-array/src/scalar_fn/row/`) is the only authoring trait above
 `ScalarFnVTable`: an implementor names witness types, picks concrete element types per batch in
 `dispatch`, and hands the framework a row closure. One blanket impl,
-`impl<F: RowFn> ScalarFnVTable for F` in `row/row_fn.rs`, derives everything else. Adopters:
-`byte_length`, geo `contains`/`intersects`/`distance`, tensor `l2_norm`/`inner_product`/
-`cosine_similarity`/`l2_denorm`.
+`impl<F: RowFn> ScalarFnVTable for F` in `row/row_fn.rs`, derives everything else. The prototype on
+this branch still includes `l2_denorm`, but the intended adopters after the encoding rebase are
+`byte_length`, geo `contains`/`intersects`/`distance`, and tensor `l2_norm`/`inner_product`/
+`cosine_similarity`.
 
 **The lifting** (`vortex-array/src/scalar_fn/row/lift.rs`, `pub(super)`) turns that row loop into a
 full `execute`: null propagation, constant folding, nullability widening, output dtype
@@ -206,12 +229,14 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
    work, and required before any porting PR can show a comparison. See "The measurement plan"
    below.
 4. **The PR stack**, cut fresh from develop, each linking 9129 or 9130 and recorded in that issue's
-   Implementation history: row core plus `byte_length`; then `OutputSink` plus `l2_denorm`; then
-   `l2_norm` and `inner_product` on the plain visit; then `visit_prepared` with both of its users,
-   `cosine_similarity` and geo; then adaptive execution and its benches. Land each API surface with
-   its first user, which is why `visit_prepared` travels with geo rather than with cosine (the
-   prepared-geometry win carries the API, cosine's few percent does not) and why adaptive execution comes after geo
-   (geo is its only production beneficiary, since every other adopter is dense-safe). Two of 9129's
+   Implementation history: the dedicated `L2Denorm` encoding first; then row core plus
+   `byte_length`; then `l2_norm` and `inner_product` on the plain visit; then `visit_prepared` with
+   both of its users, `cosine_similarity` and geo; then adaptive execution and its benches. Defer
+   `OutputSink` until a production builder-backed output, most likely the future string library, can
+   land with it. Land each API surface with its first user, which is why `visit_prepared` travels
+   with geo rather than with cosine (the prepared-geometry win carries the API, cosine's few percent
+   does not) and why adaptive execution comes after geo (geo is its only production beneficiary,
+   since every other adopter is dense-safe). Two of 9129's
    steps are already satisfied on this branch and only need carrying over: serialized metadata of
    migrated functions is preserved (the per-function array serde described above), and the "when to
    use `RowFn`" guidance is written in `vortex-array/src/scalar_fn/mod.rs`.
@@ -322,10 +347,12 @@ Four of their unresolved questions are genuinely open, and two of them this bran
   three already carry defaults chosen for internal convenience (`DECODE_SHRINKS_WHEN_FILTERED` is
   `false`, `decode_null_tolerant` forwards to `decode`). If they go public, audit which defaults are
   the *safe* answer rather than the common one.
-- **Does `OutputSink::sink_dtype` need access to function options?** (9129.) Today it takes only the
-  input dtypes, which is what lets a tensor row's runtime width come from its arguments. No adopter
-  wants options there yet, so the question is whether option-dependent output dtypes can stay
-  unsupported initially.
+- **What is the first production `OutputSink` adopter?** (9129.) `L2Denorm` no longer qualifies
+  because its normalized child and authoritative norm are an encoding representation. The likely
+  adopter is a builder-backed string transform such as `upper`, `lower`, or `replace`. Until one
+  lands, omit the sink surface from the initial RowFn PRs rather than stabilizing it from synthetic
+  tests alone. When it does land, also answer whether `sink_dtype` needs access to function options;
+  the current design sees only input dtypes.
 - **What benchmark set and regression threshold gate replacing a hand-written implementation?**
   (9130.) This branch has no policy, only precedent: per-adopter divan benchmarks with constant and
   non-constant arms, `fastest` of two runs, and one accepted regression (1 to 3% on the

@@ -13,9 +13,9 @@
 //! closure. Implement `RowFn` when the function fits it, and `ScalarFnVTable` when it does not.
 //!
 //! [`RowFn`] is for a kernel whose value at a row is determined by that row alone, and which has to
-//! read every row anyway: `vortex.byte_length`, `vortex.tensor.l2_norm`, `vortex.tensor.l2_denorm`,
-//! `vortex.geo.distance`. Name the element types and write the row closure, and the rest is derived,
-//! including which rows get visited.
+//! read every row anyway: `vortex.byte_length`, `vortex.tensor.l2_norm`,
+//! `vortex.tensor.inner_product`, `vortex.geo.distance`. Name the element types and write the row
+//! closure, and the rest is derived, including which rows get visited.
 //!
 //! Its *input* side is open. [`InputElement::Elem`] is a GAT, so an element can hand the closure
 //! borrowed variable-length data ([`Bytes`] yields `&[u8]`) or drill through a wrapper
@@ -28,8 +28,8 @@
 //!   row, whose dtype is fixed by its Rust type. This is the common case.
 //! - [`RowVisitor::visit_into`] takes one that **writes** into an [`OutputSink`], allocated once per
 //!   batch knowing the output dtype and handing out a place to write. That carries what an owned
-//!   per-row value cannot. `vortex.tensor.l2_denorm` writes each row into a slice of one flat buffer,
-//!   so its output width can be runtime data and it allocates once rather than once per row.
+//!   per-row value cannot, such as a future string transform appending every row into one shared
+//!   byte buffer instead of allocating one owned string per row.
 //!
 //! When part of the kernel's work depends only on an operand that is constant for the batch (the
 //! norm of a broadcast query vector, a prepared form of a constant geometry), visit through

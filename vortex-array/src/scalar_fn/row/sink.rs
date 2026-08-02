@@ -12,10 +12,10 @@ use crate::dtype::DType;
 ///
 /// This is the second of the two ways a [`RowFn`](crate::scalar_fn::RowFn) produces output, and it
 /// exists for what the first cannot express. An [`OutputElement`](crate::scalar_fn::OutputElement) is
-/// one owned value per row whose dtype is a property of its Rust type, which rules out an output whose
-/// *width* is runtime data: a tensor row would mean an allocation per row, and its dtype is not
-/// knowable from the type alone. A sink resolves both, because it is created knowing the output dtype
-/// and hands out a place to write rather than taking a value back.
+/// one owned value per row whose dtype is a property of its Rust type. That rules out an output whose
+/// *width* is runtime data, and makes builder-backed output such as a transformed string allocate an
+/// owned value per row. A sink resolves both: it is created knowing the output dtype and owns the
+/// batch-wide builder while handing out a place to write rather than taking a value back.
 ///
 /// Two properties of the contract are worth stating, since both are load-bearing:
 ///

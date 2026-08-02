@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--SPDX-FileCopyrightText: Copyright the Vortex contributors -->
+
 # A layered authoring API for strict scalar functions
 
 **Status: proposal, feature-complete on this branch.** Most scalar functions in Vortex are
@@ -13,6 +16,18 @@ Every pre-existing test passes unchanged, plus new regression tests for the inva
 now enforces. Along the way it turned up three problems that are not about the framework, filed as
 #9091, #9090 and #9092 and discussed in
 [Problems to extract](#problems-to-extract-onto-develop).
+
+> **Later architecture decision:** `L2Denorm` is not a scalar-function adopter. Its normalized
+> child and authoritative stored norms form a physical representation with cross-value invariants,
+> so it is moving to a dedicated tensor encoding at the bottom of the PR stack. Sections below that
+> describe its `RowFn`/`OutputSink` port remain as a record of the experiment and its measurements,
+> not as the intended architecture.
+>
+> This does not invalidate `OutputSink`. A future string library still needs a batch-owned builder
+> for functions such as `upper`, `lower`, and `replace`; returning one owned string per row would
+> add avoidable allocation and copying. It does remove the current production consumer, so the
+> initial RowFn PRs can omit `visit_into`, `OutputSink`, `SinkResult`, and `TensorSink`, with issue
+> 9129 retaining the design as an additive follow-up to land with the first string consumer.
 
 ---
 
@@ -502,8 +517,11 @@ output that *aliases* its input, since `trim` and `substring` want to keep the i
 rewrite only views, copying nothing, and a sink still copies bytes into itself. Likewise kernels whose
 natural unit is not a row (`not`'s word-at-a-time negation, `binary`'s slice kernels) gain nothing.
 
-The sink is also what a `str -> str` string library needs, so it has a second prospective user beyond
-tensors, which was the argument for generalizing it rather than special-casing `&mut [T]`.
+The sink is also what a `str -> str` string library needs. After reclassifying `L2Denorm` as an
+encoding, that string library becomes the prospective first production user rather than a second
+one. The experiment still demonstrates that the generic sink can carry runtime-shaped and
+builder-backed outputs without making the returning path pay, but it should not be stabilized from
+the tensor experiment alone.
 
 ---
 

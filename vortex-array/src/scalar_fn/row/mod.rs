@@ -24,8 +24,8 @@
 //! Output comes in two forms, and a dispatch picks one per visit. [`RowVisitor::visit`] takes a
 //! closure that *returns* an [`OutputElement`] per row, which is the common case.
 //! [`RowVisitor::visit_into`] takes one that *writes* its row into an [`OutputSink`], which carries
-//! what an owned per-row value cannot: a runtime-shaped row such as a tensor, or bytes appended to a
-//! buffer shared by the whole batch.
+//! what an owned per-row value cannot: a runtime-shaped row, or bytes appended to a buffer shared by
+//! the whole batch as a future string library will need.
 //!
 //! [`RowVisitor::visit_prepared`] adds a per-batch prepare step to the returning form: it is handed
 //! the element value of every argument whose operand is constant for the batch, and whatever it
