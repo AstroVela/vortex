@@ -25,10 +25,12 @@ use jni::objects::JString;
 use jni::sys::jlong;
 use vortex::aggregate_fn::Accumulator;
 use vortex::aggregate_fn::DynAccumulator;
+use vortex::aggregate_fn::EmptyOptions;
 use vortex::aggregate_fn::NumericalAggregateOpts;
 use vortex::aggregate_fn::fns::count::Count;
 use vortex::aggregate_fn::fns::max::Max;
 use vortex::aggregate_fn::fns::min::Min;
+use vortex::aggregate_fn::fns::nan_count::NanCount;
 use vortex::aggregate_fn::fns::sum::Sum;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
@@ -47,6 +49,7 @@ use vortex::dtype::DType;
 use vortex::dtype::FieldName;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
+use vortex::dtype::half::f16;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
@@ -91,17 +94,20 @@ impl AggKind {
     }
 
     fn state(self, dtype: DType) -> VortexResult<AggState> {
+        let opts = NumericalAggregateOpts::default();
         Ok(match self {
-            Self::Min => AggState::Column(Box::new(Accumulator::try_new(
-                Min,
-                opts_for(&dtype),
-                dtype,
-            )?)),
-            Self::Max => AggState::Column(Box::new(Accumulator::try_new(
-                Max,
-                opts_for(&dtype),
-                dtype,
-            )?)),
+            Self::Min if dtype.is_float() => AggState::MinMaxFloat {
+                is_max: false,
+                inner: Box::new(Accumulator::try_new(Min, opts, dtype.clone())?),
+                nan_count: Box::new(Accumulator::try_new(NanCount, EmptyOptions, dtype)?),
+            },
+            Self::Max if dtype.is_float() => AggState::MinMaxFloat {
+                is_max: true,
+                inner: Box::new(Accumulator::try_new(Max, opts, dtype.clone())?),
+                nan_count: Box::new(Accumulator::try_new(NanCount, EmptyOptions, dtype)?),
+            },
+            Self::Min => AggState::Column(Box::new(Accumulator::try_new(Min, opts, dtype)?)),
+            Self::Max => AggState::Column(Box::new(Accumulator::try_new(Max, opts, dtype)?)),
             Self::Count => AggState::Column(Box::new(Accumulator::try_new(
                 Count,
                 opts_for(&dtype),
@@ -116,14 +122,29 @@ impl AggKind {
     }
 }
 
-/// Spark treats NaN as an ordinary (largest) value, so NaNs must flow into the accumulators
-/// rather than being skipped like the statistics default.
+/// SUM and COUNT options: Spark propagates NaN into sums and counts NaN as an ordinary
+/// non-null value, so NaNs must flow into these accumulators rather than being skipped like
+/// the statistics default. Float MIN/MAX instead skip NaNs and recover Spark's NaN-is-largest
+/// ordering from a [`NanCount`] (see [`AggState::MinMaxFloat`]).
 fn opts_for(dtype: &DType) -> NumericalAggregateOpts {
     if dtype.is_float() {
         NumericalAggregateOpts::include_nans()
     } else {
         NumericalAggregateOpts::default()
     }
+}
+
+/// A NaN scalar of the given float dtype.
+fn nan_scalar(dtype: &DType) -> VortexResult<Scalar> {
+    let DType::Primitive(ptype, _) = dtype else {
+        vortex_bail!("NaN scalar requires a float dtype, got {dtype}");
+    };
+    Ok(match ptype {
+        PType::F16 => Scalar::primitive(f16::NAN, Nullability::Nullable),
+        PType::F32 => Scalar::primitive(f32::NAN, Nullability::Nullable),
+        PType::F64 => Scalar::primitive(f64::NAN, Nullability::Nullable),
+        _ => vortex_bail!("NaN scalar requires a float dtype, got {dtype}"),
+    })
 }
 
 /// One requested aggregate: its kind and, for column aggregates, the index of its column in
@@ -138,6 +159,14 @@ enum AggState {
     /// count(*): folded from chunk lengths, no accumulator needed.
     RowCount,
     Column(Box<dyn DynAccumulator>),
+    /// Float MIN/MAX under Spark's ordering, where NaN is larger than every other value. The
+    /// inner accumulator skips NaNs entirely; the NaN count recovers the cases whose result
+    /// must be NaN: any NaN present for max, and NaN with no other non-null values for min.
+    MinMaxFloat {
+        is_max: bool,
+        inner: Box<dyn DynAccumulator>,
+        nan_count: Box<dyn DynAccumulator>,
+    },
     /// SQL SUM over a column. Vortex's sum of zero non-null values is `0`, but SQL requires
     /// `NULL`, so a non-null count is tracked alongside the sum.
     Sum {
@@ -151,6 +180,12 @@ impl AggState {
         match self {
             Self::RowCount => Ok(()),
             Self::Column(accumulator) => accumulator.accumulate(batch, ctx),
+            Self::MinMaxFloat {
+                inner, nan_count, ..
+            } => {
+                inner.accumulate(batch, ctx)?;
+                nan_count.accumulate(batch, ctx)
+            }
             Self::Sum {
                 sum,
                 non_null_count,
@@ -165,6 +200,23 @@ impl AggState {
         match self {
             Self::RowCount => Ok(Scalar::from(row_count as i64)),
             Self::Column(mut accumulator) => accumulator.finish(),
+            Self::MinMaxFloat {
+                is_max,
+                mut inner,
+                mut nan_count,
+            } => {
+                let nans = nan_count
+                    .finish()?
+                    .as_primitive()
+                    .typed_value::<u64>()
+                    .ok_or_else(|| vortex_err!("NaN count must not be null"))?;
+                let value = inner.finish()?;
+                if nans > 0 && (is_max || value.is_null()) {
+                    nan_scalar(value.dtype())
+                } else {
+                    Ok(value)
+                }
+            }
             Self::Sum {
                 mut sum,
                 mut non_null_count,
