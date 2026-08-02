@@ -6,6 +6,7 @@ package dev.vortex.api;
 import com.google.common.base.Preconditions;
 import dev.vortex.VortexCleaner;
 import dev.vortex.io.NativeReadable;
+import dev.vortex.jni.NativeAggregate;
 import dev.vortex.jni.NativeDataSource;
 import java.util.Arrays;
 import java.util.Collections;
@@ -13,9 +14,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
+import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -223,6 +226,42 @@ public final class DataSource {
                 return OptionalLong.of(value);
             }
         }
+    }
+
+    /**
+     * Evaluate aggregates natively over this data source, optionally restricted by a filter expression.
+     *
+     * <p>Returns an {@link ArrowReader} that yields a single record batch with a single row: one column per requested
+     * aggregate, in request order. Aggregate semantics are described on {@link Aggregate}. The caller must close the
+     * reader when finished.
+     *
+     * @param aggregates aggregates to evaluate; must not be empty
+     * @param filter optional row filter applied before aggregation, or {@code null} for none
+     * @param allocator allocator that owns the imported Arrow data
+     */
+    public ArrowReader aggregate(List<Aggregate> aggregates, Expression filter, BufferAllocator allocator) {
+        Objects.requireNonNull(aggregates, "aggregates");
+        Objects.requireNonNull(allocator, "allocator");
+        Preconditions.checkArgument(!aggregates.isEmpty(), "at least one aggregate is required");
+
+        byte[] kinds = new byte[aggregates.size()];
+        String[] columns = new String[aggregates.size()];
+        for (int i = 0; i < aggregates.size(); i++) {
+            Aggregate aggregate = Objects.requireNonNull(aggregates.get(i), "aggregate");
+            kinds[i] = aggregate.kind().code();
+            columns[i] = aggregate.column();
+        }
+        long filterPtr = filter == null ? 0L : filter.nativePointer();
+
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator);
+        try {
+            NativeAggregate.compute(
+                    session.nativePointer(), pointer, kinds, columns, filterPtr, stream.memoryAddress());
+        } catch (RuntimeException ex) {
+            stream.close();
+            throw ex;
+        }
+        return Data.importArrayStream(allocator, stream);
     }
 
     /** Submit a scan. */

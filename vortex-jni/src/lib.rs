@@ -18,6 +18,7 @@ macro_rules! throw_runtime {
     };
 }
 
+mod aggregate;
 mod data_source;
 mod errors;
 mod expression;
