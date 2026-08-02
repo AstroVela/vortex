@@ -156,7 +156,10 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         }
     }
 
-    private static Optional<Expression> buildFilterExpression(Predicate[] predicates) {
+    /**
+     * Converts pushed predicates to a single conjunctive Vortex filter expression. Shared with the aggregate reader.
+     */
+    static Optional<Expression> buildFilterExpression(Predicate[] predicates) {
         Expression combined = null;
         for (Predicate predicate : predicates) {
             Optional<Expression> expr = SparkPredicateToVortexExpression.convert(predicate);

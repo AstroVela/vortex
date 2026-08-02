@@ -7,6 +7,7 @@ import static com.google.common.base.Preconditions.checkState;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
+import dev.vortex.api.Aggregate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -23,6 +24,9 @@ import org.apache.spark.sql.connector.expressions.aggregate.AggregateFunc;
 import org.apache.spark.sql.connector.expressions.aggregate.Aggregation;
 import org.apache.spark.sql.connector.expressions.aggregate.Count;
 import org.apache.spark.sql.connector.expressions.aggregate.CountStar;
+import org.apache.spark.sql.connector.expressions.aggregate.Max;
+import org.apache.spark.sql.connector.expressions.aggregate.Min;
+import org.apache.spark.sql.connector.expressions.aggregate.Sum;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
@@ -31,8 +35,21 @@ import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownTableSample;
 import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
+import org.apache.spark.sql.types.BooleanType;
+import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.DateType;
+import org.apache.spark.sql.types.DecimalType;
+import org.apache.spark.sql.types.DoubleType;
+import org.apache.spark.sql.types.FloatType;
+import org.apache.spark.sql.types.IntegerType;
+import org.apache.spark.sql.types.LongType;
+import org.apache.spark.sql.types.ShortType;
+import org.apache.spark.sql.types.StringType;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.types.TimestampNTZType;
+import org.apache.spark.sql.types.TimestampType;
 
 /** Spark V2 {@link ScanBuilder} for table scans over Vortex files. */
 public final class VortexScanBuilder
@@ -52,6 +69,7 @@ public final class VortexScanBuilder
     private int limit = VortexScan.NO_LIMIT;
     private int pushedCountColumns = 0;
     private VortexTableSample tableSample;
+    private List<PushedAggregate> pushedAggregates;
 
     /** Creates a new VortexScanBuilder with empty paths and columns. */
     public VortexScanBuilder(Map<String, String> formatOptions) {
@@ -139,6 +157,9 @@ public final class VortexScanBuilder
         if (pushedCountColumns > 0) {
             return new VortexCountScan(paths, this.formatOptions, pushedCountColumns);
         }
+        if (pushedAggregates != null) {
+            return new VortexAggregateScan(paths, this.formatOptions, pushedAggregates, pushedPredicates);
+        }
 
         return new VortexScan(
                 paths,
@@ -175,24 +196,32 @@ public final class VortexScanBuilder
     }
 
     /**
-     * Accepts aggregations that count rows: any combination of {@code COUNT(*)} and {@code COUNT(col)} over
-     * non-nullable data columns, without grouping. Every accepted aggregate evaluates to the file row count recorded in
-     * the Vortex footer, so the scan can answer from metadata without decoding any data. The pushdown is partial (see
-     * {@link SupportsPushDownAggregates#supportCompletePushDown}): the scan emits one count per file and Spark sums
-     * them.
+     * Accepts ungrouped aggregations that Vortex can answer without decoding rows into Spark. The pushdown is partial
+     * (see {@link SupportsPushDownAggregates#supportCompletePushDown}): the scan emits one row of per-file aggregate
+     * values and Spark re-aggregates them.
      *
-     * <p>Rejected cases fall back to a regular scan: grouped aggregations, distinct counts, counts of nullable or
-     * partition columns (their null counts are not recorded), other aggregate functions, and scans that already pushed
-     * predicates (the footer count does not reflect filtering).
+     * <p>Two strategies are used, in order of preference:
+     *
+     * <ul>
+     *   <li><b>Footer counts:</b> when no predicates were pushed and every aggregate is {@code COUNT(*)} or
+     *       {@code COUNT(col)} over a non-nullable data column, the counts are answered from the file footers via
+     *       {@link VortexCountScan} without opening the data at all.
+     *   <li><b>Native aggregation:</b> otherwise, {@code MIN}/{@code MAX}/{@code SUM}/{@code COUNT}/{@code COUNT(*)}
+     *       over supported data column types are streamed through Vortex's native accumulators via
+     *       {@link VortexAggregateScan}, applying any pushed predicates before aggregation.
+     * </ul>
+     *
+     * <p>Rejected cases fall back to a regular scan: grouped aggregations, distinct aggregates, aggregates over
+     * partition or nested columns, {@code MIN}/{@code MAX} over floating point columns (Spark orders NaN above every
+     * value, Vortex does not), {@code SUM} over longs (Spark wraps on overflow, Vortex returns null), unsupported
+     * column types, and scans that already pushed a TABLESAMPLE or LIMIT (neither strategy reflects them).
      */
     @Override
     public boolean pushAggregation(Aggregation aggregation) {
-        if (pushedPredicates.length > 0) {
-            return false;
-        }
         if (tableSample != null || limit != VortexScan.NO_LIMIT) {
-            // A pushed TABLESAMPLE or LIMIT changes the row set; footer row counts no longer
-            // describe the scan output, so counts must fall back to a regular scan.
+            // A pushed TABLESAMPLE or LIMIT changes the row set; neither the footer row counts
+            // nor the native aggregate scan reflect it, so aggregates must fall back to a
+            // regular scan.
             return false;
         }
         if (aggregation.groupByExpressions().length > 0) {
@@ -202,6 +231,26 @@ public final class VortexScanBuilder
         if (funcs.length == 0) {
             return false;
         }
+
+        if (pushedPredicates.length == 0 && allCountableFromFooters(funcs)) {
+            this.pushedCountColumns = funcs.length;
+            return true;
+        }
+
+        List<PushedAggregate> translated = new ArrayList<>(funcs.length);
+        for (AggregateFunc func : funcs) {
+            PushedAggregate aggregate = translateAggregate(func);
+            if (aggregate == null) {
+                return false;
+            }
+            translated.add(aggregate);
+        }
+        this.pushedAggregates = List.copyOf(translated);
+        return true;
+    }
+
+    /** Whether every aggregate is answerable from footer row counts alone. */
+    private boolean allCountableFromFooters(AggregateFunc[] funcs) {
         for (AggregateFunc func : funcs) {
             if (func instanceof CountStar) {
                 continue;
@@ -211,8 +260,99 @@ public final class VortexScanBuilder
             }
             return false;
         }
-        this.pushedCountColumns = funcs.length;
         return true;
+    }
+
+    /** Maps one Spark aggregate onto a native Vortex aggregate, or returns {@code null} if it cannot be pushed. */
+    private PushedAggregate translateAggregate(AggregateFunc func) {
+        if (func instanceof CountStar) {
+            return new PushedAggregate(Aggregate.Kind.COUNT_STAR, null, DataTypes.LongType);
+        }
+        if (func instanceof Count count && !count.isDistinct()) {
+            String column = dataColumnName(count.column());
+            return column == null ? null : new PushedAggregate(Aggregate.Kind.COUNT, column, DataTypes.LongType);
+        }
+        if (func instanceof Min min) {
+            String column = dataColumnName(min.column());
+            DataType type = column == null ? null : columnType(column);
+            return type == null || !isMinMaxSupported(type)
+                    ? null
+                    : new PushedAggregate(Aggregate.Kind.MIN, column, type);
+        }
+        if (func instanceof Max max) {
+            String column = dataColumnName(max.column());
+            DataType type = column == null ? null : columnType(column);
+            return type == null || !isMinMaxSupported(type)
+                    ? null
+                    : new PushedAggregate(Aggregate.Kind.MAX, column, type);
+        }
+        if (func instanceof Sum sum && !sum.isDistinct()) {
+            String column = dataColumnName(sum.column());
+            DataType type = column == null ? null : columnType(column);
+            DataType resultType = type == null ? null : sumResultType(type);
+            return resultType == null ? null : new PushedAggregate(Aggregate.Kind.SUM, column, resultType);
+        }
+        return null;
+    }
+
+    /**
+     * Resolves an aggregate input to the name of a top-level data column stored in the Vortex files, or {@code null}
+     * when the reference is nested, unknown, or a partition column (partition values live in paths, not files).
+     */
+    private String dataColumnName(org.apache.spark.sql.connector.expressions.Expression expression) {
+        if (!(expression instanceof NamedReference ref) || ref.fieldNames().length != 1) {
+            return null;
+        }
+        String name = ref.fieldNames()[0];
+        if (partitionColumnNames.contains(name)) {
+            return null;
+        }
+        return columnType(name) == null ? null : name;
+    }
+
+    private DataType columnType(String name) {
+        for (Column column : tableColumns) {
+            if (column.name().equals(name)) {
+                return column.dataType();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Types whose native min/max ordering matches Spark's. Floating point columns are excluded because Spark orders NaN
+     * above every other value while Vortex does not define a total order over NaNs.
+     */
+    private static boolean isMinMaxSupported(DataType type) {
+        return type instanceof BooleanType
+                || type instanceof ByteType
+                || type instanceof ShortType
+                || type instanceof IntegerType
+                || type instanceof LongType
+                || type instanceof DateType
+                || type instanceof TimestampType
+                || type instanceof TimestampNTZType
+                || type instanceof StringType
+                || type instanceof DecimalType;
+    }
+
+    /**
+     * The Spark result type of a pushed {@code SUM}, mirroring {@code Sum.dataType}, or {@code null} when the input
+     * type cannot be pushed. {@code SUM(long)} is rejected because Spark wraps on overflow while Vortex saturates to
+     * null; decimal sums that Spark would widen beyond precision 38 are rejected for the same overflow-semantics
+     * reason.
+     */
+    private static DataType sumResultType(DataType type) {
+        if (type instanceof ByteType || type instanceof ShortType || type instanceof IntegerType) {
+            return DataTypes.LongType;
+        }
+        if (type instanceof FloatType || type instanceof DoubleType) {
+            return DataTypes.DoubleType;
+        }
+        if (type instanceof DecimalType decimal && decimal.precision() + 10 <= DecimalType.MAX_PRECISION()) {
+            return DataTypes.createDecimalType(decimal.precision() + 10, decimal.scale());
+        }
+        return null;
     }
 
     private boolean isNonNullableDataColumn(org.apache.spark.sql.connector.expressions.Expression expression) {
