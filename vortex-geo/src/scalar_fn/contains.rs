@@ -84,8 +84,16 @@ impl ScalarFnVTable for GeoContains {
     ) -> VortexResult<ArrayRef> {
         let a = args.get(0)?;
         let b = args.get(1)?;
-        // Containment is not symmetric: `a` is always the container and `b` the contained.
-        execute_null_propagating(&a, &b, |a, b| a.contains(b), ctx)
+        // Containment is not symmetric: `a` is always the container and `b` the contained. A
+        // container's rect must cover the contained's rect (`Rect::contains` is the closed
+        // test), so a contained rect poking outside proves the row false.
+        execute_null_propagating(
+            &a,
+            &b,
+            |a, b| a.contains(b),
+            Some(|ra, rb| (!ra.contains(rb)).then_some(false)),
+            ctx,
+        )
     }
 
     fn validity(
@@ -98,6 +106,10 @@ impl ScalarFnVTable for GeoContains {
 
     fn is_strict(&self, _: &Self::Options) -> bool {
         true
+    }
+
+    fn is_fallible(&self, _: &Self::Options) -> bool {
+        false
     }
 }
 
@@ -129,6 +141,7 @@ mod tests {
     use wkb::writer::WriteOptions;
 
     use super::GeoContains;
+    use crate::test_harness::linestring_column;
     use crate::test_harness::nullable_point_column;
     use crate::test_harness::point_column;
 
@@ -232,6 +245,20 @@ mod tests {
 
         assert_contains(around, point.clone(), [true; 2])?;
         assert_contains(away, point, [false; 2])
+    }
+
+    /// Constant container vs a linestring column: a row whose bounding rect pokes outside the
+    /// container's rect is proven false by the rect pre-check alone; a fully inside row still
+    /// needs (and passes) the exact test.
+    #[test]
+    fn constant_container_vs_row_rect_poking_outside() -> VortexResult<()> {
+        let container = geometry_constant(&Geometry::Polygon(rect_polygon(0.0, 0.0, 4.0, 4.0)), 3)?;
+        let lines = linestring_column(vec![
+            vec![(1.0, 1.0), (3.0, 3.0)],
+            vec![(1.0, 1.0), (9.0, 1.0)],
+            vec![(5.0, 5.0), (9.0, 9.0)],
+        ])?;
+        assert_contains(container, lines, [true, false, false])
     }
 
     /// Column vs column pairs rows: each polygon row is tested against the point row at the
