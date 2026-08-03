@@ -3,31 +3,18 @@
 
 # A layered authoring API for strict scalar functions
 
-**Status: proposal, feature-complete on this branch.** Most scalar functions in Vortex are
-[strict](https://github.com/vortex-data/vortex/pull/8930): a null input row forces a null output row,
-and non-null outputs depend only on non-null inputs. The null propagation, constant folding, validity
-bookkeeping, and nullability derivation that follow are identical in every implementation, and right
-now each function re-derives them by hand. This branch lifts them out into two authoring traits and
-an open element vocabulary, and ports eleven functions onto them as proof: `byte_length`,
-`list_length`, `not`, `list_sum`, the four `vortex-tensor` functions, and the three `vortex-geo`
-functions.
+**Status: historical design record, with the final prototype recorded at the end.** This document
+keeps the experiments in the order they happened, including APIs and ports that were later removed.
+The current architecture is one `RowFn` authoring trait, private lifting, one sink-backed
+`RowVisitor::visit_prepared_into` primitive, and an open input/output vocabulary. Read
+[`SCALAR_FN_HANDOFF.md`](SCALAR_FN_HANDOFF.md) for orientation, then the final section here before
+using an earlier sketch.
 
-Every pre-existing test passes unchanged, plus new regression tests for the invariants the framework
-now enforces. Along the way it turned up three problems that are not about the framework, filed as
-#9091, #9090 and #9092 and discussed in
-[Problems to extract](#problems-to-extract-onto-develop).
-
-> **Later architecture decision:** `L2Denorm` is not a scalar-function adopter. Its normalized
-> child and authoritative stored norms form a physical representation with cross-value invariants,
-> so it is moving to a dedicated tensor encoding at the bottom of the PR stack. Sections below that
-> describe its `RowFn`/`OutputSink` port remain as a record of the experiment and its measurements,
-> not as the intended architecture.
->
-> This does not invalidate `OutputSink`. A future string library still needs a batch-owned builder
-> for functions such as `upper`, `lower`, and `replace`; returning one owned string per row would
-> add avoidable allocation and copying. It does remove the current production consumer, so the
-> initial RowFn PRs can omit `visit_into`, `OutputSink`, `SinkResult`, and `TensorSink`, with issue
-> 9129 retaining the design as an additive follow-up to land with the first string consumer.
+> **Later architecture decisions:** `StrictScalarFnVTable`, the columnar ports, returning visits,
+> and the return witness were deleted. `L2Denorm` is classified publicly as an encoding because its
+> normalized child and authoritative stored norms form one physical representation, although this
+> prototype still uses its row implementation to exercise `TensorSink`. Sections below remain the
+> evidence that led to those decisions, not the API to implement.
 
 ---
 
@@ -1419,3 +1406,136 @@ reverted `list_sum` port is what removed its second implementor.
 
 If a non-row columnar kernel ever wants the lifting, extract the trait then, named for the lifting
 contract rather than for strictness, with that kernel as its first user.
+
+## Sink-only execution, the final prototype
+
+The last executor revision collapses every row function onto one primitive:
+
+```rust
+visitor.visit_prepared_into::<Args, Sink, _, _>(
+    |constant_args| prepare(constant_args),
+    |state, args, output| write_one_row(state, args, output),
+)
+```
+
+The ordinary case uses unit preparation and `ElementSink<T>`. A tensor uses `TensorSink<T>` so the
+input dtype can determine the runtime row width. A future string transform can own one batch-wide
+builder. These are not different executor modes, so the API no longer gives them different visit
+methods.
+
+### Why the return witness disappeared
+
+A returning row closure needed a return witness before dispatch so `return_dtype` and fallibility
+could be derived without knowing which dtype arm dispatch would select. Once every closure writes
+through a sink, the sink already answers the output question:
+
+- `sink_dtype(args)` supplies the non-nullable element or runtime-shaped dtype.
+- `with_capacity` allocates once for the batch.
+- `rows` borrows the loop-local storage once.
+- `row_count_matches` proves the output bound once.
+- `row` hands one slot into the closure.
+- `finish` builds the column and interprets any deferred error.
+
+`RowFn::ArgsWitness` remains load-bearing because arity and input decode properties are needed
+before dispatch. `RowFn::FALLIBLE` remains because `ScalarFnVTable::is_fallible` is queried without
+input dtypes. There is no analogous need for a return witness.
+
+The closure stays `Fn`, not `FnMut`. An earlier sink design captured `&mut Sink` in the closure and
+measured 8 to 11% slower because the mutable capture blocked loop vectorization. The executor now
+owns the sink, borrows its rows once, and passes a row slot as an ordinary argument.
+
+### Errors without a per-row result branch
+
+`SinkResult` has three implementations:
+
+- `()` for an infallible write.
+- `VortexResult<()>` for an error that must exit immediately.
+- `DeferredError` for a row that can write a legal provisional value and report failure after the
+  loop.
+
+Checked integer addition is the motivating deferred case. Its sink writes the wrapping sum, each
+row returns a word whose sign bit means overflow, and the executor OR-reduces those words. `finish`
+returns the overflow error only when the final word has its sign bit set. No `Result` discriminant
+or conditional error branch is required per row.
+
+Nullable dense execution needs one extra rule. Garbage behind a null may overflow even when every
+valid row succeeds. When dense execution finishes with a deferred error, the lifting materializes
+the conjoined validity and retries only valid rows. A successful retry proves the first error came
+only from discarded rows; a second deferred error is real. This preserves strict null propagation
+without giving up the dense vector loop on the common path.
+
+This is deliberately narrow. Parsing, allocation, and any computation that cannot produce a legal
+provisional row still returns `VortexResult<()>` and receives valid-row-only execution.
+
+### Skipped rows are a sink property
+
+`OutputSink::SUPPORTS_SKIPPED_ROWS` replaces the earlier blanket statement that sinks cannot use
+branch-and-skip. `ElementSink<T>` pre-fills `OutputElement::placeholder` and supports skipped rows.
+A custom sink may do the same, or decline and let the lifting filter and scatter. The semantic
+contract remains that skipped values are legal but arbitrary and are masked before the result
+escapes.
+
+### Final executor measurements and IR
+
+The final `row_fn_executor` run used 65,536 `i64` rows, 100 samples and a one-second minimum per arm:
+
+| workload | specialized median | sink-only `RowFn` median | delta |
+| --- | ---: | ---: | ---: |
+| checked add, two columns | 13.54 us | 13.79 us | 1.8% slower |
+| checked add, column and constant | 12.83 us | 11.33 us | 11.7% faster |
+| checked add, nullable columns | 12.91 us | 12.95 us | 0.3% slower |
+
+The corresponding LLVM IR has vector error-word accumulators and
+`llvm.vector.reduce.or.v2i64`. The typed row loads, wrapping sums, overflow-word ORs, and stores are
+one vector loop; no `RowFn`, visitor, sink, dynamic dispatch, or per-row `VortexResult` remains in
+that body. The remaining ordinary-column difference is setup and output construction around the
+loop. The constant arm is faster because stride-zero decoding and preparation remove work the
+specialized operator path still performs.
+
+Other final diagnostic medians:
+
+- `strict_validity` lazy versus eager stayed within 2% across 65,536 and 1,048,576 rows, including
+  a chain of three calls.
+- `byte_length_element` found `BytesLen` 28 to 29% faster than resolving a byte slice at 65,536
+  rows. This justifies the element choice but is not a production benchmark.
+- `null_strategy_bytes` auto matched branch-and-skip; at 90% nulls it took 24.95 us against
+  175.4 us for filter-and-scatter.
+- Geo auto tracked branch at dense validity and filter at sparse validity for both one- and
+  two-nullable-operand shapes. The full forced-strategy matrix remains an implementation
+  diagnostic, not permanent CodSpeed coverage.
+- Distinct per-row LIKE patterns took 126.4 us against 26.87 us for a repeated pattern, 4.7x
+  slower. That is the measured reason LIKE remains a stateful columnar implementation.
+
+### Durable benchmark boundary
+
+Draft PR [#9136](https://github.com/vortex-data/vortex/pull/9136) now owns the stable production
+benchmark names. At `bf814bbe02cb` it covers public-path byte length; signed and unsigned add,
+including constant and nullable inputs; repeated and distinct LIKE patterns; tensor functions and
+the `Normalized` encoding; and geo contains, intersects, and distance with constant and nullable
+shapes. It also reduces the expensive overlapping-contains simulation to 1,024 rows and uses
+vendored `mimalloc` in allocating binaries.
+
+Do not merge the research harnesses above into that permanent suite. They compare internal
+strategies or frozen controls that do not exist on develop. Land #9136 first, then use its identical
+benchmark names to gate each production implementation PR through CodSpeed's compiled amd64/AVX2
+simulation. Keep local Divan for real wall-clock diagnosis and generated IR for explaining a
+regression.
+
+### Final API consequence
+
+Issue 9129's current sketch is obsolete: it still has `RetWitness`, `visit`, `visit_prepared`, and
+`visit_into`. Issue 9130 still says sink-backed execution cannot branch-and-skip. Update both before
+using their checklists to cut the implementation stack. The prototype to carry forward is:
+
+```text
+RowFn
+  -> dispatches Args + OutputSink through visit_prepared_into
+  -> private Batch lifting chooses dense, branch-and-skip, or filter-and-scatter
+  -> ElementSink covers ordinary output
+  -> custom sinks cover runtime shape and deferred errors
+  -> ScalarFnVTable blanket impl exposes the function
+```
+
+Nullable outputs remain separate. A sink can build values plus validity, but doing so invalidates
+the unconditional `validity() = union_child_validities` derivation. That semantic change should
+land with its first strict non-total user, not inside the initial sink executor.

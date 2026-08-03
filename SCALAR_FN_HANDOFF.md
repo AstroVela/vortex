@@ -9,19 +9,21 @@ alternatives that were rejected and why; this file is the orientation and the pl
 then that. Both are working notes that live on this branch only: they are not meant to land in the
 pull-request stack, and the tracking issue is their public form.
 
-The design is now proposed publicly, in three issues that Connor wrote by hand and that supersede
-this file wherever they disagree:
+The design is proposed publicly in three issues that Connor wrote by hand. Their goals and scope
+remain authoritative, but the API and executor sketches in 9129 and 9130 predate the final
+sink-only refactor. This handoff records the current prototype until those issues are updated:
 
 - **Epic 9128, Row-oriented scalar functions.** Goals, motivation (the `Hypot` walkthrough of
   everything an author has to get right today), non-goals, and the current benchmark/codegen
   record in its [follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802).
   Status is *Proposed*, and it links this branch and its diffshub comparison as the prototype, so
   the branch is now publicly referenced: do not rewrite or delete it.
-- **9129, Define the `RowFn` API.** The author-facing surface, with the trait sketches and worked
-  `Hypot` and `CosineSimilarity` examples. Its Steps list is the API work plan.
+- **9129, Define the `RowFn` API.** The author-facing surface, with trait sketches and worked
+  `Hypot` and `CosineSimilarity` examples. Its current return-witness and three-visit design is
+  obsolete.
 - **9130, Execute `RowFn` over Vortex arrays.** The private lifting, the two null-handling
-  contracts, and adaptive execution. Its Steps list is the machinery work plan. Marked WIP because
-  the mechanics may optimize further.
+  contracts, and adaptive execution. Its current statement that sinks cannot branch-and-skip is
+  obsolete.
 
 Both tracking issues end with an "Implementation history" section reading "None yet". Add each pull
 request there as it lands; that is the intended record of progress.
@@ -29,50 +31,72 @@ request there as it lands; that is the intended record of progress.
 This branch is where the design was worked out and measured, and the plan below turns it into small
 reviewable pull requests cut fresh from develop.
 
-## Architecture update: `L2Denorm` is an encoding
+## Final prototype status
 
-The original prototype used `L2Denorm` as the first production `OutputSink` adopter. That
-classification has since been rejected: its normalized child and authoritative stored norms form a
-physical representation with cross-value invariants, so it belongs in a dedicated tensor encoding,
-not behind `RowFn`. A separate agent is preparing that encoding as the new bottom PR in the stack.
+The final prototype is commit `b918a8fb1f`, on top of the loop work in `3e675c9aaa`. It makes an
+output sink the only row-execution model. `RowVisitor` now has one method,
+`visit_prepared_into`; ordinary scalar outputs use `ElementSink<T>`, and runtime-shaped outputs use
+a custom sink. `RowFn` has no return witness because the sink owns the output dtype and builder.
 
-This changes the staging argument for sinks, not the sink design itself. Once `L2Denorm` moves,
-`visit_into` and `OutputSink` have no current production consumer. They still cover an important
-future class that `OutputElement` cannot: builder-backed outputs such as `upper`, `lower`, and
-`replace`, which should append all rows into one string buffer rather than allocate an owned string
-per row. Do not infer from the missing first adopter that sinks are unnecessary.
+This is simpler than the three-mode API in issue 9129 and faster than the earlier returning loop.
+The framework borrows the sink's row storage once, validates its length once, and passes one row
+slot into an `Fn` closure. A captured mutable sink would require `FnMut` and measured 8 to 11%
+slower because it inhibited vectorization. Keep the row slot explicit.
 
-For the initial RowFn PRs, prefer omitting `visit_into`, `OutputSink`, `SinkResult`, and `TensorSink`
-unless another production consumer lands with them. Preserve the design and measurements in the
-research document, and track the additive sink API in issue 9129 so a future string-library PR can
-add it without redesigning `RowFn`. Before cutting the stack, update issue 9129's examples and Steps
-so they no longer present `L2Denorm` as the reason to stabilize the sink surface.
+Fallible kernels now have two forms. `VortexResult<()>` still exits on the first real error and
+therefore gets valid-row-only execution. `DeferredError` is for operations such as checked add that
+can write a memory-safe provisional value for every row. The executor OR-reduces one error word
+across the batch and asks the sink to report it from `finish`. A nullable dense batch that reports a
+deferred error is retried over only its valid rows, which discards errors caused by garbage behind
+nulls without putting a branch or `VortexResult` discriminant in the hot loop.
+
+`L2Denorm` remains implemented through the row machinery on this prototype, but its normalized
+child and authoritative stored norms are now classified publicly as an encoding. The baseline PR
+therefore benchmarks the renamed `Normalized` encoding rather than presenting it as a scalar
+function. This classification does not weaken the sink result: `TensorSink` remains a production
+runtime-shaped sink, and checked add demonstrates the deferred-error form.
 
 ## Current benchmark and codegen record
 
 The [issue #9128 benchmark and codegen follow-up](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802)
-is the authoritative current comparison. It states the machine and harness, reports two-run
-fastest and median results, documents the control-arm limitations, and includes representative
-generated LLVM IR and assembly. Older shared-VM numbers in this handoff remain historical context,
-not the current branch-versus-develop record.
+remains the broad branch-versus-develop comparison for tensor and geo. It predates the sink-only
+executor, so use the final checked-add measurements below for the machinery itself.
+
+At 65,536 `i64` rows, 100 samples and a one-second minimum per arm, the sink-only checked-add
+medians were:
+
+| workload | specialized | `RowFn` | delta |
+| --- | ---: | ---: | ---: |
+| two columns | 13.54 us | 13.79 us | 1.8% slower |
+| column and constant | 12.83 us | 11.33 us | 11.7% faster |
+| nullable columns | 12.91 us | 12.95 us | 0.3% slower |
+
+The generated LLVM IR contains vector error-word OR accumulators and
+`llvm.vector.reduce.or.v2i64`; there is no per-row result discriminant or error branch. The
+remaining ordinary two-column difference is framework setup and output construction around a hot
+loop that has reached the intended shape, not a hidden `VortexResult` in that loop.
+
+The other final diagnostic runs support keeping the abstractions separate. Lazy and eager validity
+were within 2% in every `strict_validity` arm. `BytesLen` was 28 to 29% faster than resolving a byte
+slice for `byte_length`, which justifies the specialized input element but is not a permanent
+production benchmark. Distinct per-row LIKE patterns were 4.7x slower than repeated patterns,
+which confirms that state shared across rows belongs outside `RowFn`.
 
 ## Where the work lives
 
-Everything is on `claude/strict-scalar-fn-abstraction-ah88x3`, which is the designated development
-branch and the only branch to push to. Two earlier split branches
-(`claude/strict-scalar-fn-vtable-ah88x3`, `claude/row-fn-ah88x3`) are fully contained in this one
-and should be deleted from the remote; `git push --delete` is blocked by the permission classifier,
-so that is a manual step in the GitHub UI. There is no open pull request, by design: the plan is to
-propose this as a clean stack of small PRs cut fresh from develop, not to merge this branch.
+Everything is on `claude/strict-scalar-fn-abstraction-ah88x3`. The branch is publicly linked from
+epic 9128 and is a prototype record, not a merge candidate. Commit `b918a8fb1f` is currently one
+local commit ahead of the remote branch; this handoff update will be the second. Do not rewrite the
+published history. Push the final implementation and documentation commits only when explicitly
+requested.
 
-A scratch worktree at `/home/user/vortex-nullproto` (branch `proto/null-strategies`) holds an
-unmerged prototype kept only for reference. It is not to be pushed.
-
-Working notes from the session live in the session scratchpad, notably
-`null_strategy_report.md` (prototype measurements), `branch_skip_impl_report.md` (implementation
-report), `nonstrict_survey.md` (the non-strict function survey), and
-`null_strategy_prototype.diff`. These are disposable; anything load-bearing was folded into
-`STRICT_SCALAR_FN_RESEARCH.md`.
+The production benchmark baseline is separate: draft PR
+[#9136](https://github.com/vortex-data/vortex/pull/9136), branch `ct/scalar-fn-baselines`, currently
+at `bf814bbe02cb`. It includes public-path baselines for byte length, binary add, LIKE, tensor,
+geo predicates, and geo distance; scales the expensive overlapping-contains arm to 1,024 rows;
+and gives each allocating binary a vendored `mimalloc`. It is stacked on
+`ct/scalar-fn-factory-ext` and currently reports `DIRTY`, so resolve the stack before treating it as
+ready to merge.
 
 ## What exists, in dependency order
 
@@ -92,19 +116,32 @@ hands over and one trying branch-and-skip over the conjoined mask. This used to 
 `StrictScalarFnVTable`, which was deleted; see the last section of the research document for why and
 for what replaced each of its members.
 
-**`RowVisitor`** has three methods. `visit_prepared` is the primitive for returning kernels and
-runs a `prepare` closure once per batch over whichever operands are batch-constant, threading the
-result to every row by `&P`. `visit` is a provided method deriving from it with unit state (a ZST,
-so it monomorphizes to the identical loop; verified by benchmark parity). `visit_into` is the
-primitive for kernels writing into an `OutputSink`, which exists for outputs whose width is runtime
-data (a tensor row) or that append into one buffer for the batch.
+**`RowVisitor`** has one method: `visit_prepared_into`. It chooses an argument tuple, an output
+sink, a batch preparation closure, and a row closure. Passing `|_| ()` is the unprepared case;
+choosing `ElementSink<T>` is the ordinary one-value-per-row case. The API does not retain aliases
+for those combinations because the executor never needs separate methods and every implementation
+must already understand the complete primitive.
 
-**Adaptive null strategy** is the most recent framework work. `row_null_handling` (in
+**`OutputSink`** owns the return contract. `sink_dtype` derives the non-nullable output dtype from
+the input dtypes, `with_capacity` allocates once, `rows` exposes loop-local storage,
+`row_count_matches` discharges the output bound once, `row` hands one slot to the closure, and
+`finish` builds the array. `ElementSink<T>` adapts an ordinary `OutputElement`; `TensorSink<T>`
+writes runtime-width tensor rows. `SUPPORTS_SKIPPED_ROWS` controls branch-and-skip, while
+`ERRORS_ARE_DEFERRED` opts a sink into batch-wide error accumulation.
+
+**`SinkResult`** is the only row return contract: `()` for infallible writes,
+`VortexResult<()>` for early errors, and `DeferredError` for a failure bit reduced across the full
+loop. The value itself is already in the sink, which is why no `RetWitness` or returning
+`ApplyResult` remains.
+
+**Adaptive null strategy** is implemented. `row_null_handling` (in
 `row/execute.rs`) derives `Dense` (run over the garbage behind null rows, mask after) or `Filter`
 (the kernel must never see a null row) from element dense-safety and fallibility. `Filter` names
 that *contract*, and two mechanisms satisfy it: the original filter-and-scatter, and
 branch-and-skip, which decodes full length null-tolerantly and visits only mask-set rows
-word-at-a-time. The lifting chooses per batch from `Mask::true_count` and
+word-at-a-time. A sink participates when `SUPPORTS_SKIPPED_ROWS` is true; otherwise the branch
+attempt declines and filtering remains the fallback. The lifting chooses per batch from
+`Mask::true_count` and
 `InputElement::DECODE_SHRINKS_WHEN_FILTERED`, a defaulted const that is `true` only for elements
 whose decode parses every row (geo geometries). Threshold
 `BRANCH_MIN_SURVIVING_FRACTION = 0.75`, with the measured crossover tables cited in its doc
@@ -116,25 +153,28 @@ benchmark, `execute_row_fn_with_strategy` (test-harness gated) is the only seam.
 - **Dispatch must be pure in `(options, args)`** and is value-blind: it sees dtypes, never data.
   Plan time and run time both go through it. This is why constant-compute hoisting had to live
   inside the visit (`prepare`) rather than in dispatch.
-- **The witnesses pin what the framework reads before dispatching**: arity, dense-safety,
-  fallibility, and now `DECODE_SHRINKS_WHEN_FILTERED`. `assert_witness_agrees` makes a
-  contradicting dispatch a compile error, even in an arm that never runs.
+- **The argument witness and `RowFn::FALLIBLE` pin what the framework reads before dispatching**:
+  arity, dense-safety, decode fallibility, early kernel fallibility, and
+  `DECODE_SHRINKS_WHEN_FILTERED`. `assert_witness_agrees` makes a contradicting dispatch a compile
+  error, even in an arm that never runs. There is no return witness; the selected sink supplies the
+  dtype and its `SinkResult` supplies the row error shape.
 - **`prepare` must never be load-bearing for validation.** An empty batch decodes as non-constant,
   so a check that only runs in `prepare` will not run at all. It is also infallible by design,
   because fallibility is read off the witnesses before dispatch.
 - **`P` has no `Send`/`Sync` bounds, deliberately.** Geo's prepared geometry carries `Rc`/`RefCell`.
   Adding bounds later is a breaking change.
-- **Both output forms build an all-valid column**, which is what licenses the derived
+- **Every sink builds an all-valid column**, which is what licenses the derived
   `validity() = union_child_validities`. Anything that lets a kernel emit nulls must change that
-  derivation in the same commit (this is what step 3 of the plan below is about).
+  derivation in the same commit.
 - **A `RowFn` cannot also implement `ScalarFnVTable`**, since the blanket impl claims the slot.
   `RowFn` therefore mirrors any `ScalarFnVTable` method an adopter needs to vary. Today that is
   `validity` and nothing else, and `reduce` was dropped when the strict trait went because no
   adopter used it. Mirror the next one when a real adopter needs it, not before.
-- **A fallible kernel must never run behind a null row**, which is why fallibility forces the
-  `Filter` contract, and why branch-and-skip visits only set bits. The hostile tests (views
-  pointing at nonexistent buffers, poison zero divisors behind nulls) exist to catch a regression
-  here; keep them.
+- **An early-failing kernel must never run behind a null row**, which is why `VortexResult<()>`
+  forces the `Filter` contract and branch-and-skip visits only set bits. A deferred-error kernel is
+  different: it may run densely when its arguments are dense-safe, then retry over valid rows only
+  if its reduced error bit is set. The hostile tests (views pointing at nonexistent buffers,
+  poison zero divisors behind nulls) exist to catch a regression here; keep them.
 - **`reduce_encoded` sees different row counts per strategy**: original count under `Dense` and
   branch-and-skip, filtered count under filter-and-scatter. Its doc says so; every current
   implementor is a dense-path tensor function, so nothing in tree depends on the difference yet.
@@ -195,6 +235,17 @@ allocation; ablations including SmallVec found nothing beneficial, and an earlie
 monomorphize the prelude over the compile-time arity (`[ArrayRef; N]` from the tuple witness),
 which the row layer can do through its tuple witness.
 
+**Sink-only execution is the final prototype shape.** Returning visits, sink visits, and prepared
+visits were three spellings of the same executor. Keeping only `visit_prepared_into` removes the
+return witness and makes preparation plus output construction one explicit contract. The simple
+case is still short because `ElementSink<T>` and unit preparation supply the defaults. Do not add
+the convenience methods back unless an independently simpler executor would consume them.
+
+**Value errors should be deferred only when provisional computation is memory-safe.** Checked add
+can write the wrapping sum and OR an overflow word, so a specialized sink avoids a per-row result
+branch. Parsing, allocation, and errors that cannot produce a legal provisional row still use
+`VortexResult<()>`. `DeferredError` is not a general replacement for ordinary error handling.
+
 **Non-strict functions are out of scope, and the epic settles it.** Epic 9128 states the framework
 will focus solely on strict functions, because the semantics around non-strict ones are complicated
 enough that extending an already-somewhat-complicated API is probably not worth it. The research
@@ -205,7 +256,7 @@ null-visible kernels (`RowEncode`/`RowSize`) are blocked by variadic heterogeneo
 nullability. Four functions have value-dependent output validity (`false AND null` is a valid
 `false`), for which no validity expression over child validities exists even in principle. Keep the
 survey's constraint list for reference; do not build the tier. Note this is a different question
-from nullable *outputs* (step 3 below), which stay strict and are an explicit goal of the epic.
+from nullable *outputs* (step 5 below), which stay strict and are an explicit goal of the epic.
 
 The epic's non-goals also match the exclusion taxonomy the research arrived at independently:
 `RowFn` is not for columnar or zero-copy kernels (`not`, `list_length`), kernels with state shared
@@ -213,49 +264,36 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
 
 ## What to do next, in order
 
-0. ~~**Fold the lifting into the row layer and drop the public strict trait.**~~ Done, in three
-   commits on this branch: revert the two remaining columnar ports, take the two benchmark control
-   arms off the trait, then delete it. No PR in the stack has to argue for a public trait that the
-   measurements did not support.
-1. ~~**Write the tracking issue.**~~ Done, by hand: epic 9128 with sub-issues 9129 and 9130. Their
-   Steps checklists are the authoritative work plan; read them before planning a change, and answer
-   their unresolved questions with evidence from this branch where it exists.
-2. **Settle adaptive execution.** This is the next design task, ahead of any porting, because it is
-   the least settled thing in the proposal and design churn invalidates measurement. 9130 marks it
-   WIP; the threshold is a global const calibrated on a shared VM whose noisiest arms are the ones
-   that determine it; and the open question is not just the number but the *shape*. See "Settling
-   adaptive execution" below for the specific questions to answer.
-3. **Land the baseline benchmarks on develop, in parallel with step 2.** Independent of the design
-   work, and required before any porting PR can show a comparison. See "The measurement plan"
-   below.
-4. **The PR stack**, cut fresh from develop, each linking 9129 or 9130 and recorded in that issue's
-   Implementation history: the dedicated `L2Denorm` encoding first; then row core plus
-   `byte_length`; then `l2_norm` and `inner_product` on the plain visit; then `visit_prepared` with
-   both of its users, `cosine_similarity` and geo; then adaptive execution and its benches. Defer
-   `OutputSink` until a production builder-backed output, most likely the future string library, can
-   land with it. Land each API surface with its first user, which is why `visit_prepared` travels
-   with geo rather than with cosine (the prepared-geometry win carries the API, cosine's few percent
-   does not) and why adaptive execution comes after geo (geo is its only production beneficiary,
-   since every other adopter is dense-safe). Two of 9129's
-   steps are already satisfied on this branch and only need carrying over: serialized metadata of
-   migrated functions is preserved (the per-function array serde described above), and the "when to
-   use `RowFn`" guidance is written in `vortex-array/src/scalar_fn/mod.rs`.
-3. **Option outputs**, the one extension with demonstrated in-tree demand: `list_sum` (a valid
-   empty list sums to null) and `variant_get` (missing path yields null) are strict but excluded
-   from `RowFn` today only by the all-valid-output rule. Needs an `Option<T>`
-   output form with a nullable element dtype, a nullability bit on the return witness, and derived
-   `validity()` becoming `None` for such functions. `is_strict` stays true. Three tests were
-   deleted with the strict trait for exactly this gap, since they used a synthetic kernel returning
-   null for a valid row: `a_non_total_kernel_declines_precomputed_validity`,
-   `a_non_total_kernel_is_still_strict` and `a_non_total_kernel_keeps_its_own_nulls`, recoverable
-   from `git show a605e5779^:vortex-array/src/scalar_fn/strict/tests.rs`. Restore them as row
-   functions when this lands.
+1. **Land PR #9136.** It now contains the durable public-path benchmark set needed before the
+   implementation stack: byte length, signed and unsigned add including a constant operand, LIKE
+   cache behavior, tensor functions, geo predicates, and geo distance. Resolve its stacked-base
+   conflict, rerun its targeted checks and CodSpeed shard, then merge it before any benchmarked
+   implementation change.
+2. **Update issues 9129 and 9130 before cutting code.** Their API sketches still contain
+   `RetWitness`, `visit`, `visit_prepared`, and `visit_into`; 9130 still says sinks cannot
+   branch-and-skip. Replace those with the sink-only API, `SinkResult`, deferred-error retry, and
+   `SUPPORTS_SKIPPED_ROWS`. The issues are the public contract and must not direct an implementing
+   agent back to the discarded design.
+3. **Cut the implementation stack fresh from current develop.** Do not merge this prototype
+   branch. Keep each PR independently reviewable and link it from the appropriate tracking issue.
+   A sensible split is row core plus `ElementSink` and `byte_length`; tensor elements and kernels;
+   prepared execution with cosine and geo; adaptive null execution; then specialized sinks and
+   deferred errors with a production checked arithmetic user. Preserve each migrated function's
+   serialized metadata.
+4. **Use CodSpeed to decide whether handwritten add can be deleted.** The local executor harness
+   establishes that the machinery can reach parity, but the gate is the stable production
+   `binary_ops` names from #9136 on the actual implementation PR. Require non-null, nullable,
+   constant, signed, and unsigned cases. Treat a sub-percent local difference as noise; investigate
+   a repeatable CodSpeed regression from the generated IR before accepting it.
+5. **Add nullable outputs separately.** `list_sum` and `variant_get` are strict but may return null
+   from valid inputs. A sink that builds validity can express this, but the blanket
+   `validity() = union_child_validities` derivation must become conditional in the same change. Do
+   not smuggle this into the initial execution PR.
 
-## Settling adaptive execution
+## Adaptive execution status
 
-What exists works and is tested, and the numbers on this branch are real. What is unsettled is
-whether the *selection rule* is the right shape, and that question should be answered before the
-porting PRs, because every later measurement is taken through it.
+Adaptive execution is no longer a design blocker for the prototype. The implementation is tested,
+and the final measurements still show auto selecting the intended side of the crossover.
 
 The rule today: for a mixed validity mask, use branch-and-skip unless some argument's element sets
 `DECODE_SHRINKS_WHEN_FILTERED` and fewer than 75% of rows survive, in which case filter and scatter.
@@ -277,11 +315,11 @@ One boolean per element, one global threshold, no other inputs. The questions:
   null density with two nullable operands, versus 50% with one). One threshold against the conjoined
   fraction may already handle this correctly; confirm rather than assume.
 - **Does the crossover hold across architectures?** It trades memory-bandwidth-bound work against
-  compute-bound work, so x86 and Apple Silicon need not agree. Partly blocked on hardware, and the
-  answer decides whether a fixed number is defensible at all.
-- **Do sinks need branch-and-skip?** They stay on dense and filter today because a sink has no
-  skipped-row representation. Resolving this needs either a pre-filled sink row or a sparse writer,
-  or a documented decision that sinks keep filtering.
+  compute-bound work, so x86 and Apple Silicon need not agree. CodSpeed's x86/AVX2 simulation is the
+  next stable data point, but it does not replace real wall-clock measurements on either machine.
+- **Which sinks should branch-and-skip?** The question is now per sink, expressed by
+  `SUPPORTS_SKIPPED_ROWS`. `ElementSink` supports it by pre-filling placeholders; a custom builder
+  that cannot finish skipped rows declines and filters. No new execution model is required.
 - **Is the strategy observable in production?** The only seam today is test-harness gated. A session
   option, or tracing the chosen strategy, may be wanted for debugging a slow query.
 - Plus the recorded follow-up: avoid probing `reduce_encoded` twice when branch execution turns out
@@ -296,15 +334,10 @@ for the no-regression claim, since it is the team's own process rather than anyo
 
 **The constraint that shapes everything: CodSpeed compares a pull request against develop for the
 same benchmark name.** A benchmark introduced in the same change it measures has no baseline and
-produces no comparison. Every benchmark on this branch is new, and develop currently has no
-benchmark for any tensor or geo scalar function at all, so the baselines have to land first, as their
-own pull request against develop.
-
-That baseline pull request is purely additive test tooling, uncontroversial, valuable to the project
-on its own, and a chance to get the team to agree on what counts as evidence before any design
-debate. It should cover the current develop implementations of: tensor `l2_norm`, `l2_denorm`,
-`inner_product` and `cosine_similarity`; geo `contains` and `intersects`, each with non-nullable and
-nullable arms; and `byte_length`. Two rules make it work:
+produces no comparison. Draft PR #9136 exists to land those names first. Its current public-path
+set covers `byte_length`; signed and unsigned add; repeated and distinct LIKE patterns; tensor
+`l2_norm`, `normalized`, `inner_product`, and `cosine_similarity`; and geo `contains`, `intersects`,
+and `distance`, including constant and nullable shapes. Two rules remain load-bearing:
 
 - **Exercise the functions through the public expression and execution API only.** The versions on
   this branch reference framework internals (forced-strategy seams, hand-written control arms
@@ -313,28 +346,23 @@ nullable arms; and `byte_length`. Two rules make it work:
 - **Identical benchmark and arm names on both sides**, or CodSpeed cannot line them up.
 
 Arms that compare framework strategies against each other (forced filter versus forced branch versus
-auto) cannot be baselined, because they need machinery that does not exist on develop. That is fine:
-their claim is "auto tracks the faster forced arm", an internal comparison rather than a before and
-after, so they land with adaptive execution.
+auto) cannot be baselined, because they need machinery that does not exist on develop. Keep those as
+implementation diagnostics. The durable CodSpeed suite should contain only public production paths
+at representative null densities.
 
 **Adaptive execution is less entangled with the other measurements than it looks.** Every adopter
 except geo is dense-safe and infallible, so it takes the dense path and never reaches strategy
 selection at all: `l2_norm`, `l2_denorm`, `inner_product`, `cosine_similarity`, and `byte_length` (which
 ships at `BytesLen`) are unaffected no matter what the rule becomes. Only geo's nullable batches are
 affected, which is why the geo baseline needs both nullable and non-nullable arms: it keeps the
-port's parity claim separable from adaptive execution's win. So steps 2 and 3 above genuinely can run
-in parallel.
+port's parity claim separable from adaptive execution's win. The baseline can land before the
+implementation stack without depending on the final threshold.
 
-Priority for wall-clock runs on real hardware, highest first: parity for the dense-path adopters (all
-four already have in-binary hand-written control arms, which is the credible form: same compiler,
-same run, arms side by side); then the crossover sweep across 0 to 90% null density; then the
-headline wins (geo `contains` prepared, `byte_length` adaptive); then a small-batch sweep from 100 to
-1M rows, which is both the known weak spot and an input to the batch-size question above. Report
-`fastest` and `median` from at least two runs with machine metadata, since `fastest` alone reads as a
-cherry-picked minimum. Expect cosine's small prepare win to shrink or vanish on a wider machine: the
-explanation for why it was only a few percent is that the hoisted arithmetic rode in spare slots of a
-latency-bound FMA chain, and a machine with more slack removes even that. Better to drop the claim
-ourselves than have a reviewer find it.
+CodSpeed runs these CPU-bound microbenchmarks in simulation over compiled amd64/AVX2 machine code.
+That is useful for the LLVM and vectorization questions that motivated the executor work, but it is
+not real x86 wall time or a branch-predictor measurement. Continue to use local Divan runs for
+wall-clock diagnosis, sequentially, with machine metadata, `fastest` and median from at least two
+runs. Use CodSpeed as the merge gate once the stable baseline names are on develop.
 
 ## What the tracking issues ask that this branch has not answered
 
@@ -347,36 +375,33 @@ Four of their unresolved questions are genuinely open, and two of them this bran
   three already carry defaults chosen for internal convenience (`DECODE_SHRINKS_WHEN_FILTERED` is
   `false`, `decode_null_tolerant` forwards to `decode`). If they go public, audit which defaults are
   the *safe* answer rather than the common one.
-- **What is the first production `OutputSink` adopter?** (9129.) `L2Denorm` no longer qualifies
-  because its normalized child and authoritative norm are an encoding representation. The likely
-  adopter is a builder-backed string transform such as `upper`, `lower`, or `replace`. Until one
-  lands, omit the sink surface from the initial RowFn PRs rather than stabilizing it from synthetic
-  tests alone. When it does land, also answer whether `sink_dtype` needs access to function options;
-  the current design sees only input dtypes.
-- **What benchmark set and regression threshold gate replacing a hand-written implementation?**
-  (9130.) This branch has no policy, only precedent: per-adopter divan benchmarks with constant and
-  non-constant arms, `fastest` of two runs, and one accepted regression (1 to 3% on the
-  always-overlapping `intersects` arm, taken for a 2.1x win on the disjoint arm). Worth turning that
-  precedent into a stated rule.
-- **Do sinks need branch-and-skip, and are nullable outputs required for v1?** (9128, 9129, 9130.)
-  Sinks currently stay on dense and filter because a sink has no skipped-row representation;
-  nullable outputs are step 3 above.
+- **Which sink contracts belong in the first public API?** (9129.) `ElementSink` now backs every
+  ordinary row function and `TensorSink` proves runtime-shaped output, so the sink itself is no
+  longer speculative. The open compatibility questions are whether downstream crates may implement
+  it, whether `sink_dtype` needs options, and whether `SUPPORTS_SKIPPED_ROWS` and
+  `ERRORS_ARE_DEFERRED` should be stable extension points.
+- **What regression threshold gates replacing a hand-written implementation?** (9130.) PR #9136
+  now supplies the benchmark set, but the policy still needs a number and a repeatability rule.
+  Checked add shows the intended precedent: parity for ordinary and nullable columns, with a
+  constant-side win. Make CodSpeed over those stable names the gate.
+- **Are nullable outputs required for v1?** (9128, 9129.) The sink-only shape makes them possible,
+  but the validity derivation remains the semantic change. Keep this separate from skipped-row sink
+  support, which is already implemented.
 
-9130's three non-blocking follow-ups are the same items this branch recorded, so they need no
-separate tracking here: the double `reduce_encoded` probe when branch execution is unsupported, the
-global 75% threshold pending a second per-row-decode element, and the fallible branch loop's
-inability to stop iterating at the first error. Two more of the same kind that the issues do not
-mention: geo's null-tolerant decode still arrow-exports the full column, where slicing runs of valid
-rows would blunt filter's sparse-validity advantage enough to retire the threshold for geo, and the
-lifting's small-batch prelude cost discussed above.
+9130's remaining non-blocking follow-ups are the double `reduce_encoded` probe when branch execution
+is unsupported, the global 75% threshold pending a second per-row-decode element, and the branch
+loop's inability to stop `for_each_set_index` immediately after an early error. Geo's null-tolerant
+decode still arrow-exports the full column; slicing runs of valid rows could move or remove its
+filter crossover. The lifting's small-batch prelude cost remains structural.
 
 ## Loose ends, and issues worth filing separately
 
-The reworked benchmark control arms in `vortex-array/benches/strict_validity.rs` and
-`vortex-tensor/benches/l2_denorm.rs` have now been run in release; use the [issue #9128 follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802), rather than
-the historical figures in this document, when quoting their results. Commit `72e01f96c` (the first version
-of this file) is pushed unsigned, so GitHub shows it unverified; every commit after it is signed, and
-fixing it needs a force-push, which is blocked.
+The branch-only benchmark binaries are diagnostic, not the permanent CI suite. In particular,
+`row_fn_executor`, `byte_length_element`, `strict_validity`, and the two forced null-strategy
+matrices should travel only with the implementation work that needs them. PR #9136 contains the
+durable public-path names. Commit `72e01f96c` (the first version of this file) is pushed unsigned,
+so GitHub shows it unverified; fixing it would require rewriting published history and is not worth
+doing.
 
 Also worth an issue on its own, unrelated to this work: `Between::validity` declares the strict
 three-way conjunction while its fallback execute path joins two comparisons with Kleene AND, so
@@ -388,8 +413,8 @@ and looks like dead code.
 
 Read `CLAUDE.md` and follow it. Invoke the `rust-style` skill before writing Rust: this branch is
 written to Connor's personal style and reviewers will notice the difference. No em dashes anywhere,
-in code, docs, or commit messages. Sign every commit off exactly as
-`Signed-off-by: "Connor" <connor@spiraldb.com>`.
+in code, docs, or commit messages. Use `git commit -s` with the repository's configured identity;
+this branch currently uses `Connor Tsui <connor.tsui20@gmail.com>`.
 
 Verification that matters for changes here:
 
@@ -401,14 +426,16 @@ git diff --check
 cargo build -p vortex -p vortex-file -p vortex-datafusion
 ```
 
-3,596 tests pass across the three crates as of the strict-trait deletion.
+The final implementation verification was: 65 focused RowFn tests, 225 geo library tests, 164 tensor
+library tests, 72 `vortex-array` doctests with 10 ignored, targeted all-target/all-feature clippy for
+the three crates, nightly fmt, and whitespace checks. The compile-fail witness doctest passed.
 
-**`origin/develop` in this container is stale, and it will bite you.** It predates the
-`is_null_sensitive` to `is_strict` rename (upstream #8930), so restoring a file from it yields a body
-that does not compile against this branch. This branch is based on `e58fb5861`. To recover a
-function's pre-port body, use the commit before the port instead: `24d1933e1^` for `not`,
-`list_length` and `list_sum`. More generally, prefer `git log --oneline <base>..HEAD` over any
-assumption about what develop contains, and `git fetch origin develop` before comparing against it.
+The prototype forked from current development history at `bb4138d051`; the local
+`origin/develop` was `2de0319312` when this handoff was finalized. Those refs will move before the
+implementation stack is cut. Fetch `origin/develop`, recompute the merge base, and use
+`git range-diff` rather than assuming either recorded hash is still current. To recover the
+pre-port body of `not`, `list_length`, or `list_sum` from the prototype history, use
+`24d1933e1^`.
 
 Benchmarks are divan (aliased to `codspeed-divan-compat`, so they also run in CI); report `fastest`
 and `median` from at least two runs and state the machine. The historical measurements here used a
