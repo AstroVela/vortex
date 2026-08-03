@@ -5,6 +5,7 @@ use prost::Message;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
+mod fused;
 mod kernels;
 mod operations;
 mod slice;
@@ -33,6 +34,7 @@ use crate::array::VTable;
 use crate::array::ValidityChild;
 use crate::array::ValidityVTableFromChild;
 use crate::array::with_empty_buffers;
+use crate::arrays::Constant;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::patched::PatchedArrayExt;
@@ -41,6 +43,7 @@ use crate::arrays::patched::PatchedData;
 use crate::arrays::patched::PatchedSlots;
 use crate::arrays::patched::PatchedSlotsView;
 use crate::arrays::patched::compute::rules::PARENT_RULES;
+use crate::arrays::patched::vtable::fused::fused_decompress_constant;
 use crate::arrays::primitive::PrimitiveDataParts;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
@@ -253,13 +256,27 @@ impl VTable for Patched {
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        let array = require_child!(array, array.inner(), PatchedSlots::INNER => Primitive);
+        // A Patched array over a non-null Constant is a Sparse array in transposed form, and can
+        // be decompressed without ever materializing the inner array. A null constant is left to
+        // the generic path, which preserves its all-invalid validity.
+        let fill_value = array
+            .inner()
+            .as_opt::<Constant>()
+            .map(|constant| constant.scalar().clone())
+            .filter(|scalar| !scalar.is_null());
+
         let array =
             require_child!(array, array.lane_offsets(), PatchedSlots::LANE_OFFSETS => Primitive);
         let array =
             require_child!(array, array.patch_indices(), PatchedSlots::PATCH_INDICES => Primitive);
         let array =
             require_child!(array, array.patch_values(), PatchedSlots::PATCH_VALUES => Primitive);
+
+        if let Some(fill_value) = fill_value {
+            return fused_decompress_constant(array, &fill_value);
+        }
+
+        let array = require_child!(array, array.inner(), PatchedSlots::INNER => Primitive);
 
         let len = array.len();
 
