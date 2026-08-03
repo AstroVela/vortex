@@ -105,6 +105,10 @@ impl ScalarFnVTable for GeoIntersects {
     fn is_strict(&self, _: &Self::Options) -> bool {
         true
     }
+
+    fn is_fallible(&self, _: &Self::Options) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
