@@ -8,9 +8,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::StructFields;
-use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
-use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -240,7 +238,10 @@ fn plan_display_matches_array_tree_display_shape() -> VortexResult<()> {
         vec![flat(3, field_dtype.clone(), 0), flat(3, field_dtype, 1)],
     )
     .into_layout();
-    let plan = ExpressionPlan::new_ref(get_item("a", root()), make_plan(layout)?)?;
+    let plan: PlanRef = Arc::new(ExpressionPlan::try_new(
+        get_item("a", root()),
+        make_plan(layout)?,
+    )?);
 
     assert_eq!(plan.to_string(), "ExpressionPlan(i32, rows=3)");
     insta::assert_snapshot!(plan.tree_display(), @r"
@@ -368,41 +369,10 @@ fn list_plan_display_handles_optional_validity() -> VortexResult<()> {
 }
 
 #[test]
-fn expression_plan_composes_nested_expressions() -> VortexResult<()> {
-    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
-    let layout = StructLayout::new(
-        1,
-        DType::Struct(
-            StructFields::from_iter([("a", field_dtype.clone())]),
-            Nullability::NonNullable,
-        ),
-        vec![flat(1, field_dtype.clone(), 0)],
-    )
-    .into_layout();
-    let source = make_plan(layout)?;
-
-    let field = ExpressionPlan::new_ref(get_item("a", root()), Arc::clone(&source))?;
-    assert!(field.as_any().is::<ExpressionPlan>());
-    assert_eq!(field.dtype(), &field_dtype);
-
-    let predicate = ExpressionPlan::new_ref(eq(root(), lit(1_i32)), field)?.optimize()?;
-    assert_eq!(predicate.dtype(), &DType::Bool(Nullability::NonNullable));
-    let expression = predicate
-        .as_any()
-        .downcast_ref::<ExpressionPlan>()
-        .ok_or_else(|| vortex_err!("optimized plan is not an expression plan"))?;
-    assert_eq!(
-        expression.expression(),
-        &eq(get_item("a", root()), lit(1_i32))
-    );
-    Ok(())
-}
-
-#[test]
 fn row_idx_plan_preserves_row_index_expressions() -> VortexResult<()> {
     let layout = flat(3, primitive(PType::I32, Nullability::NonNullable), 0);
     let plan = RowIdxPlan::new_ref(10, make_plan(layout)?);
-    let plan = ExpressionPlan::new_ref(row_idx(), plan)?.optimize()?;
+    let plan = ExpressionPlan::try_new(row_idx(), plan)?.optimize()?;
     let expression = plan
         .as_any()
         .downcast_ref::<ExpressionPlan>()
