@@ -43,6 +43,13 @@ pub trait InputElement: 'static {
     /// The decoded column representation supporting `O(1)` row access.
     type Column;
 
+    /// The view of a varying decoded column read by the hot row loop.
+    ///
+    /// This may borrow a cheaper representation than [`Column`](Self::Column). Primitive elements,
+    /// for example, expose a slice so its pointer and length are loop invariants rather than
+    /// re-reading a [`Buffer`](vortex_buffer::Buffer) descriptor for every row.
+    type Varying<'a>;
+
     /// The borrowed element value handed to the row closure a [`RowFn`](crate::scalar_fn::RowFn)
     /// visits with.
     type Elem<'a>;
@@ -120,6 +127,20 @@ pub trait InputElement: 'static {
     /// per row cost `l2_norm` 2x at width 2, invisible in the call because it read like a getter. Do
     /// that work in [`decode`](Self::decode) and leave this an offset computation.
     fn get(column: &Self::Column, index: usize) -> Self::Elem<'_>;
+
+    /// Borrow the representation used when this argument varies within the batch.
+    ///
+    /// Called once before the hot loop. Constants do not use this view because [`ArgColumn`](crate::
+    /// scalar_fn::ArgColumn) keeps their one-row decoded representation separate.
+    fn varying(column: &Self::Column) -> Self::Varying<'_>;
+
+    /// Number of rows addressable through a [`Varying`](Self::Varying) view.
+    fn varying_len(column: &Self::Varying<'_>) -> usize;
+
+    /// Read one row from a [`Varying`](Self::Varying) view.
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> Self::Elem<'a>
+    where
+        Self: 'a;
 }
 
 /// An element type that a row computation can produce, buildable into an all-valid column.
@@ -135,6 +156,28 @@ pub trait OutputElement: 'static + Sized {
 
     /// Build a column from one value per row. Called once per batch.
     fn build(values: Vec<Self>) -> ArrayRef;
+
+    /// Build an all-valid column by computing one value for every row.
+    ///
+    /// The default collects through a [`Vec`]. Elements with a cheaper bulk allocation shape may
+    /// override this, which primitive elements use to write directly into an uninitialized
+    /// [`BufferMut`](vortex_buffer::BufferMut) without a per-row `Vec::push`.
+    fn build_from_fn(row_count: usize, apply: impl FnMut(usize) -> Self) -> ArrayRef {
+        Self::build((0..row_count).map(apply).collect())
+    }
+
+    /// Fallible counterpart to [`build_from_fn`](Self::build_from_fn).
+    fn try_build_from_fn(
+        row_count: usize,
+        mut apply: impl FnMut(usize) -> VortexResult<Self>,
+    ) -> VortexResult<ArrayRef> {
+        let mut values = Vec::with_capacity(row_count);
+        for index in 0..row_count {
+            values.push(apply(index)?);
+        }
+
+        Ok(Self::build(values))
+    }
 
     /// An arbitrary value of this element, pre-filled into the output slots that the
     /// branch-and-skip null strategy skips.

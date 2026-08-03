@@ -47,6 +47,9 @@ pub struct TensorRows<T> {
     /// Every row's elements, back to back.
     elements: Buffer<T>,
 
+    /// Number of logical tensor rows, stored so zero-width tensors retain their length.
+    rows: usize,
+
     /// Elements per row, the length of each row slice.
     list_size: usize,
 
@@ -57,6 +60,7 @@ pub struct TensorRows<T> {
 
 impl<T: Float + NativePType> InputElement for TensorRow<T> {
     type Column = TensorRows<T>;
+    type Varying<'a> = &'a TensorRows<T>;
     type Elem<'a> = &'a [T];
 
     // Tensor storage is a fully materialized non-nullable primitive buffer, so the elements behind
@@ -77,11 +81,13 @@ impl<T: Float + NativePType> InputElement for TensorRow<T> {
     }
 
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+        let rows = array.len();
         let list_size = validate_tensor_float_input(array.dtype())?.list_size() as usize;
         let ext: ExtensionArray = array.execute(ctx)?;
         let flat = extract_flat_elements(ext.storage_array(), list_size, ctx)?;
 
         Ok(TensorRows {
+            rows,
             list_size: flat.list_size(),
             stride: flat.row_stride(),
             elements: flat.into_buffer::<T>(),
@@ -98,6 +104,21 @@ impl<T: Float + NativePType> InputElement for TensorRow<T> {
     fn get(column: &Self::Column, index: usize) -> &[T] {
         let start = index * column.stride;
         &column.elements.as_slice()[start..start + column.list_size]
+    }
+
+    fn varying(column: &Self::Column) -> Self::Varying<'_> {
+        column
+    }
+
+    fn varying_len(column: &Self::Varying<'_>) -> usize {
+        column.rows
+    }
+
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> &'a [T]
+    where
+        Self: 'a,
+    {
+        Self::get(column, index)
     }
 }
 
@@ -125,6 +146,7 @@ pub struct TensorSink<T> {
 }
 
 impl<T: Float + NativePType> OutputSink for TensorSink<T> {
+    type Rows<'a> = (&'a mut [T], usize, usize);
     type Row<'a> = &'a mut [T];
 
     fn sink_dtype(args: &[DType]) -> VortexResult<DType> {
@@ -157,8 +179,17 @@ impl<T: Float + NativePType> OutputSink for TensorSink<T> {
         })
     }
 
-    fn row(&mut self, index: usize) -> &mut [T] {
-        &mut self.elements.as_mut_slice()[index * self.list_size..][..self.list_size]
+    fn rows(&mut self) -> Self::Rows<'_> {
+        (self.elements.as_mut_slice(), self.list_size, self.rows)
+    }
+
+    fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
+        rows.2 == row_count && row_count.checked_mul(rows.1) == Some(rows.0.len())
+    }
+
+    fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> &'a mut [T] {
+        let start = index * rows.1;
+        &mut rows.0[start..][..rows.1]
     }
 
     fn finish(self) -> VortexResult<ArrayRef> {

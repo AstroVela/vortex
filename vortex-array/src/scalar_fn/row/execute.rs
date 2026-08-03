@@ -99,23 +99,63 @@ pub(super) fn execute_row_loop_prepared<A: ElementTuple, P, R: ApplyResult>(
 ) -> VortexResult<ArrayRef> {
     let columns = A::decode(args, ctx)?;
     let state = prepare(A::constants(&columns));
-    let rows = 0..args.row_count();
+    let row_count = args.row_count();
 
-    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization, exactly as in
-    // [`execute_row_loop`].
-    let values = if R::FALLIBLE {
-        rows.map(|index| apply(&state, A::get(&columns, index)).into_result())
-            .collect::<VortexResult<Vec<_>>>()?
+    if let Some(varying) = A::varying(&columns) {
+        vortex_ensure!(
+            A::varying_len_matches(&varying, row_count),
+            "decoded row input length must match the execution row count, got {row_count}",
+        );
+        build_varying_rows::<A, P, R>(&varying, &state, row_count, &apply)
     } else {
-        rows.map(|index| {
-            apply(&state, A::get(&columns, index))
+        build_rows::<A, P, R>(&columns, &state, row_count, &apply)
+    }
+}
+
+/// Run the fallback loop used when one or more arguments are batch-constant.
+#[inline(always)]
+fn build_rows<A: ElementTuple, P, R: ApplyResult>(
+    columns: &A::Columns,
+    state: &P,
+    row_count: usize,
+    apply: &impl Fn(&P, A::Elems<'_>) -> R,
+) -> VortexResult<ArrayRef> {
+    if R::FALLIBLE {
+        R::Out::try_build_from_fn(row_count, |index| {
+            apply(state, A::get(columns, index)).into_result()
+        })
+    } else {
+        Ok(R::Out::build_from_fn(row_count, |index| {
+            apply(state, A::get(columns, index))
                 .into_result()
                 .vortex_expect("an infallible ApplyResult cannot be an error")
-        })
-        .collect()
-    };
+        }))
+    }
+}
 
-    Ok(R::Out::build(values))
+/// Run the contiguous fast path selected when every argument varies within the batch.
+///
+/// This must flatten into the dispatched row closure for LLVM to see one loop over the decoded
+/// columns. Without inlining, the primitive wrapping-add benchmark remains scalar and is 3.7x
+/// slower than the specialized kernel.
+#[inline(always)]
+fn build_varying_rows<A: ElementTuple, P, R: ApplyResult>(
+    columns: &A::VaryingColumns<'_>,
+    state: &P,
+    row_count: usize,
+    apply: &impl Fn(&P, A::Elems<'_>) -> R,
+) -> VortexResult<ArrayRef> {
+    if R::FALLIBLE {
+        R::Out::try_build_from_fn(row_count, |index| {
+            apply(state, A::get_varying(columns, index)).into_result()
+        })
+    } else {
+        Ok(R::Out::build_from_fn(row_count, |index| {
+            apply(state, A::get_varying(columns, index))
+                .into_result()
+                .vortex_expect("an infallible ApplyResult cannot be an error")
+        }))
+    }
 }
 
 /// Decode every column null-tolerantly, then run the row loop only over the rows set in `valid`,
@@ -152,11 +192,37 @@ pub(super) fn execute_row_loop_branch<A: ElementTuple, P, R: ApplyResult>(
     let mut values: Vec<R::Out> = Vec::with_capacity(args.row_count());
     values.resize_with(args.row_count(), R::Out::placeholder);
 
-    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization, exactly as in
-    // [`execute_row_loop_prepared`].
-    if R::FALLIBLE {
-        // `for_each_set_index` cannot early-return, so the first error is remembered and the
-        // remaining set rows are skipped cheaply; the success path pays only the `is_none` check.
+    if let Some(varying) = A::varying(&columns) {
+        vortex_ensure!(
+            A::varying_len_matches(&varying, args.row_count()),
+            "decoded row input length must match the execution row count, got {}",
+            args.row_count(),
+        );
+
+        if R::FALLIBLE {
+            // `for_each_set_index` cannot early-return, so the first error is remembered and the
+            // remaining set rows are skipped cheaply; the success path pays only `is_none`.
+            let mut error = None;
+            valid.for_each_set_index(|index| {
+                if error.is_none() {
+                    match apply(&state, A::get_varying(&varying, index)).into_result() {
+                        Ok(value) => values[index] = value,
+                        Err(e) => error = Some(e),
+                    }
+                }
+            });
+
+            if let Some(error) = error {
+                return Err(error);
+            }
+        } else {
+            valid.for_each_set_index(|index| {
+                values[index] = apply(&state, A::get_varying(&varying, index))
+                    .into_result()
+                    .vortex_expect("an infallible ApplyResult cannot be an error");
+            });
+        }
+    } else if R::FALLIBLE {
         let mut error = None;
         valid.for_each_set_index(|index| {
             if error.is_none() {
@@ -196,17 +262,41 @@ pub(super) fn execute_row_sink<A: ElementTuple, S: OutputSink, R: SinkResult>(
     let mut sink = S::with_capacity(row_count, &S::sink_dtype(arg_dtypes)?)?;
     let columns = A::decode(args, ctx)?;
 
-    // `R::FALLIBLE` is a constant, so only one of these survives monomorphization. There
-    // `into_result` inlines to `Ok(())` and the unwrap folds away.
-    if R::FALLIBLE {
-        for index in 0..row_count {
-            apply(A::get(&columns, index), sink.row(index)).into_result()?;
-        }
-    } else {
-        for index in 0..row_count {
-            apply(A::get(&columns, index), sink.row(index))
-                .into_result()
-                .vortex_expect("an infallible SinkResult cannot be an error");
+    {
+        let mut rows = sink.rows();
+        vortex_ensure!(
+            S::row_count_matches(&rows, row_count),
+            "output sink row count must match the execution row count, got {row_count}",
+        );
+
+        if let Some(varying) = A::varying(&columns) {
+            vortex_ensure!(
+                A::varying_len_matches(&varying, row_count),
+                "decoded row input length must match the execution row count, got {row_count}",
+            );
+
+            if R::FALLIBLE {
+                for index in 0..row_count {
+                    apply(A::get_varying(&varying, index), S::row(&mut rows, index))
+                        .into_result()?;
+                }
+            } else {
+                for index in 0..row_count {
+                    apply(A::get_varying(&varying, index), S::row(&mut rows, index))
+                        .into_result()
+                        .vortex_expect("an infallible SinkResult cannot be an error");
+                }
+            }
+        } else if R::FALLIBLE {
+            for index in 0..row_count {
+                apply(A::get(&columns, index), S::row(&mut rows, index)).into_result()?;
+            }
+        } else {
+            for index in 0..row_count {
+                apply(A::get(&columns, index), S::row(&mut rows, index))
+                    .into_result()
+                    .vortex_expect("an infallible SinkResult cannot be an error");
+            }
         }
     }
 

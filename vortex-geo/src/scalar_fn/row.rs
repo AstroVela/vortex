@@ -25,6 +25,7 @@ pub struct GeometryRow;
 
 impl InputElement for GeometryRow {
     type Column = Vec<Geometry<f64>>;
+    type Varying<'a> = &'a [Geometry<f64>];
     type Elem<'a> = &'a Geometry<f64>;
 
     // A geometry row is decoded from its coordinate storage, which behind a null row holds arbitrary
@@ -46,6 +47,21 @@ impl InputElement for GeometryRow {
     }
 
     fn get(column: &Self::Column, index: usize) -> &Geometry<f64> {
+        &column[index]
+    }
+
+    fn varying(column: &Self::Column) -> Self::Varying<'_> {
+        column.as_slice()
+    }
+
+    fn varying_len(column: &Self::Varying<'_>) -> usize {
+        column.len()
+    }
+
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> &'a Geometry<f64>
+    where
+        Self: 'a,
+    {
         &column[index]
     }
 

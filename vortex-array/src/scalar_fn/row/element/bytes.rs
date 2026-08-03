@@ -39,6 +39,7 @@ pub struct BytesColumn {
 
 impl InputElement for Bytes {
     type Column = BytesColumn;
+    type Varying<'a> = &'a BytesColumn;
     type Elem<'a> = &'a [u8];
 
     // A view behind a null row may point outside its buffer, or name a buffer that does not
@@ -74,6 +75,21 @@ impl InputElement for Bytes {
             &column.buffers[view.buffer_index as usize].as_slice()[view.as_range()]
         }
     }
+
+    fn varying(column: &Self::Column) -> Self::Varying<'_> {
+        column
+    }
+
+    fn varying_len(column: &Self::Varying<'_>) -> usize {
+        column.array.len()
+    }
+
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> &'a [u8]
+    where
+        Self: 'a,
+    {
+        Self::get(column, index)
+    }
 }
 
 /// Marker for the byte *length* of a `Utf8` or `Binary` row, presented as `usize`.
@@ -85,6 +101,7 @@ pub struct BytesLen;
 
 impl InputElement for BytesLen {
     type Column = VarBinViewArray;
+    type Varying<'a> = &'a VarBinViewArray;
     type Elem<'a> = usize;
 
     // The length lives in the view itself, so a view behind a null row yields an arbitrary length
@@ -109,6 +126,21 @@ impl InputElement for BytesLen {
 
     fn get(column: &Self::Column, index: usize) -> usize {
         column.views()[index].len() as usize
+    }
+
+    fn varying(column: &Self::Column) -> Self::Varying<'_> {
+        column
+    }
+
+    fn varying_len(column: &Self::Varying<'_>) -> usize {
+        column.len()
+    }
+
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> usize
+    where
+        Self: 'a,
+    {
+        Self::get(column, index)
     }
 }
 

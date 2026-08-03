@@ -30,6 +30,14 @@ use crate::dtype::DType;
 ///
 /// Rows arrive in order, `0..row_count`, exactly once each.
 pub trait OutputSink: 'static + Sized {
+    /// A loop-local view of all output rows.
+    ///
+    /// Borrowed once before execution so the sink's buffer descriptor and shape become loop
+    /// invariants rather than being re-read through `&mut Self` for every row.
+    type Rows<'a>
+    where
+        Self: 'a;
+
     /// The place a row closure writes one row through, borrowed from the sink.
     type Row<'a>
     where
@@ -45,8 +53,17 @@ pub trait OutputSink: 'static + Sized {
     /// [`sink_dtype`](Self::sink_dtype). Called once per batch.
     fn with_capacity(rows: usize, dtype: &DType) -> VortexResult<Self>;
 
+    /// Borrow all output rows for the hot loop.
+    fn rows(&mut self) -> Self::Rows<'_>;
+
+    /// Whether every index in `0..row_count` is addressable through [`row`](Self::row).
+    ///
+    /// Called once before the hot loop. Besides validating the sink contract, this gives the
+    /// optimizer the output bounds it needs to remove the bounds check hidden in each row accessor.
+    fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool;
+
     /// Hand out the place to write row `index`. Must be `O(1)`: it is called in the row loop.
-    fn row(&mut self, index: usize) -> Self::Row<'_>;
+    fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a>;
 
     /// Finish into the built column, whose dtype **must** be this sink's
     /// [`sink_dtype`](Self::sink_dtype). Called once per batch.

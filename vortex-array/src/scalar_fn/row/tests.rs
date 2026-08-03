@@ -200,20 +200,29 @@ mod nullable_outputs {
         }
     }
 
-    struct NullableSink;
+    struct NullableSink(usize);
 
     impl OutputSink for NullableSink {
+        type Rows<'a> = usize;
         type Row<'a> = ();
 
         fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
             Ok(DType::Primitive(PType::I64, Nullability::Nullable))
         }
 
-        fn with_capacity(_rows: usize, _dtype: &DType) -> VortexResult<Self> {
-            Ok(Self)
+        fn with_capacity(rows: usize, _dtype: &DType) -> VortexResult<Self> {
+            Ok(Self(rows))
         }
 
-        fn row(&mut self, _index: usize) -> Self::Row<'_> {}
+        fn rows(&mut self) -> Self::Rows<'_> {
+            self.0
+        }
+
+        fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
+            *rows == row_count
+        }
+
+        fn row<'a>(_rows: &'a mut Self::Rows<'_>, _index: usize) -> Self::Row<'a> {}
 
         fn finish(self) -> VortexResult<ArrayRef> {
             Ok(PrimitiveArray::from_option_iter(Vec::<Option<i64>>::new()).into_array())
@@ -512,6 +521,7 @@ mod lifting {
 
     impl<const DENSE: bool> InputElement for MaybeDenseI32<DENSE> {
         type Column = <i32 as InputElement>::Column;
+        type Varying<'a> = <i32 as InputElement>::Varying<'a>;
         type Elem<'a> = i32;
 
         const DENSE_SAFE: bool = DENSE;
@@ -527,6 +537,21 @@ mod lifting {
 
         fn get(column: &Self::Column, index: usize) -> i32 {
             <i32 as InputElement>::get(column, index)
+        }
+
+        fn varying(column: &Self::Column) -> Self::Varying<'_> {
+            <i32 as InputElement>::varying(column)
+        }
+
+        fn varying_len(column: &Self::Varying<'_>) -> usize {
+            <i32 as InputElement>::varying_len(column)
+        }
+
+        fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> i32
+        where
+            Self: 'a,
+        {
+            <i32 as InputElement>::get_varying(column, index)
         }
     }
 
@@ -796,6 +821,7 @@ mod constant_operands {
 
     impl InputElement for CountedI64 {
         type Column = Buffer<i64>;
+        type Varying<'a> = <i64 as InputElement>::Varying<'a>;
         type Elem<'a> = i64;
 
         const DENSE_SAFE: bool = true;
@@ -812,6 +838,21 @@ mod constant_operands {
 
         fn get(column: &Self::Column, index: usize) -> i64 {
             <i64 as InputElement>::get(column, index)
+        }
+
+        fn varying(column: &Self::Column) -> Self::Varying<'_> {
+            <i64 as InputElement>::varying(column)
+        }
+
+        fn varying_len(column: &Self::Varying<'_>) -> usize {
+            <i64 as InputElement>::varying_len(column)
+        }
+
+        fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> i64
+        where
+            Self: 'a,
+        {
+            <i64 as InputElement>::get_varying(column, index)
         }
     }
 
@@ -1018,6 +1059,7 @@ mod decode_fallibility {
 
     impl InputElement for ParsedBytes {
         type Column = VarBinViewArray;
+        type Varying<'a> = &'a VarBinViewArray;
         type Elem<'a> = usize;
 
         const DENSE_SAFE: bool = true;
@@ -1033,6 +1075,21 @@ mod decode_fallibility {
 
         fn get(column: &Self::Column, index: usize) -> usize {
             column.views()[index].len() as usize
+        }
+
+        fn varying(column: &Self::Column) -> Self::Varying<'_> {
+            column
+        }
+
+        fn varying_len(column: &Self::Varying<'_>) -> usize {
+            column.len()
+        }
+
+        fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> usize
+        where
+            Self: 'a,
+        {
+            Self::get(column, index)
         }
     }
 
@@ -1115,6 +1172,7 @@ mod sink {
     }
 
     impl<T: NativePType, const W: usize> OutputSink for SpreadSink<T, W> {
+        type Rows<'a> = (&'a mut [T], usize);
         type Row<'a> = &'a mut [T];
 
         fn sink_dtype(args: &[DType]) -> VortexResult<DType> {
@@ -1137,8 +1195,16 @@ mod sink {
             })
         }
 
-        fn row(&mut self, index: usize) -> &mut [T] {
-            &mut self.elements.as_mut_slice()[index * W..][..W]
+        fn rows(&mut self) -> Self::Rows<'_> {
+            (self.elements.as_mut_slice(), self.rows)
+        }
+
+        fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
+            rows.1 == row_count && row_count.checked_mul(W) == Some(rows.0.len())
+        }
+
+        fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> &'a mut [T] {
+            &mut rows.0[index * W..][..W]
         }
 
         fn finish(self) -> VortexResult<ArrayRef> {
@@ -1503,6 +1569,7 @@ mod null_strategies {
 
         impl<const SHRINKS: bool> InputElement for TrackedI64<SHRINKS> {
             type Column = Buffer<i64>;
+            type Varying<'a> = <i64 as InputElement>::Varying<'a>;
             type Elem<'a> = i64;
 
             const DENSE_SAFE: bool = false;
@@ -1528,6 +1595,21 @@ mod null_strategies {
 
             fn get(column: &Self::Column, index: usize) -> i64 {
                 <i64 as InputElement>::get(column, index)
+            }
+
+            fn varying(column: &Self::Column) -> Self::Varying<'_> {
+                <i64 as InputElement>::varying(column)
+            }
+
+            fn varying_len(column: &Self::Varying<'_>) -> usize {
+                <i64 as InputElement>::varying_len(column)
+            }
+
+            fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> i64
+            where
+                Self: 'a,
+            {
+                <i64 as InputElement>::get_varying(column, index)
             }
         }
 
@@ -1631,6 +1713,7 @@ mod null_strategies {
 
         impl InputElement for RefusesNullTolerant {
             type Column = Buffer<i64>;
+            type Varying<'a> = <i64 as InputElement>::Varying<'a>;
             type Elem<'a> = i64;
 
             const DENSE_SAFE: bool = false;
@@ -1647,6 +1730,21 @@ mod null_strategies {
 
             fn get(column: &Self::Column, index: usize) -> i64 {
                 <i64 as InputElement>::get(column, index)
+            }
+
+            fn varying(column: &Self::Column) -> Self::Varying<'_> {
+                <i64 as InputElement>::varying(column)
+            }
+
+            fn varying_len(column: &Self::Varying<'_>) -> usize {
+                <i64 as InputElement>::varying_len(column)
+            }
+
+            fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> i64
+            where
+                Self: 'a,
+            {
+                <i64 as InputElement>::get_varying(column, index)
             }
         }
 

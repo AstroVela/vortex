@@ -16,19 +16,17 @@ use crate::dtype::DType;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::InputElement;
 
-/// One decoded input column of an [`ElementTuple`], together with the stride used to read it.
+/// One decoded input column of an [`ElementTuple`].
 ///
 /// A constant operand holds the same value in every row, so it is decoded once as a single row and
 /// read at index 0 forever. That is what stops a constant argument costing one decode per row, which
 /// matters whenever the decode is more than a buffer read: parsing a geometry from WKB, or
 /// canonicalizing an extension row.
-pub struct ArgColumn<T: InputElement> {
-    /// The decoded column, holding either every row or the single row of a constant operand.
-    column: T::Column,
+pub struct ArgColumn<T: InputElement>(ArgColumnKind<T>);
 
-    /// `1` for a real column and `0` for a constant operand, so `index * stride` pins a constant to
-    /// its only row. A multiplier rather than a branch, to leave the row loop's shape unconditional.
-    stride: usize,
+enum ArgColumnKind<T: InputElement> {
+    Varying(T::Column),
+    Constant(T::Column),
 }
 
 impl<T: InputElement> ArgColumn<T> {
@@ -38,16 +36,13 @@ impl<T: InputElement> ArgColumn<T> {
         if let Some(constant) = batch_constant(&array)
             && !array.is_empty()
         {
-            return Ok(Self {
-                column: T::decode(constant.slice(0..1)?, ctx)?,
-                stride: 0,
-            });
+            return Ok(Self(ArgColumnKind::Constant(T::decode(
+                constant.slice(0..1)?,
+                ctx,
+            )?)));
         }
 
-        Ok(Self {
-            column: T::decode(array, ctx)?,
-            stride: 1,
-        })
+        Ok(Self(ArgColumnKind::Varying(T::decode(array, ctx)?)))
     }
 
     /// Like [`decode`](Self::decode), but a varying column decodes null-tolerantly through
@@ -60,18 +55,31 @@ impl<T: InputElement> ArgColumn<T> {
         if let Some(constant) = batch_constant(&array)
             && !array.is_empty()
         {
-            return Ok(Some(Self {
-                column: T::decode(constant.slice(0..1)?, ctx)?,
-                stride: 0,
-            }));
+            return Ok(Some(Self(ArgColumnKind::Constant(T::decode(
+                constant.slice(0..1)?,
+                ctx,
+            )?))));
         }
 
-        Ok(T::decode_null_tolerant(array, ctx)?.map(|column| Self { column, stride: 1 }))
+        Ok(T::decode_null_tolerant(array, ctx)?
+            .map(ArgColumnKind::Varying)
+            .map(Self))
     }
 
     /// Read the element at `index`, which for a constant operand is always its single row.
     fn get(&self, index: usize) -> T::Elem<'_> {
-        T::get(&self.column, index * self.stride)
+        match &self.0 {
+            ArgColumnKind::Varying(column) => T::get(column, index),
+            ArgColumnKind::Constant(column) => T::get(column, 0),
+        }
+    }
+
+    /// The decoded full column, or `None` when this argument was collapsed to one constant row.
+    fn varying(&self) -> Option<&T::Column> {
+        match &self.0 {
+            ArgColumnKind::Varying(column) => Some(column),
+            ArgColumnKind::Constant(_) => None,
+        }
     }
 
     /// The single decoded element of a constant operand, or `None` for a real column.
@@ -79,7 +87,10 @@ impl<T: InputElement> ArgColumn<T> {
     /// `Some` exactly when [`decode`](Self::decode) collapsed the operand to its one distinct row,
     /// in which case the value returned is the element every row of the batch reads.
     fn constant(&self) -> Option<T::Elem<'_>> {
-        (self.stride == 0).then(|| T::get(&self.column, 0))
+        match &self.0 {
+            ArgColumnKind::Varying(_) => None,
+            ArgColumnKind::Constant(column) => Some(T::get(column, 0)),
+        }
     }
 }
 
@@ -118,6 +129,9 @@ pub(in crate::scalar_fn::row) fn batch_constant(array: &ArrayRef) -> Option<Arra
 pub trait ElementTuple: 'static {
     /// The decoded column representations.
     type Columns;
+
+    /// Direct references to decoded columns when every argument varies within the batch.
+    type VaryingColumns<'a>;
 
     /// The borrowed row of element values.
     type Elems<'a>;
@@ -165,12 +179,25 @@ pub trait ElementTuple: 'static {
     /// Read the row of elements at `index`. Must be `O(1)`: it is called in the row loop.
     fn get(columns: &Self::Columns, index: usize) -> Self::Elems<'_>;
 
+    /// Borrow every decoded column directly, or `None` when any argument is batch-constant.
+    ///
+    /// This is selected once outside the hot loop. Keeping [`ArgColumn`] out of the resulting tuple
+    /// gives the optimizer ordinary contiguous column access without a per-row constant check.
+    fn varying(columns: &Self::Columns) -> Option<Self::VaryingColumns<'_>>;
+
+    /// Whether every varying column contains exactly `row_count` rows.
+    fn varying_len_matches(columns: &Self::VaryingColumns<'_>, row_count: usize) -> bool;
+
+    /// Read one row from columns already known to vary within the batch.
+    fn get_varying<'a>(columns: &Self::VaryingColumns<'a>, index: usize) -> Self::Elems<'a>;
+
     /// Read the batch-constant elements out of the decoded columns. Called once per batch.
     fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
 }
 
 impl ElementTuple for () {
     type Columns = ();
+    type VaryingColumns<'a> = ();
     type Elems<'a> = ();
     type ConstElems<'a> = ();
 
@@ -202,6 +229,16 @@ impl ElementTuple for () {
 
     fn get(_columns: &Self::Columns, _index: usize) -> Self::Elems<'_> {}
 
+    fn varying(_columns: &Self::Columns) -> Option<Self::VaryingColumns<'_>> {
+        Some(())
+    }
+
+    fn varying_len_matches(_columns: &Self::VaryingColumns<'_>, _row_count: usize) -> bool {
+        true
+    }
+
+    fn get_varying<'a>(_columns: &Self::VaryingColumns<'a>, _index: usize) -> Self::Elems<'a> {}
+
     fn constants(_columns: &Self::Columns) -> Self::ConstElems<'_> {}
 }
 
@@ -209,6 +246,7 @@ macro_rules! element_tuple {
     ($arity:literal; $($t:ident : $idx:tt),+) => {
         impl<$($t: InputElement),+> ElementTuple for ($($t,)+) {
             type Columns = ($(ArgColumn<$t>,)+);
+            type VaryingColumns<'a> = ($($t::Varying<'a>,)+);
             type Elems<'a> = ($($t::Elem<'a>,)+);
             type ConstElems<'a> = ($(Option<$t::Elem<'a>>,)+);
 
@@ -252,6 +290,24 @@ macro_rules! element_tuple {
 
             fn get(columns: &Self::Columns, index: usize) -> Self::Elems<'_> {
                 ($(columns.$idx.get(index),)+)
+            }
+
+            fn varying(columns: &Self::Columns) -> Option<Self::VaryingColumns<'_>> {
+                Some(($($t::varying(columns.$idx.varying()?),)+))
+            }
+
+            fn varying_len_matches(
+                columns: &Self::VaryingColumns<'_>,
+                row_count: usize,
+            ) -> bool {
+                $($t::varying_len(&columns.$idx) == row_count &&)+ true
+            }
+
+            fn get_varying<'a>(
+                columns: &Self::VaryingColumns<'a>,
+                index: usize,
+            ) -> Self::Elems<'a> {
+                ($($t::get_varying(&columns.$idx, index),)+)
             }
 
             fn constants(columns: &Self::Columns) -> Self::ConstElems<'_> {

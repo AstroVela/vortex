@@ -17,6 +17,7 @@ use crate::validity::Validity;
 
 impl InputElement for bool {
     type Column = BitBuffer;
+    type Varying<'a> = &'a BitBuffer;
     type Elem<'a> = bool;
 
     // Every bit of the buffer is readable, valid or not.
@@ -43,6 +44,21 @@ impl InputElement for bool {
     }
 
     fn get(column: &Self::Column, index: usize) -> bool {
+        column.value(index)
+    }
+
+    fn varying(column: &Self::Column) -> Self::Varying<'_> {
+        column
+    }
+
+    fn varying_len(column: &Self::Varying<'_>) -> usize {
+        column.len()
+    }
+
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> bool
+    where
+        Self: 'a,
+    {
         column.value(index)
     }
 }

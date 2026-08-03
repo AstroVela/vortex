@@ -51,17 +51,25 @@ pub fn assert_element_conforms<E: InputElement>(
     );
 
     let column = E::decode(array, ctx)?;
+    let varying = E::varying(&column);
+    assert_eq!(
+        E::varying_len(&varying),
+        len,
+        "varying element view changed the decoded row count",
+    );
 
     // The claim under test. Reading a null row may yield garbage, but it must not fault, so an
     // element that secretly follows a per-row offset panics here instead of in production.
     if E::DENSE_SAFE {
         for index in 0..len {
             black_box(E::get(&column, index));
+            black_box(E::get_varying(&varying, index));
         }
     } else {
         for index in 0..len {
             if valid.value(index) {
                 black_box(E::get(&column, index));
+                black_box(E::get_varying(&varying, index));
             }
         }
     }
