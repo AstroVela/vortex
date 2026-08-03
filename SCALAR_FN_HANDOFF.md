@@ -33,10 +33,16 @@ reviewable pull requests cut fresh from develop.
 
 ## Final prototype status
 
-The final prototype is commit `b918a8fb1f`, on top of the loop work in `3e675c9aaa`. It makes an
-output sink the only row-execution model. `RowVisitor` now has one method,
-`visit_prepared_into`; ordinary scalar outputs use `ElementSink<T>`, and runtime-shaped outputs use
-a custom sink. `RowFn` has no return witness because the sink owns the output dtype and builder.
+The prototype's design is settled at commit `b918a8fb1f`, on top of the loop work in `3e675c9aaa`.
+Two commits follow it and change no design: a decoded-length guard on the mixed constant path, and a
+merge of `origin/develop` at `fae9da1ebb`. The merge matters for measurement rather than for the
+API, and [the x86 re-measurement runbook](#the-x86-avx-512-re-measurement-runbook) is the section
+to read before running anything.
+
+The sink-only shape makes an output sink the only row-execution model. `RowVisitor` now has one
+method, `visit_prepared_into`; ordinary scalar outputs use `ElementSink<T>`, and runtime-shaped
+outputs use a custom sink. `RowFn` has no return witness because the sink owns the output dtype and
+builder.
 
 This is simpler than the three-mode API in issue 9129 and faster than the earlier returning loop.
 The framework borrows the sink's row storage once, validates its length once, and passes one row
@@ -58,9 +64,31 @@ runtime-shaped sink, and checked add demonstrates the deferred-error form.
 
 ## Current benchmark and codegen record
 
-The [issue #9128 benchmark and codegen follow-up](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802)
-remains the broad branch-versus-develop comparison for tensor and geo. It predates the sink-only
-executor, so use the final checked-add measurements below for the machinery itself.
+**Every published ratio is stale. Do not cite the issue tables until they are re-run.** The
+[issue #9128 benchmark and codegen follow-up](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802)
+was the broad branch-versus-develop comparison for tensor and geo, and three independent things have
+invalidated it since. They are separable, and only the second is confined to geo:
+
+1. **The candidate moved.** The comment records candidate `0c0d1f80ee21`. `3e675c9aaa` then added
+   the borrowed `Varying` view and hoisted the sink's row storage and bounds out of the loop, and
+   `b918a8fb1f` made the sink the only execution model. Both rewrote the hot loop, so every tensor
+   and geo row measures an executor that no longer exists.
+2. **Develop moved, for geo only.** The comment's baseline is develop at `08c336f54a88`.
+   [#9076](https://github.com/vortex-data/vortex/pull/9076) has since landed bounding-rect rejection
+   for the geo predicates on develop, which is the same class of win the comment credits to the row
+   ports ("`intersects` hoists the constant bounding rectangle and short-circuits disjoint cases").
+   All nine geo rows therefore compare against a baseline that no longer exists, and the disjoint
+   arms in particular should be assumed gone until re-measured. Develop's tensor code is unchanged
+   over the same range, so the tensor baseline is still good and only reason 1 applies there.
+3. **`l2_denorm` is no longer a scalar function.** Its normalized child and stored norms are
+   classified as an encoding, so its row is not port-parity evidence for anything. Re-label it as
+   the `Normalized` encoding or drop it.
+
+The checked-add table below is the machinery measurement for the sink-only executor, and it carries
+its own caveat: both arms live in `vortex-array/benches/row_fn_executor.rs`, so the "specialized"
+control is bench-local rather than a production function, and there is no production deferred-error
+user at all (`ERRORS_ARE_DEFERRED` is set only in that bench and in `row/tests/sink.rs`). State that
+when the number goes public.
 
 At 65,536 `i64` rows, 100 samples and a one-second minimum per arm, the sink-only checked-add
 medians were:
@@ -76,6 +104,9 @@ The generated LLVM IR contains vector error-word OR accumulators and
 remaining ordinary two-column difference is framework setup and output construction around a hot
 loop that has reached the intended shape, not a hidden `VortexResult` in that loop.
 
+**The machine for that table is unrecorded, which by itself makes it unciteable.** Do not assume it
+matches the 7950X in the issue comment. Re-run it under the runbook below and record the host.
+
 The other final diagnostic runs support keeping the abstractions separate. Lazy and eager validity
 were within 2% in every `strict_validity` arm. `BytesLen` was 28 to 29% faster than resolving a byte
 slice for `byte_length`, which justifies the specialized input element but is not a permanent
@@ -85,10 +116,18 @@ which confirms that state shared across rows belongs outside `RowFn`.
 ## Where the work lives
 
 Everything is on `claude/strict-scalar-fn-abstraction-ah88x3`. The branch is publicly linked from
-epic 9128 and is a prototype record, not a merge candidate. Commit `b918a8fb1f` is currently one
-local commit ahead of the remote branch; this handoff update will be the second. Do not rewrite the
-published history. Push the final implementation and documentation commits only when explicitly
-requested.
+epic 9128 and is a prototype record, not a merge candidate. It is now several local commits ahead of
+the remote branch: the sink-only work, the decoded-length guard, the `origin/develop` merge at
+`fae9da1ebb`, and this handoff update. Do not rewrite the published history. Push the final
+implementation and documentation commits only when explicitly requested.
+
+The merge is the only develop integration on this branch, and its five conflicts were all in
+`vortex-geo`, all resolved to the row ports because #9076 changed bodies the row layer replaces.
+`vortex-geo/src/scalar_fn/execute.rs` stays deleted, develop's new `is_fallible` overrides are gone
+because the blanket impl derives that from the witness, and develop's two new behavior tests were
+carried across (`constant_container_vs_row_rect_poking_outside` and
+`distance_to_constant_polygon_is_exact`) since both constrain the verdict rather than the mechanism.
+`git rerere` recorded the resolutions, so re-doing the merge will not re-ask.
 
 The production benchmark baseline is separate: draft PR
 [#9136](https://github.com/vortex-data/vortex/pull/9136), branch `ct/scalar-fn-baselines`, currently
@@ -264,6 +303,12 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
 
 ## What to do next, in order
 
+0. **Re-measure on x86 AVX-512, before touching the issues.** Every published ratio is stale for the
+   three reasons in the benchmark-record section, so the issue text cannot be corrected without
+   numbers to correct it to. Follow
+   [the x86 runbook](#the-x86-avx-512-re-measurement-runbook), which the `origin/develop` merge has
+   already unblocked by giving both suites one valid baseline. Supersede the existing #9128 comment
+   with a new one rather than editing it, so its AVX-512 codegen audit survives.
 1. **Land PR #9136.** It now contains the durable public-path benchmark set needed before the
    implementation stack: byte length, signed and unsigned add including a constant operand, LIKE
    cache behavior, tensor functions, geo predicates, and geo distance. Resolve its stacked-base
@@ -279,7 +324,9 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
    A sensible split is row core plus `ElementSink` and `byte_length`; tensor elements and kernels;
    prepared execution with cosine and geo; adaptive null execution; then specialized sinks and
    deferred errors with a production checked arithmetic user. Preserve each migrated function's
-   serialized metadata.
+   serialized metadata. Two amendments the merge added: the geo PR also owns reconciling with #9076,
+   including whether to widen the early-out gate, and the deferred-error PR has to bring its own
+   production user, since `ERRORS_ARE_DEFERRED` currently has none outside a bench and a test.
 4. **Use CodSpeed to decide whether handwritten add can be deleted.** The local executor harness
    establishes that the machinery can reach parity, but the gate is the stable production
    `binary_ops` names from #9136 on the actual implementation PR. Require non-null, nullable,
@@ -324,6 +371,104 @@ One boolean per element, one global threshold, no other inputs. The questions:
   option, or tracing the chosen strategy, may be wanted for debugging a slow query.
 - Plus the recorded follow-up: avoid probing `reduce_encoded` twice when branch execution turns out
   unsupported.
+
+## The x86 AVX-512 re-measurement runbook
+
+This section is self-contained: it is what to run on an x86 AVX-512 host to replace the stale issue
+tables, and it assumes nothing from the sections above except that they explain *why* the old
+numbers cannot be cited.
+
+### The one rule about machines
+
+**Label every number with its host, and never mix hosts inside one table.** The issue comment's
+numbers are x86 (7950X, AVX-512, pinned to one core, TSC timer). Anything measured on Apple Silicon
+is separate evidence, not an update to that table, because three of its claims do not survive the
+move at all:
+
+- The folded IR and assembly are AVX-512 specific: `vbroadcastss`, four `vmulps`, zmm stores, "64
+  `f32` coordinates per iteration". On NEON that is 128-bit vectors and a different unroll factor.
+  Re-derive those claims on x86 or scope them explicitly to x86; do not restate them from an
+  aarch64 run.
+- `BRANCH_MIN_SURVIVING_FRACTION = 0.75` is calibrated on x86. It trades memory-bandwidth work
+  against compute-bound work, so a macOS run disagreeing with it is not evidence the threshold is
+  wrong.
+- macOS has no equivalent core pinning and no TSC, so its per-sample variance is higher and its
+  `fastest` is less meaningful.
+
+If an interim aarch64 run happens first, post it as a clearly labeled interim comment and leave the
+x86 re-verification open. Do not overwrite the existing comment: it holds the AVX-512 codegen audit,
+which is the strongest part of the record and is not reproducible off x86.
+
+### Revisions to measure
+
+| role | ref |
+| --- | --- |
+| candidate | `claude/strict-scalar-fn-abstraction-ah88x3`, at or after the `origin/develop` merge |
+| baseline | `origin/develop` at `fae9da1ebb` or later, which **must** include #9076 |
+
+The merge is what makes a single baseline valid for both suites. Before it, geo needed a pre-#9076
+baseline and tensor a post-#9076 one. Confirm with `git merge-base --is-ancestor 2de0319312 HEAD`
+before trusting any geo comparison.
+
+### What each suite needs
+
+Tensor and `byte_length` controls are in-binary, so one checkout measures both arms:
+
+```bash
+cargo bench -p vortex-tensor --bench l2_norm --bench cosine_similarity
+cargo bench -p vortex-array --bench row_fn_executor --bench byte_length_element
+```
+
+Geo needs two checkouts, because its comparison is against develop's columnar path rather than an
+in-binary control. Mind which bench exists where: develop registers only `envelope` and
+`predicate_bbox`, so `binary_predicates` has to be carried into the develop tree. It is portable
+because it touches nothing branch-only (`GeoContains` / `GeoIntersects` constructors and the
+`geo_session` / `point_column` / `polygon_column` helpers all exist on develop unchanged):
+
+```bash
+git worktree add ../vortex-develop origin/develop
+cp vortex-geo/benches/binary_predicates.rs ../vortex-develop/vortex-geo/benches/
+# then add the matching [[bench]] stanza to ../vortex-develop/vortex-geo/Cargo.toml
+
+# candidate tree
+cargo bench -p vortex-geo --bench binary_predicates --bench predicate_bbox
+cargo bench -p vortex-geo --bench null_strategies
+# develop tree
+cargo bench -p vortex-geo --bench binary_predicates --bench predicate_bbox
+```
+
+`predicate_bbox` arrived with #9076 and still builds against the row ports, since it goes through
+the public path, which makes it the one geo bench already named identically on both sides and so the
+cheapest signal on whether the ports kept develop's rejection win. `null_strategies` and
+`null_strategy_bytes` force a strategy through the test-harness seam, so they cannot exist on
+develop and can never be baselined; keep them as candidate-only diagnostics. `l2_denorm` measures
+what is now an encoding, so run it only if the encoding claim is what is wanted.
+
+Report `fastest` and median from at least two runs, sequentially, with the host recorded. Divan is
+aliased to `codspeed-divan-compat` and behaves as ordinary divan locally.
+
+### The specific hypothesis this run should test
+
+The merge left the candidate with a *narrower* bounding-rect early-out than develop, and this is the
+most likely cause of a geo regression:
+
+- `intersects_opens_with_bbox_check` admits the hoisted early-out only for pairings where geo itself
+  opens with that same rect comparison. Develop's #9076 applies its rejection to every one-constant
+  pairing. So for a pairing geo does not open with a rect test, `Point` against `Polygon` above all,
+  develop gets an early-out the candidate does not.
+- `contains` on the candidate routes through a prepared geometry and has **no** rect test at all,
+  while develop now rejects on `!ra.contains(rb)`.
+
+The gate was written to keep the hoist pure common-subexpression elimination, on the worry that a
+rect test could change the verdict for NaN coordinates. That worry is settled and the answer is no:
+geo 0.31's `Rect::intersects` returns false only after finding an ordered separation, so NaN bounds
+make all four comparisons false, it falls through to true, and
+`(!ra.intersects(rb)).then_some(false)` yields `None` and defers to the exact test. Develop's
+unconditional form is therefore conservative and result-preserving.
+
+So if `intersects points x constant` or either constant-side `contains` arm loses to develop,
+widening the gate is the first thing to try, not a mystery. Both were already the weakest arms
+against the *old* baseline (0.907-0.998x), and they are now measured against a faster one.
 
 ## The measurement plan
 
@@ -430,16 +575,18 @@ The final implementation verification was: 65 focused RowFn tests, 225 geo libra
 library tests, 72 `vortex-array` doctests with 10 ignored, targeted all-target/all-feature clippy for
 the three crates, nightly fmt, and whitespace checks. The compile-fail witness doctest passed.
 
-The prototype forked from current development history at `bb4138d051`; the local
-`origin/develop` was `2de0319312` when this handoff was finalized. Those refs will move before the
-implementation stack is cut. Fetch `origin/develop`, recompute the merge base, and use
-`git range-diff` rather than assuming either recorded hash is still current. To recover the
-pre-port body of `not`, `list_length`, or `list_sum` from the prototype history, use
-`24d1933e1^`.
+The prototype forked from development history at `bb4138d051` and has since merged `origin/develop`
+at `fae9da1ebb`, so develop is an ancestor and there is no merge base to recompute for ordinary
+diffing. Both refs will still move before the implementation stack is cut: fetch `origin/develop`
+and use `git range-diff` rather than assuming either recorded hash is current. To recover the
+pre-port body of `not`, `list_length`, or `list_sum` from the prototype history, use `24d1933e1^`.
 
 Benchmarks are divan (aliased to `codspeed-divan-compat`, so they also run in CI); report `fastest`
-and `median` from at least two runs and state the machine. The historical measurements here used a
-shared 4-vCPU VM; the current 7950X comparison is recorded in the [issue #9128 follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802). Any new bench must be
+and `median` from at least two runs and **always state the machine**, which is the one convention
+that has actually been broken here: the historical measurements used a shared 4-vCPU VM, the issue
+comment used a 7950X, and the checked-add table records no host at all. See
+[the x86 runbook](#the-x86-avx-512-re-measurement-runbook) for why mixing hosts in one table is not
+recoverable after the fact. Any new bench must be
 registered as a `[[bench]]` with `harness = false` in the crate's `Cargo.toml`. Per-adopter
 benchmarks with constant and non-constant arms are the convention, and where a claim is "as fast as
 the hand-written version", put both arms in one binary rather than comparing across builds. Disk is tight:
