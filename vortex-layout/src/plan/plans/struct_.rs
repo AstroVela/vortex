@@ -5,11 +5,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::DType;
-use vortex_array::dtype::StructFields;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 
 use crate::layouts::struct_::StructLayout;
+use crate::plan::LazyPlanChildren;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
@@ -18,48 +17,39 @@ use crate::plan::new_plan;
 pub struct StructPlan {
     layout: StructLayout,
     dtype: DType,
-    fields: Arc<[PlanRef]>,
-    validity: Option<PlanRef>,
+    children: LazyPlanChildren,
 }
 
 impl StructPlan {
-    pub(crate) fn try_new(layout: &StructLayout) -> VortexResult<Self> {
+    pub(crate) fn new(layout: &StructLayout) -> Self {
         // Struct layout slot 0 is validity and field i is slot i + 1. The plan puts validity last
         // so field indices are identical to their plan-child indices.
-        let fields =
-            (0..layout.struct_fields().nfields())
-                .map(|index| {
-                    new_plan(&layout.slot(index + 1)?.ok_or_else(|| {
-                        vortex_error::vortex_err!("Struct field {index} is absent")
-                    })?)
-                })
-                .collect::<VortexResult<Vec<_>>>()?;
-        let validity = layout
-            .slot(0)?
-            .map(|validity| new_plan(&validity))
-            .transpose()?;
-        Ok(Self {
+        let child_layout = layout.clone();
+        let field_count = layout.struct_fields().nfields();
+        let children = LazyPlanChildren::new(field_count + 1, move |index| {
+            if index < field_count {
+                let field = child_layout
+                    .slot(index + 1)?
+                    .ok_or_else(|| vortex_error::vortex_err!("Struct field {index} is absent"))?;
+                return Ok(Some(new_plan(&field)?));
+            }
+            child_layout
+                .slot(0)?
+                .map(|validity| new_plan(&validity))
+                .transpose()
+        });
+        Self {
             layout: layout.clone(),
             dtype: layout.dtype().clone(),
-            fields: fields.into(),
-            validity,
-        })
+            children,
+        }
     }
 
-    fn with_children(&self, fields: Vec<PlanRef>, validity: Option<PlanRef>) -> Self {
-        let struct_fields = StructFields::from_iter(
-            self.layout
-                .struct_fields()
-                .names()
-                .iter()
-                .zip(fields.iter())
-                .map(|(name, field)| (name.clone(), field.dtype().clone())),
-        );
+    fn with_children(&self, children: LazyPlanChildren) -> Self {
         Self {
             layout: self.layout.clone(),
-            dtype: DType::Struct(struct_fields, self.layout.dtype().nullability()),
-            fields: fields.into(),
-            validity,
+            dtype: self.dtype.clone(),
+            children,
         }
     }
 }
@@ -74,17 +64,8 @@ impl Plan for StructPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let fields = self
-            .fields
-            .iter()
-            .map(|field| field.optimize())
-            .collect::<VortexResult<Vec<_>>>()?;
-        let validity = self
-            .validity
-            .as_ref()
-            .map(|validity| validity.optimize())
-            .transpose()?;
-        Ok(Arc::new(self.with_children(fields, validity)))
+        let children = self.children.map(|_, child| child.optimize());
+        Ok(Arc::new(self.with_children(children)))
     }
 
     fn dtype(&self) -> &DType {
@@ -96,24 +77,18 @@ impl Plan for StructPlan {
     }
 
     fn child_count(&self) -> usize {
-        self.fields.len() + 1
+        self.children.len()
     }
 
     fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
-        if let Some(field) = self.fields.get(index) {
-            return Ok(Some(Arc::clone(field)));
-        }
-        if index == self.fields.len() {
-            return Ok(self.validity.clone());
-        }
-        vortex_bail!("Struct plan has no child {index}")
+        self.children.get(index)
     }
 
     fn child_name(&self, index: usize) -> Cow<'_, str> {
         if let Some(name) = self.layout.struct_fields().field_name(index) {
             return Cow::Borrowed(name.as_ref());
         }
-        if index == self.fields.len() {
+        if index == self.layout.struct_fields().nfields() {
             return Cow::Borrowed("validity");
         }
         Cow::Owned(format!("child[{index}]"))

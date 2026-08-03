@@ -193,6 +193,11 @@ not change layout vtables, layout readers, scan builders, or scan execution. Bui
 dispatched inside `vortex_layout::plan::new_plan`, keeping the provisional planner isolated while
 its plan shapes and optimization rules are developed.
 
+Plan child access is demand-driven. High-fanout chunked and struct plans initialize and cache only
+the children requested by an optimizer rule; optimizing the parent preserves that laziness. Plan
+types with small, fixed fan-out may construct their children eagerly. Rendering a complete plan
+tree intentionally requests every child.
+
 A follow-up can define reader materialization and wire optimized plans into scans. Until then, the
 existing reader and scan paths continue unchanged.
 

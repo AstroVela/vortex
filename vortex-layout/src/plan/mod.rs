@@ -3,6 +3,7 @@
 
 //! Heap-allocated physical plans for layout scans.
 
+mod children;
 mod display;
 mod plans;
 
@@ -10,6 +11,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+pub(crate) use children::LazyPlanChildren;
 pub use display::PlanExpressionExtractor;
 pub use display::PlanIndentedFormatter;
 pub use display::PlanSummaryExtractor;
@@ -41,7 +43,7 @@ pub type PlanRef = Arc<dyn Plan>;
 ///
 /// Layout plans expose their optimizer-facing children in a stable logical order. Optional child
 /// slots count toward [`child_count`](Self::child_count) and are returned as `None` by
-/// [`child`](Self::child) when absent.
+/// [`child`](Self::child) when absent. Accessing a child may initialize and cache its plan.
 pub trait Plan: 'static + Send + Sync {
     /// Returns this plan as [`Any`] for plan-specific optimization rules.
     fn as_any(&self) -> &dyn Any;
@@ -53,7 +55,9 @@ pub trait Plan: 'static + Send + Sync {
         std::any::type_name::<Self>()
     }
 
-    /// Recursively optimizes this plan.
+    /// Optimizes this plan while preserving its dtype and row domain.
+    ///
+    /// Implementations may defer child optimization until the child is accessed.
     fn optimize(&self) -> VortexResult<PlanRef>;
 
     /// Returns the dtype produced by this plan.
@@ -80,11 +84,11 @@ pub trait Plan: 'static + Send + Sync {
 
 /// Constructs a physical plan without changing the layout or scan APIs.
 ///
-/// Known layouts are expanded into optimizer-visible plan nodes. Unsupported layout kinds return
-/// an error until a corresponding plan node is added.
+/// Known layouts are represented by optimizer-visible plan nodes, which may defer constructing
+/// their children. Unsupported layout kinds return an error when their plan is requested.
 pub fn new_plan(layout: &LayoutRef) -> VortexResult<PlanRef> {
     if let Some(layout) = layout.as_opt::<Chunked>() {
-        return Ok(Arc::new(ChunkedPlan::try_new(layout)?));
+        return Ok(Arc::new(ChunkedPlan::new(layout)));
     }
     if let Some(layout) = layout.as_opt::<Dict>() {
         return Ok(Arc::new(DictPlan::try_new(layout)?));
@@ -96,7 +100,7 @@ pub fn new_plan(layout: &LayoutRef) -> VortexResult<PlanRef> {
         return Ok(Arc::new(ListPlan::try_new(layout)?));
     }
     if let Some(layout) = layout.as_opt::<Struct>() {
-        return Ok(Arc::new(StructPlan::try_new(layout)?));
+        return Ok(Arc::new(StructPlan::new(layout)));
     }
     vortex_bail!(
         "No physical plan implementation for layout '{}'",

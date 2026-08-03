@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
 
 use crate::layouts::chunked::ChunkedLayout;
+use crate::plan::LazyPlanChildren;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
@@ -17,45 +17,31 @@ use crate::plan::new_plan;
 pub struct ChunkedPlan {
     layout: ChunkedLayout,
     dtype: DType,
-    chunks: Arc<[PlanRef]>,
+    chunks: LazyPlanChildren,
 }
 
 impl ChunkedPlan {
-    pub(crate) fn try_new(layout: &ChunkedLayout) -> VortexResult<Self> {
-        let chunks = (0..layout.nchildren())
-            .map(|index| {
-                new_plan(
-                    &layout
-                        .slot(index)?
-                        .ok_or_else(|| vortex_error::vortex_err!("Missing chunk {index}"))?,
-                )
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-        Ok(Self {
+    pub(crate) fn new(layout: &ChunkedLayout) -> Self {
+        let child_layout = layout.clone();
+        let chunks = LazyPlanChildren::new(layout.nchildren(), move |index| {
+            let child = child_layout
+                .slot(index)?
+                .ok_or_else(|| vortex_error::vortex_err!("Missing chunk {index}"))?;
+            Ok(Some(new_plan(&child)?))
+        });
+        Self {
             layout: layout.clone(),
             dtype: layout.dtype().clone(),
-            chunks: chunks.into(),
-        })
+            chunks,
+        }
     }
 
-    fn try_with_chunks(&self, chunks: Vec<PlanRef>) -> VortexResult<Self> {
-        let dtype = chunks
-            .first()
-            .map(|chunk| chunk.dtype().clone())
-            .unwrap_or_else(|| self.dtype.clone());
-        for (index, chunk) in chunks.iter().enumerate() {
-            vortex_ensure!(
-                chunk.dtype() == &dtype,
-                "Chunk {index} plan dtype {} does not match {}",
-                chunk.dtype(),
-                dtype
-            );
-        }
-        Ok(Self {
+    fn with_chunks(&self, chunks: LazyPlanChildren) -> Self {
+        Self {
             layout: self.layout.clone(),
-            dtype,
-            chunks: chunks.into(),
-        })
+            dtype: self.dtype.clone(),
+            chunks,
+        }
     }
 }
 
@@ -69,12 +55,8 @@ impl Plan for ChunkedPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let chunks = self
-            .chunks
-            .iter()
-            .map(|chunk| chunk.optimize())
-            .collect::<VortexResult<Vec<_>>>()?;
-        Ok(Arc::new(self.try_with_chunks(chunks)?))
+        let chunks = self.chunks.map(|_, chunk| chunk.optimize());
+        Ok(Arc::new(self.with_chunks(chunks)))
     }
 
     fn dtype(&self) -> &DType {
@@ -90,7 +72,10 @@ impl Plan for ChunkedPlan {
     }
 
     fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
-        Ok(self.chunks.get(index).cloned())
+        if index >= self.chunks.len() {
+            return Ok(None);
+        }
+        self.chunks.get(index)
     }
 
     fn child_name(&self, index: usize) -> Cow<'_, str> {
