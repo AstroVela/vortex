@@ -45,7 +45,7 @@ impl ScalarFnVTable for GeoIntersects {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        static ID: CachedId = CachedId::new("vortex.geo.intersects");
+        static ID: CachedId = CachedId::new("vortex.st.intersects");
         *ID
     }
 

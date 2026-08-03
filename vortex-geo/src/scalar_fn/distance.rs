@@ -47,7 +47,7 @@ impl ScalarFnVTable for GeoDistance {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        static ID: CachedId = CachedId::new("vortex.geo.distance");
+        static ID: CachedId = CachedId::new("vortex.st.distance");
         *ID
     }
 
