@@ -34,18 +34,6 @@ impl ExpressionPlan {
         })
     }
 
-    /// Creates a shared expression plan.
-    pub fn new_ref(expression: Expression, child: PlanRef) -> VortexResult<PlanRef> {
-        if let Some(inner) = child.as_any().downcast_ref::<Self>() {
-            let expression = replace(expression, &root(), inner.expression.clone());
-            return Ok(Arc::new(Self::try_new(
-                expression,
-                Arc::clone(&inner.child),
-            )?));
-        }
-        Ok(Arc::new(Self::try_new(expression, child)?))
-    }
-
     /// Returns the expression evaluated by this plan.
     pub fn expression(&self) -> &Expression {
         &self.expression
@@ -72,7 +60,14 @@ impl Plan for ExpressionPlan {
         if is_root(&expression) {
             return Ok(child);
         }
-        Self::new_ref(expression, child)
+        if let Some(inner) = child.as_any().downcast_ref::<Self>() {
+            let expression = replace(expression, &root(), inner.expression.clone());
+            return Ok(Arc::new(Self::try_new(
+                expression,
+                Arc::clone(&inner.child),
+            )?));
+        }
+        Ok(Arc::new(Self::try_new(expression, child)?))
     }
 
     fn dtype(&self) -> &DType {
