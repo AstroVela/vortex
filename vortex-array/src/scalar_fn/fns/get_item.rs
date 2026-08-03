@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::fmt::Formatter;
+use std::sync::Arc;
 
 use prost::Message;
 use vortex_error::VortexResult;
@@ -12,7 +13,10 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::arrays::MapArray;
 use crate::arrays::StructArray;
+use crate::arrays::map::MapArrayExt;
 use crate::arrays::struct_::StructArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::builtins::ExprBuiltins;
@@ -37,6 +41,8 @@ use crate::scalar_fn::fns::pack::Pack;
 
 #[derive(Clone)]
 pub struct GetItem;
+
+const MAP_ENTRIES_FIELD: &str = "entries";
 
 impl ScalarFnVTable for GetItem {
     type Options = FieldName;
@@ -86,23 +92,36 @@ impl ScalarFnVTable for GetItem {
     }
 
     fn return_dtype(&self, field_name: &FieldName, arg_dtypes: &[DType]) -> VortexResult<DType> {
-        let struct_dtype = &arg_dtypes[0];
-        let field_dtype = struct_dtype
-            .as_struct_fields_opt()
-            .and_then(|st| st.field(field_name))
-            .ok_or_else(|| {
-                vortex_err!("Couldn't find the {} field in the input scope", field_name)
-            })?;
+        let input_dtype = &arg_dtypes[0];
 
-        // Match here to avoid cloning the dtype if nullability doesn't need to change
-        if matches!(
-            (struct_dtype.nullability(), field_dtype.nullability()),
-            (Nullability::Nullable, Nullability::NonNullable)
-        ) {
-            return Ok(field_dtype.with_nullability(Nullability::Nullable));
+        if let Some(map_dtype) = input_dtype.as_map_opt()
+            && field_name == MAP_ENTRIES_FIELD
+        {
+            return Ok(DType::List(
+                Arc::new(map_dtype.entries_dtype()),
+                input_dtype.nullability(),
+            ));
         }
 
-        Ok(field_dtype)
+        if let Some(field_dtype) = input_dtype
+            .as_struct_fields_opt()
+            .and_then(|st| st.field(field_name))
+        {
+            // Match here to avoid cloning the dtype if nullability doesn't need to change
+            if matches!(
+                (input_dtype.nullability(), field_dtype.nullability()),
+                (Nullability::Nullable, Nullability::NonNullable)
+            ) {
+                return Ok(field_dtype.with_nullability(Nullability::Nullable));
+            }
+
+            return Ok(field_dtype);
+        }
+
+        Err(vortex_err!(
+            "Couldn't find the {} field in the input scope",
+            field_name
+        ))
     }
 
     fn execute(
@@ -111,7 +130,24 @@ impl ScalarFnVTable for GetItem {
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?.execute::<StructArray>(ctx)?;
+        let input = args.get(0)?;
+
+        if input.dtype().is_map() {
+            if field_name == MAP_ENTRIES_FIELD {
+                return Ok(input
+                    .execute::<MapArray>(ctx)?
+                    .entries()
+                    .into_owned()
+                    .into_array());
+            }
+
+            return Err(vortex_err!(
+                "Couldn't find the {} field in the input scope",
+                field_name
+            ));
+        }
+
+        let input = input.execute::<StructArray>(ctx)?;
         let field = input.unmasked_field_by_name(field_name).cloned()?;
 
         match input.dtype().nullability() {

@@ -20,6 +20,7 @@ use crate::arrays::BoolArray;
 use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::FilterArray;
+use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
 use crate::arrays::Map;
 use crate::arrays::MapArray;
@@ -27,15 +28,18 @@ use crate::arrays::PrimitiveArray;
 use crate::arrays::map::MapArrayExt;
 use crate::arrays::map::MapData;
 use crate::arrays::map::MapDataParts;
+use crate::arrays::scalar_fn::ScalarFnFactoryExt;
 use crate::assert_arrays_eq;
 use crate::builders::ArrayBuilder;
 use crate::builders::MapBuilder;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
+use crate::dtype::FieldName;
 use crate::dtype::MapDType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::scalar::Scalar;
+use crate::scalar_fn::fns::get_item::GetItem;
 use crate::serde::SerializeOptions;
 use crate::serde::SerializedArray;
 use crate::session::ArraySessionExt;
@@ -460,6 +464,47 @@ fn mask_combines_with_existing_map_validity() -> VortexResult<()> {
 
     assert!(masked.is::<Map>());
     assert_arrays_eq!(masked, expected, &mut ctx);
+
+    Ok(())
+}
+
+#[test]
+fn get_item_entries_pushes_down_to_entries_child() -> VortexResult<()> {
+    let source = sample_array()?;
+    let expected = source.entries().into_owned().into_array();
+    let expected_dtype = expected.dtype().clone();
+    let entries = source.into_array().get_item("entries")?;
+    let mut ctx = array_session().create_execution_ctx();
+
+    assert!(entries.is::<ListView>());
+    assert_eq!(entries.dtype(), &expected_dtype);
+    assert_arrays_eq!(entries, expected, &mut ctx);
+
+    Ok(())
+}
+
+#[test]
+fn get_item_rejects_unknown_map_field() -> VortexResult<()> {
+    let source = sample_array()?.into_array();
+
+    assert!(source.get_item("missing").is_err());
+
+    Ok(())
+}
+
+#[test]
+fn get_item_entries_executes_on_map_array_without_pushdown() -> VortexResult<()> {
+    let source = sample_array()?;
+    let expected = source.entries().into_owned().into_array();
+    let get_item = GetItem.try_new_array(
+        source.len(),
+        FieldName::from("entries"),
+        [source.into_array()],
+    )?;
+    let mut ctx = array_session().create_execution_ctx();
+    let entries = get_item.execute::<ListViewArray>(&mut ctx)?.into_array();
+
+    assert_arrays_eq!(entries, expected, &mut ctx);
 
     Ok(())
 }
