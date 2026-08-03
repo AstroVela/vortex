@@ -178,8 +178,7 @@ pub struct OnPairData {
     /// duplicate initialization work before one value wins the `OnceLock`.
     ///
     /// INVARIANT: once populated, the offsets passed
-    /// [`CompactDictionary::validate_safety`] against `dict_bytes` (or came
-    /// from the trainer via [`init_dict_offsets`](Self::init_dict_offsets)).
+    /// [`CompactDictionary::validate_safety`] against `dict_bytes`.
     /// The `Arc` cell is shared only between arrays with identical dictionary
     /// bytes and logically identical offsets (slice / filter / cast keep both).
     dictionary: Arc<OnceLock<CompactDictionary<OnPairDictionaryStorage>>>,
@@ -194,36 +193,21 @@ impl OnPairData {
         }
     }
 
-    /// Seed the dictionary cell with offsets that are already known to be
-    /// safe, so the first operation skips validation.
+    /// Build [`OnPairData`] with the dictionary already materialised, so the
+    /// first decode skips both widening and validation.
     ///
-    /// This is the crate-internal trust mint (the moral equivalent of
-    /// [`onpair::CompactDictionary::new_unchecked`]): compression seeds it
-    /// with the trainer's offsets, which are conformant by construction.
-    ///
-    /// # Safety
-    /// `(self.dict_bytes, offsets)` must satisfy the structural [`onpair`]
-    /// compact dictionary invariants (i.e.
-    /// [`CompactDictionaryView::validate_safety`] would succeed on them), and
-    /// `offsets` must be the widened values of the array's `dict_offsets` child.
-    /// [`dict_view`] relies on this to build an unchecked dictionary view.
-    pub(crate) unsafe fn init_dict_offsets(&self, offsets: Buffer<u32>) {
-        debug_assert!(
-            CompactDictionaryView::validate_safety(
-                self.dict_bytes().as_slice(),
-                offsets.as_slice()
-            )
-            .is_ok(),
-            "init_dict_offsets called with a structurally unsafe dictionary"
-        );
-        let dictionary = unsafe {
-            CompactDictionary::new_unchecked(OnPairDictionaryStorage {
-                bytes: self.dict_bytes().clone(),
-                offsets,
-            })
-        };
-        // A benign race can only ever install another structurally safe value.
-        drop(self.dictionary.set(dictionary));
+    /// `offsets` must be the widened values of the `dict_offsets` child the
+    /// caller attaches to the array; validation proves only that they are
+    /// structurally safe against `dict_bytes`.
+    pub(crate) fn try_new_with_dictionary(
+        dict_bytes: BufferHandle,
+        offsets: Buffer<u32>,
+    ) -> VortexResult<Self> {
+        let dictionary = build_dictionary(dict_bytes.as_host().clone(), offsets)?;
+        Ok(Self {
+            dict_bytes,
+            dictionary: Arc::new(OnceLock::from(dictionary)),
+        })
     }
 
     /// The dictionary blob as a host byte buffer.
@@ -235,6 +219,16 @@ impl OnPairData {
     pub fn dict_bytes_handle(&self) -> &BufferHandle {
         &self.dict_bytes
     }
+}
+
+/// Safety-validate `(bytes, offsets)` and seal them into a storage-backed
+/// dictionary.
+fn build_dictionary(
+    bytes: ByteBuffer,
+    offsets: Buffer<u32>,
+) -> VortexResult<CompactDictionary<OnPairDictionaryStorage>> {
+    CompactDictionary::validate_safety(OnPairDictionaryStorage { bytes, offsets })
+        .map_err(|e| vortex_err!(InvalidArgument: "Unsafe OnPair dictionary: {e}"))
 }
 
 /// A safety-validated [`CompactDictionaryView`] over `array`'s dictionary.
@@ -253,11 +247,7 @@ pub(crate) fn dict_view<'a>(
         Some(dictionary) => dictionary,
         None => {
             let widened = collect_widened::<u32>(array.dict_offsets(), ctx)?;
-            let dictionary = CompactDictionary::validate_safety(OnPairDictionaryStorage {
-                bytes: data.dict_bytes().clone(),
-                offsets: widened,
-            })
-            .map_err(|e| vortex_err!(InvalidArgument: "Unsafe OnPair dictionary: {e}"))?;
+            let dictionary = build_dictionary(data.dict_bytes().clone(), widened)?;
             data.dictionary.get_or_init(|| dictionary)
         }
     };
