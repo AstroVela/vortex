@@ -70,6 +70,7 @@ struct Args {
     /// Run GPU decompression for the allow-listed benchmarks.
     ///
     /// This filters the suite to GPU-supported dataset names and runs only Vortex decompression.
+    /// Passing `--datasets` overrides the allow-list.
     #[arg(long)]
     gpu_decompress: bool,
     #[arg(short, long, default_value_t, value_enum)]
@@ -207,7 +208,12 @@ async fn run_compress(
     .into_iter()
     .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
     .filter(|d| {
-        if gpu_decompress && !gpu_decompress_benchmarks.contains(&d.name()) {
+        // An explicit `--datasets` filter overrides the allow-list, so the remaining CPU
+        // datasets can be run on GPU to do the end-to-end verification that promotes them.
+        if gpu_decompress
+            && datasets_filter.is_none()
+            && !gpu_decompress_benchmarks.contains(&d.name())
+        {
             return false;
         }
         if let Some(filter) = datasets_filter.as_ref() {
