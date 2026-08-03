@@ -14,6 +14,7 @@ use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
+use vortex_session::registry::CachedId;
 use vortex_session::registry::ReadContext;
 
 use super::*;
@@ -22,6 +23,7 @@ use crate::OwnedLayoutChildren;
 use crate::layouts::chunked::ChunkedLayout;
 use crate::layouts::dict::DictLayout;
 use crate::layouts::flat::FlatLayout;
+use crate::layouts::foreign::new_foreign_layout;
 use crate::layouts::list::ListLayout;
 use crate::layouts::row_idx::row_idx;
 use crate::layouts::struct_::StructLayout;
@@ -43,6 +45,22 @@ fn flat(row_count: u64, dtype: DType, segment: u32) -> LayoutRef {
 
 fn make_plan(layout: LayoutRef) -> VortexResult<PlanRef> {
     new_plan(&layout)
+}
+
+#[test]
+fn unsupported_layout_has_no_plan() -> VortexResult<()> {
+    static ID: CachedId = CachedId::new("vortex.test.unsupported");
+    let layout = new_foreign_layout(*ID, DType::Null, 3, Vec::new(), Vec::new(), Vec::new());
+
+    let error = new_plan(&layout)
+        .err()
+        .ok_or_else(|| vortex_err!("unsupported layout unexpectedly produced a plan"))?;
+    assert!(
+        error
+            .to_string()
+            .contains("No physical plan implementation for layout 'vortex.test.unsupported'")
+    );
+    Ok(())
 }
 
 #[test]
