@@ -45,5 +45,10 @@ harness = false
 name = "mask_iteration"
 harness = false
 
+# TEMPORARY: proves the bench-budget CI check fires. Delete before merge.
+[[bench]]
+name = "budget_canary"
+harness = false
+
 [lints]
 workspace = true
