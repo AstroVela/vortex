@@ -52,9 +52,10 @@ jobs:
           # `Patches` into a top-level `vortex.patched` array, which has no CUDA decode
           # kernel and makes GPU decompression fail with "No CUDA kernel for encoding
           # vortex.patched". Leaving it unset keeps patches inline in the bitpacked array,
-          # which the CUDA bitpacked kernel decodes. This matches the GPU test workflow
-          # (cuda.yaml), which also sets only FLAT_LAYOUT_INLINE_ARRAY_NODE.
-          FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
+          # which the CUDA bitpacked kernel decodes.
+          # The flat layout reads this as enabled only when it is exactly "1", so "0" leaves
+          # the array node out of line, as it was before the inline node was introduced.
+          FLAT_LAYOUT_INLINE_ARRAY_NODE: "0"
         run: |
           bash scripts/bench-taskset.sh target/release_debug/compress-bench \
             --gpu-decompress -d table > gpu-compress.txt
