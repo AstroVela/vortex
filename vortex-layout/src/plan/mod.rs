@@ -20,7 +20,6 @@ pub use plans::ChunkedPlan;
 pub use plans::DictPlan;
 pub use plans::ExpressionPlan;
 pub use plans::FlatPlan;
-pub(crate) use plans::LayoutPlan;
 pub use plans::ListPlan;
 pub use plans::RowIdxPlan;
 pub use plans::StructPlan;
@@ -81,8 +80,8 @@ pub trait Plan: 'static + Send + Sync {
 
 /// Constructs a physical plan without changing the layout or scan APIs.
 ///
-/// Known layouts are expanded into optimizer-visible plan nodes. Other layouts remain opaque so
-/// the planner can represent them without requiring planner hooks in every layout vtable.
+/// Known layouts are expanded into optimizer-visible plan nodes. Unsupported layout kinds return
+/// an error until a corresponding plan node is added.
 pub fn new_plan(layout: &LayoutRef) -> VortexResult<PlanRef> {
     if let Some(layout) = layout.as_opt::<Chunked>() {
         return Ok(Arc::new(ChunkedPlan::try_new(layout)?));
@@ -99,7 +98,10 @@ pub fn new_plan(layout: &LayoutRef) -> VortexResult<PlanRef> {
     if let Some(layout) = layout.as_opt::<Struct>() {
         return Ok(Arc::new(StructPlan::try_new(layout)?));
     }
-    Ok(Arc::new(LayoutPlan::new(Arc::clone(layout))))
+    vortex_bail!(
+        "No physical plan implementation for layout '{}'",
+        layout.encoding_id()
+    )
 }
 
 impl dyn Plan + '_ {
