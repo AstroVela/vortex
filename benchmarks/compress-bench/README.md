@@ -15,20 +15,21 @@ See [`src/main.rs`](./src/main.rs) for the dataset list and CLI flags (`--format
 cargo run -p compress-bench --profile release_debug
 ```
 
-GPU decompression is opt-in. By default it runs only the existing benchmark names
-allow-listed in `src/main.rs`:
+GPU decompression is opt-in and runs the full dataset suite:
 
 ```bash
 cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress
 ```
 
-An explicit `--datasets` filter overrides the allow-list, which is how you run a
-not-yet-promoted dataset on GPU to do the end-to-end verification that promotes it:
+A dataset only decodes on GPU if every encoding `only_cuda_compatible()` picks for it has a
+kernel registered in `initialize_cuda`. Where one does not, the run fails with `No CUDA kernel
+for encoding ...` — the `wide table` datasets encode their columns as `vortex.list`, which has
+no kernel. Use `--datasets` to narrow the run to the datasets that decode:
 
 ```bash
 cargo run -p compress-bench --profile release_debug \
-  --features cuda,unstable_encodings -- --gpu-decompress --datasets 'Arade'
+  --features cuda,unstable_encodings -- --gpu-decompress --datasets 'TPC-H l_comment canonical'
 ```
 
 On Linux, GPU files are read with direct IO (`O_DIRECT`) so repeated iterations measure

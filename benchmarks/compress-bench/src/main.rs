@@ -67,10 +67,11 @@ struct Args {
     ops: Vec<CompressOp>,
     #[arg(long)]
     datasets: Option<String>,
-    /// Run GPU decompression for the allow-listed benchmarks.
+    /// Run GPU decompression instead of CPU decompression.
     ///
-    /// This filters the suite to GPU-supported dataset names and runs only Vortex decompression.
-    /// Passing `--datasets` overrides the allow-list.
+    /// This runs the full dataset suite, restricted to Vortex decompression. A dataset whose
+    /// CUDA-compatible encoding has no matching CUDA kernel fails with "No CUDA kernel for
+    /// encoding ..."; use `--datasets` to narrow the run to those that decode.
     #[arg(long)]
     gpu_decompress: bool,
     #[arg(short, long, default_value_t, value_enum)]
@@ -179,14 +180,6 @@ async fn run_compress(
         // ),
     ];
 
-    // Add an existing benchmark name here only after its CUDA-compatible compression and
-    // decompression kernels have been verified end to end.
-    #[expect(
-        clippy::useless_vec,
-        reason = "this is an intentionally incremental allow-list of benchmark names"
-    )]
-    let gpu_decompress_benchmarks = vec!["TPC-H l_comment canonical"];
-
     let datasets: Vec<&dyn Dataset> = [
         &TaxiData as &dyn Dataset,
         PBI_DATASETS.get(Arade),
@@ -208,14 +201,6 @@ async fn run_compress(
     .into_iter()
     .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
     .filter(|d| {
-        // An explicit `--datasets` filter overrides the allow-list, so the remaining CPU
-        // datasets can be run on GPU to do the end-to-end verification that promotes them.
-        if gpu_decompress
-            && datasets_filter.is_none()
-            && !gpu_decompress_benchmarks.contains(&d.name())
-        {
-            return false;
-        }
         if let Some(filter) = datasets_filter.as_ref() {
             filter.is_match(d.name())
         } else {
