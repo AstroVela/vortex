@@ -82,6 +82,17 @@ impl<T: InputElement> ArgColumn<T> {
         }
     }
 
+    /// Whether this argument addresses exactly `row_count` rows.
+    ///
+    /// A constant operand was collapsed to its one distinct row and is read at index 0 forever, so
+    /// it addresses any row count and is exempt.
+    fn addresses_rows(&self, row_count: usize) -> bool {
+        match &self.0 {
+            ArgColumnKind::Varying(column) => T::varying_len(&T::varying(column)) == row_count,
+            ArgColumnKind::Constant(_) => true,
+        }
+    }
+
     /// The single decoded element of a constant operand, or `None` for a real column.
     ///
     /// `Some` exactly when [`decode`](Self::decode) collapsed the operand to its one distinct row,
@@ -188,6 +199,13 @@ pub trait ElementTuple: 'static {
     /// Whether every varying column contains exactly `row_count` rows.
     fn varying_len_matches(columns: &Self::VaryingColumns<'_>, row_count: usize) -> bool;
 
+    /// Whether every argument that varies within the batch contains exactly `row_count` rows.
+    ///
+    /// The same guarantee as [`varying_len_matches`](Self::varying_len_matches), for the mixed case
+    /// [`varying`](Self::varying) declines: a batch-constant argument is exempt because it was
+    /// collapsed to one row, while every argument beside it still has to address the whole batch.
+    fn decoded_lens_match(columns: &Self::Columns, row_count: usize) -> bool;
+
     /// Read one row from columns already known to vary within the batch.
     fn get_varying<'a>(columns: &Self::VaryingColumns<'a>, index: usize) -> Self::Elems<'a>;
 
@@ -234,6 +252,10 @@ impl ElementTuple for () {
     }
 
     fn varying_len_matches(_columns: &Self::VaryingColumns<'_>, _row_count: usize) -> bool {
+        true
+    }
+
+    fn decoded_lens_match(_columns: &Self::Columns, _row_count: usize) -> bool {
         true
     }
 
@@ -301,6 +323,10 @@ macro_rules! element_tuple {
                 row_count: usize,
             ) -> bool {
                 $($t::varying_len(&columns.$idx) == row_count &&)+ true
+            }
+
+            fn decoded_lens_match(columns: &Self::Columns, row_count: usize) -> bool {
+                $(columns.$idx.addresses_rows(row_count) &&)+ true
             }
 
             fn get_varying<'a>(

@@ -108,13 +108,13 @@ pub(super) fn execute_row_sink_prepared<A: ElementTuple, P, S: OutputSink, R: Si
         let mut rows = sink.rows();
         vortex_ensure!(
             S::row_count_matches(&rows, row_count),
-            "output sink row count must match the execution row count, got {row_count}",
+            "the output sink does not address exactly {row_count} rows",
         );
 
         if let Some(varying) = A::varying(&columns) {
             vortex_ensure!(
                 A::varying_len_matches(&varying, row_count),
-                "decoded row input length must match the execution row count, got {row_count}",
+                "a decoded row input does not address exactly {row_count} rows",
             );
 
             for index in 0..row_count {
@@ -126,6 +126,11 @@ pub(super) fn execute_row_sink_prepared<A: ElementTuple, P, S: OutputSink, R: Si
                 .accumulate(&mut deferred_error)?;
             }
         } else {
+            vortex_ensure!(
+                A::decoded_lens_match(&columns, row_count),
+                "a decoded row input does not address exactly {row_count} rows",
+            );
+
             for index in 0..row_count {
                 apply(&state, A::get(&columns, index), S::row(&mut rows, index))
                     .accumulate(&mut deferred_error)?;
@@ -165,16 +170,18 @@ pub(super) fn execute_row_sink_branch<A: ElementTuple, P, S: OutputSink, R: Sink
         let mut rows = sink.rows();
         vortex_ensure!(
             S::row_count_matches(&rows, row_count),
-            "output sink row count must match the execution row count, got {row_count}",
+            "the output sink does not address exactly {row_count} rows",
         );
 
         let varying = A::varying(&columns);
-        if let Some(varying) = &varying {
-            vortex_ensure!(
-                A::varying_len_matches(varying, row_count),
-                "decoded row input length must match the execution row count, got {row_count}",
-            );
-        }
+        let lens_match = match &varying {
+            Some(varying) => A::varying_len_matches(varying, row_count),
+            None => A::decoded_lens_match(&columns, row_count),
+        };
+        vortex_ensure!(
+            lens_match,
+            "a decoded row input does not address exactly {row_count} rows",
+        );
 
         let mut error = None;
         valid.for_each_set_index(|index| {
