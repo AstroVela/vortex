@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Microbenchmark for the `vortex.geo.envelope` scalar function: per-row bounding boxes over
+//! Microbenchmark for the `vortex.st.envelope` scalar function: per-row bounding boxes over
 //! native geometry storage.
 //!
 //! Cases vary the two axes that dominate the kernel's cost profile:

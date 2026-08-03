@@ -118,7 +118,7 @@ impl ScalarFnVTable for GeoEnvelope {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        static ID: CachedId = CachedId::new("vortex.geo.envelope");
+        static ID: CachedId = CachedId::new("vortex.st.envelope");
         *ID
     }
 

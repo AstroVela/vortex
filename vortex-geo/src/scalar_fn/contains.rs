@@ -46,7 +46,7 @@ impl ScalarFnVTable for GeoContains {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        static ID: CachedId = CachedId::new("vortex.geo.contains");
+        static ID: CachedId = CachedId::new("vortex.st.contains");
         *ID
     }
 
