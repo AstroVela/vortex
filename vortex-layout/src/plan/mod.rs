@@ -3,18 +3,27 @@
 
 //! Heap-allocated physical plans for layout scans.
 
+mod display;
 mod plans;
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::sync::Arc;
 
+pub use display::PlanExpressionExtractor;
+pub use display::PlanIndentedFormatter;
+pub use display::PlanSummaryExtractor;
+pub use display::PlanTreeContext;
+pub use display::PlanTreeDisplay;
+pub use display::PlanTreeExtractor;
 pub use plans::ChunkedPlan;
 pub use plans::DictPlan;
 pub use plans::ExpressionPlan;
+pub(crate) use plans::ExpressionReader;
 pub use plans::FlatPlan;
 pub(crate) use plans::LayoutPlan;
-pub use plans::LayoutReaderPlan;
 pub use plans::ListPlan;
+pub(crate) use plans::RowIdxPlan;
 pub use plans::StructPlan;
 use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
@@ -37,6 +46,13 @@ pub type PlanRef = Arc<dyn Plan>;
 pub trait Plan: 'static + Send + Sync {
     /// Returns this plan as [`Any`] for plan-specific optimization rules.
     fn as_any(&self) -> &dyn Any;
+
+    /// Returns the display name of this plan kind.
+    ///
+    /// Plans should override this when the fully qualified Rust type name is not appropriate.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 
     /// Recursively optimizes this plan.
     fn optimize(&self) -> VortexResult<PlanRef>;
@@ -64,6 +80,28 @@ pub trait Plan: 'static + Send + Sync {
     /// Returns the plan in logical child slot `index`, or `None` when that optional slot is absent.
     fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
         vortex_bail!("Plan has no child {index}")
+    }
+
+    /// Returns the display name of logical child slot `index`.
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        Cow::Owned(format!("child[{index}]"))
+    }
+}
+
+impl dyn Plan + '_ {
+    /// Displays this plan and its descendants with the default plan extractors.
+    pub fn display_tree(&self) -> PlanTreeDisplay<'_> {
+        PlanTreeDisplay::default_display(self)
+    }
+
+    /// Displays this plan and its descendants with the default plan extractors.
+    pub fn tree_display(&self) -> PlanTreeDisplay<'_> {
+        PlanTreeDisplay::default_display(self)
+    }
+
+    /// Creates a composable tree display with no extractors.
+    pub fn tree_display_builder(&self) -> PlanTreeDisplay<'_> {
+        PlanTreeDisplay::new(self)
     }
 }
 

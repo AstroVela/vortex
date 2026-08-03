@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::DType;
@@ -66,6 +67,10 @@ impl Plan for ChunkedPlan {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "ChunkedPlan"
+    }
+
     fn optimize(&self) -> VortexResult<PlanRef> {
         let chunks = self
             .chunks
@@ -117,5 +122,9 @@ impl Plan for ChunkedPlan {
 
     fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
         Ok(self.chunks.get(index).cloned())
+    }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        Cow::Owned(format!("chunks[{index}]"))
     }
 }

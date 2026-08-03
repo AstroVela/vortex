@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::DType;
@@ -72,6 +73,10 @@ impl Plan for StructPlan {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "StructPlan"
+    }
+
     fn optimize(&self) -> VortexResult<PlanRef> {
         let fields = self
             .fields
@@ -93,6 +98,7 @@ impl Plan for StructPlan {
         session: &VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
+        eprintln!("VORTEX_STRUCT_PLAN_NEW_READER");
         let fields = self
             .fields
             .iter()
@@ -152,5 +158,15 @@ impl Plan for StructPlan {
             return Ok(self.validity.clone());
         }
         vortex_bail!("Struct plan has no child {index}")
+    }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        if let Some(name) = self.layout.struct_fields().field_name(index) {
+            return Cow::Borrowed(name.as_ref());
+        }
+        if index == self.fields.len() {
+            return Cow::Borrowed("validity");
+        }
+        Cow::Owned(format!("child[{index}]"))
     }
 }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -72,6 +73,10 @@ impl Plan for ExpressionPlan {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "ExpressionPlan"
+    }
+
     fn optimize(&self) -> VortexResult<PlanRef> {
         let child = self.child.optimize()?;
         let expression = self.expression.optimize_recursive(child.dtype())?;
@@ -88,12 +93,11 @@ impl Plan for ExpressionPlan {
         session: &VortexSession,
         ctx: &crate::LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
-        Ok(Arc::new(ExpressionReader::try_new(
+        ExpressionReader::try_new_ref(
             self.expression.clone(),
             self.child.new_reader(name, segment_source, session, ctx)?,
-        )?))
+        )
     }
-
     fn dtype(&self) -> &DType {
         &self.dtype
     }
@@ -112,6 +116,14 @@ impl Plan for ExpressionPlan {
         }
         Ok(Some(Arc::clone(&self.child)))
     }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        if index == 0 {
+            Cow::Borrowed("child")
+        } else {
+            Cow::Owned(format!("child[{index}]"))
+        }
+    }
 }
 
 /// A reader that binds an expression to the output of another reader.
@@ -129,6 +141,13 @@ impl ExpressionReader {
             child,
             dtype,
         })
+    }
+
+    pub(crate) fn try_new_ref(
+        expression: Expression,
+        child: LayoutReaderRef,
+    ) -> VortexResult<LayoutReaderRef> {
+        Ok(Arc::new(Self::try_new(expression, child)?))
     }
 
     fn compose(&self, expression: &Expression) -> Expression {

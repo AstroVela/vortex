@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_error::VortexResult;
@@ -58,6 +59,10 @@ impl Plan for DictPlan {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "DictPlan"
+    }
+
     fn optimize(&self) -> VortexResult<PlanRef> {
         let codes = self.codes.optimize()?;
         let values = self.values.optimize()?;
@@ -109,6 +114,14 @@ impl Plan for DictPlan {
             0 => Ok(Some(Arc::clone(&self.codes))),
             1 => Ok(Some(Arc::clone(&self.values))),
             _ => vortex_bail!("Dictionary plan has no child {index}"),
+        }
+    }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        match index {
+            0 => Cow::Borrowed("codes"),
+            1 => Cow::Borrowed("values"),
+            _ => Cow::Owned(format!("child[{index}]")),
         }
     }
 }

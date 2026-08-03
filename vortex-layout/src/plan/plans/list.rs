@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::DType;
@@ -75,6 +76,10 @@ impl Plan for ListPlan {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "ListPlan"
+    }
+
     fn optimize(&self) -> VortexResult<PlanRef> {
         let elements = self.elements.optimize()?;
         let offsets = self.offsets.optimize()?;
@@ -145,6 +150,15 @@ impl Plan for ListPlan {
             1 => Ok(Some(Arc::clone(&self.offsets))),
             2 => Ok(self.validity.clone()),
             _ => vortex_bail!("List plan has no child {index}"),
+        }
+    }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        match index {
+            0 => Cow::Borrowed("elements"),
+            1 => Cow::Borrowed("offsets"),
+            2 => Cow::Borrowed("validity"),
+            _ => Cow::Owned(format!("child[{index}]")),
         }
     }
 }

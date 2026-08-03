@@ -31,6 +31,10 @@ impl Plan for FlatPlan {
         self
     }
 
+    fn name(&self) -> &'static str {
+        "FlatPlan"
+    }
+
     fn optimize(&self) -> VortexResult<PlanRef> {
         Ok(Arc::new(Self::new(&self.layout)))
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::fmt;
 use std::sync::Arc;
 
 use vortex_array::ArrayContext;
@@ -41,6 +42,7 @@ use crate::layouts::flat::reader::FlatReader;
 use crate::layouts::flat::writer::FlatLayoutStrategy;
 use crate::layouts::list::ListLayout;
 use crate::layouts::list::reader::ListReader;
+use crate::layouts::row_idx::row_idx;
 use crate::layouts::struct_::StructLayout;
 use crate::layouts::struct_::reader::StructReader;
 use crate::segments::SegmentId;
@@ -249,6 +251,145 @@ fn struct_plan_orders_fields_before_optional_validity() -> VortexResult<()> {
 }
 
 #[test]
+fn plan_display_matches_array_tree_display_shape() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone()), ("b", field_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![flat(3, field_dtype.clone(), 0), flat(3, field_dtype, 1)],
+    )
+    .into_layout();
+    let plan = ExpressionPlan::new_ref(get_item("a", root()), make_plan(layout)?)?;
+
+    assert_eq!(plan.to_string(), "ExpressionPlan(i32, rows=3)");
+    insta::assert_snapshot!(plan.tree_display(), @r"
+    root: ExpressionPlan(i32, rows=3) expr=$.a
+      child: StructPlan({a=i32, b=i32}, rows=3)
+        a: FlatPlan(i32, rows=3)
+        b: FlatPlan(i32, rows=3)
+    ");
+
+    struct DepthExtractor;
+
+    impl PlanTreeExtractor for DepthExtractor {
+        fn write_header(
+            &self,
+            _plan: &dyn Plan,
+            context: &PlanTreeContext,
+            formatter: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            write!(formatter, " depth={}", context.depth())
+        }
+    }
+
+    insta::assert_snapshot!(plan.tree_display_builder().with(DepthExtractor), @r"
+    root: depth=0
+      child: depth=1
+        a: depth=2
+        b: depth=2
+    ");
+
+    let nullable_fields = StructFields::from_iter([
+        ("a", primitive(PType::I32, Nullability::NonNullable)),
+        ("b", primitive(PType::I32, Nullability::NonNullable)),
+    ]);
+    let nullable = StructLayout::new(
+        3,
+        DType::Struct(nullable_fields, Nullability::Nullable),
+        vec![
+            flat(3, DType::Bool(Nullability::NonNullable), 2),
+            flat(3, primitive(PType::I32, Nullability::NonNullable), 3),
+            flat(3, primitive(PType::I32, Nullability::NonNullable), 4),
+        ],
+    )
+    .into_layout()
+    .new_plan()?;
+    insta::assert_snapshot!(nullable.tree_display_builder(), @r"
+    root:
+      a:
+      b:
+      validity:
+    ");
+    Ok(())
+}
+
+#[test]
+fn chunked_plan_display_names_chunks() -> VortexResult<()> {
+    let dtype = primitive(PType::I32, Nullability::NonNullable);
+    let plan = ChunkedLayout::new(
+        3,
+        dtype.clone(),
+        OwnedLayoutChildren::layout_children(vec![flat(2, dtype.clone(), 0), flat(1, dtype, 1)]),
+    )
+    .into_layout()
+    .new_plan()?;
+
+    insta::assert_snapshot!(plan.display_tree(), @r"
+    root: ChunkedPlan(i32, rows=3)
+      chunks[0]: FlatPlan(i32, rows=2)
+      chunks[1]: FlatPlan(i32, rows=1)
+    ");
+    Ok(())
+}
+
+#[test]
+fn dict_plan_display_names_logical_children() -> VortexResult<()> {
+    let plan = DictLayout::new(
+        flat(2, primitive(PType::I32, Nullability::NonNullable), 0),
+        flat(3, primitive(PType::U8, Nullability::NonNullable), 1),
+    )
+    .into_layout()
+    .new_plan()?;
+
+    insta::assert_snapshot!(plan.tree_display(), @r"
+    root: DictPlan(i32, rows=3)
+      codes: FlatPlan(u8, rows=3)
+      values: FlatPlan(i32, rows=2)
+    ");
+    Ok(())
+}
+
+#[test]
+fn list_plan_display_handles_optional_validity() -> VortexResult<()> {
+    let element_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let offsets_dtype = primitive(PType::U32, Nullability::NonNullable);
+    let non_nullable = ListLayout::new(
+        DType::List(Arc::new(element_dtype.clone()), Nullability::NonNullable),
+        flat(4, element_dtype.clone(), 0),
+        flat(3, offsets_dtype.clone(), 1),
+        None,
+    )
+    .into_layout()
+    .new_plan()?;
+
+    insta::assert_snapshot!(non_nullable.tree_display(), @r"
+    root: ListPlan(list(i32), rows=2)
+      elements: FlatPlan(i32, rows=4)
+      offsets: FlatPlan(u32, rows=3)
+    ");
+
+    let nullable = ListLayout::new(
+        DType::List(Arc::new(element_dtype.clone()), Nullability::Nullable),
+        flat(4, element_dtype, 2),
+        flat(3, offsets_dtype, 3),
+        Some(flat(2, DType::Bool(Nullability::NonNullable), 4)),
+    )
+    .into_layout()
+    .new_plan()?;
+
+    insta::assert_snapshot!(nullable.tree_display(), @r"
+    root: ListPlan(list(i32)?, rows=2)
+      elements: FlatPlan(i32, rows=4)
+      offsets: FlatPlan(u32, rows=3)
+      validity: FlatPlan(bool, rows=2)
+    ");
+    Ok(())
+}
+
+#[test]
 fn expression_plan_composes_and_materializes_expression_reader() -> VortexResult<()> {
     let field_dtype = primitive(PType::I32, Nullability::NonNullable);
     let layout = StructLayout::new(
@@ -276,11 +417,7 @@ fn expression_plan_composes_and_materializes_expression_reader() -> VortexResult
         expression.expression(),
         &eq(get_item("a", root()), lit(1_i32))
     );
-    assert!(
-        make_reader(&predicate)?
-            .as_any()
-            .is::<plans::ExpressionReader>()
-    );
+    assert!(make_reader(&predicate)?.as_any().is::<ExpressionReader>());
     Ok(())
 }
 
@@ -294,7 +431,7 @@ fn optimized_plan_materializes_and_executes() -> VortexResult<()> {
         let array = PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
         let layout = FlatLayoutStrategy::default()
             .write_stream(
-                ArrayContext::empty(),
+                ArrayContext::empty().into(),
                 Arc::<TestSegments>::clone(&segments),
                 array.to_array_stream().sequenced(sequence),
                 eof,
@@ -314,6 +451,26 @@ fn optimized_plan_materializes_and_executes() -> VortexResult<()> {
             .await?;
 
         let expected = BoolArray::from_iter([false, false, false, true, true].map(Some));
+        assert_arrays_eq!(result, expected, &mut execution);
+        Ok(())
+    })
+}
+
+#[test]
+fn row_idx_plan_preserves_row_index_expressions() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = new_session().with_handle(handle);
+        let mut execution = session.create_execution_ctx();
+        let layout = flat(3, primitive(PType::I32, Nullability::NonNullable), 0);
+        let plan = RowIdxPlan::new_ref(10, layout.new_plan()?);
+        let plan = ExpressionPlan::new_ref(row_idx(), plan)?.optimize()?;
+        let segments: Arc<dyn SegmentSource> = Arc::new(TestSegments::default());
+        let reader = plan.new_reader(Arc::from("root"), segments, &session, &Default::default())?;
+        let result = reader
+            .projection_evaluation(&(0..3), &root(), MaskFuture::new_true(3))?
+            .await?;
+
+        let expected = buffer![10_u64, 11, 12].into_array();
         assert_arrays_eq!(result, expected, &mut execution);
         Ok(())
     })
