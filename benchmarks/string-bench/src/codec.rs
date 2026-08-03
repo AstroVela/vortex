@@ -23,7 +23,7 @@ use vortex_bench::measurements::CustomUnitMeasurement;
 use vortex_fsst::fsst_compress;
 use vortex_fsst::fsst_train_compressor;
 use vortex_onpair::Config;
-use vortex_onpair::DEFAULT_DICT12_CONFIG;
+use vortex_onpair::DEFAULT_CONFIG;
 use vortex_onpair::MaxDictBits;
 use vortex_onpair::onpair_compress;
 
@@ -59,7 +59,7 @@ impl DirectCandidate {
         })?;
         Ok(Self::OnPair(Config {
             max_dict_bits,
-            ..DEFAULT_DICT12_CONFIG
+            ..DEFAULT_CONFIG
         }))
     }
 

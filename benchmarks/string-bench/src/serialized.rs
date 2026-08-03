@@ -45,7 +45,7 @@ use vortex_btrblocks::schemes::string::FSSTScheme;
 use vortex_btrblocks::schemes::string::NullDominatedSparseScheme;
 use vortex_btrblocks::schemes::string::OnPairScheme;
 use vortex_btrblocks::schemes::string::StringDictScheme;
-use vortex_onpair::DEFAULT_DICT12_CONFIG;
+use vortex_onpair::DEFAULT_CONFIG;
 
 use crate::StringColumn;
 use crate::StringEncoder;
@@ -87,7 +87,7 @@ fn serialized_encoder_label(encoder: StringEncoder) -> String {
     match encoder {
         // The config `OnPairScheme` compresses with. When btrblocks gains a
         // configurable budget, pass the benchmark's own config here.
-        StringEncoder::OnPair => onpair_label(&DEFAULT_DICT12_CONFIG),
+        StringEncoder::OnPair => onpair_label(&DEFAULT_CONFIG),
         StringEncoder::Fsst => encoder.label().to_string(),
     }
 }

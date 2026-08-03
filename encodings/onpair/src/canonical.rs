@@ -24,7 +24,7 @@ use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_panic;
+use vortex_error::vortex_err;
 
 use crate::OnPair;
 use crate::OnPairArraySlotsExt;
@@ -91,18 +91,14 @@ pub(crate) fn onpair_decode_bytes(
     let codes = collect_widened::<u16>(&array.codes().slice(code_start..code_end)?, ctx)?;
     let dict = dict_view(array, ctx)?;
     let mut out_bytes = ByteBufferMut::with_capacity(total_size);
-    let written =
-        match onpair::try_decode_into(codes.as_slice(), dict, out_bytes.spare_capacity_mut()) {
-            Ok(written) => written,
-            Err(_) => {
-                vortex_panic!("OnPair codes decode to more bytes than uncompressed_lengths records")
-            }
-        };
-    if written != total_size {
-        vortex_panic!(
-            "OnPair codes decoded to {written} bytes but uncompressed_lengths records {total_size}"
-        );
-    }
+    let written = onpair::try_decode_into(codes.as_slice(), dict, out_bytes.spare_capacity_mut())
+        .map_err(|_| {
+        vortex_err!("OnPair codes decode to more bytes than uncompressed_lengths records")
+    })?;
+    vortex_ensure!(
+        written == total_size,
+        "OnPair codes decoded to {written} bytes but uncompressed_lengths records {total_size}"
+    );
     // SAFETY: `try_decode_into` initialised exactly `written` bytes.
     unsafe { out_bytes.set_len(written) };
     Ok((out_bytes, lengths))
