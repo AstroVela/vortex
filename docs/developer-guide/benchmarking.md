@@ -124,6 +124,24 @@ fn my_bench<const N: usize>(bencher: Bencher, num_indices: usize) { ... }
 Each individual iteration of the benchmarked closure should complete in
 **less than 1ms**. This is to keep benchmarks snappy, locally and on CI.
 
+CI checks this on any pull request that touches a `benches/` directory, and reports the
+result as a comment rather than failing the build. Because the simulation instrument
+reports estimated cycles rather than wall-clock time, the `bench-budget` job in
+`.github/workflows/codspeed.yml` rebuilds the same benchmarks in CodSpeed's walltime mode
+and compares the *fastest* observed iteration against the budget -- the estimate least
+affected by runner noise. Only benchmarks CodSpeed actually measures are checked, so
+anything gated with `#[cfg(not(codspeed))]` is exempt automatically.
+
+To reproduce the check locally:
+
+```bash
+cargo codspeed build -m walltime -p <crate-name> --profile bench
+CODSPEED_ENV=1 cargo codspeed run -m walltime
+python3 scripts/check-bench-budget.py check --shard local --output verdicts/local.json
+```
+
+Omitting `--scope` checks every benchmark, including the `#[cfg(not(codspeed))]` ones.
+
 ### Gate CodSpeed-incompatible benchmarks
 
 Use `#[cfg(not(codspeed))]` for benchmarks that are incompatible with CodSpeed.

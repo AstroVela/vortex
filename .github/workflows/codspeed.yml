@@ -33,6 +33,7 @@ jobs:
       pull-requests: read
     outputs:
       run-cuda-benchmarks: ${{ github.event_name != 'pull_request' || steps.filter.outputs.cuda == 'true' }}
+      run-budget-check: ${{ steps.filter.outputs.benches == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4
@@ -44,8 +45,13 @@ jobs:
               - "vortex-cuda/**"
               # Only this workflow defines the CUDA benchmark jobs.
               - ".github/workflows/codspeed.yml"
+            benches:
+              - "**/benches/**"
+              - "scripts/check-bench-budget.py"
+              - ".github/workflows/codspeed.yml"
 
   bench-codspeed:
+    needs: [changes]
     strategy:
       matrix:
         include:
@@ -90,6 +96,125 @@ jobs:
           run: cargo codspeed run
           token: ${{ secrets.CODSPEED_TOKEN }}
           mode: "simulation"
+
+      # The analysis-mode binaries print one `Measured:`/`Checked:` line per benchmark they
+      # run, which is the only authoritative answer to "what does CodSpeed actually
+      # benchmark?" -- it honours `#[cfg(not(codspeed))]` because it *is* that build. Replay
+      # them outside the CodSpeed runner (one un-instrumented iteration each, so this costs
+      # seconds) to hand the budget job its scope.
+      - name: Enumerate measured benchmarks
+        if: needs.changes.outputs.run-budget-check == 'true'
+        run: |
+          set -Eeuo pipefail
+          cargo codspeed run > codspeed-run.log
+          grep -E "^(Measured|Checked): " codspeed-run.log > codspeed-uris.txt
+          wc -l < codspeed-uris.txt
+
+      - name: Upload measured benchmark URIs
+        if: needs.changes.outputs.run-budget-check == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: codspeed-uris-${{ matrix.shard }}
+          path: codspeed-uris.txt
+          retention-days: 1
+          if-no-files-found: error
+
+  # Enforces the "keep per-iteration execution time under ~1 ms" rule from
+  # docs/developer-guide/benchmarking.md. The simulation instrument above reports estimated
+  # cycles from an instruction trace, never wall-clock time, so the budget needs its own
+  # measurement: the same benchmarks rebuilt in walltime mode, where the divan harness dumps
+  # per-iteration statistics as JSON. Results are reported as a PR comment, not a hard
+  # failure.
+  bench-budget:
+    needs: [changes, bench-codspeed]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.run-budget-check == 'true'
+    strategy:
+      matrix:
+        include:
+          - { shard: 1, name: "Core foundation", packages: "vortex-buffer vortex-error vortex-mask vortex-compute" }
+          - { shard: 2, name: "Arrays", packages: "vortex-array", features: "--features _test-harness" }
+          - { shard: 3, name: "Main library", packages: "vortex" }
+          - { shard: 4, name: "Encodings 1", packages: "vortex-alp vortex-bytebool vortex-datetime-parts" }
+          - { shard: 5, name: "Encodings 2", packages: "vortex-decimal-byte-parts vortex-fastlanes vortex-fsst", features: "--features _test-harness" }
+          - { shard: 6, name: "Encodings 3", packages: "vortex-pco vortex-runend vortex-sequence" }
+          - { shard: 7, name: "Encodings 4", packages: "vortex-sparse vortex-zigzag vortex-zstd" }
+          - { shard: 8, name: "Storage formats & row encoding", packages: "vortex-flatbuffers vortex-proto vortex-btrblocks vortex-row" }
+    name: "Check benchmark budget (Shard #${{ matrix.shard }})"
+    timeout-minutes: 30
+    runs-on: >-
+      ${{ github.repository == 'vortex-data/vortex'
+          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=bench-budget-{1}', github.run_id, matrix.shard)
+          || 'ubuntu-latest' }}
+    steps:
+      - uses: runs-on/action@v2
+        if: github.repository == 'vortex-data/vortex'
+        with:
+          sccache: s3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-prebuild
+        with:
+          enable-sccache: ${{ github.repository == 'vortex-data/vortex' && 'true' || 'false' }}
+      - name: Install Codspeed
+        uses: taiki-e/cache-cargo-install-action@66c9585ef5ca780ee69399975a5e911f47905995
+        with:
+          tool: cargo-codspeed
+      - name: Download measured benchmark URIs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: codspeed-uris-${{ matrix.shard }}
+      - name: Build benchmarks
+        env:
+          RUSTFLAGS: "-C target-feature=+avx2"
+        run: cargo codspeed build -m walltime ${{ matrix.features }} $(printf -- '-p %s ' ${{ matrix.packages }}) --profile bench
+      # `cargo codspeed run` only asks the harness to dump raw walltime JSON when it believes
+      # it is under the CodSpeed runner, so set CODSPEED_ENV ourselves. No token, no upload,
+      # and no valgrind: these numbers are for the budget check alone and are never reported
+      # to CodSpeed. Benchmarks that honour the budget make this run take milliseconds.
+      - name: Measure benchmarks
+        env:
+          CODSPEED_ENV: "1"
+          DIVAN_SAMPLE_COUNT: "3"
+          DIVAN_MIN_TIME: "0"
+        run: cargo codspeed run -m walltime
+      - name: Check against budget
+        run: |
+          python3 scripts/check-bench-budget.py check \
+            --scope codspeed-uris.txt \
+            --shard "${{ matrix.shard }}" \
+            --output "verdicts/${{ matrix.shard }}.json"
+      - name: Upload verdict
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: bench-budget-${{ matrix.shard }}
+          path: verdicts/
+          retention-days: 1
+          if-no-files-found: error
+
+  bench-budget-comment:
+    needs: [bench-budget]
+    if: always() && needs.bench-budget.result == 'success' && github.event.pull_request.head.repo.fork == false
+    name: "Report benchmark budget"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Download verdicts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          pattern: bench-budget-*
+          path: verdicts
+      - name: Render comment
+        run: |
+          python3 scripts/check-bench-budget.py report --inputs verdicts --output comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment PR
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
+        with:
+          file-path: comment.md
+          comment-tag: bench-budget-comment
 
   # Getting a GPU box is slow, in the future we can build on a box without one and only run
   # on GPU machines.

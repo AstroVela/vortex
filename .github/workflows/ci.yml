@@ -166,6 +166,11 @@ jobs:
           uv run --no-project --with pytest --with xxhash \
             pytest scripts/tests/test_measurement_id.py
 
+      - name: Pytest - benchmark budget check
+        run: |
+          uv run --no-project --with pytest \
+            pytest scripts/tests/test_check_bench_budget.py
+
   python-cuda-test:
     name: "Python CUDA (test)"
     if: github.repository == 'vortex-data/vortex'
