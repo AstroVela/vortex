@@ -41,14 +41,18 @@ fn flat(row_count: u64, dtype: DType, segment: u32) -> LayoutRef {
     .into_layout()
 }
 
+fn unsupported(row_count: u64, dtype: DType) -> LayoutRef {
+    static ID: CachedId = CachedId::new("vortex.test.unsupported");
+    new_foreign_layout(*ID, dtype, row_count, Vec::new(), Vec::new(), Vec::new())
+}
+
 fn make_plan(layout: LayoutRef) -> VortexResult<PlanRef> {
     new_plan(&layout)
 }
 
 #[test]
 fn unsupported_layout_has_no_plan() -> VortexResult<()> {
-    static ID: CachedId = CachedId::new("vortex.test.unsupported");
-    let layout = new_foreign_layout(*ID, DType::Null, 3, Vec::new(), Vec::new(), Vec::new());
+    let layout = unsupported(3, DType::Null);
 
     let error = new_plan(&layout)
         .err()
@@ -95,6 +99,41 @@ fn chunked_plan_exposes_chunks() -> VortexResult<()> {
             .ok_or_else(|| vortex_err!("missing second chunk"))?
             .row_count(),
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn chunked_plan_defers_unrequested_chunks_through_optimization() -> VortexResult<()> {
+    let dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = ChunkedLayout::new(
+        2,
+        dtype.clone(),
+        OwnedLayoutChildren::layout_children(vec![
+            flat(1, dtype.clone(), 0),
+            unsupported(1, dtype),
+        ]),
+    )
+    .into_layout();
+    let plan = make_plan(layout)?.optimize()?;
+
+    let first = plan
+        .child(0)?
+        .ok_or_else(|| vortex_err!("missing first chunk"))?;
+    assert!(first.as_any().is::<FlatPlan>());
+    let cached = plan
+        .child(0)?
+        .ok_or_else(|| vortex_err!("missing cached first chunk"))?;
+    assert!(Arc::ptr_eq(&first, &cached));
+
+    let error = plan
+        .child(1)
+        .err()
+        .ok_or_else(|| vortex_err!("unsupported chunk unexpectedly produced a plan"))?;
+    assert!(
+        error
+            .to_string()
+            .contains("No physical plan implementation for layout 'vortex.test.unsupported'")
     );
     Ok(())
 }
@@ -222,6 +261,38 @@ fn struct_plan_orders_fields_before_optional_validity() -> VortexResult<()> {
             .ok_or_else(|| vortex_err!("missing validity"))?
             .dtype(),
         &DType::Bool(Nullability::NonNullable)
+    );
+    Ok(())
+}
+
+#[test]
+fn struct_plan_defers_unrequested_fields_through_optimization() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = StructLayout::new(
+        1,
+        DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone()), ("b", field_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![flat(1, field_dtype.clone(), 0), unsupported(1, field_dtype)],
+    )
+    .into_layout();
+    let plan = make_plan(layout)?.optimize()?;
+
+    assert!(
+        plan.child(0)?
+            .ok_or_else(|| vortex_err!("missing field a"))?
+            .as_any()
+            .is::<FlatPlan>()
+    );
+    let error = plan
+        .child(1)
+        .err()
+        .ok_or_else(|| vortex_err!("unsupported field unexpectedly produced a plan"))?;
+    assert!(
+        error
+            .to_string()
+            .contains("No physical plan implementation for layout 'vortex.test.unsupported'")
     );
     Ok(())
 }
