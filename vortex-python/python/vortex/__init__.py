@@ -87,7 +87,7 @@ from .arrays import (
     array,
 )
 from .file import VortexFile, open
-from .files import VortexFiles, open_files
+from .files import VortexFiles, open_dataset, open_files, scan_polars
 from .scan import RepeatedScan
 
 assert _lib, "Ensure we eagerly import the Vortex native library"
@@ -210,6 +210,8 @@ __all__ = [
     "open",
     "VortexFiles",
     "open_files",
+    "open_dataset",
+    "scan_polars",
     # Iterator
     "ArrayIterator",
     # Scan
