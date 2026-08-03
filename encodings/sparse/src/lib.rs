@@ -27,6 +27,7 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::bool::BoolArrayExt;
+use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
@@ -58,12 +59,14 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::canonical::execute_sparse;
+use crate::plugin::SparsePatchedPlugin;
 use crate::rules::RULES;
 
 mod canonical;
 mod compute;
 mod kernel;
 mod ops;
+mod plugin;
 mod rules;
 mod slice;
 
@@ -81,7 +84,13 @@ use vortex_array::session::ArraySessionExt;
 /// Registers the Sparse array vtable, parent execution kernels, and aggregate kernels
 /// (`IsConstant`, `Sum`, `MinMax`, `NullCount`, `NanCount`).
 pub fn initialize(session: &VortexSession) {
-    session.arrays().register(Sparse);
+    // If we're using the experimental Patched encoding, register a shim so that a Sparse array
+    // over primitive values decodes as a Patched array over a Constant fill.
+    if use_experimental_patches() {
+        session.arrays().register(SparsePatchedPlugin);
+    } else {
+        session.arrays().register(Sparse);
+    }
     kernel::initialize(session);
 
     let aggregate_fns = session.aggregate_fns();
