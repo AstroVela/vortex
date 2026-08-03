@@ -40,15 +40,21 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
+use crate::LayoutRef;
 use crate::layouts::row_idx::RowIdxLayoutReader;
 use crate::plan::ExpressionPlan;
-use crate::plan::LayoutReaderPlan;
-use crate::plan::PlanRef;
-use crate::scan::plan_v2::plan_v2_enabled;
+use crate::plan::ExpressionReader;
+use crate::plan::RowIdxPlan;
 use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
 use crate::scan::splits::attempt_split_ranges;
+use crate::segments::SegmentSource;
+
+struct LayoutPlanSource {
+    layout: LayoutRef,
+    segment_source: Arc<dyn SegmentSource>,
+}
 
 /// Builder for scanning a [`LayoutReader`] into arrays, streams, iterators, or mapped outputs.
 ///
@@ -64,6 +70,7 @@ use crate::scan::splits::attempt_split_ranges;
 pub struct ScanBuilder<A> {
     session: VortexSession,
     layout_reader: LayoutReaderRef,
+    layout_plan_source: Option<LayoutPlanSource>,
     projection: Expression,
     filter: Option<Expression>,
     /// Whether the scan needs to return splits in the order they appear in the file.
@@ -90,11 +97,15 @@ pub struct ScanBuilder<A> {
 }
 
 impl ScanBuilder<ArrayRef> {
-    /// Create a scan builder over `layout_reader` using `session` for runtime and execution state.
+    /// Creates a scan builder over `layout_reader` using `session` for runtime and execution state.
+    ///
+    /// Expressions are bound to the existing reader. Use [`Self::new_with_layout`] when the layout
+    /// and segment source are available so expressions can be optimized through the layout plan.
     pub fn new(session: VortexSession, layout_reader: Arc<dyn LayoutReader>) -> Self {
         Self {
             session,
             layout_reader,
+            layout_plan_source: None,
             projection: root(),
             filter: None,
             ordered: true,
@@ -109,6 +120,26 @@ impl ScanBuilder<ArrayRef> {
             file_stats: None,
             limit: None,
             row_offset: 0,
+        }
+    }
+
+    /// Creates a scan builder that can construct a physical plan from `layout`.
+    ///
+    /// The existing `layout_reader` is used to compute natural splits. During preparation, the
+    /// builder calls [`Layout::new_plan`](crate::Layout::new_plan), optimizes the projection and
+    /// predicates, and materializes their readers with `segment_source`.
+    pub fn new_with_layout(
+        session: VortexSession,
+        layout_reader: LayoutReaderRef,
+        layout: LayoutRef,
+        segment_source: Arc<dyn SegmentSource>,
+    ) -> Self {
+        Self {
+            layout_plan_source: Some(LayoutPlanSource {
+                layout,
+                segment_source,
+            }),
+            ..Self::new(session, layout_reader)
         }
     }
 
@@ -251,6 +282,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
         ScanBuilder {
             session: self.session,
             layout_reader: self.layout_reader,
+            layout_plan_source: self.layout_plan_source,
             projection: self.projection,
             filter: self.filter,
             ordered: self.ordered,
@@ -314,37 +346,54 @@ impl<A: 'static + Send> ScanBuilder<A> {
                 )?)
             };
 
-        if plan_v2_enabled()? {
-            let source: PlanRef = Arc::new(LayoutReaderPlan::new(Arc::clone(&layout_reader)));
-            let projection_plan =
-                ExpressionPlan::new_ref(projection, Arc::clone(&source))?.optimize()?;
-            let predicate_plans = filter
-                .as_ref()
-                .map(conjuncts)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|expr| ExpressionPlan::new_ref(expr, Arc::clone(&source))?.optimize())
-                .collect::<VortexResult<Vec<_>>>()?;
-            return RepeatedScan::new_plan_v2(
-                self.session.clone(),
-                projection_plan,
-                predicate_plans,
-                filter,
-                self.ordered,
-                self.row_range,
-                self.selection,
-                splits,
-                self.concurrency,
-                self.map_fn,
-                self.limit,
-                dtype,
-            );
-        }
+        let predicate_expressions = filter.as_ref().map(conjuncts).unwrap_or_default();
+        let (projection_reader, predicate_readers) = match self.layout_plan_source {
+            Some(layout_plan_source) => {
+                let source =
+                    RowIdxPlan::new_ref(self.row_offset, layout_plan_source.layout.new_plan()?);
+                let projection_plan =
+                    ExpressionPlan::new_ref(projection, Arc::clone(&source))?.optimize()?;
+                let predicate_plans = predicate_expressions
+                    .into_iter()
+                    .map(|expr| ExpressionPlan::new_ref(expr, Arc::clone(&source))?.optimize())
+                    .collect::<VortexResult<Vec<_>>>()?;
+                let ctx = Default::default();
+                let projection_reader = projection_plan.new_reader(
+                    Arc::from(""),
+                    Arc::clone(&layout_plan_source.segment_source),
+                    &self.session,
+                    &ctx,
+                )?;
+                let predicate_readers = predicate_plans
+                    .iter()
+                    .map(|predicate| {
+                        predicate.new_reader(
+                            Arc::from(""),
+                            Arc::clone(&layout_plan_source.segment_source),
+                            &self.session,
+                            &ctx,
+                        )
+                    })
+                    .collect::<VortexResult<Vec<_>>>()?;
+                (projection_reader, predicate_readers)
+            }
+            None => {
+                let projection_reader =
+                    ExpressionReader::try_new_ref(projection, Arc::clone(&layout_reader))?;
+                let predicate_readers = predicate_expressions
+                    .into_iter()
+                    .map(|expression| {
+                        ExpressionReader::try_new_ref(expression, Arc::clone(&layout_reader))
+                    })
+                    .collect::<VortexResult<Vec<_>>>()?;
+                (projection_reader, predicate_readers)
+            }
+        };
 
-        Ok(RepeatedScan::new_plan(
+        Ok(RepeatedScan::new(
             self.session.clone(),
-            layout_reader,
-            projection,
+            projection_reader,
+            predicate_readers,
             filter,
             self.ordered,
             self.row_range,

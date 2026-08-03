@@ -354,7 +354,12 @@ impl FileOpener for VortexOpener {
                 }
             };
 
-            let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader));
+            let mut scan_builder = ScanBuilder::new_with_layout(
+                session.clone(),
+                Arc::clone(&layout_reader),
+                Arc::clone(vxf.footer().layout()),
+                vxf.segment_source(),
+            );
 
             if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);

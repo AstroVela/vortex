@@ -215,9 +215,11 @@ impl VortexFile {
     /// Initiate a scan of the file, returning a builder for projection, filtering, selection, and
     /// execution options.
     pub fn scan(&self) -> VortexResult<ScanBuilder<ArrayRef>> {
-        Ok(ScanBuilder::new(
+        Ok(ScanBuilder::new_with_layout(
             self.session.clone(),
             self.layout_reader()?,
+            Arc::clone(self.footer.layout()),
+            self.segment_source(),
         ))
     }
 
