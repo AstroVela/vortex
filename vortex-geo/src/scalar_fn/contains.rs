@@ -13,6 +13,7 @@ use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
@@ -45,7 +46,6 @@ impl GeoContains {
 impl RowFn for GeoContains {
     type Options = EmptyOptions;
     type ArgsWitness = (GeometryRow, GeometryRow);
-    type RetWitness = bool;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.geo.contains");
@@ -63,7 +63,7 @@ impl RowFn for GeoContains {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit_prepared::<(GeometryRow, GeometryRow), ConstOperands, bool>(
+        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<bool>, _, _>(
             |(a, b)| {
                 #[cfg(test)]
                 probe::record(a.is_some(), b.is_some());
@@ -72,7 +72,7 @@ impl RowFn for GeoContains {
                     b: b.map(PreparedOperand::new),
                 }
             },
-            |operands, (a, b)| contains_row_prepared(operands, a, b),
+            |operands, (a, b), output| output.write(contains_row_prepared(operands, a, b)),
         )
     }
 }

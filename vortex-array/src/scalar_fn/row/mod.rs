@@ -7,42 +7,39 @@
 //! to read every row anyway. See [choosing a trait](crate::scalar_fn#choosing-a-trait) for when to
 //! drop to [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable) instead.
 //!
-//! [`RowFn`] asks for two things: a witness argument tuple and return type, and a
-//! [`dispatch`](RowFn::dispatch) that picks the concrete element types for a batch and visits the
-//! framework with a row closure. Everything structural (arity, dtype checks, null handling,
-//! fallibility, constants, and validity) is derived from the witnesses and from whatever
-//! `dispatch` visits.
+//! [`RowFn`] asks for an argument witness and a [`dispatch`](RowFn::dispatch) that picks the concrete
+//! element and sink types for a batch. Everything structural (arity, dtype checks, output dtype,
+//! null handling, constants, and validity) is derived from those types.
 //!
 //! When the element types are fixed, `dispatch` is a single visit at those types. When one function
 //! ID has to cover several (`l2_norm` accepts `f16`, `f32` and `f64` columns), `dispatch` matches on
-//! the input dtypes and visits at the chosen width. The witnesses name one representative choice,
-//! and the framework checks at compile time that every visit agrees with them.
+//! the input dtypes and visits at the chosen width. The argument witness names one representative
+//! choice, and the framework checks at compile time that every visit agrees with it. Kernel
+//! fallibility is declared separately because it is also independent of the input dtypes.
 //!
-//! [`RowFn`] does not say how a row is *stored*, which is the element's job: `vortex-tensor` adds a
+//! [`RowFn`] does not say how a row is _stored_, which is the element's job: `vortex-tensor` adds a
 //! `TensorRow<T>` [`InputElement`] and writes ordinary kernels over it.
 //!
-//! Output comes in two forms, and a dispatch picks one per visit. [`RowVisitor::visit`] takes a
-//! closure that *returns* an [`OutputElement`] per row, which is the common case.
-//! [`RowVisitor::visit_into`] takes one that *writes* its row into an [`OutputSink`], which carries
-//! what an owned per-row value cannot: a runtime-shaped row, or bytes appended to a buffer shared by
-//! the whole batch as a future string library will need.
+//! Output always goes through [`RowVisitor::visit_prepared_into`]. [`ElementSink`] covers one owned
+//! [`OutputElement`] per row; custom [`OutputSink`] implementations cover runtime-shaped rows. The
+//! prepare closure sees every batch-constant input and returns shared state for the row loop. Pass
+//! `|_| ()` when there is nothing to prepare.
 //!
-//! [`RowVisitor::visit_prepared`] adds a per-batch prepare step to the returning form: it is handed
-//! the element value of every argument whose operand is constant for the batch, and whatever it
-//! returns reaches every row by shared reference, so work that depends only on a constant argument
-//! runs once per batch instead of once per row.
+//! A kernel that can safely write a provisional value uses [`DeferredError`] instead of returning
+//! a per-row result. The executor vector-reduces those bits and hands one batch-wide error to the
+//! sink. With nullable fixed-width inputs it runs densely and retries only valid rows on the cold
+//! error path.
 //!
 //! Null handling is derived and executed by the [lifting](lift), never by the row closure, which
 //! only ever computes rows valid in every argument. A batch with a mixed validity mask executes by
-//! one of two strategies, selected per batch: *branch-and-skip* (decode the unfiltered columns
+//! one of two strategies, selected per batch: _branch-and-skip_ (decode the unfiltered columns
 //! null-tolerantly via [`InputElement::decode_null_tolerant`], compute only the valid rows a word
-//! of the mask at a time, mask the result) whenever it can, and *filter* (shrink every input to
+//! of the mask at a time, mask the result) whenever it can, and _filter_ (shrink every input to
 //! the surviving rows, compute, scatter back) when an argument has no null-tolerant decode for its
 //! array or when a per-row decode makes filtering cheaper at sparse validity. Authors do nothing;
 //! an element whose decode does expensive per-row work opts its sparse batches back into filtering
-//! by setting [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]. Sink dispatches
-//! ([`RowVisitor::visit_into`]) always use the dense or filter paths: a sink has no notion of a
-//! skipped row.
+//! by setting [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]. A sink opts into branch-and-skip with
+//! [`OutputSink::SUPPORTS_SKIPPED_ROWS`].
 
 mod element;
 pub use element::ArgColumn;
@@ -56,11 +53,11 @@ pub use element::OutputElement;
 pub use element::assert_element_conforms;
 
 mod result;
-pub use result::ApplyResult;
-pub use result::RowResult;
+pub use result::DeferredError;
 pub use result::SinkResult;
 
 mod sink;
+pub use sink::ElementSink;
 pub use sink::OutputSink;
 
 mod execute;
@@ -73,8 +70,10 @@ pub use lift::NullStrategy;
 mod row_fn;
 pub use row_fn::RowFn;
 pub use row_fn::RowVisitor;
+
+mod vtable;
 #[cfg(any(test, feature = "_test-harness"))]
-pub use row_fn::execute_row_fn_with_strategy;
+pub use vtable::execute_row_fn_with_strategy;
 
 #[cfg(test)]
 mod tests;

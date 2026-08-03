@@ -152,7 +152,6 @@ impl L2Denorm {
 impl RowFn for L2Denorm {
     type Options = EmptyOptions;
     type ArgsWitness = (TensorRow<f64>, f64);
-    type RetWitness = ();
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.tensor.l2_denorm");
@@ -183,11 +182,14 @@ impl RowFn for L2Denorm {
         match_each_float_ptype!(
             validate_tensor_float_input(normalized)?.element_ptype(),
             |T| {
-                visitor.visit_into::<(TensorRow<T>, T), TensorSink<T>, ()>(|(row, norm), out| {
-                    for (scaled, &x) in out.iter_mut().zip(row) {
-                        *scaled = x * norm;
-                    }
-                })
+                visitor.visit_prepared_into::<(TensorRow<T>, T), TensorSink<T>, _, _>(
+                    |_| (),
+                    |&(), (row, norm), out| {
+                        for (scaled, &x) in out.iter_mut().zip(row) {
+                            *scaled = x * norm;
+                        }
+                    },
+                )
             }
         )
     }

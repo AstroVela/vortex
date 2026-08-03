@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::Buffer;
-use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure_eq;
@@ -78,41 +77,6 @@ impl<T: NativePType> OutputElement for T {
 
     fn build(values: Vec<Self>) -> ArrayRef {
         PrimitiveArray::new(values, Validity::NonNullable).into_array()
-    }
-
-    #[inline(always)]
-    fn build_from_fn(row_count: usize, mut apply: impl FnMut(usize) -> Self) -> ArrayRef {
-        let mut values = BufferMut::with_capacity(row_count);
-        for (index, slot) in values.spare_capacity_mut()[..row_count]
-            .iter_mut()
-            .enumerate()
-        {
-            slot.write(apply(index));
-        }
-
-        // SAFETY: the loop above initializes every one of the `row_count` slots.
-        unsafe { values.set_len(row_count) };
-        PrimitiveArray::new(values.freeze(), Validity::NonNullable).into_array()
-    }
-
-    #[inline(always)]
-    fn try_build_from_fn(
-        row_count: usize,
-        mut apply: impl FnMut(usize) -> VortexResult<Self>,
-    ) -> VortexResult<ArrayRef> {
-        let mut values = BufferMut::with_capacity(row_count);
-        for (index, slot) in values.spare_capacity_mut()[..row_count]
-            .iter_mut()
-            .enumerate()
-        {
-            slot.write(apply(index)?);
-        }
-
-        // SAFETY: successful completion of the loop initializes every one of the `row_count`
-        // slots. `NativePType` values need no drop, so an early error may safely leave the buffer's
-        // logical length at zero.
-        unsafe { values.set_len(row_count) };
-        Ok(PrimitiveArray::new(values.freeze(), Validity::NonNullable).into_array())
     }
 
     fn placeholder() -> Self {

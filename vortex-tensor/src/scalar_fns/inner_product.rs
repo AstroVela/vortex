@@ -15,6 +15,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_float_ptype;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
@@ -48,7 +49,6 @@ pub struct InnerProduct;
 impl RowFn for InnerProduct {
     type Options = EmptyOptions;
     type ArgsWitness = (TensorRow<f64>, TensorRow<f64>);
-    type RetWitness = f64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.tensor.inner_product");
@@ -66,8 +66,10 @@ impl RowFn for InnerProduct {
         visitor: V,
     ) -> VortexResult<V::Out> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
-            visitor
-                .visit::<(TensorRow<T>, TensorRow<T>), T>(|(lhs, rhs)| inner_product_row(lhs, rhs))
+            visitor.visit_prepared_into::<(TensorRow<T>, TensorRow<T>), ElementSink<T>, _, _>(
+                |_| (),
+                |&(), (lhs, rhs), output| output.write(inner_product_row(lhs, rhs)),
+            )
         })
     }
 

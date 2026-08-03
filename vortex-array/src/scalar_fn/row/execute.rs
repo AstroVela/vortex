@@ -6,7 +6,7 @@
 //! These back the blanket impls in [`row_fn`](super::row_fn) and are deliberately not public:
 //! [`RowFn`](crate::scalar_fn::RowFn) is the abstraction, these are its internals.
 
-use vortex_error::VortexExpect;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -16,35 +16,37 @@ use vortex_mask::Mask;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::scalar_fn::ApplyResult;
+use crate::scalar_fn::DeferredError;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::NullHandling;
-use crate::scalar_fn::OutputElement;
 use crate::scalar_fn::OutputSink;
-use crate::scalar_fn::RowResult;
 use crate::scalar_fn::SinkResult;
 
-/// Validate the input dtypes of a row function and return its output element dtype.
-///
-/// The lifting widens the result to nullable iff any input is nullable, so this ignores
-/// nullability.
-pub(super) fn validate_row_args<A: ElementTuple, R: ApplyResult>(
-    args: &[DType],
-) -> VortexResult<DType> {
-    A::validate(args)?;
-    let dtype = R::Out::element_dtype();
-    vortex_ensure!(
-        !dtype.is_nullable(),
-        "row output elements must declare a non-nullable dtype, got {dtype}",
-    );
-    Ok(dtype)
+/// The value path out of a row executor, keeping a deferred row error distinct from structural
+/// execution errors so nullable lifting retries only the former.
+pub(super) enum RowExecution {
+    /// A successfully built output column.
+    Output(ArrayRef),
+
+    /// A batch-wide row error that nullable lifting may retry over only the valid rows.
+    DeferredError(VortexError),
+}
+
+impl RowExecution {
+    /// Return the output or surface its deferred row error.
+    pub(super) fn into_result(self) -> VortexResult<ArrayRef> {
+        match self {
+            Self::Output(output) => Ok(output),
+            Self::DeferredError(error) => Err(error),
+        }
+    }
 }
 
 /// Validate the input dtypes of a sink-writing row function and return the dtype its sink builds.
 ///
-/// Unlike [`validate_row_args`] the output dtype may be a function of the inputs. A sink can also
-/// own a batch-wide builder, such as the shared byte and view buffers of a future string transform.
+/// The output dtype may be a function of the inputs. A sink can also own a batch-wide builder, such
+/// as the shared byte and view buffers of a future string transform.
 pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
     args: &[DType],
 ) -> VortexResult<DType> {
@@ -57,14 +59,14 @@ pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
     Ok(dtype)
 }
 
-/// The [`NullHandling`] a row function gets, from what its arguments and return type allow.
+/// The [`NullHandling`] a dispatched row loop gets from its arguments and early fallibility.
 ///
 /// [`NullHandling::Dense`] is cheaper and the only option that leaves inputs at their original
 /// encoding, so it is used whenever it is sound: every argument readable behind a null row, and a
-/// row computation that cannot fail. Both conditions are read off the types, so a row function never
-/// declares its null handling.
-pub(super) const fn row_null_handling<A: ElementTuple, R: RowResult>() -> NullHandling {
-    if A::DENSE_SAFE && !row_is_fallible::<A, R>() {
+/// row computation that cannot exit early. Both conditions are read off the types, so a row
+/// function never declares its null handling.
+pub(super) const fn row_null_handling<A: ElementTuple>(kernel_fallible: bool) -> NullHandling {
+    if A::DENSE_SAFE && !row_is_fallible::<A>(kernel_fallible) {
         NullHandling::Dense
     } else {
         NullHandling::Filter
@@ -80,171 +82,8 @@ pub(super) const fn row_null_handling<A: ElementTuple, R: RowResult>() -> NullHa
 /// its bytes: a geometry column is fallible however total the kernel over it is.
 ///
 /// [`InputElement::DECODE_FALLIBLE`]: crate::scalar_fn::InputElement::DECODE_FALLIBLE
-pub(super) const fn row_is_fallible<A: ElementTuple, R: RowResult>() -> bool {
-    A::DECODE_FALLIBLE || R::FALLIBLE
-}
-
-/// Decode every input column once, run `prepare` over the batch-constant elements, then compute
-/// one output element per row with the prepared state behind a shared reference.
-///
-/// The state lives here rather than in the closure, so `apply` stays [`Fn`] and the loop keeps the
-/// unconditional shape that lets it vectorize, exactly as in [`execute_row_loop`]. `P` is chosen by
-/// the dispatch and names no column lifetime, so the state owns its data and cannot alias the
-/// columns the loop reads.
-pub(super) fn execute_row_loop_prepared<A: ElementTuple, P, R: ApplyResult>(
-    args: &dyn ExecutionArgs,
-    ctx: &mut ExecutionCtx,
-    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
-    apply: impl Fn(&P, A::Elems<'_>) -> R,
-) -> VortexResult<ArrayRef> {
-    let columns = A::decode(args, ctx)?;
-    let state = prepare(A::constants(&columns));
-    let row_count = args.row_count();
-
-    if let Some(varying) = A::varying(&columns) {
-        vortex_ensure!(
-            A::varying_len_matches(&varying, row_count),
-            "decoded row input length must match the execution row count, got {row_count}",
-        );
-        build_varying_rows::<A, P, R>(&varying, &state, row_count, &apply)
-    } else {
-        build_rows::<A, P, R>(&columns, &state, row_count, &apply)
-    }
-}
-
-/// Run the fallback loop used when one or more arguments are batch-constant.
-#[inline(always)]
-fn build_rows<A: ElementTuple, P, R: ApplyResult>(
-    columns: &A::Columns,
-    state: &P,
-    row_count: usize,
-    apply: &impl Fn(&P, A::Elems<'_>) -> R,
-) -> VortexResult<ArrayRef> {
-    if R::FALLIBLE {
-        R::Out::try_build_from_fn(row_count, |index| {
-            apply(state, A::get(columns, index)).into_result()
-        })
-    } else {
-        Ok(R::Out::build_from_fn(row_count, |index| {
-            apply(state, A::get(columns, index))
-                .into_result()
-                .vortex_expect("an infallible ApplyResult cannot be an error")
-        }))
-    }
-}
-
-/// Run the contiguous fast path selected when every argument varies within the batch.
-///
-/// This must flatten into the dispatched row closure for LLVM to see one loop over the decoded
-/// columns. Without inlining, the primitive wrapping-add benchmark remains scalar and is 3.7x
-/// slower than the specialized kernel.
-#[inline(always)]
-fn build_varying_rows<A: ElementTuple, P, R: ApplyResult>(
-    columns: &A::VaryingColumns<'_>,
-    state: &P,
-    row_count: usize,
-    apply: &impl Fn(&P, A::Elems<'_>) -> R,
-) -> VortexResult<ArrayRef> {
-    if R::FALLIBLE {
-        R::Out::try_build_from_fn(row_count, |index| {
-            apply(state, A::get_varying(columns, index)).into_result()
-        })
-    } else {
-        Ok(R::Out::build_from_fn(row_count, |index| {
-            apply(state, A::get_varying(columns, index))
-                .into_result()
-                .vortex_expect("an infallible ApplyResult cannot be an error")
-        }))
-    }
-}
-
-/// Decode every column null-tolerantly, then run the row loop only over the rows set in `valid`,
-/// leaving a placeholder in every other output slot.
-///
-/// This is the branch-and-skip null strategy's row loop. The caller masks the built column with
-/// `valid` afterwards, so the placeholders are never observed; what matters is that `apply` (and
-/// any per-row fallible decode) never runs for an unset row, since those rows hold arbitrary
-/// values and a fallible kernel would spuriously fail on them. Iteration is a word at a time via
-/// [`BitBuffer::for_each_set_index`] rather than a per-row `valid.value(i)` branch.
-///
-/// Returns `Ok(None)` when some argument cannot decode null-tolerantly, in which case the lifting
-/// falls back to the filter strategy.
-///
-/// [`BitBuffer::for_each_set_index`]: vortex_buffer::BitBuffer::for_each_set_index
-pub(super) fn execute_row_loop_branch<A: ElementTuple, P, R: ApplyResult>(
-    args: &dyn ExecutionArgs,
-    valid: &Mask,
-    ctx: &mut ExecutionCtx,
-    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
-    apply: impl Fn(&P, A::Elems<'_>) -> R,
-) -> VortexResult<Option<ArrayRef>> {
-    let Some(columns) = A::decode_null_tolerant(args, ctx)? else {
-        return Ok(None);
-    };
-    let state = prepare(A::constants(&columns));
-
-    let AllOr::Some(valid) = valid.bit_buffer() else {
-        // The lifting takes the all-true and all-false shortcuts before choosing a strategy, so a
-        // degenerate mask here is a bug in the lifting.
-        vortex_bail!("execute_row_loop_branch requires a mixed mask");
-    };
-
-    let mut values: Vec<R::Out> = Vec::with_capacity(args.row_count());
-    values.resize_with(args.row_count(), R::Out::placeholder);
-
-    if let Some(varying) = A::varying(&columns) {
-        vortex_ensure!(
-            A::varying_len_matches(&varying, args.row_count()),
-            "decoded row input length must match the execution row count, got {}",
-            args.row_count(),
-        );
-
-        if R::FALLIBLE {
-            // `for_each_set_index` cannot early-return, so the first error is remembered and the
-            // remaining set rows are skipped cheaply; the success path pays only `is_none`.
-            let mut error = None;
-            valid.for_each_set_index(|index| {
-                if error.is_none() {
-                    match apply(&state, A::get_varying(&varying, index)).into_result() {
-                        Ok(value) => values[index] = value,
-                        Err(e) => error = Some(e),
-                    }
-                }
-            });
-
-            if let Some(error) = error {
-                return Err(error);
-            }
-        } else {
-            valid.for_each_set_index(|index| {
-                values[index] = apply(&state, A::get_varying(&varying, index))
-                    .into_result()
-                    .vortex_expect("an infallible ApplyResult cannot be an error");
-            });
-        }
-    } else if R::FALLIBLE {
-        let mut error = None;
-        valid.for_each_set_index(|index| {
-            if error.is_none() {
-                match apply(&state, A::get(&columns, index)).into_result() {
-                    Ok(value) => values[index] = value,
-                    Err(e) => error = Some(e),
-                }
-            }
-        });
-
-        if let Some(error) = error {
-            return Err(error);
-        }
-    } else {
-        valid.for_each_set_index(|index| {
-            values[index] = apply(&state, A::get(&columns, index))
-                .into_result()
-                .vortex_expect("an infallible ApplyResult cannot be an error");
-        });
-    }
-
-    Ok(Some(R::Out::build(values)))
+pub(super) const fn row_is_fallible<A: ElementTuple>(kernel_fallible: bool) -> bool {
+    A::DECODE_FALLIBLE || kernel_fallible
 }
 
 /// Decode every input column once, allocate the sink once, then write one row at a time.
@@ -252,15 +91,18 @@ pub(super) fn execute_row_loop_branch<A: ElementTuple, P, R: ApplyResult>(
 /// The sink lives here rather than in the closure, so `apply` stays [`Fn`] and the loop keeps the
 /// unconditional shape that lets it vectorize. Monomorphic in `A`, `S` and `R`, so `apply` and
 /// [`OutputSink::row`] both inline.
-pub(super) fn execute_row_sink<A: ElementTuple, S: OutputSink, R: SinkResult>(
+pub(super) fn execute_row_sink_prepared<A: ElementTuple, P, S: OutputSink, R: SinkResult>(
     args: &dyn ExecutionArgs,
-    arg_dtypes: &[DType],
+    sink_dtype: &DType,
     ctx: &mut ExecutionCtx,
-    apply: impl Fn(A::Elems<'_>, S::Row<'_>) -> R,
-) -> VortexResult<ArrayRef> {
+    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+    apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
+) -> VortexResult<RowExecution> {
     let row_count = args.row_count();
-    let mut sink = S::with_capacity(row_count, &S::sink_dtype(arg_dtypes)?)?;
+    let mut sink = S::with_capacity(row_count, sink_dtype)?;
     let columns = A::decode(args, ctx)?;
+    let state = prepare(A::constants(&columns));
+    let mut deferred_error = DeferredError::default();
 
     {
         let mut rows = sink.rows();
@@ -275,30 +117,100 @@ pub(super) fn execute_row_sink<A: ElementTuple, S: OutputSink, R: SinkResult>(
                 "decoded row input length must match the execution row count, got {row_count}",
             );
 
-            if R::FALLIBLE {
-                for index in 0..row_count {
-                    apply(A::get_varying(&varying, index), S::row(&mut rows, index))
-                        .into_result()?;
-                }
-            } else {
-                for index in 0..row_count {
-                    apply(A::get_varying(&varying, index), S::row(&mut rows, index))
-                        .into_result()
-                        .vortex_expect("an infallible SinkResult cannot be an error");
-                }
-            }
-        } else if R::FALLIBLE {
             for index in 0..row_count {
-                apply(A::get(&columns, index), S::row(&mut rows, index)).into_result()?;
+                apply(
+                    &state,
+                    A::get_varying(&varying, index),
+                    S::row(&mut rows, index),
+                )
+                .accumulate(&mut deferred_error)?;
             }
         } else {
             for index in 0..row_count {
-                apply(A::get(&columns, index), S::row(&mut rows, index))
-                    .into_result()
-                    .vortex_expect("an infallible SinkResult cannot be an error");
+                apply(&state, A::get(&columns, index), S::row(&mut rows, index))
+                    .accumulate(&mut deferred_error)?;
             }
         }
     }
 
-    sink.finish()
+    finish_sink(sink, deferred_error)
+}
+
+/// Run a prepared sink over only the rows set in `valid`, or decline when the sink cannot skip.
+pub(super) fn execute_row_sink_branch<A: ElementTuple, P, S: OutputSink, R: SinkResult>(
+    args: &dyn ExecutionArgs,
+    sink_dtype: &DType,
+    valid: &Mask,
+    ctx: &mut ExecutionCtx,
+    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+    apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
+) -> VortexResult<Option<RowExecution>> {
+    if !S::SUPPORTS_SKIPPED_ROWS {
+        return Ok(None);
+    }
+
+    let Some(columns) = A::decode_null_tolerant(args, ctx)? else {
+        return Ok(None);
+    };
+    let state = prepare(A::constants(&columns));
+    let row_count = args.row_count();
+    let mut sink = S::with_capacity(row_count, sink_dtype)?;
+    let mut deferred_error = DeferredError::default();
+
+    let AllOr::Some(valid) = valid.bit_buffer() else {
+        vortex_bail!("execute_row_sink_branch requires a mixed mask");
+    };
+
+    {
+        let mut rows = sink.rows();
+        vortex_ensure!(
+            S::row_count_matches(&rows, row_count),
+            "output sink row count must match the execution row count, got {row_count}",
+        );
+
+        let varying = A::varying(&columns);
+        if let Some(varying) = &varying {
+            vortex_ensure!(
+                A::varying_len_matches(varying, row_count),
+                "decoded row input length must match the execution row count, got {row_count}",
+            );
+        }
+
+        let mut error = None;
+        valid.for_each_set_index(|index| {
+            if error.is_some() {
+                return;
+            }
+
+            let result = match &varying {
+                Some(varying) => apply(
+                    &state,
+                    A::get_varying(varying, index),
+                    S::row(&mut rows, index),
+                ),
+                None => apply(&state, A::get(&columns, index), S::row(&mut rows, index)),
+            };
+            if let Err(err) = result.accumulate(&mut deferred_error) {
+                error = Some(err);
+            }
+        });
+
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+
+    finish_sink(sink, deferred_error).map(Some)
+}
+
+/// Finish a sink while preserving whether its error came from the deferred row accumulator.
+fn finish_sink<S: OutputSink>(
+    sink: S,
+    deferred_error: DeferredError,
+) -> VortexResult<RowExecution> {
+    match sink.finish(deferred_error) {
+        Ok(output) => Ok(RowExecution::Output(output)),
+        Err(error) if deferred_error.occurred() => Ok(RowExecution::DeferredError(error)),
+        Err(error) => Err(error),
+    }
 }

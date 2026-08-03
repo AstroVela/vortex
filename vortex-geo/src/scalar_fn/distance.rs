@@ -9,6 +9,7 @@ use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
@@ -38,7 +39,6 @@ impl GeoDistance {
 impl RowFn for GeoDistance {
     type Options = EmptyOptions;
     type ArgsWitness = (GeometryRow, GeometryRow);
-    type RetWitness = f64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.geo.distance");
@@ -49,7 +49,7 @@ impl RowFn for GeoDistance {
         ChildName::from(["a", "b"][idx])
     }
 
-    /// Deliberately a plain visit, not a prepared one: a batch-constant operand offers nothing
+    /// Deliberately uses unit preparation: a batch-constant operand offers nothing
     /// sound to hoist. geo computes linestring and polygon distances through its private
     /// `nearest_neighbour_distance`, which builds the R*-trees for *both* sides inside each call,
     /// and the point pairings are single expressions; reusing a tree across rows would mean
@@ -61,7 +61,10 @@ impl RowFn for GeoDistance {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(GeometryRow, GeometryRow), f64>(|(a, b)| Euclidean.distance(a, b))
+        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<f64>, _, _>(
+            |_| (),
+            |&(), (a, b), output| output.write(Euclidean.distance(a, b)),
+        )
     }
 }
 

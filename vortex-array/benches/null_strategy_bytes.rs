@@ -28,6 +28,7 @@ use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::Bytes;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::NullStrategy;
 use vortex_array::scalar_fn::RowFn;
@@ -66,7 +67,6 @@ struct LenFromSlice;
 impl RowFn for LenFromSlice {
     type Options = EmptyOptions;
     type ArgsWitness = (Bytes,);
-    type RetWitness = u64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.null_strategy.len_from_slice");
@@ -83,7 +83,10 @@ impl RowFn for LenFromSlice {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(Bytes,), u64>(|(bytes,)| bytes.len() as u64)
+        visitor.visit_prepared_into::<(Bytes,), ElementSink<u64>, _, _>(
+            |_| (),
+            |&(), (bytes,), output| output.write(bytes.len() as u64),
+        )
     }
 }
 

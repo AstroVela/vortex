@@ -35,6 +35,7 @@ use vortex_array::expr::Expression;
 use vortex_array::expr::union_child_validities;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ExecutionArgs;
 use vortex_array::scalar_fn::RowFn;
@@ -78,7 +79,6 @@ struct LazyDouble;
 impl RowFn for LazyDouble {
     type Options = EmptyOptions;
     type ArgsWitness = (i32,);
-    type RetWitness = i32;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.lazy_double");
@@ -95,7 +95,10 @@ impl RowFn for LazyDouble {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(i32,), i32>(|(value,)| value.wrapping_mul(2))
+        visitor.visit_prepared_into::<(i32,), ElementSink<i32>, _, _>(
+            |_| (),
+            |&(), (value,), output| output.write(value.wrapping_mul(2)),
+        )
     }
 
     fn reduce_encoded(

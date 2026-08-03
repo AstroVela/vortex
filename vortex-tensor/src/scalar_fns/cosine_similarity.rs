@@ -17,6 +17,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_float_ptype;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
@@ -61,7 +62,6 @@ pub struct CosineSimilarity;
 impl RowFn for CosineSimilarity {
     type Options = EmptyOptions;
     type ArgsWitness = (TensorRow<f64>, TensorRow<f64>);
-    type RetWitness = f64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.tensor.cosine_similarity");
@@ -79,7 +79,7 @@ impl RowFn for CosineSimilarity {
         visitor: V,
     ) -> VortexResult<V::Out> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
-            visitor.visit_prepared::<(TensorRow<T>, TensorRow<T>), ConstNorms<T>, T>(
+            visitor.visit_prepared_into::<(TensorRow<T>, TensorRow<T>), ElementSink<T>, _, _>(
                 |(lhs, rhs)| {
                     #[cfg(test)]
                     probe::record(lhs.is_some(), rhs.is_some());
@@ -88,7 +88,9 @@ impl RowFn for CosineSimilarity {
                         rhs: rhs.map(l2_norm_row),
                     }
                 },
-                |norms, (lhs, rhs)| cosine_similarity_row_prepared(norms, lhs, rhs),
+                |norms, (lhs, rhs), output| {
+                    output.write(cosine_similarity_row_prepared(norms, lhs, rhs));
+                },
             )
         })
     }

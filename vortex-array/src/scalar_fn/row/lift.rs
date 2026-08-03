@@ -16,6 +16,7 @@
 //! [`RowFn`]: crate::scalar_fn::RowFn
 //! [`ScalarFnVTable::execute`]: crate::scalar_fn::ScalarFnVTable::execute
 
+use smallvec::SmallVec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -34,14 +35,78 @@ use crate::dtype::DType;
 use crate::scalar::Scalar;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
-use crate::scalar_fn::VecExecutionArgs;
 use crate::scalar_fn::row::element::batch_constant;
+use crate::scalar_fn::row::execute::RowExecution;
 use crate::validity::Validity;
+
+struct BorrowedExecutionArgs<'a> {
+    inputs: &'a [ArrayRef],
+    row_count: usize,
+}
+
+impl<'a> BorrowedExecutionArgs<'a> {
+    fn new(inputs: &'a [ArrayRef], row_count: usize) -> Self {
+        Self { inputs, row_count }
+    }
+}
+
+impl ExecutionArgs for BorrowedExecutionArgs<'_> {
+    fn get(&self, index: usize) -> VortexResult<ArrayRef> {
+        self.inputs.get(index).cloned().ok_or_else(|| {
+            vortex_error::vortex_err!(
+                "Input index {} out of bounds (num_inputs={})",
+                index,
+                self.inputs.len()
+            )
+        })
+    }
+
+    fn num_inputs(&self) -> usize {
+        self.inputs.len()
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
+
+/// The arguments handed to one kernel invocation.
+///
+/// `arrays` may be filtered or sliced, while `dtypes` and `sink_dtype` always describe the original
+/// planned batch. Keeping them together prevents an execution path from accidentally pairing an
+/// input view with unrelated planning metadata.
+#[derive(Clone, Copy)]
+pub(super) struct KernelArgs<'a> {
+    /// The executor-facing view, including the row count for this invocation.
+    pub(super) execution: &'a dyn ExecutionArgs,
+
+    /// The same inputs as concrete arrays for encoding-aware rewrites.
+    pub(super) arrays: &'a [ArrayRef],
+
+    /// The original input dtypes used to select the row implementation.
+    pub(super) dtypes: &'a [DType],
+
+    /// The non-nullable dtype allocated by the selected output sink.
+    pub(super) sink_dtype: &'a DType,
+}
+
+/// The execution policy and output dtype selected by a planning visit.
+pub(super) struct BatchPlan {
+    /// The non-nullable dtype built by the selected sink.
+    pub(super) sink_dtype: DType,
+
+    /// How the lifting may expose rows that are null in some input.
+    pub(super) null_handling: NullHandling,
+
+    /// Whether dense execution should retry only valid rows after a deferred error.
+    pub(super) retry_deferred_error: bool,
+}
 
 /// How the lifting shows a kernel the rows that are null in some input.
 ///
-/// A row function never declares this: [`row_null_handling`] derives it from the element types the
-/// function's witnesses name.
+/// A row function never declares this: [`row_null_handling`] derives it from the argument element
+/// types and whether the dispatched row closure can exit early. A deferred-error sink remains
+/// dense and gets a valid-row retry only if its batch-wide error bit is set.
 ///
 /// [`row_null_handling`]: super::execute::row_null_handling
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,28 +114,28 @@ pub enum NullHandling {
     /// Evaluate every row, including rows behind nulls, then mask the result.
     ///
     /// Cheapest: no filtering, no scattering, and the inputs keep their original encoding.
-    /// Requires that the kernel is infallible and total over whatever sits behind a null, which
-    /// holds for any flat fixed-width payload since a null row is just unused bytes. Both halves of
-    /// that requirement are read off the element types rather than trusted: a fallible kernel, or
-    /// one over an argument that is not
+    /// Requires that the kernel is total over whatever sits behind a null and cannot exit the hot
+    /// loop early. A deferred-error kernel qualifies because it writes a safe provisional result
+    /// and reduces failure separately. The argument requirement is read off the element types: one
+    /// that is not
     /// [`InputElement::DENSE_SAFE`](crate::scalar_fn::InputElement::DENSE_SAFE), gets
     /// [`Filter`](Self::Filter) instead.
     Dense,
 
     /// Never evaluate a row that is null in some input: the kernel only ever sees valid rows.
     ///
-    /// Always sound. It is what a fallible kernel gets, and what an argument gets when decoding a
-    /// row behind a null could itself fail (a dictionary code or string view only meaningful for
-    /// valid rows).
+    /// Always sound. It is what an early-failing kernel gets, and what an argument gets when
+    /// decoding a row behind a null could itself fail (a dictionary code or string view only
+    /// meaningful for valid rows).
     ///
-    /// `Filter` names that *contract*, not a mechanism. A batch whose mask is mixed executes by one
+    /// `Filter` names that _contract_, not a mechanism. A batch whose mask is mixed executes by one
     /// of two strategies, selected per batch by the lifting and invisible to the kernel: filter the
     /// inputs to the valid rows, evaluate those, and scatter the results back; or, when the kernel
-    /// supports it (every [`RowFn`](crate::scalar_fn::RowFn) with a returning dispatch does),
-    /// branch-and-skip, which evaluates only the valid rows over the *unfiltered* inputs and masks
+    /// supports it (every sink with skipped-row support does),
+    /// branch-and-skip, which evaluates only the valid rows over the _unfiltered_ inputs and masks
     /// the result.
     ///
-    /// Encoding-aware kernels see original encodings under branch-and-skip but *filtered copies*
+    /// Encoding-aware kernels see original encodings under branch-and-skip but _filtered copies_
     /// under the filter strategy, and filtering only pushes through an extension array or a
     /// `ScalarFnArray` with at most one non-constant child. With two or more, the filter stays on
     /// top, so `array.is::<ExactScalarFn<Foo>>()` stops matching and the kernel silently takes its
@@ -89,7 +154,10 @@ pub(super) struct Batch<'a> {
 
     /// The input columns, collected once: constant folding inspects them and the filter strategy
     /// filters them.
-    inputs: Vec<ArrayRef>,
+    inputs: SmallVec<[ArrayRef; 4]>,
+
+    /// The input dtypes, collected with the columns and reused by both planning and execution.
+    arg_dtypes: SmallVec<[DType; 4]>,
 
     /// The conjoined input validity, so a row of the output is valid iff it is valid in every
     /// input. Conjoining is lazy, and nothing materializes it unless the null handling asks.
@@ -99,8 +167,15 @@ pub(super) struct Batch<'a> {
     /// against. Already widened to nullable if any input is nullable.
     result_dtype: DType,
 
+    /// The non-nullable dtype the dispatched sink builds, computed once while planning.
+    sink_dtype: DType,
+
     /// How the kernel sees rows that are null in some input.
     null_handling: NullHandling,
+
+    /// Whether an error from dense execution may have come only from rows that will be null, in
+    /// which case execution is retried over the valid rows.
+    retry_deferred_error: bool,
 
     /// Whether any argument's decode does per-row work whose cost shrinks when the inputs are
     /// filtered first, which is the one input to the per-batch strategy choice that comes from the
@@ -117,19 +192,19 @@ impl<'a> Batch<'a> {
     pub(super) fn new(
         id: ScalarFnId,
         args: &'a dyn ExecutionArgs,
-        return_dtype: impl FnOnce(&[DType]) -> VortexResult<DType>,
-        null_handling: NullHandling,
+        plan: impl FnOnce(&[DType]) -> VortexResult<BatchPlan>,
         decode_shrinks_when_filtered: bool,
     ) -> VortexResult<Self> {
-        let inputs = (0..args.num_inputs())
+        let inputs: SmallVec<[ArrayRef; 4]> = (0..args.num_inputs())
             .map(|i| args.get(i))
-            .collect::<VortexResult<Vec<_>>>()?;
+            .collect::<VortexResult<_>>()?;
 
-        let arg_dtypes = inputs
-            .iter()
-            .map(|input| input.dtype().clone())
-            .collect::<Vec<_>>();
-        let result_dtype = return_dtype(&arg_dtypes)?;
+        let arg_dtypes: SmallVec<[DType; 4]> =
+            inputs.iter().map(|input| input.dtype().clone()).collect();
+        let plan = plan(&arg_dtypes)?;
+        let nullability = plan.sink_dtype.nullability()
+            | crate::dtype::Nullability::from(arg_dtypes.iter().any(DType::is_nullable));
+        let result_dtype = plan.sink_dtype.with_nullability(nullability);
 
         let mut validity = Validity::NonNullable;
         for input in &inputs {
@@ -140,9 +215,12 @@ impl<'a> Batch<'a> {
             id,
             args,
             inputs,
+            arg_dtypes,
             validity,
             result_dtype,
-            null_handling,
+            sink_dtype: plan.sink_dtype,
+            null_handling: plan.null_handling,
+            retry_deferred_error: plan.retry_deferred_error,
             decode_shrinks_when_filtered,
         })
     }
@@ -163,7 +241,7 @@ impl<'a> Batch<'a> {
     /// `return_dtype` up to nullability. A kernel that returns nulls of its own keeps them, unioned
     /// with the ones the lifting applies, which requires its declared dtype to be nullable.
     ///
-    /// `branch` computes only the rows set in the conjoined mask, over the *unfiltered* arguments,
+    /// `branch` computes only the rows set in the conjoined mask, over the _unfiltered_ arguments,
     /// writing an arbitrary placeholder everywhere else; `Ok(None)` means it cannot for these
     /// inputs, which sends the batch to the filter strategy. It is only ever called with a mixed
     /// mask, and it **must not** run its row computation (nor any per-row fallible decode) on an
@@ -171,8 +249,12 @@ impl<'a> Batch<'a> {
     /// fail on them.
     pub(super) fn execute(
         &self,
-        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
-        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        branch: impl FnOnce(
+            KernelArgs<'_>,
+            &Mask,
+            &mut ExecutionCtx,
+        ) -> VortexResult<Option<RowExecution>>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         // Strictness: any null-constant input forces an all-null result without evaluating the
@@ -210,16 +292,17 @@ impl<'a> Batch<'a> {
     /// paper over a disagreement.
     fn broadcast_one_row(
         &self,
-        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let one_row = self
+        let one_row: SmallVec<[ArrayRef; 4]> = self
             .inputs
             .iter()
             .map(|input| input.slice(0..1))
-            .collect::<VortexResult<Vec<_>>>()?;
+            .collect::<VortexResult<_>>()?;
 
-        let result = kernel(&VecExecutionArgs::new(one_row, 1), ctx)?;
+        let args = BorrowedExecutionArgs::new(&one_row, 1);
+        let result = kernel(self.kernel_args(&args, &one_row), ctx)?.into_result()?;
         let scalar = self.with_return_dtype(result, 1)?.execute_scalar(0, ctx)?;
 
         Ok(ConstantArray::new(scalar, self.args.row_count()).into_array())
@@ -232,7 +315,7 @@ impl<'a> Batch<'a> {
     /// array rather than materialized into a [`Mask`] first.
     fn execute_dense(
         &self,
-        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         // Every row is null, so the kernel has nothing to contribute.
@@ -240,7 +323,25 @@ impl<'a> Batch<'a> {
             return Ok(self.all_null());
         }
 
-        let values = kernel(self.args, ctx)?;
+        let values = match kernel(self.kernel_args(self.args, &self.inputs), ctx)? {
+            RowExecution::Output(values) => values,
+            RowExecution::DeferredError(error) if self.retry_deferred_error => {
+                let valid = self
+                    .validity
+                    .clone()
+                    .execute_mask(self.args.row_count(), ctx)?;
+
+                if valid.all_true() {
+                    return Err(error);
+                }
+                if valid.all_false() {
+                    return Ok(self.all_null());
+                }
+
+                return self.filter_and_scatter(kernel, &valid, ctx);
+            }
+            RowExecution::DeferredError(error) => return Err(error),
+        };
 
         match self.validity.clone() {
             Validity::NonNullable | Validity::AllValid => {
@@ -259,7 +360,7 @@ impl<'a> Batch<'a> {
     ///
     /// Two strategies can execute a mixed mask, and neither is visible to the kernel:
     ///
-    /// - **Branch-and-skip** ([`execute_branched`](Self::execute_branched)): hand the *unfiltered*
+    /// - **Branch-and-skip** ([`execute_branched`](Self::execute_branched)): hand the _unfiltered_
     ///   arguments plus the mask to `branch`, which computes only the valid rows, then mask the
     ///   full-length result exactly as the dense path does. This skips the filter and the scatter
     ///   entirely, at the price of decoding full-length columns.
@@ -271,8 +372,12 @@ impl<'a> Batch<'a> {
     /// strategy is also the fallback for a kernel with no branch execution.
     fn execute_filtered(
         &self,
-        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
-        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        branch: impl FnOnce(
+            KernelArgs<'_>,
+            &Mask,
+            &mut ExecutionCtx,
+        ) -> VortexResult<Option<RowExecution>>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let valid = self
@@ -283,7 +388,10 @@ impl<'a> Batch<'a> {
         // Check all-true before all-false: an empty mask is both, and must not be treated as
         // all-null (a zero-length non-nullable execution keeps its non-nullable dtype).
         if valid.all_true() {
-            return self.with_return_dtype(kernel(self.args, ctx)?, self.args.row_count());
+            return self.with_return_dtype(
+                kernel(self.kernel_args(self.args, &self.inputs), ctx)?.into_result()?,
+                self.args.row_count(),
+            );
         }
 
         if valid.all_false() {
@@ -305,13 +413,18 @@ impl<'a> Batch<'a> {
     /// the caller falls back to [`filter_and_scatter`](Self::filter_and_scatter).
     fn execute_branched(
         &self,
-        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        branch: impl FnOnce(
+            KernelArgs<'_>,
+            &Mask,
+            &mut ExecutionCtx,
+        ) -> VortexResult<Option<RowExecution>>,
         valid: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let Some(values) = branch(valid, ctx)? else {
+        let Some(values) = branch(self.kernel_args(self.args, &self.inputs), valid, ctx)? else {
             return Ok(None);
         };
+        let values = values.into_result()?;
 
         let mask = BoolArray::new(valid.to_bit_buffer(), Validity::NonNullable).into_array();
         self.with_return_dtype(values.mask(mask)?, valid.len())
@@ -322,17 +435,18 @@ impl<'a> Batch<'a> {
     /// run the kernel over those, and scatter its results back into a null-padded output.
     fn filter_and_scatter(
         &self,
-        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         valid: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let filtered = self
+        let filtered: SmallVec<[ArrayRef; 4]> = self
             .inputs
             .iter()
             .map(|input| input.filter(valid.clone()))
-            .collect::<VortexResult<Vec<_>>>()?;
+            .collect::<VortexResult<_>>()?;
 
-        let values = kernel(&VecExecutionArgs::new(filtered, valid.true_count()), ctx)?;
+        let args = BorrowedExecutionArgs::new(&filtered, valid.true_count());
+        let values = kernel(self.kernel_args(&args, &filtered), ctx)?.into_result()?;
 
         self.with_return_dtype(self.scatter_valid(values, valid)?, valid.len())
     }
@@ -344,6 +458,20 @@ impl<'a> Batch<'a> {
             self.args.row_count(),
         )
         .into_array()
+    }
+
+    /// Pair an input view with this batch's planning metadata.
+    fn kernel_args<'b>(
+        &'b self,
+        execution: &'b dyn ExecutionArgs,
+        arrays: &'b [ArrayRef],
+    ) -> KernelArgs<'b> {
+        KernelArgs {
+            execution,
+            arrays,
+            dtypes: &self.arg_dtypes,
+            sink_dtype: &self.sink_dtype,
+        }
     }
 
     /// Reconcile the kernel's output dtype with the function's declared return dtype.
@@ -421,9 +549,9 @@ pub(super) fn reconcile_return(
 /// branch-and-skip is still chosen for a function whose decode shrinks when filtered.
 ///
 /// From the branch-and-skip measurements (65536 rows, divan fastest of 100 samples, two runs on a
-/// shared 4-vCPU VM). A kernel with a *bulk* decode never lost under branch: `byte_length` over
+/// shared 4-vCPU VM). A kernel with a _bulk_ decode never lost under branch: `byte_length` over
 /// the `Bytes` element ran 1.8-5.9x faster than filter at every null density from 1% to 90%, so
-/// such kernels skip this check entirely. A kernel with a *per-row* decode (geo `contains`, which
+/// such kernels skip this check entirely. A kernel with a _per-row_ decode (geo `contains`, which
 /// arrow-exports and parses one geometry per row) pays that decode over the full column under
 /// branch but only over the survivors under filter, so filter wins once validity is sparse:
 ///
@@ -478,8 +606,12 @@ impl Batch<'_> {
     /// caller reports rather than silently falling back.
     pub(super) fn execute_with_strategy(
         &self,
-        kernel: impl Fn(&dyn ExecutionArgs, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
-        branch: impl FnOnce(&Mask, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
+        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        branch: impl FnOnce(
+            KernelArgs<'_>,
+            &Mask,
+            &mut ExecutionCtx,
+        ) -> VortexResult<Option<RowExecution>>,
         strategy: NullStrategy,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -490,7 +622,10 @@ impl Batch<'_> {
 
         if valid.all_true() {
             return self
-                .with_return_dtype(kernel(self.args, ctx)?, self.args.row_count())
+                .with_return_dtype(
+                    kernel(self.kernel_args(self.args, &self.inputs), ctx)?.into_result()?,
+                    self.args.row_count(),
+                )
                 .map(Some);
         }
 

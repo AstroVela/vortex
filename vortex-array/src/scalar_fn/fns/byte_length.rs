@@ -15,6 +15,7 @@ use crate::dtype::DType;
 use crate::kernel::ExecuteParentKernel;
 use crate::scalar_fn::BytesLen;
 use crate::scalar_fn::ChildName;
+use crate::scalar_fn::ElementSink;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::RowFn;
 use crate::scalar_fn::RowVisitor;
@@ -57,7 +58,6 @@ pub struct ByteLength;
 impl RowFn for ByteLength {
     type Options = EmptyOptions;
     type ArgsWitness = (BytesLen,);
-    type RetWitness = u64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.byte_length");
@@ -77,7 +77,10 @@ impl RowFn for ByteLength {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(BytesLen,), u64>(|(len,)| len as u64)
+        visitor.visit_prepared_into::<(BytesLen,), ElementSink<u64>, _, _>(
+            |_| (),
+            |&(), (len,), output| output.write(len as u64),
+        )
     }
 }
 

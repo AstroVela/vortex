@@ -28,6 +28,7 @@ use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::Bytes;
 use vortex_array::scalar_fn::BytesLen;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
@@ -52,7 +53,6 @@ struct LenFromView;
 impl RowFn for LenFromView {
     type Options = EmptyOptions;
     type ArgsWitness = (BytesLen,);
-    type RetWitness = u64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.len_from_view");
@@ -69,7 +69,10 @@ impl RowFn for LenFromView {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(BytesLen,), u64>(|(len,)| len as u64)
+        visitor.visit_prepared_into::<(BytesLen,), ElementSink<u64>, _, _>(
+            |_| (),
+            |&(), (len,), output| output.write(len as u64),
+        )
     }
 }
 
@@ -81,7 +84,6 @@ struct LenFromSlice;
 impl RowFn for LenFromSlice {
     type Options = EmptyOptions;
     type ArgsWitness = (Bytes,);
-    type RetWitness = u64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.len_from_slice");
@@ -98,7 +100,10 @@ impl RowFn for LenFromSlice {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(Bytes,), u64>(|(bytes,)| bytes.len() as u64)
+        visitor.visit_prepared_into::<(Bytes,), ElementSink<u64>, _, _>(
+            |_| (),
+            |&(), (bytes,), output| output.write(bytes.len() as u64),
+        )
     }
 }
 

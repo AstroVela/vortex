@@ -8,10 +8,9 @@
 //! `vortex-tensor`'s `TensorRow` drills through an extension wrapper into its storage.
 //!
 //! The two directions are deliberately asymmetric. [`InputElement::Elem`] is a GAT, so an input row
-//! can borrow out of the decoded column, while an [`OutputElement`] is one owned value per row. When
-//! that owned value is the wrong shape for an output, the row function writes into an
-//! [`OutputSink`](crate::scalar_fn::OutputSink) instead. See
-//! [choosing a trait](crate::scalar_fn#choosing-a-trait) for which to reach for.
+//! can borrow out of the decoded column, while an [`OutputElement`] is one owned value written into
+//! an [`ElementSink`](crate::scalar_fn::ElementSink). Runtime-shaped output uses a custom
+//! [`OutputSink`](crate::scalar_fn::OutputSink) instead.
 
 use vortex_error::VortexResult;
 
@@ -56,7 +55,7 @@ pub trait InputElement: 'static {
 
     /// Whether [`get`](Self::get) may be called for a row that is null in the input.
     ///
-    /// Arrays only guarantee their contents for *valid* rows, so this is `false` for any element
+    /// Arrays only guarantee their contents for _valid_ rows, so this is `false` for any element
     /// that follows an offset or pointer stored in the array: behind a null row that value is
     /// arbitrary and may not address anything. Reading a whole value out of a flat buffer is `true`,
     /// since the value is garbage but the read cannot fault.
@@ -66,11 +65,11 @@ pub trait InputElement: 'static {
     /// instead when it does not hold.
     const DENSE_SAFE: bool;
 
-    /// Whether [`decode`](Self::decode) can fail on *legal* input data.
+    /// Whether [`decode`](Self::decode) can fail on _legal_ input data.
     ///
     /// `false` for an element read straight out of a buffer: decoding can still fail for
     /// infrastructural reasons (IO, allocation), but never because of the values. `true` for an
-    /// element that parses its bytes, since a malformed WKB geometry in a *valid* row is a domain
+    /// element that parses its bytes, since a malformed WKB geometry in a _valid_ row is a domain
     /// error, which makes a function over that element
     /// [fallible](crate::scalar_fn::ScalarFnVTable::is_fallible) however infallible its own row
     /// computation is.
@@ -79,7 +78,7 @@ pub trait InputElement: 'static {
     /// Whether [`decode`](Self::decode) does per-row work whose cost shrinks proportionally when
     /// the column is filtered to fewer rows first.
     ///
-    /// `true` for an element whose decode *parses* every row (a geometry built from coordinate
+    /// `true` for an element whose decode _parses_ every row (a geometry built from coordinate
     /// storage): decoding only the survivors of a sparse validity mask is genuinely cheaper than
     /// decoding everyone. `false`, the default, for a bulk canonicalization (bytes, bools,
     /// primitives), whose decode is a memcpy-shaped pass that filtering barely shrinks.
@@ -100,7 +99,7 @@ pub trait InputElement: 'static {
     /// the type to widen if that means carrying more, since it is chosen by the element.
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column>;
 
-    /// Decode `array` *without* assuming every row is valid, or `Ok(None)` when this element
+    /// Decode `array` _without_ assuming every row is valid, or `Ok(None)` when this element
     /// cannot for this particular array.
     ///
     /// The ordinary [`decode`](Self::decode) only ever sees all-valid inputs, so an element whose
@@ -156,28 +155,6 @@ pub trait OutputElement: 'static + Sized {
 
     /// Build a column from one value per row. Called once per batch.
     fn build(values: Vec<Self>) -> ArrayRef;
-
-    /// Build an all-valid column by computing one value for every row.
-    ///
-    /// The default collects through a [`Vec`]. Elements with a cheaper bulk allocation shape may
-    /// override this, which primitive elements use to write directly into an uninitialized
-    /// [`BufferMut`](vortex_buffer::BufferMut) without a per-row `Vec::push`.
-    fn build_from_fn(row_count: usize, apply: impl FnMut(usize) -> Self) -> ArrayRef {
-        Self::build((0..row_count).map(apply).collect())
-    }
-
-    /// Fallible counterpart to [`build_from_fn`](Self::build_from_fn).
-    fn try_build_from_fn(
-        row_count: usize,
-        mut apply: impl FnMut(usize) -> VortexResult<Self>,
-    ) -> VortexResult<ArrayRef> {
-        let mut values = Vec::with_capacity(row_count);
-        for index in 0..row_count {
-            values.push(apply(index)?);
-        }
-
-        Ok(Self::build(values))
-    }
 
     /// An arbitrary value of this element, pre-filled into the output slots that the
     /// branch-and-skip null strategy skips.

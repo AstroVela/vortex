@@ -141,7 +141,7 @@ pub trait ElementTuple: 'static {
     ///
     /// `Some` marks an argument whose operand is constant for the batch and carries the element
     /// every row reads; `None` marks one that varies by row. This is what
-    /// [`visit_prepared`](crate::scalar_fn::RowVisitor::visit_prepared) hands to its prepare
+    /// [`visit_prepared_into`](crate::scalar_fn::RowVisitor::visit_prepared_into) hands to its prepare
     /// closure, so a kernel can hoist work that depends only on a constant argument out of the
     /// row loop.
     type ConstElems<'a>;
@@ -152,10 +152,10 @@ pub trait ElementTuple: 'static {
     /// Whether every argument is [`InputElement::DENSE_SAFE`].
     const DENSE_SAFE: bool;
 
-    /// Whether *any* argument is [`InputElement::DECODE_FALLIBLE`].
+    /// Whether _any_ argument is [`InputElement::DECODE_FALLIBLE`].
     const DECODE_FALLIBLE: bool;
 
-    /// Whether *any* argument is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`].
+    /// Whether _any_ argument is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`].
     const DECODE_SHRINKS_WHEN_FILTERED: bool;
 
     /// Validate the input dtypes, including that `dtypes` has exactly `ARITY` entries.

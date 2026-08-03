@@ -11,6 +11,7 @@ use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
@@ -42,7 +43,6 @@ impl GeoIntersects {
 impl RowFn for GeoIntersects {
     type Options = EmptyOptions;
     type ArgsWitness = (GeometryRow, GeometryRow);
-    type RetWitness = bool;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.geo.intersects");
@@ -59,13 +59,13 @@ impl RowFn for GeoIntersects {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit_prepared::<(GeometryRow, GeometryRow), ConstBboxes, bool>(
+        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<bool>, _, _>(
             |(a, b)| {
                 #[cfg(test)]
                 probe::record(a.is_some(), b.is_some());
                 ConstBboxes::new(a, b)
             },
-            |bboxes, (a, b)| intersects_row_prepared(bboxes, a, b),
+            |bboxes, (a, b), output| output.write(intersects_row_prepared(bboxes, a, b)),
         )
     }
 }

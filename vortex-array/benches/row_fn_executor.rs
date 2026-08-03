@@ -5,6 +5,7 @@
 
 #![expect(clippy::unwrap_used)]
 
+use std::mem::MaybeUninit;
 use std::sync::LazyLock;
 
 use divan::Bencher;
@@ -21,6 +22,8 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::DeferredError;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::OutputSink;
 use vortex_array::scalar_fn::RowFn;
@@ -50,7 +53,6 @@ struct RowWrappingAdd;
 impl RowFn for RowWrappingAdd {
     type Options = EmptyOptions;
     type ArgsWitness = (i64, i64);
-    type RetWitness = i64;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_wrapping_add");
@@ -67,17 +69,87 @@ impl RowFn for RowWrappingAdd {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(i64, i64), i64>(|(lhs, rhs)| lhs.wrapping_add(rhs))
+        visitor.visit_prepared_into::<(i64, i64), ElementSink<i64>, _, _>(
+            |_| (),
+            |&(), (lhs, rhs), output| output.write(lhs.wrapping_add(rhs)),
+        )
     }
 }
 
 #[derive(Clone)]
 struct RowCheckedAdd;
 
+struct CheckedAddSink {
+    values: BufferMut<i64>,
+    row_count: usize,
+}
+
+struct CheckedAddRows<'a> {
+    values: &'a mut [MaybeUninit<i64>],
+}
+
+struct CheckedAddRow<'a> {
+    value: &'a mut MaybeUninit<i64>,
+}
+
+impl CheckedAddRow<'_> {
+    fn write(self, lhs: i64, rhs: i64) -> DeferredError {
+        let value = lhs.wrapping_add(rhs);
+        let error = (lhs ^ value) & (rhs ^ value);
+        self.value.write(value);
+        DeferredError::from_sign_bit(error)
+    }
+}
+
+impl OutputSink for CheckedAddSink {
+    const ERRORS_ARE_DEFERRED: bool = true;
+
+    type Rows<'a> = CheckedAddRows<'a>;
+    type Row<'a> = CheckedAddRow<'a>;
+
+    fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
+        Ok(DType::from(i64::PTYPE))
+    }
+
+    fn with_capacity(rows: usize, _dtype: &DType) -> VortexResult<Self> {
+        Ok(Self {
+            values: BufferMut::with_capacity(rows),
+            row_count: rows,
+        })
+    }
+
+    fn rows(&mut self) -> Self::Rows<'_> {
+        CheckedAddRows {
+            values: &mut self.values.spare_capacity_mut()[..self.row_count],
+        }
+    }
+
+    fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
+        rows.values.len() == row_count
+    }
+
+    fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a> {
+        CheckedAddRow {
+            value: &mut rows.values[index],
+        }
+    }
+
+    fn finish(mut self, error: DeferredError) -> VortexResult<ArrayRef> {
+        if error.occurred() {
+            return Err(vortex_err!("integer overflow in row checked add"));
+        }
+
+        // SAFETY: dense execution writes every slot before `finish` is called. This sink does not
+        // support branch-and-skip, and filtered execution allocates exactly one slot per valid row.
+        unsafe { self.values.set_len(self.row_count) };
+        Ok(PrimitiveArray::new(self.values.freeze(), Validity::NonNullable).into_array())
+    }
+}
+
 impl RowFn for RowCheckedAdd {
     type Options = EmptyOptions;
     type ArgsWitness = (i64, i64);
-    type RetWitness = VortexResult<i64>;
+    const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_checked_add");
@@ -94,10 +166,10 @@ impl RowFn for RowCheckedAdd {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit::<(i64, i64), VortexResult<i64>>(|(lhs, rhs)| {
-            lhs.checked_add(rhs)
-                .ok_or_else(|| vortex_err!("integer overflow in row checked add"))
-        })
+        visitor.visit_prepared_into::<(i64, i64), CheckedAddSink, _, _>(
+            |_| (),
+            |&(), (lhs, rhs), output| output.write(lhs, rhs),
+        )
     }
 }
 
@@ -127,7 +199,7 @@ impl OutputSink for I64Sink {
         &mut rows[index]
     }
 
-    fn finish(self) -> VortexResult<ArrayRef> {
+    fn finish(self, _error: DeferredError) -> VortexResult<ArrayRef> {
         Ok(PrimitiveArray::new(self.0.freeze(), Validity::NonNullable).into_array())
     }
 }
@@ -138,7 +210,6 @@ struct RowSinkWrappingAdd;
 impl RowFn for RowSinkWrappingAdd {
     type Options = EmptyOptions;
     type ArgsWitness = (i64, i64);
-    type RetWitness = ();
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_sink_wrapping_add");
@@ -155,9 +226,12 @@ impl RowFn for RowSinkWrappingAdd {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit_into::<(i64, i64), I64Sink, ()>(|(lhs, rhs), out| {
-            *out = lhs.wrapping_add(rhs);
-        })
+        visitor.visit_prepared_into::<(i64, i64), I64Sink, _, _>(
+            |_| (),
+            |&(), (lhs, rhs), out| {
+                *out = lhs.wrapping_add(rhs);
+            },
+        )
     }
 }
 

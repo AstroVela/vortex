@@ -7,15 +7,14 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::dtype::DType;
+use crate::scalar_fn::DeferredError;
+use crate::scalar_fn::OutputElement;
 
 /// A column allocated once per batch that a row closure writes into, one row at a time.
 ///
-/// This is the second of the two ways a [`RowFn`](crate::scalar_fn::RowFn) produces output, and it
-/// exists for what the first cannot express. An [`OutputElement`](crate::scalar_fn::OutputElement) is
-/// one owned value per row whose dtype is a property of its Rust type. That rules out an output whose
-/// *width* is runtime data, and makes builder-backed output such as a transformed string allocate an
-/// owned value per row. A sink resolves both: it is created knowing the output dtype and owns the
-/// batch-wide builder while handing out a place to write rather than taking a value back.
+/// Every [`RowFn`](crate::scalar_fn::RowFn) writes through one. [`ElementSink`] covers an ordinary
+/// owned value per row. A custom sink covers output whose width is runtime data or whose rows append
+/// into one batch-wide builder.
 ///
 /// Two properties of the contract are worth stating, since both are load-bearing:
 ///
@@ -28,8 +27,28 @@ use crate::dtype::DType;
 ///   none. That is the whole reason a runtime-shaped output fits here: the width comes out of the
 ///   arguments.
 ///
-/// Rows arrive in order, `0..row_count`, exactly once each.
+/// Rows arrive in increasing index order. Ordinary execution visits `0..row_count` exactly once;
+/// branch-and-skip may omit null rows when [`SUPPORTS_SKIPPED_ROWS`](Self::SUPPORTS_SKIPPED_ROWS)
+/// is `true`.
 pub trait OutputSink: 'static + Sized {
+    /// Whether this sink accepts [`DeferredError`] from its row closure instead of requiring a
+    /// per-row [`VortexResult`].
+    ///
+    /// The executor OR-reduces the row error words and passes the result to
+    /// [`finish`](Self::finish). When the arguments are safe to read behind nulls, this lets the
+    /// lifting optimistically run a dense loop. If `finish` reports the deferred error for a
+    /// nullable batch, the lifting retries over only the valid rows: success means the error came
+    /// exclusively from null rows, while another deferred error is real.
+    ///
+    /// A supporting sink must return an error from `finish` when its `error` argument occurred.
+    const ERRORS_ARE_DEFERRED: bool = false;
+
+    /// Whether this sink can finish a full-length output when some rows were never visited.
+    ///
+    /// A supporting sink must leave a legal arbitrary value at every skipped row. The lifting masks
+    /// those rows before the result escapes, so that value is never observable.
+    const SUPPORTS_SKIPPED_ROWS: bool = false;
+
     /// A loop-local view of all output rows.
     ///
     /// Borrowed once before execution so the sink's buffer descriptor and shape become loop
@@ -66,6 +85,59 @@ pub trait OutputSink: 'static + Sized {
     fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a>;
 
     /// Finish into the built column, whose dtype **must** be this sink's
-    /// [`sink_dtype`](Self::sink_dtype). Called once per batch.
-    fn finish(self) -> VortexResult<ArrayRef>;
+    /// [`sink_dtype`](Self::sink_dtype). Called once per batch with the OR of every row's deferred
+    /// error bit.
+    fn finish(self, error: DeferredError) -> VortexResult<ArrayRef>;
+}
+
+/// The standard output sink for one owned [`OutputElement`] per row.
+pub struct ElementSink<T> {
+    values: Vec<T>,
+}
+
+/// One output slot in an [`ElementSink`].
+pub struct ElementRow<'a, T: OutputElement> {
+    value: &'a mut T,
+}
+
+impl<T: OutputElement> ElementRow<'_, T> {
+    /// Replace this row's placeholder with its computed value.
+    pub fn write(self, value: T) {
+        *self.value = value;
+    }
+}
+
+impl<T: OutputElement> OutputSink for ElementSink<T> {
+    const SUPPORTS_SKIPPED_ROWS: bool = true;
+
+    type Rows<'a> = &'a mut [T];
+    type Row<'a> = ElementRow<'a, T>;
+
+    fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
+        Ok(T::element_dtype())
+    }
+
+    fn with_capacity(rows: usize, _dtype: &DType) -> VortexResult<Self> {
+        let mut values = Vec::with_capacity(rows);
+        values.resize_with(rows, T::placeholder);
+        Ok(Self { values })
+    }
+
+    fn rows(&mut self) -> Self::Rows<'_> {
+        &mut self.values
+    }
+
+    fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
+        rows.len() == row_count
+    }
+
+    fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a> {
+        ElementRow {
+            value: &mut rows[index],
+        }
+    }
+
+    fn finish(self, _error: DeferredError) -> VortexResult<ArrayRef> {
+        Ok(T::build(self.values))
+    }
 }

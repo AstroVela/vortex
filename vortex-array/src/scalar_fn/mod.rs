@@ -22,23 +22,16 @@
 //! (`vortex-tensor`'s `TensorRow` yields a slice of an extension array's storage). Covering a new
 //! type family, a list row included, is one impl.
 //!
-//! Its *output* side comes in two forms, and a dispatch picks one per visit:
-//!
-//! - [`RowVisitor::visit`] takes a closure that **returns** an [`OutputElement`]: one owned value per
-//!   row, whose dtype is fixed by its Rust type. This is the common case.
-//! - [`RowVisitor::visit_into`] takes one that **writes** into an [`OutputSink`], allocated once per
-//!   batch knowing the output dtype and handing out a place to write. That carries what an owned
-//!   per-row value cannot, such as a future string transform appending every row into one shared
-//!   byte buffer instead of allocating one owned string per row.
+//! Its output is always an [`OutputSink`], allocated once per batch and handing the closure one row
+//! to write. [`ElementSink`] is the standard sink for one owned [`OutputElement`] per row. A custom
+//! sink carries runtime-shaped output, such as a tensor whose width comes from its input dtype, or a
+//! future string transform appending every row into one shared byte buffer.
 //!
 //! When part of the kernel's work depends only on an operand that is constant for the batch (the
-//! norm of a broadcast query vector, a prepared form of a constant geometry), visit through
-//! [`RowVisitor::visit_prepared`] and do that work in its once-per-batch prepare step. Reach for it
-//! when the hoisted work is a loop, a parse, or a structure build; arithmetic that merely overlaps
-//! the row's own dependency chain measures as free either way, so land every adopter with a
-//! constant/non-constant benchmark pair. Prepare **must not** be load-bearing for validation: an
-//! empty batch decodes every operand as non-constant, so a prepare that validated its constant
-//! would silently not run.
+//! norm of a broadcast query vector, a prepared form of a constant geometry), do that work in
+//! [`RowVisitor::visit_prepared_into`]'s once-per-batch prepare step. Pass `|_| ()` when there is
+//! nothing to prepare. Prepare **must not** be load-bearing for validation: an empty batch decodes
+//! every operand as non-constant, so a prepare that validated its constant would silently not run.
 //!
 //! Null handling is derived too, null-strategy selection included: a nullable batch runs densely
 //! (compute every row, mask after), by branch-and-skip (decode full length, compute only the
@@ -48,14 +41,13 @@
 //! it when decoding a column does expensive per-row work (parsing a geometry), so sparse batches
 //! keep the filter strategy's shrunken decode.
 //!
-//! Two things neither output form covers, and they are what actually send a function to
+//! Two things no output sink covers, and they are what actually send a function to
 //! [`ScalarFnVTable`]:
 //!
-//! - **A result that aliases an input.** Both forms own their output bytes: an element returns them
-//!   and a sink copies them into itself. Trimming strings is the example, where the ideal kernel keeps
-//!   the input's data buffer and writes new views over it, copying no bytes, which only a columnar
-//!   kernel can express.
-//! - **A null result for a non-null row.** Both forms build an all-valid column, so
+//! - **A result that aliases an input.** Sinks own their output bytes. Trimming strings is the
+//!   example, where the ideal kernel keeps the input's data buffer and writes new views over it,
+//!   copying no bytes, which only a columnar kernel can express.
+//! - **A null result for a non-null row.** Sinks build an all-valid column, so
 //!   `vortex.list.sum` cannot be a row function: a valid empty list sums to null.
 //!
 //! [`ScalarFnVTable`] takes the whole column instead, and everything a row function gets derived is

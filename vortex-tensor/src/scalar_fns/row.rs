@@ -14,6 +14,7 @@ use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
+use vortex_array::scalar_fn::DeferredError;
 use vortex_array::scalar_fn::InputElement;
 use vortex_array::scalar_fn::OutputSink;
 use vortex_array::validity::Validity;
@@ -192,7 +193,7 @@ impl<T: Float + NativePType> OutputSink for TensorSink<T> {
         &mut rows.0[start..][..rows.1]
     }
 
-    fn finish(self) -> VortexResult<ArrayRef> {
+    fn finish(self, _error: DeferredError) -> VortexResult<ArrayRef> {
         build_tensor_array(
             self.dtype,
             self.list_size,

@@ -218,7 +218,7 @@ fn l2_denorm_readthrough_returns_stored_norms() -> VortexResult<()> {
 
 /// The readthrough must survive a partially-null column.
 ///
-/// This pins the [`NullHandling::Dense`] choice the witnesses derive: under
+/// This pins the [`NullHandling::Dense`] choice the row contract derives: under
 /// [`NullHandling::Filter`](vortex_array::scalar_fn::NullHandling::Filter) the lifting could hand
 /// `reduce_encoded` a *filtered* input, which is no longer an `ExactScalarFn<L2Denorm>`, silently
 /// falling back to decode-and-recompute. For a lossy child that changes the answer: row 0
