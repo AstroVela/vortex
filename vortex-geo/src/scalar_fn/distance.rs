@@ -90,6 +90,7 @@ mod tests {
     use super::GeoDistance;
     use crate::test_harness::nullable_point_column;
     use crate::test_harness::point_column;
+    use crate::test_harness::polygon_column;
 
     /// A constant `Point` column of length `len`, every row at `(x, y)`.
     fn point_constant(
@@ -137,6 +138,24 @@ mod tests {
         let distance = GeoDistance::try_new_array(a, b)?.into_array();
 
         assert_eq!(distances(distance, &mut ctx)?, vec![5.0, 0.0]);
+        Ok(())
+    }
+
+    /// Distance is a value rather than a verdict, so no bounding-rect rejection may fire for it: a
+    /// point far outside a constant polygon's rect still gets its true distance. Carried over from
+    /// #9076, which added the rejection to the predicates but deliberately not to this function.
+    #[test]
+    fn distance_to_constant_polygon_is_exact() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let ring = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)];
+        let single = polygon_column(vec![vec![ring]])?.execute_scalar(0, &mut ctx)?;
+        let square = ConstantArray::new(single, 2).into_array();
+        let points = point_column(vec![7.0, 2.0], vec![2.0, 2.0])?;
+        let distance = GeoDistance::try_new_array(points, square)?.into_array();
+
+        assert_eq!(distances(distance, &mut ctx)?, vec![3.0, 0.0]);
         Ok(())
     }
 

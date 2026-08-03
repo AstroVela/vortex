@@ -397,6 +397,20 @@ mod tests {
         assert_contains(container, points, [true, false, false])
     }
 
+    /// Constant container vs a linestring column: a row whose bounding rect pokes outside the
+    /// container's is not contained, while one wholly inside is. Carried over from the columnar
+    /// bounding-rect rejection in #9076, since it constrains the verdict rather than the mechanism.
+    #[test]
+    fn constant_container_vs_row_rect_poking_outside() -> VortexResult<()> {
+        let container = geometry_constant(&Geometry::Polygon(rect_polygon(0.0, 0.0, 4.0, 4.0)), 3)?;
+        let lines = linestring_column(vec![
+            vec![(1.0, 1.0), (3.0, 3.0)],
+            vec![(1.0, 1.0), (9.0, 1.0)],
+            vec![(5.0, 5.0), (9.0, 9.0)],
+        ])?;
+        assert_contains(container, lines, [true, false, false])
+    }
+
     /// Polygon column vs constant point: only the polygon around the point contains it.
     #[test]
     fn polygon_column_vs_constant_point() -> VortexResult<()> {
