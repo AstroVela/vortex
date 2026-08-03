@@ -190,8 +190,7 @@ fn mask_preserves_row_view_metadata_and_encoding() -> VortexResult<()> {
     let mask = Validity::from_iter((0..view.len()).map(|row| row % 5 != 2)).to_array(view.len());
     let masked = view.clone().into_array().mask(mask)?.optimize()?;
 
-    assert!(masked.is::<TiledFixedSizeList>());
-    let masked = masked.try_downcast::<TiledFixedSizeList>().unwrap();
+    let masked = masked.as_::<TiledFixedSizeList>();
     assert_eq!(masked.row_offset(), view.row_offset());
     assert_eq!(masked.backing_rows(), view.backing_rows());
     assert_eq!(masked.elements().len(), view.elements().len());
