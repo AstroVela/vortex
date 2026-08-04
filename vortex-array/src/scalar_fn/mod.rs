@@ -18,7 +18,7 @@
 //! closure, and the rest is derived, including which rows get visited.
 //!
 //! Its *input* side is open. [`InputElement::Elem`] is a GAT, so an element can hand the closure
-//! borrowed variable-length data ([`Bytes`] yields `&[u8]`) or drill through a wrapper
+//! borrowed variable-length data (a byte-string element yielding `&[u8]`) or drill through a wrapper
 //! (`vortex-tensor`'s `TensorRow` yields a slice of an extension array's storage). Covering a new
 //! type family, a list row included, is one impl.
 //!
@@ -59,7 +59,7 @@
 //! - **The answer is already an array, or is one value for the whole column.**
 //!   `vortex.list.length` hands back a `ListViewArray`'s sizes child, and a single `ConstantArray`
 //!   for a `FixedSizeListArray`. A row loop would rebuild that one `u64` at a time, even given a
-//!   list-length element in the style of [`BytesLen`].
+//!   list-length element that reads the size out of the layout rather than the list.
 //! - **A row is not the natural unit of work.** `vortex.not` is one `!` per 64-bit word, in place
 //!   when the bit buffer is unshared, against 64 loop iterations and 64 bit writes, and its
 //!   encoding-aware fallback pushes the inversion down instead of canonicalizing.

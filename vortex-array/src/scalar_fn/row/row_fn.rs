@@ -24,20 +24,37 @@ use crate::scalar_fn::SinkResult;
 ///
 /// The argument witness names one representative choice. Its arity and decode properties steer the
 /// framework _before_ `dispatch` runs. They therefore **must** not vary between dispatches, which
-/// the following pins: the witness promises the dense-safe
-/// [`BytesLen`](crate::scalar_fn::BytesLen), the dispatch visits the non-dense-safe
-/// [`Bytes`](crate::scalar_fn::Bytes), and the build fails.
-///
+/// the following pins: the witness promises a dense-safe primitive, the dispatch visits an element
+/// that is not readable behind a null row, and the build fails.///
 /// ```compile_fail
-/// # use vortex_array::dtype::{DType, Nullability};
+/// # use vortex_array::{ArrayRef, ExecutionCtx};
+/// # use vortex_array::arrays::PrimitiveArray;
+/// # use vortex_array::dtype::{DType, Nullability, PType};
 /// # use vortex_array::scalar_fn::*;
+/// # use vortex_buffer::Buffer;
 /// # use vortex_error::VortexResult;
 /// # use vortex_session::registry::CachedId;
+/// # struct Odd;
+/// # impl InputElement for Odd {
+/// #     type Column = Buffer<u64>;
+/// #     type Varying<'a> = &'a [u64];
+/// #     type Elem<'a> = u64;
+/// #     const DENSE_SAFE: bool = false;
+/// #     const DECODE_FALLIBLE: bool = false;
+/// #     fn validate(_dtype: &DType) -> VortexResult<()> { Ok(()) }
+/// #     fn decode(a: ArrayRef, c: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+/// #         Ok(a.execute::<PrimitiveArray>(c)?.into_buffer::<u64>())
+/// #     }
+/// #     fn get(col: &Self::Column, i: usize) -> u64 { col[i] }
+/// #     fn varying(col: &Self::Column) -> &[u64] { col.as_slice() }
+/// #     fn varying_len(col: &&[u64]) -> usize { col.len() }
+/// #     fn get_varying<'a>(col: &&'a [u64], i: usize) -> u64 where Self: 'a { col[i] }
+/// # }
 /// #[derive(Clone)]
 /// struct Lie;
 /// impl RowFn for Lie {
 ///     type Options = EmptyOptions;
-///     type ArgsWitness = (BytesLen,);
+///     type ArgsWitness = (u64,);
 ///     fn id(&self) -> ScalarFnId {
 ///         static ID: CachedId = CachedId::new("example.lie");
 ///         *ID
@@ -51,69 +68,50 @@ use crate::scalar_fn::SinkResult;
 ///         _args: &[DType],
 ///         visitor: V,
 ///     ) -> VortexResult<V::Out> {
-///         visitor.visit_prepared_into::<(Bytes,), ElementSink<u64>, _, _>(
+///         visitor.visit_prepared_into::<(Odd,), ElementSink<u64>, _, _>(
 ///             |_| (),
-///             |&(), (b,), output| output.write(b.len() as u64),
+///             |&(), (v,), output| output.write(v),
 ///         )
 ///     }
 /// }
-/// // Instantiating a vtable method that dispatches evaluates the compile-time witness check.
-/// let dtype = DType::Utf8(Nullability::NonNullable);
+/// // Instantiating a vtable method that dispatches evaluates the compile-time check.
+/// let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
 /// let _ = ScalarFnVTable::return_dtype(&Lie, &EmptyOptions, &[dtype]);
 /// ```
 ///
 /// The same check pins whether decoding can fail, which is what keeps
 /// [`is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible) honest: dictionary pushdown
 /// evaluates an infallible function over values that no code references, so a parse hidden behind
-/// an infallible witness would fail a query it should not. Here the witness promises
-/// [`BytesLen`](crate::scalar_fn::BytesLen), whose decode reads a length out of a view, while the
-/// dispatch visits an element that parses every row.
-///
+/// an infallible witness would fail a query it should not.///
 /// ```compile_fail
-/// # use vortex_array::ArrayRef;
-/// # use vortex_array::ExecutionCtx;
-/// # use vortex_array::arrays::VarBinViewArray;
-/// # use vortex_array::dtype::{DType, Nullability};
+/// # use vortex_array::{ArrayRef, ExecutionCtx};
+/// # use vortex_array::arrays::PrimitiveArray;
+/// # use vortex_array::dtype::{DType, Nullability, PType};
 /// # use vortex_array::scalar_fn::*;
+/// # use vortex_buffer::Buffer;
 /// # use vortex_error::VortexResult;
 /// # use vortex_session::registry::CachedId;
-/// struct Parsed;
-/// impl InputElement for Parsed {
-///     type Column = VarBinViewArray;
-///     type Varying<'a> = &'a VarBinViewArray;
-///     type Elem<'a> = usize;
-///
-///     const DENSE_SAFE: bool = true;
-///     const DECODE_FALLIBLE: bool = true;
-///
-///     fn validate(_dtype: &DType) -> VortexResult<()> {
-///         Ok(())
-///     }
-///     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
-///         array.execute::<VarBinViewArray>(ctx)
-///     }
-///     fn get(column: &Self::Column, index: usize) -> usize {
-///         column.views()[index].len() as usize
-///     }
-///     fn varying(column: &Self::Column) -> Self::Varying<'_> {
-///         column
-///     }
-///     fn varying_len(column: &Self::Varying<'_>) -> usize {
-///         column.len()
-///     }
-///     fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> usize
-///     where
-///         Self: 'a,
-///     {
-///         Self::get(column, index)
-///     }
-/// }
-///
+/// # struct Odd;
+/// # impl InputElement for Odd {
+/// #     type Column = Buffer<u64>;
+/// #     type Varying<'a> = &'a [u64];
+/// #     type Elem<'a> = u64;
+/// #     const DENSE_SAFE: bool = true;
+/// #     const DECODE_FALLIBLE: bool = true;
+/// #     fn validate(_dtype: &DType) -> VortexResult<()> { Ok(()) }
+/// #     fn decode(a: ArrayRef, c: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+/// #         Ok(a.execute::<PrimitiveArray>(c)?.into_buffer::<u64>())
+/// #     }
+/// #     fn get(col: &Self::Column, i: usize) -> u64 { col[i] }
+/// #     fn varying(col: &Self::Column) -> &[u64] { col.as_slice() }
+/// #     fn varying_len(col: &&[u64]) -> usize { col.len() }
+/// #     fn get_varying<'a>(col: &&'a [u64], i: usize) -> u64 where Self: 'a { col[i] }
+/// # }
 /// #[derive(Clone)]
 /// struct HidesAParse;
 /// impl RowFn for HidesAParse {
 ///     type Options = EmptyOptions;
-///     type ArgsWitness = (BytesLen,);
+///     type ArgsWitness = (u64,);
 ///     fn id(&self) -> ScalarFnId {
 ///         static ID: CachedId = CachedId::new("example.hides_a_parse");
 ///         *ID
@@ -127,13 +125,14 @@ use crate::scalar_fn::SinkResult;
 ///         _args: &[DType],
 ///         visitor: V,
 ///     ) -> VortexResult<V::Out> {
-///         visitor.visit_prepared_into::<(Parsed,), ElementSink<u64>, _, _>(
+///         visitor.visit_prepared_into::<(Odd,), ElementSink<u64>, _, _>(
 ///             |_| (),
-///             |&(), (len,), output| output.write(len as u64),
+///             |&(), (v,), output| output.write(v),
 ///         )
 ///     }
 /// }
-/// let dtype = DType::Utf8(Nullability::NonNullable);
+/// // Instantiating a vtable method that dispatches evaluates the compile-time check.
+/// let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
 /// let _ = ScalarFnVTable::return_dtype(&HidesAParse, &EmptyOptions, &[dtype]);
 /// ```
 ///

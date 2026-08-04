@@ -570,7 +570,7 @@ pub(super) fn reconcile_return(
 ///
 /// From the branch-and-skip measurements (65536 rows, divan fastest of 100 samples, two runs on a
 /// shared 4-vCPU VM). A kernel with a _bulk_ decode never lost under branch: `byte_length` over
-/// the `Bytes` element ran 1.8-5.9x faster than filter at every null density from 1% to 90%, so
+/// a byte-string element ran 1.8-5.9x faster than filter at every null density from 1% to 90%, so
 /// such kernels skip this check entirely. A kernel with a _per-row_ decode (geo `contains`, which
 /// arrow-exports and parses one geometry per row) pays that decode over the full column under
 /// branch but only over the survivors under filter, so filter wins once validity is sparse:

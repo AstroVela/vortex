@@ -43,9 +43,6 @@
 
 mod element;
 pub use element::ArgColumn;
-pub use element::Bytes;
-pub use element::BytesColumn;
-pub use element::BytesLen;
 pub use element::ElementTuple;
 pub use element::InputElement;
 pub use element::OutputElement;

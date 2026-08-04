@@ -19,9 +19,8 @@ use crate::arrays::VarBinViewArray;
 use crate::arrays::varbinview::BinaryView;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
-use crate::scalar_fn::Bytes;
-use crate::scalar_fn::BytesLen;
 use crate::scalar_fn::assert_element_conforms;
+use crate::scalar_fn::row::tests::TestBytes;
 use crate::validity::Validity;
 
 /// A `Utf8` column whose single null row carries a view naming a buffer that does not exist, at
@@ -67,19 +66,9 @@ fn bool_element_conforms() -> VortexResult<()> {
 }
 
 #[test]
-fn bytes_len_element_conforms() -> VortexResult<()> {
+fn test_bytes_element_conforms() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
-    assert_element_conforms::<BytesLen>(
-        hostile_views()?,
-        &DType::Bool(Nullability::NonNullable),
-        &mut ctx,
-    )
-}
-
-#[test]
-fn bytes_element_conforms() -> VortexResult<()> {
-    let mut ctx = array_session().create_execution_ctx();
-    assert_element_conforms::<Bytes>(
+    assert_element_conforms::<TestBytes>(
         hostile_views()?,
         &DType::Bool(Nullability::NonNullable),
         &mut ctx,

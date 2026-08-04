@@ -1,25 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use num_traits::AsPrimitive;
+use vortex_buffer::Buffer;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::arrays::ConstantArray;
+use crate::arrays::PrimitiveArray;
+use crate::arrays::VarBinViewArray;
 use crate::arrays::scalar_fn::ExactScalarFn;
 use crate::arrays::scalar_fn::ScalarFnArrayView;
+use crate::arrays::varbinview::VarBinViewArrayExt;
 use crate::dtype::DType;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
+use crate::expr::Expression;
 use crate::kernel::ExecuteParentKernel;
-use crate::scalar_fn::BytesLen;
+use crate::scalar::Scalar;
+use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
-use crate::scalar_fn::ElementSink;
 use crate::scalar_fn::EmptyOptions;
-use crate::scalar_fn::RowFn;
-use crate::scalar_fn::RowVisitor;
+use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::ScalarFnVTable;
 
 pub trait ByteLengthKernel: VTable {
     fn byte_length(
@@ -47,50 +60,122 @@ impl<V: ByteLengthKernel> ExecuteParentKernel<V> for ByteLengthExecuteAdaptor<V>
 }
 
 /// Byte length of each element in a Utf8 or Binary array.
-///
-/// This is a [`RowFn`] over fixed element types, so the definition below is the whole function:
-/// arity, dtype validation, the return dtype, constant handling and null propagation all follow from
-/// it. Reading [`BytesLen`] rather than [`Bytes`](crate::scalar_fn::Bytes) is what lets the rows
-/// behind nulls be computed densely and masked afterwards, since a view carries its own length.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ByteLength;
 
-impl RowFn for ByteLength {
+impl ScalarFnVTable for ByteLength {
     type Options = EmptyOptions;
-    type ArgsWitness = (BytesLen,);
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.byte_length");
         *ID
     }
 
-    fn arg_name(&self, idx: usize) -> ChildName {
-        match idx {
+    fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
+    }
+
+    fn arity(&self, _options: &Self::Options) -> Arity {
+        Arity::Exact(1)
+    }
+
+    fn child_name(&self, _instance: &Self::Options, child_idx: usize) -> ChildName {
+        match child_idx {
             0 => ChildName::from("input"),
-            _ => unreachable!("Invalid child index {idx} for byte_length()"),
+            _ => unreachable!("Invalid child index {child_idx} for byte_length()"),
         }
     }
 
-    fn dispatch<V: RowVisitor>(
+    fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
+        match &arg_dtypes[0] {
+            DType::Utf8(nullable) | DType::Binary(nullable) => {
+                Ok(DType::Primitive(PType::U64, *nullable))
+            }
+            other => vortex_bail!("byte_length() requires Utf8 or Binary, got {other}"),
+        }
+    }
+
+    fn execute(
         &self,
         _options: &Self::Options,
-        _args: &[DType],
-        visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(BytesLen,), ElementSink<u64>, _, _>(
-            |_| (),
-            |&(), (len,), output| output.write(len as u64),
-        )
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let input = args.get(0)?;
+        let nullability = input.dtype().nullability();
+
+        if let Some(scalar) = input.as_constant() {
+            let len_scalar = scalar_byte_length(&scalar, nullability)?;
+            return Ok(ConstantArray::new(len_scalar, args.row_count()).into_array());
+        }
+
+        match input.dtype() {
+            DType::Utf8(_) | DType::Binary(_) => byte_length(&input, nullability, ctx),
+            other => vortex_bail!("byte_length() requires Utf8 or Binary, got {other}"),
+        }
     }
+
+    fn validity(
+        &self,
+        _: &Self::Options,
+        expression: &Expression,
+    ) -> VortexResult<Option<Expression>> {
+        Ok(Some(expression.child(0).validity()?))
+    }
+
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
+    }
+
+    fn is_fallible(&self, _options: &Self::Options) -> bool {
+        false
+    }
+}
+
+fn scalar_byte_length(scalar: &Scalar, nullability: Nullability) -> VortexResult<Scalar> {
+    if scalar.is_null() {
+        let dtype = DType::Primitive(PType::U64, Nullability::Nullable);
+        return Ok(Scalar::null(dtype));
+    }
+    let len = match scalar.dtype() {
+        DType::Utf8(_) => scalar
+            .as_utf8()
+            .value()
+            .vortex_expect("null utf-8 scalar")
+            .len(),
+        DType::Binary(_) => scalar
+            .as_binary()
+            .value()
+            .vortex_expect("null binary scalar")
+            .len(),
+        other => vortex_bail!("byte_length() requires Utf8 or Binary, got {other}"),
+    };
+    let len: u64 = len.as_();
+    Ok(Scalar::primitive(len, nullability))
+}
+
+pub(crate) fn byte_length(
+    array: &ArrayRef,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let array = array.clone().execute::<VarBinViewArray>(ctx)?;
+    let validity = array.varbinview_validity();
+    let lengths: Buffer<u64> = array.views().iter().map(|v| v.len() as u64).collect();
+    Ok(PrimitiveArray::new(lengths, validity.union_nullability(nullability)).into_array())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rstest::rstest;
-    use vortex_buffer::ByteBuffer;
-    use vortex_buffer::buffer;
     use vortex_error::VortexResult;
 
     use crate::ArrayRef;
@@ -101,14 +186,12 @@ mod tests {
     use crate::arrays::PrimitiveArray;
     use crate::arrays::VarBinArray;
     use crate::arrays::VarBinViewArray;
-    use crate::arrays::varbinview::BinaryView;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::expr::byte_length;
     use crate::expr::root;
     use crate::scalar::Scalar;
-    use crate::validity::Validity;
 
     #[rstest]
     #[case(VarBinArray::from_strs(vec!["hello", "world", ""]).into_array(), vec![5u64, 5, 0])]
@@ -165,45 +248,6 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         assert!(!result.is_valid(0, &mut ctx)?);
         assert!(!result.is_valid(1, &mut ctx)?);
-        Ok(())
-    }
-
-    #[test]
-    fn test_constant_byte_length() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
-        let array = ConstantArray::new(Scalar::from("hello"), 3).into_array();
-        let result = array.apply(&byte_length(root()))?;
-        let expected = ConstantArray::new(Scalar::primitive(5u64, Nullability::NonNullable), 3);
-        assert_arrays_eq!(result, expected, &mut ctx);
-        Ok(())
-    }
-
-    /// `VarBinViewArray` only validates the views of its *valid* rows, so a legal array may hold a
-    /// view behind a null row that names a buffer that does not exist. Byte length is a function of
-    /// the view alone, so it must read the length rather than resolve the row.
-    #[test]
-    fn test_byte_length_ignores_unresolvable_views_behind_nulls() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
-
-        let views = buffer![
-            BinaryView::make_view(b"a longer string here", 0, 0),
-            // Null row: buffer 9 does not exist and the offset is far past the end of the data.
-            BinaryView::new_ref(64, *b"junk", 9, 4096),
-        ];
-        let array = VarBinViewArray::try_new(
-            views,
-            Arc::from([ByteBuffer::copy_from(b"a longer string here")]),
-            DType::Utf8(Nullability::Nullable),
-            Validity::from_iter([true, false]),
-        )?
-        .into_array();
-
-        let result = array.apply(&byte_length(root()))?;
-        assert_arrays_eq!(
-            result,
-            PrimitiveArray::from_option_iter([Some(20u64), None]),
-            &mut ctx
-        );
         Ok(())
     }
 

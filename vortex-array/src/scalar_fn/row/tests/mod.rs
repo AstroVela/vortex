@@ -4,9 +4,11 @@
 //! End-to-end tests for row function execution.
 
 use rstest::rstest;
+use vortex_buffer::ByteBuffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
@@ -20,8 +22,10 @@ use crate::arrays::MaskedArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::varbinview::BinaryView;
 use crate::assert_arrays_eq;
 use crate::dtype::DType;
+use crate::dtype::Nullability;
 use crate::expr::root;
 use crate::scalar::Scalar;
 use crate::scalar_fn::row::execute::row_null_handling;
@@ -82,14 +86,105 @@ impl RowFn for Hypot {
     }
 }
 
-/// A unary row function over strings: uppercased text, exercising [`Bytes`] input and
+/// A byte-string element that resolves each row's view into a data buffer, which is only
+/// meaningful for a valid row.
+///
+/// This is the crate's only non-dense-safe element, so it is what exercises
+/// [`NullHandling::Filter`], branch-and-skip, and the agreement between the two strategies. It
+/// lives here rather than beside the framework because no production row function reads bytes yet.
+struct TestBytes;
+
+/// The canonical views array plus its resolved data buffers.
+struct TestBytesColumn {
+    array: VarBinViewArray,
+    buffers: Vec<ByteBuffer>,
+}
+
+/// Resolve one view, which is either inlined or an offset into `buffers`.
+fn read_view<'a>(view: &'a BinaryView, buffers: &'a [ByteBuffer]) -> &'a [u8] {
+    if view.is_inlined() {
+        view.as_inlined().value()
+    } else {
+        let view = view.as_view();
+        &buffers[view.buffer_index as usize].as_slice()[view.as_range()]
+    }
+}
+
+impl InputElement for TestBytes {
+    type Column = TestBytesColumn;
+    // The views slice, not the array: `VarBinViewArray::views` resolves a host buffer and its
+    // `vortex_expect` is a side effect the optimizer cannot hoist out of the row loop.
+    type Varying<'a> = (&'a [BinaryView], &'a [ByteBuffer]);
+    type Elem<'a> = &'a [u8];
+
+    const DENSE_SAFE: bool = false;
+    const DECODE_FALLIBLE: bool = false;
+
+    fn validate(dtype: &DType) -> VortexResult<()> {
+        vortex_ensure!(
+            matches!(dtype, DType::Utf8(_) | DType::Binary(_)),
+            "expected a Utf8 or Binary column, got {dtype}",
+        );
+        Ok(())
+    }
+
+    fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+        let array = array.execute::<VarBinViewArray>(ctx)?;
+        let buffers = (0..array.data_buffers().len())
+            .map(|idx| array.buffer(idx).clone())
+            .collect();
+        Ok(TestBytesColumn { array, buffers })
+    }
+
+    fn decode_null_tolerant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Self::Column>> {
+        Self::decode(array, ctx).map(Some)
+    }
+
+    fn get(column: &Self::Column, index: usize) -> &[u8] {
+        read_view(&column.array.views()[index], &column.buffers)
+    }
+
+    fn varying(column: &Self::Column) -> Self::Varying<'_> {
+        (column.array.views(), &column.buffers)
+    }
+
+    fn varying_len(column: &Self::Varying<'_>) -> usize {
+        column.0.len()
+    }
+
+    fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> &'a [u8]
+    where
+        Self: 'a,
+    {
+        read_view(&column.0[index], column.1)
+    }
+}
+
+impl OutputElement for String {
+    fn element_dtype() -> DType {
+        DType::Utf8(Nullability::NonNullable)
+    }
+
+    fn build(values: Vec<Self>) -> ArrayRef {
+        VarBinViewArray::from_iter_str(values).into_array()
+    }
+
+    fn placeholder() -> Self {
+        String::new()
+    }
+}
+
+/// A unary row function over strings: uppercased text, exercising [`TestBytes`] input and
 /// [`String`] output.
 #[derive(Clone)]
 struct Shout;
 
 impl RowFn for Shout {
     type Options = EmptyOptions;
-    type ArgsWitness = (Bytes,);
+    type ArgsWitness = (TestBytes,);
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.shout");
@@ -106,7 +201,7 @@ impl RowFn for Shout {
         _args: &[DType],
         visitor: V,
     ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(Bytes,), ElementSink<String>, _, _>(
+        visitor.visit_prepared_into::<(TestBytes,), ElementSink<String>, _, _>(
             |_| (),
             |&(), (text,), output| {
                 output.write(String::from_utf8_lossy(text).to_uppercase());
@@ -400,7 +495,7 @@ fn null_handling<F: RowFn>() -> NullHandling {
 fn null_handling_follows_from_args_and_fallibility() {
     // Primitive arguments, infallible: nothing behind a null row can fault.
     assert_eq!(null_handling::<Hypot>(), NullHandling::Dense);
-    // `Bytes` resolves a view into a data buffer, which is only meaningful for valid rows.
+    // `TestBytes` resolves a view into a data buffer, which is only meaningful for valid rows.
     assert_eq!(null_handling::<Shout>(), NullHandling::Filter);
     // Fallible: a garbage row could raise an error of its own.
     assert_eq!(null_handling::<CheckedDiv>(), NullHandling::Filter);

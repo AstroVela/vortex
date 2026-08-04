@@ -20,11 +20,6 @@ use crate::dtype::DType;
 
 mod bool;
 
-mod bytes;
-pub use bytes::Bytes;
-pub use bytes::BytesColumn;
-pub use bytes::BytesLen;
-
 #[cfg(any(test, feature = "_test-harness"))]
 mod conformance;
 #[cfg(any(test, feature = "_test-harness"))]
