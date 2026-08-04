@@ -46,17 +46,24 @@ impl LazyPlanChildren {
         Ok(cell.get_or_try_init(|| (self.initializer)(index))?.clone())
     }
 
-    /// Lazily transforms each present child into a new child collection.
-    pub(crate) fn map(
+    /// Eagerly transforms each present child into a new child collection.
+    pub(crate) fn try_map(
         &self,
-        transform: impl Fn(usize, PlanRef) -> VortexResult<PlanRef> + 'static + Send + Sync,
-    ) -> Self {
-        let source = self.clone();
-        Self::new(self.len(), move |index| {
-            source
-                .get(index)?
-                .map(|child| transform(index, child))
-                .transpose()
-        })
+        transform: impl Fn(usize, PlanRef) -> VortexResult<PlanRef>,
+    ) -> VortexResult<Self> {
+        // TODO: Make recursive child optimization lazy again once the optimizer API can
+        // explicitly distinguish fully optimized plans from plans with deferred optimizer work.
+        let children = (0..self.len())
+            .map(|index| {
+                self.get(index)?
+                    .map(|child| transform(index, child))
+                    .transpose()
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+        let children: Arc<[Option<PlanRef>]> = children.into();
+        let len = children.len();
+        Ok(Self::new(len, move |index| {
+            Ok(children.get(index).cloned().flatten())
+        }))
     }
 }

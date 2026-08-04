@@ -14,5 +14,7 @@ pub use dict::DictPlan;
 pub use expression::ExpressionPlan;
 pub use flat::FlatPlan;
 pub use list::ListPlan;
+pub use row_idx::RowIdxPartitionPlan;
 pub use row_idx::RowIdxPlan;
+pub use row_idx::RowIdxValuesPlan;
 pub use struct_::StructPlan;
