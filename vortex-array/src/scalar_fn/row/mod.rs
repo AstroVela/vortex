@@ -57,6 +57,7 @@ pub use result::DeferredError;
 pub use result::SinkResult;
 
 mod sink;
+pub use sink::ElementRow;
 pub use sink::ElementSink;
 pub use sink::OutputSink;
 
