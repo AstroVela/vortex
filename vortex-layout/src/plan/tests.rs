@@ -8,7 +8,12 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::StructFields;
+use vortex_array::expr::Expression;
+use vortex_array::expr::checked_add;
 use vortex_array::expr::get_item;
+use vortex_array::expr::gt;
+use vortex_array::expr::is_null;
+use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -48,6 +53,13 @@ fn unsupported(row_count: u64, dtype: DType) -> LayoutRef {
 
 fn make_plan(layout: LayoutRef) -> VortexResult<PlanRef> {
     new_plan(&layout)
+}
+
+fn make_expression_plan(expression: Expression, child: PlanRef) -> VortexResult<ExpressionPlan> {
+    let expression = expression
+        .optimize_recursive(child.dtype())?
+        .bind(child.dtype())?;
+    Ok(ExpressionPlan::new(expression, child))
 }
 
 #[test]
@@ -450,5 +462,85 @@ fn row_idx_plan_preserves_row_index_expressions() -> VortexResult<()> {
     assert_eq!(expression.expression(), &bound_expression);
     assert!(expression.child_plan().is::<RowIdxPlan>());
     assert_eq!(expression.row_count(), 3);
+    Ok(())
+}
+
+#[test]
+fn expression_pushes_through_struct_field_and_dictionary_values() -> VortexResult<()> {
+    let value_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let codes_dtype = primitive(PType::U8, Nullability::NonNullable);
+    let dictionary =
+        DictLayout::new(flat(2, value_dtype.clone(), 0), flat(3, codes_dtype, 1)).into_layout();
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([("a", value_dtype.clone()), ("b", value_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![dictionary, unsupported(3, value_dtype)],
+    )
+    .into_layout();
+    let plan: PlanRef = Arc::new(make_expression_plan(
+        gt(get_item("a", root()), lit(5_i32)),
+        make_plan(layout)?,
+    )?);
+
+    let optimized = plan.optimize()?;
+
+    insta::assert_snapshot!(optimized.tree_display(), @r"
+    root: DictPlan(bool, rows=3)
+      codes: FlatPlan(u8, rows=3)
+      values: ExpressionPlan(bool, rows=2) expr=($ > 5i32)
+        child: FlatPlan(i32, rows=2)
+    ");
+    Ok(())
+}
+
+#[test]
+fn dictionary_pushdown_rejects_unsafe_expressions() -> VortexResult<()> {
+    let value_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let dictionary = DictLayout::new(
+        flat(2, value_dtype, 0),
+        flat(3, primitive(PType::U8, Nullability::NonNullable), 1),
+    )
+    .into_layout();
+
+    for expression in [
+        lit(false),
+        is_null(root()),
+        gt(checked_add(root(), lit(1_i32)), lit(5_i32)),
+    ] {
+        let plan = make_expression_plan(expression.clone(), make_plan(Arc::clone(&dictionary))?)?;
+        let optimized = plan.optimize()?;
+        let expression_plan = optimized.downcast_ref::<ExpressionPlan>().ok_or_else(|| {
+            vortex_err!("Expression unexpectedly pushed into dictionary: {expression}")
+        })?;
+        assert!(expression_plan.child_plan().is::<DictPlan>());
+    }
+    Ok(())
+}
+
+#[test]
+fn nullable_struct_keeps_expression_above_parent_validity() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone())]),
+            Nullability::Nullable,
+        ),
+        vec![
+            flat(3, DType::Bool(Nullability::NonNullable), 0),
+            flat(3, field_dtype, 1),
+        ],
+    )
+    .into_layout();
+    let plan = make_expression_plan(gt(get_item("a", root()), lit(5_i32)), make_plan(layout)?)?;
+
+    let optimized = plan.optimize()?;
+    let expression_plan = optimized
+        .downcast_ref::<ExpressionPlan>()
+        .ok_or_else(|| vortex_err!("Nullable struct expression unexpectedly pushed down"))?;
+    assert!(expression_plan.child_plan().is::<StructPlan>());
     Ok(())
 }
