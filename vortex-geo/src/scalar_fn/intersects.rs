@@ -100,28 +100,20 @@ impl ConstBboxes {
 
 /// Computes one row of intersects, spending any bounding rect hoisted into `bboxes`.
 ///
-/// Where geo's own dispatch for the pairing opens with `has_disjoint_bboxes`, the same comparison
-/// runs here first with the constant side's rect already folded, returning `false` on a miss
-/// exactly as geo would. The fall-through delegates to the unchanged `a.intersects(b)`, which
-/// refolds both rects internally, so a batch where every row overlaps pays one extra
-/// `bounding_rect` fold over the row operand; the win concentrates where most rows are disjoint,
-/// the usual spatial-filter shape.
+/// Disjoint bounding rectangles conservatively prove that the geometries do not intersect. The
+/// fall-through delegates to the unchanged `a.intersects(b)`, which refolds both rects internally,
+/// so a batch where every row overlaps pays one extra `bounding_rect` fold over the row operand;
+/// the win concentrates where most rows are disjoint, the usual spatial-filter shape.
 fn intersects_row_prepared(bboxes: &ConstBboxes, a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
     let disjoint = match (bboxes.a, bboxes.b) {
         (None, None) => false,
-        (Some(bbox_a), Some(bbox_b)) => {
-            intersects_opens_with_bbox_check(a, b) && !bbox_a.intersects(&bbox_b)
-        }
-        (Some(bbox_a), None) => {
-            intersects_opens_with_bbox_check(a, b)
-                && b.bounding_rect()
-                    .is_some_and(|bbox_b| !bbox_a.intersects(&bbox_b))
-        }
-        (None, Some(bbox_b)) => {
-            intersects_opens_with_bbox_check(a, b)
-                && a.bounding_rect()
-                    .is_some_and(|bbox_a| !bbox_a.intersects(&bbox_b))
-        }
+        (Some(bbox_a), Some(bbox_b)) => !bbox_a.intersects(&bbox_b),
+        (Some(bbox_a), None) => b
+            .bounding_rect()
+            .is_some_and(|bbox_b| !bbox_a.intersects(&bbox_b)),
+        (None, Some(bbox_b)) => a
+            .bounding_rect()
+            .is_some_and(|bbox_a| !bbox_a.intersects(&bbox_b)),
     };
 
     if disjoint {
@@ -129,36 +121,6 @@ fn intersects_row_prepared(bboxes: &ConstBboxes, a: &Geometry<f64>, b: &Geometry
     }
 
     a.intersects(b)
-}
-
-/// Whether geo's `a.intersects(b)` opens with `has_disjoint_bboxes(a, b)` before any other work.
-///
-/// The hoisted early-out in [`intersects_row_prepared`] **must** be pure common-subexpression
-/// elimination: it may fire only where geo itself compares exactly these two bounding rects
-/// first, so that hoisting cannot change the verdict on any input, NaN coordinates included.
-/// From geo 0.31's dispatch:
-///
-/// - `MultiPoint` iterates its points before anything else, so no whole-operand rect is ever
-///   compared, whatever the other side is.
-/// - `MultiLineString`, `MultiPolygon` and `GeometryCollection` open with the check against any
-///   operand (their blanket impls), whichever side they are on.
-/// - `LineString` opens with the check against everything except `MultiPoint`.
-/// - `Polygon` x `Polygon` opens with the check.
-/// - Every other pairing opens with a direct algorithm (coordinate position, segment orientation)
-///   or converts `Rect`/`Triangle` to a fresh polygon whose rect geo then folds itself, and must
-///   keep the unhoisted path.
-fn intersects_opens_with_bbox_check(a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
-    use Geometry as G;
-
-    match (a, b) {
-        (G::MultiPoint(_), _) => false,
-        (G::MultiLineString(_) | G::MultiPolygon(_) | G::GeometryCollection(_), _) => true,
-        (_, G::MultiLineString(_) | G::MultiPolygon(_) | G::GeometryCollection(_)) => true,
-        (G::LineString(_), G::MultiPoint(_)) => false,
-        (G::LineString(_), _) | (_, G::LineString(_)) => true,
-        (G::Polygon(_), G::Polygon(_)) => true,
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -508,6 +470,8 @@ mod tests {
     #[case::polygon_x_point_on_boundary(donut(), point(0.0, 5.0))]
     #[case::polygon_x_point_in_hole(donut(), point(5.0, 5.0))]
     #[case::point_outside_x_polygon(point(20.0, 20.0), donut())]
+    #[case::nan_point_x_polygon(point(f64::NAN, 2.0), donut())]
+    #[case::polygon_x_nan_point(donut(), point(f64::NAN, 2.0))]
     #[case::points_equal(point(1.0, 1.0), point(1.0, 1.0))]
     #[case::points_distinct(point(1.0, 1.0), point(2.0, 1.0))]
     #[case::linestring_crossing_polygon(line(vec![(-2.0, -2.0), (2.0, 2.0)]), rect_polygon(0.0, 0.0, 4.0, 4.0).into())]
@@ -536,9 +500,8 @@ mod tests {
         )
     }
 
-    /// `Rect` has no WKB form, so its constant comes from a one-row rect column; the pairing
-    /// takes the route excluded from the bbox early-out (geo converts the rect to a fresh
-    /// polygon first) and must agree like the rest.
+    /// `Rect` has no WKB form, so its constant comes from a one-row rect column; its conservative
+    /// bbox early-out and exact fall-through must agree with the expanded form like the rest.
     #[test]
     fn rect_operand_agrees_with_columns() -> VortexResult<()> {
         let session = vortex_array::array_session();

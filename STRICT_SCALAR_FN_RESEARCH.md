@@ -20,10 +20,54 @@ using an earlier sketch.
 
 ## Current benchmark and codegen record
 
-The authoritative current comparison is the [benchmark and codegen follow-up on issue #9128](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802). It records the
-machine, harness, two-run fastest and median results, control limitations, and representative LLVM
-IR/assembly in folded sections. It supersedes the older shared-VM performance figures in these
-notes for claims about the current branch versus `develop`.
+The authoritative current comparison is the
+[x86 AVX-512 re-measurement on issue #9128](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802).
+It records the machine, exact refs, stabilized governor, two-run fastest and median results, control
+limitations, geo fix, adaptive-null diagnostics, and native LLVM IR/assembly in folded sections.
+It supersedes every older shared-VM or pre-#9076 figure in these notes for claims about the current
+branch versus `develop`.
+
+The run used candidate `d293d3cdd59e` plus the recorded geo bbox widening, baseline
+`876996fe7846`, and a Ryzen 9 7950X pinned to CPU 4 with the TSC timer and performance governor.
+The conclusions that survive into the implementation plan are:
+
+- sink-only checked add is 1.018-1.226x faster by median than its benchmark-local specialized
+  control, depending on constant and null shape;
+- cosine is 1.40-30.13x faster than current develop;
+- prepared overlapping `contains` is 8.60-8.77x faster by median, while the widened bbox gate
+  restores disjoint polygons to parity with #9076;
+- point/constant geo still has real 8.6-14.2% and 10.9-13.2% median regressions;
+- `BytesLen` is 1.410-1.411x faster by median on long strings and 1.097x on short strings;
+- the global 75% survivor threshold mispredicts both one-input/50%-null and
+  two-input/10%-null geo cases, so adaptive selection needs element/arity-aware cost data;
+- checked-add codegen has AVX-512 error-word accumulation and post-loop vector reduction with no
+  per-row error branch; current `l2_norm` remains a strict-order scalar reduction.
+
+The stabilized cosine median ratios preserve the shape and width dependence instead of collapsing
+the result into one headline range:
+
+| shape | width 2 | width 32 | width 256 |
+| --- | ---: | ---: | ---: |
+| column x column | 5.77-5.79x | 1.93-2.19x | 2.54-2.58x |
+| column x constant | 12.44-12.48x | 28.87-28.96x | 30.08-30.13x |
+| column x extension constant | 3.05x | 1.40-1.41x | 1.77-1.78x |
+
+The final geo median ratios, including the bbox patch, are:
+
+| predicate and shape | develop / row branch |
+| --- | ---: |
+| contains, column x column points | 0.951-0.964x |
+| contains, column x column polygons | 0.999-1.003x |
+| contains, constant x points | 0.876-0.921x |
+| contains, disjoint polygons | 0.993-0.997x |
+| contains, overlapping polygons | 8.60-8.77x |
+| intersects, column x column polygons | 0.983-0.995x |
+| intersects, points x constant | 0.884-0.902x |
+| intersects, disjoint polygons | 1.011-1.019x |
+| intersects, overlapping polygons | 1.011-1.023x |
+
+Here, as above, ratios greater than 1x favor the row branch. The issue comment contains the paired
+fastest and median observations rather than only these compact ranges.
 
 The historical measurements below remain because they explain design decisions and experiments made
 while building the prototype; they are not the current before/after performance record.
@@ -1337,8 +1381,8 @@ comment. Sinks stay on Dense/Filter, documented at the visitor. `reduce_encoded`
 branch path over the *original* encodings, which is strictly better for encoding fast paths than
 Filter's canonical copies, and its contract doc now states the row count differs per strategy.
 
-Measured with forced-filter, forced-branch and auto arms, so selection correctness is itself a
-measurement (65,536 rows, divan fastest, two runs, shared 4-vCPU VM):
+The original forced-filter, forced-branch and auto measurements used 65,536 rows on a shared 4-vCPU
+VM:
 
 | workload | 1% | 5% | 10% | 25% | 50% | 90% |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1346,11 +1390,23 @@ measurement (65,536 rows, divan fastest, two runs, shared 4-vCPU VM):
 | geo `contains` x const, auto picks | branch | branch | branch | branch | filter | filter |
 | geo `contains` x column, auto picks | branch | branch | branch | filter | filter | filter |
 
-At every mixed density in all three workloads the auto arm sits on the faster forced arm, on both
-sides of the crossover. The single concession the threshold makes is geo's one-nullable-operand
-50%-null case, where branch would have won about 1.1x and the rule sends it to Filter; the
-alternative is a per-element threshold, deliberately deferred until a second per-row-decode
-element exists to calibrate against.
+Those historical rows justified shipping branch-and-skip, but they no longer calibrate the global
+threshold. The controlled x86 AVX-512 rerun used a Ryzen 9 7950X pinned to CPU 4, TSC timing, a
+performance governor, 60 samples for 2-4 seconds per arm, and two runs. Its representative medians
+were:
+
+| workload | auto | branch | filter | verdict |
+| --- | ---: | ---: | ---: | --- |
+| one nullable, 50% nulls | 5.999-6.050 ms | 5.560-5.642 ms | 6.026-6.049 ms | auto filters, branch is 6-8% lower latency |
+| two nullable, 10% nulls | 10.40-10.48 ms | 10.49-10.60 ms | 10.20-10.34 ms | auto branches, filter is 2.5-2.8% lower latency |
+| two nullable, 25% nulls | 7.502-7.678 ms | 9.156-9.285 ms | 7.588-7.749 ms | auto correctly filters; filter is 1.21-1.22x faster than branch |
+| two nullable, 90% nulls | 277.1-277.4 us | 3.232-3.253 ms | 277.7-278.5 us | auto matches filter; filter is about 11.6x faster than branch |
+
+The two misses point in opposite directions. A 50% surviving one-element decode still favors
+branch, while an approximately 81% surviving two-element decode already favors filter. A single
+threshold against the conjoined survivor fraction therefore cannot represent both decode cost and
+arity. Replace it with per-element/arity inputs or a small estimated-cost comparison when this work
+moves onto production branches. Batch size remains an unmeasured input to that model.
 
 Verified independently of the implementing agent: 3,441 tests pass across vortex-array and
 vortex-geo (17 new: hostile out-of-bounds views behind nulls, a fallible kernel with poison
@@ -1477,32 +1533,35 @@ escapes.
 
 ### Final executor measurements and IR
 
-The final `row_fn_executor` run used 65,536 `i64` rows, 100 samples and a one-second minimum per arm:
+The authoritative `row_fn_executor` run used 65,536 `i64` rows, 100 samples, a one-second minimum
+per arm, TSC timing, CPU 4, and a performance governor on the Ryzen 9 7950X. Each cell is the range
+across two runs as fastest / median:
 
-| workload | specialized median | sink-only `RowFn` median | delta |
+| workload | specialized | sink-only `RowFn` | specialized / `RowFn` |
 | --- | ---: | ---: | ---: |
-| checked add, two columns | 13.54 us | 13.79 us | 1.8% slower |
-| checked add, column and constant | 12.83 us | 11.33 us | 11.7% faster |
-| checked add, nullable columns | 12.91 us | 12.95 us | 0.3% slower |
+| checked add, two columns | 131.5-132.3 / 132.3-133.3 us | 128.4-129.6 / 129.5-130.9 us | 1.021-1.024x / 1.018-1.022x |
+| checked add, column and constant | 16.90-16.93 / 17.10-17.21 us | 13.82-13.85 / 14.04 us | 1.222x / 1.218-1.226x |
+| checked add, nullable columns | 133.8-134.8 / 136.1 us | 128.4-128.7 / 130.6-131.8 us | 1.042-1.047x / 1.033-1.042x |
 
-The corresponding LLVM IR has vector error-word accumulators and
-`llvm.vector.reduce.or.v2i64`. The typed row loads, wrapping sums, overflow-word ORs, and stores are
-one vector loop; no `RowFn`, visitor, sink, dynamic dispatch, or per-row `VortexResult` remains in
-that body. The remaining ordinary-column difference is setup and output construction around the
-loop. The constant arm is faster because stride-zero decoding and preparation remove work the
-specialized operator path still performs.
+The native release IR has `<8 x i64>` vector error-word accumulators and
+`llvm.vector.reduce.or.v8i64`. The two-column assembly is four-way unrolled over AVX-512 `zmm`
+registers, producing 32 `i64` rows per iteration with four `vpaddq` instructions. Overflow bits
+accumulate through vector xor/ternary-OR operations and reduce after the loop; there is no per-row
+result discriminant or error branch. The specialized arm remains benchmark-local, and no production
+deferred-error user exists yet.
 
 Other final diagnostic medians:
 
 - `strict_validity` lazy versus eager stayed within 2% across 65,536 and 1,048,576 rows, including
   a chain of three calls.
-- `byte_length_element` found `BytesLen` 28 to 29% faster than resolving a byte slice at 65,536
-  rows. This justifies the element choice but is not a production benchmark.
+- `byte_length_element` found `BytesLen` 1.410-1.411x faster by median than resolving a byte slice
+  for long strings and 1.097x for short/inlined strings at 65,536 rows. This justifies the element
+  choice but is not a production benchmark.
 - `null_strategy_bytes` auto matched branch-and-skip; at 90% nulls it took 24.95 us against
   175.4 us for filter-and-scatter.
-- Geo auto tracked branch at dense validity and filter at sparse validity for both one- and
-  two-nullable-operand shapes. The full forced-strategy matrix remains an implementation
-  diagnostic, not permanent CodSpeed coverage.
+- Geo auto broadly tracks branch at dense validity and filter at sparse validity, but the controlled
+  x86 run found the two threshold misses recorded above. The full forced-strategy matrix remains an
+  implementation diagnostic, not permanent CodSpeed coverage.
 - Distinct per-row LIKE patterns took 126.4 us against 26.87 us for a repeated pattern, 4.7x
   slower. That is the measured reason LIKE remains a stateful columnar implementation.
 

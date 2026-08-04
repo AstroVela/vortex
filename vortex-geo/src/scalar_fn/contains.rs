@@ -5,10 +5,12 @@
 
 use std::cell::OnceCell;
 
+use geo::BoundingRect;
 use geo::Contains;
 use geo::PreparedGeometry;
 use geo::Relate;
 use geo_types::Geometry;
+use geo_types::Rect;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
@@ -99,6 +101,9 @@ struct PreparedOperand {
     /// The constant's decoded geometry, owned so [`prepared`](Self::prepared) can be `'static`.
     geometry: Geometry<f64>,
 
+    /// The constant's bounding rectangle, folded once for conservative row rejection.
+    bbox: Option<Rect<f64>>,
+
     /// The lazily built prepared form of [`geometry`](Self::geometry).
     prepared: OnceCell<PreparedGeometry<'static, Geometry<f64>, f64>>,
 }
@@ -107,6 +112,7 @@ impl PreparedOperand {
     fn new(geometry: &Geometry<f64>) -> Self {
         Self {
             geometry: geometry.clone(),
+            bbox: geometry.bounding_rect(),
             prepared: OnceCell::new(),
         }
     }
@@ -252,11 +258,28 @@ fn contains_route(a: &Geometry<f64>, b: &Geometry<f64>) -> ContainsRoute {
 /// [`PreparedGeometry`] carries the operand's self-noded topology graph and edge R*-tree, so a
 /// relate against it skips rebuilding both and reads its bounding rect from cache; geo asserts
 /// the cached graph equal to a freshly built one (its `swap_arg_index` test), which is what makes
-/// the substitution result-preserving. Direct pairings and the no-constant batch call the
-/// unchanged `a.contains(b)`.
+/// the substitution result-preserving. Before dispatch, a disjoint constant-side bounding rect
+/// conservatively rejects the row, matching the columnar implementation's #9076 optimization.
+/// All other rows delegate to the same direct or relate route as `a.contains(b)`.
 fn contains_row_prepared(operands: &ConstOperands, a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
-    if operands.a.is_none() && operands.b.is_none() {
-        return a.contains(b);
+    let rejected = match (&operands.a, &operands.b) {
+        (None, None) => false,
+        (Some(const_a), Some(const_b)) => const_a
+            .bbox
+            .zip(const_b.bbox)
+            .is_some_and(|(bbox_a, bbox_b)| !bbox_a.contains(&bbox_b)),
+        (Some(const_a), None) => const_a
+            .bbox
+            .zip(b.bounding_rect())
+            .is_some_and(|(bbox_a, bbox_b)| !bbox_a.contains(&bbox_b)),
+        (None, Some(const_b)) => a
+            .bounding_rect()
+            .zip(const_b.bbox)
+            .is_some_and(|(bbox_a, bbox_b)| !bbox_a.contains(&bbox_b)),
+    };
+
+    if rejected {
+        return false;
     }
 
     match contains_route(a, b) {
@@ -719,6 +742,7 @@ mod tests {
     #[case::polygon_x_point_inside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(2.0, 2.0))]
     #[case::polygon_x_point_on_boundary(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(0.0, 2.0))]
     #[case::polygon_x_point_outside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(20.0, 20.0))]
+    #[case::polygon_x_nan_point(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), point(f64::NAN, 2.0))]
     #[case::polygon_x_linestring_inside(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![(1.0, 1.0), (2.0, 2.0)]))]
     #[case::polygon_x_linestring_on_boundary(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![(0.0, 1.0), (0.0, 3.0)]))]
     #[case::polygon_x_linestring_crossing(rect_polygon(0.0, 0.0, 4.0, 4.0).into(), line(vec![(-2.0, 2.0), (2.0, 2.0)]))]

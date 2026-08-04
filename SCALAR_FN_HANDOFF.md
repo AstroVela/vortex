@@ -34,10 +34,10 @@ reviewable pull requests cut fresh from develop.
 ## Final prototype status
 
 The prototype's design is settled at commit `b918a8fb1f`, on top of the loop work in `3e675c9aaa`.
-Two commits follow it and change no design: a decoded-length guard on the mixed constant path, and a
-merge of `origin/develop` at `fae9da1ebb`. The merge matters for measurement rather than for the
-API, and [the x86 re-measurement runbook](#the-x86-avx-512-re-measurement-runbook) is the section
-to read before running anything.
+The branch then added a decoded-length guard, merged `origin/develop` at `fae9da1ebb`, documented the
+x86 runbook at `d293d3cdd59e`, and widened geo's constant-side bbox rejection after the measurement
+confirmed the predicted #9076 regression. The API did not change in those follow-ups. Read
+[the completed x86 record](#the-x86-avx-512-re-measurement-runbook) before citing performance.
 
 The sink-only shape makes an output sink the only row-execution model. `RowVisitor` now has one
 method, `visit_prepared_into`; ordinary scalar outputs use `ElementSink<T>`, and runtime-shaped
@@ -64,62 +64,51 @@ runtime-shaped sink, and checked add demonstrates the deferred-error form.
 
 ## Current benchmark and codegen record
 
-**Every published ratio is stale. Do not cite the issue tables until they are re-run.** The
-[issue #9128 benchmark and codegen follow-up](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802)
-was the broad branch-versus-develop comparison for tensor and geo, and three independent things have
-invalidated it since. They are separable, and only the second is confined to geo:
+The authoritative record is now the
+[updated issue #9128 x86 AVX-512 comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802).
+It measures candidate `d293d3cdd59e` plus the geo bbox widening against current develop
+`876996fe7846` on a Ryzen 9 7950X. Runs were pinned to CPU 4 with TSC timing, performance governor
+and EPP, two sequential repetitions, and ABBA ordering for cross-revision comparisons. Ratios below
+are control/develop divided by candidate, so above 1x favors the row branch.
 
-1. **The candidate moved.** The comment records candidate `0c0d1f80ee21`. `3e675c9aaa` then added
-   the borrowed `Varying` view and hoisted the sink's row storage and bounds out of the loop, and
-   `b918a8fb1f` made the sink the only execution model. Both rewrote the hot loop, so every tensor
-   and geo row measures an executor that no longer exists.
-2. **Develop moved, for geo only.** The comment's baseline is develop at `08c336f54a88`.
-   [#9076](https://github.com/vortex-data/vortex/pull/9076) has since landed bounding-rect rejection
-   for the geo predicates on develop, which is the same class of win the comment credits to the row
-   ports ("`intersects` hoists the constant bounding rectangle and short-circuits disjoint cases").
-   All nine geo rows therefore compare against a baseline that no longer exists, and the disjoint
-   arms in particular should be assumed gone until re-measured. Develop's tensor code is unchanged
-   over the same range, so the tensor baseline is still good and only reason 1 applies there.
-3. **`l2_denorm` is no longer a scalar function.** Its normalized child and stored norms are
-   classified as an encoding, so its row is not port-parity evidence for anything. Re-label it as
-   the `Normalized` encoding or drop it.
+The results that constrain the implementation stack are:
 
-The checked-add table below is the machinery measurement for the sink-only executor, and it carries
-its own caveat: both arms live in `vortex-array/benches/row_fn_executor.rs`, so the "specialized"
-control is bench-local rather than a production function, and there is no production deferred-error
-user at all (`ERRORS_ARE_DEFERRED` is set only in that bench and in `row/tests/sink.rs`). State that
-when the number goes public.
+- sink-only checked add is 1.018-1.022x faster by median for two columns, 1.218-1.226x for a
+  column and constant, and 1.033-1.042x for nullable columns;
+- `BytesLen` is 1.410-1.411x faster by median than resolving a byte slice for long strings and
+  1.097x for short/inlined strings;
+- non-null `l2_norm` is 1.038x faster by median at width 32 and within 0.4% at width 256; width 2
+  has a repeatable fastest/median split, about 2% faster by fastest and 3.5% slower by median;
+- cosine is 1.40-30.13x faster than develop across column, constant, and extension-constant shapes;
+- prepared overlapping `contains` is 8.60-8.77x faster by median, disjoint polygons are at parity
+  after the bbox widening, and overlapping/disjoint `intersects` are at parity or slightly faster;
+- point/constant geo remains slower: `contains` constant x points is 8.6-14.2% higher by median,
+  `intersects` points x constant is 10.9-13.2% higher, and column x column point `contains` is
+  3.7-5.2% higher;
+- direct bbox rejection is 33.4-33.5x faster by median on disjoint rows and adds 1.8-1.9% before
+  exact evaluation on overlapping rows;
+- the global 75% survivor threshold misses one-nullable/50%-null in favor of filter when branch is
+  6-8% lower latency, and two-nullable/10%-null in favor of branch when filter is 2.5-2.8% lower.
 
-At 65,536 `i64` rows, 100 samples and a one-second minimum per arm, the sink-only checked-add
-medians were:
+The checked-add control is benchmark-local rather than a production function, and there is still no
+production deferred-error user. Its native release IR contains `<8 x i64>` error accumulators and
+`llvm.vector.reduce.or.v8i64`; assembly uses a four-way-unrolled AVX-512 `zmm` loop with no per-row
+error branch. Current `l2_norm` remains a strict-order scalar reduction. The old four-`vmulps`,
+64-`f32` loop belonged to `l2_denorm`, which is now `Normalized` encoding evidence rather than a
+scalar-function claim.
 
-| workload | specialized | `RowFn` | delta |
-| --- | ---: | ---: | ---: |
-| two columns | 13.54 us | 13.79 us | 1.8% slower |
-| column and constant | 12.83 us | 11.33 us | 11.7% faster |
-| nullable columns | 12.91 us | 12.95 us | 0.3% slower |
-
-The generated LLVM IR contains vector error-word OR accumulators and
-`llvm.vector.reduce.or.v2i64`; there is no per-row result discriminant or error branch. The
-remaining ordinary two-column difference is framework setup and output construction around a hot
-loop that has reached the intended shape, not a hidden `VortexResult` in that loop.
-
-**The machine for that table is unrecorded, which by itself makes it unciteable.** Do not assume it
-matches the 7950X in the issue comment. Re-run it under the runbook below and record the host.
-
-The other final diagnostic runs support keeping the abstractions separate. Lazy and eager validity
-were within 2% in every `strict_validity` arm. `BytesLen` was 28 to 29% faster than resolving a byte
-slice for `byte_length`, which justifies the specialized input element but is not a permanent
-production benchmark. Distinct per-row LIKE patterns were 4.7x slower than repeated patterns,
-which confirms that state shared across rows belongs outside `RowFn`.
+Lazy/eager validity and distinct/repeated LIKE diagnostics were not rerun because the relevant code
+did not move. Their earlier conclusions remain scoped to those in-binary controls: validity stayed
+within 2%, while distinct LIKE patterns were 4.7x slower and justify keeping shared pattern state
+outside `RowFn`.
 
 ## Where the work lives
 
 Everything is on `claude/strict-scalar-fn-abstraction-ah88x3`. The branch is publicly linked from
-epic 9128 and is a prototype record, not a merge candidate. It is now several local commits ahead of
-the remote branch: the sink-only work, the decoded-length guard, the `origin/develop` merge at
-`fae9da1ebb`, and this handoff update. Do not rewrite the published history. Push the final
-implementation and documentation commits only when explicitly requested.
+epic 9128 and is a prototype record, not a merge candidate. It contains the sink-only work, the
+decoded-length guard, the `origin/develop` merge at `fae9da1ebb`, the completed x86 measurement, and
+the geo bbox correction. Do not rewrite the published history. Push final implementation and
+documentation commits only when explicitly requested.
 
 The merge is the only develop integration on this branch, and its five conflicts were all in
 `vortex-geo`, all resolved to the row ports because #9076 changed bodies the row layer replaces.
@@ -303,12 +292,9 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
 
 ## What to do next, in order
 
-0. **Re-measure on x86 AVX-512, before touching the issues.** Every published ratio is stale for the
-   three reasons in the benchmark-record section, so the issue text cannot be corrected without
-   numbers to correct it to. Follow
-   [the x86 runbook](#the-x86-avx-512-re-measurement-runbook), which the `origin/develop` merge has
-   already unblocked by giving both suites one valid baseline. Supersede the existing #9128 comment
-   with a new one rather than editing it, so its AVX-512 codegen audit survives.
+The x86 AVX-512 re-measurement is complete, the #9128 comment is updated, and the predicted geo bbox
+gap is fixed and tested on this branch. The remaining work starts with the durable baseline:
+
 1. **Land PR #9136.** It now contains the durable public-path benchmark set needed before the
    implementation stack: byte length, signed and unsigned add including a constant operand, LIKE
    cache behavior, tensor functions, geo predicates, and geo distance. Resolve its stacked-base
@@ -324,9 +310,10 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
    A sensible split is row core plus `ElementSink` and `byte_length`; tensor elements and kernels;
    prepared execution with cosine and geo; adaptive null execution; then specialized sinks and
    deferred errors with a production checked arithmetic user. Preserve each migrated function's
-   serialized metadata. Two amendments the merge added: the geo PR also owns reconciling with #9076,
-   including whether to widen the early-out gate, and the deferred-error PR has to bring its own
-   production user, since `ERRORS_ARE_DEFERRED` currently has none outside a bench and a test.
+   serialized metadata. Two amendments the measurement settled: the geo PR should carry the widened
+   conservative bbox rejection and its NaN agreement tests, and should explicitly track the
+   remaining point/constant regressions; the deferred-error PR has to bring its own production user,
+   since `ERRORS_ARE_DEFERRED` currently has none outside a bench and a test.
 4. **Use CodSpeed to decide whether handwritten add can be deleted.** The local executor harness
    establishes that the machinery can reach parity, but the gate is the stable production
    `binary_ops` names from #9136 on the actual implementation PR. Require non-null, nullable,
@@ -339,28 +326,34 @@ across rows (`like`), or heterogeneous variadic kernels (`RowEncode`, `pack`, `c
 
 ## Adaptive execution status
 
-Adaptive execution is no longer a design blocker for the prototype. The implementation is tested,
-and the final measurements still show auto selecting the intended side of the crossover.
+Adaptive execution is correct and tested, but its current selection rule is not fully calibrated.
+The x86 run found two repeatable cases where auto chooses the slower forced strategy.
 
 The rule today: for a mixed validity mask, use branch-and-skip unless some argument's element sets
 `DECODE_SHRINKS_WHEN_FILTERED` and fewer than 75% of rows survive, in which case filter and scatter.
-One boolean per element, one global threshold, no other inputs. The questions:
+One boolean per element, one global threshold, no other inputs. The measured misses are:
 
-- **Is a global const the right shape at all?** The alternatives are a per-element threshold (each
-  element knows its own decode-to-kernel cost ratio), or a small cost model comparing estimated
-  decode work over all rows against decode over survivors plus filter and scatter. The measured
-  crossover sat between 56% and 81% surviving rows for *one* element type, which is a single
-  calibration point: a second per-row-decode element could easily want a different number, and that
-  is the argument for moving the knob onto the element.
+- one nullable geometry at 50% nulls: auto/filter median 5.999-6.050 ms, branch
+  5.560-5.642 ms, so branch is 6-8% lower latency;
+- two nullable geometries at 10% nulls, about 81% conjoined survivors: auto/branch median
+  10.40-10.60 ms, filter 10.20-10.34 ms, so filter is 2.5-2.8% lower latency;
+- at two nullable geometries and 25% nulls, auto correctly filters and filter is 1.21-1.22x faster
+  than branch; at 90% nulls it is about 11.6x faster.
+
+The first two cases point in opposite directions, so conjoined survivor fraction alone is not enough.
+The remaining questions are:
+
+- **What should replace the global const?** The alternatives are per-element and arity-aware
+  thresholds, or a small cost model comparing estimated full-row decode work against survivor-only
+  decode plus filter and scatter. The one-versus-two-element reversal is now direct evidence that
+  element/arity cost must be represented.
 - **Should batch size be an input?** Filter's cost is dominated by allocation and copying, which
   does not amortize on small batches, while branch's cost is proportional to the full column. The
   crossover therefore probably moves with row count, and nothing measures that yet. The small-batch
   sweep in the measurement plan below feeds this directly.
-- **Is the rule right with more than one nullable per-row-decode argument?** The flag is ORed across
-  arguments, but with independent nulls the conjoined surviving fraction falls roughly quadratically,
-  and the measurements did show the crossover moving down in that case (branch won only to about 10%
-  null density with two nullable operands, versus 50% with one). One threshold against the conjoined
-  fraction may already handle this correctly; confirm rather than assume.
+- **How should multiple nullable per-row-decode arguments compose?** The flag is ORed across
+  arguments, but decode cost grows with arity while the conjoined survivor fraction falls. The 10%
+  two-input miss proves that the current OR plus one threshold does not compose those effects.
 - **Does the crossover hold across architectures?** It trades memory-bandwidth-bound work against
   compute-bound work, so x86 and Apple Silicon need not agree. CodSpeed's x86/AVX2 simulation is the
   next stable data point, but it does not replace real wall-clock measurements on either machine.
@@ -374,37 +367,32 @@ One boolean per element, one global threshold, no other inputs. The questions:
 
 ## The x86 AVX-512 re-measurement runbook
 
-This section is self-contained: it is what to run on an x86 AVX-512 host to replace the stale issue
-tables, and it assumes nothing from the sections above except that they explain *why* the old
-numbers cannot be cited.
+The re-measurement was completed on 2026-08-04 and published in the
+[#9128 follow-up comment](https://github.com/vortex-data/vortex/issues/9128#issuecomment-5151831802).
+This section now records the completed protocol and remains the procedure for reproducing it.
 
 ### The one rule about machines
 
-**Label every number with its host, and never mix hosts inside one table.** The issue comment's
-numbers are x86 (7950X, AVX-512, pinned to one core, TSC timer). Anything measured on Apple Silicon
-is separate evidence, not an update to that table, because three of its claims do not survive the
-move at all:
+**Label every number with its host, and never mix hosts inside one table.** The authoritative issue
+comment is x86 (7950X, AVX-512, CPU 4, TSC timer, performance governor and EPP). Anything measured on
+Apple Silicon is separate evidence, not an update to that table.
 
-- The folded IR and assembly are AVX-512 specific: `vbroadcastss`, four `vmulps`, zmm stores, "64
-  `f32` coordinates per iteration". On NEON that is 128-bit vectors and a different unroll factor.
-  Re-derive those claims on x86 or scope them explicitly to x86; do not restate them from an
-  aarch64 run.
-- `BRANCH_MIN_SURVIVING_FRACTION = 0.75` is calibrated on x86. It trades memory-bandwidth work
-  against compute-bound work, so a macOS run disagreeing with it is not evidence the threshold is
-  wrong.
+- The checked-add audit is AVX-512 specific: four `zmm` `vpaddq` operations produce 32 `i64` rows
+  per main-loop iteration and vector error words reduce after the loop. Do not translate that
+  instruction claim to NEON.
+- The old four-`vmulps`, 64-`f32` claim belongs to `l2_denorm`, now the `Normalized` encoding. The
+  current `l2_norm` audit is scalar because strict reduction order prevents reassociation.
+- `BRANCH_MIN_SURVIVING_FRACTION = 0.75` was tested on x86 and found imperfect in both directions.
+  An architecture change may move the misses, but does not erase the x86 evidence.
 - macOS has no equivalent core pinning and no TSC, so its per-sample variance is higher and its
   `fastest` is less meaningful.
 
-If an interim aarch64 run happens first, post it as a clearly labeled interim comment and leave the
-x86 re-verification open. Do not overwrite the existing comment: it holds the AVX-512 codegen audit,
-which is the strongest part of the record and is not reproducible off x86.
-
-### Revisions to measure
+### Revisions measured
 
 | role | ref |
 | --- | --- |
-| candidate | `claude/strict-scalar-fn-abstraction-ah88x3`, at or after the `origin/develop` merge |
-| baseline | `origin/develop` at `fae9da1ebb` or later, which **must** include #9076 |
+| candidate | `d293d3cdd59e` plus the geo bbox widening recorded in this update |
+| baseline | `origin/develop` at `876996fe7846` |
 
 The merge is what makes a single baseline valid for both suites. Before it, geo needed a pre-#9076
 baseline and tensor a post-#9076 one. Confirm with `git merge-base --is-ancestor 2de0319312 HEAD`
@@ -447,28 +435,15 @@ what is now an encoding, so run it only if the encoding claim is what is wanted.
 Report `fastest` and median from at least two runs, sequentially, with the host recorded. Divan is
 aliased to `codspeed-divan-compat` and behaves as ordinary divan locally.
 
-### The specific hypothesis this run should test
+### Outcome of the geo hypothesis
 
-The merge left the candidate with a *narrower* bounding-rect early-out than develop, and this is the
-most likely cause of a geo regression:
-
-- `intersects_opens_with_bbox_check` admits the hoisted early-out only for pairings where geo itself
-  opens with that same rect comparison. Develop's #9076 applies its rejection to every one-constant
-  pairing. So for a pairing geo does not open with a rect test, `Point` against `Polygon` above all,
-  develop gets an early-out the candidate does not.
-- `contains` on the candidate routes through a prepared geometry and has **no** rect test at all,
-  while develop now rejects on `!ra.contains(rb)`.
-
-The gate was written to keep the hoist pure common-subexpression elimination, on the worry that a
-rect test could change the verdict for NaN coordinates. That worry is settled and the answer is no:
-geo 0.31's `Rect::intersects` returns false only after finding an ordered separation, so NaN bounds
-make all four comparisons false, it falls through to true, and
-`(!ra.intersects(rb)).then_some(false)` yields `None` and defers to the exact test. Develop's
-unconditional form is therefore conservative and result-preserving.
-
-So if `intersects points x constant` or either constant-side `contains` arm loses to develop,
-widening the gate is the first thing to try, not a mystery. Both were already the weakest arms
-against the *old* baseline (0.907-0.998x), and they are now measured against a faster one.
+The hypothesis was correct. The pre-fix diagnostic showed the expected constant-point and
+disjoint-`contains` losses. The final patch caches the constant bbox for `contains` and applies
+conservative bbox rejection to every constant arrangement for both predicates. NaN agreement tests
+cover both operand orders. The stabilized rerun restores disjoint polygons to parity, keeps
+overlapping prepared `contains` 8.60-8.77x faster by median, and leaves the point/constant regressions
+listed in the benchmark-record section. Carry the widened gate and tests into the geo implementation
+PR; do not treat the remaining point cost as a bbox mystery.
 
 ## The measurement plan
 
@@ -497,11 +472,12 @@ at representative null densities.
 
 **Adaptive execution is less entangled with the other measurements than it looks.** Every adopter
 except geo is dense-safe and infallible, so it takes the dense path and never reaches strategy
-selection at all: `l2_norm`, `l2_denorm`, `inner_product`, `cosine_similarity`, and `byte_length` (which
-ships at `BytesLen`) are unaffected no matter what the rule becomes. Only geo's nullable batches are
-affected, which is why the geo baseline needs both nullable and non-nullable arms: it keeps the
-port's parity claim separable from adaptive execution's win. The baseline can land before the
-implementation stack without depending on the final threshold.
+selection at all: `l2_norm`, `inner_product`, `cosine_similarity`, and `byte_length` (which ships at
+`BytesLen`) are unaffected no matter what the rule becomes. The prototype's `l2_denorm` port is
+dense-safe too, although that operation is now classified as the `Normalized` encoding. Only geo's
+nullable batches are affected, which is why the geo baseline needs both nullable and non-nullable
+arms: it keeps the port's parity claim separable from adaptive execution's win. The baseline can
+land before the implementation stack without depending on the final threshold.
 
 CodSpeed runs these CPU-bound microbenchmarks in simulation over compiled amd64/AVX2 machine code.
 That is useful for the LLVM and vectorization questions that motivated the executor work, but it is
@@ -534,10 +510,12 @@ Four of their unresolved questions are genuinely open, and two of them this bran
   support, which is already implemented.
 
 9130's remaining non-blocking follow-ups are the double `reduce_encoded` probe when branch execution
-is unsupported, the global 75% threshold pending a second per-row-decode element, and the branch
-loop's inability to stop `for_each_set_index` immediately after an early error. Geo's null-tolerant
-decode still arrow-exports the full column; slicing runs of valid rows could move or remove its
-filter crossover. The lifting's small-batch prelude cost remains structural.
+is unsupported, replacing the global 75% threshold with an element/arity-aware decision, and the
+branch loop's inability to stop `for_each_set_index` immediately after an early error. The x86
+matrix proves the current threshold misses in opposite directions, but geo is still the only
+per-row-decode element measured. Geo's null-tolerant decode still arrow-exports the full column;
+slicing runs of valid rows could move or remove its filter crossover. The lifting's small-batch
+prelude cost remains structural.
 
 ## Loose ends, and issues worth filing separately
 
@@ -571,20 +549,22 @@ git diff --check
 cargo build -p vortex -p vortex-file -p vortex-datafusion
 ```
 
-The final implementation verification was: 65 focused RowFn tests, 225 geo library tests, 164 tensor
-library tests, 72 `vortex-array` doctests with 10 ignored, targeted all-target/all-feature clippy for
-the three crates, nightly fmt, and whitespace checks. The compile-fail witness doctest passed.
+The final framework verification was: 65 focused RowFn tests, 164 tensor library tests, 72
+`vortex-array` doctests with 10 ignored, targeted all-target/all-feature clippy for the three crates,
+nightly fmt, and whitespace checks. After the geo bbox widening, 43 focused geo tests and all 230
+`vortex-geo` tests passed, as did targeted all-target/all-feature `vortex-geo` clippy.
 
 The prototype forked from development history at `bb4138d051` and has since merged `origin/develop`
-at `fae9da1ebb`, so develop is an ancestor and there is no merge base to recompute for ordinary
-diffing. Both refs will still move before the implementation stack is cut: fetch `origin/develop`
-and use `git range-diff` rather than assuming either recorded hash is current. To recover the
-pre-port body of `not`, `list_length`, or `list_sum` from the prototype history, use `24d1933e1^`.
+at `fae9da1ebb`. That merge commit is an ancestor of the branch, but current `origin/develop` has
+advanced and is not. Before the implementation stack is cut, fetch `origin/develop` and use `git
+range-diff` rather than assuming either recorded hash or merge relationship is current. To recover
+the pre-port body of `not`, `list_length`, or `list_sum` from the prototype history, use
+`24d1933e1^`.
 
 Benchmarks are divan (aliased to `codspeed-divan-compat`, so they also run in CI); report `fastest`
-and `median` from at least two runs and **always state the machine**, which is the one convention
-that has actually been broken here: the historical measurements used a shared 4-vCPU VM, the issue
-comment used a 7950X, and the checked-add table records no host at all. See
+and `median` from at least two runs and **always state the machine**. Historical measurements used a
+shared 4-vCPU VM, while the current issue comment and checked-add audit use the recorded 7950X setup.
+See
 [the x86 runbook](#the-x86-avx-512-re-measurement-runbook) for why mixing hosts in one table is not
 recoverable after the fact. Any new bench must be
 registered as a `[[bench]]` with `harness = false` in the crate's `Cargo.toml`. Per-adopter
