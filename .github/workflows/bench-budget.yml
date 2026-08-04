@@ -1,0 +1,101 @@
+name: Benchmark Budget
+
+# Enforces the "keep per-iteration execution time under 1 ms" rule from
+# docs/developer-guide/benchmarking.md, reported as a comment rather than a failing check.
+#
+# CodSpeed already measures per-iteration time and publishes it in its own sticky PR
+# comment, so this workflow reads that comment instead of building or running anything.
+# The trade is scope, not accuracy: CodSpeed only reports benchmarks a PR added or
+# changed, so an untouched benchmark that is already over budget is not caught here.
+#
+# `issue_comment` workflows always run from the default branch, so edits to this file (or
+# to the script) only take effect once merged. Use the `workflow_dispatch` entry point to
+# try a change against a real PR's report before merging it.
+
+on:
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: "Pull request to re-check against the budget"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || inputs.pr-number }}
+  cancel-in-progress: true
+
+jobs:
+  bench-budget:
+    name: "Check benchmark iteration budget"
+    # CodSpeed edits one sticky comment per PR, so this fires on every update to its
+    # report. Anyone can post a comment containing the marker; pinning the author is what
+    # makes the parsed table trustworthy.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.issue.pull_request != null
+          && github.event.comment.user.login == 'codspeed-hq[bot]'
+          && contains(github.event.comment.body, '__CODSPEED_PERFORMANCE_REPORT_COMMENT__'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.issue.number || inputs.pr-number }}
+    steps:
+      # On `issue_comment` this checks out the default branch, never the pull request's
+      # head. That is deliberate: the job holds a `pull-requests: write` token, and must
+      # run this repository's script rather than a version a fork could edit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      # The comment body is untrusted input, so it reaches the script through the
+      # environment and never through shell interpolation.
+      - name: Read CodSpeed report from the triggering comment
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: printenv COMMENT_BODY > codspeed-comment.md
+
+      - name: Fetch CodSpeed report for the requested pull request
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.user.login == "codspeed-hq[bot]") | .body] | last' \
+            > codspeed-comment.md
+          test -s codspeed-comment.md
+
+      - name: Check against the budget
+        id: check
+        run: |
+          python3 scripts/check-bench-budget.py \
+            --comment-file codspeed-comment.md \
+            --output comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report over-budget benchmarks
+        if: steps.check.outputs.violations != '0'
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
+        with:
+          file-path: comment.md
+          comment-tag: bench-budget
+          pr-number: ${{ env.PR_NUMBER }}
+
+      # Nothing is over budget: update an existing complaint to say so, but never open a
+      # new all-clear comment on every PR that touches a benchmark.
+      - name: Clear a resolved report
+        if: steps.check.outputs.violations == '0'
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
+        with:
+          file-path: comment.md
+          comment-tag: bench-budget
+          pr-number: ${{ env.PR_NUMBER }}
+          create-if-not-exists: false

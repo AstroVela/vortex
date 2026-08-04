@@ -132,7 +132,26 @@ gate it with `#[cfg(not(codspeed))]` if it genuinely cannot be made to fit.
 The number to check against the budget is the per-iteration time, not the time the whole
 benchmark binary takes. CodSpeed reports exactly that: its performance report on a pull
 request lists the per-iteration time under `HEAD` for every benchmark the pull request adds
-or changes, so check any new benchmark there before merging.
+or changes.
+
+CI reads that report on every pull request, and comments rather than failing the build. The
+`bench-budget` job in `.github/workflows/bench-budget.yml` pulls the per-iteration times out
+of CodSpeed's report and comments listing any benchmark over the budget. Nothing is rebuilt
+or re-run: the numbers are the ones CodSpeed already published.
+
+Two limits follow from using that report as the source:
+
+- Only benchmarks CodSpeed reports as **new or changed** are checked, because those are the
+  only ones it lists. A benchmark you did not touch is not re-checked, so the budget is
+  enforced going forward rather than retroactively.
+- CodSpeed truncates its table at 20 rows. When it does, the comment says so rather than
+  implying the rest were checked — open the full report in CodSpeed to see them.
+
+To check a report by hand, for example while iterating on the check itself:
+
+```bash
+python3 scripts/check-bench-budget.py --comment-file codspeed-comment.md --output comment.md
+```
 
 ### Gate CodSpeed-incompatible benchmarks
 
