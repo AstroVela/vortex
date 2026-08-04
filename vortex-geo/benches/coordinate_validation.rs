@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Microbenchmark for validating native geometry coordinates during Arrow import.
+//! Microbenchmark for the incremental cost of native geometry validation during Arrow import.
 //!
 //! Run with `cargo bench -p vortex-geo --bench coordinate_validation`.
 
 #![expect(clippy::unwrap_used)]
 
-use std::sync::Arc;
 use std::sync::LazyLock;
 
+use arrow_array::Array as ArrowArray;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_schema::Field;
 use divan::Bencher;
 use divan::counter::BytesCount;
 use vortex_array::ArrayRef;
+use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::ExtensionArray;
+use vortex_array::dtype::DType;
 use vortex_arrow::ArrowSessionExt;
+use vortex_arrow::FromArrowArray;
+use vortex_error::VortexResult;
+use vortex_geo::extension::benchmark_validate_list_geometry as validate_list_geometry;
+use vortex_geo::extension::benchmark_validate_point as validate_point;
+use vortex_geo::extension::benchmark_validate_rect as validate_rect;
 use vortex_geo::test_harness::MultiPolygonRings;
 use vortex_geo::test_harness::geo_session;
 use vortex_geo::test_harness::multipoint_column;
@@ -42,7 +50,21 @@ fn ordinate(index: usize) -> f64 {
     (index.wrapping_mul(2654435761) % 1000) as f64
 }
 
-fn to_arrow(array: ArrayRef) -> (ArrowArrayRef, Field) {
+struct ImportCase {
+    array: ArrowArrayRef,
+    field: Field,
+    dtype: DType,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Validation {
+    Without,
+    With,
+}
+
+type Validate = fn(&dyn ArrowArray) -> VortexResult<()>;
+
+fn to_arrow(array: ArrayRef) -> ImportCase {
     let mut ctx = SESSION.create_execution_ctx();
     let field = SESSION
         .arrow()
@@ -52,14 +74,22 @@ fn to_arrow(array: ArrayRef) -> (ArrowArrayRef, Field) {
         .arrow()
         .execute_arrow(array, Some(&field), &mut ctx)
         .unwrap();
-    (arrow, field)
+    let dtype = SESSION.arrow().from_arrow_field(&field).unwrap();
+    ImportCase {
+        array: arrow,
+        field,
+        dtype,
+    }
 }
 
-fn import(array: &ArrowArrayRef, field: &Field) -> ArrayRef {
-    SESSION
-        .arrow()
-        .from_arrow_array(Arc::clone(array), field)
+fn import(case: &ImportCase, validation: Validation, validate: Validate) -> ArrayRef {
+    if matches!(validation, Validation::With) {
+        validate(case.array.as_ref()).unwrap();
+    }
+    let storage = ArrayRef::from_arrow(case.array.as_ref(), case.field.is_nullable()).unwrap();
+    ExtensionArray::try_new(case.dtype.as_extension().clone(), storage)
         .unwrap()
+        .into_array()
 }
 
 fn xy_bytes(coordinates: usize) -> BytesCount {
@@ -80,32 +110,32 @@ fn multipolygon_row(row: usize) -> MultiPolygonRings {
     vec![vec![ring(0), ring(1)], vec![ring(2), ring(3)]]
 }
 
-#[divan::bench]
-fn point(bencher: Bencher) {
+#[divan::bench(args = [Validation::Without, Validation::With])]
+fn point(bencher: Bencher, validation: Validation) {
     let xs = (0..COORDINATES).map(ordinate).collect();
     let ys = (0..COORDINATES).map(|index| ordinate(index + 1)).collect();
-    let (array, field) = to_arrow(point_column(xs, ys).unwrap());
+    let case = to_arrow(point_column(xs, ys).unwrap());
 
     bencher
         .counter(xy_bytes(COORDINATES))
-        .bench(|| import(&array, &field));
+        .bench(|| import(&case, validation, validate_point));
 }
 
-#[divan::bench]
-fn point_sparse_nulls(bencher: Bencher) {
+#[divan::bench(args = [Validation::Without, Validation::With])]
+fn point_sparse_nulls(bencher: Bencher, validation: Validation) {
     let points: Vec<_> = (0..COORDINATES)
         .map(|index| (!index.is_multiple_of(10)).then(|| (ordinate(index), ordinate(index + 1))))
         .collect();
     let valid_points = points.iter().filter(|point| point.is_some()).count();
-    let (array, field) = to_arrow(nullable_point_column(points).unwrap());
+    let case = to_arrow(nullable_point_column(points).unwrap());
 
     bencher
         .counter(xy_bytes(valid_points))
-        .bench(|| import(&array, &field));
+        .bench(|| import(&case, validation, validate_point));
 }
 
-#[divan::bench]
-fn rect(bencher: Bencher) {
+#[divan::bench(args = [Validation::Without, Validation::With])]
+fn rect(bencher: Bencher, validation: Validation) {
     let boxes = (0..COORDINATES)
         .map(|index| {
             let xmin = ordinate(index);
@@ -113,15 +143,15 @@ fn rect(bencher: Bencher) {
             (xmin, ymin, xmin + 1.0, ymin + 1.0)
         })
         .collect();
-    let (array, field) = to_arrow(rect_column(boxes).unwrap());
+    let case = to_arrow(rect_column(boxes).unwrap());
 
     bencher
         .counter(BytesCount::of_many::<f64>(COORDINATES * 4))
-        .bench(|| import(&array, &field));
+        .bench(|| import(&case, validation, validate_rect));
 }
 
-#[divan::bench]
-fn multipoint(bencher: Bencher) {
+#[divan::bench(args = [Validation::Without, Validation::With])]
+fn multipoint(bencher: Bencher, validation: Validation) {
     let rows: Vec<_> = (0..NESTED_ROWS)
         .map(|row| {
             (0..COORDINATES_PER_ROW)
@@ -129,32 +159,32 @@ fn multipoint(bencher: Bencher) {
                 .collect()
         })
         .collect();
-    let (array, field) = to_arrow(multipoint_column(rows).unwrap());
+    let case = to_arrow(multipoint_column(rows).unwrap());
 
     bencher
         .counter(xy_bytes(COORDINATES))
-        .bench(|| import(&array, &field));
+        .bench(|| import(&case, validation, validate_list_geometry));
 }
 
-#[divan::bench]
-fn multipolygon(bencher: Bencher) {
+#[divan::bench(args = [Validation::Without, Validation::With])]
+fn multipolygon(bencher: Bencher, validation: Validation) {
     let rows = (0..NESTED_ROWS).map(multipolygon_row).collect();
-    let (array, field) = to_arrow(multipolygon_column(rows).unwrap());
+    let case = to_arrow(multipolygon_column(rows).unwrap());
 
     bencher
         .counter(xy_bytes(COORDINATES))
-        .bench(|| import(&array, &field));
+        .bench(|| import(&case, validation, validate_list_geometry));
 }
 
-#[divan::bench]
-fn multipolygon_sparse_nulls(bencher: Bencher) {
+#[divan::bench(args = [Validation::Without, Validation::With])]
+fn multipolygon_sparse_nulls(bencher: Bencher, validation: Validation) {
     let rows: Vec<_> = (0..NESTED_ROWS)
         .map(|row| (!row.is_multiple_of(10)).then(|| multipolygon_row(row)))
         .collect();
     let valid_coordinates = rows.iter().filter(|row| row.is_some()).count() * COORDINATES_PER_ROW;
-    let (array, field) = to_arrow(nullable_multipolygon_column(rows).unwrap());
+    let case = to_arrow(nullable_multipolygon_column(rows).unwrap());
 
     bencher
         .counter(xy_bytes(valid_coordinates))
-        .bench(|| import(&array, &field));
+        .bench(|| import(&case, validation, validate_list_geometry));
 }

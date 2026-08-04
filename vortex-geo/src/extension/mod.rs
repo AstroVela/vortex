@@ -40,6 +40,12 @@ pub use multipolygon::*;
 pub use point::*;
 pub use polygon::*;
 pub use rect::*;
+#[cfg(feature = "_test-harness")]
+pub use validation::validate_list_geometry as benchmark_validate_list_geometry;
+#[cfg(feature = "_test-harness")]
+pub use validation::validate_point as benchmark_validate_point;
+#[cfg(feature = "_test-harness")]
+pub use validation::validate_rect as benchmark_validate_rect;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;

@@ -23,7 +23,7 @@ use vortex_error::vortex_err;
 /// - Otherwise, X and Y must be finite.
 /// - Z and M are attributes and are not part of this 2-D validity check.
 /// - Child values of null Point rows are ignored.
-pub(super) fn validate_point(array: &dyn Array) -> VortexResult<()> {
+pub fn validate_point(array: &dyn Array) -> VortexResult<()> {
     let coordinates = array
         .as_any()
         .downcast_ref::<StructArray>()
@@ -73,7 +73,7 @@ pub(super) fn validate_point(array: &dyn Array) -> VortexResult<()> {
 /// - A non-null Rect must have finite, ordered X/Y bounds.
 /// - Z and M bounds are not part of this 2-D validity check.
 /// - Child values of null Rect rows are ignored.
-pub(super) fn validate_rect(array: &dyn Array) -> VortexResult<()> {
+pub fn validate_rect(array: &dyn Array) -> VortexResult<()> {
     let bounds = array
         .as_any()
         .downcast_ref::<StructArray>()
@@ -126,7 +126,7 @@ pub(super) fn validate_rect(array: &dyn Array) -> VortexResult<()> {
 ///
 /// Empty geometries use empty lists, so every coordinate reachable from a non-null outer row must
 /// have finite X and Y. Z and M are attributes and are not part of this 2-D validity check.
-pub(super) fn validate_list_geometry(array: &dyn Array) -> VortexResult<()> {
+pub fn validate_list_geometry(array: &dyn Array) -> VortexResult<()> {
     let mut values = array;
     let mut list_levels = Vec::new();
     while let Some(list) = values.as_any().downcast_ref::<ListArray>() {
