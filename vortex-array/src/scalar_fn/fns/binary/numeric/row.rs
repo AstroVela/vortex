@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! The primitive arithmetic operators as a [`RowFn`].
+//!
+//! [`Binary`] keeps its ID, its options serialization, and its strictness, fallibility and validity
+//! contracts, and delegates only the _execution_ of `Add`, `Sub`, `Mul` and `Div` over primitive
+//! columns to [`NumericBinary`]. Delegation rather than conversion is what makes the port possible
+//! at all: `Binary` also covers Kleene `And`/`Or`, which are not strict, and the six comparisons,
+//! which are infallible, so no single [`RowFn`] can stand in for the whole function.
+//!
+//! [`NumericBinary`] is not registered and appears in no serialized expression. It is reached only
+//! through the [`ScalarFnVTable::execute`] that the blanket [`RowFn`] implementation provides, so
+//! it needs no rewrite rule, no ID in the registry, and no wire format of its own.
+//!
+//! Everything the previous hand-written implementation did around the arithmetic itself now comes
+//! from the lifting: input decoding, the constant operand collapse, the all-constant fold, the
+//! null-constant short circuit, output allocation, nullability widening, and masking. What is left
+//! here is the per-type checked operation and the sink that carries its overflow bit.
+//!
+//! [`Binary`]: crate::scalar_fn::fns::binary::Binary
+
+use std::marker::PhantomData;
+use std::mem::MaybeUninit;
+
+use vortex_buffer::BufferMut;
+use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+use vortex_session::registry::CachedId;
+
+use super::primitive::CheckedAdd;
+use super::primitive::CheckedDiv;
+use super::primitive::CheckedMul;
+use super::primitive::CheckedPrimitiveOp;
+use super::primitive::CheckedSub;
+use crate::ArrayRef;
+use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::arrays::PrimitiveArray;
+use crate::dtype::DType;
+use crate::dtype::NativePType;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
+use crate::match_each_native_ptype;
+use crate::scalar::NumericOperator;
+use crate::scalar_fn::ChildName;
+use crate::scalar_fn::DeferredError;
+use crate::scalar_fn::OutputSink;
+use crate::scalar_fn::RowFn;
+use crate::scalar_fn::RowVisitor;
+use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::VecExecutionArgs;
+use crate::validity::Validity;
+
+/// Execute a numeric operation between two primitive-typed arrays.
+///
+/// The caller has already established that both operands are primitive, of the same type, and of
+/// the same length.
+pub(super) fn execute_numeric_primitive(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    op: NumericOperator,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let args = VecExecutionArgs::new(vec![lhs.clone(), rhs.clone()], lhs.len());
+
+    ScalarFnVTable::execute(&NumericBinary, &op, &args, ctx)
+}
+
+/// The four arithmetic operators of [`Binary`] over primitive columns, as one row function per
+/// operator and width.
+///
+/// [`Binary`]: crate::scalar_fn::fns::binary::Binary
+#[derive(Clone)]
+struct NumericBinary;
+
+impl RowFn for NumericBinary {
+    type Options = NumericOperator;
+    type ArgsWitness = (i64, i64);
+
+    /// Only the integer widths can overflow, and only integer division can divide by zero, but
+    /// fallibility is declared without input dtypes. The float widths are therefore covered by the
+    /// same `true`, which costs them nothing: a deferred error keeps the batch on the dense path.
+    const FALLIBLE: bool = true;
+
+    fn id(&self) -> ScalarFnId {
+        static ID: CachedId = CachedId::new("vortex.numeric_binary");
+        *ID
+    }
+
+    fn arg_name(&self, idx: usize) -> ChildName {
+        ChildName::from(["lhs", "rhs"][idx])
+    }
+
+    fn dispatch<V: RowVisitor>(
+        &self,
+        op: &Self::Options,
+        args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        let ptype = operand_ptype(args)?;
+
+        match_each_native_ptype!(ptype, |T| {
+            match op {
+                NumericOperator::Add => visit_checked::<T, CheckedAdd, V>(visitor),
+                NumericOperator::Sub => visit_checked::<T, CheckedSub, V>(visitor),
+                NumericOperator::Mul => visit_checked::<T, CheckedMul, V>(visitor),
+                NumericOperator::Div => visit_checked::<T, CheckedDiv, V>(visitor),
+            }
+        })
+    }
+}
+
+/// The width both operands are read at.
+///
+/// Only the left operand is inspected. `(T, T)` validates each argument against the chosen width,
+/// so a right operand of a different type is rejected by the visit rather than here.
+fn operand_ptype(args: &[DType]) -> VortexResult<PType> {
+    let lhs = args
+        .first()
+        .ok_or_else(|| vortex_err!("a numeric operator takes two operands, got none"))?;
+
+    PType::try_from(lhs)
+}
+
+/// Visit at two `T` columns, applying `Op` per row into the sink that defers its overflow bit.
+fn visit_checked<T, Op, V>(visitor: V) -> VortexResult<V::Out>
+where
+    T: NativePType,
+    Op: CheckedPrimitiveOp<T>,
+    V: RowVisitor,
+{
+    visitor.visit_prepared_into::<(T, T), CheckedSink<T, Op>, _, _>(
+        |_| (),
+        |&(), (lhs, rhs), output| output.write(lhs, rhs),
+    )
+}
+
+/// The output column of one checked arithmetic batch, reporting failure once after the row loop.
+///
+/// Deferring the failure is what keeps a fallible kernel on the dense path: every row writes a
+/// value unconditionally and contributes one bit, so the loop holds no branch and no `Result`
+/// discriminant. The lifting retries a nullable batch over only its valid rows if that bit is set,
+/// which is what makes an overflow behind a null row invisible.
+///
+/// Rows are written into uninitialized storage, so this sink cannot finish a batch whose rows were
+/// not all visited and leaves [`OutputSink::SUPPORTS_SKIPPED_ROWS`] at `false`. Nothing is lost:
+/// branch-and-skip only ever runs under [`NullHandling::Filter`], and a deferred-error kernel is
+/// dense.
+///
+/// [`NullHandling::Filter`]: crate::scalar_fn::NullHandling::Filter
+struct CheckedSink<T, Op> {
+    /// The result values, initialized one row at a time up to `row_count`.
+    values: BufferMut<T>,
+
+    /// The batch length, which is the capacity `values` was allocated with.
+    row_count: usize,
+
+    /// The operation applied to every row, which also names the error reported by
+    /// [`finish`](OutputSink::finish).
+    op: PhantomData<Op>,
+}
+
+/// The uninitialized output slots of a [`CheckedSink`], borrowed once for the row loop.
+struct CheckedRows<'a, T, Op> {
+    values: &'a mut [MaybeUninit<T>],
+    op: PhantomData<Op>,
+}
+
+/// One output slot of a [`CheckedSink`].
+struct CheckedRow<'a, T, Op> {
+    value: &'a mut MaybeUninit<T>,
+    op: PhantomData<Op>,
+}
+
+impl<T: NativePType, Op: CheckedPrimitiveOp<T>> CheckedRow<'_, T, Op> {
+    /// Apply `Op` to one row, writing its value and returning whether that row failed.
+    ///
+    /// The value is written whether or not the operation failed, since a failing row is either
+    /// masked away as null or turned into a batch error before it can be read.
+    fn write(self, lhs: T, rhs: T) -> DeferredError {
+        let (value, failed) = Op::apply(lhs, rhs);
+        self.value.write(value);
+
+        DeferredError::new(failed)
+    }
+}
+
+impl<T: NativePType, Op: CheckedPrimitiveOp<T>> OutputSink for CheckedSink<T, Op> {
+    const ERRORS_ARE_DEFERRED: bool = true;
+
+    type Rows<'a>
+        = CheckedRows<'a, T, Op>
+    where
+        Self: 'a;
+    type Row<'a>
+        = CheckedRow<'a, T, Op>
+    where
+        Self: 'a;
+
+    fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
+        Ok(DType::Primitive(T::PTYPE, Nullability::NonNullable))
+    }
+
+    fn with_capacity(rows: usize, _dtype: &DType) -> VortexResult<Self> {
+        Ok(Self {
+            values: BufferMut::with_capacity(rows),
+            row_count: rows,
+            op: PhantomData,
+        })
+    }
+
+    fn rows(&mut self) -> Self::Rows<'_> {
+        CheckedRows {
+            values: &mut self.values.spare_capacity_mut()[..self.row_count],
+            op: PhantomData,
+        }
+    }
+
+    fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
+        rows.values.len() == row_count
+    }
+
+    fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a> {
+        CheckedRow {
+            value: &mut rows.values[index],
+            op: PhantomData,
+        }
+    }
+
+    fn finish(mut self, error: DeferredError) -> VortexResult<ArrayRef> {
+        if error.occurred() {
+            return Err(vortex_err!(InvalidArgument: "{}", Op::ERROR));
+        }
+
+        // SAFETY: the sink reports `SUPPORTS_SKIPPED_ROWS = false`, so every path that reaches
+        // `finish` without an error has written all `row_count` slots: dense execution visits
+        // `0..row_count`, and the valid-row retry runs densely over a sink allocated for exactly
+        // the filtered rows.
+        unsafe { self.values.set_len(self.row_count) };
+
+        Ok(PrimitiveArray::new(self.values.freeze(), Validity::NonNullable).into_array())
+    }
+}

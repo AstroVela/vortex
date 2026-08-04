@@ -11,27 +11,25 @@ use vortex_error::VortexResult;
 ///
 /// Unlike [`VortexResult`], this never exits the loop. It is for kernels such as checked addition
 /// that can safely write a provisional value for every row and report any failure once at the end.
+///
+/// **The reduction is one byte wide on purpose.** It is OR-reduced once per row alongside the
+/// kernel's own arithmetic, so a wider accumulator caps how many rows a vector of the reduction
+/// covers, whatever the element width. Carrying the bit in an `i64` instead cost the primitive
+/// `Mul` kernel 3.1x at `i8`, 1.9x at `i16` and 1.2x at `i32`, and nothing at `i64` where the two
+/// widths already agree (`binary_ops`, 65536 rows, divan fastest of 100 samples, best of two runs,
+/// Apple M4 Max).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DeferredError(i64);
+pub struct DeferredError(bool);
 
 impl DeferredError {
     /// Record whether this row encountered an error.
     pub const fn new(failed: bool) -> Self {
-        Self(if failed { i64::MIN } else { 0 })
-    }
-
-    /// Record an error represented by the sign bit of `word`.
-    ///
-    /// This avoids materializing a per-row boolean when a checked operation already computes a
-    /// word whose sign bit means failure. Non-sign bits are ignored by [`occurred`](Self::occurred)
-    /// and may hold arbitrary values.
-    pub const fn from_sign_bit(word: i64) -> Self {
-        Self(word)
+        Self(failed)
     }
 
     /// Whether any row accumulated into this value failed.
     pub const fn occurred(self) -> bool {
-        self.0 < 0
+        self.0
     }
 }
 
@@ -90,11 +88,17 @@ mod tests {
     use super::DeferredError;
 
     #[test]
-    fn sign_bit_is_the_only_error_bit() {
-        let mut error = DeferredError::from_sign_bit(i64::MAX);
+    fn one_failing_row_is_enough() {
+        let mut error = DeferredError::default();
         assert!(!error.occurred());
 
-        error |= DeferredError::from_sign_bit(i64::MIN);
+        error |= DeferredError::new(false);
+        assert!(!error.occurred());
+
+        error |= DeferredError::new(true);
+        assert!(error.occurred());
+
+        error |= DeferredError::new(false);
         assert!(error.occurred());
     }
 }

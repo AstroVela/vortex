@@ -97,7 +97,7 @@ impl CheckedAddRow<'_> {
         let value = lhs.wrapping_add(rhs);
         let error = (lhs ^ value) & (rhs ^ value);
         self.value.write(value);
-        DeferredError::from_sign_bit(error)
+        DeferredError::new(error < 0)
     }
 }
 

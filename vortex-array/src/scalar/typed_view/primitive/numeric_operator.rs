@@ -5,12 +5,17 @@
 
 use std::fmt;
 
+use prost::Message;
 use vortex_error::VortexError;
+use vortex_error::VortexResult;
 use vortex_error::vortex_err;
+use vortex_proto::expr as pb;
+use vortex_session::VortexSession;
 
+use crate::scalar_fn::PersistableOptions;
 use crate::scalar_fn::fns::operators::Operator;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Binary element-wise operations.
 pub enum NumericOperator {
     /// Binary element-wise addition of two arrays or of two scalars.
@@ -53,5 +58,24 @@ impl TryFrom<Operator> for NumericOperator {
             Operator::Div => Ok(NumericOperator::Div),
             _ => Err(vortex_err!(InvalidArgument: "{op} is not a numeric operator")),
         }
+    }
+}
+
+/// A [`NumericOperator`] is the options type of the row function that executes the arithmetic
+/// operators of `vortex.binary`. That function is internal to this crate and never registered, so
+/// nothing serializes these options today. Encoding them as `vortex.binary` does keeps the two from
+/// drifting if the row function is ever exposed on its own.
+impl PersistableOptions for NumericOperator {
+    fn serialize(&self) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(
+            pb::BinaryOpts {
+                op: Operator::from(*self).into(),
+            }
+            .encode_to_vec(),
+        ))
+    }
+
+    fn deserialize(metadata: &[u8], _session: &VortexSession) -> VortexResult<Self> {
+        Self::try_from(Operator::try_from(pb::BinaryOpts::decode(metadata)?.op)?)
     }
 }
