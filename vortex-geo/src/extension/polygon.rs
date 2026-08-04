@@ -53,6 +53,7 @@ use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
+use super::validation::validate_list_geometry;
 
 /// A polygon: `geoarrow.polygon`, stored as `List<List<Struct<x, y[, z][, m]>>>` (rings of vertices).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -140,7 +141,7 @@ fn polygon_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Pol
         .map_err(|e| vortex_err!("failed to construct PolygonArray: {e}"))
 }
 
-/// A validated `Polygon` array (`try_from` checks the extension type).
+/// A typed view of a native `Polygon` extension array.
 pub struct PolygonData(ExtensionArray);
 
 impl TryFrom<ExtensionArray> for PolygonData {
@@ -294,6 +295,7 @@ impl ArrowImportVTable for Polygon {
         {
             return Ok(ArrowImport::Unsupported(array));
         }
+        validate_list_geometry(array.as_ref())?;
 
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(

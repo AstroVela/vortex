@@ -54,6 +54,7 @@ use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
+use super::validation::validate_list_geometry;
 
 /// A multipoint: `geoarrow.multipoint`, stored as `List<Struct<x, y[, z][, m]>>` (a set of points).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -138,7 +139,7 @@ fn multipoint_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<
         .map_err(|e| vortex_err!("failed to construct MultiPointArray: {e}"))
 }
 
-/// A validated `MultiPoint` array (`try_from` checks the extension type).
+/// A typed view of a native `MultiPoint` extension array.
 pub struct MultiPointData(ExtensionArray);
 
 impl TryFrom<ExtensionArray> for MultiPointData {
@@ -285,6 +286,7 @@ impl ArrowImportVTable for MultiPoint {
         {
             return Ok(ArrowImport::Unsupported(array));
         }
+        validate_list_geometry(array.as_ref())?;
 
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(

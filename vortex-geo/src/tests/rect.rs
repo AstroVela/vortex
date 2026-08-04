@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::Array;
+use arrow_array::StructArray as ArrowStructArray;
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::extension::ExtensionType as _;
@@ -107,6 +110,54 @@ fn roundtrips_through_arrow() -> VortexResult<()> {
     assert_eq!(corner(0, "ymax")?, 3.0);
     assert_eq!(corner(1, "xmin")?, -5.0);
     assert_eq!(corner(1, "ymax")?, 5.0);
+    Ok(())
+}
+
+/// Non-null boxes must contain finite, ordered X/Y bounds before entering native storage.
+#[test]
+fn rejects_invalid_box_values() -> VortexResult<()> {
+    let field = box_field("bbox", GeoArrowDimension::XY, false, Some("EPSG:4326"));
+    let invalid_boxes = [
+        (f64::NAN, 0.0, 1.0, 1.0),
+        (0.0, 0.0, f64::INFINITY, 1.0),
+        (2.0, 0.0, 1.0, 1.0),
+        (0.0, 2.0, 1.0, 1.0),
+    ];
+
+    for invalid_box in invalid_boxes {
+        let mut ctx = SESSION.create_execution_ctx();
+        let source = rect_column(vec![invalid_box])?;
+        let arrow = SESSION
+            .arrow()
+            .execute_arrow(source, Some(&field), &mut ctx)?;
+        assert!(SESSION.arrow().from_arrow_array(arrow, &field).is_err());
+    }
+    Ok(())
+}
+
+/// Bounds beneath a null box are unspecified and must not affect validation.
+#[test]
+fn ignores_invalid_bounds_under_null_box() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let field = box_field("bbox", GeoArrowDimension::XY, true, Some("EPSG:4326"));
+    let source = rect_column(vec![(f64::NAN, 2.0, 1.0, 1.0)])?;
+    let arrow = SESSION
+        .arrow()
+        .execute_arrow(source, Some(&field), &mut ctx)?;
+    let rects = arrow
+        .as_any()
+        .downcast_ref::<ArrowStructArray>()
+        .ok_or_else(|| vortex_err!("expected Arrow StructArray"))?;
+    let nullable = ArrowStructArray::try_new(
+        rects.fields().clone(),
+        rects.columns().to_vec(),
+        Some(NullBuffer::from(vec![false])),
+    )
+    .map_err(|error| vortex_err!("failed to build nullable Rect: {error}"))?;
+
+    SESSION
+        .arrow()
+        .from_arrow_array(Arc::new(nullable), &field)?;
     Ok(())
 }
 

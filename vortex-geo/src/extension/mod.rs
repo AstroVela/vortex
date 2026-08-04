@@ -9,6 +9,7 @@ mod multipolygon;
 mod point;
 mod polygon;
 mod rect;
+mod validation;
 mod wkb;
 
 use std::fmt::Display;
@@ -64,6 +65,9 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 pub use wkb::*;
+
+use self::validation::validate_list_geometry;
+use self::validation::validate_point;
 
 /// Whether `dtype` is one of the native geometry extension types the geo kernels operate on.
 pub(crate) fn is_native_geometry(dtype: &DType) -> bool {
@@ -218,10 +222,14 @@ pub fn native_geometry_scalar_from_wkb(bytes: &[u8]) -> VortexResult<Option<Scal
     .map_err(|e| vortex_err!("failed to read WKB literal: {e}"))?;
 
     // Cast the WKB value to `target`, import its native storage as a Vortex array.
-    let to_storage = |target: &GeoArrowType| -> VortexResult<ArrayRef> {
+    let to_storage = |target: &GeoArrowType,
+                      validate: fn(&dyn arrow_array::Array) -> VortexResult<()>|
+     -> VortexResult<ArrayRef> {
         let native =
             cast(&wkb, target).map_err(|e| vortex_err!("failed to cast WKB literal: {e}"))?;
-        ArrayRef::from_arrow(native.to_array_ref().as_ref(), false)
+        let arrow = native.to_array_ref();
+        validate(arrow.as_ref())?;
+        ArrayRef::from_arrow(arrow.as_ref(), false)
     };
 
     let scalar = match Wkb::try_from_bytes(bytes)?.geometry_type() {
@@ -229,39 +237,42 @@ pub fn native_geometry_scalar_from_wkb(bytes: &[u8]) -> VortexResult<Option<Scal
             let target = GeoArrowType::Point(
                 PointType::new(Dimension::XY, metadata).with_coord_type(CoordType::Separated),
             );
-            geo_ext_scalar(Point, to_storage(&target)?)?
+            geo_ext_scalar(Point, to_storage(&target, validate_point)?)?
         }
         GeometryType::LineString => {
             let target = GeoArrowType::LineString(
                 LineStringType::new(Dimension::XY, metadata).with_coord_type(CoordType::Separated),
             );
-            geo_ext_scalar(LineString, to_storage(&target)?)?
+            geo_ext_scalar(LineString, to_storage(&target, validate_list_geometry)?)?
         }
         GeometryType::Polygon => {
             let target = GeoArrowType::Polygon(
                 PolygonType::new(Dimension::XY, metadata).with_coord_type(CoordType::Separated),
             );
-            geo_ext_scalar(Polygon, to_storage(&target)?)?
+            geo_ext_scalar(Polygon, to_storage(&target, validate_list_geometry)?)?
         }
         GeometryType::MultiPoint => {
             let target = GeoArrowType::MultiPoint(
                 MultiPointType::new(Dimension::XY, metadata).with_coord_type(CoordType::Separated),
             );
-            geo_ext_scalar(MultiPoint, to_storage(&target)?)?
+            geo_ext_scalar(MultiPoint, to_storage(&target, validate_list_geometry)?)?
         }
         GeometryType::MultiLineString => {
             let target = GeoArrowType::MultiLineString(
                 MultiLineStringType::new(Dimension::XY, metadata)
                     .with_coord_type(CoordType::Separated),
             );
-            geo_ext_scalar(MultiLineString, to_storage(&target)?)?
+            geo_ext_scalar(
+                MultiLineString,
+                to_storage(&target, validate_list_geometry)?,
+            )?
         }
         GeometryType::MultiPolygon => {
             let target = GeoArrowType::MultiPolygon(
                 MultiPolygonType::new(Dimension::XY, metadata)
                     .with_coord_type(CoordType::Separated),
             );
-            geo_ext_scalar(MultiPolygon, to_storage(&target)?)?
+            geo_ext_scalar(MultiPolygon, to_storage(&target, validate_list_geometry)?)?
         }
         _ => return Ok(None),
     };
@@ -352,6 +363,26 @@ mod tests {
     use super::native_geometry_scalar_from_wkb;
     use crate::extension::GeoMetadata;
 
+    fn point_wkb(x: f64, y: f64) -> Vec<u8> {
+        let mut wkb = vec![1u8];
+        wkb.extend_from_slice(&1u32.to_le_bytes());
+        wkb.extend_from_slice(&x.to_le_bytes());
+        wkb.extend_from_slice(&y.to_le_bytes());
+        wkb
+    }
+
+    fn linestring_wkb(points: &[(f64, f64)]) -> VortexResult<Vec<u8>> {
+        let mut wkb = vec![1u8];
+        wkb.extend_from_slice(&2u32.to_le_bytes());
+        let len = u32::try_from(points.len()).map_err(|e| vortex_err!("{e}"))?;
+        wkb.extend_from_slice(&len.to_le_bytes());
+        for &(x, y) in points {
+            wkb.extend_from_slice(&x.to_le_bytes());
+            wkb.extend_from_slice(&y.to_le_bytes());
+        }
+        Ok(wkb)
+    }
+
     #[test]
     fn test_metadata() {
         let meta = GeoMetadata {
@@ -368,10 +399,7 @@ mod tests {
     /// A little-endian WKB `POINT` literal decodes to the native `Point` extension scalar.
     #[test]
     fn decodes_wkb_point_to_native() -> VortexResult<()> {
-        let mut wkb = vec![1u8]; // little-endian byte order
-        wkb.extend_from_slice(&1u32.to_le_bytes()); // geometry type: point
-        wkb.extend_from_slice(&1.0f64.to_le_bytes()); // x
-        wkb.extend_from_slice(&2.0f64.to_le_bytes()); // y
+        let wkb = point_wkb(1.0, 2.0);
 
         let scalar = native_geometry_scalar_from_wkb(&wkb)?.expect("a point scalar");
         let DType::Extension(ext) = scalar.dtype() else {
@@ -407,20 +435,33 @@ mod tests {
     #[test]
     fn decodes_wkb_linestring_to_native() -> VortexResult<()> {
         let points = [(0.0, 0.0), (1.0, 1.0)];
-        let mut wkb = vec![1u8]; // little-endian byte order
-        wkb.extend_from_slice(&2u32.to_le_bytes()); // geometry type: linestring
-        let len = u32::try_from(points.len()).map_err(|e| vortex_err!("{e}"))?;
-        wkb.extend_from_slice(&len.to_le_bytes());
-        for (x, y) in points {
-            wkb.extend_from_slice(&f64::to_le_bytes(x));
-            wkb.extend_from_slice(&f64::to_le_bytes(y));
-        }
+        let wkb = linestring_wkb(&points)?;
 
         let scalar = native_geometry_scalar_from_wkb(&wkb)?.expect("a linestring scalar");
         let DType::Extension(ext) = scalar.dtype() else {
             panic!("expected an extension dtype, got {}", scalar.dtype());
         };
         assert!(ext.is::<LineString>());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_empty_wkb_point_sentinel() -> VortexResult<()> {
+        let wkb = point_wkb(f64::NAN, f64::NAN);
+        assert!(native_geometry_scalar_from_wkb(&wkb)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_partial_nan_wkb_point() {
+        let wkb = point_wkb(f64::NAN, 5.0);
+        assert!(native_geometry_scalar_from_wkb(&wkb).is_err());
+    }
+
+    #[test]
+    fn rejects_nan_wkb_linestring_coordinate() -> VortexResult<()> {
+        let wkb = linestring_wkb(&[(0.0, 0.0), (f64::NAN, 1.0)])?;
+        assert!(native_geometry_scalar_from_wkb(&wkb).is_err());
         Ok(())
     }
 

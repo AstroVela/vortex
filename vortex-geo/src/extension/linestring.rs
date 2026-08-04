@@ -53,6 +53,7 @@ use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
+use super::validation::validate_list_geometry;
 
 /// A line string: `geoarrow.linestring`, stored as `List<Struct<x, y[, z][, m]>>` (an ordered path
 /// of vertices).
@@ -140,7 +141,7 @@ fn linestring_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<
         .map_err(|e| vortex_err!("failed to construct LineStringArray: {e}"))
 }
 
-/// A validated `LineString` array (`try_from` checks the extension type).
+/// A typed view of a native `LineString` extension array.
 pub struct LineStringData(ExtensionArray);
 
 impl TryFrom<ExtensionArray> for LineStringData {
@@ -290,6 +291,7 @@ impl ArrowImportVTable for LineString {
         {
             return Ok(ArrowImport::Unsupported(array));
         }
+        validate_list_geometry(array.as_ref())?;
 
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(

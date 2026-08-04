@@ -10,6 +10,7 @@ use arrow_array::Float64Array;
 use arrow_array::StructArray as ArrowStructArray;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Fields;
@@ -34,28 +35,51 @@ use crate::test_harness::point_column;
 
 /// A `geoarrow.point` Arrow field with separated (struct) XY coordinates.
 fn point_field(name: &str, nullable: bool, crs: Option<&str>) -> Field {
+    point_field_with_dimension(name, nullable, crs, GeoArrowDimension::XY)
+}
+
+/// A `geoarrow.point` Arrow field with separated coordinates in the requested dimension.
+fn point_field_with_dimension(
+    name: &str,
+    nullable: bool,
+    crs: Option<&str>,
+    dimension: GeoArrowDimension,
+) -> Field {
     let crs = crs
         .map(|crs| Crs::from_unknown_crs_type(crs.to_string()))
         .unwrap_or_default();
     let metadata = Arc::new(Metadata::new(crs, None));
-    PointType::new(GeoArrowDimension::XY, metadata).to_field(name, nullable)
+    PointType::new(dimension, metadata).to_field(name, nullable)
 }
 
 /// An Arrow `Struct<x, y>` point array with non-nullable `Float64` children.
 fn arrow_point_struct(xs: Vec<f64>, ys: Vec<f64>) -> ArrowStructArray {
-    let fields: Fields = vec![
-        Field::new("x", DataType::Float64, false),
-        Field::new("y", DataType::Float64, false),
-    ]
-    .into();
-    ArrowStructArray::new(
-        fields,
-        vec![
-            Arc::new(Float64Array::from(xs)) as ArrowArrayRef,
-            Arc::new(Float64Array::from(ys)),
-        ],
-        None,
-    )
+    arrow_point_struct_with_ordinates([("x", xs), ("y", ys)])
+}
+
+/// An Arrow `Struct<x, y, z>` Point array with non-nullable `Float64` children.
+fn arrow_point_struct_xyz(xs: Vec<f64>, ys: Vec<f64>, zs: Vec<f64>) -> ArrowStructArray {
+    arrow_point_struct_with_ordinates([("x", xs), ("y", ys), ("z", zs)])
+}
+
+/// An Arrow `Struct<x, y, m>` Point array with non-nullable `Float64` children.
+fn arrow_point_struct_xym(xs: Vec<f64>, ys: Vec<f64>, ms: Vec<f64>) -> ArrowStructArray {
+    arrow_point_struct_with_ordinates([("x", xs), ("y", ys), ("m", ms)])
+}
+
+fn arrow_point_struct_with_ordinates<const N: usize>(
+    ordinates: [(&str, Vec<f64>); N],
+) -> ArrowStructArray {
+    let fields: Fields = ordinates
+        .iter()
+        .map(|(name, _)| Field::new(*name, DataType::Float64, false))
+        .collect::<Vec<_>>()
+        .into();
+    let columns = ordinates
+        .into_iter()
+        .map(|(_, values)| Arc::new(Float64Array::from(values)) as ArrowArrayRef)
+        .collect();
+    ArrowStructArray::new(fields, columns, None)
 }
 
 /// The exported Arrow field carries the `geoarrow.point` extension over the separated
@@ -158,6 +182,85 @@ fn imports_from_struct() -> VortexResult<()> {
         coordinate_from_scalar(&imported.execute_scalar(1, &mut ctx)?)?,
         Coordinate::xy(-111.7610, 34.8697)
     );
+    Ok(())
+}
+
+/// GeoArrow's all-NaN Point sentinel is an empty Point and remains importable.
+#[test]
+fn imports_empty_point_sentinel() -> VortexResult<()> {
+    let arrow: ArrowArrayRef = Arc::new(arrow_point_struct(vec![f64::NAN], vec![f64::NAN]));
+    let field = point_field("loc", false, Some("EPSG:4326"));
+
+    SESSION.arrow().from_arrow_array(arrow, &field)?;
+    Ok(())
+}
+
+/// A Point with only one non-finite XY ordinate is malformed, not GeoArrow's empty-Point
+/// sentinel, and is rejected before it enters native Vortex storage.
+#[test]
+fn rejects_partial_nan_point() {
+    let arrow: ArrowArrayRef = Arc::new(arrow_point_struct(vec![f64::NAN], vec![5.0]));
+    let field = point_field("loc", false, Some("EPSG:4326"));
+    assert!(SESSION.arrow().from_arrow_array(arrow, &field).is_err());
+}
+
+/// Child values of a null Point row are unspecified and must not be validated.
+#[test]
+fn ignores_invalid_point_under_null_row() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let field = point_field("loc", true, Some("EPSG:4326"));
+    let source = point_column(vec![f64::NAN, 1.0], vec![0.0, 2.0])?;
+    let arrow = SESSION
+        .arrow()
+        .execute_arrow(source, Some(&field), &mut ctx)?;
+    let points = arrow.as_struct();
+    let nullable = ArrowStructArray::try_new(
+        points.fields().clone(),
+        points.columns().to_vec(),
+        Some(NullBuffer::from(vec![false, true])),
+    )
+    .map_err(|error| vortex_err!("failed to build nullable points: {error}"))?;
+
+    SESSION
+        .arrow()
+        .from_arrow_array(Arc::new(nullable), &field)?;
+    Ok(())
+}
+
+/// A higher-dimensional Point is empty only when every ordinate is NaN. A NaN Z value on a
+/// finite XY coordinate remains an attribute value, because native geometry validity is 2-D.
+#[test]
+fn xyz_empty_point_uses_every_ordinate() -> VortexResult<()> {
+    let field = point_field_with_dimension("loc", false, Some("EPSG:4326"), GeoArrowDimension::XYZ);
+
+    let empty: ArrowArrayRef = Arc::new(arrow_point_struct_xyz(
+        vec![f64::NAN],
+        vec![f64::NAN],
+        vec![f64::NAN],
+    ));
+    SESSION.arrow().from_arrow_array(empty, &field)?;
+
+    let partial: ArrowArrayRef = Arc::new(arrow_point_struct_xyz(
+        vec![f64::NAN],
+        vec![f64::NAN],
+        vec![1.0],
+    ));
+    assert!(SESSION.arrow().from_arrow_array(partial, &field).is_err());
+
+    let finite_xy: ArrowArrayRef =
+        Arc::new(arrow_point_struct_xyz(vec![1.0], vec![2.0], vec![f64::NAN]));
+    SESSION.arrow().from_arrow_array(finite_xy, &field)?;
+    Ok(())
+}
+
+/// M is carried as an attribute ordinate, so a NaN M value does not invalidate finite XY.
+#[test]
+fn xym_point_keeps_nan_measure() -> VortexResult<()> {
+    let field = point_field_with_dimension("loc", false, Some("EPSG:4326"), GeoArrowDimension::XYM);
+    let point: ArrowArrayRef =
+        Arc::new(arrow_point_struct_xym(vec![1.0], vec![2.0], vec![f64::NAN]));
+
+    SESSION.arrow().from_arrow_array(point, &field)?;
     Ok(())
 }
 

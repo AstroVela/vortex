@@ -35,6 +35,7 @@ wkb = { workspace = true }
 _test-harness = []
 
 [dev-dependencies]
+arrow-buffer = { workspace = true }
 divan = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
@@ -47,6 +48,10 @@ harness = false
 
 [[bench]]
 name = "predicate_bbox"
+harness = false
+
+[[bench]]
+name = "coordinate_validation"
 harness = false
 
 [lints]

@@ -53,6 +53,7 @@ use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
+use super::validation::validate_list_geometry;
 
 /// A multipolygon (`geoarrow.multipolygon`); a single `Polygon` is a one-element multipolygon.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -148,7 +149,7 @@ fn multipolygon_array(
         .map_err(|e| vortex_err!("failed to construct MultiPolygonArray: {e}"))
 }
 
-/// A validated `MultiPolygon` array (`try_from` checks the extension type).
+/// A typed view of a native `MultiPolygon` extension array.
 pub struct MultiPolygonData(ExtensionArray);
 
 impl TryFrom<ExtensionArray> for MultiPolygonData {
@@ -302,6 +303,7 @@ impl ArrowImportVTable for MultiPolygon {
         {
             return Ok(ArrowImport::Unsupported(array));
         }
+        validate_list_geometry(array.as_ref())?;
 
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(

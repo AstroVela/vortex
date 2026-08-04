@@ -53,6 +53,7 @@ use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
+use super::validation::validate_point;
 
 /// A single location: `geoarrow.point`, stored as `Struct<x, y[, z][, m]>` of non-nullable `f64`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -275,6 +276,7 @@ impl ArrowImportVTable for Point {
         {
             return Ok(ArrowImport::Unsupported(array));
         }
+        validate_point(array.as_ref())?;
 
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(

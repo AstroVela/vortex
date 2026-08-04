@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::Array;
+use arrow_array::ListArray as ArrowListArray;
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::extension::ExtensionType as _;
@@ -13,6 +16,7 @@ use geoarrow::datatypes::Crs;
 use geoarrow::datatypes::Dimension as GeoArrowDimension;
 use geoarrow::datatypes::LineStringType;
 use geoarrow::datatypes::Metadata;
+use vortex_array::VortexSessionExecute;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_arrow::ArrowSessionExt;
@@ -20,6 +24,7 @@ use vortex_error::VortexResult;
 
 use super::SESSION;
 use crate::extension::LineString;
+use crate::test_harness::linestring_column;
 
 /// A `geoarrow.linestring` Arrow field with separated (struct) XY coordinates.
 fn linestring_field(name: &str, nullable: bool, crs: Option<&str>) -> Field {
@@ -84,5 +89,68 @@ fn export_field_carries_extension() -> VortexResult<()> {
         "expected List storage, got {}",
         field.data_type()
     );
+    Ok(())
+}
+
+/// A NaN coordinate in a non-Point geometry is invalid rather than an empty-geometry sentinel.
+#[test]
+fn rejects_non_finite_coordinate() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let field = linestring_field("geom", false, Some("EPSG:4326"));
+    let source = linestring_column(vec![vec![(0.0, 0.0), (f64::NAN, 1.0)]])?;
+    let arrow = SESSION
+        .arrow()
+        .execute_arrow(source, Some(&field), &mut ctx)?;
+
+    assert!(SESSION.arrow().from_arrow_array(arrow, &field).is_err());
+    Ok(())
+}
+
+/// Coordinates outside an Arrow slice are not part of the imported geometry.
+#[test]
+fn ignores_non_finite_coordinates_outside_slice() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let field = linestring_field("geom", false, Some("EPSG:4326"));
+    let source = linestring_column(vec![
+        vec![(f64::NAN, 0.0)],
+        vec![(1.0, 2.0), (3.0, 4.0)],
+        vec![(5.0, f64::NAN)],
+    ])?;
+    let arrow = SESSION
+        .arrow()
+        .execute_arrow(source, Some(&field), &mut ctx)?
+        .slice(1, 1);
+
+    SESSION.arrow().from_arrow_array(arrow, &field)?;
+    Ok(())
+}
+
+/// Child values of a null geometry row are unspecified and must not be validated.
+#[test]
+fn ignores_non_finite_coordinates_under_null_row() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let field = linestring_field("geom", true, Some("EPSG:4326"));
+    let source = linestring_column(vec![vec![(f64::NAN, 0.0)], vec![(1.0, 2.0)]])?;
+    let arrow = SESSION
+        .arrow()
+        .execute_arrow(source, Some(&field), &mut ctx)?;
+    let lists = arrow
+        .as_any()
+        .downcast_ref::<ArrowListArray>()
+        .ok_or_else(|| vortex_error::vortex_err!("expected Arrow ListArray"))?;
+    let DataType::List(element) = lists.data_type() else {
+        vortex_error::vortex_bail!("expected Arrow ListArray")
+    };
+    let nullable = ArrowListArray::try_new(
+        Arc::clone(element),
+        lists.offsets().clone(),
+        Arc::clone(lists.values()),
+        Some(NullBuffer::from(vec![false, true])),
+    )
+    .map_err(|error| vortex_error::vortex_err!("failed to build nullable list: {error}"))?;
+
+    SESSION
+        .arrow()
+        .from_arrow_array(Arc::new(nullable), &field)?;
     Ok(())
 }

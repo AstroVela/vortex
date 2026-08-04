@@ -55,6 +55,7 @@ use super::GeoMetadata;
 use super::coordinate::Dimension;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
+use super::validation::validate_rect;
 
 /// An axis-aligned bounding box (`geoarrow.box`), stored as `Struct<xmin, ymin[, ..], xmax, ymax[, ..]>`.
 // Named `Rect`, not `Box`: matches `geo::Rect` / geoarrow-rs `RectArray`, and `Box` is a std name.
@@ -303,6 +304,7 @@ impl ArrowImportVTable for Rect {
             return Ok(ArrowImport::Unsupported(array));
         }
 
+        validate_rect(array.as_ref())?;
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(
             ExtensionArray::try_new(ext_dtype.clone(), storage)?.into_array(),

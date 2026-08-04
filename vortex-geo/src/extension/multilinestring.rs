@@ -54,6 +54,7 @@ use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
+use super::validation::validate_list_geometry;
 
 /// A multilinestring: `geoarrow.multilinestring`, stored as `List<List<Struct<x, y[, z][, m]>>>`
 /// (line strings of vertices).
@@ -147,7 +148,7 @@ fn multilinestring_array(
         .map_err(|e| vortex_err!("failed to construct MultiLineStringArray: {e}"))
 }
 
-/// A validated `MultiLineString` array (`try_from` checks the extension type).
+/// A typed view of a native `MultiLineString` extension array.
 pub struct MultiLineStringData(ExtensionArray);
 
 impl TryFrom<ExtensionArray> for MultiLineStringData {
@@ -300,6 +301,7 @@ impl ArrowImportVTable for MultiLineString {
         {
             return Ok(ArrowImport::Unsupported(array));
         }
+        validate_list_geometry(array.as_ref())?;
 
         let storage = ArrayRef::from_arrow(array.as_ref(), field.is_nullable())?;
         Ok(ArrowImport::Imported(

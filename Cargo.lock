@@ -10067,6 +10067,7 @@ name = "vortex-geo"
 version = "0.1.0"
 dependencies = [
  "arrow-array 58.4.0",
+ "arrow-buffer 58.4.0",
  "arrow-schema 58.4.0",
  "codspeed-divan-compat",
  "geo",
