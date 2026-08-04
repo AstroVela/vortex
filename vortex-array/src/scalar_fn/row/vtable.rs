@@ -46,8 +46,8 @@ use crate::scalar_fn::row::lift::reconcile_return;
 
 /// Compile-time check that a dispatched `(A, S, R)` agrees with `F`'s witness and fallibility. The
 /// framework reads the arity (which the expression layer
-/// uses), dense-safety, and declared fallibility _without_ input dtypes and therefore before
-/// dispatching. Evaluated by monomorphizing
+/// uses), dense-safety, decode fallibility, and declared fallibility _without_ input dtypes and
+/// therefore before dispatching. Evaluated by monomorphizing
 /// [`visit_prepared_into`](RowVisitor::visit_prepared_into), so even a dispatch arm that never runs
 /// is checked.
 ///
@@ -63,6 +63,14 @@ const fn assert_witness_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: Sink
         A::DENSE_SAFE == <F::ArgsWitness as ElementTuple>::DENSE_SAFE,
         "dispatch visited an argument that differs from ArgsWitness in whether it is readable \
          behind a null row",
+    );
+    // A disagreement here would leave `is_fallible` reading `false` off the witness while the
+    // dispatched decode can fail on legal data, and dictionary pushdown treats an infallible
+    // function as safe to evaluate over values no code references.
+    assert!(
+        A::DECODE_FALLIBLE == <F::ArgsWitness as ElementTuple>::DECODE_FALLIBLE,
+        "dispatch visited an argument that differs from ArgsWitness in whether its decode can \
+         fail on legal data",
     );
     assert!(
         A::DECODE_SHRINKS_WHEN_FILTERED

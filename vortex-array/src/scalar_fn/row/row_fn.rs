@@ -62,6 +62,81 @@ use crate::scalar_fn::SinkResult;
 /// let _ = ScalarFnVTable::return_dtype(&Lie, &EmptyOptions, &[dtype]);
 /// ```
 ///
+/// The same check pins whether decoding can fail, which is what keeps
+/// [`is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible) honest: dictionary pushdown
+/// evaluates an infallible function over values that no code references, so a parse hidden behind
+/// an infallible witness would fail a query it should not. Here the witness promises
+/// [`BytesLen`](crate::scalar_fn::BytesLen), whose decode reads a length out of a view, while the
+/// dispatch visits an element that parses every row.
+///
+/// ```compile_fail
+/// # use vortex_array::ArrayRef;
+/// # use vortex_array::ExecutionCtx;
+/// # use vortex_array::arrays::VarBinViewArray;
+/// # use vortex_array::dtype::{DType, Nullability};
+/// # use vortex_array::scalar_fn::*;
+/// # use vortex_error::VortexResult;
+/// # use vortex_session::registry::CachedId;
+/// struct Parsed;
+/// impl InputElement for Parsed {
+///     type Column = VarBinViewArray;
+///     type Varying<'a> = &'a VarBinViewArray;
+///     type Elem<'a> = usize;
+///
+///     const DENSE_SAFE: bool = true;
+///     const DECODE_FALLIBLE: bool = true;
+///
+///     fn validate(_dtype: &DType) -> VortexResult<()> {
+///         Ok(())
+///     }
+///     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+///         array.execute::<VarBinViewArray>(ctx)
+///     }
+///     fn get(column: &Self::Column, index: usize) -> usize {
+///         column.views()[index].len() as usize
+///     }
+///     fn varying(column: &Self::Column) -> Self::Varying<'_> {
+///         column
+///     }
+///     fn varying_len(column: &Self::Varying<'_>) -> usize {
+///         column.len()
+///     }
+///     fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> usize
+///     where
+///         Self: 'a,
+///     {
+///         Self::get(column, index)
+///     }
+/// }
+///
+/// #[derive(Clone)]
+/// struct HidesAParse;
+/// impl RowFn for HidesAParse {
+///     type Options = EmptyOptions;
+///     type ArgsWitness = (BytesLen,);
+///     fn id(&self) -> ScalarFnId {
+///         static ID: CachedId = CachedId::new("example.hides_a_parse");
+///         *ID
+///     }
+///     fn arg_name(&self, _idx: usize) -> ChildName {
+///         ChildName::from("input")
+///     }
+///     fn dispatch<V: RowVisitor>(
+///         &self,
+///         _options: &Self::Options,
+///         _args: &[DType],
+///         visitor: V,
+///     ) -> VortexResult<V::Out> {
+///         visitor.visit_prepared_into::<(Parsed,), ElementSink<u64>, _, _>(
+///             |_| (),
+///             |&(), (len,), output| output.write(len as u64),
+///         )
+///     }
+/// }
+/// let dtype = DType::Utf8(Nullability::NonNullable);
+/// let _ = ScalarFnVTable::return_dtype(&HidesAParse, &EmptyOptions, &[dtype]);
+/// ```
+///
 /// A function whose kernel is columnar rather than row-at-a-time (negating a whole bit buffer, a
 /// zero-copy unwrap) is not a `RowFn`, and implements
 /// [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable) directly.
@@ -72,9 +147,10 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
 
     /// Any one argument tuple [`dispatch`](Self::dispatch) can choose.
     ///
-    /// The framework reads the arity, and whether every argument is readable behind a null row, off
-    /// this witness before dispatching. A dispatch that visits at a tuple disagreeing with it on
-    /// either does not compile.
+    /// The framework reads four things off this witness before dispatching: the arity, whether
+    /// every argument is readable behind a null row, whether any argument's decode can fail on
+    /// legal data, and whether any argument's decode shrinks when the inputs are filtered first. A
+    /// dispatch that visits at a tuple disagreeing with it on any of them does not compile.
     ///
     /// **Why a witness exists at all**, rather than the framework asking `dispatch`:
     /// [`arity`](crate::scalar_fn::ScalarFnVTable::arity) and
