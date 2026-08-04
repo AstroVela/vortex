@@ -32,9 +32,15 @@ vortex-session = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
+hegeltest = { workspace = true }
 rand = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { path = "../../vortex-array", features = ["_test-harness"] }
+
+[[test]]
+name = "props"
+# Property tests cover the multi-part paths, which the write gate only permits here.
+required-features = ["unstable_encodings"]
 
 [[bench]]
 name = "decimal_assemble"
