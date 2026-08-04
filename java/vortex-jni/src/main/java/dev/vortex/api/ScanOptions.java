@@ -24,6 +24,13 @@ public interface ScanOptions {
     /** Projection expression. If empty, all columns are returned. */
     Optional<Expression> projection();
 
+    /**
+     * Aggregation to evaluate inside the scan. When set, each partition returns a single row of that partition's
+     * aggregates instead of the projected rows, and {@link #projection()} must be empty because the plan reads only the
+     * columns its aggregates need. See {@link AggregatePlan}.
+     */
+    Optional<AggregatePlan> aggregates();
+
     /** Filter expression applied before returning rows. */
     Optional<Expression> filter();
 
@@ -55,6 +62,13 @@ public interface ScanOptions {
     @Value.Default
     default boolean ordered() {
         return false;
+    }
+
+    @Value.Check
+    default void validateAggregates() {
+        if (aggregates().isPresent() && projection().isPresent()) {
+            throw new IllegalArgumentException("aggregate pushdown and projection are mutually exclusive");
+        }
     }
 
     @Value.Check

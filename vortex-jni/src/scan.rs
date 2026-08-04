@@ -9,8 +9,12 @@
 //!    of the scan stream. Returns `0` when exhausted.
 //! 3. `Java_dev_vortex_jni_NativePartition_scanArrow` → consumes a partition into an
 //!    `FFI_ArrowArrayStream` that Java imports via Arrow's C Data Interface.
+//!
+//! A scan created with an aggregate plan (see [`crate::aggregate`]) keeps the same lifecycle, but
+//! each partition yields a single row of that partition's partial aggregates.
 
 use std::io::Cursor;
+use std::iter;
 use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
@@ -43,34 +47,50 @@ use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
+use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 
 use crate::POOL;
 use crate::RUNTIME;
+use crate::aggregate::AggregatePlan;
+use crate::aggregate::NativeAggregate;
 use crate::data_source::NativeDataSource;
 use crate::errors::try_or_throw;
 use crate::session::session_ref;
+
+/// A pushed-down aggregation attached to a scan.
+///
+/// Every partition of such a scan produces a single row of partial aggregates instead of the
+/// projected rows; see [`crate::aggregate`].
+#[derive(Clone)]
+pub(crate) struct AggregateScan {
+    plan: Arc<AggregatePlan>,
+    /// Whether `Partition::row_count()` counts exactly the rows the partition returns, which
+    /// holds only when the scan applies no filter, row range, row selection, or limit. A
+    /// `count(*)`-only plan can then be answered from partition metadata alone.
+    exact_row_count: bool,
+}
 
 /// Opaque scan handle. Holds a three-state machine: either the scan is pending (not yet
 /// realized as a stream), actively streaming partitions, or finished.
 #[allow(dead_code)]
 pub(crate) enum NativeScan {
-    Pending(Box<dyn DataSourceScan>),
-    Started(PartitionStream),
+    Pending(Box<dyn DataSourceScan>, Option<AggregateScan>),
+    Started(PartitionStream, Option<AggregateScan>),
     Finished,
 }
 
 /// Opaque partition handle with the same three-state machine shape.
 #[allow(dead_code)]
 pub(crate) enum NativePartition {
-    Pending(PartitionRef),
+    Pending(PartitionRef, Option<AggregateScan>),
     Started(SendableArrayStream),
     Finished,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_scan_request(
-    projection_ptr: jlong,
+    projection: Expression,
     filter_ptr: jlong,
     row_range_begin: jlong,
     row_range_end: jlong,
@@ -80,12 +100,6 @@ fn build_scan_request(
     limit: jlong,
     ordered: jboolean,
 ) -> VortexResult<ScanRequest> {
-    let projection = if projection_ptr == 0 {
-        root()
-    } else {
-        unsafe { &*(projection_ptr as *const Expression) }.clone()
-    };
-
     let filter = if filter_ptr == 0 {
         None
     } else {
@@ -128,6 +142,10 @@ fn deserialize_roaring_selection(bytes: &[u8]) -> VortexResult<roaring::RoaringT
     Ok(roaring::RoaringTreemap::deserialize_from(cursor)?)
 }
 
+/// Create a scan over a data source.
+///
+/// When `aggregate_ptr` is non-zero it points at an aggregate plan (see [`crate::aggregate`]),
+/// which replaces the projection: every partition then yields a single row of partial aggregates.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
@@ -143,6 +161,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
     selection_include: jni::sys::jbyte,
     limit: jlong,
     ordered: jboolean,
+    aggregate_ptr: jlong,
 ) -> jlong {
     try_or_throw(&mut env, |env| {
         let ds = unsafe { NativeDataSource::from_ptr(data_source_ptr) };
@@ -169,8 +188,23 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
             env.convert_byte_array(&selection_roaring_bitmap)?
         };
 
+        let aggregate = (aggregate_ptr != 0)
+            .then(|| Arc::clone(unsafe { NativeAggregate::from_ptr(aggregate_ptr) }.inner()));
+
+        let projection = match &aggregate {
+            // The plan reads only the columns its aggregates need.
+            Some(plan) => {
+                if projection_ptr != 0 {
+                    throw_runtime!("aggregate pushdown and projection are mutually exclusive");
+                }
+                plan.projection().clone()
+            }
+            None if projection_ptr == 0 => root(),
+            None => unsafe { &*(projection_ptr as *const Expression) }.clone(),
+        };
+
         let request = build_scan_request(
-            projection_ptr,
+            projection,
             filter_ptr,
             row_range_begin,
             row_range_end,
@@ -181,8 +215,16 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_create(
             ordered,
         )?;
 
+        let aggregate = aggregate.map(|plan| AggregateScan {
+            plan,
+            exact_row_count: request.filter.is_none()
+                && request.limit.is_none()
+                && request.row_range.is_none()
+                && matches!(request.selection, Selection::All),
+        });
+
         let scan = RUNTIME.block_on(async { ds.inner().scan(request).await })?;
-        Ok(Box::into_raw(Box::new(NativeScan::Pending(scan))) as jlong)
+        Ok(Box::into_raw(Box::new(NativeScan::Pending(scan, aggregate))) as jlong)
     })
 }
 
@@ -198,7 +240,8 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_free(
     drop(unsafe { Box::from_raw(pointer as *mut NativeScan) });
 }
 
-/// Write the scan's DType as an Arrow schema to the FFI struct at `schema_addr`.
+/// Write the scan's DType as an Arrow schema to the FFI struct at `schema_addr`. For an
+/// aggregate scan this is the plan's output schema, not the projected columns.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vortex_jni_NativeScan_arrowSchema(
     mut env: EnvUnowned,
@@ -213,10 +256,14 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_arrowSchema(
         }
         let session = unsafe { session_ref(session_ptr) };
         let scan = unsafe { &*(pointer as *const NativeScan) };
-        let NativeScan::Pending(scan) = scan else {
+        let NativeScan::Pending(scan, aggregate) = scan else {
             throw_runtime!("schema unavailable: scan already started");
         };
-        let arrow_schema = session.arrow().to_arrow_schema(scan.dtype())?;
+        let dtype = match aggregate {
+            Some(aggregate) => aggregate.plan.output_dtype(),
+            None => scan.dtype(),
+        };
+        let arrow_schema = session.arrow().to_arrow_schema(dtype)?;
         let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
         unsafe {
             ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
@@ -235,7 +282,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_partitionCount(
 ) {
     try_or_throw(&mut env, |env| {
         let scan = unsafe { &*(pointer as *const NativeScan) };
-        let NativeScan::Pending(scan) = scan else {
+        let NativeScan::Pending(scan, _) = scan else {
             throw_runtime!("partition count unavailable: scan already started");
         };
         let (rows, cardinality) = match scan.partition_count() {
@@ -265,17 +312,20 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_nextPartition(
         // only rewrite it on the happy path where we want to keep streaming.
         ptr::write(slot, NativeScan::Finished);
 
-        let mut stream = match owned {
-            NativeScan::Pending(scan) => scan.partitions(),
-            NativeScan::Started(stream) => stream,
+        let (mut stream, aggregate) = match owned {
+            NativeScan::Pending(scan, aggregate) => (scan.partitions(), aggregate),
+            NativeScan::Started(stream, aggregate) => (stream, aggregate),
             NativeScan::Finished => return Ok(0),
         };
 
         match RUNTIME.block_on(stream.next()) {
             Some(partition) => {
                 let partition = partition?;
-                let handle = Box::into_raw(Box::new(NativePartition::Pending(partition))) as jlong;
-                ptr::write(slot, NativeScan::Started(stream));
+                let handle = Box::into_raw(Box::new(NativePartition::Pending(
+                    partition,
+                    aggregate.clone(),
+                ))) as jlong;
+                ptr::write(slot, NativeScan::Started(stream, aggregate));
                 Ok(handle)
             }
             None => Ok(0),
@@ -305,7 +355,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_rowCount(
 ) {
     try_or_throw(&mut env, |env| {
         let partition = unsafe { &*(pointer as *const NativePartition) };
-        let NativePartition::Pending(partition) = partition else {
+        let NativePartition::Pending(partition, _) = partition else {
             throw_runtime!("row count unavailable: partition already started");
         };
         let (rows, cardinality) = match partition.row_count() {
@@ -320,6 +370,9 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_rowCount(
 
 /// Consume a partition into the `FFI_ArrowArrayStream` pointed to by `stream_addr`. The
 /// partition pointer is invalidated by this call; Java must not `free` it afterwards.
+///
+/// A partition of an aggregate scan yields a single batch of one row, holding that partition's
+/// partial aggregates.
 ///
 /// Ownership of `partition_ptr` is unconditionally transferred into this function — it
 /// is boxed up front so that any subsequent error still drops the partition.
@@ -340,15 +393,24 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_scanArrow(
             throw_runtime!("null arrow stream address");
         }
 
-        let partition = match partition {
-            NativePartition::Pending(p) => p,
+        let (partition, aggregate) = match partition {
+            NativePartition::Pending(p, aggregate) => (p, aggregate),
             _ => throw_runtime!("partition already consumed"),
         };
+
+        let session = unsafe { session_ref(session_ptr) };
+
+        if let Some(aggregate) = aggregate {
+            let arrow_stream = aggregate_stream(partition, &aggregate, session)?;
+            unsafe {
+                ptr::write(stream_addr as *mut FFI_ArrowArrayStream, arrow_stream);
+            }
+            return Ok(());
+        }
 
         let array_stream = partition.execute()?;
         let dtype = array_stream.dtype().clone();
 
-        let session = unsafe { session_ref(session_ptr) };
         let schema = Arc::new(session.arrow().to_arrow_schema(&dtype)?);
         let target = Arc::new(Field::new_struct("", schema.fields().clone(), false));
 
@@ -382,4 +444,36 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_scanArrow(
         }
         Ok(())
     });
+}
+
+/// Compute a partition's partial aggregates as a single-batch Arrow stream.
+///
+/// Unlike a regular partition read this is eager: the partition is drained here rather than as
+/// Java pulls batches, because the aggregates are only defined once every row has been seen.
+fn aggregate_stream(
+    partition: PartitionRef,
+    aggregate: &AggregateScan,
+    session: &VortexSession,
+) -> VortexResult<FFI_ArrowArrayStream> {
+    let plan = &aggregate.plan;
+
+    // A `count(*)` over a scan that returns every row is already recorded in the partition's
+    // metadata, so answer it without reading any data at all.
+    let row = match partition.row_count() {
+        Precision::Exact(rows) if plan.is_row_count_only() && aggregate.exact_row_count => {
+            plan.row_count_only_result(rows)?
+        }
+        _ => plan.aggregate(partition.execute()?, session)?,
+    };
+
+    let schema = Arc::new(session.arrow().to_arrow_schema(plan.output_dtype())?);
+    let target = Field::new_struct("", schema.fields().clone(), false);
+    let mut ctx = session.create_execution_ctx();
+    let arrow = session
+        .arrow()
+        .execute_arrow(row, Some(&target), &mut ctx)?;
+    let batch = RecordBatch::from(arrow.as_struct().clone());
+
+    let reader = RecordBatchIteratorAdapter::new(iter::once(Ok(batch)), schema);
+    Ok(FFI_ArrowArrayStream::new(Box::new(reader)))
 }

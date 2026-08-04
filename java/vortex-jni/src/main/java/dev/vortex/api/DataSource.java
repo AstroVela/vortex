@@ -117,6 +117,14 @@ public final class DataSource {
         return new DataSource(session, pointer);
     }
 
+    long nativePointer() {
+        return pointer;
+    }
+
+    Session session() {
+        return session;
+    }
+
     /** Arrow schema of the data source (and of scans produced from it). */
     public Schema arrowSchema(BufferAllocator allocator) {
         try (ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
@@ -225,10 +233,17 @@ public final class DataSource {
         }
     }
 
-    /** Submit a scan. */
+    /**
+     * Submit a scan.
+     *
+     * <p>When {@link ScanOptions#aggregates()} is set, every partition of the returned scan yields a single row of that
+     * partition's aggregates instead of the projected rows; see {@link AggregatePlan}.
+     */
     public Scan scan(ScanOptions options) {
         Objects.requireNonNull(options, "options");
 
+        long aggregatePtr =
+                options.aggregates().map(AggregatePlan::nativePointer).orElse(0L);
         long projectionPtr = options.projection().map(Expression::nativePointer).orElse(0L);
         long filterPtr = options.filter().map(Expression::nativePointer).orElse(0L);
         long begin = options.rowRangeBegin().orElse(0L);
@@ -249,7 +264,8 @@ public final class DataSource {
                 selectionRoaringBitmap,
                 selectionMode.code(),
                 limit,
-                ordered);
+                ordered,
+                aggregatePtr);
         return Scan.fromPointer(session, scanPtr);
     }
 

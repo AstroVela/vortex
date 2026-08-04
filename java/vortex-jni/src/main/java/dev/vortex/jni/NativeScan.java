@@ -27,6 +27,9 @@ public final class NativeScan {
      *     {@code selectionRoaringBitmap})
      * @param limit max rows to return, or {@code 0} for "no limit"
      * @param ordered true to preserve row order across partitions
+     * @param aggregatePointer pointer from {@link NativeAggregate#plan}, or 0 for "no aggregate pushdown". When set it
+     *     supplies the projection, so {@code projectionPointer} must be 0, and every partition yields a single row of
+     *     partial aggregates.
      */
     public static native long create(
             long dataSourcePointer,
@@ -38,7 +41,8 @@ public final class NativeScan {
             byte[] selectionRoaringBitmap,
             byte selectionInclude,
             long limit,
-            boolean ordered);
+            boolean ordered,
+            long aggregatePointer);
 
     /** Free a scan pointer. */
     public static native void free(long pointer);
