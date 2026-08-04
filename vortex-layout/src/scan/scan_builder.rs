@@ -39,6 +39,7 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
+use crate::layouts::row_idx::RowIdx;
 use crate::layouts::row_idx::RowIdxLayoutReader;
 use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
@@ -273,14 +274,24 @@ impl<A: 'static + Send> ScanBuilder<A> {
         // conjunction splitting if a filter is provided.
         let mut layout_reader = self.layout_reader;
 
-        // Enrich the layout reader to support RowIdx expressions.
+        // Enrich the layout reader to support RowIdx expressions, but only when the scan actually
+        // references `#row_idx`. The wrapper partitions every expression on each layout operation
+        // (pruning, splits, reads), which is pure overhead when nothing uses the row index — a
+        // significant per-scan cost when scanning many small files. `RowIdxLayoutReader` otherwise
+        // delegates dtype/row_count/register_splits straight to the child, so skipping it when
+        // unused is transparent.
+        //
         // Note that this is applied below the filter layout reader since it can perform
         // better over individual conjunctions.
-        layout_reader = Arc::new(RowIdxLayoutReader::new(
-            self.row_offset,
-            layout_reader,
-            self.session.clone(),
-        ));
+        if references_row_idx(&self.projection)
+            || self.filter.as_ref().is_some_and(references_row_idx)
+        {
+            layout_reader = Arc::new(RowIdxLayoutReader::new(
+                self.row_offset,
+                layout_reader,
+                self.session.clone(),
+            ));
+        }
 
         // Normalize and simplify the expressions.
         let projection = self.projection.optimize_recursive(layout_reader.dtype())?;
@@ -429,6 +440,11 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
             }
         }
     }
+}
+
+/// Returns true if the expression tree references the row index (`#row_idx`) anywhere.
+fn references_row_idx(expr: &Expression) -> bool {
+    expr.is::<RowIdx>() || expr.children().iter().any(references_row_idx)
 }
 
 /// Compute masks of field paths referenced by the projection and filter in the scan.
@@ -895,5 +911,18 @@ mod test {
         assert_eq!(values.as_ref(), [1, 2]);
 
         Ok(())
+    }
+
+    #[test]
+    fn references_row_idx_detects() {
+        use crate::layouts::row_idx::row_idx;
+
+        // Bare and nested references are found — these must still wrap in a RowIdxLayoutReader.
+        assert!(super::references_row_idx(&row_idx()));
+        assert!(super::references_row_idx(&eq(row_idx(), lit(3u64))));
+
+        // Expressions without the row index are not misdetected, so the wrapper is skipped.
+        assert!(!super::references_row_idx(&root()));
+        assert!(!super::references_row_idx(&eq(root(), lit(1i32))));
     }
 }
