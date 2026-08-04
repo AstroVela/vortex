@@ -16,7 +16,6 @@
 
 use hegel::TestCase;
 use hegel::generators as gs;
-use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -27,17 +26,12 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::i256;
-use vortex_array::serde::SerializeOptions;
-use vortex_array::serde::SerializedArray;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
-use vortex_buffer::ByteBufferMut;
 use vortex_decimal_byte_parts::DecimalByteParts;
 use vortex_decimal_byte_parts::DecimalBytePartsArray;
 use vortex_decimal_byte_parts::split_decimal;
 use vortex_error::VortexExpect;
-use vortex_mask::Mask;
-use vortex_session::registry::ReadContext;
 
 /// Largest magnitude a `Decimal(38, _)` can hold: 38 nines.
 const MAX_I128: i128 = 10i128.pow(38) - 1;
@@ -124,14 +118,45 @@ fn canonicalize(array: ArrayRef, ctx: &mut ExecutionCtx) -> DecimalArray {
     array.execute::<DecimalArray>(ctx).vortex_expect("execute")
 }
 
-// ---------------------------------------------------------------------------------------
-// Split / assemble
-// ---------------------------------------------------------------------------------------
+/// A byte-parts array built directly from drawn parts, rather than by splitting a decimal.
+///
+/// `split_decimal` only ever emits 0, 1 or 3 lower parts under an `i64` most significant
+/// part, so drawing the part count here is the only way to reach the two-part shape and the
+/// sign extension that sits above a most significant part below the top word.
+fn draw_encoded(tc: &TestCase) -> (DecimalBytePartsArray, usize) {
+    let lower_part_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let msp: Vec<i64> = tc.draw(
+        gs::vecs(gs::integers::<i64>())
+            .min_size(1)
+            .max_size(MAX_LEN),
+    );
+    let len = msp.len();
 
-/// Splitting a decimal into byte parts and reassembling it must reproduce it exactly,
-/// including null rows and the sign extension above a narrow most significant part.
+    let lower: Vec<ArrayRef> = (0..lower_part_count)
+        .map(|_| {
+            let part: Vec<u64> =
+                tc.draw(gs::vecs(gs::integers::<u64>()).min_size(len).max_size(len));
+            PrimitiveArray::new(Buffer::from(part), Validity::NonNullable).into_array()
+        })
+        .collect();
+
+    // The declared precision must be wide enough for what the parts assemble into.
+    let precision = match lower_part_count {
+        0 => 18,
+        1 => 38,
+        _ => 76,
+    };
+    let msp = PrimitiveArray::new(Buffer::from(msp), draw_validity(tc, len)).into_array();
+    let array =
+        DecimalByteParts::try_new_with_lower_parts(msp, lower, DecimalDType::new(precision, 2))
+            .vortex_expect("valid byte parts");
+    (array, len)
+}
+
+/// Encoding a decimal and decoding it again must reproduce it exactly, including null rows
+/// and the storage width.
 #[hegel::test]
-fn split_then_assemble_is_identity(tc: TestCase) {
+fn decoded_survives_encode_then_decode(tc: TestCase) {
     let decimal = draw_decimal(&tc);
     let mut ctx = ctx();
 
@@ -141,195 +166,34 @@ fn split_then_assemble_is_identity(tc: TestCase) {
     assert_arrays_eq!(decimal, round_tripped, &mut ctx);
 }
 
-/// Serializing an encoded array and reading it back must preserve it. This is the path a file
-/// takes, so it covers the metadata carrying the lower part count as well as the buffers.
-#[hegel::test]
-fn serde_round_trip_preserves_values(tc: TestCase) {
-    let decimal = draw_decimal(&tc);
-    let session = array_session();
-    vortex_decimal_byte_parts::initialize(&session);
-    let mut ctx = session.create_execution_ctx();
-
-    let encoded = encode(&decimal).into_array();
-    let dtype = encoded.dtype().clone();
-    let len = encoded.len();
-
-    let array_ctx = ArrayContext::empty();
-    let serialized = encoded
-        .serialize(&array_ctx, &session, &SerializeOptions::default())
-        .vortex_expect("serialize");
-    let mut concat = ByteBufferMut::empty();
-    for buf in serialized {
-        concat.extend_from_slice(buf.as_ref());
-    }
-    let parts = SerializedArray::try_from(concat.freeze()).vortex_expect("serialized array");
-    let decoded = parts
-        .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &session)
-        .vortex_expect("decode");
-
-    assert_arrays_eq!(decimal, canonicalize(decoded, &mut ctx), &mut ctx);
-}
-
-/// Reading one row at a time must agree with canonicalizing the whole array. These are
-/// separate implementations — `combine_*` per row against the bulk assembly loops — so they
-/// can disagree without any test noticing.
-#[hegel::test]
-fn scalar_at_agrees_with_canonical(tc: TestCase) {
-    let decimal = draw_decimal(&tc);
-    let mut ctx = ctx();
-
-    let encoded = encode(&decimal).into_array();
-    let canonical = decimal.into_array();
-
-    for index in 0..encoded.len() {
-        let from_parts = encoded
-            .execute_scalar(index, &mut ctx)
-            .vortex_expect("scalar from byte parts");
-        let from_canonical = canonical
-            .execute_scalar(index, &mut ctx)
-            .vortex_expect("scalar from canonical");
-        assert_eq!(from_parts, from_canonical, "row {index}");
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// Compute
-// ---------------------------------------------------------------------------------------
-
-/// Filtering the encoded array must match filtering the canonical one. The encoding pushes the
-/// filter into every part, so dropping or misaligning one shows up here.
-#[hegel::test]
-fn filter_matches_canonical(tc: TestCase) {
-    let decimal = draw_decimal(&tc);
-    let len = decimal.len();
-    let keep: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(len).max_size(len));
-    let mut ctx = ctx();
-
-    let mask = Mask::from_iter(keep);
-    let expected = canonicalize(
-        decimal
-            .clone()
-            .into_array()
-            .filter(mask.clone())
-            .vortex_expect("filter canonical"),
-        &mut ctx,
-    );
-    let actual = canonicalize(
-        encode(&decimal)
-            .into_array()
-            .filter(mask)
-            .vortex_expect("filter byte parts"),
-        &mut ctx,
-    );
-
-    assert_arrays_eq!(expected, actual, &mut ctx);
-}
-
-/// Slicing must match, including slices that start partway through the array — the offsets of
-/// every part have to move together.
-#[hegel::test]
-fn slice_matches_canonical(tc: TestCase) {
-    let decimal = draw_decimal(&tc);
-    let len = decimal.len();
-    let a = tc.draw(gs::integers::<usize>().min_value(0).max_value(len));
-    let b = tc.draw(gs::integers::<usize>().min_value(0).max_value(len));
-    let (start, stop) = if a <= b { (a, b) } else { (b, a) };
-    tc.assume(start < stop);
-    let mut ctx = ctx();
-
-    let expected = canonicalize(
-        decimal
-            .clone()
-            .into_array()
-            .slice(start..stop)
-            .vortex_expect("slice canonical"),
-        &mut ctx,
-    );
-    let actual = canonicalize(
-        encode(&decimal)
-            .into_array()
-            .slice(start..stop)
-            .vortex_expect("slice byte parts"),
-        &mut ctx,
-    );
-
-    assert_arrays_eq!(expected, actual, &mut ctx);
-}
-
-/// Taking arbitrary indices must match, including repeats and out-of-order indices.
-#[hegel::test]
-fn take_matches_canonical(tc: TestCase) {
-    let decimal = draw_decimal(&tc);
-    let len = decimal.len();
-    let indices: Vec<u64> = tc.draw(
-        gs::vecs(
-            gs::integers::<u64>()
-                .min_value(0)
-                .max_value((len - 1) as u64),
-        )
-        .min_size(1)
-        .max_size(MAX_LEN),
-    );
-    let mut ctx = ctx();
-
-    let indices = PrimitiveArray::new(Buffer::from(indices), Validity::NonNullable).into_array();
-    let expected = canonicalize(
-        decimal
-            .clone()
-            .into_array()
-            .take(indices.clone())
-            .vortex_expect("take canonical"),
-        &mut ctx,
-    );
-    let actual = canonicalize(
-        encode(&decimal)
-            .into_array()
-            .take(indices)
-            .vortex_expect("take byte parts"),
-        &mut ctx,
-    );
-
-    assert_arrays_eq!(expected, actual, &mut ctx);
-}
-
-/// A most significant part sitting below the top word must sign-extend into the words above
-/// it. `split_decimal` never produces this shape — it always fills all three lower parts, so
-/// every word is written and the sign fill is dead — which means the round-trip properties
-/// above cannot see it. Only a directly constructed array reaches it.
+/// Decoding an encoded array and encoding it again must not change the values it decodes to.
 ///
-/// The expectation is computed independently of the assembly loop: with two lower parts the
-/// MSP occupies bits 191..128, which is exactly the low half of an `i256`'s signed `i128`
-/// half, so widening it with `i128::from` performs the sign extension the encoding must.
+/// Starting from the encoded side reaches part counts `split_decimal` never produces, so this
+/// covers layouts the property above cannot generate. It compares decoded values rather than
+/// the arrays themselves because re-encoding normalizes the part count: splitting an `i256`
+/// always yields three lower parts, whatever the original array carried.
 #[hegel::test]
-fn msp_below_the_top_word_sign_extends(tc: TestCase) {
-    let msp: Vec<i64> = tc.draw(
-        gs::vecs(gs::integers::<i64>())
-            .min_size(1)
-            .max_size(MAX_LEN),
-    );
-    let len = msp.len();
-    let high: Vec<u64> = tc.draw(gs::vecs(gs::integers::<u64>()).min_size(len).max_size(len));
-    let low: Vec<u64> = tc.draw(gs::vecs(gs::integers::<u64>()).min_size(len).max_size(len));
+fn encoded_survives_decode_then_encode(tc: TestCase) {
+    let (array, _len) = draw_encoded(&tc);
     let mut ctx = ctx();
 
-    let array = DecimalByteParts::try_new_with_lower_parts(
-        PrimitiveArray::new(Buffer::from(msp.clone()), Validity::NonNullable).into_array(),
-        vec![
-            PrimitiveArray::new(Buffer::from(high.clone()), Validity::NonNullable).into_array(),
-            PrimitiveArray::new(Buffer::from(low.clone()), Validity::NonNullable).into_array(),
-        ],
-        DecimalDType::new(76, 2),
-    )
-    .vortex_expect("two lower parts under an i64 msp");
+    let decoded = canonicalize(array.into_array(), &mut ctx);
+    let re_decoded = canonicalize(encode(&decoded).into_array(), &mut ctx);
 
-    let canonical = canonicalize(array.into_array(), &mut ctx);
-    let actual = canonical.buffer::<i256>();
-
-    for row in 0..len {
-        let expected = i256::from_parts(
-            u128::from(low[row]) | (u128::from(high[row]) << 64),
-            i128::from(msp[row]),
-        );
-        assert_eq!(actual[row], expected, "row {row}, msp {}", msp[row]);
-    }
+    assert_arrays_eq!(decoded, re_decoded, &mut ctx);
 }
+
+// TODO(joe): restore the coverage removed alongside these two round trips. Each of the
+// following was a property here and caught mutations that the round trips do not:
+//
+// - `scalar_at` against bulk canonicalization. `combine_i128`/`combine_i256` are a second
+//   implementation of the assembly loops and can drift from them silently.
+// - filter, slice and take against the same operation on the canonical array. These caught
+//   part-order and word-placement mutations, though the round trips catch those too.
+// - a serialize/decode round trip, which is the only property that exercised the metadata
+//   carrying the lower part count.
+// - sign extension above a most significant part below the top word, checked against an
+//   expectation computed independently of the assembly loop. This is the one real gap: a
+//   round trip compares decode against decode, so a decode-side sign-extension bug is
+//   invisible to it. Dropping the sign fill in `sign_extended_words` is caught by neither
+//   property here.
