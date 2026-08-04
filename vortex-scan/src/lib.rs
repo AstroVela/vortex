@@ -207,13 +207,4 @@ pub trait Partition: 'static + Send {
     /// operations should be spawned onto the runtime to enable parallel execution across
     /// threads.
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream>;
-
-    /// Subdivides this partition along its natural split boundaries, so a larger unit of work
-    /// (e.g. a whole file) can be handed out to several workers instead of being pinned to one.
-    ///
-    /// Returns `Ok(None)` when the partition does not subdivide (a single split, or not
-    /// supported), in which case the caller should keep the original partition.
-    fn split_partitions(&self) -> VortexResult<Option<Vec<PartitionRef>>> {
-        Ok(None)
-    }
 }

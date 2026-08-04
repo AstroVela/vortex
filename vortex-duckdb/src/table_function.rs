@@ -328,18 +328,13 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
     let scan = RUNTIME.block_on(bind_data.data_source.scan(request))?;
 
     // Materialize the scan's partitions once (this only opens footers; the heavy I/O and decoding
-    // stay lazy inside `execute`), then expand each into its natural splits. Each split is handed
-    // out to exactly one worker, which drives it on the shared runtime — no producer/channel funnel.
-    let files: Vec<PartitionRef> = RUNTIME.block_on(scan.partitions().try_collect())?;
-    let mut splits = Vec::with_capacity(files.len());
-    for file in files {
-        match file.split_partitions()? {
-            Some(file_splits) => splits.extend(file_splits),
-            None => splits.push(file),
-        }
-    }
-    let pending = AtomicU64::new(splits.len() as u64);
-    let queue = Arc::new(Mutex::new(VecDeque::from(splits)));
+    // stay lazy inside `execute`). Each partition is handed out to exactly one worker, which drives
+    // it on the shared runtime — no producer/channel funnel. We keep whole partitions rather than
+    // splitting them further, so each is prepared (expression optimization, split computation) once
+    // when its owner executes it, not once per split.
+    let partitions: Vec<PartitionRef> = RUNTIME.block_on(scan.partitions().try_collect())?;
+    let pending = AtomicU64::new(partitions.len() as u64);
+    let queue = Arc::new(Mutex::new(VecDeque::from(partitions)));
 
     let aggregates = bind_data.aggregates.clone();
     let partials = build_partials(&aggregates, &bind_data.column_fields)?;
