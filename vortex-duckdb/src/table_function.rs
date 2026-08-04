@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cmp::max;
-use std::collections::VecDeque;
 use std::fmt::Formatter;
 use std::fmt::{self};
 use std::sync::Arc;
@@ -12,7 +11,6 @@ use std::sync::atomic::Ordering;
 
 use custom_labels::CURRENT_LABELSET;
 use futures::StreamExt;
-use futures::TryStreamExt;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
 use parking_lot::Mutex;
@@ -37,6 +35,7 @@ use vortex::expr::stats::Precision;
 use vortex::file::v2::FileStatsLayoutReader;
 use vortex::io::runtime::BlockingRuntime as _;
 use vortex::io::runtime::current::CurrentThreadIterator;
+use vortex::io::runtime::current::ThreadSafeIterator;
 use vortex::layout::scan::multi::MultiLayoutChild;
 use vortex::layout::scan::multi::MultiLayoutDataSource;
 use vortex::metrics::tracing::get_global_labels;
@@ -127,58 +126,62 @@ impl<'a> TableInitInput<'a> {
 
 type ScanItem = VortexResult<(ArrayRef, Arc<ConversionCache>)>;
 
-/// A shared queue of scan splits, each claimed by exactly one worker.
-type SplitQueue = Arc<Mutex<VecDeque<PartitionRef>>>;
+/// A shared, lazily-driven iterator over the scan's partitions (one per file).
+///
+/// Every worker holds a clone. Pulling the next partition co-drives the shared runtime, so
+/// partition generation (footer open + pruning) happens on demand and overlaps with the decode
+/// work other workers are doing — rather than being front-loaded serially in `init_global`.
+type PartitionIterator = ThreadSafeIterator<VortexResult<PartitionRef>>;
 
-/// Per-worker split-scan state: claims splits from the shared queue and drives each one on the
-/// global runtime, co-driven by every worker that calls into it.
+/// Per-worker scan state: claims a whole partition, then drives and decodes it on the shared
+/// runtime before claiming the next.
 ///
-/// This is the whole scan model — both the regular and the pushed-down-aggregate scan pull from
-/// it, so there is no per-array channel funnelling workers through one producer. The claim/drive
-/// split also mirrors what a DuckDB `MultiFileReaderInterface` would need: [`claim_next`] is the
-/// `TryInitializeScan` unit (grab one split) and draining the current split is the per-worker
-/// `Scan`. Keeping the runtime shared (rather than giving each worker its own executor) is what
-/// lets a split's I/O tasks — and the file's segment source driver — make progress: they live on
-/// the global runtime, and every worker's `block_on` drives it.
-///
-/// [`claim_next`]: SplitScan::claim_next
+/// Claiming is at partition granularity (cheap, roughly one per file), so workers are not
+/// funnelled through a per-array channel — each decodes its partition's arrays independently, and
+/// a partition is prepared (expression optimization, split computation) once by its owner. The
+/// claim/drive shape is also what a DuckDB `MultiFileReaderInterface` needs: claiming a partition
+/// is the per-file `TryInitializeScan`, draining it is the per-worker `Scan`. Keeping the runtime
+/// shared (rather than a per-worker executor) is what lets a partition's I/O tasks and the file's
+/// segment source driver make progress — they live on the shared runtime that every `block_on`
+/// drives.
 struct SplitScan {
-    queue: SplitQueue,
+    partitions: PartitionIterator,
     current: Option<CurrentThreadIterator<'static, ScanItem>>,
 }
 
 impl SplitScan {
-    fn new(queue: SplitQueue) -> Self {
+    fn new(partitions: PartitionIterator) -> Self {
         Self {
-            queue,
+            partitions,
             current: None,
         }
     }
 
-    /// Claim the next split and start driving it. Returns `false` once the queue is drained.
+    /// Claim the next partition and start driving it. Returns `false` once none remain.
     fn claim_next(&mut self) -> VortexResult<bool> {
-        let Some(split) = self.queue.lock().pop_front() else {
+        let Some(partition) = self.partitions.next() else {
             self.current = None;
             return Ok(false);
         };
+        let partition = partition?;
         let cache = Arc::new(ConversionCache {
-            file_index: split.index(),
+            file_index: partition.index(),
             ..Default::default()
         });
-        let stream = split
+        let stream = partition
             .execute()?
             .map(move |item| item.map(|array| (array, Arc::clone(&cache))));
         self.current = Some(RUNTIME.block_on_stream(stream));
         Ok(true)
     }
 
-    /// Pull the next array from the current split, or `None` when it is exhausted.
+    /// Pull the next array from the current partition, or `None` when it is exhausted.
     fn current_next(&mut self) -> Option<ScanItem> {
         self.current.as_mut().and_then(Iterator::next)
     }
 
-    /// Pull the next array, transparently claiming further splits as each one drains. Returns
-    /// `None` only once the shared queue is fully drained.
+    /// Pull the next array, transparently claiming further partitions as each one drains. Returns
+    /// `None` only once every partition has been consumed.
     fn next_item(&mut self) -> Option<ScanItem> {
         loop {
             if let Some(item) = self.current_next() {
@@ -194,18 +197,21 @@ impl SplitScan {
 }
 
 pub struct TableFunctionGlobal {
-    queue: SplitQueue,
+    partitions: PartitionIterator,
     batch_id: AtomicU64,
     bytes_total: Arc<AtomicU64>,
     bytes_read: AtomicU64,
     file_index_column_pos: Option<usize>,
     file_row_number_column_pos: Option<usize>,
 
-    // Following 4 fields are used only in aggregate scans.
-    /// Splits not yet fully drained. Initialized to the total split count; each worker decrements
-    /// it as it finishes a split. When it reaches 0 every split's arrays are in `partials`, so the
-    /// first worker to observe 0 (via CAS to `u64::MAX`) writes the single aggregate output row.
-    pending: AtomicU64,
+    // Following fields are used only in aggregate scans.
+    /// Partitions currently claimed-and-not-yet-finished across all workers. A worker bumps it
+    /// while it holds a partition and looks for more; when it settles to 0 with the partition
+    /// iterator drained, every partition's arrays are in `partials`.
+    active: AtomicU64,
+    /// Finalization gate: 0 until some worker observes the scan is complete and swaps it to
+    /// `u64::MAX`, so exactly one worker writes the single aggregate output row.
+    finalized: AtomicU64,
     aggregates: Vec<ColumnAggregate>,
     // Accumulated partials
     partials: Mutex<Vec<Box<dyn DynAccumulator>>>,
@@ -327,26 +333,25 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
 
     let scan = RUNTIME.block_on(bind_data.data_source.scan(request))?;
 
-    // Materialize the scan's partitions once (this only opens footers; the heavy I/O and decoding
-    // stay lazy inside `execute`). Each partition is handed out to exactly one worker, which drives
-    // it on the shared runtime — no producer/channel funnel. We keep whole partitions rather than
-    // splitting them further, so each is prepared (expression optimization, split computation) once
-    // when its owner executes it, not once per split.
-    let partitions: Vec<PartitionRef> = RUNTIME.block_on(scan.partitions().try_collect())?;
-    let pending = AtomicU64::new(partitions.len() as u64);
-    let queue = Arc::new(Mutex::new(VecDeque::from(partitions)));
+    // Drive the partitions lazily through a shared iterator instead of collecting them up front:
+    // pulling a partition opens its footer and prunes it on demand, co-driven by whichever worker
+    // pulls, so partition generation overlaps with decode rather than serializing in `init_global`.
+    // Each partition is handed to one worker, which prepares (expression optimization, split
+    // computation) and decodes it once — no per-array channel funnel.
+    let partitions = RUNTIME.block_on_stream_thread_safe(|_handle| scan.partitions());
 
     let aggregates = bind_data.aggregates.clone();
     let partials = build_partials(&aggregates, &bind_data.column_fields)?;
 
     Ok(TableFunctionGlobal {
-        queue,
+        partitions,
         batch_id: AtomicU64::new(0),
         bytes_total: Arc::new(AtomicU64::new(0)),
         bytes_read: AtomicU64::new(0),
         file_index_column_pos,
         file_row_number_column_pos,
-        pending,
+        active: AtomicU64::new(0),
+        finalized: AtomicU64::new(0),
         aggregates,
         partials: Mutex::new(partials),
         row_count: AtomicU64::new(0),
@@ -397,7 +402,7 @@ pub fn init_local(
         .vortex_expect("local state aggregate initialization failed");
 
     TableFunctionLocal {
-        scan: SplitScan::new(Arc::clone(&global.queue)),
+        scan: SplitScan::new(global.partitions.clone()),
         exporter: None,
         partition_index: 0,
         file_index: 0,
@@ -471,22 +476,26 @@ fn scan_aggregate(
             continue;
         }
 
-        // The current split (if any) is fully drained and its arrays are in `partials`; account
-        // for it before looking for more work.
+        // The current partition (if any) is fully drained and its arrays are in `partials`. Bump
+        // `active` for the claim we're about to attempt before releasing the finished partition, so
+        // the count never dips to 0 between two partitions the same worker handles (which would let
+        // another worker finalize early).
+        global_state.active.fetch_add(1, Ordering::AcqRel);
         if local_state.scan.current.take().is_some() {
-            global_state.pending.fetch_sub(1, Ordering::Release);
+            global_state.active.fetch_sub(1, Ordering::Release);
         }
-
         if local_state.scan.claim_next()? {
             continue;
         }
+        global_state.active.fetch_sub(1, Ordering::Release);
 
-        // No more splits for this worker. The first worker to observe every split finished
-        // (pending == 0, swapped to u64::MAX so exactly one wins) writes the aggregate output row.
-        if global_state
-            .pending
-            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
+        // No more partitions for this worker. Once every partition is finished (`active` back to 0)
+        // the first worker to swap `finalized` writes the single aggregate output row.
+        if global_state.active.load(Ordering::Acquire) != 0
+            || global_state
+                .finalized
+                .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
         {
             return Ok(());
         }
