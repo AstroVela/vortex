@@ -58,12 +58,17 @@ use vortex_array::dtype::extension::ExtDType;
 use vortex_array::dtype::extension::ExtVTable;
 use vortex_array::scalar::Scalar;
 use vortex_arrow::FromArrowArray;
+use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_mask::Mask;
 pub use wkb::*;
+
+use crate::extension::coordinate::box_corners;
+use crate::extension::coordinate::ordinates;
 
 /// Whether `dtype` is one of the native geometry extension types the geo kernels operate on.
 pub(crate) fn is_native_geometry(dtype: &DType) -> bool {
@@ -157,6 +162,37 @@ pub(crate) fn flatten_row_offsets(
         level = list.elements().clone();
     }
     Ok((row_offsets, level.execute::<StructArray>(ctx)?))
+}
+
+/// Visit the XY bounds of every non-empty row in native coordinate storage.
+///
+/// The callback receives the row index and `[xmin, ymin, xmax, ymax]`. The returned mask marks
+/// exactly the rows that own at least one coordinate. Callers combine it with the geometry
+/// validity: a null row can still have placeholder coordinates in its storage, while an empty
+/// (but valid) row owns none.
+///
+/// This walks the nested list parents once to attribute leaf coordinates to their outer geometry
+/// row. It deliberately does not materialize a `geoarrow.box` array, so scalar kernels can
+/// consume each row's bounds directly.
+pub(crate) fn for_each_row_coordinate_bounds(
+    storage: ArrayRef,
+    ctx: &mut ExecutionCtx,
+    mut visit: impl FnMut(usize, [f64; 4]),
+) -> VortexResult<Mask> {
+    let len = storage.len();
+    let (row_offsets, coords) = flatten_row_offsets(storage, ctx)?;
+    let xs = ordinates(&coords, "x", ctx)?;
+    let ys = ordinates(&coords, "y", ctx)?;
+
+    let non_empty = Mask::from(BitBuffer::collect_bool(len, |row| {
+        row_offsets[row] < row_offsets[row + 1]
+    }));
+    for (row, (&start, &end)) in row_offsets.iter().zip(&row_offsets[1..]).enumerate() {
+        if start != end {
+            visit(row, box_corners(&xs[start..end], &ys[start..end]));
+        }
+    }
+    Ok(non_empty)
 }
 
 /// Decode a native geometry column to `geo_types`. A non-geometry operand is an error.

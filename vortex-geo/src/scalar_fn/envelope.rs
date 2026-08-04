@@ -27,11 +27,9 @@ use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_array::validity::Validity;
-use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -40,9 +38,7 @@ use crate::extension::Rect;
 use crate::extension::box_field_names;
 use crate::extension::box_storage_dtype;
 use crate::extension::coordinate::Dimension;
-use crate::extension::coordinate::box_corners;
-use crate::extension::coordinate::ordinates;
-use crate::extension::flatten_row_offsets;
+use crate::extension::for_each_row_coordinate_bounds;
 use crate::extension::validate_geometry_operands;
 
 /// `envelope`: the axis-aligned bounding box of each geometry in a native geometry operand (a column
@@ -78,16 +74,6 @@ fn output_box_dtype() -> VortexResult<ExtDType<Rect>> {
 fn row_boxes(storage: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<(Vec<ArrayRef>, Validity)> {
     let len = storage.len();
     let valid = storage.validity()?.execute_mask(len, ctx)?;
-    let (row_offsets, coords) = flatten_row_offsets(storage, ctx)?;
-
-    // A row has a box iff it is valid and owns at least one coordinate (an empty geometry has
-    // no box). Two masks combined word-at-a-time: folding `valid` into the closure instead —
-    // per-index or via `Mask::iter` — benches 6-33% slower end-to-end.
-    let non_empty = Mask::from(BitBuffer::collect_bool(len, |r| {
-        row_offsets[r] < row_offsets[r + 1]
-    }));
-    let xs = ordinates(&coords, "x", ctx)?;
-    let ys = ordinates(&coords, "y", ctx)?;
 
     // The output's four corner columns.
     let mut xmins = BufferMut::zeroed(len);
@@ -95,13 +81,13 @@ fn row_boxes(storage: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<(Vec<Arr
     let mut xmaxs = BufferMut::zeroed(len);
     let mut ymaxs = BufferMut::zeroed(len);
 
-    for (r, (&start, &end)) in row_offsets.iter().zip(&row_offsets[1..]).enumerate() {
-        let [xmin, ymin, xmax, ymax] = box_corners(&xs[start..end], &ys[start..end]);
-        xmins[r] = xmin;
-        ymins[r] = ymin;
-        xmaxs[r] = xmax;
-        ymaxs[r] = ymax;
-    }
+    let non_empty =
+        for_each_row_coordinate_bounds(storage, ctx, |row, [xmin, ymin, xmax, ymax]| {
+            xmins[row] = xmin;
+            ymins[row] = ymin;
+            xmaxs[row] = xmax;
+            ymaxs[row] = ymax;
+        })?;
 
     Ok((
         vec![
