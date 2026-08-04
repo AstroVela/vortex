@@ -530,6 +530,42 @@ impl Partition for MultiLayoutPartition {
             dtype, stream,
         )))
     }
+
+    fn split_partitions(&self) -> VortexResult<Option<Vec<PartitionRef>>> {
+        // Ask a ScanBuilder — configured exactly as `execute` would — for the row ranges of its
+        // natural splits, so the boundaries (and their field-mask computation) match what the scan
+        // uses internally. Each range then becomes a partition a distinct worker can claim.
+        let mut builder = ScanBuilder::new(self.session.clone(), Arc::clone(&self.reader))
+            .with_selection(self.request.selection.clone())
+            .with_projection(self.request.projection.clone())
+            .with_some_filter(self.request.filter.clone())
+            .with_some_limit(self.request.limit)
+            .with_ordered(self.request.ordered);
+        if let Some(row_range) = self.request.row_range.clone() {
+            builder = builder.with_row_range(row_range);
+        }
+
+        let ranges = builder.split_ranges()?;
+        if ranges.len() <= 1 {
+            return Ok(None);
+        }
+
+        let partitions = ranges
+            .into_iter()
+            .map(|range| {
+                Box::new(MultiLayoutPartition {
+                    reader: Arc::clone(&self.reader),
+                    session: self.session.clone(),
+                    request: ScanRequest {
+                        row_range: Some(range),
+                        ..self.request.clone()
+                    },
+                    index: self.index,
+                }) as PartitionRef
+            })
+            .collect();
+        Ok(Some(partitions))
+    }
 }
 
 #[cfg(test)]

@@ -2,21 +2,17 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cmp::max;
+use std::collections::VecDeque;
 use std::fmt::Formatter;
 use std::fmt::{self};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::task::Context;
-use std::task::Poll;
 
 use custom_labels::CURRENT_LABELSET;
-use futures::FutureExt;
-use futures::Stream;
 use futures::StreamExt;
-use futures::future::BoxFuture;
+use futures::TryStreamExt;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
 use parking_lot::Mutex;
@@ -39,9 +35,8 @@ use vortex::error::VortexResult;
 use vortex::expr::Expression;
 use vortex::expr::stats::Precision;
 use vortex::file::v2::FileStatsLayoutReader;
-use vortex::io::kanal_ext::KanalExt as _;
 use vortex::io::runtime::BlockingRuntime as _;
-use vortex::io::runtime::current::ThreadSafeIterator;
+use vortex::io::runtime::current::CurrentThreadIterator;
 use vortex::layout::scan::multi::MultiLayoutChild;
 use vortex::layout::scan::multi::MultiLayoutDataSource;
 use vortex::metrics::tracing::get_global_labels;
@@ -49,9 +44,9 @@ use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::scalar_fn::fns::pack::Pack;
 use vortex::scan::DataSource;
+use vortex::scan::PartitionRef;
 use vortex::scan::ScanRequest;
 use vortex_utils::aliases::hash_map::HashMap;
-use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -131,10 +126,75 @@ impl<'a> TableInitInput<'a> {
 }
 
 type ScanItem = VortexResult<(ArrayRef, Arc<ConversionCache>)>;
-type DataSourceIterator = ThreadSafeIterator<ScanItem>;
+
+/// A shared queue of scan splits, each claimed by exactly one worker.
+type SplitQueue = Arc<Mutex<VecDeque<PartitionRef>>>;
+
+/// Per-worker split-scan state: claims splits from the shared queue and drives each one on the
+/// global runtime, co-driven by every worker that calls into it.
+///
+/// This is the whole scan model — both the regular and the pushed-down-aggregate scan pull from
+/// it, so there is no per-array channel funnelling workers through one producer. The claim/drive
+/// split also mirrors what a DuckDB `MultiFileReaderInterface` would need: [`claim_next`] is the
+/// `TryInitializeScan` unit (grab one split) and draining the current split is the per-worker
+/// `Scan`. Keeping the runtime shared (rather than giving each worker its own executor) is what
+/// lets a split's I/O tasks — and the file's segment source driver — make progress: they live on
+/// the global runtime, and every worker's `block_on` drives it.
+///
+/// [`claim_next`]: SplitScan::claim_next
+struct SplitScan {
+    queue: SplitQueue,
+    current: Option<CurrentThreadIterator<'static, ScanItem>>,
+}
+
+impl SplitScan {
+    fn new(queue: SplitQueue) -> Self {
+        Self {
+            queue,
+            current: None,
+        }
+    }
+
+    /// Claim the next split and start driving it. Returns `false` once the queue is drained.
+    fn claim_next(&mut self) -> VortexResult<bool> {
+        let Some(split) = self.queue.lock().pop_front() else {
+            self.current = None;
+            return Ok(false);
+        };
+        let cache = Arc::new(ConversionCache {
+            file_index: split.index(),
+            ..Default::default()
+        });
+        let stream = split
+            .execute()?
+            .map(move |item| item.map(|array| (array, Arc::clone(&cache))));
+        self.current = Some(RUNTIME.block_on_stream(stream));
+        Ok(true)
+    }
+
+    /// Pull the next array from the current split, or `None` when it is exhausted.
+    fn current_next(&mut self) -> Option<ScanItem> {
+        self.current.as_mut().and_then(Iterator::next)
+    }
+
+    /// Pull the next array, transparently claiming further splits as each one drains. Returns
+    /// `None` only once the shared queue is fully drained.
+    fn next_item(&mut self) -> Option<ScanItem> {
+        loop {
+            if let Some(item) = self.current_next() {
+                return Some(item);
+            }
+            match self.claim_next() {
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
 
 pub struct TableFunctionGlobal {
-    iterator: DataSourceIterator,
+    queue: SplitQueue,
     batch_id: AtomicU64,
     bytes_total: Arc<AtomicU64>,
     bytes_read: AtomicU64,
@@ -142,10 +202,10 @@ pub struct TableFunctionGlobal {
     file_row_number_column_pos: Option<usize>,
 
     // Following 4 fields are used only in aggregate scans.
-    /// ArrayRef's scanned but not aggregated in "partials".
-    /// 0 means all arrays have been aggregated but output is not written.
-    /// u64::MAX means arrays have been aggregated and we've written output row
-    pending: Arc<AtomicU64>,
+    /// Splits not yet fully drained. Initialized to the total split count; each worker decrements
+    /// it as it finishes a split. When it reaches 0 every split's arrays are in `partials`, so the
+    /// first worker to observe 0 (via CAS to `u64::MAX`) writes the single aggregate output row.
+    pending: AtomicU64,
     aggregates: Vec<ColumnAggregate>,
     // Accumulated partials
     partials: Mutex<Vec<Box<dyn DynAccumulator>>>,
@@ -155,7 +215,7 @@ assert_impl_all!(TableFunctionGlobal: Send, Sync);
 
 /// Per-thread scan state
 pub struct TableFunctionLocal {
-    iterator: DataSourceIterator,
+    scan: SplitScan,
     exporter: Option<ArrayExporter>,
     partition_index: u64,
     file_index: usize,
@@ -267,68 +327,25 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
 
     let scan = RUNTIME.block_on(bind_data.data_source.scan(request))?;
 
-    let num_workers = get_available_parallelism().unwrap_or(1);
-
-    // We create an async bounded channel so that all thread-local workers can pull the next
-    // available array chunk regardless of which partition it came from.
-    let (tx, rx) = kanal::bounded_async(num_workers * 2);
-
-    let pending = Arc::new(AtomicU64::new(0));
-    let pending_producer = Arc::clone(&pending);
-
-    // We drive one partition per worker thread. Each partition is driven as a spawned task
-    // that pushes array chunks into the shared channel as they are produced. This spawning
-    // allows all worker threads to drive the polling of all partitions, and then return the
-    // first available array chunk.
-    let stream = scan
-        .partitions()
-        .map(move |partition| {
-            let tx = tx.clone();
-            let pending = Arc::clone(&pending_producer);
-            RUNTIME.handle().spawn(async move {
-                let partition = match partition {
-                    Ok(partition) => partition,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-                let cache = Arc::new(ConversionCache {
-                    file_index: partition.index(),
-                    ..Default::default()
-                });
-
-                let mut stream = match partition.execute() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                while let Some(item) = stream.next().await {
-                    pending.fetch_add(1, Ordering::Relaxed);
-                    if tx
-                        .send(item.map(|a| (a, Arc::clone(&cache))))
-                        .await
-                        .is_err()
-                    {
-                        // Exit early if the receiver has been dropped, which happens when the
-                        // scan is complete or if an error has occurred in another partition.
-                        return;
-                    }
-                }
-            })
-        })
-        .buffer_unordered(num_workers);
-
-    let iterator = RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
+    // Materialize the scan's partitions once (this only opens footers; the heavy I/O and decoding
+    // stay lazy inside `execute`), then expand each into its natural splits. Each split is handed
+    // out to exactly one worker, which drives it on the shared runtime — no producer/channel funnel.
+    let files: Vec<PartitionRef> = RUNTIME.block_on(scan.partitions().try_collect())?;
+    let mut splits = Vec::with_capacity(files.len());
+    for file in files {
+        match file.split_partitions()? {
+            Some(file_splits) => splits.extend(file_splits),
+            None => splits.push(file),
+        }
+    }
+    let pending = AtomicU64::new(splits.len() as u64);
+    let queue = Arc::new(Mutex::new(VecDeque::from(splits)));
 
     let aggregates = bind_data.aggregates.clone();
     let partials = build_partials(&aggregates, &bind_data.column_fields)?;
 
     Ok(TableFunctionGlobal {
-        iterator,
+        queue,
         batch_id: AtomicU64::new(0),
         bytes_total: Arc::new(AtomicU64::new(0)),
         bytes_read: AtomicU64::new(0),
@@ -339,39 +356,6 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         partials: Mutex::new(partials),
         row_count: AtomicU64::new(0),
     })
-}
-
-fn scan_driver_stream<S>(stream: S, rx: kanal::AsyncReceiver<ScanItem>) -> ScanDriverStream
-where
-    S: Stream<Item = ()> + Send + 'static,
-{
-    ScanDriverStream {
-        driver: Some(stream.collect::<()>().boxed()),
-        rx: rx.into_stream().boxed(),
-    }
-}
-
-struct ScanDriverStream {
-    driver: Option<BoxFuture<'static, ()>>,
-    rx: futures::stream::BoxStream<'static, ScanItem>,
-}
-
-impl Stream for ScanDriverStream {
-    type Item = ScanItem;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if let Some(driver) = this.driver.as_mut()
-            && driver.as_mut().poll(cx).is_ready()
-        {
-            this.driver = None;
-        }
-
-        match this.rx.as_mut().poll_next(cx) {
-            Poll::Ready(None) if this.driver.is_some() => Poll::Pending,
-            poll => poll,
-        }
-    }
 }
 
 fn build_partials(
@@ -418,7 +402,7 @@ pub fn init_local(
         .vortex_expect("local state aggregate initialization failed");
 
     TableFunctionLocal {
-        iterator: global.iterator.clone(),
+        scan: SplitScan::new(Arc::clone(&global.queue)),
         exporter: None,
         partition_index: 0,
         file_index: 0,
@@ -469,52 +453,64 @@ fn scan_aggregate(
 
     let mut ctx = SESSION.create_execution_ctx();
     loop {
-        let Some(result) = local_state.iterator.next() else {
-            // 0 means we're the last thread, u64::MAX means output is written.
-            // is_err() means CAS didn't succeed
-            if global_state
-                .pending
-                .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
+        // Drain the current split, folding each array into the local then global partials.
+        if let Some(result) = local_state.scan.current_next() {
+            let array = convert_result(result?.0, &mut ctx)?;
+
+            for (i, partial) in positions.iter().zip(local_state.partials.iter_mut()) {
+                partial.accumulate(array.unmasked_field(*i), &mut ctx)?;
+            }
+
             {
-                return Ok(());
+                let mut partials = global_state.partials.lock();
+                for (global, local) in partials.iter_mut().zip(&mut local_state.partials) {
+                    global.combine_partials(local.flush()?)?;
+                }
             }
 
-            let mut accumulators = global_state.partials.lock();
-            let row_count = global_state.row_count.load(Ordering::Acquire) as i64;
-            let mut accum_iter = accumulators.iter_mut();
-            for (idx, aggregate) in global_state.aggregates.iter().enumerate() {
-                let value = match aggregate {
-                    ColumnAggregate::Real { .. } => {
-                        let accum = accum_iter.next().vortex_expect("partial for real agg");
-                        Value::try_from(accum.finish()?)?
-                    }
-                    ColumnAggregate::CountStar => Value::from(row_count),
-                };
-                chunk.get_vector_mut(idx).reference_value(&value);
+            if has_count_star {
+                global_state
+                    .row_count
+                    .fetch_add(array.len() as u64, Ordering::Relaxed);
             }
-            chunk.set_len(1);
-            return Ok(());
-        };
-        let array = convert_result(result?.0, &mut ctx)?;
-
-        for (i, partial) in positions.iter().zip(local_state.partials.iter_mut()) {
-            partial.accumulate(array.unmasked_field(*i), &mut ctx)?;
+            continue;
         }
 
+        // The current split (if any) is fully drained and its arrays are in `partials`; account
+        // for it before looking for more work.
+        if local_state.scan.current.take().is_some() {
+            global_state.pending.fetch_sub(1, Ordering::Release);
+        }
+
+        if local_state.scan.claim_next()? {
+            continue;
+        }
+
+        // No more splits for this worker. The first worker to observe every split finished
+        // (pending == 0, swapped to u64::MAX so exactly one wins) writes the aggregate output row.
+        if global_state
+            .pending
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
         {
-            let mut partials = global_state.partials.lock();
-            for (global, local) in partials.iter_mut().zip(&mut local_state.partials) {
-                global.combine_partials(local.flush()?)?;
-            }
+            return Ok(());
         }
 
-        if has_count_star {
-            global_state
-                .row_count
-                .fetch_add(array.len() as u64, Ordering::Relaxed);
+        let mut accumulators = global_state.partials.lock();
+        let row_count = global_state.row_count.load(Ordering::Acquire) as i64;
+        let mut accum_iter = accumulators.iter_mut();
+        for (idx, aggregate) in global_state.aggregates.iter().enumerate() {
+            let value = match aggregate {
+                ColumnAggregate::Real { .. } => {
+                    let accum = accum_iter.next().vortex_expect("partial for real agg");
+                    Value::try_from(accum.finish()?)?
+                }
+                ColumnAggregate::CountStar => Value::from(row_count),
+            };
+            chunk.get_vector_mut(idx).reference_value(&value);
         }
-        global_state.pending.fetch_sub(1, Ordering::Release);
+        chunk.set_len(1);
+        return Ok(());
     }
 }
 
@@ -530,7 +526,7 @@ pub fn scan(
     loop {
         if local_state.exporter.is_none() {
             let mut ctx = SESSION.create_execution_ctx();
-            let Some(result) = local_state.iterator.next() else {
+            let Some(result) = local_state.scan.next_item() else {
                 return Ok(());
             };
             let (array_result, conversion_cache) = result?;
@@ -841,11 +837,8 @@ fn progress(bytes_read: &AtomicU64, bytes_total: &AtomicU64) -> f64 {
 mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::Relaxed;
-    use std::task::Poll;
 
-    use crate::RUNTIME;
     use crate::table_function::progress;
-    use crate::table_function::scan_driver_stream;
 
     #[test]
     fn test_table_scan_progress() {
@@ -859,27 +852,5 @@ mod tests {
 
         bytes_total.fetch_add(100, Relaxed);
         assert!((progress(&bytes_read, &bytes_total) - 50.).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn scan_driver_panic_propagates_through_iterator() {
-        let (tx, rx) = kanal::bounded_async(1);
-        let _tx = tx;
-        let stream = futures::stream::poll_fn(|_| -> Poll<Option<()>> {
-            panic!("duckdb scan driver panic");
-        });
-
-        let mut iter =
-            RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
-        let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next())) {
-            Ok(_) => panic!("driver panic must propagate through iterator"),
-            Err(panic) => panic,
-        };
-        let message = panic
-            .downcast_ref::<&'static str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<unknown panic>");
-        assert!(message.contains("duckdb scan driver panic"));
     }
 }

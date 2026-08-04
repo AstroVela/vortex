@@ -325,6 +325,43 @@ impl<A: 'static + Send> ScanBuilder<A> {
         ))
     }
 
+    /// Compute this scan's natural row-range splits without executing it.
+    ///
+    /// This runs the same expression optimization and split computation as [`prepare`], so the
+    /// ranges line up with the splits the scan would use internally — the difference is only that
+    /// they are surfaced as independent units a caller can hand out per worker.
+    ///
+    /// [`prepare`]: Self::prepare
+    pub fn split_ranges(&self) -> VortexResult<Vec<Range<u64>>> {
+        let layout_reader: LayoutReaderRef = Arc::new(RowIdxLayoutReader::new(
+            self.row_offset,
+            Arc::clone(&self.layout_reader),
+            self.session.clone(),
+        ));
+
+        if let Some(ranges) = attempt_split_ranges(&self.selection, self.row_range.as_ref()) {
+            return Ok(ranges);
+        }
+
+        let projection = self.projection.optimize_recursive(layout_reader.dtype())?;
+        let filter = self
+            .filter
+            .as_ref()
+            .map(|f| f.optimize_recursive(layout_reader.dtype()))
+            .transpose()?;
+        let field_mask = referenced_field_masks(&projection, filter.as_ref(), layout_reader.dtype())?;
+
+        let split_range = self
+            .row_range
+            .clone()
+            .unwrap_or_else(|| 0..layout_reader.row_count());
+        let boundaries = self
+            .split_by
+            .splits(layout_reader.as_ref(), &split_range, &field_mask)?;
+
+        Ok(boundaries.windows(2).map(|w| w[0]..w[1]).collect())
+    }
+
     /// Constructs a task per row split of the scan, returned as a vector of futures.
     pub fn build(self) -> VortexResult<Vec<BoxFuture<'static, VortexResult<Option<A>>>>> {
         // The ultimate short circuit
