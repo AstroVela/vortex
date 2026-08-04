@@ -5,9 +5,14 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::DType;
+use vortex_array::expr::BoundExpression;
+use vortex_array::expr::ExactBoundExpr;
+use vortex_array::expr::label_bound_tree;
 use vortex_error::VortexResult;
 
 use crate::layouts::chunked::ChunkedLayout;
+use crate::layouts::row_idx::RowIdx;
+use crate::plan::ExpressionPlan;
 use crate::plan::LazyPlanChildren;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
@@ -36,10 +41,10 @@ impl ChunkedPlan {
         }
     }
 
-    fn with_chunks(&self, chunks: LazyPlanChildren) -> Self {
+    fn with_chunks(&self, dtype: DType, chunks: LazyPlanChildren) -> Self {
         Self {
             layout: self.layout.clone(),
-            dtype: self.dtype.clone(),
+            dtype,
             chunks,
         }
     }
@@ -51,8 +56,31 @@ impl Plan for ChunkedPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let chunks = self.chunks.map(|_, chunk| chunk.optimize());
-        Ok(Arc::new(self.with_chunks(chunks)))
+        let chunks = self.chunks.try_map(|_, chunk| chunk.optimize())?;
+        Ok(Arc::new(self.with_chunks(self.dtype.clone(), chunks)))
+    }
+
+    fn optimize_expression(&self, expression: &BoundExpression) -> VortexResult<Option<PlanRef>> {
+        let references_row_idx = label_bound_tree(
+            expression,
+            |node| {
+                node.as_scalar()
+                    .is_some_and(|scalar_fn| scalar_fn.is::<RowIdx>())
+            },
+            |acc, &child| acc | child,
+        )
+        .get(&ExactBoundExpr(expression.clone()))
+        .copied()
+        .unwrap_or(false);
+        if references_row_idx {
+            return Ok(None);
+        }
+
+        let dtype = expression.dtype().clone();
+        let chunks = self
+            .chunks
+            .try_map(|_, chunk| ExpressionPlan::new(expression.clone(), chunk).optimize())?;
+        Ok(Some(Arc::new(self.with_chunks(dtype, chunks))))
     }
 
     fn dtype(&self) -> &DType {

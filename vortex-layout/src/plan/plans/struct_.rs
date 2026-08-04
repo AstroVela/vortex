@@ -78,7 +78,7 @@ impl Plan for StructPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let children = self.children.map(|_, child| child.optimize());
+        let children = self.children.try_map(|_, child| child.optimize())?;
         Ok(Arc::new(self.with_children(children)))
     }
 

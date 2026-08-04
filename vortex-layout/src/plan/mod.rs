@@ -24,7 +24,9 @@ pub use plans::DictPlan;
 pub use plans::ExpressionPlan;
 pub use plans::FlatPlan;
 pub use plans::ListPlan;
+pub use plans::RowIdxPartitionPlan;
 pub use plans::RowIdxPlan;
+pub use plans::RowIdxValuesPlan;
 pub use plans::StructPlan;
 use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
@@ -56,9 +58,8 @@ pub trait Plan: Any + Send + Sync {
         std::any::type_name::<Self>()
     }
 
-    /// Optimizes this plan while preserving its dtype and row domain.
-    ///
-    /// Implementations may defer child optimization until the child is accessed.
+    /// Recursively optimizes this plan and all of its children while preserving its dtype and row
+    /// domain.
     fn optimize(&self) -> VortexResult<PlanRef>;
 
     /// Attempts to rewrite `expression` through this plan.
