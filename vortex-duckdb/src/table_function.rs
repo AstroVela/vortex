@@ -2,10 +2,12 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cmp::max;
+use std::collections::VecDeque;
 use std::fmt::Formatter;
 use std::fmt::{self};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -16,6 +18,7 @@ use custom_labels::CURRENT_LABELSET;
 use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
@@ -41,6 +44,8 @@ use vortex::expr::stats::Precision;
 use vortex::file::v2::FileStatsLayoutReader;
 use vortex::io::kanal_ext::KanalExt as _;
 use vortex::io::runtime::BlockingRuntime as _;
+use vortex::io::runtime::current::CurrentThreadIterator;
+use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::current::ThreadSafeIterator;
 use vortex::layout::scan::multi::MultiLayoutChild;
 use vortex::layout::scan::multi::MultiLayoutDataSource;
@@ -49,7 +54,9 @@ use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::scalar_fn::fns::pack::Pack;
 use vortex::scan::DataSource;
+use vortex::scan::PartitionRef;
 use vortex::scan::ScanRequest;
+use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::parallelism::get_available_parallelism;
 
@@ -133,8 +140,70 @@ impl<'a> TableInitInput<'a> {
 type ScanItem = VortexResult<(ArrayRef, Arc<ConversionCache>)>;
 type DataSourceIterator = ThreadSafeIterator<ScanItem>;
 
+/// Experiment toggle: when `VORTEX_SCAN_PERTHREAD` is set, non-aggregate scans hand each DuckDB
+/// worker its own partition and its own current-thread executor instead of funnelling every
+/// partition through one shared executor + channel. Lets us A/B the shared-executor contention
+/// without recompiling.
+static PERTHREAD: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VORTEX_SCAN_PERTHREAD").is_some());
+
+type PartitionQueue = Arc<Mutex<VecDeque<PartitionRef>>>;
+
+/// How a scan produces arrays. The aggregate path always uses the shared iterator; the
+/// non-aggregate path can additionally use the per-thread partition queue (the experiment).
+enum GlobalSource {
+    Shared(DataSourceIterator),
+    PerThread(PartitionQueue),
+}
+
+enum LocalSource {
+    Shared(DataSourceIterator),
+    PerThread {
+        queue: PartitionQueue,
+        /// This worker's own executor; nobody else drives it, so there is no cross-thread
+        /// contention on the executor's run queue.
+        runtime: CurrentThreadRuntime,
+        /// Session whose runtime handle points at `runtime`, so a partition's internal split
+        /// tasks spawn onto this worker's executor rather than the global one.
+        session: VortexSession,
+        current: Option<CurrentThreadIterator<'static, ScanItem>>,
+    },
+}
+
+impl LocalSource {
+    fn next_item(&mut self) -> Option<ScanItem> {
+        match self {
+            LocalSource::Shared(iterator) => iterator.next(),
+            LocalSource::PerThread {
+                queue,
+                runtime,
+                session,
+                current,
+            } => loop {
+                if let Some(current) = current.as_mut()
+                    && let Some(item) = current.next()
+                {
+                    return Some(item);
+                }
+
+                let partition = queue.lock().pop_front()?;
+                let cache = Arc::new(ConversionCache {
+                    file_index: partition.index(),
+                    ..Default::default()
+                });
+                let stream = match partition.execute_on(session.clone()) {
+                    Ok(stream) => stream,
+                    Err(e) => return Some(Err(e)),
+                };
+                let stream = stream.map(move |item| item.map(|a| (a, Arc::clone(&cache))));
+                *current = Some(runtime.block_on_stream(stream));
+            },
+        }
+    }
+}
+
 pub struct TableFunctionGlobal {
-    iterator: DataSourceIterator,
+    source: GlobalSource,
     batch_id: AtomicU64,
     bytes_total: Arc<AtomicU64>,
     bytes_read: AtomicU64,
@@ -155,7 +224,7 @@ assert_impl_all!(TableFunctionGlobal: Send, Sync);
 
 /// Per-thread scan state
 pub struct TableFunctionLocal {
-    iterator: DataSourceIterator,
+    source: LocalSource,
     exporter: Option<ArrayExporter>,
     partition_index: u64,
     file_index: usize,
@@ -269,66 +338,86 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
 
     let num_workers = get_available_parallelism().unwrap_or(1);
 
-    // We create an async bounded channel so that all thread-local workers can pull the next
-    // available array chunk regardless of which partition it came from.
-    let (tx, rx) = kanal::bounded_async(num_workers * 2);
-
-    let pending = Arc::new(AtomicU64::new(0));
-    let pending_producer = Arc::clone(&pending);
-
-    // We drive one partition per worker thread. Each partition is driven as a spawned task
-    // that pushes array chunks into the shared channel as they are produced. This spawning
-    // allows all worker threads to drive the polling of all partitions, and then return the
-    // first available array chunk.
-    let stream = scan
-        .partitions()
-        .map(move |partition| {
-            let tx = tx.clone();
-            let pending = Arc::clone(&pending_producer);
-            RUNTIME.handle().spawn(async move {
-                let partition = match partition {
-                    Ok(partition) => partition,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-                let cache = Arc::new(ConversionCache {
-                    file_index: partition.index(),
-                    ..Default::default()
-                });
-
-                let mut stream = match partition.execute() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                while let Some(item) = stream.next().await {
-                    pending.fetch_add(1, Ordering::Relaxed);
-                    if tx
-                        .send(item.map(|a| (a, Arc::clone(&cache))))
-                        .await
-                        .is_err()
-                    {
-                        // Exit early if the receiver has been dropped, which happens when the
-                        // scan is complete or if an error has occurred in another partition.
-                        return;
-                    }
-                }
-            })
-        })
-        .buffer_unordered(num_workers);
-
-    let iterator = RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
-
     let aggregates = bind_data.aggregates.clone();
+    let pending = Arc::new(AtomicU64::new(0));
+
+    let source = if *PERTHREAD && aggregates.is_empty() {
+        // Experiment: materialize the per-file partitions once (this only opens footers, the
+        // heavy I/O and decoding stay lazy inside `execute_on`), then hand them out one at a
+        // time to DuckDB workers, each of which drives its claimed partition on its own executor.
+        // Each file yields one partition; expand it into its natural layout splits so a single
+        // file can be scanned by several workers instead of being pinned to one.
+        let files: Vec<PartitionRef> = RUNTIME.block_on(scan.partitions().try_collect())?;
+        let mut partitions = Vec::with_capacity(files.len());
+        for file in files {
+            match file.split_partitions()? {
+                Some(splits) => partitions.extend(splits),
+                None => partitions.push(file),
+            }
+        }
+        GlobalSource::PerThread(Arc::new(Mutex::new(partitions.into())))
+    } else {
+        // We create an async bounded channel so that all thread-local workers can pull the next
+        // available array chunk regardless of which partition it came from.
+        let (tx, rx) = kanal::bounded_async(num_workers * 2);
+
+        let pending_producer = Arc::clone(&pending);
+
+        // We drive one partition per worker thread. Each partition is driven as a spawned task
+        // that pushes array chunks into the shared channel as they are produced. This spawning
+        // allows all worker threads to drive the polling of all partitions, and then return the
+        // first available array chunk.
+        let stream = scan
+            .partitions()
+            .map(move |partition| {
+                let tx = tx.clone();
+                let pending = Arc::clone(&pending_producer);
+                RUNTIME.handle().spawn(async move {
+                    let partition = match partition {
+                        Ok(partition) => partition,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+
+                    let cache = Arc::new(ConversionCache {
+                        file_index: partition.index(),
+                        ..Default::default()
+                    });
+
+                    let mut stream = match partition.execute() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+                    while let Some(item) = stream.next().await {
+                        pending.fetch_add(1, Ordering::Relaxed);
+                        if tx
+                            .send(item.map(|a| (a, Arc::clone(&cache))))
+                            .await
+                            .is_err()
+                        {
+                            // Exit early if the receiver has been dropped, which happens when the
+                            // scan is complete or if an error has occurred in another partition.
+                            return;
+                        }
+                    }
+                })
+            })
+            .buffer_unordered(num_workers);
+
+        let iterator =
+            RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
+        GlobalSource::Shared(iterator)
+    };
+
     let partials = build_partials(&aggregates, &bind_data.column_fields)?;
 
     Ok(TableFunctionGlobal {
-        iterator,
+        source,
         batch_id: AtomicU64::new(0),
         bytes_total: Arc::new(AtomicU64::new(0)),
         bytes_read: AtomicU64::new(0),
@@ -417,8 +506,25 @@ pub fn init_local(
         // init_global, see "partials" initialization there
         .vortex_expect("local state aggregate initialization failed");
 
+    let source = match &global.source {
+        GlobalSource::Shared(iterator) => LocalSource::Shared(iterator.clone()),
+        GlobalSource::PerThread(queue) => {
+            // Each worker gets its own executor, and a session whose runtime handle points at
+            // that executor so the partition's split tasks spawn locally instead of onto the
+            // one global executor that all workers would otherwise contend on.
+            let runtime = CurrentThreadRuntime::new();
+            let session = crate::new_scan_session(runtime.handle());
+            LocalSource::PerThread {
+                queue: Arc::clone(queue),
+                runtime,
+                session,
+                current: None,
+            }
+        }
+    };
+
     TableFunctionLocal {
-        iterator: global.iterator.clone(),
+        source,
         exporter: None,
         partition_index: 0,
         file_index: 0,
@@ -469,7 +575,7 @@ fn scan_aggregate(
 
     let mut ctx = SESSION.create_execution_ctx();
     loop {
-        let Some(result) = local_state.iterator.next() else {
+        let Some(result) = local_state.source.next_item() else {
             // 0 means we're the last thread, u64::MAX means output is written.
             // is_err() means CAS didn't succeed
             if global_state
@@ -530,7 +636,7 @@ pub fn scan(
     loop {
         if local_state.exporter.is_none() {
             let mut ctx = SESSION.create_execution_ctx();
-            let Some(result) = local_state.iterator.next() else {
+            let Some(result) = local_state.source.next_item() else {
                 return Ok(());
             };
             let (array_result, conversion_cache) = result?;

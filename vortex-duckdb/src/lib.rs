@@ -14,6 +14,7 @@ use vortex::VortexSessionDefault;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::io::runtime::BlockingRuntime;
+use vortex::io::runtime::Handle;
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -48,6 +49,17 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     vortex_geo::initialize(&session);
     session
 });
+
+/// Builds an independent session configured like [`SESSION`] but driven by `handle`.
+///
+/// Cloning [`SESSION`] shares its backing store, so rebinding the handle on a clone would
+/// clobber the global handle for everyone. Starting from `default()` gives a fresh store whose
+/// handle can point at a per-worker runtime without affecting other threads.
+fn new_scan_session(handle: Handle) -> VortexSession {
+    let session = VortexSession::default().with_handle(handle);
+    vortex_geo::initialize(&session);
+    session
+}
 
 // Duckdb's logger requires a *Context as first argument which
 // would be hard to integrate with tracing::. We use logging for

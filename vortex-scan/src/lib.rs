@@ -207,4 +207,23 @@ pub trait Partition: 'static + Send {
     /// operations should be spawned onto the runtime to enable parallel execution across
     /// threads.
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream>;
+
+    /// Like [`execute`](Self::execute), but spawns the partition's internal tasks onto the
+    /// runtime handle carried by `session` instead of the one the partition was created with.
+    ///
+    /// This lets a caller drive a single partition entirely on its own runtime/executor so that
+    /// concurrent partitions do not contend on one shared executor. The default implementation
+    /// ignores `session` and falls back to [`execute`](Self::execute).
+    fn execute_on(self: Box<Self>, session: VortexSession) -> VortexResult<SendableArrayStream> {
+        drop(session);
+        self.execute()
+    }
+
+    /// Subdivides this partition along its natural layout split boundaries, so a larger unit of
+    /// work (e.g. a whole file) can be handed out to several workers instead of being pinned to
+    /// one. Returns `Ok(None)` when the partition does not subdivide (single split, or not
+    /// supported), in which case the caller should keep the original partition.
+    fn split_partitions(&self) -> VortexResult<Option<Vec<PartitionRef>>> {
+        Ok(None)
+    }
 }

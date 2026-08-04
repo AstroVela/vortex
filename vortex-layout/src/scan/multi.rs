@@ -58,6 +58,8 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
 use crate::scan::scan_builder::ScanBuilder;
+use crate::scan::scan_builder::referenced_field_masks;
+use crate::scan::split_by::SplitBy;
 
 /// Default concurrency for opening deferred readers.
 const DEFAULT_CONCURRENCY: usize = 8;
@@ -511,8 +513,13 @@ impl Partition for MultiLayoutPartition {
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
+        let session = self.session.clone();
+        self.execute_on(session)
+    }
+
+    fn execute_on(self: Box<Self>, session: VortexSession) -> VortexResult<SendableArrayStream> {
         let request = self.request;
-        let mut builder = ScanBuilder::new(self.session, self.reader)
+        let mut builder = ScanBuilder::new(session, self.reader)
             .with_selection(request.selection)
             .with_projection(request.projection)
             .with_some_filter(request.filter)
@@ -529,6 +536,45 @@ impl Partition for MultiLayoutPartition {
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             dtype, stream,
         )))
+    }
+
+    fn split_partitions(&self) -> VortexResult<Option<Vec<PartitionRef>>> {
+        let row_range = self
+            .request
+            .row_range
+            .clone()
+            .unwrap_or_else(|| 0..self.reader.row_count());
+
+        // The same layout split boundaries the ScanBuilder would use internally, surfaced here so
+        // each split becomes a partition that a distinct worker can claim.
+        let field_mask = referenced_field_masks(
+            &self.request.projection,
+            self.request.filter.as_ref(),
+            self.reader.dtype(),
+        )?;
+        let boundaries = SplitBy::Layout.splits(self.reader.as_ref(), &row_range, &field_mask)?;
+
+        // `boundaries` are split points; adjacent pairs form the row ranges. Two points means a
+        // single range covering the whole partition, so there is nothing to hand out.
+        if boundaries.len() <= 2 {
+            return Ok(None);
+        }
+
+        let partitions = boundaries
+            .windows(2)
+            .map(|window| {
+                Box::new(MultiLayoutPartition {
+                    reader: Arc::clone(&self.reader),
+                    session: self.session.clone(),
+                    request: ScanRequest {
+                        row_range: Some(window[0]..window[1]),
+                        ..self.request.clone()
+                    },
+                    index: self.index,
+                }) as PartitionRef
+            })
+            .collect();
+        Ok(Some(partitions))
     }
 }
 
