@@ -51,7 +51,6 @@ vortex-session = { workspace = true }
 unstable_encodings = [
     "dep:vortex-onpair",
     "vortex-zstd?/unstable_encodings",
-    "vortex-decimal-byte-parts/unstable_encodings",
 ]
 pco = ["dep:pco", "dep:vortex-pco"]
 zstd = ["dep:vortex-zstd"]

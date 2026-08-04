@@ -11,11 +11,8 @@ use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::pin_mut;
-#[cfg(feature = "unstable_encodings")]
 use rand::RngExt;
-#[cfg(feature = "unstable_encodings")]
 use rand::SeedableRng as _;
-#[cfg(feature = "unstable_encodings")]
 use rand::rngs::StdRng;
 use rstest::rstest;
 use vortex_array::ArrayRef;
@@ -42,7 +39,6 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::PType::I32;
 use vortex_array::dtype::StructFields;
-#[cfg(feature = "unstable_encodings")]
 use vortex_array::dtype::i256;
 use vortex_array::expr::and;
 use vortex_array::expr::cast;
@@ -234,19 +230,15 @@ async fn test_round_trip_many_types() {
     assert_eq!(read.len(), 3);
 }
 
-/// End-to-end check that decimals wider than 64 bits survive a write/read round trip and are
-/// actually compressed: the compressor splits them into a most significant part plus 64-bit
-/// lower parts, each of which compresses on its own.
+/// End-to-end check that decimals wider than 64 bits survive a write/read round trip.
 ///
-/// Requires `unstable_encodings`: the split writes more than one child, so without the
-/// feature the compressor deliberately leaves these values canonical and uncompressed.
-#[cfg(feature = "unstable_encodings")]
+/// The compressor declines to split these — that would need lower parts, which cannot be
+/// serialized — so they are written as canonical decimals. This pins that the wide path still
+/// round trips through a file rather than being compressed.
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn test_wide_decimal_round_trip_compresses() -> VortexResult<()> {
+async fn test_wide_decimal_round_trips_through_a_file() -> VortexResult<()> {
     const N: usize = 16_384;
-    /// Bytes each value would occupy uncompressed: `i128` plus `i256` storage.
-    const UNCOMPRESSED_BYTES_PER_ROW: usize = 16 + 32;
 
     /// Deterministic 24-bit noise, so the low bits of each value are neither constant nor a
     /// sequence.
@@ -290,7 +282,6 @@ async fn test_wide_decimal_round_trip_compresses() -> VortexResult<()> {
         .write_options()
         .write(&mut buf, st.clone().to_array_stream())
         .await?;
-    let written = buf.len();
 
     let chunks: Vec<_> = SESSION
         .open_options()
@@ -305,12 +296,6 @@ async fn test_wide_decimal_round_trip_compresses() -> VortexResult<()> {
     assert_eq!(read.len(), N);
     assert_arrays_eq!(st, read, &mut ctx);
 
-    let uncompressed = N * UNCOMPRESSED_BYTES_PER_ROW;
-    assert!(
-        written * 4 < uncompressed,
-        "expected at least 4x compression, wrote {written} bytes for {uncompressed} bytes of \
-         decimal values"
-    );
     Ok(())
 }
 

@@ -152,11 +152,10 @@ impl VTable for DecimalByteParts {
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
-        // The last gate before bytes reach a file. Constructing lower parts is already gated,
-        // but an array read from a file can be handed straight back to a writer without going
-        // through a constructor or the compressor, and the write allow-list only checks the
-        // encoding id, not how many children it carries. Without this a build lacking the
-        // feature could still emit a multi-child array it never could have built.
+        // The only gate on lower parts reaching a file. Building them in memory is allowed —
+        // reading a file requires it — and the write allow-list checks only the encoding id,
+        // not how many children it carries, so this is the single point where a multi-child
+        // array can be refused before it becomes bytes.
         vortex_ensure!(
             array.lower_parts().is_empty() || cfg!(feature = "unstable_encodings"),
             "serializing DecimalByteParts with lower parts requires the `unstable_encodings` \
@@ -358,39 +357,18 @@ impl DecimalByteParts {
         // This gate is on *introducing* lower parts only. Reading them back, and rebuilding an
         // array that already has them, go through `rebuild_with_lower_parts` and stay ungated —
         // otherwise a build without the feature could not read a file written by one with it.
-        vortex_ensure!(
-            lower_parts.is_empty() || cfg!(feature = "unstable_encodings"),
-            "DecimalByteParts with lower parts requires the `unstable_encodings` feature: \
-             readers that predate lower parts understand only a single child, and would fail \
-             to open a file containing this array"
-        );
-
-        rebuild_with_lower_parts(msp, lower_parts, decimal_dtype)
+        let len = msp.len();
+        let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
+        let slots = DecimalBytePartsSlots { msp, lower_parts }.into_slots();
+        Array::try_from_parts(
+            ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData).with_slots(slots),
+        )
     }
 }
 
 /// The decimal storage type this array canonicalizes to.
 fn values_type(array: ArrayView<'_, DecimalByteParts>) -> VortexResult<DecimalType> {
     assembled_values_type(array.msp().dtype().as_ptype(), array.lower_parts().len())
-}
-
-/// Build a byte-parts array without the lower-parts write gate.
-///
-/// For rebuilding an array whose lower parts already exist — a compute kernel reshaping one,
-/// or a reader materializing one from a file. Those must keep working regardless of the
-/// feature, because the parts were introduced by whoever wrote the file, not by this call.
-/// Use [`DecimalByteParts::try_new_with_lower_parts`] to introduce lower parts.
-pub(crate) fn rebuild_with_lower_parts(
-    msp: ArrayRef,
-    lower_parts: Vec<ArrayRef>,
-    decimal_dtype: DecimalDType,
-) -> VortexResult<DecimalBytePartsArray> {
-    let len = msp.len();
-    let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
-    let slots = DecimalBytePartsSlots { msp, lower_parts }.into_slots();
-    Array::try_from_parts(
-        ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData).with_slots(slots),
-    )
 }
 
 /// The decimal dtype this array carries.
@@ -419,7 +397,7 @@ pub(crate) fn map_parts(
         .iter()
         .map(&mut f)
         .collect::<VortexResult<Vec<_>>>()?;
-    rebuild_with_lower_parts(msp, lower_parts, decimal_dtype(array))
+    DecimalByteParts::try_new_with_lower_parts(msp, lower_parts, decimal_dtype(array))
 }
 
 /// Rebuild the array with a replacement MSP, keeping its lower parts untouched.
@@ -432,7 +410,7 @@ pub(crate) fn with_msp(
     msp: ArrayRef,
     decimal_dtype: DecimalDType,
 ) -> VortexResult<DecimalBytePartsArray> {
-    rebuild_with_lower_parts(msp, array.lower_parts().to_vec(), decimal_dtype)
+    DecimalByteParts::try_new_with_lower_parts(msp, array.lower_parts().to_vec(), decimal_dtype)
 }
 
 /// Converts a DecimalBytePartsArray to its canonical DecimalArray representation.
@@ -789,7 +767,9 @@ mod tests {
         #[case] lower_parts: Vec<ArrayRef>,
         #[case] decimal_dtype: DecimalDType,
     ) {
-        assert!(rebuild_with_lower_parts(msp(), lower_parts, decimal_dtype).is_err());
+        assert!(
+            DecimalByteParts::try_new_with_lower_parts(msp(), lower_parts, decimal_dtype).is_err()
+        );
     }
 
     fn deserialize_with(
@@ -917,7 +897,7 @@ mod tests {
         assert_eq!(canonical.values_type(), DecimalType::I256);
 
         // A narrow MSP with a single lower part still fits 128 bits.
-        let array = rebuild_with_lower_parts(
+        let array = DecimalByteParts::try_new_with_lower_parts(
             buffer![1i8, -1, 0].into_array(),
             vec![buffer![7u64, 7, 7].into_array()],
             DecimalDType::new(38, 2),
@@ -930,7 +910,7 @@ mod tests {
         );
 
         // Two lower parts under a narrow MSP overflow 128 bits, so the value widens.
-        let array = rebuild_with_lower_parts(
+        let array = DecimalByteParts::try_new_with_lower_parts(
             buffer![1i8].into_array(),
             vec![buffer![0u64].into_array(), buffer![9u64].into_array()],
             DecimalDType::new(76, 2),
@@ -944,7 +924,7 @@ mod tests {
     #[test]
     fn test_unused_buffer_of_values_is_ignored_for_null_rows() -> VortexResult<()> {
         // Null rows may hold arbitrary bits in the lower parts; they must stay null.
-        let array = rebuild_with_lower_parts(
+        let array = DecimalByteParts::try_new_with_lower_parts(
             PrimitiveArray::new(
                 buffer![0i64, 0, 0],
                 Validity::Array(BoolArray::from_iter([false, false, true]).into_array()),

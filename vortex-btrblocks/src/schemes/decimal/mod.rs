@@ -15,7 +15,6 @@ use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_decimal_byte_parts::DecimalByteParts;
 use vortex_decimal_byte_parts::DecimalBytePartsSlots;
-use vortex_decimal_byte_parts::MAX_LOWER_PARTS;
 use vortex_decimal_byte_parts::split_decimal;
 use vortex_error::VortexResult;
 
@@ -30,11 +29,9 @@ use crate::SchemeExt;
 /// Narrows the decimal to the smallest integer type, compresses the underlying primitive, and wraps
 /// the result in a `DecimalBytePartsArray`.
 ///
-/// With `unstable_encodings`, values that stay wider than 64 bits after narrowing are split
-/// into a signed most significant part and 64-bit lower parts — one for `i128`, three for
-/// `i256` — each compressed independently. That writes more than one child, which readers
-/// predating lower parts cannot open, so without the feature such values are left
-/// uncompressed instead.
+/// Only decimals that fit a single signed part are compressed. Anything still wider than 64
+/// bits after narrowing would need lower parts, which cannot be serialized, so those are left
+/// as the canonical decimal.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct DecimalScheme;
 
@@ -51,13 +48,9 @@ impl Scheme for DecimalScheme {
         vec![DecimalByteParts.id()]
     }
 
-    /// Children: msp=0, and with `unstable_encodings`, lower parts=1..=3.
+    /// Children: msp=0. This scheme never emits lower parts.
     fn num_children(&self) -> usize {
-        if cfg!(feature = "unstable_encodings") {
-            DecimalBytePartsSlots::FIXED_COUNT + MAX_LOWER_PARTS
-        } else {
-            DecimalBytePartsSlots::FIXED_COUNT
-        }
+        DecimalBytePartsSlots::FIXED_COUNT
     }
 
     fn expected_compression_ratio(
@@ -81,10 +74,10 @@ impl Scheme for DecimalScheme {
         let decimal = narrowed_decimal(decimal);
         let parts = split_decimal(&decimal)?;
 
-        // Splitting a value too wide for one signed part writes more than one child, which a
-        // reader predating lower parts cannot open. Until that is stable, leave those values
-        // as the canonical decimal rather than emitting a file such a reader would reject.
-        if !parts.lower_parts.is_empty() && !cfg!(feature = "unstable_encodings") {
+        // A value too wide for one signed part splits into lower parts, and an array carrying
+        // those cannot be serialized. Leave it as the canonical decimal rather than build
+        // something the writer will refuse.
+        if !parts.lower_parts.is_empty() {
             return Ok(decimal.into_array());
         }
 
@@ -95,23 +88,7 @@ impl Scheme for DecimalScheme {
             DecimalBytePartsSlots::MSP,
             exec_ctx,
         )?;
-        let lower_parts = parts
-            .lower_parts
-            .iter()
-            .enumerate()
-            .map(|(idx, part)| {
-                compressor.compress_child(
-                    part,
-                    &compress_ctx,
-                    self.id(),
-                    DecimalBytePartsSlots::LOWER_PARTS_OFFSET + idx,
-                    exec_ctx,
-                )
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-
-        DecimalByteParts::try_new_with_lower_parts(msp, lower_parts, decimal.decimal_dtype())
-            .map(|d| d.into_array())
+        DecimalByteParts::try_new(msp, decimal.decimal_dtype()).map(|d| d.into_array())
     }
 }
 

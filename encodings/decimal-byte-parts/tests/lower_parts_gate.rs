@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The lower-parts write gate, checked from outside the crate.
+//! The lower-parts write gate.
 //!
-//! The gate lets the crate's own unit tests through so the multi-part paths stay covered by a
-//! default `cargo test`. That bypass keys off `cfg!(test)`, which is false for the library
-//! when it is compiled as a dependency of this integration test — so this is the only place
-//! the gate's real behaviour can be observed.
+//! Lower parts can be built and computed over freely; what `unstable_encodings` gates is
+//! turning them back into bytes. These tests pin both halves of that: construction always
+//! works, and serialization refuses however the array was obtained.
 
 #![expect(clippy::tests_outside_test_module)]
 
@@ -33,24 +32,10 @@ fn single_child_is_always_allowed() {
     );
 }
 
-#[cfg(not(feature = "unstable_encodings"))]
+/// Building lower parts in memory is always allowed — reading a file requires it. The gate is
+/// on serialization alone.
 #[test]
-fn lower_parts_rejected_without_the_feature() {
-    let result = DecimalByteParts::try_new_with_lower_parts(
-        msp(),
-        vec![lower_part()],
-        DecimalDType::new(38, 2),
-    );
-    let err = result.expect_err("expected the write gate to reject");
-    assert!(
-        err.to_string().contains("unstable_encodings"),
-        "error should name the feature, got: {err}"
-    );
-}
-
-#[cfg(feature = "unstable_encodings")]
-#[test]
-fn lower_parts_allowed_with_the_feature() {
+fn lower_parts_can_always_be_constructed() {
     assert!(
         DecimalByteParts::try_new_with_lower_parts(
             msp(),

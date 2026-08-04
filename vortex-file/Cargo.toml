@@ -85,4 +85,5 @@ unstable_encodings = [
     "dep:vortex-tensor",
     "vortex-zstd?/unstable_encodings",
     "vortex-btrblocks/unstable_encodings",
+    "vortex-decimal-byte-parts/unstable_encodings",
 ]

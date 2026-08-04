@@ -17,8 +17,8 @@ version = { workspace = true }
 workspace = true
 
 [features]
-# Lower parts make this encoding write more than one child, which readers that predate them
-# cannot open. Gated until enough readers understand it.
+# Serializing more than one child, which readers that predate lower parts cannot open.
+# Building and reading them is always allowed; only writing is gated.
 unstable_encodings = []
 
 [dependencies]
@@ -37,13 +37,6 @@ rand = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { path = "../../vortex-array", features = ["_test-harness"] }
 
-[[test]]
-name = "props"
-# Property tests cover the multi-part paths, which the write gate only permits here.
-required-features = ["unstable_encodings"]
-
 [[bench]]
 name = "decimal_assemble"
 harness = false
-# Builds multi-part arrays, which the write gate only permits with this feature.
-required-features = ["unstable_encodings"]
