@@ -37,6 +37,9 @@ use crate::extension::multilinestring_storage_dtype;
 use crate::extension::multipoint_storage_dtype;
 use crate::extension::multipolygon_storage_dtype;
 use crate::extension::polygon_storage_dtype;
+pub use crate::extension::validation::validate_list_geometry;
+pub use crate::extension::validation::validate_point;
+pub use crate::extension::validation::validate_rect;
 
 /// A fresh session with the geospatial types, functions, and pruning rules registered.
 pub fn geo_session() -> VortexSession {

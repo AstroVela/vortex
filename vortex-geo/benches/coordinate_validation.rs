@@ -22,9 +22,6 @@ use vortex_array::dtype::DType;
 use vortex_arrow::ArrowSessionExt;
 use vortex_arrow::FromArrowArray;
 use vortex_error::VortexResult;
-use vortex_geo::extension::benchmark_validate_list_geometry as validate_list_geometry;
-use vortex_geo::extension::benchmark_validate_point as validate_point;
-use vortex_geo::extension::benchmark_validate_rect as validate_rect;
 use vortex_geo::test_harness::MultiPolygonRings;
 use vortex_geo::test_harness::geo_session;
 use vortex_geo::test_harness::multipoint_column;
@@ -33,6 +30,9 @@ use vortex_geo::test_harness::nullable_multipolygon_column;
 use vortex_geo::test_harness::nullable_point_column;
 use vortex_geo::test_harness::point_column;
 use vortex_geo::test_harness::rect_column;
+use vortex_geo::test_harness::validate_list_geometry;
+use vortex_geo::test_harness::validate_point;
+use vortex_geo::test_harness::validate_rect;
 use vortex_session::VortexSession;
 
 fn main() {
@@ -62,7 +62,7 @@ enum Validation {
     With,
 }
 
-type Validate = fn(&dyn ArrowArray) -> VortexResult<()>;
+type Validator = fn(&dyn ArrowArray) -> VortexResult<()>;
 
 fn to_arrow(array: ArrayRef) -> ImportCase {
     let mut ctx = SESSION.create_execution_ctx();
@@ -82,10 +82,13 @@ fn to_arrow(array: ArrayRef) -> ImportCase {
     }
 }
 
-fn import(case: &ImportCase, validation: Validation, validate: Validate) -> ArrayRef {
+fn import_native(case: &ImportCase, validation: Validation, validate: Validator) -> ArrayRef {
     if matches!(validation, Validation::With) {
         validate(case.array.as_ref()).unwrap();
     }
+
+    // Both modes perform the same zero-copy import and extension wrapping. `Without` deliberately
+    // skips reading the coordinate buffers, so its reported throughput is not memory bandwidth.
     let storage = ArrayRef::from_arrow(case.array.as_ref(), case.field.is_nullable()).unwrap();
     ExtensionArray::try_new(case.dtype.as_extension().clone(), storage)
         .unwrap()
@@ -118,7 +121,7 @@ fn point(bencher: Bencher, validation: Validation) {
 
     bencher
         .counter(xy_bytes(COORDINATES))
-        .bench(|| import(&case, validation, validate_point));
+        .bench(|| import_native(&case, validation, validate_point));
 }
 
 #[divan::bench(args = [Validation::Without, Validation::With])]
@@ -131,7 +134,7 @@ fn point_sparse_nulls(bencher: Bencher, validation: Validation) {
 
     bencher
         .counter(xy_bytes(valid_points))
-        .bench(|| import(&case, validation, validate_point));
+        .bench(|| import_native(&case, validation, validate_point));
 }
 
 #[divan::bench(args = [Validation::Without, Validation::With])]
@@ -147,7 +150,7 @@ fn rect(bencher: Bencher, validation: Validation) {
 
     bencher
         .counter(BytesCount::of_many::<f64>(COORDINATES * 4))
-        .bench(|| import(&case, validation, validate_rect));
+        .bench(|| import_native(&case, validation, validate_rect));
 }
 
 #[divan::bench(args = [Validation::Without, Validation::With])]
@@ -163,7 +166,7 @@ fn multipoint(bencher: Bencher, validation: Validation) {
 
     bencher
         .counter(xy_bytes(COORDINATES))
-        .bench(|| import(&case, validation, validate_list_geometry));
+        .bench(|| import_native(&case, validation, validate_list_geometry));
 }
 
 #[divan::bench(args = [Validation::Without, Validation::With])]
@@ -173,7 +176,7 @@ fn multipolygon(bencher: Bencher, validation: Validation) {
 
     bencher
         .counter(xy_bytes(COORDINATES))
-        .bench(|| import(&case, validation, validate_list_geometry));
+        .bench(|| import_native(&case, validation, validate_list_geometry));
 }
 
 #[divan::bench(args = [Validation::Without, Validation::With])]
@@ -186,5 +189,5 @@ fn multipolygon_sparse_nulls(bencher: Bencher, validation: Validation) {
 
     bencher
         .counter(xy_bytes(valid_coordinates))
-        .bench(|| import(&case, validation, validate_list_geometry));
+        .bench(|| import_native(&case, validation, validate_list_geometry));
 }
