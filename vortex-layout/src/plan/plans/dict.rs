@@ -4,10 +4,16 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use vortex_array::expr::Expression;
+use vortex_array::expr::is_root;
+use vortex_array::expr::label_is_fallible;
+use vortex_array::expr::label_strict;
+use vortex_array::expr::label_tree;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::layouts::dict::DictLayout;
+use crate::plan::ExpressionPlan;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
@@ -61,6 +67,33 @@ impl Plan for DictPlan {
         let codes = self.codes.optimize()?;
         let values = self.values.optimize()?;
         Ok(Arc::new(self.with_children(codes, values)))
+    }
+
+    fn optimize_expression(&self, expression: &Expression) -> VortexResult<Option<PlanRef>> {
+        if !expression.return_dtype(&self.dtype)?.is_boolean() {
+            return Ok(None);
+        }
+        let references_root = label_tree(expression, is_root, |acc, &child| acc | child)
+            .get(expression)
+            .copied()
+            .unwrap_or(false);
+        let is_strict = label_strict(expression)
+            .get(expression)
+            .copied()
+            .unwrap_or(false);
+        let is_fallible = label_is_fallible(expression)
+            .get(expression)
+            .copied()
+            .unwrap_or(true);
+        if !references_root || !is_strict || is_fallible {
+            return Ok(None);
+        }
+
+        let values =
+            ExpressionPlan::try_new(expression.clone(), Arc::clone(&self.values))?.optimize()?;
+        Ok(Some(Arc::new(
+            self.with_children(Arc::clone(&self.codes), values),
+        )))
     }
 
     fn dtype(&self) -> &vortex_array::dtype::DType {

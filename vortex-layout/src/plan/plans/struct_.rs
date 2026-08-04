@@ -5,9 +5,18 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use vortex_array::dtype::DType;
+use vortex_array::expr::Expression;
+use vortex_array::expr::col;
+use vortex_array::expr::make_free_field_annotator;
+use vortex_array::expr::root;
+use vortex_array::expr::transform::partition;
+use vortex_array::expr::transform::replace;
+use vortex_array::expr::transform::replace_root_fields;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use crate::layouts::struct_::StructLayout;
+use crate::plan::ExpressionPlan;
 use crate::plan::LazyPlanChildren;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
@@ -62,6 +71,39 @@ impl Plan for StructPlan {
     fn optimize(&self) -> VortexResult<PlanRef> {
         let children = self.children.map(|_, child| child.optimize());
         Ok(Arc::new(self.with_children(children)))
+    }
+
+    fn optimize_expression(&self, expression: &Expression) -> VortexResult<Option<PlanRef>> {
+        if self.dtype.is_nullable() {
+            return Ok(None);
+        }
+
+        let fields = self.layout.struct_fields();
+        let expanded =
+            replace_root_fields(expression.clone(), fields).optimize_recursive(&self.dtype)?;
+        let partitioned = partition(
+            expanded.clone(),
+            &self.dtype,
+            make_free_field_annotator(fields),
+        )?;
+        if partitioned.partition_names.len() != 1 {
+            return Ok(None);
+        }
+
+        let field_name = partitioned
+            .partition_names
+            .get(0)
+            .ok_or_else(|| vortex_err!("Struct expression partition has no field"))?;
+        let field_index = fields.find(field_name).ok_or_else(|| {
+            vortex_err!("Struct expression references unknown field '{field_name}'")
+        })?;
+        let field = self
+            .children
+            .get(field_index)?
+            .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
+        let lowered = replace(expanded, &col(field_name.clone()), root());
+
+        Ok(Some(ExpressionPlan::try_new(lowered, field)?.optimize()?))
     }
 
     fn dtype(&self) -> &DType {

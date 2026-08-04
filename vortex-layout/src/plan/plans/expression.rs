@@ -57,10 +57,10 @@ impl Plan for ExpressionPlan {
         }
         if let Some(inner) = child.downcast_ref::<Self>() {
             let expression = replace(expression, &root(), inner.expression.clone());
-            return Ok(Arc::new(Self::try_new(
-                expression,
-                Arc::clone(&inner.child),
-            )?));
+            return Self::try_new(expression, Arc::clone(&inner.child))?.optimize();
+        }
+        if let Some(rewritten) = child.optimize_expression(&expression)? {
+            return Ok(rewritten);
         }
         Ok(Arc::new(Self::try_new(expression, child)?))
     }
