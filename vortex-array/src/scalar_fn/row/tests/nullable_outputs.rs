@@ -7,6 +7,7 @@ use super::*;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 
+#[derive(Clone)]
 struct NullableI64(i64);
 
 impl OutputElement for NullableI64 {

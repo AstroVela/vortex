@@ -143,7 +143,11 @@ pub trait InputElement: 'static {
 }
 
 /// An element type that a row computation can produce, buildable into an all-valid column.
-pub trait OutputElement: 'static + Sized {
+///
+/// [`Clone`] is required so [`ElementSink`](crate::scalar_fn::ElementSink) can allocate through
+/// `vec![placeholder; rows]`, which is what lets a zero placeholder reach the allocator's zeroed
+/// path instead of costing a write pass over the output.
+pub trait OutputElement: 'static + Sized + Clone {
     /// The dtype of columns built from this element type. Must be non-nullable: nullability is
     /// derived from the inputs by the lifting.
     ///

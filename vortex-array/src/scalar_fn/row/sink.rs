@@ -118,9 +118,13 @@ impl<T: OutputElement> OutputSink for ElementSink<T> {
     }
 
     fn with_capacity(rows: usize, _dtype: &DType) -> VortexResult<Self> {
-        let mut values = Vec::with_capacity(rows);
-        values.resize_with(rows, T::placeholder);
-        Ok(Self { values })
+        // `vec![placeholder; rows]` rather than `resize_with(rows, placeholder)`: the former hands
+        // a zeroable placeholder (every primitive, `false`) straight to `alloc_zeroed`, while the
+        // latter always writes one element at a time. Only branch-and-skip ever reads a
+        // placeholder back, so on the dense and filter paths that write is pure waste.
+        Ok(Self {
+            values: vec![T::placeholder(); rows],
+        })
     }
 
     fn rows(&mut self) -> Self::Rows<'_> {
