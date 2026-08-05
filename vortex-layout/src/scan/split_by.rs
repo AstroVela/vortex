@@ -3,6 +3,7 @@
 
 use std::iter::once;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use vortex_array::dtype::FieldMask;
 use vortex_error::VortexExpect;
@@ -18,6 +19,17 @@ use crate::scan::IDEAL_SPLIT_SIZE;
 ///
 /// Reuses [`IDEAL_SPLIT_SIZE`] as the target span per split.
 const MAX_SPLIT_ROWS: u64 = IDEAL_SPLIT_SIZE;
+
+/// EXPERIMENT: coarsen splits by this factor. Target span per split becomes
+/// `factor * MAX_SPLIT_ROWS`; adjacent splits smaller than the target are merged. `1` (default)
+/// preserves current behaviour. Set `VORTEX_SPLIT_FACTOR` to try 2/4/8.
+static SPLIT_FACTOR: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("VORTEX_SPLIT_FACTOR")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&f| f >= 1)
+        .unwrap_or(1)
+});
 
 /// Defines how the Vortex file is split into batches for reading.
 ///
@@ -54,7 +66,13 @@ impl SplitBy {
                     &SplitRange::root(row_range.clone())?,
                     &mut row_splits,
                 )?;
-                subdivide_large_spans(row_splits.into_sorted_deduped(), MAX_SPLIT_ROWS)
+                let cap = MAX_SPLIT_ROWS.saturating_mul(*SPLIT_FACTOR);
+                let splits = subdivide_large_spans(row_splits.into_sorted_deduped(), cap);
+                if *SPLIT_FACTOR > 1 {
+                    merge_small_spans(splits, cap)
+                } else {
+                    splits
+                }
             }
             SplitBy::RowCount(n) => row_range
                 .clone()
@@ -116,6 +134,27 @@ fn subdivide_large_spans(boundaries: Vec<u64>, max_span: u64) -> Vec<u64> {
         out.windows(2).all(|w| w[0] < w[1]),
         "subdivided boundaries must stay strictly increasing (deduped)"
     );
+    out
+}
+
+/// EXPERIMENT: drop interior boundaries so each retained span is at least `target` rows, coarsening
+/// the split set. The first and last boundaries are always kept, so the covered row range is
+/// unchanged; only the number of splits shrinks.
+fn merge_small_spans(boundaries: Vec<u64>, target: u64) -> Vec<u64> {
+    if boundaries.len() <= 2 {
+        return boundaries;
+    }
+    let last = *boundaries.last().vortex_expect("len > 2 checked above");
+    let mut out = Vec::with_capacity(boundaries.len());
+    let mut anchor = boundaries[0];
+    out.push(anchor);
+    for &b in &boundaries[1..boundaries.len() - 1] {
+        if b - anchor >= target {
+            out.push(b);
+            anchor = b;
+        }
+    }
+    out.push(last);
     out
 }
 
