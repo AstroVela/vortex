@@ -5,6 +5,7 @@
 
 mod children;
 mod display;
+pub mod optimizer;
 mod plans;
 
 use std::any::Any;
@@ -44,6 +45,8 @@ pub type PlanRef = Arc<dyn Plan>;
 /// Layout plans expose their optimizer-facing children in a stable logical order. Optional child
 /// slots count toward [`child_count`](Self::child_count) and are returned as `None` by
 /// [`child`](Self::child) when absent. Accessing a child may initialize and cache its plan.
+/// Parent-child rewrites are expressed as [`optimizer::PlanParentReduceRule`]s and collected in a
+/// static [`optimizer::PlanParentRuleSet`].
 pub trait Plan: Any + Send + Sync {
     /// Returns the display name of this plan kind.
     ///
