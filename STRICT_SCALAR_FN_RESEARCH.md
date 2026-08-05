@@ -3,18 +3,19 @@
 
 # A layered authoring API for strict scalar functions
 
-**Status: historical design record, with the final prototype recorded at the end.** This document
+**Status: historical design record, with the final API review recorded at the end.** This document
 keeps the experiments in the order they happened, including APIs and ports that were later removed.
 The current architecture is one `RowFn` authoring trait, private lifting, one sink-backed
-`RowVisitor::visit_prepared_into` primitive, and an open input/output vocabulary. Read
+`RowVisitor::visit_prepared_into` primitive, and a deliberately open input/output vocabulary. Read
 [`SCALAR_FN_HANDOFF.md`](SCALAR_FN_HANDOFF.md) for orientation, then the final section here before
 using an earlier sketch.
 
 > **Later architecture decisions:** `StrictScalarFnVTable`, the columnar ports, returning visits,
-> and the return witness were deleted. `L2Denorm` is classified publicly as an encoding because its
-> normalized child and authoritative stored norms form one physical representation, although this
-> prototype still uses its row implementation to exercise `TensorSink`. Sections below remain the
-> evidence that led to those decisions, not the API to implement.
+> both witness types, `PersistableOptions`, the public `NullHandling`, the aggregate decode-shrinks
+> flag, and the unused `TensorSink` were deleted. Framework-only visitor, tuple, and result traits
+> are sealed. `InputElement`, `OutputElement`, and `OutputSink` remain open so functions can add
+> their own decode and output primitives. Sections below remain the evidence that led to those
+> decisions, not the API to implement.
 
 ---
 
@@ -1598,3 +1599,192 @@ RowFn
 Nullable outputs remain separate. A sink can build values plus validity, but doing so invalidates
 the unconditional `validity() = union_child_validities` derivation. That semantic change should
 land with its first strict non-total user, not inside the initial sink executor.
+
+---
+
+## Final API simplification review
+
+This section supersedes every earlier API sketch in this document. In particular, do not carry
+forward `ArgsWitness`, `RetWitness`, `PersistableOptions`, public `NullHandling`,
+`DECODE_SHRINKS_WHEN_FILTERED`, or `TensorSink`.
+
+The review started from two constraints. The public API should expose only decisions a function
+author can meaningfully make, and the executor should not trust facts fabricated by downstream
+implementations. Applying both constraints removed more framework surface without preventing a
+function from defining domain-specific rows.
+
+### The final extension boundary
+
+The framework is selectively sealed:
+
+- `RowFn` remains open. It names the function, options, argument names, fallibility, persistence,
+  and dtype-based dispatch.
+- `InputElement` remains open. This is how a crate adds a new decoder for a geometry, tensor view,
+  byte view, or another domain scalar.
+- `OutputElement` remains open for ordinary one-value-per-row outputs.
+- `OutputSink` remains open for output representations that need their own builder or row state.
+- `RowVisitor`, `ElementTuple`, and `SinkResult` are sealed because their implementations assert
+  executor facts used by the blanket vtable.
+
+Sealing `ElementTuple` does not seal decoding. The framework supplies tuple recursion for arities 0
+through 12, and a function places any open `InputElement` implementation inside those tuples.
+Sealing `SinkResult` likewise does not seal output representation. A custom `OutputSink` selects one
+of the supplied result behaviors.
+
+This keeps the author vocabulary extensible while avoiding public implementations that can lie
+about arity, dense safety, result fallibility, deferred errors, or skipped-row support.
+
+### Dispatch contains its own evidence
+
+`RowFn` no longer has argument or return witnesses. `ARG_NAMES.len()` is the exact arity. The types
+selected by `dispatch` carry the remaining evidence:
+
+```text
+(InputElement, ...) + OutputSink + SinkResult
+  -> arity and decode properties
+  -> output representation and dtype
+  -> row fallibility and deferred-error word
+```
+
+The visitor asserts at compile time that the dispatched tuple arity matches `ARG_NAMES`, a
+fallible decoder or result implies `RowFn::FALLIBLE`, and deferred evidence is accepted by the
+selected sink. These are implications rather than equalities. A function may conservatively
+declare `FALLIBLE = true` while selecting an infallible arm for some dtypes.
+
+This is enough for planning because dispatch is pure in `(options, args)`. It is also simpler than
+duplicating the same tuple in a witness and every dispatch arm, then proving that the declarations
+agree.
+
+### Persistence follows the function ID
+
+`Options: PersistableOptions` assigned one wire contract to a Rust type. That was the wrong owner.
+Two functions may reuse an options type while choosing different encodings or serializability, and
+an unregistered function should not invent persistence merely because its options type supports it.
+
+The final `RowFn` therefore owns `serialize` and `deserialize` hooks. Serialization defaults to
+`Ok(None)`, and deserialization defaults to an error. Registered tensor and geo functions preserve
+their explicit existing formats. The unregistered `NumericBinary` needs no otherwise-unused
+serialization implementation for `NumericOperator`.
+
+### One custom sink is enough
+
+`OutputSink` already permits arbitrary internal state. A function that needs two builders defines
+one sink with two fields rather than asking the executor to understand pairs of sinks. The same
+rule applies to other composite or runtime-shaped results: express the shape inside one sink and
+add framework abstraction only after two real users expose shared mechanics.
+
+The public `TensorSink` had no user after `l2_denorm` became the `Normalized` encoding. `l2_norm`,
+inner product, and cosine similarity all return scalar rows through `ElementSink`. Removing
+`TensorSink` avoids stabilizing roughly 90 lines of runtime-shaped row behavior without preventing
+a future tensor-valued function from defining a private sink.
+
+`ElementSink<T>` also no longer needs an `ElementRow` wrapper. Its row is `&mut T`, and a closure
+writes with `*output = value`. The sink still pre-fills legal placeholders so branch-and-skip may
+leave masked rows untouched.
+
+### Per-argument filtered-decode cost
+
+The aggregate `DECODE_SHRINKS_WHEN_FILTERED` flag was measurably lossy. OR-ing the flag made one
+expensive decode indistinguishable from two, even though the x86 data selected opposite mechanisms:
+
+- one nullable geometry argument at 50% nulls favored branch-and-skip; and
+- two independently nullable geometry arguments at 10% nulls, about 81% surviving rows, favored
+  filter-and-scatter.
+
+`InputElement::FILTERED_DECODE_COST` now defaults to zero, and each tuple adds the costs of all its
+arguments. The batch selector uses the following coarse policy:
+
+- cost 0 always branches;
+- cost 1 branches at 50% or more survivors; and
+- cost 2 or greater branches at 85% or more survivors.
+
+The exact values come from the measured cases rather than a general cost model. There is not yet
+enough evidence to distinguish two costly arguments from three, or to make the crossover depend on
+batch size. Keep the value additive so a later selector can use that information without another
+author-facing API change.
+
+The old public `NullHandling` enum is gone. The executor privately derives `Dense`,
+`DenseWithRetry`, or `ValidOnly { filtered_decode_cost }`. Authors declare local safety and cost on
+their input/result types, not a global mechanism. `NullStrategy` survives only in the test harness
+to force branch-and-skip or filter-and-scatter.
+
+### Deferred errors stay in a loop-local word
+
+The numeric migration confirmed two constraints on deferred error evidence:
+
+- the accumulated word must be no wider than the element type; and
+- the accumulator must live in the generated loop, not behind a mutable sink reference.
+
+The sealed `SinkResult` implementations for `bool`, `u8`, `u16`, `u32`, and `u64` preserve both.
+Checked multiplication can report discarded high bits directly, LLVM can accumulate those words in
+vectors, and `finish` turns the final evidence into the function error. `VortexResult<()>` remains
+the separate early-exit form for a row that cannot write a legal provisional value.
+
+### Code generation after the simplification
+
+The final cleanup at `4becc863ae` was compared with parent `53c51d803c` using rustc 1.91.0 and LLVM
+21.1.2. Both revisions were cross-compiled with:
+
+```bash
+cargo rustc -p vortex-array --bench row_fn_executor --profile bench \
+    --target x86_64-apple-darwin -- \
+    --emit=llvm-ir -C codegen-units=1 -C target-cpu=x86-64-v3
+```
+
+The optimized executor monomorphs were normalized to remove revision-specific symbol names and
+metadata. Their vector/reduction block hashes matched exactly for wrapping add through
+`ElementSink`, checked add with deferred evidence, and wrapping add through the custom `I64Sink`.
+
+The two wrapping paths retain 256-bit `<4 x i64>` loads, adds, and stores across six vector loop
+bodies covering constant and varying inputs. Checked add retains `<4 x i64>` arithmetic, derives
+overflow with vector xor/and/compare operations, ORs `<4 x i1>` evidence in the vector loop, and
+reduces after the loop. The vector bodies have no calls or panic references. Scalar tails are
+present in both revisions.
+
+The production tensor benchmark IR was checked separately for `l2_norm`, inner product, and cosine
+similarity. After normalizing SSA and metadata, arithmetic sequences and instruction counts matched
+between revisions for both `f32` and `f64`. Their ordered floating-point reductions remain
+eightfold scalar-unrolled in both revisions. They were not vectorized before the cleanup, so the
+API change did not cause that property.
+
+Native Apple M4 Max `row_fn_executor` timings used 65,536 rows, two alternating revisions, 100
+samples, and a 0.5-second minimum per arm. RowFn median deltas ranged from 1.11% faster to 0.94%
+slower. Fastest deltas stayed within approximately 0.17%, while specialized controls had median
+drift as high as 3.7%. That is no measurable native regression.
+
+This evidence is deliberately bounded. Cross-target optimized IR shows that the API cleanup did
+not change the x86_64-v3 hot loops. It cannot establish the runtime effect of the new null selector
+on an x86 branch predictor. Re-run the measured null shapes on x86 before changing or declaring the
+50% and 85% thresholds settled.
+
+### Required x86 rerun
+
+The next session will run on an x86 machine. It must rerun the production comparison before this
+performance record is considered complete. The #9136 benchmark baseline is now on `develop` at
+`9a482c0230`, including the public binary, tensor, and geo benchmark binaries used by this work.
+Fetch the latest `origin/develop`, record both exact revisions, and compare the branch against
+`develop` with the same benchmark names.
+
+Run `binary_ops` and `like` from `vortex-array`. Run `l2_norm`, `inner_product`,
+`cosine_similarity`, and `normalized` from `vortex-tensor`. Run `binary_predicates`, `distance`,
+`envelope`, and `predicate_bbox` from `vortex-geo`. Use at least two alternating runs per revision.
+If the host permits it, pin one core. Report both fastest and median values with the CPU, timer, and
+governor configuration.
+
+The stable production binaries are the cross-revision gate because they now exist on `develop`.
+The branch-only `vortex-geo` `null_strategies` benchmark remains the forced-policy diagnostic. Run
+it on the same x86 host to verify both measured selector decisions: one costly decode at 50%
+survivors must select the faster mechanism, and two costly decodes at about 81% survivors must do
+the same. Inspect optimized LLVM IR again for any stable regression before changing the API or the
+selector.
+
+### Final verification state
+
+The final API state recorded 67 focused RowFn tests, 179 tensor tests, and 230 geo tests. Nightly
+formatting passed. Full workspace clippy passed with
+`PYO3_NO_PYTHON=1 PYO3_BUILD_EXTENSION_MODULE=1`, required because the host `/usr/bin/python3` is
+3.9 while the workspace targets the Python 3.11 stable ABI.
+
+Issues #9128, #9129, and #9130 were updated to this API. The durable public-path benchmark baseline
+from #9136 is now in the repository. Earlier statements in this document that those issues or the
+baseline still need updating are historical only.

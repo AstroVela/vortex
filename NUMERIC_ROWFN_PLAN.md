@@ -8,19 +8,14 @@ compaction: everything needed to start is here, and nothing below depends on cha
 
 ## Where things stand
 
-Branch `claude/strict-scalar-fn-abstraction-ah88x3`, pushed, five commits past `a8b6cd52a1`:
+Branch `claude/strict-scalar-fn-abstraction-ah88x3`, at `4becc863ae` after the final API
+simplification. Issues #9128, #9129, and #9130 match the implementation. The public-path benchmark
+baseline from #9136 is now in the repository.
 
-```
-7dbd9044cb Take byte_length off the row framework
-926f4590c6 Attach the scatter mask as validity instead of masking again
-8942e9ace4 Export ElementRow, the slot a row closure writes through
-48e260e002 Allocate row output through a zeroable placeholder
-d0b938aacf Pin decode fallibility to the argument witness
-```
-
-Issues 9128, 9129 and 9130 are updated to the sink-only API and contain no stale design. PRs #9138
-(`ct/l2-denorm-encoding` to develop) and #9136 (`ct/scalar-fn-baselines`, stacked on it) are both
-mergeable; #9136 is blocked only on #9138 landing. CodSpeed baselines do not exist until both merge.
+This document preserves the original spike plan and the measurements that answered it. The current
+API has no witnesses, persistence is function-owned, executor-only helper traits are sealed, and
+filtered decode cost is additive per input. Read the outcome and final API/codegen sections before
+following an earlier step literally.
 
 `byte_length` is no longer a row function, and `Bytes`/`BytesLen` are deleted. It measured 7.6-7.7x
 slower than develop and is the case #9128 already excludes.
@@ -111,7 +106,7 @@ The numeric suite specifically:
 cargo nextest run -p vortex-array scalar_fn::fns::binary
 ```
 
-Performance gate is CodSpeed on the `binary_ops` names from #9136, once it lands on develop. Locally,
+Performance gate is CodSpeed on the stable `binary_ops` names from #9136. Locally, use
 `cargo bench -p vortex-array --bench binary_ops` with two runs, fastest and median, machine stated.
 
 ## What this spike is not
@@ -138,9 +133,10 @@ the old implementation did around the arithmetic (decoding, the constant-operand
 all-constant fold, the null-constant short circuit, output allocation, nullability widening, masking,
 and the valid-row retry after an overflow behind a null) is now the lifting's.
 
-`NumericOperator` became the options type, which needed `Hash` and a `PersistableOptions` impl.
-Nothing serializes it, since `NumericBinary` is unregistered, but encoding it as `vortex.binary` does
-keeps a future registration wire-compatible.
+`NumericOperator` became the options type. `NumericBinary` is unregistered and deliberately has no
+serialization implementation. Persistence now belongs to each `RowFn`, so reusing an options type
+does not silently assign the helper a wire contract. `Binary` retains its existing ID and options
+serialization, and only primitive execution delegates to `NumericBinary`.
 
 Three things the old code carried are gone because the row framework removes the distinction they
 existed for:
@@ -206,22 +202,55 @@ CodSpeed settle whether it is real.
 ### What this implies for #9129 and #9130
 
 - The `RowFn` API needed nothing. No new visit method, no options-aware `sink_dtype`, no return
-  witness. The options-independence of `RowFn::is_fallible` does not bite, because fallibility is
-  uniform across the four arithmetic operators.
+  witness. `NumericBinary::FALLIBLE = true` is conservative for every dispatch arm, and each
+  concrete result type supplies the precise loop behavior.
 - `SinkResult::Accumulated` and its two constraints belong in #9130, and are recorded there.
 - On kernels this close to the vectorizer's decision boundary, the emitted IR is the reliable gate
   and wall clock on one host is not. Two separate interventions here moved a benchmark the wrong
   way, and host drift between sessions exceeded the effects under measurement.
 
+### Final API cleanup and generated code
+
+The later simplification did not add numeric-specific surface:
+
+- `NumericBinary` declares `ARG_NAMES = &["lhs", "rhs"]` instead of repeating an argument witness.
+- Its `Options = NumericOperator` has no persistence bound or implementation. The registered
+  `Binary` function remains the sole owner of the serialized `vortex.binary` contract.
+- The selected input tuple carries arity, dense-safety, decode fallibility, and filtered-decode
+  cost. The selected sink and `SinkResult` carry output and deferred-error facts.
+- `SinkResult` is sealed, but a numeric function does not need to implement it. It chooses the
+  supplied unsigned evidence width that matches the primitive element width.
+- `OutputSink` remains one abstraction. A later numeric function with multiple logical outputs
+  should put both builders in one sink rather than add a pair-of-sinks framework type.
+
+The final cleanup was checked against its parent by cross-compiling the optimized
+`row_fn_executor` benchmark for `x86_64-apple-darwin` with `target-cpu=x86-64-v3`. After normalizing
+symbol names and metadata, the vector/reduction block for checked `i64` add matched exactly. It
+retains `<4 x i64>` loads and adds, vector overflow detection through xor/and/compare operations,
+`<4 x i1>` OR accumulation, and a reduction after the loop. The vector body has no call or panic
+path, and the scalar tail is unchanged.
+
+The ordinary `ElementSink` and custom-sink wrapping-add monomorphs also matched exactly. Native
+Apple M4 Max measurements over 65,536 rows found RowFn median changes between 1.11% faster and 0.94%
+slower, with fastest changes within about 0.17%. Specialized controls drifted more than the RowFn
+arms, so there is no measurable native regression from the cleanup.
+
+This is not an x86 runtime result. It proves that the API edits preserved the optimized x86_64-v3
+loop shape. Runtime confirmation for numeric changes should use the stable public benchmark names
+from #9136 on the target host.
+
+The next session will run on x86 and must perform that confirmation. The #9136 `binary_ops`
+benchmark is on `develop` at `9a482c0230`, so compare this branch with the latest
+`origin/develop` using the same public benchmark names. Record both exact commits and run each
+revision at least twice in alternating order. If possible, pin one core. Report fastest and median
+values with the CPU and timer configuration. If a stable case regresses, compare its optimized LLVM
+IR before changing the row API or restoring hand-written execution.
+
 ### Verification
 
-```bash
-cargo nextest run --workspace
-cargo clippy --all-targets --all-features
-cargo +nightly fmt --all
-cargo test --doc -p vortex-array
-```
-
-The whole of `binary/numeric/tests.rs` passes unchanged, including
+The whole of `binary/numeric/tests.rs` passed unchanged, including
 `test_decimal_overflow_on_null_lane_ignored` and the integer-error tests that pin the valid-row
-retry. Decimal is untouched and stays on `execute_numeric_decimal`.
+retry. Decimal is untouched and stays on `execute_numeric_decimal`. The final API state also
+recorded 67 focused RowFn tests, 179 tensor tests, 230 geo tests, nightly formatting, and full
+workspace clippy. Clippy needed `PYO3_NO_PYTHON=1 PYO3_BUILD_EXTENSION_MODULE=1` because the host
+Python is 3.9 while the workspace targets the Python 3.11 stable ABI.
