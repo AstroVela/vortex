@@ -7,10 +7,15 @@
 //! The constant is a 128-vertex query polygon, the shape a spatial filter broadcasts against a
 //! column. Arms pair it with a point column (geo answers those pairings with direct
 //! point-in-polygon algorithms) and with a small-polygon column (geo routes those pairings through
-//! bounding-box prechecks and `relate`), split into a mostly-disjoint and a mostly-overlapping
-//! dataset so the bbox early-out's win and its overhead are both visible. The column-x-column arms
-//! are the control: no operand is constant, so a prepared path has nothing to hoist and must not
-//! regress them.
+//! bounding-box prechecks and `relate`), covering both a mostly-disjoint dataset where the bbox
+//! early-out rejects nearly every row and an all-overlapping one where it never does. The
+//! column-x-column arms are the control: no operand is constant, so a prepared path has nothing to
+//! hoist and must not regress them.
+//!
+//! `contains` has no all-overlapping arm. One `contains(query polygon, contained square)` row
+//! builds a topology graph over the constant's 128 edges, which CodSpeed's CPU simulation charges
+//! around 120 µs, so no row count both fits the per-iteration budget and exercises the row loop.
+//! [`intersects::polygons_overlapping_x_constant`] covers the never-rejects case instead.
 //!
 //! Run with `cargo bench -p vortex-geo --bench binary_predicates`.
 
@@ -21,13 +26,15 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
+use mimalloc::MiMalloc;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::ScalarFnArray;
+use vortex_array::arrays::MaskedArray;
+use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 use vortex_geo::scalar_fn::contains::GeoContains;
 use vortex_geo::scalar_fn::intersects::GeoIntersects;
@@ -36,14 +43,26 @@ use vortex_geo::test_harness::point_column;
 use vortex_geo::test_harness::polygon_column;
 use vortex_session::VortexSession;
 
+// Scalar function execution allocates its output inside the timed region, so use the vendored
+// allocator instead of measuring glibc differences between CodSpeed runner images.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
     divan::main();
 }
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(geo_session);
 
-/// Every arm has the same row count so results are comparable across shapes.
-const ROWS: usize = 1 << 14;
+/// The ordinary arms use the same row count so results are comparable across shapes. A geometry
+/// predicate costs roughly a microsecond per row under CodSpeed's CPU simulation, which caps the
+/// row count well below a typical batch to stay inside the 1 ms per-iteration budget from
+/// `docs/developer-guide/benchmarking.md`.
+const ROWS: usize = 1 << 7;
+
+/// The all-overlapping polygon arm never rejects on bounding boxes, so every row pays for the full
+/// pairwise predicate. It needs a smaller fixture than [`ROWS`] to stay inside the same budget.
+const OVERLAPPING_POLYGON_ROWS: usize = 1 << 5;
 
 /// Deterministic pseudo-random value in `[0, 1)`.
 fn unit(i: usize) -> f64 {
@@ -64,12 +83,21 @@ fn query_ring(cx: f64, cy: f64) -> Vec<(f64, f64)> {
 
 /// The query polygon as a batch-constant operand: a top-level `ConstantArray` over the geometry
 /// extension scalar, the shape that reaches the row loop's stride-0 path.
-fn query_constant(ctx: &mut ExecutionCtx) -> ArrayRef {
+fn query_constant(ctx: &mut ExecutionCtx, rows: usize) -> ArrayRef {
     let scalar = polygon_column(vec![vec![query_ring(0.0, 0.0)]])
         .unwrap()
         .execute_scalar(0, ctx)
         .unwrap();
-    ConstantArray::new(scalar, ROWS).into_array()
+    ConstantArray::new(scalar, rows).into_array()
+}
+
+/// A batch-constant point operand with the requested row count.
+fn point_constant(ctx: &mut ExecutionCtx, rows: usize) -> ArrayRef {
+    let scalar = point_column(vec![0.0], vec![0.0])
+        .unwrap()
+        .execute_scalar(0, ctx)
+        .unwrap();
+    ConstantArray::new(scalar, rows).into_array()
 }
 
 /// A small square (side 2) centered at `(cx, cy)`.
@@ -83,39 +111,58 @@ fn square(cx: f64, cy: f64) -> Vec<Vec<(f64, f64)>> {
     ]]
 }
 
-/// [`ROWS`] small squares whose centers avoid the query polygon almost always: the shape of a
+/// `rows` small squares whose centers avoid the query polygon almost always: the shape of a
 /// selective spatial filter, where a bbox check rejects nearly every row.
-fn squares_mostly_disjoint() -> ArrayRef {
-    let rows = (0..ROWS)
+fn squares_mostly_disjoint(rows: usize) -> ArrayRef {
+    let rows = (0..rows)
         .map(|i| square(150.0 + 700.0 * unit(i), 150.0 + 700.0 * unit(i + 1)))
         .collect();
     polygon_column(rows).unwrap()
 }
 
-/// [`ROWS`] small squares whose centers all fall well inside the query polygon, so a bbox check
+/// `rows` small squares whose centers all fall well inside the query polygon, so a bbox check
 /// never rejects and the full pairwise predicate always runs.
-fn squares_mostly_overlapping() -> ArrayRef {
-    let rows = (0..ROWS)
+fn squares_mostly_overlapping(rows: usize) -> ArrayRef {
+    let rows = (0..rows)
         .map(|i| square(120.0 * unit(i) - 60.0, 120.0 * unit(i + 1) - 60.0))
         .collect();
     polygon_column(rows).unwrap()
 }
 
-/// [`ROWS`] points spread over `[-150, 150)^2`, mixing rows inside and outside the query polygon.
-fn points() -> ArrayRef {
-    let xs = (0..ROWS).map(|i| 300.0 * unit(i) - 150.0).collect();
-    let ys = (0..ROWS).map(|i| 300.0 * unit(i + 1) - 150.0).collect();
+/// `rows` points spread over `[-150, 150)^2`, mixing rows inside and outside the query polygon.
+fn points(rows: usize) -> ArrayRef {
+    let xs = (0..rows).map(|i| 300.0 * unit(i) - 150.0).collect();
+    let ys = (0..rows).map(|i| 300.0 * unit(i + 1) - 150.0).collect();
     point_column(xs, ys).unwrap()
 }
 
 /// Execute `array` to completion.
-fn execute(array: VortexResult<ScalarFnArray>, ctx: &mut ExecutionCtx) -> ArrayRef {
+fn execute(array: VortexResult<impl IntoArray>, ctx: &mut ExecutionCtx) -> ArrayRef {
     array
         .unwrap()
         .into_array()
         .execute::<Canonical>(ctx)
         .unwrap()
         .into_array()
+}
+
+/// Marks one row in `null_every` null without changing the geometry storage.
+fn nullable_every(array: ArrayRef, null_every: usize) -> ArrayRef {
+    let validity = Validity::from_iter((0..array.len()).map(|i| !i.is_multiple_of(null_every)));
+    MaskedArray::try_new(array, validity).unwrap().into_array()
+}
+
+/// A deterministic 90%-null validity pattern.
+fn ninety_percent_null(array: ArrayRef) -> ArrayRef {
+    let validity = Validity::from_iter((0..array.len()).map(|i| i.is_multiple_of(10)));
+    MaskedArray::try_new(array, validity).unwrap().into_array()
+}
+
+/// A deterministic 50% validity pattern with a distinct phase per operand. Adjacent phases make
+/// the two columns jointly cover every valid/null combination once per four rows.
+fn half_valid(array: ArrayRef, phase: usize) -> ArrayRef {
+    let validity = Validity::from_iter((0..array.len()).map(|i| (i + phase) % 4 < 2));
+    MaskedArray::try_new(array, validity).unwrap().into_array()
 }
 
 mod contains {
@@ -125,8 +172,8 @@ mod contains {
     #[divan::bench]
     fn column_x_column_points(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let polygons = squares_mostly_overlapping();
-        let points = points();
+        let polygons = squares_mostly_overlapping(ROWS);
+        let points = points(ROWS);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoContains::try_new_array(polygons.clone(), points.clone()),
@@ -139,8 +186,8 @@ mod contains {
     #[divan::bench]
     fn column_x_column_polygons(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let a = squares_mostly_overlapping();
-        let b = squares_mostly_disjoint();
+        let a = squares_mostly_overlapping(ROWS);
+        let b = squares_mostly_disjoint(ROWS);
         bencher
             .counter(ItemsCount::new(ROWS))
             .bench_local(|| execute(GeoContains::try_new_array(a.clone(), b.clone()), &mut ctx));
@@ -150,8 +197,8 @@ mod contains {
     #[divan::bench]
     fn constant_x_points(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let query = query_constant(&mut ctx);
-        let points = points();
+        let query = query_constant(&mut ctx, ROWS);
+        let points = points(ROWS);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoContains::try_new_array(query.clone(), points.clone()),
@@ -165,8 +212,8 @@ mod contains {
     #[divan::bench]
     fn constant_x_polygons_disjoint(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let query = query_constant(&mut ctx);
-        let polygons = squares_mostly_disjoint();
+        let query = query_constant(&mut ctx, ROWS);
+        let polygons = squares_mostly_disjoint(ROWS);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoContains::try_new_array(query.clone(), polygons.clone()),
@@ -175,16 +222,73 @@ mod contains {
         });
     }
 
-    /// Constant container against mostly-overlapping polygons: relate-routed, and every row pays
-    /// for topology graphs.
+    /// Constant container against a point column with one null row in eight.
     #[divan::bench]
-    fn constant_x_polygons_overlapping(bencher: Bencher) {
+    fn constant_x_nullable_points(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let query = query_constant(&mut ctx);
-        let polygons = squares_mostly_overlapping();
+        let query = query_constant(&mut ctx, ROWS);
+        let points = nullable_every(points(ROWS), 8);
+        bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
+            execute(
+                GeoContains::try_new_array(query.clone(), points.clone()),
+                &mut ctx,
+            )
+        });
+    }
+
+    /// Constant container against mostly-disjoint polygons with one null row in eight.
+    #[divan::bench]
+    fn constant_x_nullable_polygons_disjoint(bencher: Bencher) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let query = query_constant(&mut ctx, ROWS);
+        let polygons = nullable_every(squares_mostly_disjoint(ROWS), 8);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoContains::try_new_array(query.clone(), polygons.clone()),
+                &mut ctx,
+            )
+        });
+    }
+
+    /// Polygon columns against a constant point exercise the direct geometry pairing without a
+    /// constant container.
+    #[divan::bench]
+    fn polygons_x_constant_point(bencher: Bencher) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let polygons = squares_mostly_overlapping(ROWS);
+        let point = point_constant(&mut ctx, ROWS);
+        bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
+            execute(
+                GeoContains::try_new_array(polygons.clone(), point.clone()),
+                &mut ctx,
+            )
+        });
+    }
+
+    /// The same polygon-x-constant-point pairing with a deterministic 90% null polygon column.
+    #[divan::bench]
+    fn nullable_polygons_90pct_x_constant_point(bencher: Bencher) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let polygons = ninety_percent_null(squares_mostly_overlapping(ROWS));
+        let point = point_constant(&mut ctx, ROWS);
+        bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
+            execute(
+                GeoContains::try_new_array(polygons.clone(), point.clone()),
+                &mut ctx,
+            )
+        });
+    }
+
+    /// Independently 50%-valid polygon and point columns cover mixed validity without test-only
+    /// execution controls.
+    #[divan::bench]
+    fn nullable_polygons_x_nullable_points(bencher: Bencher) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let polygons = half_valid(squares_mostly_overlapping(ROWS), 0);
+        let points = half_valid(points(ROWS), 1);
+        bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
+            execute(
+                GeoContains::try_new_array(polygons.clone(), points.clone()),
                 &mut ctx,
             )
         });
@@ -198,8 +302,8 @@ mod intersects {
     #[divan::bench]
     fn column_x_column_polygons(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let a = squares_mostly_overlapping();
-        let b = squares_mostly_disjoint();
+        let a = squares_mostly_overlapping(ROWS);
+        let b = squares_mostly_disjoint(ROWS);
         bencher
             .counter(ItemsCount::new(ROWS))
             .bench_local(|| execute(GeoIntersects::try_new_array(a.clone(), b.clone()), &mut ctx));
@@ -210,8 +314,8 @@ mod intersects {
     #[divan::bench]
     fn points_x_constant(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let points = points();
-        let query = query_constant(&mut ctx);
+        let points = points(ROWS);
+        let query = query_constant(&mut ctx, ROWS);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoIntersects::try_new_array(points.clone(), query.clone()),
@@ -225,8 +329,8 @@ mod intersects {
     #[divan::bench]
     fn polygons_disjoint_x_constant(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let polygons = squares_mostly_disjoint();
-        let query = query_constant(&mut ctx);
+        let polygons = squares_mostly_disjoint(ROWS);
+        let query = query_constant(&mut ctx, ROWS);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoIntersects::try_new_array(polygons.clone(), query.clone()),
@@ -235,13 +339,44 @@ mod intersects {
         });
     }
 
-    /// Mostly-overlapping polygons against the constant query: the bbox precheck never rejects,
-    /// so every row still pays for the full pairwise predicate.
+    /// Mostly-overlapping polygons against the constant query: the bbox precheck never rejects, so
+    /// every row still pays for the full pairwise predicate. That is several times the per-row cost
+    /// of the other arms, so this one uses [`OVERLAPPING_POLYGON_ROWS`].
     #[divan::bench]
     fn polygons_overlapping_x_constant(bencher: Bencher) {
         let mut ctx = SESSION.create_execution_ctx();
-        let polygons = squares_mostly_overlapping();
-        let query = query_constant(&mut ctx);
+        let polygons = squares_mostly_overlapping(OVERLAPPING_POLYGON_ROWS);
+        let query = query_constant(&mut ctx, OVERLAPPING_POLYGON_ROWS);
+        bencher
+            .counter(ItemsCount::new(OVERLAPPING_POLYGON_ROWS))
+            .bench_local(|| {
+                execute(
+                    GeoIntersects::try_new_array(polygons.clone(), query.clone()),
+                    &mut ctx,
+                )
+            });
+    }
+
+    /// Nullable point column against the constant query, with one null row in eight.
+    #[divan::bench]
+    fn nullable_points_x_constant(bencher: Bencher) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let points = nullable_every(points(ROWS), 8);
+        let query = query_constant(&mut ctx, ROWS);
+        bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
+            execute(
+                GeoIntersects::try_new_array(points.clone(), query.clone()),
+                &mut ctx,
+            )
+        });
+    }
+
+    /// Mostly-disjoint nullable polygons against the constant query.
+    #[divan::bench]
+    fn nullable_polygons_disjoint_x_constant(bencher: Bencher) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let polygons = nullable_every(squares_mostly_disjoint(ROWS), 8);
+        let query = query_constant(&mut ctx, ROWS);
         bencher.counter(ItemsCount::new(ROWS)).bench_local(|| {
             execute(
                 GeoIntersects::try_new_array(polygons.clone(), query.clone()),

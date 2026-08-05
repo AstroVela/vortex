@@ -16,11 +16,11 @@ use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 
+use crate::encodings::normalized::Normalized;
 use crate::scalar_fns::inner_product::InnerProduct;
-use crate::scalar_fns::l2_denorm::L2Denorm;
 use crate::tests::SESSION;
 use crate::utils::test_helpers::assert_close;
-use crate::utils::test_helpers::l2_denorm_array;
+use crate::utils::test_helpers::normalized_array;
 use crate::utils::test_helpers::tensor_array;
 use crate::utils::test_helpers::vector_array;
 
@@ -136,13 +136,13 @@ fn rejects_mismatched_dtypes() -> VortexResult<()> {
 }
 
 #[test]
-fn both_denorm() -> VortexResult<()> {
-    // LHS: [3.0, 4.0] = L2Denorm([0.6, 0.8], 5.0).
-    // RHS: [1.0, 0.0] = L2Denorm([1.0, 0.0], 1.0).
+fn both_normalized() -> VortexResult<()> {
+    // LHS: [3.0, 4.0] = Normalized([0.6, 0.8], 5.0).
+    // RHS: [1.0, 0.0] = Normalized([1.0, 0.0], 1.0).
     // dot([3.0, 4.0], [1.0, 0.0]) = 3.0.
     let mut ctx = SESSION.create_execution_ctx();
-    let lhs = l2_denorm_array(&[2], &[0.6, 0.8], &[5.0], &mut ctx)?;
-    let rhs = l2_denorm_array(&[2], &[1.0, 0.0], &[1.0], &mut ctx)?;
+    let lhs = normalized_array(&[2], &[0.6, 0.8], &[5.0], &mut ctx)?;
+    let rhs = normalized_array(&[2], &[1.0, 0.0], &[1.0], &mut ctx)?;
 
     // Expected: 5.0 * 1.0 * dot([0.6, 0.8], [1.0, 0.0]) = 5.0 * 0.6 = 3.0.
     assert_close(&eval_inner_product(lhs, rhs)?, &[3.0]);
@@ -150,24 +150,24 @@ fn both_denorm() -> VortexResult<()> {
 }
 
 #[test]
-fn both_denorm_multiple_rows() -> VortexResult<()> {
+fn both_normalized_multiple_rows() -> VortexResult<()> {
     // Row 0: [3.0, 4.0] dot [3.0, 4.0] = 25.0.
     // Row 1: [1.0, 0.0] dot [0.0, 1.0] = 0.0.
     let mut ctx = SESSION.create_execution_ctx();
-    let lhs = l2_denorm_array(&[2], &[0.6, 0.8, 1.0, 0.0], &[5.0, 1.0], &mut ctx)?;
-    let rhs = l2_denorm_array(&[2], &[0.6, 0.8, 0.0, 1.0], &[5.0, 1.0], &mut ctx)?;
+    let lhs = normalized_array(&[2], &[0.6, 0.8, 1.0, 0.0], &[5.0, 1.0], &mut ctx)?;
+    let rhs = normalized_array(&[2], &[0.6, 0.8, 0.0, 1.0], &[5.0, 1.0], &mut ctx)?;
 
     assert_close(&eval_inner_product(lhs, rhs)?, &[25.0, 0.0]);
     Ok(())
 }
 
 #[test]
-fn one_side_denorm_lhs() -> VortexResult<()> {
-    // LHS: L2Denorm([0.6, 0.8], 5.0) representing [3.0, 4.0].
+fn one_side_normalized_lhs() -> VortexResult<()> {
+    // LHS: Normalized([0.6, 0.8], 5.0) representing [3.0, 4.0].
     // RHS: plain [1.0, 2.0].
     // dot([3.0, 4.0], [1.0, 2.0]) = 3.0 + 8.0 = 11.0.
     let mut ctx = SESSION.create_execution_ctx();
-    let lhs = l2_denorm_array(&[2], &[0.6, 0.8], &[5.0], &mut ctx)?;
+    let lhs = normalized_array(&[2], &[0.6, 0.8], &[5.0], &mut ctx)?;
     let rhs = tensor_array(&[2], &[1.0, 2.0])?;
 
     assert_close(&eval_inner_product(lhs, rhs)?, &[11.0]);
@@ -175,27 +175,27 @@ fn one_side_denorm_lhs() -> VortexResult<()> {
 }
 
 #[test]
-fn one_side_denorm_rhs() -> VortexResult<()> {
+fn one_side_normalized_rhs() -> VortexResult<()> {
     // LHS: plain [1.0, 2.0].
-    // RHS: L2Denorm([0.6, 0.8], 5.0) representing [3.0, 4.0].
+    // RHS: Normalized([0.6, 0.8], 5.0) representing [3.0, 4.0].
     // dot([1.0, 2.0], [3.0, 4.0]) = 3.0 + 8.0 = 11.0.
     let mut ctx = SESSION.create_execution_ctx();
     let lhs = tensor_array(&[2], &[1.0, 2.0])?;
-    let rhs = l2_denorm_array(&[2], &[0.6, 0.8], &[5.0], &mut ctx)?;
+    let rhs = normalized_array(&[2], &[0.6, 0.8], &[5.0], &mut ctx)?;
 
     assert_close(&eval_inner_product(lhs, rhs)?, &[11.0]);
     Ok(())
 }
 
 #[test]
-fn both_denorm_null_norms() -> VortexResult<()> {
+fn both_normalized_null_norms() -> VortexResult<()> {
     // Row 0: valid, row 1: null (via nullable norms on lhs).
     let normalized_l = tensor_array(&[2], &[0.6, 0.8, 1.0, 0.0])?;
     let norms_l = PrimitiveArray::from_option_iter([Some(5.0f64), None]).into_array();
     let mut ctx = SESSION.create_execution_ctx();
 
-    let lhs = L2Denorm::try_new_array(normalized_l, norms_l, &mut ctx)?.into_array();
-    let rhs = l2_denorm_array(&[2], &[0.6, 0.8, 1.0, 0.0], &[5.0, 1.0], &mut ctx)?;
+    let lhs = Normalized::try_new(normalized_l, norms_l, &mut ctx)?.into_array();
+    let rhs = normalized_array(&[2], &[0.6, 0.8, 1.0, 0.0], &[5.0, 1.0], &mut ctx)?;
 
     let scalar_fn = InnerProduct.bind(EmptyOptions);
     let result = ScalarFnArray::try_new(scalar_fn, vec![lhs, rhs])?;

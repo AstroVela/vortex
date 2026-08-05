@@ -26,11 +26,11 @@ use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::scalar_fns::l2_denorm::DenormOrientation;
+use crate::encodings::normalized::NormalizedOrientation;
 use crate::scalar_fns::row::TensorRow;
 use crate::scalar_fns::row::tensor_element_ptype;
 use crate::utils::BinaryTensorOpMetadata;
-use crate::utils::extract_l2_denorm_children;
+use crate::utils::extract_normalized_children;
 
 /// Inner product (dot product) between two columns.
 ///
@@ -73,12 +73,12 @@ impl RowFn for InnerProduct {
         })
     }
 
-    /// [`L2Denorm`]-wrapped operands factor through their stored norms: with `D(x, s)` denoting
+    /// [`Normalized`]-encoded operands factor through their stored norms: with `D(x, s)` denoting
     /// `x * s` rowwise, `dot(D(x, s), D(y, t)) = s * t * dot(x, y)` and
     /// `dot(D(x, s), y) = s * dot(x, y)`. The rewrite is expressed with lazy [`Operator::Mul`]
     /// arrays over the (much smaller) norm columns, so no denormalized coordinates are decoded.
     ///
-    /// [`L2Denorm`]: crate::scalar_fns::l2_denorm::L2Denorm
+    /// [`Normalized`]: crate::encodings::normalized::Normalized
     fn reduce_encoded(
         &self,
         _options: &Self::Options,
@@ -87,10 +87,10 @@ impl RowFn for InnerProduct {
     ) -> VortexResult<Option<ArrayRef>> {
         let len = args[0].len();
 
-        Ok(match DenormOrientation::classify(&args[0], &args[1]) {
-            DenormOrientation::Both { lhs, rhs } => {
-                let (normalized_l, norms_l) = extract_l2_denorm_children(lhs);
-                let (normalized_r, norms_r) = extract_l2_denorm_children(rhs);
+        Ok(match NormalizedOrientation::classify(&args[0], &args[1]) {
+            NormalizedOrientation::Both { lhs, rhs } => {
+                let (normalized_l, norms_l) = extract_normalized_children(lhs);
+                let (normalized_r, norms_r) = extract_normalized_children(rhs);
                 let dot =
                     InnerProduct.try_new_array(len, EmptyOptions, [normalized_l, normalized_r])?;
                 Some(
@@ -98,13 +98,16 @@ impl RowFn for InnerProduct {
                         .binary(norms_r, Operator::Mul)?,
                 )
             }
-            DenormOrientation::One { denorm, plain } => {
-                let (normalized, norms) = extract_l2_denorm_children(denorm);
+            NormalizedOrientation::One {
+                normalized_array,
+                plain,
+            } => {
+                let (normalized, norms) = extract_normalized_children(normalized_array);
                 let dot =
                     InnerProduct.try_new_array(len, EmptyOptions, [normalized, plain.clone()])?;
                 Some(dot.binary(norms, Operator::Mul)?)
             }
-            DenormOrientation::Neither => None,
+            NormalizedOrientation::Neither => None,
         })
     }
 }

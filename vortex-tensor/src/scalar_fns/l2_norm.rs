@@ -8,7 +8,6 @@ use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::arrays::ScalarFn as ScalarFnArrayEncoding;
-use vortex_array::arrays::scalar_fn::ExactScalarFn;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayParts;
@@ -30,10 +29,10 @@ use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::scalar_fns::l2_denorm::L2Denorm;
+use crate::encodings::normalized::Normalized;
 use crate::scalar_fns::row::TensorRow;
 use crate::scalar_fns::row::tensor_element_ptype;
-use crate::utils::extract_l2_denorm_children;
+use crate::utils::extract_normalized_children;
 use crate::utils::validate_tensor_float_input;
 
 /// L2 norm (Euclidean norm) of a tensor or vector column.
@@ -43,10 +42,12 @@ use crate::utils::validate_tensor_float_input;
 /// The input must be a tensor-like extension array with a float element type. The output is a float
 /// column of the same float type.
 ///
-/// When the input is wrapped in [`L2Denorm`], this operator treats the stored norms as
-/// authoritative. For lossy encodings, that means `L2Norm` may intentionally
-/// read the stored norms instead of re-deriving them from fully decoded coordinates. That behavior
-/// is part of the lossy storage contract, not a separate lossy-compute mode.
+/// When the input is [`Normalized`]-encoded, this operator treats the stored norms as
+/// authoritative. For lossy normalized children, that means `L2Norm` intentionally reads the
+/// stored norms instead of re-deriving them from fully decoded coordinates. That behavior is part
+/// of the storage contract, not a separate lossy-compute mode.
+///
+/// [`Normalized`]: crate::encodings::normalized::Normalized
 #[derive(Clone, Debug, Default)]
 pub struct L2Norm;
 
@@ -77,8 +78,8 @@ impl RowFn for L2Norm {
         })
     }
 
-    /// `L2Norm(L2Denorm(normalized, norms))` is defined to read back the authoritative stored
-    /// norms. Exact callers of lossy encodings opt into that storage semantics instead of forcing
+    /// `L2Norm` over a [`Normalized`]-encoded column is defined to read back the authoritative
+    /// stored norms. Callers of lossy encodings opt into that storage semantics instead of forcing
     /// a decode-and-recompute path here.
     fn reduce_encoded(
         &self,
@@ -87,11 +88,11 @@ impl RowFn for L2Norm {
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let input = &args[0];
-        if !input.is::<ExactScalarFn<L2Denorm>>() {
+        if !input.is::<Normalized>() {
             return Ok(None);
         }
         let element_ptype = validate_tensor_float_input(input.dtype())?.element_ptype();
-        let (_, norms) = extract_l2_denorm_children(input);
+        let (_, norms) = extract_normalized_children(input);
         vortex_ensure_eq!(norms.dtype().as_ptype(), element_ptype);
         Ok(Some(norms))
     }

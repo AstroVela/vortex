@@ -24,7 +24,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 
-use crate::scalar_fns::l2_denorm::build_tensor_array;
+use crate::utils::build_tensor_array;
 use crate::utils::extract_flat_elements;
 use crate::utils::validate_tensor_float_input;
 use crate::utils::validate_tensor_float_inputs;

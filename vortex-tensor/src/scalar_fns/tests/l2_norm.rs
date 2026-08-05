@@ -24,7 +24,7 @@ use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 
-use crate::scalar_fns::l2_denorm::L2Denorm;
+use crate::encodings::normalized::Normalized;
 use crate::scalar_fns::l2_norm::L2Norm;
 use crate::tests::SESSION;
 use crate::types::vector::Vector;
@@ -200,17 +200,17 @@ fn dispatches_at_input_width<T: vortex_array::dtype::NativePType>(
     Ok(())
 }
 
-/// `L2Norm(L2Denorm(normalized, norms))` reads back the authoritative stored norms rather than
+/// `L2Norm(Normalized(normalized, norms))` reads back the authoritative stored norms rather than
 /// recomputing over decoded coordinates. The normalized child here is deliberately *not*
 /// unit-norm, mimicking lossy storage, so readthrough and recompute disagree: row 0 decodes to
 /// `[6, 8]` (norm `10`) and row 1 to `[6, 0]` (norm `6`), while the stored norms are `5` and `2`.
 #[test]
-fn l2_denorm_readthrough_returns_stored_norms() -> VortexResult<()> {
+fn normalized_readthrough_returns_stored_norms() -> VortexResult<()> {
     let normalized = tensor_array(&[2], &[1.2, 1.6, 3.0, 0.0])?;
     let norms = PrimitiveArray::from_iter([5.0f64, 2.0]).into_array();
     // SAFETY: A focused test of the lossy storage contract: the stored norms are authoritative
     // even though this normalized child violates the unit-norm invariant.
-    let denorm = unsafe { L2Denorm::new_array_unchecked(normalized, norms)? }.into_array();
+    let denorm = unsafe { Normalized::new_unchecked(normalized, norms) }.into_array();
 
     assert_close(&eval_l2_norm(denorm)?, &[5.0, 2.0]);
     Ok(())
@@ -220,17 +220,17 @@ fn l2_denorm_readthrough_returns_stored_norms() -> VortexResult<()> {
 ///
 /// This pins the [`NullHandling::Dense`] choice the row contract derives: under
 /// [`NullHandling::Filter`](vortex_array::scalar_fn::NullHandling::Filter) the lifting could hand
-/// `reduce_encoded` a *filtered* input, which is no longer an `ExactScalarFn<L2Denorm>`, silently
+/// `reduce_encoded` a *filtered* input, which is no longer an `ExactScalarFn<Normalized>`, silently
 /// falling back to decode-and-recompute. For a lossy child that changes the answer: row 0
 /// below would come back as `10` (recomputed from `[6, 8]`) instead of the authoritative stored
 /// `5`.
 #[test]
-fn l2_denorm_readthrough_survives_null_rows() -> VortexResult<()> {
+fn normalized_readthrough_survives_null_rows() -> VortexResult<()> {
     let normalized = tensor_array(&[2], &[1.2, 1.6, 3.0, 0.0])?;
     let norms = PrimitiveArray::from_option_iter([Some(5.0f64), None]).into_array();
-    // SAFETY: Intentionally lossy, as in `l2_denorm_readthrough_returns_stored_norms`, so that
+    // SAFETY: Intentionally lossy, as in `normalized_readthrough_returns_stored_norms`, so that
     // a recompute fallback is observable.
-    let denorm = unsafe { L2Denorm::new_array_unchecked(normalized, norms)? }.into_array();
+    let denorm = unsafe { Normalized::new_unchecked(normalized, norms) }.into_array();
 
     let scalar_fn = L2Norm.bind(EmptyOptions);
     let result = ScalarFnArray::try_new(scalar_fn, vec![denorm])?;
@@ -245,11 +245,11 @@ fn l2_denorm_readthrough_survives_null_rows() -> VortexResult<()> {
 
 /// The readthrough must still propagate nulls carried by the `norms` child.
 #[test]
-fn l2_denorm_readthrough_propagates_null_norms() -> VortexResult<()> {
+fn normalized_readthrough_propagates_null_norms() -> VortexResult<()> {
     let normalized = tensor_array(&[2], &[0.6, 0.8, 1.0, 0.0])?;
     let norms = PrimitiveArray::from_option_iter([Some(5.0f64), None]).into_array();
     let mut ctx = SESSION.create_execution_ctx();
-    let denorm = L2Denorm::try_new_array(normalized, norms, &mut ctx)?.into_array();
+    let denorm = Normalized::try_new(normalized, norms, &mut ctx)?.into_array();
 
     let scalar_fn = L2Norm.bind(EmptyOptions);
     let result = ScalarFnArray::try_new(scalar_fn, vec![denorm])?;

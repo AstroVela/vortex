@@ -29,15 +29,15 @@ use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::encodings::normalized::NormalizedOrientation;
 use crate::scalar_fns::inner_product::InnerProduct;
-use crate::scalar_fns::l2_denorm::DenormOrientation;
 use crate::scalar_fns::l2_norm::L2Norm;
 use crate::scalar_fns::row::TensorRow;
 #[cfg(test)]
 use crate::scalar_fns::row::probe;
 use crate::scalar_fns::row::tensor_element_ptype;
 use crate::utils::BinaryTensorOpMetadata;
-use crate::utils::extract_l2_denorm_children;
+use crate::utils::extract_normalized_children;
 
 /// Cosine similarity between two columns.
 ///
@@ -48,14 +48,14 @@ use crate::utils::extract_l2_denorm_children;
 /// Both inputs must be tensor-like extension arrays ([`FixedShapeTensor`] or [`Vector`]) with the
 /// same dtype and a float element type. The output is a float column of the same float type.
 ///
-/// When either input is wrapped in [`L2Denorm`], this operator treats the stored norms and
-/// normalized children as authoritative. For lossy encodings, that means the
-/// optimized readthrough path may intentionally differ slightly from decoding both sides to dense
+/// When either input is [`Normalized`]-encoded, this operator treats the stored norms and
+/// normalized children as authoritative. For lossy normalized children, that means the optimized
+/// read-through path may intentionally differ slightly from decoding both sides to dense
 /// coordinates and recomputing cosine from scratch.
 ///
 /// [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
 /// [`Vector`]: crate::vector::Vector
-/// [`L2Denorm`]: crate::scalar_fns::l2_denorm::L2Denorm
+/// [`Normalized`]: crate::encodings::normalized::Normalized
 #[derive(Clone, Debug, Default)]
 pub struct CosineSimilarity;
 
@@ -95,13 +95,12 @@ impl RowFn for CosineSimilarity {
         })
     }
 
-    /// [`L2Denorm`]-wrapped operands make the *stored* norms and normalized children
+    /// [`Normalized`]-encoded operands make the *stored* norms and normalized children
     /// authoritative: `cos(D(x, s), D(y, t)) = dot(x, y)` and `cos(D(x, s), y) = dot(x, y) /
     /// ||y||`, in both cases forced to `0.0` on rows where any authoritative norm is `0.0` (even
-    /// for lossy children whose decoded coordinates are nonzero). A constant plain operand is
-    /// first normalized once and rewrapped so it takes the same path.
+    /// for lossy children whose decoded coordinates are nonzero).
     ///
-    /// [`L2Denorm`]: crate::scalar_fns::l2_denorm::L2Denorm
+    /// [`Normalized`]: crate::encodings::normalized::Normalized
     fn reduce_encoded(
         &self,
         _options: &Self::Options,
@@ -111,12 +110,15 @@ impl RowFn for CosineSimilarity {
         let lhs = args[0].clone();
         let rhs = args[1].clone();
 
-        match DenormOrientation::classify(&lhs, &rhs) {
-            DenormOrientation::Both { lhs, rhs } => cosine_both_denorm(lhs, rhs, ctx).map(Some),
-            DenormOrientation::One { denorm, plain } => {
-                cosine_one_denorm(denorm, plain, ctx).map(Some)
+        match NormalizedOrientation::classify(&lhs, &rhs) {
+            NormalizedOrientation::Both { lhs, rhs } => {
+                cosine_both_normalized(lhs, rhs, ctx).map(Some)
             }
-            DenormOrientation::Neither => Ok(None),
+            NormalizedOrientation::One {
+                normalized_array,
+                plain,
+            } => cosine_one_normalized(normalized_array, plain, ctx).map(Some),
+            NormalizedOrientation::Neither => Ok(None),
         }
     }
 }
@@ -240,16 +242,18 @@ fn cosine_from_parts<T: Float>(dot: T, denom: T) -> T {
     }
 }
 
-/// Both sides are `L2Denorm`: the normalized children are authoritative, so their dot product is
-/// the cosine similarity, except that a row with a zero *stored* norm is a zero vector.
-fn cosine_both_denorm(
+/// Both sides are [`Normalized`]-encoded: the normalized children are authoritative, so their dot
+/// product is the cosine similarity, except that a row with a zero *stored* norm is a zero vector.
+///
+/// [`Normalized`]: crate::encodings::normalized::Normalized
+fn cosine_both_normalized(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let len = lhs.len();
-    let (normalized_l, norms_l) = extract_l2_denorm_children(lhs);
-    let (normalized_r, norms_r) = extract_l2_denorm_children(rhs);
+    let (normalized_l, norms_l) = extract_normalized_children(lhs);
+    let (normalized_r, norms_r) = extract_normalized_children(rhs);
 
     let dot: PrimitiveArray = InnerProduct
         .try_new_array(len, EmptyOptions, [normalized_l, normalized_r])?
@@ -275,31 +279,33 @@ fn cosine_both_denorm(
     })
 }
 
-/// One side is `L2Denorm`: `cos = dot(normalized, plain) / ||plain||`, forced to `0.0` on rows
-/// where the stored norm or the plain norm is `0.0`.
-fn cosine_one_denorm(
-    denorm: &ArrayRef,
+/// One side is [`Normalized`]-encoded: `cos = dot(normalized, plain) / ||plain||`, forced to `0.0`
+/// on rows where the stored norm or the plain norm is `0.0`.
+///
+/// [`Normalized`]: crate::encodings::normalized::Normalized
+fn cosine_one_normalized(
+    normalized_array: &ArrayRef,
     plain: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let len = denorm.len();
-    let (normalized, denorm_norms) = extract_l2_denorm_children(denorm);
+    let len = normalized_array.len();
+    let (normalized, normalized_norms) = extract_normalized_children(normalized_array);
 
     let dot: PrimitiveArray = InnerProduct
         .try_new_array(len, EmptyOptions, [normalized, plain.clone()])?
         .execute(ctx)?;
-    let denorm_norms: PrimitiveArray = denorm_norms.execute(ctx)?;
+    let normalized_norms: PrimitiveArray = normalized_norms.execute(ctx)?;
     let plain_norm: PrimitiveArray = L2Norm
         .try_new_array(len, EmptyOptions, [plain.clone()])?
         .execute(ctx)?;
 
     match_each_float_ptype!(dot.ptype(), |T| {
         let dots = dot.as_slice::<T>();
-        let denorm_norms = denorm_norms.as_slice::<T>();
+        let normalized_norms = normalized_norms.as_slice::<T>();
         let plain_norms = plain_norm.as_slice::<T>();
         let buffer: Buffer<T> = (0..len)
             .map(|i| {
-                if denorm_norms[i] == T::zero() || plain_norms[i] == T::zero() {
+                if normalized_norms[i] == T::zero() || plain_norms[i] == T::zero() {
                     T::zero()
                 } else {
                     dots[i] / plain_norms[i]

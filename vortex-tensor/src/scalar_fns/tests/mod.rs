@@ -5,6 +5,5 @@
 
 mod cosine_similarity;
 mod inner_product;
-mod l2_denorm;
 mod l2_norm;
 mod row;

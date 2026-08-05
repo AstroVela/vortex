@@ -33,8 +33,11 @@ prost = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
+mimalloc = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-btrblocks = { workspace = true }
+vortex-mask = { workspace = true }
 
 [[bench]]
 name = "cosine_similarity"
@@ -45,5 +48,9 @@ name = "l2_norm"
 harness = false
 
 [[bench]]
-name = "l2_denorm"
+name = "normalized"
+harness = false
+
+[[bench]]
+name = "inner_product"
 harness = false
