@@ -13,15 +13,12 @@ struct Max;
 
 impl RowFn for Max {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.int_max");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -41,7 +38,7 @@ impl RowFn for Max {
         match_each_integer_ptype!(ptype, |T| {
             visitor.visit_prepared_into::<(T, T), ElementSink<T>, _, _>(
                 |_| (),
-                |&(), (a, b), output| output.write(a.max(b)),
+                |&(), (a, b), output| *output = a.max(b),
             )
         })
     }

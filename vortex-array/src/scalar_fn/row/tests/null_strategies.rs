@@ -68,8 +68,8 @@ fn hostile_nullable_strings() -> VortexResult<ArrayRef> {
     .into_array())
 }
 
-/// `Bytes` is not dense-safe, so `Shout` runs under [`NullHandling::Filter`]; both strategies
-/// must produce the same array without resolving the hostile views behind the nulls.
+/// `Bytes` is not dense-safe, so `Shout` uses valid-only execution; both strategies must produce
+/// the same array without resolving the hostile views behind the nulls.
 #[test]
 fn branch_matches_filter_for_bytes() -> VortexResult<()> {
     assert_strategies_agree(Shout, vec![hostile_nullable_strings()?])
@@ -158,20 +158,18 @@ mod selection {
         static LAST_DECODE: Cell<Option<(bool, usize)>> = const { Cell::new(None) };
     }
 
-    /// An i64 element that records its decodes and claims `SHRINKS` for
-    /// [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]. Declared not dense-safe so the
-    /// function runs under [`NullHandling::Filter`] and the strategy selection actually
-    /// happens.
-    struct TrackedI64<const SHRINKS: bool>;
+    /// An i64 element that records its decodes and reports `COST` units of filtered decode work.
+    /// It is not dense-safe, so strategy selection actually happens.
+    struct TrackedI64<const COST: usize>;
 
-    impl<const SHRINKS: bool> InputElement for TrackedI64<SHRINKS> {
+    impl<const COST: usize> InputElement for TrackedI64<COST> {
         type Column = Buffer<i64>;
         type Varying<'a> = <i64 as InputElement>::Varying<'a>;
         type Elem<'a> = i64;
 
         const DENSE_SAFE: bool = false;
         const DECODE_FALLIBLE: bool = false;
-        const DECODE_SHRINKS_WHEN_FILTERED: bool = SHRINKS;
+        const FILTERED_DECODE_COST: usize = COST;
 
         fn validate(dtype: &DType) -> VortexResult<()> {
             <i64 as InputElement>::validate(dtype)
@@ -212,24 +210,21 @@ mod selection {
 
     /// Negation over one tracked column.
     #[derive(Clone)]
-    struct TrackedNegate<const SHRINKS: bool>;
+    struct TrackedNegate<const COST: usize>;
 
-    impl<const SHRINKS: bool> RowFn for TrackedNegate<SHRINKS> {
+    impl<const COST: usize> RowFn for TrackedNegate<COST> {
         type Options = EmptyOptions;
-        type ArgsWitness = (TrackedI64<SHRINKS>,);
+
+        const ARG_NAMES: &'static [&'static str] = &["input"];
 
         fn id(&self) -> ScalarFnId {
-            if SHRINKS {
-                static ID: CachedId = CachedId::new("vortex.test.tracked_negate.per_row");
-                *ID
-            } else {
+            if COST == 0 {
                 static ID: CachedId = CachedId::new("vortex.test.tracked_negate.bulk");
                 *ID
+            } else {
+                static ID: CachedId = CachedId::new("vortex.test.tracked_negate.per_row");
+                *ID
             }
-        }
-
-        fn arg_name(&self, _idx: usize) -> ChildName {
-            ChildName::from("input")
         }
 
         fn dispatch<V: RowVisitor>(
@@ -238,9 +233,9 @@ mod selection {
             _args: &[DType],
             visitor: V,
         ) -> VortexResult<V::Out> {
-            visitor.visit_prepared_into::<(TrackedI64<SHRINKS>,), ElementSink<i64>, _, _>(
+            visitor.visit_prepared_into::<(TrackedI64<COST>,), ElementSink<i64>, _, _>(
                 |_| (),
-                |&(), (value,), output| output.write(-value),
+                |&(), (value,), output| *output = -value,
             )
         }
     }
@@ -255,12 +250,12 @@ mod selection {
 
     /// Executes the tracked function through the full pipeline and returns what the decode
     /// recorded: whether it was null-tolerant, and how many rows it saw.
-    fn run<const SHRINKS: bool>(valid_count: usize) -> VortexResult<(bool, usize)> {
+    fn run<const COST: usize>(valid_count: usize) -> VortexResult<(bool, usize)> {
         let mut ctx = array_session().create_execution_ctx();
         LAST_DECODE.set(None);
 
         apply(
-            TrackedNegate::<SHRINKS>,
+            TrackedNegate::<COST>,
             [column_with_survivors(valid_count)],
             &mut ctx,
         )?;
@@ -274,21 +269,21 @@ mod selection {
     /// survivors: the decode is null-tolerant and full length.
     #[test]
     fn bulk_decode_branches_at_any_density() -> VortexResult<()> {
-        assert_eq!(run::<false>(31)?, (true, 32));
-        assert_eq!(run::<false>(4)?, (true, 32));
+        assert_eq!(run::<0>(31)?, (true, 32));
+        assert_eq!(run::<0>(4)?, (true, 32));
         Ok(())
     }
 
-    /// A per-row decode branches only while at least 75% of the rows survive; below that the
-    /// filter strategy shrinks the decode to the survivors.
+    /// One per-row decode still branches when half the rows survive, matching the measured
+    /// single-nullable-input crossover.
     #[test]
     fn per_row_decode_filters_when_sparse() -> VortexResult<()> {
         // 30/32 surviving: branch, full-length null-tolerant decode.
-        assert_eq!(run::<true>(30)?, (true, 32));
-        // 24/32 = 75% surviving sits exactly on the threshold: still branch.
-        assert_eq!(run::<true>(24)?, (true, 32));
-        // 16/32 = 50% surviving: filter, ordinary decode over the survivors.
-        assert_eq!(run::<true>(16)?, (false, 16));
+        assert_eq!(run::<1>(30)?, (true, 32));
+        // 16/32 = 50% surviving sits exactly on the threshold: still branch.
+        assert_eq!(run::<1>(16)?, (true, 32));
+        // Below 50% surviving: filter, ordinary decode over the survivors.
+        assert_eq!(run::<1>(15)?, (false, 15));
         Ok(())
     }
 
@@ -296,11 +291,11 @@ mod selection {
     /// all-null constant, before any strategy is selected.
     #[test]
     fn degenerate_masks_bypass_the_selection() -> VortexResult<()> {
-        assert_eq!(run::<true>(32)?, (false, 32));
+        assert_eq!(run::<1>(32)?, (false, 32));
 
         let mut ctx = array_session().create_execution_ctx();
         LAST_DECODE.set(None);
-        apply(TrackedNegate::<true>, [column_with_survivors(0)], &mut ctx)?;
+        apply(TrackedNegate::<1>, [column_with_survivors(0)], &mut ctx)?;
         assert_eq!(LAST_DECODE.get(), None);
         Ok(())
     }
@@ -352,15 +347,12 @@ mod selection {
 
     impl RowFn for RefusingNegate {
         type Options = EmptyOptions;
-        type ArgsWitness = (RefusesNullTolerant,);
+
+        const ARG_NAMES: &'static [&'static str] = &["input"];
 
         fn id(&self) -> ScalarFnId {
             static ID: CachedId = CachedId::new("vortex.test.refusing_negate");
             *ID
-        }
-
-        fn arg_name(&self, _idx: usize) -> ChildName {
-            ChildName::from("input")
         }
 
         fn dispatch<V: RowVisitor>(
@@ -371,7 +363,7 @@ mod selection {
         ) -> VortexResult<V::Out> {
             visitor.visit_prepared_into::<(RefusesNullTolerant,), ElementSink<i64>, _, _>(
                 |_| (),
-                |&(), (value,), output| output.write(-value),
+                |&(), (value,), output| *output = -value,
             )
         }
     }
@@ -399,25 +391,34 @@ mod selection {
     }
 
     /// The rule itself, at and around the threshold, without going through an execution.
-    ///
-    /// [`BRANCH_MIN_SURVIVING_FRACTION`]: crate::scalar_fn::row::lift::BRANCH_MIN_SURVIVING_FRACTION
     #[rstest]
-    #[case::bulk_dense_mask(false, 99, 100, true)]
-    #[case::bulk_sparse_mask(false, 1, 100, true)]
-    #[case::per_row_dense_mask(true, 99, 100, true)]
-    #[case::per_row_at_threshold(true, 75, 100, true)]
-    #[case::per_row_below_threshold(true, 74, 100, false)]
-    #[case::per_row_sparse_mask(true, 10, 100, false)]
+    #[case::bulk_dense_mask(0, 99, 100, true)]
+    #[case::bulk_sparse_mask(0, 1, 100, true)]
+    #[case::one_decode_dense_mask(1, 99, 100, true)]
+    #[case::one_decode_at_threshold(1, 50, 100, true)]
+    #[case::one_decode_below_threshold(1, 49, 100, false)]
+    #[case::two_decodes_at_old_boolean_choice(2, 81, 100, false)]
+    #[case::two_decodes_dense_mask(2, 90, 100, true)]
     fn selects_branch_per_the_measured_rule(
-        #[case] decode_shrinks_when_filtered: bool,
+        #[case] filtered_decode_cost: usize,
         #[case] true_count: usize,
         #[case] len: usize,
         #[case] expect_branch: bool,
     ) {
         let valid = Mask::from_indices(len, 0..true_count);
         assert_eq!(
-            branch_beats_filter(decode_shrinks_when_filtered, &valid),
+            branch_beats_filter(filtered_decode_cost, &valid),
             expect_branch,
+        );
+    }
+
+    #[test]
+    fn planning_adds_decode_cost_across_arguments() {
+        assert_eq!(
+            RowPolicy::for_dispatch::<(TrackedI64<1>, TrackedI64<1>), ()>(),
+            RowPolicy::ValidOnly {
+                filtered_decode_cost: 2
+            }
         );
     }
 }

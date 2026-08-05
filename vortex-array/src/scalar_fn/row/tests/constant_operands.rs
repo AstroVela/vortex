@@ -60,15 +60,12 @@ struct AddCounted;
 
 impl RowFn for AddCounted {
     type Options = EmptyOptions;
-    type ArgsWitness = (CountedI64, CountedI64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.add_counted");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -79,7 +76,7 @@ impl RowFn for AddCounted {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(CountedI64, CountedI64), ElementSink<i64>, _, _>(
             |_| (),
-            |&(), (lhs, rhs), output| output.write(lhs + rhs),
+            |&(), (lhs, rhs), output| *output = lhs + rhs,
         )
     }
 }
@@ -131,15 +128,12 @@ struct AddShort;
 
 impl RowFn for AddShort {
     type Options = EmptyOptions;
-    type ArgsWitness = (ShortDecodeI64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.add_short");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -150,7 +144,7 @@ impl RowFn for AddShort {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(ShortDecodeI64, i64), ElementSink<i64>, _, _>(
             |_| (),
-            |&(), (lhs, rhs), output| output.write(lhs + rhs),
+            |&(), (lhs, rhs), output| *output = lhs + rhs,
         )
     }
 }

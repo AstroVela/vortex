@@ -36,7 +36,7 @@ impl InputElement for GeometryRow {
     const DECODE_FALLIBLE: bool = true;
     // Decoding arrow-exports the column and parses one geometry per row, so filtering the column
     // first shrinks the decode itself, not just the row loop.
-    const DECODE_SHRINKS_WHEN_FILTERED: bool = true;
+    const FILTERED_DECODE_COST: usize = 1;
 
     fn validate(dtype: &DType) -> VortexResult<()> {
         validate_geometry_operands(std::slice::from_ref(dtype))

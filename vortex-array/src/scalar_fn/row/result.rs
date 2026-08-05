@@ -7,6 +7,10 @@ use std::ops::BitOrAssign;
 
 use vortex_error::VortexResult;
 
+mod private {
+    pub trait Sealed {}
+}
+
 /// A value-dependent failure bit reduced across the whole row loop and handed to the output sink.
 ///
 /// Unlike [`VortexResult`], this never exits the loop. It is for kernels such as checked addition
@@ -54,7 +58,10 @@ impl BitOrAssign for DeferredError {
 /// bounds how many rows a vector covers.
 ///
 /// The sink never sees this. It is handed a plain [`DeferredError`] once, after the loop.
-pub trait SinkResult: 'static {
+///
+/// This trait is framework-only. Row functions choose one of the supplied return forms; custom
+/// output representation belongs in [`OutputSink`](crate::scalar_fn::OutputSink).
+pub trait SinkResult: 'static + private::Sealed {
     /// The word this result reduces into, kept in a loop-local by the executor.
     type Accumulated: 'static + Copy + Default;
 
@@ -71,6 +78,8 @@ pub trait SinkResult: 'static {
     fn occurred(accumulated: Self::Accumulated) -> bool;
 }
 
+impl private::Sealed for () {}
+
 impl SinkResult for () {
     type Accumulated = ();
 
@@ -85,6 +94,8 @@ impl SinkResult for () {
         false
     }
 }
+
+impl private::Sealed for VortexResult<()> {}
 
 impl SinkResult for VortexResult<()> {
     type Accumulated = ();
@@ -106,6 +117,8 @@ impl SinkResult for VortexResult<()> {
 macro_rules! impl_sink_result_word {
     ($($word:ty),+ $(,)?) => {
         $(
+            impl private::Sealed for $word {}
+
             impl SinkResult for $word {
                 type Accumulated = $word;
 

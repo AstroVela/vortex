@@ -12,7 +12,6 @@ use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_float_ptype;
-use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
@@ -36,15 +35,12 @@ struct L1Norm;
 
 impl RowFn for L1Norm {
     type Options = EmptyOptions;
-    type ArgsWitness = (TensorRow<f64>,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.l1_norm");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -56,7 +52,7 @@ impl RowFn for L1Norm {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
             visitor.visit_prepared_into::<(TensorRow<T>,), ElementSink<T>, _, _>(
                 |_| (),
-                |&(), (row,), output| output.write(l1_norm_row(row)),
+                |&(), (row,), output| *output = l1_norm_row(row),
             )
         })
     }

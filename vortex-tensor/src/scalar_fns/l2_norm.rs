@@ -16,7 +16,6 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::proto::dtype as pb;
 use vortex_array::match_each_float_ptype;
-use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
@@ -53,15 +52,24 @@ pub struct L2Norm;
 
 impl RowFn for L2Norm {
     type Options = EmptyOptions;
-    type ArgsWitness = (TensorRow<f64>,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.tensor.l2_norm");
         *ID
     }
 
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
+    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
     }
 
     fn dispatch<V: RowVisitor>(
@@ -73,7 +81,7 @@ impl RowFn for L2Norm {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
             visitor.visit_prepared_into::<(TensorRow<T>,), ElementSink<T>, _, _>(
                 |_| (),
-                |&(), (row,), output| output.write(l2_norm_row(row)),
+                |&(), (row,), output| *output = l2_norm_row(row),
             )
         })
     }

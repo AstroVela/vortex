@@ -27,7 +27,6 @@ use crate::scalar_fn::ExecutionArgs;
 #[cfg(any(test, feature = "_test-harness"))]
 use crate::scalar_fn::NullStrategy;
 use crate::scalar_fn::OutputSink;
-use crate::scalar_fn::PersistableOptions;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::SinkResult;
@@ -36,47 +35,27 @@ use crate::scalar_fn::VecExecutionArgs;
 use crate::scalar_fn::row::execute::RowExecution;
 use crate::scalar_fn::row::execute::execute_row_sink_branch;
 use crate::scalar_fn::row::execute::execute_row_sink_prepared;
-use crate::scalar_fn::row::execute::row_is_fallible;
-use crate::scalar_fn::row::execute::row_null_handling;
 use crate::scalar_fn::row::execute::validate_row_sink;
 use crate::scalar_fn::row::lift::Batch;
 use crate::scalar_fn::row::lift::BatchPlan;
 use crate::scalar_fn::row::lift::KernelArgs;
+use crate::scalar_fn::row::lift::RowPolicy;
 use crate::scalar_fn::row::lift::reconcile_return;
 
-/// Compile-time check that a dispatched `(A, S, R)` agrees with `F`'s witness and fallibility. The
-/// framework reads the arity (which the expression layer
-/// uses), dense-safety, decode fallibility, and declared fallibility _without_ input dtypes and
-/// therefore before dispatching. Evaluated by monomorphizing
+/// Compile-time check that a dispatched `(A, S, R)` agrees with `F`'s public metadata. Evaluated by
+/// monomorphizing
 /// [`visit_prepared_into`](RowVisitor::visit_prepared_into), so even a dispatch arm that never runs
 /// is checked.
-///
-/// Checking the raw properties rather than the derived
-/// [`NullHandling`](crate::scalar_fn::NullHandling) is deliberate: null handling collapses
-/// dense-safety and fallibility together and could hide a disagreement.
-const fn assert_witness_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: SinkResult>() {
+const fn assert_dispatch_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: SinkResult>() {
     assert!(
-        A::ARITY == <F::ArgsWitness as ElementTuple>::ARITY,
-        "dispatch visited a tuple whose arity differs from ArgsWitness",
+        A::ARITY == F::ARG_NAMES.len(),
+        "dispatch visited a tuple whose arity differs from RowFn::ARG_NAMES",
     );
+    // Dictionary pushdown treats an infallible function as safe to evaluate over values no code
+    // references, so every dispatch must fit the function-wide declaration.
     assert!(
-        A::DENSE_SAFE == <F::ArgsWitness as ElementTuple>::DENSE_SAFE,
-        "dispatch visited an argument that differs from ArgsWitness in whether it is readable \
-         behind a null row",
-    );
-    // A disagreement here would leave `is_fallible` reading `false` off the witness while the
-    // dispatched decode can fail on legal data, and dictionary pushdown treats an infallible
-    // function as safe to evaluate over values no code references.
-    assert!(
-        A::DECODE_FALLIBLE == <F::ArgsWitness as ElementTuple>::DECODE_FALLIBLE,
-        "dispatch visited an argument that differs from ArgsWitness in whether its decode can \
-         fail on legal data",
-    );
-    assert!(
-        A::DECODE_SHRINKS_WHEN_FILTERED
-            == <F::ArgsWitness as ElementTuple>::DECODE_SHRINKS_WHEN_FILTERED,
-        "dispatch visited an argument that differs from ArgsWitness in whether its decode \
-         shrinks when filtered",
+        !A::DECODE_FALLIBLE || F::FALLIBLE,
+        "dispatch decoded fallibly without declaring RowFn::FALLIBLE",
     );
     assert!(
         !R::FALLIBLE || F::FALLIBLE,
@@ -97,7 +76,7 @@ const fn assert_witness_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: Sink
 struct PlanRows<'a, F> {
     args: &'a [DType],
 
-    /// The visited function, carried only so the witness check can name its contract.
+    /// The visited function, carried only so the dispatch check can name its contract.
     row_fn: PhantomData<F>,
 }
 
@@ -111,14 +90,11 @@ impl<F: RowFn> RowVisitor for PlanRows<'_, F> {
         _prepare: impl FnOnce(A::ConstElems<'_>) -> P,
         _apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<BatchPlan> {
-        const { assert_witness_agrees::<F, A, S, R>() };
+        const { assert_dispatch_agrees::<F, A, S, R>() };
 
-        let retry_deferred_error = R::DEFERRED;
-        let row_fallible = R::FALLIBLE || (F::FALLIBLE && !retry_deferred_error);
         Ok(BatchPlan {
             sink_dtype: validate_row_sink::<A, S>(self.args)?,
-            null_handling: row_null_handling::<A>(row_fallible),
-            retry_deferred_error,
+            policy: RowPolicy::for_dispatch::<A, R>(),
         })
     }
 }
@@ -132,7 +108,7 @@ struct ExecuteRows<'a, 'b, F> {
 
     ctx: &'b mut ExecutionCtx,
 
-    /// The visited function, carried only so the witness check can name its contract.
+    /// The visited function, carried only so the dispatch check can name its contract.
     row_fn: PhantomData<F>,
 }
 
@@ -146,7 +122,7 @@ impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
         prepare: impl FnOnce(A::ConstElems<'_>) -> P,
         apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<RowExecution> {
-        const { assert_witness_agrees::<F, A, S, R>() };
+        const { assert_dispatch_agrees::<F, A, S, R>() };
         execute_row_sink_prepared::<A, P, S, R>(
             self.args,
             self.sink_dtype,
@@ -173,7 +149,7 @@ struct ExecuteRowsBranch<'a, 'b, F> {
 
     ctx: &'b mut ExecutionCtx,
 
-    /// The visited function, carried only so the witness check can name its contract.
+    /// The visited function, carried only so the dispatch check can name its contract.
     row_fn: PhantomData<F>,
 }
 
@@ -187,7 +163,7 @@ impl<F: RowFn> RowVisitor for ExecuteRowsBranch<'_, '_, F> {
         prepare: impl FnOnce(A::ConstElems<'_>) -> P,
         apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<Option<RowExecution>> {
-        const { assert_witness_agrees::<F, A, S, R>() };
+        const { assert_dispatch_agrees::<F, A, S, R>() };
         execute_row_sink_branch::<A, P, S, R>(
             self.args,
             self.sink_dtype,
@@ -253,28 +229,42 @@ fn execute_rows_branch<F: RowFn>(
     )
 }
 
-/// The batch facts for `row_fn` over `args`, derived from its argument witness and dispatched sink.
+/// The batch facts for `row_fn` over `args`, derived from its dispatched elements and sink.
 fn lift_batch<'a, F: RowFn>(
     row_fn: &F,
     options: &F::Options,
     args: &'a dyn ExecutionArgs,
 ) -> VortexResult<Batch<'a>> {
-    Batch::new(
-        RowFn::id(row_fn),
-        args,
-        |arg_dtypes| {
-            let plan = row_fn.dispatch(
-                options,
-                arg_dtypes,
-                PlanRows::<F> {
-                    args: arg_dtypes,
-                    row_fn: PhantomData,
-                },
-            )?;
-            Ok(plan)
-        },
-        F::ArgsWitness::DECODE_SHRINKS_WHEN_FILTERED,
-    )
+    Batch::new(RowFn::id(row_fn), args, |arg_dtypes| {
+        let plan = row_fn.dispatch(
+            options,
+            arg_dtypes,
+            PlanRows::<F> {
+                args: arg_dtypes,
+                row_fn: PhantomData,
+            },
+        )?;
+        Ok(plan)
+    })
+}
+
+/// The nullable execution policy selected by one concrete dispatch.
+#[cfg(test)]
+pub(super) fn row_policy<F: RowFn>(
+    row_fn: &F,
+    options: &F::Options,
+    args: &[DType],
+) -> VortexResult<RowPolicy> {
+    row_fn
+        .dispatch(
+            options,
+            args,
+            PlanRows::<F> {
+                args,
+                row_fn: PhantomData,
+            },
+        )
+        .map(|plan| plan.policy)
 }
 
 /// Every [`RowFn`] is a [`ScalarFnVTable`], the row loop lifted by [`Batch`].
@@ -290,19 +280,19 @@ impl<F: RowFn> ScalarFnVTable for F {
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        options.serialize()
+        RowFn::serialize(self, options)
     }
 
     fn deserialize(&self, metadata: &[u8], session: &VortexSession) -> VortexResult<Self::Options> {
-        Self::Options::deserialize(metadata, session)
+        RowFn::deserialize(self, metadata, session)
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
-        Arity::Exact(F::ArgsWitness::ARITY)
+        Arity::Exact(F::ARG_NAMES.len())
     }
 
     fn child_name(&self, _options: &Self::Options, child_idx: usize) -> ChildName {
-        self.arg_name(child_idx)
+        ChildName::from(F::ARG_NAMES[child_idx])
     }
 
     /// The visited output element's dtype, widened to nullable iff any input is nullable, which is
@@ -371,7 +361,7 @@ impl<F: RowFn> ScalarFnVTable for F {
     }
 
     fn is_fallible(&self, _options: &Self::Options) -> bool {
-        row_is_fallible::<F::ArgsWitness>(F::FALLIBLE)
+        F::FALLIBLE
     }
 }
 

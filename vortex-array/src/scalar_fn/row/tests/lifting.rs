@@ -56,7 +56,8 @@ struct Add<const DENSE: bool>;
 
 impl<const DENSE: bool> RowFn for Add<DENSE> {
     type Options = EmptyOptions;
-    type ArgsWitness = (MaybeDenseI32<DENSE>, MaybeDenseI32<DENSE>);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     fn id(&self) -> ScalarFnId {
         if DENSE {
@@ -66,10 +67,6 @@ impl<const DENSE: bool> RowFn for Add<DENSE> {
             static ID: CachedId = CachedId::new("vortex.test.add.filter");
             *ID
         }
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -85,7 +82,7 @@ impl<const DENSE: bool> RowFn for Add<DENSE> {
             _,
         >(
             |_| (),
-            |&(), (lhs, rhs), output| output.write(lhs.wrapping_add(rhs)),
+            |&(), (lhs, rhs), output| *output = lhs.wrapping_add(rhs),
         )
     }
 }
@@ -101,8 +98,17 @@ fn assert_add(lhs: ArrayRef, rhs: ArrayRef, expected: ArrayRef) -> VortexResult<
     let dense = apply(Add::<true>, [lhs.clone(), rhs.clone()], &mut ctx)?;
     let filtered = apply(Add::<false>, [lhs, rhs], &mut ctx)?;
 
-    assert_eq!(null_handling::<Add<true>>(), NullHandling::Dense);
-    assert_eq!(null_handling::<Add<false>>(), NullHandling::Filter);
+    let args = [
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+    ];
+    assert_eq!(policy(&Add::<true>, &args), RowPolicy::Dense);
+    assert_eq!(
+        policy(&Add::<false>, &args),
+        RowPolicy::ValidOnly {
+            filtered_decode_cost: 0
+        }
+    );
     assert_arrays_eq!(dense, expected, &mut ctx);
     assert_arrays_eq!(filtered, expected, &mut ctx);
     Ok(())
@@ -212,14 +218,13 @@ fn validity_is_the_child_conjunction() -> VortexResult<()> {
     Ok(())
 }
 
-/// Options serde comes from [`PersistableOptions`], so a row function needs none of its own.
+/// A row function is not serializable until the function opts into a wire representation.
 #[test]
-fn options_round_trip_without_per_function_serde() -> VortexResult<()> {
-    let metadata = ScalarFnVTable::serialize(&Add::<true>, &EmptyOptions)?
-        .expect("EmptyOptions is serializable");
-
-    let options = ScalarFnVTable::deserialize(&Add::<true>, &metadata, &array_session())?;
-
-    assert_eq!(options, EmptyOptions);
+fn options_are_not_serializable_by_default() -> VortexResult<()> {
+    assert_eq!(
+        ScalarFnVTable::serialize(&Add::<true>, &EmptyOptions)?,
+        None
+    );
+    assert!(ScalarFnVTable::deserialize(&Add::<true>, &[], &array_session()).is_err());
     Ok(())
 }

@@ -6,7 +6,7 @@
 //! A [`RowFn`] hands the framework a kernel that only ever computes rows valid in every argument.
 //! Everything between that kernel and [`ScalarFnVTable::execute`] lives here: null propagation,
 //! constant folding, nullability widening, output dtype reconciliation, and the per-batch choice
-//! between the two mechanisms that satisfy [`NullHandling::Filter`].
+//! between dense execution and the two mechanisms that execute only valid rows.
 //!
 //! This is machinery, not an interface. It takes the kernel as a pair of closures rather than a
 //! trait because the one trait that ever occupied the slot (a public `StrictScalarFnVTable`, with
@@ -35,8 +35,10 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::scalar::Scalar;
+use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::SinkResult;
 use crate::scalar_fn::row::element::batch_constant;
 use crate::scalar_fn::row::execute::RowExecution;
 use crate::validity::Validity;
@@ -97,52 +99,38 @@ pub(super) struct BatchPlan {
     /// The non-nullable dtype built by the selected sink.
     pub(super) sink_dtype: DType,
 
-    /// How the lifting may expose rows that are null in some input.
-    pub(super) null_handling: NullHandling,
-
-    /// Whether dense execution should retry only valid rows after a deferred error.
-    pub(super) retry_deferred_error: bool,
+    /// How this concrete dispatch executes nullable rows.
+    pub(super) policy: RowPolicy,
 }
 
-/// How the lifting shows a kernel the rows that are null in some input.
-///
-/// A row function never declares this: [`row_null_handling`] derives it from the argument element
-/// types and whether the dispatched row closure can exit early. A deferred-error sink remains
-/// dense and gets a valid-row retry only if its batch-wide error bit is set.
-///
-/// [`row_null_handling`]: super::execute::row_null_handling
+/// The nullable execution policy derived from one concrete dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NullHandling {
-    /// Evaluate every row, including rows behind nulls, then mask the result.
-    ///
-    /// Cheapest: no filtering, no scattering, and the inputs keep their original encoding.
-    /// Requires that the kernel is total over whatever sits behind a null and cannot exit the hot
-    /// loop early. A deferred-error kernel qualifies because it writes a safe provisional result
-    /// and reduces failure separately. The argument requirement is read off the element types: one
-    /// that is not
-    /// [`InputElement::DENSE_SAFE`](crate::scalar_fn::InputElement::DENSE_SAFE), gets
-    /// [`Filter`](Self::Filter) instead.
+pub(super) enum RowPolicy {
+    /// Evaluate all rows and mask the result.
     Dense,
 
-    /// Never evaluate a row that is null in some input: the kernel only ever sees valid rows.
-    ///
-    /// Always sound. It is what an early-failing kernel gets, and what an argument gets when
-    /// decoding a row behind a null could itself fail (a dictionary code or string view only
-    /// meaningful for valid rows).
-    ///
-    /// `Filter` names that _contract_, not a mechanism. A batch whose mask is mixed executes by one
-    /// of two strategies, selected per batch by the lifting and invisible to the kernel: filter the
-    /// inputs to the valid rows, evaluate those, and scatter the results back; or, when the kernel
-    /// supports it (every sink with skipped-row support does),
-    /// branch-and-skip, which evaluates only the valid rows over the _unfiltered_ inputs and masks
-    /// the result.
-    ///
-    /// Encoding-aware kernels see original encodings under branch-and-skip but _filtered copies_
-    /// under the filter strategy, and filtering only pushes through an extension array or a
-    /// `ScalarFnArray` with at most one non-constant child. With two or more, the filter stays on
-    /// top, so `array.is::<ExactScalarFn<Foo>>()` stops matching and the kernel silently takes its
-    /// generic path.
-    Filter,
+    /// Evaluate all rows, retrying only valid rows if a deferred error is raised.
+    DenseWithRetry,
+
+    /// Execute only valid rows, choosing branch-and-skip or filtering from the mask and decode
+    /// cost.
+    ValidOnly { filtered_decode_cost: usize },
+}
+
+impl RowPolicy {
+    pub(super) const fn for_dispatch<A: ElementTuple, R: SinkResult>() -> Self {
+        if A::DENSE_SAFE && !A::DECODE_FALLIBLE && !R::FALLIBLE {
+            if R::DEFERRED {
+                Self::DenseWithRetry
+            } else {
+                Self::Dense
+            }
+        } else {
+            Self::ValidOnly {
+                filtered_decode_cost: A::FILTERED_DECODE_COST,
+            }
+        }
+    }
 }
 
 /// One batch of inputs, with everything the lifting reads off them before the kernel runs.
@@ -172,17 +160,8 @@ pub(super) struct Batch<'a> {
     /// The non-nullable dtype the dispatched sink builds, computed once while planning.
     sink_dtype: DType,
 
-    /// How the kernel sees rows that are null in some input.
-    null_handling: NullHandling,
-
-    /// Whether an error from dense execution may have come only from rows that will be null, in
-    /// which case execution is retried over the valid rows.
-    retry_deferred_error: bool,
-
-    /// Whether any argument's decode does per-row work whose cost shrinks when the inputs are
-    /// filtered first, which is the one input to the per-batch strategy choice that comes from the
-    /// function rather than from the mask.
-    decode_shrinks_when_filtered: bool,
+    /// How the concrete dispatch executes nullable rows.
+    policy: RowPolicy,
 }
 
 impl<'a> Batch<'a> {
@@ -195,7 +174,6 @@ impl<'a> Batch<'a> {
         id: ScalarFnId,
         args: &'a dyn ExecutionArgs,
         plan: impl FnOnce(&[DType]) -> VortexResult<BatchPlan>,
-        decode_shrinks_when_filtered: bool,
     ) -> VortexResult<Self> {
         let inputs: SmallVec<[ArrayRef; 4]> = (0..args.num_inputs())
             .map(|i| args.get(i))
@@ -221,9 +199,7 @@ impl<'a> Batch<'a> {
             validity,
             result_dtype,
             sink_dtype: plan.sink_dtype,
-            null_handling: plan.null_handling,
-            retry_deferred_error: plan.retry_deferred_error,
-            decode_shrinks_when_filtered,
+            policy: plan.policy,
         })
     }
 
@@ -235,9 +211,9 @@ impl<'a> Batch<'a> {
     /// in the all-constant fold, where they are one row each. What it may assume:
     ///
     /// - No input is a null constant, and the inputs are not all constant.
-    /// - Under [`NullHandling::Filter`], every row of every input is valid.
-    /// - Under [`NullHandling::Dense`], rows behind nulls hold arbitrary values, and their results
-    ///   are discarded.
+    /// - Under valid-only execution, every row of every input is valid.
+    /// - Under dense execution, rows behind nulls hold arbitrary values, and their results are
+    ///   discarded.
     ///
     /// Either way the kernel can ignore input validity, and its output **must** equal
     /// `return_dtype` up to nullability. A kernel that returns nulls of its own keeps them, unioned
@@ -281,9 +257,12 @@ impl<'a> Batch<'a> {
             return self.broadcast_one_row(kernel, ctx);
         }
 
-        match self.null_handling {
-            NullHandling::Dense => self.execute_dense(kernel, ctx),
-            NullHandling::Filter => self.execute_filtered(kernel, branch, ctx),
+        match self.policy {
+            RowPolicy::Dense => self.execute_dense(kernel, false, ctx),
+            RowPolicy::DenseWithRetry => self.execute_dense(kernel, true, ctx),
+            RowPolicy::ValidOnly {
+                filtered_decode_cost,
+            } => self.execute_filtered(kernel, branch, filtered_decode_cost, ctx),
         }
     }
 
@@ -312,12 +291,13 @@ impl<'a> Batch<'a> {
 
     /// Run the kernel over every row, including the rows behind nulls, then mask its result.
     ///
-    /// This is the [`NullHandling::Dense`] path. The arguments reach the kernel untouched, so the
-    /// inputs keep their original encoding, and the conjoined validity is handed to `mask` as an
-    /// array rather than materialized into a [`Mask`] first.
+    /// The arguments reach the kernel untouched, so the inputs keep their original encoding, and
+    /// the conjoined validity is handed to `mask` as an array rather than materialized into a
+    /// [`Mask`] first.
     fn execute_dense(
         &self,
         kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        retry_deferred_error: bool,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         // Every row is null, so the kernel has nothing to contribute.
@@ -327,7 +307,7 @@ impl<'a> Batch<'a> {
 
         let values = match kernel(self.kernel_args(self.args, &self.inputs), ctx)? {
             RowExecution::Output(values) => values,
-            RowExecution::DeferredError(error) if self.retry_deferred_error => {
+            RowExecution::DeferredError(error) if retry_deferred_error => {
                 let valid = self
                     .validity
                     .clone()
@@ -357,8 +337,8 @@ impl<'a> Batch<'a> {
         }
     }
 
-    /// The [`NullHandling::Filter`] path: materialize the conjoined validity once, take the
-    /// all-true and all-false shortcuts, and pick a strategy per batch for a mixed mask.
+    /// Materialize the conjoined validity once, take the all-true and all-false shortcuts, and
+    /// pick a strategy per batch for a mixed mask.
     ///
     /// Two strategies can execute a mixed mask, and neither is visible to the kernel:
     ///
@@ -380,6 +360,7 @@ impl<'a> Batch<'a> {
             &Mask,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<RowExecution>>,
+        filtered_decode_cost: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let valid = self
@@ -400,7 +381,7 @@ impl<'a> Batch<'a> {
             return Ok(self.all_null());
         }
 
-        if branch_beats_filter(self.decode_shrinks_when_filtered, &valid)
+        if branch_beats_filter(filtered_decode_cost, &valid)
             && let Some(result) = self.execute_branched(branch, &valid, ctx)?
         {
             return Ok(result);
@@ -566,7 +547,7 @@ pub(super) fn reconcile_return(
 }
 
 /// The minimum surviving-row fraction (`true_count / len` of the conjoined mask) at which
-/// branch-and-skip is still chosen for a function whose decode shrinks when filtered.
+/// branch-and-skip is still chosen for one filtered decode unit.
 ///
 /// From the branch-and-skip measurements (65536 rows, divan fastest of 100 samples, two runs on a
 /// shared 4-vCPU VM). A kernel with a _bulk_ decode never lost under branch: `byte_length` over
@@ -580,22 +561,27 @@ pub(super) fn reconcile_return(
 /// - polygons CONTAINS points, independent nulls on both: branch won up to ~10% null density
 ///   (~81% surviving); filter won 1.2x at ~56% surviving, 1.9x at ~25%, 11.3x at ~1%.
 ///
-/// The measured crossover sits between ~56% and ~81% surviving rows. 0.75 keeps the branch wins
-/// at dense validity (the two-nullable-operand case included) and sends every batch where filter
-/// measurably dominated to filter; the one concession is the single-operand 50%-null case, at
-/// exactly 50% surviving, where branch's ~1.1x edge is given up for filter.
-pub(super) const BRANCH_MIN_SURVIVING_FRACTION: f64 = 0.75;
+/// A single nullable operand still favored branch at 50% surviving, while two independent nullable
+/// operands favored filtering at 81% surviving. Keep those cases distinct instead of collapsing
+/// every per-row decode into one boolean. There is not yet enough evidence to distinguish two from
+/// three or more decode units, so they share the conservative multi-decode threshold.
+pub(super) const ONE_DECODE_BRANCH_MIN_SURVIVING_FRACTION: f64 = 0.50;
+pub(super) const MULTI_DECODE_BRANCH_MIN_SURVIVING_FRACTION: f64 = 0.85;
 
 /// Whether the branch-and-skip strategy should be preferred over filtering for the mixed mask
-/// `valid`: always, unless a per-row decode would shrink under filter
-/// (`decode_shrinks_when_filtered`) and fewer than [`BRANCH_MIN_SURVIVING_FRACTION`] of the rows
-/// survive.
-pub(super) fn branch_beats_filter(decode_shrinks_when_filtered: bool, valid: &Mask) -> bool {
-    if !decode_shrinks_when_filtered {
+/// `valid`. A zero cost always branches; otherwise the survivor threshold grows when filtering
+/// avoids more than one unit of per-row decode work.
+pub(super) fn branch_beats_filter(filtered_decode_cost: usize, valid: &Mask) -> bool {
+    if filtered_decode_cost == 0 {
         return true;
     }
 
-    valid.true_count() as f64 >= valid.len() as f64 * BRANCH_MIN_SURVIVING_FRACTION
+    let minimum = if filtered_decode_cost == 1 {
+        ONE_DECODE_BRANCH_MIN_SURVIVING_FRACTION
+    } else {
+        MULTI_DECODE_BRANCH_MIN_SURVIVING_FRACTION
+    };
+    valid.true_count() as f64 >= valid.len() as f64 * minimum
 }
 
 /// Which null strategy a forced execution takes for a mixed validity mask.

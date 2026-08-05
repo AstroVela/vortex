@@ -3,138 +3,27 @@
 
 //! Scalar functions computed one row at a time.
 
+use std::fmt::Debug;
+use std::fmt::Display;
+use std::hash::Hash;
+
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::OutputSink;
-use crate::scalar_fn::PersistableOptions;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::SinkResult;
 
 /// A scalar function computed one row at a time.
 ///
-/// An implementor names a representative argument tuple, then in [`dispatch`](Self::dispatch) picks
-/// the concrete element and sink types for a batch. Everything structural (arity, dtype validation,
-/// the return dtype, null handling, and execution) is derived through the blanket impls, so the
-/// implementing type _is_ the scalar function, with no wrapper.
-///
-/// The argument witness names one representative choice. Its arity and decode properties steer the
-/// framework _before_ `dispatch` runs. They therefore **must** not vary between dispatches, which
-/// the following pins: the witness promises a dense-safe primitive, the dispatch visits an element
-/// that is not readable behind a null row, and the build fails.///
-/// ```compile_fail
-/// # use vortex_array::{ArrayRef, ExecutionCtx};
-/// # use vortex_array::arrays::PrimitiveArray;
-/// # use vortex_array::dtype::{DType, Nullability, PType};
-/// # use vortex_array::scalar_fn::*;
-/// # use vortex_buffer::Buffer;
-/// # use vortex_error::VortexResult;
-/// # use vortex_session::registry::CachedId;
-/// # struct Odd;
-/// # impl InputElement for Odd {
-/// #     type Column = Buffer<u64>;
-/// #     type Varying<'a> = &'a [u64];
-/// #     type Elem<'a> = u64;
-/// #     const DENSE_SAFE: bool = false;
-/// #     const DECODE_FALLIBLE: bool = false;
-/// #     fn validate(_dtype: &DType) -> VortexResult<()> { Ok(()) }
-/// #     fn decode(a: ArrayRef, c: &mut ExecutionCtx) -> VortexResult<Self::Column> {
-/// #         Ok(a.execute::<PrimitiveArray>(c)?.into_buffer::<u64>())
-/// #     }
-/// #     fn get(col: &Self::Column, i: usize) -> u64 { col[i] }
-/// #     fn varying(col: &Self::Column) -> &[u64] { col.as_slice() }
-/// #     fn varying_len(col: &&[u64]) -> usize { col.len() }
-/// #     fn get_varying<'a>(col: &&'a [u64], i: usize) -> u64 where Self: 'a { col[i] }
-/// # }
-/// #[derive(Clone)]
-/// struct Lie;
-/// impl RowFn for Lie {
-///     type Options = EmptyOptions;
-///     type ArgsWitness = (u64,);
-///     fn id(&self) -> ScalarFnId {
-///         static ID: CachedId = CachedId::new("example.lie");
-///         *ID
-///     }
-///     fn arg_name(&self, _idx: usize) -> ChildName {
-///         ChildName::from("input")
-///     }
-///     fn dispatch<V: RowVisitor>(
-///         &self,
-///         _options: &Self::Options,
-///         _args: &[DType],
-///         visitor: V,
-///     ) -> VortexResult<V::Out> {
-///         visitor.visit_prepared_into::<(Odd,), ElementSink<u64>, _, _>(
-///             |_| (),
-///             |&(), (v,), output| output.write(v),
-///         )
-///     }
-/// }
-/// // Instantiating a vtable method that dispatches evaluates the compile-time check.
-/// let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-/// let _ = ScalarFnVTable::return_dtype(&Lie, &EmptyOptions, &[dtype]);
-/// ```
-///
-/// The same check pins whether decoding can fail, which is what keeps
-/// [`is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible) honest: dictionary pushdown
-/// evaluates an infallible function over values that no code references, so a parse hidden behind
-/// an infallible witness would fail a query it should not.///
-/// ```compile_fail
-/// # use vortex_array::{ArrayRef, ExecutionCtx};
-/// # use vortex_array::arrays::PrimitiveArray;
-/// # use vortex_array::dtype::{DType, Nullability, PType};
-/// # use vortex_array::scalar_fn::*;
-/// # use vortex_buffer::Buffer;
-/// # use vortex_error::VortexResult;
-/// # use vortex_session::registry::CachedId;
-/// # struct Odd;
-/// # impl InputElement for Odd {
-/// #     type Column = Buffer<u64>;
-/// #     type Varying<'a> = &'a [u64];
-/// #     type Elem<'a> = u64;
-/// #     const DENSE_SAFE: bool = true;
-/// #     const DECODE_FALLIBLE: bool = true;
-/// #     fn validate(_dtype: &DType) -> VortexResult<()> { Ok(()) }
-/// #     fn decode(a: ArrayRef, c: &mut ExecutionCtx) -> VortexResult<Self::Column> {
-/// #         Ok(a.execute::<PrimitiveArray>(c)?.into_buffer::<u64>())
-/// #     }
-/// #     fn get(col: &Self::Column, i: usize) -> u64 { col[i] }
-/// #     fn varying(col: &Self::Column) -> &[u64] { col.as_slice() }
-/// #     fn varying_len(col: &&[u64]) -> usize { col.len() }
-/// #     fn get_varying<'a>(col: &&'a [u64], i: usize) -> u64 where Self: 'a { col[i] }
-/// # }
-/// #[derive(Clone)]
-/// struct HidesAParse;
-/// impl RowFn for HidesAParse {
-///     type Options = EmptyOptions;
-///     type ArgsWitness = (u64,);
-///     fn id(&self) -> ScalarFnId {
-///         static ID: CachedId = CachedId::new("example.hides_a_parse");
-///         *ID
-///     }
-///     fn arg_name(&self, _idx: usize) -> ChildName {
-///         ChildName::from("input")
-///     }
-///     fn dispatch<V: RowVisitor>(
-///         &self,
-///         _options: &Self::Options,
-///         _args: &[DType],
-///         visitor: V,
-///     ) -> VortexResult<V::Out> {
-///         visitor.visit_prepared_into::<(Odd,), ElementSink<u64>, _, _>(
-///             |_| (),
-///             |&(), (v,), output| output.write(v),
-///         )
-///     }
-/// }
-/// // Instantiating a vtable method that dispatches evaluates the compile-time check.
-/// let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-/// let _ = ScalarFnVTable::return_dtype(&HidesAParse, &EmptyOptions, &[dtype]);
-/// ```
+/// An implementor declares its argument names, then [`dispatch`](Self::dispatch) picks the concrete
+/// element and sink types for a batch. The planning visit reads dense safety, decode fallibility,
+/// and decode cost from that concrete choice; no representative element types are needed.
 ///
 /// A function whose kernel is columnar rather than row-at-a-time (negating a whole bit buffer, a
 /// zero-copy unwrap) is not a `RowFn`, and implements
@@ -142,35 +31,34 @@ use crate::scalar_fn::SinkResult;
 pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// Options for this function, if any. Use [`EmptyOptions`](crate::scalar_fn::EmptyOptions)
     /// for none.
-    type Options: PersistableOptions;
+    type Options: 'static + Send + Sync + Clone + Debug + Display + PartialEq + Eq + Hash;
 
-    /// Any one argument tuple [`dispatch`](Self::dispatch) can choose.
-    ///
-    /// The framework reads four things off this witness before dispatching: the arity, whether
-    /// every argument is readable behind a null row, whether any argument's decode can fail on
-    /// legal data, and whether any argument's decode shrinks when the inputs are filtered first. A
-    /// dispatch that visits at a tuple disagreeing with it on any of them does not compile.
-    ///
-    /// **Why a witness exists at all**, rather than the framework asking `dispatch`:
-    /// [`arity`](crate::scalar_fn::ScalarFnVTable::arity) and
-    /// [`is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible) take no input dtypes, while
-    /// `dispatch` needs dtypes to choose. The argument properties must therefore be
-    /// dtype-independent. The compile-time check on every visit stops a dispatch from contradicting
-    /// this witness.
-    type ArgsWitness: ElementTuple;
+    /// The arguments in display order. Its length is the function's exact arity.
+    const ARG_NAMES: &'static [&'static str];
 
-    /// Whether the row computation can fail on legal input values.
+    /// Whether any legal dispatch can fail while decoding or computing a row.
     ///
-    /// Fallible input decoding is derived separately from [`ArgsWitness`](Self::ArgsWitness). This
-    /// constant exists because [`ScalarFnVTable::is_fallible`] is queried without input dtypes, so
-    /// the framework cannot run [`dispatch`](Self::dispatch) to inspect its [`SinkResult`].
+    /// The framework verifies that every fallible dispatched element or result implies this value.
+    /// A conservative `true` is allowed when only some dtype choices are fallible.
     const FALLIBLE: bool = false;
 
     /// Returns the ID of the scalar function.
     fn id(&self) -> ScalarFnId;
 
-    /// The display name of the `idx`-th argument.
-    fn arg_name(&self, idx: usize) -> ChildName;
+    /// Serialize this function's options, or return `None` when the function is not serializable.
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        _ = options;
+        Ok(None)
+    }
+
+    /// Restore options written by [`serialize`](Self::serialize).
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        vortex_bail!("Expression {} is not deserializable", self.id())
+    }
 
     /// Choose element types for these input dtypes and visit the framework with them.
     ///
@@ -195,13 +83,11 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// **must** have one row per row of `args`, which on the filter strategy is the _filtered_ count
     /// rather than the original one.
     ///
-    /// Whether the arrays still carry their original encoding depends on the path above:
-    ///
-    /// - [`Dense`](crate::scalar_fn::NullHandling::Dense) always passes them through untouched.
-    /// - [`Filter`](crate::scalar_fn::NullHandling::Filter) passes them through untouched when no
-    ///   row is null. For a mixed mask, the branch-and-skip strategy also passes them through
-    ///   untouched (full length, the result masked afterwards), while the filter strategy hands
-    ///   over filtered copies, which are canonical and so match no encoding fast path.
+    /// Whether the arrays still carry their original encoding depends on the execution path.
+    /// Dense execution always passes them through untouched. Valid-only execution does too when
+    /// no row is null; for a mixed mask, branch-and-skip also passes them through untouched (full
+    /// length, with the result masked afterwards), while filtering hands over filtered copies,
+    /// which are canonical and so match no encoding fast path.
     ///
     /// A non-nullable operand therefore reaches an encoding fast path under either. Note also that
     /// filtering a constant yields a constant, so a fast path keyed on
@@ -236,10 +122,9 @@ pub trait RowVisitor: private::Sealed {
     /// argument whose operand is constant for the batch, and `None` for each one that varies by
     /// row. Whatever it returns is handed to every `apply` call by shared reference.
     ///
-    /// `A` **must** agree with the [`RowFn`]'s argument witness. A fallible or deferred-error `R`
-    /// also requires [`RowFn::FALLIBLE`] to be `true`; the reverse is not required. A deferred
-    /// result must be paired with a sink whose [`OutputSink::ERRORS_ARE_DEFERRED`] is `true`. A visit
-    /// that violates any of these conditions is a compile error.
+    /// `A` **must** have the arity declared by [`RowFn::ARG_NAMES`]. A fallible element or result
+    /// also requires [`RowFn::FALLIBLE`] to be `true`; the reverse is not required. A deferred result
+    /// must be paired with a sink whose [`OutputSink::ERRORS_ARE_DEFERRED`] is `true`.
     fn visit_prepared_into<A: ElementTuple, S: OutputSink, P, R: SinkResult>(
         self,
         prepare: impl FnOnce(A::ConstElems<'_>) -> P,

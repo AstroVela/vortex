@@ -7,15 +7,14 @@
 //! to read every row anyway. See [choosing a trait](crate::scalar_fn#choosing-a-trait) for when to
 //! drop to [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable) instead.
 //!
-//! [`RowFn`] asks for an argument witness and a [`dispatch`](RowFn::dispatch) that picks the concrete
-//! element and sink types for a batch. Everything structural (arity, dtype checks, output dtype,
-//! null handling, constants, and validity) is derived from those types.
+//! [`RowFn`] names its arguments and provides a [`dispatch`](RowFn::dispatch) that picks the
+//! concrete element and sink types for a batch. Everything else (dtype checks, output dtype, null
+//! handling, constants, and validity) is derived from that dispatch.
 //!
 //! When the element types are fixed, `dispatch` is a single visit at those types. When one function
 //! ID has to cover several (`l2_norm` accepts `f16`, `f32` and `f64` columns), `dispatch` matches on
-//! the input dtypes and visits at the chosen width. The argument witness names one representative
-//! choice, and the framework checks at compile time that every visit agrees with it. Kernel
-//! fallibility is declared separately because it is also independent of the input dtypes.
+//! the input dtypes and visits at the chosen width. Kernel fallibility is declared separately
+//! because callers need it before dispatch.
 //!
 //! [`RowFn`] does not say how a row is _stored_, which is the element's job: `vortex-tensor` adds a
 //! `TensorRow<T>` [`InputElement`] and writes ordinary kernels over it.
@@ -37,12 +36,12 @@
 //! of the mask at a time, mask the result) whenever it can, and _filter_ (shrink every input to
 //! the surviving rows, compute, scatter back) when an argument has no null-tolerant decode for its
 //! array or when a per-row decode makes filtering cheaper at sparse validity. Authors do nothing;
-//! an element whose decode does expensive per-row work opts its sparse batches back into filtering
-//! by setting [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]. A sink opts into branch-and-skip with
-//! [`OutputSink::SUPPORTS_SKIPPED_ROWS`].
+//! an element whose decode does expensive per-row work reports that work through
+//! [`InputElement::FILTERED_DECODE_COST`]. The costs of all arguments are added together so the
+//! batch selector can distinguish one expensive decode from several. A sink opts into
+//! branch-and-skip with [`OutputSink::SUPPORTS_SKIPPED_ROWS`].
 
 mod element;
-pub use element::ArgColumn;
 pub use element::ElementTuple;
 pub use element::InputElement;
 pub use element::OutputElement;
@@ -54,14 +53,12 @@ pub use result::DeferredError;
 pub use result::SinkResult;
 
 mod sink;
-pub use sink::ElementRow;
 pub use sink::ElementSink;
 pub use sink::OutputSink;
 
 mod execute;
 
 mod lift;
-pub use lift::NullHandling;
 #[cfg(any(test, feature = "_test-harness"))]
 pub use lift::NullStrategy;
 

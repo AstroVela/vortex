@@ -8,9 +8,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use vortex_error::VortexResult;
-use vortex_session::VortexSession;
 
-use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::typed::DynScalarFn;
 
 /// An opaque handle to expression options.
@@ -55,30 +53,5 @@ impl<'a> ScalarFnOptions<'a> {
     /// Return the underlying `Any` reference.
     pub fn as_any(&self) -> &'a dyn Any {
         self.inner.options_any()
-    }
-}
-
-/// The options of a scalar function, together with how to persist them.
-///
-/// This lives on the options type rather than on every function that uses it, so a
-/// [`RowFn`](super::RowFn) carrying options needs no serde of its own. [`EmptyOptions`] already
-/// implements it, which is what every row function in tree uses.
-pub trait PersistableOptions:
-    'static + Sized + Send + Sync + Clone + Debug + Display + PartialEq + Eq + Hash
-{
-    /// Serialize these options. See [`ScalarFnVTable::serialize`](super::ScalarFnVTable::serialize).
-    fn serialize(&self) -> VortexResult<Option<Vec<u8>>>;
-
-    /// Restore options written by [`serialize`](Self::serialize).
-    fn deserialize(metadata: &[u8], session: &VortexSession) -> VortexResult<Self>;
-}
-
-impl PersistableOptions for EmptyOptions {
-    fn serialize(&self) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(vec![]))
-    }
-
-    fn deserialize(_metadata: &[u8], _session: &VortexSession) -> VortexResult<Self> {
-        Ok(EmptyOptions)
     }
 }

@@ -78,15 +78,12 @@ struct LazyDouble;
 
 impl RowFn for LazyDouble {
     type Options = EmptyOptions;
-    type ArgsWitness = (i32,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.lazy_double");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -97,7 +94,7 @@ impl RowFn for LazyDouble {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(i32,), ElementSink<i32>, _, _>(
             |_| (),
-            |&(), (value,), output| output.write(value.wrapping_mul(2)),
+            |&(), (value,), output| *output = value.wrapping_mul(2),
         )
     }
 

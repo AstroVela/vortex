@@ -28,7 +28,6 @@ pub use conformance::assert_element_conforms;
 mod primitive;
 
 mod tuple;
-pub use tuple::ArgColumn;
 pub use tuple::ElementTuple;
 pub(super) use tuple::batch_constant;
 
@@ -48,17 +47,17 @@ pub trait InputElement: 'static {
     /// visits with.
     type Elem<'a>;
 
-    /// Whether [`get`](Self::get) may be called for a row that is null in the input.
+    /// Whether [`decode`](Self::decode) and [`get`](Self::get) tolerate rows that are null in the
+    /// input.
     ///
     /// Arrays only guarantee their contents for _valid_ rows, so this is `false` for any element
     /// that follows an offset or pointer stored in the array: behind a null row that value is
     /// arbitrary and may not address anything. Reading a whole value out of a flat buffer is `true`,
     /// since the value is garbage but the read cannot fault.
     ///
-    /// [`NullHandling::Dense`](crate::scalar_fn::NullHandling::Dense) requires this of every
-    /// argument, and the row layer derives [`Filter`](crate::scalar_fn::NullHandling::Filter)
-    /// instead when it does not hold.
-    const DENSE_SAFE: bool;
+    /// Dense execution requires this of every argument; otherwise the row layer executes only
+    /// valid rows.
+    const DENSE_SAFE: bool = false;
 
     /// Whether [`decode`](Self::decode) can fail on _legal_ input data.
     ///
@@ -68,21 +67,21 @@ pub trait InputElement: 'static {
     /// error, which makes a function over that element
     /// [fallible](crate::scalar_fn::ScalarFnVTable::is_fallible) however infallible its own row
     /// computation is.
-    const DECODE_FALLIBLE: bool;
+    const DECODE_FALLIBLE: bool = true;
 
-    /// Whether [`decode`](Self::decode) does per-row work whose cost shrinks proportionally when
-    /// the column is filtered to fewer rows first.
+    /// A relative unit count for per-row decode work avoided by filtering this argument first.
     ///
-    /// `true` for an element whose decode _parses_ every row (a geometry built from coordinate
+    /// Use `1` for an element whose decode _parses_ every row (a geometry built from coordinate
     /// storage): decoding only the survivors of a sparse validity mask is genuinely cheaper than
-    /// decoding everyone. `false`, the default, for a bulk canonicalization (bytes, bools,
-    /// primitives), whose decode is a memcpy-shaped pass that filtering barely shrinks.
+    /// decoding everyone. Keep the default `0` for a bulk canonicalization (bytes, bools,
+    /// primitives), whose decode is a memcpy-shaped pass that filtering barely shrinks. Larger
+    /// values may express a proportionally more expensive decode.
     ///
     /// The lifting reads this when it picks a null strategy for a batch with a mixed
     /// validity mask: filtering the inputs first only pays off when it shrinks a per-row decode,
-    /// so an element that leaves this `false` always takes the cheaper branch-and-skip strategy.
+    /// so elements that leave this at zero always take the cheaper branch-and-skip strategy.
     /// Getting it wrong is a performance bug, never a correctness bug.
-    const DECODE_SHRINKS_WHEN_FILTERED: bool = false;
+    const FILTERED_DECODE_COST: usize = 0;
 
     /// Validate that `dtype` is an acceptable input column dtype for this element type.
     fn validate(dtype: &DType) -> VortexResult<()>;
@@ -97,21 +96,22 @@ pub trait InputElement: 'static {
     /// Decode `array` _without_ assuming every row is valid, or `Ok(None)` when this element
     /// cannot for this particular array.
     ///
-    /// The ordinary [`decode`](Self::decode) only ever sees all-valid inputs, so an element whose
-    /// decode does per-row work (parsing a geometry) may fail on, or produce nonsense for, a null
-    /// row. This variant **must** tolerate null rows by writing an arbitrary placeholder into
-    /// their column slots; the caller guarantees [`get`](Self::get) is never called for such a
-    /// row. It is what the branch-and-skip null strategy decodes with.
+    /// An element with [`DENSE_SAFE`](Self::DENSE_SAFE) set may use the default, because its ordinary
+    /// decode already tolerates null payloads. Other elements may override this by writing an
+    /// arbitrary placeholder into null slots; the caller guarantees [`get`](Self::get) is never
+    /// called for such a row. It is what the branch-and-skip null strategy decodes with.
     ///
-    /// The conservative default is `Ok(None)`. Elements whose decode is safe over null payloads
-    /// must opt in explicitly, typically by forwarding to [`decode`](Self::decode). Return
-    /// `Ok(None)` rather than an error when an array has no null-tolerant decode; the lifting falls
-    /// back to the filter strategy.
+    /// Return `Ok(None)` rather than an error when an array has no null-tolerant decode; the lifting
+    /// falls back to the filter strategy.
     fn decode_null_tolerant(
-        _array: ArrayRef,
-        _ctx: &mut ExecutionCtx,
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<Self::Column>> {
-        Ok(None)
+        if Self::DENSE_SAFE {
+            Self::decode(array, ctx).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Read the element at `index`, the one function called once per row.
@@ -124,8 +124,8 @@ pub trait InputElement: 'static {
 
     /// Borrow the representation used when this argument varies within the batch.
     ///
-    /// Called once before the hot loop. Constants do not use this view because [`ArgColumn`](crate::
-    /// scalar_fn::ArgColumn) keeps their one-row decoded representation separate.
+    /// Called once before the hot loop. Constants do not use this view because the tuple adapter
+    /// keeps their one-row decoded representation separate.
     fn varying(column: &Self::Column) -> Self::Varying<'_>;
 
     /// Number of rows addressable through a [`Varying`](Self::Varying) view.

@@ -11,6 +11,8 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_session::registry::CachedId;
 
+use super::lift::RowPolicy;
+use super::vtable::row_policy;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
@@ -26,9 +28,9 @@ use crate::arrays::varbinview::BinaryView;
 use crate::assert_arrays_eq;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
+use crate::dtype::PType;
 use crate::expr::root;
 use crate::scalar::Scalar;
-use crate::scalar_fn::row::execute::row_null_handling;
 use crate::scalar_fn::*;
 
 mod conformance;
@@ -62,15 +64,12 @@ struct Hypot;
 
 impl RowFn for Hypot {
     type Options = EmptyOptions;
-    type ArgsWitness = (f64, f64);
+
+    const ARG_NAMES: &'static [&'static str] = &["x", "y"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.hypot");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["x", "y"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -81,7 +80,7 @@ impl RowFn for Hypot {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(f64, f64), ElementSink<f64>, _, _>(
             |_| (),
-            |&(), (x, y), output| output.write(x.hypot(y)),
+            |&(), (x, y), output| *output = x.hypot(y),
         )
     }
 }
@@ -89,9 +88,9 @@ impl RowFn for Hypot {
 /// A byte-string element that resolves each row's view into a data buffer, which is only
 /// meaningful for a valid row.
 ///
-/// This is the crate's only non-dense-safe element, so it is what exercises
-/// [`NullHandling::Filter`], branch-and-skip, and the agreement between the two strategies. It
-/// lives here rather than beside the framework because no production row function reads bytes yet.
+/// This is the crate's only non-dense-safe element, so it exercises valid-only execution,
+/// branch-and-skip, and the agreement between the two strategies. It lives here rather than beside
+/// the framework because no production row function reads bytes yet.
 struct TestBytes;
 
 /// The canonical views array plus its resolved data buffers.
@@ -184,15 +183,12 @@ struct Shout;
 
 impl RowFn for Shout {
     type Options = EmptyOptions;
-    type ArgsWitness = (TestBytes,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.shout");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -204,7 +200,7 @@ impl RowFn for Shout {
         visitor.visit_prepared_into::<(TestBytes,), ElementSink<String>, _, _>(
             |_| (),
             |&(), (text,), output| {
-                output.write(String::from_utf8_lossy(text).to_uppercase());
+                *output = String::from_utf8_lossy(text).to_uppercase();
             },
         )
     }
@@ -216,16 +212,13 @@ struct CheckedDiv;
 
 impl RowFn for CheckedDiv {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
     const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.checked_div");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -240,7 +233,7 @@ impl RowFn for CheckedDiv {
                 if rhs == 0 {
                     vortex_bail!("division by zero");
                 }
-                output.write(lhs / rhs);
+                *output = lhs / rhs;
                 Ok(())
             },
         )
@@ -300,15 +293,12 @@ struct WrongLength;
 
 impl RowFn for WrongLength {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.wrong_length");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -319,7 +309,7 @@ impl RowFn for WrongLength {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(i64,), ElementSink<i64>, _, _>(
             |_| (),
-            |&(), (value,), output| output.write(value),
+            |&(), (value,), output| *output = value,
         )
     }
 
@@ -353,15 +343,12 @@ struct FortyTwo;
 
 impl RowFn for FortyTwo {
     type Options = EmptyOptions;
-    type ArgsWitness = ();
+
+    const ARG_NAMES: &'static [&'static str] = &[];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.forty_two");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("unused")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -372,7 +359,7 @@ impl RowFn for FortyTwo {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(), ElementSink<i64>, _, _>(
             |()| (),
-            |&(), (), output| output.write(42),
+            |&(), (), output| *output = 42,
         )
     }
 }
@@ -393,15 +380,12 @@ struct SumFour;
 
 impl RowFn for SumFour {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64, i64, i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["a", "b", "c", "d"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.sum_four");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["a", "b", "c", "d"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -412,7 +396,7 @@ impl RowFn for SumFour {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(i64, i64, i64, i64), ElementSink<i64>, _, _>(
             |_| (),
-            |&(), (a, b, c, d), output| output.write(a + b + c + d),
+            |&(), (a, b, c, d), output| *output = a + b + c + d,
         )
     }
 }
@@ -483,20 +467,43 @@ fn fallible_apply_never_sees_rows_behind_nulls() -> VortexResult<()> {
     Ok(())
 }
 
-/// The [`NullHandling`] the framework derives for `F`, which no other API exposes: a row function
-/// never declares one.
-fn null_handling<F: RowFn>() -> NullHandling {
-    row_null_handling::<F::ArgsWitness>(F::FALLIBLE)
+/// The internal nullable execution policy selected by a concrete dispatch.
+fn policy<F: RowFn<Options = EmptyOptions>>(row_fn: &F, args: &[DType]) -> RowPolicy {
+    row_policy(row_fn, &EmptyOptions, args).expect("test dispatch must produce a policy")
 }
 
-/// Neither `Dense` nor `Filter` is ever written down: the arguments and fallibility decide.
-/// `Dense` is chosen whenever it is sound, because it is cheaper and preserves input encodings.
+/// The function never declares a policy: the dispatched arguments and result decide it.
 #[test]
 fn null_handling_follows_from_args_and_fallibility() {
     // Primitive arguments, infallible: nothing behind a null row can fault.
-    assert_eq!(null_handling::<Hypot>(), NullHandling::Dense);
+    assert_eq!(
+        policy(
+            &Hypot,
+            &[
+                DType::Primitive(PType::F64, Nullability::NonNullable),
+                DType::Primitive(PType::F64, Nullability::NonNullable),
+            ]
+        ),
+        RowPolicy::Dense
+    );
     // `TestBytes` resolves a view into a data buffer, which is only meaningful for valid rows.
-    assert_eq!(null_handling::<Shout>(), NullHandling::Filter);
+    assert_eq!(
+        policy(&Shout, &[DType::Utf8(Nullability::Nullable)]),
+        RowPolicy::ValidOnly {
+            filtered_decode_cost: 0
+        }
+    );
     // Fallible: a garbage row could raise an error of its own.
-    assert_eq!(null_handling::<CheckedDiv>(), NullHandling::Filter);
+    assert_eq!(
+        policy(
+            &CheckedDiv,
+            &[
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+            ]
+        ),
+        RowPolicy::ValidOnly {
+            filtered_decode_cost: 0
+        }
+    );
 }

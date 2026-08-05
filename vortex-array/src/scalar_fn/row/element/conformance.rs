@@ -17,9 +17,9 @@ use crate::scalar_fn::InputElement;
 /// The part worth checking mechanically is [`InputElement::DENSE_SAFE`]. An element claiming it will
 /// be read at rows that are *null*, where an array guarantees nothing about the payload, and getting
 /// the `const` wrong is either an out-of-bounds panic in production (the failure mode of
-/// [#9090](https://github.com/vortex-data/vortex/issues/9090)) or a silent fall back to
-/// [`NullHandling::Filter`](crate::scalar_fn::NullHandling::Filter). Nothing else verifies it, since
-/// the framework reads the `const` rather than testing the claim.
+/// [#9090](https://github.com/vortex-data/vortex/issues/9090)) or an unnecessary valid-only
+/// execution path. Nothing else verifies it, since the framework reads the `const` rather than
+/// testing the claim.
 ///
 /// So `array` **must** contain at least one null row, and its payload behind those nulls **must** be
 /// deliberately extreme rather than zeroed, or the check passes vacuously. Build that safely by

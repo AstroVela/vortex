@@ -22,15 +22,12 @@ struct PreparedHypot;
 
 impl RowFn for PreparedHypot {
     type Options = EmptyOptions;
-    type ArgsWitness = (f64, f64);
+
+    const ARG_NAMES: &'static [&'static str] = &["x", "y"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.prepared_hypot");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["x", "y"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -45,7 +42,7 @@ impl RowFn for PreparedHypot {
                 (x.map(|x| x * x), y.map(|y| y * y))
             },
             |&(x_sq, y_sq), (x, y), output| {
-                output.write((x_sq.unwrap_or(x * x) + y_sq.unwrap_or(y * y)).sqrt());
+                *output = (x_sq.unwrap_or(x * x) + y_sq.unwrap_or(y * y)).sqrt();
             },
         )
     }

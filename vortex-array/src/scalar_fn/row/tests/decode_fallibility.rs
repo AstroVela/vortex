@@ -51,15 +51,13 @@ struct TotalKernelOverParsedInput;
 
 impl RowFn for TotalKernelOverParsedInput {
     type Options = EmptyOptions;
-    type ArgsWitness = (ParsedBytes,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
+    const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.total_over_parsed");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -70,7 +68,7 @@ impl RowFn for TotalKernelOverParsedInput {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(ParsedBytes,), ElementSink<u64>, _, _>(
             |_| (),
-            |&(), (len,), output| output.write(len as u64),
+            |&(), (len,), output| *output = len as u64,
         )
     }
 }
@@ -89,7 +87,12 @@ fn a_fallible_decode_makes_the_function_fallible() {
 #[test]
 fn a_fallible_decode_forces_filtering() {
     assert_eq!(
-        null_handling::<TotalKernelOverParsedInput>(),
-        NullHandling::Filter
+        policy(
+            &TotalKernelOverParsedInput,
+            &[DType::Binary(Nullability::Nullable)]
+        ),
+        RowPolicy::ValidOnly {
+            filtered_decode_cost: 0
+        }
     );
 }

@@ -21,7 +21,6 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::DeferredError;
 use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
@@ -52,15 +51,12 @@ struct RowWrappingAdd;
 
 impl RowFn for RowWrappingAdd {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_wrapping_add");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -71,7 +67,7 @@ impl RowFn for RowWrappingAdd {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(i64, i64), ElementSink<i64>, _, _>(
             |_| (),
-            |&(), (lhs, rhs), output| output.write(lhs.wrapping_add(rhs)),
+            |&(), (lhs, rhs), output| *output = lhs.wrapping_add(rhs),
         )
     }
 }
@@ -148,16 +144,13 @@ impl OutputSink for CheckedAddSink {
 
 impl RowFn for RowCheckedAdd {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
     const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_checked_add");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -209,15 +202,12 @@ struct RowSinkWrappingAdd;
 
 impl RowFn for RowSinkWrappingAdd {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_sink_wrapping_add");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(

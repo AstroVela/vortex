@@ -19,7 +19,6 @@ use crate::dtype::DType;
 use crate::scalar_fn::DeferredError;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::NullHandling;
 use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::SinkResult;
 
@@ -57,33 +56,6 @@ pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
         "row output sinks must declare a non-nullable dtype, got {dtype}",
     );
     Ok(dtype)
-}
-
-/// The [`NullHandling`] a dispatched row loop gets from its arguments and early fallibility.
-///
-/// [`NullHandling::Dense`] is cheaper and the only option that leaves inputs at their original
-/// encoding, so it is used whenever it is sound: every argument readable behind a null row, and a
-/// row computation that cannot exit early. Both conditions are read off the types, so a row
-/// function never declares its null handling.
-pub(super) const fn row_null_handling<A: ElementTuple>(kernel_fallible: bool) -> NullHandling {
-    if A::DENSE_SAFE && !row_is_fallible::<A>(kernel_fallible) {
-        NullHandling::Dense
-    } else {
-        NullHandling::Filter
-    }
-}
-
-/// Whether a row function can fail on legal data, from either of the two places fallibility can
-/// live: parsing an argument ([`InputElement::DECODE_FALLIBLE`]), or the row computation itself
-/// returning a [`VortexResult`](vortex_error::VortexResult).
-///
-/// Deriving it from both is what keeps
-/// [`is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible) honest for an element that parses
-/// its bytes: a geometry column is fallible however total the kernel over it is.
-///
-/// [`InputElement::DECODE_FALLIBLE`]: crate::scalar_fn::InputElement::DECODE_FALLIBLE
-pub(super) const fn row_is_fallible<A: ElementTuple>(kernel_fallible: bool) -> bool {
-    A::DECODE_FALLIBLE || kernel_fallible
 }
 
 /// Decode every input column once, allocate the sink once, then write one row at a time.

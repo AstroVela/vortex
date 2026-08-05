@@ -37,9 +37,9 @@
 //! (compute every row, mask after), by branch-and-skip (decode full length, compute only the
 //! conjoined-valid rows, mask after), or by filtering (shrink the inputs to the valid rows,
 //! compute, scatter back), and the framework picks per batch. Function authors do nothing. The one
-//! input to that choice an element controls is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`]: set
-//! it when decoding a column does expensive per-row work (parsing a geometry), so sparse batches
-//! keep the filter strategy's shrunken decode.
+//! input to that choice an element controls is [`InputElement::FILTERED_DECODE_COST`]: set it when
+//! decoding a column does expensive per-row work (parsing a geometry), so sparse batches keep the
+//! filter strategy's shrunken decode. Costs from separate arguments are additive.
 //!
 //! Two things no output sink covers, and they are what actually send a function to
 //! [`ScalarFnVTable`]:

@@ -16,6 +16,10 @@ use crate::dtype::DType;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::InputElement;
 
+mod private {
+    pub trait Sealed {}
+}
+
 /// One decoded input column of an [`ElementTuple`].
 ///
 /// A constant operand holds the same value in every row, so it is decoded once as a single row and
@@ -136,8 +140,10 @@ pub(in crate::scalar_fn::row) fn batch_constant(array: &ArrayRef) -> Option<Arra
 }
 
 /// Tuples of [`InputElement`]s forming the typed argument list a [`RowFn`](crate::scalar_fn::RowFn)
-/// visits with. Implemented for `()` and tuples of one through twelve elements.
-pub trait ElementTuple: 'static {
+/// visits with. Implemented for `()` and tuples of one through twelve elements. This trait is
+/// framework-only; add a new decode primitive by implementing [`InputElement`], then use it inside
+/// one of those tuples.
+pub trait ElementTuple: 'static + private::Sealed {
     /// The decoded column representations.
     type Columns;
 
@@ -166,8 +172,8 @@ pub trait ElementTuple: 'static {
     /// Whether _any_ argument is [`InputElement::DECODE_FALLIBLE`].
     const DECODE_FALLIBLE: bool;
 
-    /// Whether _any_ argument is [`InputElement::DECODE_SHRINKS_WHEN_FILTERED`].
-    const DECODE_SHRINKS_WHEN_FILTERED: bool;
+    /// The additive cost of per-row decode work avoided by filtering the arguments first.
+    const FILTERED_DECODE_COST: usize;
 
     /// Validate the input dtypes, including that `dtypes` has exactly `ARITY` entries.
     ///
@@ -213,6 +219,8 @@ pub trait ElementTuple: 'static {
     fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
 }
 
+impl private::Sealed for () {}
+
 impl ElementTuple for () {
     type Columns = ();
     type VaryingColumns<'a> = ();
@@ -222,7 +230,7 @@ impl ElementTuple for () {
     const ARITY: usize = 0;
     const DENSE_SAFE: bool = true;
     const DECODE_FALLIBLE: bool = false;
-    const DECODE_SHRINKS_WHEN_FILTERED: bool = false;
+    const FILTERED_DECODE_COST: usize = 0;
 
     fn validate(dtypes: &[DType]) -> VortexResult<()> {
         vortex_ensure_eq!(
@@ -266,6 +274,8 @@ impl ElementTuple for () {
 
 macro_rules! element_tuple {
     ($arity:literal; $($t:ident : $idx:tt),+) => {
+        impl<$($t: InputElement),+> private::Sealed for ($($t,)+) {}
+
         impl<$($t: InputElement),+> ElementTuple for ($($t,)+) {
             type Columns = ($(ArgColumn<$t>,)+);
             type VaryingColumns<'a> = ($($t::Varying<'a>,)+);
@@ -275,8 +285,7 @@ macro_rules! element_tuple {
             const ARITY: usize = $arity;
             const DENSE_SAFE: bool = $($t::DENSE_SAFE &&)+ true;
             const DECODE_FALLIBLE: bool = $($t::DECODE_FALLIBLE ||)+ false;
-            const DECODE_SHRINKS_WHEN_FILTERED: bool =
-                $($t::DECODE_SHRINKS_WHEN_FILTERED ||)+ false;
+            const FILTERED_DECODE_COST: usize = $($t::FILTERED_DECODE_COST +)+ 0;
 
             fn validate(dtypes: &[DType]) -> VortexResult<()> {
                 vortex_ensure_eq!(

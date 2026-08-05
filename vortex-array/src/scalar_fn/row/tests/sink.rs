@@ -143,15 +143,12 @@ struct Spread;
 
 impl RowFn for Spread {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.spread");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -173,16 +170,13 @@ struct SpreadNonNegative;
 
 impl RowFn for SpreadNonNegative {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
     const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.spread_non_negative");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -210,16 +204,13 @@ struct DeferredNonNegative;
 
 impl RowFn for DeferredNonNegative {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
     const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.deferred_non_negative");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -283,13 +274,19 @@ fn nulls_are_masked_after_the_sink() -> VortexResult<()> {
     Ok(())
 }
 
-/// A sink whose closure cannot fail is dense, while one whose closure can fail is filtered.
+/// A sink whose closure cannot fail is dense, while one whose closure can fail is valid-only.
 #[test]
 fn null_handling_follows_from_declared_fallibility() {
-    assert_eq!(null_handling::<Spread>(), NullHandling::Dense);
+    let args = [DType::Primitive(PType::I64, Nullability::NonNullable)];
+    assert_eq!(policy(&Spread, &args), RowPolicy::Dense);
     assert!(!ScalarFnVTable::is_fallible(&Spread, &EmptyOptions));
 
-    assert_eq!(null_handling::<SpreadNonNegative>(), NullHandling::Filter);
+    assert_eq!(
+        policy(&SpreadNonNegative, &args),
+        RowPolicy::ValidOnly {
+            filtered_decode_cost: 0
+        }
+    );
     assert!(ScalarFnVTable::is_fallible(
         &SpreadNonNegative,
         &EmptyOptions

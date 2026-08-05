@@ -14,7 +14,6 @@ use geo_types::Rect;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
-use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::RowFn;
@@ -22,6 +21,7 @@ use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::scalar_fn::row::GeometryRow;
@@ -47,15 +47,25 @@ impl GeoContains {
 
 impl RowFn for GeoContains {
     type Options = EmptyOptions;
-    type ArgsWitness = (GeometryRow, GeometryRow);
+
+    const ARG_NAMES: &'static [&'static str] = &["a", "b"];
+    const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.geo.contains");
         *ID
     }
 
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["a", "b"][idx])
+    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
     }
 
     /// Containment is not symmetric, so `a` is always the container and `b` the contained.
@@ -74,7 +84,7 @@ impl RowFn for GeoContains {
                     b: b.map(PreparedOperand::new),
                 }
             },
-            |operands, (a, b), output| output.write(contains_row_prepared(operands, a, b)),
+            |operands, (a, b), output| *output = contains_row_prepared(operands, a, b),
         )
     }
 }

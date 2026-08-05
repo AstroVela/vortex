@@ -58,15 +58,12 @@ struct NullableElementFn;
 
 impl RowFn for NullableElementFn {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.nullable_element");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(
@@ -77,7 +74,7 @@ impl RowFn for NullableElementFn {
     ) -> VortexResult<V::Out> {
         visitor.visit_prepared_into::<(i64,), ElementSink<NullableI64>, _, _>(
             |_| (),
-            |&(), (value,), output| output.write(NullableI64(value)),
+            |&(), (value,), output| *output = NullableI64(value),
         )
     }
 }
@@ -87,15 +84,12 @@ struct NullableSinkFn;
 
 impl RowFn for NullableSinkFn {
     type Options = EmptyOptions;
-    type ArgsWitness = (i64,);
+
+    const ARG_NAMES: &'static [&'static str] = &["input"];
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.test.nullable_sink");
         *ID
-    }
-
-    fn arg_name(&self, _idx: usize) -> ChildName {
-        ChildName::from("input")
     }
 
     fn dispatch<V: RowVisitor>(

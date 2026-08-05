@@ -218,12 +218,10 @@ fn normalized_readthrough_returns_stored_norms() -> VortexResult<()> {
 
 /// The readthrough must survive a partially-null column.
 ///
-/// This pins the [`NullHandling::Dense`] choice the row contract derives: under
-/// [`NullHandling::Filter`](vortex_array::scalar_fn::NullHandling::Filter) the lifting could hand
-/// `reduce_encoded` a *filtered* input, which is no longer an `ExactScalarFn<Normalized>`, silently
-/// falling back to decode-and-recompute. For a lossy child that changes the answer: row 0
-/// below would come back as `10` (recomputed from `[6, 8]`) instead of the authoritative stored
-/// `5`.
+/// This pins the dense policy the row contract derives. Filtering could hand `reduce_encoded` a
+/// filtered input, which is no longer an `ExactScalarFn<Normalized>`, silently falling back to
+/// decode-and-recompute. For a lossy child that changes the answer: row 0 below would come back as
+/// `10` (recomputed from `[6, 8]`) instead of the authoritative stored `5`.
 #[test]
 fn normalized_readthrough_survives_null_rows() -> VortexResult<()> {
     let normalized = tensor_array(&[2], &[1.2, 1.6, 3.0, 0.0])?;

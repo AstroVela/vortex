@@ -95,23 +95,11 @@ pub struct ElementSink<T> {
     values: Vec<T>,
 }
 
-/// One output slot in an [`ElementSink`].
-pub struct ElementRow<'a, T: OutputElement> {
-    value: &'a mut T,
-}
-
-impl<T: OutputElement> ElementRow<'_, T> {
-    /// Replace this row's placeholder with its computed value.
-    pub fn write(self, value: T) {
-        *self.value = value;
-    }
-}
-
 impl<T: OutputElement> OutputSink for ElementSink<T> {
     const SUPPORTS_SKIPPED_ROWS: bool = true;
 
     type Rows<'a> = &'a mut [T];
-    type Row<'a> = ElementRow<'a, T>;
+    type Row<'a> = &'a mut T;
 
     fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
         Ok(T::element_dtype())
@@ -136,9 +124,7 @@ impl<T: OutputElement> OutputSink for ElementSink<T> {
     }
 
     fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a> {
-        ElementRow {
-            value: &mut rows[index],
-        }
+        &mut rows[index]
     }
 
     fn finish(self, _error: DeferredError) -> VortexResult<ArrayRef> {

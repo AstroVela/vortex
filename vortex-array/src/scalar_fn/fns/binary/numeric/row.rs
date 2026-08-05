@@ -43,7 +43,6 @@ use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
 use crate::scalar::NumericOperator;
-use crate::scalar_fn::ChildName;
 use crate::scalar_fn::DeferredError;
 use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::RowFn;
@@ -77,7 +76,8 @@ struct NumericBinary;
 
 impl RowFn for NumericBinary {
     type Options = NumericOperator;
-    type ArgsWitness = (i64, i64);
+
+    const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
 
     /// Only the integer widths can overflow, and only integer division can divide by zero, but
     /// fallibility is declared without input dtypes. The float widths are therefore covered by the
@@ -87,10 +87,6 @@ impl RowFn for NumericBinary {
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.numeric_binary");
         *ID
-    }
-
-    fn arg_name(&self, idx: usize) -> ChildName {
-        ChildName::from(["lhs", "rhs"][idx])
     }
 
     fn dispatch<V: RowVisitor>(
@@ -150,11 +146,8 @@ where
 /// so stay vectorized.
 ///
 /// Rows are written into uninitialized storage, so this sink cannot finish a batch whose rows were
-/// not all visited and leaves [`OutputSink::SUPPORTS_SKIPPED_ROWS`] at `false`. Nothing is lost:
-/// branch-and-skip only ever runs under [`NullHandling::Filter`], and a deferred-error kernel is
-/// dense.
-///
-/// [`NullHandling::Filter`]: crate::scalar_fn::NullHandling::Filter
+/// not all visited and leaves [`OutputSink::SUPPORTS_SKIPPED_ROWS`] at `false`. Nothing is lost: a
+/// deferred-error kernel runs densely and retries valid rows only on its cold error path.
 struct CheckedSink<T: NativePType, Op: CheckedPrimitiveOp<T>> {
     /// The result values, initialized one row at a time up to `row_count`.
     values: BufferMut<T>,
