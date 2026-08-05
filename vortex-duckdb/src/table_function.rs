@@ -33,6 +33,7 @@ use vortex::array::arrays::StructArray;
 use vortex::array::arrays::scalar_fn::ScalarFnArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::optimizer::ArrayOptimizer;
+use vortex::dtype::PType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::expr::Expression;
@@ -187,6 +188,9 @@ pub enum Cardinality {
     Estimate(u64),
 }
 
+// Called for every new query. For example, if there is a VIEW over *.vortex,
+// and after a query another file is added matching the glob, for second query
+// bind() will be called again.
 pub fn bind(input: &BindInputRef, result: &mut BindResultRef) -> VortexResult<TableFunctionBind> {
     let data_source = bind_multi_file_scan(input)?;
     let column_fields = extract_schema_from_dtype(data_source.dtype())?;
@@ -584,6 +588,15 @@ pub fn table_scan_progress(global_state: &TableFunctionGlobal) -> f64 {
     progress(&global_state.bytes_read, &global_state.bytes_total)
 }
 
+/// Table filter pushdown is used for two tasks in duckdb:
+///
+/// 1. Prune files based on filename or hive partitioning, see Parquet
+///    filter pushdown. We don't use this because we do own file-level pruning
+///    in FileStatsLayoutReader, and we don't support hive partitioning yet.
+/// 2. Avoid reading unused file data. Filter expressions are pushed to Vortex,
+///    converted to Vortex expressions and used during the scan.
+///    Duckdb pushes a subset of expressions i.e. equality operators, and also
+///    expressions which return true in pushdown_expression.
 pub fn pushdown_complex_filter(
     bind_data: &mut TableFunctionBind,
     expr: &ExpressionRef,
@@ -671,6 +684,26 @@ pub fn pushdown_projection_aggregates(
             debug!(%expr, %i, "failed to push down projection aggregate");
             return Ok(false);
         };
+
+        let projection_id_usize: usize = projection_id.as_();
+        let dtype = &bind_data.column_fields[projection_id_usize].dtype;
+
+        // duckdb's min() returns nan only when every value is nan.
+        // vortex's min() either ignores or counts nans.
+        // See slt/duckdb/nan_aggregates.slt.
+        if aggregate == PushedAggregate::Min && dtype.is_float() {
+            return Ok(false);
+        }
+
+        // duckdb's sum() on i64/u64 extends to i128/u128 but vortex
+        // accumulators work on i64/u64 max.
+        if aggregate == PushedAggregate::Sum
+            && dtype.is_primitive()
+            && matches!(dtype.as_ptype(), PType::I64 | PType::U64)
+        {
+            return Ok(false);
+        }
+
         debug!(%expr, %projection_id, %i, "pushed down projection aggregate");
         aggregates.push(ColumnAggregate::Real {
             projection_id,
@@ -752,6 +785,10 @@ pub fn cardinality(bind_data: &TableFunctionBind) -> Cardinality {
     }
 }
 
+/// Duckdb requests this function after exporting the chunk. We answer with
+/// partition_index we have exported as well as information about constant
+/// columns in this partition. As data is partitioned by array exporters, in
+/// each partition ~ exported array file_index is constant.
 pub fn get_partition_data(
     global_init_data: &TableFunctionGlobal,
     local_init_data: &mut TableFunctionLocal,

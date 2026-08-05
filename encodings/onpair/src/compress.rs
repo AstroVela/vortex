@@ -23,12 +23,7 @@ use vortex_error::vortex_err;
 use vortex_mask::AllOr;
 
 use crate::OnPair;
-
-/// Default OnPair training configuration: 12-bit codes ("dict-12").
-pub const DEFAULT_DICT12_CONFIG: Config = Config {
-    seed: Some(42),
-    ..onpair::DEFAULT_CONFIG
-};
+use crate::OnPairData;
 
 /// Compress any [`ArrayRef`] whose canonical form is a string array.
 ///
@@ -102,18 +97,19 @@ pub fn onpair_compress(
 
     let uncompressed_lengths = uncompressed_lengths.into_array();
 
-    let encoded = OnPair::try_new(
-        array.dtype().clone(),
+    let data = OnPairData::try_new_with_dictionary(
         dict_bytes_to_buffer(dict_bytes),
-        dict_offsets.clone().into_array(),
+        dict_offsets.clone(),
+    )?;
+    let encoded = OnPair::try_new_with_data(
+        array.dtype().clone(),
+        data,
+        dict_offsets.into_array(),
         codes,
         codes_offsets,
         uncompressed_lengths,
         validity,
     )?;
-    // SAFETY: the trainer's dictionary is conformant by construction, and
-    // `dict_offsets` is exactly the u32 child attached above.
-    unsafe { encoded.init_dict_offsets(dict_offsets) };
     Ok(encoded.into_array())
 }
 

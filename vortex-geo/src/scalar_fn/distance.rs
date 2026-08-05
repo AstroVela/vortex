@@ -85,7 +85,8 @@ impl ScalarFnVTable for GeoDistance {
     ) -> VortexResult<ArrayRef> {
         let a = args.get(0)?;
         let b = args.get(1)?;
-        execute_null_propagating(&a, &b, |x, y| Euclidean.distance(x, y), ctx)
+        // Distance is a value, not a verdict: no bounding-rect test can decide it.
+        execute_null_propagating(&a, &b, |x, y| Euclidean.distance(x, y), None, ctx)
     }
 
     fn validity(
@@ -98,6 +99,10 @@ impl ScalarFnVTable for GeoDistance {
 
     fn is_strict(&self, _: &Self::Options) -> bool {
         true
+    }
+
+    fn is_fallible(&self, _: &Self::Options) -> bool {
+        false
     }
 }
 
@@ -123,6 +128,7 @@ mod tests {
     use super::GeoDistance;
     use crate::test_harness::nullable_point_column;
     use crate::test_harness::point_column;
+    use crate::test_harness::polygon_column;
 
     /// A constant `Point` column of length `len`, every row at `(x, y)`.
     fn point_constant(
@@ -170,6 +176,23 @@ mod tests {
         let distance = GeoDistance::try_new_array(a, b)?.into_array();
 
         assert_eq!(distances(distance, &mut ctx)?, vec![5.0, 0.0]);
+        Ok(())
+    }
+
+    /// Distance passes no bounding-rect rejection: a point far outside a constant polygon's
+    /// bounding rect still gets its true distance, alongside an inside point at distance zero.
+    #[test]
+    fn distance_to_constant_polygon_is_exact() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let ring = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)];
+        let single = polygon_column(vec![vec![ring]])?.execute_scalar(0, &mut ctx)?;
+        let square = ConstantArray::new(single, 2).into_array();
+        let points = point_column(vec![7.0, 2.0], vec![2.0, 2.0])?;
+        let distance = GeoDistance::try_new_array(points, square)?.into_array();
+
+        assert_eq!(distances(distance, &mut ctx)?, vec![3.0, 0.0]);
         Ok(())
     }
 

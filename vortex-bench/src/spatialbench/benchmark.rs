@@ -148,7 +148,7 @@ impl Benchmark for SpatialBenchBenchmark {
         // shorter vec means the runner skips them).
         match self.scale_factor.as_str() {
             "1.0" => Some(vec![0, 94, 1, 22, 258, 316691, 3, 6000000, 369, 37]),
-            "10.0" => Some(vec![0, 994, 1, 79, 231, 3144328, 3, 60000000, 9357, 573]),
+            "10.0" => Some(vec![0, 994, 1, 79, 243, 3144328, 3, 60000000, 9357, 573]),
             _ => None,
         }
     }

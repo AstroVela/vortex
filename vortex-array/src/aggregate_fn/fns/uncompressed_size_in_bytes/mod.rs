@@ -45,6 +45,7 @@ use crate::aggregate_fn::EmptyOptions;
 use crate::array::ArrayView;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
+use crate::arrays::map::MapArrayExt;
 use crate::arrays::varbinview::BinaryView;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
@@ -199,6 +200,9 @@ pub(crate) fn canonical_uncompressed_size_in_bytes(
         Canonical::Decimal(array) => decimal_uncompressed_size_in_bytes(array, ctx),
         Canonical::VarBinView(array) => varbinview_uncompressed_size_in_bytes(array, ctx),
         Canonical::List(array) => list_view_uncompressed_size_in_bytes(array, ctx),
+        Canonical::Map(array) => {
+            list_view_uncompressed_size_in_bytes(&array.entries().into_owned(), ctx)
+        }
         Canonical::FixedSizeList(array) => fixed_size_list_uncompressed_size_in_bytes(array, ctx),
         Canonical::Struct(array) => struct_uncompressed_size_in_bytes(array, ctx),
         Canonical::Union(array) => union_uncompressed_size_in_bytes(array, ctx),
@@ -232,7 +236,11 @@ pub(crate) fn constant_uncompressed_size_in_bytes(
             array.len(),
             array.scalar().as_binary().value().map(|value| value.len()),
         )?,
-        DType::List(..) | DType::FixedSizeList(..) | DType::Struct(..) | DType::Extension(_) => {
+        DType::List(..)
+        | DType::Map(..)
+        | DType::FixedSizeList(..)
+        | DType::Struct(..)
+        | DType::Extension(_) => {
             let canonical = array.array().clone().execute::<Canonical>(ctx)?;
             return canonical_uncompressed_size_in_bytes(&canonical, ctx);
         }
@@ -294,6 +302,10 @@ fn supports_uncompressed_size_in_bytes(dtype: &DType) -> bool {
         DType::List(element_dtype, _) | DType::FixedSizeList(element_dtype, ..) => {
             supports_uncompressed_size_in_bytes(element_dtype)
         }
+        DType::Map(map_dtype, _) => {
+            supports_uncompressed_size_in_bytes(&map_dtype.key_dtype())
+                && supports_uncompressed_size_in_bytes(&map_dtype.value_dtype())
+        }
         DType::Struct(fields, _) => fields
             .fields()
             .all(|field| supports_uncompressed_size_in_bytes(&field)),
@@ -350,6 +362,7 @@ mod tests {
     use crate::arrays::UnionArray;
     use crate::arrays::VarBinViewArray;
     use crate::arrays::VariantArray;
+    use crate::arrays::listview::ListViewRebuildMode;
     use crate::builders::builder_with_capacity;
     use crate::dtype::DType;
     use crate::dtype::DecimalDType;
@@ -506,9 +519,19 @@ mod tests {
         let array =
             ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
 
+        // These lists are out of order and leave element 1 unreferenced, which the builder
+        // round-trip inside `materialized_uncompressed_size_in_bytes` now keeps. Compare against
+        // the exact layout instead, which is what "materialized" means here.
+        let mut ctx = array_session().create_execution_ctx();
+        let exact = array
+            .clone()
+            .execute::<ListViewArray>(&mut ctx)?
+            .rebuild(ListViewRebuildMode::MakeExact, &mut ctx)?
+            .into_array();
+
         assert_eq!(
             aggregate(&array)?,
-            materialized_uncompressed_size_in_bytes(&array)
+            materialized_uncompressed_size_in_bytes(&exact)
         );
         Ok(())
     }

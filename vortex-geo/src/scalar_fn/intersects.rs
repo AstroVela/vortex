@@ -83,7 +83,15 @@ impl ScalarFnVTable for GeoIntersects {
     ) -> VortexResult<ArrayRef> {
         let a = args.get(0)?;
         let b = args.get(1)?;
-        execute_null_propagating(&a, &b, |x, y| x.intersects(y), ctx)
+        // Disjoint bounding rects prove the geometries disjoint; rect contact (closed test)
+        // falls through to the exact test.
+        execute_null_propagating(
+            &a,
+            &b,
+            |x, y| x.intersects(y),
+            Some(|ra, rb| (!ra.intersects(rb)).then_some(false)),
+            ctx,
+        )
     }
 
     fn validity(
@@ -96,6 +104,10 @@ impl ScalarFnVTable for GeoIntersects {
 
     fn is_strict(&self, _: &Self::Options) -> bool {
         true
+    }
+
+    fn is_fallible(&self, _: &Self::Options) -> bool {
+        false
     }
 }
 
