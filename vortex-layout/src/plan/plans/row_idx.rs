@@ -11,7 +11,6 @@ use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::StructFields;
-use vortex_array::expr::Expression;
 use vortex_array::expr::get_item;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::partition;
@@ -25,6 +24,7 @@ use crate::layouts::row_idx::row_idx;
 use crate::plan::ExpressionPlan;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
+use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical plan that adds row-index expression support to its child.
 pub struct RowIdxPlan {
@@ -48,8 +48,49 @@ impl Plan for RowIdxPlan {
         Ok(Self::new_ref(self.row_offset, self.child.optimize()?))
     }
 
-    fn optimize_expression(&self, expression: &Expression) -> VortexResult<Option<PlanRef>> {
-        let partitioned = partition(expression.clone(), self.dtype(), |node| {
+    fn dtype(&self) -> &DType {
+        self.child.dtype()
+    }
+
+    fn row_count(&self) -> u64 {
+        self.child.row_count()
+    }
+
+    fn child_count(&self) -> usize {
+        1
+    }
+
+    fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
+        if index != 0 {
+            vortex_bail!("Row-index plan has no child {index}")
+        }
+        Ok(Some(Arc::clone(&self.child)))
+    }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        if index == 0 {
+            Cow::Borrowed("child")
+        } else {
+            Cow::Owned(format!("child[{index}]"))
+        }
+    }
+}
+
+/// Partitions an expression between generated row indices and the data child.
+#[derive(Debug)]
+pub(crate) struct ExpressionRowIdxRule;
+
+impl PlanParentReduceRule<RowIdxPlan> for ExpressionRowIdxRule {
+    type Parent = ExpressionPlan;
+
+    fn reduce_parent(
+        &self,
+        child: &RowIdxPlan,
+        parent: &ExpressionPlan,
+        _child_idx: usize,
+    ) -> VortexResult<Option<PlanRef>> {
+        let expression = parent.expression();
+        let partitioned = partition(expression.clone(), child.dtype(), |node| {
             if node.is::<RowIdx>() {
                 vec![RowIdxExpressionPartition::RowIdx]
             } else if vortex_array::expr::is_root(node) {
@@ -63,13 +104,13 @@ impl Plan for RowIdxPlan {
             return match partitioned.partition_annotations[0] {
                 RowIdxExpressionPartition::RowIdx => {
                     let expression = replace(expression.clone(), &row_idx(), root());
-                    let values = RowIdxValuesPlan::new_ref(self.row_offset, self.row_count());
+                    let values = RowIdxValuesPlan::new_ref(child.row_offset, child.row_count());
                     Ok(Some(
                         ExpressionPlan::try_new(expression, values)?.optimize()?,
                     ))
                 }
                 RowIdxExpressionPartition::Child => Ok(Some(
-                    ExpressionPlan::try_new(expression.clone(), Arc::clone(&self.child))?
+                    ExpressionPlan::try_new(expression.clone(), Arc::clone(&child.child))?
                         .optimize()?,
                 )),
             };
@@ -101,74 +142,50 @@ impl Plan for RowIdxPlan {
         ) else {
             return Ok(None);
         };
-        // A general pack plan is needed to expose more than one result from either branch.
-        if row_idx_partition.children().len() != 1 || child_partition.children().len() != 1 {
-            return Ok(None);
-        }
-
-        let (Some(row_idx_value_name), Some(child_value_name)) =
-            (row_idx_pack.names.get(0), child_pack.names.get(0))
-        else {
-            return Ok(None);
-        };
-        let row_idx_value_name = row_idx_value_name.clone();
-        let child_value_name = child_value_name.clone();
         let row_idx_partition_name = partitioned.partition_names[row_idx_index].clone();
         let child_partition_name = partitioned.partition_names[child_index].clone();
-        let row_idx_expression = row_idx_partition.child(0).clone();
-        let child_expression = child_partition.child(0).clone();
+        let mut residual = partitioned.root;
 
-        let residual = replace(
-            partitioned.root,
-            &get_item(row_idx_value_name, get_item(row_idx_partition_name, root())),
-            get_item(RowIdxExpressionPartition::RowIdx.name(), root()),
-        );
-        let residual = replace(
-            residual,
-            &get_item(child_value_name, get_item(child_partition_name, root())),
-            get_item(RowIdxExpressionPartition::Child.name(), root()),
-        );
+        let row_idx_expression = if row_idx_partition.children().len() == 1 {
+            let Some(value_name) = row_idx_pack.names.get(0) else {
+                return Ok(None);
+            };
+            residual = replace(
+                residual,
+                &get_item(value_name.clone(), get_item(row_idx_partition_name, root())),
+                get_item(RowIdxExpressionPartition::RowIdx.name(), root()),
+            );
+            row_idx_partition.child(0).clone()
+        } else {
+            row_idx_partition.clone()
+        };
+        let child_expression = if child_partition.children().len() == 1 {
+            let Some(value_name) = child_pack.names.get(0) else {
+                return Ok(None);
+            };
+            residual = replace(
+                residual,
+                &get_item(value_name.clone(), get_item(child_partition_name, root())),
+                get_item(RowIdxExpressionPartition::Child.name(), root()),
+            );
+            child_partition.child(0).clone()
+        } else {
+            child_partition.clone()
+        };
 
         let row_idx_expression = replace(row_idx_expression, &row_idx(), root());
         let row_idx_plan = ExpressionPlan::try_new(
             row_idx_expression,
-            RowIdxValuesPlan::new_ref(self.row_offset, self.row_count()),
+            RowIdxValuesPlan::new_ref(child.row_offset, child.row_count()),
         )?
         .optimize()?;
         let child_plan =
-            ExpressionPlan::try_new(child_expression, Arc::clone(&self.child))?.optimize()?;
+            ExpressionPlan::try_new(child_expression, Arc::clone(&child.child))?.optimize()?;
         let partitions = RowIdxPartitionPlan::try_new(row_idx_plan, child_plan)?;
 
         Ok(Some(
             ExpressionPlan::try_new(residual, partitions)?.optimize()?,
         ))
-    }
-
-    fn dtype(&self) -> &DType {
-        self.child.dtype()
-    }
-
-    fn row_count(&self) -> u64 {
-        self.child.row_count()
-    }
-
-    fn child_count(&self) -> usize {
-        1
-    }
-
-    fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
-        if index != 0 {
-            vortex_bail!("Row-index plan has no child {index}")
-        }
-        Ok(Some(Arc::clone(&self.child)))
-    }
-
-    fn child_name(&self, index: usize) -> Cow<'_, str> {
-        if index == 0 {
-            Cow::Borrowed("child")
-        } else {
-            Cow::Owned(format!("child[{index}]"))
-        }
     }
 }
 

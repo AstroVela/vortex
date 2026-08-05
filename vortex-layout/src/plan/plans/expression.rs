@@ -14,6 +14,7 @@ use vortex_error::vortex_bail;
 
 use crate::plan::Plan;
 use crate::plan::PlanRef;
+use crate::plan::optimizer::reduce_parent;
 
 /// A physical plan that applies an expression to the output of `child`.
 pub struct ExpressionPlan {
@@ -59,10 +60,11 @@ impl Plan for ExpressionPlan {
             let expression = replace(expression, &root(), inner.expression.clone());
             return Self::try_new(expression, Arc::clone(&inner.child))?.optimize();
         }
-        if let Some(rewritten) = child.optimize_expression(&expression)? {
+        let parent: PlanRef = Arc::new(Self::try_new(expression, child)?);
+        if let Some(rewritten) = reduce_parent(&parent, 0)? {
             return Ok(rewritten);
         }
-        Ok(Arc::new(Self::try_new(expression, child)?))
+        Ok(parent)
     }
 
     fn dtype(&self) -> &DType {
