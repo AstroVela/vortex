@@ -28,6 +28,7 @@ pub use plans::RowIdxPartitionPlan;
 pub use plans::RowIdxPlan;
 pub use plans::RowIdxValuesPlan;
 pub use plans::StructPlan;
+pub use plans::ZonedPlan;
 use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -38,6 +39,8 @@ use crate::layouts::dict::Dict;
 use crate::layouts::flat::Flat;
 use crate::layouts::list::List;
 use crate::layouts::struct_::Struct;
+use crate::layouts::zoned::LegacyStats;
+use crate::layouts::zoned::Zoned;
 
 /// Shared handle to a heap-allocated physical plan.
 pub type PlanRef = Arc<dyn Plan>;
@@ -102,6 +105,9 @@ pub fn new_plan(layout: &LayoutRef) -> VortexResult<PlanRef> {
     }
     if let Some(layout) = layout.as_opt::<Struct>() {
         return Ok(Arc::new(StructPlan::new(layout)));
+    }
+    if layout.is::<Zoned>() || layout.is::<LegacyStats>() {
+        return Ok(Arc::new(ZonedPlan::try_new(layout)?));
     }
     vortex_bail!(
         "No physical plan implementation for layout '{}'",
