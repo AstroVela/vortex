@@ -8,6 +8,7 @@ mod flat;
 mod list;
 mod row_idx;
 mod struct_;
+mod zoned;
 
 pub use chunked::ChunkedPlan;
 pub(crate) use chunked::ExpressionChunkedRule;
@@ -22,3 +23,4 @@ pub use row_idx::RowIdxPlan;
 pub use row_idx::RowIdxValuesPlan;
 pub(crate) use struct_::ExpressionStructRule;
 pub use struct_::StructPlan;
+pub use zoned::ZonedPlan;
