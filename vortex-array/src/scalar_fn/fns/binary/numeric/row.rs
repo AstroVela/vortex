@@ -140,9 +140,14 @@ where
 /// The output column of one checked arithmetic batch, reporting failure once after the row loop.
 ///
 /// Deferring the failure is what keeps a fallible kernel on the dense path: every row writes a
-/// value unconditionally and contributes one bit, so the loop holds no branch and no `Result`
-/// discriminant. The lifting retries a nullable batch over only its valid rows if that bit is set,
-/// which is what makes an overflow behind a null row invisible.
+/// value unconditionally and OR-reduces its failure evidence, so the loop holds no branch and no
+/// `Result` discriminant. The lifting retries a nullable batch over only its valid rows if that
+/// reduction is non-zero, which is what makes an overflow behind a null row invisible.
+///
+/// The reduction lives in the sink rather than in the row closure's return type so that its width
+/// is [`Op::Failure`](CheckedPrimitiveOp::Failure), the operator's choice, rather than one bit. That
+/// is what lets unsigned multiplication report its discarded high half instead of a comparison, and
+/// so stay vectorized.
 ///
 /// Rows are written into uninitialized storage, so this sink cannot finish a batch whose rows were
 /// not all visited and leaves [`OutputSink::SUPPORTS_SKIPPED_ROWS`] at `false`. Nothing is lost:
@@ -150,40 +155,43 @@ where
 /// dense.
 ///
 /// [`NullHandling::Filter`]: crate::scalar_fn::NullHandling::Filter
-struct CheckedSink<T, Op> {
+struct CheckedSink<T: NativePType, Op: CheckedPrimitiveOp<T>> {
     /// The result values, initialized one row at a time up to `row_count`.
     values: BufferMut<T>,
 
     /// The batch length, which is the capacity `values` was allocated with.
     row_count: usize,
 
-    /// The operation applied to every row, which also names the error reported by
+    /// The operation applied to every row, which names the error reported by
     /// [`finish`](OutputSink::finish).
     op: PhantomData<Op>,
 }
 
-/// The uninitialized output slots of a [`CheckedSink`], borrowed once for the row loop.
-struct CheckedRows<'a, T, Op> {
+/// The uninitialized output slots of a [`CheckedSink`], borrowed once for the row loop, together
+/// with the batch-wide failure reduction they contribute to.
+struct CheckedRows<'a, T: NativePType, Op: CheckedPrimitiveOp<T>> {
     values: &'a mut [MaybeUninit<T>],
     op: PhantomData<Op>,
 }
 
 /// One output slot of a [`CheckedSink`].
-struct CheckedRow<'a, T, Op> {
+struct CheckedRow<'a, T: NativePType, Op: CheckedPrimitiveOp<T>> {
     value: &'a mut MaybeUninit<T>,
     op: PhantomData<Op>,
 }
 
 impl<T: NativePType, Op: CheckedPrimitiveOp<T>> CheckedRow<'_, T, Op> {
-    /// Apply `Op` to one row, writing its value and returning whether that row failed.
+    /// Apply `Op` to one row, writing its value and handing back its failure evidence.
     ///
     /// The value is written whether or not the operation failed, since a failing row is either
-    /// masked away as null or turned into a batch error before it can be read.
-    fn write(self, lhs: T, rhs: T) -> DeferredError {
-        let (value, failed) = Op::apply(lhs, rhs);
+    /// masked away as null or turned into a batch error before it can be read. The evidence is
+    /// returned rather than reduced here so the executor can keep the reduction in a register, and
+    /// it is `Op`'s own width so the row never has to compare.
+    fn write(self, lhs: T, rhs: T) -> Op::Failure {
+        let (value, failure) = Op::apply(lhs, rhs);
         self.value.write(value);
 
-        DeferredError::new(failed)
+        failure
     }
 }
 
@@ -212,8 +220,9 @@ impl<T: NativePType, Op: CheckedPrimitiveOp<T>> OutputSink for CheckedSink<T, Op
     }
 
     fn rows(&mut self) -> Self::Rows<'_> {
+        let row_count = self.row_count;
         CheckedRows {
-            values: &mut self.values.spare_capacity_mut()[..self.row_count],
+            values: &mut self.values.spare_capacity_mut()[..row_count],
             op: PhantomData,
         }
     }

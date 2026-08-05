@@ -102,7 +102,7 @@ pub(super) fn execute_row_sink_prepared<A: ElementTuple, P, S: OutputSink, R: Si
     let mut sink = S::with_capacity(row_count, sink_dtype)?;
     let columns = A::decode(args, ctx)?;
     let state = prepare(A::constants(&columns));
-    let mut deferred_error = DeferredError::default();
+    let mut accumulated = R::Accumulated::default();
 
     {
         let mut rows = sink.rows();
@@ -123,7 +123,7 @@ pub(super) fn execute_row_sink_prepared<A: ElementTuple, P, S: OutputSink, R: Si
                     A::get_varying(&varying, index),
                     S::row(&mut rows, index),
                 )
-                .accumulate(&mut deferred_error)?;
+                .accumulate(&mut accumulated)?;
             }
         } else {
             vortex_ensure!(
@@ -133,12 +133,12 @@ pub(super) fn execute_row_sink_prepared<A: ElementTuple, P, S: OutputSink, R: Si
 
             for index in 0..row_count {
                 apply(&state, A::get(&columns, index), S::row(&mut rows, index))
-                    .accumulate(&mut deferred_error)?;
+                    .accumulate(&mut accumulated)?;
             }
         }
     }
 
-    finish_sink(sink, deferred_error)
+    finish_sink(sink, DeferredError::new(R::occurred(accumulated)))
 }
 
 /// Run a prepared sink over only the rows set in `valid`, or decline when the sink cannot skip.
@@ -160,7 +160,7 @@ pub(super) fn execute_row_sink_branch<A: ElementTuple, P, S: OutputSink, R: Sink
     let state = prepare(A::constants(&columns));
     let row_count = args.row_count();
     let mut sink = S::with_capacity(row_count, sink_dtype)?;
-    let mut deferred_error = DeferredError::default();
+    let mut accumulated = R::Accumulated::default();
 
     let AllOr::Some(valid) = valid.bit_buffer() else {
         vortex_bail!("execute_row_sink_branch requires a mixed mask");
@@ -197,7 +197,7 @@ pub(super) fn execute_row_sink_branch<A: ElementTuple, P, S: OutputSink, R: Sink
                 ),
                 None => apply(&state, A::get(&columns, index), S::row(&mut rows, index)),
             };
-            if let Err(err) = result.accumulate(&mut deferred_error) {
+            if let Err(err) = result.accumulate(&mut accumulated) {
                 error = Some(err);
             }
         });
@@ -207,7 +207,7 @@ pub(super) fn execute_row_sink_branch<A: ElementTuple, P, S: OutputSink, R: Sink
         }
     }
 
-    finish_sink(sink, deferred_error).map(Some)
+    finish_sink(sink, DeferredError::new(R::occurred(accumulated))).map(Some)
 }
 
 /// Finish a sink while preserving whether its error came from the deferred row accumulator.

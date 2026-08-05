@@ -199,6 +199,88 @@ fn test_integer_array_array_errors_on_valid_lanes() {
     assert!(result.is_err());
 }
 
+/// The 64-bit widths detect multiplication overflow from the high half of the true product rather
+/// than from a comparison, so each boundary is worth pinning: `MIN * 1` and `-1 * -1` fit, while
+/// `MIN * -1` and `MAX * 2` do not.
+#[rstest]
+#[case::min_times_one(i64::MIN, 1, false)]
+#[case::minus_one_squared(-1i64, -1, false)]
+#[case::max_times_one(i64::MAX, 1, false)]
+#[case::negative_product(-5i64, 3, false)]
+#[case::zero(0i64, i64::MIN, false)]
+#[case::min_times_minus_one(i64::MIN, -1, true)]
+#[case::max_times_two(i64::MAX, 2, true)]
+#[case::min_times_two(i64::MIN, 2, true)]
+fn test_i64_multiply_overflow_boundaries(
+    #[case] lhs: i64,
+    #[case] rhs: i64,
+    #[case] overflows: bool,
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let values = PrimitiveArray::from_iter([lhs, 1]).into_array();
+    let rhs_array = PrimitiveArray::from_iter([rhs, 1]).into_array();
+
+    let result = values
+        .binary(rhs_array, Operator::Mul)?
+        .execute::<PrimitiveArray>(&mut ctx);
+
+    assert_eq!(result.is_err(), overflows, "{lhs} * {rhs}");
+    if !overflows {
+        assert_arrays_eq!(
+            result?,
+            PrimitiveArray::from_iter([lhs.wrapping_mul(rhs), 1]),
+            &mut ctx
+        );
+    }
+    Ok(())
+}
+
+/// The same, unsigned: overflow is exactly a non-zero discarded high half.
+#[rstest]
+#[case::max_times_one(u64::MAX, 1, false)]
+#[case::halves(1u64 << 32, 1 << 31, false)]
+#[case::zero(0u64, u64::MAX, false)]
+#[case::max_times_two(u64::MAX, 2, true)]
+#[case::squared_halves(1u64 << 32, 1 << 32, true)]
+fn test_u64_multiply_overflow_boundaries(
+    #[case] lhs: u64,
+    #[case] rhs: u64,
+    #[case] overflows: bool,
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let values = PrimitiveArray::from_iter([lhs, 1]).into_array();
+    let rhs_array = PrimitiveArray::from_iter([rhs, 1]).into_array();
+
+    let result = values
+        .binary(rhs_array, Operator::Mul)?
+        .execute::<PrimitiveArray>(&mut ctx);
+
+    assert_eq!(result.is_err(), overflows, "{lhs} * {rhs}");
+    Ok(())
+}
+
+/// An overflowing 64-bit multiply behind a null row is invisible, exactly as for the narrow widths.
+#[test]
+fn test_i64_multiply_overflow_on_null_lane_ignored() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let lhs =
+        PrimitiveArray::new(buffer![i64::MAX, 3], Validity::from_iter([false, true])).into_array();
+    let rhs = buffer![2i64, 4].into_array();
+
+    let result = lhs
+        .binary(rhs, Operator::Mul)?
+        .execute::<RecursiveCanonical>(&mut ctx)?
+        .0
+        .into_array();
+
+    assert_arrays_eq!(
+        result,
+        PrimitiveArray::from_option_iter([None, Some(12i64)]),
+        &mut ctx
+    );
+    Ok(())
+}
+
 #[test]
 fn test_present_nullable_constant_preserves_nullable_output() {
     let mut ctx = array_session().create_execution_ctx();

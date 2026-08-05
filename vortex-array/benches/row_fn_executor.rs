@@ -93,11 +93,11 @@ struct CheckedAddRow<'a> {
 }
 
 impl CheckedAddRow<'_> {
-    fn write(self, lhs: i64, rhs: i64) -> DeferredError {
+    fn write(self, lhs: i64, rhs: i64) -> bool {
         let value = lhs.wrapping_add(rhs);
         let error = (lhs ^ value) & (rhs ^ value);
         self.value.write(value);
-        DeferredError::new(error < 0)
+        error < 0
     }
 }
 

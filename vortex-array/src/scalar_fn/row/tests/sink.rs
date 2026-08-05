@@ -89,9 +89,9 @@ struct NonNegativeRow<'a> {
 }
 
 impl NonNegativeRow<'_> {
-    fn write(self, value: i64) -> DeferredError {
+    fn write(self, value: i64) -> bool {
         *self.value = value;
-        DeferredError::new(value < 0)
+        value < 0
     }
 }
 
