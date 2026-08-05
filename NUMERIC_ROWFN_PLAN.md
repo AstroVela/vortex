@@ -152,114 +152,76 @@ existed for:
 - `checked_apply_lanes` had no caller left. `checked_lanes` stays for decimal.
 - `PrimitiveOperand` moved to `compare/primitive.rs`, its only remaining user.
 
-### The one machinery change: `DeferredError` is a byte, not an `i64`
+### The machinery change: the reduction is a word the kernel chooses
 
-This was not predicted and it is the substantive finding. `DeferredError` held an `i64` so a kernel
-could OR raw words and read failure off the sign bit. The bit is reduced once per row alongside the
-kernel's own arithmetic, so a 64-bit accumulator caps how many rows a vector of the reduction covers
-regardless of the element width. Measured against `Mul`, which is where the value work is widest:
+`SinkResult` gained `Accumulated`, the word the executor OR-reduces in a loop-local. Two properties
+of that reduction are load-bearing, and each was got wrong once before the numbers made it obvious.
 
-| width | `i64` accumulator | byte accumulator |
-| --- | --- | --- |
-| `i8` | 3.5x slower than baseline | 1.05x |
-| `i16` | 2.05x | 1.03x |
-| `i32` | 1.28x | 1.01x |
-| `i64` | 1.13x | 1.12x |
+- **Width no greater than the element.** `DeferredError` held an `i64`, which bounds how many rows a
+  vector of the reduction covers whatever the element width. That cost `Mul` 3.5x at `i8`, 2.05x at
+  `i16` and 1.28x at `i32`, and nothing at `i64` where the widths already agree.
+- **It lives in a loop-local, not in the sink.** Holding the accumulator as a sink field, reached
+  through a `&mut` for every row, is a loop-carried memory dependence. It cost the boolean kernels
+  2.5x to 10x while leaving the three unsigned multiply kernels untouched.
 
-`from_sign_bit` went with it. Its premise (that reusing an already-computed word is free) is what the
-measurement contradicts, and its only caller was the `row_fn_executor` benchmark, now on
-`DeferredError::new`. `row_checked_add` is unchanged at 13.99 µs, matching `specialized_checked_add`
-exactly, so nothing was given up at `i64`.
+Naming the word is also what lets multiplication report the discarded high half of its product
+rather than a comparison, which is what recovers its vectorization. `OutputSink` is unchanged and no
+sink names the word.
 
-### Benchmarks
+### Results
 
-`binary_ops`, 65536 rows, divan fastest of 100 samples, best of two runs, Apple M4 Max. The six
-benchmarks over unchanged code (`add_decimal_*`, `and_bool`, `eq_i64`, `lt_i64`, `or_bool`) all moved
-by less than 1%, which is what makes the rest comparable.
+Against the hand-written kernels, divan medians, best of two runs, 65536 rows, Apple M4 Max, with
+the decimal, boolean and comparison benchmarks held as controls and moving under 2%:
 
-| benchmark | before | after | |
+| benchmark | hand-written | row framework | |
 | --- | --- | --- | --- |
-| `div_i64_nonnull` | 38.95 µs | 35.24 µs | 1.11x faster |
-| `add_i64_nonnull` | 13.45 µs | 13.83 µs | 1.03x slower |
-| `add_i64_nullable` | 14.24 µs | 14.37 µs | 1.01x slower |
-| `sub_i64_constant` | 12.87 µs | 13.33 µs | 1.04x slower |
-| `mul_i8_nonnull` | 2.665 µs | 2.790 µs | 1.05x slower |
-| `mul_i16_nonnull` | 4.957 µs | 5.082 µs | 1.03x slower |
-| `mul_i32_nonnull` | 7.582 µs | 7.666 µs | 1.01x slower |
-| `mul_i32_nullable` | 8.29 µs | 8.12 µs | 1.02x faster |
-| `mul_i32_constant` | 7.499 µs | 7.999 µs | 1.07x slower |
-| `mul_i64_nonnull` | 27.16 µs | 30.45 µs | 1.12x slower |
-| `mul_u8_nonnull` | 22.70 µs | 27.08 µs | 1.19x slower |
-| `mul_u16_nonnull` | 20.33 µs | 26.33 µs | 1.30x slower |
-| `mul_u32_nonnull` | 24.16 µs | 29.37 µs | 1.22x slower |
+| `mul_u8_nonnull` | 22.91 us | 1.854 us | 12.4x faster |
+| `mul_u16_nonnull` | 22.20 us | 3.791 us | 5.9x faster |
+| `mul_u32_nonnull` | 24.62 us | 7.124 us | 3.5x faster |
+| `div_i64_nonnull` | 40.41 us | 34.83 us | 1.16x faster |
+| `mul_i64_nonnull` | 27.37 us | 28.66 us | 1.05x slower |
+| `mul_i32_constant` | 7.583 us | 8.041 us | 1.06x slower |
 
-### The open regression: unsigned `Mul` and `mul_i64`
+Everything else lands within 3%, which is inside this host's drift between sessions. The unsigned
+multiply win is not attributable to the port: the same defect exists in the hand-written kernels and
+is fixed for `develop` separately in vortex-data/vortex#9210, stacked on vortex-data/vortex#9211.
+Re-measure the port against `develop` once that lands, because the comparison above flatters it.
 
-Every regression that survives is on a loop that does not vectorize, and there are two separate
-causes stacked on top of each other.
+### Measured dead ends
 
-**Underneath: unsigned narrow `mul_error` never vectorizes.** Not in Vortex, and not in a twelve-line
-standalone program with no Vortex code in it. Compiled to ARM64, the signed check
-(`p < MIN || p > MAX` over the widened product) emits `smlal.8h` and `cmhi.8h` and runs sixteen lanes
-at a time; the unsigned check (`p > MAX`) emits `ldrb`/`mul`/`strb` and runs one. Eight rewrites of
-the unsigned check (shift, mask, round-trip truncation, `checked_mul`, `overflowing_mul`, widening to
-`u32`, mirroring the signed two-sided form) all produced byte-identical scalar code, so LLVM is
-canonicalizing every spelling to `umul.with.overflow`, which has no vector lowering. Removing the
-check entirely takes `mul_u8_nonnull` from 27.1 µs to 1.5 µs.
+Recorded so they are not retried. All of these are in vortex-data/vortex#9130 as well.
 
-This is why `mul_u8` costs 22.7 µs on develop against `mul_i8`'s 2.7 µs for the same shape of code,
-and why `mul_i64` (which uses `overflowing_mul` explicitly) sits in the same 20-30 µs band at every
-width. It predates this work and affects develop identically. It deserves its own issue.
+- Bounds-check elimination in the row loop is not available. Narrowing the varying view to the row
+  count buys nothing, and `get_unchecked` is not uniformly a win: about 10% on `mul_u16` and
+  `mul_u32`, and 22% slower on `mul_u8`.
+- A per-argument row source that keeps the `Varying` view when another argument is batch-constant is
+  4x slower than the `ArgColumn` branch it replaces, which already vectorizes.
+- A batch-constant operand therefore still demotes its neighbours off the slice path. Closing that
+  needs the row loop monomorphized over which arguments are constant. Revisit when `Compare` moves
+  onto `RowFn`, since `col < literal` is exactly this shape.
 
-**On top: the row loop pays for bounds checks.** A scalar loop has nothing to hide them behind.
-Replacing the two input reads and the one output write with `get_unchecked` (ABBA, two rounds,
-medians, both rounds agreeing):
-
-| benchmark | row loop | with unchecked indexing |
-| --- | --- | --- |
-| `mul_u8_nonnull` | 27.41 / 27.70 µs | 25.12 / 25.62 µs |
-| `mul_u16_nonnull` | 27.04 / 26.87 µs | 24.66 / 24.60 µs |
-| `mul_u32_nonnull` | 30.58 / 29.83 µs | 27.10 / 27.66 µs |
-| `mul_i64_nonnull` | 31.20 / 31.24 µs | 29.41 / 29.79 µs |
-| `mul_i8_nonnull` | 2.832 / 2.915 µs | 2.915 / 2.874 µs |
-| `add_i64_nonnull` | 14.04 / 14.41 µs | 13.66 / 13.62 µs |
-
-So bounds checking is 5-9% on the scalar loops and nothing measurable on the vectorized ones, which
-accounts for about half the remaining gap. The other half is the rest of the per-row shape against
-`map_checked_into`, which is a `get_unchecked` loop with a register-resident `bool`.
-
-`execute_row_sink_prepared` already tries to enable this: `varying_len_matches` and
-`row_count_matches` are asserted before the loop for exactly this reason, and the doc on
-`row_count_matches` says so. They are not achieving it. An isolated reproduction of the same shape
-(nested references, generic accessors, a `&mut` row slot) does eliminate its bounds checks, so the
-mechanism is not simply the double indirection and is not yet pinned down.
-
-The sound fix is an API change rather than an `unsafe` block: `InputElement::get_varying` and
-`OutputSink::row` are safe public methods, so neither may skip its check on the framework's promise.
-Giving `varying(column, row_count)` the row count and having it return a view already sliced to that
-length would make `column[index]` provably in bounds, delete `varying_len_matches` and
-`varying_len`, and move a runtime assert into the type. That is a change to #9129's surface and to
-every element implementation, so it belongs to that issue rather than to this port.
+`mul_i32_constant` is the one regression that survives, and it is inside this host's drift. Let
+CodSpeed settle whether it is real.
 
 ### What this implies for #9129 and #9130
 
 - The `RowFn` API needed nothing. No new visit method, no options-aware `sink_dtype`, no return
   witness. The options-independence of `RowFn::is_fallible` does not bite, because fallibility is
   uniform across the four arithmetic operators.
-- `DeferredError`'s width is part of #9130's machinery contract and should be recorded there: a
-  deferred bit is only free when the accumulator is no wider than the element.
-- `varying_len_matches` and `row_count_matches` exist to buy bounds-check elimination and do not buy
-  it. Worth 5-9% on any row kernel whose arithmetic does not vectorize. Slicing the varying view to
-  the row count inside `varying()` would get it without `unsafe`.
-- A batch-constant operand still costs a per-row `ArgColumn` branch, since `ElementTuple::varying`
-  declines whenever any argument is constant and `prepare` cannot remove the read. Worth 1.07x on
-  `mul_i32_constant` and nothing measurable on `sub_i64_constant`. Not a blocker, but it is the
-  remaining structural gap against a hand-written kernel that hoists its constant into a register.
+- `SinkResult::Accumulated` and its two constraints belong in #9130, and are recorded there.
+- On kernels this close to the vectorizer's decision boundary, the emitted IR is the reliable gate
+  and wall clock on one host is not. Two separate interventions here moved a benchmark the wrong
+  way, and host drift between sessions exceeded the effects under measurement.
 
 ### Verification
 
-`cargo nextest run -p vortex-array` (3156 passed), `cargo nextest run --workspace`,
-`cargo clippy --all-targets --all-features`, `cargo +nightly fmt --all`, `cargo test --doc -p
-vortex-array`. The whole of `binary/numeric/tests.rs` passes unchanged, including
-`test_decimal_overflow_on_null_lane_ignored` and the three integer-error tests that pin the valid-row
-retry.
+```bash
+cargo nextest run --workspace
+cargo clippy --all-targets --all-features
+cargo +nightly fmt --all
+cargo test --doc -p vortex-array
+```
+
+The whole of `binary/numeric/tests.rs` passes unchanged, including
+`test_decimal_overflow_on_null_lane_ignored` and the integer-error tests that pin the valid-row
+retry. Decimal is untouched and stays on `execute_numeric_decimal`.
