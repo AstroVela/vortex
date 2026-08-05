@@ -29,7 +29,6 @@ pub use plans::RowIdxPlan;
 pub use plans::RowIdxValuesPlan;
 pub use plans::StructPlan;
 use vortex_array::dtype::DType;
-use vortex_array::expr::BoundExpression;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
@@ -61,16 +60,6 @@ pub trait Plan: Any + Send + Sync {
     /// Recursively optimizes this plan and all of its children while preserving its dtype and row
     /// domain.
     fn optimize(&self) -> VortexResult<PlanRef>;
-
-    /// Attempts to rewrite `expression` through this plan.
-    ///
-    /// Returns `None` when this plan has no applicable expression rewrite. Implementations may
-    /// request only the children needed by the rewrite and should preserve all other lazy child
-    /// slots.
-    fn optimize_expression(&self, expression: &BoundExpression) -> VortexResult<Option<PlanRef>> {
-        let _ = expression;
-        Ok(None)
-    }
 
     /// Returns the dtype produced by this plan.
     fn dtype(&self) -> &DType;

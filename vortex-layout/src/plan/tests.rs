@@ -155,7 +155,10 @@ fn expression_partitions_across_row_idx_and_struct() -> VortexResult<()> {
     .into_layout();
     let expression = and(
         gt(row_idx(), lit(11_u64)),
-        gt(get_item("a", root()), lit(5_i32)),
+        and(
+            gt(get_item("a", root()), lit(5_i32)),
+            gt(get_item("b", root()), lit(7_i32)),
+        ),
     );
     let plan: PlanRef = Arc::new(make_expression_plan(
         expression,
@@ -163,7 +166,7 @@ fn expression_partitions_across_row_idx_and_struct() -> VortexResult<()> {
     )?);
 
     insta::assert_snapshot!(plan.tree_display(), @r"
-    root: ExpressionPlan(bool, rows=3) expr=((#row_idx > 11u64) and ($.a > 5i32))
+    root: ExpressionPlan(bool, rows=3) expr=(((#row_idx > 11u64) and ($.a > 5i32)) and ($.b > 7i32))
       child: RowIdxPlan({a=i32, b=i32}, rows=3)
         child: StructPlan({a=i32, b=i32}, rows=3)
           a: DictPlan(i32, rows=3)
@@ -174,14 +177,18 @@ fn expression_partitions_across_row_idx_and_struct() -> VortexResult<()> {
 
     let optimized = plan.optimize()?;
     insta::assert_snapshot!(optimized.tree_display(), @r"
-    root: ExpressionPlan(bool, rows=3) expr=($.row_idx and $.child)
-      child: RowIdxPartitionPlan({row_idx=bool, child=bool}, rows=3)
+    root: ExpressionPlan(bool, rows=3) expr=(($.row_idx and $.child.child_0) and $.child.child_1)
+      child: RowIdxPartitionPlan({row_idx=bool, child={child_0=bool, child_1=bool}}, rows=3)
         row_idx: ExpressionPlan(bool, rows=3) expr=($ > 11u64)
           child: RowIdxValuesPlan(u64, rows=3)
-        child: DictPlan(bool, rows=3)
-          codes: FlatPlan(u8, rows=3)
-          values: ExpressionPlan(bool, rows=2) expr=($ > 5i32)
-            child: FlatPlan(i32, rows=2)
+        child: ExpressionPlan({child_0=bool, child_1=bool}, rows=3) expr=pack(child_0: $.a, child_1: $.b)
+          child: StructPlan({a=bool, b=bool}, rows=3)
+            a: DictPlan(bool, rows=3)
+              codes: FlatPlan(u8, rows=3)
+              values: ExpressionPlan(bool, rows=2) expr=($ > 5i32)
+                child: FlatPlan(i32, rows=2)
+            b: ExpressionPlan(bool, rows=3) expr=($ > 7i32)
+              child: FlatPlan(i32, rows=3)
     ");
     let residual = optimized
         .downcast_ref::<ExpressionPlan>()
@@ -312,6 +319,103 @@ fn expression_pushes_through_struct_field_with_heterogeneous_chunks() -> VortexR
           child: FlatPlan(i32, rows=2)
       chunks[1]: ExpressionPlan(bool, rows=2) expr=($ > 5i32)
         child: FlatPlan(i32, rows=2)
+    ");
+    Ok(())
+}
+
+#[test]
+fn multi_field_struct_expression_pushes_into_each_field() -> VortexResult<()> {
+    let value_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let dictionary = DictLayout::new(
+        flat(2, value_dtype.clone(), 0),
+        flat(3, primitive(PType::U8, Nullability::NonNullable), 1),
+    )
+    .into_layout();
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([
+                ("a", value_dtype.clone()),
+                ("b", value_dtype.clone()),
+                ("c", value_dtype.clone()),
+            ]),
+            Nullability::NonNullable,
+        ),
+        vec![
+            dictionary,
+            flat(3, value_dtype.clone(), 2),
+            flat(3, value_dtype, 3),
+        ],
+    )
+    .into_layout();
+    let expression = and(
+        gt(get_item("a", root()), lit(5_i32)),
+        gt(get_item("b", root()), lit(7_i32)),
+    );
+    let plan: PlanRef = Arc::new(make_expression_plan(expression, make_plan(layout)?)?);
+
+    insta::assert_snapshot!(plan.tree_display(), @r"
+    root: ExpressionPlan(bool, rows=3) expr=(($.a > 5i32) and ($.b > 7i32))
+      child: StructPlan({a=i32, b=i32, c=i32}, rows=3)
+        a: DictPlan(i32, rows=3)
+          codes: FlatPlan(u8, rows=3)
+          values: FlatPlan(i32, rows=2)
+        b: FlatPlan(i32, rows=3)
+        c: FlatPlan(i32, rows=3)
+    ");
+
+    let optimized = plan.optimize()?;
+
+    insta::assert_snapshot!(optimized.tree_display(), @r"
+    root: ExpressionPlan(bool, rows=3) expr=($.a and $.b)
+      child: StructPlan({a=bool, b=bool, c=i32}, rows=3)
+        a: DictPlan(bool, rows=3)
+          codes: FlatPlan(u8, rows=3)
+          values: ExpressionPlan(bool, rows=2) expr=($ > 5i32)
+            child: FlatPlan(i32, rows=2)
+        b: ExpressionPlan(bool, rows=3) expr=($ > 7i32)
+          child: FlatPlan(i32, rows=3)
+        c: FlatPlan(i32, rows=3)
+    ");
+    assert_eq!(
+        optimized.tree_display().to_string(),
+        optimized.optimize()?.tree_display().to_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_field_struct_expression_keeps_cross_field_refinement() -> VortexResult<()> {
+    let value_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let dictionary = DictLayout::new(
+        flat(2, value_dtype.clone(), 0),
+        flat(3, primitive(PType::U8, Nullability::NonNullable), 1),
+    )
+    .into_layout();
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([("a", value_dtype.clone()), ("b", value_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![dictionary, flat(3, value_dtype, 2)],
+    )
+    .into_layout();
+    let expression = gt(
+        checked_add(get_item("a", root()), get_item("b", root())),
+        lit(10_i32),
+    );
+    let plan = make_expression_plan(expression, make_plan(layout)?)?;
+
+    let optimized = plan.optimize()?;
+
+    insta::assert_snapshot!(optimized.tree_display(), @r"
+    root: ExpressionPlan(bool, rows=3) expr=(($.a + $.b) > 10i32)
+      child: StructPlan({a=i32, b=i32}, rows=3)
+        a: DictPlan(i32, rows=3)
+          codes: FlatPlan(u8, rows=3)
+          values: FlatPlan(i32, rows=2)
+        b: FlatPlan(i32, rows=3)
     ");
     Ok(())
 }

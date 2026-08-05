@@ -16,16 +16,16 @@ use vortex_array::expr::transform::partition_bound;
 use vortex_array::expr::traversal::NodeExt;
 use vortex_array::expr::traversal::Transformed;
 use vortex_array::expr::traversal::TraversalOrder;
-use vortex_array::scalar_fn::ScalarFnVTableExt;
-use vortex_array::scalar_fn::fns::get_item::GetItem;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
+use super::expression::rewrite_partition_root;
 use crate::layouts::row_idx::RowIdx;
 use crate::plan::ExpressionPlan;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
+use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical plan that adds row-index expression support to its child.
 pub struct RowIdxPlan {
@@ -49,7 +49,48 @@ impl Plan for RowIdxPlan {
         Ok(Self::new_ref(self.row_offset, self.child.optimize()?))
     }
 
-    fn optimize_expression(&self, expression: &BoundExpression) -> VortexResult<Option<PlanRef>> {
+    fn dtype(&self) -> &DType {
+        self.child.dtype()
+    }
+
+    fn row_count(&self) -> u64 {
+        self.child.row_count()
+    }
+
+    fn child_count(&self) -> usize {
+        1
+    }
+
+    fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
+        if index != 0 {
+            vortex_bail!("Row-index plan has no child {index}")
+        }
+        Ok(Some(Arc::clone(&self.child)))
+    }
+
+    fn child_name(&self, index: usize) -> Cow<'_, str> {
+        if index == 0 {
+            Cow::Borrowed("child")
+        } else {
+            Cow::Owned(format!("child[{index}]"))
+        }
+    }
+}
+
+/// Partitions an expression between generated row indices and the data child.
+#[derive(Debug)]
+pub(crate) struct ExpressionRowIdxRule;
+
+impl PlanParentReduceRule<RowIdxPlan> for ExpressionRowIdxRule {
+    type Parent = ExpressionPlan;
+
+    fn reduce_parent(
+        &self,
+        child: &RowIdxPlan,
+        parent: &ExpressionPlan,
+        _child_idx: usize,
+    ) -> VortexResult<Option<PlanRef>> {
+        let expression = parent.expression();
         let partitioned = partition_bound(expression.clone(), |node| {
             if node
                 .as_scalar()
@@ -67,11 +108,11 @@ impl Plan for RowIdxPlan {
             return match partitioned.partition_annotations[0] {
                 RowIdxExpressionPartition::RowIdx => {
                     let expression = replace_row_idx(expression.clone())?;
-                    let values = RowIdxValuesPlan::new_ref(self.row_offset, self.row_count());
+                    let values = RowIdxValuesPlan::new_ref(child.row_offset, child.row_count());
                     Ok(Some(ExpressionPlan::new(expression, values).optimize()?))
                 }
                 RowIdxExpressionPartition::Child => Ok(Some(
-                    ExpressionPlan::new(expression.clone(), Arc::clone(&self.child)).optimize()?,
+                    ExpressionPlan::new(expression.clone(), Arc::clone(&child.child)).optimize()?,
                 )),
             };
         }
@@ -106,66 +147,42 @@ impl Plan for RowIdxPlan {
         ) else {
             return Ok(None);
         };
-        if row_idx_partition.children().len() != 1 || child_partition.children().len() != 1 {
-            return Ok(None);
-        }
-        let (Some(row_idx_value_name), Some(child_value_name)) =
-            (row_idx_pack.names.get(0), child_pack.names.get(0))
-        else {
-            return Ok(None);
-        };
-        let row_idx_value_name = row_idx_value_name.clone();
-        let child_value_name = child_value_name.clone();
         let row_idx_partition_name = partitioned.partition_names[row_idx_index].clone();
         let child_partition_name = partitioned.partition_names[child_index].clone();
+        let mut collapsed = Vec::with_capacity(2);
 
-        let row_idx_expression = replace_row_idx(row_idx_partition.children()[0].clone())?;
-        let child_expression = child_partition.children()[0].clone();
+        let row_idx_expression = if row_idx_partition.children().len() == 1 {
+            let Some(value_name) = row_idx_pack.names.get(0) else {
+                return Ok(None);
+            };
+            collapsed.push((row_idx_partition_name, value_name.clone()));
+            row_idx_partition.children()[0].clone()
+        } else {
+            row_idx_partition.clone()
+        };
+        let child_expression = if child_partition.children().len() == 1 {
+            let Some(value_name) = child_pack.names.get(0) else {
+                return Ok(None);
+            };
+            collapsed.push((child_partition_name, value_name.clone()));
+            child_partition.children()[0].clone()
+        } else {
+            child_partition.clone()
+        };
+
+        let row_idx_expression = replace_row_idx(row_idx_expression)?;
         let row_idx_plan = ExpressionPlan::new(
             row_idx_expression,
-            RowIdxValuesPlan::new_ref(self.row_offset, self.row_count()),
+            RowIdxValuesPlan::new_ref(child.row_offset, child.row_count()),
         )
         .optimize()?;
         let child_plan =
-            ExpressionPlan::new(child_expression, Arc::clone(&self.child)).optimize()?;
+            ExpressionPlan::new(child_expression, Arc::clone(&child.child)).optimize()?;
         let partitions = RowIdxPartitionPlan::try_new(row_idx_plan, child_plan)?;
-        let residual = collapse_partition_root(
-            partitioned.root,
-            partitions.dtype().clone(),
-            [
-                (row_idx_partition_name, row_idx_value_name),
-                (child_partition_name, child_value_name),
-            ],
-        )?;
+        let residual =
+            rewrite_partition_root(partitioned.root, partitions.dtype().clone(), &collapsed)?;
 
         Ok(Some(ExpressionPlan::new(residual, partitions).optimize()?))
-    }
-
-    fn dtype(&self) -> &DType {
-        self.child.dtype()
-    }
-
-    fn row_count(&self) -> u64 {
-        self.child.row_count()
-    }
-
-    fn child_count(&self) -> usize {
-        1
-    }
-
-    fn child(&self, index: usize) -> VortexResult<Option<PlanRef>> {
-        if index != 0 {
-            vortex_bail!("Row-index plan has no child {index}")
-        }
-        Ok(Some(Arc::clone(&self.child)))
-    }
-
-    fn child_name(&self, index: usize) -> Cow<'_, str> {
-        if index == 0 {
-            Cow::Borrowed("child")
-        } else {
-            Cow::Owned(format!("child[{index}]"))
-        }
     }
 }
 
@@ -190,50 +207,6 @@ fn replace_row_idx(expression: BoundExpression) -> VortexResult<BoundExpression>
 
 fn row_idx_dtype() -> DType {
     DType::Primitive(PType::U64, Nullability::NonNullable)
-}
-
-fn collapse_partition_root(
-    expression: BoundExpression,
-    root_dtype: DType,
-    mappings: [(FieldName, FieldName); 2],
-) -> VortexResult<BoundExpression> {
-    Ok(expression
-        .transform_down(|node| {
-            if let Some(value_name) = node
-                .as_scalar()
-                .and_then(|scalar_fn| scalar_fn.as_opt::<GetItem>())
-            {
-                let partition_access = &node.children()[0];
-                if let Some(partition_name) = partition_access
-                    .as_scalar()
-                    .and_then(|scalar_fn| scalar_fn.as_opt::<GetItem>())
-                    && partition_access.children()[0].is_root()
-                    && mappings.iter().any(|(partition, value)| {
-                        partition == partition_name && value == value_name
-                    })
-                {
-                    return Ok(Transformed {
-                        value: BoundExpression::try_new(
-                            GetItem.bind(partition_name.clone()),
-                            [BoundExpression::new_root(root_dtype.clone())],
-                        )?,
-                        changed: true,
-                        order: TraversalOrder::Skip,
-                    });
-                }
-            }
-
-            if node.is_root() {
-                Ok(Transformed {
-                    value: BoundExpression::new_root(root_dtype.clone()),
-                    changed: true,
-                    order: TraversalOrder::Skip,
-                })
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })?
-        .into_inner())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

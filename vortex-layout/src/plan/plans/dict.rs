@@ -4,7 +4,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use vortex_array::expr::BoundExpression;
 use vortex_array::expr::ExactBoundExpr;
 use vortex_array::expr::label_bound_tree;
 use vortex_error::VortexResult;
@@ -15,6 +14,7 @@ use crate::plan::ExpressionPlan;
 use crate::plan::Plan;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
+use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical dictionary plan with children ordered as `[codes, values]`.
 pub struct DictPlan {
@@ -67,37 +67,6 @@ impl Plan for DictPlan {
         Ok(Arc::new(self.with_children(codes, values)))
     }
 
-    fn optimize_expression(&self, expression: &BoundExpression) -> VortexResult<Option<PlanRef>> {
-        if !expression.dtype().is_boolean() {
-            return Ok(None);
-        }
-        let labels = label_bound_tree(
-            expression,
-            |node| match node.as_scalar() {
-                Some(scalar_fn) => (
-                    false,
-                    scalar_fn.signature().is_strict(),
-                    scalar_fn.signature().is_fallible(),
-                ),
-                None => (true, true, false),
-            },
-            |acc, &child| (acc.0 | child.0, acc.1 & child.1, acc.2 | child.2),
-        );
-        let (references_root, is_strict, is_fallible) = labels
-            .get(&ExactBoundExpr(expression.clone()))
-            .copied()
-            .unwrap_or((false, false, true));
-        if !references_root || !is_strict || is_fallible {
-            return Ok(None);
-        }
-
-        let values =
-            ExpressionPlan::new(expression.clone(), Arc::clone(&self.values)).optimize()?;
-        Ok(Some(Arc::new(
-            self.with_children(Arc::clone(&self.codes), values),
-        )))
-    }
-
     fn dtype(&self) -> &vortex_array::dtype::DType {
         &self.dtype
     }
@@ -124,5 +93,50 @@ impl Plan for DictPlan {
             1 => Cow::Borrowed("values"),
             _ => Cow::Owned(format!("child[{index}]")),
         }
+    }
+}
+
+/// Pushes a safe boolean expression into dictionary values.
+#[derive(Debug)]
+pub(crate) struct ExpressionDictRule;
+
+impl PlanParentReduceRule<DictPlan> for ExpressionDictRule {
+    type Parent = ExpressionPlan;
+
+    fn reduce_parent(
+        &self,
+        child: &DictPlan,
+        parent: &ExpressionPlan,
+        _child_idx: usize,
+    ) -> VortexResult<Option<PlanRef>> {
+        let expression = parent.expression();
+        if !expression.dtype().is_boolean() {
+            return Ok(None);
+        }
+        let labels = label_bound_tree(
+            expression,
+            |node| match node.as_scalar() {
+                Some(scalar_fn) => (
+                    false,
+                    scalar_fn.signature().is_strict(),
+                    scalar_fn.signature().is_fallible(),
+                ),
+                None => (true, true, false),
+            },
+            |acc, &child| (acc.0 | child.0, acc.1 & child.1, acc.2 | child.2),
+        );
+        let (references_root, is_strict, is_fallible) = labels
+            .get(&ExactBoundExpr(expression.clone()))
+            .copied()
+            .unwrap_or((false, false, true));
+        if !references_root || !is_strict || is_fallible {
+            return Ok(None);
+        }
+
+        let values =
+            ExpressionPlan::new(expression.clone(), Arc::clone(&child.values)).optimize()?;
+        Ok(Some(Arc::new(
+            child.with_children(Arc::clone(&child.codes), values),
+        )))
     }
 }
