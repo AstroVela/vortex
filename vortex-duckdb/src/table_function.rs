@@ -4,19 +4,13 @@
 use std::cmp::max;
 use std::fmt::Formatter;
 use std::fmt::{self};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::task::Context;
-use std::task::Poll;
 
 use custom_labels::CURRENT_LABELSET;
-use futures::FutureExt;
-use futures::Stream;
 use futures::StreamExt;
-use futures::future::BoxFuture;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
 use parking_lot::Mutex;
@@ -39,8 +33,8 @@ use vortex::error::VortexResult;
 use vortex::expr::Expression;
 use vortex::expr::stats::Precision;
 use vortex::file::v2::FileStatsLayoutReader;
-use vortex::io::kanal_ext::KanalExt as _;
 use vortex::io::runtime::BlockingRuntime as _;
+use vortex::io::runtime::current::CurrentThreadIterator;
 use vortex::io::runtime::current::ThreadSafeIterator;
 use vortex::layout::scan::multi::MultiLayoutChild;
 use vortex::layout::scan::multi::MultiLayoutDataSource;
@@ -49,9 +43,9 @@ use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::scalar_fn::fns::pack::Pack;
 use vortex::scan::DataSource;
+use vortex::scan::PartitionRef;
 use vortex::scan::ScanRequest;
 use vortex_utils::aliases::hash_map::HashMap;
-use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -131,36 +125,75 @@ impl<'a> TableInitInput<'a> {
 }
 
 type ScanItem = VortexResult<(ArrayRef, Arc<ConversionCache>)>;
-type DataSourceIterator = ThreadSafeIterator<ScanItem>;
+type PartitionIterator = ThreadSafeIterator<VortexResult<PartitionRef>>;
 
 pub struct TableFunctionGlobal {
-    iterator: DataSourceIterator,
+    partitions: PartitionIterator,
     batch_id: AtomicU64,
     bytes_total: Arc<AtomicU64>,
     bytes_read: AtomicU64,
     file_index_column_pos: Option<usize>,
     file_row_number_column_pos: Option<usize>,
 
-    // Following 4 fields are used only in aggregate scans.
-    /// ArrayRef's scanned but not aggregated in "partials".
-    /// 0 means all arrays have been aggregated but output is not written.
-    /// u64::MAX means arrays have been aggregated and we've written output row
-    pending: Arc<AtomicU64>,
+    // Following fields are used only in aggregate scans.
+    /// Partitions claimed and not finished.
+    /// 0 means every partition's data is in "partials".
+    partitions_active: AtomicU64,
+    /// Worker that writes aggregated row swaps it from false to true
+    aggregation_finalized: AtomicBool,
     aggregates: Vec<ColumnAggregate>,
-    // Accumulated partials
     partials: Mutex<Vec<Box<dyn DynAccumulator>>>,
     row_count: AtomicU64,
 }
 assert_impl_all!(TableFunctionGlobal: Send, Sync);
 
-/// Per-thread scan state
 pub struct TableFunctionLocal {
-    iterator: DataSourceIterator,
+    partitions: PartitionIterator,
+    current: Option<CurrentThreadIterator<'static, ScanItem>>,
     exporter: Option<ArrayExporter>,
     partition_index: u64,
     file_index: usize,
-    // Aggregate scan accumulated partials. Empty for non-aggregate scan
+    // Empty for non-aggregate scans.
     partials: Vec<Box<dyn DynAccumulator>>,
+}
+
+impl TableFunctionLocal {
+    /// Start driving next partition, put it into "current".
+    /// Returns false once there are no more partitions
+    fn claim_partition(&mut self) -> VortexResult<bool> {
+        let Some(partition) = self.partitions.next() else {
+            self.current = None;
+            return Ok(false);
+        };
+        let partition = partition?;
+        let cache = Arc::new(ConversionCache {
+            file_index: partition.index(),
+            ..Default::default()
+        });
+        let stream = partition
+            .execute()?
+            .map(move |item| item.map(|array| (array, Arc::clone(&cache))));
+        self.current = Some(RUNTIME.block_on_stream(stream));
+        Ok(true)
+    }
+
+    fn current_next(&mut self) -> Option<ScanItem> {
+        self.current.as_mut().and_then(Iterator::next)
+    }
+
+    /// Get next array across partitions. Returns None when done
+    fn next_item(&mut self) -> Option<ScanItem> {
+        loop {
+            if let Some(item) = self.current_next() {
+                return Some(item);
+            }
+            match self.claim_partition() {
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
 }
 
 pub struct PartitionData {
@@ -269,112 +302,24 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
     };
 
     let scan = RUNTIME.block_on(bind_data.data_source.scan(request))?;
-
-    let num_workers = get_available_parallelism().unwrap_or(1);
-
-    // We create an async bounded channel so that all thread-local workers can pull the next
-    // available array chunk regardless of which partition it came from.
-    let (tx, rx) = kanal::bounded_async(num_workers * 2);
-
-    let pending = Arc::new(AtomicU64::new(0));
-    let pending_producer = Arc::clone(&pending);
-
-    // We drive one partition per worker thread. Each partition is driven as a spawned task
-    // that pushes array chunks into the shared channel as they are produced. This spawning
-    // allows all worker threads to drive the polling of all partitions, and then return the
-    // first available array chunk.
-    let stream = scan
-        .partitions()
-        .map(move |partition| {
-            let tx = tx.clone();
-            let pending = Arc::clone(&pending_producer);
-            RUNTIME.handle().spawn(async move {
-                let partition = match partition {
-                    Ok(partition) => partition,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-                let cache = Arc::new(ConversionCache {
-                    file_index: partition.index(),
-                    ..Default::default()
-                });
-
-                let mut stream = match partition.execute() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                while let Some(item) = stream.next().await {
-                    pending.fetch_add(1, Ordering::Relaxed);
-                    if tx
-                        .send(item.map(|a| (a, Arc::clone(&cache))))
-                        .await
-                        .is_err()
-                    {
-                        // Exit early if the receiver has been dropped, which happens when the
-                        // scan is complete or if an error has occurred in another partition.
-                        return;
-                    }
-                }
-            })
-        })
-        .buffer_unordered(num_workers);
-
-    let iterator = RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
+    let partitions = RUNTIME.block_on_stream_thread_safe(|_handle| scan.partitions());
 
     let aggregates = bind_data.aggregates.clone();
     let partials = build_partials(&aggregates, &bind_data.column_fields)?;
 
     Ok(TableFunctionGlobal {
-        iterator,
+        partitions,
         batch_id: AtomicU64::new(0),
         bytes_total: Arc::new(AtomicU64::new(0)),
         bytes_read: AtomicU64::new(0),
         file_index_column_pos,
         file_row_number_column_pos,
-        pending,
+        partitions_active: AtomicU64::new(0),
+        aggregation_finalized: AtomicBool::new(false),
         aggregates,
         partials: Mutex::new(partials),
         row_count: AtomicU64::new(0),
     })
-}
-
-fn scan_driver_stream<S>(stream: S, rx: kanal::AsyncReceiver<ScanItem>) -> ScanDriverStream
-where
-    S: Stream<Item = ()> + Send + 'static,
-{
-    ScanDriverStream {
-        driver: Some(stream.collect::<()>().boxed()),
-        rx: rx.into_stream().boxed(),
-    }
-}
-
-struct ScanDriverStream {
-    driver: Option<BoxFuture<'static, ()>>,
-    rx: futures::stream::BoxStream<'static, ScanItem>,
-}
-
-impl Stream for ScanDriverStream {
-    type Item = ScanItem;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if let Some(driver) = this.driver.as_mut()
-            && driver.as_mut().poll(cx).is_ready()
-        {
-            this.driver = None;
-        }
-
-        match this.rx.as_mut().poll_next(cx) {
-            Poll::Ready(None) if this.driver.is_some() => Poll::Pending,
-            poll => poll,
-        }
-    }
 }
 
 fn build_partials(
@@ -421,7 +366,8 @@ pub fn init_local(
         .vortex_expect("local state aggregate initialization failed");
 
     TableFunctionLocal {
-        iterator: global.iterator.clone(),
+        partitions: global.partitions.clone(),
+        current: None,
         exporter: None,
         partition_index: 0,
         file_index: 0,
@@ -472,52 +418,69 @@ fn scan_aggregate(
 
     let mut ctx = SESSION.create_execution_ctx();
     loop {
-        let Some(result) = local_state.iterator.next() else {
-            // 0 means we're the last thread, u64::MAX means output is written.
-            // is_err() means CAS didn't succeed
-            if global_state
-                .pending
-                .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
+        if let Some(result) = local_state.current_next() {
+            let array = convert_result(result?.0, &mut ctx)?;
+
+            for (i, partial) in positions.iter().zip(local_state.partials.iter_mut()) {
+                partial.accumulate(array.unmasked_field(*i), &mut ctx)?;
+            }
+
             {
-                return Ok(());
+                let mut partials = global_state.partials.lock();
+                for (global, local) in partials.iter_mut().zip(&mut local_state.partials) {
+                    global.combine_partials(local.flush()?)?;
+                }
             }
 
-            let mut accumulators = global_state.partials.lock();
-            let row_count = global_state.row_count.load(Ordering::Acquire) as i64;
-            let mut accum_iter = accumulators.iter_mut();
-            for (idx, aggregate) in global_state.aggregates.iter().enumerate() {
-                let value = match aggregate {
-                    ColumnAggregate::Real { .. } => {
-                        let accum = accum_iter.next().vortex_expect("partial for real agg");
-                        Value::try_from(accum.finish()?)?
-                    }
-                    ColumnAggregate::CountStar => Value::from(row_count),
-                };
-                chunk.get_vector_mut(idx).reference_value(&value);
+            if has_count_star {
+                global_state
+                    .row_count
+                    .fetch_add(array.len() as u64, Ordering::Relaxed);
             }
-            chunk.set_len(1);
-            return Ok(());
-        };
-        let array = convert_result(result?.0, &mut ctx)?;
-
-        for (i, partial) in positions.iter().zip(local_state.partials.iter_mut()) {
-            partial.accumulate(array.unmasked_field(*i), &mut ctx)?;
+            continue;
         }
 
-        {
-            let mut partials = global_state.partials.lock();
-            for (global, local) in partials.iter_mut().zip(&mut local_state.partials) {
-                global.combine_partials(local.flush()?)?;
-            }
-        }
-
-        if has_count_star {
+        global_state
+            .partitions_active
+            .fetch_add(1, Ordering::AcqRel);
+        if local_state.current.take().is_some() {
             global_state
-                .row_count
-                .fetch_add(array.len() as u64, Ordering::Relaxed);
+                .partitions_active
+                .fetch_sub(1, Ordering::Release);
         }
-        global_state.pending.fetch_sub(1, Ordering::Release);
+        if local_state.claim_partition()? {
+            continue;
+        }
+        global_state
+            .partitions_active
+            .fetch_sub(1, Ordering::Release);
+
+        // if active > 0, we have some partitions to process
+        // .is_err() means we're not the first thread to write aggregation row
+        if global_state.partitions_active.load(Ordering::Acquire) != 0
+            || global_state
+                .aggregation_finalized
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return Ok(());
+        }
+
+        let mut accumulators = global_state.partials.lock();
+        let row_count = global_state.row_count.load(Ordering::Acquire) as i64;
+        let mut accum_iter = accumulators.iter_mut();
+        for (idx, aggregate) in global_state.aggregates.iter().enumerate() {
+            let value = match aggregate {
+                ColumnAggregate::Real { .. } => {
+                    let accum = accum_iter.next().vortex_expect("partial for real agg");
+                    Value::try_from(accum.finish()?)?
+                }
+                ColumnAggregate::CountStar => Value::from(row_count),
+            };
+            chunk.get_vector_mut(idx).reference_value(&value);
+        }
+        chunk.set_len(1);
+        return Ok(());
     }
 }
 
@@ -533,7 +496,7 @@ pub fn scan(
     loop {
         if local_state.exporter.is_none() {
             let mut ctx = SESSION.create_execution_ctx();
-            let Some(result) = local_state.iterator.next() else {
+            let Some(result) = local_state.next_item() else {
                 return Ok(());
             };
             let (array_result, conversion_cache) = result?;
@@ -857,11 +820,8 @@ fn progress(bytes_read: &AtomicU64, bytes_total: &AtomicU64) -> f64 {
 mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::Relaxed;
-    use std::task::Poll;
 
-    use crate::RUNTIME;
     use crate::table_function::progress;
-    use crate::table_function::scan_driver_stream;
 
     #[test]
     fn test_table_scan_progress() {
@@ -875,27 +835,5 @@ mod tests {
 
         bytes_total.fetch_add(100, Relaxed);
         assert!((progress(&bytes_read, &bytes_total) - 50.).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn scan_driver_panic_propagates_through_iterator() {
-        let (tx, rx) = kanal::bounded_async(1);
-        let _tx = tx;
-        let stream = futures::stream::poll_fn(|_| -> Poll<Option<()>> {
-            panic!("duckdb scan driver panic");
-        });
-
-        let mut iter =
-            RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
-        let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next())) {
-            Ok(_) => panic!("driver panic must propagate through iterator"),
-            Err(panic) => panic,
-        };
-        let message = panic
-            .downcast_ref::<&'static str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<unknown panic>");
-        assert!(message.contains("duckdb scan driver panic"));
     }
 }
