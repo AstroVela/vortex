@@ -71,8 +71,9 @@ pub use output::BenchmarkOutput;
 pub use output::create_output_writer;
 use vortex::VortexSessionDefault;
 pub use vortex::error::vortex_panic;
+use vortex::io::runtime::Handle;
 use vortex::io::session::RuntimeSessionExt;
-use vortex::session::VortexSession;
+pub use vortex::session::VortexSession;
 
 // All benchmarks run with mimalloc for consistency.
 #[global_allocator]
@@ -83,6 +84,13 @@ pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     vortex_geo::initialize(&session);
     session
 });
+
+/// Create a benchmark session that schedules work on `handle`.
+pub fn session_with_handle(handle: Handle) -> VortexSession {
+    let session = VortexSession::default().with_handle(handle);
+    vortex_geo::initialize(&session);
+    session
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {

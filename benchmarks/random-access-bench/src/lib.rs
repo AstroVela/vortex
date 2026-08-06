@@ -2,12 +2,16 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::ValueEnum;
 use indicatif::ProgressBar;
+use parking_lot::Mutex;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -16,6 +20,7 @@ use rand_distr::Exp;
 use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Target;
+use vortex_bench::VortexSession;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
 use vortex_bench::display::print_measurements_json;
@@ -24,13 +29,107 @@ use vortex_bench::random_access::BenchDataset;
 use vortex_bench::random_access::ParquetRandomAccessor;
 use vortex_bench::random_access::RandomAccessor;
 use vortex_bench::random_access::VortexRandomAccessor;
+use vortex_bench::session_with_handle;
 use vortex_bench::utils::constants::STORAGE_NVME;
 use vortex_bench::v3;
+use vortex_compio::CompioFileReadAt;
+use vortex_compio::CompioHandle;
+use vortex_compio::CompioRuntime;
+use vortex_io::runtime::BlockingRuntime;
 
 use crate::render::RandomAccessRun;
 use crate::render::render_random_access_table;
 
 mod render;
+
+const IO_RUNTIME_ENV: &str = "VORTEX_IO_RUNTIME";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoRuntime {
+    Tokio,
+    Compio,
+}
+
+impl IoRuntime {
+    fn from_env() -> Result<Self> {
+        match std::env::var(IO_RUNTIME_ENV) {
+            Ok(value) => Self::from_str(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Tokio),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tokio => "tokio",
+            Self::Compio => "compio",
+        }
+    }
+
+    fn for_format(self, format: Format) -> Self {
+        if matches!(format, Format::OnDiskVortex | Format::VortexCompact) {
+            self
+        } else {
+            Self::Tokio
+        }
+    }
+}
+
+impl FromStr for IoRuntime {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "tokio" => Ok(Self::Tokio),
+            "compio" => Ok(Self::Compio),
+            _ => anyhow::bail!(
+                "unsupported {IO_RUNTIME_ENV} value {value:?}; expected `tokio` or `compio`"
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CompioHandles {
+    io: CompioHandle,
+    session: VortexSession,
+}
+
+static COMPIO_HANDLES: Mutex<Option<CompioHandles>> = Mutex::new(None);
+
+fn compio_handles() -> Result<CompioHandles> {
+    let mut handles = COMPIO_HANDLES.lock();
+    if let Some(handles) = handles.as_ref() {
+        return Ok(handles.clone());
+    }
+
+    let (handle_send, handle_recv) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("vortex-compio-bench".to_string())
+        .spawn(move || {
+            let runtime = match CompioRuntime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    drop(handle_send.send(Err(error)));
+                    return;
+                }
+            };
+            let handles = CompioHandles {
+                io: runtime.compio_handle(),
+                session: session_with_handle(runtime.handle()),
+            };
+            if handle_send.send(Ok(handles)).is_err() {
+                return;
+            }
+            runtime.block_on(std::future::pending::<()>());
+        })?;
+
+    let new_handles = handle_recv
+        .recv()
+        .map_err(|error| anyhow::anyhow!("Compio benchmark runtime failed to start: {error}"))??;
+    *handles = Some(new_handles.clone());
+    Ok(new_handles)
+}
 
 // ---------------------------------------------------------------------------
 // Access patterns
@@ -145,11 +244,14 @@ async fn benchmark_random_access(
     time_limit_secs: u64,
     storage: &str,
     reopen: bool,
+    io_runtime: IoRuntime,
 ) -> Result<RandomAccessRun> {
     let time_limit = Duration::from_secs(time_limit_secs);
-    let overall_start = Instant::now();
     let mut runs = Vec::new();
-    let mut accessor = open_accessor(dataset, format).await?;
+    let mut accessor = open_accessor(dataset, format, io_runtime).await?;
+    // Opening may generate or download the dataset on its first use. Keep that one-time setup out
+    // of the measurement budget so cold and warm invocations collect comparable sample counts.
+    let overall_start = Instant::now();
 
     loop {
         let start = Instant::now();
@@ -162,7 +264,7 @@ async fn benchmark_random_access(
         }
 
         if reopen {
-            accessor = open_accessor(dataset, format).await?;
+            accessor = open_accessor(dataset, format, io_runtime).await?;
         }
     }
 
@@ -193,20 +295,26 @@ fn display_name(dataset: &str, pattern: Option<AccessPattern>) -> String {
 
 /// Build a measurement name for a benchmark run.
 ///
-/// For taxi (legacy), the name is `random-access/{format}-tokio-local-disk` to preserve
-/// historical continuity with existing benchmark data.
-/// For other datasets, includes dataset and pattern:
-/// `random-access/{dataset}/{pattern}/{format}-tokio-local-disk`.
-fn measurement_name(dataset: &str, pattern: Option<AccessPattern>, format: Format) -> String {
+/// For taxi (legacy), the name is `random-access/{format}-{runtime}-local-disk`.
+/// For other datasets, it includes the dataset and pattern:
+/// `random-access/{dataset}/{pattern}/{format}-{runtime}-local-disk`.
+fn measurement_name(
+    dataset: &str,
+    pattern: Option<AccessPattern>,
+    format: Format,
+    io_runtime: IoRuntime,
+) -> String {
+    let io_runtime = io_runtime.for_format(format);
     let fmt = format.ext();
+    let runtime = io_runtime.name();
     match pattern {
         Some(p) => format!(
-            "random-access/{}/{}/{}-tokio-local-disk",
+            "random-access/{}/{}/{}-{runtime}-local-disk",
             dataset,
             p.name(),
             fmt
         ),
-        None => format!("random-access/{}-tokio-local-disk", fmt),
+        None => format!("random-access/{fmt}-{runtime}-local-disk"),
     }
 }
 
@@ -233,18 +341,33 @@ fn push_v3_random_access_record(records: &mut Vec<v3::V3Record>, run: &RandomAcc
 async fn open_accessor(
     dataset: &dyn BenchDataset,
     format: Format,
+    io_runtime: IoRuntime,
 ) -> Result<Box<dyn RandomAccessor>> {
+    let io_runtime = io_runtime.for_format(format);
     let name = format!(
-        "random-access/{}/{}-tokio-local-disk",
+        "random-access/{}/{}-{}-local-disk",
         dataset.name(),
-        format.ext()
+        format.ext(),
+        io_runtime.name()
     );
     match format {
         Format::OnDiskVortex | Format::VortexCompact => {
             let path = dataset.path(format).await?;
-            Ok(Box::new(
-                VortexRandomAccessor::open(path, name, format).await?,
-            ))
+            let accessor = match io_runtime {
+                IoRuntime::Tokio => VortexRandomAccessor::open(path, name, format).await?,
+                IoRuntime::Compio => {
+                    let handles = compio_handles()?;
+                    let reader = CompioFileReadAt::open(path, handles.io).await?;
+                    VortexRandomAccessor::open_source_with_session(
+                        handles.session,
+                        Arc::new(reader),
+                        name,
+                        format,
+                    )
+                    .await?
+                }
+            };
+            Ok(Box::new(accessor))
         }
         Format::Parquet => {
             let path = dataset.path(format).await?;
@@ -309,6 +432,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
         output_path,
         ingest_output,
     } = config;
+    let io_runtime = IoRuntime::from_env()?;
 
     let reopen_variants: &[bool] = match open_mode {
         OpenMode::Cached => &[false],
@@ -333,7 +457,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     for dataset in &datasets {
         for format in &formats {
             if dataset.name() == "taxi" {
-                let name = measurement_name(dataset.name(), None, *format);
+                let name = measurement_name(dataset.name(), None, *format, io_runtime);
                 for &reopen in reopen_variants {
                     let bench_name = if reopen {
                         format!("{name}-footer")
@@ -349,6 +473,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
                         time_limit,
                         STORAGE_NVME,
                         reopen,
+                        io_runtime,
                     )
                     .await?;
 
@@ -360,7 +485,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
             for pattern in &patterns {
                 let indices = generate_indices(dataset.as_ref(), *pattern);
-                let name = measurement_name(dataset.name(), Some(*pattern), *format);
+                let name = measurement_name(dataset.name(), Some(*pattern), *format, io_runtime);
                 for &reopen in reopen_variants {
                     let bench_name = if reopen {
                         format!("{name}-footer")
@@ -376,6 +501,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
                         time_limit,
                         STORAGE_NVME,
                         reopen,
+                        io_runtime,
                     )
                     .await?;
 
@@ -411,6 +537,32 @@ pub async fn run(config: RunConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_io_runtime_values() -> Result<()> {
+        assert_eq!(IoRuntime::from_str("tokio")?, IoRuntime::Tokio);
+        assert_eq!(IoRuntime::from_str("compio")?, IoRuntime::Compio);
+        assert!(IoRuntime::from_str("unknown").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn io_runtime_only_changes_vortex_measurement_names() {
+        let vortex = measurement_name(
+            "feature-vectors",
+            Some(AccessPattern::Uniform),
+            Format::OnDiskVortex,
+            IoRuntime::Compio,
+        );
+        let parquet = measurement_name(
+            "feature-vectors",
+            Some(AccessPattern::Uniform),
+            Format::Parquet,
+            IoRuntime::Compio,
+        );
+        assert!(vortex.ends_with("vortex-compio-local-disk"));
+        assert!(parquet.ends_with("parquet-tokio-local-disk"));
+    }
 
     #[test]
     fn v3_random_access_dataset_names_match_schema_dims() {

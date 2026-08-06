@@ -7493,11 +7493,14 @@ dependencies = [
  "clap",
  "indicatif",
  "lance-bench",
+ "parking_lot",
  "rand 0.10.2",
  "rand_distr 0.6.0",
  "tabled",
  "tokio",
  "vortex-bench",
+ "vortex-compio",
+ "vortex-io",
 ]
 
 [[package]]

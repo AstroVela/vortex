@@ -20,3 +20,15 @@ reopening the file per lookup. CI drives the full matrix via
 ```bash
 cargo run -p random-access-bench --profile release_debug --features lance
 ```
+
+Set `VORTEX_IO_RUNTIME=compio` to use completion-based local Vortex reads instead of the default
+Tokio blocking-I/O path. This only changes Vortex files; Parquet and Lance retain their native I/O
+runtimes.
+
+```bash
+cargo run -p random-access-bench --profile release_debug -- \
+  --formats vortex --datasets feature-vectors --patterns uniform --open-mode cached --time-limit 5
+
+VORTEX_IO_RUNTIME=compio cargo run -p random-access-bench --profile release_debug -- \
+  --formats vortex --datasets feature-vectors --patterns uniform --open-mode cached --time-limit 5
+```

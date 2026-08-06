@@ -25,7 +25,9 @@ use vortex::array::stream::ArrayStreamExt;
 use vortex::buffer::Buffer;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
+use vortex::io::VortexReadAt;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
+use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
 
 use crate::Format;
@@ -40,6 +42,7 @@ pub struct VortexRandomAccessor {
     name: String,
     format: Format,
     file: VortexFile,
+    session: VortexSession,
 }
 
 impl VortexRandomAccessor {
@@ -49,7 +52,8 @@ impl VortexRandomAccessor {
         name: impl Into<String>,
         format: Format,
     ) -> anyhow::Result<Self> {
-        let file = SESSION
+        let session = SESSION.clone();
+        let file = session
             .open_options()
             .with_layout_reader_cache()
             .open_path(path.as_ref())
@@ -58,6 +62,36 @@ impl VortexRandomAccessor {
             name: name.into(),
             format,
             file,
+            session,
+        })
+    }
+
+    /// Open a Vortex file using a caller-provided random-access I/O implementation.
+    pub async fn open_source(
+        source: Arc<dyn VortexReadAt>,
+        name: impl Into<String>,
+        format: Format,
+    ) -> anyhow::Result<Self> {
+        Self::open_source_with_session(SESSION.clone(), source, name, format).await
+    }
+
+    /// Open a Vortex file using a caller-provided session and random-access I/O implementation.
+    pub async fn open_source_with_session(
+        session: VortexSession,
+        source: Arc<dyn VortexReadAt>,
+        name: impl Into<String>,
+        format: Format,
+    ) -> anyhow::Result<Self> {
+        let file = session
+            .open_options()
+            .with_layout_reader_cache()
+            .open(source)
+            .await?;
+        Ok(Self {
+            name: name.into(),
+            format,
+            file,
+            session,
         })
     }
 }
@@ -83,7 +117,7 @@ impl RandomAccessor for VortexRandomAccessor {
             .await?;
 
         // We canonicalize / decompress for equivalence to Arrow's `RecordBatch`es.
-        let mut ctx = SESSION.create_execution_ctx();
+        let mut ctx = self.session.create_execution_ctx();
         let canonical = array.execute::<Canonical>(&mut ctx)?.into_array();
         Ok(RandomAccessorRet::ArrayRef(canonical))
     }
