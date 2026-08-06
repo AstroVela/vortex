@@ -2,16 +2,25 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
+use futures::try_join;
+use vortex_array::IntoArray;
+use vortex_array::MaskFuture;
+use vortex_array::arrays::DictArray;
 use vortex_array::expr::ExactBoundExpr;
 use vortex_array::expr::label_bound_tree;
+use vortex_array::optimizer::ArrayOptimizer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::layouts::dict::DictLayout;
 use crate::plan::ExpressionPlan;
 use crate::plan::Plan;
+use crate::plan::PlanArrayFuture;
+use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
 use crate::plan::optimizer::PlanParentReduceRule;
@@ -65,6 +74,35 @@ impl Plan for DictPlan {
         let codes = self.codes.optimize()?;
         let values = self.values.optimize()?;
         Ok(Arc::new(self.with_children(codes, values)))
+    }
+
+    fn execute(
+        &self,
+        ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        let codes = self.codes.execute(ctx, row_range, mask)?;
+        let values_len = usize::try_from(self.values.row_count())?;
+        let values = self.values.execute(
+            ctx,
+            &(0..self.values.row_count()),
+            MaskFuture::new_true(values_len),
+        )?;
+        let all_values_referenced = self.layout.has_all_values_referenced();
+
+        Ok(async move {
+            let (codes, values) = try_join!(codes, values)?;
+            // SAFETY: DictLayout validation guarantees integer codes and matching child dtypes.
+            let dictionary = unsafe {
+                DictArray::new_unchecked(codes, values)
+                    .set_all_values_referenced(all_values_referenced)
+            }
+            .into_array()
+            .optimize()?;
+            Ok(dictionary)
+        }
+        .boxed())
     }
 
     fn dtype(&self) -> &vortex_array::dtype::DType {

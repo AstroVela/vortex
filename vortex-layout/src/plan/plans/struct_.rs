@@ -2,8 +2,15 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
+use futures::future;
+use futures::try_join;
+use vortex_array::IntoArray;
+use vortex_array::MaskFuture;
+use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::FieldNames;
@@ -22,6 +29,7 @@ use vortex_array::scalar_fn::fns::get_item::GetItem;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
 use vortex_array::scalar_fn::fns::select::Select;
+use vortex_array::validity::Validity;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -32,6 +40,8 @@ use crate::layouts::struct_::StructLayout;
 use crate::plan::ExpressionPlan;
 use crate::plan::LazyPlanChildren;
 use crate::plan::Plan;
+use crate::plan::PlanArrayFuture;
+use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
 use crate::plan::optimizer::PlanParentReduceRule;
@@ -132,6 +142,56 @@ impl Plan for StructPlan {
     fn optimize(&self) -> VortexResult<PlanRef> {
         let children = self.children.try_map(|_, child| child.optimize())?;
         Ok(Arc::new(self.with_children(children)?))
+    }
+
+    fn execute(
+        &self,
+        ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        vortex_ensure!(
+            row_range.start <= row_range.end && row_range.end <= self.row_count(),
+            "Struct plan row range {:?} is outside 0..{}",
+            row_range,
+            self.row_count()
+        );
+        vortex_ensure!(
+            mask.len() == usize::try_from(row_range.end - row_range.start)?,
+            "Struct plan mask length mismatch"
+        );
+        let struct_fields = self.struct_fields();
+        let names = struct_fields.names().clone();
+        let field_count = struct_fields.nfields();
+        let mut field_futures = Vec::with_capacity(field_count);
+        for index in 0..field_count {
+            let child = self
+                .children
+                .get(index)?
+                .ok_or_else(|| vortex_err!("Struct field {index} has no plan"))?;
+            field_futures.push(child.execute(ctx, row_range, mask.clone())?);
+        }
+        let validity = self
+            .children
+            .get(field_count)?
+            .map(|validity| validity.execute(ctx, row_range, mask.clone()))
+            .transpose()?;
+        let output_mask = mask;
+
+        Ok(async move {
+            let fields = future::try_join_all(field_futures);
+            let validity = async move {
+                match validity {
+                    Some(validity) => validity.await.map(Some),
+                    None => Ok(None),
+                }
+            };
+            let (fields, validity) = try_join!(fields, validity)?;
+            let len = output_mask.await?.true_count();
+            let validity = validity.map_or(Validity::NonNullable, Validity::Array);
+            Ok(StructArray::try_new(names, fields, len, validity)?.into_array())
+        }
+        .boxed())
     }
 
     fn dtype(&self) -> &DType {

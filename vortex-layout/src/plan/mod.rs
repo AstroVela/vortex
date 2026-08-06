@@ -5,6 +5,7 @@
 
 mod children;
 mod display;
+mod execution;
 pub mod optimizer;
 mod plans;
 
@@ -19,6 +20,8 @@ pub use display::PlanSummaryExtractor;
 pub use display::PlanTreeContext;
 pub use display::PlanTreeDisplay;
 pub use display::PlanTreeExtractor;
+pub use execution::PlanArrayFuture;
+pub use execution::PlanExecutionContext;
 pub use plans::ChunkedPlan;
 pub use plans::DictPlan;
 pub use plans::ExpressionPlan;
@@ -64,6 +67,19 @@ pub trait Plan: Any + Send + Sync {
     /// domain.
     fn optimize(&self) -> VortexResult<PlanRef>;
 
+    /// Executes this plan for `row_range`, returning values selected by `mask`.
+    ///
+    /// The row range is expressed in this plan's row domain. The returned array has one row for
+    /// every true value in `mask`.
+    fn execute(
+        &self,
+        _ctx: &PlanExecutionContext,
+        _row_range: &std::ops::Range<u64>,
+        _mask: vortex_array::MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        vortex_bail!("Plan execution is not implemented for '{}'", self.name())
+    }
+
     /// Returns the dtype produced by this plan.
     fn dtype(&self) -> &DType;
 
@@ -86,7 +102,7 @@ pub trait Plan: Any + Send + Sync {
     }
 }
 
-/// Constructs a physical plan without changing the layout or scan APIs.
+/// Constructs a physical plan for a stored layout tree.
 ///
 /// Known layouts are represented by optimizer-visible plan nodes, which may defer constructing
 /// their children. Unsupported layout kinds return an error when their plan is requested.

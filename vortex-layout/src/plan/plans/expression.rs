@@ -3,8 +3,11 @@
 
 use std::any::TypeId;
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
+use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::expr::BoundExpression;
@@ -17,6 +20,8 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::plan::Plan;
+use crate::plan::PlanArrayFuture;
+use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::optimizer::reduce_parent;
 
@@ -98,6 +103,17 @@ impl Plan for ExpressionPlan {
 
     fn optimize(&self) -> VortexResult<PlanRef> {
         self.optimize_top_down(None)
+    }
+
+    fn execute(
+        &self,
+        ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        let child = self.child.execute(ctx, row_range, mask)?;
+        let expression = self.expression.clone();
+        Ok(async move { child.await?.apply_bound(&expression) }.boxed())
     }
 
     fn dtype(&self) -> &DType {
