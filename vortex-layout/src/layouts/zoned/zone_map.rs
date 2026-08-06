@@ -17,11 +17,13 @@ use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
 use vortex_array::aggregate_fn::fns::nan_count::NanCount;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
@@ -87,7 +89,7 @@ impl ZoneMap {
         Ok(unsafe { Self::new_unchecked(column_dtype, array, aggregate_fns, zone_len, row_count) })
     }
 
-    pub(super) unsafe fn new_unchecked(
+    pub(crate) unsafe fn new_unchecked(
         column_dtype: DType,
         array: StructArray,
         aggregate_fns: Arc<[AggregateFnRef]>,
@@ -143,19 +145,34 @@ impl ZoneMap {
     /// only after the predicate has been lowered to the zone-map table.
     pub fn prune(&self, predicate: &Expression, session: &VortexSession) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
+        self.applied_predicate(predicate)?
+            .null_as_false()
+            .execute(&mut ctx)
+    }
+
+    /// Evaluate a pruning predicate while preserving unknown (null) proof values.
+    pub(crate) fn evaluate(
+        &self,
+        predicate: &BoundExpression,
+        session: &VortexSession,
+    ) -> VortexResult<BoolArray> {
+        let mut ctx = session.create_execution_ctx();
+        self.applied_predicate(&predicate.unbind())?
+            .execute::<BoolArray>(&mut ctx)
+    }
+
+    fn applied_predicate(&self, predicate: &Expression) -> VortexResult<ArrayRef> {
         let num_zones = self.array.len();
         let predicate = self.lower_stats(predicate.clone())?;
 
-        let array = self.array.clone().into_array();
-        let applied = array.apply(&predicate)?;
-
-        if !contains_row_count(&applied) {
-            return applied.null_as_false().execute(&mut ctx);
-        }
-
-        let row_count_array = row_count_array(self.zone_len, self.row_count, num_zones)?;
-        let substituted = substitute_row_count(applied, &row_count_array)?;
-        substituted.null_as_false().execute(&mut ctx)
+        let applied = self.array.clone().into_array().apply(&predicate)?;
+        let applied = if contains_row_count(&applied) {
+            let row_count_array = row_count_array(self.zone_len, self.row_count, num_zones)?;
+            substitute_row_count(applied, &row_count_array)?
+        } else {
+            applied
+        };
+        Ok(applied)
     }
 
     fn lower_stats(&self, predicate: Expression) -> VortexResult<Expression> {

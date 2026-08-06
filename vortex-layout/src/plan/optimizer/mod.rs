@@ -16,10 +16,12 @@ use super::DictPlan;
 use super::PlanRef;
 use super::RowIdxPlan;
 use super::StructPlan;
+use super::ZonedPlan;
 use super::plans::ExpressionChunkedRule;
 use super::plans::ExpressionDictRule;
 use super::plans::ExpressionRowIdxRule;
 use super::plans::ExpressionStructRule;
+use super::plans::ExpressionZonedRule;
 
 static EXPRESSION_CHUNKED_RULE: PlanParentReduceRuleAdapter<ChunkedPlan, ExpressionChunkedRule> =
     PlanParentReduceRuleAdapter::new(ExpressionChunkedRule);
@@ -29,12 +31,15 @@ static EXPRESSION_ROW_IDX_RULE: PlanParentReduceRuleAdapter<RowIdxPlan, Expressi
     PlanParentReduceRuleAdapter::new(ExpressionRowIdxRule);
 static EXPRESSION_STRUCT_RULE: PlanParentReduceRuleAdapter<StructPlan, ExpressionStructRule> =
     PlanParentReduceRuleAdapter::new(ExpressionStructRule);
+static EXPRESSION_ZONED_RULE: PlanParentReduceRuleAdapter<ZonedPlan, ExpressionZonedRule> =
+    PlanParentReduceRuleAdapter::new(ExpressionZonedRule);
 
 static PARENT_RULES: PlanParentRuleSet = PlanParentRuleSet::new(&[
     &EXPRESSION_CHUNKED_RULE,
     &EXPRESSION_DICT_RULE,
     &EXPRESSION_ROW_IDX_RULE,
     &EXPRESSION_STRUCT_RULE,
+    &EXPRESSION_ZONED_RULE,
 ]);
 
 /// Attempts a static rewrite for `parent` and its child at `child_idx`.

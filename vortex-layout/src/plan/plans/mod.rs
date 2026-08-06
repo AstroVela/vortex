@@ -23,4 +23,5 @@ pub use row_idx::RowIdxPlan;
 pub use row_idx::RowIdxValuesPlan;
 pub(crate) use struct_::ExpressionStructRule;
 pub use struct_::StructPlan;
+pub(crate) use zoned::ExpressionZonedRule;
 pub use zoned::ZonedPlan;
