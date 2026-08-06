@@ -6,7 +6,9 @@
 This is the concise source of truth for the branch. `STRICT_SCALAR_FN_RESEARCH.md` keeps the full
 design history, rejected alternatives, measurements, and generated-code evidence.
 `NUMERIC_ROWFN_PLAN.md` records the numeric-binary migration and its narrower performance boundary.
-All three are branch-only working notes for agents. They are not intended to land with the API.
+`ROWFN_MERGE_PLAN.md` is the execution plan for landing this branch as a PR series against
+`develop`, with per-PR manifests, reconciliations, and gates. All four are branch-only working
+notes for agents. They are not intended to land with the API.
 
 The public design lives in these tracking issues, which now match the implementation:
 
@@ -345,7 +347,8 @@ Deliberately **not** done:
 - **No PR split.** Recommended landing order, each step individually revertible and separately
   benchmarkable: (1) API + lifting with dense/filter only; (2) branch-and-skip + adaptive selection
   + its benchmarks; (3) `NumericBinary`; (4) tensor; (5) geo. The seam already supports this split
-  and no API changes between steps.
+  and no API changes between steps. `ROWFN_MERGE_PLAN.md` now turns this order into per-PR
+  manifests and gates, with the framework-only extraction verified against `develop`.
 
 ### Three API changes proposed, and why none of them landed
 
