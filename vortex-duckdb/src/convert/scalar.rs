@@ -243,8 +243,9 @@ impl ToDuckDBScalar for ExtScalar<'_> {
                 TimeUnit::Microseconds => Value::new_time(value()?),
                 TimeUnit::Milliseconds => Value::new_time(value()? * 1000),
                 TimeUnit::Seconds => Value::new_time(value()? * 1000 * 1000),
-                TimeUnit::Nanoseconds | TimeUnit::Days => {
-                    vortex_bail!("cannot convert timeunit {unit} to a duckdb MS time")
+                TimeUnit::Nanoseconds => Value::new_time_ns(value()?),
+                TimeUnit::Days => {
+                    vortex_bail!("cannot convert timeunit {unit} to a duckdb time")
                 }
             },
         })
@@ -313,6 +314,13 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
                 Scalar::try_new(
                     DType::Primitive(I64, Nullable),
                     Some(ScalarValue::from(micros)),
+                )?,
+            )),
+            ExtractedValue::TimeNs(nanos) => Ok(Scalar::extension::<Time>(
+                TimeUnit::Nanoseconds,
+                Scalar::try_new(
+                    DType::Primitive(I64, Nullable),
+                    Some(ScalarValue::from(nanos)),
                 )?,
             )),
             ExtractedValue::TimestampNs(nanos) => Ok(Scalar::extension::<Timestamp>(

@@ -117,7 +117,7 @@ impl ValueRef {
                 ExtractedValue::Time(unsafe { cpp::duckdb_get_time(self.as_ptr()).micros })
             }
             DUCKDB_TYPE::DUCKDB_TYPE_TIME_NS => {
-                ExtractedValue::Time(unsafe { cpp::duckdb_get_time_ns(self.as_ptr()).nanos })
+                ExtractedValue::TimeNs(unsafe { cpp::duckdb_get_time_ns(self.as_ptr()).nanos })
             }
             DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_NS => ExtractedValue::TimestampNs(unsafe {
                 cpp::duckdb_get_timestamp_ns(self.as_ptr()).nanos
@@ -247,6 +247,10 @@ impl Value {
                 seconds,
             }))
         }
+    }
+
+    pub fn new_time_ns(nanos: i64) -> Self {
+        unsafe { Self::own(cpp::duckdb_create_time_ns(cpp::duckdb_time_ns { nanos })) }
     }
 
     pub fn new_time(micros: i64) -> Self {
@@ -444,6 +448,7 @@ pub enum ExtractedValue {
     Blob(ByteBuffer),
     Date(i32),
     Time(i64),
+    TimeNs(i64),
     TimestampNs(i64),
     Timestamp(i64),
     TimestampMs(i64),
