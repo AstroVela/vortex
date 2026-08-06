@@ -10,6 +10,8 @@ use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
+use vortex_array::expr::ExactBoundExpr;
+use vortex_array::expr::descendent_bound_annotations;
 use vortex_array::expr::make_bound_free_field_annotator;
 use vortex_array::expr::transform::partition_bound;
 use vortex_array::expr::traversal::NodeExt;
@@ -22,6 +24,7 @@ use vortex_array::scalar_fn::fns::pack::PackOptions;
 use vortex_array::scalar_fn::fns::select::Select;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
 use super::expression::rewrite_partition_root;
@@ -65,8 +68,14 @@ impl StructPlan {
         }
     }
 
+    fn struct_fields(&self) -> &StructFields {
+        self.dtype
+            .as_struct_fields_opt()
+            .vortex_expect("StructPlan dtype must be a struct")
+    }
+
     fn with_children(&self, children: LazyPlanChildren) -> VortexResult<Self> {
-        let fields = self.layout.struct_fields();
+        let fields = self.struct_fields();
         let dtypes = (0..fields.nfields())
             .map(|index| {
                 children
@@ -79,8 +88,37 @@ impl StructPlan {
             layout: self.layout.clone(),
             dtype: DType::Struct(
                 StructFields::new(fields.names().clone(), dtypes),
-                self.layout.dtype().nullability(),
+                self.dtype.nullability(),
             ),
+            children,
+        })
+    }
+
+    fn with_pruned_fields(&self, fields: Vec<(FieldName, PlanRef)>) -> VortexResult<Self> {
+        vortex_ensure!(
+            !self.dtype.is_nullable(),
+            "Cannot prune fields from a nullable StructPlan"
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter(
+                fields
+                    .iter()
+                    .map(|(name, plan)| (name.clone(), plan.dtype().clone())),
+            ),
+            self.dtype.nullability(),
+        );
+        let field_plans: Arc<[PlanRef]> = fields
+            .into_iter()
+            .map(|(_, plan)| plan)
+            .collect::<Vec<_>>()
+            .into();
+        let field_count = field_plans.len();
+        let children = LazyPlanChildren::new(field_count + 1, move |index| {
+            Ok(field_plans.get(index).cloned())
+        });
+        Ok(Self {
+            layout: self.layout.clone(),
+            dtype,
             children,
         })
     }
@@ -113,10 +151,10 @@ impl Plan for StructPlan {
     }
 
     fn child_name(&self, index: usize) -> Cow<'_, str> {
-        if let Some(name) = self.layout.struct_fields().field_name(index) {
+        if let Some(name) = self.struct_fields().field_name(index) {
             return Cow::Borrowed(name.as_ref());
         }
-        if index == self.layout.struct_fields().nfields() {
+        if index == self.struct_fields().nfields() {
             return Cow::Borrowed("validity");
         }
         Cow::Owned(format!("child[{index}]"))
@@ -141,13 +179,46 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
         }
 
         let expression = parent.expression();
-        let fields = child.layout.struct_fields();
+        let fields = child.struct_fields();
+        let referenced_fields =
+            descendent_bound_annotations(expression, make_bound_free_field_annotator(fields))
+                .get(&ExactBoundExpr(expression.clone()))
+                .vortex_expect("Bound expression missing free-field annotations")
+                .clone();
         let expanded_root = expanded_struct_root(&child.dtype, fields)?;
         let expanded = expand_struct_root(expression.clone(), &expanded_root, fields)?;
         let partitioned =
             partition_bound(expanded.clone(), make_bound_free_field_annotator(fields))?;
         if partitioned.partition_names.is_empty() {
-            return Ok(None);
+            let selected_indices = fields
+                .names()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| referenced_fields.contains(name).then_some(index))
+                .collect::<Vec<_>>();
+            if selected_indices.len() == fields.nfields() {
+                return Ok(None);
+            }
+
+            let pruned_fields = selected_indices
+                .into_iter()
+                .map(|field_index| {
+                    let field_name = fields
+                        .field_name(field_index)
+                        .ok_or_else(|| vortex_err!("Struct field {field_index} has no name"))?
+                        .clone();
+                    let field = child
+                        .children
+                        .get(field_index)?
+                        .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
+                    Ok((field_name, field))
+                })
+                .collect::<VortexResult<Vec<_>>>()?;
+            let rewritten: PlanRef = Arc::new(child.with_pruned_fields(pruned_fields)?);
+            return Ok(Some(Arc::new(ExpressionPlan::new(
+                expression.clone(),
+                rewritten,
+            ))));
         }
 
         if partitioned.partition_names.len() == 1 {
@@ -199,13 +270,23 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
             field_expressions[field_index] = Some(lowered);
         }
 
-        let children = child.children.try_map(|index, field| {
-            let Some(expression) = field_expressions.get(index).and_then(Option::as_ref) else {
-                return Ok(field);
+        let mut pruned_fields = Vec::with_capacity(partitioned.partition_names.len());
+        for (field_index, expression) in field_expressions.into_iter().enumerate() {
+            let Some(expression) = expression else {
+                continue;
             };
-            ExpressionPlan::new(expression.clone(), field).optimize()
-        })?;
-        let rewritten: PlanRef = Arc::new(child.with_children(children)?);
+            let field_name = fields
+                .field_name(field_index)
+                .ok_or_else(|| vortex_err!("Struct field {field_index} has no name"))?
+                .clone();
+            let field = child
+                .children
+                .get(field_index)?
+                .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
+            let field = ExpressionPlan::new(expression, field).optimize()?;
+            pruned_fields.push((field_name, field));
+        }
+        let rewritten: PlanRef = Arc::new(child.with_pruned_fields(pruned_fields)?);
         let residual = rewrite_partition_root(residual, rewritten.dtype().clone(), &collapsed)?;
 
         Ok(Some(Arc::new(ExpressionPlan::new(residual, rewritten))))
