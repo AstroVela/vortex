@@ -10053,6 +10053,7 @@ dependencies = [
  "jiff",
  "object_store",
  "prost 0.14.4",
+ "rstest",
  "serial_test",
  "temp-env",
  "tokio",

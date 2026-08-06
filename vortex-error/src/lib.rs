@@ -459,15 +459,67 @@ macro_rules! vortex_ensure {
 
 /// A macro that mirrors `assert_eq!` but instead of panicking when left != right,
 /// it will immediately return an erroneous `VortexResult` to the calling context.
+///
+/// Within the error message arguments, `@lhs` and `@rhs` expand to the already-evaluated
+/// left and right operands, so they do not have to be written out a second time:
+///
+/// ```
+/// # use vortex_error::{VortexResult, vortex_ensure_eq};
+/// # fn check(names: &[&str], type_ids: &[u8]) -> VortexResult<()> {
+/// vortex_ensure_eq!(
+///     names.len(),
+///     type_ids.len(),
+///     "length mismatch between names ({}) and type_ids ({})",
+///     @lhs,
+///     @rhs
+/// );
+/// # Ok(())
+/// # }
+/// ```
+///
+/// `@lhs` and `@rhs` are bound by reference and evaluated exactly once, so they are also
+/// safe to use with expensive or side-effecting operands. They may be used any number of
+/// times, and may be followed by further token trees (`@lhs.len()`).
+///
+/// Two limits follow from substituting tokens in a `macro_rules!` muncher:
+///
+/// - `@lhs`/`@rhs` are not substituted inside a nested group. Write `@lhs` at the top level
+///   of an argument rather than as `foo(@lhs)`.
+/// - The error message arguments must be under roughly 120 token trees, or expansion hits
+///   the caller's `recursion_limit`. The longest call site in this repository is 23.
 #[macro_export]
 macro_rules! vortex_ensure_eq {
     ($left:expr, $right:expr) => {
-        $crate::vortex_ensure_eq!($left, $right, AssertionFailed: "{} != {}: {:?} != {:?}", stringify!($left), stringify!($right), $left, $right);
+        $crate::vortex_ensure_eq!($left, $right, AssertionFailed: "{} != {}: {:?} != {:?}", stringify!($left), stringify!($right), @lhs, @rhs);
     };
-    ($left:expr, $right:expr, $($tt:tt)*) => {
-        if $left != $right {
-            $crate::vortex_bail!($($tt)*);
+    ($left:expr, $right:expr, $($tt:tt)*) => {{
+        let lhs = &$left;
+        let rhs = &$right;
+        if lhs != rhs {
+            $crate::__vortex_ensure_subst!(lhs rhs [] $($tt)*);
         }
+    }};
+}
+
+/// Substitutes `@lhs`/`@rhs` in the token stream `$($tt)*` for the operand bindings `$l`/`$r`,
+/// accumulating the rewritten tokens in `[$($out)*]` before handing them to
+/// [`vortex_bail!`][crate::vortex_bail].
+///
+/// Not part of the public API. Used by [`vortex_ensure_eq!`][crate::vortex_ensure_eq].
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __vortex_ensure_subst {
+    ($l:ident $r:ident [$($out:tt)*] @lhs $($rest:tt)*) => {
+        $crate::__vortex_ensure_subst!($l $r [$($out)* $l] $($rest)*)
+    };
+    ($l:ident $r:ident [$($out:tt)*] @rhs $($rest:tt)*) => {
+        $crate::__vortex_ensure_subst!($l $r [$($out)* $r] $($rest)*)
+    };
+    ($l:ident $r:ident [$($out:tt)*] $tt:tt $($rest:tt)*) => {
+        $crate::__vortex_ensure_subst!($l $r [$($out)* $tt] $($rest)*)
+    };
+    ($l:ident $r:ident [$($out:tt)*]) => {
+        $crate::vortex_bail!($($out)*)
     };
 }
 
@@ -582,5 +634,143 @@ pub mod __private {
     #[must_use]
     pub const fn must_use(error: crate::VortexError) -> crate::VortexError {
         error
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use rstest::rstest;
+
+    use crate::VortexError;
+    use crate::VortexResult;
+    use crate::vortex_ensure_eq;
+
+    /// `Display` for a `VortexError` appends a captured backtrace, which is not what these
+    /// tests are asserting on.
+    fn err_message(result: VortexResult<()>) -> String {
+        match result {
+            Ok(()) => String::from("<ok>"),
+            Err(err) => err
+                .to_string()
+                .split("\nBacktrace:")
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    #[rstest]
+    #[case::default_message(
+        default_message(3, 5),
+        "Assertion failed error: 3usize != other: 3 != 5"
+    )]
+    #[case::sugar(sugar(3, 5), "Other error: expected 5 elements, got 3")]
+    #[case::sugar_repeated(sugar_repeated(3, 5), "Other error: 3 != 5 (3 is not 5)")]
+    #[case::sugar_with_format_spec(sugar_with_format_spec(3, 5), "Other error: got 3, expected 5")]
+    #[case::sugar_trailing_tokens(
+        sugar_trailing_tokens(&[1, 2, 3], &[1]),
+        "Other error: 3 bytes != 1 bytes"
+    )]
+    #[case::sugar_named_variant(sugar_named_variant(3, 5), "Serde error: expected 5 fields, got 3")]
+    fn error_messages(#[case] result: VortexResult<()>, #[case] expected: &str) {
+        assert_eq!(err_message(result), expected);
+    }
+
+    fn default_message(lhs: usize, other: usize) -> VortexResult<()> {
+        vortex_ensure_eq!(3usize, other);
+        let _ = lhs;
+        Ok(())
+    }
+
+    fn sugar(actual: usize, expected: usize) -> VortexResult<()> {
+        vortex_ensure_eq!(actual, expected, "expected {} elements, got {}", @rhs, @lhs);
+        Ok(())
+    }
+
+    fn sugar_repeated(actual: usize, expected: usize) -> VortexResult<()> {
+        vortex_ensure_eq!(
+            actual,
+            expected,
+            "{} != {} ({} is not {})",
+            @lhs,
+            @rhs,
+            @lhs,
+            @rhs
+        );
+        Ok(())
+    }
+
+    fn sugar_with_format_spec(actual: usize, expected: usize) -> VortexResult<()> {
+        vortex_ensure_eq!(actual, expected, "got {:?}, expected {:?}", @lhs, @rhs);
+        Ok(())
+    }
+
+    /// `@lhs` may be followed by further tokens, such as a method call.
+    fn sugar_trailing_tokens(actual: &[u8], expected: &[u8]) -> VortexResult<()> {
+        vortex_ensure_eq!(
+            actual.len(),
+            expected.len(),
+            "{} bytes != {} bytes",
+            @lhs,
+            @rhs
+        );
+        Ok(())
+    }
+
+    fn sugar_named_variant(actual: usize, expected: usize) -> VortexResult<()> {
+        vortex_ensure_eq!(
+            actual,
+            expected,
+            Serde: "expected {} fields, got {}",
+            @rhs,
+            @lhs
+        );
+        Ok(())
+    }
+
+    /// Operands are bound once, so `@lhs` does not re-run a side-effecting expression.
+    #[test]
+    fn operands_are_evaluated_once() {
+        let calls = Cell::new(0);
+        let bump = || {
+            calls.set(calls.get() + 1);
+            3usize
+        };
+
+        let result = (|| -> VortexResult<()> {
+            vortex_ensure_eq!(bump(), 5usize, "got {}, expected {}", @lhs, @rhs);
+            Ok(())
+        })();
+
+        assert_eq!(err_message(result), "Other error: got 3, expected 5");
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// Operands of differing types still compare, since `&A: PartialEq<&B>` where `A: PartialEq<B>`.
+    #[test]
+    fn borrowed_and_owned_operands() -> VortexResult<()> {
+        let owned = String::from("a");
+        vortex_ensure_eq!(owned.as_str(), "a", "{} != {}", @lhs, @rhs);
+        Ok(())
+    }
+
+    #[test]
+    fn equal_operands_do_not_bail() -> VortexResult<()> {
+        vortex_ensure_eq!(1usize, 1usize);
+        vortex_ensure_eq!(1usize, 1usize, "{} != {}", @lhs, @rhs);
+        Ok(())
+    }
+
+    /// The bail path is still an early return, not a value.
+    #[test]
+    fn bails_with_assertion_failed_variant() {
+        let result = (|| -> VortexResult<()> {
+            vortex_ensure_eq!(1usize, 2usize, AssertionFailed: "boom {}", @lhs);
+            unreachable!("vortex_ensure_eq! must return before this point")
+        })();
+
+        assert!(matches!(result, Err(VortexError::AssertionFailed(..))));
     }
 }

@@ -28,6 +28,7 @@ prost = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 serial_test = { version = "3.3.1" }
 temp-env = { workspace = true }
 
