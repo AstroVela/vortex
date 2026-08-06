@@ -44,10 +44,7 @@ pub type PlanRef = Arc<dyn Plan>;
 /// Layout plans expose their optimizer-facing children in a stable logical order. Optional child
 /// slots count toward [`child_count`](Self::child_count) and are returned as `None` by
 /// [`child`](Self::child) when absent. Accessing a child may initialize and cache its plan.
-pub trait Plan: 'static + Send + Sync {
-    /// Returns this plan as [`Any`] for plan-specific optimization rules.
-    fn as_any(&self) -> &dyn Any;
-
+pub trait Plan: Any + Send + Sync {
     /// Returns the display name of this plan kind.
     ///
     /// Plans should override this when the fully qualified Rust type name is not appropriate.
@@ -109,6 +106,16 @@ pub fn new_plan(layout: &LayoutRef) -> VortexResult<PlanRef> {
 }
 
 impl dyn Plan + '_ {
+    /// Returns whether this plan has concrete type `T`.
+    pub fn is<T: Plan>(&self) -> bool {
+        (self as &dyn Any).is::<T>()
+    }
+
+    /// Downcasts this plan to concrete type `T`.
+    pub fn downcast_ref<T: Plan>(&self) -> Option<&T> {
+        (self as &dyn Any).downcast_ref::<T>()
+    }
+
     /// Displays this plan and its descendants with the default plan extractors.
     pub fn display_tree(&self) -> PlanTreeDisplay<'_> {
         PlanTreeDisplay::default_display(self)

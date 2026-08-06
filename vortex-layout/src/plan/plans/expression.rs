@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -46,10 +45,6 @@ impl ExpressionPlan {
 }
 
 impl Plan for ExpressionPlan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "ExpressionPlan"
     }
@@ -60,7 +55,7 @@ impl Plan for ExpressionPlan {
         if is_root(&expression) {
             return Ok(child);
         }
-        if let Some(inner) = child.as_any().downcast_ref::<Self>() {
+        if let Some(inner) = child.downcast_ref::<Self>() {
             let expression = replace(expression, &root(), inner.expression.clone());
             return Ok(Arc::new(Self::try_new(
                 expression,

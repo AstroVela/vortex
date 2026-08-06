@@ -69,7 +69,7 @@ fn unsupported_layout_has_no_plan() -> VortexResult<()> {
 fn flat_plan_has_no_children() -> VortexResult<()> {
     let plan = make_plan(flat(3, primitive(PType::I32, Nullability::NonNullable), 0))?;
 
-    assert!(plan.as_any().is::<FlatPlan>());
+    assert!(plan.is::<FlatPlan>());
     assert_eq!(plan.child_count(), 0);
     assert!(plan.child(0).is_err());
     Ok(())
@@ -86,7 +86,7 @@ fn chunked_plan_exposes_chunks() -> VortexResult<()> {
     .into_layout();
     let plan = make_plan(layout)?;
 
-    assert!(plan.as_any().is::<ChunkedPlan>());
+    assert!(plan.is::<ChunkedPlan>());
     assert_eq!(plan.child_count(), 2);
     assert_eq!(
         plan.child(0)?
@@ -120,7 +120,7 @@ fn chunked_plan_defers_unrequested_chunks_through_optimization() -> VortexResult
     let first = plan
         .child(0)?
         .ok_or_else(|| vortex_err!("missing first chunk"))?;
-    assert!(first.as_any().is::<FlatPlan>());
+    assert!(first.is::<FlatPlan>());
     let cached = plan
         .child(0)?
         .ok_or_else(|| vortex_err!("missing cached first chunk"))?;
@@ -149,7 +149,7 @@ fn dict_plan_orders_codes_before_values() -> VortexResult<()> {
     .into_layout();
     let plan = make_plan(layout)?;
 
-    assert!(plan.as_any().is::<DictPlan>());
+    assert!(plan.is::<DictPlan>());
     assert_eq!(plan.child_count(), 2);
     assert_eq!(
         plan.child(0)?
@@ -179,7 +179,7 @@ fn list_plan_has_stable_optional_validity_slot() -> VortexResult<()> {
     .into_layout();
     let plan = make_plan(non_nullable)?;
 
-    assert!(plan.as_any().is::<ListPlan>());
+    assert!(plan.is::<ListPlan>());
     assert_eq!(plan.child_count(), 3);
     assert_eq!(
         plan.child(0)?
@@ -228,7 +228,7 @@ fn struct_plan_orders_fields_before_optional_validity() -> VortexResult<()> {
     .into_layout();
     let plan = make_plan(non_nullable)?;
 
-    assert!(plan.as_any().is::<StructPlan>());
+    assert!(plan.is::<StructPlan>());
     assert_eq!(plan.child_count(), 3);
     assert_eq!(
         plan.child(0)?
@@ -282,7 +282,6 @@ fn struct_plan_defers_unrequested_fields_through_optimization() -> VortexResult<
     assert!(
         plan.child(0)?
             .ok_or_else(|| vortex_err!("missing field a"))?
-            .as_any()
             .is::<FlatPlan>()
     );
     let error = plan
@@ -445,12 +444,11 @@ fn row_idx_plan_preserves_row_index_expressions() -> VortexResult<()> {
     let plan = RowIdxPlan::new_ref(10, make_plan(layout)?);
     let plan = ExpressionPlan::try_new(row_idx(), plan)?.optimize()?;
     let expression = plan
-        .as_any()
         .downcast_ref::<ExpressionPlan>()
         .ok_or_else(|| vortex_err!("optimized plan is not an expression plan"))?;
 
     assert_eq!(expression.expression(), &row_idx());
-    assert!(expression.child_plan().as_any().is::<RowIdxPlan>());
+    assert!(expression.child_plan().is::<RowIdxPlan>());
     assert_eq!(expression.row_count(), 3);
     Ok(())
 }
