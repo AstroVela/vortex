@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -26,10 +25,6 @@ impl RowIdxPlan {
 }
 
 impl Plan for RowIdxPlan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "RowIdxPlan"
     }

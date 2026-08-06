@@ -46,10 +46,6 @@ impl ChunkedPlan {
 }
 
 impl Plan for ChunkedPlan {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "ChunkedPlan"
     }

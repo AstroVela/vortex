@@ -120,7 +120,7 @@ impl PlanTreeExtractor for PlanExpressionExtractor {
         _context: &PlanTreeContext,
         formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let Some(expression_plan) = plan.as_any().downcast_ref::<ExpressionPlan>() else {
+        let Some(expression_plan) = plan.downcast_ref::<ExpressionPlan>() else {
             return Ok(());
         };
         write!(formatter, " expr={}", expression_plan.expression())
