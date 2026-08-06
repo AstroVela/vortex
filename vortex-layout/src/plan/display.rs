@@ -5,6 +5,7 @@ use std::fmt;
 
 use super::ExpressionPlan;
 use super::Plan;
+use super::ZonedPlan;
 
 /// Context threaded through a plan tree traversal.
 pub struct PlanTreeContext {
@@ -110,7 +111,7 @@ impl PlanTreeExtractor for PlanSummaryExtractor {
     }
 }
 
-/// Adds an expression annotation to [`ExpressionPlan`] nodes.
+/// Adds expression annotations to expression and zoned-pruning plans.
 pub struct PlanExpressionExtractor;
 
 impl PlanTreeExtractor for PlanExpressionExtractor {
@@ -120,10 +121,16 @@ impl PlanTreeExtractor for PlanExpressionExtractor {
         _context: &PlanTreeContext,
         formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let Some(expression_plan) = plan.downcast_ref::<ExpressionPlan>() else {
-            return Ok(());
-        };
-        write!(formatter, " expr={}", expression_plan.expression())
+        if let Some(expression_plan) = plan.downcast_ref::<ExpressionPlan>() {
+            return write!(formatter, " expr={}", expression_plan.expression());
+        }
+        if let Some(expression) = plan
+            .downcast_ref::<ZonedPlan>()
+            .and_then(ZonedPlan::pruning_expression)
+        {
+            return write!(formatter, " prune={expression}");
+        }
+        Ok(())
     }
 }
 
