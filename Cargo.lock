@@ -10363,12 +10363,19 @@ dependencies = [
 name = "vortex-scan-v2"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema 58.4.0",
  "futures",
  "itertools 0.14.0",
  "parking_lot",
+ "tokio",
+ "tokio-stream",
+ "tpchgen",
+ "tpchgen-arrow",
  "tracing",
  "tracing-subscriber",
+ "vortex",
  "vortex-array",
+ "vortex-arrow",
  "vortex-buffer",
  "vortex-error",
  "vortex-file",

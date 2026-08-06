@@ -28,6 +28,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::layouts::struct_::StructLayout;
 use crate::plan::ExpressionPlan;
@@ -95,6 +96,25 @@ impl StructPlan {
             ),
             children,
         })
+    }
+
+    /// Returns this plan with only the fields named in `retained`, in their original order.
+    fn retain_fields(&self, retained: &HashSet<FieldName>) -> VortexResult<Self> {
+        let fields = self.struct_fields();
+        let retained = fields
+            .names()
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| retained.contains(*name))
+            .map(|(index, name)| {
+                let field = self
+                    .children
+                    .get(index)?
+                    .ok_or_else(|| vortex_err!("Struct field '{name}' has no plan"))?;
+                Ok((name.clone(), field))
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+        self.with_pruned_fields(retained)
     }
 
     fn with_pruned_fields(&self, fields: Vec<(FieldName, PlanRef)>) -> VortexResult<Self> {
@@ -232,8 +252,18 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
         }
 
         let expression = parent.expression();
+        let referenced_fields = immediate_scope_access(expression, child.struct_fields());
+
+        // Drop unreferenced fields before expanding the scope. `replace_root_fields` substitutes
+        // every `root()` reference with a pack over the whole scope, so a wide struct costs one
+        // expression node per field per reference, all of which the following `optimize_recursive`
+        // and `partition` have to walk and simplify away again.
+        let narrowed = (referenced_fields.len() < child.struct_fields().nfields())
+            .then(|| child.retain_fields(&referenced_fields))
+            .transpose()?;
+        let child = narrowed.as_ref().unwrap_or(child);
+
         let fields = child.struct_fields();
-        let referenced_fields = immediate_scope_access(expression, fields);
         let expanded =
             replace_root_fields(expression.clone(), fields).optimize_recursive(&child.dtype)?;
         let partitioned = partition(
@@ -242,34 +272,14 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
             make_free_field_annotator(fields),
         )?;
         if partitioned.partition_names.is_empty() {
-            let selected_indices = fields
-                .names()
-                .iter()
-                .enumerate()
-                .filter_map(|(index, name)| referenced_fields.contains(name).then_some(index))
-                .collect::<Vec<_>>();
-            if selected_indices.len() == fields.nfields() {
+            // Nothing can be pushed into a field, so the only available rewrite is the narrowing
+            // performed above.
+            let Some(narrowed) = narrowed else {
                 return Ok(None);
-            }
-
-            let pruned_fields = selected_indices
-                .into_iter()
-                .map(|field_index| {
-                    let field_name = fields
-                        .field_name(field_index)
-                        .ok_or_else(|| vortex_err!("Struct field {field_index} has no name"))?
-                        .clone();
-                    let field = child
-                        .children
-                        .get(field_index)?
-                        .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
-                    Ok((field_name, field))
-                })
-                .collect::<VortexResult<Vec<_>>>()?;
-            let rewritten: PlanRef = Arc::new(child.with_pruned_fields(pruned_fields)?);
+            };
             return Ok(Some(Arc::new(ExpressionPlan::try_new(
                 expression.clone(),
-                rewritten,
+                Arc::new(narrowed) as PlanRef,
             )?)));
         }
 

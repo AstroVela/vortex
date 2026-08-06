@@ -27,17 +27,37 @@ pub struct ExpressionPlan {
     expression: Expression,
     child: PlanRef,
     dtype: DType,
+    /// Whether `expression` is already optimized for `child`'s dtype.
+    ///
+    /// Optimizing an expression rebuilds its tree, so re-optimizing one that a previous pass
+    /// already normalized for the same scope is the dominant cost of planning a deep layout.
+    optimized: bool,
 }
 
 impl ExpressionPlan {
     /// Creates an expression plan and validates its output dtype.
     pub fn try_new(expression: Expression, child: PlanRef) -> VortexResult<Self> {
+        Self::try_new_impl(expression, child, false)
+    }
+
+    fn try_new_impl(expression: Expression, child: PlanRef, optimized: bool) -> VortexResult<Self> {
         let dtype = expression.return_dtype(child.dtype())?;
         Ok(Self {
             expression,
             child,
             dtype,
+            optimized,
         })
+    }
+
+    /// Creates a plan whose `expression` is already optimized for `child`'s dtype.
+    ///
+    /// Callers must have optimized `expression` against exactly `child.dtype()`.
+    pub(crate) fn try_new_optimized_ref(
+        expression: Expression,
+        child: PlanRef,
+    ) -> VortexResult<PlanRef> {
+        Ok(Arc::new(Self::try_new_impl(expression, child, true)?))
     }
 
     /// Returns the expression evaluated by this plan.
@@ -55,7 +75,11 @@ impl ExpressionPlan {
     }
 
     fn optimize_top_down(&self, blocked_child_type: Option<TypeId>) -> VortexResult<PlanRef> {
-        let expression = self.expression.optimize_recursive(self.child.dtype())?;
+        let expression = if self.optimized {
+            self.expression.clone()
+        } else {
+            self.expression.optimize_recursive(self.child.dtype())?
+        };
         if is_root(&expression) {
             return self.child.optimize();
         }
@@ -73,7 +97,14 @@ impl ExpressionPlan {
         }
 
         let child = self.child.optimize()?;
-        let expression = expression.optimize_recursive(child.dtype())?;
+        // The expression was already optimized against this scope above. Optimizing a child
+        // usually preserves its dtype, and re-optimizing against an unchanged scope cannot
+        // produce a different expression, so skip a full recursive pass over the tree.
+        let expression = if child.dtype() == self.child.dtype() {
+            expression
+        } else {
+            expression.optimize_recursive(child.dtype())?
+        };
         if is_root(&expression) {
             return Ok(child);
         }
@@ -83,7 +114,9 @@ impl ExpressionPlan {
         }
 
         let child_type = child.as_ref().type_id();
-        let parent = Self::try_new_ref(expression, child)?;
+        // `expression` is optimized for `child`'s dtype, so a later pass over this subtree does
+        // not need to rebuild it.
+        let parent = Self::try_new_optimized_ref(expression, child)?;
         if blocked_child_type != Some(child_type)
             && let Some(rewritten) = reduce_parent(&parent, 0)?
         {

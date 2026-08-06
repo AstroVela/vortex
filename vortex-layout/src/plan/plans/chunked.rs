@@ -179,9 +179,11 @@ impl PlanParentReduceRule<ChunkedPlan> for ExpressionChunkedRule {
         }
 
         let dtype = expression.return_dtype(&child.dtype)?;
+        // Every chunk shares the chunked plan's dtype, and the optimizer already normalized
+        // `expression` for it, so none of the per-chunk plans need to optimize it again.
         let chunks = child
             .chunks
-            .try_map(|_, chunk| ExpressionPlan::try_new_ref(expression.clone(), chunk))?;
+            .try_map(|_, chunk| ExpressionPlan::try_new_optimized_ref(expression.clone(), chunk))?;
         Ok(Some(Arc::new(child.with_chunks(dtype, chunks))))
     }
 }
