@@ -34,6 +34,9 @@ vortex-io = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+vortex-file = { workspace = true }
+vortex-layout = { workspace = true }
+vortex-metrics = { workspace = true }
 
 [lints]
 workspace = true

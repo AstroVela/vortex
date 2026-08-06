@@ -168,7 +168,7 @@ impl FileSegmentSource {
 
         // Spawn the driver so the runtime makes I/O progress independently of any reader. Readers
         // join it (below) only to surface a panic raised while driving reads.
-        let mut task = handle.spawn(drive_fut);
+        let mut task = handle.spawn_io(drive_fut);
         let driver_panic: DriverPanic = Arc::new(Mutex::new(None));
         let driver = {
             let driver_panic = Arc::clone(&driver_panic);
@@ -381,13 +381,88 @@ impl SegmentSource for BufferSegmentSource {
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use futures::future::BoxFuture;
+    use vortex_io::runtime::AbortHandle;
+    use vortex_io::runtime::AbortHandleRef;
+    use vortex_io::runtime::Executor;
     use vortex_io::runtime::tokio::TokioRuntime;
     use vortex_layout::segments::SegmentSource;
     use vortex_metrics::DefaultMetricsRegistry;
 
     use super::*;
+
+    #[derive(Default)]
+    struct CountingExecutor {
+        spawn_io_count: AtomicUsize,
+    }
+
+    impl Executor for CountingExecutor {
+        fn spawn(&self, _future: BoxFuture<'static, ()>) -> AbortHandleRef {
+            panic!("read driver used spawn instead of spawn_io")
+        }
+
+        fn spawn_io(&self, future: BoxFuture<'static, ()>) -> AbortHandleRef {
+            self.spawn_io_count.fetch_add(1, Ordering::SeqCst);
+            drop(future);
+            Box::new(NoOpAbortHandle)
+        }
+
+        fn spawn_cpu(&self, _task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+            unreachable!("read driver does not spawn CPU work")
+        }
+
+        fn spawn_blocking_io(&self, _task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+            unreachable!("read driver does not spawn blocking work")
+        }
+    }
+
+    struct NoOpAbortHandle;
+
+    impl AbortHandle for NoOpAbortHandle {
+        fn abort(self: Box<Self>) {}
+    }
+
+    #[derive(Clone)]
+    struct EmptyReadAt;
+
+    impl VortexReadAt for EmptyReadAt {
+        fn concurrency(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+            async { Ok(0) }.boxed()
+        }
+
+        fn read_at(
+            &self,
+            _offset: u64,
+            _length: usize,
+            _alignment: Alignment,
+        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+            async { Ok(BufferHandle::new_host(ByteBuffer::empty())) }.boxed()
+        }
+    }
+
+    #[test]
+    fn read_driver_uses_spawn_io() {
+        let executor = Arc::new(CountingExecutor::default());
+        let runtime = Arc::clone(&executor) as Arc<dyn Executor>;
+        let handle = Handle::new(Arc::downgrade(&runtime));
+        let metrics = DefaultMetricsRegistry::default();
+
+        let _source = FileSegmentSource::open(
+            Arc::from([]),
+            EmptyReadAt,
+            handle,
+            RequestMetrics::new(&metrics, vec![]),
+        );
+
+        assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
+    }
 
     #[derive(Clone)]
     struct PanickingReadAt;
