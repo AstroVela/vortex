@@ -133,11 +133,13 @@ impl<T> Iterator for CompioBlockingIterator<'_, T> {
 
 struct Sender {
     tasks: kanal::Sender<Spawn>,
+    runtime_id: usize,
 }
 
 impl Sender {
     fn new(runtime: &compio::runtime::Runtime) -> Self {
         let (send, recv) = kanal::unbounded::<Spawn>();
+        let runtime_id = runtime_identity(runtime);
 
         runtime
             .spawn(async move {
@@ -147,15 +149,33 @@ impl Sender {
             })
             .detach();
 
-        Self { tasks: send }
+        Self {
+            tasks: send,
+            runtime_id,
+        }
+    }
+
+    fn is_current_runtime(&self) -> bool {
+        compio::runtime::Runtime::try_with_current(|runtime| {
+            runtime_identity(runtime) == self.runtime_id
+        })
+        .unwrap_or(false)
+    }
+
+    fn schedule(&self, spawn: Spawn) {
+        // Vortex's coalescing driver runs on this runtime, so this is the hot path for local file
+        // reads. Bypass the synchronized cross-thread queue when scheduling from the owner.
+        if self.is_current_runtime() {
+            spawn.schedule();
+        } else if let Err(error) = self.tasks.send(spawn) {
+            vortex_panic!("Compio executor missing: {error}");
+        }
     }
 
     fn send(&self, spawn: Spawn) -> AbortHandleRef {
         let (task_send, task_recv) = oneshot::channel();
         let spawn = spawn.with_callback(task_send);
-        if let Err(error) = self.tasks.send(spawn) {
-            vortex_panic!("Compio executor missing: {error}");
-        }
+        self.schedule(spawn);
         Box::new(LazyAbortHandle {
             task: Mutex::new(task_recv),
         })
@@ -183,15 +203,17 @@ impl Sender {
             .boxed_local()
         });
 
-        if let Err(error) = self.tasks.send(Spawn::Local { factory }) {
-            vortex_panic!("Compio executor missing: {error}");
-        }
+        self.schedule(Spawn::Local { factory });
 
         LocalTask {
             result: result_recv.into_future(),
             abort_handle: Some(abort_handle),
         }
     }
+}
+
+fn runtime_identity(runtime: &compio::runtime::Runtime) -> usize {
+    std::ptr::from_ref(&**runtime).addr()
 }
 
 impl Executor for Sender {
@@ -392,6 +414,16 @@ mod tests {
             .block_on_stream(stream::iter([1, 2, 3]))
             .collect::<Vec<_>>();
         assert_eq!(values, [1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn identifies_the_owning_runtime() -> VortexResult<()> {
+        let runtime = CompioRuntime::new()?;
+        assert!(!runtime.sender.is_current_runtime());
+        runtime.block_on(async {
+            assert!(runtime.sender.is_current_runtime());
+        });
         Ok(())
     }
 }
