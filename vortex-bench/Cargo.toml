@@ -36,6 +36,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 bzip2 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
@@ -80,10 +81,13 @@ tracing-subscriber = { workspace = true, features = [
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 wkb = { workspace = true }
+vortex-cuda = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
 insta = { workspace = true }
 rstest = { workspace = true }
 
 [features]
+cuda = ["dep:cudarc", "dep:vortex-cuda"]
 unstable_encodings = ["vortex/unstable_encodings"]

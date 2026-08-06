@@ -28,6 +28,9 @@ fn main() {
 
     // Source directory for kernels (hand-written and generated .cu/.cuh files)
     let kernels_src = Path::new(&manifest_dir).join("kernels/src");
+    // Watch the directory as well as individual files so newly added kernels
+    // are discovered without requiring a workspace clean.
+    println!("cargo:rerun-if-changed={}", kernels_src.display());
     // Output directory for compiled .ptx files - separate by profile.
     let kernels_gen = Path::new(&manifest_dir).join("kernels/gen").join(&profile);
 
