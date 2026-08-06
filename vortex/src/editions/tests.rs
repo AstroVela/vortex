@@ -3,16 +3,33 @@
 
 use std::sync::Arc;
 
+use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::VTable;
 use vortex_array::array_session;
+use vortex_array::arrays::Bool;
+use vortex_array::arrays::Decimal;
+use vortex_array::arrays::Extension;
+use vortex_array::arrays::FixedSizeList;
+use vortex_array::arrays::ListView;
+use vortex_array::arrays::Map;
+use vortex_array::arrays::Null;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::Struct;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::Union;
+use vortex_array::arrays::VarBinView;
+use vortex_array::arrays::Variant;
+use vortex_array::builders::MapBuilder;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::MapDType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::field_path;
+use vortex_array::scalar::Scalar;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
@@ -62,9 +79,9 @@ fn every_declared_edition_validates() -> Result<(), EditionError> {
     Ok(())
 }
 
-/// The full encoding set of the newest frozen `core` edition. This set is frozen: the only
-/// way it may change is by declaring a *new* edition, so a failure here means a frozen
-/// declaration was edited.
+/// The full encoding set of a frozen `core` edition. This set is frozen: the only way it may
+/// change is by declaring a *new* edition, so a failure here means a frozen declaration was
+/// edited.
 #[test]
 fn core_2026_07_encoding_set_is_pinned() {
     let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
@@ -94,6 +111,56 @@ fn core_2026_07_encoding_set_is_pinned() {
             "vortex.fsst",
             "vortex.list",
             "vortex.listview",
+            "vortex.masked",
+            "vortex.null",
+            "vortex.pco",
+            "vortex.primitive",
+            "vortex.runend",
+            "vortex.sequence",
+            "vortex.sparse",
+            "vortex.struct",
+            "vortex.varbin",
+            "vortex.varbinview",
+            "vortex.variant",
+            "vortex.zigzag",
+            "vortex.zstd",
+        ]
+    );
+}
+
+/// The full encoding set of the newest frozen `core` edition, the one the default session writes.
+/// Frozen on the same terms as [`core_2026_07_encoding_set_is_pinned`]; pinning it here also keeps
+/// `vortex.map` in the released set (vortex-data/vortex#9223).
+#[test]
+fn core_2026_08_encoding_set_is_pinned() {
+    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
+    let encodings = session.encodings_in(&CORE_2026_08);
+    let ids: Vec<&str> = encodings
+        .iter()
+        .map(|inclusion| inclusion.encoding_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "fastlanes.bitpacked",
+            "fastlanes.for",
+            "fastlanes.rle",
+            "vortex.alp",
+            "vortex.alprd",
+            "vortex.bool",
+            "vortex.bytebool",
+            "vortex.chunked",
+            "vortex.constant",
+            "vortex.datetimeparts",
+            "vortex.decimal",
+            "vortex.decimal_byte_parts",
+            "vortex.dict",
+            "vortex.ext",
+            "vortex.fixed_size_list",
+            "vortex.fsst",
+            "vortex.list",
+            "vortex.listview",
+            "vortex.map",
             "vortex.masked",
             "vortex.null",
             "vortex.pco",
@@ -177,6 +244,119 @@ fn core_edition_ids_are_registered_array_encodings() {
             inclusion.encoding_id
         );
     }
+}
+
+/// The encoding a `DType` canonicalizes to, for every variant of [`vortex_array::Canonical`].
+///
+/// Kept in lock-step with `AnyCanonical::matches`: adding a canonical encoding without adding it
+/// here leaves [`every_canonical_encoding_is_writable_by_the_default_session`] unable to see it.
+fn canonical_encoding_ids() -> Vec<ArrayId> {
+    vec![
+        Null.id(),
+        Bool.id(),
+        Primitive.id(),
+        Decimal.id(),
+        Struct.id(),
+        Union.id(),
+        ListView.id(),
+        Map.id(),
+        FixedSizeList.id(),
+        VarBinView.id(),
+        Variant.id(),
+        Extension.id(),
+    ]
+}
+
+/// Canonical encodings the default session cannot write, each with the reason it is excluded.
+///
+/// These are known gaps, not accepted ones. Anything listed here fails at write time with
+/// `not permitted by ctx`, so an entry should be deleted as soon as the encoding joins an
+/// edition.
+const CANONICAL_ENCODINGS_NOT_YET_WRITABLE: &[&str] = &[
+    // `builder_with_capacity` still has `todo!()` for `DType::Union`, so union columns cannot
+    // reach the writer at all. Union joins an edition once it is implemented end to end.
+    "vortex.union",
+];
+
+/// Every canonical encoding must be writable by the default session.
+///
+/// A canonical encoding is reachable from its `DType` alone — any array of that dtype
+/// canonicalizes to it — so if it is absent from the default write edition, every write of that
+/// dtype fails in [`vortex_array::serde`] with `Array encoding <id> not permitted by ctx`. That is
+/// how `vortex.map` shipped as a canonical encoding while no edition declared it, surfacing only
+/// as a `file_io` fuzz crash (vortex-data/vortex#9223) rather than as a test failure.
+#[test]
+fn every_canonical_encoding_is_writable_by_the_default_session() {
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    let enabled: HashSet<_> = session.enabled_encoding_ids().into_iter().collect();
+
+    let canonical = canonical_encoding_ids();
+    let mut missing: Vec<&str> = canonical
+        .iter()
+        .filter(|id| !enabled.contains(*id))
+        .map(|id| id.as_str())
+        .collect();
+    missing.sort_unstable();
+
+    let mut expected: Vec<&str> = CANONICAL_ENCODINGS_NOT_YET_WRITABLE.to_vec();
+    expected.sort_unstable();
+
+    assert_eq!(
+        missing, expected,
+        "canonical encodings not enabled by the default session changed; every canonical \
+         encoding must be declared in an edition the default session enables, or listed in \
+         CANONICAL_ENCODINGS_NOT_YET_WRITABLE with a reason"
+    );
+}
+
+/// Writing a map column through the default session must succeed.
+///
+/// Regression test for vortex-data/vortex#9223: `vortex.map` was a canonical encoding that no
+/// edition declared, so this write failed with `not permitted by ctx`.
+#[tokio::test]
+async fn map_round_trips_through_the_default_session() -> VortexResult<()> {
+    use crate::VortexSessionDefault;
+
+    let map_dtype = MapDType::try_new(
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+        DType::Utf8(Nullability::Nullable),
+        true,
+    )?;
+    let dtype = DType::Map(map_dtype.clone(), Nullability::Nullable);
+    let mut builder = MapBuilder::<u64, u64>::new(map_dtype, Nullability::Nullable);
+    for i in 0..1024i32 {
+        let scalar = Scalar::try_map(
+            dtype.clone(),
+            [(
+                Scalar::primitive(i, Nullability::NonNullable),
+                Scalar::utf8(format!("value-{i}"), Nullability::Nullable),
+            )],
+        )?;
+        builder.append_value(scalar.as_map())?;
+    }
+    let array = builder.finish_into_map().into_array();
+
+    let session = VortexSession::default();
+    let mut buffer = ByteBufferMut::empty();
+    session
+        .write_options()
+        .write(&mut buffer, array.to_array_stream())
+        .await?;
+
+    let round_tripped = session
+        .open_options()
+        .open_buffer(buffer)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    assert_eq!(round_tripped.len(), array.len());
+    assert_eq!(round_tripped.dtype(), array.dtype());
+
+    Ok(())
 }
 
 fn baseline_core_session() -> VortexResult<VortexSession> {
