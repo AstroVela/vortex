@@ -11,7 +11,10 @@ mod polygon;
 mod rect;
 mod wkb;
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt::Display;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use ::wkb::reader::GeometryType;
@@ -43,9 +46,13 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Dict;
+use vortex_array::arrays::Extension;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::ListViewArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::list::ListArraySlotsExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
@@ -170,11 +177,16 @@ pub(crate) fn geometries(
             array.dtype()
         );
     };
-    let storage = array
-        .clone()
-        .execute::<ExtensionArray>(ctx)?
-        .storage_array()
-        .clone();
+    // Preserve a reduced extension's lazy ListView storage. Executing the extension first would
+    // compact duplicate list views and lose the shared row identity before we can deduplicate it.
+    let storage = match array.as_opt::<Extension>() {
+        Some(extension) => extension.storage_array().clone(),
+        None => array
+            .clone()
+            .execute::<ExtensionArray>(ctx)?
+            .storage_array()
+            .clone(),
+    };
     if ext.is::<Point>() {
         point_geometries(&storage, ctx)
     } else if ext.is::<LineString>() {
@@ -192,6 +204,134 @@ pub(crate) fn geometries(
     } else {
         vortex_bail!("geo: unsupported geometry extension {}", array.dtype())
     }
+}
+
+/// Owned geometries decoded once per distinct native list row, plus the row mapping needed to
+/// preserve the input's logical repetition.
+///
+/// A spatial join can `take` the same build geometry many times. Native list views preserve the
+/// shared coordinate buffers, but flattening those views before decoding otherwise copies every
+/// repeated row. Keeping this indirection lets binary kernels reuse one decoded geometry for all
+/// candidate rows that reference the same list range.
+pub(crate) struct GeometryRows {
+    geometries: Vec<Geometry<f64>>,
+    row_to_geometry: Option<Vec<usize>>,
+}
+
+impl GeometryRows {
+    pub(crate) fn geometry(&self, row: usize) -> &Geometry<f64> {
+        let geometry = self
+            .row_to_geometry
+            .as_ref()
+            .map_or(row, |mapping| mapping[row]);
+        &self.geometries[geometry]
+    }
+}
+
+/// Decode a valid native geometry column while retaining duplicate top-level list views as shared
+/// references. Non-list geometries and columns without duplicate rows use the ordinary decoder.
+pub(crate) fn geometry_rows(
+    array: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<GeometryRows> {
+    if array.dtype().as_extension_opt().is_none() {
+        vortex_bail!(
+            "geo: operand is not a geometry extension type, was {}",
+            array.dtype()
+        );
+    }
+    let storage = match array.as_opt::<Extension>() {
+        Some(extension) => extension.storage_array().clone(),
+        None => array
+            .clone()
+            .execute::<ExtensionArray>(ctx)?
+            .storage_array()
+            .clone(),
+    };
+    if array.len() < 2 {
+        return Ok(GeometryRows {
+            geometries: geometries(array, ctx)?,
+            row_to_geometry: None,
+        });
+    }
+
+    let slot_dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+    let deduplicated = if let Some(dict) = storage.as_opt::<Dict>() {
+        let codes = dict
+            .codes()
+            .clone()
+            .cast(slot_dtype.clone())?
+            .execute::<Buffer<u64>>(ctx)?;
+        distinct_geometry_rows(codes.iter().copied())?
+    } else if let Some(list) = storage.as_opt::<vortex_array::arrays::ListView>() {
+        let offsets = list
+            .offsets()
+            .clone()
+            .cast(slot_dtype.clone())?
+            .execute::<Buffer<u64>>(ctx)?;
+        let sizes = list
+            .sizes()
+            .clone()
+            .cast(slot_dtype)?
+            .execute::<Buffer<u64>>(ctx)?;
+        distinct_geometry_rows(offsets.iter().copied().zip(sizes.iter().copied()))?
+    } else {
+        None
+    };
+
+    let Some((representatives, row_to_geometry)) = deduplicated else {
+        return Ok(GeometryRows {
+            geometries: geometries(array, ctx)?,
+            row_to_geometry: None,
+        });
+    };
+
+    let representatives = PrimitiveArray::from_iter(representatives).into_array();
+    let unique = array.clone().take(representatives)?;
+    let geometries = geometries(&unique, ctx)?;
+    vortex_ensure!(
+        geometries.len()
+            == row_to_geometry
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |last| last + 1),
+        "geo: distinct geometry row count changed while decoding"
+    );
+    Ok(GeometryRows {
+        geometries,
+        row_to_geometry: Some(row_to_geometry),
+    })
+}
+
+/// Return representative input rows and the row-to-representative mapping when `keys` contains
+/// duplicates. `None` keeps the ordinary decoder's zero-indirection path for all-distinct input.
+fn distinct_geometry_rows<K>(
+    keys: impl ExactSizeIterator<Item = K>,
+) -> VortexResult<Option<(Vec<u64>, Vec<usize>)>>
+where
+    K: Eq + Hash,
+{
+    let len = keys.len();
+    let mut distinct = HashMap::with_capacity(len);
+    let mut representatives = Vec::new();
+    let mut row_to_geometry = Vec::with_capacity(len);
+    for (row, key) in keys.enumerate() {
+        let next = distinct.len();
+        let geometry = match distinct.entry(key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                representatives.push(
+                    u64::try_from(row)
+                        .map_err(|_| vortex_err!("geo: geometry row index exceeds u64"))?,
+                );
+                entry.insert(next);
+                next
+            }
+        };
+        row_to_geometry.push(geometry);
+    }
+    Ok((representatives.len() != len).then_some((representatives, row_to_geometry)))
 }
 
 /// Decode a constant operand scalar to one geo geometry, a constant of any
@@ -340,6 +480,9 @@ pub(crate) fn geo_metadata_from_arrow(metadata: &Metadata) -> GeoMetadata {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::dtype::DType;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
@@ -349,7 +492,27 @@ mod tests {
     use super::MultiPoint;
     use super::Point;
     use super::Polygon;
+    use super::geometry_rows;
     use super::native_geometry_scalar_from_wkb;
+    use crate::test_harness::polygon_column;
+
+    #[test]
+    fn repeated_list_views_decode_once() -> VortexResult<()> {
+        let geometries = polygon_column(vec![
+            vec![vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]],
+            vec![vec![(10.0, 10.0), (11.0, 10.0), (10.0, 11.0), (10.0, 10.0)]],
+        ])?;
+        let indices = PrimitiveArray::from_iter([0u64, 0, 1, 0]).into_array();
+        let repeated = geometries.take(indices)?;
+        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let decoded = geometry_rows(&repeated, &mut ctx)?;
+
+        assert_eq!(decoded.geometries.len(), 2);
+        assert_eq!(decoded.geometry(0), decoded.geometry(1));
+        assert_eq!(decoded.geometry(0), decoded.geometry(3));
+        assert_ne!(decoded.geometry(0), decoded.geometry(2));
+        Ok(())
+    }
     use crate::extension::GeoMetadata;
 
     #[test]

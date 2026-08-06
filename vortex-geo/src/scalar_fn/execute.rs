@@ -33,6 +33,7 @@ use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use crate::extension::geometries;
+use crate::extension::geometry_rows;
 use crate::extension::single_geometry;
 
 /// The result type a binary geo kernel produces. Today that is `f64` (for `ST_Distance`) and
@@ -261,9 +262,11 @@ where
     let valid = &a_present & &b_present;
     // Keep only the rows valid in both columns, so decoding never sees a null geometry. `filter`
     // collapses an all-true mask, so all-valid columns pass through unchanged.
-    let ag = geometries(&a.filter(valid.clone())?, ctx)?;
-    let bg = geometries(&b.filter(valid.clone())?, ctx)?;
-    let values = ag.iter().zip(&bg).map(|(x, y)| compute(x, y)).collect();
+    let ag = geometry_rows(&a.filter(valid.clone())?, ctx)?;
+    let bg = geometry_rows(&b.filter(valid.clone())?, ctx)?;
+    let values = (0..valid.true_count())
+        .map(|row| compute(ag.geometry(row), bg.geometry(row)))
+        .collect();
     Ok(T::build_array(len, &valid, values, nullability))
 }
 

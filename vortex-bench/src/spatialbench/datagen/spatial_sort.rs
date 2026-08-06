@@ -58,7 +58,10 @@ pub async fn spatially_sort_tables(
     parquet_dir: &Path,
     derived_dirs: &[PathBuf],
 ) -> anyhow::Result<()> {
-    for table in Table::ALL.into_iter().filter(|table| table.is_generated()) {
+    // `zone` is externally sourced rather than generated, but it still needs the same spatial
+    // clustering before the derived Vortex lanes are written. If the optional zone parquet is
+    // absent, its file glob is empty and this remains a no-op.
+    for table in Table::ALL {
         sort_table_parquet(table, parquet_dir, derived_dirs).await?;
     }
     Ok(())
