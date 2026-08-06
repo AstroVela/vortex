@@ -1,0 +1,39 @@
+[package]
+name = "vortex-compio"
+authors = { workspace = true }
+categories = { workspace = true }
+description = "Compio runtime and filesystem I/O integration for Vortex"
+edition = { workspace = true }
+homepage = { workspace = true }
+include = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+[dependencies]
+compio = { workspace = true, features = ["fs", "io-uring", "polling", "sync"] }
+futures = { workspace = true, features = ["std"] }
+kanal = { workspace = true }
+oneshot = { workspace = true }
+parking_lot = { workspace = true }
+vortex-array = { workspace = true }
+vortex-buffer = { workspace = true, features = ["compio"] }
+vortex-error = { workspace = true }
+vortex-io = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -12,6 +12,7 @@ members = [
     "vortex-flatbuffers",
     "vortex-metrics",
     "vortex-io",
+    "vortex-compio",
     "vortex-cloud",
     "vortex-proto",
     "vortex-array",
@@ -127,6 +128,7 @@ cc = "1.2"
 cfg-if = "1.0.1"
 chrono = "0.4.44"
 clap = "4.5"
+compio = { version = "=0.18.0", default-features = false }
 compio-buf = "=0.8.0"
 criterion = { package = "codspeed-criterion-compat-walltime", version = "5.0.0" }
 crossterm = "0.29"
@@ -300,6 +302,7 @@ vortex-bytebool = { version = "0.1.0", path = "./encodings/bytebool", default-fe
 vortex-cloud = { version = "0.1.0", path = "./vortex-cloud", default-features = false }
 vortex-compressor = { version = "0.1.0", path = "./vortex-compressor", default-features = false }
 vortex-compute = { version = "0.1.0", path = "./vortex-compute", default-features = false }
+vortex-compio = { version = "0.1.0", path = "./vortex-compio", default-features = false }
 vortex-datafusion = { version = "0.1.0", path = "./vortex-datafusion", default-features = false }
 vortex-datetime-parts = { version = "0.1.0", path = "./encodings/datetime-parts", default-features = false }
 vortex-decimal-byte-parts = { version = "0.1.0", path = "encodings/decimal-byte-parts", default-features = false }
