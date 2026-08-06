@@ -78,6 +78,7 @@ use crate::duckdb::ExpressionClass::BoundComparison;
 use crate::duckdb::ExpressionClass::BoundConjunction;
 use crate::duckdb::ExpressionClass::BoundConstant;
 use crate::duckdb::ExpressionClass::BoundRef;
+use crate::duckdb::ExtractedValue;
 use crate::projection::DuckdbField;
 
 fn from_bound_str(value: &duckdb::ExpressionRef) -> VortexResult<String> {
@@ -440,6 +441,21 @@ pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
             ) {
                 return false;
             }
+            // x IN (1, NULL) is NULL when x is not in the list.
+            // list_contains has no way to express this logic
+            if matches!(
+                op.op,
+                DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_COMPARE_IN
+                    | DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_COMPARE_NOT_IN
+            ) && op.children().any(|child| {
+                matches!(
+                    child.as_class(),
+                    Some(BoundConstant(constant))
+                        if matches!(constant.value.extract(), ExtractedValue::Null)
+                )
+            }) {
+                return false;
+            }
             op.children().all(can_push_expression)
         }
         ExpressionClass::BoundAggregate(_) => false,
@@ -722,6 +738,13 @@ fn try_from_compare_in(
     else {
         return Ok(None);
     };
+
+    // x IN (1, NULL) is NULL for x not in the list.
+    // list_contains returns false instead of NULL
+    if list_elements.iter().any(Scalar::is_null) {
+        return Ok(None);
+    }
+
     let list = Scalar::list(
         Arc::new(list_elements[0].dtype().clone()),
         list_elements,

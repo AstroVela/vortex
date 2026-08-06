@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+# pushed filter literals of less common types must keep duckdb semantics
+
+include ../setup.slt.no
+
+statement ok
+CREATE TABLE tn(t TIME_NS);
+
+statement ok
+INSERT INTO tn VALUES ('10:00:00.123456789'), ('11:00:00');
+
+statement ok
+COPY tn TO '${WORK_DIR}/ftn.vortex';
+
+query I
+SELECT count(*) FROM tn WHERE t = TIME_NS '10:00:00.123456789';
+----
+1
+
+query I
+SELECT count(*) FROM '${WORK_DIR}/ftn.vortex' WHERE t = TIME_NS '10:00:00.123456789';
+----
+1
+
+query I
+SELECT count(*) FROM tn WHERE t > TIME_NS '10:30:00';
+----
+1
+
+query I
+SELECT count(*) FROM '${WORK_DIR}/ftn.vortex' WHERE t > TIME_NS '10:30:00';
+----
+1
+
+statement ok
+CREATE TABLE ts(s VARCHAR);
+
+statement ok
+INSERT INTO ts VALUES ('a%b'), ('axb');
+
+statement ok
+COPY ts TO '${WORK_DIR}/fts.vortex';
+
+query I
+SELECT count(*) FROM ts WHERE s LIKE 'a!%b' ESCAPE '!';
+----
+1
+
+query I
+SELECT count(*) FROM '${WORK_DIR}/fts.vortex' WHERE s LIKE 'a!%b' ESCAPE '!';
+----
+1
+
+statement ok
+CREATE TABLE ti(i INTEGER);
+
+statement ok
+INSERT INTO ti VALUES (1), (2), (NULL);
+
+statement ok
+COPY ti TO '${WORK_DIR}/fti.vortex';
+
+query I
+SELECT count(*) FROM ti WHERE i NOT IN (1, NULL);
+----
+0
+
+query I
+SELECT count(*) FROM '${WORK_DIR}/fti.vortex' WHERE i NOT IN (1, NULL);
+----
+0
+
+query I
+SELECT count(*) FROM ti WHERE i IN (1, NULL);
+----
+1
+
+query I
+SELECT count(*) FROM '${WORK_DIR}/fti.vortex' WHERE i IN (1, NULL);
+----
+1
+
+statement ok
+CREATE TABLE tst(s STRUCT(a INTEGER, b VARCHAR));
+
+statement ok
+INSERT INTO tst VALUES ({'a': 1, 'b': 'x'}), ({'a': 2, 'b': 'y'});
+
+statement ok
+COPY tst TO '${WORK_DIR}/fst.vortex';
+
+query I
+SELECT count(*) FROM tst WHERE s.a = 1;
+----
+1
+
+query I
+SELECT count(*) FROM '${WORK_DIR}/fst.vortex' WHERE s.a = 1;
+----
+1
