@@ -27,6 +27,8 @@ use vortex_array::expr::gt;
 use vortex_array::expr::is_null;
 use vortex_array::expr::lit;
 use vortex_array::expr::root;
+use vortex_array::expr::select;
+use vortex_array::expr::select_exclude;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_io::runtime::single::block_on;
@@ -279,6 +281,71 @@ fn struct_plan_optimization_visits_all_fields() -> VortexResult<()> {
             .to_string()
             .contains("No physical plan implementation for layout 'vortex.test.unsupported'")
     );
+    Ok(())
+}
+
+#[test]
+fn struct_select_preserves_struct_output() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone()), ("b", field_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![
+            flat(3, field_dtype.clone(), 0),
+            flat(3, field_dtype.clone(), 1),
+        ],
+    )
+    .into_layout();
+
+    let optimized = make_expression_plan(select(["a"], root()), make_plan(layout)?)?.optimize()?;
+
+    assert_eq!(
+        optimized.dtype(),
+        &DType::Struct(
+            StructFields::from_iter([("a", field_dtype)]),
+            Nullability::NonNullable,
+        )
+    );
+    insta::assert_snapshot!(optimized.tree_display(), @r"
+    root: ExpressionPlan({a=i32}, rows=3) expr=pack(a: $)
+      child: FlatPlan(i32, rows=3)
+    ");
+    Ok(())
+}
+
+#[test]
+fn struct_select_exclude_preserves_struct_output() -> VortexResult<()> {
+    let field_dtype = primitive(PType::I32, Nullability::NonNullable);
+    let layout = StructLayout::new(
+        3,
+        DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone()), ("b", field_dtype.clone())]),
+            Nullability::NonNullable,
+        ),
+        vec![
+            flat(3, field_dtype.clone(), 0),
+            flat(3, field_dtype.clone(), 1),
+        ],
+    )
+    .into_layout();
+
+    let optimized =
+        make_expression_plan(select_exclude(["b"], root()), make_plan(layout)?)?.optimize()?;
+
+    assert_eq!(
+        optimized.dtype(),
+        &DType::Struct(
+            StructFields::from_iter([("a", field_dtype)]),
+            Nullability::NonNullable,
+        )
+    );
+    insta::assert_snapshot!(optimized.tree_display(), @r"
+    root: ExpressionPlan({a=i32}, rows=3) expr=pack(a: $)
+      child: FlatPlan(i32, rows=3)
+    ");
     Ok(())
 }
 
