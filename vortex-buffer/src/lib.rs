@@ -45,6 +45,9 @@
 //! The `arrow` feature can be enabled to provide conversion functions to/from Arrow Rust buffers,
 //! including `arrow_buffer::Buffer`, `arrow_buffer::ScalarBuffer<T>`, and
 //! `arrow_buffer::OffsetBuffer`.
+//!
+//! The `compio` feature implements completion-based I/O buffer traits from `compio-buf` for
+//! [`ByteBuffer`] and [`ByteBufferMut`].
 
 pub use alignment::*;
 pub use bit::*;
@@ -61,6 +64,8 @@ mod bit;
 mod buffer;
 mod buffer_mut;
 mod bytes;
+#[cfg(feature = "compio")]
+mod compio;
 mod r#const;
 mod debug;
 mod dispatch;

@@ -18,6 +18,7 @@ all-features = true
 
 [features]
 arrow = []
+compio = ["dep:compio-buf"]
 memmap2 = ["dep:memmap2"]
 serde = ["dep:serde", "serde/serde_derive"]
 warn-copy = ["dep:tracing"]
@@ -26,6 +27,7 @@ warn-copy = ["dep:tracing"]
 arrow-buffer = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
+compio-buf = { workspace = true, optional = true }
 itertools = { workspace = true }
 memmap2 = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

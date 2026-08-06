@@ -1563,6 +1563,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "compio-buf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e8777c3ad31ab42f8a3a4a1bd629b78f688371df9b0f528d94dfbdbe5c945c9"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "compress-bench"
 version = "0.1.0"
 dependencies = [
@@ -9773,6 +9782,7 @@ dependencies = [
  "bitvec",
  "bytes",
  "codspeed-divan-compat",
+ "compio-buf",
  "itertools 0.14.0",
  "memmap2",
  "num-traits",

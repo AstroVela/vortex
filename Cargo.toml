@@ -127,6 +127,7 @@ cc = "1.2"
 cfg-if = "1.0.1"
 chrono = "0.4.44"
 clap = "4.5"
+compio-buf = "=0.8.0"
 criterion = { package = "codspeed-criterion-compat-walltime", version = "5.0.0" }
 crossterm = "0.29"
 cudarc = { version = "0.19.0", features = [
