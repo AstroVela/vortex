@@ -95,6 +95,8 @@ jobs:
           RUST_BACKTRACE: full
           VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
+          # Temporary: exercise the Compio path for the vortex-compio PR.
+          VORTEX_IO_RUNTIME: compio
         run: |
           python3 scripts/random-access-split.py
 
