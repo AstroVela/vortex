@@ -8,7 +8,7 @@ compaction: everything needed to start is here, and nothing below depends on cha
 
 ## Where things stand
 
-Branch `claude/strict-scalar-fn-abstraction-ah88x3`, at `4becc863ae` after the final API
+Branch `ct/row-fn`, at `4becc863ae` after the final API
 simplification. Issues #9128, #9129, and #9130 match the implementation. The public-path benchmark
 baseline from #9136 is now in the repository.
 

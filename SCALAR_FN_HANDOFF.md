@@ -14,7 +14,7 @@ The public design lives in these tracking issues, which now match the implementa
 - [#9129, Define the `RowFn` API](https://github.com/vortex-data/vortex/issues/9129)
 - [#9130, Execute `RowFn` over Vortex arrays](https://github.com/vortex-data/vortex/issues/9130)
 
-The branch is `claude/strict-scalar-fn-abstraction-ah88x3`. It is publicly linked from #9128, so do
+The branch is `ct/row-fn`. It is publicly linked from #9128, so do
 not rewrite or delete its history. Commit `4becc863ae` contains the final API simplification. Push
 only when explicitly requested.
 
