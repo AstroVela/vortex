@@ -358,14 +358,13 @@ fn multi_field_struct_expression_pushes_into_each_field() -> VortexResult<()> {
 
     insta::assert_snapshot!(optimized.tree_display(), @r"
     root: ExpressionPlan(bool, rows=3) expr=($.a and $.b)
-      child: StructPlan({a=bool, b=bool, c=i32}, rows=3)
+      child: StructPlan({a=bool, b=bool}, rows=3)
         a: DictPlan(bool, rows=3)
           codes: FlatPlan(u8, rows=3)
           values: ExpressionPlan(bool, rows=2) expr=($ > 5i32)
             child: FlatPlan(i32, rows=2)
         b: ExpressionPlan(bool, rows=3) expr=($ > 7i32)
           child: FlatPlan(i32, rows=3)
-        c: FlatPlan(i32, rows=3)
     ");
     assert_eq!(
         optimized.tree_display().to_string(),
@@ -385,10 +384,18 @@ fn multi_field_struct_expression_keeps_cross_field_refinement() -> VortexResult<
     let layout = StructLayout::new(
         3,
         DType::Struct(
-            StructFields::from_iter([("a", value_dtype.clone()), ("b", value_dtype.clone())]),
+            StructFields::from_iter([
+                ("a", value_dtype.clone()),
+                ("b", value_dtype.clone()),
+                ("c", value_dtype.clone()),
+            ]),
             Nullability::NonNullable,
         ),
-        vec![dictionary, flat(3, value_dtype, 2)],
+        vec![
+            dictionary,
+            flat(3, value_dtype.clone(), 2),
+            flat(3, value_dtype, 3),
+        ],
     )
     .into_layout();
     let expression = gt(
@@ -407,6 +414,10 @@ fn multi_field_struct_expression_keeps_cross_field_refinement() -> VortexResult<
           values: FlatPlan(i32, rows=2)
         b: FlatPlan(i32, rows=3)
     ");
+    assert_eq!(
+        optimized.tree_display().to_string(),
+        optimized.optimize()?.tree_display().to_string()
+    );
     Ok(())
 }
 
