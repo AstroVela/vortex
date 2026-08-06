@@ -227,7 +227,7 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
                 .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
             let lowered = replace(expanded, &col(field_name.clone()), root());
 
-            return Ok(Some(ExpressionPlan::try_new(lowered, field)?.optimize()?));
+            return Ok(Some(ExpressionPlan::try_new_ref(lowered, field)?));
         }
 
         let mut residual = partitioned.root;
@@ -271,7 +271,7 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
                 .children
                 .get(field_index)?
                 .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
-            let field = ExpressionPlan::try_new(expression, field)?.optimize()?;
+            let field = ExpressionPlan::try_new_ref(expression, field)?;
             pruned_fields.push((field_name, field));
         }
         let rewritten: PlanRef = Arc::new(child.with_pruned_fields(pruned_fields)?);
@@ -279,5 +279,111 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
         Ok(Some(Arc::new(ExpressionPlan::try_new(
             residual, rewritten,
         )?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::dtype::StructFields;
+    use vortex_array::expr::get_item;
+    use vortex_array::expr::root;
+    use vortex_error::VortexResult;
+    use vortex_session::registry::ReadContext;
+
+    use super::StructPlan;
+    use crate::LayoutRef;
+    use crate::layouts::flat::FlatLayout;
+    use crate::layouts::struct_::StructLayout;
+    use crate::plan::ExpressionPlan;
+    use crate::plan::LazyPlanChildren;
+    use crate::plan::Plan;
+    use crate::plan::PlanRef;
+    use crate::plan::RowIdxPlan;
+    use crate::segments::SegmentId;
+
+    struct CountingPlan {
+        dtype: DType,
+        optimizations: Arc<AtomicUsize>,
+    }
+
+    impl CountingPlan {
+        fn new_ref(dtype: DType, optimizations: Arc<AtomicUsize>) -> PlanRef {
+            Arc::new(Self {
+                dtype,
+                optimizations,
+            })
+        }
+    }
+
+    impl Plan for CountingPlan {
+        fn optimize(&self) -> VortexResult<PlanRef> {
+            self.optimizations.fetch_add(1, Ordering::Relaxed);
+            Ok(Self::new_ref(
+                self.dtype.clone(),
+                Arc::clone(&self.optimizations),
+            ))
+        }
+
+        fn dtype(&self) -> &DType {
+            &self.dtype
+        }
+
+        fn row_count(&self) -> u64 {
+            1
+        }
+    }
+
+    fn flat(dtype: DType, segment_id: u32) -> LayoutRef {
+        FlatLayout::new(1, dtype, SegmentId::from(segment_id), ReadContext::new([])).into_layout()
+    }
+
+    #[test]
+    fn expression_optimizes_only_referenced_struct_fields() -> VortexResult<()> {
+        let field_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let struct_dtype = DType::Struct(
+            StructFields::from_iter([("a", field_dtype.clone()), ("b", field_dtype.clone())]),
+            Nullability::NonNullable,
+        );
+        let layout = StructLayout::new(
+            1,
+            struct_dtype.clone(),
+            vec![flat(field_dtype.clone(), 0), flat(field_dtype.clone(), 1)],
+        );
+        let a_optimizations = Arc::new(AtomicUsize::new(0));
+        let b_optimizations = Arc::new(AtomicUsize::new(0));
+        let children: Arc<[Option<PlanRef>]> = [
+            Some(CountingPlan::new_ref(
+                field_dtype.clone(),
+                Arc::clone(&a_optimizations),
+            )),
+            Some(CountingPlan::new_ref(
+                field_dtype,
+                Arc::clone(&b_optimizations),
+            )),
+            None,
+        ]
+        .into();
+        let child_count = children.len();
+        let struct_plan: PlanRef = Arc::new(StructPlan {
+            layout,
+            dtype: struct_dtype,
+            children: LazyPlanChildren::new(child_count, move |index| {
+                Ok(children.get(index).cloned().flatten())
+            }),
+        });
+        let plan = RowIdxPlan::new_ref(0, struct_plan);
+
+        ExpressionPlan::try_new(get_item("a", root()), plan)?.optimize()?;
+
+        assert_eq!(a_optimizations.load(Ordering::Relaxed), 1);
+        assert_eq!(b_optimizations.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 }
