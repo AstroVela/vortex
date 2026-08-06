@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::TypeId;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -40,6 +41,54 @@ impl ExpressionPlan {
     pub fn child_plan(&self) -> &PlanRef {
         &self.child
     }
+
+    pub(crate) fn new_ref(expression: BoundExpression, child: PlanRef) -> PlanRef {
+        Arc::new(Self::new(expression, child))
+    }
+
+    fn optimize_top_down(&self, blocked_child_type: Option<TypeId>) -> VortexResult<PlanRef> {
+        if self.expression.is_root() {
+            return self.child.optimize();
+        }
+        if let Some(inner) = self.child.downcast_ref::<Self>() {
+            let expression = replace_root(self.expression.clone(), inner.expression.clone())?;
+            return Self::new(expression, Arc::clone(&inner.child)).optimize_top_down(None);
+        }
+
+        let child_type = self.child.as_ref().type_id();
+        let parent = Self::new_ref(self.expression.clone(), Arc::clone(&self.child));
+        if blocked_child_type != Some(child_type)
+            && let Some(rewritten) = reduce_parent(&parent, 0)?
+        {
+            return Self::optimize_rewrite(rewritten, child_type);
+        }
+
+        let child = self.child.optimize()?;
+        if let Some(inner) = child.downcast_ref::<Self>() {
+            let expression = replace_root(self.expression.clone(), inner.expression.clone())?;
+            return Self::new(expression, Arc::clone(&inner.child)).optimize_top_down(None);
+        }
+
+        let child_type = child.as_ref().type_id();
+        let parent = Self::new_ref(self.expression.clone(), child);
+        if blocked_child_type != Some(child_type)
+            && let Some(rewritten) = reduce_parent(&parent, 0)?
+        {
+            return Self::optimize_rewrite(rewritten, child_type);
+        }
+        Ok(parent)
+    }
+
+    fn optimize_rewrite(rewritten: PlanRef, previous_child_type: TypeId) -> VortexResult<PlanRef> {
+        let Some(expression) = rewritten.downcast_ref::<Self>() else {
+            return rewritten.optimize();
+        };
+        let child_type = expression.child.as_ref().type_id();
+        // A residual expression may remain above the same child kind after a successful rewrite.
+        // Do not immediately apply that rule again; recursively optimize only the retained child.
+        let blocked_child_type = (child_type == previous_child_type).then_some(previous_child_type);
+        expression.optimize_top_down(blocked_child_type)
+    }
 }
 
 impl Plan for ExpressionPlan {
@@ -48,19 +97,7 @@ impl Plan for ExpressionPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let child = self.child.optimize()?;
-        if self.expression.is_root() {
-            return Ok(child);
-        }
-        if let Some(inner) = child.downcast_ref::<Self>() {
-            let expression = replace_root(self.expression.clone(), inner.expression.clone())?;
-            return Self::new(expression, Arc::clone(&inner.child)).optimize();
-        }
-        let parent: PlanRef = Arc::new(Self::new(self.expression.clone(), child));
-        if let Some(rewritten) = reduce_parent(&parent, 0)? {
-            return Ok(rewritten);
-        }
-        Ok(parent)
+        self.optimize_top_down(None)
     }
 
     fn dtype(&self) -> &DType {

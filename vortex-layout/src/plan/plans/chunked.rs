@@ -116,7 +116,7 @@ impl PlanParentReduceRule<ChunkedPlan> for ExpressionChunkedRule {
         let dtype = expression.dtype().clone();
         let chunks = child
             .chunks
-            .try_map(|_, chunk| ExpressionPlan::new(expression.clone(), chunk).optimize())?;
+            .try_map(|_, chunk| Ok(ExpressionPlan::new_ref(expression.clone(), chunk)))?;
         Ok(Some(Arc::new(child.with_chunks(dtype, chunks))))
     }
 }

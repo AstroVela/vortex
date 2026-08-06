@@ -109,11 +109,12 @@ impl PlanParentReduceRule<RowIdxPlan> for ExpressionRowIdxRule {
                 RowIdxExpressionPartition::RowIdx => {
                     let expression = replace_row_idx(expression.clone())?;
                     let values = RowIdxValuesPlan::new_ref(child.row_offset, child.row_count());
-                    Ok(Some(ExpressionPlan::new(expression, values).optimize()?))
+                    Ok(Some(ExpressionPlan::new_ref(expression, values)))
                 }
-                RowIdxExpressionPartition::Child => Ok(Some(
-                    ExpressionPlan::new(expression.clone(), Arc::clone(&child.child)).optimize()?,
-                )),
+                RowIdxExpressionPartition::Child => Ok(Some(ExpressionPlan::new_ref(
+                    expression.clone(),
+                    Arc::clone(&child.child),
+                ))),
             };
         }
 
@@ -171,18 +172,16 @@ impl PlanParentReduceRule<RowIdxPlan> for ExpressionRowIdxRule {
         };
 
         let row_idx_expression = replace_row_idx(row_idx_expression)?;
-        let row_idx_plan = ExpressionPlan::new(
+        let row_idx_plan = ExpressionPlan::new_ref(
             row_idx_expression,
             RowIdxValuesPlan::new_ref(child.row_offset, child.row_count()),
-        )
-        .optimize()?;
-        let child_plan =
-            ExpressionPlan::new(child_expression, Arc::clone(&child.child)).optimize()?;
+        );
+        let child_plan = ExpressionPlan::new_ref(child_expression, Arc::clone(&child.child));
         let partitions = RowIdxPartitionPlan::try_new(row_idx_plan, child_plan)?;
         let residual =
             rewrite_partition_root(partitioned.root, partitions.dtype().clone(), &collapsed)?;
 
-        Ok(Some(ExpressionPlan::new(residual, partitions).optimize()?))
+        Ok(Some(ExpressionPlan::new_ref(residual, partitions)))
     }
 }
 

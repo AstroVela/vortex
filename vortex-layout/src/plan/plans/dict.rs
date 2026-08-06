@@ -133,8 +133,7 @@ impl PlanParentReduceRule<DictPlan> for ExpressionDictRule {
             return Ok(None);
         }
 
-        let values =
-            ExpressionPlan::new(expression.clone(), Arc::clone(&child.values)).optimize()?;
+        let values = ExpressionPlan::new_ref(expression.clone(), Arc::clone(&child.values));
         Ok(Some(Arc::new(
             child.with_children(Arc::clone(&child.codes), values),
         )))
