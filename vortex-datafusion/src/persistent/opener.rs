@@ -673,6 +673,7 @@ mod tests {
     use vortex::io::object_store::ObjectStoreWrite;
     use vortex::metrics::DefaultMetricsRegistry;
     use vortex::scan::selection::Selection;
+    use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
     use vortex::session::VortexSession;
     use vortex_arrow::FromArrowArray;
 
@@ -1504,8 +1505,6 @@ mod tests {
     // Test that Selection::IncludeByIndex filters to specific row indices.
     async fn test_selection_include_by_index() -> anyhow::Result<()> {
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
-        use vortex::buffer::Buffer;
-        use vortex::scan::selection::Selection;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "/path/file.vortex";
@@ -1519,7 +1518,7 @@ mod tests {
         file.extensions
             .insert(
                 VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
-                    Buffer::from_iter(vec![1, 3, 5, 7]),
+                    StrictSortedBuffer::try_new(Buffer::from_iter(vec![1, 3, 5, 7]))?,
                 )),
             );
 
@@ -1563,7 +1562,7 @@ mod tests {
         file.extensions
             .insert(
                 VortexAccessPlan::default().with_selection(Selection::ExcludeByIndex(
-                    Buffer::from_iter(vec![0, 2, 4, 6, 8]),
+                    StrictSortedBuffer::try_new(Buffer::from_iter(vec![0, 2, 4, 6, 8]))?,
                 )),
             );
 
