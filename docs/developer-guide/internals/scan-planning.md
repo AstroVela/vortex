@@ -25,9 +25,10 @@ general logical query plan.
 Every rewrite must preserve the query result, including its dtype, row domain, row order, row
 identity, null behavior, and observable errors.
 
-## Future execution
+## Execution
 
-Plans currently stop at construction and optimization. A future PR will add a method for executing
-an optimized plan. That method will walk the physical plan, read the referenced layout data,
-evaluate its expressions, and return the result of the query. The execution API and return type
-will be defined as part of that integration rather than fixed by the planning IR today.
+Each plan node can execute a row range and selection mask. Leaf plans read their referenced
+segments, structural plans combine their children, and expression plans evaluate the remaining
+derived work. The separate `vortex-scan-v2` crate copies the existing scan orchestration around
+this API so the original `LayoutReader` scanner remains unchanged while the plan-native path is
+developed.

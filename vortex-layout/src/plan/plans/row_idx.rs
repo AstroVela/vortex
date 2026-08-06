@@ -4,8 +4,14 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
+use futures::try_join;
+use vortex_array::IntoArray;
+use vortex_array::MaskFuture;
+use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
@@ -16,13 +22,19 @@ use vortex_array::expr::root;
 use vortex_array::expr::transform::partition;
 use vortex_array::expr::transform::replace;
 use vortex_array::scalar_fn::fns::pack::Pack;
+use vortex_array::validity::Validity;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 
 use crate::layouts::row_idx::RowIdx;
+use crate::layouts::row_idx::idx_array;
 use crate::layouts::row_idx::row_idx;
 use crate::plan::ExpressionPlan;
 use crate::plan::Plan;
+use crate::plan::PlanArrayFuture;
+use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::optimizer::PlanParentReduceRule;
 
@@ -46,6 +58,15 @@ impl Plan for RowIdxPlan {
 
     fn optimize(&self) -> VortexResult<PlanRef> {
         Ok(Self::new_ref(self.row_offset, self.child.optimize()?))
+    }
+
+    fn execute(
+        &self,
+        ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        self.child.execute(ctx, row_range, mask)
     }
 
     fn dtype(&self) -> &DType {
@@ -242,6 +263,40 @@ impl Plan for RowIdxValuesPlan {
         Ok(Self::new_ref(self.row_offset, self.row_count))
     }
 
+    fn execute(
+        &self,
+        _ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        vortex_ensure!(
+            row_range.start <= row_range.end && row_range.end <= self.row_count,
+            "Row-index plan row range {:?} is outside 0..{}",
+            row_range,
+            self.row_count
+        );
+        vortex_ensure!(
+            mask.len() == usize::try_from(row_range.end - row_range.start)?,
+            "Row-index plan mask length mismatch"
+        );
+        vortex_ensure!(
+            self.row_offset.checked_add(row_range.start).is_some()
+                && (row_range.is_empty()
+                    || self.row_offset.checked_add(row_range.end - 1).is_some()),
+            "Row-index plan offset overflows u64"
+        );
+        let array = idx_array(self.row_offset, row_range).into_array();
+        Ok(async move {
+            let mask = mask.await?;
+            if mask.all_true() {
+                Ok(array)
+            } else {
+                array.filter(mask)
+            }
+        }
+        .boxed())
+    }
+
     fn dtype(&self) -> &DType {
         &self.dtype
     }
@@ -306,6 +361,30 @@ impl Plan for RowIdxPartitionPlan {
 
     fn optimize(&self) -> VortexResult<PlanRef> {
         Self::try_new(self.row_idx.optimize()?, self.child.optimize()?)
+    }
+
+    fn execute(
+        &self,
+        ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        let row_idx = self.row_idx.execute(ctx, row_range, mask.clone())?;
+        let child = self.child.execute(ctx, row_range, mask)?;
+        let fields = self
+            .dtype
+            .as_struct_fields_opt()
+            .vortex_expect("RowIdxPartitionPlan dtype must be a struct");
+        let names = fields.names().clone();
+        Ok(async move {
+            let (row_idx, child) = try_join!(row_idx, child)?;
+            let len = child.len();
+            Ok(
+                StructArray::try_new(names, vec![row_idx, child], len, Validity::NonNullable)?
+                    .into_array(),
+            )
+        }
+        .boxed())
     }
 
     fn dtype(&self) -> &DType {

@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
+use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -11,6 +13,8 @@ use vortex_error::vortex_err;
 
 use crate::LayoutRef;
 use crate::plan::Plan;
+use crate::plan::PlanArrayFuture;
+use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
 
@@ -67,6 +71,15 @@ impl Plan for ZonedPlan {
         let data = self.data.optimize()?;
         let zones = self.zones.optimize()?;
         Ok(Arc::new(self.with_children(data, zones)))
+    }
+
+    fn execute(
+        &self,
+        ctx: &PlanExecutionContext,
+        row_range: &Range<u64>,
+        mask: MaskFuture,
+    ) -> VortexResult<PlanArrayFuture> {
+        self.data.execute(ctx, row_range, mask)
     }
 
     fn dtype(&self) -> &DType {
