@@ -308,10 +308,9 @@ fn plan_display_matches_array_tree_display_shape() -> VortexResult<()> {
         vec![flat(3, field_dtype.clone(), 0), flat(3, field_dtype, 1)],
     )
     .into_layout();
-    let plan: PlanRef = Arc::new(ExpressionPlan::try_new(
-        get_item("a", root()),
-        make_plan(layout)?,
-    )?);
+    let child = make_plan(layout)?;
+    let expression = get_item("a", root()).bind(child.dtype())?;
+    let plan: PlanRef = Arc::new(ExpressionPlan::new(expression, child));
 
     assert_eq!(plan.to_string(), "ExpressionPlan(i32, rows=3)");
     insta::assert_snapshot!(plan.tree_display(), @r"
@@ -442,12 +441,13 @@ fn list_plan_display_handles_optional_validity() -> VortexResult<()> {
 fn row_idx_plan_preserves_row_index_expressions() -> VortexResult<()> {
     let layout = flat(3, primitive(PType::I32, Nullability::NonNullable), 0);
     let plan = RowIdxPlan::new_ref(10, make_plan(layout)?);
-    let plan = ExpressionPlan::try_new(row_idx(), plan)?.optimize()?;
+    let bound_expression = row_idx().bind(plan.dtype())?;
+    let plan = ExpressionPlan::new(bound_expression.clone(), plan).optimize()?;
     let expression = plan
         .downcast_ref::<ExpressionPlan>()
         .ok_or_else(|| vortex_err!("optimized plan is not an expression plan"))?;
 
-    assert_eq!(expression.expression(), &row_idx());
+    assert_eq!(expression.expression(), &bound_expression);
     assert!(expression.child_plan().is::<RowIdxPlan>());
     assert_eq!(expression.row_count(), 3);
     Ok(())
