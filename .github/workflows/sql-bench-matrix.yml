@@ -84,10 +84,32 @@ jobs:
             target/release_debug/duckdb-bench
             target/release_debug/lance-bench
             target/release_debug/build/vortex-duckdb-cache/duckdb-lib-*-prebuilt/libduckdb.so
+
+  # Runs alongside `bench` rather than inside `build`: the debuginfo upload is best-effort and
+  # only needs to land before profiles are symbolized, so blocking the build job (and therefore
+  # every bench job) on it just serializes two independent uploads of the same binaries.
+  debuginfo:
+    needs: build
+    if: inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false
+    # Best-effort, as it was when it ran inside `build`: a failed upload costs symbolized
+    # profiles, not benchmark results.
+    continue-on-error: true
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: bench-binaries
+          path: target/release_debug/
       - name: Pre-upload SQL benchmark debuginfo to Polar Signals
-        if: inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false
         uses: ./.github/actions/upload-parca-debuginfo
-        continue-on-error: true
         with:
           paths: |
             target/release_debug/datafusion-bench
