@@ -220,6 +220,10 @@ async fn run_compress(
     })
     .collect();
 
+    // Fetch every dataset's remote inputs up front so downloads run in parallel instead of
+    // serially as each benchmark first touches its data.
+    futures::future::try_join_all(datasets.iter().map(|d| d.download())).await?;
+
     let progress = ProgressBar::new((datasets.len() * formats.len() * ops.len()) as u64);
 
     let mut measurements = vec![];

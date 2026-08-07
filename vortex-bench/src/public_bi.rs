@@ -25,13 +25,9 @@ use tokio::process::Command as TokioCommand;
 use tracing::info;
 use tracing::trace;
 use url::Url;
-use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
-use vortex::array::stream::ArrayStreamExt;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::utils::aliases::hash_map::HashMap;
 
@@ -462,25 +458,8 @@ impl Dataset for PBIBenchmark {
         (&self.name, None)
     }
 
-    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> anyhow::Result<ArrayRef> {
-        let dataset = self.dataset()?;
-        dataset.write_as_vortex().await?;
-        // reading only the first table, each table in a PBI benchmark
-        // has its own schema.
-        let path = dataset
-            .list_files(FileType::Vortex)
-            .first()
-            .ok_or_else(|| anyhow!("must have at least one table"))?
-            .clone();
-
-        Ok(SESSION
-            .open_options()
-            .open_path(path.as_path())
-            .await?
-            .scan()?
-            .into_array_stream()?
-            .read_all()
-            .await?)
+    async fn download(&self) -> anyhow::Result<()> {
+        self.dataset()?.download_bzips().await
     }
 
     async fn to_parquet_path(&self) -> anyhow::Result<PathBuf> {
