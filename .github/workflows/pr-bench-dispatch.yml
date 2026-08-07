@@ -23,11 +23,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-all
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-all"
 
   all-random-access-bench:
     needs: remove-all-label
@@ -82,11 +84,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-random-access
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-random-access"
 
   random-access-bench:
     needs: remove-random-access-label
@@ -105,11 +109,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-compress
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-compress"
 
   compression-bench:
     needs: remove-compress-label
@@ -128,11 +134,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-string
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-string"
 
   string-bench:
     needs: remove-string-label
@@ -151,11 +159,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-gpu-compress
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-gpu-compress"
 
   gpu-compress-bench:
     needs: remove-gpu-compress-label
@@ -171,11 +181,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-sql
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-sql"
 
   sql-bench:
     needs: remove-sql-label
@@ -200,11 +212,13 @@ jobs:
     permissions:
       pull-requests: write  # for label removal
     steps:
-      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1
+      - name: Remove benchmark label
         if: github.event.pull_request.head.repo.full_name == 'vortex-data/vortex'
-        with:
-          labels: action/bench-sql-compact
-          fail_on_error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label "action/bench-sql-compact"
 
   sql-compact-bench:
     needs: remove-sql-compact-label
