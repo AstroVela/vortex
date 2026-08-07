@@ -135,6 +135,33 @@ impl Handle {
         }
     }
 
+    /// Spawn an I/O future that must be constructed and polled on one runtime thread.
+    ///
+    /// This is intended for runtimes such as io_uring where request futures may carry
+    /// thread-local state and therefore cannot implement `Send`.
+    pub fn spawn_local_io<F, Fut, R>(&self, f: F) -> Task<R>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        let (send, recv) = oneshot::channel();
+        let span = tracing::trace_span!(target: "vortex_io::spawn_local_io", "spawn_local_io");
+        let abort_handle = self.runtime().spawn_local_io(Box::new(move || {
+            async move {
+                // See `spawn`: catch a panic so it re-raises on the joining side.
+                let output = AssertUnwindSafe(f()).catch_unwind().await;
+                drop(send.send(output));
+            }
+            .instrument(span)
+            .boxed_local()
+        }));
+        Task {
+            recv: recv.into_future(),
+            abort_handle: Some(abort_handle),
+        }
+    }
+
     /// Spawn a CPU-bound task for execution on the runtime.
     ///
     /// Note that many runtimes will interleave this work on the same async runtime. See the

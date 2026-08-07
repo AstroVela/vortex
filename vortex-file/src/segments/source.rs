@@ -24,9 +24,9 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
-use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
 use vortex_io::runtime::JoinOutcome;
+use vortex_io::{VortexLocalReadAt, VortexReadAt};
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
@@ -176,6 +176,97 @@ impl FileSegmentSource {
                 // Poll for the terminal outcome without re-raising: a benign abort (runtime
                 // teardown) resolves to `()` so readers report a graceful error, while a panic is
                 // stashed for the first reader to re-raise.
+                if let JoinOutcome::Panicked(panic) = future::poll_fn(|cx| task.poll_join(cx)).await
+                {
+                    *driver_panic.lock() = Some(panic);
+                }
+            }
+            .boxed()
+            .shared()
+        };
+
+        Self {
+            segments,
+            events: send,
+            driver,
+            driver_panic,
+            next_id: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Open a file-backed segment source over a reader whose read futures are local to one I/O
+    /// runtime thread.
+    ///
+    /// Segment request futures remain `Send`; the local read futures are constructed and polled
+    /// inside one runtime-local driver spawned through [`Handle::spawn_local_io`].
+    pub fn open_local<R: VortexLocalReadAt + Clone>(
+        segments: Arc<[SegmentSpec]>,
+        reader: R,
+        handle: Handle,
+        metrics: RequestMetrics,
+    ) -> Self {
+        let (send, recv) = mpsc::unbounded();
+
+        let max_alignment = segments
+            .iter()
+            .map(|segment| segment.alignment)
+            .max()
+            .unwrap_or_else(Alignment::none);
+        let coalesce_config = reader.coalesce_config().map(|mut config| {
+            let extra = (*max_alignment as u64).saturating_sub(1);
+            config.max_size = config.max_size.saturating_add(extra);
+            config
+        });
+        let concurrency = reader.concurrency();
+        if concurrency == 0 {
+            vortex_panic!(
+                "VortexLocalReadAt::concurrency returned 0 (uri={:?}); this would stall I/O",
+                reader.uri()
+            );
+        }
+
+        let stream = IoRequestStream::new(
+            StreamExt::boxed(recv),
+            coalesce_config,
+            max_alignment,
+            metrics,
+        )
+        .boxed();
+
+        let mut task = handle.spawn_local_io(move || {
+            async move {
+                stream
+                    .map(move |req| {
+                        let reader = reader.clone();
+                        async move {
+                            let result = reader
+                                .read_at_local(req.offset(), req.len(), req.alignment())
+                                .await;
+                            let result = result.and_then(|buffer| {
+                                if req.len() != buffer.len() {
+                                    vortex_bail!(
+                                        "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
+                                        req.len(),
+                                        buffer.len(),
+                                        req
+                                    )
+                                }
+                                Ok(buffer)
+                            });
+
+                            req.resolve(result);
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect::<()>()
+                    .await
+            }
+            .boxed_local()
+        });
+        let driver_panic: DriverPanic = Arc::new(Mutex::new(None));
+        let driver = {
+            let driver_panic = Arc::clone(&driver_panic);
+            async move {
                 if let JoinOutcome::Panicked(panic) = future::poll_fn(|cx| task.poll_join(cx)).await
                 {
                     *driver_panic.lock() = Some(panic);

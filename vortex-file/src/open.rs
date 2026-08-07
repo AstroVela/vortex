@@ -13,8 +13,8 @@ use vortex_buffer::ByteBuffer;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_io::VortexReadAt;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_io::{VortexLocalReadAt, VortexReadAt};
 use vortex_layout::segments::InstrumentedSegmentCache;
 use vortex_layout::segments::NoOpSegmentCache;
 use vortex_layout::segments::SegmentCache;
@@ -283,6 +283,59 @@ impl VortexOpenOptions {
         })
     }
 
+    /// Open a [`VortexFile`] using a reader whose I/O futures must stay local to one runtime
+    /// thread.
+    pub async fn open_read_local<R: VortexLocalReadAt + Clone>(
+        self,
+        reader: R,
+    ) -> VortexResult<VortexFile> {
+        let segment_cache = self
+            .segment_cache
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoOpSegmentCache));
+
+        let metrics_registry = self
+            .metrics_registry
+            .clone()
+            .unwrap_or_else(|| Arc::new(DefaultMetricsRegistry::default()));
+
+        let footer = if let Some(footer) = self.footer {
+            footer
+        } else {
+            self.read_footer_local(&reader).await?
+        };
+
+        let segment_cache = Arc::new(InstrumentedSegmentCache::new(
+            InitialReadSegmentCache {
+                initial: self.initial_read_segments,
+                fallback: segment_cache,
+            },
+            metrics_registry.as_ref(),
+            self.labels.clone(),
+        ));
+
+        let metrics = RequestMetrics::new(metrics_registry.as_ref(), self.labels);
+
+        let segment_source = Arc::new(SharedSegmentSource::new(FileSegmentSource::open_local(
+            Arc::clone(footer.segment_map()),
+            reader,
+            self.session.handle(),
+            metrics,
+        )));
+
+        let segment_source = Arc::new(SegmentCacheSourceAdapter::new(
+            segment_cache,
+            segment_source,
+        ));
+
+        let file = VortexFile::new(footer, segment_source, self.session.clone());
+        Ok(if self.cache_layout_reader {
+            file.with_caching()
+        } else {
+            file
+        })
+    }
+
     async fn read_footer(&self, read: &dyn VortexReadAt) -> VortexResult<Footer> {
         // Fetch the file size and perform the initial read.
         let file_size = match self.file_size {
@@ -325,6 +378,50 @@ impl VortexOpenOptions {
 
         // If the initial read happened to cover any segments, then we can populate the
         // segment cache
+        let initial_offset = file_size - (deserializer.buffer().len() as u64);
+        self.populate_initial_segments(initial_offset, deserializer.buffer(), &footer);
+
+        Ok(footer)
+    }
+
+    async fn read_footer_local(&self, read: &dyn VortexLocalReadAt) -> VortexResult<Footer> {
+        let file_size = match self.file_size {
+            None => read.size().await?,
+            Some(file_size) => file_size,
+        };
+        let mut initial_read_size = self
+            .initial_read_size
+            .max(MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE);
+        if let Ok(file_size) = usize::try_from(file_size) {
+            initial_read_size = initial_read_size.min(file_size);
+        }
+
+        let initial_offset = file_size - initial_read_size as u64;
+        let initial_read: ByteBuffer = read
+            .read_at_local(initial_offset, initial_read_size, Alignment::none())
+            .await?
+            .try_into_host()?
+            .await?;
+
+        let mut deserializer = Footer::deserializer(initial_read, self.session.clone())
+            .with_size(file_size)
+            .with_some_dtype(self.dtype.clone());
+
+        let footer = loop {
+            match deserializer.deserialize()? {
+                DeserializeStep::NeedMoreData { offset, len } => {
+                    let more_data = read
+                        .read_at_local(offset, len, Alignment::none())
+                        .await?
+                        .try_into_host()?
+                        .await?;
+                    deserializer.prefix_data(more_data);
+                }
+                DeserializeStep::NeedFileSize => unreachable!("We passed file_size above"),
+                DeserializeStep::Done(footer) => break Ok::<_, VortexError>(footer),
+            }
+        }?;
+
         let initial_offset = file_size - (deserializer.buffer().len() as u64);
         self.populate_initial_segments(initial_offset, deserializer.buffer(), &footer);
 

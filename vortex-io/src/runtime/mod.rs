@@ -13,6 +13,7 @@
 //! * Tokio: work is driven on a Tokio runtime provided by the caller.
 
 use futures::future::BoxFuture;
+use futures::future::LocalBoxFuture;
 
 mod blocking;
 pub use blocking::*;
@@ -50,6 +51,17 @@ pub trait Executor: Send + Sync {
     /// By default, it just calls `Executor::spawn`.
     fn spawn_io(&self, fut: BoxFuture<'static, ()>) -> AbortHandleRef {
         self.spawn(fut)
+    }
+
+    /// Spawns a future doing I/O that must be constructed and polled on one runtime thread.
+    ///
+    /// The factory is `Send` so runtimes may route it to an I/O worker before constructing the
+    /// returned `!Send` future.
+    fn spawn_local_io(
+        &self,
+        _future: Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send + 'static>,
+    ) -> AbortHandleRef {
+        vortex_error::vortex_panic!("runtime does not support local I/O futures")
     }
 
     /// Spawns a CPU-bound task for execution on the runtime.

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures::Stream;
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::future::LocalBoxFuture;
 use futures::stream::LocalBoxStream;
 use parking_lot::Mutex;
 use smol::LocalExecutor;
@@ -39,6 +40,7 @@ impl Default for SingleThreadRuntime {
 
 struct Sender {
     scheduling: kanal::Sender<SpawnAsync<'static>>,
+    local_io: kanal::Sender<SpawnLocalAsync<'static>>,
     cpu: kanal::Sender<SpawnSync<'static>>,
     blocking: kanal::Sender<SpawnSync<'static>>,
 }
@@ -46,6 +48,7 @@ struct Sender {
 impl Sender {
     fn new(local: &Rc<LocalExecutor<'static>>) -> Self {
         let (scheduling_send, scheduling_recv) = kanal::unbounded::<SpawnAsync>();
+        let (local_io_send, local_io_recv) = kanal::unbounded::<SpawnLocalAsync>();
         let (cpu_send, cpu_recv) = kanal::unbounded::<SpawnSync>();
         let (blocking_send, blocking_recv) = kanal::unbounded::<SpawnSync>();
 
@@ -64,6 +67,23 @@ impl Sender {
                             spawn
                                 .task_callback
                                 .send(SmolAbortHandle::new_handle(local.spawn(spawn.future))),
+                        );
+                    }
+                }
+            })
+            .detach();
+
+        // Drive local I/O tasks. The future is constructed on this thread so it may capture
+        // runtime-local state and does not need to be Send.
+        let weak_local2 = RcWeak::clone(&weak_local);
+        local
+            .spawn(async move {
+                while let Ok(spawn) = local_io_recv.as_async().recv().await {
+                    if let Some(local) = weak_local2.upgrade() {
+                        drop(
+                            spawn
+                                .task_callback
+                                .send(SmolAbortHandle::new_handle(local.spawn((spawn.future)()))),
                         );
                     }
                 }
@@ -104,6 +124,7 @@ impl Sender {
 
         Self {
             scheduling: scheduling_send,
+            local_io: local_io_send,
             cpu: cpu_send,
             blocking: blocking_send,
         }
@@ -118,6 +139,22 @@ impl Executor for Sender {
     fn spawn(&self, future: BoxFuture<'static, ()>) -> AbortHandleRef {
         let (send, recv) = oneshot::channel();
         if let Err(e) = self.scheduling.send(SpawnAsync {
+            future,
+            task_callback: send,
+        }) {
+            vortex_panic!("Executor missing: {}", e);
+        }
+        Box::new(LazyAbortHandle {
+            task: Mutex::new(recv),
+        })
+    }
+
+    fn spawn_local_io(
+        &self,
+        future: Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send + 'static>,
+    ) -> AbortHandleRef {
+        let (send, recv) = oneshot::channel();
+        if let Err(e) = self.local_io.send(SpawnLocalAsync {
             future,
             task_callback: send,
         }) {
@@ -220,6 +257,11 @@ where
 /// a race where the caller detaches the LazyAbortHandle before the smol::Task has been launched.
 struct SpawnAsync<'rt> {
     future: BoxFuture<'rt, ()>,
+    task_callback: oneshot::Sender<AbortHandleRef>,
+}
+
+struct SpawnLocalAsync<'rt> {
+    future: Box<dyn FnOnce() -> LocalBoxFuture<'rt, ()> + Send + 'rt>,
     task_callback: oneshot::Sender<AbortHandleRef>,
 }
 

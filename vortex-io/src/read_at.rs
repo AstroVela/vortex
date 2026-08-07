@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::future::LocalBoxFuture;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
@@ -89,6 +90,37 @@ pub trait VortexReadAt: Send + Sync + 'static {
         length: usize,
         alignment: Alignment,
     ) -> BoxFuture<'static, VortexResult<BufferHandle>>;
+}
+
+/// A random-access source whose read futures are local to the I/O thread that polls them.
+///
+/// The reader value itself remains `Send + Sync` so it can be assigned to an I/O worker, but each
+/// concrete read future may borrow runtime-local state and does not need to implement `Send`.
+pub trait VortexLocalReadAt: Send + Sync + 'static {
+    /// URI for debugging/logging. Returns `None` for anonymous sources.
+    fn uri(&self) -> Option<&Arc<str>> {
+        None
+    }
+
+    /// Configuration for merging nearby I/O requests into fewer, larger reads.
+    fn coalesce_config(&self) -> Option<CoalesceConfig> {
+        None
+    }
+
+    /// Maximum number of concurrent local I/O requests for this source.
+    fn concurrency(&self) -> usize;
+
+    /// Asynchronously get the number of bytes of the underlying source.
+    fn size(&self) -> BoxFuture<'static, VortexResult<u64>>;
+
+    /// Request an asynchronous positional read whose future must be polled on the local I/O
+    /// runtime thread that owns the source.
+    fn read_at_local(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> LocalBoxFuture<'static, VortexResult<BufferHandle>>;
 }
 
 impl VortexReadAt for Arc<dyn VortexReadAt> {
