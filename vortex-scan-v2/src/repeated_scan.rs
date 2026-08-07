@@ -25,6 +25,7 @@ use vortex_layout::plan::PlanRef;
 use vortex_scan::selection::Selection;
 use vortex_utils::parallelism::get_available_parallelism;
 
+use crate::scan_builder::LazyPruningPlan;
 use crate::splits::Splits;
 use crate::tasks::TaskContext;
 use crate::tasks::split_exec;
@@ -33,7 +34,7 @@ use crate::tasks::split_exec;
 pub struct RepeatedScan<A: 'static + Send> {
     execution: PlanExecutionContext,
     projection: PlanRef,
-    pruning: Option<PlanRef>,
+    pruning: LazyPruningPlan,
     filter: Option<PlanRef>,
     ordered: bool,
     row_range: Option<Range<u64>>,
@@ -81,7 +82,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
     pub(crate) fn new(
         execution: PlanExecutionContext,
         projection: PlanRef,
-        pruning: Option<PlanRef>,
+        pruning: LazyPruningPlan,
         filter: Option<PlanRef>,
         ordered: bool,
         row_range: Option<Range<u64>>,
@@ -162,7 +163,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
 
         let ctx = Arc::new(TaskContext {
             execution: self.execution.clone(),
-            pruning: self.pruning.clone(),
+            pruning: self.pruning.get(self.execution.session())?,
             filter: self.filter.clone(),
             projection: Arc::clone(&self.projection),
             mapper: Arc::clone(&self.map_fn),

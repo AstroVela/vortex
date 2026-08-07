@@ -10,6 +10,7 @@ use std::task::ready;
 
 use futures::Stream;
 use futures::StreamExt;
+use once_cell::sync::OnceCell;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use vortex_array::ArrayRef;
@@ -257,12 +258,12 @@ impl<A: 'static + Send> ScanBuilder<A> {
         );
         let projection = optimize_projection_plan(self.projection, &source)?;
         let filter_expression = optimize_filter_expression(self.filter, &source)?;
-        let pruning = optimize_pruning_plan(
-            filter_expression.as_ref(),
-            &source,
-            self.execution.session(),
-        )?;
         let filter = optimize_filter_plan(filter_expression.as_ref(), &source)?;
+        // Deriving and optimizing the statistics falsifier is the most expensive planning
+        // phase, and its plan never contributes split boundaries: pruning leaves read zone
+        // maps whose data children are absent. Defer it to first execution, mirroring the
+        // LayoutReader scan where zoned readers derive pruning proofs lazily.
+        let pruning = LazyPruningPlan::new(filter_expression, Arc::clone(&source));
 
         let splits =
             if let Some(ranges) = attempt_split_ranges(&self.selection, self.row_range.as_ref()) {
@@ -274,7 +275,6 @@ impl<A: 'static + Send> ScanBuilder<A> {
                     .unwrap_or_else(|| 0..self.base_plan.row_count());
                 let mut plans = vec![&projection];
                 plans.extend(filter.as_ref());
-                plans.extend(pruning.as_ref());
                 Splits::Natural(self.split_by.splits(&plans, &row_range)?)
             };
         match &splits {
@@ -366,6 +366,37 @@ fn optimize_filter_expression(
                 .bind(source.dtype())
         })
         .transpose()
+}
+
+/// Lazily derives the statistics pruning plan for a prepared scan.
+///
+/// The falsifier derivation and its plan optimization only matter once a split actually
+/// executes, so [`RepeatedScan`] initializes this on first use and shares the result across
+/// splits and repeated executions.
+pub(crate) struct LazyPruningPlan {
+    filter: Option<BoundExpression>,
+    source: PlanRef,
+    plan: OnceCell<Option<PlanRef>>,
+}
+
+impl LazyPruningPlan {
+    pub(crate) fn new(filter: Option<BoundExpression>, source: PlanRef) -> Self {
+        Self {
+            filter,
+            source,
+            plan: OnceCell::new(),
+        }
+    }
+
+    /// Returns the optimized pruning plan, deriving and caching it on first use.
+    pub(crate) fn get(&self, session: &VortexSession) -> VortexResult<Option<PlanRef>> {
+        let Some(filter) = self.filter.as_ref() else {
+            return Ok(None);
+        };
+        self.plan
+            .get_or_try_init(|| optimize_pruning_plan(Some(filter), &self.source, session))
+            .cloned()
+    }
 }
 
 fn optimize_pruning_plan(

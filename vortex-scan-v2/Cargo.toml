@@ -16,6 +16,7 @@ version = { workspace = true }
 [dependencies]
 futures = { workspace = true, features = ["alloc", "async-await"] }
 itertools = { workspace = true }
+once_cell = { workspace = true, features = ["parking_lot"] }
 tracing = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
