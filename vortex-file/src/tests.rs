@@ -2755,3 +2755,66 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     assert_eq!(result.len(), 1);
     Ok(())
 }
+
+/// A multi-limb array handed to the file writer must not reach the file as one.
+///
+/// Two independent mechanisms stop it, and this pins the one that applies here: the writer
+/// recompresses its input, and the decimal scheme declines to split values too wide for a
+/// single signed part, so the column lands as a canonical decimal with no children. The other
+/// mechanism — `serialize` refusing outright — is the backstop for a write strategy that does
+/// not recompress, and is covered in the encoding crate.
+#[cfg(not(feature = "unstable_encodings"))]
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_lower_parts_do_not_reach_a_file_without_unstable_encodings() -> VortexResult<()> {
+    use vortex_decimal_byte_parts::DecimalByteParts;
+    use vortex_decimal_byte_parts::split_decimal;
+
+    let decimal = DecimalArray::new(
+        (0..64i128)
+            .map(|i| (1i128 << 70) + i)
+            .collect::<Buffer<i128>>(),
+        DecimalDType::new(38, 2),
+        Validity::NonNullable,
+    );
+
+    // Building the encoded array is allowed; only getting it into a file is restricted.
+    let parts = split_decimal(&decimal)?;
+    assert_eq!(parts.lower_parts.len(), 1, "expected a wide split");
+    let encoded = DecimalByteParts::try_new_with_lower_parts(
+        parts.msp,
+        parts.lower_parts,
+        decimal.decimal_dtype(),
+    )?
+    .into_array();
+
+    let st = StructArray::from_fields(&[("wide", encoded)])?.into_array();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, st.clone().to_array_stream())
+        .await?;
+
+    let chunks: Vec<_> = SESSION
+        .open_options()
+        .open_buffer(buf)?
+        .scan()?
+        .into_array_stream()?
+        .try_collect()
+        .await?;
+
+    for chunk in &chunks {
+        for field in chunk.children_iter() {
+            assert!(
+                field.as_opt::<DecimalByteParts>().is_none(),
+                "expected a canonical decimal in the file, got {}",
+                field.encoding_id()
+            );
+        }
+    }
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let read = ChunkedArray::try_new(chunks, st.dtype().clone())?.into_array();
+    assert_arrays_eq!(st, read, &mut ctx);
+    Ok(())
+}
