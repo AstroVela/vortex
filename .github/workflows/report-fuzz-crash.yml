@@ -70,6 +70,8 @@ jobs:
 
       - name: Extract crash info
         id: extract
+        env:
+          INPUTS_CRASH_FILE: ${{ inputs.crash_file }}
         run: |
           python3 -m fuzz_report extract \
             logs/fuzz_output.log \
@@ -87,8 +89,7 @@ jobs:
             echo "crash_found=false" >> "$GITHUB_OUTPUT"
           else
             echo "crash_found=true" >> "$GITHUB_OUTPUT"
-          fi        env:
-          INPUTS_CRASH_FILE: ${{ inputs.crash_file }}
+          fi
 
       - name: Skip if no crash found
         if: steps.extract.outputs.crash_found != 'true'
@@ -148,6 +149,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.gh_token }}
           INPUTS_FUZZ_TARGET: ${{ inputs.fuzz_target }}
+          INPUTS_FUZZ_NAME: ${{ inputs.fuzz_name || inputs.fuzz_target }}
           INPUTS_CRASH_FILE: ${{ inputs.crash_file }}
           INPUTS_BRANCH: ${{ inputs.branch }}
           INPUTS_COMMIT: ${{ inputs.commit }}
@@ -159,7 +161,7 @@ jobs:
             --dedup-result dedup_result.json \
             --claude-analysis claude_analysis.txt \
             -v "FUZZ_TARGET=${INPUTS_FUZZ_TARGET}" \
-            -v "FUZZ_NAME=${{ inputs.fuzz_name || inputs.fuzz_target }}" \
+            -v "FUZZ_NAME=${INPUTS_FUZZ_NAME}" \
             -v "CRASH_FILE=${INPUTS_CRASH_FILE}" \
             -v "BRANCH=${INPUTS_BRANCH}" \
             -v "COMMIT=${INPUTS_COMMIT}" \

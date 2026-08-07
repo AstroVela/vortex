@@ -5,7 +5,12 @@ name: DuckDB R2 mirror
 # page and upload it to R2.
 # If it's a commit, build Duckdb from source and upload it to R2.
 on:
-  workflow_call: { }
+  workflow_call:
+    secrets:
+      DUCKDB_R2_ACCESS_KEY_ID:
+        required: false
+      DUCKDB_R2_SECRET_ACCESS_KEY:
+        required: false
 
 concurrency:
   group: duckdb-r2-${{ github.event.pull_request.number || github.ref }}

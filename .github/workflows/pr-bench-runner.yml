@@ -21,6 +21,9 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      POLAR_SIGNALS_API_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -105,8 +108,8 @@ jobs:
         shell: bash
         env:
           RUST_BACKTRACE: full
-          VORTEX_EXPERIMENTAL_PATCHED_ARRAY: '1'
-          FLAT_LAYOUT_INLINE_ARRAY_NODE: '1'
+          VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
+          FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
           INPUTS_BENCHMARK_ID: ${{ inputs.benchmark_id }}
         run: |
           bash scripts/bench-taskset.sh target/release_debug/${INPUTS_BENCHMARK_ID} -d gh-json -o results.json

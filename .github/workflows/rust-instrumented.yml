@@ -26,7 +26,9 @@ jobs:
     name: "Mirror DuckDB to R2"
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/duckdb-r2.yml
-    secrets: inherit
+    secrets:
+      DUCKDB_R2_ACCESS_KEY_ID: ${{ secrets.DUCKDB_R2_ACCESS_KEY_ID }}
+      DUCKDB_R2_SECRET_ACCESS_KEY: ${{ secrets.DUCKDB_R2_SECRET_ACCESS_KEY }}
 
   duckdb-ready:
     name: "DuckDB libraries available in R2"

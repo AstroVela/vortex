@@ -14,6 +14,17 @@ on:
         required: false
         type: string
         default: c6id.metal
+    secrets:
+      POLAR_SIGNALS_API_KEY:
+        required: false
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+        required: false
+      OTEL_EXPORTER_OTLP_HEADERS:
+        required: false
+      BENCH_REVALIDATE_TOKEN:
+        required: false
+      INCIDENT_IO_ALERT_TOKEN:
+        required: false
 
 jobs:
   resolve-matrix:

@@ -16,7 +16,6 @@ jobs:
     uses: ./.github/workflows/package.yml
     with:
       version: ${{ github.event.release.tag_name }}
-    secrets: inherit
 
   publish-rust:
     runs-on: ubuntu-latest
@@ -124,7 +123,6 @@ jobs:
     with:
       git_ref: ${{ github.event.release.tag_name }}
       confirm_upload: "yes"
-    secrets: inherit
     permissions:
       id-token: write
       contents: read
