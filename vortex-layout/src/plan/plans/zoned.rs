@@ -10,6 +10,7 @@ use futures::FutureExt;
 use futures::TryFutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use parking_lot::RwLock;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
@@ -22,6 +23,7 @@ use vortex_array::expr::BoundExpression;
 use vortex_array::expr::traversal::NodeExt;
 use vortex_array::expr::traversal::Transformed;
 use vortex_array::expr::traversal::TraversalOrder;
+use vortex_array::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex_array::scalar_fn::fns::stat::StatFn;
 use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
@@ -30,6 +32,7 @@ use vortex_error::SharedVortexResult;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_session::VortexSession;
 
 use crate::LayoutRef;
 use crate::layouts::zoned::LegacyStats;
@@ -47,11 +50,13 @@ const DATA_CHILD_INDEX: usize = 0;
 const ZONES_CHILD_INDEX: usize = 1;
 
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
+type SharedPruningResult = Shared<BoxFuture<'static, SharedVortexResult<Arc<ZonedPruningResult>>>>;
 
 #[derive(Clone)]
 struct ZonedPruningState {
     expression: BoundExpression,
     zone_map: Arc<OnceLock<SharedZoneMap>>,
+    pruning_result: Arc<OnceLock<SharedPruningResult>>,
 }
 
 impl ZonedPruningState {
@@ -59,6 +64,7 @@ impl ZonedPruningState {
         Self {
             expression,
             zone_map: Arc::new(OnceLock::new()),
+            pruning_result: Arc::new(OnceLock::new()),
         }
     }
 
@@ -105,6 +111,71 @@ impl ZonedPruningState {
                 .shared()
             })
             .clone())
+    }
+
+    fn pruning_result(
+        &self,
+        ctx: &PlanExecutionContext,
+        zones: &PlanRef,
+        column_dtype: &DType,
+        aggregate_fns: &Arc<[AggregateFnRef]>,
+        zone_len: u64,
+        row_count: u64,
+    ) -> VortexResult<SharedPruningResult> {
+        let zone_map =
+            self.zone_map(ctx, zones, column_dtype, aggregate_fns, zone_len, row_count)?;
+        let expression = self.expression.clone();
+        let session = ctx.session().clone();
+        Ok(self
+            .pruning_result
+            .get_or_init(|| {
+                async move {
+                    let zone_map = zone_map.await?;
+                    let initial_result =
+                        zone_map.evaluate(&expression, &session).map_err(Arc::new)?;
+                    let dynamic_updates = DynamicExprUpdates::new(&expression.unbind());
+                    Ok(Arc::new(ZonedPruningResult {
+                        zone_map,
+                        expression,
+                        dynamic_updates,
+                        latest_result: RwLock::new((0, initial_result)),
+                        session,
+                    }))
+                }
+                .boxed()
+                .shared()
+            })
+            .clone())
+    }
+}
+
+struct ZonedPruningResult {
+    zone_map: ZoneMap,
+    expression: BoundExpression,
+    dynamic_updates: Option<DynamicExprUpdates>,
+    latest_result: RwLock<(u64, BoolArray)>,
+    session: VortexSession,
+}
+
+impl ZonedPruningResult {
+    fn evaluate(&self) -> VortexResult<BoolArray> {
+        let Some(dynamic_updates) = &self.dynamic_updates else {
+            return Ok(self.latest_result.read().1.clone());
+        };
+        let version = dynamic_updates.version();
+        {
+            let result = self.latest_result.read();
+            if result.0 >= version {
+                return Ok(result.1.clone());
+            }
+        }
+
+        let mut result = self.latest_result.write();
+        if result.0 < version {
+            result.1 = self.zone_map.evaluate(&self.expression, &self.session)?;
+            result.0 = version;
+        }
+        Ok(result.1.clone())
     }
 }
 
@@ -233,7 +304,7 @@ impl ZonedPlan {
                 .into_array());
             }
 
-            let zone_map = state.zone_map(
+            let pruning_result = state.pruning_result(
                 &ctx,
                 &zones,
                 &column_dtype,
@@ -241,8 +312,7 @@ impl ZonedPlan {
                 zone_len,
                 row_count,
             )?;
-            let zone_map = zone_map.await?;
-            let evaluated = zone_map.evaluate(&state.expression, ctx.session())?;
+            let evaluated = pruning_result.await?.evaluate()?;
             let mut execution = ctx.session().create_execution_ctx();
             let zone_validity =
                 BoolArrayExt::validity(&evaluated).execute_mask(evaluated.len(), &mut execution)?;

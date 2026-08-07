@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::ops::BitAnd;
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -81,14 +82,14 @@ pub(crate) fn split_exec<A: 'static + Send>(
             let predicate = filter.execute(
                 &ctx.execution,
                 &row_range,
-                MaskFuture::ready(row_mask.clone()),
+                MaskFuture::new_true(row_mask.len()),
             )?;
             let session = ctx.execution.session().clone();
             MaskFuture::new(row_mask.len(), async move {
                 let predicate = predicate.await?;
                 let mut execution = session.create_execution_ctx();
                 let predicate: Mask = predicate.null_as_false().execute(&mut execution)?;
-                Ok(row_mask.intersect_by_rank(&predicate))
+                Ok(row_mask.bitand(&predicate))
             })
         } else {
             MaskFuture::ready(row_mask)
