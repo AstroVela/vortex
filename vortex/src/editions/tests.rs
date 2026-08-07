@@ -548,8 +548,10 @@ async fn wide_decimal_byte_parts_is_gated_by_the_unstable_edition() -> VortexRes
 
         let lower_part_counts: Vec<usize> = read
             .depth_first_traversal()
-            .filter_map(|node| node.as_opt::<DecimalByteParts>())
-            .map(|array| array.lower_parts().len())
+            .filter_map(|node| {
+                node.as_opt::<DecimalByteParts>()
+                    .map(|array| array.lower_parts().len())
+            })
             .collect();
         assert!(
             !lower_part_counts.is_empty(),
