@@ -275,6 +275,15 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
             return Ok(Some(ExpressionPlan::new_ref(lowered, field)));
         }
 
+        // Projections pushed down by query engines are almost always a pack of plain top-level
+        // field accesses. Resolve that shape directly: prune the struct to the referenced fields
+        // and re-pack them from the pruned root, skipping the partitioning machinery.
+        if !access.needs_expansion
+            && let Some(rewritten) = reduce_pack_of_fields(expression, child, fields)?
+        {
+            return Ok(Some(rewritten));
+        }
+
         let expanded = expand_struct_root(expression.clone(), fields)?;
         let partitioned =
             partition_bound(expanded.clone(), make_bound_free_field_annotator(fields))?;
@@ -381,6 +390,67 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
 
         Ok(Some(ExpressionPlan::new_ref(residual, rewritten)))
     }
+}
+
+/// Rewrites a `Pack` whose children are all plain `GetItem`s on the root into the packed
+/// selection of a pruned struct.
+///
+/// Returns `None` when the expression has any other shape. The produced plan is equivalent to
+/// running expansion and partitioning: the struct keeps only the referenced fields, and a
+/// residual pack re-selects them from the pruned root.
+fn reduce_pack_of_fields(
+    expression: &BoundExpression,
+    child: &StructPlan,
+    fields: &StructFields,
+) -> VortexResult<Option<PlanRef>> {
+    let Some(scalar_fn) = expression.as_scalar() else {
+        return Ok(None);
+    };
+    if !scalar_fn.is::<Pack>() {
+        return Ok(None);
+    }
+    let mut packed_fields = Vec::with_capacity(expression.children().len());
+    for packed in expression.children() {
+        let Some(field_name) = packed
+            .as_scalar()
+            .and_then(|packed_fn| packed_fn.as_opt::<GetItem>())
+        else {
+            return Ok(None);
+        };
+        if !packed.children()[0].is_root() {
+            return Ok(None);
+        }
+        packed_fields.push(field_name.clone());
+    }
+
+    let mut pruned_fields = Vec::with_capacity(packed_fields.len());
+    for field_name in &packed_fields {
+        if pruned_fields
+            .iter()
+            .any(|(pruned, _): &(FieldName, PlanRef)| pruned == field_name)
+        {
+            continue;
+        }
+        let field_index = fields.find(field_name).ok_or_else(|| {
+            vortex_err!("Struct expression references unknown field '{field_name}'")
+        })?;
+        let field = child
+            .children
+            .get(field_index)?
+            .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
+        pruned_fields.push((field_name.clone(), field));
+    }
+
+    let rewritten: PlanRef = Arc::new(child.with_pruned_fields(pruned_fields)?);
+    let pruned_root = BoundExpression::new_root(rewritten.dtype().clone());
+    let residual_children = packed_fields
+        .into_iter()
+        .map(|field_name| {
+            BoundExpression::try_new(GetItem.bind(field_name), [pruned_root.clone()])
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let residual = BoundExpression::try_new(scalar_fn.clone(), residual_children)?;
+    Ok(Some(ExpressionPlan::new_ref(residual, rewritten)))
 }
 
 struct RootFieldAccesses {

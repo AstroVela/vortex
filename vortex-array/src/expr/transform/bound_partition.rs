@@ -24,6 +24,7 @@ use crate::expr::analysis::BoundAnnotations;
 use crate::expr::analysis::descendent_bound_annotations;
 use crate::expr::traversal::NodeExt;
 use crate::expr::traversal::NodeRewriter;
+use crate::expr::traversal::NodeVisitor;
 use crate::expr::traversal::Transformed;
 use crate::expr::traversal::TraversalOrder;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -68,7 +69,7 @@ where
     FieldName: From<A>,
 {
     let mut collector = PartitionCollector::<A>::new(&annotations);
-    expr.clone().rewrite(&mut collector)?;
+    expr.accept(&mut collector)?;
 
     let mut partitions = Vec::with_capacity(collector.sub_expressions.len());
     let mut partition_annotations = Vec::with_capacity(collector.sub_expressions.len());
@@ -185,14 +186,14 @@ impl<'a, A: Annotation + Display> PartitionCollector<'a, A> {
     }
 }
 
-impl<A: Annotation + Display> NodeRewriter for PartitionCollector<'_, A>
+impl<'a, A: Annotation + Display> NodeVisitor<'a> for PartitionCollector<'_, A>
 where
     FieldName: From<A>,
 {
     type NodeTy = BoundExpression;
 
-    fn visit_down(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
-        match self.annotations.get(&ExactBoundExprRef(&node)) {
+    fn visit_down(&mut self, node: &'a Self::NodeTy) -> VortexResult<TraversalOrder> {
+        match self.annotations.get(&ExactBoundExprRef(node)) {
             // If this expression only accesses a single field, then we can skip the children
             Some(annotations) if annotations.len() == 1 => {
                 let annotation = annotations
@@ -201,20 +202,12 @@ where
                     .vortex_expect("expected one field");
                 let sub_exprs = self.sub_expressions.entry(annotation.clone()).or_default();
                 sub_exprs.push(node.clone());
-                Ok(Transformed {
-                    value: node,
-                    changed: false,
-                    order: TraversalOrder::Skip,
-                })
+                Ok(TraversalOrder::Skip)
             }
 
             // Otherwise, continue traversing.
-            _ => Ok(Transformed::no(node)),
+            _ => Ok(TraversalOrder::Continue),
         }
-    }
-
-    fn visit_up(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
-        Ok(Transformed::no(node))
     }
 }
 
