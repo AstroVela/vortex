@@ -441,7 +441,7 @@ async fn read_footer_local<R: VortexLocalReadAt + Clone>(
     session: VortexSession,
 ) -> VortexResult<(Footer, u64, ByteBuffer)> {
     let file_size = match file_size {
-        None => read.size().await?,
+        None => read.size_local().await?,
         Some(file_size) => file_size,
     };
     let mut initial_read_size = initial_read_size.max(MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE);

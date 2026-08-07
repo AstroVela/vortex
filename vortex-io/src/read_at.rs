@@ -113,6 +113,12 @@ pub trait VortexLocalReadAt: Send + Sync + 'static {
     /// Asynchronously get the number of bytes of the underlying source.
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>>;
 
+    /// Asynchronously get the number of bytes of the underlying source on a local I/O worker.
+    fn size_local(&self) -> LocalBoxFuture<'static, VortexResult<u64>> {
+        let size = self.size();
+        async move { size.await }.boxed_local()
+    }
+
     /// Request an asynchronous positional read whose future must be polled on the local I/O
     /// runtime thread that owns the source.
     fn read_at_local(
