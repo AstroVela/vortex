@@ -89,6 +89,7 @@ use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::session::LayoutSession;
+use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_session::VortexSession;
 use vortex_zigzag::ZigZag;
 
@@ -114,6 +115,10 @@ fn bind_scan_expr(file: &VortexFile, expr: Expression) -> BoundExpression {
     expr.optimize_recursive(file.dtype())
         .and_then(|expr| expr.bind(file.dtype()))
         .vortex_expect("scan expression should bind")
+}
+
+fn strict_sorted(indices: Buffer<u64>) -> StrictSortedBuffer<u64> {
+    StrictSortedBuffer::try_new(indices).expect("test indices should be strictly increasing")
 }
 
 #[tokio::test]
@@ -775,7 +780,7 @@ async fn test_with_indices_simple() {
     let actual_kept_array = file
         .scan()
         .unwrap()
-        .with_row_indices(Buffer::<u64>::empty())
+        .with_row_indices(strict_sorted(Buffer::<u64>::empty()))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -792,7 +797,7 @@ async fn test_with_indices_simple() {
     let actual_kept_array = file
         .scan()
         .unwrap()
-        .with_row_indices(Buffer::from_iter(kept_indices))
+        .with_row_indices(strict_sorted(Buffer::from_iter(kept_indices)))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -817,7 +822,7 @@ async fn test_with_indices_simple() {
     let actual_array = file
         .scan()
         .unwrap()
-        .with_row_indices((0u64..500).collect::<Buffer<_>>())
+        .with_row_indices(strict_sorted((0u64..500).collect::<Buffer<_>>()))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -862,7 +867,7 @@ async fn test_with_indices_on_two_columns() {
     let array = file
         .scan()
         .unwrap()
-        .with_row_indices(Buffer::from_iter(kept_indices))
+        .with_row_indices(strict_sorted(Buffer::from_iter(kept_indices)))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -922,7 +927,7 @@ async fn test_with_indices_and_with_row_filter_simple() {
             &file,
             gt(get_item("numbers", root()), lit(50_i16)),
         ))
-        .with_row_indices(Buffer::empty())
+        .with_row_indices(strict_sorted(Buffer::empty()))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -943,7 +948,7 @@ async fn test_with_indices_and_with_row_filter_simple() {
             &file,
             gt(get_item("numbers", root()), lit(50_i16)),
         ))
-        .with_row_indices(Buffer::from_iter(kept_indices))
+        .with_row_indices(strict_sorted(Buffer::from_iter(kept_indices)))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -974,7 +979,7 @@ async fn test_with_indices_and_with_row_filter_simple() {
             &file,
             gt(get_item("numbers", root()), lit(50_i16)),
         ))
-        .with_row_indices((0..500).collect::<Buffer<_>>())
+        .with_row_indices(strict_sorted((0..500).collect::<Buffer<_>>()))
         .into_array_stream()
         .unwrap()
         .read_all()
@@ -1286,7 +1291,7 @@ async fn file_take() -> VortexResult<()> {
     let vxf = chunked_file().await?;
     let result = vxf
         .scan()?
-        .with_row_indices(buffer![0, 1, 8])
+        .with_row_indices(StrictSortedBuffer::try_new(buffer![0, 1, 8])?)
         .into_array_stream()?
         .read_all()
         .await?;
