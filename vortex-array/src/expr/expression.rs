@@ -127,7 +127,9 @@ impl Expression {
         scope: &DType,
         session: &VortexSession,
     ) -> VortexResult<Option<Expression>> {
-        StatsRewriteCtx::new(session, scope).falsify(self)
+        let ctx = StatsRewriteCtx::new(session, scope);
+        ctx.ensure_predicate(self)?;
+        ctx.falsify(self)
     }
 
     /// Returns an expression that proves this predicate is definitely true from stats.
@@ -141,7 +143,9 @@ impl Expression {
         scope: &DType,
         session: &VortexSession,
     ) -> VortexResult<Option<Expression>> {
-        StatsRewriteCtx::new(session, scope).satisfy(self)
+        let ctx = StatsRewriteCtx::new(session, scope);
+        ctx.ensure_predicate(self)?;
+        ctx.satisfy(self)
     }
 
     /// Format the expression as a compact string.

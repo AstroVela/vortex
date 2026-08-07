@@ -105,18 +105,23 @@ impl<'a> StatsRewriteCtx<'a> {
     }
 
     /// Rewrite `expr` into a stats-backed falsifier.
+    ///
+    /// The caller must pass a boolean predicate. The entry points on [`Expression`] validate
+    /// this once; rules recursing through nested predicates skip that re-validation because
+    /// computing an expression's dtype walks its whole subtree.
     pub fn falsify(&self, expr: &Expression) -> VortexResult<Option<Expression>> {
-        self.ensure_predicate(expr)?;
         rewrite(expr, self, StatsRewriteRule::falsify)
     }
 
     /// Rewrite `expr` into a stats-backed satisfier.
+    ///
+    /// The caller must pass a boolean predicate; see [`Self::falsify`] for the validation
+    /// contract.
     pub fn satisfy(&self, expr: &Expression) -> VortexResult<Option<Expression>> {
-        self.ensure_predicate(expr)?;
         rewrite(expr, self, StatsRewriteRule::satisfy)
     }
 
-    fn ensure_predicate(&self, expr: &Expression) -> VortexResult<()> {
+    pub(crate) fn ensure_predicate(&self, expr: &Expression) -> VortexResult<()> {
         let dtype = self.return_dtype(expr)?;
         vortex_ensure!(
             matches!(dtype, DType::Bool(_)),

@@ -112,6 +112,16 @@ impl PlanParentReduceRule<RowIdxPlan> for ExpressionRowIdxRule {
         _child_idx: usize,
     ) -> VortexResult<Option<PlanRef>> {
         let expression = parent.expression();
+
+        // Expressions without row-index functions evaluate identically over the child, so skip
+        // the partitioning machinery and push the whole expression down.
+        if !expression.contains::<RowIdx>() {
+            return Ok(Some(ExpressionPlan::new_ref(
+                expression.clone(),
+                Arc::clone(&child.child),
+            )));
+        }
+
         let partitioned = partition_bound(expression.clone(), |node| {
             if node
                 .as_scalar()

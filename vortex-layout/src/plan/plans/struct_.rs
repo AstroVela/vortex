@@ -17,8 +17,6 @@ use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
-use vortex_array::expr::ExactBoundExpr;
-use vortex_array::expr::descendent_bound_annotations;
 use vortex_array::expr::make_bound_free_field_annotator;
 use vortex_array::expr::transform::partition_bound;
 use vortex_array::expr::traversal::NodeExt;
@@ -34,6 +32,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_utils::aliases::hash_set::HashSet;
 
 use super::expression::rewrite_partition_root;
 use crate::layouts::struct_::StructLayout;
@@ -240,15 +239,36 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
 
         let expression = parent.expression();
         let fields = child.struct_fields();
-        let referenced_fields =
-            descendent_bound_annotations(expression, make_bound_free_field_annotator(fields))
-                .get(&ExactBoundExpr(expression.clone()))
-                .vortex_expect("Bound expression missing free-field annotations")
+
+        // A cheap linear scan resolves the dominant single-field case without the expansion and
+        // partitioning machinery. When every root access is a `GetItem` on the root and only one
+        // field is referenced, expansion is the identity and partitioning would produce exactly
+        // that field, so step directly into it.
+        let access = scan_root_field_accesses(expression, fields)?;
+        if !access.needs_expansion && access.referenced_fields.len() == 1 {
+            let field_name = access
+                .referenced_fields
+                .iter()
+                .next()
+                .vortex_expect("one referenced field")
                 .clone();
+            let field_index = fields.find(&field_name).ok_or_else(|| {
+                vortex_err!("Struct expression references unknown field '{field_name}'")
+            })?;
+            let field = child
+                .children
+                .get(field_index)?
+                .ok_or_else(|| vortex_err!("Struct field '{field_name}' has no plan"))?;
+            let lowered =
+                step_into_struct_field(expression.clone(), &field_name, field.dtype().clone())?;
+            return Ok(Some(ExpressionPlan::new_ref(lowered, field)));
+        }
+
         let expanded = expand_struct_root(expression.clone(), fields)?;
         let partitioned =
             partition_bound(expanded.clone(), make_bound_free_field_annotator(fields))?;
         if partitioned.partition_names.is_empty() {
+            let referenced_fields = access.referenced_fields;
             let selected_indices = fields
                 .names()
                 .iter()
@@ -350,6 +370,57 @@ impl PlanParentReduceRule<StructPlan> for ExpressionStructRule {
 
         Ok(Some(ExpressionPlan::new_ref(residual, rewritten)))
     }
+}
+
+struct RootFieldAccesses {
+    /// The top-level fields referenced anywhere in the expression.
+    referenced_fields: HashSet<FieldName>,
+    /// Whether any root access is not a plain `GetItem` on the root, in which case
+    /// [`expand_struct_root`] would rewrite the expression.
+    needs_expansion: bool,
+}
+
+/// Linearly collects the free top-level fields of `expression` without per-node allocation.
+///
+/// This matches the propagation semantics of [`descendent_bound_annotations`] with
+/// [`make_bound_free_field_annotator`]: `Select` on root contributes its normalized fields, a
+/// `GetItem` on root contributes its field without descending further, and a bare root
+/// conservatively contributes every field in scope.
+fn scan_root_field_accesses(
+    expression: &BoundExpression,
+    fields: &StructFields,
+) -> VortexResult<RootFieldAccesses> {
+    let mut access = RootFieldAccesses {
+        referenced_fields: HashSet::new(),
+        needs_expansion: false,
+    };
+    let mut stack = vec![expression];
+    while let Some(node) = stack.pop() {
+        let Some(scalar_fn) = node.as_scalar() else {
+            access
+                .referenced_fields
+                .extend(fields.names().iter().cloned());
+            access.needs_expansion = true;
+            continue;
+        };
+        if let Some(selection) = scalar_fn.as_opt::<Select>()
+            && node.children()[0].is_root()
+        {
+            access
+                .referenced_fields
+                .extend(selection.normalize_to_included_fields(fields.names())?);
+            access.needs_expansion = true;
+            continue;
+        }
+        if let Some(field_name) = scalar_fn.as_opt::<GetItem>()
+            && node.children()[0].is_root()
+        {
+            access.referenced_fields.insert(field_name.clone());
+            continue;
+        }
+        stack.extend(node.children());
+    }
+    Ok(access)
 }
 
 fn expanded_struct_root(

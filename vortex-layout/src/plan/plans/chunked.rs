@@ -14,8 +14,6 @@ use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
-use vortex_array::expr::ExactBoundExpr;
-use vortex_array::expr::label_bound_tree;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -167,18 +165,7 @@ impl PlanParentReduceRule<ChunkedPlan> for ExpressionChunkedRule {
         _child_idx: usize,
     ) -> VortexResult<Option<PlanRef>> {
         let expression = parent.expression();
-        let references_row_idx = label_bound_tree(
-            expression,
-            |node| {
-                node.as_scalar()
-                    .is_some_and(|scalar_fn| scalar_fn.is::<RowIdx>())
-            },
-            |acc, &child| acc | child,
-        )
-        .get(&ExactBoundExpr(expression.clone()))
-        .copied()
-        .unwrap_or(false);
-        if references_row_idx {
+        if expression.contains::<RowIdx>() {
             return Ok(None);
         }
 

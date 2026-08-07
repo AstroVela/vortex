@@ -18,6 +18,7 @@ use crate::expr::Expression;
 use crate::expr::display::DisplayTreeExpr;
 use crate::expr::scope::Scope;
 use crate::scalar_fn::ScalarFnRef;
+use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::root::Root;
 
 /// An [`Expression`] that has been type-checked against a [`Scope`].
@@ -182,6 +183,21 @@ impl BoundExpression {
     /// Whether this node is the scope root.
     pub fn is_root(&self) -> bool {
         matches!(self.kind, BoundKind::Root)
+    }
+
+    /// Returns whether any node in this bound tree is the scalar function `E`.
+    ///
+    /// This is a linear walk without per-node allocation, suitable for cheap pre-checks before
+    /// running more expensive whole-tree analyses.
+    pub fn contains<E: ScalarFnVTable>(&self) -> bool {
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            if node.as_scalar().is_some_and(|scalar_fn| scalar_fn.is::<E>()) {
+                return true;
+            }
+            stack.extend(node.children());
+        }
+        false
     }
 
     /// Display the bound expression as a formatted tree structure.
