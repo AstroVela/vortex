@@ -147,8 +147,7 @@ fn misaligned_block_len(column: usize) -> usize {
 /// boundaries never align across columns: run deduplication in split collection cannot collapse
 /// them, exercising the sort fallback.
 fn make_misaligned_file(columns: usize, chunks: usize) -> VortexFile {
-    let mean_block_len =
-        (0..columns).map(misaligned_block_len).sum::<usize>() / columns.max(1);
+    let mean_block_len = (0..columns).map(misaligned_block_len).sum::<usize>() / columns.max(1);
     let rows = chunks * mean_block_len;
 
     let fields = (0..columns)
@@ -177,10 +176,7 @@ fn make_misaligned_file(columns: usize, chunks: usize) -> VortexFile {
                 canonicalize: false,
             },
         );
-        strategy = strategy.with_field_writer(
-            Field::from(name.as_str()),
-            Arc::new(field_strategy),
-        );
+        strategy = strategy.with_field_writer(Field::from(name.as_str()), Arc::new(field_strategy));
     }
 
     let mut buf = ByteBufferMut::empty();
