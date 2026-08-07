@@ -10330,6 +10330,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bit-vec",
+ "codspeed-divan-compat",
  "flatbuffers",
  "futures",
  "insta",
