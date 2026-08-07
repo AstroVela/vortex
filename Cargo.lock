@@ -10229,6 +10229,7 @@ dependencies = [
  "vortex-layout",
  "vortex-mask",
  "vortex-session",
+ "vortex-utils",
  "wkb",
 ]
 

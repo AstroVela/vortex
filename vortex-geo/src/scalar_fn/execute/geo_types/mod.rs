@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Shared input decoding and Vortex output construction for `geo_types` kernels.
+//! Shared geometry input decoding and Vortex output construction for `geo_types` kernels.
 //!
 //! `geo_types` is the row representation consumed by the kernel. These helpers always construct
 //! and return Vortex arrays; they do not expose `geo_types` values as scalar-function outputs.
+
+mod decode;
 
 use geo_types::Geometry;
 use vortex_array::ArrayRef;
@@ -22,7 +24,7 @@ use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
-use crate::extension::geometries;
+use self::decode::DecodedGeometries;
 
 /// A primitive result produced after kernel inputs are decoded to `geo_types`.
 pub(crate) trait GeoTypesOutput: Copy {
@@ -114,7 +116,7 @@ where
     F: Fn(&Geometry<f64>) -> T,
 {
     let len = column.len();
-    let decoded = geometries(&column.filter(valid.clone())?, ctx)?;
+    let decoded = DecodedGeometries::decode(&column.filter(valid.clone())?, ctx)?;
     let values = decoded.iter().map(compute).collect();
     Ok(T::build_array(len, valid, values, nullability))
 }
@@ -133,11 +135,11 @@ where
     F: Fn(&Geometry<f64>, &Geometry<f64>) -> T,
 {
     let len = left.len();
-    let left = geometries(&left.filter(valid.clone())?, ctx)?;
-    let right = geometries(&right.filter(valid.clone())?, ctx)?;
+    let left = DecodedGeometries::decode(&left.filter(valid.clone())?, ctx)?;
+    let right = DecodedGeometries::decode(&right.filter(valid.clone())?, ctx)?;
     let values = left
         .iter()
-        .zip(&right)
+        .zip(right.iter())
         .map(|(left, right)| compute(left, right))
         .collect();
     Ok(T::build_array(len, valid, values, nullability))
