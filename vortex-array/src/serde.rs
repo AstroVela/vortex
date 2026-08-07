@@ -195,9 +195,10 @@ impl<'a> ArrayNodeFlatBuffer<'a> {
         // from the in-memory encoding id. The permitted-encoding check applies to it: what is
         // gated is the bytes a reader will meet, not the in-memory representation.
         let serialized_id = self.session.array_serialized_id(self.array)?;
-        let encoding_idx = self.ctx.intern(&serialized_id).ok_or_else(|| {
-            vortex_err!("Array encoding {} not permitted by ctx", serialized_id)
-        })?;
+        let encoding_idx = self
+            .ctx
+            .intern(&serialized_id)
+            .ok_or_else(|| vortex_err!("Array encoding {} not permitted by ctx", serialized_id))?;
 
         let metadata_bytes = self.session.array_serialize(self.array)?.ok_or_else(|| {
             vortex_err!(

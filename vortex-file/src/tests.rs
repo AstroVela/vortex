@@ -2885,8 +2885,7 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
 /// the `vortex` editions tests.
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn test_lower_parts_recompress_to_canonical_through_the_default_writer() -> VortexResult<()>
-{
+async fn test_lower_parts_recompress_to_canonical_through_the_default_writer() -> VortexResult<()> {
     use vortex_decimal_byte_parts::DecimalByteParts;
     use vortex_decimal_byte_parts::split_decimal;
 
