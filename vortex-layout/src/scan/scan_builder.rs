@@ -44,6 +44,7 @@ use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
 use crate::scan::splits::attempt_split_ranges;
+use crate::scan::tasks::LocalTaskFuture;
 
 /// Builder for scanning a [`LayoutReader`] into arrays, streams, iterators, or mapped outputs.
 ///
@@ -333,6 +334,19 @@ impl<A: 'static + Send> ScanBuilder<A> {
         }
 
         self.prepare()?.execute(None)
+    }
+
+    /// Constructs local-I/O task factories, one per row split of the scan.
+    ///
+    /// Use this when the caller has a local runtime such as io_uring and wants scan futures to be
+    /// constructed and polled on one I/O worker instead of on the caller's worker thread.
+    pub fn build_local(self) -> VortexResult<Vec<LocalTaskFuture<Option<A>>>> {
+        // The ultimate short circuit
+        if self.limit.is_some_and(|l| l == 0) {
+            return Ok(vec![]);
+        }
+
+        self.prepare()?.execute_local(None)
     }
 
     /// Returns a [`Stream`] with tasks spawned onto the session's runtime handle.
