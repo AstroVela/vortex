@@ -27,6 +27,7 @@ mod cache;
 mod format;
 pub mod metrics;
 mod opener;
+mod plan_bench;
 pub mod reader;
 mod sink;
 mod source;

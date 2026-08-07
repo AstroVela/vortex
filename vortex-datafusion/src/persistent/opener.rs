@@ -389,6 +389,18 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?;
 
+            if let Some(iterations) = crate::persistent::plan_bench::plan_bench_iterations() {
+                crate::persistent::plan_bench::run_plan_bench(
+                    iterations,
+                    &session,
+                    &layout_reader,
+                    &vxf,
+                    file.object_meta.location.as_ref(),
+                    &scan_projection,
+                    filter.as_ref(),
+                );
+            }
+
             if let Some(limit) = limit
                 && filter.is_none()
             {
