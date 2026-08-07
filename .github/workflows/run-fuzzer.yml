@@ -71,12 +71,14 @@ jobs:
       first_crash_name: ${{ steps.check.outputs.first_crash_name }}
       artifact_url: ${{ steps.upload_artifacts.outputs.artifact-url }}
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2
         if: github.repository == 'vortex-data/vortex'
         with:
           sccache: s3
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -119,20 +121,24 @@ jobs:
         run: |
           CORPUS_DIR="fuzz/corpus/${FUZZ_NAME}"
           FEATURES_FLAG=""
-          if [ -n "${{ inputs.extra_features }}" ]; then
-            FEATURES_FLAG="--features ${{ inputs.extra_features }}"
+          if [ -n "${INPUTS_EXTRA_FEATURES}" ]; then
+            FEATURES_FLAG="--features ${INPUTS_EXTRA_FEATURES}"
           fi
           FORK_FLAG=""
           if [ "${{ inputs.jobs }}" -gt 1 ]; then
             FORK_FLAG="-fork=${{ inputs.jobs }}"
           fi
-          ${{ inputs.extra_env }} RUST_BACKTRACE=1 \
+          ${INPUTS_EXTRA_ENV} RUST_BACKTRACE=1 \
             cargo +$NIGHTLY_TOOLCHAIN fuzz run --release --debug-assertions \
             $FEATURES_FLAG \
-            ${{ inputs.fuzz_target }} "$CORPUS_DIR" -- \
+            ${INPUTS_FUZZ_TARGET} "$CORPUS_DIR" -- \
             $FORK_FLAG -max_total_time=${{ inputs.max_time }} -rss_limit_mb=0 \
             2>&1 | tee fuzz_output.log
         continue-on-error: true
+        env:
+          INPUTS_EXTRA_FEATURES: ${{ inputs.extra_features }}
+          INPUTS_EXTRA_ENV: ${{ inputs.extra_env }}
+          INPUTS_FUZZ_TARGET: ${{ inputs.fuzz_target }}
 
       - name: Check for crashes
         id: check
@@ -162,15 +168,19 @@ jobs:
           # fuzz_output.log. Replay the crashing input in single-process mode to get
           # the full output for the crash reporting pipeline.
           FEATURES_FLAG=""
-          if [ -n "${{ inputs.extra_features }}" ]; then
-            FEATURES_FLAG="--features ${{ inputs.extra_features }}"
+          if [ -n "${INPUTS_EXTRA_FEATURES}" ]; then
+            FEATURES_FLAG="--features ${INPUTS_EXTRA_FEATURES}"
           fi
           RUST_BACKTRACE=1 \
             cargo +$NIGHTLY_TOOLCHAIN fuzz run --release --debug-assertions \
             $FEATURES_FLAG \
-            ${{ inputs.fuzz_target }} \
-            "${{ steps.check.outputs.first_crash }}" \
+            ${INPUTS_FUZZ_TARGET} \
+            "${STEPS_CHECK_OUTPUTS_FIRST_CRASH}" \
             2>&1 | tee fuzz_output.log || true
+        env:
+          INPUTS_EXTRA_FEATURES: ${{ inputs.extra_features }}
+          INPUTS_FUZZ_TARGET: ${{ inputs.fuzz_target }}
+          STEPS_CHECK_OUTPUTS_FIRST_CRASH: ${{ steps.check.outputs.first_crash }}
 
       - name: Archive crash artifacts
         id: upload_artifacts

@@ -50,6 +50,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       - name: Download fuzzer logs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
@@ -72,7 +74,7 @@ jobs:
           python3 -m fuzz_report extract \
             logs/fuzz_output.log \
             --crash-dir crash_artifacts \
-            --crash-name "${{ inputs.crash_file }}" \
+            --crash-name "${INPUTS_CRASH_FILE}" \
             -o crash_info.json
 
           # Validate that extraction found a real crash.
@@ -85,7 +87,8 @@ jobs:
             echo "crash_found=false" >> "$GITHUB_OUTPUT"
           else
             echo "crash_found=true" >> "$GITHUB_OUTPUT"
-          fi
+          fi        env:
+          INPUTS_CRASH_FILE: ${{ inputs.crash_file }}
 
       - name: Skip if no crash found
         if: steps.extract.outputs.crash_found != 'true'
@@ -144,18 +147,23 @@ jobs:
         id: report
         env:
           GH_TOKEN: ${{ secrets.gh_token }}
+          INPUTS_FUZZ_TARGET: ${{ inputs.fuzz_target }}
+          INPUTS_CRASH_FILE: ${{ inputs.crash_file }}
+          INPUTS_BRANCH: ${{ inputs.branch }}
+          INPUTS_COMMIT: ${{ inputs.commit }}
+          INPUTS_ARTIFACT_URL: ${{ inputs.artifact_url }}
         run: |
           python3 -m fuzz_report report \
             crash_info.json \
             --repo "${{ github.repository }}" \
             --dedup-result dedup_result.json \
             --claude-analysis claude_analysis.txt \
-            -v "FUZZ_TARGET=${{ inputs.fuzz_target }}" \
+            -v "FUZZ_TARGET=${INPUTS_FUZZ_TARGET}" \
             -v "FUZZ_NAME=${{ inputs.fuzz_name || inputs.fuzz_target }}" \
-            -v "CRASH_FILE=${{ inputs.crash_file }}" \
-            -v "BRANCH=${{ inputs.branch }}" \
-            -v "COMMIT=${{ inputs.commit }}" \
-            -v "ARTIFACT_URL=${{ inputs.artifact_url }}"
+            -v "CRASH_FILE=${INPUTS_CRASH_FILE}" \
+            -v "BRANCH=${INPUTS_BRANCH}" \
+            -v "COMMIT=${INPUTS_COMMIT}" \
+            -v "ARTIFACT_URL=${INPUTS_ARTIFACT_URL}"
 
       - name: Alert incident.io on validation failure
         if: failure() && steps.report.outputs.validation_failed == 'true'

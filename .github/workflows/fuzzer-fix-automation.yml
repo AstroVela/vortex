@@ -73,9 +73,10 @@ jobs:
         id: fetch_issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUTS_ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: |
-          ISSUE_DATA=$(gh issue view ${{ inputs.issue_number }} --repo ${{ github.repository }} --json number,title,body,labels)
-          echo "issue_number=${{ inputs.issue_number }}" >> $GITHUB_OUTPUT
+          ISSUE_DATA=$(gh issue view ${INPUTS_ISSUE_NUMBER} --repo ${{ github.repository }} --json number,title,body,labels)
+          echo "issue_number=${INPUTS_ISSUE_NUMBER}" >> $GITHUB_OUTPUT
           echo "issue_title=$(echo "$ISSUE_DATA" | jq -r '.title')" >> $GITHUB_OUTPUT
           echo "issue_body<<EOF" >> $GITHUB_OUTPUT
           echo "$ISSUE_DATA" | jq -r '.body' >> $GITHUB_OUTPUT
@@ -103,7 +104,7 @@ jobs:
         run: |
           # Extract crash details from the fetched issue body
           cat > issue_body.txt <<'ISSUE_EOF'
-          ${{ steps.fetch_issue.outputs.issue_body }}
+          ${STEPS_FETCH_ISSUE_OUTPUTS_ISSUE_BODY}
           ISSUE_EOF
 
           # Extract target name from issue body
@@ -120,13 +121,19 @@ jobs:
 
           echo "Extracted: target=$TARGET, crash_file=$CRASH_FILE"
           rm -f issue_body.txt
+        env:
+          STEPS_FETCH_ISSUE_OUTPUTS_ISSUE_BODY: ${{ steps.fetch_issue.outputs.issue_body }}
 
       - name: Validate issue details
         id: validate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUTS_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STEPS_EXTRACT_OUTPUTS_CRASH_FILE: ${{ steps.extract.outputs.crash_file }}
+          STEPS_EXTRACT_OUTPUTS_ARTIFACT_URL: ${{ steps.extract.outputs.artifact_url }}
+          STEPS_EXTRACT_OUTPUTS_TARGET: ${{ steps.extract.outputs.target }}
         run: |
-          ISSUE_NUM="${{ inputs.issue_number }}"
+          ISSUE_NUM="${INPUTS_ISSUE_NUMBER}"
 
           # Check if issue exists and has fuzzer label
           ISSUE_LABELS=$(gh issue view "$ISSUE_NUM" --repo ${{ github.repository }} --json labels --jq '.labels[].name')
@@ -139,30 +146,34 @@ jobs:
           echo "✅ Issue #$ISSUE_NUM has 'fuzzer' label"
 
           # Check if we have required crash details
-          if [ -z "${{ steps.extract.outputs.crash_file }}" ]; then
+          if [ -z "${STEPS_EXTRACT_OUTPUTS_CRASH_FILE}" ]; then
             echo "❌ Could not extract crash file name from issue"
             exit 1
           fi
 
-          if [ -z "${{ steps.extract.outputs.artifact_url }}" ]; then
+          if [ -z "${STEPS_EXTRACT_OUTPUTS_ARTIFACT_URL}" ]; then
             echo "❌ Could not extract artifact URL from issue"
             exit 1
           fi
 
-          echo "✅ Extracted crash details: target=${{ steps.extract.outputs.target }}, crash_file=${{ steps.extract.outputs.crash_file }}"
+          echo "✅ Extracted crash details: target=${STEPS_EXTRACT_OUTPUTS_TARGET}, crash_file=${STEPS_EXTRACT_OUTPUTS_CRASH_FILE}"
 
       - name: Download and verify crash artifact
         id: download
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEPS_EXTRACT_OUTPUTS_ARTIFACT_URL: ${{ steps.extract.outputs.artifact_url }}
+          INPUTS_FUZZ_TARGET: ${{ inputs.fuzz_target }}
+          STEPS_EXTRACT_OUTPUTS_TARGET: ${{ steps.extract.outputs.target }}
+          STEPS_EXTRACT_OUTPUTS_CRASH_FILE: ${{ steps.extract.outputs.crash_file }}
         run: |
           # Extract run ID from artifact URL
-          ARTIFACT_URL="${{ steps.extract.outputs.artifact_url }}"
+          ARTIFACT_URL="${STEPS_EXTRACT_OUTPUTS_ARTIFACT_URL}"
           RUN_ID=$(echo "$ARTIFACT_URL" | grep -oP 'runs/\K[0-9]+')
           ARTIFACT_ID=$(echo "$ARTIFACT_URL" | grep -oP 'artifacts/\K[0-9]+')
 
-          # Artifact name matches run-fuzzer.yml upload: ${{ inputs.fuzz_target }}-crash-artifacts
-          TARGET="${{ steps.extract.outputs.target }}"
+          # Artifact name matches run-fuzzer.yml upload: ${INPUTS_FUZZ_TARGET}-crash-artifacts
+          TARGET="${STEPS_EXTRACT_OUTPUTS_TARGET}"
           ARTIFACT_NAME="${TARGET}-crash-artifacts"
 
           echo "Downloading artifact $ARTIFACT_NAME (ID: $ARTIFACT_ID) from run $RUN_ID"
@@ -171,10 +182,10 @@ jobs:
           gh run download "$RUN_ID" --name "$ARTIFACT_NAME" --repo ${{ github.repository }}
 
           # Verify crash file exists
-          CRASH_FILE_PATH="${{ steps.extract.outputs.target }}/${{ steps.extract.outputs.crash_file }}"
+          CRASH_FILE_PATH="${STEPS_EXTRACT_OUTPUTS_TARGET}/${STEPS_EXTRACT_OUTPUTS_CRASH_FILE}"
           if [ ! -f "$CRASH_FILE_PATH" ]; then
             echo "❌ Crash file not found: $CRASH_FILE_PATH"
-            ls -la "${{ steps.extract.outputs.target }}/" || true
+            ls -la "${STEPS_EXTRACT_OUTPUTS_TARGET}/" || true
             exit 1
           fi
 
@@ -184,10 +195,10 @@ jobs:
       - name: Build fuzzer target
         id: build
         run: |
-          echo "Building fuzzer target: ${{ steps.extract.outputs.target }} (debug mode for faster build)"
+          echo "Building fuzzer target: ${STEPS_EXTRACT_OUTPUTS_TARGET} (debug mode for faster build)"
 
           # Build the fuzzer target in debug mode (faster than release)
-          if cargo +$NIGHTLY_TOOLCHAIN fuzz build --dev --sanitizer=none "${{ steps.extract.outputs.target }}" 2>&1 | tee fuzzer_build.log; then
+          if cargo +$NIGHTLY_TOOLCHAIN fuzz build --dev --sanitizer=none "${STEPS_EXTRACT_OUTPUTS_TARGET}" 2>&1 | tee fuzzer_build.log; then
             echo "✅ Fuzzer target built successfully"
             echo "build_success=true" >> $GITHUB_OUTPUT
           else
@@ -199,6 +210,8 @@ jobs:
             tail -50 fuzzer_build.log
             exit 1
           fi
+        env:
+          STEPS_EXTRACT_OUTPUTS_TARGET: ${{ steps.extract.outputs.target }}
 
       - name: Reproduce crash
         id: reproduce
@@ -207,7 +220,7 @@ jobs:
           echo "Attempting to reproduce crash with fuzzer (debug mode)..."
 
           # Run fuzzer with crash file (debug mode, no sanitizer, full backtrace)
-          RUST_BACKTRACE=full timeout 30s cargo +$NIGHTLY_TOOLCHAIN fuzz run --dev --sanitizer=none "${{ steps.extract.outputs.target }}" "${{ steps.download.outputs.crash_file_path }}" -- -runs=1 -rss_limit_mb=0 2>&1 | tee crash_reproduction.log
+          RUST_BACKTRACE=full timeout 30s cargo +$NIGHTLY_TOOLCHAIN fuzz run --dev --sanitizer=none "${STEPS_EXTRACT_OUTPUTS_TARGET}" "${STEPS_DOWNLOAD_OUTPUTS_CRASH_FILE_PATH}" -- -runs=1 -rss_limit_mb=0 2>&1 | tee crash_reproduction.log
 
           FUZZ_EXIT_CODE=${PIPESTATUS[0]}
 
@@ -218,13 +231,19 @@ jobs:
             echo "✅ Crash reproduced (exit code: $FUZZ_EXIT_CODE)"
             echo "crash_reproduced=true" >> $GITHUB_OUTPUT
           fi
+        env:
+          STEPS_EXTRACT_OUTPUTS_TARGET: ${{ steps.extract.outputs.target }}
+          STEPS_DOWNLOAD_OUTPUTS_CRASH_FILE_PATH: ${{ steps.download.outputs.crash_file_path }}
 
       - name: Check if crash still exists
         if: steps.reproduce.outputs.crash_reproduced == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUTS_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STEPS_EXTRACT_OUTPUTS_TARGET: ${{ steps.extract.outputs.target }}
+          STEPS_DOWNLOAD_OUTPUTS_CRASH_FILE_PATH: ${{ steps.download.outputs.crash_file_path }}
         run: |
-          ISSUE_NUM="${{ inputs.issue_number }}"
+          ISSUE_NUM="${INPUTS_ISSUE_NUMBER}"
 
           gh issue comment "$ISSUE_NUM" --repo ${{ github.repository }} --body "## 🤖 Automated Analysis
 
@@ -236,7 +255,7 @@ jobs:
 
           I ran:
           \`\`\`bash
-          cargo +nightly fuzz run --sanitizer=none ${{ steps.extract.outputs.target }} ${{ steps.download.outputs.crash_file_path }} -- -runs=1 -rss_limit_mb=0
+          cargo +nightly fuzz run --sanitizer=none ${STEPS_EXTRACT_OUTPUTS_TARGET} ${STEPS_DOWNLOAD_OUTPUTS_CRASH_FILE_PATH} -- -runs=1 -rss_limit_mb=0
           \`\`\`
 
           The fuzzer exited with code 0 (success).
@@ -408,8 +427,9 @@ jobs:
         if: steps.reproduce.outputs.crash_reproduced == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUTS_ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: |
-          ISSUE_NUM="${{ inputs.issue_number }}"
+          ISSUE_NUM="${INPUTS_ISSUE_NUMBER}"
 
           # Check for comments from claude-code[bot]
           COMMENT_COUNT=$(gh api "repos/${{ github.repository }}/issues/$ISSUE_NUM/comments" \

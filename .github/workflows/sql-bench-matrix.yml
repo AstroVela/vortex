@@ -53,13 +53,14 @@ jobs:
           && format('runs-on={0}/runner=bench-dedicated/family={1}/tag=build{2}', github.run_id, inputs.machine_type, (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false) && '/extras=s3-cache' || '')
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2
         if: inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false
         with:
           sccache: s3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -67,10 +68,11 @@ jobs:
       - name: Build binaries
         shell: bash
         env:
-          RUSTFLAGS: "-C target-cpu=native -C force-frame-pointers=yes"
+          RUSTFLAGS: -C target-cpu=native -C force-frame-pointers=yes
+          INPUTS_MODE: ${{ inputs.mode }}
         run: |
           packages=(--bin data-gen --bin datafusion-bench --bin duckdb-bench)
-          if [ "${{ inputs.mode }}" != "pr" ]; then
+          if [ "${INPUTS_MODE}" != "pr" ]; then
             packages+=(--bin lance-bench)
           fi
           cargo build "${packages[@]}" --profile release_debug --features unstable_encodings
@@ -114,13 +116,14 @@ jobs:
           && format('runs-on={0}/runner=bench-dedicated/family={1}/tag={2}{3}', github.run_id, inputs.machine_type, matrix.id, (inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false) && '/extras=s3-cache' || '')
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
+      - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2
         if: inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false
         with:
           sccache: s3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}

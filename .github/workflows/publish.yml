@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -36,7 +37,9 @@ jobs:
 
       - name: Cargo Set Version
         run: |
-          cargo set-version --workspace ${{ github.event.release.tag_name }}
+          cargo set-version --workspace ${GITHUB_EVENT_RELEASE_TAG_NAME}
+        env:
+          GITHUB_EVENT_RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
 
       - name: Release
         run: |
@@ -88,6 +91,8 @@ jobs:
         working-directory: ./java
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
         with:
           distribution: "corretto"
