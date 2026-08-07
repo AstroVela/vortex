@@ -3,12 +3,19 @@
 
 #![expect(clippy::cast_possible_truncation)]
 use std::iter;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::thread;
 
 use bytes::Bytes;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::future::BoxFuture;
+use futures::future::LocalBoxFuture;
 use futures::pin_mut;
 use rstest::rstest;
 use vortex_array::ArrayRef;
@@ -62,11 +69,18 @@ use vortex_array::validity::Validity;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::string::StringDictScheme;
+use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
+use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_io::VortexLocalReadAt;
+use vortex_io::runtime::BlockingRuntime;
+use vortex_io::runtime::single::SingleThreadRuntime;
 use vortex_io::session::RuntimeSession;
+use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::Layout;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::zoned::LegacyStats;
@@ -141,6 +155,115 @@ async fn test_read_simple() {
     }
 
     assert_eq!(row_count, 8);
+}
+
+#[derive(Clone)]
+struct StrictLocalReadAt {
+    bytes: ByteBuffer,
+    worker: thread::ThreadId,
+    local_sizes: Arc<AtomicUsize>,
+    local_reads: Arc<AtomicUsize>,
+    send_sizes: Arc<AtomicUsize>,
+}
+
+impl VortexLocalReadAt for StrictLocalReadAt {
+    fn concurrency(&self) -> usize {
+        4
+    }
+
+    fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+        self.send_sizes.fetch_add(1, Ordering::Relaxed);
+        async { vortex_bail!("local file open used the Send size fallback") }.boxed()
+    }
+
+    fn size_local(&self) -> LocalBoxFuture<'static, VortexResult<u64>> {
+        let marker = Rc::new(());
+        let bytes = self.bytes.clone();
+        let worker = self.worker;
+        let local_sizes = Arc::clone(&self.local_sizes);
+        async move {
+            let _marker = marker;
+            assert_eq!(thread::current().id(), worker);
+            local_sizes.fetch_add(1, Ordering::Relaxed);
+            Ok(bytes.len() as u64)
+        }
+        .boxed_local()
+    }
+
+    fn read_at_local(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> LocalBoxFuture<'static, VortexResult<vortex_array::buffer::BufferHandle>> {
+        let marker = Rc::new(());
+        let bytes = self.bytes.clone();
+        let worker = self.worker;
+        let local_reads = Arc::clone(&self.local_reads);
+        async move {
+            let _marker = marker;
+            assert_eq!(thread::current().id(), worker);
+            local_reads.fetch_add(1, Ordering::Relaxed);
+            let start = usize::try_from(offset).expect("offset fits usize");
+            let end = start.checked_add(length).expect("range does not overflow");
+            if end > bytes.len() {
+                vortex_bail!(
+                    "requested range {start}..{end} exceeds buffer length {}",
+                    bytes.len()
+                );
+            }
+            Ok(vortex_array::buffer::BufferHandle::new_host(
+                bytes.slice_unaligned(start..end).aligned(alignment),
+            ))
+        }
+        .boxed_local()
+    }
+}
+
+#[test]
+fn local_file_scan_keeps_non_send_reads_on_runtime_worker() -> VortexResult<()> {
+    const ROW_COUNT: usize = 32_768;
+
+    let runtime = SingleThreadRuntime::default();
+    let session = array_session()
+        .with::<LayoutSession>()
+        .with::<RuntimeSession>()
+        .with_handle(runtime.handle());
+    crate::register_default_encodings(&session);
+
+    runtime.block_on(async move {
+        let input = StructArray::from_fields(&[(
+            "value",
+            PrimitiveArray::from_iter(0..ROW_COUNT as u32).into_array(),
+        )])?
+        .into_array();
+        let mut bytes = ByteBufferMut::empty();
+        session
+            .write_options()
+            .with_strategy(Arc::new(FlatLayoutStrategy::default()))
+            .write(&mut bytes, input.to_array_stream())
+            .await?;
+
+        let local_sizes = Arc::new(AtomicUsize::new(0));
+        let local_reads = Arc::new(AtomicUsize::new(0));
+        let send_sizes = Arc::new(AtomicUsize::new(0));
+        let reader = StrictLocalReadAt {
+            bytes: bytes.freeze(),
+            worker: thread::current().id(),
+            local_sizes: Arc::clone(&local_sizes),
+            local_reads: Arc::clone(&local_reads),
+            send_sizes: Arc::clone(&send_sizes),
+        };
+
+        let file = session.open_options().open_read_local(reader).await?;
+        let result = file.scan()?.into_array_stream()?.read_all().await?;
+
+        assert_eq!(result.len(), ROW_COUNT);
+        assert_eq!(local_sizes.load(Ordering::Relaxed), 1);
+        assert!(local_reads.load(Ordering::Relaxed) > 1);
+        assert_eq!(send_sizes.load(Ordering::Relaxed), 0);
+        Ok(())
+    })
 }
 
 #[tokio::test]
