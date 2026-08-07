@@ -5,14 +5,18 @@ use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_session::registry::ReadContext;
 
 use crate::ArrayContext;
+use crate::Canonical;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
+use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use crate::array_session;
 use crate::arrays::BoolArray;
+use crate::arrays::ConstantArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::Union;
 use crate::arrays::UnionArray;
@@ -26,6 +30,8 @@ use crate::scalar::Scalar;
 use crate::serde::SerializeOptions;
 use crate::serde::SerializedArray;
 use crate::validity::Validity;
+
+mod take;
 
 fn variants() -> VortexResult<UnionVariants> {
     UnionVariants::try_new(
@@ -230,6 +236,68 @@ fn slice_and_filter_preserve_sparse_alignment() -> VortexResult<()> {
         filtered.execute_scalar(1, &mut ctx)?,
         Scalar::union(variants()?, 5, 30i32.into(), Nullability::NonNullable,)?
     );
+
+    Ok(())
+}
+
+/// A constant union canonicalizes into a sparse union whose selected child repeats the scalar's
+/// value and whose unselected children hold placeholders.
+#[test]
+fn constant_union_canonicalizes_to_sparse_union() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let i32_variant = DType::Primitive(PType::I32, Nullability::NonNullable);
+    let i64_variant = DType::Primitive(PType::I64, Nullability::Nullable);
+
+    // Each case pairs a constant scalar with the dtype of a variant it does not select.
+    let cases = [
+        (
+            Scalar::union(variants()?, 9, true.into(), Nullability::NonNullable)?,
+            i32_variant.clone(),
+        ),
+        (
+            Scalar::union(nullable_variants()?, 5, 7i32.into(), Nullability::Nullable)?,
+            i64_variant,
+        ),
+        (
+            Scalar::null(DType::Union(variants()?, Nullability::Nullable)),
+            i32_variant,
+        ),
+    ];
+
+    for (scalar, unselected_dtype) in cases {
+        let canonical = ConstantArray::new(scalar.clone(), 3)
+            .into_array()
+            .execute::<Canonical>(&mut ctx)?
+            .into_union();
+
+        assert_eq!(canonical.dtype(), scalar.dtype());
+
+        let unselected = canonical
+            .iter_children()
+            .find(|child| child.dtype() == &unselected_dtype)
+            .ok_or_else(|| vortex_err!("No child with dtype {unselected_dtype}"))?;
+        assert_eq!(
+            unselected.execute_scalar(0, &mut ctx)?,
+            Scalar::default_value(&unselected_dtype)
+        );
+
+        for index in 0..canonical.len() {
+            assert_eq!(canonical.execute_scalar(index, &mut ctx)?, scalar);
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn constant_union_reports_uncompressed_size() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let scalar = Scalar::union(variants()?, 5, 10i32.into(), Nullability::NonNullable)?;
+
+    // Four `u8` type IDs, four `i32` rows, and four `bool` placeholder bits rounded up to a byte.
+    let size = uncompressed_size_in_bytes(&ConstantArray::new(scalar, 4).into_array(), &mut ctx)?;
+
+    assert_eq!(size, 4 + 4 * 4 + 1);
 
     Ok(())
 }
