@@ -4,20 +4,28 @@
 //! Native execution of the arithmetic operators over decimal arrays.
 //!
 //! Both operands share a logical [`DecimalDType`] (equal precision and scale). Add and Sub apply
-//! directly to the unscaled stored integers and are exact at that shared scale. The result reserves
-//! one additional precision digit for a carry, capped at Vortex's maximum decimal precision.
+//! directly to the unscaled stored integers and are exact at that shared scale. Mul takes the raw
+//! product, which the doubled result scale leaves correctly scaled, and Div rescales the dividend
+//! (or the divisor, for a negative result scale) before integer division. Result precision and
+//! scale follow Arrow's rules — see [`decimal_numeric_result_dtype`].
 //!
-//! Lanes execute in a working width chosen so that in-precision inputs cannot spuriously
-//! overflow an intermediate value. An operation that overflows the result precision on a valid
-//! lane is an error; invalid lanes never error.
+//! Lanes execute in a working width wide enough that in-precision inputs cannot spuriously
+//! overflow an intermediate, then narrow to the result's own storage width. Every lane is still
+//! checked at that width: [`DecimalArray`] does not validate its stored values against the
+//! declared precision, so an out-of-precision value can reach a kernel and must not be able to
+//! overflow it. An operation that overflows the result precision on a valid lane is an error;
+//! invalid lanes never error.
+
+use std::ops::Mul;
 
 use num_traits::CheckedAdd;
+use num_traits::CheckedDiv;
+use num_traits::CheckedMul;
 use num_traits::CheckedSub;
 use vortex_buffer::Buffer;
 use vortex_compute::lane_kernels::LaneZip;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 
@@ -33,33 +41,15 @@ use crate::arrays::decimal::DecimalArrayExt;
 use crate::dtype::BigCast;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
-use crate::dtype::MAX_PRECISION;
+use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
 use crate::match_each_decimal_value_type;
 use crate::scalar::DecimalValue;
 use crate::scalar::NumericOperator;
 use crate::scalar::Scalar;
+use crate::scalar::decimal_numeric_result_dtype;
+use crate::scalar::decimal_numeric_work_dtype;
 use crate::validity::Validity;
-
-/// Derive the result decimal dtype for a numeric operation over same-typed operands.
-pub(crate) fn result_decimal_dtype(
-    input: DecimalDType,
-    op: NumericOperator,
-) -> VortexResult<DecimalDType> {
-    match op {
-        NumericOperator::Add | NumericOperator::Sub => {
-            // A p-digit Add/Sub result needs at most one carry digit:
-            // 2 * (10^p - 1) < 10^(p + 1). Follows Arrow rules.
-            Ok(DecimalDType::new(
-                input.precision().saturating_add(1).min(MAX_PRECISION),
-                input.scale(),
-            ))
-        }
-        NumericOperator::Mul | NumericOperator::Div => {
-            vortex_bail!("numeric operator {op} is not yet supported for decimal arrays")
-        }
-    }
-}
 
 /// Execute a numeric operation between two decimal arrays sharing a decimal dtype.
 pub(super) fn execute_numeric_decimal(
@@ -73,7 +63,7 @@ pub(super) fn execute_numeric_decimal(
         .as_decimal_opt()
         .vortex_expect("inputs are both decimals");
 
-    let result_decimal_dtype = result_decimal_dtype(*decimal_dtype, op)?;
+    let result_decimal_dtype = decimal_numeric_result_dtype(*decimal_dtype, op)?;
     let result_dtype = DType::Decimal(
         result_decimal_dtype,
         lhs.dtype().nullability() | rhs.dtype().nullability(),
@@ -96,20 +86,30 @@ pub(super) fn execute_numeric_decimal(
     let validity = lhs.validity().and(rhs.validity())?;
     let valid_rows = validity.execute_mask(len, ctx)?;
 
-    match_each_decimal_value_type!(
-        DecimalType::smallest_decimal_value_type(&result_decimal_dtype),
-        |W| {
-            execute_decimal_at_width::<W>(
-                &lhs,
-                &rhs,
-                op,
-                result_decimal_dtype,
-                &result_dtype,
-                validity,
-                &valid_rows,
-            )
+    let work_dtype = decimal_numeric_work_dtype(*decimal_dtype, result_decimal_dtype, op);
+    match_each_decimal_value_type!(DecimalType::smallest_decimal_value_type(&work_dtype), |W| {
+        let constants = DecimalOpConstants::<W>::new(result_decimal_dtype, op)?;
+        macro_rules! execute_typed {
+            ($Op:ty) => {
+                execute_decimal_typed::<W, $Op>(
+                    &lhs,
+                    &rhs,
+                    result_decimal_dtype,
+                    &result_dtype,
+                    validity,
+                    &valid_rows,
+                    &constants,
+                )
+            };
         }
-    )
+
+        match op {
+            NumericOperator::Add => execute_typed!(CheckedDecimalAdd),
+            NumericOperator::Sub => execute_typed!(CheckedDecimalSub),
+            NumericOperator::Mul => execute_typed!(CheckedDecimalMul),
+            NumericOperator::Div => execute_typed!(CheckedDecimalDiv),
+        }
+    })
 }
 
 fn is_null_constant(array: &ArrayRef) -> bool {
@@ -187,7 +187,7 @@ struct DecimalValueBounds<W> {
 
 impl<W: NativeDecimalType> DecimalValueBounds<W> {
     fn new(dtype: DecimalDType) -> Self {
-        let precision = dtype.precision() as usize;
+        let precision = usize::from(dtype.precision());
         Self {
             lower_bound: W::MIN_BY_PRECISION[precision],
             upper_bound: W::MAX_BY_PRECISION[precision],
@@ -200,74 +200,121 @@ impl<W: NativeDecimalType> DecimalValueBounds<W> {
     }
 }
 
-/// A checked fixed-point decimal operation on unscaled values at working width `W`.
+/// Per-execution constants for a decimal operation at working width `W`, hoisted out of the
+/// lane loop.
+struct DecimalOpConstants<W> {
+    bounds: DecimalValueBounds<W>,
+    /// Arrow's division rescaling factors. Both are one for every other operator.
+    lhs_scale_factor: W,
+    rhs_scale_factor: W,
+}
+
+impl<W> DecimalOpConstants<W>
+where
+    W: NativeDecimalType + CheckedMul,
+{
+    fn new(result: DecimalDType, op: NumericOperator) -> VortexResult<Self> {
+        let one = <W as BigCast>::from(1_i8).vortex_expect("one fits every decimal working width");
+        let (lhs_scale_factor, rhs_scale_factor) = if op == NumericOperator::Div {
+            // Arrow scales the quotient by 10^(result_scale - lhs_scale + rhs_scale). Both
+            // Vortex operands share a dtype, so this simplifies to 10^result_scale. A negative
+            // exponent scales the divisor instead of the dividend.
+            let exponent = <u32 as From<u8>>::from(result.scale().unsigned_abs());
+            if result.scale() >= 0 {
+                (decimal_scale_factor::<W>(exponent)?, one)
+            } else {
+                (one, decimal_scale_factor::<W>(exponent)?)
+            }
+        } else {
+            (one, one)
+        };
+
+        Ok(Self {
+            bounds: DecimalValueBounds::new(result),
+            lhs_scale_factor,
+            rhs_scale_factor,
+        })
+    }
+}
+
+fn decimal_scale_factor<W>(exp: u32) -> VortexResult<W>
+where
+    W: NativeDecimalType + CheckedMul,
+{
+    let ten = <W as BigCast>::from(10_i8).vortex_expect("ten fits every decimal working width");
+    let mut factor =
+        <W as BigCast>::from(1_i8).vortex_expect("one fits every decimal working width");
+    for _ in 0..exp {
+        factor = factor.checked_mul(&ten).ok_or_else(|| {
+            vortex_err!(
+                InvalidArgument:
+                "decimal scale factor 10^{exp} cannot be represented at the working width"
+            )
+        })?;
+    }
+    Ok(factor)
+}
+
+/// A checked decimal operation on unscaled values at working width `W`.
 trait CheckedDecimalOp {
     const ERROR: &'static str;
 
-    fn apply<W>(lhs: W, rhs: W, bounds: &DecimalValueBounds<W>) -> Option<W>
+    fn apply<W>(lhs: W, rhs: W, constants: &DecimalOpConstants<W>) -> Option<W>
     where
-        W: NativeDecimalType + CheckedAdd + CheckedSub;
+        W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>;
 }
 
 struct CheckedDecimalAdd;
 
 struct CheckedDecimalSub;
 
+struct CheckedDecimalMul;
+
+struct CheckedDecimalDiv;
+
 impl CheckedDecimalOp for CheckedDecimalAdd {
     const ERROR: &'static str = "decimal overflow in checked add";
 
-    fn apply<W>(lhs: W, rhs: W, bounds: &DecimalValueBounds<W>) -> Option<W>
+    fn apply<W>(lhs: W, rhs: W, constants: &DecimalOpConstants<W>) -> Option<W>
     where
-        W: NativeDecimalType + CheckedAdd + CheckedSub,
+        W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
     {
-        bounds.in_precision(lhs.checked_add(&rhs)?)
+        constants.bounds.in_precision(lhs.checked_add(&rhs)?)
     }
 }
 
 impl CheckedDecimalOp for CheckedDecimalSub {
     const ERROR: &'static str = "decimal overflow in checked sub";
 
-    fn apply<W>(lhs: W, rhs: W, bounds: &DecimalValueBounds<W>) -> Option<W>
+    fn apply<W>(lhs: W, rhs: W, constants: &DecimalOpConstants<W>) -> Option<W>
     where
-        W: NativeDecimalType + CheckedAdd + CheckedSub,
+        W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
     {
-        bounds.in_precision(lhs.checked_sub(&rhs)?)
+        constants.bounds.in_precision(lhs.checked_sub(&rhs)?)
     }
 }
 
-fn execute_decimal_at_width<W>(
-    lhs: &DecimalOperand,
-    rhs: &DecimalOperand,
-    op: NumericOperator,
-    result_decimal_dtype: DecimalDType,
-    result_dtype: &DType,
-    validity: Validity,
-    valid_rows: &Mask,
-) -> VortexResult<ArrayRef>
-where
-    W: NativeDecimalType + CheckedAdd + CheckedSub,
-    DecimalValue: From<W>,
-{
-    macro_rules! execute_typed {
-        ($Op:ty) => {
-            execute_decimal_typed::<W, $Op>(
-                lhs,
-                rhs,
-                result_decimal_dtype,
-                result_dtype,
-                validity,
-                valid_rows,
-            )
-        };
-    }
+impl CheckedDecimalOp for CheckedDecimalMul {
+    const ERROR: &'static str = "decimal overflow in checked mul";
 
-    match op {
-        NumericOperator::Add => execute_typed!(CheckedDecimalAdd),
-        NumericOperator::Sub => execute_typed!(CheckedDecimalSub),
-        NumericOperator::Mul | NumericOperator::Div => vortex_bail!(
-            "numeric operator {:?} is not yet supported for decimal arrays",
-            op
-        ),
+    fn apply<W>(lhs: W, rhs: W, constants: &DecimalOpConstants<W>) -> Option<W>
+    where
+        W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
+    {
+        constants.bounds.in_precision(lhs.checked_mul(&rhs)?)
+    }
+}
+
+impl CheckedDecimalOp for CheckedDecimalDiv {
+    const ERROR: &'static str = "decimal overflow or division by zero in checked div";
+
+    fn apply<W>(lhs: W, rhs: W, constants: &DecimalOpConstants<W>) -> Option<W>
+    where
+        W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
+    {
+        let lhs = lhs.checked_mul(&constants.lhs_scale_factor)?;
+        let rhs = rhs.checked_mul(&constants.rhs_scale_factor)?;
+        constants.bounds.in_precision(lhs.checked_div(&rhs)?)
     }
 }
 
@@ -278,25 +325,25 @@ fn execute_decimal_typed<W, Op>(
     result_dtype: &DType,
     validity: Validity,
     valid_rows: &Mask,
+    constants: &DecimalOpConstants<W>,
 ) -> VortexResult<ArrayRef>
 where
-    W: NativeDecimalType + CheckedAdd + CheckedSub,
+    W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
     DecimalValue: From<W>,
     Op: CheckedDecimalOp,
 {
     let len = lhs.len();
-    let bounds = DecimalValueBounds::<W>::new(result_decimal_dtype);
 
     let values = match (lhs, rhs) {
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Array { values: rhs, .. }) => {
-            checked_decimal_arrays::<W, Op>(lhs, rhs, &bounds, valid_rows)
+            checked_decimal_arrays::<W, Op>(lhs, rhs, constants, valid_rows)
         }
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Constant { value, .. }) => {
             let rhs = typed_constant::<W>(value);
             match_each_decimal_value_type!(lhs.values_type(), |L| {
                 let lhs = lhs.buffer::<L>();
                 checked_lanes(lhs.as_slice(), valid_rows, |lhs| {
-                    Op::apply(<W as BigCast>::from(lhs)?, rhs, &bounds)
+                    Op::apply(<W as BigCast>::from(lhs)?, rhs, constants)
                 })
             })
         }
@@ -305,7 +352,7 @@ where
             match_each_decimal_value_type!(rhs.values_type(), |R| {
                 let rhs = rhs.buffer::<R>();
                 checked_lanes(rhs.as_slice(), valid_rows, |rhs| {
-                    Op::apply(lhs, <W as BigCast>::from(rhs)?, &bounds)
+                    Op::apply(lhs, <W as BigCast>::from(rhs)?, constants)
                 })
             })
         }
@@ -315,14 +362,13 @@ where
         ) => {
             let lhs = typed_constant::<W>(lhs);
             let rhs = typed_constant::<W>(rhs);
-            let value = Op::apply(lhs, rhs, &bounds)
+            let value = Op::apply(lhs, rhs, constants)
                 .ok_or_else(|| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
+            let value = DecimalValue::from(value)
+                .normalize(result_decimal_dtype)
+                .vortex_expect("bounds-checked result fits the result precision");
             return Ok(ConstantArray::new(
-                Scalar::decimal(
-                    DecimalValue::from(value),
-                    result_decimal_dtype,
-                    result_dtype.nullability(),
-                ),
+                Scalar::decimal(value, result_decimal_dtype, result_dtype.nullability()),
                 len,
             )
             .into_array());
@@ -330,22 +376,48 @@ where
     }
     .map_err(|_lane| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
 
-    Ok(DecimalArray::new(
+    Ok(decimal_array_narrowed(
         values,
         result_decimal_dtype,
         validity.union_nullability(result_dtype.nullability()),
-    )
-    .into_array())
+    ))
+}
+
+/// Build the result array, narrowing to the dtype's own storage width when the working width is
+/// wider than it. Only division picks a working width above the result precision, and only for a
+/// negative result scale, so this copies in a corner case rather than on the common path.
+fn decimal_array_narrowed<W: NativeDecimalType>(
+    values: Buffer<W>,
+    decimal_dtype: DecimalDType,
+    validity: Validity,
+) -> ArrayRef {
+    let target = DecimalType::smallest_decimal_value_type(&decimal_dtype);
+    if target == W::DECIMAL_TYPE {
+        return DecimalArray::new(values, decimal_dtype, validity).into_array();
+    }
+
+    match_each_decimal_value_type!(target, |O| {
+        let narrowed: Buffer<O> = values
+            .as_slice()
+            .iter()
+            .copied()
+            .map(|value| {
+                <O as BigCast>::from(value)
+                    .vortex_expect("precision-checked decimal result must fit the output width")
+            })
+            .collect();
+        DecimalArray::new(narrowed, decimal_dtype, validity).into_array()
+    })
 }
 
 fn checked_decimal_arrays<W, Op>(
     lhs: &DecimalArray,
     rhs: &DecimalArray,
-    bounds: &DecimalValueBounds<W>,
+    constants: &DecimalOpConstants<W>,
     valid_rows: &Mask,
 ) -> Result<Buffer<W>, usize>
 where
-    W: NativeDecimalType + CheckedAdd + CheckedSub,
+    W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
     Op: CheckedDecimalOp,
 {
     debug_assert_eq!(lhs.len(), rhs.len());
@@ -360,7 +432,7 @@ where
                     Op::apply(
                         <W as BigCast>::from(lhs)?,
                         <W as BigCast>::from(rhs)?,
-                        bounds,
+                        constants,
                     )
                 },
             )
