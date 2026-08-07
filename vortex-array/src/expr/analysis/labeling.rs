@@ -9,6 +9,7 @@ use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::expr::BoundExpression;
 use crate::expr::ExactBoundExpr;
+use crate::expr::ExactBoundExprRef;
 use crate::expr::Expression;
 use crate::expr::traversal::Node;
 use crate::expr::traversal::NodeExt;
@@ -144,7 +145,7 @@ where
         let final_label = node.children().iter().fold(self_label, |acc, child| {
             let child_label = self
                 .labels
-                .get(&ExactBoundExpr(child.clone()))
+                .get(&ExactBoundExprRef(child))
                 .vortex_expect("child must have label");
             (self.merge_child)(acc, child_label)
         });

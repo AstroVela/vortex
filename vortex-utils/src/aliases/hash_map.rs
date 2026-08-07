@@ -13,6 +13,9 @@ pub type Entry<'a, K, V, S> = hashbrown::hash_map::Entry<'a, K, V, S>;
 pub type EntryRef<'a, 'b, K, Q, V, S, A> = hashbrown::hash_map::EntryRef<'a, 'b, K, Q, V, S, A>;
 /// IntoIter type for HashMap.
 pub type IntoIter<K, V> = hashbrown::hash_map::IntoIter<K, V>;
+/// Borrowed-key equivalence trait used by HashMap lookups.
+pub use hashbrown::Equivalent;
+
 /// HashTable type alias.
 pub type HashTable<T> = hashbrown::HashTable<T>;
 /// Entry type for HashTable.

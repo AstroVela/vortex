@@ -12,6 +12,7 @@ use itertools::Itertools;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_utils::aliases::hash_map::Equivalent;
 
 use crate::dtype::DType;
 use crate::expr::Expression;
@@ -56,26 +57,50 @@ pub enum BoundKind {
 #[derive(Clone, Debug)]
 pub struct ExactBoundExpr(pub BoundExpression);
 
+/// A borrowed lookup key for maps keyed by [`ExactBoundExpr`].
+///
+/// Cloning a [`BoundExpression`] just to look it up pays reference-count traffic and the
+/// iterative [`Drop`] bookkeeping on every probe; this wrapper hashes and compares the same
+/// identity from a borrow.
+#[derive(Debug)]
+pub struct ExactBoundExprRef<'a>(pub &'a BoundExpression);
+
+fn exact_eq(lhs: &BoundExpression, rhs: &BoundExpression) -> bool {
+    match (&lhs.kind, &rhs.kind) {
+        (BoundKind::Root, BoundKind::Root) => lhs.dtype == rhs.dtype,
+        (
+            BoundKind::Scalar {
+                scalar_fn: lhs_fn,
+                children: lhs_children,
+            },
+            BoundKind::Scalar {
+                scalar_fn: rhs_fn,
+                children: rhs_children,
+            },
+        ) => lhs_fn == rhs_fn && Arc::ptr_eq(lhs_children, rhs_children) && lhs.dtype == rhs.dtype,
+        _ => false,
+    }
+}
+
+// DType differences are resolved by equality. Omitting the potentially lazy dtype keeps
+// identity-keyed cache lookups from deserializing an entire schema just to compute a hash.
+fn exact_hash<H: Hasher>(expr: &BoundExpression, state: &mut H) {
+    match &expr.kind {
+        BoundKind::Root => state.write_u8(0),
+        BoundKind::Scalar {
+            scalar_fn,
+            children,
+        } => {
+            state.write_u8(1);
+            scalar_fn.hash(state);
+            Arc::as_ptr(children).hash(state);
+        }
+    }
+}
+
 impl PartialEq for ExactBoundExpr {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0.kind, &other.0.kind) {
-            (BoundKind::Root, BoundKind::Root) => self.0.dtype == other.0.dtype,
-            (
-                BoundKind::Scalar {
-                    scalar_fn: lhs_fn,
-                    children: lhs_children,
-                },
-                BoundKind::Scalar {
-                    scalar_fn: rhs_fn,
-                    children: rhs_children,
-                },
-            ) => {
-                lhs_fn == rhs_fn
-                    && Arc::ptr_eq(lhs_children, rhs_children)
-                    && self.0.dtype == other.0.dtype
-            }
-            _ => false,
-        }
+        exact_eq(&self.0, &other.0)
     }
 }
 
@@ -83,19 +108,19 @@ impl Eq for ExactBoundExpr {}
 
 impl Hash for ExactBoundExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // DType differences are resolved by equality. Omitting the potentially lazy dtype keeps
-        // identity-keyed cache lookups from deserializing an entire schema just to compute a hash.
-        match &self.0.kind {
-            BoundKind::Root => state.write_u8(0),
-            BoundKind::Scalar {
-                scalar_fn,
-                children,
-            } => {
-                state.write_u8(1);
-                scalar_fn.hash(state);
-                Arc::as_ptr(children).hash(state);
-            }
-        }
+        exact_hash(&self.0, state)
+    }
+}
+
+impl Hash for ExactBoundExprRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        exact_hash(self.0, state)
+    }
+}
+
+impl Equivalent<ExactBoundExpr> for ExactBoundExprRef<'_> {
+    fn equivalent(&self, key: &ExactBoundExpr) -> bool {
+        exact_eq(self.0, &key.0)
     }
 }
 

@@ -10,7 +10,7 @@ use futures::try_join;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::arrays::DictArray;
-use vortex_array::expr::ExactBoundExpr;
+use vortex_array::expr::ExactBoundExprRef;
 use vortex_array::expr::label_bound_tree;
 use vortex_array::optimizer::ArrayOptimizer;
 use vortex_error::VortexResult;
@@ -164,7 +164,7 @@ impl PlanParentReduceRule<DictPlan> for ExpressionDictRule {
             |acc, &child| (acc.0 | child.0, acc.1 & child.1, acc.2 | child.2),
         );
         let (references_root, is_strict, is_fallible) = labels
-            .get(&ExactBoundExpr(expression.clone()))
+            .get(&ExactBoundExprRef(expression))
             .copied()
             .unwrap_or((false, false, true));
         if !references_root || !is_strict || is_fallible {

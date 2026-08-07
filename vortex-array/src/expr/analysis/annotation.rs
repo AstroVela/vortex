@@ -10,6 +10,7 @@ use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::expr::BoundExpression;
 use crate::expr::ExactBoundExpr;
+use crate::expr::ExactBoundExprRef;
 use crate::expr::Expression;
 use crate::expr::traversal::Node;
 use crate::expr::traversal::NodeExt;
@@ -207,22 +208,20 @@ where
             return Ok(TraversalOrder::Continue);
         }
 
-        let child_annotations = node
-            .children()
-            .iter()
-            .filter_map(|child| {
-                self.annotations
-                    .get(&ExactBoundExpr(child.clone()))
-                    .cloned()
-            })
-            .collect::<Vec<_>>();
-        let annotations = self
-            .annotations
-            .entry(ExactBoundExpr(node.clone()))
-            .or_default();
-        child_annotations
-            .into_iter()
-            .for_each(|child| annotations.extend(child));
+        // Gather inherited annotations through borrowed lookups so probing the map does not
+        // clone (and then drop) a bound-expression key per child.
+        let mut inherited = Vec::new();
+        for child in node.children() {
+            if let Some(annotations) = self.annotations.get(&ExactBoundExprRef(child)) {
+                inherited.extend(annotations.iter().cloned());
+            }
+        }
+        if let Some(annotations) = self.annotations.get_mut(&ExactBoundExprRef(node)) {
+            annotations.extend(inherited);
+        } else {
+            self.annotations
+                .insert(ExactBoundExpr(node.clone()), inherited.into_iter().collect());
+        }
 
         Ok(TraversalOrder::Continue)
     }

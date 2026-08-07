@@ -17,7 +17,7 @@ use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
 use crate::dtype::StructFields;
 use crate::expr::BoundExpression;
-use crate::expr::ExactBoundExpr;
+use crate::expr::ExactBoundExprRef;
 use crate::expr::analysis::Annotation;
 use crate::expr::analysis::AnnotationFn;
 use crate::expr::analysis::BoundAnnotations;
@@ -192,7 +192,7 @@ where
     type NodeTy = BoundExpression;
 
     fn visit_down(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
-        match self.annotations.get(&ExactBoundExpr(node.clone())) {
+        match self.annotations.get(&ExactBoundExprRef(&node)) {
             // If this expression only accesses a single field, then we can skip the children
             Some(annotations) if annotations.len() == 1 => {
                 let annotation = annotations
@@ -241,7 +241,7 @@ where
     type NodeTy = BoundExpression;
 
     fn visit_down(&mut self, node: Self::NodeTy) -> VortexResult<Transformed<Self::NodeTy>> {
-        let Some(annotations) = self.annotations.get(&ExactBoundExpr(node.clone())) else {
+        let Some(annotations) = self.annotations.get(&ExactBoundExprRef(&node)) else {
             return Ok(Transformed::no(node));
         };
         if annotations.len() != 1 {
