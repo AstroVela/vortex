@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use futures::FutureExt;
 use futures::executor::block_on;
 use parking_lot::RwLock;
 use vortex_array::dtype::DType;
@@ -302,7 +303,27 @@ impl VortexOpenOptions {
         let footer = if let Some(footer) = self.footer {
             footer
         } else {
-            self.read_footer_local(&reader).await?
+            let file_size = self.file_size;
+            let initial_read_size = self.initial_read_size;
+            let dtype = self.dtype.clone();
+            let session = self.session.clone();
+            let footer_reader = reader.clone();
+            let task = self.session.handle().spawn_local_io(move || {
+                async move {
+                    read_footer_local(
+                        footer_reader.clone(),
+                        file_size,
+                        initial_read_size,
+                        dtype,
+                        session,
+                    )
+                    .await
+                }
+                .boxed_local()
+            });
+            let (footer, initial_offset, initial_read) = task.await?;
+            self.populate_initial_segments(initial_offset, &initial_read, &footer);
+            footer
         };
 
         let segment_cache = Arc::new(InstrumentedSegmentCache::new(
@@ -384,50 +405,6 @@ impl VortexOpenOptions {
         Ok(footer)
     }
 
-    async fn read_footer_local(&self, read: &dyn VortexLocalReadAt) -> VortexResult<Footer> {
-        let file_size = match self.file_size {
-            None => read.size().await?,
-            Some(file_size) => file_size,
-        };
-        let mut initial_read_size = self
-            .initial_read_size
-            .max(MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE);
-        if let Ok(file_size) = usize::try_from(file_size) {
-            initial_read_size = initial_read_size.min(file_size);
-        }
-
-        let initial_offset = file_size - initial_read_size as u64;
-        let initial_read: ByteBuffer = read
-            .read_at_local(initial_offset, initial_read_size, Alignment::none())
-            .await?
-            .try_into_host()?
-            .await?;
-
-        let mut deserializer = Footer::deserializer(initial_read, self.session.clone())
-            .with_size(file_size)
-            .with_some_dtype(self.dtype.clone());
-
-        let footer = loop {
-            match deserializer.deserialize()? {
-                DeserializeStep::NeedMoreData { offset, len } => {
-                    let more_data = read
-                        .read_at_local(offset, len, Alignment::none())
-                        .await?
-                        .try_into_host()?
-                        .await?;
-                    deserializer.prefix_data(more_data);
-                }
-                DeserializeStep::NeedFileSize => unreachable!("We passed file_size above"),
-                DeserializeStep::Done(footer) => break Ok::<_, VortexError>(footer),
-            }
-        }?;
-
-        let initial_offset = file_size - (deserializer.buffer().len() as u64);
-        self.populate_initial_segments(initial_offset, deserializer.buffer(), &footer);
-
-        Ok(footer)
-    }
-
     /// Populate segments in the cache that were covered by the initial read.
     fn populate_initial_segments(
         &self,
@@ -453,6 +430,52 @@ impl VortexOpenOptions {
             initial_read_segments.insert(segment_id, buffer);
         }
     }
+}
+
+async fn read_footer_local<R: VortexLocalReadAt + Clone>(
+    read: R,
+    file_size: Option<u64>,
+    initial_read_size: usize,
+    dtype: Option<DType>,
+    session: VortexSession,
+) -> VortexResult<(Footer, u64, ByteBuffer)> {
+    let file_size = match file_size {
+        None => read.size().await?,
+        Some(file_size) => file_size,
+    };
+    let mut initial_read_size = initial_read_size.max(MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE);
+    if let Ok(file_size) = usize::try_from(file_size) {
+        initial_read_size = initial_read_size.min(file_size);
+    }
+
+    let initial_offset = file_size - initial_read_size as u64;
+    let initial_read: ByteBuffer = read
+        .read_at_local(initial_offset, initial_read_size, Alignment::none())
+        .await?
+        .try_into_host()?
+        .await?;
+
+    let mut deserializer = Footer::deserializer(initial_read, session)
+        .with_size(file_size)
+        .with_some_dtype(dtype);
+
+    let footer = loop {
+        match deserializer.deserialize()? {
+            DeserializeStep::NeedMoreData { offset, len } => {
+                let more_data = read
+                    .read_at_local(offset, len, Alignment::none())
+                    .await?
+                    .try_into_host()?
+                    .await?;
+                deserializer.prefix_data(more_data);
+            }
+            DeserializeStep::NeedFileSize => unreachable!("We passed file_size above"),
+            DeserializeStep::Done(footer) => break Ok::<_, VortexError>(footer),
+        }
+    }?;
+
+    let initial_offset = file_size - (deserializer.buffer().len() as u64);
+    Ok((footer, initial_offset, deserializer.buffer().clone()))
 }
 
 #[cfg(feature = "object_store")]
