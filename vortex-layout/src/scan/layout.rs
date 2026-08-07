@@ -36,6 +36,7 @@ use vortex_scan::Partition;
 use vortex_scan::PartitionRef;
 use vortex_scan::PartitionStream;
 use vortex_scan::ScanRequest;
+use vortex_scan::SplitTask;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
@@ -341,6 +342,18 @@ impl Partition for LayoutReaderSplit {
             dtype, stream,
         )))
     }
+
+    fn execute_splits(self: Box<Self>) -> VortexResult<Vec<SplitTask>> {
+        ScanBuilder::new(self.session, self.reader)
+            .with_row_range(self.row_range)
+            .with_selection(self.selection)
+            .with_projection(self.projection)
+            .with_some_filter(self.filter)
+            .with_some_limit(self.limit)
+            .with_some_metrics_registry(self.metrics_registry)
+            .with_ordered(self.ordered)
+            .build()
+    }
 }
 
 /// A scan that produces no data, only empty arrays with the correct row count.
@@ -400,5 +413,12 @@ impl Partition for Empty {
             dtype,
             stream::iter(iter),
         )))
+    }
+
+    fn execute_splits(self: Box<Self>) -> VortexResult<Vec<SplitTask>> {
+        let scalar = Scalar::default_value(&self.dtype);
+        let row_count = usize::try_from(self.row_count)?;
+        let array = ConstantArray::new(scalar.clone(), row_count).into_array();
+        Ok(vec![futures::future::ready(Ok(Some(array))).boxed()])
     }
 }

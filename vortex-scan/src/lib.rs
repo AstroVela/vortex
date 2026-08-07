@@ -31,8 +31,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use selection::Selection;
+use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldPath;
 use vortex_array::expr::Expression;
@@ -208,4 +210,10 @@ pub trait Partition: 'static + Send {
     /// operations should be spawned onto the runtime to enable parallel execution across
     /// threads.
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream>;
+
+    /// Prepare independent split tasks for a partition and execute it.
+    fn execute_splits(self: Box<Self>) -> VortexResult<Vec<SplitTask>>;
 }
+
+/// Split task of a partition. Future yields array of a split.
+pub type SplitTask = BoxFuture<'static, VortexResult<Option<ArrayRef>>>;

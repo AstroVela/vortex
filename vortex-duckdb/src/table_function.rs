@@ -18,6 +18,7 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
+use kanal::AsyncSender;
 use num_traits::AsPrimitive;
 use parking_lot::Mutex;
 use static_assertions::assert_impl_all;
@@ -52,6 +53,7 @@ use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::scalar_fn::fns::pack::Pack;
 use vortex::scan::DataSource;
+use vortex::scan::Partition;
 use vortex::scan::ScanRequest;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::parallelism::get_available_parallelism;
@@ -211,6 +213,59 @@ pub fn bind(input: &BindInputRef, result: &mut BindResultRef) -> VortexResult<Ta
     })
 }
 
+type PartitionResult = VortexResult<Box<dyn Partition>>;
+type PartitionSender = AsyncSender<ScanItem>;
+
+async fn on_partition(
+    sender: PartitionSender,
+    partition: PartitionResult,
+    pending: Arc<AtomicU64>,
+) {
+    let partition = match partition {
+        Ok(partition) => partition,
+        Err(e) => {
+            let _ = sender.send(Err(e)).await;
+            return;
+        }
+    };
+
+    let cache = Arc::new(ConversionCache {
+        file_index: partition.index(),
+        ..Default::default()
+    });
+
+    let splits = match partition.execute_splits() {
+        Ok(splits) => splits,
+        Err(e) => {
+            let _ = sender.send(Err(e)).await;
+            return;
+        }
+    };
+    let handles = splits
+        .into_iter()
+        .map(|task| RUNTIME.handle().spawn(task))
+        .collect::<Vec<_>>();
+    for handle in handles {
+        match handle.await {
+            Ok(Some(array)) => {
+                pending.fetch_add(1, Ordering::Relaxed);
+                if sender.send(Ok((array, Arc::clone(&cache)))).await.is_err() {
+                    // Exit early if the receiver has been dropped, which happens
+                    // when the scan is complete or if an error has occurred in
+                    // another partition.
+                    return;
+                }
+            }
+            // split is filtered
+            Ok(None) => {}
+            Err(e) => {
+                let _ = sender.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+}
+
 pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlobal> {
     debug!(input=?init_input, "table function global input");
 
@@ -274,63 +329,28 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
     };
 
     let scan = RUNTIME.block_on(bind_data.data_source.scan(request))?;
-
     let num_workers = get_available_parallelism().unwrap_or(1);
 
     // We create an async bounded channel so that all thread-local workers can pull the next
     // available array chunk regardless of which partition it came from.
-    let (tx, rx) = kanal::bounded_async(num_workers * 2);
+    let (sender, receiver) = kanal::bounded_async(num_workers * 2);
 
     let pending = Arc::new(AtomicU64::new(0));
     let pending_producer = Arc::clone(&pending);
 
-    // We drive one partition per worker thread. Each partition is driven as a spawned task
-    // that pushes array chunks into the shared channel as they are produced. This spawning
-    // allows all worker threads to drive the polling of all partitions, and then return the
-    // first available array chunk.
     let stream = scan
         .partitions()
         .map(move |partition| {
-            let tx = tx.clone();
+            let sender = sender.clone();
             let pending = Arc::clone(&pending_producer);
-            RUNTIME.handle().spawn(async move {
-                let partition = match partition {
-                    Ok(partition) => partition,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-                let cache = Arc::new(ConversionCache {
-                    file_index: partition.index(),
-                    ..Default::default()
-                });
-
-                let mut stream = match partition.execute() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                while let Some(item) = stream.next().await {
-                    pending.fetch_add(1, Ordering::Relaxed);
-                    if tx
-                        .send(item.map(|a| (a, Arc::clone(&cache))))
-                        .await
-                        .is_err()
-                    {
-                        // Exit early if the receiver has been dropped, which happens when the
-                        // scan is complete or if an error has occurred in another partition.
-                        return;
-                    }
-                }
-            })
+            RUNTIME
+                .handle()
+                .spawn(async move { on_partition(sender, partition, pending).await })
         })
         .buffer_unordered(num_workers);
 
-    let iterator = RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
+    let iterator =
+        RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, receiver));
 
     let aggregates = bind_data.aggregates.clone();
     let partials = build_partials(

@@ -56,6 +56,7 @@ use vortex_scan::Partition;
 use vortex_scan::PartitionRef;
 use vortex_scan::PartitionStream;
 use vortex_scan::ScanRequest;
+use vortex_scan::SplitTask;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
@@ -595,6 +596,23 @@ impl Partition for MultiLayoutPartition {
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             dtype, stream,
         )))
+    }
+
+    fn execute_splits(self: Box<Self>) -> VortexResult<Vec<SplitTask>> {
+        let request = self.request;
+        let filter = request.filter?;
+        let mut builder = ScanBuilder::new(self.session, self.reader)
+            .with_selection(request.selection)
+            .with_projection(request.projection)
+            .with_some_filter(filter)
+            .with_some_limit(request.limit)
+            .with_ordered(request.ordered);
+
+        if let Some(row_range) = request.row_range {
+            builder = builder.with_row_range(row_range);
+        }
+
+        builder.build()
     }
 }
 
