@@ -84,8 +84,8 @@ fn lower_part_count(array: &ArrayRef) -> usize {
 }
 
 /// Values too wide for a single signed part are left as the canonical decimal. Splitting them
-/// would need lower parts, which cannot be serialized, so the scheme declines rather than
-/// building an array the writer would refuse.
+/// would need lower parts, which serialize under the wide format id the scheme does not
+/// declare, so it declines rather than building an array outside its declared output.
 #[rstest]
 #[case::i128(wide_i128_array(Validity::NonNullable).into_array())]
 #[case::i128_nullable(wide_i128_array(Validity::from_iter((0..N).map(|i| i % 3 != 0))).into_array())]

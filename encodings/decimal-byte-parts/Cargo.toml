@@ -16,11 +16,6 @@ version = { workspace = true }
 [lints]
 workspace = true
 
-[features]
-# Serializing more than one child, which readers that predate lower parts cannot open.
-# Building and reading them is always allowed; only writing is gated.
-unstable_encodings = []
-
 [dependencies]
 num-traits = { workspace = true }
 prost = { workspace = true }

@@ -22,6 +22,7 @@ use prost::Message as _;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
 use vortex_array::ArrayId;
+use vortex_array::ArrayPlugin;
 use vortex_array::ArrayRef;
 use vortex_array::ArraySlots;
 use vortex_array::EqMode;
@@ -152,17 +153,6 @@ impl VTable for DecimalByteParts {
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
-        // The only gate on lower parts reaching a file. Building them in memory is allowed —
-        // reading a file requires it — and the write allow-list checks only the encoding id,
-        // not how many children it carries, so this is the single point where a multi-child
-        // array can be refused before it becomes bytes.
-        vortex_ensure!(
-            array.lower_parts().is_empty() || cfg!(feature = "unstable_encodings"),
-            "serializing DecimalByteParts with lower parts requires the `unstable_encodings` \
-             feature: readers that predate lower parts understand only a single child, and \
-             would fail to open a file containing this array"
-        );
-
         let lower_part_count = u32::try_from(array.lower_parts().len())
             .map_err(|_| vortex_err!("lower part count exceeds u32"))?;
         Ok(Some(
@@ -172,6 +162,19 @@ impl VTable for DecimalByteParts {
             }
             .encode_to_vec(),
         ))
+    }
+
+    fn serialized_id(&self, array: ArrayView<'_, Self>) -> ArrayId {
+        // The frozen `vortex.decimal_byte_parts` format promises a single child: readers that
+        // predate lower parts require `lower_part_count == 0`, so an array carrying lower
+        // parts must serialize under the wide format id instead. That id is what the writer's
+        // permitted-encoding check gates, and what a reader without wide support rejects as an
+        // unknown encoding instead of misreading the children.
+        if array.lower_parts().is_empty() {
+            VTable::id(self)
+        } else {
+            ArrayPlugin::id(&DecimalBytePartsWide)
+        }
     }
 
     fn deserialize(
@@ -350,19 +353,67 @@ impl DecimalByteParts {
         lower_parts: Vec<ArrayRef>,
         decimal_dtype: DecimalDType,
     ) -> VortexResult<DecimalBytePartsArray> {
-        // A reader that predates lower parts expects this encoding to have exactly one child,
-        // so a file containing a multi-child array is one it cannot open. Introducing lower
-        // parts is gated behind `unstable_encodings` until enough readers understand them.
-        //
-        // This gate is on *introducing* lower parts only. Reading them back, and rebuilding an
-        // array that already has them, go through `rebuild_with_lower_parts` and stay ungated —
-        // otherwise a build without the feature could not read a file written by one with it.
+        // Building lower parts in memory is never gated — reading a file requires it. What is
+        // gated is the serialized form: an array carrying lower parts serializes under the
+        // `DecimalBytePartsWide` format id, which only editions that contain it may write.
         let len = msp.len();
         let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
         let slots = DecimalBytePartsSlots { msp, lower_parts }.into_slots();
         Array::try_from_parts(
             ArrayParts::new(DecimalByteParts, dtype, len, DecimalBytePartsData).with_slots(slots),
         )
+    }
+}
+
+/// The `vortex.decimal_byte_parts_wide` serialized format: byte parts carrying lower parts.
+///
+/// This is a serialized format, not a second in-memory encoding. `vortex.decimal_byte_parts`
+/// froze promising a single child, so an array with lower parts serializes under this id
+/// instead — see [`VTable::serialized_id`] on [`DecimalByteParts`] — and both ids deserialize
+/// back into the same [`DecimalBytePartsArray`]. A reader that predates lower parts fails on
+/// this id with an unknown-encoding error rather than misreading the children.
+#[derive(Clone, Debug)]
+pub struct DecimalBytePartsWide;
+
+impl ArrayPlugin for DecimalBytePartsWide {
+    fn id(&self) -> ArrayId {
+        static ID: CachedId = CachedId::new("vortex.decimal_byte_parts_wide");
+        *ID
+    }
+
+    fn serialize(
+        &self,
+        array: &ArrayRef,
+        session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
+        // In-memory arrays always carry the `DecimalByteParts` encoding id, so metadata
+        // serialization is resolved through that plugin; both formats share it.
+        ArrayPlugin::serialize(&DecimalByteParts, array, session)
+    }
+
+    fn deserialize(
+        &self,
+        dtype: &DType,
+        len: usize,
+        metadata: &[u8],
+        buffers: &[BufferHandle],
+        children: &dyn ArrayChildren,
+        session: &VortexSession,
+    ) -> VortexResult<ArrayRef> {
+        Ok(Array::try_from_parts(VTable::deserialize(
+            &DecimalByteParts,
+            dtype,
+            len,
+            metadata,
+            buffers,
+            children,
+            session,
+        )?)?
+        .into_array())
+    }
+
+    fn is_supported_encoding(&self, id: &ArrayId) -> bool {
+        *id == ArrayPlugin::id(self) || *id == VTable::id(&DecimalByteParts)
     }
 }
 
@@ -682,9 +733,6 @@ mod tests {
         Ok(())
     }
 
-    /// Serializing lower parts is gated: an array carrying them can only be written to bytes
-    /// with `unstable_encodings`, so these cases only exist when the feature is on.
-    #[cfg(feature = "unstable_encodings")]
     #[rstest]
     #[case::one_lower_part(i128_parts(wide_i128_values(), Validity::NonNullable))]
     #[case::three_lower_parts(i256_parts(wide_i256_values(), Validity::NonNullable))]
@@ -706,7 +754,9 @@ mod tests {
 
     fn test_serde_round_trip(array: DecimalBytePartsArray) -> VortexResult<()> {
         let session = array_session();
-        session.arrays().register(DecimalByteParts);
+        // Both serialized formats must be registered: an array with lower parts comes back
+        // under the wide format id.
+        crate::initialize(&session);
 
         let array = array.into_array();
         let dtype = array.dtype().clone();
@@ -780,7 +830,8 @@ mod tests {
             zeroth_child_ptype: PType::I64 as i32,
             lower_part_count,
         };
-        DecimalByteParts.deserialize(
+        VTable::deserialize(
+            &DecimalByteParts,
             &DType::Decimal(DecimalDType::new(38, 2), Nullability::NonNullable),
             3,
             &metadata.encode_to_vec(),
@@ -806,36 +857,38 @@ mod tests {
     }
 
     /// An array read from a file can be handed straight back to a writer, bypassing both the
-    /// constructor and the compressor. Without the feature that write must be refused, or a
-    /// build that could never have built this array could still emit one.
-    #[cfg(not(feature = "unstable_encodings"))]
+    /// constructor and the compressor. Its serialized id must still be the wide format, so a
+    /// writer whose permitted encodings predate the wide format refuses it.
     #[test]
-    fn serializing_read_lower_parts_is_gated() -> VortexResult<()> {
+    fn read_lower_parts_serialize_under_the_wide_format() -> VortexResult<()> {
         let session = array_session();
-        session.arrays().register(DecimalByteParts);
+        crate::initialize(&session);
 
         let array = deserialize_with(1, vec![msp(), lower_part()])
             .and_then(Array::try_from_parts)?
             .into_array();
 
+        assert_eq!(
+            session.array_serialized_id(&array)?,
+            ArrayPlugin::id(&DecimalBytePartsWide)
+        );
+
+        let restricted = ArrayContext::empty()
+            .with_allowed_ids([VTable::id(&DecimalByteParts)].into_iter().collect());
         let err = array
-            .serialize(
-                &ArrayContext::empty(),
-                &session,
-                &SerializeOptions::default(),
-            )
-            .expect_err("expected the write gate to refuse");
+            .serialize(&restricted, &session, &SerializeOptions::default())
+            .expect_err("expected the permitted-encoding check to refuse the wide format");
         assert!(
-            err.to_string().contains("unstable_encodings"),
-            "error should name the feature, got: {err}"
+            err.to_string().contains("not permitted"),
+            "error should name the permitted-encoding check, got: {err}"
         );
         Ok(())
     }
 
     /// Reading back an array that already carries lower parts, and computing over it, must
-    /// work regardless of the `unstable_encodings` write gate. The gate stops a writer
-    /// introducing lower parts; if it also blocked the rebuild that every compute kernel does,
-    /// a build without the feature could not read a file written by a build with it.
+    /// always work: the wide format only restricts which writers may emit it. If reading or
+    /// the rebuild that every compute kernel does were blocked, a session whose editions
+    /// predate the wide format could not read a file written by one that includes it.
     #[test]
     fn compute_over_existing_lower_parts_is_not_gated() -> VortexResult<()> {
         let session = array_session();

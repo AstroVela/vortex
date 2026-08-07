@@ -2874,17 +2874,19 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     Ok(())
 }
 
-/// A multi-limb array handed to the file writer must not reach the file as one.
+/// A multi-limb array handed to the default file writer does not reach the file as one.
 ///
-/// Two independent mechanisms stop it, and this pins the one that applies here: the writer
-/// recompresses its input, and the decimal scheme declines to split values too wide for a
-/// single signed part, so the column lands as a canonical decimal with no children. The other
-/// mechanism — `serialize` refusing outright — is the backstop for a write strategy that does
-/// not recompress, and is covered in the encoding crate.
-#[cfg(not(feature = "unstable_encodings"))]
+/// Two independent mechanisms stand between lower parts and a file, and this pins the one
+/// that applies here: the writer recompresses its input, and the decimal scheme declines to
+/// split values too wide for a single signed part, so the column lands as a canonical decimal
+/// with no children. The other mechanism — the permitted-encoding check refusing the
+/// `vortex.decimal_byte_parts_wide` serialized format outside its edition — is the backstop
+/// for a write strategy that does not recompress, and is covered in the encoding crate and
+/// the `vortex` editions tests.
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn test_lower_parts_do_not_reach_a_file_without_unstable_encodings() -> VortexResult<()> {
+async fn test_lower_parts_recompress_to_canonical_through_the_default_writer() -> VortexResult<()>
+{
     use vortex_decimal_byte_parts::DecimalByteParts;
     use vortex_decimal_byte_parts::split_decimal;
 

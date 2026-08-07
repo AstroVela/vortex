@@ -94,7 +94,6 @@ serde = ["vortex-array/serde", "vortex-buffer/serde", "vortex-mask/serde"]
 unstable_encodings = [
     "dep:vortex-tensor",
     "vortex-btrblocks/unstable_encodings",
-    "vortex-decimal-byte-parts/unstable_encodings",
     "vortex-file?/unstable_encodings",
     "vortex-zstd?/unstable_encodings",
 ]
