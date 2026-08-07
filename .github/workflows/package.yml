@@ -18,6 +18,8 @@ on:
         required: true
         type: string
 
+permissions: { }
+
 jobs:
   prepare-python:
     runs-on: ${{ matrix.target.runs-on }}
