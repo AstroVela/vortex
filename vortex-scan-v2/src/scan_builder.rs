@@ -19,6 +19,8 @@ use vortex_array::expr::Expression;
 use vortex_array::expr::root;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorAdapter;
+use vortex_array::scalar_fn::fns::binary::Binary;
+use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::stream::ArrayStream;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_error::VortexExpect;
@@ -273,7 +275,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
                     .clone()
                     .unwrap_or_else(|| 0..self.base_plan.row_count());
                 let mut plans = vec![&projection];
-                plans.extend(filter.as_ref());
+                plans.extend(filter.iter());
                 plans.extend(pruning.as_ref());
                 Splits::Natural(self.split_by.splits(&plans, &row_range)?)
             };
@@ -426,22 +428,47 @@ fn build_pruning_plan(
 fn optimize_filter_plan(
     filter: Option<&BoundExpression>,
     source: &PlanRef,
-) -> VortexResult<Option<PlanRef>> {
+) -> VortexResult<Vec<PlanRef>> {
     let Some(expression) = filter else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let filter: PlanRef = Arc::new(ExpressionPlan::new(expression.clone(), Arc::clone(source)));
-    let filter = filter.optimize()?;
-    vortex_ensure!(
-        filter.dtype().is_boolean(),
-        "Filter plan must produce booleans"
-    );
-    tracing::debug!(
-        target: "vortex_scan_v2::planner",
-        plan = %filter.tree_display(),
-        "optimized the filter physical plan"
-    );
-    Ok(Some(filter))
+    // Split the filter into conjuncts so execution can evaluate each conjunct over only the rows
+    // surviving the previous ones.
+    bound_conjuncts(expression)
+        .into_iter()
+        .map(|conjunct| {
+            let filter: PlanRef = Arc::new(ExpressionPlan::new(conjunct, Arc::clone(source)));
+            let filter = filter.optimize()?;
+            vortex_ensure!(
+                filter.dtype().is_boolean(),
+                "Filter plan must produce booleans"
+            );
+            tracing::debug!(
+                target: "vortex_scan_v2::planner",
+                plan = %filter.tree_display(),
+                "optimized a filter conjunct physical plan"
+            );
+            Ok(filter)
+        })
+        .collect()
+}
+
+/// Flattens nested `AND` expressions into their conjuncts, preserving evaluation order.
+fn bound_conjuncts(expression: &BoundExpression) -> Vec<BoundExpression> {
+    let mut conjuncts = Vec::new();
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        if expression
+            .as_scalar()
+            .and_then(|scalar_fn| scalar_fn.as_opt::<Binary>())
+            .is_some_and(|operator| *operator == Operator::And)
+        {
+            pending.extend(expression.children().iter().rev());
+        } else {
+            conjuncts.push(expression.clone());
+        }
+    }
+    conjuncts
 }
 
 fn uses_only_pruning_sources(plan: &PlanRef) -> VortexResult<bool> {

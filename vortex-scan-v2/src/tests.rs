@@ -70,8 +70,14 @@ impl TrackingSource {
 
 impl SegmentSource for TrackingSource {
     fn request(&self, id: SegmentId) -> SegmentFuture {
-        self.requests.lock().push(id);
-        self.inner.request(id)
+        let inner = self.inner.request(id);
+        let requests = Arc::clone(&self.requests);
+        // Split tasks may register reads that are later canceled without any IO, so only record
+        // a segment once its read future is actually polled.
+        Box::pin(async move {
+            requests.lock().push(id);
+            inner.await
+        })
     }
 }
 

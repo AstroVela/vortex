@@ -42,6 +42,13 @@ pub struct ChunkedData {
     chunk_offsets: Vec<u64>,
 }
 
+impl ChunkedData {
+    /// Returns the cumulative chunk row offsets, one entry per chunk plus a trailing total.
+    pub fn chunk_offsets(&self) -> &[u64] {
+        &self.chunk_offsets
+    }
+}
+
 /// A layout partitioned into independently readable row chunks.
 pub type ChunkedLayout = Layout<Chunked>;
 

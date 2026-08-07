@@ -16,6 +16,7 @@ use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::dtype::DType;
@@ -23,6 +24,7 @@ use vortex_array::expr::BoundExpression;
 use vortex_array::expr::traversal::NodeExt;
 use vortex_array::expr::traversal::Transformed;
 use vortex_array::expr::traversal::TraversalOrder;
+use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex_array::scalar_fn::fns::stat::StatFn;
 use vortex_array::validity::Validity;
@@ -133,12 +135,14 @@ impl ZonedPruningState {
                     let zone_map = zone_map.await?;
                     let initial_result =
                         zone_map.evaluate(&expression, &session).map_err(Arc::new)?;
+                    let initial_decision =
+                        ZoneDecision::try_new(&initial_result, &session).map_err(Arc::new)?;
                     let dynamic_updates = DynamicExprUpdates::new(&expression.unbind());
                     Ok(Arc::new(ZonedPruningResult {
                         zone_map,
                         expression,
                         dynamic_updates,
-                        latest_result: RwLock::new((0, initial_result)),
+                        latest_result: RwLock::new((0, initial_decision)),
                         session,
                     }))
                 }
@@ -149,16 +153,40 @@ impl ZonedPruningState {
     }
 }
 
+/// Zone-level proof bits resolved once per pruning expression evaluation.
+#[derive(Clone)]
+struct ZoneDecision {
+    values: BitBuffer,
+    /// `None` when every zone-level proof value is valid.
+    validity: Option<BitBuffer>,
+}
+
+impl ZoneDecision {
+    fn try_new(evaluated: &BoolArray, session: &VortexSession) -> VortexResult<Self> {
+        let mut execution = session.create_execution_ctx();
+        let validity =
+            BoolArrayExt::validity(evaluated).execute_mask(evaluated.len(), &mut execution)?;
+        Ok(Self {
+            values: evaluated.to_bit_buffer(),
+            validity: (!validity.all_true()).then(|| validity.to_bit_buffer()),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
 struct ZonedPruningResult {
     zone_map: ZoneMap,
     expression: BoundExpression,
     dynamic_updates: Option<DynamicExprUpdates>,
-    latest_result: RwLock<(u64, BoolArray)>,
+    latest_result: RwLock<(u64, ZoneDecision)>,
     session: VortexSession,
 }
 
 impl ZonedPruningResult {
-    fn evaluate(&self) -> VortexResult<BoolArray> {
+    fn evaluate(&self) -> VortexResult<ZoneDecision> {
         let Some(dynamic_updates) = &self.dynamic_updates else {
             return Ok(self.latest_result.read().1.clone());
         };
@@ -172,7 +200,8 @@ impl ZonedPruningResult {
 
         let mut result = self.latest_result.write();
         if result.0 < version {
-            result.1 = self.zone_map.evaluate(&self.expression, &self.session)?;
+            let evaluated = self.zone_map.evaluate(&self.expression, &self.session)?;
+            result.1 = ZoneDecision::try_new(&evaluated, &self.session)?;
             result.0 = version;
         }
         Ok(result.1.clone())
@@ -312,58 +341,90 @@ impl ZonedPlan {
                 zone_len,
                 row_count,
             )?;
-            let evaluated = pruning_result.await?.evaluate()?;
-            let mut execution = ctx.session().create_execution_ctx();
-            let zone_validity =
-                BoolArrayExt::validity(&evaluated).execute_mask(evaluated.len(), &mut execution)?;
-            let zone_values = evaluated.to_bit_buffer();
+            let decision = pruning_result.await?.evaluate()?;
 
             let zone_start = row_range.start / zone_len;
             let zone_end = row_range.end.div_ceil(zone_len);
             let zone_start_usize = usize::try_from(zone_start)?;
             let zone_end_usize = usize::try_from(zone_end)?;
             vortex_ensure!(
-                zone_end_usize <= evaluated.len(),
+                zone_end_usize <= decision.len(),
                 "Zoned pruning requires zones {zone_start}..{zone_end}, but only {} exist",
-                evaluated.len()
+                decision.len()
             );
 
-            let mut values = BitBufferMut::with_capacity(range_len);
-            let mut validity = BitBufferMut::with_capacity(range_len);
-            let relevant_values = zone_values.slice(zone_start_usize..zone_end_usize);
-            let relevant_validity = zone_validity.slice(zone_start_usize..zone_end_usize);
-            for (offset, (value, valid)) in relevant_values
-                .iter()
-                .zip(relevant_validity.iter())
-                .enumerate()
-            {
-                let zone_index = zone_start + u64::try_from(offset)?;
-                let zone_row_start = zone_index.saturating_mul(zone_len).min(row_count);
-                let zone_row_end = zone_index
-                    .saturating_add(1)
-                    .saturating_mul(zone_len)
-                    .min(row_count);
-                let start = zone_row_start.max(row_range.start);
-                let end = zone_row_end.min(row_range.end);
-                if start < end {
-                    let len = usize::try_from(end - start)?;
-                    values.append_n(value, len);
-                    validity.append_n(valid, len);
+            // Most splits cover zones with a uniform valid proof value; expand those into a
+            // constant so downstream mask conversions stay O(1).
+            let uniform_validity = match &decision.validity {
+                None => true,
+                Some(validity) => {
+                    let relevant = validity.slice(zone_start_usize..zone_end_usize);
+                    relevant.true_count() == relevant.len()
+                }
+            };
+            if uniform_validity {
+                let relevant = decision.values.slice(zone_start_usize..zone_end_usize);
+                let true_count = relevant.true_count();
+                if true_count == 0 || true_count == relevant.len() {
+                    let output_len = if input_mask.all_true() {
+                        range_len
+                    } else {
+                        input_mask.true_count()
+                    };
+                    let value = Scalar::bool(true_count > 0, output_dtype.nullability());
+                    return Ok(ConstantArray::new(value, output_len).into_array());
                 }
             }
+
+            let expand = |zone_bits: &BitBuffer| -> VortexResult<BitBufferMut> {
+                let mut expanded = BitBufferMut::with_capacity(range_len);
+                let relevant = zone_bits.slice(zone_start_usize..zone_end_usize);
+                for (offset, bit) in relevant.iter().enumerate() {
+                    let zone_index = zone_start + u64::try_from(offset)?;
+                    let zone_row_start = zone_index.saturating_mul(zone_len).min(row_count);
+                    let zone_row_end = zone_index
+                        .saturating_add(1)
+                        .saturating_mul(zone_len)
+                        .min(row_count);
+                    let start = zone_row_start.max(row_range.start);
+                    let end = zone_row_end.min(row_range.end);
+                    if start < end {
+                        expanded.append_n(bit, usize::try_from(end - start)?);
+                    }
+                }
+                Ok(expanded)
+            };
+
+            let values = expand(&decision.values)?;
             vortex_ensure!(
-                values.len() == range_len && validity.len() == range_len,
+                values.len() == range_len,
                 "Expanded zone proof length does not match row range"
             );
+            let validity = decision.validity.as_ref().map(&expand).transpose()?;
 
-            let validity = if output_dtype.is_nullable() {
-                Validity::from(validity.freeze())
-            } else {
-                vortex_ensure!(
-                    validity.freeze().true_count() == range_len,
-                    "Non-nullable zoned proof produced null values"
-                );
-                Validity::NonNullable
+            let validity = match validity {
+                None => {
+                    if output_dtype.is_nullable() {
+                        Validity::AllValid
+                    } else {
+                        Validity::NonNullable
+                    }
+                }
+                Some(validity) => {
+                    vortex_ensure!(
+                        validity.len() == range_len,
+                        "Expanded zone validity length does not match row range"
+                    );
+                    if output_dtype.is_nullable() {
+                        Validity::from(validity.freeze())
+                    } else {
+                        vortex_ensure!(
+                            validity.freeze().true_count() == range_len,
+                            "Non-nullable zoned proof produced null values"
+                        );
+                        Validity::NonNullable
+                    }
+                }
             };
             let output = BoolArray::new(values.freeze(), validity).into_array();
             if input_mask.all_true() {

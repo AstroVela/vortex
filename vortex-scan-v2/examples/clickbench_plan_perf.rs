@@ -11,8 +11,12 @@ use std::time::Instant;
 use futures::future::try_join_all;
 use tracing_subscriber::EnvFilter;
 use vortex_array::array_session;
+use vortex_array::expr::Expression;
+use vortex_array::expr::and;
 use vortex_array::expr::get_item;
+use vortex_array::expr::gt;
 use vortex_array::expr::lit;
+use vortex_array::expr::lt;
 use vortex_array::expr::not_eq;
 use vortex_array::expr::root;
 use vortex_array::expr::select;
@@ -30,6 +34,32 @@ use vortex_scan_v2::RepeatedScan as PlanRepeatedScan;
 use vortex_scan_v2::ScanBuilder;
 
 const DATASET: &str = "vortex-bench/data/clickbench_partitioned/vortex-file-compressed";
+
+/// Returns the benchmark filter and projection expressions for the configured query.
+fn query_expressions() -> (Expression, Expression) {
+    match env::var("QUERY").as_deref() {
+        Ok("lineitem") => (
+            gt(get_item("l_linenumber", root()), lit(5_i32)),
+            select(["l_orderkey", "l_linenumber"], root()),
+        ),
+        Ok("lineitem_prune") => (
+            lt(get_item("l_orderkey", root()), lit(600_000_i64)),
+            select(["l_orderkey", "l_extendedprice"], root()),
+        ),
+        Ok("lineitem_and") => (
+            and(
+                gt(get_item("l_linenumber", root()), lit(5_i32)),
+                lt(get_item("l_orderkey", root()), lit(3_000_000_i64)),
+            ),
+            select(["l_orderkey", "l_linenumber"], root()),
+        ),
+        Ok("lineitem_wide") => (gt(get_item("l_linenumber", root()), lit(5_i32)), root()),
+        _ => (
+            not_eq(get_item("AdvEngineID", root()), lit(0_i16)),
+            select(["AdvEngineID"], root()),
+        ),
+    }
+}
 
 fn main() -> VortexResult<()> {
     if env::var_os("RUST_LOG").is_some() {
@@ -50,7 +80,8 @@ fn main() -> VortexResult<()> {
             .with_handle(handle);
         vortex_file::register_default_encodings(&session);
 
-        let mut paths = fs::read_dir(DATASET)?
+        let dataset = env::var("DATASET").unwrap_or_else(|_| DATASET.to_owned());
+        let mut paths = fs::read_dir(dataset)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<PathBuf>, _>>()?;
         paths.retain(|path| {
@@ -153,8 +184,7 @@ fn prepare_plan_scans(
     files: &[VortexFile],
     session: &vortex_session::VortexSession,
 ) -> VortexResult<Vec<PlanRepeatedScan<vortex_array::ArrayRef>>> {
-    let filter = not_eq(get_item("AdvEngineID", root()), lit(0_i16));
-    let projection = select(["AdvEngineID"], root());
+    let (filter, projection) = query_expressions();
     files
         .iter()
         .map(|file| {
@@ -173,8 +203,7 @@ fn prepare_plan_scans(
 fn prepare_reader_scans(
     files: &[VortexFile],
 ) -> VortexResult<Vec<ReaderRepeatedScan<vortex_array::ArrayRef>>> {
-    let filter = not_eq(get_item("AdvEngineID", root()), lit(0_i16));
-    let projection = select(["AdvEngineID"], root());
+    let (filter, projection) = query_expressions();
     files
         .iter()
         .map(|file| {

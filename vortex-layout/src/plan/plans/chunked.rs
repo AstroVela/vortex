@@ -94,25 +94,36 @@ impl Plan for ChunkedPlan {
             return Ok(future::ready(Ok(empty)).boxed());
         }
 
+        // Visit only the chunks overlapping the row range instead of scanning every chunk.
+        let chunk_offsets = self.layout.data().chunk_offsets();
+        let first_chunk = chunk_offsets
+            .partition_point(|&offset| offset <= row_range.start)
+            .saturating_sub(1);
         let mut chunk_futures = Vec::new();
-        let mut chunk_offset = 0_u64;
-        for chunk_index in 0..self.chunks.len() {
+        for chunk_index in first_chunk..self.chunks.len() {
+            let chunk_offset = chunk_offsets[chunk_index];
+            if chunk_offset >= row_range.end {
+                break;
+            }
+            let chunk_end = chunk_offsets[chunk_index + 1];
+            let start = row_range.start.max(chunk_offset);
+            let end = row_range.end.min(chunk_end);
+            if start >= end {
+                continue;
+            }
             let chunk = self
                 .chunks
                 .get(chunk_index)?
                 .ok_or_else(|| vortex_error::vortex_err!("Chunk {chunk_index} has no plan"))?;
-            let chunk_end = chunk_offset
-                .checked_add(chunk.row_count())
-                .ok_or_else(|| vortex_error::vortex_err!("Chunk row offset overflow"))?;
-            let start = row_range.start.max(chunk_offset);
-            let end = row_range.end.min(chunk_end);
-            if start < end {
-                let child_range = start - chunk_offset..end - chunk_offset;
-                let mask_range = usize::try_from(start - row_range.start)?
-                    ..usize::try_from(end - row_range.start)?;
-                chunk_futures.push(chunk.execute(ctx, &child_range, mask.slice(mask_range))?);
-            }
-            chunk_offset = chunk_end;
+            let child_range = start - chunk_offset..end - chunk_offset;
+            let mask_range =
+                usize::try_from(start - row_range.start)?..usize::try_from(end - row_range.start)?;
+            let child_mask = if mask_range.start == 0 && mask_range.end == mask.len() {
+                mask.clone()
+            } else {
+                mask.slice(mask_range)
+            };
+            chunk_futures.push(chunk.execute(ctx, &child_range, child_mask)?);
         }
 
         Ok(async move {

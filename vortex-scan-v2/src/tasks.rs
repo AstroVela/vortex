@@ -17,6 +17,14 @@ use vortex_scan::row_mask::RowMask;
 
 pub(crate) type TaskFuture<A> = BoxFuture<'static, VortexResult<A>>;
 
+/// The mask density below which a filter conjunct is evaluated only over the surviving rows,
+/// letting leaves filter their arrays before expression evaluation.
+const FILTER_EVAL_DENSITY_THRESHOLD: f64 = 0.2;
+
+fn sparse_filter_input(mask: &Mask) -> bool {
+    !mask.all_true() && mask.density() < FILTER_EVAL_DENSITY_THRESHOLD
+}
+
 pub(crate) fn split_exec<A: 'static + Send>(
     ctx: Arc<TaskContext<A>>,
     read_mask: RowMask,
@@ -29,13 +37,13 @@ pub(crate) fn split_exec<A: 'static + Send>(
         ?row_range,
         selected_rows = row_mask.true_count(),
         has_pruning = ctx.pruning.is_some(),
-        has_filter = ctx.filter.is_some(),
+        conjuncts = ctx.filter.len(),
         "executing a plan scan split"
     );
 
-    let row_mask = match (&ctx.filter, limit) {
-        (None, Some(limit)) if *limit == 0 => Mask::new_false(row_mask.len()),
-        (None, Some(limit)) => {
+    let row_mask = match (ctx.filter.is_empty(), limit) {
+        (true, Some(limit)) if *limit == 0 => Mask::new_false(row_mask.len()),
+        (true, Some(limit)) => {
             let true_count = row_mask.true_count();
             let mask_limit = usize::try_from(*limit)
                 .map(|limit| limit.min(true_count))
@@ -46,62 +54,90 @@ pub(crate) fn split_exec<A: 'static + Send>(
         }
         _ => row_mask,
     };
+    let split_len = row_mask.len();
 
-    Ok(async move {
-        let mut row_mask = row_mask;
-        if let Some(pruning) = &ctx.pruning {
-            let proof = pruning.execute(
-                &ctx.execution,
-                &row_range,
-                MaskFuture::ready(row_mask.clone()),
-            )?;
+    // NOTE: every plan execution is registered OUTSIDE the returned future. Registering leaf
+    // segment reads eagerly - before any split task is polled - lets the IO system coalesce
+    // reads across expressions and across splits. Registered reads trigger no IO until their
+    // futures are polled, and dropped futures are canceled when possible.
+    let mut filter_mask = if let Some(pruning) = &ctx.pruning {
+        let proof = pruning.execute(
+            &ctx.execution,
+            &row_range,
+            MaskFuture::ready(row_mask.clone()),
+        )?;
+        let session = ctx.execution.session().clone();
+        let pruning_range = row_range.clone();
+        MaskFuture::new(split_len, async move {
             let proof = proof.await?;
-            let mut execution = ctx.execution.session().create_execution_ctx();
+            let mut execution = session.create_execution_ctx();
             let pruned: Mask = proof.null_as_false().execute(&mut execution)?;
             let pruned_rows = pruned.true_count();
-            row_mask = row_mask.intersect_by_rank(&!pruned);
+            let row_mask = if pruned.all_false() {
+                row_mask
+            } else if pruned.all_true() {
+                Mask::new_false(row_mask.len())
+            } else {
+                row_mask.intersect_by_rank(&!pruned)
+            };
             tracing::trace!(
                 target: "vortex_scan_v2::execution",
-                ?row_range,
+                row_range = ?pruning_range,
                 pruned_rows,
                 remaining_rows = row_mask.true_count(),
                 "applied the plan pruning proof"
             );
-        }
+            Ok(row_mask)
+        })
+    } else {
+        MaskFuture::ready(row_mask)
+    };
 
-        if row_mask.all_false() {
-            tracing::trace!(
-                target: "vortex_scan_v2::execution",
-                ?row_range,
-                "plan pruning skipped the scan split"
-            );
-            return Ok(None);
-        }
-
-        let filter_mask = if let Some(filter) = &ctx.filter {
-            let predicate = filter.execute(
-                &ctx.execution,
-                &row_range,
-                MaskFuture::new_true(row_mask.len()),
-            )?;
-            let session = ctx.execution.session().clone();
-            MaskFuture::new(row_mask.len(), async move {
-                let predicate = predicate.await?;
-                let mut execution = session.create_execution_ctx();
-                let predicate: Mask = predicate.null_as_false().execute(&mut execution)?;
-                Ok(row_mask.bitand(&predicate))
+    // Evaluate each filter conjunct over the rows surviving the previous conjuncts. When the
+    // surviving mask is sparse, the conjunct is evaluated only over the surviving rows so leaves
+    // filter their arrays before the expression runs; otherwise it is evaluated over the full
+    // split and intersected afterwards. The same density decision is recomputed from the same
+    // resolved mask in both futures, so they always agree.
+    for conjunct in &ctx.filter {
+        let predicate_input = {
+            let input_mask = filter_mask.clone();
+            MaskFuture::new(split_len, async move {
+                let row_mask = input_mask.await?;
+                Ok(if sparse_filter_input(&row_mask) {
+                    row_mask
+                } else {
+                    Mask::new_true(row_mask.len())
+                })
             })
-        } else {
-            MaskFuture::ready(row_mask)
         };
+        let predicate = conjunct.execute(&ctx.execution, &row_range, predicate_input)?;
+        let session = ctx.execution.session().clone();
+        let input_mask = filter_mask.clone();
+        filter_mask = MaskFuture::new(split_len, async move {
+            let row_mask = input_mask.await?;
+            if row_mask.all_false() {
+                return Ok(row_mask);
+            }
+            let predicate = predicate.await?;
+            let mut execution = session.create_execution_ctx();
+            let predicate: Mask = predicate.null_as_false().execute(&mut execution)?;
+            if sparse_filter_input(&row_mask) {
+                Ok(row_mask.intersect_by_rank(&predicate))
+            } else {
+                Ok(row_mask.bitand(&predicate))
+            }
+        });
+    }
 
-        // Register projection reads before resolving the filter mask so segments used by both
-        // expressions can share the same in-flight request.
-        let projection = ctx
-            .projection
-            .execute(&ctx.execution, &row_range, filter_mask.clone())?;
+    // Register projection reads before any mask resolves so segments used by several
+    // expressions can share the same in-flight request.
+    let projection = ctx
+        .projection
+        .execute(&ctx.execution, &row_range, filter_mask.clone())?;
+
+    let mapper = Arc::clone(&ctx.mapper);
+    Ok(async move {
         let row_mask = filter_mask.await?;
-
         if row_mask.all_false() {
             tracing::trace!(
                 target: "vortex_scan_v2::execution",
@@ -119,7 +155,7 @@ pub(crate) fn split_exec<A: 'static + Send>(
             dtype = %array.dtype(),
             "completed a plan scan split"
         );
-        (ctx.mapper)(array).map(Some)
+        mapper(array).map(Some)
     }
     .boxed())
 }
@@ -127,7 +163,7 @@ pub(crate) fn split_exec<A: 'static + Send>(
 pub(crate) struct TaskContext<A> {
     pub(crate) execution: PlanExecutionContext,
     pub(crate) pruning: Option<PlanRef>,
-    pub(crate) filter: Option<PlanRef>,
+    pub(crate) filter: Vec<PlanRef>,
     pub(crate) projection: PlanRef,
     pub(crate) mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
 }
