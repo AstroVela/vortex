@@ -30,6 +30,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::runtime::Handle;
+use vortex_io::runtime::LocalIoWorker;
 use vortex_io::runtime::Task;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_metrics::MetricsRegistry;
@@ -83,6 +84,7 @@ pub struct ScanBuilder<A> {
     /// The row-offset assigned to the first row of the file. Used by the `row_idx` expression,
     /// but not by the scan [`Selection`] which remains relative.
     row_offset: u64,
+    local_io_worker: Option<LocalIoWorker>,
 }
 
 impl ScanBuilder<ArrayRef> {
@@ -105,6 +107,7 @@ impl ScanBuilder<ArrayRef> {
             file_stats: None,
             limit: None,
             row_offset: 0,
+            local_io_worker: None,
         }
     }
 
@@ -132,6 +135,12 @@ impl ScanBuilder<ArrayRef> {
 }
 
 impl<A: 'static + Send> ScanBuilder<A> {
+    /// Pin local scan tasks to the worker that owns the underlying I/O driver.
+    pub fn with_local_io_worker(mut self, worker: Option<LocalIoWorker>) -> Self {
+        self.local_io_worker = worker;
+        self
+    }
+
     /// Add a filter expression evaluated against the projected row ranges.
     pub fn with_filter(mut self, filter: Expression) -> Self {
         self.filter = Some(filter);
@@ -258,6 +267,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             file_stats: self.file_stats,
             limit: self.limit,
             row_offset: self.row_offset,
+            local_io_worker: self.local_io_worker,
             map_fn: Arc::new(move |a| old_map_fn(a).and_then(&map_fn)),
         }
     }
@@ -323,6 +333,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             self.map_fn,
             self.limit,
             dtype,
+            self.local_io_worker,
         ))
     }
 

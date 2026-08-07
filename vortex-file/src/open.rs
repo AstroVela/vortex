@@ -291,6 +291,7 @@ impl VortexOpenOptions {
         self,
         reader: R,
     ) -> VortexResult<VortexFile> {
+        let local_io_worker = self.session.handle().acquire_local_io_worker();
         let segment_cache = self
             .segment_cache
             .clone()
@@ -309,19 +310,22 @@ impl VortexOpenOptions {
             let dtype = self.dtype.clone();
             let session = self.session.clone();
             let footer_reader = reader.clone();
-            let task = self.session.handle().spawn_local_io(move || {
-                async move {
-                    read_footer_local(
-                        footer_reader.clone(),
-                        file_size,
-                        initial_read_size,
-                        dtype,
-                        session,
-                    )
-                    .await
-                }
-                .boxed_local()
-            });
+            let task = self
+                .session
+                .handle()
+                .spawn_local_io_on(local_io_worker, move || {
+                    async move {
+                        read_footer_local(
+                            footer_reader.clone(),
+                            file_size,
+                            initial_read_size,
+                            dtype,
+                            session,
+                        )
+                        .await
+                    }
+                    .boxed_local()
+                });
             let (footer, initial_offset, initial_read) = task.await?;
             self.populate_initial_segments(initial_offset, &initial_read, &footer);
             footer
@@ -342,6 +346,7 @@ impl VortexOpenOptions {
             Arc::clone(footer.segment_map()),
             reader,
             self.session.handle(),
+            local_io_worker,
             metrics,
         )));
 

@@ -11,6 +11,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_error::SharedVortexResult;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
+use vortex_io::runtime::LocalIoWorker;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
@@ -60,6 +61,10 @@ impl<S: SegmentSource> SegmentSource for SharedSegmentSource<S> {
                 }
             }
         }
+    }
+
+    fn local_io_worker(&self) -> Option<LocalIoWorker> {
+        self.inner.local_io_worker()
     }
 }
 

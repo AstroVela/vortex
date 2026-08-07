@@ -28,6 +28,7 @@ use vortex_io::VortexLocalReadAt;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
 use vortex_io::runtime::JoinOutcome;
+use vortex_io::runtime::LocalIoWorker;
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
@@ -96,6 +97,7 @@ pub struct FileSegmentSource {
     driver_panic: DriverPanic,
     /// The next read request ID.
     next_id: Arc<AtomicUsize>,
+    local_io_worker: Option<LocalIoWorker>,
 }
 
 impl FileSegmentSource {
@@ -192,6 +194,7 @@ impl FileSegmentSource {
             driver,
             driver_panic,
             next_id: Arc::new(AtomicUsize::new(0)),
+            local_io_worker: None,
         }
     }
 
@@ -204,6 +207,7 @@ impl FileSegmentSource {
         segments: Arc<[SegmentSpec]>,
         reader: R,
         handle: Handle,
+        local_io_worker: LocalIoWorker,
         metrics: RequestMetrics,
     ) -> Self {
         let (send, recv) = mpsc::unbounded();
@@ -234,7 +238,7 @@ impl FileSegmentSource {
         )
         .boxed();
 
-        let mut task = handle.spawn_local_io(move || {
+        let mut task = handle.spawn_local_io_on(local_io_worker, move || {
             async move {
                 stream
                     .map(move |req| {
@@ -283,6 +287,7 @@ impl FileSegmentSource {
             driver,
             driver_panic,
             next_id: Arc::new(AtomicUsize::new(0)),
+            local_io_worker: Some(local_io_worker),
         }
     }
 }
@@ -331,6 +336,10 @@ impl SegmentSource for FileSegmentSource {
 
         // One allocation: we only box the returned SegmentFuture, not the inner ReadFuture.
         fut.boxed()
+    }
+
+    fn local_io_worker(&self) -> Option<LocalIoWorker> {
+        self.local_io_worker
     }
 }
 

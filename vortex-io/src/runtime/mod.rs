@@ -15,6 +15,20 @@
 use futures::future::BoxFuture;
 use futures::future::LocalBoxFuture;
 
+/// Opaque affinity token for one runtime-local I/O worker.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct LocalIoWorker(usize);
+
+impl LocalIoWorker {
+    pub fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 mod blocking;
 pub use blocking::*;
 mod handle;
@@ -62,6 +76,23 @@ pub trait Executor: Send + Sync {
         _future: Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send + 'static>,
     ) -> AbortHandleRef {
         vortex_error::vortex_panic!("runtime does not support local I/O futures")
+    }
+
+    /// Select a local I/O worker for a group of related tasks.
+    fn acquire_local_io_worker(&self) -> LocalIoWorker {
+        LocalIoWorker::default()
+    }
+
+    /// Spawn a local I/O future on a previously selected worker.
+    fn spawn_local_io_on(
+        &self,
+        worker: LocalIoWorker,
+        future: Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send + 'static>,
+    ) -> AbortHandleRef {
+        if worker != LocalIoWorker::default() {
+            vortex_error::vortex_panic!("runtime does not support multiple local I/O workers")
+        }
+        self.spawn_local_io(future)
     }
 
     /// Spawns a CPU-bound task for execution on the runtime.

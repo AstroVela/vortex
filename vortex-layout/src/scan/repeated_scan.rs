@@ -20,6 +20,7 @@ use vortex_array::stream::ArrayStreamAdapter;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_io::runtime::BlockingRuntime;
+use vortex_io::runtime::LocalIoWorker;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
@@ -57,6 +58,7 @@ pub struct RepeatedScan<A: 'static + Send> {
     limit: Option<u64>,
     /// The dtype of the projected arrays.
     dtype: DType,
+    local_io_worker: Option<LocalIoWorker>,
 }
 
 impl RepeatedScan<ArrayRef> {
@@ -104,6 +106,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
         limit: Option<u64>,
         dtype: DType,
+        local_io_worker: Option<LocalIoWorker>,
     ) -> Self {
         Self {
             session,
@@ -118,6 +121,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
             map_fn,
             limit,
             dtype,
+            local_io_worker,
         }
     }
 
@@ -136,7 +140,10 @@ impl<A: 'static + Send> RepeatedScan<A> {
         &self,
         row_range: Option<Range<u64>>,
     ) -> VortexResult<Vec<LocalTaskFuture<Option<A>>>> {
-        self.execute_with(row_range, split_exec_local)
+        let worker = self.local_io_worker;
+        self.execute_with(row_range, move |ctx, read_mask, limit| {
+            split_exec_local(ctx, read_mask, limit, worker)
+        })
     }
 
     fn execute_with<T>(

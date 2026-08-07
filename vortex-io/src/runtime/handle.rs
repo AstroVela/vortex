@@ -16,6 +16,7 @@ use vortex_error::vortex_panic;
 
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
+use crate::runtime::LocalIoWorker;
 
 /// A handle to an active Vortex runtime.
 ///
@@ -156,6 +157,37 @@ impl Handle {
             .instrument(span)
             .boxed_local()
         }));
+        Task {
+            recv: recv.into_future(),
+            abort_handle: Some(abort_handle),
+        }
+    }
+
+    /// Select a local I/O worker for related tasks that should retain affinity.
+    pub fn acquire_local_io_worker(&self) -> LocalIoWorker {
+        self.runtime().acquire_local_io_worker()
+    }
+
+    /// Spawn a local I/O future on a previously selected worker.
+    pub fn spawn_local_io_on<F, Fut, R>(&self, worker: LocalIoWorker, f: F) -> Task<R>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        let (send, recv) = oneshot::channel();
+        let span = tracing::trace_span!(target: "vortex_io::spawn_local_io", "spawn_local_io");
+        let abort_handle = self.runtime().spawn_local_io_on(
+            worker,
+            Box::new(move || {
+                async move {
+                    let output = AssertUnwindSafe(f()).catch_unwind().await;
+                    drop(send.send(output));
+                }
+                .instrument(span)
+                .boxed_local()
+            }),
+        );
         Task {
             recv: recv.into_future(),
             abort_handle: Some(abort_handle),

@@ -13,6 +13,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_io::runtime::LocalIoWorker;
 use vortex_metrics::Counter;
 use vortex_metrics::Label;
 use vortex_metrics::MetricBuilder;
@@ -165,5 +166,9 @@ impl SegmentSource for SegmentCacheSourceAdapter {
             Ok(result)
         }
         .boxed()
+    }
+
+    fn local_io_worker(&self) -> Option<LocalIoWorker> {
+        self.source.local_io_worker()
     }
 }
