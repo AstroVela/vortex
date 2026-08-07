@@ -514,7 +514,14 @@ async fn wide_decimal_byte_parts_is_gated_by_the_unstable_edition() -> VortexRes
     #[cfg(not(feature = "unstable_encodings"))]
     {
         let _ = &st;
-        let error = result.expect_err("the wide serialized format requires the unstable edition");
+        let error = match result {
+            Ok(_) => {
+                return Err(vortex_err!(
+                    "the wide serialized format requires the unstable edition"
+                ));
+            }
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(
             message.contains("not permitted by ctx"),
