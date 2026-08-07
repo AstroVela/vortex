@@ -106,25 +106,46 @@ execution validates both varying lengths once. The generic owned executor calls
 The indexed source closed the varying and nullable gap. It did not affect mixed constants, which
 exposed the next compiler-sensitive detail.
 
-## Store placement and the `Copy` ablation
+## Compiler ablations: `Copy`, source order, and whole-function sensitivity
 
-Moving the output store before the failure OR changed `mul_i32_constant` from about 32.38 to
-18.68 microseconds. Final assembly records overflow `setb`, output store, then loop-carried OR. The
-source-order ablation therefore changes whole-function code generation, but the final instruction
-order is **not** a confirmed explanation for the throughput change.
+The completed ablation matrix isolates the public `Output: Copy` bound as a reliable trigger, while
+falsifying the simpler explanations considered during the initial investigation:
 
-Adding the descriptive `Output: Copy` bound regressed that case to 29.88/29.86 microseconds.
-Replacing it with compile-time `!needs_drop::<Output>()` returned it to 18.65/18.67. A generic store
-helper did not repair the `Copy` case. The executor needs only the no-drop property for safe panic
-cleanup; it never copies an output. The API therefore enforces the actual requirement without the
-measured optimizer-visible bound. Re-test this workaround whenever LLVM changes.
+| Variant | `mul_i32_constant` run 1 / 2 |
+| --- | ---: |
+| No `Copy` bound | 18.77 / 18.72 us |
+| Inert private marker bound | 18.77 / 18.72 us |
+| `Output: Copy` | 29.94 / 29.93 us |
+| `Output: Copy`, `codegen-units=1` | 29.87 / 29.89 us |
 
-An isolated exact-loop ablation on the same CPU contradicted the simple scheduling story. LLVM-MCA
-estimated both final instruction orders at 2.7 cycles per iteration. Direct CPU 8 measurements made
-OR-before-store slightly faster at 0.75-0.77 nanoseconds per row than store-before-OR at
-0.823-0.825 nanoseconds per row. The production source-order effect is therefore an unresolved
-whole-function compiler interaction, such as layout, surrounding control flow, or another
-optimization decision. Do not justify the chosen source order as intrinsically better scheduling.
+The `i64` and `u64` controls did not move. The inert private marker is important: an arbitrary
+where-clause or source perturbation is insufficient to trigger the loss. The result is specific to
+the optimizer-visible `Copy` constraint, though the mechanism is not yet known.
+
+The default-CGU DWARF ranges show large whole-function differences for the exact `i32 CheckedMul`
+monomorph. The `Copy` function spans `0xe58c90..0xe59adc` (`0xe4c` bytes); no-Copy spans
+`0xe7a1c0..0xe7b6d0` (`0x1510` bytes). The `Copy` hot loop at `0xe58f90` is only 16-byte aligned and
+computes the low multiply before the widened chain. The no-Copy loop at `0xe7b260` is 32-byte
+aligned, computes the widened chain first, and delays the low multiply. LLVM-MCA nevertheless
+predicts the smaller `Copy` loop slightly better, 2.5 versus 2.7 cycles. Alignment and final loop
+scheduling therefore do not explain the measured direction.
+
+A fresh `Copy` plus `codegen-units=1` build makes this conclusion stronger: its optimized IR already
+has store-before-OR, yet the linked benchmark remains at about 29.9 microseconds. Store-before-OR is
+neither sufficient nor established as causal. The earlier source-order edit changed production
+performance, but it must be described only as another trigger for a whole-function compiler
+interaction. An isolated exact-loop hardware ablation also found OR-before-store slightly faster
+(0.75-0.77 ns/row) than store-before-OR (0.823-0.825 ns/row), while LLVM-MCA rated both at 2.7
+cycles. The loop's local instruction order cannot explain the production result.
+
+A standalone generic `MaybeUninit` loop emits identical optimized IR and assembly with and without
+`Copy`. The sensitivity therefore needs the real trait, closure, `Vec`, and monomorphization context.
+This is currently evidence of compiler phase-order or code-quality sensitivity, not enough to claim
+a rustc correctness bug or a specific LLVM bug. The next upstream step is to reduce the real
+monomorph while retaining both the timing and whole-function delta, then bisect MIR/LLVM passes and
+compiler versions. The executor needs only the no-drop property, so the selected API continues to
+enforce `!needs_drop::<Output>()` without exposing the harmful, unnecessary `Copy` bound. See the
+compact [Copy-ablation evidence](codegen/copy-ablation.md).
 
 ## Final results
 
@@ -193,8 +214,9 @@ Confirmed:
 - `SinkResult` already reduced to a register OR and did not impose a per-row `Result`.
 - Output ownership materially helped but was insufficient alone.
 - A typed indexed source restored stable parity for varying primitive tuples.
-- Source store/OR order and omission of a `Copy` bound materially affect LLVM 21.1.2 production
-  codegen; the mechanism behind the source-order effect remains unresolved.
+- An `Output: Copy` bound reliably triggers slower LLVM 21.1.2 production codegen; an inert marker
+  does not. Source store/OR order is neither sufficient nor established as causal. The mechanism is
+  an unresolved whole-function compiler interaction.
 - The default x86 target prefers scalar high-half 64-bit multiply; SIMD is not the recovered speed.
 
 Still inference:
