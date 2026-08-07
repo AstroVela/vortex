@@ -23,6 +23,7 @@ use crate::plan::PlanArrayFuture;
 use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
+use crate::plan::optimize_child;
 use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical dictionary plan with children ordered as `[codes, values]`.
@@ -31,6 +32,9 @@ pub struct DictPlan {
     dtype: vortex_array::dtype::DType,
     codes: PlanRef,
     values: PlanRef,
+    /// Whether the children may contain expression plans; layout-pure dictionaries skip
+    /// re-optimization entirely.
+    expression_children: bool,
 }
 
 impl DictPlan {
@@ -52,6 +56,7 @@ impl DictPlan {
             dtype: values.dtype().clone(),
             codes,
             values,
+            expression_children: false,
         })
     }
 
@@ -61,6 +66,7 @@ impl DictPlan {
             dtype: values.dtype().clone(),
             codes,
             values,
+            expression_children: true,
         }
     }
 }
@@ -71,9 +77,13 @@ impl Plan for DictPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let codes = self.codes.optimize()?;
-        let values = self.values.optimize()?;
+        let codes = optimize_child(&self.codes)?;
+        let values = optimize_child(&self.values)?;
         Ok(Arc::new(self.with_children(codes, values)))
+    }
+
+    fn needs_optimize(&self) -> bool {
+        self.expression_children
     }
 
     fn execute(

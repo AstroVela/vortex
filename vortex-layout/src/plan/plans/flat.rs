@@ -38,6 +38,10 @@ impl Plan for FlatPlan {
         Ok(Arc::new(Self::new(&self.layout)))
     }
 
+    fn needs_optimize(&self) -> bool {
+        false
+    }
+
     fn execute(
         &self,
         ctx: &PlanExecutionContext,

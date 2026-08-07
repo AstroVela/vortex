@@ -23,6 +23,7 @@ use crate::plan::Plan;
 use crate::plan::PlanArrayFuture;
 use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
+use crate::plan::optimize_child;
 use crate::plan::optimizer::reduce_parent;
 
 /// A physical plan that applies an expression to the output of `child`.
@@ -53,7 +54,7 @@ impl ExpressionPlan {
 
     fn optimize_top_down(&self, blocked_child_type: Option<TypeId>) -> VortexResult<PlanRef> {
         if self.expression.is_root() {
-            return self.child.optimize();
+            return optimize_child(&self.child);
         }
         if let Some(inner) = self.child.downcast_ref::<Self>() {
             let expression = replace_root(self.expression.clone(), inner.expression.clone())?;
@@ -68,7 +69,7 @@ impl ExpressionPlan {
             return Self::optimize_rewrite(rewritten, child_type);
         }
 
-        let child = self.child.optimize()?;
+        let child = optimize_child(&self.child)?;
         if let Some(inner) = child.downcast_ref::<Self>() {
             let expression = replace_root(self.expression.clone(), inner.expression.clone())?;
             return Self::new(expression, Arc::clone(&inner.child)).optimize_top_down(None);
@@ -86,6 +87,9 @@ impl ExpressionPlan {
 
     fn optimize_rewrite(rewritten: PlanRef, previous_child_type: TypeId) -> VortexResult<PlanRef> {
         let Some(expression) = rewritten.downcast_ref::<Self>() else {
+            if !rewritten.needs_optimize() {
+                return Ok(rewritten);
+            }
             return rewritten.optimize();
         };
         let child_type = expression.child.as_ref().type_id();

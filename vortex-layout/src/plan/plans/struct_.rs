@@ -43,6 +43,7 @@ use crate::plan::PlanArrayFuture;
 use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
+use crate::plan::optimize_child;
 use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical struct plan with children ordered as `[field(0), ..., field(n - 1), validity?]`.
@@ -50,6 +51,9 @@ pub struct StructPlan {
     layout: StructLayout,
     dtype: DType,
     children: LazyPlanChildren,
+    /// Whether any child slot may contain expression plans; layout-pure structs skip
+    /// re-optimization entirely.
+    expression_children: bool,
 }
 
 impl StructPlan {
@@ -74,6 +78,7 @@ impl StructPlan {
             layout: layout.clone(),
             dtype: layout.dtype().clone(),
             children,
+            expression_children: false,
         }
     }
 
@@ -100,6 +105,7 @@ impl StructPlan {
                 self.dtype.nullability(),
             ),
             children,
+            expression_children: true,
         })
     }
 
@@ -129,6 +135,7 @@ impl StructPlan {
             layout: self.layout.clone(),
             dtype,
             children,
+            expression_children: true,
         })
     }
 }
@@ -139,8 +146,12 @@ impl Plan for StructPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let children = self.children.try_map(|_, child| child.optimize())?;
+        let children = self.children.try_map(|_, child| optimize_child(&child))?;
         Ok(Arc::new(self.with_children(children)?))
+    }
+
+    fn needs_optimize(&self) -> bool {
+        self.expression_children
     }
 
     fn execute(
@@ -621,6 +632,7 @@ mod tests {
             children: LazyPlanChildren::new(child_count, move |index| {
                 Ok(children.get(index).cloned().flatten())
             }),
+            expression_children: true,
         });
         let plan = RowIdxPlan::new_ref(0, struct_plan);
 

@@ -37,6 +37,7 @@ use crate::plan::Plan;
 use crate::plan::PlanArrayFuture;
 use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
+use crate::plan::optimize_child;
 use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical plan that adds row-index expression support to its child.
@@ -58,7 +59,11 @@ impl Plan for RowIdxPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        Ok(Self::new_ref(self.row_offset, self.child.optimize()?))
+        Ok(Self::new_ref(self.row_offset, optimize_child(&self.child)?))
+    }
+
+    fn needs_optimize(&self) -> bool {
+        self.child.needs_optimize()
     }
 
     fn execute(
@@ -298,6 +303,10 @@ impl Plan for RowIdxValuesPlan {
         Ok(Self::new_ref(self.row_offset, self.row_count))
     }
 
+    fn needs_optimize(&self) -> bool {
+        false
+    }
+
     fn execute(
         &self,
         _ctx: &PlanExecutionContext,
@@ -395,7 +404,7 @@ impl Plan for RowIdxPartitionPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        Self::try_new(self.row_idx.optimize()?, self.child.optimize()?)
+        Self::try_new(optimize_child(&self.row_idx)?, optimize_child(&self.child)?)
     }
 
     fn execute(

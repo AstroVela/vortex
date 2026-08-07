@@ -101,6 +101,11 @@ impl Plan for ListPlan {
         Ok(Arc::new(self.with_children(elements, offsets, validity)))
     }
 
+    // No rule injects expressions below a list plan, so its subtree is always layout-pure.
+    fn needs_optimize(&self) -> bool {
+        false
+    }
+
     fn execute(
         &self,
         ctx: &PlanExecutionContext,

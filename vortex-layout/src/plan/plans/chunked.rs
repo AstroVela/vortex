@@ -27,6 +27,7 @@ use crate::plan::PlanArrayFuture;
 use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
+use crate::plan::optimize_child;
 use crate::plan::optimizer::PlanParentReduceRule;
 
 /// A physical plan with one child per row chunk.
@@ -34,6 +35,9 @@ pub struct ChunkedPlan {
     layout: ChunkedLayout,
     dtype: DType,
     chunks: LazyPlanChildren,
+    /// Whether chunk slots may contain expression plans; layout-pure chunks skip
+    /// re-optimization entirely.
+    expression_chunks: bool,
 }
 
 impl ChunkedPlan {
@@ -49,6 +53,7 @@ impl ChunkedPlan {
             layout: layout.clone(),
             dtype: layout.dtype().clone(),
             chunks,
+            expression_chunks: false,
         }
     }
 
@@ -57,6 +62,7 @@ impl ChunkedPlan {
             layout: self.layout.clone(),
             dtype,
             chunks,
+            expression_chunks: true,
         }
     }
 }
@@ -67,8 +73,12 @@ impl Plan for ChunkedPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let chunks = self.chunks.try_map(|_, chunk| chunk.optimize())?;
+        let chunks = self.chunks.try_map(|_, chunk| optimize_child(&chunk))?;
         Ok(Arc::new(self.with_chunks(self.dtype.clone(), chunks)))
+    }
+
+    fn needs_optimize(&self) -> bool {
+        self.expression_chunks
     }
 
     fn execute(

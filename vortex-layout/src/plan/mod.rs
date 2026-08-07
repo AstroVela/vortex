@@ -67,6 +67,17 @@ pub trait Plan: Any + Send + Sync {
     /// domain.
     fn optimize(&self) -> VortexResult<PlanRef>;
 
+    /// Returns whether [`optimize`](Self::optimize) could rewrite this subtree.
+    ///
+    /// Rules only fire at [`ExpressionPlan`] boundaries, so a subtree built purely from a stored
+    /// layout by [`new_plan`] contains nothing to rewrite; optimizing it is the identity. Plans
+    /// that know their subtree is expression-free return `false` so parents can reuse the shared
+    /// subtree, keeping lazily initialized children cached across optimize passes. The
+    /// conservative default is `true`.
+    fn needs_optimize(&self) -> bool {
+        true
+    }
+
     /// Executes this plan for `row_range`, returning values selected by `mask`.
     ///
     /// The row range is expressed in this plan's row domain. The returned array has one row for
@@ -99,6 +110,18 @@ pub trait Plan: Any + Send + Sync {
     /// Returns the display name of logical child slot `index`.
     fn child_name(&self, index: usize) -> Cow<'_, str> {
         Cow::Owned(format!("child[{index}]"))
+    }
+}
+
+/// Optimizes `child` unless its subtree is expression-free.
+///
+/// Reusing the shared plan keeps lazily initialized children cached across optimize passes
+/// instead of rebuilding identical subtrees.
+pub(crate) fn optimize_child(child: &PlanRef) -> VortexResult<PlanRef> {
+    if child.needs_optimize() {
+        child.optimize()
+    } else {
+        Ok(Arc::clone(child))
     }
 }
 

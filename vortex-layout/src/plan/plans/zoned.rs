@@ -44,6 +44,7 @@ use crate::plan::PlanArrayFuture;
 use crate::plan::PlanExecutionContext;
 use crate::plan::PlanRef;
 use crate::plan::new_plan;
+use crate::plan::optimize_child;
 use crate::plan::optimizer::PlanParentReduceRule;
 
 const DATA_CHILD_INDEX: usize = 0;
@@ -382,9 +383,19 @@ impl Plan for ZonedPlan {
     }
 
     fn optimize(&self) -> VortexResult<PlanRef> {
-        let data = self.data.as_ref().map(|data| data.optimize()).transpose()?;
-        let zones = self.zones.optimize()?;
+        let data = self
+            .data
+            .as_ref()
+            .map(|data| optimize_child(data))
+            .transpose()?;
+        let zones = optimize_child(&self.zones)?;
         Ok(Arc::new(self.with_children(data, zones)))
+    }
+
+    // Zoned children come from `new_plan` and no rule injects expressions below a zoned plan,
+    // so the subtree is always layout-pure.
+    fn needs_optimize(&self) -> bool {
+        false
     }
 
     fn execute(
