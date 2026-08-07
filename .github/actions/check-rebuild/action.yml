@@ -13,14 +13,15 @@ runs:
   steps:
     - name: "Build"
       shell: bash
-      run: ${INPUTS_COMMAND}
+      run: bash -c -- "$INPUTS_COMMAND"
       env:
         INPUTS_COMMAND: ${{ inputs.command }}
     - name: "Verify rebuild is a no-op"
       shell: bash
       run: |
-        stale=$(${INPUTS_COMMAND} \
-          ${INPUTS_MESSAGE_FORMAT_FLAG} json 2>/dev/null \
+        verify_command=${INPUTS_COMMAND}' "$@"'
+        stale=$(bash -c -- "$verify_command" _ \
+          "$INPUTS_MESSAGE_FORMAT_FLAG" json 2>/dev/null \
           | jq -r 'select(.reason == "compiler-artifact" and .fresh == false) | .target.name')
         if [ -n "$stale" ]; then
           echo "ERROR: Rebuild recompiled crates that should have been cached:"

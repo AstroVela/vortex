@@ -103,9 +103,7 @@ jobs:
         shell: bash
         run: |
           # Extract crash details from the fetched issue body
-          cat > issue_body.txt <<'ISSUE_EOF'
-          ${STEPS_FETCH_ISSUE_OUTPUTS_ISSUE_BODY}
-          ISSUE_EOF
+          printf '%s\n' "$STEPS_FETCH_ISSUE_OUTPUTS_ISSUE_BODY" > issue_body.txt
 
           # Extract target name from issue body
           TARGET=$(grep -oP '(?<=\*\*Target\*\*: `)[^`]+' issue_body.txt || echo "file_io")
@@ -163,7 +161,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STEPS_EXTRACT_OUTPUTS_ARTIFACT_URL: ${{ steps.extract.outputs.artifact_url }}
-          INPUTS_FUZZ_TARGET: ${{ inputs.fuzz_target }}
           STEPS_EXTRACT_OUTPUTS_TARGET: ${{ steps.extract.outputs.target }}
           STEPS_EXTRACT_OUTPUTS_CRASH_FILE: ${{ steps.extract.outputs.crash_file }}
         run: |
@@ -172,7 +169,7 @@ jobs:
           RUN_ID=$(echo "$ARTIFACT_URL" | grep -oP 'runs/\K[0-9]+')
           ARTIFACT_ID=$(echo "$ARTIFACT_URL" | grep -oP 'artifacts/\K[0-9]+')
 
-          # Artifact name matches run-fuzzer.yml upload: ${INPUTS_FUZZ_TARGET}-crash-artifacts
+          # Artifact name matches run-fuzzer.yml upload: <target>-crash-artifacts
           TARGET="${STEPS_EXTRACT_OUTPUTS_TARGET}"
           ARTIFACT_NAME="${TARGET}-crash-artifacts"
 
