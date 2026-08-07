@@ -75,7 +75,7 @@ impl Scheme for DecimalScheme {
         let parts = split_decimal(&decimal)?;
 
         // A value too wide for one signed part splits into lower parts, which serialize under
-        // the wide format id — one this scheme does not declare in `produced_encodings`, so a
+        // the v2 format id — one this scheme does not declare in `produced_encodings`, so a
         // writer restricted to its editions could refuse it. Leave it as the canonical decimal
         // rather than build something outside the scheme's declared output.
         if !parts.lower_parts.is_empty() {

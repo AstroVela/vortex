@@ -139,13 +139,13 @@ fn encodings_in_editions_unions_families() {
 /// The wide byte-parts serialized format joins the `unstable` family at 2026.08: absent from
 /// the June draft, present from August on.
 #[test]
-fn decimal_byte_parts_wide_joins_unstable_2026_08() {
+fn decimal_byte_parts_v2_joins_unstable_2026_08() {
     let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
     let in_edition = |edition| {
         session
             .encodings_in(edition)
             .iter()
-            .any(|inclusion| inclusion.encoding_id.as_str() == "vortex.decimal_byte_parts_wide")
+            .any(|inclusion| inclusion.encoding_id.as_str() == "vortex.decimal_byte_parts_v2")
     };
     assert!(!in_edition(&UNSTABLE_2026_06_0));
     assert!(in_edition(&UNSTABLE_2026_08_0));
@@ -464,7 +464,7 @@ async fn configured_btrblocks_builder_uses_enabled_editions_in_either_order() ->
     Ok(())
 }
 
-/// Build a byte-parts array that must serialize under `vortex.decimal_byte_parts_wide`.
+/// Build a byte-parts array that must serialize under `vortex.decimal_byte_parts_v2`.
 fn wide_byte_parts_column() -> VortexResult<ArrayRef> {
     use vortex_array::arrays::DecimalArray;
     use vortex_array::dtype::DecimalDType;
@@ -499,7 +499,7 @@ fn wide_byte_parts_column() -> VortexResult<ArrayRef> {
 /// between it and the file: without the `unstable` edition the write is refused, and with it
 /// the array round-trips back into the same in-memory encoding, lower parts intact.
 #[tokio::test]
-async fn wide_decimal_byte_parts_is_gated_by_the_unstable_edition() -> VortexResult<()> {
+async fn decimal_byte_parts_v2_is_gated_by_the_unstable_edition() -> VortexResult<()> {
     use crate::VortexSessionDefault;
 
     let st = wide_byte_parts_column()?;
@@ -517,7 +517,7 @@ async fn wide_decimal_byte_parts_is_gated_by_the_unstable_edition() -> VortexRes
         let error = match result {
             Ok(_) => {
                 return Err(vortex_err!(
-                    "the wide serialized format requires the unstable edition"
+                    "the v2 serialized format requires the unstable edition"
                 ));
             }
             Err(error) => error,
@@ -555,7 +555,7 @@ async fn wide_decimal_byte_parts_is_gated_by_the_unstable_edition() -> VortexRes
             .collect();
         assert!(
             !lower_part_counts.is_empty(),
-            "expected the wide format to deserialize into vortex.decimal_byte_parts"
+            "expected the v2 format to deserialize into vortex.decimal_byte_parts"
         );
         assert!(
             lower_part_counts.iter().all(|count| *count > 0),

@@ -167,13 +167,13 @@ impl VTable for DecimalByteParts {
     fn serialized_id(&self, array: ArrayView<'_, Self>) -> ArrayId {
         // The frozen `vortex.decimal_byte_parts` format promises a single child: readers that
         // predate lower parts require `lower_part_count == 0`, so an array carrying lower
-        // parts must serialize under the wide format id instead. That id is what the writer's
-        // permitted-encoding check gates, and what a reader without wide support rejects as an
+        // parts must serialize under the v2 format id instead. That id is what the writer's
+        // permitted-encoding check gates, and what a reader without v2 support rejects as an
         // unknown encoding instead of misreading the children.
         if array.lower_parts().is_empty() {
             VTable::id(self)
         } else {
-            ArrayPlugin::id(&DecimalBytePartsWide)
+            ArrayPlugin::id(&DecimalBytePartsV2)
         }
     }
 
@@ -355,7 +355,7 @@ impl DecimalByteParts {
     ) -> VortexResult<DecimalBytePartsArray> {
         // Building lower parts in memory is never gated — reading a file requires it. What is
         // gated is the serialized form: an array carrying lower parts serializes under the
-        // `DecimalBytePartsWide` format id, which only editions that contain it may write.
+        // `DecimalBytePartsV2` format id, which only editions that contain it may write.
         let len = msp.len();
         let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
         let slots = DecimalBytePartsSlots { msp, lower_parts }.into_slots();
@@ -365,7 +365,7 @@ impl DecimalByteParts {
     }
 }
 
-/// The `vortex.decimal_byte_parts_wide` serialized format: byte parts carrying lower parts.
+/// The `vortex.decimal_byte_parts_v2` serialized format: byte parts carrying lower parts.
 ///
 /// This is a serialized format, not a second in-memory encoding. `vortex.decimal_byte_parts`
 /// froze promising a single child, so an array with lower parts serializes under this id
@@ -373,11 +373,11 @@ impl DecimalByteParts {
 /// back into the same [`DecimalBytePartsArray`]. A reader that predates lower parts fails on
 /// this id with an unknown-encoding error rather than misreading the children.
 #[derive(Clone, Debug)]
-pub struct DecimalBytePartsWide;
+pub struct DecimalBytePartsV2;
 
-impl ArrayPlugin for DecimalBytePartsWide {
+impl ArrayPlugin for DecimalBytePartsV2 {
     fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.decimal_byte_parts_wide");
+        static ID: CachedId = CachedId::new("vortex.decimal_byte_parts_v2");
         *ID
     }
 
@@ -755,7 +755,7 @@ mod tests {
     fn test_serde_round_trip(array: DecimalBytePartsArray) -> VortexResult<()> {
         let session = array_session();
         // Both serialized formats must be registered: an array with lower parts comes back
-        // under the wide format id.
+        // under the v2 format id.
         crate::initialize(&session);
 
         let array = array.into_array();
@@ -857,8 +857,8 @@ mod tests {
     }
 
     /// An array read from a file can be handed straight back to a writer, bypassing both the
-    /// constructor and the compressor. Its serialized id must still be the wide format, so a
-    /// writer whose permitted encodings predate the wide format refuses it.
+    /// constructor and the compressor. Its serialized id must still be the v2 format, so a
+    /// writer whose permitted encodings predate the v2 format refuses it.
     #[test]
     fn read_lower_parts_serialize_under_the_wide_format() -> VortexResult<()> {
         let session = array_session();
@@ -870,14 +870,14 @@ mod tests {
 
         assert_eq!(
             session.array_serialized_id(&array)?,
-            ArrayPlugin::id(&DecimalBytePartsWide)
+            ArrayPlugin::id(&DecimalBytePartsV2)
         );
 
         let restricted = ArrayContext::empty()
             .with_allowed_ids([VTable::id(&DecimalByteParts)].into_iter().collect());
         let err = array
             .serialize(&restricted, &session, &SerializeOptions::default())
-            .expect_err("expected the permitted-encoding check to refuse the wide format");
+            .expect_err("expected the permitted-encoding check to refuse the v2 format");
         assert!(
             err.to_string().contains("not permitted"),
             "error should name the permitted-encoding check, got: {err}"
@@ -886,9 +886,9 @@ mod tests {
     }
 
     /// Reading back an array that already carries lower parts, and computing over it, must
-    /// always work: the wide format only restricts which writers may emit it. If reading or
+    /// always work: the v2 format only restricts which writers may emit it. If reading or
     /// the rebuild that every compute kernel does were blocked, a session whose editions
-    /// predate the wide format could not read a file written by one that includes it.
+    /// predate the v2 format could not read a file written by one that includes it.
     #[test]
     fn compute_over_existing_lower_parts_is_not_gated() -> VortexResult<()> {
         let session = array_session();
