@@ -1,0 +1,237 @@
+# Comment-driven benchmark bot.
+#
+# Maintainers start the existing PR benchmark suites by commenting on a pull
+# request:
+#
+#   @vortex-bot bench sql
+#   @vortex-bot bench all
+#   @vortex-bot bench help
+#
+# How it works
+# - `issue_comment` fires for pull request comments. GitHub always reads this
+#   workflow from the default branch, so edits here only take effect once they
+#   are merged into `develop`.
+# - The gate job runs with the default read-only `GITHUB_TOKEN` and decides
+#   whether the comment is a benchmark command from someone allowed to spend
+#   dedicated runner time. Only `admin`, `maintain` and `write` collaborators
+#   pass; everyone else gets a thumbs-down reaction and nothing runs.
+# - The bot does not dispatch benchmarks itself. It applies the matching
+#   `action/bench-*` label, and `pr-bench-dispatch.yml` already listens for
+#   those labels, removes them again, and starts the runs. Reusing that path
+#   means fork pull requests keep the fork handling the `pull_request` trigger
+#   gives them, and this workflow never needs benchmark secrets, AWS OIDC, or
+#   access to the dedicated runners.
+# - `GITHUB_TOKEN` cannot do the labelling: label events created with it do not
+#   trigger further workflow runs, so `pr-bench-dispatch.yml` would never fire.
+#   The bot mints a short-lived GitHub App token instead, readable only from the
+#   `bench-automation` environment.
+#
+# Setup
+# 1. Create a GitHub App and install it only on this repository. Grant it just
+#    `Pull requests: Read & write`; that covers the label endpoints when the
+#    target is a pull request. If the labelling step comes back 403, add
+#    `Issues: Read & write` and request it in the token step below too.
+# 2. Create a GitHub Actions environment named `bench-automation`.
+# 3. Store these environment secrets in `bench-automation`:
+#    - BENCH_APP_ID
+#    - BENCH_APP_PRIVATE_KEY
+# 4. Optionally set the repository or organization Actions variable
+#    `BENCH_BOT_MENTION` to change the mention the bot answers to. It defaults
+#    to `@vortex-bot`.
+
+name: Benchmark Command
+
+run-name: >-
+  PR #${{ github.event.issue.number }} benchmark command
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # Serialize per pull request so two quick commands cannot race on the same
+  # label. Never cancel: a cancelled run would leave a stale label behind.
+  group: bench-command-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate Benchmark Command
+    # Cheap pre-filter so ordinary review chatter does not start a job at all.
+    # It only narrows; the script below does the real parse against the
+    # configured mention, and makes every trust decision.
+    if: >-
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, 'bench')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write  # for reactions and help replies
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+      bench_label: ${{ steps.gate.outputs.bench_label }}
+    steps:
+      - name: Parse and authorize the comment
+        id: gate
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        env:
+          BOT_MENTION: ${{ vars.BENCH_BOT_MENTION || '@vortex-bot' }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // Keep this table in sync with pr-bench-dispatch.yml and with
+            // docs/developer-guide/benchmarking.md.
+            const SUITES = new Map([
+              ["all", "action/bench-all"],
+              ["compress", "action/bench-compress"],
+              ["gpu-compress", "action/bench-gpu-compress"],
+              ["random-access", "action/bench-random-access"],
+              ["sql", "action/bench-sql"],
+              ["sql-compact", "action/bench-sql-compact"],
+              ["string", "action/bench-string"],
+            ]);
+
+            const mention = process.env.BOT_MENTION;
+            const issue = context.payload.issue ?? {};
+            const comment = context.payload.comment ?? {};
+            const sender = context.payload.sender?.login ?? "";
+
+            const finish = (reason, label) => {
+              core.setOutput("should_run", label ? "true" : "false");
+              core.setOutput("reason", reason);
+              core.setOutput("bench_label", label ?? "");
+              core.info(`bench-command: ${reason}`);
+            };
+
+            const react = (content) => github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: comment.id,
+              content,
+            });
+
+            const reply = (body) => github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body,
+            });
+
+            // Comments on plain issues carry no pull request to benchmark.
+            if (!issue.pull_request) {
+              return finish("not_a_pull_request");
+            }
+
+            const escaped = mention.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+            const command = new RegExp(
+              String.raw`(?:^|\s)${escaped}\s+bench(?:\s+(\S+))?`,
+              "i",
+            ).exec(comment.body ?? "");
+            if (!command) {
+              return finish("not_a_command");
+            }
+
+            // Refuse bot senders so automation cannot loop benchmarks back on
+            // itself, and so a compromised bot cannot burn dedicated runners.
+            if (context.payload.sender?.type === "Bot") {
+              return finish("bot_sender_refused");
+            }
+
+            let permission = "none";
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: sender,
+              });
+              permission = data.permission;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+            if (!["admin", "maintain", "write"].includes(permission)) {
+              await react("-1");
+              return finish("actor_lacks_write");
+            }
+
+            // Everything below this point is a trusted user, so replying is safe.
+            const known = [...SUITES.keys()].map((name) => `\`${mention} bench ${name}\``);
+            const suite = (command[1] ?? "").toLowerCase().replace(/[.,!?;:]+$/, "");
+
+            if (suite === "" || suite === "help") {
+              await reply(
+                `### Benchmark commands\n\n${known.map((c) => `- ${c}`).join("\n")}\n\n` +
+                `See [the benchmarking guide](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/HEAD/docs/developer-guide/benchmarking.md#ci-benchmarks) for what each suite covers.`,
+              );
+              return finish("help_requested");
+            }
+
+            const label = SUITES.get(suite);
+            if (!label) {
+              await react("confused");
+              await reply(
+                `Unknown benchmark suite \`${suite}\`. Known commands:\n\n${known.map((c) => `- ${c}`).join("\n")}`,
+              );
+              return finish("unknown_suite");
+            }
+
+            await react("eyes");
+            return finish("allowed", label);
+
+  start-benchmarks:
+    name: Start Benchmarks
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      # The App private key lives only in this environment, so only this job can
+      # mint a token capable of triggering `pull_request` label events.
+      name: bench-automation
+      deployment: false
+
+    # No GITHUB_TOKEN permissions are needed; the App token does the work.
+    permissions: { }
+
+    steps:
+      - name: Generate short-lived GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859
+        with:
+          app-id: ${{ secrets.BENCH_APP_ID }}
+          private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+
+      - name: Apply benchmark label
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        env:
+          BENCH_LABEL: ${{ needs.gate.outputs.bench_label }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const target = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+            };
+            const name = process.env.BENCH_LABEL;
+
+            // Adding a label that is already present emits no `labeled` event,
+            // so `pr-bench-dispatch.yml` would not fire. Clear it first. The
+            // dispatch workflow removes the label itself, so a leftover only
+            // happens if a previous dispatch failed early.
+            try {
+              await github.rest.issues.removeLabel({ ...target, name });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            await github.rest.issues.addLabels({ ...target, labels: [name] });
+            core.info(`Applied ${name} to #${target.issue_number}`);

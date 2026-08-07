@@ -237,3 +237,20 @@ All CI benchmarks run on dedicated instances with the `release_debug` profile an
 `-C target-cpu=native` to produce representative numbers.
 
 Results can be viewed at [bench.vortex.dev](https://bench.vortex.dev).
+
+### Starting benchmarks from a comment
+
+Each label above has a matching chat command, handled by `.github/workflows/bench-command.yml`.
+Comment on the pull request:
+
+```text
+@vortex-bot bench sql
+```
+
+The suite name is the label suffix: `all`, `compress`, `gpu-compress`, `random-access`, `sql`,
+`sql-compact`, or `string`. `@vortex-bot bench help` lists them.
+
+The bot reacts with 👀 when it accepts a command, then applies the corresponding
+`action/bench-*` label; the existing label dispatch starts the run and removes the label again.
+Only collaborators with `write`, `maintain`, or `admin` permission can start benchmarks, since
+each run occupies a dedicated bare-metal instance. Anyone else gets a 👎 reaction and no run.
