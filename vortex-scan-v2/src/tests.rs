@@ -13,7 +13,10 @@ use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::VarBinArray;
 use vortex_array::assert_arrays_eq;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
 use vortex_array::expr::and;
 use vortex_array::expr::checked_add;
 use vortex_array::expr::get_item;
@@ -22,6 +25,7 @@ use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
+use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -30,6 +34,8 @@ use vortex_io::session::RuntimeSession;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex_layout::layouts::dict::writer::DictLayoutOptions;
+use vortex_layout::layouts::dict::writer::DictStrategy;
 use vortex_layout::layouts::flat::Flat;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::row_idx::row_idx;
@@ -307,6 +313,156 @@ fn scans_selected_rows_from_a_list_plan() -> VortexResult<()> {
         .into_array();
 
         assert_arrays_eq!(actual, expected, &mut session.create_execution_ctx());
+        Ok(())
+    })
+}
+
+#[test]
+fn evaluates_each_filter_conjunct_against_the_narrowed_mask() -> VortexResult<()> {
+    block_on(|handle| async {
+        let session = array_session()
+            .with::<LayoutSession>()
+            .with::<RuntimeSession>()
+            .with_handle(handle);
+        let segments = Arc::new(TestSegments::default());
+        let (sequence, eof) = SequenceId::root().split();
+        let input = StructArray::from_fields(
+            [
+                ("a", PrimitiveArray::from_iter(0_i32..64).into_array()),
+                (
+                    "b",
+                    PrimitiveArray::from_iter((0_i32..64).map(|value| value % 8)).into_array(),
+                ),
+            ]
+            .as_slice(),
+        )?
+        .into_array();
+        let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+        let layout = TableStrategy::new(Arc::clone(&flat), flat)
+            .write_stream(
+                ArrayContext::empty().into(),
+                Arc::<TestSegments>::clone(&segments),
+                input.to_array_stream().sequenced(sequence),
+                eof,
+                &session,
+            )
+            .await?;
+
+        // Three conjuncts over two columns, evaluated over splits that each see a different
+        // incoming mask density.
+        let filter = and(
+            gt(get_item("a", root()), lit(20_i32)),
+            and(
+                gt(get_item("b", root()), lit(5_i32)),
+                gt(lit(60_i32), get_item("a", root())),
+            ),
+        );
+        let actual = ScanBuilder::try_new(&layout, segments, session.clone())?
+            .with_filter(filter)
+            .with_projection(get_item("a", root()))
+            .with_split_by(SplitBy::RowCount(7))
+            .into_array_stream()?
+            .read_all()
+            .await?;
+        let expected = PrimitiveArray::from_iter(
+            (0_i32..64).filter(|value| *value > 20 && value % 8 > 5 && *value < 60),
+        )
+        .into_array();
+
+        assert_arrays_eq!(actual, expected, &mut session.create_execution_ctx());
+        Ok(())
+    })
+}
+
+#[test]
+fn filters_a_sparse_row_selection() -> VortexResult<()> {
+    block_on(|handle| async {
+        let session = array_session()
+            .with::<LayoutSession>()
+            .with::<RuntimeSession>()
+            .with_handle(handle);
+        let segments = Arc::new(TestSegments::default());
+        let (sequence, eof) = SequenceId::root().split();
+        let input = PrimitiveArray::from_iter(0_i32..128).into_array();
+        let layout = FlatLayoutStrategy::default()
+            .write_stream(
+                ArrayContext::empty().into(),
+                Arc::<TestSegments>::clone(&segments),
+                input.to_array_stream().sequenced(sequence),
+                eof,
+                &session,
+            )
+            .await?;
+
+        // Two of 128 rows are selected, so the filter runs below the selective-evaluation
+        // threshold and must still combine its predicate with the incoming selection.
+        let actual = ScanBuilder::try_new(&layout, segments, session.clone())?
+            .with_row_indices(StrictSortedBuffer::try_new(buffer![7_u64, 100])?)
+            .with_filter(gt(root(), lit(50_i32)))
+            .into_array_stream()?
+            .read_all()
+            .await?;
+        let expected = PrimitiveArray::from_iter([100_i32]).into_array();
+
+        assert_arrays_eq!(actual, expected, &mut session.create_execution_ctx());
+        Ok(())
+    })
+}
+
+#[test]
+fn decodes_dictionary_values_once_across_splits() -> VortexResult<()> {
+    block_on(|handle| async {
+        let session = array_session()
+            .with::<LayoutSession>()
+            .with::<RuntimeSession>()
+            .with_handle(handle);
+        let segments = Arc::new(TestSegments::default());
+        let (sequence, eof) = SequenceId::root().split();
+        let input = VarBinArray::from_iter_nonnull(
+            (0..64).map(|row| format!("value-{}", row % 4)),
+            DType::Utf8(Nullability::NonNullable),
+        )
+        .into_array();
+        let strategy = DictStrategy::new(
+            FlatLayoutStrategy::default(),
+            FlatLayoutStrategy::default(),
+            FlatLayoutStrategy::default(),
+            DictLayoutOptions::default(),
+            Arc::new(BtrBlocksCompressor::default()),
+        );
+        let layout = strategy
+            .write_stream(
+                ArrayContext::empty().into(),
+                Arc::<TestSegments>::clone(&segments),
+                input.to_array_stream().sequenced(sequence),
+                eof,
+                &session,
+            )
+            .await?;
+        let values_segment = layout
+            .slot(0)?
+            .ok_or_else(|| vortex_err!("dictionary values child is absent"))?
+            .as_::<Flat>()
+            .segment_id();
+
+        let tracking = TrackingSource::new(segments);
+        let source: Arc<dyn SegmentSource> = Arc::new(tracking.clone());
+        let actual = ScanBuilder::try_new(&layout, source, session.clone())?
+            .with_split_by(SplitBy::RowCount(8))
+            .into_array_stream()?
+            .read_all()
+            .await?;
+
+        assert_arrays_eq!(actual, input, &mut session.create_execution_ctx());
+        // Eight splits share one decode of the dictionary values.
+        assert_eq!(
+            tracking
+                .requests()
+                .into_iter()
+                .filter(|&segment| segment == values_segment)
+                .count(),
+            1
+        );
         Ok(())
     })
 }

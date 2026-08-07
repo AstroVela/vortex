@@ -14,6 +14,7 @@ rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
+bit-vec = { workspace = true }
 futures = { workspace = true, features = ["alloc", "async-await"] }
 itertools = { workspace = true }
 tracing = { workspace = true }
@@ -29,8 +30,11 @@ vortex-utils = { workspace = true }
 
 [dev-dependencies]
 parking_lot = { workspace = true }
+rand = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+vortex = { workspace = true, features = ["files", "tokio"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-btrblocks = { workspace = true }
 vortex-file = { workspace = true, features = ["tokio"] }
 vortex-io = { workspace = true, features = ["tokio"] }
 vortex-layout = { workspace = true, features = ["_test-harness"] }

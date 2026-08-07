@@ -37,6 +37,7 @@ use vortex_layout::plan::RowIdxPlan;
 use vortex_layout::plan::RowIdxValuesPlan;
 use vortex_layout::plan::ZonedPlan;
 use vortex_layout::plan::new_plan;
+use vortex_layout::scan::filter::FilterExpr;
 use vortex_layout::segments::SegmentSource;
 use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
@@ -47,6 +48,7 @@ use crate::RepeatedScan;
 use crate::splits::SplitBy;
 use crate::splits::Splits;
 use crate::splits::attempt_split_ranges;
+use crate::tasks::FilterPlan;
 
 /// Builds a plan-native scan without constructing a layout reader.
 pub struct ScanBuilder<A> {
@@ -262,7 +264,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             &source,
             self.execution.session(),
         )?;
-        let filter = optimize_filter_plan(filter_expression.as_ref(), &source)?;
+        let filter = optimize_filter_plan(filter_expression.as_ref(), &source)?.map(Arc::new);
 
         let splits =
             if let Some(ranges) = attempt_split_ranges(&self.selection, self.row_range.as_ref()) {
@@ -273,7 +275,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
                     .clone()
                     .unwrap_or_else(|| 0..self.base_plan.row_count());
                 let mut plans = vec![&projection];
-                plans.extend(filter.as_ref());
+                plans.extend(filter.iter().flat_map(|filter| filter.conjunct_plans()));
                 plans.extend(pruning.as_ref());
                 Splits::Natural(self.split_by.splits(&plans, &row_range)?)
             };
@@ -423,25 +425,38 @@ fn build_pruning_plan(
     Ok(Some(pruning))
 }
 
+/// Builds one physical plan per top-level conjunct of the filter.
+///
+/// Conjuncts are planned separately so that execution can evaluate them one at a time, narrowing
+/// the row mask between them and stopping as soon as no rows remain.
 fn optimize_filter_plan(
     filter: Option<&BoundExpression>,
     source: &PlanRef,
-) -> VortexResult<Option<PlanRef>> {
+) -> VortexResult<Option<FilterPlan>> {
     let Some(expression) = filter else {
         return Ok(None);
     };
-    let filter: PlanRef = Arc::new(ExpressionPlan::new(expression.clone(), Arc::clone(source)));
-    let filter = filter.optimize()?;
-    vortex_ensure!(
-        filter.dtype().is_boolean(),
-        "Filter plan must produce booleans"
-    );
-    tracing::debug!(
-        target: "vortex_scan_v2::planner",
-        plan = %filter.tree_display(),
-        "optimized the filter physical plan"
-    );
-    Ok(Some(filter))
+    let expression = FilterExpr::new(expression.clone());
+    let conjuncts = expression
+        .conjuncts()
+        .iter()
+        .map(|conjunct| {
+            let plan: PlanRef = Arc::new(ExpressionPlan::new(conjunct.clone(), Arc::clone(source)));
+            let plan = plan.optimize()?;
+            vortex_ensure!(
+                plan.dtype().is_boolean(),
+                "Filter plan must produce booleans"
+            );
+            tracing::debug!(
+                target: "vortex_scan_v2::planner",
+                %conjunct,
+                plan = %plan.tree_display(),
+                "optimized a filter conjunct physical plan"
+            );
+            Ok(plan)
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    Ok(Some(FilterPlan::new(expression, conjuncts)))
 }
 
 fn uses_only_pruning_sources(plan: &PlanRef) -> VortexResult<bool> {

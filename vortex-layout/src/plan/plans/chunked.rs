@@ -55,11 +55,36 @@ impl ChunkedPlan {
     }
 
     fn with_chunks(&self, dtype: DType, chunks: LazyPlanChildren) -> Self {
+        debug_assert_eq!(
+            chunks.len(),
+            self.chunks.len(),
+            "Chunked plan rewrites must preserve one child per layout chunk"
+        );
         Self {
             layout: self.layout.clone(),
             dtype,
             chunks,
         }
+    }
+
+    /// Returns the exclusive prefix sum of the chunk row counts.
+    ///
+    /// The offsets come from the layout, so locating the chunks that intersect a row range never
+    /// instantiates a chunk plan.
+    fn chunk_offsets(&self) -> &[u64] {
+        self.layout.chunk_offsets()
+    }
+
+    /// Returns the indices of the chunks intersecting `row_range`.
+    fn chunk_range(&self, row_range: &Range<u64>) -> Range<usize> {
+        let offsets = self.chunk_offsets();
+        let start = offsets
+            .binary_search(&row_range.start)
+            .unwrap_or_else(|index| index.saturating_sub(1));
+        let end = offsets
+            .binary_search(&row_range.end)
+            .unwrap_or_else(|index| index);
+        start..end.min(self.chunks.len())
     }
 }
 
@@ -94,25 +119,26 @@ impl Plan for ChunkedPlan {
             return Ok(future::ready(Ok(empty)).boxed());
         }
 
-        let mut chunk_futures = Vec::new();
-        let mut chunk_offset = 0_u64;
-        for chunk_index in 0..self.chunks.len() {
+        // Only the chunks intersecting the row range are located and instantiated. A split covers
+        // one or a few chunks, so walking every chunk here would cost O(chunks) per split.
+        let chunk_indices = self.chunk_range(row_range);
+        let mut chunk_futures = Vec::with_capacity(chunk_indices.len());
+        for chunk_index in chunk_indices {
+            let chunk_offset = self.chunk_offsets()[chunk_index];
+            let chunk_end = self.chunk_offsets()[chunk_index + 1];
+            let start = row_range.start.max(chunk_offset);
+            let end = row_range.end.min(chunk_end);
+            if start >= end {
+                continue;
+            }
             let chunk = self
                 .chunks
                 .get(chunk_index)?
                 .ok_or_else(|| vortex_error::vortex_err!("Chunk {chunk_index} has no plan"))?;
-            let chunk_end = chunk_offset
-                .checked_add(chunk.row_count())
-                .ok_or_else(|| vortex_error::vortex_err!("Chunk row offset overflow"))?;
-            let start = row_range.start.max(chunk_offset);
-            let end = row_range.end.min(chunk_end);
-            if start < end {
-                let child_range = start - chunk_offset..end - chunk_offset;
-                let mask_range = usize::try_from(start - row_range.start)?
-                    ..usize::try_from(end - row_range.start)?;
-                chunk_futures.push(chunk.execute(ctx, &child_range, mask.slice(mask_range))?);
-            }
-            chunk_offset = chunk_end;
+            let child_range = start - chunk_offset..end - chunk_offset;
+            let mask_range =
+                usize::try_from(start - row_range.start)?..usize::try_from(end - row_range.start)?;
+            chunk_futures.push(chunk.execute(ctx, &child_range, mask.slice(mask_range))?);
         }
 
         Ok(async move {

@@ -10560,12 +10560,16 @@ dependencies = [
 name = "vortex-scan-v2"
 version = "0.1.0"
 dependencies = [
+ "bit-vec",
  "futures",
  "itertools 0.14.0",
  "parking_lot",
+ "rand 0.10.2",
  "tracing",
  "tracing-subscriber",
+ "vortex",
  "vortex-array",
+ "vortex-btrblocks",
  "vortex-buffer",
  "vortex-error",
  "vortex-file",

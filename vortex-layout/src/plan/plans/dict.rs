@@ -4,15 +4,23 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures::FutureExt;
+use futures::TryFutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use futures::try_join;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::arrays::DictArray;
+use vortex_array::arrays::SharedArray;
 use vortex_array::expr::ExactBoundExpr;
 use vortex_array::expr::label_bound_tree;
 use vortex_array::optimizer::ArrayOptimizer;
+use vortex_error::SharedVortexResult;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
@@ -25,12 +33,19 @@ use crate::plan::PlanRef;
 use crate::plan::new_plan;
 use crate::plan::optimizer::PlanParentReduceRule;
 
+type SharedValuesFuture = Shared<BoxFuture<'static, SharedVortexResult<ArrayRef>>>;
+
 /// A physical dictionary plan with children ordered as `[codes, values]`.
 pub struct DictPlan {
     layout: DictLayout,
     dtype: vortex_array::dtype::DType,
     codes: PlanRef,
     values: PlanRef,
+    /// The decoded dictionary values, shared by every split that executes this plan.
+    ///
+    /// The values child covers the whole dictionary rather than the executing split's row range,
+    /// so decoding it once per split would repeat the same work for every split of the scan.
+    values_array: Arc<OnceLock<SharedValuesFuture>>,
 }
 
 impl DictPlan {
@@ -52,16 +67,43 @@ impl DictPlan {
             dtype: values.dtype().clone(),
             codes,
             values,
+            values_array: Arc::new(OnceLock::new()),
         })
     }
 
     fn with_children(&self, codes: PlanRef, values: PlanRef) -> Self {
+        // A rewritten values child produces a different array, so the cache does not carry over.
         Self {
             layout: self.layout.clone(),
             dtype: values.dtype().clone(),
             codes,
             values,
+            values_array: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Returns the decoded dictionary values, executing the values child at most once.
+    ///
+    /// The result is wrapped in a [`SharedArray`] so that canonicalization performed by one split
+    /// is visible to the others.
+    fn values_array(&self, ctx: &PlanExecutionContext) -> VortexResult<SharedValuesFuture> {
+        let values_len = usize::try_from(self.values.row_count())?;
+        let values_range = 0..self.values.row_count();
+        Ok(self
+            .values_array
+            .get_or_init(|| {
+                let values =
+                    self.values
+                        .execute(ctx, &values_range, MaskFuture::new_true(values_len));
+                async move {
+                    let values = values?.await?;
+                    Ok(SharedArray::new(values).into_array())
+                }
+                .map_err(Arc::new)
+                .boxed()
+                .shared()
+            })
+            .clone())
     }
 }
 
@@ -83,16 +125,11 @@ impl Plan for DictPlan {
         mask: MaskFuture,
     ) -> VortexResult<PlanArrayFuture> {
         let codes = self.codes.execute(ctx, row_range, mask)?;
-        let values_len = usize::try_from(self.values.row_count())?;
-        let values = self.values.execute(
-            ctx,
-            &(0..self.values.row_count()),
-            MaskFuture::new_true(values_len),
-        )?;
+        let values = self.values_array(ctx)?;
         let all_values_referenced = self.layout.has_all_values_referenced();
 
         Ok(async move {
-            let (codes, values) = try_join!(codes, values)?;
+            let (codes, values) = try_join!(codes, values.map_err(VortexError::from))?;
             // SAFETY: DictLayout validation guarantees integer codes and matching child dtypes.
             let dictionary = unsafe {
                 DictArray::new_unchecked(codes, values)

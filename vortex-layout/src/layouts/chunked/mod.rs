@@ -96,6 +96,15 @@ impl VTable for Chunked {
 }
 
 impl Layout<Chunked> {
+    /// Returns the exclusive prefix sum of the chunk row counts.
+    ///
+    /// The slice has `nchildren() + 1` entries; chunk `i` covers rows
+    /// `chunk_offsets()[i]..chunk_offsets()[i + 1]`. Reading these offsets does not instantiate
+    /// any child, so consumers can locate the chunks intersecting a row range by binary search.
+    pub fn chunk_offsets(&self) -> &[u64] {
+        &self.chunk_offsets
+    }
+
     /// Construct a chunked layout.
     pub fn new(row_count: u64, dtype: DType, children: Arc<dyn LayoutChildren>) -> Self {
         let offsets = chunk_offsets(children.as_ref()).vortex_expect("chunk row counts overflow");
