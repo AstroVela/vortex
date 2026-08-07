@@ -10,9 +10,9 @@
 //! [`Benchmark::native_formats`], and materializes one of them in
 //! [`Benchmark::setup`]. Everything else is derived by [`prepare_data`].
 //!
-//! Parquet is the pivot format because it is the only one that can be derived *from*:
-//! [`crate::conversions`] converts Parquet to Vortex, but nothing converts Vortex back to
-//! Parquet. A benchmark that produces only Vortex therefore cannot serve a Parquet run.
+//! Parquet and Vortex convert in both directions, so either can act as the pivot: a
+//! Parquet-native suite derives Vortex, and a Vortex-native suite derives Parquet. A suite
+//! that produces neither can only serve the formats it lists.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ use crate::Benchmark;
 use crate::CompactionStrategy;
 use crate::Format;
 use crate::conversions::convert_parquet_directory_to_vortex;
+use crate::conversions::convert_vortex_directory_to_parquet;
 use crate::datasets::data_downloads::download_many;
 use crate::datasets::data_downloads::http_client;
 
@@ -133,29 +134,32 @@ pub async fn prepare_data(benchmark: &dyn Benchmark, formats: &[Format]) -> Resu
 
     let native = benchmark.native_formats();
 
-    // Parquet underpins every derived format, so produce it if anything needs it.
-    let needs_parquet = formats
+    let plans = formats
         .iter()
-        .any(|f| !native.contains(f) || *f == Format::Parquet);
-    if needs_parquet && native.contains(&Format::Parquet) {
-        setup_format(benchmark, &base_path, Format::Parquet).await?;
+        // Lance and DuckDB are built by their own bench binaries from the Parquet below.
+        .filter(|f| !matches!(f, Format::Lance | Format::OnDiskDuckDB | Format::Csv))
+        .map(|&f| plan(native, f))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("benchmark {}", benchmark.dataset_name()))?;
+
+    // Run `setup` once per source format any plan depends on, before any derivation reads it.
+    let mut sources: Vec<Format> = plans.iter().map(Plan::source).collect();
+    sources.sort_unstable_by_key(|f| f.name());
+    sources.dedup();
+    for source in sources {
+        setup_format(benchmark, &base_path, source).await?;
     }
 
-    for &format in formats {
-        // Lance and DuckDB are built by their own bench binaries from the Parquet above.
-        if matches!(format, Format::Lance | Format::OnDiskDuckDB | Format::Csv) {
-            continue;
-        }
-
-        match plan(native, format)
-            .with_context(|| format!("benchmark {}", benchmark.dataset_name()))?
-        {
-            Plan::Native(Format::Parquet) => {
-                // Already produced above.
-            }
-            Plan::Native(format) => setup_format(benchmark, &base_path, format).await?,
+    for plan in plans {
+        match plan {
+            // Produced by the source loop above.
+            Plan::Native(_) => {}
             Plan::DeriveFromParquet(format, compaction) => {
                 convert_parquet_directory_to_vortex(&base_path, compaction).await?;
+                benchmark.prepare_format(format, &base_path).await?;
+            }
+            Plan::DeriveFromVortex(format) => {
+                convert_vortex_directory_to_parquet(&base_path).await?;
                 benchmark.prepare_format(format, &base_path).await?;
             }
         }
@@ -183,7 +187,7 @@ async fn setup_format(benchmark: &dyn Benchmark, base_path: &Path, format: Forma
     Ok(())
 }
 
-/// Which formats a benchmark produces natively and which are derived from Parquet.
+/// How one requested format gets produced.
 ///
 /// Split out so the routing is testable without running a download or a generator.
 #[derive(Debug, PartialEq, Eq)]
@@ -192,25 +196,45 @@ pub(crate) enum Plan {
     Native(Format),
     /// Parquet is produced, then converted with this strategy.
     DeriveFromParquet(Format, CompactionStrategy),
+    /// Vortex is produced, then converted back to Parquet.
+    DeriveFromVortex(Format),
 }
 
+impl Plan {
+    /// The format `setup` must produce before this plan can run.
+    fn source(&self) -> Format {
+        match self {
+            Plan::Native(format) => *format,
+            Plan::DeriveFromParquet(..) => Format::Parquet,
+            Plan::DeriveFromVortex(_) => Format::OnDiskVortex,
+        }
+    }
+}
+
+/// Pick how to produce `requested` given what the benchmark makes natively.
+///
+/// Parquet and Vortex convert in both directions, so either can serve as the pivot: a
+/// Parquet-native suite derives Vortex, and a Vortex-native suite derives Parquet.
 pub(crate) fn plan(native: &[Format], requested: Format) -> Result<Plan> {
     if native.contains(&requested) {
         return Ok(Plan::Native(requested));
     }
-    if !native.contains(&Format::Parquet) {
-        bail!("cannot produce {requested}: not native ({native:?}) and Parquet is unavailable");
-    }
+
     match requested {
-        Format::OnDiskVortex => Ok(Plan::DeriveFromParquet(
+        Format::OnDiskVortex if native.contains(&Format::Parquet) => Ok(Plan::DeriveFromParquet(
             requested,
             CompactionStrategy::Default,
         )),
-        Format::VortexCompact => Ok(Plan::DeriveFromParquet(
+        Format::VortexCompact if native.contains(&Format::Parquet) => Ok(Plan::DeriveFromParquet(
             requested,
             CompactionStrategy::Compact,
         )),
-        other => bail!("cannot derive {other} from Parquet"),
+        // Reverse direction: only plain on-disk Vortex is a valid source. Reading back a
+        // compacted file would produce identical Parquet, so it is not worth a second path.
+        Format::Parquet if native.contains(&Format::OnDiskVortex) => {
+            Ok(Plan::DeriveFromVortex(requested))
+        }
+        other => bail!("cannot produce {other}: native formats are {native:?}"),
     }
 }
 
@@ -247,13 +271,36 @@ mod tests {
         Ok(())
     }
 
-    /// Parquet is the only pivot: nothing converts Vortex back, so a Vortex-only suite
-    /// asking for Parquet is an error rather than a silent no-op.
+    /// Conversion runs both ways, so a Vortex-only suite can serve a Parquet run.
     #[test]
-    fn vortex_only_suite_cannot_produce_parquet() {
+    fn vortex_only_suite_derives_parquet() -> Result<()> {
         let native = [Format::OnDiskVortex];
-        assert!(plan(&native, Format::Parquet).is_err());
-        assert!(plan(&native, Format::Lance).is_err());
+        assert_eq!(
+            plan(&native, Format::Parquet)?,
+            Plan::DeriveFromVortex(Format::Parquet),
+        );
+        Ok(())
+    }
+
+    /// A format with no conversion path from anything native is still a hard error.
+    #[test]
+    fn unreachable_format_is_an_error() {
+        assert!(plan(&[Format::OnDiskVortex], Format::Lance).is_err());
+        // VortexCompact is only derivable from Parquet, which this suite does not produce.
+        assert!(plan(&[Format::OnDiskVortex], Format::VortexCompact).is_err());
+    }
+
+    #[test]
+    fn source_is_what_setup_must_produce() {
+        assert_eq!(Plan::Native(Format::Parquet).source(), Format::Parquet);
+        assert_eq!(
+            Plan::DeriveFromParquet(Format::OnDiskVortex, CompactionStrategy::Default).source(),
+            Format::Parquet,
+        );
+        assert_eq!(
+            Plan::DeriveFromVortex(Format::Parquet).source(),
+            Format::OnDiskVortex,
+        );
     }
 
     #[test]

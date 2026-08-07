@@ -44,10 +44,10 @@ pub trait Benchmark: Send + Sync {
 
     /// Formats this benchmark can materialize without help.
     ///
-    /// [`prepare_data`] derives the rest. Parquet is the pivot: Vortex is converted from it,
-    /// and nothing converts back, so a benchmark that omits Parquet here cannot serve a
-    /// Parquet run. Suites that write Vortex straight from a row generator list it alongside
-    /// Parquet to skip a needless round trip through Parquet on disk.
+    /// [`prepare_data`] derives the rest by converting between Parquet and Vortex, in either
+    /// direction. Listing only Parquet is the common case; suites that write Vortex straight
+    /// from a row generator list it too, so requesting Vortex skips a needless round trip
+    /// through Parquet on disk.
     ///
     /// [`prepare_data`]: crate::setup::prepare_data
     fn native_formats(&self) -> &[Format] {
