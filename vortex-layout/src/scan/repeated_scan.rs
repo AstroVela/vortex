@@ -20,7 +20,6 @@ use vortex_array::stream::ArrayStreamAdapter;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_io::runtime::BlockingRuntime;
-use vortex_io::runtime::LocalIoWorker;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
@@ -29,10 +28,8 @@ use vortex_utils::parallelism::get_available_parallelism;
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
 use crate::scan::splits::Splits;
-use crate::scan::tasks::LocalTaskFuture;
 use crate::scan::tasks::TaskContext;
 use crate::scan::tasks::split_exec;
-use crate::scan::tasks::split_exec_local;
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
 ///
@@ -58,7 +55,6 @@ pub struct RepeatedScan<A: 'static + Send> {
     limit: Option<u64>,
     /// The dtype of the projected arrays.
     dtype: DType,
-    local_io_worker: Option<LocalIoWorker>,
 }
 
 impl RepeatedScan<ArrayRef> {
@@ -106,7 +102,6 @@ impl<A: 'static + Send> RepeatedScan<A> {
         map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
         limit: Option<u64>,
         dtype: DType,
-        local_io_worker: Option<LocalIoWorker>,
     ) -> Self {
         Self {
             session,
@@ -121,7 +116,6 @@ impl<A: 'static + Send> RepeatedScan<A> {
             map_fn,
             limit,
             dtype,
-            local_io_worker,
         }
     }
 
@@ -129,32 +123,6 @@ impl<A: 'static + Send> RepeatedScan<A> {
         &self,
         row_range: Option<Range<u64>>,
     ) -> VortexResult<Vec<BoxFuture<'static, VortexResult<Option<A>>>>> {
-        self.execute_with(row_range, split_exec)
-    }
-
-    /// Constructs local-I/O task factories for each row split of the scan.
-    ///
-    /// These factories are `Send`, but each scan future they create is intended to be constructed
-    /// and polled on one local I/O worker via [`vortex_io::runtime::Handle::spawn_local_io`].
-    pub fn execute_local(
-        &self,
-        row_range: Option<Range<u64>>,
-    ) -> VortexResult<Vec<LocalTaskFuture<Option<A>>>> {
-        let worker = self.local_io_worker;
-        self.execute_with(row_range, move |ctx, read_mask, limit| {
-            split_exec_local(ctx, read_mask, limit, worker)
-        })
-    }
-
-    fn execute_with<T>(
-        &self,
-        row_range: Option<Range<u64>>,
-        mut split_exec_fn: impl FnMut(
-            Arc<TaskContext<A>>,
-            vortex_scan::row_mask::RowMask,
-            Option<&mut u64>,
-        ) -> VortexResult<T>,
-    ) -> VortexResult<Vec<T>> {
         let selection_range: Option<Range<u64>> = match &self.selection {
             Selection::IncludeByIndex(buf) if !buf.is_empty() => {
                 Some(buf[0]..buf[buf.len() - 1] + 1)
@@ -218,7 +186,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
                 continue;
             }
 
-            tasks.push(split_exec_fn(Arc::clone(&ctx), row_mask, limit.as_mut())?);
+            tasks.push(split_exec(Arc::clone(&ctx), row_mask, limit.as_mut())?);
             if limit.is_some_and(|l| l == 0) {
                 break;
             }

@@ -30,7 +30,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::runtime::Handle;
-use vortex_io::runtime::LocalIoWorker;
 use vortex_io::runtime::Task;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_metrics::MetricsRegistry;
@@ -45,7 +44,6 @@ use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
 use crate::scan::splits::attempt_split_ranges;
-use crate::scan::tasks::LocalTaskFuture;
 
 /// Builder for scanning a [`LayoutReader`] into arrays, streams, iterators, or mapped outputs.
 ///
@@ -84,7 +82,6 @@ pub struct ScanBuilder<A> {
     /// The row-offset assigned to the first row of the file. Used by the `row_idx` expression,
     /// but not by the scan [`Selection`] which remains relative.
     row_offset: u64,
-    local_io_worker: Option<LocalIoWorker>,
 }
 
 impl ScanBuilder<ArrayRef> {
@@ -107,7 +104,6 @@ impl ScanBuilder<ArrayRef> {
             file_stats: None,
             limit: None,
             row_offset: 0,
-            local_io_worker: None,
         }
     }
 
@@ -135,12 +131,6 @@ impl ScanBuilder<ArrayRef> {
 }
 
 impl<A: 'static + Send> ScanBuilder<A> {
-    /// Pin local scan tasks to the worker that owns the underlying I/O driver.
-    pub fn with_local_io_worker(mut self, worker: Option<LocalIoWorker>) -> Self {
-        self.local_io_worker = worker;
-        self
-    }
-
     /// Add a filter expression evaluated against the projected row ranges.
     pub fn with_filter(mut self, filter: Expression) -> Self {
         self.filter = Some(filter);
@@ -267,7 +257,6 @@ impl<A: 'static + Send> ScanBuilder<A> {
             file_stats: self.file_stats,
             limit: self.limit,
             row_offset: self.row_offset,
-            local_io_worker: self.local_io_worker,
             map_fn: Arc::new(move |a| old_map_fn(a).and_then(&map_fn)),
         }
     }
@@ -333,7 +322,6 @@ impl<A: 'static + Send> ScanBuilder<A> {
             self.map_fn,
             self.limit,
             dtype,
-            self.local_io_worker,
         ))
     }
 
@@ -345,19 +333,6 @@ impl<A: 'static + Send> ScanBuilder<A> {
         }
 
         self.prepare()?.execute(None)
-    }
-
-    /// Constructs local-I/O task factories, one per row split of the scan.
-    ///
-    /// Use this when the caller has a local runtime such as io_uring and wants scan futures to be
-    /// constructed and polled on one I/O worker instead of on the caller's worker thread.
-    pub fn build_local(self) -> VortexResult<Vec<LocalTaskFuture<Option<A>>>> {
-        // The ultimate short circuit
-        if self.limit.is_some_and(|l| l == 0) {
-            return Ok(vec![]);
-        }
-
-        self.prepare()?.execute_local(None)
     }
 
     /// Returns a [`Stream`] with tasks spawned onto the session's runtime handle.

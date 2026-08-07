@@ -9,14 +9,10 @@ use std::sync::Arc;
 use bit_vec::BitVec;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use futures::future::LocalBoxFuture;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
 use vortex_array::expr::Expression;
 use vortex_error::VortexResult;
-use vortex_io::runtime::Handle;
-use vortex_io::runtime::LocalIoWorker;
-use vortex_io::runtime::Task;
 use vortex_mask::Mask;
 use vortex_scan::row_mask::RowMask;
 
@@ -24,32 +20,6 @@ use crate::LayoutReader;
 use crate::scan::filter::FilterExpr;
 
 pub type TaskFuture<A> = BoxFuture<'static, VortexResult<A>>;
-
-/// Factory for a split task that must be constructed and polled on one local I/O worker.
-pub struct LocalTaskFuture<A> {
-    local_io_worker: Option<LocalIoWorker>,
-    future: Box<dyn FnOnce() -> LocalBoxFuture<'static, VortexResult<A>> + Send + 'static>,
-}
-
-impl<A: Send + 'static> LocalTaskFuture<A> {
-    pub fn new(
-        local_io_worker: Option<LocalIoWorker>,
-        future: impl FnOnce() -> LocalBoxFuture<'static, VortexResult<A>> + Send + 'static,
-    ) -> Self {
-        Self {
-            local_io_worker,
-            future: Box::new(future),
-        }
-    }
-
-    /// Spawn this task on the I/O worker that owns its segment source.
-    pub fn spawn(self, handle: &Handle) -> Task<VortexResult<A>> {
-        match self.local_io_worker {
-            Some(worker) => handle.spawn_local_io_on(worker, self.future),
-            None => handle.spawn_local_io(self.future),
-        }
-    }
-}
 
 /// Logic for executing a single split reading task.
 /// N.B. read_mask should be evaluated against all_false() before calling this
@@ -178,23 +148,6 @@ pub fn split_exec<A: 'static + Send>(
     };
 
     Ok(array_fut.boxed())
-}
-
-/// Local-I/O variant of [`split_exec`].
-///
-/// The returned value is `Send`, so callers may store it in shared scan state and route it to a
-/// local runtime worker when the split is claimed. The future itself is created by the factory and
-/// then polled on that worker, which supports runtimes where I/O futures carry thread-local state.
-pub fn split_exec_local<A: 'static + Send>(
-    ctx: Arc<TaskContext<A>>,
-    read_mask: RowMask,
-    limit: Option<&mut u64>,
-    local_io_worker: Option<LocalIoWorker>,
-) -> VortexResult<LocalTaskFuture<Option<A>>> {
-    let task = split_exec(ctx, read_mask, limit)?;
-    Ok(LocalTaskFuture::new(local_io_worker, move || {
-        async move { task.await }.boxed_local()
-    }))
 }
 
 /// Information needed to execute a single split task.

@@ -97,7 +97,6 @@ pub struct FileSegmentSource {
     driver_panic: DriverPanic,
     /// The next read request ID.
     next_id: Arc<AtomicUsize>,
-    local_io_worker: Option<LocalIoWorker>,
 }
 
 impl FileSegmentSource {
@@ -194,7 +193,6 @@ impl FileSegmentSource {
             driver,
             driver_panic,
             next_id: Arc::new(AtomicUsize::new(0)),
-            local_io_worker: None,
         }
     }
 
@@ -287,7 +285,6 @@ impl FileSegmentSource {
             driver,
             driver_panic,
             next_id: Arc::new(AtomicUsize::new(0)),
-            local_io_worker: Some(local_io_worker),
         }
     }
 }
@@ -336,10 +333,6 @@ impl SegmentSource for FileSegmentSource {
 
         // One allocation: we only box the returned SegmentFuture, not the inner ReadFuture.
         fut.boxed()
-    }
-
-    fn local_io_worker(&self) -> Option<LocalIoWorker> {
-        self.local_io_worker
     }
 }
 

@@ -176,10 +176,10 @@ impl VortexFile {
     /// Initiate a scan of the file, returning a builder for projection, filtering, selection, and
     /// execution options.
     pub fn scan(&self) -> VortexResult<ScanBuilder<ArrayRef>> {
-        Ok(
-            ScanBuilder::new(self.session.clone(), self.layout_reader()?)
-                .with_local_io_worker(self.segment_source.local_io_worker()),
-        )
+        Ok(ScanBuilder::new(
+            self.session.clone(),
+            self.layout_reader()?,
+        ))
     }
 
     /// Returns `true` if file-level statistics prove the expression cannot

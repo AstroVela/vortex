@@ -4,7 +4,6 @@
 use futures::future::BoxFuture;
 use vortex_array::buffer::BufferHandle;
 use vortex_error::VortexResult;
-use vortex_io::runtime::LocalIoWorker;
 
 use crate::segments::SegmentId;
 /// Static future resolving to a segment byte buffer.
@@ -17,9 +16,4 @@ pub type SegmentFuture = BoxFuture<'static, VortexResult<BufferHandle>>;
 pub trait SegmentSource: 'static + Send + Sync {
     /// Request a segment, returning a future that will eventually resolve to the segment data.
     fn request(&self, id: SegmentId) -> SegmentFuture;
-
-    /// Worker that owns runtime-local I/O for this source, when applicable.
-    fn local_io_worker(&self) -> Option<LocalIoWorker> {
-        None
-    }
 }

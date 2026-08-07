@@ -13,8 +13,6 @@ mod tasks;
 #[cfg(test)]
 mod test;
 
-pub use tasks::LocalTaskFuture;
-
 /// A heuristic for an ideal split size.
 ///
 /// We don't actually know if this is right, but it is probably a good estimate.
