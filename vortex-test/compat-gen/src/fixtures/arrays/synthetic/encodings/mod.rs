@@ -13,7 +13,7 @@ mod constant;
 mod datetimeparts;
 mod decimal_byte_parts;
 #[cfg(feature = "unstable_encodings")]
-mod decimal_byte_parts_wide;
+mod decimal_byte_parts_v2;
 mod delta;
 mod dict;
 mod for_;
@@ -59,7 +59,7 @@ pub fn fixtures() -> Vec<Box<dyn FlatLayoutFixture>> {
     ];
     #[cfg(feature = "unstable_encodings")]
     fixtures.push(Box::new(
-        decimal_byte_parts_wide::DecimalBytePartsWideFixture,
+        decimal_byte_parts_v2::DecimalBytePartsV2Fixture,
     ));
     fixtures
 }

@@ -44,11 +44,11 @@ fn encode_byte_parts(decimal: &DecimalArray) -> VortexResult<DecimalBytePartsArr
     )
 }
 
-pub struct DecimalBytePartsWideFixture;
+pub struct DecimalBytePartsV2Fixture;
 
-impl FlatLayoutFixture for DecimalBytePartsWideFixture {
+impl FlatLayoutFixture for DecimalBytePartsV2Fixture {
     fn name(&self) -> &str {
-        "decimal_byte_parts_wide.vortex"
+        "decimal_byte_parts_v2.vortex"
     }
 
     fn description(&self) -> &str {
