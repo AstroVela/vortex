@@ -6,7 +6,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use itertools::Itertools;
 use tracing::trace;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
@@ -14,8 +13,8 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::expr::BoundExpression;
 use vortex_buffer::BitBufferMut;
-use vortex_error::VortexError;
 use vortex_error::VortexResult;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
@@ -97,13 +96,13 @@ impl ZonedReader {
         let zone_end = row_range.end.div_ceil(zone_len_u64);
         zone_start..zone_end
     }
+}
 
-    /// Get the row index for the first row in a zone with the given `zone_index`.
-    pub(crate) fn first_row_offset(&self, zone_idx: u64) -> u64 {
-        zone_idx
-            .saturating_mul(self.zone_len as u64)
-            .min(self.row_count)
-    }
+/// Get the row index for the first row in a zone with the given `zone_idx`.
+///
+/// Free function so that it can be used from a `'static` future without capturing the reader.
+fn first_row_offset(zone_idx: u64, zone_len: u64, row_count: u64) -> u64 {
+    zone_idx.saturating_mul(zone_len).min(row_count)
 }
 
 impl LayoutReader for ZonedReader {
@@ -149,44 +148,64 @@ impl LayoutReader for ZonedReader {
             return Ok(data_eval);
         };
 
-        let row_count = row_range.end - row_range.start;
+        let split_row_count = row_range.end - row_range.start;
+        let row_start = row_range.start;
         let zone_range = self.zone_range(row_range);
-        let zone_lengths: Vec<_> = zone_range
-            .clone()
-            .map(|zone_idx| {
-                // Figure out the range in the mask that corresponds to the zone
-                let start = usize::try_from(
-                    self.first_row_offset(zone_idx)
-                        .saturating_sub(row_range.start),
-                )?;
-                let end = usize::try_from(
-                    self.first_row_offset(zone_idx + 1)
-                        .saturating_sub(row_range.start)
-                        .min(row_count),
-                )?;
-                Ok::<_, VortexError>(end - start)
-            })
-            .try_collect()?;
+        let zone_start = usize::try_from(zone_range.start)?;
+        let zone_end = usize::try_from(zone_range.end)?;
+        let covered_zones = zone_end - zone_start;
+        let zone_len = self.zone_len as u64;
+        let layout_row_count = self.row_count;
 
         let name = Arc::clone(&self.name);
         let expr = expr.clone();
+        let mask_len = mask.len();
 
-        Ok(MaskFuture::new(mask.len(), async move {
+        Ok(MaskFuture::new(mask_len, async move {
             trace!("Invoking stats pruning evaluation {}: {}", name, expr);
 
             let pruning_mask = pruning_mask_future.await?.mask()?;
 
-            let mut builder = BitBufferMut::with_capacity(mask.len());
-            for (zone_idx, &zone_length) in zone_range.clone().zip_eq(&zone_lengths) {
-                builder.append_n(!pruning_mask.value(usize::try_from(zone_idx)?), zone_length);
-            }
+            // Only the zones covering this row range matter. Counting their pruned bits is a
+            // handful of bit reads, and the overwhelming majority of splits are uniform: either
+            // no covered zone is pruned, or all of them are. Both collapse to a constant stats
+            // mask, so we can skip expanding zones into a row-aligned buffer entirely.
+            let pruned_zones = match pruning_mask.bit_buffer() {
+                AllOr::All => covered_zones,
+                AllOr::None => 0,
+                AllOr::Some(buffer) => buffer.count_range(zone_start, zone_end),
+            };
 
-            let stats_mask = Mask::from(builder.freeze());
-            assert_eq!(stats_mask.len(), mask.len(), "Mask length mismatch");
-
-            // Intersect the masks.
             let mask_density = mask.density();
-            let mut stats_mask = mask.bitand(&stats_mask);
+            let mut stats_mask = if pruned_zones == 0 {
+                // The stats mask would be all-true, so intersecting it is a no-op.
+                mask
+            } else if pruned_zones == covered_zones {
+                // The stats mask would be all-false.
+                Mask::new_false(mask_len)
+            } else {
+                let mut builder = BitBufferMut::with_capacity(mask_len);
+                for zone_idx in zone_start..zone_end {
+                    // Figure out the range in the mask that corresponds to the zone
+                    let zone_idx_u64 = zone_idx as u64;
+                    let start = usize::try_from(
+                        first_row_offset(zone_idx_u64, zone_len, layout_row_count)
+                            .saturating_sub(row_start),
+                    )?;
+                    let end = usize::try_from(
+                        first_row_offset(zone_idx_u64 + 1, zone_len, layout_row_count)
+                            .saturating_sub(row_start)
+                            .min(split_row_count),
+                    )?;
+                    builder.append_n(!pruning_mask.value(zone_idx), end - start);
+                }
+
+                let stats_mask = Mask::from(builder.freeze());
+                assert_eq!(stats_mask.len(), mask_len, "Mask length mismatch");
+
+                // Intersect the masks.
+                mask.bitand(&stats_mask)
+            };
 
             // Forward to data child for further pruning.
             if !stats_mask.all_false() {
@@ -231,6 +250,7 @@ impl LayoutReader for ZonedReader {
 #[cfg(test)]
 mod test {
     use std::num::NonZeroUsize;
+    use std::ops::Range;
     use std::sync::Arc;
 
     use rstest::fixture;
@@ -372,6 +392,36 @@ mod test {
                 result,
                 Mask::from_iter([false, false, false, false, false, false, true, true, true])
             );
+        })
+    }
+
+    /// The zoned reader takes a uniform fast path when every zone covering the requested row
+    /// range agrees, so exercise all-pruned, all-kept and mixed ranges.
+    #[rstest]
+    #[case::only_pruned_zones(0..6, vec![false; 6])]
+    #[case::only_kept_zones(6..9, vec![true; 3])]
+    #[case::single_pruned_zone(3..6, vec![false; 3])]
+    #[case::partial_zones_mixed(1..8, vec![false, false, false, false, false, true, true])]
+    #[case::empty_range(4..4, vec![])]
+    fn test_stats_pruning_mask_zone_ranges(
+        #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+        #[case] row_range: Range<u64>,
+        #[case] expected: Vec<bool>,
+    ) -> VortexResult<()> {
+        block_on(|handle| async {
+            let session = session_with_handle(handle);
+            let reader = layout.new_reader("".into(), segments, &session, &Default::default())?;
+
+            // Values are 1..=9 in zones of 3, so `> 7` prunes zones 0 and 1 and keeps zone 2.
+            let expr = gt(root(), lit(7)).bind(reader.dtype())?;
+            let len = usize::try_from(row_range.end - row_range.start)?;
+
+            let result = reader
+                .pruning_evaluation(&row_range, &expr, Mask::new_true(len))?
+                .await?;
+
+            assert_eq!(result, Mask::from_iter(expected));
+            Ok(())
         })
     }
 
