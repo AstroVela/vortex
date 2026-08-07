@@ -71,15 +71,15 @@ box_wrapper!(
 
 /// Readonly view over bitpacked booleans.
 ///
-/// "elements" is the number of bits/elements, not the number of uint8_t words.
+/// "elements" is the number of bits/elements. Use vx_bool_view_words(view) to
+/// get the number of uint8_t words.
 /// Bits are laid out LSB-first.
 ///
 /// "bit_offset" is in [0; 8) and lets a view start at a non-byte-aligned bit.
-/// You can use vx_bool_view_nth(view, index) macro to read a
-/// single element and vx_bool_view_len(view) to get the number of uint8_t words.
+/// Use vx_bool_view_nth(view, index) macro to read a single element.
 ///
 /// Example:
-/// "view" holds 6 boolean elements starting at bit 2, first 5 set to "true",
+/// "view" holds 6 boolean elements, bit_offset=2, first 5 elements are "true",
 /// last is "false".
 ///
 /// uint8_t word = 0b01111100;
@@ -88,8 +88,7 @@ box_wrapper!(
 pub struct vx_bool_view {
     /// Element 0 is bit "bit_offset" of "ptr".
     pub ptr: *const u8,
-    /// Number of elements represented by "ptr". Get the number of uint8_t
-    /// words in "ptr" with vx_bool_view_len(view).
+    /// Number of elements represented by "ptr".
     pub elements: usize,
     /// Bit offset of element 0 within the first byte of "ptr".
     pub bit_offset: usize,
@@ -462,7 +461,7 @@ pub extern "C-unwind" fn vx_array_new_bool(
         let buffer = Buffer::copy_from(slice);
         let bits = BitBuffer::new_with_offset(buffer, bits.elements, bits.bit_offset);
         let array = BoolArray::try_new(bits, validity.into())?;
-        Ok(vx_array::new(Arc::new(array.into_array())))
+        Ok(vx_array::new(array.into_array()))
     })
 }
 

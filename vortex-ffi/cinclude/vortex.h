@@ -61,7 +61,7 @@ typedef struct ArrowArrayStream FFI_ArrowArrayStream;
 #endif
 
 // Number of uint8_t words holding view's elements
-#define vx_bool_view_len(X) (((X).elements + (X).bit_offset + 7) / 8)
+#define vx_bool_view_words(X) (((X).elements + (X).bit_offset + 7) / 8)
 // I'th element (bit) in view, LSB-first. Already accounts for bit_offset
 #define vx_bool_view_nth(X, I)                                                                               \
     ((((X).ptr[((I) + (X).bit_offset) / 8] & (1 << (((I) + (X).bit_offset) % 8))) != 0))
@@ -484,15 +484,15 @@ typedef struct {
 /**
  * Readonly view over bitpacked booleans.
  *
- * "elements" is the number of bits/elements, not the number of uint8_t words.
+ * "elements" is the number of bits/elements. Use vx_bool_view_words(view) to
+ * get the number of uint8_t words.
  * Bits are laid out LSB-first.
  *
  * "bit_offset" is in [0; 8) and lets a view start at a non-byte-aligned bit.
- * You can use vx_bool_view_nth(view, index) macro to read a
- * single element and vx_bool_view_len(view) to get the number of uint8_t words.
+ * Use vx_bool_view_nth(view, index) macro to read a single element.
  *
  * Example:
- * "view" holds 6 boolean elements starting at bit 2, first 5 set to "true",
+ * "view" holds 6 boolean elements, bit_offset=2, first 5 elements are "true",
  * last is "false".
  *
  * uint8_t word = 0b01111100;
@@ -504,8 +504,7 @@ typedef struct {
      */
     const uint8_t *ptr;
     /**
-     * Number of elements represented by "ptr". Get the number of uint8_t
-     * words in "ptr" with vx_bool_view_len(view).
+     * Number of elements represented by "ptr".
      */
     size_t elements;
     /**
