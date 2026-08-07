@@ -14,18 +14,37 @@ The public design lives in these tracking issues, which now match the implementa
 - [#9129, Define the `RowFn` API](https://github.com/vortex-data/vortex/issues/9129)
 - [#9130, Execute `RowFn` over Vortex arrays](https://github.com/vortex-data/vortex/issues/9130)
 
-The branch is `ct/row-fn`. It is publicly linked from #9128, so do
-not rewrite or delete its history. Commit `4becc863ae` contains the final API simplification. Push
-only when explicitly requested.
+The branch is `ct/row-fn`, and draft PR #9255 remains the integration and research branch. Its
+history was rewritten at `ea58061b5d` to remove the regressing broadcast-index-mask experiment.
+Do not use the draft PR as the first mergeable change. Cut the first PR from the latest
+`origin/develop`, and keep this branch as the source for later tensor and spatial ports. Push or
+rewrite either branch only when explicitly requested.
 
-## Next action: rerun the benchmarks on x86
+## Next action: cut the vortex-array PR
 
-The next session will run on an x86 machine. Rerun the performance comparison there before treating
-the implementation as complete. Do not reuse the Apple timings as the final runtime result.
+The first mergeable PR must stay within `vortex-array` and contain:
 
-The production benchmark baseline from #9136 is on `develop` at `9a482c0230`. Fetch the latest
-`origin/develop`, record the exact baseline and candidate commits, and run the same public benchmark
-binaries at both revisions:
+1. the `RowFn` API, lifting, executor, and focused behavioral tests.
+2. the primitive `NumericBinary` port as its production consumer.
+3. only the executor and numeric benchmarks needed to support its performance claim.
+
+Do not include the tensor or spatial ports, these branch-only working notes, the unrelated `like`
+benchmark additions, or the fixed-size-list test. `NumericBinary` is the only `RowFn` consumer in
+`vortex-array` on this branch. It already exercises varying and constant inputs, all-constant
+folding, null constants, nullable execution, deferred overflow evidence, and the valid-row retry.
+Do not add another consumer only to make the PR appear broader.
+
+The numeric commit deletes the now-unused `vortex-compute::lane_kernels::map_into` helper. Leave
+that helper in place for a strictly `vortex-array`-only PR, and remove it in a separate cleanup.
+
+The first PR must establish parity against the latest `origin/develop`, not the integration
+branch's old merge base. Run the public `binary_ops` benchmark on x86 with identical build flags at
+both revisions. Cover varying x varying, varying x constant, constant x varying, and nullable plus
+constant inputs. Run each revision at least twice in alternating order. Record the exact commits,
+CPU, timer, pinning, fastest values, and medians. Inspect optimized LLVM IR or assembly for every
+stable regression before changing the row API.
+
+The production benchmark commands across the staged work are:
 
 ```bash
 cargo bench -p vortex-array --bench binary_ops
@@ -40,23 +59,17 @@ cargo bench -p vortex-spatial --bench envelope
 cargo bench -p vortex-spatial --bench predicate_bbox
 ```
 
-Run each revision at least twice in alternating order. If the host allows it, pin the process to one
-core. Record the timer and CPU configuration, and compare both fastest and median values. The
-benchmark binaries and public names are now shared with `develop`, so the comparison no longer
-needs a frozen benchmark-local implementation as its primary control.
-
-Also run the branch-only `vortex-spatial` `null_strategies` diagnostic. It forces branch-and-skip and
-filter-and-scatter for the measured nullable geometry shapes. Confirm that automatic selection uses
-the faster mechanism for one costly decode at 50% survivors and for two costly decodes at about 81%
-survivors. This is the x86 runtime check that remains after the LLVM comparison.
+For the spatial PR, also run the branch-only `vortex-spatial` `null_strategies` diagnostic. It
+forces branch-and-skip and filter-and-scatter for the measured nullable geometry shapes. Confirm
+that automatic selection uses the faster mechanism for one costly decode at 50% survivors and for
+two costly decodes at about 81% survivors.
 
 ```bash
 cargo bench -p vortex-spatial --bench null_strategies
 ```
 
-If a stable benchmark regresses, inspect optimized LLVM IR again. The previous cross-compile proves
-that the API cleanup preserved the x86_64-v3 loop shape. The x86 run must confirm runtime effects
-from the revised null selector and the target CPU's vectorizer and branch predictor.
+The public benchmark names are shared with `develop`, so cross-revision comparisons do not need a
+frozen benchmark-local implementation as their primary control.
 
 ## The API in one screen
 
@@ -343,10 +356,10 @@ Deliberately **not** done:
   and masking a full-length result looks like a simplification and is not one:
   `normalized_readthrough_survives_null_rows` pins that a filtered input is no longer `Normalized`,
   so which arrays reach `reduce_encoded` is load-bearing and differs per strategy.
-- **No PR split.** Recommended landing order, each step individually revertible and separately
-  benchmarkable: (1) API + lifting with dense/filter only; (2) branch-and-skip + adaptive selection
-  + its benchmarks; (3) `NumericBinary`; (4) tensor; (5) geo. The seam already supports this split
-  and no API changes between steps.
+- **No mixed-constant specialization without a failing benchmark.** The broadcast-index-mask
+  experiment regressed numeric constants by 4x to 7x on x86 and was removed. Keep the current
+  executor for the first PR. Add a specialized varying x constant or constant x varying loop only
+  after the clean branch has a stable regression against the current merge base.
 
 ### Three API changes proposed, and why none of them landed
 

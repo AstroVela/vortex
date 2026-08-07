@@ -185,19 +185,33 @@ Re-measure the port against `develop` once that lands, because the comparison ab
 
 ### Measured dead ends
 
-Recorded so they are not retried. All of these are in vortex-data/vortex#9130 as well.
+Recorded so they are not retried. The entries that predate the broadcast-index-mask experiment are
+also in vortex-data/vortex#9130.
 
 - Bounds-check elimination in the row loop is not available. Narrowing the varying view to the row
   count buys nothing, and `get_unchecked` is not uniformly a win: about 10% on `mul_u16` and
   `mul_u32`, and 22% slower on `mul_u8`.
 - A per-argument row source that keeps the `Varying` view when another argument is batch-constant is
   4x slower than the `ArgColumn` branch it replaces, which already vectorizes.
-- A batch-constant operand therefore still demotes its neighbours off the slice path. Closing that
-  needs the row loop monomorphized over which arguments are constant. Revisit when `Compare` moves
-  onto `RowFn`, since `col < literal` is exactly this shape.
+- Pairing each varying view with a runtime index mask also fails. Commit `ad24700088` used
+  `index & usize::MAX` for varying inputs and `index & 0` for constants. On x86 with
+  `RUSTFLAGS="-C target-feature=+avx2"`, the constant numeric cases became approximately 4x to 7x
+  slower in wall time while non-constant cases stayed at parity. CodSpeed reported smaller but
+  consistent regressions: `add_i64_constant` 31.34%, `sub_i64_constant` 32.38%, and
+  `mul_i32_constant` 46.24%.
+- The disassembly explains the mask result. Each `index & mask` remained behind a slice bounds
+  check, so LLVM saw a non-affine index and emitted a scalar loop. The old enum match was
+  loop-invariant, and LLVM unswitched it into constant-pattern loops with affine varying
+  accesses. Removing a branch removed information that the vectorizer needed.
 
-`mul_i32_constant` is the one regression that survives, and it is inside this host's drift. Let
-CodSpeed settle whether it is real.
+Commit `ad24700088` was removed from `ct/row-fn` history. The clean head after the rewrite is
+`ea58061b5d`. A compile-time varying x constant or constant x varying specialization remains a
+possible design, but it is not work for the first PR. Implement it only after the clean branch has
+a stable mixed-constant regression against the current merge base.
+
+The earlier `mul_i32_constant` result was within Apple host drift and predates the mask experiment.
+It does not establish parity against current `develop`. Rerun the clean candidate and current merge
+base on x86 before deleting the hand-written kernels in a mergeable PR.
 
 ### What this implies for #9129 and #9130
 

@@ -73,6 +73,45 @@ fastest and median observations rather than only these compact ranges.
 The historical measurements below remain because they explain design decisions and experiments made
 while building the prototype; they are not the current before/after performance record.
 
+### Later broadcast-index-mask experiment
+
+Commit `ad24700088` tried to preserve a varying neighbor's decoded slice when another input was
+constant. Every argument exposed `(Varying, mask)`, where the mask was `usize::MAX` for a varying
+column and `0` for a one-row constant, and the fallback loop indexed each input with
+`index & mask`. The all-varying loop was unchanged.
+
+The design regressed the numeric mixed-constant cases. The comparison used baseline `fed7038` and
+candidate `edb3953`, with `RUSTFLAGS="-C target-feature=+avx2"` at both revisions:
+
+| benchmark | `fed7038` | `edb3953` | result |
+| --- | ---: | ---: | ---: |
+| `add_i64_constant` | 9.5-9.7 us | 37-71 us | approximately 4x to 7x slower |
+| `sub_i64_constant` | 9.4-9.7 us | 37-45 us | approximately 4x slower |
+| `mul_i32_constant` | 10.7-11.1 us | 42-43 us | approximately 4x slower |
+| `add_i64_nonnull` | 11.1 us | 11.2 us | parity |
+| `mul_i32_nonnull` | 13.9 us | 13.4 us | parity |
+
+The x86 report did not record the CPU, timer, pinning, or fastest and median values separately, so
+these wall-clock values diagnose the code-generation failure rather than satisfy the release gate.
+CodSpeed reported the same direction at a smaller magnitude: `add_i64_constant` 31.34%,
+`sub_i64_constant` 32.38%, and `mul_i32_constant` 46.24% slower.
+
+The generated assembly kept two bounds checks per row and performed scalar loads. The runtime mask
+made each varying index non-affine, so LLVM could not prove it in bounds or vectorize the loop. The
+previous `ArgColumnKind` match was loop-invariant, which allowed LLVM to unswitch the numeric loop
+into constant-pattern variants. The experiment optimized the branch count and discarded the
+information that enabled vectorization.
+
+The commit was removed from `ct/row-fn` history. The clean integration head is `ea58061b5d`. Two
+unpinned Divan runs on an Apple M4 Max, with 41 ns timer precision, restored the constant medians to
+8.71-8.73 us for `add_i64`, 8.79-9.00 us for `sub_i64`, and 5.71-5.75 us for `mul_i32`. These
+values prove that the mask regression is gone. They are not an x86 comparison against current
+`develop`.
+
+Do not reintroduce a runtime mask or another runtime-shaped per-argument source. A later
+mixed-constant optimization must monomorphize the loop over the constant pattern and must first be
+justified by a stable benchmark against the current merge base.
+
 ---
 
 ## The design in one screen
