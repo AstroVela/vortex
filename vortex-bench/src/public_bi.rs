@@ -36,6 +36,7 @@ use crate::BenchmarkDataset;
 use crate::Format;
 use crate::IdempotentPath;
 use crate::SESSION;
+use crate::SetupCtx;
 use crate::TableSpec;
 use crate::conversions::parquet_to_vortex_chunks;
 use crate::datasets::Dataset;
@@ -517,9 +518,17 @@ impl Benchmark for PublicBiBenchmark {
         self.pbi_benchmark().queries()
     }
 
-    async fn generate_base_data(&self) -> anyhow::Result<()> {
+    async fn setup(&self, ctx: &SetupCtx, _format: Format) -> anyhow::Result<()> {
         let pbi_data = self.pbi_benchmark().dataset()?;
-        pbi_data.write_as_parquet().await
+        pbi_data.write_as_parquet().await?;
+        for (table, path) in pbi_data
+            .tables
+            .iter()
+            .zip(pbi_data.list_files(FileType::Parquet))
+        {
+            ctx.emit(&table.name, path);
+        }
+        Ok(())
     }
 
     fn dataset(&self) -> BenchmarkDataset {
