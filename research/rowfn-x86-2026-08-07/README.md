@@ -109,14 +109,22 @@ exposed the next compiler-sensitive detail.
 ## Store placement and the `Copy` ablation
 
 Moving the output store before the failure OR changed `mul_i32_constant` from about 32.38 to
-18.68 microseconds. Final assembly records overflow `setb`, output store, then loop-carried OR. This
-is compiler scheduling sensitivity, not a semantic difference.
+18.68 microseconds. Final assembly records overflow `setb`, output store, then loop-carried OR. The
+source-order ablation therefore changes whole-function code generation, but the final instruction
+order is **not** a confirmed explanation for the throughput change.
 
 Adding the descriptive `Output: Copy` bound regressed that case to 29.88/29.86 microseconds.
 Replacing it with compile-time `!needs_drop::<Output>()` returned it to 18.65/18.67. A generic store
 helper did not repair the `Copy` case. The executor needs only the no-drop property for safe panic
 cleanup; it never copies an output. The API therefore enforces the actual requirement without the
 measured optimizer-visible bound. Re-test this workaround whenever LLVM changes.
+
+An isolated exact-loop ablation on the same CPU contradicted the simple scheduling story. LLVM-MCA
+estimated both final instruction orders at 2.7 cycles per iteration. Direct CPU 8 measurements made
+OR-before-store slightly faster at 0.75-0.77 nanoseconds per row than store-before-OR at
+0.823-0.825 nanoseconds per row. The production source-order effect is therefore an unresolved
+whole-function compiler interaction, such as layout, surrounding control flow, or another
+optimization decision. Do not justify the chosen source order as intrinsically better scheduling.
 
 ## Final results
 
@@ -165,6 +173,12 @@ AVX features, and LLVM selected the same essential scalar high-half strategy as 
 [`final i64 assembly`](codegen/final-i64-mul-dense-s.md), and
 [`final u64 assembly`](codegen/final-u64-mul-dense-s.md).
 
+A separate minimal `target-cpu=native` experiment did form `<8 x i128>` operations in LLVM IR for
+the widened `u64` product. The x86 backend still scalarized them into eight `mulq`/`imulq`
+instructions, then used ZMM registers only to pack and reduce the scalar results. x86 has no true
+wide 64-by-64-to-128 integer multiply here. Seeing a vector IR type or ZMM instruction is therefore
+not evidence that the expensive multiply itself executed as SIMD.
+
 `-C remark=loop-vectorize` emitted no remark attributable to the exact dense production loop. The
 constant fallback source line had successes for other monomorphs and duplicated cost-model misses,
 but diagnostics lacked function identity. Exact IR proves the measured specialization is scalar;
@@ -179,7 +193,8 @@ Confirmed:
 - `SinkResult` already reduced to a register OR and did not impose a per-row `Result`.
 - Output ownership materially helped but was insufficient alone.
 - A typed indexed source restored stable parity for varying primitive tuples.
-- Store-before-OR and omission of a `Copy` bound materially affect LLVM 21.1.2 constant codegen.
+- Source store/OR order and omission of a `Copy` bound materially affect LLVM 21.1.2 production
+  codegen; the mechanism behind the source-order effect remains unresolved.
 - The default x86 target prefers scalar high-half 64-bit multiply; SIMD is not the recovered speed.
 
 Still inference:
