@@ -40,7 +40,6 @@ where
                 operands: [Operand::Constant(constant.scalar().clone())],
                 valid: Validity::AllValid,
                 len,
-                nullability: output_dtype.nullability(),
             },
             ctx,
         );
@@ -55,7 +54,6 @@ where
             operands: [Operand::Column(array.clone())],
             valid,
             len,
-            nullability: output_dtype.nullability(),
         },
         ctx,
     )
