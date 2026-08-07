@@ -8,9 +8,10 @@
 //! `vortex-tensor`'s `TensorRow` drills through an extension wrapper into its storage.
 //!
 //! The two directions are deliberately asymmetric. [`InputElement::Elem`] is a GAT, so an input row
-//! can borrow out of the decoded column, while an [`OutputElement`] is one owned value written into
-//! an [`ElementSink`](crate::scalar_fn::ElementSink). Runtime-shaped output uses a custom
-//! [`OutputSink`](crate::scalar_fn::OutputSink) instead.
+//! can borrow out of the decoded column, while an [`OutputElement`] is one owned value returned by
+//! an owned row computation or written through
+//! [`ElementSink`](crate::scalar_fn::ElementSink); runtime-shaped output uses a custom
+//! [`OutputSink`](crate::scalar_fn::OutputSink).
 
 use vortex_error::VortexResult;
 
@@ -29,6 +30,7 @@ mod primitive;
 
 mod tuple;
 pub use tuple::ElementTuple;
+pub use tuple::IndexedElementTuple;
 pub(super) use tuple::batch_constant;
 
 /// An element type that can be read row-wise out of an input column.

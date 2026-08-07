@@ -5,6 +5,7 @@
 //! caller-provided `&mut [MaybeUninit<R>]`.
 
 use std::mem::MaybeUninit;
+use std::ops::BitOrAssign;
 
 use vortex_buffer::BitBuffer;
 
@@ -154,6 +155,50 @@ pub trait IndexedSourceExt: IndexedSource + Sized {
         if remainder != 0 {
             chunk(&values, out, &mut f, chunks_count * CHUNK_LEN, remainder);
         }
+    }
+
+    /// Write each mapped value and OR-reduce independent failure evidence across the batch.
+    ///
+    /// The failure stays local to this method so the optimizer can keep it in a register. The
+    /// caller receives only whether the batch failed and can attribute errors on a cold retry.
+    /// **`Failure` must be no wider than `Output`**, or its reduction can limit vector width.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out.len() != self.len()`.
+    #[inline]
+    fn map_checked_into<Output, Failure, Apply>(
+        self,
+        out: &mut [MaybeUninit<Output>],
+        mut apply: Apply,
+    ) -> Failure
+    where
+        Failure: Copy + Default + BitOrAssign,
+        Apply: FnMut(Self::Item) -> (Output, Failure),
+    {
+        const {
+            assert!(
+                size_of::<Failure>() <= size_of::<Output>(),
+                "failure evidence must be no wider than the value, or it bounds the vector width"
+            )
+        };
+
+        let values = self;
+        let len = values.len();
+        assert_eq!(out.len(), len, "out must have the same length as values");
+
+        let mut failed = Failure::default();
+        for index in 0..len {
+            // SAFETY: `index < len` by the loop bound.
+            let value = unsafe { values.get_unchecked(index) };
+            let (output, failure) = apply(value);
+            failed |= failure;
+
+            // SAFETY: `index < len == out.len()`.
+            unsafe { out.get_unchecked_mut(index).write(output) };
+        }
+
+        failed
     }
 
     /// Apply the predicate `f(value)` lane-by-lane and bit-pack the results into
@@ -544,6 +589,25 @@ mod tests {
             (v <= u32::MAX as u64).then_some(v as u32)
         });
         assert!(res.is_ok(), "null lane should bypass the range check");
+    }
+
+    #[test]
+    fn map_checked_into_writes_all_lanes_and_reduces_failure() {
+        let mut values: Vec<u64> = (0..130).collect();
+        let mut output = vec![MaybeUninit::<u32>::uninit(); 130];
+        let failed = values
+            .as_slice()
+            .map_checked_into(&mut output, |value| (value as u32, value > u32::MAX as u64));
+        assert!(!failed);
+        assert_eq!(write_t(output), (0..130u32).collect::<Vec<_>>());
+
+        values[77] = (u32::MAX as u64) + 1;
+        let mut output = vec![MaybeUninit::<u32>::uninit(); 130];
+        let failed = values
+            .as_slice()
+            .map_checked_into(&mut output, |value| (value as u32, value > u32::MAX as u64));
+        assert!(failed);
+        assert_eq!(write_t(output)[76], 76);
     }
 
     #[test]

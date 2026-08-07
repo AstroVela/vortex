@@ -6,6 +6,7 @@
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
+use std::ops::BitOrAssign;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -15,6 +16,8 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::scalar_fn::ElementTuple;
+use crate::scalar_fn::IndexedElementTuple;
+use crate::scalar_fn::OutputElement;
 use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::SinkResult;
@@ -115,6 +118,33 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
 pub trait RowVisitor: private::Sealed {
     /// What this visit produces.
     type Out;
+
+    /// Visit at indexed argument tuple `A`, returning one independently owned output and one
+    /// deferred failure word per row.
+    ///
+    /// The executor allocates and writes the output column. It reads through
+    /// [`IndexedElementTuple`] when every argument varies; batches containing a constant use
+    /// ordinary row access selected once outside the loop. `F::default()` **must** mean success,
+    /// including for empty execution, and `|=` must combine the evidence from independent rows.
+    /// `finish_failure` runs once after the loop: it must return `Ok(())` for successful evidence
+    /// and may report only the operation's row error for failed evidence. That error is deferred,
+    /// so nullable lifting may retry over only valid rows.
+    ///
+    /// `A` **must** have the arity declared by [`RowFn::ARG_NAMES`]. This method requires
+    /// [`RowFn::FALLIBLE`] to be `true`, and `O` must be no narrower than `F` so failure reduction
+    /// does not constrain vector width. `O` must not require drop glue. Use
+    /// [`visit_prepared_into`](Self::visit_prepared_into) for non-indexed tuples, runtime-shaped
+    /// output, shared builders, and output that requires drop.
+    fn visit_prepared_deferred<A, O, P, F>(
+        self,
+        prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        apply: impl Fn(&P, A::Elems<'_>) -> (O, F),
+        finish_failure: impl FnOnce(F) -> VortexResult<()>,
+    ) -> VortexResult<Self::Out>
+    where
+        A: IndexedElementTuple,
+        O: OutputElement,
+        F: 'static + Copy + Default + BitOrAssign;
 
     /// Visit at argument tuple `A`, preparing shared state once and writing every output row into
     /// sink `S`.

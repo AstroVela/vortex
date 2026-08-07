@@ -493,7 +493,7 @@ mod selection {
     #[test]
     fn planning_adds_decode_cost_across_arguments() {
         assert_eq!(
-            RowPolicy::for_dispatch::<(TrackedI64<1>, TrackedI64<1>), ()>(),
+            RowPolicy::for_sink::<(TrackedI64<1>, TrackedI64<1>), ()>(),
             RowPolicy::ValidOnly {
                 filtered_decode_cost: 2
             }

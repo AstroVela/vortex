@@ -8,9 +8,10 @@
 //! Keeping them apart is what lets [`row`](super::row) write a value for every row and reduce the
 //! evidence without a branch, so the loop vectorizes.
 
+use std::ops::BitOrAssign;
+
 use crate::dtype::NativePType;
 use crate::dtype::half::f16;
-use crate::scalar_fn::SinkResult;
 
 /// Checked addition, failing on integer overflow.
 pub(super) struct CheckedAdd;
@@ -33,9 +34,9 @@ pub(super) struct CheckedDiv;
 /// never compares, so the multiply stays a widening vector multiply and the reduction stays a
 /// vector OR. **The width must not exceed the element's**, or the reduction becomes the loop's
 /// bottleneck instead of the arithmetic.
-pub(super) trait Failure: SinkResult<Accumulated = Self> + Copy + Default {}
+pub(super) trait Failure: Copy + Default + PartialEq + BitOrAssign {}
 
-impl<T: SinkResult<Accumulated = T> + Copy + Default> Failure for T {}
+impl<T: Copy + Default + PartialEq + BitOrAssign> Failure for T {}
 
 /// One arithmetic operator at one width, as a value and its failure evidence.
 ///
@@ -309,7 +310,6 @@ impl_checked_float!(f16, f32, f64);
 #[cfg(test)]
 mod tests {
     use super::CheckedArithmetic;
-    use crate::scalar_fn::SinkResult;
 
     /// Values whose pairwise products are worth probing: the saturating boundaries, the sign-change
     /// pivots, and a spread of magnitudes that straddles the 64-bit split.
@@ -336,7 +336,7 @@ mod tests {
     /// hold each against `checked_mul`, whose `None` is the definition of overflow.
     #[track_caller]
     fn assert_agrees_with_checked_mul<T: CheckedArithmetic>(lhs: T, rhs: T, reference: Option<T>) {
-        let failed = <T::MulFailure as SinkResult>::occurred(lhs.mul_failure(rhs));
+        let failed = lhs.mul_failure(rhs) != <T::MulFailure as Default>::default();
 
         assert_eq!(failed, reference.is_none(), "{lhs:?} * {rhs:?}");
     }

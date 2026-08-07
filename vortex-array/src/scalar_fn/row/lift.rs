@@ -76,9 +76,9 @@ impl ExecutionArgs for BorrowedExecutionArgs<'_> {
 
 /// The arguments handed to one kernel invocation.
 ///
-/// `arrays` may be filtered or sliced, while `dtypes` and `sink_dtype` always describe the original
-/// planned batch. Keeping them together prevents an execution path from accidentally pairing an
-/// input view with unrelated planning metadata.
+/// `arrays` may be filtered or sliced, while `dtypes` and `output_dtype` always describe the
+/// original planned batch. Keeping them together prevents an execution path from accidentally
+/// pairing an input view with unrelated planning metadata.
 #[derive(Clone, Copy)]
 pub(super) struct KernelArgs<'a> {
     /// The executor-facing view, including the row count for this invocation.
@@ -90,14 +90,14 @@ pub(super) struct KernelArgs<'a> {
     /// The original input dtypes used to select the row implementation.
     pub(super) dtypes: &'a [DType],
 
-    /// The non-nullable dtype allocated by the selected output sink.
-    pub(super) sink_dtype: &'a DType,
+    /// The non-nullable dtype built by the selected output capability.
+    pub(super) output_dtype: &'a DType,
 }
 
 /// The execution policy and output dtype selected by a planning visit.
 pub(super) struct BatchPlan {
-    /// The non-nullable dtype built by the selected sink.
-    pub(super) sink_dtype: DType,
+    /// The non-nullable dtype built by the selected output capability.
+    pub(super) output_dtype: DType,
 
     /// How this concrete dispatch executes nullable rows.
     pub(super) policy: RowPolicy,
@@ -118,6 +118,17 @@ pub(super) enum RowPolicy {
 }
 
 impl RowPolicy {
+    /// The policy for an owned output carrying batch-deferred failure evidence.
+    pub(super) const fn for_deferred_output<A: ElementTuple>() -> Self {
+        if A::DENSE_SAFE && !A::DECODE_FALLIBLE {
+            Self::DenseWithRetry
+        } else {
+            Self::ValidOnly {
+                filtered_decode_cost: A::FILTERED_DECODE_COST,
+            }
+        }
+    }
+
     /// The policy one concrete dispatch executes nullable rows under.
     ///
     /// Note what is deliberately **not** read here: [`OutputSink::SUPPORTS_SKIPPED_ROWS`]. Hoisting
@@ -130,7 +141,7 @@ impl RowPolicy {
     /// answer differently from its row loop, that is a wrong answer rather than a slow one.
     ///
     /// [`OutputSink::SUPPORTS_SKIPPED_ROWS`]: crate::scalar_fn::OutputSink::SUPPORTS_SKIPPED_ROWS
-    pub(super) const fn for_dispatch<A: ElementTuple, R: SinkResult>() -> Self {
+    pub(super) const fn for_sink<A: ElementTuple, R: SinkResult>() -> Self {
         if A::DENSE_SAFE && !A::DECODE_FALLIBLE && !R::FALLIBLE {
             if R::DEFERRED {
                 Self::DenseWithRetry
@@ -178,8 +189,8 @@ pub(super) struct Batch<'a> {
     /// against. Already widened to nullable if any input is nullable.
     result_dtype: DType,
 
-    /// The non-nullable dtype the dispatched sink builds, computed once while planning.
-    sink_dtype: DType,
+    /// The non-nullable dtype the dispatched output capability builds, computed while planning.
+    output_dtype: DType,
 
     /// How the concrete dispatch executes nullable rows.
     policy: RowPolicy,
@@ -203,9 +214,9 @@ impl<'a> Batch<'a> {
         let arg_dtypes: SmallVec<[DType; 4]> =
             inputs.iter().map(|input| input.dtype().clone()).collect();
         let plan = plan(&arg_dtypes)?;
-        let nullability = plan.sink_dtype.nullability()
+        let nullability = plan.output_dtype.nullability()
             | Nullability::from(arg_dtypes.iter().any(DType::is_nullable));
-        let result_dtype = plan.sink_dtype.with_nullability(nullability);
+        let result_dtype = plan.output_dtype.with_nullability(nullability);
 
         let mut validity = Validity::NonNullable;
         for input in &inputs {
@@ -219,7 +230,7 @@ impl<'a> Batch<'a> {
             arg_dtypes,
             validity,
             result_dtype,
-            sink_dtype: plan.sink_dtype,
+            output_dtype: plan.output_dtype,
             policy: plan.policy,
         })
     }
@@ -507,7 +518,7 @@ impl<'a> Batch<'a> {
             execution,
             arrays,
             dtypes: &self.arg_dtypes,
-            sink_dtype: &self.sink_dtype,
+            output_dtype: &self.output_dtype,
         }
     }
 

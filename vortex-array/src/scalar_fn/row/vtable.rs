@@ -4,6 +4,8 @@
 //! Blanket scalar-function implementation and execution visitors for row functions.
 
 use std::marker::PhantomData;
+use std::mem::needs_drop;
+use std::ops::BitOrAssign;
 
 use vortex_error::VortexResult;
 #[cfg(any(test, feature = "_test-harness"))]
@@ -24,8 +26,10 @@ use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::IndexedElementTuple;
 #[cfg(any(test, feature = "_test-harness"))]
 use crate::scalar_fn::NullStrategy;
+use crate::scalar_fn::OutputElement;
 use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
@@ -33,8 +37,10 @@ use crate::scalar_fn::SinkResult;
 #[cfg(any(test, feature = "_test-harness"))]
 use crate::scalar_fn::VecExecutionArgs;
 use crate::scalar_fn::row::execute::RowExecution;
+use crate::scalar_fn::row::execute::execute_row_output_prepared;
 use crate::scalar_fn::row::execute::execute_row_sink_branch;
 use crate::scalar_fn::row::execute::execute_row_sink_prepared;
+use crate::scalar_fn::row::execute::validate_row_output;
 use crate::scalar_fn::row::execute::validate_row_sink;
 use crate::scalar_fn::row::lift::Batch;
 use crate::scalar_fn::row::lift::BatchPlan;
@@ -42,11 +48,8 @@ use crate::scalar_fn::row::lift::KernelArgs;
 use crate::scalar_fn::row::lift::RowPolicy;
 use crate::scalar_fn::row::lift::reconcile_return;
 
-/// Compile-time check that a dispatched `(A, S, R)` agrees with `F`'s public metadata. Evaluated by
-/// monomorphizing
-/// [`visit_prepared_into`](RowVisitor::visit_prepared_into), so even a dispatch arm that never runs
-/// is checked.
-const fn assert_dispatch_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: SinkResult>() {
+/// Compile-time checks shared by both output capabilities.
+const fn assert_input_dispatch_agrees<F: RowFn, A: ElementTuple>() {
     assert!(
         A::ARITY == F::ARG_NAMES.len(),
         "dispatch visited a tuple whose arity differs from RowFn::ARG_NAMES",
@@ -57,6 +60,11 @@ const fn assert_dispatch_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: Sin
         !A::DECODE_FALLIBLE || F::FALLIBLE,
         "dispatch decoded fallibly without declaring RowFn::FALLIBLE",
     );
+}
+
+/// Compile-time check for a sink-writing dispatch.
+const fn assert_sink_dispatch_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: SinkResult>() {
+    assert_input_dispatch_agrees::<F, A>();
     assert!(
         !R::FALLIBLE || F::FALLIBLE,
         "dispatch returned an error without declaring RowFn::FALLIBLE",
@@ -71,7 +79,30 @@ const fn assert_dispatch_agrees<F: RowFn, A: ElementTuple, S: OutputSink, R: Sin
     );
 }
 
-/// The plan-time visit: validate the dtypes and derive execution from the concrete sink and row
+/// Compile-time check for an owned output with deferred failure evidence.
+const fn assert_deferred_dispatch_agrees<F, A, O, Failure>()
+where
+    F: RowFn,
+    A: IndexedElementTuple,
+    O: OutputElement,
+    Failure: Copy + Default + BitOrAssign,
+{
+    assert_input_dispatch_agrees::<F, A>();
+    assert!(
+        F::FALLIBLE,
+        "dispatch deferred an error without declaring RowFn::FALLIBLE",
+    );
+    assert!(
+        size_of::<Failure>() <= size_of::<O>(),
+        "failure evidence must be no wider than the value, or it bounds the vector width",
+    );
+    assert!(
+        !needs_drop::<O>(),
+        "owned deferred outputs must not require drop glue",
+    );
+}
+
+/// The plan-time visit: validate the dtypes and derive execution from the output capability and row
 /// closure selected by dispatch.
 struct PlanRows<'a, F> {
     args: &'a [DType],
@@ -85,16 +116,35 @@ impl<F> private::Sealed for PlanRows<'_, F> {}
 impl<F: RowFn> RowVisitor for PlanRows<'_, F> {
     type Out = BatchPlan;
 
+    fn visit_prepared_deferred<A, O, P, Failure>(
+        self,
+        _prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        _apply: impl Fn(&P, A::Elems<'_>) -> (O, Failure),
+        _finish_failure: impl FnOnce(Failure) -> VortexResult<()>,
+    ) -> VortexResult<BatchPlan>
+    where
+        A: IndexedElementTuple,
+        O: OutputElement,
+        Failure: 'static + Copy + Default + BitOrAssign,
+    {
+        const { assert_deferred_dispatch_agrees::<F, A, O, Failure>() };
+
+        Ok(BatchPlan {
+            output_dtype: validate_row_output::<A, O>(self.args)?,
+            policy: RowPolicy::for_deferred_output::<A>(),
+        })
+    }
+
     fn visit_prepared_into<A: ElementTuple, S: OutputSink, P, R: SinkResult>(
         self,
         _prepare: impl FnOnce(A::ConstElems<'_>) -> P,
         _apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<BatchPlan> {
-        const { assert_dispatch_agrees::<F, A, S, R>() };
+        const { assert_sink_dispatch_agrees::<F, A, S, R>() };
 
         Ok(BatchPlan {
-            sink_dtype: validate_row_sink::<A, S>(self.args)?,
-            policy: RowPolicy::for_dispatch::<A, R>(),
+            output_dtype: validate_row_sink::<A, S>(self.args)?,
+            policy: RowPolicy::for_sink::<A, R>(),
         })
     }
 }
@@ -103,8 +153,8 @@ impl<F: RowFn> RowVisitor for PlanRows<'_, F> {
 struct ExecuteRows<'a, 'b, F> {
     args: &'a dyn ExecutionArgs,
 
-    /// The sink dtype computed by the planning visit.
-    sink_dtype: &'a DType,
+    /// The output dtype computed by the planning visit.
+    output_dtype: &'a DType,
 
     ctx: &'b mut ExecutionCtx,
 
@@ -117,15 +167,36 @@ impl<F> private::Sealed for ExecuteRows<'_, '_, F> {}
 impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     type Out = RowExecution;
 
+    fn visit_prepared_deferred<A, O, P, Failure>(
+        self,
+        prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        apply: impl Fn(&P, A::Elems<'_>) -> (O, Failure),
+        finish_failure: impl FnOnce(Failure) -> VortexResult<()>,
+    ) -> VortexResult<RowExecution>
+    where
+        A: IndexedElementTuple,
+        O: OutputElement,
+        Failure: 'static + Copy + Default + BitOrAssign,
+    {
+        const { assert_deferred_dispatch_agrees::<F, A, O, Failure>() };
+        execute_row_output_prepared::<A, O, P, Failure>(
+            self.args,
+            self.ctx,
+            prepare,
+            apply,
+            finish_failure,
+        )
+    }
+
     fn visit_prepared_into<A: ElementTuple, S: OutputSink, P, R: SinkResult>(
         self,
         prepare: impl FnOnce(A::ConstElems<'_>) -> P,
         apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<RowExecution> {
-        const { assert_dispatch_agrees::<F, A, S, R>() };
+        const { assert_sink_dispatch_agrees::<F, A, S, R>() };
         execute_row_sink_prepared::<A, P, S, R>(
             self.args,
-            self.sink_dtype,
+            self.output_dtype,
             self.ctx,
             prepare,
             apply,
@@ -136,13 +207,13 @@ impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
 /// The run-time visit for the branch-and-skip null strategy: compute only the conjoined-valid
 /// rows over unfiltered columns.
 ///
-/// `Ok(None)` means the visit cannot take that strategy because the sink cannot skip rows or an
-/// argument has no null-tolerant decode, and the lifting falls back to the filter strategy.
+/// `Ok(None)` means the visit requires filtering, a sink cannot skip rows, or an argument has no
+/// null-tolerant decode. The lifting then falls back to the filter strategy.
 struct ExecuteRowsBranch<'a, 'b, F> {
     args: &'a dyn ExecutionArgs,
 
-    /// The sink dtype computed by the planning visit.
-    sink_dtype: &'a DType,
+    /// The output dtype computed by the planning visit.
+    output_dtype: &'a DType,
 
     /// The conjoined validity, materialized by the lifting and guaranteed mixed.
     valid: &'a Mask,
@@ -158,15 +229,30 @@ impl<F> private::Sealed for ExecuteRowsBranch<'_, '_, F> {}
 impl<F: RowFn> RowVisitor for ExecuteRowsBranch<'_, '_, F> {
     type Out = Option<RowExecution>;
 
+    fn visit_prepared_deferred<A, O, P, Failure>(
+        self,
+        _prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+        _apply: impl Fn(&P, A::Elems<'_>) -> (O, Failure),
+        _finish_failure: impl FnOnce(Failure) -> VortexResult<()>,
+    ) -> VortexResult<Option<RowExecution>>
+    where
+        A: IndexedElementTuple,
+        O: OutputElement,
+        Failure: 'static + Copy + Default + BitOrAssign,
+    {
+        const { assert_deferred_dispatch_agrees::<F, A, O, Failure>() };
+        Ok(None)
+    }
+
     fn visit_prepared_into<A: ElementTuple, S: OutputSink, P, R: SinkResult>(
         self,
         prepare: impl FnOnce(A::ConstElems<'_>) -> P,
         apply: impl Fn(&P, A::Elems<'_>, S::Row<'_>) -> R,
     ) -> VortexResult<Option<RowExecution>> {
-        const { assert_dispatch_agrees::<F, A, S, R>() };
+        const { assert_sink_dispatch_agrees::<F, A, S, R>() };
         execute_row_sink_branch::<A, P, S, R>(
             self.args,
-            self.sink_dtype,
+            self.output_dtype,
             self.valid,
             self.ctx,
             prepare,
@@ -192,7 +278,7 @@ fn execute_rows<F: RowFn>(
         args.dtypes,
         ExecuteRows::<F> {
             args: args.execution,
-            sink_dtype: args.sink_dtype,
+            output_dtype: args.output_dtype,
             ctx,
             row_fn: PhantomData,
         },
@@ -221,7 +307,7 @@ fn execute_rows_branch<F: RowFn>(
         args.dtypes,
         ExecuteRowsBranch::<F> {
             args: args.execution,
-            sink_dtype: args.sink_dtype,
+            output_dtype: args.output_dtype,
             valid,
             ctx,
             row_fn: PhantomData,
@@ -229,7 +315,7 @@ fn execute_rows_branch<F: RowFn>(
     )
 }
 
-/// The batch facts for `row_fn` over `args`, derived from its dispatched elements and sink.
+/// The batch facts for `row_fn` over `args`, derived from its selected output capability.
 fn lift_batch<'a, F: RowFn>(
     row_fn: &F,
     options: &F::Options,
@@ -307,9 +393,9 @@ impl<F: RowFn> ScalarFnVTable for F {
             },
         )?;
 
-        let nullability =
-            plan.sink_dtype.nullability() | Nullability::from(args.iter().any(DType::is_nullable));
-        Ok(plan.sink_dtype.with_nullability(nullability))
+        let nullability = plan.output_dtype.nullability()
+            | Nullability::from(args.iter().any(DType::is_nullable));
+        Ok(plan.output_dtype.with_nullability(nullability))
     }
 
     fn execute(
@@ -328,7 +414,7 @@ impl<F: RowFn> ScalarFnVTable for F {
                     execution: args,
                     arrays: &[],
                     dtypes: &[],
-                    sink_dtype: &result_dtype,
+                    output_dtype: &result_dtype,
                 },
                 ctx,
             )?
@@ -343,9 +429,9 @@ impl<F: RowFn> ScalarFnVTable for F {
         )
     }
 
-    /// Output sinks build an all-valid column, so a row kernel cannot turn a wholly non-null row into
-    /// a null and the output validity is exactly the conjunction of the inputs'. Letting a sink
-    /// produce nulls would invalidate this.
+    /// Row output capabilities build an all-valid column, so a kernel cannot turn a wholly non-null
+    /// row into a null and the output validity is exactly the conjunction of the inputs'. Letting an
+    /// output capability produce nulls would invalidate this.
     fn validity(
         &self,
         _options: &Self::Options,

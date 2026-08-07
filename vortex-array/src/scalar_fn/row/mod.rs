@@ -19,9 +19,11 @@
 //! [`RowFn`] does not say how a row is _stored_, which is the element's job: `vortex-tensor` adds a
 //! `TensorRow<T>` [`InputElement`] and writes ordinary kernels over it.
 //!
-//! Output always goes through [`RowVisitor::visit_prepared_into`]. [`ElementSink`] covers one owned
-//! [`OutputElement`] per row; custom [`OutputSink`] implementations cover runtime-shaped rows. The
-//! prepare closure sees every batch-constant input and returns shared state for the row loop. Pass
+//! Output has two capabilities. [`RowVisitor::visit_prepared_deferred`] returns one independent
+//! [`OutputElement`] and failure word per row, letting shared execution own the stores and choose an
+//! indexed dense source. [`RowVisitor::visit_prepared_into`] writes through an [`OutputSink`] for
+//! runtime-shaped rows, shared builders, skip-capable output, and values requiring drop glue. Both
+//! prepare closures see every batch-constant input and return shared state for the row loop. Pass
 //! `|_| ()` when there is nothing to prepare.
 //!
 //! A kernel that can safely write a provisional value uses [`DeferredError`] instead of returning
@@ -43,6 +45,7 @@
 
 mod element;
 pub use element::ElementTuple;
+pub use element::IndexedElementTuple;
 pub use element::InputElement;
 pub use element::OutputElement;
 #[cfg(any(test, feature = "_test-harness"))]

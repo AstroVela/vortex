@@ -3,6 +3,8 @@
 
 //! Argument lists built from [`InputElement`]s, and the per-argument decode behind them.
 
+use vortex_compute::lane_kernels::IndexedSource;
+use vortex_compute::lane_kernels::LaneZip;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
 
@@ -13,6 +15,7 @@ use crate::arrays::Masked;
 use crate::arrays::extension::ExtensionArrayExt;
 use crate::arrays::masked::MaskedArraySlotsExt;
 use crate::dtype::DType;
+use crate::dtype::NativePType;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::InputElement;
 
@@ -162,9 +165,8 @@ pub trait ElementTuple: 'static + private::Sealed {
     ///
     /// `Some` marks an argument whose operand is constant for the batch and carries the element
     /// every row reads; `None` marks one that varies by row. This is what
-    /// [`visit_prepared_into`](crate::scalar_fn::RowVisitor::visit_prepared_into) hands to its prepare
-    /// closure, so a kernel can hoist work that depends only on a constant argument out of the
-    /// row loop.
+    /// [`RowVisitor`](crate::scalar_fn::RowVisitor) hands to a visit's prepare closure, so a kernel
+    /// can hoist work that depends only on a constant argument out of the row loop.
     type ConstElems<'a>;
 
     /// The number of arguments.
@@ -221,6 +223,22 @@ pub trait ElementTuple: 'static + private::Sealed {
 
     /// Read the batch-constant elements out of the decoded columns. Called once per batch.
     fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
+}
+
+/// An argument tuple that can expose independent indexed reads after one length validation.
+///
+/// This trait is sealed through [`ElementTuple`]. Tuples without a natural indexed source continue
+/// to use ordinary row access and output sinks.
+pub trait IndexedElementTuple: ElementTuple {
+    /// The source shared execution uses for a dense all-varying loop.
+    ///
+    /// Its length must be the common varying-column length. For every valid index it must preserve
+    /// row order, return the same value as [`ElementTuple::get_varying`], and uphold the unchecked
+    /// read contract of [`IndexedSource`].
+    type Source<'a>: IndexedSource<Item = Self::Elems<'a>>;
+
+    /// Borrow a source from columns already validated to vary within the batch.
+    fn indexed_source<'a>(columns: &Self::VaryingColumns<'a>) -> Self::Source<'a>;
 }
 
 impl private::Sealed for () {}
@@ -368,3 +386,11 @@ element_tuple!(9; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8);
 element_tuple!(10; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9);
 element_tuple!(11; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10);
 element_tuple!(12; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11);
+
+impl<A: NativePType, B: NativePType> IndexedElementTuple for (A, B) {
+    type Source<'a> = LaneZip<&'a [A], &'a [B]>;
+
+    fn indexed_source<'a>(columns: &Self::VaryingColumns<'a>) -> Self::Source<'a> {
+        LaneZip::new(columns.0, columns.1)
+    }
+}

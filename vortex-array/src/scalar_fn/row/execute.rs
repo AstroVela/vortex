@@ -6,6 +6,10 @@
 //! These back the blanket impls in [`row_fn`](super::row_fn) and are deliberately not public:
 //! [`RowFn`](crate::scalar_fn::RowFn) is the abstraction, these are its internals.
 
+use std::mem::needs_drop;
+use std::ops::BitOrAssign;
+
+use vortex_compute::lane_kernels::IndexedSourceExt;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -19,6 +23,8 @@ use crate::dtype::DType;
 use crate::scalar_fn::DeferredError;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::IndexedElementTuple;
+use crate::scalar_fn::OutputElement;
 use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::SinkResult;
 
@@ -42,6 +48,19 @@ impl RowExecution {
     }
 }
 
+/// Validate the input dtypes of an owned-output row function and return its output dtype.
+pub(super) fn validate_row_output<A: ElementTuple, O: OutputElement>(
+    args: &[DType],
+) -> VortexResult<DType> {
+    A::validate(args)?;
+    let dtype = O::element_dtype();
+    vortex_ensure!(
+        !dtype.is_nullable(),
+        "row output elements must declare a non-nullable dtype, got {dtype}",
+    );
+    Ok(dtype)
+}
+
 /// Validate the input dtypes of a sink-writing row function and return the dtype its sink builds.
 ///
 /// The output dtype may be a function of the inputs. A sink can also own a batch-wide builder, such
@@ -56,6 +75,69 @@ pub(super) fn validate_row_sink<A: ElementTuple, S: OutputSink>(
         "row output sinks must declare a non-nullable dtype, got {dtype}",
     );
     Ok(dtype)
+}
+
+/// Decode every input column once, then store owned row outputs and reduce deferred failures.
+pub(super) fn execute_row_output_prepared<A, O, P, F>(
+    args: &dyn ExecutionArgs,
+    ctx: &mut ExecutionCtx,
+    prepare: impl FnOnce(A::ConstElems<'_>) -> P,
+    apply: impl Fn(&P, A::Elems<'_>) -> (O, F),
+    finish_failure: impl FnOnce(F) -> VortexResult<()>,
+) -> VortexResult<RowExecution>
+where
+    A: IndexedElementTuple,
+    O: OutputElement,
+    F: Copy + Default + BitOrAssign,
+{
+    const {
+        assert!(
+            !needs_drop::<O>(),
+            "owned deferred outputs must not require drop glue"
+        )
+    };
+
+    let row_count = args.row_count();
+    let mut values = Vec::<O>::with_capacity(row_count);
+    let columns = A::decode(args, ctx)?;
+    let state = prepare(A::constants(&columns));
+    let failed;
+
+    {
+        let output = &mut values.spare_capacity_mut()[..row_count];
+
+        if let Some(varying) = A::varying(&columns) {
+            vortex_ensure!(
+                A::varying_len_matches(&varying, row_count),
+                "a decoded row input does not address exactly {row_count} rows",
+            );
+
+            failed =
+                A::indexed_source(&varying).map_checked_into(output, |elems| apply(&state, elems));
+        } else {
+            vortex_ensure!(
+                A::decoded_lens_match(&columns, row_count),
+                "a decoded row input does not address exactly {row_count} rows",
+            );
+
+            let mut accumulated = F::default();
+            for index in 0..row_count {
+                let (value, failure) = apply(&state, A::get(&columns, index));
+                output[index].write(value);
+                accumulated |= failure;
+            }
+            failed = accumulated;
+        }
+    }
+
+    // SAFETY: normal completion of either loop initializes every slot in `0..row_count` exactly
+    // once, and `values` was allocated with at least `row_count` capacity.
+    unsafe { values.set_len(row_count) };
+
+    match finish_failure(failed) {
+        Ok(()) => Ok(RowExecution::Output(O::build(values))),
+        Err(error) => Ok(RowExecution::DeferredError(error)),
+    }
 }
 
 /// Decode every input column once, allocate the sink once, then write one row at a time.
