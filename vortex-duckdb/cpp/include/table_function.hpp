@@ -13,15 +13,11 @@ static_assert(sizeof(idx_t) == 8);
 
 bool is_vortex_scan(const TableFunction &function);
 
-struct TableFunctionProjectionExpressionInput {
-    const LogicalGet &get;
-    const Expression &expression;
-    idx_t projection_idx;
-};
-
-// true if we can push down the expression, false otherwise
-bool projection_expression_pushdown(ClientContext &context,
-                                    const TableFunctionProjectionExpressionInput &input);
+// We need this exposed to compare function addresses in optimizer.cpp
+unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &context,
+                                                       TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types,
+                                                       vector<string> &names);
 
 struct TableFunctionUngroupedAggregateInput {
     const LogicalGet &get;
