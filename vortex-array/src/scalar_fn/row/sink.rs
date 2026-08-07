@@ -23,7 +23,7 @@ use crate::scalar_fn::OutputElement;
 ///   Relaxing the row closure to `FnMut` instead was measured at 8 to 11%, because a captured `&mut`
 ///   inhibits vectorization of the loop.
 /// - **[`sink_dtype`](Self::sink_dtype) sees the input dtypes**, unlike
-///   [`OutputElement::element_dtype`](crate::scalar_fn::OutputElement::element_dtype), which takes
+///   [`OutputElement::element_dtype`], which takes
 ///   none. That is the whole reason a runtime-shaped output fits here: the width comes out of the
 ///   arguments.
 ///

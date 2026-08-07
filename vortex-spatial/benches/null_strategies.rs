@@ -32,13 +32,13 @@ use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::NullStrategy;
 use vortex_array::scalar_fn::execute_row_fn_with_strategy;
 use vortex_array::validity::Validity;
+use vortex_session::VortexSession;
 use vortex_spatial::scalar_fn::contains::SpatialContains;
-use vortex_spatial::test_harness::geo_session;
 use vortex_spatial::test_harness::point_column;
 use vortex_spatial::test_harness::polygon_column;
-use vortex_session::VortexSession;
+use vortex_spatial::test_harness::spatial_session;
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(geo_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(spatial_session);
 
 fn main() {
     LazyLock::force(&SESSION);

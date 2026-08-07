@@ -355,7 +355,7 @@ fn a_failing_row_is_never_reached_behind_a_null() -> VortexResult<()> {
 }
 
 /// The sink names its output dtype from the input, so a wrong input dtype is rejected at plan
-/// time rather than producing a mis-typed column.
+/// time rather than producing a mistyped column.
 #[test]
 fn the_sink_dtype_validates_its_input() {
     let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);

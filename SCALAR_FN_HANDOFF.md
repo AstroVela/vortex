@@ -34,10 +34,10 @@ cargo bench -p vortex-tensor --bench l2_norm
 cargo bench -p vortex-tensor --bench inner_product
 cargo bench -p vortex-tensor --bench cosine_similarity
 cargo bench -p vortex-tensor --bench normalized
-cargo bench -p vortex-geo --bench binary_predicates
-cargo bench -p vortex-geo --bench distance
-cargo bench -p vortex-geo --bench envelope
-cargo bench -p vortex-geo --bench predicate_bbox
+cargo bench -p vortex-spatial --bench binary_predicates
+cargo bench -p vortex-spatial --bench distance
+cargo bench -p vortex-spatial --bench envelope
+cargo bench -p vortex-spatial --bench predicate_bbox
 ```
 
 Run each revision at least twice in alternating order. If the host allows it, pin the process to one
@@ -45,13 +45,13 @@ core. Record the timer and CPU configuration, and compare both fastest and media
 benchmark binaries and public names are now shared with `develop`, so the comparison no longer
 needs a frozen benchmark-local implementation as its primary control.
 
-Also run the branch-only `vortex-geo` `null_strategies` diagnostic. It forces branch-and-skip and
+Also run the branch-only `vortex-spatial` `null_strategies` diagnostic. It forces branch-and-skip and
 filter-and-scatter for the measured nullable geometry shapes. Confirm that automatic selection uses
 the faster mechanism for one costly decode at 50% survivors and for two costly decodes at about 81%
 survivors. This is the x86 runtime check that remains after the LLVM comparison.
 
 ```bash
-cargo bench -p vortex-geo --bench null_strategies
+cargo bench -p vortex-spatial --bench null_strategies
 ```
 
 If a stable benchmark regresses, inspect optimized LLVM IR again. The previous cross-compile proves
@@ -262,7 +262,8 @@ x86.
 
 ## Current implementation and checks
 
-The implementation includes production users in `vortex-array`, `vortex-tensor`, and `vortex-geo`.
+The implementation includes production users in `vortex-array`, `vortex-tensor`, and
+`vortex-spatial`.
 `NumericBinary` is an unregistered `RowFn` used only for primitive arithmetic execution. Decimal
 arithmetic keeps its existing path. The stable public-path benchmark baseline landed as #9136.
 
@@ -270,7 +271,7 @@ The checks recorded for the final API state are:
 
 - 67 focused RowFn tests;
 - 179 `vortex-tensor` tests;
-- 230 `vortex-geo` tests;
+- 230 `vortex-spatial` tests;
 - `cargo +nightly fmt --all`; and
 - full workspace clippy, with `PYO3_NO_PYTHON=1 PYO3_BUILD_EXTENSION_MODULE=1` because the host
   `/usr/bin/python3` is 3.9 while the workspace requires the Python 3.11 stable ABI.

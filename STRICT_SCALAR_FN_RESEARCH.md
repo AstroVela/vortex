@@ -200,9 +200,9 @@ is one `apply` per row. Three whole classes of strict function are therefore ine
 `RowFn` at any cost:
 
 - **Output dtype outside the element set.** `ext_storage`'s output is an extension array's storage
-  dtype, so `vortex.geo.box` is a struct and `vortex.uuid` is a `FixedSizeList(u8,16)`. `vortex-geo`'s
-  zone-map pruning calls `ext_storage` on a `geo.box` statistic, and a row-function port breaks it at
-  plan time.
+  dtype, so `vortex.st.box` is a struct and `vortex.uuid` is a `FixedSizeList(u8,16)`.
+  Zone-map pruning in `vortex-spatial` calls `ext_storage` on an `st.box` statistic, and a
+  row-function port breaks it at plan time.
 - **Variadic arity.** `merge` and `select` take an unbounded number of children, while `RowFn` fixes
   `Arity::Exact(n <= 3)`.
 - **Sub-row-granular kernels.** `not` negates one 64-bit word at a time, so a row loop over `bool` is
@@ -721,12 +721,12 @@ stopping them.
 | blocker | count | members |
 | --- | --- | --- |
 | **Not strict.** `RowFn` implies strict, so these cannot reach it at all. | 12 | `between`, `case_when`, `cast`, `dynamic`, `fill_null`, `is_null`, `is_not_null`, `list_contains`, `pack`, `stat`, `row_size`, `zip` |
-| **The answer already exists in bulk.** Zero-copy child projection, a metadata field, or a vectorized slice kernel. A row loop would be strictly slower. | 12 | `not`, `list_length`, `binary`, `mask`, `ext_storage`, `get_item`, `select`, `merge`, `variant_get`, `geo.envelope`, `json_to_variant`, `row_encode` |
+| **The answer already exists in bulk.** Zero-copy child projection, a metadata field, or a vectorized slice kernel. A row loop would be strictly slower. | 12 | `not`, `list_length`, `binary`, `mask`, `ext_storage`, `get_item`, `select`, `merge`, `variant_get`, `spatial.envelope`, `json_to_variant`, `row_encode` |
 | **No element rows to read.** Zero-arity, or a type-erasure adapter. | 5 | `literal`, `root`, `row_idx`, `row_count`, `ForeignScalarFnVTable` |
-| **Output side.** Nullable output, or an output dtype that depends on runtime data. | 2 | `list_sum`, `geo.envelope` |
+| **Output side.** Nullable output, or an output dtype that depends on runtime data. | 2 | `list_sum`, `spatial.envelope` |
 | **Value-dependent per-batch setup.** | 1 | `like` |
 
-`geo.envelope` is the one function counted twice: its output is a struct-of-four extension type *and*
+`spatial.envelope` is the one function counted twice: its output is a struct-of-four extension type *and*
 its fast paths hand back existing child arrays untouched.
 
 `binary` deserves a note, since on strictness alone it looks portable: only its Kleene `And`/`Or` are
@@ -997,7 +997,7 @@ does generically for every function, and computed its output nullability by hand
 
 This is the justification to carry onto a clean branch. It also bounds the claim: a `vortex-tensor`
 local helper owning the same invariant would remove the same `unsafe`, so what earns the *generic*
-placement in `vortex-array` is that `vortex-geo`'s three predicates and `byte_length` use it too,
+placement in `vortex-array` is that `vortex-spatial`'s three predicates and `byte_length` use it too,
 over three different element types. Two downstream crates plus core is the second-caller test met, not
 anticipated.
 
@@ -1241,7 +1241,7 @@ Method: a survey of every non-strict `ScalarFnVTable` impl in the workspace plus
 `is_strict` and `validity()`, and a working prototype (worktree branch `proto/null-strategies`,
 2,034-line diff, not for merging) that implemented both a branch-and-skip execution strategy and a
 `Nullable<E>` input element, benchmarked on 65,536-row batches at null densities from 0% to 90%.
-All 435 vortex-array scalar_fn tests and 223 vortex-geo tests pass with the prototype strategy both
+All 435 vortex-array scalar_fn tests and 223 vortex-spatial tests pass with the prototype strategy both
 off and on, including new hostile tests (out-of-bounds views and poison divisors behind null rows)
 proving the kernel never runs behind a null.
 
@@ -1327,7 +1327,7 @@ selectable per batch from `Mask::true_count`, with Filter kept for the sparse ta
 implemented on this branch** (see "Adaptive null strategy, as shipped" below); the rest of this
 section records the prototype evidence that justified it. The prototype
 also validated the two supporting pieces: a null-tolerant `decode_branch` on `InputElement`
-(defaulting to plain decode, correct for bulk canonicalizations) and `OutputElement::garbage()`
+(defaulting to plain decode, correct for bulk canonicalization) and `OutputElement::garbage()`
 for pre-fill. Production caveats recorded in the prototype report: `reduce_encoded` is not
 consulted on the branch path, sinks fall back to Filter, the toggle must become per-execution and
 cost-based, and geo's null-tolerant decode covered Point and Polygon only, still paying a
@@ -1410,7 +1410,7 @@ arity. Replace it with per-element/arity inputs or a small estimated-cost compar
 moves onto production branches. Batch size remains an unmeasured input to that model.
 
 Verified independently of the implementing agent: 3,441 tests pass across vortex-array and
-vortex-geo (17 new: hostile out-of-bounds views behind nulls, a fallible kernel with poison
+vortex-spatial (17 new: hostile out-of-bounds views behind nulls, a fallible kernel with poison
 divisors behind nulls in one and both operands, conjoined-mask honoring, constant operands, real
 errors still propagating, geo filter-versus-branch agreement, the unsupported-geometry fallback,
 and six selection-rule cases), vortex-tensor's 164 pass unchanged, clippy `--all-targets
@@ -1767,12 +1767,13 @@ Fetch the latest `origin/develop`, record both exact revisions, and compare the 
 
 Run `binary_ops` and `like` from `vortex-array`. Run `l2_norm`, `inner_product`,
 `cosine_similarity`, and `normalized` from `vortex-tensor`. Run `binary_predicates`, `distance`,
-`envelope`, and `predicate_bbox` from `vortex-geo`. Use at least two alternating runs per revision.
+`envelope`, and `predicate_bbox` from `vortex-spatial`. Use at least two alternating runs per
+revision.
 If the host permits it, pin one core. Report both fastest and median values with the CPU, timer, and
 governor configuration.
 
 The stable production binaries are the cross-revision gate because they now exist on `develop`.
-The branch-only `vortex-geo` `null_strategies` benchmark remains the forced-policy diagnostic. Run
+The branch-only `vortex-spatial` `null_strategies` benchmark remains the forced-policy diagnostic. Run
 it on the same x86 host to verify both measured selector decisions: one costly decode at 50%
 survivors must select the faster mechanism, and two costly decodes at about 81% survivors must do
 the same. Inspect optimized LLVM IR again for any stable regression before changing the API or the
