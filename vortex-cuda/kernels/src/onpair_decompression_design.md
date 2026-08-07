@@ -30,6 +30,36 @@ Explicit `.cg` and `.cs` code-load policies were tested but did not establish a
 universal win. The new kernel therefore improves scheduling without changing
 the code stream or requiring a second code buffer.
 
+### Code streaming versus dictionary caching
+
+The codes and dictionary tables have different reuse patterns:
+
+- Each `u16` code is consumed exactly once, in four coalesced 32-lane planes.
+  It is therefore logically streaming data.
+- The 4,096-entry `dict_s8` table is 32 KiB and the `lens` table is 4 KiB.
+  Their indices are data-dependent, but the same 36 KiB working set is reused
+  by every warp. Keeping useful lines in cache can therefore avoid repeated L2
+  or device-memory latency.
+
+It is tempting to force code loads to `.cg` (bypass L1) or `.cs` (evict first)
+to protect the reusable dictionary lines. Direct tests did not justify doing
+so in the universal kernel. On ClickBench URL, ordinary / `.cg` / `.cs` code
+loads measured 2.432 / 2.456 / 2.465 ms. On `l_comment` they measured 1.646 /
+1.633 / 1.643 ms. Thus ordinary loads won URL by about 0.9%, `.cg` won
+`l_comment` by about 0.8%, and `.cs` won neither. With `.cg`, the aggregate L1
+hit rate increased from 91.510% to 92.506% and L1 misses fell by 5.38 million,
+but L2 misses were unchanged and long-scoreboard stalls increased from 14.451%
+to 16.076%. Protecting L1 residency did not shorten the critical dependency
+chain reliably.
+
+The lower dictionary is also not copied into shared memory. CUDA provides no
+portable launch option that pins an arbitrary global allocation in L1, and a
+per-block copy would duplicate work and require barriers. The measured
+lens-only shared-memory experiment was 36.6% slower on URL; persistent
+prefetch was 33.3% slower. The retained policy is consequently: ordinary
+coalesced loads for the one-pass codes, ordinary cached gathers for `dict_s8`
+and `lens`, and instruction scheduling to overlap their exposed latency.
+
 ## The four decompression parts
 
 ### 1. Read code, length, and dictionary value
