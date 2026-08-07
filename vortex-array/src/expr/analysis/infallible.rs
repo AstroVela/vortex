@@ -15,8 +15,9 @@ pub fn label_infallible(expr: &Expression) -> BooleanLabels<'_> {
         expr,
         |expr| match expr {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.signature().is_infallible(),
-            // The scope itself cannot fail.
-            Expression::Root => true,
+            // These add no fallibility of their own. A lambda's body is one of its children, so
+            // the folded label at a lambda node is the body's infallibility.
+            Expression::Root | Expression::Variable(_) | Expression::Lambda(_) => true,
         },
         |acc, &child| acc & child,
     )
@@ -85,5 +86,28 @@ mod tests {
         let labels = label_infallible(&expr);
         assert_eq!(labels.get(&child), Some(&true));
         assert_eq!(labels.get(&expr), Some(&true));
+    }
+}
+
+#[cfg(test)]
+mod lambda_tests {
+    use super::*;
+    use crate::expr::checked_add;
+    use crate::expr::lambda;
+    use crate::expr::lit;
+    use crate::expr::var;
+
+    /// A lambda contributes no fallibility of its own, but its body is one of its children, so the
+    /// label at the lambda node is the body's.
+    #[test]
+    fn a_lambdas_label_is_its_bodys_infallibility() {
+        let fallible = Expression::from(lambda(["x"], checked_add(var("x"), lit(1i32))));
+        assert_eq!(label_infallible(&fallible).get(&fallible), Some(&false));
+
+        let infallible = Expression::from(lambda(["x"], var("x")));
+        assert_eq!(
+            label_infallible(&infallible).get(&infallible),
+            Some(&true)
+        );
     }
 }
