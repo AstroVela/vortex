@@ -3,6 +3,11 @@
 
 # Plan: fit the numeric binary operators onto `RowFn`
 
+> The later x86 follow-up found that the sink-only API regressed varying `i64`/`u64` multiply and
+> added separate owned-output and stateful-sink capabilities. Its complete evidence is in
+> [`research/rowfn-x86-2026-08-07/README.md`](research/rowfn-x86-2026-08-07/README.md). Treat that
+> record as authoritative where it supersedes the pre-x86 conclusions below.
+
 Working note, branch-only, like `SCALAR_FN_HANDOFF.md`. Written so this survives a conversation
 compaction: everything needed to start is here, and nothing below depends on chat history.
 

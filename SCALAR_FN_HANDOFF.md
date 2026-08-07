@@ -6,6 +6,8 @@
 This is the concise source of truth for the branch. `STRICT_SCALAR_FN_RESEARCH.md` keeps the full
 design history, rejected alternatives, measurements, and generated-code evidence.
 `NUMERIC_ROWFN_PLAN.md` records the numeric-binary migration and its narrower performance boundary.
+`research/rowfn-x86-2026-08-07/README.md` records the later x86 regression reproduction, the
+owned-output and indexed-source experiments, raw benchmark logs, and exact production IR/assembly.
 All three are branch-only working notes for agents. They are not intended to land with the API.
 
 The public design lives in these tracking issues, which now match the implementation:
