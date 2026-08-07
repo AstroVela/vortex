@@ -15,6 +15,7 @@ use crate::arrays::BoolArray;
 use crate::arrays::ChunkedArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::FixedSizeListArray;
+use crate::arrays::ListArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::NullArray;
 use crate::arrays::PrimitiveArray;
@@ -475,6 +476,89 @@ fn list_nullable_ignores_garbage() -> VortexResult<()> {
     assert_matches_baseline(&a, &b)
 }
 
+/// Out-of-order views are not zero-copy to list, exercising the conversion path that compares
+/// the rebuilt list offsets.
+#[test]
+fn list_out_of_order_views_identical() -> VortexResult<()> {
+    let elements = buffer![10i32, 20, 30].into_array();
+    let a = ListViewArray::try_new(
+        elements.clone(),
+        buffer![2u32, 0].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let b = ListViewArray::try_new(
+        elements,
+        buffer![2u32, 0].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
+#[test]
+fn list_out_of_order_views_different_elements() -> VortexResult<()> {
+    let a = ListViewArray::try_new(
+        buffer![10i32, 20, 30].into_array(),
+        buffer![2u32, 0].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let b = ListViewArray::try_new(
+        buffer![10i32, 20, 99].into_array(),
+        buffer![2u32, 0].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
+/// The rebuilt list offsets differ ([0, 1, 3] vs [0, 2, 3]) even though both element buffers
+/// hold the same values.
+#[test]
+fn list_out_of_order_views_different_offsets() -> VortexResult<()> {
+    let a = ListViewArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![2u32, 0].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let b = ListViewArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![1u32, 0].into_array(),
+        buffer![2u32, 1].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
+/// An out-of-order view compared against a contiguous view with the same logical lists: the
+/// zero-copy shortcut does not apply, and the rebuilt lists are identical.
+#[test]
+fn list_out_of_order_vs_contiguous_views_identical() -> VortexResult<()> {
+    let a = ListViewArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![2u32, 0].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let b = ListViewArray::try_new(
+        buffer![3i32, 1, 2].into_array(),
+        buffer![0u32, 1].into_array(),
+        buffer![1u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
 #[test]
 fn list_different_offset_dtypes() -> VortexResult<()> {
     let elements = buffer![1i32, 2, 3, 4].into_array();
@@ -489,6 +573,63 @@ fn list_different_offset_dtypes() -> VortexResult<()> {
         elements,
         buffer![0i16, 2].into_array(),
         buffer![2i16, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
+/// `ListArray` canonicalizes to a zero-copy list view, exercising the zero-copy comparison of
+/// sizes and base-relative offsets.
+#[test]
+fn list_array_zero_copy_identical() -> VortexResult<()> {
+    let a = ListArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![0u32, 2, 3].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let b = ListArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![0u32, 2, 3].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
+/// Same elements but different list boundaries ([1, 2], [3] vs [1], [2, 3]).
+#[test]
+fn list_array_zero_copy_different_sizes() -> VortexResult<()> {
+    let a = ListArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![0u32, 2, 3].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let b = ListArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![0u32, 1, 3].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    assert_matches_baseline(&a, &b)
+}
+
+/// A sliced list array starts at a non-zero base offset, so the zero-copy comparison must
+/// compare offsets relative to each array's first offset.
+#[test]
+fn list_array_zero_copy_sliced_identical() -> VortexResult<()> {
+    let a = ListArray::try_new(
+        buffer![1i32, 2, 3].into_array(),
+        buffer![0u32, 2, 3].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array()
+    .slice(1..2)?;
+    let b = ListArray::try_new(
+        buffer![3i32].into_array(),
+        buffer![0u32, 1].into_array(),
         Validity::NonNullable,
     )?
     .into_array();
