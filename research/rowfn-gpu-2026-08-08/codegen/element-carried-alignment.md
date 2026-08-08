@@ -26,6 +26,10 @@ granularity, which the element owns, not of the loop, which the executor owns.
 
 ## Source
 
+Only the chunk-indexed variant is recorded below. The row-indexed variant differed only in the
+executor loop, using `i = tid() * 2` advanced by `stride() * 2`, and emitted the same unmerged
+pair of scalar accesses.
+
 ```rust
 // Can the alignment live inside the element's Varying type, leaving the trait signature
 // `get_varying(&Varying, index) -> Elem` exactly as it is today?

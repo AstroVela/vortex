@@ -18,7 +18,11 @@ communicate the alignment through a type. The `align_offset` check is still requ
 since casting an unaligned pointer to an over-aligned type and dereferencing it is undefined
 behavior, but it does no work for code generation.
 
-The cast is executor-internal. The public element API still hands out `*const i64`.
+In these probes the cast is internal to a concrete executor that knows its pointer is
+`*const i64`. A generic executor sees only an opaque `Varying<'a>` and cannot perform it, which
+is why the README concludes the chunk granularity belongs with the element. The `align_offset`
+check stays required for soundness either way, since casting an under-aligned pointer to an
+over-aligned type and dereferencing it is undefined behavior.
 
 ## Source
 

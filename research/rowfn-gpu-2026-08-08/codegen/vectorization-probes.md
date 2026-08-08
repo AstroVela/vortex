@@ -3,8 +3,9 @@
 
 # Vectorization probes
 
-Four kernels doing the same FoR row body over adjacent `i64` elements, differing only in what the
-compiler is told about the access. Compiled for `nvptx64-nvidia-cuda` at `-O`.
+Five probes around the same FoR row body over adjacent elements. The first four differ only in
+what the compiler is told about the access. The fifth changes the access shape itself and is the
+decisive one. Compiled for `nvptx64-nvidia-cuda` at `-O`.
 
 ## Result
 
@@ -26,10 +27,10 @@ all emit zero vector loads.
 ## Source
 
 ```rust
-//! Probes for why the NVPTX backend does not merge adjacent loads.
+//! Probes for what enables vector memory operations on nvptx64.
 //!
-//! Each kernel does the same FoR row body over two adjacent i64 elements. They differ only in
-//! what the compiler is told about alignment.
+//! Each kernel does the same FoR row body over two adjacent i64 elements, varying what the
+//! compiler can prove about the access.
 
 /// Baseline: plain `*const i64`, 8-byte alignment guaranteed. This is what the executor has today.
 #[unsafe(no_mangle)]
