@@ -17,6 +17,24 @@ on:
       benchmark_name:
         required: true
         type: string
+      # Cargo package to build. Defaults to benchmark_id, which is also the
+      # runner tag, PR comment tag and job name, so a suite that shares a
+      # package with another suite keeps its own identity.
+      benchmark_package:
+        required: false
+        type: string
+        default: ""
+      # Binary to run. Defaults to benchmark_id.
+      benchmark_bin:
+        required: false
+        type: string
+        default: ""
+      # Subcommand passed to the binary before any flags. Empty for
+      # single-suite binaries.
+      benchmark_subcommand:
+        required: false
+        type: string
+        default: ""
       with_lance:
         required: false
         type: boolean
@@ -61,7 +79,8 @@ jobs:
         env:
           RUSTFLAGS: "-C target-cpu=native -C force-frame-pointers=yes"
         run: |
-          cargo build --package ${{ inputs.benchmark_id }} --profile release_debug \
+          cargo build --package ${{ inputs.benchmark_package || inputs.benchmark_id }} \
+            --profile release_debug \
             --features ${{ inputs.with_lance && 'lance,' || '' }}unstable_encodings
 
       - name: Pre-upload benchmark debuginfo to Polar Signals
@@ -70,7 +89,7 @@ jobs:
         continue-on-error: true
         with:
           paths: |
-            target/release_debug/${{ inputs.benchmark_id }}
+            target/release_debug/${{ inputs.benchmark_bin || inputs.benchmark_id }}
           polarsignals-cloud-token: ${{ secrets.POLAR_SIGNALS_API_KEY }}
           project-id: "e5d846e1-b54c-46e7-9174-8bf055a3af56"
 
@@ -107,7 +126,9 @@ jobs:
           VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         run: |
-          bash scripts/bench-taskset.sh target/release_debug/${{ inputs.benchmark_id }} -d gh-json -o results.json
+          bash scripts/bench-taskset.sh \
+            target/release_debug/${{ inputs.benchmark_bin || inputs.benchmark_id }} \
+            ${{ inputs.benchmark_subcommand }} -d gh-json -o results.json
 
       - name: Setup AWS CLI
         if: github.event.pull_request.head.repo.fork == false

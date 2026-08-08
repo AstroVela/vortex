@@ -1563,31 +1563,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "compress-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array 58.4.0",
- "arrow-schema 58.4.0",
- "async-trait",
- "bytes",
- "clap",
- "futures",
- "indicatif",
- "itertools 0.14.0",
- "lance-bench",
- "parquet 58.4.0",
- "regex",
- "tempfile",
- "tokio",
- "tracing",
- "vortex",
- "vortex-arrow",
- "vortex-bench",
- "vortex-cuda",
-]
-
-[[package]]
 name = "compression-codecs"
 version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7277,21 +7252,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "random-access-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "indicatif",
- "lance-bench",
- "rand 0.10.2",
- "rand_distr 0.6.0",
- "tabled",
- "tokio",
- "vortex-bench",
-]
-
-[[package]]
 name = "rangemap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10151,6 +10111,34 @@ dependencies = [
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
+]
+
+[[package]]
+name = "vortex-file-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array 58.4.0",
+ "arrow-schema 58.4.0",
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures",
+ "indicatif",
+ "itertools 0.14.0",
+ "lance-bench",
+ "parquet 58.4.0",
+ "rand 0.10.2",
+ "rand_distr 0.6.0",
+ "regex",
+ "tabled",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "vortex",
+ "vortex-arrow",
+ "vortex-bench",
+ "vortex-cuda",
 ]
 
 [[package]]

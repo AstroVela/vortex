@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
-#[cfg(feature = "lance")]
-use compress_bench::LanceCompressor;
-#[cfg(feature = "cuda")]
-use compress_bench::gpu_vortex::GpuVortexCompressor;
-use compress_bench::parquet::ParquetCompressor;
-use compress_bench::vortex::VortexCompressor;
+// Leading `::` disambiguates the `vortex` crate from this module's `vortex` submodule.
+use ::vortex::utils::aliases::hash_map::HashMap;
+use clap::Args;
 use indicatif::ProgressBar;
 use itertools::Itertools;
+#[cfg(feature = "lance")]
+use lance_bench::compress::LanceCompressor;
 use regex::Regex;
-use vortex::utils::aliases::hash_map::HashMap;
 use vortex_bench::Engine;
 use vortex_bench::Format;
-use vortex_bench::LogFormat;
 use vortex_bench::Target;
 use vortex_bench::compress::CompressMeasurements;
 use vortex_bench::compress::CompressOp;
@@ -42,78 +37,47 @@ use vortex_bench::public_bi::PBIDataset::CMSprovider;
 use vortex_bench::public_bi::PBIDataset::Euro2016;
 use vortex_bench::public_bi::PBIDataset::Food;
 use vortex_bench::public_bi::PBIDataset::HashTags;
-use vortex_bench::setup_logging_and_tracing_with_format;
 use vortex_bench::v3;
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
+use crate::CommonArgs;
+#[cfg(feature = "cuda")]
+use crate::compress::gpu_vortex::GpuVortexCompressor;
+use crate::compress::parquet::ParquetCompressor;
+use crate::compress::vortex::VortexCompressor;
+
+#[cfg(feature = "cuda")]
+pub mod gpu_vortex;
+pub mod parquet;
+pub mod vortex;
+
+#[derive(Args, Debug)]
+pub struct CompressArgs {
     #[arg(
         long,
         value_delimiter = ',',
         value_enum,
         default_values_t = vec![Format::Parquet, Format::OnDiskVortex]
     )]
-    formats: Vec<Format>,
+    pub formats: Vec<Format>,
     #[arg(short, long, default_value_t = 5)]
-    iterations: usize,
-    #[arg(short, long)]
-    verbose: bool,
+    pub iterations: usize,
     #[arg(
         long,
         value_enum,
         default_values_t = vec![CompressOp::Compress, CompressOp::Decompress]
     )]
-    ops: Vec<CompressOp>,
+    pub ops: Vec<CompressOp>,
+    /// Regex filter matched against dataset names.
     #[arg(long)]
-    datasets: Option<String>,
+    pub datasets: Option<String>,
     /// Run GPU decompression for the allow-listed benchmarks.
     ///
     /// This filters the suite to GPU-supported dataset names and runs only Vortex decompression.
     #[arg(long)]
-    gpu_decompress: bool,
-    #[arg(short, long, default_value_t, value_enum)]
-    display_format: DisplayFormat,
-    #[arg(short, long)]
-    output_path: Option<PathBuf>,
-    /// Additionally write benchmark ingest JSONL records to this path.
-    #[arg(long = "ingest-jsonl")]
-    ingest_output: Option<PathBuf>,
-    #[arg(long)]
-    tracing: bool,
-    /// Format for the primary stderr log sink. `text` is the default human-readable format;
-    /// `json` emits one JSON object per event, suitable for piping into `jq`.
-    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
-    log_format: LogFormat,
-}
+    pub gpu_decompress: bool,
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    setup_logging_and_tracing_with_format(args.verbose, args.tracing, args.log_format)?;
-
-    if args.gpu_decompress && !cfg!(feature = "cuda") {
-        anyhow::bail!("--gpu-decompress requires building compress-bench with --features cuda");
-    }
-
-    let (formats, ops) = if args.gpu_decompress {
-        (vec![Format::OnDiskVortex], vec![CompressOp::Decompress])
-    } else {
-        (args.formats, args.ops)
-    };
-
-    run_compress(
-        args.iterations,
-        args.datasets.map(|d| Regex::new(&d)).transpose()?,
-        formats,
-        ops,
-        args.gpu_decompress,
-        args.display_format,
-        args.output_path,
-        args.ingest_output,
-    )
-    .await
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 /// Get a compressor for the given format.
@@ -140,22 +104,39 @@ fn get_compressor(format: Format, gpu_decompress: bool) -> Box<dyn Compressor> {
 const BENCHMARK_ID: &str = "compress";
 
 /// Repo-relative path of the suite explainer linked from CI benchmark PR comments.
-const DOC_PATH: &str = "benchmarks/compress-bench/README.md";
+const DOC_PATH: &str = "benchmarks/vortex-file-bench/README.md";
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "benchmark CLI options are forwarded one-to-one"
-)]
-async fn run_compress(
-    iterations: usize,
-    datasets_filter: Option<Regex>,
-    formats: Vec<Format>,
-    ops: Vec<CompressOp>,
-    gpu_decompress: bool,
-    display_format: DisplayFormat,
-    output_path: Option<PathBuf>,
-    ingest_output: Option<PathBuf>,
-) -> anyhow::Result<()> {
+/// Run the compression suite.
+pub async fn run(args: CompressArgs) -> anyhow::Result<()> {
+    let CompressArgs {
+        formats,
+        iterations,
+        ops,
+        datasets,
+        gpu_decompress,
+        common:
+            CommonArgs {
+                display_format,
+                output_path,
+                ingest_output,
+                ..
+            },
+    } = args;
+
+    if gpu_decompress && !cfg!(feature = "cuda") {
+        anyhow::bail!("--gpu-decompress requires building vortex-file-bench with --features cuda");
+    }
+
+    // GPU decompression is only wired up for the Vortex reader, so it overrides the
+    // format and op selection rather than combining with it.
+    let (formats, ops) = if gpu_decompress {
+        (vec![Format::OnDiskVortex], vec![CompressOp::Decompress])
+    } else {
+        (formats, ops)
+    };
+
+    let datasets_filter = datasets.map(|d| Regex::new(&d)).transpose()?;
+
     let targets = formats
         .iter()
         .map(|f| Target::new(Engine::default(), *f))

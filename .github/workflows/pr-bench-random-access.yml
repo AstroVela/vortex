@@ -18,4 +18,8 @@ jobs:
     with:
       benchmark_id: random-access-bench
       benchmark_name: Random Access
+      benchmark_package: vortex-file-bench
+      benchmark_bin: vortex-file-bench
+      # The subcommand is supplied by scripts/random-access-split.py, which
+      # drives this suite one combination at a time.
       with_lance: true

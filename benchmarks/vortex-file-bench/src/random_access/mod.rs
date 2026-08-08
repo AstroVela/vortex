@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use clap::Args;
 use clap::ValueEnum;
 use indicatif::ProgressBar;
 use rand::RngExt;
@@ -17,6 +17,10 @@ use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Target;
 use vortex_bench::create_output_writer;
+use vortex_bench::datasets::feature_vectors::FeatureVectorsData;
+use vortex_bench::datasets::nested_lists::NestedListsData;
+use vortex_bench::datasets::nested_structs::NestedStructsData;
+use vortex_bench::datasets::taxi_data::TaxiData;
 use vortex_bench::display::DisplayFormat;
 use vortex_bench::display::print_measurements_json;
 use vortex_bench::measurements::TimingMeasurement;
@@ -27,10 +31,35 @@ use vortex_bench::random_access::VortexRandomAccessor;
 use vortex_bench::utils::constants::STORAGE_NVME;
 use vortex_bench::v3;
 
-use crate::render::RandomAccessRun;
-use crate::render::render_random_access_table;
+use self::render::RandomAccessRun;
+use self::render::render_random_access_table;
+use crate::CommonArgs;
 
 mod render;
+
+/// Which dataset to benchmark random access on.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum DatasetArg {
+    #[clap(name = "taxi")]
+    Taxi,
+    #[clap(name = "feature-vectors")]
+    FeatureVectors,
+    #[clap(name = "nested-lists")]
+    NestedLists,
+    #[clap(name = "nested-structs")]
+    NestedStructs,
+}
+
+impl DatasetArg {
+    fn into_dataset(self) -> Box<dyn BenchDataset> {
+        match self {
+            Self::Taxi => Box::new(TaxiData),
+            Self::FeatureVectors => Box::new(FeatureVectorsData),
+            Self::NestedLists => Box::new(NestedListsData),
+            Self::NestedStructs => Box::new(NestedStructsData),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Access patterns
@@ -272,43 +301,67 @@ async fn open_accessor(
 const BENCHMARK_ID: &str = "random-access";
 
 /// Repo-relative path of the suite explainer linked from CI benchmark PR comments.
-const DOC_PATH: &str = "benchmarks/random-access-bench/README.md";
+const DOC_PATH: &str = "benchmarks/vortex-file-bench/README.md";
 
 /// Fixed indices used by the original taxi benchmark (preserved for historical continuity).
 const FIXED_TAXI_INDICES: [u64; 6] = [10, 11, 12, 13, 100_000, 3_000_000];
 
-/// Resolved configuration for a single random-access benchmark invocation.
-pub struct RunConfig {
-    /// Datasets to benchmark.
-    pub datasets: Vec<Box<dyn BenchDataset>>,
+#[derive(Args, Debug)]
+pub struct RandomAccessArgs {
     /// File formats to measure for each dataset.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_parser = Format::parse_allowed,
+        default_values = ["parquet", "vortex", "lance"]
+    )]
     pub formats: Vec<Format>,
+    /// Datasets to benchmark random access on.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_enum,
+        default_values_t = vec![DatasetArg::Taxi, DatasetArg::FeatureVectors, DatasetArg::NestedLists, DatasetArg::NestedStructs]
+    )]
+    pub datasets: Vec<DatasetArg>,
     /// Index access patterns to measure.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_enum,
+        default_values_t = vec![AccessPattern::Correlated, AccessPattern::Uniform]
+    )]
     pub patterns: Vec<AccessPattern>,
-    /// Maximum duration of each benchmark target in seconds.
+    /// Time limit in seconds for each benchmark target (e.g., 10 for 10 seconds).
+    #[arg(long, default_value_t = 10)]
     pub time_limit: u64,
-    /// Whether each benchmark run reuses or reopens its file handle.
+    /// Whether to reopen the file on each iteration, use a cached handle, or run both.
+    #[arg(long, value_enum, default_value_t = OpenMode::Both)]
     pub open_mode: OpenMode,
-    /// Format used to emit measurements.
-    pub display_format: DisplayFormat,
-    /// Optional path for the primary result output.
-    pub output_path: Option<PathBuf>,
-    /// Optional path for benchmark ingest JSONL records.
-    pub ingest_output: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
-/// Run random-access benchmarks with `config`.
-pub async fn run(config: RunConfig) -> Result<()> {
-    let RunConfig {
-        datasets,
+/// Run the random-access suite.
+pub async fn run(args: RandomAccessArgs) -> Result<()> {
+    let RandomAccessArgs {
         formats,
+        datasets,
         patterns,
         time_limit,
         open_mode,
-        display_format,
-        output_path,
-        ingest_output,
-    } = config;
+        common:
+            CommonArgs {
+                display_format,
+                output_path,
+                ingest_output,
+                ..
+            },
+    } = args;
+
+    let datasets: Vec<Box<dyn BenchDataset>> =
+        datasets.into_iter().map(DatasetArg::into_dataset).collect();
 
     let reopen_variants: &[bool] = match open_mode {
         OpenMode::Cached => &[false],

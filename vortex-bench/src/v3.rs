@@ -22,7 +22,7 @@
 //! |--------------------------------------------------------------------------|-----------------------|------------------------------------------------------------------------------------------------------------------------|
 //! | [`crate::measurements::QueryMeasurement`] (+ paired `MemoryMeasurement`) | `query_measurement`   | Two structs collapse into **one** record; memory fields omitted if `--track-memory` was off.                           |
 //! | [`crate::measurements::TimingMeasurement`] (random-access only)          | `random_access_time`  |                                                                                                                        |
-//! | [`crate::measurements::CompressionTimingMeasurement`]                    | `compression_time`    | `op` is decided by which side of `compress-bench`'s timing loop produced it.                                           |
+//! | [`crate::measurements::CompressionTimingMeasurement`]                    | `compression_time`    | `op` is decided by which side of the `compress` suite's timing loop produced it.                                           |
 //! | `CompressionSizeMeasurement` (in `vortex-bench/src/compress/mod.rs`)     | `compression_size`    | Was previously a `CustomUnitMeasurement` with a byte unit; now extracted explicitly.                                   |
 //! | Cross-format ratio `CustomUnitMeasurement` rows                          | **dropped**           | Computed on read from `compression_sizes`.                                                                             |
 //! | `ScanTiming` (vector-search)                                             | `vector_search_run`   | Carries timing **and** the three side counters in the same row.                                                        |
@@ -36,12 +36,12 @@
 //!   (`format = lance`) → `query_measurements`; a compression runner →
 //!   `compression_times` + `compression_sizes` with `format = lance`; a
 //!   random-access runner → `random_access_times` with `format = lance`.
-//! - `benchmarks/compress-bench` produces encode + decode
+//! - `benchmarks/vortex-file-bench compress` produces encode + decode
 //!   `CompressionTimingMeasurement` → `compression_times` (with
 //!   `op ∈ {encode, decode}`) and on-disk-size measurements →
 //!   `compression_sizes`. Ratio `CustomUnitMeasurement` rows are dropped;
 //!   the reader recomputes ratios.
-//! - `benchmarks/random-access-bench` produces `TimingMeasurement` →
+//! - `benchmarks/vortex-file-bench random-access` produces `TimingMeasurement` →
 //!   `random_access_times`. Datasets here (chimp, taxi, ...) are a
 //!   different namespace from the SQL query suites.
 //! - `benchmarks/vector-search-bench` produces `ScanTiming` →
@@ -90,11 +90,11 @@ pub static ENV_TRIPLE: LazyLock<String> = LazyLock::new(|| {
 pub enum V3Record {
     /// SQL query suite measurement (TPC-H/TPC-DS/ClickBench/...).
     QueryMeasurement(QueryMeasurementRecord),
-    /// `compress-bench` encode/decode timing.
+    /// the `compress` suite encode/decode timing.
     CompressionTime(CompressionTimeRecord),
-    /// `compress-bench` on-disk size.
+    /// the `compress` suite on-disk size.
     CompressionSize(CompressionSizeRecord),
-    /// `random-access-bench` take timing.
+    /// the `random-access` suite take timing.
     RandomAccessTime(RandomAccessTimeRecord),
     /// `vector-search-bench` cosine-similarity scan run.
     VectorSearchRun(VectorSearchRunRecord),
@@ -151,7 +151,7 @@ pub struct QueryMeasurementRecord {
     pub env_triple: Option<String>,
 }
 
-/// A single encode-or-decode timing from `compress-bench`.
+/// A single encode-or-decode timing from the `compress` suite.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompressionTimeRecord {
     /// 40-hex lowercase commit SHA.
@@ -174,7 +174,7 @@ pub struct CompressionTimeRecord {
     pub env_triple: Option<String>,
 }
 
-/// On-disk size of a compressed file from `compress-bench`.
+/// On-disk size of a compressed file from the `compress` suite.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompressionSizeRecord {
     /// 40-hex lowercase commit SHA.
@@ -190,7 +190,7 @@ pub struct CompressionSizeRecord {
     pub value_bytes: u64,
 }
 
-/// A single take-time timing from `random-access-bench`.
+/// A single take-time timing from the `random-access` suite.
 #[derive(Debug, Clone, Serialize)]
 pub struct RandomAccessTimeRecord {
     /// 40-hex lowercase commit SHA.
@@ -366,7 +366,7 @@ pub fn query_measurement_record(
 
 /// Build a `compression_time` record from a [`CompressionTimingMeasurement`].
 ///
-/// Caller passes `dataset` (the compress-bench dataset name) and the
+/// Caller passes `dataset` (the compress-suite dataset name) and the
 /// `op`. `dataset_variant` is reserved and unused at alpha.
 ///
 /// `dataset` is lowercased here to match the v2 → v3 migrate classifier,
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn compression_records_lowercase_dataset_for_v2_history_match() {
         // The historical v2 backfill stores `dataset = series.to_lowercase()`
-        // for compress-bench records.
+        // for compress-suite records.
         // Datasets whose `Dataset::name()` returns mixed case
         // (`TPC-H l_comment chunked`, every PBI name like `Arade`/`CMSprovider`)
         // would otherwise emit live records that do not merge with their

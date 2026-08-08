@@ -64,11 +64,10 @@ members = [
     "encodings/onpair",
     # Benchmarks
     "benchmarks/lance-bench",
-    "benchmarks/compress-bench",
     "benchmarks/datafusion-bench",
     "benchmarks/duckdb-bench",
-    "benchmarks/random-access-bench",
     "benchmarks/string-bench",
+    "benchmarks/vortex-file-bench",
     "vortex-spatial",
 ]
 exclude = ["java/testfiles", "wasm-test"]

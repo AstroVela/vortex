@@ -40,7 +40,7 @@ impl Compressor for GpuVortexCompressor {
     }
 
     async fn compress(&self, _parquet_path: &Path) -> Result<(u64, Duration)> {
-        anyhow::bail!("GPU compress-bench only supports decompression measurements")
+        anyhow::bail!("GPU compress benchmark only supports decompression measurements")
     }
 
     async fn decompress(&self, parquet_path: &Path) -> Result<Duration> {

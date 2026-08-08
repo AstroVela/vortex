@@ -30,7 +30,7 @@ pub fn render_table<W: Write, T: ToTable>(
     all_measurements: Vec<T>,
     targets: &[Target],
 ) -> anyhow::Result<()> {
-    // `all_measurements` is empty for decompress-only runs such as `compress-bench
+    // `all_measurements` is empty for decompress-only runs such as `vortex-file-bench compress
     // --gpu-decompress`: every ratio compares vortex against parquet or lance, neither of
     // which is benchmarked there, so no ratio is recorded even though a baseline target is
     // still passed. `targets` is instead empty when the caller has no baseline format to
@@ -147,7 +147,7 @@ mod tests {
     use crate::Format;
     use crate::measurements::CompressionTimingMeasurement;
 
-    /// Decompress-only runs (`compress-bench --gpu-decompress`) collect no compression ratios,
+    /// Decompress-only runs (`vortex-file-bench compress --gpu-decompress`) collect no compression ratios,
     /// and callers pass an empty target list when the baseline format is absent. Both used to
     /// panic: the first on the missing baseline key, the second on a divide-by-zero capacity.
     #[rstest]

@@ -25,7 +25,7 @@ use vortex_bench::Format;
 use vortex_bench::measurements::TimingMeasurement;
 use vortex_bench::utils::aliases::hash_map::HashMap;
 
-use crate::AccessPattern;
+use super::AccessPattern;
 
 /// One row of random-access timing for a `(dataset, pattern)` benchmark and a
 /// specific `(format, reopen)` combination. Carries the same

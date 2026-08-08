@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 """
-Run random-access-bench once per (dataset, format, pattern, open-mode)
-then merge the per-combination outputs
+Run the vortex-file-bench random-access suite once per
+(dataset, format, pattern, open-mode) then merge the per-combination outputs
 """
 
 import argparse
@@ -14,7 +14,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-BINARY = "target/release_debug/random-access-bench"
+BINARY = "target/release_debug/vortex-file-bench"
+SUBCOMMAND = "random-access"
 PARTS_DIR = Path("parts")
 
 DATASETS = ["taxi", "feature-vectors", "nested-lists", "nested-structs"]
@@ -34,6 +35,7 @@ def run_combinations(emit_ingest_records: bool) -> None:
                         "bash",
                         str(SCRIPT_DIR / "bench-taskset.sh"),
                         BINARY,
+                        SUBCOMMAND,
                         "--datasets",
                         dataset,
                         "--formats",
