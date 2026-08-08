@@ -8,7 +8,10 @@ design history, rejected alternatives, measurements, and generated-code evidence
 `NUMERIC_ROWFN_PLAN.md` records the numeric-binary migration and its narrower performance boundary.
 `research/rowfn-x86-2026-08-07/README.md` records the later x86 regression reproduction, the
 owned-output and indexed-source experiments, raw benchmark logs, and exact production IR/assembly.
-All three are branch-only working notes for agents. They are not intended to land with the API.
+`research/rowfn-gpu-2026-08-08/README.md` records whether `RowFn` can also drive GPU execution, the
+emitted `nvptx64` PTX for a row body, and the fusion boundary that decides the answer. It contains
+no timings. All four are branch-only working notes for agents. They are not intended to land with
+the API.
 
 The public design lives in these tracking issues, which now match the implementation:
 
