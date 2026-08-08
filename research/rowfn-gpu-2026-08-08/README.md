@@ -511,6 +511,52 @@ Only the provenance of the functor differs between the routes, so both can be ev
 that one milestone on a single GPU machine, and the abandoned route still validates the other's
 output.
 
+## What remains between the PTX and production
+
+Compiling the row body is the finished part, not the whole part. The remaining work is host
+plumbing, and all of it is enumerable. One item is a design problem. The rest are the
+`filter_primitive` shape applied again.
+
+**Enumerating monomorphizations is the design problem.** On the CPU, `RowFn::dispatch` chooses
+element types at run time, and rustc monomorphizes the visit because the whole program compiles
+together. Pre-compiled PTX inverts that. Every function and ptype signature that can run on the
+GPU must exist as a named kernel entry when the device crate is built, together with a host-side
+table from `ScalarFnId` plus input dtypes to entry name. The blanket-impl story does not carry
+over: a `RowFn` does not get GPU execution by existing. Its device entries have to be declared,
+most plausibly by a macro in the device crate that stamps out the supported width matrix.
+`dispatch` stays the source of truth for which signature runs, and the table lookup either finds
+an entry or falls back to the CPU.
+
+**`prepare` output becomes kernel parameters.** The prepare step still runs on the host, once per
+batch, but its output crosses the launch boundary, so the prepared state must be plain data. `()`
+for the numeric operators and a precomputed norm for cosine both qualify. A prepared state holding
+references or heap structure does not, and such a function stays on the CPU.
+
+**The executor is `CudaExecute` for the `ScalarFn` encoding.** Scalar functions already appear in
+an array tree as the lazy `ScalarFn` encoding, and `vortex-cuda` executes encodings through
+per-encoding `CudaExecute` implementations, so the integration point exists and
+`try_gpu_dispatch` already routes trees through it. The implementation is the `filter_primitive`
+shape: verify every input is canonical and device-resident, destructure to buffer handles, look up
+the entry, launch, read the failure word back, and rebuild through `from_buffer_handle` with
+conjoined validity.
+
+**Fallback needs a residency policy.** A dispatch with no GPU entry has to run on the CPU, and the
+wrong way to do that is copying device inputs back across PCIe. Whether an unsupported function
+forces its subtree onto the CPU or pays the copy is a planner decision, and it is the same
+decision `hybrid_dispatch` already makes for unfusable encodings.
+
+**Failure words and retry.** `visit_prepared_deferred` reduces per thread. The device kernel needs
+an `atomicOr` into a device word, one copy back after the launch, and the same deferred-error
+mapping `lift.rs` applies, including the valid-only retry.
+
+**The build must degrade.** `build.rs` already produces an empty PTX table when `nvcc` is absent,
+and the session falls back to the CPU. The rustc route needs identical behavior when the nightly
+toolchain or `llvm-bitcode-linker` is missing, plus a CI job that builds the device crate so the
+fallback stays a choice rather than an accident.
+
+None of these blocks the milestone. `NumericBinary` at `i64` needs one table entry, `()` prepared
+state, one `atomicOr`, and the executor, which is why it is the first step.
+
 ## What else this knowledge is good for
 
 The result that Rust generics, trait dispatch, and closures survive to clean PTX is not confined to
