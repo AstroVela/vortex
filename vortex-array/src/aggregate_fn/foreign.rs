@@ -77,15 +77,21 @@ impl AggregateFnVTable for ForeignAggregateFnVTable {
         None
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         _options: &Self::Options,
         _input_dtype: &DType,
+        _scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
         vortex_bail!("Cannot execute unknown aggregate function '{}'", self.id)
     }
 
-    fn combine_partials(&self, _partial: &mut Self::Partial, _other: Scalar) -> VortexResult<()> {
+    fn reduce_partials(
+        &self,
+        _options: &Self::Options,
+        _input_dtype: &DType,
+        _partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
         vortex_bail!("Cannot execute unknown aggregate function '{}'", self.id)
     }
 

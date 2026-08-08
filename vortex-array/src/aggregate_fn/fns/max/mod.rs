@@ -121,21 +121,39 @@ impl AggregateFnVTable for Max {
         self.return_dtype(options, input_dtype)
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
-        Ok(MaxPartial {
+        let mut partial = MaxPartial {
             max: None,
             element_dtype: input_dtype.clone(),
             skip_nans: options.skip_nans,
-        })
+        };
+        // `merge` normalizes the parsed scalar: nulls stay empty and NaNs poison or drop.
+        partial.merge(scalar);
+        Ok(partial)
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        partial.merge(other);
-        Ok(())
+    fn reduce_partials(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        let mut acc = MaxPartial {
+            max: None,
+            element_dtype: input_dtype.clone(),
+            skip_nans: options.skip_nans,
+        };
+        for partial in partials {
+            if let Some(max) = &partial.max {
+                acc.merge(max.clone());
+            }
+        }
+        Ok(acc)
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {

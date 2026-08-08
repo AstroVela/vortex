@@ -136,6 +136,20 @@ impl<T: BinaryCombined> Combined<T> {
     pub fn new(inner: T) -> Self {
         Self(inner)
     }
+
+    /// Construct a pair of empty child accumulators.
+    fn new_child_accumulators(
+        &self,
+        options: &CombinedOptions<T>,
+        input_dtype: &DType,
+    ) -> VortexResult<(AccumulatorRef, AccumulatorRef)> {
+        let left = Accumulator::try_new(self.0.left(), options.0.clone(), input_dtype.clone())?;
+        let right = Accumulator::try_new(self.0.right(), options.1.clone(), input_dtype.clone())?;
+        Ok((
+            Box::new(left) as AccumulatorRef,
+            Box::new(right) as AccumulatorRef,
+        ))
+    }
 }
 
 impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
@@ -171,35 +185,44 @@ impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
         Some(self.0.partial_struct_dtype(l, r))
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
-        let left = Accumulator::try_new(self.0.left(), options.0.clone(), input_dtype.clone())?;
-        let right = Accumulator::try_new(self.0.right(), options.1.clone(), input_dtype.clone())?;
-        Ok((
-            Box::new(left) as AccumulatorRef,
-            Box::new(right) as AccumulatorRef,
-        ))
+        let (mut left, mut right) = self.new_child_accumulators(options, input_dtype)?;
+        // A null partial represents an empty group and parses to empty child accumulators.
+        if !scalar.is_null() {
+            let s = scalar.as_struct();
+            let lname = self.0.left_name();
+            let rname = self.0.right_name();
+            let l_field = s
+                .field(lname)
+                .ok_or_else(|| vortex_err!("BinaryCombined partial missing `{}` field", lname))?;
+            let r_field = s
+                .field(rname)
+                .ok_or_else(|| vortex_err!("BinaryCombined partial missing `{}` field", rname))?;
+            left.combine_partials(l_field)?;
+            right.combine_partials(r_field)?;
+        }
+        Ok((left, right))
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if other.is_null() {
-            return Ok(());
+    fn reduce_partials(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        let (mut left, mut right) = self.new_child_accumulators(options, input_dtype)?;
+        // The children are type-erased accumulators, so their partial scalars are the only
+        // interchange format available to fold one accumulator's state into another.
+        for (l, r) in partials {
+            left.combine_partials(l.partial_scalar()?)?;
+            right.combine_partials(r.partial_scalar()?)?;
         }
-        let s = other.as_struct();
-        let lname = self.0.left_name();
-        let rname = self.0.right_name();
-        let l_field = s
-            .field(lname)
-            .ok_or_else(|| vortex_err!("BinaryCombined partial missing `{}` field", lname))?;
-        let r_field = s
-            .field(rname)
-            .ok_or_else(|| vortex_err!("BinaryCombined partial missing `{}` field", rname))?;
-        partial.0.combine_partials(l_field)?;
-        partial.1.combine_partials(r_field)?;
-        Ok(())
+        Ok((left, right))
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {

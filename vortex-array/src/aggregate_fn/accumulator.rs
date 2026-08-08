@@ -27,6 +27,8 @@ pub type AccumulatorRef = Box<dyn DynAccumulator>;
 pub struct Accumulator<V: AggregateFnVTable> {
     /// The vtable of the aggregate function.
     vtable: V,
+    /// The options of the aggregate function.
+    options: V::Options,
     /// Type-erased aggregate function used for kernel dispatch.
     aggregate_fn: AggregateFnRef,
     /// The DType of the input.
@@ -55,17 +57,33 @@ impl<V: AggregateFnVTable> Accumulator<V> {
                 dtype
             )
         })?;
-        let partial = vtable.empty_partial(&options, &dtype)?;
-        let aggregate_fn = AggregateFn::new(vtable.clone(), options).erased();
+        let partial = vtable.reduce_partials(&options, &dtype, &[])?;
+        let aggregate_fn = AggregateFn::new(vtable.clone(), options.clone()).erased();
 
         Ok(Self {
             vtable,
+            options,
             aggregate_fn,
             dtype,
             return_dtype,
             partial_dtype,
             partial,
         })
+    }
+
+    /// Parse a partial scalar and reduce it into the accumulator's state.
+    fn merge_partial_scalar(&mut self, other: Scalar) -> VortexResult<()> {
+        let other = self
+            .vtable
+            .partial_from_scalar(&self.options, &self.dtype, other)?;
+        let empty = self
+            .vtable
+            .reduce_partials(&self.options, &self.dtype, &[])?;
+        let current = std::mem::replace(&mut self.partial, empty);
+        self.partial =
+            self.vtable
+                .reduce_partials(&self.options, &self.dtype, &[current, other])?;
+        Ok(())
     }
 }
 
@@ -146,7 +164,7 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                 );
                 partial.cast(&self.partial_dtype)?
             };
-            self.vtable.combine_partials(&mut self.partial, partial)?;
+            self.merge_partial_scalar(partial)?;
             return Ok(());
         }
 
@@ -170,7 +188,7 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                     result.dtype(),
                     self.partial_dtype,
                 );
-                self.vtable.combine_partials(&mut self.partial, result)?;
+                self.merge_partial_scalar(result)?;
                 return Ok(());
             }
         }
@@ -202,7 +220,7 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                     result.dtype(),
                     self.partial_dtype,
                 );
-                self.vtable.combine_partials(&mut self.partial, result)?;
+                self.merge_partial_scalar(result)?;
                 return Ok(());
             }
 
@@ -216,7 +234,7 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
     }
 
     fn combine_partials(&mut self, other: Scalar) -> VortexResult<()> {
-        self.vtable.combine_partials(&mut self.partial, other)
+        self.merge_partial_scalar(other)
     }
 
     fn is_saturated(&self) -> bool {

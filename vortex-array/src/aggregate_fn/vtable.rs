@@ -107,20 +107,43 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
     /// Returns `None` if the aggregate function cannot be applied to the input dtype.
     fn partial_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType>;
 
-    /// Return the partial accumulator state for an empty group.
-    fn empty_partial(
+    /// Parse a partial scalar into the typed partial accumulator state.
+    ///
+    /// The scalar must have the DType specified by `partial_dtype` for the given options and
+    /// input dtype; this is the inverse of [`to_scalar`]. Partial scalars are produced by
+    /// aggregate kernels, cached statistics, and other accumulators' [`to_scalar`].
+    ///
+    /// Implementations should only parse the scalar here; combining states belongs in
+    /// [`reduce_partials`].
+    ///
+    /// [`to_scalar`]: AggregateFnVTable::to_scalar
+    /// [`reduce_partials`]: AggregateFnVTable::reduce_partials
+    fn partial_from_scalar(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial>;
 
-    /// Combine partial scalar state into the accumulator.
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()>;
+    /// Reduce a slice of partial states into a single partial state.
+    ///
+    /// Partials must be reduced in slice order, since some aggregates (e.g. first/last or
+    /// is_sorted) are order-dependent. Reducing an empty slice returns the identity: the partial
+    /// state of a group with no accumulated values.
+    fn reduce_partials(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial>;
 
     /// Convert the partial state into a partial scalar.
     ///
     /// The returned scalar must have the same DType as specified by `partial_dtype` for the
-    /// options and input dtype used to construct the state.
+    /// options and input dtype used to construct the state. This is the inverse of
+    /// [`partial_from_scalar`].
+    ///
+    /// [`partial_from_scalar`]: AggregateFnVTable::partial_from_scalar
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar>;
 
     /// Reset the state of the accumulator to an empty group.

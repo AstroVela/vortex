@@ -115,19 +115,21 @@ mod tests {
             self.return_dtype(options, input_dtype)
         }
 
-        fn empty_partial(
+        fn partial_from_scalar(
             &self,
             _options: &Self::Options,
             _input_dtype: &DType,
+            _scalar: Scalar,
         ) -> VortexResult<Self::Partial> {
             Ok(())
         }
 
-        fn combine_partials(
+        fn reduce_partials(
             &self,
-            _partial: &mut Self::Partial,
-            _other: Scalar,
-        ) -> VortexResult<()> {
+            _options: &Self::Options,
+            _input_dtype: &DType,
+            _partials: &[Self::Partial],
+        ) -> VortexResult<Self::Partial> {
             Ok(())
         }
 

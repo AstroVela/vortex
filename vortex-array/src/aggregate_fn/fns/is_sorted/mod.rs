@@ -277,79 +277,100 @@ impl AggregateFnVTable for IsSorted {
         }
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
-        Ok(IsSortedPartial {
-            is_sorted: true,
-            strict: options.strict,
-            first_value: None,
-            last_value: None,
-            element_dtype: input_dtype.clone(),
-        })
-    }
-
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if !partial.is_sorted {
-            return Ok(());
+        // A null struct means the producing accumulator was empty.
+        if scalar.is_null() {
+            return Ok(IsSortedPartial {
+                is_sorted: true,
+                strict: options.strict,
+                first_value: None,
+                last_value: None,
+                element_dtype: input_dtype.clone(),
+            });
         }
 
-        // Null struct means the other accumulator was empty, skip it.
-        if other.is_null() {
-            return Ok(());
-        }
-
-        let other_is_sorted = other
+        let is_sorted = scalar
             .as_struct()
             .field_by_idx(0)
             .map(|s| s.as_bool().value().unwrap_or(false))
             .unwrap_or(false);
 
-        let other_first = other.as_struct().field_by_idx(2);
-        let other_last = other.as_struct().field_by_idx(3);
+        // The scalar's own strict flag is ignored: strictness comes from the options.
+        Ok(IsSortedPartial {
+            is_sorted,
+            strict: options.strict,
+            first_value: scalar.as_struct().field_by_idx(2),
+            last_value: scalar.as_struct().field_by_idx(3),
+            element_dtype: input_dtype.clone(),
+        })
+    }
 
-        if !other_is_sorted {
-            partial.is_sorted = false;
-            // Still update last_value for correctness if needed, but we're done.
-            if let Some(last) = other_last {
-                partial.last_value = Some(last);
+    fn reduce_partials(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        let mut acc = IsSortedPartial {
+            is_sorted: true,
+            strict: options.strict,
+            first_value: None,
+            last_value: None,
+            element_dtype: input_dtype.clone(),
+        };
+
+        for partial in partials {
+            if !acc.is_sorted {
+                break;
             }
-            return Ok(());
-        }
 
-        // Check boundary: self.last_value vs other.first_value
-        if let Some(self_last) = &partial.last_value
-            && let Some(other_first_val) = &other_first
-        {
-            if !self_last.is_null() && !other_first_val.is_null() {
-                let boundary_ok = if partial.strict {
-                    *self_last < *other_first_val
-                } else {
-                    *self_last <= *other_first_val
-                };
-                if !boundary_ok {
-                    partial.is_sorted = false;
+            // A partial without a first value is empty and contributes nothing.
+            let Some(first) = &partial.first_value else {
+                continue;
+            };
+            // A partial that saw a single value carries it as both boundaries.
+            let last = partial.last_value.as_ref().unwrap_or(first);
+
+            if !partial.is_sorted {
+                acc.is_sorted = false;
+                // Still update last_value for correctness if needed, but we're done.
+                acc.last_value = Some(last.clone());
+                continue;
+            }
+
+            // Check boundary: acc.last_value vs partial.first_value
+            if let Some(acc_last) = &acc.last_value {
+                if !acc_last.is_null() && !first.is_null() {
+                    let boundary_ok = if acc.strict {
+                        *acc_last < *first
+                    } else {
+                        *acc_last <= *first
+                    };
+                    if !boundary_ok {
+                        acc.is_sorted = false;
+                    }
+                } else if !acc_last.is_null() && first.is_null() {
+                    // non-null before null violates sort order
+                    acc.is_sorted = false;
+                } else if acc_last.is_null() && first.is_null() && acc.strict {
+                    // both null with strict: violates strict sort
+                    acc.is_sorted = false;
                 }
-            } else if !self_last.is_null() && other_first_val.is_null() {
-                // non-null before null violates sort order
-                partial.is_sorted = false;
-            } else if self_last.is_null() && other_first_val.is_null() && partial.strict {
-                // both null with strict: violates strict sort
-                partial.is_sorted = false;
             }
+
+            // Update first_value if this is the first non-empty partial.
+            if acc.first_value.is_none() {
+                acc.first_value = Some(first.clone());
+            }
+            acc.last_value = Some(last.clone());
         }
 
-        // Update first_value if this is the first non-empty chunk.
-        if partial.first_value.is_none() {
-            partial.first_value = other_first;
-        }
-        if let Some(last) = other_last {
-            partial.last_value = Some(last);
-        }
-
-        Ok(())
+        Ok(acc)
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {

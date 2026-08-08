@@ -231,43 +231,46 @@ impl AggregateFnVTable for Sum {
         Some(sum_partial_dtype(return_dtype))
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
-        let return_dtype = self
-            .return_dtype(options, input_dtype)
-            .ok_or_else(|| vortex_err!("Unsupported sum dtype: {}", input_dtype))?;
-        let sum = make_zero_state(&return_dtype);
-        Ok(SumPartial {
-            return_dtype,
-            sum,
-            is_overflow: false,
-            is_empty: true,
-            skip_nans: options.skip_nans,
-        })
+        let mut partial = empty_sum_partial(self, options, input_dtype)?;
+        let (sum, is_overflow, is_empty) = decode_sum_partial_scalar(scalar)?;
+        validate_sum_field_dtype(&sum, &partial.return_dtype)?;
+
+        // Adding the parsed value to the zero state cannot overflow; treat a decimal value that
+        // no longer fits its precision as an already-overflowed partial.
+        partial.is_overflow = is_overflow || checked_add_sum_state(&mut partial.sum, &sum)?;
+        partial.is_empty = is_empty && !partial.is_overflow;
+        Ok(partial)
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        let (other_sum, other_is_overflow, other_is_empty) = decode_sum_partial_scalar(other)?;
-        validate_sum_field_dtype(&other_sum, &partial.return_dtype)?;
-
-        if partial.is_overflow {
-            return Ok(());
+    fn reduce_partials(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        let mut acc = empty_sum_partial(self, options, input_dtype)?;
+        for partial in partials {
+            if acc.is_overflow {
+                break;
+            }
+            if partial.is_overflow {
+                acc.is_overflow = true;
+                acc.is_empty = false;
+                continue;
+            }
+            if partial.is_empty {
+                continue;
+            }
+            acc.is_overflow = checked_add_sum_states(&mut acc.sum, &partial.sum)?;
+            acc.is_empty = false;
         }
-        if other_is_overflow {
-            partial.is_overflow = true;
-            partial.is_empty = false;
-            return Ok(());
-        }
-        if other_is_empty {
-            return Ok(());
-        }
-
-        partial.is_overflow = checked_add_sum_state(&mut partial.sum, &other_sum)?;
-        partial.is_empty = false;
-        Ok(())
+        Ok(acc)
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
@@ -299,7 +302,7 @@ impl AggregateFnVTable for Sum {
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<bool> {
         if partial.skip_nans {
-            return try_accumulate_cached_sum(self, partial, batch);
+            return try_accumulate_cached_sum(partial, batch);
         }
 
         // NaN-aware short-circuits only apply to NaN-including float sums.
@@ -310,7 +313,7 @@ impl AggregateFnVTable for Sum {
             Precision::Exact(0) => {
                 // NaN-free batch: the cached NaN-skipping sum (if any) equals the
                 // NaN-including sum.
-                try_accumulate_cached_sum(self, partial, batch)
+                try_accumulate_cached_sum(partial, batch)
             }
             Precision::Exact(_) => {
                 // At least one NaN value: the sum is NaN without scanning the batch.
@@ -335,7 +338,7 @@ impl AggregateFnVTable for Sum {
             return Ok(());
         }
 
-        // Constants compute scalar * len and combine via combine_partials.
+        // Constants compute scalar * len and merge the product into the running state.
         if let Columnar::Constant(c) = batch {
             if !c.scalar().is_null() && !c.is_empty() {
                 partial.is_empty = false;
@@ -345,8 +348,7 @@ impl AggregateFnVTable for Sum {
                 return Ok(());
             }
             if let Some(product) = multiply_constant(c.scalar(), c.len(), &partial.return_dtype)? {
-                let product = sum_result_partial_scalar(product, &partial.return_dtype, false)?;
-                self.combine_partials(partial, product)?;
+                merge_sum_result(partial, product)?;
             }
             return Ok(());
         }
@@ -481,6 +483,71 @@ fn checked_add_sum_state(state: &mut SumState, other: &Scalar) -> VortexResult<b
     })
 }
 
+/// Checked add of one sum state into another, returning true if overflow occurred.
+fn checked_add_sum_states(state: &mut SumState, other: &SumState) -> VortexResult<bool> {
+    Ok(match (state, other) {
+        (SumState::Unsigned(acc), SumState::Unsigned(other)) => checked_add_u64(acc, *other),
+        (SumState::Signed(acc), SumState::Signed(other)) => checked_add_i64(acc, *other),
+        (SumState::Float(acc), SumState::Float(other)) => {
+            *acc += *other;
+            false
+        }
+        (SumState::Decimal { value, dtype }, SumState::Decimal { value: other, .. }) => {
+            match value.checked_add(other) {
+                Some(result) if result.fits_in_precision(*dtype) => {
+                    *value = result;
+                    false
+                }
+                Some(_) | None => true,
+            }
+        }
+        _ => vortex_bail!("Mismatched sum partial states"),
+    })
+}
+
+/// The partial state of an empty group, or an error for unsupported input dtypes.
+fn empty_sum_partial(
+    vtable: &Sum,
+    options: &SumAggregateOpts,
+    input_dtype: &DType,
+) -> VortexResult<SumPartial> {
+    let return_dtype = vtable
+        .return_dtype(options, input_dtype)
+        .ok_or_else(|| vortex_err!("Unsupported sum dtype: {}", input_dtype))?;
+    let sum = make_zero_state(&return_dtype);
+    Ok(SumPartial {
+        return_dtype,
+        sum,
+        is_overflow: false,
+        is_empty: true,
+        skip_nans: options.skip_nans,
+    })
+}
+
+/// Merge a finalized, non-empty sum result (nullable; null means overflow) into the partial.
+fn merge_sum_result(partial: &mut SumPartial, result: Scalar) -> VortexResult<()> {
+    if !result.dtype().eq_ignore_nullability(&partial.return_dtype) {
+        vortex_bail!(
+            "Sum result has dtype {}, expected {}",
+            result.dtype(),
+            partial.return_dtype
+        );
+    }
+    if partial.is_overflow {
+        return Ok(());
+    }
+    if result.is_null() {
+        partial.is_overflow = true;
+        partial.is_empty = false;
+        return Ok(());
+    }
+
+    let result = result.cast(&partial.return_dtype.as_nonnullable())?;
+    partial.is_overflow = checked_add_sum_state(&mut partial.sum, &result)?;
+    partial.is_empty = false;
+    Ok(())
+}
+
 fn make_zero_state(return_dtype: &DType) -> SumState {
     match return_dtype {
         DType::Primitive(ptype, _) => match ptype {
@@ -564,6 +631,10 @@ pub fn normalize_legacy_partial_array(partials: ArrayRef) -> VortexResult<ArrayR
     .into_array())
 }
 
+/// Build a partial scalar from a finalized sum result (test-only helper for exercising
+/// `partial_from_scalar`; live code merges results via `merge_sum_result` without a scalar
+/// roundtrip).
+#[cfg(test)]
 fn sum_result_partial_scalar(
     result: Scalar,
     return_dtype: &DType,
@@ -593,11 +664,7 @@ fn sum_result_partial_scalar(
     ))
 }
 
-fn try_accumulate_cached_sum(
-    vtable: &Sum,
-    partial: &mut SumPartial,
-    batch: &ArrayRef,
-) -> VortexResult<bool> {
+fn try_accumulate_cached_sum(partial: &mut SumPartial, batch: &ArrayRef) -> VortexResult<bool> {
     let Precision::Exact(sum) = batch.statistics().get(Stat::Sum) else {
         return Ok(false);
     };
@@ -609,8 +676,7 @@ fn try_accumulate_cached_sum(
     }
 
     let sum = sum.cast(&partial.return_dtype)?;
-    let partial_scalar = sum_result_partial_scalar(sum, &partial.return_dtype, false)?;
-    vtable.combine_partials(partial, partial_scalar)?;
+    merge_sum_result(partial, sum)?;
     Ok(true)
 }
 
@@ -648,7 +714,8 @@ mod arithmetic_tests {
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
 
-    use super::sum_result_partial_scalar;
+    use super::SumPartial;
+    use super::SumState;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
@@ -682,11 +749,6 @@ mod arithmetic_tests {
     use crate::scalar::NumericOperator;
     use crate::scalar::Scalar;
     use crate::validity::Validity;
-
-    fn partial_with_value(value: Scalar) -> VortexResult<Scalar> {
-        let return_dtype = value.dtype().as_nullable();
-        sum_result_partial_scalar(value, &return_dtype, false)
-    }
 
     /// Sum an array with an initial value (test-only helper).
     fn sum_with_accumulator(array: &ArrayRef, accumulator: &Scalar) -> VortexResult<Scalar> {
@@ -791,16 +853,17 @@ mod arithmetic_tests {
     fn sum_state_merge() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let options = SumAggregateOpts::default();
-        let mut state = Sum.empty_partial(&options, &dtype)?;
 
-        let scalar1 = Scalar::primitive(100i64, Nullable);
-        Sum.combine_partials(&mut state, partial_with_value(scalar1)?)?;
-
-        let scalar2 = Scalar::primitive(50i64, Nullable);
-        Sum.combine_partials(&mut state, partial_with_value(scalar2)?)?;
+        let partial_of = |value: i64| SumPartial {
+            return_dtype: DType::Primitive(PType::I64, Nullable),
+            sum: SumState::Signed(value),
+            is_overflow: false,
+            is_empty: false,
+            skip_nans: true,
+        };
+        let state = Sum.reduce_partials(&options, &dtype, &[partial_of(100), partial_of(50)])?;
 
         let result = Sum.to_scalar(&state)?;
-        Sum.reset(&mut state);
         assert_eq!(
             result
                 .as_struct()

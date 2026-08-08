@@ -147,25 +147,26 @@ impl AggregateFnVTable for AllNonDistinct {
         self.return_dtype(options, input_dtype)
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         _options: &Self::Options,
         _input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
         Ok(AllNonDistinctPartial {
-            all_non_distinct: true,
+            all_non_distinct: scalar.as_bool().value().unwrap_or(false),
         })
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if !partial.all_non_distinct {
-            return Ok(());
-        }
-
-        if !other.as_bool().value().unwrap_or(false) {
-            partial.all_non_distinct = false;
-        }
-        Ok(())
+    fn reduce_partials(
+        &self,
+        _options: &Self::Options,
+        _input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        Ok(AllNonDistinctPartial {
+            all_non_distinct: partials.iter().all(|partial| partial.all_non_distinct),
+        })
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {

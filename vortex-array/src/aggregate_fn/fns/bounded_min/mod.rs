@@ -143,21 +143,42 @@ impl AggregateFnVTable for BoundedMin {
         self.return_dtype(options, input_dtype)
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
+        // A null partial means the producing accumulator saw nothing valid.
+        let state = if scalar.is_null() {
+            BoundedMinState::Empty
+        } else {
+            BoundedMinState::Value(scalar)
+        };
         Ok(BoundedMinPartial {
-            state: BoundedMinState::Empty,
+            state,
             element_dtype: input_dtype.clone(),
             max_bytes: options.max_bytes,
         })
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        partial.merge(other);
-        Ok(())
+    fn reduce_partials(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        let mut acc = BoundedMinPartial {
+            state: BoundedMinState::Empty,
+            element_dtype: input_dtype.clone(),
+            max_bytes: options.max_bytes,
+        };
+        for partial in partials {
+            if let BoundedMinState::Value(min) = &partial.state {
+                acc.merge(min.clone());
+            }
+        }
+        Ok(acc)
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {

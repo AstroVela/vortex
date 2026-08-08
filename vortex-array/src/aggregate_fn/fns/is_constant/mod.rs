@@ -283,46 +283,55 @@ impl AggregateFnVTable for IsConstant {
         }
     }
 
-    fn empty_partial(
+    fn partial_from_scalar(
         &self,
         _options: &Self::Options,
         input_dtype: &DType,
+        scalar: Scalar,
     ) -> VortexResult<Self::Partial> {
-        Ok(IsConstantPartial {
-            is_constant: true,
-            first_value: None,
-            element_dtype: input_dtype.clone(),
-        })
-    }
-
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if !partial.is_constant {
-            return Ok(());
+        // A null struct means the producing accumulator was empty.
+        if scalar.is_null() {
+            return Ok(IsConstantPartial {
+                is_constant: true,
+                first_value: None,
+                element_dtype: input_dtype.clone(),
+            });
         }
 
-        // Null struct means the other accumulator was empty, skip it.
-        if other.is_null() {
-            return Ok(());
-        }
-
-        let other_is_constant = other
+        let is_constant = scalar
             .as_struct()
             .field_by_idx(0)
             .map(|s| s.as_bool().value().unwrap_or(false))
             .unwrap_or(false);
 
-        if !other_is_constant {
-            partial.is_constant = false;
-            return Ok(());
+        Ok(IsConstantPartial {
+            is_constant,
+            first_value: scalar.as_struct().field_by_idx(1),
+            element_dtype: input_dtype.clone(),
+        })
+    }
+
+    fn reduce_partials(
+        &self,
+        _options: &Self::Options,
+        input_dtype: &DType,
+        partials: &[Self::Partial],
+    ) -> VortexResult<Self::Partial> {
+        let mut acc = IsConstantPartial {
+            is_constant: true,
+            first_value: None,
+            element_dtype: input_dtype.clone(),
+        };
+        for partial in partials {
+            if !partial.is_constant {
+                acc.is_constant = false;
+                break;
+            }
+            if let Some(value) = &partial.first_value {
+                acc.check_value(value.clone());
+            }
         }
-
-        let other_value = other.as_struct().field_by_idx(1);
-
-        if let Some(other_val) = other_value {
-            partial.check_value(other_val);
-        }
-
-        Ok(())
+        Ok(acc)
     }
 
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
