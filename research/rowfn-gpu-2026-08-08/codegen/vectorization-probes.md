@@ -14,6 +14,11 @@ compiler is told about the access. Compiled for `nvptx64-nvidia-cuda` at `-O`.
 | `assert_unchecked(ptr % 16 == 0)` | `ld.global.b64` x2 |
 | `#[repr(align(16))] Pair([i64; 2])` | `ld.global.v2.b64` |
 | `#[repr(align(16))] Quad([i32; 4])` | `ld.global.v4.b32` |
+| scalar field reads through `#[repr(align(16))] Pair` | `ld.global.v2.b64` |
+
+The last row is the decisive one. The LoadStoreVectorizer *does* merge adjacent scalar accesses, so
+long as alignment is provable from the type. `assert_unchecked` emits an `llvm.assume`, which does
+not reach that analysis; `#[repr(align(16))]` does.
 
 Flags do not change the plain result. `opt-level` 2 and 3 crossed with default, `sm_80`, and `sm_90`
 all emit zero vector loads.
@@ -133,4 +138,34 @@ fn stride() -> usize {
         (nctaid * ntid) as usize
     }
 }
+```
+
+## Provable alignment with scalar accesses
+
+```rust
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn provably_aligned_scalar_access(
+    input: *const Pair, output: *mut Pair, reference: i64, len: usize,
+) {
+    let mut i = tid();
+    while i < len {
+        let a = (*input.add(i)).0[0];
+        let b = (*input.add(i)).0[1];
+        (*output.add(i)).0[0] = a + reference;
+        (*output.add(i)).0[1] = b + reference;
+        i += stride();
+    }
+}
+```
+
+```ptx
+$L__BB7_2:
+	add.s64 	%rd9, %rd1, %rd15;
+	ld.global.v2.b64 	{%rd10, %rd11}, [%rd9];
+	add.s64 	%rd12, %rd2, %rd15;
+	add.s64 	%rd13, %rd10, %rd5;
+	add.s64 	%rd14, %rd11, %rd5;
+	st.global.v2.b64 	[%rd12], {%rd13, %rd14};
+	setp.lt.u64 	%p2, %rd16, %rd6;
+	@%p2 bra 	$L__BB7_2;
 ```

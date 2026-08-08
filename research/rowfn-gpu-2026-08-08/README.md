@@ -22,10 +22,11 @@ reproduces its instruction sequence.
 What this covers is the elementwise fixed-width family, not every CPU scalar function. The columnar
 family does not need `RowFn`, and the variable-work family is hard on a GPU regardless.
 
-One gap in the generated code is real, and it is an API gap rather than a compiler one. The element
-API reads one value per row, which is what the CPU autovectorizer wants and what stops a GPU thread
-issuing a wide memory transaction. No flag fixes it. A chunked access path does, without changing
-any row body.
+One gap in the generated code is real. A GPU thread issues one 8-byte load where the CUDA kernels
+ask for 16, because the executor visits one row per iteration and `&[T]` hides the buffer's real
+alignment. No compiler flag changes it, and on x86 the loop vectorizer makes the same shape free, so
+nothing has needed it until now. It is a known gap with a known fix rather than a blocker, and
+nothing here shows the wider access is worth anything.
 
 The remaining blockers are the element types that are not flat buffers, the null-strategy
 thresholds, and the toolchain.
@@ -207,31 +208,54 @@ that differ only in what the compiler is told:
 | `#[repr(align(16))] Pair([i64; 2])` | `ld.global.v2.b64` |
 | `#[repr(align(16))] Quad([i32; 4])` | `ld.global.v4.b32` |
 
-Asserting 16-byte alignment on the base pointers changes nothing. The backend emits a vector memory
-operation when the load **is** of an aligned aggregate, and does not synthesize one by merging
-adjacent scalar loads, however much it knows about their addresses.
+Asserting 16-byte alignment on the base pointers changes nothing. `core::hint::assert_unchecked`
+emits an `llvm.assume`, which does not reach the alignment analysis the LoadStoreVectorizer uses.
 
-The alignment precondition is already met. `Alignment::DEFAULT_ALIGNMENT` is 256 bytes, so Vortex
-buffers are over-aligned far beyond the 16 a vector access needs. Only the access shape is missing.
+The pass does merge adjacent scalar accesses when alignment is provable from the *type*. Reading the
+two lanes as separate scalar field accesses through a `#[repr(align(16))]` pair still produces
+`ld.global.v2.b64`:
 
-### The API is one addition short, and the reason is on the CPU side
+```rust
+let a = (*input.add(i)).0[0];
+let b = (*input.add(i)).0[1];
+(*output.add(i)).0[0] = a + reference;
+(*output.add(i)).0[1] = b + reference;
+```
 
-The access shape is fixed by `InputElement::get(column, index) -> Elem`, which reads one element,
-and under it `IndexedSource::get_unchecked(&self, i) -> Item`, which reads one lane. That is
-deliberate. `vortex-compute/src/lane_kernels/source.rs` states the reason: the trait exists in that
-shape "so that lane reads carry no inter-iteration data dependency, the autovectorizer treats each
-lane independently".
+So the merging is not the obstacle. Two conditions have to hold together, and the current shape
+misses both:
 
-On a CPU that is correct, because LLVM's loop vectorizer does the widening. On a GPU nothing does.
-The warp already supplies the lane parallelism across threads, so what needs widening is the number
-of bytes one thread moves per transaction, and no pass introduces that. It has to be expressed at
-the load site, which the current API cannot do at any width above one element.
+1. **One iteration must touch adjacent elements.** The LoadStoreVectorizer merges accesses within an
+   iteration. It does not restructure a loop. A grid-stride or block-tiled loop visits elements
+   `stride` apart, so consecutive iterations are never adjacent and there is nothing to merge.
+2. **The pointer must carry provable alignment.** `Alignment::DEFAULT_ALIGNMENT` is 256 bytes, so
+   Vortex buffers are over-aligned far beyond the 16 a vector access needs, but `&[T]` erases that
+   to `align_of::<T>()`. The alignment is real and invisible.
+
+The earlier tiled kernel satisfied the first and not the second, which is why it stayed scalar.
+
+### Why x86 does not have this problem
+
+`InputElement::get(column, index) -> Elem` reads one element, and under it
+`IndexedSource::get_unchecked(&self, i) -> Item` reads one lane.
+`vortex-compute/src/lane_kernels/source.rs` states why: the trait exists in that shape "so that lane
+reads carry no inter-iteration data dependency, the autovectorizer treats each lane independently".
+
+That works on x86 because LLVM's **loop vectorizer** restructures the loop, turning one element per
+iteration into four or eight in a SIMD register. It supplies both conditions above by itself, so the
+one-element API costs nothing.
+
+No such pass runs for the GPU, and none is missing. On a GPU the lane parallelism already exists
+across the warp's threads, so there is nothing for a loop vectorizer to create. The only remaining
+question is how many bytes one thread moves per instruction, and the LoadStoreVectorizer answers
+that only for accesses that are already adjacent inside one iteration. A one-row-per-iteration loop
+never presents any.
 
 This is the same conclusion the CUDA code reached. `scalar_kernel.cuh` fixes
 `VALUES_PER_LOOP = 16 / sizeof(InputT)`, and `dynamic_dispatch.cu` applies each scalar op to
-`VALUES_PER_TILE` values in registers.
+`VALUES_PER_TILE` values in registers. Both write the loop N-at-a-time on purpose.
 
-### The addition does not disturb the row body
+### What closing it would take
 
 [`chunked-executor.md`](codegen/chunked-executor.md) models the proposed change: the element type
 names how many values it reads as one aligned aggregate, and the executor applies the row body once
@@ -258,6 +282,13 @@ control. `chunked_affine_i32` at `|s, v| v * *s + 7` emits `ld.global.v4.b32` wi
 
 A default of one lane per chunk preserves the current behavior exactly, which keeps the change
 additive and leaves the x86 results untouched.
+
+This is a documented gap with a known fix, not a change to make now. Nothing here shows that the
+wider transaction is worth anything. A warp already coalesces 32 scalar loads into the same memory
+transactions, so the vector access buys instruction count and memory-level parallelism rather than
+bandwidth, and whether that is measurable on a bandwidth-bound kernel is exactly what has not been
+tested. The useful position is knowing where the gap is and that closing it does not disturb any row
+body, so it can wait for a profile that asks for it.
 
 ### The chunked path is an x86 question too
 
@@ -430,14 +461,16 @@ once in CUDA C++, and nothing but tests keeps the two honest. One source compile
 makes divergence impossible rather than merely detectable. That matters most for the encodings,
 where the decode has to be bit-exact.
 
-**A second backend is a forcing function for the API.** The chunked access gap was invisible while
-x86 was the only target, because the autovectorizer covered for it. It is arguably a CPU gap as
-well, and it surfaced only because a GPU has nothing to cover for it. Any further execution target
-is likely to expose API assumptions the same way.
+**A second execution target is a forcing function for the API.** The access-width gap was invisible
+while x86 was the only target, because the loop vectorizer covered for it. Any further execution
+target is likely to expose API assumptions the same way.
 
-**The alignment lesson generalizes.** Asserting that a pointer is aligned does not widen a memory
-access. The type at the load site does. That applies to any Vortex kernel where access width
-matters, not only to the GPU.
+**Buffer alignment is invisible to the compiler.** Vortex allocates at
+`Alignment::DEFAULT_ALIGNMENT`, which is 256 bytes, and then hands the data out as `&[T]`, which
+promises only `align_of::<T>()`. Every downstream optimization that depends on alignment has to
+rediscover it or go without. Asserting the alignment with `core::hint::assert_unchecked` does not
+recover it, because that does not reach the analysis the LoadStoreVectorizer uses. Only the type
+does. That applies to any Vortex kernel where access width matters, not only to the GPU.
 
 ## Toolchain and practicality
 
