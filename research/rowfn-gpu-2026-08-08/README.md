@@ -22,8 +22,13 @@ reproduces its instruction sequence.
 What this covers is the elementwise fixed-width family, not every CPU scalar function. The columnar
 family does not need `RowFn`, and the variable-work family is hard on a GPU regardless.
 
-The blockers are narrower than the framing suggests. They are the element types that are not flat
-buffers, the null-strategy thresholds, the memory access width, and the toolchain.
+One gap in the generated code is real, and it is an API gap rather than a compiler one. The element
+API reads one value per row, which is what the CPU autovectorizer wants and what stops a GPU thread
+issuing a wide memory transaction. No flag fixes it. A chunked access path does, without changing
+any row body.
+
+The remaining blockers are the element types that are not flat buffers, the null-strategy
+thresholds, and the toolchain.
 
 ## Scope and limits of this record
 
@@ -183,19 +188,83 @@ works and the addressing is adjacent, but the loads stay scalar:
 	st.global.b64 	[%rd19+8], %rd18;
 ```
 
-No `ld.global.v2.b64` appears anywhere in either module. LLVM's NVPTX backend did not merge the
-adjacent accesses, and writing the loop in the shape that invites merging did not change that.
+No `ld.global.v2.b64` appears anywhere in either module.
 
-This is the one place the generated code is measurably behind a hand-written kernel, and it needs a
-`ptxas` comparison to size. Whether `nvcc` merges the equivalent C++ was not tested, because no CUDA
-toolkit was available. `scalar_kernel.cuh` relies on `#pragma unroll` rather than an explicit
-`int4` or `double2` cast, so it is not certain that the C++ vectorizes either. Explicit chunked
-loads on the Rust side are the obvious mitigation if the gap is real.
+### It is not a flag
 
-One artifact of the replica rather than of `RowFn`: reading `%ntid.x` through `core::arch::asm!`
-leaves the read inside the loop, because plain inline assembly is not hoistable. A real
-implementation reads the special registers once outside the loop or uses the `core::arch::nvptx`
-intrinsics.
+`opt-level` 2 and 3, crossed with the default target, `sm_80`, and `sm_90`, all emit zero vector
+loads for the scalar-access kernel. Six combinations, one result.
+
+### It is not missing alignment metadata
+
+[`vectorization-probes.md`](codegen/vectorization-probes.md) isolates the cause with four kernels
+that differ only in what the compiler is told:
+
+| Probe | Emitted |
+| --- | --- |
+| plain `*const i64` | `ld.global.b64` x2 |
+| `assert_unchecked(ptr % 16 == 0)` | `ld.global.b64` x2 |
+| `#[repr(align(16))] Pair([i64; 2])` | `ld.global.v2.b64` |
+| `#[repr(align(16))] Quad([i32; 4])` | `ld.global.v4.b32` |
+
+Asserting 16-byte alignment on the base pointers changes nothing. The backend emits a vector memory
+operation when the load **is** of an aligned aggregate, and does not synthesize one by merging
+adjacent scalar loads, however much it knows about their addresses.
+
+The alignment precondition is already met. `Alignment::DEFAULT_ALIGNMENT` is 256 bytes, so Vortex
+buffers are over-aligned far beyond the 16 a vector access needs. Only the access shape is missing.
+
+### The API is one addition short, and the reason is on the CPU side
+
+The access shape is fixed by `InputElement::get(column, index) -> Elem`, which reads one element,
+and under it `IndexedSource::get_unchecked(&self, i) -> Item`, which reads one lane. That is
+deliberate. `vortex-compute/src/lane_kernels/source.rs` states the reason: the trait exists in that
+shape "so that lane reads carry no inter-iteration data dependency, the autovectorizer treats each
+lane independently".
+
+On a CPU that is correct, because LLVM's loop vectorizer does the widening. On a GPU nothing does.
+The warp already supplies the lane parallelism across threads, so what needs widening is the number
+of bytes one thread moves per transaction, and no pass introduces that. It has to be expressed at
+the load site, which the current API cannot do at any width above one element.
+
+This is the same conclusion the CUDA code reached. `scalar_kernel.cuh` fixes
+`VALUES_PER_LOOP = 16 / sizeof(InputT)`, and `dynamic_dispatch.cu` applies each scalar op to
+`VALUES_PER_TILE` values in registers.
+
+### The addition does not disturb the row body
+
+[`chunked-executor.md`](codegen/chunked-executor.md) models the proposed change: the element type
+names how many values it reads as one aligned aggregate, and the executor applies the row body once
+per lane over registers. The row body stays an ordinary scalar closure, and the executor stays
+generic over both. `chunked_for_i64` with the body `|r, v| v + *r` emits:
+
+```ptx
+$L__BB2_2:
+	add.s64 	%rd10, %rd1, %rd16;
+	ld.global.v2.b64 	{%rd11, %rd12}, [%rd10];
+	add.s64 	%rd13, %rd11, %rd6;
+	add.s64 	%rd14, %rd12, %rd6;
+	add.s64 	%rd15, %rd2, %rd16;
+	st.global.v2.b64 	[%rd15], {%rd13, %rd14};
+	add.s64 	%rd17, %rd17, %rd4;
+	add.s64 	%rd16, %rd16, %rd5;
+	setp.lt.u64 	%p2, %rd17, %rd3;
+	@%p2 bra 	$L__BB2_2;
+```
+
+One vector load, one row body per lane, one vector store, strength-reduced increments, and loop
+control. `chunked_affine_i32` at `|s, v| v * *s + 7` emits `ld.global.v4.b32` with four
+`mad.lo.s32`, so this is not one lucky shape.
+
+A default of one lane per chunk preserves the current behavior exactly, which keeps the change
+additive and leaves the x86 results untouched.
+
+### One artifact of the replica
+
+Reading a special register through `core::arch::asm!` leaves the read inside the loop, because plain
+inline assembly is not hoistable. Adding `options(pure, nomem, nostack)` hoists it and produces the
+loop shown above. This is a property of the test harness, not of `RowFn`, but any real
+implementation needs it or the `core::arch::nvptx` intrinsics.
 
 ## Which scalar functions this actually covers
 
@@ -305,9 +374,11 @@ bandwidth-bound, so the ALU work the row body performs is not the limiting facto
 comparison makes this concrete: the Rust row body produces the same instruction sequence as the
 functor `scalar_kernel` already runs for that operation.
 
-The one identified gap is memory access width. The Rust path emits scalar loads where
-`scalar_kernel.cuh` asks for 16 bytes per iteration, and that did not change under a tiled loop.
-Sizing it needs `ptxas` and a GPU.
+The one identified gap is memory access width, and it is an API gap rather than a compiler one. The
+current element API reads one value at a time, which is right for the CPU autovectorizer and cannot
+express a wider transaction for a GPU. Adding a chunked access path recovers `ld.global.v2.b64` and
+`ld.global.v4.b32` without changing any row body. How much the difference is worth still needs
+`ptxas` and a GPU.
 
 Two costs sit outside the kernel and both are worth stating.
 
@@ -359,11 +430,13 @@ and the deferred-error retry, and it needs no new plan machinery.
 
 ## Open questions
 
-- How much does the scalar-load gap cost? The Rust path does not emit `ld.global.v2.b64` even under
-  a tiled loop. Measuring it needs `ptxas` and a GPU, and it also needs confirming that `nvcc`
-  vectorizes the equivalent C++, which `scalar_kernel.cuh` leaves to `#pragma unroll`.
-- Do explicit chunked loads on the Rust side recover the vector access, and does that belong in the
-  executor or in `InputElement`?
+- How much is the chunked access path worth? It recovers the vector transactions, but sizing the
+  difference needs `ptxas` and a GPU. `nvcc` may not vectorize the equivalent C++ either, since
+  `scalar_kernel.cuh` leaves that to `#pragma unroll` rather than an explicit `int4` cast.
+- Does the chunk width belong on `InputElement`, or on the executor as a per-batch choice? An
+  element knows its own width, but the useful chunk depends on the whole argument tuple.
+- Does a chunked path help the CPU as well, or does the loop vectorizer already capture all of it?
+  If it does help, the addition is not GPU-specific.
 - Which is the right device null policy: always `Dense` where `DENSE_SAFE` permits it, or is there a
   survivor fraction below which stream compaction wins?
 - Does the failure word reduce per block with `atomicOr`, or per warp with a ballot, and do the
