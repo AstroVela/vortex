@@ -14,8 +14,16 @@ array: it destructures to a device buffer handle, launches, handles validity sep
 and rebuilds through `PrimitiveArray::from_buffer_handle`. That is the shape a GPU `RowFn` executor
 needs, and it splits values from validity the same way `lift.rs` does.
 
+FoR decode is the existing proof that the shape runs. `ForOp<T>{reference}` plus `scalar_kernel` is
+`add(column, constant)` with `prepare` and `apply` split exactly as `RowFn` splits them, so a row
+body already executes on the GPU, written in C++ by hand. Compiling the same row body from Rust
+reproduces its instruction sequence.
+
+What this covers is the elementwise fixed-width family, not every CPU scalar function. The columnar
+family does not need `RowFn`, and the variable-work family is hard on a GPU regardless.
+
 The blockers are narrower than the framing suggests. They are the element types that are not flat
-buffers, the null-strategy thresholds, and the toolchain.
+buffers, the null-strategy thresholds, the memory access width, and the toolchain.
 
 ## Scope and limits of this record
 
@@ -99,10 +107,8 @@ work already paid for.
 
 Two gaps in the generated code:
 
-- The loads are scalar `ld.global.b64`. `scalar_kernel.cuh` deliberately processes 16 bytes per
-  iteration. A warp coalesces the scalar loads into the same transactions, so this costs instruction
-  count and latency hiding rather than raw bandwidth, but it is a real difference and it needs
-  measuring rather than assuming.
+- The loads are scalar `ld.global.b64` rather than the 16-byte access `scalar_kernel.cuh` uses. This
+  reproduces under the tiled loop shape as well, and is treated as its own finding below.
 - The replica reduces the failure word per thread and then has every failing thread store `1`. The
   stores are benign because the value is identical, but a real implementation needs `atomicOr` or a
   block reduction.
@@ -125,6 +131,99 @@ kernels as `.visible .entry`. Building through `cargo` instead reaches codegen a
 regardless, so the failure is in linking and not in compilation.
 
 </details>
+
+## FoR decode is the existing proof
+
+No scalar function executes on the GPU today. `Cast` is the only one reachable, and only because the
+plan builder special-cases it inside encoding trees.
+
+FoR decode is the closest thing, and it is closer than it looks. `for.cu` is:
+
+```cpp
+template <typename T> struct ForOp {
+    T reference;
+    __device__ inline T operator()(T value) const { return value + reference; }
+};
+scalar_kernel(input, output, array_len, ForOp<Type>{reference});
+```
+
+That is `add(column, constant)`. `ForOp<T>{reference}` is `prepare` hoisting the constant operand,
+`operator()` is `apply`, and `scalar_kernel` is the executor. The same operation on the CPU is the
+existing `NumericBinary` `RowFn` at `Add` with a constant right-hand side. A `RowFn` row body
+already executes on the GPU, written in C++ by hand.
+
+[`for-decode-rs.md`](codegen/for-decode-rs.md) writes that row body as Rust generics and compiles it
+for `nvptx64`. The grid-stride loop:
+
+```ptx
+$L__BB1_2:
+	ld.global.b64 	%rd12, [%rd11];
+	add.s64 	%rd13, %rd12, %rd5;    // %rd5 is the reference, hoisted before the loop
+	st.global.b64 	[%rd14], %rd13;
+	setp.lt.u64 	%p2, %rd16, %rd6;
+	@%p2 bra 	$L__BB1_2;
+```
+
+The `RowOp<T>` trait, the generic executor, and the constant hoist all erase. The reference is
+loaded once into a register and reused, which is what `ForOp<T>{reference}` does. This is the
+instruction sequence `scalar_kernel` produces for the same operation.
+
+## Vector loads: the Rust path does not emit them
+
+The tiled kernel in [`for-decode-rs.md`](codegen/for-decode-rs.md) mirrors `scalar_kernel.cuh`
+exactly: 2048 elements per block, 64 threads, `VALUES_PER_LOOP = 16 / size_of::<T>()`. The unroll
+works and the addressing is adjacent, but the loads stay scalar:
+
+```ptx
+	ld.global.b64 	%rd15, [%rd14];
+	add.s64 	%rd16, %rd15, %rd5;
+	ld.global.b64 	%rd17, [%rd14+8];
+	add.s64 	%rd18, %rd17, %rd5;
+	st.global.b64 	[%rd19], %rd16;
+	st.global.b64 	[%rd19+8], %rd18;
+```
+
+No `ld.global.v2.b64` appears anywhere in either module. LLVM's NVPTX backend did not merge the
+adjacent accesses, and writing the loop in the shape that invites merging did not change that.
+
+This is the one place the generated code is measurably behind a hand-written kernel, and it needs a
+`ptxas` comparison to size. Whether `nvcc` merges the equivalent C++ was not tested, because no CUDA
+toolkit was available. `scalar_kernel.cuh` relies on `#pragma unroll` rather than an explicit
+`int4` or `double2` cast, so it is not certain that the C++ vectorizes either. Explicit chunked
+loads on the Rust side are the obvious mitigation if the gap is real.
+
+One artifact of the replica rather than of `RowFn`: reading `%ntid.x` through `core::arch::asm!`
+leaves the read inside the loop, because plain inline assembly is not hoistable. A real
+implementation reads the special registers once outside the loop or uses the `core::arch::nvptx`
+intrinsics.
+
+## Which scalar functions this actually covers
+
+`RowFn` on the GPU covers the elementwise fixed-width family and does not cover the rest. The
+boundary is predictable and it mostly matches the boundary `RowFn` already draws on the CPU.
+
+**Elementwise fixed-width.** Numeric `binary`, comparison, `between`, `case_when`, `fill_null`, and
+`cast`. These port, and they are the reason to do the work at all.
+
+**Columnar and bitmap.** `not`, `is_null`, `is_not_null`, `mask`, `list_length`, and `byte_length`.
+`RowFn` excludes these by design, and they do not need it. They are straightforward hand-written GPU
+kernels that arrive through a different path.
+
+**Zero-copy and structural.** `ext_storage`, `get_item`, `pack`, `select`, and `literal`. No kernel
+on either device.
+
+**Variable work per row.** `like`, `list_contains`, `list_sum`, `variant_get`, and the geo
+predicates. Warp divergence rules these out, and `RowFn` already excludes most of them on the CPU
+for related reasons.
+
+**Variable-length output.** String transforms and other `VarBinView` sinks. Not reachable without a
+two-pass count-then-fill or an atomic bump allocator.
+
+So porting every CPU scalar function to the GPU through `RowFn` is not the outcome. The accurate
+statement is narrower and still worth having. The elementwise fixed-width family comes essentially
+for free once the executor exists, that family is the largest and the most used, the columnar family
+is easy on a GPU but arrives through a different path, and the variable-work family is hard on a GPU
+whether or not `RowFn` is involved.
 
 ## What the executor looks like
 
@@ -200,10 +299,15 @@ meaning and becomes more valuable, since it is what admits the strategy a GPU wa
 The comparison that matters is a `RowFn`-generated kernel against a hand-written CUDA kernel for the
 same new scalar function, both over canonical device arrays.
 
-On that comparison the PTX above is the answer. The abstraction erases completely, the loop body is
-what a hand author would write, and an elementwise scalar function is bandwidth-bound, so the ALU
-work the row body performs is not the limiting factor. There is no structural reason for a gap. The
-one open item is the vectorized-access difference noted above, which needs measuring.
+On that comparison the PTX above is the answer for the arithmetic. The abstraction erases
+completely, the loop body is what a hand author would write, and an elementwise scalar function is
+bandwidth-bound, so the ALU work the row body performs is not the limiting factor. The FoR
+comparison makes this concrete: the Rust row body produces the same instruction sequence as the
+functor `scalar_kernel` already runs for that operation.
+
+The one identified gap is memory access width. The Rust path emits scalar loads where
+`scalar_kernel.cuh` asks for 16 bytes per iteration, and that did not change under a tiled loop.
+Sizing it needs `ptxas` and a GPU.
 
 Two costs sit outside the kernel and both are worth stating.
 
@@ -255,8 +359,11 @@ and the deferred-error retry, and it needs no new plan machinery.
 
 ## Open questions
 
-- Does the vectorized 16-byte access in `scalar_kernel.cuh` beat the scalar grid-stride loop the
-  Rust path emits, on a bandwidth-bound elementwise operation?
+- How much does the scalar-load gap cost? The Rust path does not emit `ld.global.v2.b64` even under
+  a tiled loop. Measuring it needs `ptxas` and a GPU, and it also needs confirming that `nvcc`
+  vectorizes the equivalent C++, which `scalar_kernel.cuh` leaves to `#pragma unroll`.
+- Do explicit chunked loads on the Rust side recover the vector access, and does that belong in the
+  executor or in `InputElement`?
 - Which is the right device null policy: always `Dense` where `DENSE_SAFE` permits it, or is there a
   survivor fraction below which stream compaction wins?
 - Does the failure word reduce per block with `atomicOr`, or per warp with a ballot, and do the
