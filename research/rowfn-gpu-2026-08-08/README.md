@@ -514,18 +514,27 @@ output.
 ## What remains between the PTX and production
 
 Compiling the row body is the finished part, not the whole part. The remaining work is host
-plumbing, and all of it is enumerable. One item is a design problem. The rest are the
-`filter_primitive` shape applied again.
+plumbing, and all of it is enumerable. Most of it is the `filter_primitive` shape applied again.
 
-**Enumerating monomorphizations is the design problem.** On the CPU, `RowFn::dispatch` chooses
-element types at run time, and rustc monomorphizes the visit because the whole program compiles
-together. Pre-compiled PTX inverts that. Every function and ptype signature that can run on the
-GPU must exist as a named kernel entry when the device crate is built, together with a host-side
-table from `ScalarFnId` plus input dtypes to entry name. The blanket-impl story does not carry
-over: a `RowFn` does not get GPU execution by existing. Its device entries have to be declared,
-most plausibly by a macro in the device crate that stamps out the supported width matrix.
-`dispatch` stays the source of truth for which signature runs, and the table lookup either finds
-an entry or falls back to the CPU.
+**Mirroring monomorphizations across two compilations.** The enumeration itself is not new.
+`match_each_native_ptype!` inside `dispatch` already names every supported width, and rustc
+compiles every arm of that match into the host binary, so the CPU pays the same enumeration today
+and generic code never executes on either target. What changes is where the list lives. The host
+match cannot cause nvptx codegen, because the PTX module is a separate compilation, so the same
+width list has to appear a second time in the device crate, one `extern "ptx-kernel"` entry per
+signature, plus a host table from the dispatched signature to the entry name. One macro can stamp
+out both sides from one list. Drift between the two is a silent CPU fallback rather than an error,
+which is why the sync belongs in a test: `dispatch` must be a pure function of options and dtypes,
+so a probe visitor can enumerate every signature `dispatch` can select and assert that each one
+has an entry or a recorded exclusion.
+
+The sealed `RowVisitor` is the insertion point for all of this. A GPU executor is a second
+framework-owned visitor that runs the same `dispatch`, the same `prepare`, and the same
+`finish_failure` on the host, and replaces only the row loop with a launch of the named entry. Two
+constraints fall out. The row computation must be a nameable function whose only batch state is
+the prepared `P`, because a device entry cannot see host closure captures, and `NumericBinary`
+already satisfies this by delegating to `Operator::apply`. And a third-party `RowFn` still ships
+its own PTX, since no host compilation can produce device code for it.
 
 **`prepare` output becomes kernel parameters.** The prepare step still runs on the host, once per
 batch, but its output crosses the launch boundary, so the prepared state must be plain data. `()`
