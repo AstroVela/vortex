@@ -255,6 +255,38 @@ This is the same conclusion the CUDA code reached. `scalar_kernel.cuh` fixes
 `VALUES_PER_LOOP = 16 / sizeof(InputT)`, and `dynamic_dispatch.cu` applies each scalar op to
 `VALUES_PER_TILE` values in registers. Both write the loop N-at-a-time on purpose.
 
+### Which half is the executor's and which is the API's
+
+The two conditions have different owners, and only one of them reaches the trait.
+
+**Adjacency belongs entirely to the executor.** `execute_row_output_prepared` already owns the loop,
+and `A::get(&columns, i)` and `A::get(&columns, i + 1)` are both already callable. Visiting two rows
+per iteration is a local change with no trait involvement.
+
+**Alignment cannot be solved from the executor alone.** The executor is generic over
+`InputElement`, so it cannot reinterpret an opaque `Varying<'a>`. Moving the alignment into the
+element's own `Varying` type does not rescue it either, and the reason is worth recording because it
+rules out the whole category. Two attempts, both keeping today's
+`get_varying(&Varying, row_index) -> Elem` signature and putting a `#[repr(align(16))]` pair behind
+the pointer:
+
+1. Index by row with `i = tid() * 2`, incrementing by `stride() * 2`. The `i / 2` and `i % 2`
+   inside the accessor fold away correctly, but LLVM flattens the address to `base + i * 8` and
+   then cannot prove `i` is even, because `stride()` is opaque.
+2. Index by chunk with `i = c * 2`, which makes `i` provably even at the source level. This also
+   fails. LLVM strength-reduces the loop to a running byte offset incremented by an opaque stride,
+   and the evenness is gone by the time the load is selected.
+
+Both emit `ld.global.b64` at `[%rd10]` and `[%rd10+8]`: adjacent, correct, and unmerged.
+
+The working shape indexes a pointer whose *pointee* is the 16-byte chunk. Then `ptr.add(c)` has a
+type-derived stride of 16, so the alignment holds for any index and survives every loop transform.
+That is a property of the access granularity, which the element owns, not of the loop, which the
+executor owns.
+
+So adjacency needs no API change and alignment needs a small one: a chunk-granular accessor on
+`InputElement`, defaulting to one lane so every existing element is unaffected.
+
 ### What closing it would take
 
 [`chunked-executor.md`](codegen/chunked-executor.md) models the proposed change: the element type
