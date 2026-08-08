@@ -259,6 +259,24 @@ control. `chunked_affine_i32` at `|s, v| v * *s + 7` emits `ld.global.v4.b32` wi
 A default of one lane per chunk preserves the current behavior exactly, which keeps the change
 additive and leaves the x86 results untouched.
 
+### The chunked path is an x86 question too
+
+[`x86-chunked.md`](codegen/x86-chunked.md) compiles the same two shapes for x86-64. Under AVX-512
+the chunked shape reaches `zmm` where the one-lane-at-a-time loop stays on `ymm`, and its loads
+become `vmovdqa` rather than `vmovdqu`. Under AVX2 both reach `ymm` and the difference is small.
+
+Do not read that as a win yet. LLVM's preference for 256-bit registers is frequently a deliberate
+heuristic rather than a missed optimization, and forcing 512-bit is slower on parts that downclock
+for it. Zen 4 is not one of those parts, so the question is worth settling on the bench machine.
+
+The checked `i64` multiply does not vectorize under either shape, since x86 has no vector 64-bit
+multiply producing overflow evidence. Chunking only unrolls it further. That is consistent with
+`mul_i64` and `mul_u64` being the shapes the x86 record had the most trouble with, and it means the
+chunked path is not a fix for them.
+
+So the addition is not GPU-specific. It is an access-shape question that the GPU forced into view
+because a GPU has no autovectorizer to hide it.
+
 ### One artifact of the replica
 
 Reading a special register through `core::arch::asm!` leaves the read inside the loop, because plain
@@ -395,6 +413,32 @@ GPU-specific objection to `RowFn`, because the CPU path round-trips through memo
 exactly the same way. It is an argument for expression-level fusion in general, and the GPU raises
 the stakes rather than changing the shape of the problem.
 
+## What else this knowledge is good for
+
+The result that Rust generics, trait dispatch, and closures survive to clean PTX is not confined to
+scalar functions. Four consequences are worth separating from the `RowFn` question.
+
+**Encodings are the larger prize.** `vortex-cuda/src/bit_unpack_gen.rs` is Rust that consumes the
+`fastlanes` crate and writes CUDA C source strings, which `build.rs` then feeds to `nvcc`. The
+FastLanes logic is already Rust, and the build transliterates it into another language to reach the
+GPU. Compiling the Rust to PTX directly removes that step. Encodings are also where `vortex-cuda`'s
+throughput work actually is, so the payoff is larger than the scalar-function layer, and the
+mechanism is identical.
+
+**Agreement between CPU and GPU becomes structural.** Today a kernel exists twice, once in Rust and
+once in CUDA C++, and nothing but tests keeps the two honest. One source compiled for two targets
+makes divergence impossible rather than merely detectable. That matters most for the encodings,
+where the decode has to be bit-exact.
+
+**A second backend is a forcing function for the API.** The chunked access gap was invisible while
+x86 was the only target, because the autovectorizer covered for it. It is arguably a CPU gap as
+well, and it surfaced only because a GPU has nothing to cover for it. Any further execution target
+is likely to expose API assumptions the same way.
+
+**The alignment lesson generalizes.** Asserting that a pointer is aligned does not widen a memory
+access. The type at the load site does. That applies to any Vortex kernel where access width
+matters, not only to the GPU.
+
 ## Toolchain and practicality
 
 Rust-to-PTX is no longer the risky part, but it is not free either.
@@ -435,8 +479,9 @@ and the deferred-error retry, and it needs no new plan machinery.
   `scalar_kernel.cuh` leaves that to `#pragma unroll` rather than an explicit `int4` cast.
 - Does the chunk width belong on `InputElement`, or on the executor as a per-batch choice? An
   element knows its own width, but the useful chunk depends on the whole argument tuple.
-- Does a chunked path help the CPU as well, or does the loop vectorizer already capture all of it?
-  If it does help, the addition is not GPU-specific.
+- Does the chunked shape reaching `zmm` on AVX-512 make the x86 numbers better or worse on Zen 4?
+  The code generation differs, the direction is unmeasured, and LLVM's `ymm` preference is often
+  deliberate.
 - Which is the right device null policy: always `Dense` where `DENSE_SAFE` permits it, or is there a
   survivor fraction below which stream compaction wins?
 - Does the failure word reduce per block with `atomicOr`, or per warp with a ballot, and do the
