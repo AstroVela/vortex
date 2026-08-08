@@ -476,6 +476,41 @@ GPU-specific objection to `RowFn`, because the CPU path round-trips through memo
 exactly the same way. It is an argument for expression-level fusion in general, and the GPU raises
 the stakes rather than changing the shape of the problem.
 
+## Two routes to a shipped kernel
+
+The access-width finding does not block GPU execution. The scalar-load kernels are correct, and a
+warp coalesces their accesses into the same memory transactions the vector form uses, so the gap is
+per-thread instruction count with an unmeasured cost. The open question is not whether a `RowFn`
+row body can run on the GPU but which build route produces the kernel.
+
+Neither route asks the compiler to decide where code runs. Vortex owns dispatch, as
+`filter_primitive` does today, and the compiler only has to produce the kernel body.
+
+**Direct compilation.** `rustc` compiles the row body for `nvptx64-nvidia-cuda` and the build embeds
+the PTX exactly as `build.rs` embeds `nvcc` output today. Every codegen question this record raises
+is answered for this route: the trait machinery erases, `prepare` constant-folds, the failure word
+stays in registers, and the chunk-granular accessor closes the access-width gap where a profile
+asks for it. The costs are a nightly toolchain for the device crate alone, since
+`extern "ptx-kernel"` is feature-gated while the host workspace stays on 1.91.0, the
+`llvm-bitcode-linker` rustup component, and tier 2 target risk. This is the only route that
+delivers one source for both targets, which is the property that makes `RowFn` worth extending to
+the GPU at all.
+
+**Codegen.** A Rust generator emits CUDA C functors and `nvcc` compiles them, which is the pattern
+`bit_unpack_gen.rs` already ships for the FastLanes kernels. This route adds no toolchain
+requirement, because `vortex-cuda` already requires `nvcc`, and it inherits nvcc's optimizer,
+including whatever vectorization `#pragma unroll` recovers. Its limit is the source of truth.
+Arbitrary Rust row bodies cannot be transpiled, so the body either lives in a restricted form that
+a macro or generator can print in both languages, or it is written twice with differential tests
+keeping the pair honest. `RowFn` remains the specification either way, but only as a contract, not
+as the single implementation.
+
+The milestone is the same under either route: `NumericBinary` at `i64` over canonical device
+arrays, compared against `for.cu`, whose column-plus-constant case computes the same operation.
+Only the provenance of the functor differs between the routes, so both can be evaluated against
+that one milestone on a single GPU machine, and the abandoned route still validates the other's
+output.
+
 ## What else this knowledge is good for
 
 The result that Rust generics, trait dispatch, and closures survive to clean PTX is not confined to
