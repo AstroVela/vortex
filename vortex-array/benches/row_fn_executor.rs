@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Compares cheap primitive row functions with the specialized columnar implementation.
+//! Compares owned-output, sink-writing, and hand-written primitive row loops.
 
 #![expect(clippy::unwrap_used)]
 
-use std::mem::MaybeUninit;
 use std::sync::LazyLock;
 
 use divan::Bencher;
@@ -17,21 +16,19 @@ use vortex_array::array_session;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::DeferredError;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::OutputSink;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
-use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
@@ -64,83 +61,13 @@ impl RowFn for RowWrappingAdd {
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(i64, i64), ElementSink<i64>, _, _>(
-            |_| (),
-            |&(), (lhs, rhs), output| *output = lhs.wrapping_add(rhs),
-        )
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit::<(i64, i64), i64>(|(lhs, rhs)| lhs.wrapping_add(rhs))
     }
 }
 
 #[derive(Clone)]
 struct RowCheckedAdd;
-
-struct CheckedAddSink {
-    values: BufferMut<i64>,
-    row_count: usize,
-}
-
-struct CheckedAddRows<'a> {
-    values: &'a mut [MaybeUninit<i64>],
-}
-
-struct CheckedAddRow<'a> {
-    value: &'a mut MaybeUninit<i64>,
-}
-
-impl CheckedAddRow<'_> {
-    fn write(self, lhs: i64, rhs: i64) -> bool {
-        let value = lhs.wrapping_add(rhs);
-        let error = (lhs ^ value) & (rhs ^ value);
-        self.value.write(value);
-        error < 0
-    }
-}
-
-impl OutputSink for CheckedAddSink {
-    const ERRORS_ARE_DEFERRED: bool = true;
-
-    type Rows<'a> = CheckedAddRows<'a>;
-    type Row<'a> = CheckedAddRow<'a>;
-
-    fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
-        Ok(DType::from(i64::PTYPE))
-    }
-
-    fn with_capacity(rows: usize, _dtype: &DType) -> VortexResult<Self> {
-        Ok(Self {
-            values: BufferMut::with_capacity(rows),
-            row_count: rows,
-        })
-    }
-
-    fn rows(&mut self) -> Self::Rows<'_> {
-        CheckedAddRows {
-            values: &mut self.values.spare_capacity_mut()[..self.row_count],
-        }
-    }
-
-    fn row_count_matches(rows: &Self::Rows<'_>, row_count: usize) -> bool {
-        rows.values.len() == row_count
-    }
-
-    fn row<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a> {
-        CheckedAddRow {
-            value: &mut rows.values[index],
-        }
-    }
-
-    fn finish(mut self, error: DeferredError) -> VortexResult<ArrayRef> {
-        if error.occurred() {
-            return Err(vortex_err!("integer overflow in row checked add"));
-        }
-
-        // SAFETY: dense execution writes every slot before `finish` is called. This sink does not
-        // support branch-and-skip, and filtered execution allocates exactly one slot per valid row.
-        unsafe { self.values.set_len(self.row_count) };
-        Ok(PrimitiveArray::new(self.values.freeze(), Validity::NonNullable).into_array())
-    }
-}
 
 impl RowFn for RowCheckedAdd {
     type Options = EmptyOptions;
@@ -158,19 +85,36 @@ impl RowFn for RowCheckedAdd {
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(i64, i64), CheckedAddSink, _, _>(
-            |_| (),
-            |&(), (lhs, rhs), output| output.write(lhs, rhs),
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit_deferred::<(i64, i64), i64, bool>(
+            |(lhs, rhs)| lhs.overflowing_add(rhs),
+            |failed| {
+                if failed {
+                    return Err(checked_add_error());
+                }
+                Ok(())
+            },
         )
     }
 }
 
-struct I64Sink(BufferMut<i64>);
+/// Keep error construction out of the benchmarked success path.
+#[cold]
+#[inline(never)]
+fn checked_add_error() -> VortexError {
+    vortex_err!("integer overflow in row checked add")
+}
+
+/// A benchmark sink that writes one `i64` per row.
+struct I64Sink(
+    /// The output values written by the row loop.
+    BufferMut<i64>,
+);
 
 impl OutputSink for I64Sink {
     type Rows<'a> = &'a mut [i64];
     type Row<'a> = &'a mut i64;
+    type WriteToken = ();
 
     fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
         Ok(DType::from(i64::PTYPE))
@@ -215,13 +159,10 @@ impl RowFn for RowSinkWrappingAdd {
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(i64, i64), I64Sink, _, _>(
-            |_| (),
-            |&(), (lhs, rhs), out| {
-                *out = lhs.wrapping_add(rhs);
-            },
-        )
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit_into::<(i64, i64), I64Sink, _>(|(lhs, rhs), out| {
+            *out = lhs.wrapping_add(rhs);
+        })
     }
 }
 
@@ -259,15 +200,15 @@ fn nullable_inputs() -> (ArrayRef, ArrayRef) {
     (lhs, rhs)
 }
 
-fn bench_row_fn<F>(bencher: Bencher, row_fn: F)
+fn bench_row_fn<F>(bencher: Bencher, function: F, make_inputs: fn() -> (ArrayRef, ArrayRef))
 where
     F: RowFn<Options = EmptyOptions>,
 {
     bencher
-        .with_inputs(inputs)
+        .with_inputs(make_inputs)
         .bench_local_values(|(lhs, rhs)| {
             let mut ctx = SESSION.create_execution_ctx();
-            row_fn
+            function
                 .clone()
                 .try_new_array(ROWS, EmptyOptions, [lhs, rhs])
                 .unwrap()
@@ -278,26 +219,13 @@ where
 }
 
 #[divan::bench]
-fn specialized_checked_add(bencher: Bencher) {
-    bencher
-        .with_inputs(inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            lhs.binary(rhs, Operator::Add)
-                .unwrap()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
-}
-
-#[divan::bench]
 fn row_wrapping_add(bencher: Bencher) {
-    bench_row_fn(bencher, RowWrappingAdd);
+    bench_row_fn(bencher, RowWrappingAdd, inputs);
 }
 
 #[divan::bench]
 fn row_sink_wrapping_add(bencher: Bencher) {
-    bench_row_fn(bencher, RowSinkWrappingAdd);
+    bench_row_fn(bencher, RowSinkWrappingAdd, inputs);
 }
 
 #[divan::bench]
@@ -329,91 +257,25 @@ fn handrolled_sink_wrapping_add(bencher: Bencher) {
 
 #[divan::bench]
 fn row_checked_add(bencher: Bencher) {
-    bench_row_fn(bencher, RowCheckedAdd);
-}
-
-#[divan::bench]
-fn specialized_checked_add_constant(bencher: Bencher) {
-    bencher
-        .with_inputs(constant_inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            lhs.binary(rhs, Operator::Add)
-                .unwrap()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
+    bench_row_fn(bencher, RowCheckedAdd, inputs);
 }
 
 #[divan::bench]
 fn row_wrapping_add_constant(bencher: Bencher) {
-    bencher
-        .with_inputs(constant_inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            RowWrappingAdd
-                .try_new_array(ROWS, EmptyOptions, [lhs, rhs])
-                .unwrap()
-                .into_array()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
+    bench_row_fn(bencher, RowWrappingAdd, constant_inputs);
 }
 
 #[divan::bench]
 fn row_checked_add_constant(bencher: Bencher) {
-    bencher
-        .with_inputs(constant_inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            RowCheckedAdd
-                .try_new_array(ROWS, EmptyOptions, [lhs, rhs])
-                .unwrap()
-                .into_array()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
-}
-
-#[divan::bench]
-fn specialized_checked_add_nullable(bencher: Bencher) {
-    bencher
-        .with_inputs(nullable_inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            lhs.binary(rhs, Operator::Add)
-                .unwrap()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
+    bench_row_fn(bencher, RowCheckedAdd, constant_inputs);
 }
 
 #[divan::bench]
 fn row_checked_add_nullable(bencher: Bencher) {
-    bencher
-        .with_inputs(nullable_inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            RowCheckedAdd
-                .try_new_array(ROWS, EmptyOptions, [lhs, rhs])
-                .unwrap()
-                .into_array()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
+    bench_row_fn(bencher, RowCheckedAdd, nullable_inputs);
 }
 
 #[divan::bench]
 fn row_wrapping_add_nullable(bencher: Bencher) {
-    bencher
-        .with_inputs(nullable_inputs)
-        .bench_local_values(|(lhs, rhs)| {
-            let mut ctx = SESSION.create_execution_ctx();
-            RowWrappingAdd
-                .try_new_array(ROWS, EmptyOptions, [lhs, rhs])
-                .unwrap()
-                .into_array()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        });
+    bench_row_fn(bencher, RowWrappingAdd, nullable_inputs);
 }

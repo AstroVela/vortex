@@ -7,23 +7,21 @@ use std::ops::BitOrAssign;
 
 use vortex_error::VortexResult;
 
+use super::InitializedElement;
+
 mod private {
     pub trait Sealed {}
 }
 
-/// A value-dependent failure bit reduced across the whole row loop and handed to the output sink.
+/// A value-dependent failure bit reduced across the row loop and handed to the output sink.
 ///
-/// Unlike [`VortexResult`], this never exits the loop. It is for kernels such as checked addition
-/// that can safely write a provisional value for every row and report any failure once at the end.
-///
-/// **The reduction is one byte wide on purpose.** It is OR-reduced once per row alongside the
-/// kernel's own arithmetic, so a wider accumulator caps how many rows a vector of the reduction
-/// covers, whatever the element width. Carrying the bit in an `i64` instead cost the primitive
-/// `Mul` kernel 3.1x at `i8`, 1.9x at `i16` and 1.2x at `i32`, and nothing at `i64` where the two
-/// widths already agree (`binary_ops`, 65536 rows, divan fastest of 100 samples, best of two runs,
-/// Apple M4 Max).
+/// Unlike [`VortexResult`], this never exits the loop. Use it when every row can write a safe
+/// provisional value and report failure once at the end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DeferredError(bool);
+pub struct DeferredError(
+    /// Whether this value records a deferred error.
+    bool,
+);
 
 impl DeferredError {
     /// Record whether this row encountered an error.
@@ -43,32 +41,22 @@ impl BitOrAssign for DeferredError {
     }
 }
 
-/// What a row computation that _writes_ into an [`OutputSink`](crate::scalar_fn::OutputSink) may
-/// produce: nothing, an early [`VortexResult`] error, or non-branching failure evidence.
+/// The result of writing one row: success, an immediate error, or deferred error evidence.
 ///
-/// The value is already in the sink by the time the closure returns, so the only thing left to
-/// report is failure.
-///
-/// [`Accumulated`](Self::Accumulated) is the word the executor OR-reduces in a **local**, which is
-/// what keeps the reduction in a register and the row loop vectorizable. It exists so that evidence
-/// can be wider than one bit when narrowing it per row would cost more than carrying it: unsigned
-/// multiplication hands back the discarded high half of its product, because comparing that half
-/// against zero per row is what LLVM folds into `llvm.umul.with.overflow`, which has no vector form.
-/// **The word must be no wider than the element**, or the reduction, rather than the arithmetic,
-/// bounds how many rows a vector covers.
-///
-/// The sink never sees this. It is handed a plain [`DeferredError`] once, after the loop.
-///
-/// This trait is framework-only. Row functions choose one of the supplied return forms; custom
-/// output representation belongs in [`OutputSink`](crate::scalar_fn::OutputSink).
+/// The executor OR-reduces [`Accumulated`](Self::Accumulated) in a loop-local. The accumulated word
+/// should be no wider than the computed element so error tracking does not constrain vector width.
+/// This trait is sealed; row functions choose one of its supplied implementations.
 pub trait SinkResult: 'static + private::Sealed {
+    /// The [`OutputSink::WriteToken`](super::OutputSink::WriteToken) carried by a success.
+    type WriteToken: 'static;
+
     /// The word this result reduces into, kept in a loop-local by the executor.
     type Accumulated: 'static + Copy + Default;
 
     /// Whether this return type can carry an error.
     const FALLIBLE: bool;
 
-    /// Whether this result carries non-branching failure evidence for the sink.
+    /// Whether this result defers failure reporting until the sink finishes.
     const DEFERRED: bool;
 
     /// Merge this row's outcome into the batch-wide reduction.
@@ -81,6 +69,25 @@ pub trait SinkResult: 'static + private::Sealed {
 impl private::Sealed for () {}
 
 impl SinkResult for () {
+    type WriteToken = ();
+    type Accumulated = ();
+
+    const FALLIBLE: bool = false;
+    const DEFERRED: bool = false;
+
+    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+        Ok(())
+    }
+
+    fn occurred(_accumulated: ()) -> bool {
+        false
+    }
+}
+
+impl private::Sealed for InitializedElement {}
+
+impl SinkResult for InitializedElement {
+    type WriteToken = InitializedElement;
     type Accumulated = ();
 
     const FALLIBLE: bool = false;
@@ -98,6 +105,7 @@ impl SinkResult for () {
 impl private::Sealed for VortexResult<()> {}
 
 impl SinkResult for VortexResult<()> {
+    type WriteToken = ();
     type Accumulated = ();
 
     const FALLIBLE: bool = true;
@@ -105,6 +113,24 @@ impl SinkResult for VortexResult<()> {
 
     fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
         self
+    }
+
+    fn occurred(_accumulated: ()) -> bool {
+        false
+    }
+}
+
+impl private::Sealed for VortexResult<InitializedElement> {}
+
+impl SinkResult for VortexResult<InitializedElement> {
+    type WriteToken = InitializedElement;
+    type Accumulated = ();
+
+    const FALLIBLE: bool = true;
+    const DEFERRED: bool = false;
+
+    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+        self.map(|_| ())
     }
 
     fn occurred(_accumulated: ()) -> bool {
@@ -120,6 +146,7 @@ macro_rules! impl_sink_result_word {
             impl private::Sealed for $word {}
 
             impl SinkResult for $word {
+                type WriteToken = ();
                 type Accumulated = $word;
 
                 const FALLIBLE: bool = false;
@@ -139,23 +166,3 @@ macro_rules! impl_sink_result_word {
 }
 
 impl_sink_result_word!(bool, u8, u16, u32, u64);
-
-#[cfg(test)]
-mod tests {
-    use super::DeferredError;
-
-    #[test]
-    fn one_failing_row_is_enough() {
-        let mut error = DeferredError::default();
-        assert!(!error.occurred());
-
-        error |= DeferredError::new(false);
-        assert!(!error.occurred());
-
-        error |= DeferredError::new(true);
-        assert!(error.occurred());
-
-        error |= DeferredError::new(false);
-        assert!(error.occurred());
-    }
-}

@@ -35,10 +35,6 @@ impl InputElement for GeometryRow {
     // Decoding builds a geometry from stored coordinates, and a malformed one in a *valid* row is a
     // domain error rather than an infrastructural failure.
     const DECODE_FALLIBLE: bool = true;
-    // Decoding arrow-exports the column and parses one geometry per row, so filtering the column
-    // first shrinks the decode itself, not just the row loop.
-    const FILTERED_DECODE_COST: usize = 1;
-
     fn validate(dtype: &DType) -> VortexResult<()> {
         vortex_ensure!(
             is_native_geometry(dtype),

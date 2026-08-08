@@ -23,13 +23,11 @@ mod private {
     pub trait Sealed {}
 }
 
-/// One decoded input column of an [`ElementTuple`].
-///
-/// A constant operand holds the same value in every row, so it is decoded once as a single row and
-/// read at index 0 forever. That is what stops a constant argument costing one decode per row, which
-/// matters whenever the decode is more than a buffer read: parsing a geometry from WKB, or
-/// canonicalizing an extension row.
-pub struct ArgColumn<T: InputElement>(ArgColumnKind<T>);
+/// One decoded input, collapsed to a single row when it is constant for the batch.
+pub struct ArgColumn<T: InputElement>(
+    /// The decoded column, classified by whether it varies within the batch.
+    ArgColumnKind<T>,
+);
 
 enum ArgColumnKind<T: InputElement> {
     Varying(T::Column),
@@ -37,7 +35,6 @@ enum ArgColumnKind<T: InputElement> {
 }
 
 impl<T: InputElement> ArgColumn<T> {
-    /// Decode one input column, collapsing a constant operand to its single distinct row.
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
         // An empty input has no row 0 to slice, and its row loop runs zero times either way.
         if let Some(constant) = batch_constant(&array)
@@ -52,13 +49,9 @@ impl<T: InputElement> ArgColumn<T> {
         Ok(Self(ArgColumnKind::Varying(T::decode(array, ctx)?)))
     }
 
-    /// Like [`decode`](Self::decode), but a varying column decodes null-tolerantly through
-    /// [`InputElement::decode_null_tolerant`]. `Ok(None)` means the element cannot, and the
-    /// caller falls back to the filter strategy.
-    ///
-    /// A constant operand still takes the ordinary decode: the lifting short-circuits null
-    /// constants before any strategy runs, so a constant reaching here is non-null.
     fn decode_null_tolerant(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<Self>> {
+        // Batch execution short-circuits null constants before selecting a strategy, so a
+        // constant reaching this path is non-null and can use the ordinary decode.
         if let Some(constant) = batch_constant(&array)
             && !array.is_empty()
         {
@@ -73,7 +66,6 @@ impl<T: InputElement> ArgColumn<T> {
             .map(Self))
     }
 
-    /// Read the element at `index`, which for a constant operand is always its single row.
     fn get(&self, index: usize) -> T::Elem<'_> {
         match &self.0 {
             ArgColumnKind::Varying(column) => T::get(column, index),
@@ -81,7 +73,6 @@ impl<T: InputElement> ArgColumn<T> {
         }
     }
 
-    /// The decoded full column, or `None` when this argument was collapsed to one constant row.
     fn varying(&self) -> Option<&T::Column> {
         match &self.0 {
             ArgColumnKind::Varying(column) => Some(column),
@@ -89,21 +80,14 @@ impl<T: InputElement> ArgColumn<T> {
         }
     }
 
-    /// Whether this argument addresses exactly `row_count` rows.
-    ///
-    /// A constant operand was collapsed to its one distinct row and is read at index 0 forever, so
-    /// it addresses any row count and is exempt.
     fn addresses_rows(&self, row_count: usize) -> bool {
+        // A constant is always read at index zero, so it addresses any batch length.
         match &self.0 {
             ArgColumnKind::Varying(column) => T::varying_len(&T::varying(column)) == row_count,
             ArgColumnKind::Constant(_) => true,
         }
     }
 
-    /// The single decoded element of a constant operand, or `None` for a real column.
-    ///
-    /// `Some` exactly when [`decode`](Self::decode) collapsed the operand to its one distinct row,
-    /// in which case the value returned is the element every row of the batch reads.
     fn constant(&self) -> Option<T::Elem<'_>> {
         match &self.0 {
             ArgColumnKind::Varying(_) => None,
@@ -112,22 +96,11 @@ impl<T: InputElement> ArgColumn<T> {
     }
 }
 
-/// The array whose every row holds one distinct value, when `array` is constant for the batch.
+/// Return the batch-constant array, looking through masked and extension wrappers.
 ///
-/// Beyond the constant encoding itself this sees one level through two wrappers that spell "the
-/// same value in every row" without being the constant encoding:
-///
-/// - [`Masked`], how the compressor spells an all-same-with-nulls chunk: the child carries the
-///   value, the wrapper carries only validity. Reading the child's value for a null row is sound
-///   here because the lifting owns validity entirely; the row loop's output behind a null
-///   row is masked away (dense) or never computed (filter), so which value the loop read there
-///   cannot be observed. An all-null constant never reaches decode at all, since the lifting
-///   short-circuits it to an all-null result first.
-/// - [`Extension`] over constant storage, the shape an extension-typed builder produces before
-///   `ExtensionConstantRule` normalizes it to a top-level constant. Every row wraps the same
-///   storage value, so the whole array (sliced to one row, keeping its extension dtype) is the
-///   constant.
-pub(in crate::scalar_fn::row) fn batch_constant(array: &ArrayRef) -> Option<ArrayRef> {
+/// Batch execution owns mask validity, so a masked constant may expose its constant child here. An
+/// extension over constant storage remains wrapped to preserve its extension dtype.
+pub fn batch_constant(array: &ArrayRef) -> Option<ArrayRef> {
     if array.as_constant().is_some() {
         return Some(array.clone());
     }
@@ -142,14 +115,10 @@ pub(in crate::scalar_fn::row) fn batch_constant(array: &ArrayRef) -> Option<Arra
         .then(|| array.clone())
 }
 
-/// Tuples of [`InputElement`]s forming the typed argument list a [`RowFn`](crate::scalar_fn::RowFn)
-/// visits with. Implemented for `()` and tuples of one through twelve elements. This trait is
-/// framework-only; add a new decode primitive by implementing [`InputElement`], then use it inside
-/// one of those tuples.
+/// Typed argument tuples for arities zero through twelve.
 ///
-/// The arities past the widest function in tree are deliberate. This trait is **sealed**, so a
-/// downstream crate cannot add the one it needs, and an unused arity costs only its own macro
-/// expansion: no monomorphization happens until something instantiates it.
+/// This trait is sealed; add a new row representation by implementing [`InputElement`] and placing
+/// it in one of the supplied tuples.
 pub trait ElementTuple: 'static + private::Sealed {
     /// The decoded column representations.
     type Columns;
@@ -178,9 +147,6 @@ pub trait ElementTuple: 'static + private::Sealed {
     /// Whether _any_ argument is [`InputElement::DECODE_FALLIBLE`].
     const DECODE_FALLIBLE: bool;
 
-    /// The additive cost of per-row decode work avoided by filtering the arguments first.
-    const FILTERED_DECODE_COST: usize;
-
     /// Validate the input dtypes, including that `dtypes` has exactly `ARITY` entries.
     ///
     /// The expression layer checks the count against [`Arity`](crate::scalar_fn::Arity) before it
@@ -192,8 +158,10 @@ pub trait ElementTuple: 'static + private::Sealed {
     /// Decode every input column once. Called once per batch.
     fn decode(args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<Self::Columns>;
 
-    /// Decode every input column once, tolerating null rows, or `Ok(None)` when some argument
-    /// cannot. Called once per batch by the branch-and-skip null strategy.
+    /// Decode every input column once while tolerating null rows.
+    ///
+    /// Return `Ok(None)` when an argument has no null-tolerant representation. The skip-invalid
+    /// strategy calls this once per batch.
     fn decode_null_tolerant(
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
@@ -225,10 +193,13 @@ pub trait ElementTuple: 'static + private::Sealed {
     fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
 }
 
-/// An argument tuple that can expose independent indexed reads after one length validation.
+/// An argument tuple that supports a validated dense indexed traversal.
 ///
-/// This trait is sealed through [`ElementTuple`]. Tuples without a natural indexed source continue
-/// to use ordinary row access and output sinks.
+/// This is separate from [`ElementTuple`] because many row elements have no contiguous source, and
+/// stable Rust cannot provide a blanket fallback plus a more specific primitive implementation.
+/// The trait is sealed so shared execution can rely on its unchecked-read contract. A tuple only
+/// implements it when the source can be validated once and every lane can then be read
+/// independently.
 pub trait IndexedElementTuple: ElementTuple {
     /// The source shared execution uses for a dense all-varying loop.
     ///
@@ -239,6 +210,26 @@ pub trait IndexedElementTuple: ElementTuple {
 
     /// Borrow a source from columns already validated to vary within the batch.
     fn indexed_source<'a>(columns: &Self::VaryingColumns<'a>) -> Self::Source<'a>;
+}
+
+/// An indexed native slice yielding the one-tuples expected by a unary row closure.
+#[derive(Clone, Copy)]
+pub struct UnaryTupleSource<'a, T>(
+    /// The native values read by the row loop.
+    &'a [T],
+);
+
+impl<T: Copy> IndexedSource for UnaryTupleSource<'_, T> {
+    type Item = (T,);
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    unsafe fn get_unchecked(&self, index: usize) -> Self::Item {
+        // SAFETY: the caller guarantees that `index` is in bounds.
+        (unsafe { *self.0.get_unchecked(index) },)
+    }
 }
 
 impl private::Sealed for () {}
@@ -252,7 +243,6 @@ impl ElementTuple for () {
     const ARITY: usize = 0;
     const DENSE_SAFE: bool = true;
     const DECODE_FALLIBLE: bool = false;
-    const FILTERED_DECODE_COST: usize = 0;
 
     fn validate(dtypes: &[DType]) -> VortexResult<()> {
         vortex_ensure_eq!(
@@ -307,7 +297,6 @@ macro_rules! element_tuple {
             const ARITY: usize = $arity;
             const DENSE_SAFE: bool = $($t::DENSE_SAFE &&)+ true;
             const DECODE_FALLIBLE: bool = $($t::DECODE_FALLIBLE ||)+ false;
-            const FILTERED_DECODE_COST: usize = $($t::FILTERED_DECODE_COST +)+ 0;
 
             fn validate(dtypes: &[DType]) -> VortexResult<()> {
                 vortex_ensure_eq!(
@@ -387,10 +376,34 @@ element_tuple!(10; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9);
 element_tuple!(11; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10);
 element_tuple!(12; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11);
 
-impl<A: NativePType, B: NativePType> IndexedElementTuple for (A, B) {
-    type Source<'a> = LaneZip<&'a [A], &'a [B]>;
+impl<T: NativePType> IndexedElementTuple for (T,) {
+    type Source<'a> = UnaryTupleSource<'a, T>;
+
+    fn indexed_source<'a>(columns: &Self::VaryingColumns<'a>) -> Self::Source<'a> {
+        UnaryTupleSource(columns.0)
+    }
+}
+
+impl<Left: NativePType, Right: NativePType> IndexedElementTuple for (Left, Right) {
+    type Source<'a> = LaneZip<&'a [Left], &'a [Right]>;
 
     fn indexed_source<'a>(columns: &Self::VaryingColumns<'a>) -> Self::Source<'a> {
         LaneZip::new(columns.0, columns.1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_compute::lane_kernels::IndexedSource;
+
+    use super::UnaryTupleSource;
+
+    #[test]
+    fn test_unary_tuple_source_reads_one_tuple_per_row() {
+        let source = UnaryTupleSource(&[10, 20, 30]);
+        assert_eq!(source.len(), 3);
+
+        // SAFETY: index one is within the three-element source.
+        assert_eq!(unsafe { source.get_unchecked(1) }, (20,));
     }
 }

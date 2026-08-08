@@ -51,10 +51,6 @@ name = "binary_predicates"
 harness = false
 
 [[bench]]
-name = "null_strategies"
-harness = false
-
-[[bench]]
 name = "predicate_bbox"
 harness = false
 

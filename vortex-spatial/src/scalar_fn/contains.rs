@@ -14,12 +14,13 @@ use geo_types::Rect;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::InitializedElement;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
+use vortex_array::scalar_fn::UninitElementSink;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -74,8 +75,8 @@ impl RowFn for SpatialContains {
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<bool>, _, _>(
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), UninitElementSink<bool>, _, _>(
             |(a, b)| {
                 #[cfg(test)]
                 probe::record(a.is_some(), b.is_some());
@@ -84,7 +85,9 @@ impl RowFn for SpatialContains {
                     b: b.map(PreparedOperand::new),
                 }
             },
-            |operands, (a, b), output| *output = contains_row_prepared(operands, a, b),
+            |operands, (a, b), output| {
+                InitializedElement::write(output, contains_row_prepared(operands, a, b))
+            },
         )
     }
 }
@@ -351,9 +354,7 @@ mod tests {
     use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar_fn::EmptyOptions;
-    use vortex_array::scalar_fn::NullStrategy;
     use vortex_array::scalar_fn::ScalarFnVTable;
-    use vortex_array::scalar_fn::execute_row_fn_with_strategy;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
     use vortex_error::VortexResult;
@@ -639,30 +640,9 @@ mod tests {
         )
     }
 
-    /// Executes `SpatialContains(a, b)` with a forced null strategy, canonicalized.
-    fn contains_forced(
-        a: &ArrayRef,
-        b: &ArrayRef,
-        strategy: NullStrategy,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        Ok(execute_row_fn_with_strategy(
-            &SpatialContains,
-            &EmptyOptions,
-            vec![a.clone(), b.clone()],
-            a.len(),
-            strategy,
-            ctx,
-        )?
-        .execute::<Canonical>(ctx)?
-        .into_array())
-    }
-
-    /// The branch-and-skip and filter strategies, plus the automatic per-batch selection, must
-    /// return identical arrays for nullable geometry operands: `Masked` polygons against nullable
-    /// points, with independent nulls conjoined.
+    /// Nullable geometry operands conjoin their validity before computing containment.
     #[test]
-    fn branch_matches_filter_for_nullable_geometries() -> VortexResult<()> {
+    fn test_contains_nullable_geometries_conjoins_validity() -> VortexResult<()> {
         let session = vortex_array::array_session();
         let mut ctx = session.create_execution_ctx();
 
@@ -677,53 +657,40 @@ mod tests {
             Some((0.0, 1.0)),
         ])?;
 
-        let filtered = contains_forced(&polygons, &points, NullStrategy::Filter, &mut ctx)?;
-        let branched = contains_forced(&polygons, &points, NullStrategy::BranchAndSkip, &mut ctx)?;
-        let auto = SpatialContains::try_new_array(polygons, points)?
+        let actual = SpatialContains::try_new_array(polygons, points)?
             .into_array()
             .execute::<Canonical>(&mut ctx)?
             .into_array();
+        let expected = BoolArray::from_iter([Some(true), None, None, Some(false), None]);
 
-        assert_arrays_eq!(branched, filtered, &mut ctx);
-        assert_arrays_eq!(auto, filtered, &mut ctx);
+        assert_arrays_eq!(actual, expected, &mut ctx);
         Ok(())
     }
 
-    /// Geometry types without a null-tolerant decode refuse the branch strategy: forcing it is an
-    /// error, and the automatic selection (which prefers branch at this density) silently falls
-    /// back to filtering with the correct result.
+    /// Geometry types without a null-tolerant decode fall back to filtering valid rows.
     #[test]
-    fn unsupported_geometry_falls_back_to_filter() -> VortexResult<()> {
+    fn test_contains_unsupported_geometry_falls_back_to_filter() -> VortexResult<()> {
         let session = vortex_array::array_session();
         let mut ctx = session.create_execution_ctx();
 
-        // Four rows with one null: 75% surviving, so the selection prefers branch.
-        let lines = MaskedArray::try_new(
-            linestring_column(vec![
-                vec![(0.0, 0.0), (4.0, 4.0)],
-                vec![(0.0, 0.0), (1.0, 1.0)],
-                vec![(2.0, 2.0), (3.0, 3.0)],
-                vec![(0.0, 4.0), (4.0, 0.0)],
-            ])?,
-            Validity::from_iter([true, false, true, true]),
-        )?
-        .into_array();
+        let validity = Validity::from_iter([true, false, true, true]);
+        let lines = linestring_column(vec![
+            vec![(0.0, 0.0), (4.0, 4.0)],
+            vec![(0.0, 0.0), (1.0, 1.0)],
+            vec![(2.0, 2.0), (3.0, 3.0)],
+            vec![(0.0, 4.0), (4.0, 0.0)],
+        ])?;
+        let nullable_lines = MaskedArray::try_new(lines.clone(), validity.clone())?.into_array();
         let point = geometry_constant(&Geometry::Point(Point::new(2.0, 2.0)), 4)?;
 
-        let error = contains_forced(&lines, &point, NullStrategy::BranchAndSkip, &mut ctx)
-            .expect_err("a linestring column with nulls has no branch decode");
-        assert!(
-            error.to_string().contains("branch-and-skip"),
-            "unexpected error: {error}"
-        );
-
-        let filtered = contains_forced(&lines, &point, NullStrategy::Filter, &mut ctx)?;
-        let auto = SpatialContains::try_new_array(lines, point)?
+        let expected = SpatialContains::try_new_array(lines, point.clone())?.into_array();
+        let expected = MaskedArray::try_new(expected, validity)?.into_array();
+        let actual = SpatialContains::try_new_array(nullable_lines, point)?
             .into_array()
             .execute::<Canonical>(&mut ctx)?
             .into_array();
 
-        assert_arrays_eq!(auto, filtered, &mut ctx);
+        assert_arrays_eq!(actual, expected, &mut ctx);
         Ok(())
     }
 

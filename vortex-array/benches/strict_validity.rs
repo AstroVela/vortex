@@ -11,7 +11,8 @@
 //! - `eager` is the strategy it replaced: materialize the conjunction into a `Mask`, copy it into a
 //!   `BitBuffer`, wrap that in a `BoolArray`, and mask with it.
 //!
-//! `chain` composes three of the same function, which is where a per-call materialization compounds.
+//! `chain` composes three of the same function, which is where a per-call materialization
+//! compounds.
 
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::cast_possible_truncation)]
@@ -35,7 +36,6 @@ use vortex_array::expr::Expression;
 use vortex_array::expr::union_child_validities;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ExecutionArgs;
 use vortex_array::scalar_fn::RowFn;
@@ -48,14 +48,14 @@ use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+const SIZES: &[usize] = &[65_536, 1 << 20];
+
 static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 
 fn main() {
     LazyLock::force(&SESSION);
     divan::main();
 }
-
-const SIZES: &[usize] = &[65536, 1 << 20];
 
 /// The shared kernel: double every lane, ignoring validity.
 fn doubled(input: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
@@ -91,11 +91,8 @@ impl RowFn for LazyDouble {
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(i32,), ElementSink<i32>, _, _>(
-            |_| (),
-            |&(), (value,), output| *output = value.wrapping_mul(2),
-        )
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit::<(i32,), i32>(|(value,)| value.wrapping_mul(2))
     }
 
     fn reduce_encoded(
@@ -171,14 +168,14 @@ impl ScalarFnVTable for EagerDouble {
 fn nullable_input(len: usize) -> ArrayRef {
     PrimitiveArray::new(
         (0..len as i32).collect::<Buffer<i32>>(),
-        Validity::from_iter((0..len).map(|i| !i.is_multiple_of(10))),
+        Validity::from_iter((0..len).map(|index| !index.is_multiple_of(10))),
     )
     .into_array()
 }
 
-fn bench_depth<V>(bencher: Bencher, scalar_fn: V, len: usize, depth: usize)
+fn bench_depth<F>(bencher: Bencher, function: F, len: usize, depth: usize)
 where
-    V: ScalarFnVTable<Options = EmptyOptions> + Clone,
+    F: ScalarFnVTable<Options = EmptyOptions> + Clone,
 {
     bencher
         .with_inputs(|| nullable_input(len))
@@ -186,7 +183,7 @@ where
             let mut ctx = SESSION.create_execution_ctx();
             let mut array = input;
             for _ in 0..depth {
-                array = scalar_fn
+                array = function
                     .clone()
                     .try_new_array(len, EmptyOptions, [array])
                     .unwrap()

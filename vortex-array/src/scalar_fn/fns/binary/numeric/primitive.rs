@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The checked arithmetic one row of a primitive column is computed with.
-//!
-//! Each operator is a type implementing [`CheckedPrimitiveOp`] at every native width, and each
-//! width implements [`CheckedArithmetic`] with the value and failure evidence written separately.
-//! Keeping them apart is what lets [`row`](super::row) write a value for every row and reduce the
-//! evidence without a branch, so the loop vectorizes.
+//! Checked arithmetic for one primitive row.
 
 use std::ops::BitOrAssign;
 
@@ -25,41 +20,29 @@ pub(super) struct CheckedMul;
 /// Checked division, failing on integer division by zero and on `MIN / -1`.
 pub(super) struct CheckedDiv;
 
-/// Evidence that some row failed, in a form that OR-reduces across the batch.
-///
-/// A plain `bool` is the obvious choice and the right one for most operations. Unsigned
-/// multiplication is the exception: deriving a `bool` from the widened product costs a comparison,
-/// and LLVM rewrites that comparison plus the product into `llvm.umul.with.overflow`, which has no
-/// vector form and scalarizes the whole loop. Carrying the discarded high half instead means the row
-/// never compares, so the multiply stays a widening vector multiply and the reduction stays a
-/// vector OR. **The width must not exceed the element's**, or the reduction becomes the loop's
-/// bottleneck instead of the arithmetic.
+/// OR-reducible evidence that a row failed, with [`Default`] meaning success.
 pub(super) trait Failure: Copy + Default + PartialEq + BitOrAssign {}
 
 impl<T: Copy + Default + PartialEq + BitOrAssign> Failure for T {}
 
-/// One arithmetic operator at one width, as a value and its failure evidence.
-///
-/// The pair rather than an `Option<T>` is what a row can write unconditionally: the value is stored
-/// whatever the evidence says, and a failing row is either masked away as null or turned into a
-/// batch error before anything reads it.
+/// One arithmetic operator at one width, split into its value and failure evidence.
 pub(super) trait CheckedPrimitiveOp<T: NativePType>: 'static + Sized {
     /// The error reported for a batch in which some valid row failed.
     const ERROR: &'static str;
 
     /// How this operation reports a failing row. See [`Failure`].
-    type Failure: Failure;
+    type Fail: Failure;
 
     /// The result of this operation, paired with evidence of whether the row failed.
-    fn apply(lhs: T, rhs: T) -> (T, Self::Failure);
+    fn apply(lhs: T, rhs: T) -> (T, Self::Fail);
 }
 
 impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedAdd {
     const ERROR: &'static str = "integer overflow in checked add";
 
-    type Failure = bool;
+    type Fail = bool;
 
-    #[inline(always)]
+    #[inline]
     fn apply(lhs: T, rhs: T) -> (T, bool) {
         (lhs.add_value(rhs), lhs.add_error(rhs))
     }
@@ -68,9 +51,9 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedAdd {
 impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedSub {
     const ERROR: &'static str = "integer overflow in checked sub";
 
-    type Failure = bool;
+    type Fail = bool;
 
-    #[inline(always)]
+    #[inline]
     fn apply(lhs: T, rhs: T) -> (T, bool) {
         (lhs.sub_value(rhs), lhs.sub_error(rhs))
     }
@@ -79,9 +62,9 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedSub {
 impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedMul {
     const ERROR: &'static str = "integer overflow in checked mul";
 
-    type Failure = T::MulFailure;
+    type Fail = T::MulFailure;
 
-    #[inline(always)]
+    #[inline]
     fn apply(lhs: T, rhs: T) -> (T, T::MulFailure) {
         (lhs.mul_value(rhs), lhs.mul_failure(rhs))
     }
@@ -90,9 +73,9 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedMul {
 impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedDiv {
     const ERROR: &'static str = "integer division by zero or overflow in checked div";
 
-    type Failure = bool;
+    type Fail = bool;
 
-    #[inline(always)]
+    #[inline]
     fn apply(lhs: T, rhs: T) -> (T, bool) {
         let failed = lhs.div_error(rhs);
         let value = if failed {
@@ -104,19 +87,11 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedDiv {
     }
 }
 
-/// The per-width arithmetic behind [`CheckedPrimitiveOp`], with each operation split into the value
-/// it produces and whether producing it failed.
-///
-/// Every `_value` method **must** be total: it is called for rows behind nulls, whose operands are
-/// arbitrary, so it may not panic or trap. Integer division is the one that needs care, and
-/// [`CheckedDiv`] supplies the default instead of dividing when the divisor is rejected.
+/// Per-width checked arithmetic. Every value method **must** be total over stored lane values.
 pub(super) trait CheckedArithmetic: NativePType {
     /// How multiplication reports a failing row.
     ///
-    /// `Self` for the unsigned widths that have a widening multiply, so the row can hand back the
-    /// discarded high half rather than comparing. `bool` everywhere else: the narrow signed widths
-    /// already vectorize through a two-sided range check, floats never overflow, and the 64-bit
-    /// widths use a full-width evidence word.
+    /// This may be a word rather than `bool` when narrowing evidence would block vectorization.
     type MulFailure: Failure;
 
     fn add_value(self, rhs: Self) -> Self;
@@ -129,8 +104,7 @@ pub(super) trait CheckedArithmetic: NativePType {
     fn div_error(self, rhs: Self) -> bool;
 }
 
-/// The integer arithmetic every width shares, given the two things that actually differ between
-/// them: how multiplication reports a failing row, and how add/sub/div detect one.
+/// Generate the shared integer operations from their failure predicates.
 macro_rules! impl_checked_integer {
     (
         $ty:ty,
@@ -143,46 +117,46 @@ macro_rules! impl_checked_integer {
         impl CheckedArithmetic for $ty {
             type MulFailure = $mul_failure_ty;
 
-            #[inline(always)]
+            #[inline]
             fn add_value(self, rhs: Self) -> Self {
                 self.wrapping_add(rhs)
             }
 
-            #[inline(always)]
+            #[inline]
             fn add_error(self, rhs: Self) -> bool {
                 let ($add_lhs, $add_rhs) = (self, rhs);
                 $add_error
             }
 
-            #[inline(always)]
+            #[inline]
             fn sub_value(self, rhs: Self) -> Self {
                 self.wrapping_sub(rhs)
             }
 
-            #[inline(always)]
+            #[inline]
             fn sub_error(self, rhs: Self) -> bool {
                 let ($sub_lhs, $sub_rhs) = (self, rhs);
                 $sub_error
             }
 
-            #[inline(always)]
+            #[inline]
             fn mul_value(self, rhs: Self) -> Self {
                 self.wrapping_mul(rhs)
             }
 
-            #[inline(always)]
+            #[inline]
             $(#[$mul_failure_attr])*
             fn mul_failure(self, rhs: Self) -> $mul_failure_ty {
                 let ($mf_lhs, $mf_rhs) = (self, rhs);
                 $mul_failure
             }
 
-            #[inline(always)]
+            #[inline]
             fn div_value(self, rhs: Self) -> Self {
                 self / rhs
             }
 
-            #[inline(always)]
+            #[inline]
             fn div_error(self, rhs: Self) -> bool {
                 let ($div_lhs, $div_rhs) = (self, rhs);
                 $div_error
@@ -191,8 +165,7 @@ macro_rules! impl_checked_integer {
     };
 }
 
-/// The unsigned widths. The discarded high half of the widened product is the failure evidence,
-/// and costs none of the comparison LLVM folds into `umul.with.overflow`.
+/// Unsigned multiplication reports its discarded high half as failure evidence.
 macro_rules! impl_checked_unsigned {
     ($ty:ty, widening_mul: $wide:ty) => {
         impl_checked_integer!(
@@ -205,8 +178,7 @@ macro_rules! impl_checked_unsigned {
     };
 }
 
-/// The signed widths. The narrow widths report a two-sided range check as `bool`; the 64-bit width
-/// reports the discarded high half as a word so deriving the evidence does not scalarize the loop.
+/// Signed widths use a range check or discarded high-half evidence.
 macro_rules! impl_checked_signed {
     ($ty:ty, widening_mul: $wide:ty) => {
         impl_checked_signed!($ty, mul_failure: bool = |lhs, rhs| {
@@ -253,42 +225,42 @@ macro_rules! impl_checked_float {
             impl CheckedArithmetic for $ty {
                 type MulFailure = bool;
 
-                #[inline(always)]
+                #[inline]
                 fn add_value(self, rhs: Self) -> Self {
                     self + rhs
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn add_error(self, _rhs: Self) -> bool {
                     false
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn sub_value(self, rhs: Self) -> Self {
                     self - rhs
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn sub_error(self, _rhs: Self) -> bool {
                     false
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn mul_value(self, rhs: Self) -> Self {
                     self * rhs
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn mul_failure(self, _rhs: Self) -> bool {
                     false
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn div_value(self, rhs: Self) -> Self {
                     self / rhs
                 }
 
-                #[inline(always)]
+                #[inline]
                 fn div_error(self, _rhs: Self) -> bool {
                     false
                 }
@@ -311,8 +283,6 @@ impl_checked_float!(f16, f32, f64);
 mod tests {
     use super::CheckedArithmetic;
 
-    /// Values whose pairwise products are worth probing: the saturating boundaries, the sign-change
-    /// pivots, and a spread of magnitudes that straddles the 64-bit split.
     const PROBES: &[i64] = &[
         0,
         1,
@@ -332,8 +302,6 @@ mod tests {
         -0x8000_0000,
     ];
 
-    /// Every `mul_failure` implementation is either a bit trick or a two-sided range check, so
-    /// hold each against `checked_mul`, whose `None` is the definition of overflow.
     #[track_caller]
     fn assert_agrees_with_checked_mul<T: CheckedArithmetic>(lhs: T, rhs: T, reference: Option<T>) {
         let failed = lhs.mul_failure(rhs) != <T::MulFailure as Default>::default();
@@ -353,8 +321,6 @@ mod tests {
         }
     }
 
-    /// The 8-bit widths are cheap enough to check exhaustively, pinning the unsigned shift and the
-    /// signed range check against every product that exists.
     #[test]
     fn mul_failure_agrees_with_checked_mul_exhaustively_at_8_bits() {
         for lhs in u8::MIN..=u8::MAX {

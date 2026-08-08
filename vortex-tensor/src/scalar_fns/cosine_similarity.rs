@@ -16,11 +16,12 @@ use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_float_ptype;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::InitializedElement;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::scalar_fn::UninitElementSink;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
@@ -86,9 +87,9 @@ impl RowFn for CosineSimilarity {
         _options: &Self::Options,
         args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
+    ) -> VortexResult<V::VisitResult> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
-            visitor.visit_prepared_into::<(TensorRow<T>, TensorRow<T>), ElementSink<T>, _, _>(
+            visitor.visit_prepared_into::<(TensorRow<T>, TensorRow<T>), UninitElementSink<T>, _, _>(
                 |(lhs, rhs)| {
                     #[cfg(test)]
                     probe::record(lhs.is_some(), rhs.is_some());
@@ -98,7 +99,10 @@ impl RowFn for CosineSimilarity {
                     }
                 },
                 |norms, (lhs, rhs), output| {
-                    *output = cosine_similarity_row_prepared(norms, lhs, rhs);
+                    InitializedElement::write(
+                        output,
+                        cosine_similarity_row_prepared(norms, lhs, rhs),
+                    )
                 },
             )
         })

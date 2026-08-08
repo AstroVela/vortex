@@ -10,12 +10,13 @@ use geo_types::Rect;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::InitializedElement;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
+use vortex_array::scalar_fn::UninitElementSink;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -68,14 +69,16 @@ impl RowFn for SpatialIntersects {
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<bool>, _, _>(
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), UninitElementSink<bool>, _, _>(
             |(a, b)| {
                 #[cfg(test)]
                 probe::record(a.is_some(), b.is_some());
                 ConstBboxes::new(a, b)
             },
-            |bboxes, (a, b), output| *output = intersects_row_prepared(bboxes, a, b),
+            |bboxes, (a, b), output| {
+                InitializedElement::write(output, intersects_row_prepared(bboxes, a, b))
+            },
         )
     }
 }

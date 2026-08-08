@@ -196,8 +196,7 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     /// Returns whether this scalar function is strict.
     ///
     /// A strict function returns null for a row when any argument is null for that row. This
-    /// matches [PostgreSQL's `STRICT` convention](https://www.postgresql.org/docs/current/sql-createfunction.html)
-    /// for null propagation.
+    /// matches [PostgreSQL's `STRICT` convention][postgres-strict] for null propagation.
     ///
     /// Return `true` only when this holds for every argument. `add` is strict, but Kleene `AND`
     /// is not because `false AND null` returns `false`. `is_null` is also not strict.
@@ -212,6 +211,8 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     ///
     /// This property applies only to the scalar function, not its child expressions. Nullary
     /// functions are vacuously strict. The default is conservatively `false`.
+    ///
+    /// [postgres-strict]: https://www.postgresql.org/docs/current/sql-createfunction.html
     fn is_strict(&self, options: &Self::Options) -> bool {
         _ = options;
         false
@@ -328,20 +329,22 @@ pub trait ExecutionArgs {
     fn row_count(&self) -> usize;
 }
 
-/// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
-pub struct VecExecutionArgs {
-    inputs: Vec<ArrayRef>,
+/// An [`ExecutionArgs`] view over borrowed arrays with an explicit row count.
+pub(crate) struct BorrowedExecutionArgs<'a> {
+    /// The arrays exposed through this execution view.
+    inputs: &'a [ArrayRef],
+
+    /// The row count reported for this execution view.
     row_count: usize,
 }
 
-impl VecExecutionArgs {
-    /// Create a new `VecExecutionArgs`.
-    pub fn new(inputs: Vec<ArrayRef>, row_count: usize) -> Self {
+impl<'a> BorrowedExecutionArgs<'a> {
+    pub(crate) fn new(inputs: &'a [ArrayRef], row_count: usize) -> Self {
         Self { inputs, row_count }
     }
 }
 
-impl ExecutionArgs for VecExecutionArgs {
+impl ExecutionArgs for BorrowedExecutionArgs<'_> {
     fn get(&self, index: usize) -> VortexResult<ArrayRef> {
         self.inputs.get(index).cloned().ok_or_else(|| {
             vortex_err!(
@@ -361,7 +364,37 @@ impl ExecutionArgs for VecExecutionArgs {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
+pub struct VecExecutionArgs {
+    /// The owned arrays exposed through this execution view.
+    inputs: Vec<ArrayRef>,
+
+    /// The row count reported for this execution view.
+    row_count: usize,
+}
+
+impl VecExecutionArgs {
+    /// Create a new `VecExecutionArgs`.
+    pub fn new(inputs: Vec<ArrayRef>, row_count: usize) -> Self {
+        Self { inputs, row_count }
+    }
+}
+
+impl ExecutionArgs for VecExecutionArgs {
+    fn get(&self, index: usize) -> VortexResult<ArrayRef> {
+        BorrowedExecutionArgs::new(&self.inputs, self.row_count).get(index)
+    }
+
+    fn num_inputs(&self) -> usize {
+        BorrowedExecutionArgs::new(&self.inputs, self.row_count).num_inputs()
+    }
+
+    fn row_count(&self) -> usize {
+        BorrowedExecutionArgs::new(&self.inputs, self.row_count).row_count()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EmptyOptions;
 impl Display for EmptyOptions {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

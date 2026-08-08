@@ -14,11 +14,12 @@ use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::proto::dtype as pb;
 use vortex_array::match_each_float_ptype;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::InitializedElement;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::scalar_fn::UninitElementSink;
 use vortex_array::serde::ArrayChildren;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
@@ -76,12 +77,11 @@ impl RowFn for L2Norm {
         _options: &Self::Options,
         args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
+    ) -> VortexResult<V::VisitResult> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
-            visitor.visit_prepared_into::<(TensorRow<T>,), ElementSink<T>, _, _>(
-                |_| (),
-                |&(), (row,), output| *output = l2_norm_row(row),
-            )
+            visitor.visit_into::<(TensorRow<T>,), UninitElementSink<T>, _>(|(row,), output| {
+                InitializedElement::write(output, l2_norm_row(row))
+            })
         })
     }
 

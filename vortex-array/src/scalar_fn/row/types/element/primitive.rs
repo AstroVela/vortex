@@ -71,8 +71,4 @@ impl<T: NativePType> OutputElement for T {
     fn build(values: Vec<Self>) -> ArrayRef {
         PrimitiveArray::new(values, Validity::NonNullable).into_array()
     }
-
-    fn placeholder() -> Self {
-        T::default()
-    }
 }

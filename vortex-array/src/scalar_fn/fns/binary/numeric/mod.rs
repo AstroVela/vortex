@@ -5,7 +5,7 @@
 //! function. There is no Arrow fallback.
 //!
 //! The primitive widths are computed by a [`RowFn`](crate::scalar_fn::RowFn), which owns null
-//! handling, constants and validity for them; see [`row`]. Decimal keeps its own columnar
+//! handling, constants, and validity for them; see [`row`]. Decimal keeps its own columnar
 //! implementation in [`decimal`].
 //!
 //! [`Binary`]: super::Binary
@@ -14,8 +14,6 @@ mod checked;
 mod decimal;
 mod primitive;
 mod row;
-#[cfg(test)]
-mod tests;
 
 use decimal::execute_numeric_decimal;
 use row::execute_numeric_primitive;
@@ -86,3 +84,6 @@ fn build_empty_result(
 
     Ok(Canonical::empty(&result_dtype).into_array())
 }
+
+#[cfg(test)]
+mod tests;

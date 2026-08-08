@@ -8,12 +8,13 @@ use geo::Euclidean;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::InitializedElement;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
+use vortex_array::scalar_fn::UninitElementSink;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -59,21 +60,14 @@ impl RowFn for SpatialDistance {
         Ok(EmptyOptions)
     }
 
-    /// Deliberately uses unit preparation: a batch-constant operand offers nothing
-    /// sound to hoist. geo computes linestring and polygon distances through its private
-    /// `nearest_neighbour_distance`, which builds the R*-trees for *both* sides inside each call,
-    /// and the point pairings are single expressions; reusing a tree across rows would mean
-    /// reimplementing geo's internals. A batch where both operands are constant already folds to
-    /// a single-row execution before the row loop.
     fn dispatch<V: RowVisitor>(
         &self,
         _options: &Self::Options,
         _args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
-        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<f64>, _, _>(
-            |_| (),
-            |&(), (a, b), output| *output = Euclidean.distance(a, b),
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit_into::<(GeometryRow, GeometryRow), UninitElementSink<f64>, _>(
+            |(a, b), output| InitializedElement::write(output, Euclidean.distance(a, b)),
         )
     }
 }

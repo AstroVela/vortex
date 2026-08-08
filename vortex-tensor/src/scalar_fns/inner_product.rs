@@ -14,11 +14,12 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_float_ptype;
-use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::InitializedElement;
 use vortex_array::scalar_fn::RowFn;
 use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::scalar_fn::UninitElementSink;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::serde::ArrayChildren;
 use vortex_error::VortexResult;
@@ -72,11 +73,10 @@ impl RowFn for InnerProduct {
         _options: &Self::Options,
         args: &[DType],
         visitor: V,
-    ) -> VortexResult<V::Out> {
+    ) -> VortexResult<V::VisitResult> {
         match_each_float_ptype!(tensor_element_ptype(args)?, |T| {
-            visitor.visit_prepared_into::<(TensorRow<T>, TensorRow<T>), ElementSink<T>, _, _>(
-                |_| (),
-                |&(), (lhs, rhs), output| *output = inner_product_row(lhs, rhs),
+            visitor.visit_into::<(TensorRow<T>, TensorRow<T>), UninitElementSink<T>, _>(
+                |(lhs, rhs), output| InitializedElement::write(output, inner_product_row(lhs, rhs)),
             )
         })
     }

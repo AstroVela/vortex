@@ -5,8 +5,8 @@
 //! `vortex-compute` lane kernels.
 //!
 //! The primitive widths do not come through here: they are computed one row at a time by
-//! [`row`](super::row), which writes a value for every row and reduces failure as one bit rather
-//! than scanning lanes.
+//! [`row`](super::row), which writes a value for every row and reduces failure evidence without
+//! scanning the finished output.
 
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
@@ -25,12 +25,9 @@ use vortex_mask::Mask;
 /// 64-lane chunk. It suits an operation whose per-lane failure handling is cheap relative to the
 /// operation itself, which is what the decimal kernels and their per-lane casts are.
 ///
-/// `#[inline(always)]`: this wrapper and its kernel calls must inline into the caller that
-/// constructs the closure, so the closure environment (e.g. a captured constant operand)
-/// flattens into registers. Left to its own devices under `codegen-units > 1`, the compiler
-/// keeps the environment behind a pointer, and reloading a captured constant on every lane
-/// blocks vectorization of the whole loop.
-#[inline(always)]
+/// Keep this wrapper inlineable so captured constants can become loop invariants in the caller.
+/// The lane kernels retain their own inlining decisions.
+#[inline]
 pub(super) fn checked_lanes<S, T, Apply>(
     source: S,
     valid_rows: &Mask,

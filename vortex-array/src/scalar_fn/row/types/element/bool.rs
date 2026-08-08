@@ -62,12 +62,7 @@ impl OutputElement for bool {
     }
 
     fn build(values: Vec<Self>) -> ArrayRef {
-        // `From<Vec<bool>>` packs through the multiversioned SIMD path; `from_iter` would set one
-        // bit at a time, which measures 6.6-7.9x slower on the packing step alone.
+        // `From<Vec<bool>>` uses the bulk bit-packing path.
         BoolArray::new(BitBuffer::from(values), Validity::NonNullable).into_array()
-    }
-
-    fn placeholder() -> Self {
-        false
     }
 }
