@@ -7,9 +7,9 @@ use std::ops::BitOrAssign;
 
 use vortex_compute::lane_kernels::IndexedSourceExt;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
 
 use super::RowExecution;
+use super::ensure_decoded_lengths;
 use crate::ExecutionCtx;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::IndexedElementTuple;
@@ -66,6 +66,8 @@ where
     let mut values = Vec::<Out>::with_capacity(row_count);
     let columns = Args::decode(args, ctx)?;
     let prepared = prepare(Args::constants(&columns));
+    let varying = Args::varying(&columns);
+    ensure_decoded_lengths::<Args>(&columns, varying.as_ref(), row_count)?;
     let failure;
 
     {
@@ -73,22 +75,12 @@ where
 
         // When every input varies, the indexed source removes argument-shape dispatch from the hot
         // loop and lets the lane kernel optimize the traversal as one operation.
-        if let Some(varying) = Args::varying(&columns) {
-            vortex_ensure!(
-                Args::varying_len_matches(&varying, row_count),
-                "a decoded row input does not address exactly {row_count} rows",
-            );
-
+        if let Some(varying) = varying {
             failure = Args::indexed_source(&varying)
                 .map_checked_into(output, |elements| apply(&prepared, elements));
         } else {
             // A batch-constant input was collapsed to one row during decoding. This path reads that
             // row repeatedly while indexing only the inputs that vary.
-            vortex_ensure!(
-                Args::decoded_lens_match(&columns, row_count),
-                "a decoded row input does not address exactly {row_count} rows",
-            );
-
             let mut accumulated = Fail::default();
             for index in 0..row_count {
                 let (value, row_failure) = apply(&prepared, Args::get(&columns, index));

@@ -46,6 +46,9 @@ pub trait InputElement: 'static {
     ///
     /// Dense execution requires this of every argument; otherwise the row layer executes only
     /// valid rows.
+    ///
+    /// A dense row closure can receive unspecified values from null rows. The closure must be
+    /// total over every stored value: it must not panic or have side effects.
     const DENSE_SAFE: bool = false;
 
     /// Whether [`decode`](Self::decode) can fail on _legal_ input data.
@@ -53,13 +56,6 @@ pub trait InputElement: 'static {
     /// This excludes infrastructural failures such as IO or allocation. Set it when legal input may
     /// contain a value that the decoder rejects.
     const DECODE_FALLIBLE: bool = true;
-
-    /// A relative unit count for per-row decode work avoided by filtering this argument first.
-    ///
-    /// Leave this at zero for bulk canonicalization. Use a positive value when filtering first
-    /// avoids meaningful per-row decode work. The executor adds this cost across arguments when it
-    /// chooses between skipping invalid rows and filtering.
-    const FILTERED_DECODE_COST: usize = 0;
 
     /// Validate that `dtype` is an acceptable input column dtype for this element type.
     fn validate(dtype: &DType) -> VortexResult<()>;

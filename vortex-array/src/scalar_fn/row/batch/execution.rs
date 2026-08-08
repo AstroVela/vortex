@@ -11,11 +11,9 @@ use vortex_error::vortex_ensure_eq;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
-use super::args::BorrowedExecutionArgs;
 use super::args::KernelArgs;
 use super::policy::BatchPlan;
 use super::policy::RowPolicy;
-use super::policy::skipping_beats_filtering;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
@@ -27,6 +25,7 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::scalar::Scalar;
+use crate::scalar_fn::BorrowedExecutionArgs;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::row::execute::RowExecution;
@@ -90,9 +89,7 @@ impl<'a> Batch<'a> {
         let arg_dtypes: SmallVec<[DType; 4]> =
             inputs.iter().map(|input| input.dtype().clone()).collect();
         let plan = plan(&arg_dtypes)?;
-        let nullability = plan.output_dtype.nullability()
-            | Nullability::from(arg_dtypes.iter().any(DType::is_nullable));
-        let result_dtype = plan.output_dtype.with_nullability(nullability);
+        let result_dtype = plan.result_dtype(&arg_dtypes);
 
         let mut validity = Validity::NonNullable;
         for input in &inputs {
@@ -151,9 +148,7 @@ impl<'a> Batch<'a> {
         match self.policy {
             RowPolicy::Dense => self.execute_dense(kernel, false, ctx),
             RowPolicy::DenseWithRetry => self.execute_dense(kernel, true, ctx),
-            RowPolicy::ValidOnly {
-                filtered_decode_cost,
-            } => self.execute_valid_only(kernel, try_unfiltered, filtered_decode_cost, ctx),
+            RowPolicy::ValidOnly => self.execute_valid_only(kernel, try_unfiltered, ctx),
         }
     }
 
@@ -272,7 +267,6 @@ impl<'a> Batch<'a> {
             &Mask,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<RowExecution>>,
-        filtered_decode_cost: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let valid = match self.resolve_validity(&kernel, ctx)? {
@@ -280,9 +274,7 @@ impl<'a> Batch<'a> {
             ResolvedMask::Mixed(valid) => valid,
         };
 
-        if skipping_beats_filtering(filtered_decode_cost, &valid)
-            && let Some(result) = self.try_execute_unfiltered(try_unfiltered, &valid, ctx)?
-        {
+        if let Some(result) = self.try_execute_unfiltered(try_unfiltered, &valid, ctx)? {
             return Ok(result);
         }
 

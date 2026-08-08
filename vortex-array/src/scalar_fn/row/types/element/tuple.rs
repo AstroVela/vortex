@@ -147,9 +147,6 @@ pub trait ElementTuple: 'static + private::Sealed {
     /// Whether _any_ argument is [`InputElement::DECODE_FALLIBLE`].
     const DECODE_FALLIBLE: bool;
 
-    /// The additive cost of per-row decode work avoided by filtering the arguments first.
-    const FILTERED_DECODE_COST: usize;
-
     /// Validate the input dtypes, including that `dtypes` has exactly `ARITY` entries.
     ///
     /// The expression layer checks the count against [`Arity`](crate::scalar_fn::Arity) before it
@@ -246,7 +243,6 @@ impl ElementTuple for () {
     const ARITY: usize = 0;
     const DENSE_SAFE: bool = true;
     const DECODE_FALLIBLE: bool = false;
-    const FILTERED_DECODE_COST: usize = 0;
 
     fn validate(dtypes: &[DType]) -> VortexResult<()> {
         vortex_ensure_eq!(
@@ -301,7 +297,6 @@ macro_rules! element_tuple {
             const ARITY: usize = $arity;
             const DENSE_SAFE: bool = $($t::DENSE_SAFE &&)+ true;
             const DECODE_FALLIBLE: bool = $($t::DECODE_FALLIBLE ||)+ false;
-            const FILTERED_DECODE_COST: usize = $($t::FILTERED_DECODE_COST +)+ 0;
 
             fn validate(dtypes: &[DType]) -> VortexResult<()> {
                 vortex_ensure_eq!(
@@ -404,7 +399,7 @@ mod tests {
     use super::UnaryTupleSource;
 
     #[test]
-    fn unary_tuple_source_reads_one_tuple_per_row() {
+    fn test_unary_tuple_source_reads_one_tuple_per_row() {
         let source = UnaryTupleSource(&[10, 20, 30]);
         assert_eq!(source.len(), 3);
 

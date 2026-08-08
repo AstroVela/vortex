@@ -38,6 +38,9 @@ pub trait RowVisitor: private::Sealed + Sized {
 
     /// Visit an infallible row computation that returns one independent output value.
     ///
+    /// `apply` must be total over every stored element value: it must not panic or have side
+    /// effects. Dense execution can pass unspecified values from null rows.
+    ///
     /// # Prerequisites
     ///
     /// The framework checks these at compile time:
@@ -69,6 +72,9 @@ pub trait RowVisitor: private::Sealed + Sized {
         Out: OutputElement;
 
     /// Visit a row computation that writes through a sink-provided row handle.
+    ///
+    /// `apply` must be total over every stored element value: it must not panic or have side
+    /// effects. Dense execution can pass unspecified values from null rows.
     ///
     /// # Prerequisites
     ///
@@ -107,6 +113,9 @@ pub trait RowVisitor: private::Sealed + Sized {
         ApplyResult: SinkResult;
 
     /// Visit a row computation that returns an owned output and deferred failure evidence.
+    ///
+    /// `apply` must be total over every stored element value: it must not panic or have side
+    /// effects. Dense execution can pass unspecified values from null rows.
     ///
     /// `Fail` is OR-reduced across rows and handed to `finish_failure`. The value from
     /// [`Default::default`] **must** mean success, including for an empty batch. The compiler

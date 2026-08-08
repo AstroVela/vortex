@@ -15,7 +15,6 @@ use super::row_fn::RowFn;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::dtype::Nullability;
 use crate::expr::Expression;
 use crate::expr::union_child_validities;
 use crate::scalar_fn::Arity;
@@ -58,12 +57,7 @@ impl<F: RowFn> ScalarFnVTable for F {
     fn return_dtype(&self, options: &Self::Options, args: &[DType]) -> VortexResult<DType> {
         let plan = self.dispatch(options, args, PlanRows::<F>::new(args))?;
 
-        // Union the output nullability with the nullability of the inputs. This is required for
-        // strict scalar function semantics.
-        let nullability = plan.output_dtype.nullability()
-            | Nullability::from(args.iter().any(DType::is_nullable));
-
-        Ok(plan.output_dtype.with_nullability(nullability))
+        Ok(plan.result_dtype(args))
     }
 
     fn execute(

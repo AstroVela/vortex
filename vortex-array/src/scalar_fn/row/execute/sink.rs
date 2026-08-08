@@ -10,6 +10,7 @@ use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use super::RowExecution;
+use super::ensure_decoded_lengths;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::scalar_fn::DeferredError;
@@ -38,6 +39,8 @@ where
     let mut sink = Sink::with_capacity(row_count, sink_dtype)?;
     let columns = Args::decode(args, ctx)?;
     let prepared = prepare(Args::constants(&columns));
+    let varying = Args::varying(&columns);
+    ensure_decoded_lengths::<Args>(&columns, varying.as_ref(), row_count)?;
     let mut accumulated = ApplyResult::Accumulated::default();
 
     {
@@ -51,12 +54,7 @@ where
 
         // The all-varying representation removes argument-shape dispatch from the hot loop. The
         // mixed path instead reads collapsed batch constants at row zero.
-        if let Some(varying) = Args::varying(&columns) {
-            vortex_ensure!(
-                Args::varying_len_matches(&varying, row_count),
-                "a decoded row input does not address exactly {row_count} rows",
-            );
-
+        if let Some(varying) = varying {
             for index in 0..row_count {
                 apply(
                     &prepared,
@@ -66,11 +64,6 @@ where
                 .accumulate(&mut accumulated)?;
             }
         } else {
-            vortex_ensure!(
-                Args::decoded_lens_match(&columns, row_count),
-                "a decoded row input does not address exactly {row_count} rows",
-            );
-
             for index in 0..row_count {
                 apply(
                     &prepared,
@@ -129,14 +122,7 @@ where
         );
 
         let varying = Args::varying(&columns);
-        let lens_match = match &varying {
-            Some(varying) => Args::varying_len_matches(varying, row_count),
-            None => Args::decoded_lens_match(&columns, row_count),
-        };
-        vortex_ensure!(
-            lens_match,
-            "a decoded row input does not address exactly {row_count} rows",
-        );
+        ensure_decoded_lengths::<Args>(&columns, varying.as_ref(), row_count)?;
 
         // The loop writes only valid indices, but the sink still finishes a full-length output.
         // Initialize placeholders now; batch execution masks them before the result escapes.

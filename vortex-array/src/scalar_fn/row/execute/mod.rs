@@ -8,8 +8,10 @@
 
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 
 use crate::ArrayRef;
+use crate::scalar_fn::ElementTuple;
 
 mod owned;
 pub(super) use owned::execute_owned;
@@ -49,4 +51,22 @@ impl From<RowExecution> for VortexResult<ArrayRef> {
             RowExecution::DeferredError(error) => Err(error),
         }
     }
+}
+
+/// Ensure that every decoded varying column addresses the complete row loop.
+pub(super) fn ensure_decoded_lengths<Args: ElementTuple>(
+    columns: &Args::Columns,
+    varying: Option<&Args::VaryingColumns<'_>>,
+    row_count: usize,
+) -> VortexResult<()> {
+    let lengths_match = match varying {
+        Some(varying) => Args::varying_len_matches(varying, row_count),
+        None => Args::decoded_lens_match(columns, row_count),
+    };
+    vortex_ensure!(
+        lengths_match,
+        "a decoded row input does not address exactly {row_count} rows",
+    );
+
+    Ok(())
 }

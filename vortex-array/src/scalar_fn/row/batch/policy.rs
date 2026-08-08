@@ -3,8 +3,6 @@
 
 //! Nullable execution strategies derived from a concrete row dispatch.
 
-use vortex_mask::Mask;
-
 use crate::dtype::DType;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::SinkResult;
@@ -18,6 +16,16 @@ pub struct BatchPlan {
     pub policy: RowPolicy,
 }
 
+impl BatchPlan {
+    /// Return the output dtype widened with strict input nullability.
+    pub fn result_dtype(&self, args: &[DType]) -> DType {
+        let nullability = self.output_dtype.nullability()
+            | crate::dtype::Nullability::from(args.iter().any(DType::is_nullable));
+
+        self.output_dtype.with_nullability(nullability)
+    }
+}
+
 /// The nullable execution policy derived from one concrete dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowPolicy {
@@ -27,12 +35,8 @@ pub enum RowPolicy {
     /// Evaluate all rows, retrying only valid rows if a deferred error is raised.
     DenseWithRetry,
 
-    /// Execute only valid rows, choosing between skip-invalid execution and filtering based on the
-    /// mask and decode cost.
-    ValidOnly {
-        /// Relative per-row decode work that filtering would avoid.
-        filtered_decode_cost: usize,
-    },
+    /// Execute only valid rows, trying skip-invalid execution before filtering.
+    ValidOnly,
 }
 
 impl RowPolicy {
@@ -41,9 +45,7 @@ impl RowPolicy {
         if Args::DENSE_SAFE && !Args::DECODE_FALLIBLE {
             Self::Dense
         } else {
-            Self::ValidOnly {
-                filtered_decode_cost: Args::FILTERED_DECODE_COST,
-            }
+            Self::ValidOnly
         }
     }
 
@@ -52,16 +54,14 @@ impl RowPolicy {
         if Args::DENSE_SAFE && !Args::DECODE_FALLIBLE {
             Self::DenseWithRetry
         } else {
-            Self::ValidOnly {
-                filtered_decode_cost: Args::FILTERED_DECODE_COST,
-            }
+            Self::ValidOnly
         }
     }
 
     /// The policy one concrete dispatch executes nullable rows under.
     ///
-    /// This deliberately ignores [`OutputSink::SUPPORTS_SKIPPED_ROWS`]. Batch execution tries
-    /// [`reduce_encoded`](crate::scalar_fn::RowFn::reduce_encoded) against the original arrays
+    /// This deliberately ignores [`OutputSink::SUPPORTS_SKIPPED_ROWS`]. Batch execution always
+    /// tries [`reduce_encoded`](crate::scalar_fn::RowFn::reduce_encoded) against the original arrays
     /// before it tries the sink or filters the inputs. Skipping that probe can change the result of
     /// an encoding-aware function.
     ///
@@ -74,29 +74,7 @@ impl RowPolicy {
                 Self::Dense
             }
         } else {
-            Self::ValidOnly {
-                filtered_decode_cost: Args::FILTERED_DECODE_COST,
-            }
+            Self::ValidOnly
         }
     }
-}
-
-/// Minimum surviving-row fractions for skipping when filtering avoids per-row decode work.
-/// The thresholds distinguish one costly decode from multiple costly decodes.
-const ONE_DECODE_SKIP_MIN_SURVIVING_FRACTION: f64 = 0.50;
-const MULTI_DECODE_SKIP_MIN_SURVIVING_FRACTION: f64 = 0.85;
-
-/// Whether skipping invalid rows should be preferred over filtering for a mixed mask.
-pub(super) fn skipping_beats_filtering(filtered_decode_cost: usize, valid: &Mask) -> bool {
-    if filtered_decode_cost == 0 {
-        return true;
-    }
-
-    let minimum = if filtered_decode_cost == 1 {
-        ONE_DECODE_SKIP_MIN_SURVIVING_FRACTION
-    } else {
-        MULTI_DECODE_SKIP_MIN_SURVIVING_FRACTION
-    };
-
-    valid.true_count() as f64 >= valid.len() as f64 * minimum
 }
