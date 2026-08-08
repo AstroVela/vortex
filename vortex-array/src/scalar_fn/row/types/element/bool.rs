@@ -54,6 +54,14 @@ impl InputElement for bool {
     {
         column.value(index)
     }
+
+    unsafe fn get_varying_unchecked<'a>(column: &Self::Varying<'a>, index: usize) -> bool
+    where
+        Self: 'a,
+    {
+        // SAFETY: forwarded from this method's contract.
+        unsafe { column.value_unchecked(index) }
+    }
 }
 
 impl OutputElement for bool {

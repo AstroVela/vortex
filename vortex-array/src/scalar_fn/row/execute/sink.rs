@@ -56,12 +56,11 @@ where
         // mixed path instead reads collapsed batch constants at row zero.
         if let Some(varying) = varying {
             for index in 0..row_count {
-                apply(
-                    &prepared,
-                    Args::get_varying(&varying, index),
-                    Sink::row(&mut rows, index),
-                )
-                .accumulate(&mut accumulated)?;
+                // SAFETY: `ensure_decoded_lengths` proved every varying column has `row_count`
+                // rows before the loop.
+                let elements = unsafe { Args::get_varying_unchecked(&varying, index) };
+                apply(&prepared, elements, Sink::row(&mut rows, index))
+                    .accumulate(&mut accumulated)?;
             }
         } else {
             for index in 0..row_count {
@@ -139,7 +138,9 @@ where
             let result = match &varying {
                 Some(varying) => apply(
                     &prepared,
-                    Args::get_varying(varying, index),
+                    // SAFETY: `ensure_decoded_lengths` proved every varying column has
+                    // `row_count` rows, and mask indices are below `row_count`.
+                    unsafe { Args::get_varying_unchecked(varying, index) },
                     Sink::row(&mut rows, index),
                 ),
                 None => apply(

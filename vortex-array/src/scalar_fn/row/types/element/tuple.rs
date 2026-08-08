@@ -189,6 +189,16 @@ pub trait ElementTuple: 'static + private::Sealed {
     /// Read one row from columns already known to vary within the batch.
     fn get_varying<'a>(columns: &Self::VaryingColumns<'a>, index: usize) -> Self::Elems<'a>;
 
+    /// Read one row from varying columns without checking bounds.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be in bounds for every column.
+    unsafe fn get_varying_unchecked<'a>(
+        columns: &Self::VaryingColumns<'a>,
+        index: usize,
+    ) -> Self::Elems<'a>;
+
     /// Read the batch-constant elements out of the decoded columns. Called once per batch.
     fn constants(columns: &Self::Columns) -> Self::ConstElems<'_>;
 }
@@ -281,6 +291,12 @@ impl ElementTuple for () {
 
     fn get_varying<'a>(_columns: &Self::VaryingColumns<'a>, _index: usize) -> Self::Elems<'a> {}
 
+    unsafe fn get_varying_unchecked<'a>(
+        _columns: &Self::VaryingColumns<'a>,
+        _index: usize,
+    ) -> Self::Elems<'a> {
+    }
+
     fn constants(_columns: &Self::Columns) -> Self::ConstElems<'_> {}
 }
 
@@ -354,6 +370,14 @@ macro_rules! element_tuple {
                 index: usize,
             ) -> Self::Elems<'a> {
                 ($($t::get_varying(&columns.$idx, index),)+)
+            }
+
+            unsafe fn get_varying_unchecked<'a>(
+                columns: &Self::VaryingColumns<'a>,
+                index: usize,
+            ) -> Self::Elems<'a> {
+                // SAFETY: forwarded from this method's contract.
+                ($(unsafe { $t::get_varying_unchecked(&columns.$idx, index) },)+)
             }
 
             fn constants(columns: &Self::Columns) -> Self::ConstElems<'_> {

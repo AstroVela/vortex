@@ -101,12 +101,27 @@ pub trait InputElement: 'static {
     fn varying(column: &Self::Column) -> Self::Varying<'_>;
 
     /// Number of rows addressable through a [`Varying`](Self::Varying) view.
+    ///
+    /// Every index below this length must be valid for
+    /// [`get_varying_unchecked`](Self::get_varying_unchecked).
     fn varying_len(column: &Self::Varying<'_>) -> usize;
 
     /// Read one row from a [`Varying`](Self::Varying) view.
     fn get_varying<'a>(column: &Self::Varying<'a>, index: usize) -> Self::Elem<'a>
     where
         Self: 'a;
+
+    /// Read one row without checking that `index` is in bounds.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be less than [`varying_len`](Self::varying_len) for `column`.
+    unsafe fn get_varying_unchecked<'a>(column: &Self::Varying<'a>, index: usize) -> Self::Elem<'a>
+    where
+        Self: 'a,
+    {
+        Self::get_varying(column, index)
+    }
 }
 
 /// An owned row value that can be built into an all-valid column.

@@ -61,6 +61,14 @@ impl<T: NativePType> InputElement for T {
     {
         column[index]
     }
+
+    unsafe fn get_varying_unchecked<'a>(column: &Self::Varying<'a>, index: usize) -> T
+    where
+        Self: 'a,
+    {
+        // SAFETY: forwarded from this method's contract.
+        unsafe { *column.get_unchecked(index) }
+    }
 }
 
 impl<T: NativePType> OutputElement for T {
