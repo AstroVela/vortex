@@ -7,6 +7,8 @@ use std::ops::BitOrAssign;
 
 use vortex_error::VortexResult;
 
+use super::InitializedElement;
+
 mod private {
     pub trait Sealed {}
 }
@@ -45,6 +47,9 @@ impl BitOrAssign for DeferredError {
 /// should be no wider than the computed element so error tracking does not constrain vector width.
 /// This trait is sealed; row functions choose one of its supplied implementations.
 pub trait SinkResult: 'static + private::Sealed {
+    /// The [`OutputSink::WriteToken`](super::OutputSink::WriteToken) carried by a success.
+    type WriteToken: 'static;
+
     /// The word this result reduces into, kept in a loop-local by the executor.
     type Accumulated: 'static + Copy + Default;
 
@@ -64,6 +69,7 @@ pub trait SinkResult: 'static + private::Sealed {
 impl private::Sealed for () {}
 
 impl SinkResult for () {
+    type WriteToken = ();
     type Accumulated = ();
 
     const FALLIBLE: bool = false;
@@ -81,6 +87,7 @@ impl SinkResult for () {
 impl private::Sealed for VortexResult<()> {}
 
 impl SinkResult for VortexResult<()> {
+    type WriteToken = ();
     type Accumulated = ();
 
     const FALLIBLE: bool = true;
@@ -88,6 +95,24 @@ impl SinkResult for VortexResult<()> {
 
     fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
         self
+    }
+
+    fn occurred(_accumulated: ()) -> bool {
+        false
+    }
+}
+
+impl private::Sealed for VortexResult<InitializedElement> {}
+
+impl SinkResult for VortexResult<InitializedElement> {
+    type WriteToken = InitializedElement;
+    type Accumulated = ();
+
+    const FALLIBLE: bool = true;
+    const DEFERRED: bool = false;
+
+    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+        self.map(|_| ())
     }
 
     fn occurred(_accumulated: ()) -> bool {
@@ -103,6 +128,7 @@ macro_rules! impl_sink_result_word {
             impl private::Sealed for $word {}
 
             impl SinkResult for $word {
+                type WriteToken = ();
                 type Accumulated = $word;
 
                 const FALLIBLE: bool = false;

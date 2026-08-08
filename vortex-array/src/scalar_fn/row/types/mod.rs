@@ -19,5 +19,6 @@ pub use result::DeferredError;
 pub use result::SinkResult;
 
 mod sink;
+pub use sink::InitializedElement;
 pub use sink::OutputSink;
 pub use sink::UninitElementSink;

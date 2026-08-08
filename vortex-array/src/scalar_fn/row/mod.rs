@@ -24,6 +24,7 @@ mod types;
 pub use types::DeferredError;
 pub use types::ElementTuple;
 pub use types::IndexedElementTuple;
+pub use types::InitializedElement;
 pub use types::InputElement;
 pub use types::OutputElement;
 pub use types::OutputSink;

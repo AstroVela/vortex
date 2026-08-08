@@ -90,7 +90,7 @@ impl<F: RowFn> RowVisitor for ExecuteRows<'_, '_, F> {
     where
         Args: ElementTuple,
         Sink: OutputSink,
-        ApplyResult: SinkResult,
+        ApplyResult: SinkResult<WriteToken = Sink::WriteToken>,
     {
         const { assert_sink_visit_contract::<F, Args, Sink, ApplyResult>() };
 
@@ -193,7 +193,7 @@ impl<F: RowFn> RowVisitor for ExecuteValidRows<'_, '_, F> {
     where
         Args: ElementTuple,
         Sink: OutputSink,
-        ApplyResult: SinkResult,
+        ApplyResult: SinkResult<WriteToken = Sink::WriteToken>,
     {
         const { assert_sink_visit_contract::<F, Args, Sink, ApplyResult>() };
 

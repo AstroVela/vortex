@@ -29,6 +29,7 @@ use crate::scalar_fn::RowVisitor;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::VecExecutionArgs;
+use crate::scalar_fn::row::InitializedElement;
 use crate::scalar_fn::row::UninitElementSink;
 
 pub(super) fn execute_numeric_primitive(
@@ -112,14 +113,13 @@ where
     // vectorization. Check each divide immediately and stop at the first failure.
     // Dense execution leaves output uninitialized. Nullable branches fill placeholders only when
     // they need to skip invalid rows.
-    visitor.visit_into::<(T, T), UninitElementSink<T>, VortexResult<()>>(|(lhs, rhs), output| {
+    visitor.visit_into::<(T, T), UninitElementSink<T>, _>(|(lhs, rhs), output| {
         let (value, failed) = CheckedDiv::apply(lhs, rhs);
         if failed {
             return Err(numeric_error(<CheckedDiv as CheckedPrimitiveOp<T>>::ERROR));
         }
 
-        output.write(value);
-        Ok(())
+        Ok(InitializedElement::write(output, value))
     })
 }
 

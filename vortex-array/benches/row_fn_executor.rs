@@ -114,6 +114,7 @@ struct I64Sink(
 impl OutputSink for I64Sink {
     type Rows<'a> = &'a mut [i64];
     type Row<'a> = &'a mut i64;
+    type WriteToken = ();
 
     fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
         Ok(DType::from(i64::PTYPE))

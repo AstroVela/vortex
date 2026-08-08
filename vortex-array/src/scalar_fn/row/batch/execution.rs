@@ -25,7 +25,6 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::scalar::Scalar;
-use crate::scalar_fn::BorrowedExecutionArgs;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::row::execute::RowExecution;
@@ -42,13 +41,12 @@ enum ResolvedMask {
 }
 
 /// One batch of inputs and the metadata needed before its row kernel runs.
-pub struct Batch<'a> {
+pub struct Batch {
     /// The function being executed, named in the errors this raises.
     id: ScalarFnId,
 
-    /// The arguments as the execution layer handed them over. Every path but the filter strategy
-    /// gives the kernel these untouched, so it sees the original encodings.
-    args: &'a dyn ExecutionArgs,
+    /// The number of rows in the original execution scope.
+    row_count: usize,
 
     /// The input columns, collected once: constant folding inspects them and the filter strategy
     /// filters them.
@@ -72,14 +70,14 @@ pub struct Batch<'a> {
     policy: RowPolicy,
 }
 
-impl<'a> Batch<'a> {
+impl Batch {
     /// Collect the inputs and derive their dtype, validity, and execution policy.
     ///
     /// **Not** for a nullary function: with no inputs there is no validity to propagate and no
     /// per-row work to fold, and the all-constant check below would vacuously pass.
     pub fn new(
         id: ScalarFnId,
-        args: &'a dyn ExecutionArgs,
+        args: &dyn ExecutionArgs,
         plan: impl FnOnce(&[DType]) -> VortexResult<BatchPlan>,
     ) -> VortexResult<Self> {
         let inputs: SmallVec<[ArrayRef; 4]> = (0..args.num_inputs())
@@ -98,7 +96,7 @@ impl<'a> Batch<'a> {
 
         Ok(Self {
             id,
-            args,
+            row_count: args.row_count(),
             inputs,
             arg_dtypes,
             validity,
@@ -135,7 +133,7 @@ impl<'a> Batch<'a> {
 
         // All inputs constant, and their conjoined validity proves every row non-null. This sees
         // through extension and masked wrappers just like argument decoding does.
-        if self.args.row_count() > 0
+        if self.row_count > 0
             && self.validity.definitely_no_nulls()
             && self
                 .inputs
@@ -168,11 +166,10 @@ impl<'a> Batch<'a> {
             .map(|input| input.slice(0..1))
             .collect::<VortexResult<_>>()?;
 
-        let args = BorrowedExecutionArgs::new(&one_row, 1);
-        let result = VortexResult::from(kernel(self.kernel_args(&args, &one_row), ctx)?)?;
+        let result = VortexResult::from(kernel(self.kernel_args(&one_row, 1), ctx)?)?;
         let scalar = self.finalize_output(result, 1)?.execute_scalar(0, ctx)?;
 
-        Ok(ConstantArray::new(scalar, self.args.row_count()).into_array())
+        Ok(ConstantArray::new(scalar, self.row_count).into_array())
     }
 
     /// Run the kernel over every row, including the rows behind nulls, then mask its result.
@@ -191,13 +188,10 @@ impl<'a> Batch<'a> {
             return Ok(self.all_null());
         }
 
-        let values = match kernel(self.kernel_args(self.args, &self.inputs), ctx)? {
+        let values = match kernel(self.kernel_args(&self.inputs, self.row_count), ctx)? {
             RowExecution::Output(values) => values,
             RowExecution::DeferredError(error) if retry_deferred_error => {
-                let valid = self
-                    .validity
-                    .clone()
-                    .execute_mask(self.args.row_count(), ctx)?;
+                let valid = self.validity.clone().execute_mask(self.row_count, ctx)?;
 
                 // Unlike `resolve_validity`, all-true preserves the deferred error and all-false
                 // suppresses evidence that came entirely from null rows. An empty loop cannot
@@ -218,11 +212,9 @@ impl<'a> Batch<'a> {
 
         match self.validity.clone() {
             Validity::NonNullable | Validity::AllValid => {
-                self.finalize_output(values, self.args.row_count())
+                self.finalize_output(values, self.row_count)
             }
-            Validity::Array(valid) => {
-                self.finalize_output(values.mask(valid)?, self.args.row_count())
-            }
+            Validity::Array(valid) => self.finalize_output(values.mask(valid)?, self.row_count),
             // Handled by the guard above, before the kernel ran.
             Validity::AllInvalid => Ok(self.all_null()),
         }
@@ -235,18 +227,18 @@ impl<'a> Batch<'a> {
         kernel: &impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ResolvedMask> {
-        let valid = self
-            .validity
-            .clone()
-            .execute_mask(self.args.row_count(), ctx)?;
+        let valid = self.validity.clone().execute_mask(self.row_count, ctx)?;
 
         // Check all-true before all-false: an empty mask is both, and must not be treated as
         // all-null (a zero-length non-nullable execution keeps its non-nullable dtype).
         if valid.all_true() {
             return self
                 .finalize_output(
-                    VortexResult::from(kernel(self.kernel_args(self.args, &self.inputs), ctx)?)?,
-                    self.args.row_count(),
+                    VortexResult::from(kernel(
+                        self.kernel_args(&self.inputs, self.row_count),
+                        ctx,
+                    )?)?,
+                    self.row_count,
                 )
                 .map(ResolvedMask::Decided);
         }
@@ -293,7 +285,7 @@ impl<'a> Batch<'a> {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let Some(execution) =
-            try_unfiltered(self.kernel_args(self.args, &self.inputs), valid, ctx)?
+            try_unfiltered(self.kernel_args(&self.inputs, self.row_count), valid, ctx)?
         else {
             return Ok(None);
         };
@@ -318,30 +310,24 @@ impl<'a> Batch<'a> {
             .map(|input| input.filter(valid.clone()))
             .collect::<VortexResult<_>>()?;
 
-        let args = BorrowedExecutionArgs::new(&filtered, valid.true_count());
-        let values = VortexResult::from(kernel(self.kernel_args(&args, &filtered), ctx)?)?;
+        let values = VortexResult::from(kernel(
+            self.kernel_args(&filtered, valid.true_count()),
+            ctx,
+        )?)?;
 
         self.finalize_output(self.scatter_valid(values, valid)?, valid.len())
     }
 
     /// An all-null result of the function's declared return dtype.
     fn all_null(&self) -> ArrayRef {
-        ConstantArray::new(
-            Scalar::null(self.result_dtype.clone()),
-            self.args.row_count(),
-        )
-        .into_array()
+        ConstantArray::new(Scalar::null(self.result_dtype.clone()), self.row_count).into_array()
     }
 
     /// Pair an input view with this batch's planning metadata.
-    fn kernel_args<'b>(
-        &'b self,
-        execution: &'b dyn ExecutionArgs,
-        arrays: &'b [ArrayRef],
-    ) -> KernelArgs<'b> {
+    fn kernel_args<'b>(&'b self, arrays: &'b [ArrayRef], row_count: usize) -> KernelArgs<'b> {
         KernelArgs {
-            execution,
             arrays,
+            row_count,
             dtypes: &self.arg_dtypes,
             output_dtype: &self.output_dtype,
         }

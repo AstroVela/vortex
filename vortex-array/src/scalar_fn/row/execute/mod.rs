@@ -53,7 +53,7 @@ impl From<RowExecution> for VortexResult<ArrayRef> {
     }
 }
 
-/// Ensure that every decoded varying column addresses the complete row loop.
+/// Ensure that every decoded input addresses the complete row loop.
 pub(super) fn ensure_decoded_lengths<Args: ElementTuple>(
     columns: &Args::Columns,
     varying: Option<&Args::VaryingColumns<'_>>,

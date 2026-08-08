@@ -47,8 +47,8 @@ pub trait InputElement: 'static {
     /// Dense execution requires this of every argument; otherwise the row layer executes only
     /// valid rows.
     ///
-    /// A dense row closure can receive unspecified values from null rows. The closure must be
-    /// total over every stored value: it must not panic or have side effects.
+    /// Dense execution can pass unspecified values from null rows. The closure must be total over
+    /// every stored value: it cannot panic or cause side effects beyond its declared output.
     const DENSE_SAFE: bool = false;
 
     /// Whether [`decode`](Self::decode) can fail on _legal_ input data.

@@ -18,6 +18,7 @@ use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::union_child_validities;
 use crate::scalar_fn::Arity;
+use crate::scalar_fn::BorrowedExecutionArgs;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
@@ -70,8 +71,8 @@ impl<F: RowFn> ScalarFnVTable for F {
         if args.num_inputs() == 0 {
             let result_dtype = ScalarFnVTable::return_dtype(self, options, &[])?;
             let nullary_args = KernelArgs {
-                execution: args,
                 arrays: &[],
+                row_count: args.row_count(),
                 dtypes: &[],
                 output_dtype: &result_dtype,
             };
@@ -125,10 +126,12 @@ fn execute_rows<F: RowFn>(
         return Ok(RowExecution::Output(reduced));
     }
 
+    let execution = BorrowedExecutionArgs::new(args.arrays, args.row_count);
+
     function.dispatch(
         options,
         args.dtypes,
-        ExecuteRows::<F>::new(args.execution, args.output_dtype, ctx),
+        ExecuteRows::<F>::new(&execution, args.output_dtype, ctx),
     )
 }
 
@@ -146,19 +149,21 @@ fn try_execute_rows_unfiltered<F: RowFn>(
         return Ok(Some(RowExecution::Output(reduced)));
     }
 
+    let execution = BorrowedExecutionArgs::new(args.arrays, args.row_count);
+
     function.dispatch(
         options,
         args.dtypes,
-        ExecuteValidRows::<F>::new(args.execution, args.output_dtype, valid, ctx),
+        ExecuteValidRows::<F>::new(&execution, args.output_dtype, valid, ctx),
     )
 }
 
 /// Prepare the batch inputs and execution plan for `function`.
-fn prepare_batch<'args, F: RowFn>(
+fn prepare_batch<F: RowFn>(
     function: &F,
     options: &F::Options,
-    args: &'args dyn ExecutionArgs,
-) -> VortexResult<Batch<'args>> {
+    args: &dyn ExecutionArgs,
+) -> VortexResult<Batch> {
     Batch::new(RowFn::id(function), args, |arg_dtypes| {
         function.dispatch(options, arg_dtypes, PlanRows::<F>::new(arg_dtypes))
     })

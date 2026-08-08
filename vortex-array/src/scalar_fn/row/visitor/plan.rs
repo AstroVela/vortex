@@ -73,7 +73,7 @@ impl<F: RowFn> RowVisitor for PlanRows<'_, F> {
     where
         Args: ElementTuple,
         Sink: OutputSink,
-        ApplyResult: SinkResult,
+        ApplyResult: SinkResult<WriteToken = Sink::WriteToken>,
     {
         const { assert_sink_visit_contract::<F, Args, Sink, ApplyResult>() };
 

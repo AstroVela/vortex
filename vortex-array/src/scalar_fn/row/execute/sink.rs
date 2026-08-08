@@ -33,7 +33,7 @@ pub fn execute_sink<Args, Prepared, Sink, ApplyResult>(
 where
     Args: ElementTuple,
     Sink: OutputSink,
-    ApplyResult: SinkResult,
+    ApplyResult: SinkResult<WriteToken = Sink::WriteToken>,
 {
     let row_count = args.row_count();
     let mut sink = Sink::with_capacity(row_count, sink_dtype)?;
@@ -91,7 +91,7 @@ pub fn execute_sink_valid_rows<Args, Prepared, Sink, ApplyResult>(
 where
     Args: ElementTuple,
     Sink: OutputSink,
-    ApplyResult: SinkResult,
+    ApplyResult: SinkResult<WriteToken = Sink::WriteToken>,
 {
     // Batch execution needs a full-length result before applying the validity mask. Decline when
     // the sink cannot leave legal placeholders in positions this loop skips.

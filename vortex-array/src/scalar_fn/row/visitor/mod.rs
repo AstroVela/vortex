@@ -73,8 +73,9 @@ pub trait RowVisitor: private::Sealed + Sized {
 
     /// Visit a row computation that writes through a sink-provided row handle.
     ///
-    /// `apply` must be total over every stored element value: it must not panic or have side
-    /// effects. Dense execution can pass unspecified values from null rows.
+    /// `apply` must be total over every stored input value: it must not panic or cause side effects
+    /// other than writing the supplied row handle. Dense execution can pass unspecified values
+    /// from null rows.
     ///
     /// # Prerequisites
     ///
@@ -93,7 +94,7 @@ pub trait RowVisitor: private::Sealed + Sized {
     where
         Args: ElementTuple,
         Sink: OutputSink,
-        ApplyResult: SinkResult,
+        ApplyResult: SinkResult<WriteToken = Sink::WriteToken>,
     {
         self.visit_prepared_into::<Args, Sink, (), ApplyResult>(
             |_| (),
@@ -110,7 +111,7 @@ pub trait RowVisitor: private::Sealed + Sized {
     where
         Args: ElementTuple,
         Sink: OutputSink,
-        ApplyResult: SinkResult;
+        ApplyResult: SinkResult<WriteToken = Sink::WriteToken>;
 
     /// Visit a row computation that returns an owned output and deferred failure evidence.
     ///

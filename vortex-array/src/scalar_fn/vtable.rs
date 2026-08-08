@@ -196,8 +196,7 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     /// Returns whether this scalar function is strict.
     ///
     /// A strict function returns null for a row when any argument is null for that row. This
-    /// matches [PostgreSQL's `STRICT` convention](https://www.postgresql.org/docs/current/sql-createfunction.html)
-    /// for null propagation.
+    /// matches [PostgreSQL's `STRICT` convention][postgres-strict] for null propagation.
     ///
     /// Return `true` only when this holds for every argument. `add` is strict, but Kleene `AND`
     /// is not because `false AND null` returns `false`. `is_null` is also not strict.
@@ -212,6 +211,8 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     ///
     /// This property applies only to the scalar function, not its child expressions. Nullary
     /// functions are vacuously strict. The default is conservatively `false`.
+    ///
+    /// [postgres-strict]: https://www.postgresql.org/docs/current/sql-createfunction.html
     fn is_strict(&self, options: &Self::Options) -> bool {
         _ = options;
         false
@@ -365,7 +366,10 @@ impl ExecutionArgs for BorrowedExecutionArgs<'_> {
 
 /// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
 pub struct VecExecutionArgs {
+    /// The owned arrays exposed through this execution view.
     inputs: Vec<ArrayRef>,
+
+    /// The row count reported for this execution view.
     row_count: usize,
 }
 

@@ -5,20 +5,19 @@
 
 use crate::ArrayRef;
 use crate::dtype::DType;
-use crate::scalar_fn::ExecutionArgs;
 
 /// The arguments handed to one kernel invocation.
 ///
 /// `arrays` may be filtered or sliced, while `dtypes` and `output_dtype` always describe the
-/// original planned batch. Keeping them together prevents an execution path from accidentally
-/// pairing an input view with unrelated planning metadata.
+/// original planned batch. Keeping them together prevents an execution path from pairing an input
+/// view with unrelated planning metadata.
 #[derive(Clone, Copy)]
 pub struct KernelArgs<'a> {
-    /// The executor-facing view, including the row count for this invocation.
-    pub execution: &'a dyn ExecutionArgs,
-
-    /// The same inputs as concrete arrays for encoding-aware rewrites.
+    /// The input arrays for this kernel invocation.
     pub arrays: &'a [ArrayRef],
+
+    /// The number of rows in this kernel invocation.
+    pub row_count: usize,
 
     /// The original input dtypes used to select the row implementation.
     pub dtypes: &'a [DType],

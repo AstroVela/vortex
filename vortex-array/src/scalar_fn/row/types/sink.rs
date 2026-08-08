@@ -47,6 +47,12 @@ pub trait OutputSink: 'static + Sized {
     where
         Self: 'a;
 
+    /// Proof that a successful row closure left its row handle initialized.
+    ///
+    /// Use `()` for initialized row handles. A sink exposing uninitialized storage uses an
+    /// unforgeable token returned after initialization.
+    type WriteToken: 'static;
+
     /// The dtype of the column this sink builds, given the function's input dtypes.
     ///
     /// **Must** be non-nullable: batch execution derives nullability from the inputs, widens the
@@ -81,7 +87,27 @@ pub trait OutputSink: 'static + Sized {
     fn finish(self, error: DeferredError) -> VortexResult<ArrayRef>;
 }
 
+/// Proof that one uninitialized element row was initialized.
+#[must_use = "return this token from the row closure to prove that it initialized the output"]
+pub struct InitializedElement(
+    /// Private so safe code can only obtain this token by writing an uninitialized row.
+    (),
+);
+
+impl InitializedElement {
+    /// Write `value` into an uninitialized row and return its proof token.
+    #[inline]
+    pub fn write<T>(row: &mut MaybeUninit<T>, value: T) -> Self {
+        row.write(value);
+
+        Self(())
+    }
+}
+
 /// An element sink that leaves dense output uninitialized before the row loop.
+///
+/// The row closure must return the [`InitializedElement`] from [`InitializedElement::write`] on
+/// success. The token is zero-sized, so the proof adds no runtime row state.
 ///
 /// Skip-invalid execution initializes placeholders before omitting rows. Immediate failures are
 /// safe because [`OutputSink::finish`] is not called after one.
@@ -98,6 +124,7 @@ impl<T: OutputElement + Copy + Default> OutputSink for UninitElementSink<T> {
 
     type Rows<'a> = &'a mut [MaybeUninit<T>];
     type Row<'a> = &'a mut MaybeUninit<T>;
+    type WriteToken = InitializedElement;
 
     fn sink_dtype(_args: &[DType]) -> VortexResult<DType> {
         Ok(T::element_dtype())
@@ -129,9 +156,9 @@ impl<T: OutputElement + Copy + Default> OutputSink for UninitElementSink<T> {
     }
 
     fn finish(mut self, _error: DeferredError) -> VortexResult<ArrayRef> {
-        // SAFETY: dense execution writes every row, while skip-invalid execution initializes every
-        // row before overwriting valid ones. The executor calls `finish` only after successful
-        // execution, and the allocation reserved every slot in `0..row_count`.
+        // SAFETY: dense execution reaches `finish` only after every row returned the token from
+        // `InitializedElement::write`. Skip-invalid execution initializes every row before
+        // overwriting valid ones. The allocation reserved every slot in `0..row_count`.
         unsafe { self.values.set_len(self.row_count) };
 
         Ok(T::build(self.values))
