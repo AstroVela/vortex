@@ -108,6 +108,21 @@ impl<T: Float + NativePType> InputElement for TensorRow<T> {
     {
         Self::get(column, index)
     }
+
+    unsafe fn get_varying_unchecked<'a>(column: &Self::Varying<'a>, index: usize) -> &'a [T]
+    where
+        Self: 'a,
+    {
+        let start = index * column.stride;
+
+        // SAFETY: the caller guarantees that `index` addresses a complete row.
+        unsafe {
+            std::slice::from_raw_parts(
+                column.elements.as_slice().as_ptr().add(start),
+                column.list_size,
+            )
+        }
+    }
 }
 
 /// Test-only probe recording which operands the last `prepare` step saw as batch-constant, so a

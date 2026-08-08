@@ -66,6 +66,17 @@ impl InputElement for GeometryRow {
         &column[index]
     }
 
+    unsafe fn get_varying_unchecked<'a>(
+        column: &Self::Varying<'a>,
+        index: usize,
+    ) -> &'a Geometry<f64>
+    where
+        Self: 'a,
+    {
+        // SAFETY: forwarded from this method's contract.
+        unsafe { column.get_unchecked(index) }
+    }
+
     /// Null rows decode to a placeholder geometry that the branch-and-skip row loop never reads.
     /// `Point` and `Polygon` columns are covered; other geometry types return `Ok(None)` and the
     /// batch falls back to the filter strategy.
