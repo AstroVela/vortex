@@ -3,25 +3,26 @@
 
 # RowFn investigation handoff
 
-This file records the exact state at the end of the 2026-08-09 investigation. Start with this
-file, then read [`DESIGN.md`](DESIGN.md), [`OPTIMIZATION.md`](OPTIMIZATION.md), and
+This file records the current state of the 2026-08-09 investigation. Start with this file, then
+read [`DESIGN.md`](DESIGN.md), [`OPTIMIZATION.md`](OPTIMIZATION.md), and
 [`REPRODUCE.md`](REPRODUCE.md).
 
 ## Branch state
 
 - Branch: `ct/row-fn`.
-- Code head before this documentation commit: `4c936447a`.
+- Last RowFn code commit: `4c936447a`.
+- Documentation head before the offsets fix: `bdf95a77e`.
 - Comparison revision: develop at `66d096b5d`.
-- No RowFn code changed during this final investigation.
-- The only intended new branch changes are the files in `research/rowfn-reconstruction`.
+- The offsets fix does not change the RowFn API or implementation.
 
-Two temporary remote refs exist for a future CodSpeed ablation:
+Three temporary remote refs exist for the CodSpeed ablation:
 
 - `ct/row-fn-codspeed-framework` points to `0a0ad0db1`.
 - `ct/row-fn-codspeed-numeric` points to `89fd28bc1`.
+- `ct/row-fn-codspeed-take-filter` is the head of temporary draft PR #9298.
 
-The refs contain exact historical code. They do not contain the uncommitted focused-workflow edits
-that were made only in temporary local worktrees.
+The first two refs contain exact historical code. The third ref adds a PR-only workflow that runs
+only `cargo codspeed run --bench take_filter`.
 
 ## Corrected CodSpeed history
 
@@ -38,10 +39,55 @@ The latest push did not bring back the `take_filter_list_*` regressions.
 The PR bot edits one current comment, and GitHub displays only the 20 largest changes. These two
 details can make a persistent regression appear to leave and return.
 
-## What is known about take/filter
+## Verified take/filter cause
 
 The list, filter, and take source files are identical between develop and `4c936447a`. The
-`take_filter_list` benchmark does not execute a RowFn operation.
+benchmark still reaches RowFn through an indirect call:
+
+```text
+take_filter
+  -> list_view_from_list
+    -> ListArrayExt::reset_offsets
+      -> binary(Sub) on offsets and the first offset
+        -> numeric RowFn
+```
+
+The differential profile therefore corrects the earlier claim that the benchmark does not execute
+RowFn. `reset_offsets` creates a constant array and runs generic numeric subtraction. Numeric RowFn
+adds batch planning, dispatch, argument decoding, and output reconciliation to this small operation.
+
+The representative benchmark is
+`take_filter_list_small_uncached_random_mask_random_indices[256, 10]`. The current PR report gives
+233.737 microseconds for develop and 280.793 microseconds for `bdf95a77e`. This is a 16.76%
+regression.
+
+CodSpeed creates the downloadable callgraph in a separate profiling execution. Its total can
+differ slightly from the aggregate report. The callgraph components are:
+
+| Revision | Instructions | Cache | Memory | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Develop `66d096b5d` | 21.312 us | 83.443 us | 133.294 us | 238.050 us |
+| RowFn `bdf95a77e` | 26.210 us | 104.293 us | 155.172 us | 285.675 us |
+| Increase | 4.898 us | 20.850 us | 21.878 us | 47.626 us |
+
+The extra instructions and the changed stack rule out a cache-only layout explanation. Cache and
+memory costs also increase, but they occur on newly executed RowFn work.
+
+The largest changed functions in the focused numeric profile are:
+
+| Function | Base self / total | Head self / total |
+| --- | ---: | ---: |
+| Old `execute_numeric_primitive` | 0.741 / 18.639 us | absent |
+| RowFn `execute_numeric_primitive` | absent | 0.430 / 71.156 us |
+| `Batch::execute` | absent | 1.033 / 49.972 us |
+| `Batch::execute_dense` | absent | 0.634 / 45.781 us |
+| `NumericBinary::dispatch` | absent | 1.316 / 45.736 us |
+| `(A, B)::decode` | absent | 0.539 / 37.501 us |
+| `ArgColumn<T>::decode` | absent | 0.968 / 36.254 us |
+| `list_view_from_list` | 3.543 / 79.144 us | 2.592 / 108.951 us |
+| `Batch::new` | absent | 1.797 / 10.794 us |
+
+These totals are inclusive callgraph costs. A function can appear in more than one caller stack.
 
 The linked AVX2 benchmark binaries still differ. Native inspection found:
 
@@ -51,12 +97,11 @@ The linked AVX2 benchmark binaries still differ. Native inspection found:
 - Normalized list-take disassembly has the same instructions.
 - Function addresses, relative call targets, and linked layout differ.
 
-This evidence is consistent with a linked-layout effect or a changed callee outside the inspected
-symbol. It does not prove which cache, branch, or callee causes the result.
+That native inspection covered the large take and filter functions. It missed the changed numeric
+callee reached during list offset normalization.
 
 CodSpeed documents [function alignment] as a reason unchanged microbenchmarks can move after a
-rebuild. Its differential flame graph is the correct next source of evidence. Inspect the
-instruction, cache, and memory components separately.
+rebuild. That warning remains useful, but alignment is not the cause of this simulation regression.
 
 ## Native measurements are separate evidence
 
@@ -75,7 +120,7 @@ representative median pair was:
 These measurements do not explain the CodSpeed simulation result. Do not use local wall time as a
 proxy for CodSpeed CPU simulation.
 
-## Incomplete CodSpeed ablation
+## Focused CodSpeed ablation
 
 Two `workflow_dispatch` runs were started and then canceled:
 
@@ -83,26 +128,42 @@ Two `workflow_dispatch` runs were started and then canceled:
 - Numeric RowFn: [run `31289622392`].
 
 This approach was not sufficient. A workflow-dispatch run has no pull-request context, so it does
-not update PR #9255's comment or create the PR comparison check needed for an inspectable result.
-The framework array shard also reached an unrelated cancellation in
-`take_slices_to_buffer_matrix`. Do not use either run as performance evidence.
+not create the needed comparison. Do not use either run as performance evidence.
+
+Draft PR [#9298] provides the required pull-request context. Its workflow builds and runs only the
+`take_filter` benchmark.
+
+- [Focused framework check] at `0a0ad0db1`: 232.542 microseconds against 233.737 microseconds for
+  develop. This is a 0.51% improvement and CodSpeed classifies it as no change.
+- [Focused numeric check] at `89fd28bc1`: 279.491 microseconds against 233.737 microseconds for
+  develop. This is a 16.37% regression.
+
+`89fd28bc1` is the first bad revision. It is the direct child of clean revision `0a0ad0db1`.
+
+The numeric revision's callgraph totals are 25.835 microseconds for instructions, 103.531
+microseconds for cache, and 154.728 microseconds for memory. Develop's totals are 21.312, 83.443,
+and 133.294 microseconds. The total increases from 238.050 to 284.093 microseconds.
+
+## Focused fix
+
+`ListArrayExt::reset_offsets` now decodes offsets once and subtracts the first offset in a typed
+loop. It no longer allocates a constant array or invokes the generic scalar-function path.
+
+The AVX2 release binary auto-vectorizes the benchmark's `u16` loop. The loop uses two packed
+`psubw` instructions per iteration and processes 16 offsets. This is code-generation evidence,
+not a local timing result.
+
+A new test covers nonzero `u16` offsets. The existing list and list-view tests cover other offset
+types and conversion behavior. A push to PR #9255 is still required for CodSpeed validation.
 
 ## Recommended next steps
 
-1. Open one affected `take_filter_list_*` benchmark in the existing `4c936447a` CodSpeed check.
-2. Compare its differential flame graph with develop. Record executed instruction, cache, and
-   memory costs for the changed stack.
-3. If the cost is extra instructions or a changed call path, follow that stack into assembly and
-   source.
-4. If the cost is only instruction-cache placement, do not add arbitrary padding or unrelated
-   source edits. Determine whether a stable alignment or build-level remedy exists.
-5. To locate the first bad revision, run focused `take_filter` simulations for `0a0ad0db1` and
-   `89fd28bc1` in a pull-request context. A dedicated temporary PR is less disruptive than moving
-   the head of PR #9255. Run only `cargo codspeed run --bench take_filter`.
-6. If framework-only is clean and numeric RowFn is bad, compare those two profiles. If both are
-   clean, continue through `5c02036a2`, `a236e0b9d`, and `f4617a2b5`.
-7. Recheck native wall time only after finding a CodSpeed cause. Keep the two result types labeled
-   separately.
+1. Push the focused offsets fix to `ct/row-fn` so PR #9255 creates a CodSpeed comparison.
+2. Verify the representative benchmark's report value and callgraph components.
+3. Check the remaining `take_filter_list_*` cases for a consistent recovery.
+4. Keep local wall time separate from CodSpeed CPU simulation.
+5. Continue investigating the native wall-time gap only if it remains after the measured call path
+   is removed.
 
 ## Mixed-constant optimization
 
@@ -121,5 +182,8 @@ source-placement sensitivity remains unknown.
 [CodSpeed check at `892717f30`]: https://github.com/vortex-data/vortex/runs/93169735961
 [CodSpeed check at `4c936447a`]: https://github.com/vortex-data/vortex/runs/93181527671
 [function alignment]: https://codspeed.io/docs/instruments/cpu/regression-causes#function-alignment
+[#9298]: https://github.com/vortex-data/vortex/pull/9298
+[Focused framework check]: https://github.com/vortex-data/vortex/actions/runs/31316492455
+[Focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
 [run `31289620637`]: https://github.com/vortex-data/vortex/actions/runs/31289620637
 [run `31289622392`]: https://github.com/vortex-data/vortex/actions/runs/31289622392

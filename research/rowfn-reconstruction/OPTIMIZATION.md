@@ -270,7 +270,7 @@ differential flame graph.
 An unrelated recovery does not prove that an algorithmic problem was fixed. The result is stable
 only after source ablation, machine-code inspection, and repeated measurements agree on a cause.
 
-## Current `take_filter_list` evidence
+## `take_filter_list` regression
 
 The [CodSpeed check at `4c936447a`] reports 31 regressions. Several `take_filter_list_*`
 benchmarks are 14% to 16% slower than develop in CPU simulation.
@@ -286,8 +286,81 @@ performance table also contains `take_filter_list_*` regressions. Some GitHub vi
 regression appear to leave and return.
 
 The compared list, filter, and take source files are identical between develop and the branch.
-The measured benchmark has no runtime call to RowFn. Therefore, the change is not an algorithmic
-regression in list take or filter execution.
+However, the benchmark reaches RowFn through code outside those files:
+
+```text
+take_filter
+  -> list_view_from_list
+    -> ListArrayExt::reset_offsets
+      -> binary(Sub) on offsets and the first offset
+        -> numeric RowFn
+```
+
+The old implementation of `reset_offsets` used generic binary subtraction. It created a constant
+array from the first offset. The numeric RowFn migration changed that generic call's implementation.
+
+### Differential simulation evidence
+
+For `take_filter_list_small_uncached_random_mask_random_indices[256, 10]`, the current PR report
+measures 233.737 microseconds on develop and 280.793 microseconds on `bdf95a77e`. This is a 16.76%
+regression.
+
+CodSpeed creates the downloadable callgraph during a separate profiling execution. Its absolute
+total can differ slightly from the report aggregate. The component totals are:
+
+| Revision | Instructions | Cache | Memory | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Develop `66d096b5d` | 21.312 us | 83.443 us | 133.294 us | 238.050 us |
+| RowFn `bdf95a77e` | 26.210 us | 104.293 us | 155.172 us | 285.675 us |
+| Increase | 4.898 us | 20.850 us | 21.878 us | 47.626 us |
+
+The profile contains extra executed instructions and a new call path. It does not support a
+cache-only or alignment-only explanation.
+
+The focused numeric profile shows these self and inclusive function costs:
+
+| Function | Base self / total | Head self / total |
+| --- | ---: | ---: |
+| Old `execute_numeric_primitive` | 0.741 / 18.639 us | absent |
+| RowFn `execute_numeric_primitive` | absent | 0.430 / 71.156 us |
+| `Batch::execute` | absent | 1.033 / 49.972 us |
+| `Batch::execute_dense` | absent | 0.634 / 45.781 us |
+| `NumericBinary::dispatch` | absent | 1.316 / 45.736 us |
+| `(A, B)::decode` | absent | 0.539 / 37.501 us |
+| `ArgColumn<T>::decode` | absent | 0.968 / 36.254 us |
+| `list_view_from_list` | 3.543 / 79.144 us | 2.592 / 108.951 us |
+| `Batch::new` | absent | 1.797 / 10.794 us |
+
+These inclusive costs overlap when functions call each other. They identify the changed stack.
+
+### First bad revision
+
+Temporary draft PR [#9298] runs only `cargo codspeed run --bench take_filter` in a pull-request
+context.
+
+- The [focused framework check] at `0a0ad0db1` measures 232.542 microseconds. Develop measures
+  233.737 microseconds, so CodSpeed classifies the 0.51% improvement as no change.
+- The [focused numeric check] at `89fd28bc1` measures 279.491 microseconds. This is 16.37% slower
+  than develop.
+
+The two revisions are parent and child. Therefore, `89fd28bc1` is the first bad revision.
+
+The numeric revision's callgraph totals are 25.835 microseconds for instructions, 103.531
+microseconds for cache, and 154.728 microseconds for memory. Its total is 284.093 microseconds.
+
+### Focused remedy
+
+`ListArrayExt::reset_offsets` now decodes its offsets once. A typed loop subtracts the first offset
+and builds the replacement primitive array. This removes the constant allocation, batch planning,
+dispatch, argument decoding, and output reconciliation from this small internal operation.
+
+The AVX2 release binary auto-vectorizes the benchmark's `u16` subtraction. The generated loop has
+two packed `psubw` operations and handles 16 offsets per iteration. No SIMD claim is made for the
+other integer types without inspecting their machine code.
+
+This fix targets the measured changed call path. It does not add padding or unrelated structural
+changes. Its local tests establish correctness only. A PR-context CodSpeed run must establish its
+simulation effect.
 
 AVX2 wall-time runs on CPU 4 provide a separate native-runtime observation:
 
@@ -306,24 +379,25 @@ case measured 8.25 and 6.41 microseconds with 16 codegen units.
 
 The main filter-take and list-take function sizes are identical across the three AVX2 binaries.
 Normalized disassembly of the list-take function has the same instructions. Relative addresses and
-link layout differ. This native evidence points to linked-code layout or a called function outside
-the compared symbol. It does not identify a specific cache or branch mechanism. The CodSpeed
-differential flame graph and its instruction and cache counters are the correct evidence for the
-simulation result.
+link layout differ. The earlier inspection did not include the numeric callee in `reset_offsets`.
 
-Do not fix this result with arbitrary padding or an unrelated source edit. Such a change can move
-the report without removing the cause.
+Do not fix unrelated movement with arbitrary padding or an unrelated source edit. Such a change can
+move a report without removing a measured cause.
 
 ## Current unresolved work
 
 - Reduce the mixed-constant LLVM sensitivity while preserving the production monomorph.
-- Identify the linked-code cause of the list/filter wall-time gap.
+- Validate the offsets fix with PR-context CodSpeed simulation.
+- Recheck the native list/filter wall-time gap after removing the measured call path.
 - Identify the spatial `envelope` regression that begins when numeric RowFn code enters the linked
   binary.
-- Compare current CodSpeed flame graphs for list/filter and `envelope` against develop.
+- Compare the current CodSpeed flame graph for `envelope` against develop.
 - Repeat the key results on a second compiler version before filing a compiler issue.
 
 [CodSpeed check at `4c936447a`]: https://github.com/vortex-data/vortex/runs/93181527671
 [CodSpeed check at `892717f30`]: https://github.com/vortex-data/vortex/runs/93169735961
 [CodSpeed CPU simulation]: https://codspeed.io/docs/instruments/cpu
 [function alignment]: https://codspeed.io/docs/instruments/cpu/regression-causes#function-alignment
+[#9298]: https://github.com/vortex-data/vortex/pull/9298
+[focused framework check]: https://github.com/vortex-data/vortex/actions/runs/31316492455
+[focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479

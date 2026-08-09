@@ -351,6 +351,24 @@ mod tests {
     }
 
     #[test]
+    fn test_list_to_listview_resets_nonzero_offsets() -> VortexResult<()> {
+        let elements = buffer![0i32, 1, 2, 3, 4].into_array();
+        let offsets = buffer![2u16, 4, 5].into_array();
+        let list = ListArray::try_new(elements, offsets, Validity::NonNullable)?;
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let list_view = list_view_from_list(list.clone(), &mut ctx)?;
+
+        assert_arrays_eq!(
+            buffer![0u16, 2].into_array(),
+            list_view.offsets().clone(),
+            &mut ctx
+        );
+        assert_arrays_eq!(list, list_view, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
     fn test_listview_to_list_zero_copy() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let list_view = create_basic_listview();

@@ -6,6 +6,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use num_traits::AsPrimitive;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -26,17 +27,15 @@ use crate::array::TypedArrayRef;
 use crate::array::child_to_validity;
 use crate::array::validity_to_child;
 use crate::array_slots;
-use crate::arrays::ConstantArray;
 use crate::arrays::List;
 use crate::arrays::ListArray;
 use crate::arrays::Primitive;
-use crate::builtins::ArrayBuiltins;
+use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::legacy_session;
 use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
-use crate::scalar_fn::fns::operators::Operator;
 use crate::validity::Validity;
 
 #[array_slots(List)]
@@ -343,12 +342,17 @@ pub trait ListArrayExt: ListArraySlotsExt {
                 .into_array();
         }
 
-        let offsets = self.offsets();
-        let first_offset = offsets.execute_scalar(0, ctx)?;
-        let adjusted_offsets = offsets.clone().binary(
-            ConstantArray::new(first_offset, offsets.len()).into_array(),
-            Operator::Sub,
-        )?;
+        let offsets = self.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+        let adjusted_offsets = match_each_integer_ptype!(offsets.ptype(), |P| {
+            let offsets = offsets.as_slice::<P>();
+            let first_offset = offsets[0];
+            let adjusted = offsets
+                .iter()
+                .map(|offset| *offset - first_offset)
+                .collect::<BufferMut<P>>();
+
+            PrimitiveArray::new(adjusted, Validity::NonNullable).into_array()
+        });
 
         // SAFETY: By resetting the offsets we simply "shift" everything left and discard trailing garbage, so all invariants remain the same.
         Ok(unsafe { ListArray::new_unchecked(elements, adjusted_offsets, self.list_validity()) })
