@@ -13,8 +13,9 @@ read [`DESIGN.md`](DESIGN.md), [`OPTIMIZATION.md`](OPTIMIZATION.md), and
 - Last RowFn code commit: `4c936447a`.
 - Documentation head before the offsets fix: `bdf95a77e`.
 - Comparison revision: develop at `66d096b5d`.
-- The offsets fix does not change the RowFn API or implementation.
-- `ct/row-fn-api` has one later optimization commit, `df8fcbe1a`.
+- Direct offsets fix: `61410ef21`.
+- Numeric helper ID fix: `f9dfde730` on this branch and `df8fcbe1a` on `ct/row-fn-api`.
+- Masked tensor decode fix: `7baa9fab7`.
 
 Three temporary remote refs exist for the CodSpeed ablation:
 
@@ -216,18 +217,42 @@ profile for `inner_product::nullable[256]` records these component increases:
 | Memory | 158.567 us | 186.622 us | 28.056 us |
 | Total | 233.878 us | 272.845 us | 38.966 us |
 
-The floating-point row work is approximately unchanged. `TensorRow::decode` costs 33.553
-microseconds total, including 19.956 microseconds in `ArrayRef::mask`. The input is a `Masked`
-tensor, but dense RowFn execution owns its validity and restores it on the output. Decoding the
-child values directly avoids rebuilding extension storage under the same mask.
+The floating-point row work is approximately unchanged. Before the fix, `TensorRow::decode` costs
+33.553 microseconds total. It spends 25.638 microseconds canonicalizing the masked extension. The
+`ArrayRef::mask` node in this profile is Batch's expected output mask, not input decode.
+
+Dense RowFn execution owns input validity and restores it on the output. `TensorRow::decode` now
+reads a `Masked` tensor's child values directly. The [masked tensor check] validates the change:
+
+- `inner_product::nullable[256]` improves from 270.674 to 247.710 microseconds. It changes from a
+  14.77% regression to a 6.87% no-change result against develop.
+- `l2_norm::nullable[256]` improves from 271.115 to 249.766 microseconds. It changes from a 12.46%
+  regression to a 4.98% no-change result against develop.
+- `TensorRow::decode` drops from 33.553 to 6.801 microseconds total.
+- Extension canonicalization under that decoder drops from 25.638 to 0.439 microseconds total.
+
+The post-fix inner-product callgraph totals are 12.537 microseconds for instructions, 64.096
+microseconds for cache, and 172.833 microseconds for memory. Its total is 249.466 microseconds.
+The remaining difference from develop is memory cost, not extra executed instructions.
 
 The local `f64` inner-product loop is scalar-unrolled by four. It emits `mulsd` and `addsd` in the
 source fold order, not packed floating-point SIMD. Reassociating this reduction could enable wider
 SIMD, but it would change floating-point results. It is not a free RowFn code-generation change.
 
+## Remaining `mul_u8_nonnull` regression
+
+The [numeric ID check] still reports `mul_u8_nonnull` as 12.74% slower than develop. Its callgraph
+components increase by 1.149 microseconds for instructions, 6.147 microseconds for cache, and
+18.411 microseconds for memory. The indexed loop's self cost is 69.973 microseconds on both sides.
+
+The RowFn run enters `mi_page_fresh_alloc`, which is absent on develop. Inclusive `__rust_alloc`
+cost increases from 7.221 to 22.449 microseconds. The evidence points to allocator state or
+benchmark-order sensitivity around the output allocation. It does not show a slower arithmetic
+loop. Do not change the loop or add layout padding without an isolated allocator experiment.
+
 ## Recommended next steps
 
-1. Validate the masked tensor decode change in a PR-context CodSpeed comparison.
+1. Isolate the allocator state before `mul_u8_nonnull` if its CodSpeed regression must be removed.
 2. Keep local wall time separate from CodSpeed CPU simulation.
 3. Continue investigating the native wall-time gap only if it remains after the measured call path
    is removed.
@@ -254,5 +279,6 @@ source-placement sensitivity remains unknown.
 [Focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
 [offsets fix check]: https://github.com/vortex-data/vortex/actions/runs/31317322594
 [numeric ID check]: https://github.com/vortex-data/vortex/actions/runs/31318131466
+[masked tensor check]: https://github.com/vortex-data/vortex/actions/runs/31318825883
 [run `31289620637`]: https://github.com/vortex-data/vortex/actions/runs/31289620637
 [run `31289622392`]: https://github.com/vortex-data/vortex/actions/runs/31289622392

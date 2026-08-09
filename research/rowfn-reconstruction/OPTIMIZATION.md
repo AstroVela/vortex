@@ -409,15 +409,39 @@ norm. For `inner_product::nullable[256]`, the callgraph components are:
 | Memory | 158.567 us | 186.622 us | 28.056 us |
 | Total | 233.878 us | 272.845 us | 38.966 us |
 
-The floating-point row work is approximately unchanged. `TensorRow::decode` costs 33.553
-microseconds total, including 19.956 microseconds in `ArrayRef::mask`. The benchmark passes a
-`Masked` tensor. Dense RowFn execution owns that validity and restores it on the result, so the
-tensor decoder can read the mask's child values directly.
+The floating-point row work is approximately unchanged. Before the fix, `TensorRow::decode` costs
+33.553 microseconds total. It spends 25.638 microseconds canonicalizing the masked extension. The
+`ArrayRef::mask` node in this profile is Batch's expected output mask, not input decode.
+
+Dense RowFn execution owns input validity and restores it on the result. The tensor decoder now
+reads a `Masked` tensor's child values directly. The [masked tensor check] validates the change:
+
+- `inner_product::nullable[256]` improves from 270.674 to 247.710 microseconds. It changes from a
+  14.77% regression to a 6.87% no-change result against develop.
+- `l2_norm::nullable[256]` improves from 271.115 to 249.766 microseconds. It changes from a 12.46%
+  regression to a 4.98% no-change result against develop.
+- `TensorRow::decode` drops from 33.553 to 6.801 microseconds total.
+- Extension canonicalization under that decoder drops from 25.638 to 0.439 microseconds total.
+
+The post-fix inner-product callgraph totals are 12.537 microseconds for instructions, 64.096
+microseconds for cache, and 172.833 microseconds for memory. Its total is 249.466 microseconds.
+The remaining difference from develop is memory cost, not extra executed instructions.
 
 The linked `f64` inner-product loop is scalar-unrolled by four. It uses `mulsd` and `addsd` in the
 source fold order, not packed floating-point SIMD. LLVM cannot reassociate the strict reduction.
 Changing that order could enable wider SIMD, but it would change floating-point results and needs
 an explicit numerical contract.
+
+### `mul_u8_nonnull` allocator path
+
+The [numeric ID check] still reports `mul_u8_nonnull` as 12.74% slower than develop. Its callgraph
+components increase by 1.149 microseconds for instructions, 6.147 microseconds for cache, and
+18.411 microseconds for memory. The indexed loop's self cost is 69.973 microseconds on both sides.
+
+The RowFn run enters `mi_page_fresh_alloc`, which is absent on develop. Inclusive `__rust_alloc`
+cost increases from 7.221 to 22.449 microseconds. This points to allocator state or benchmark-order
+sensitivity around the output allocation. It does not show a slower arithmetic loop. A focused
+allocator-state experiment must precede any code or benchmark change.
 
 AVX2 wall-time runs on CPU 4 provide a separate native-runtime observation:
 
@@ -444,7 +468,7 @@ move a report without removing a measured cause.
 ## Current unresolved work
 
 - Reduce the mixed-constant LLVM sensitivity while preserving the production monomorph.
-- Validate the masked tensor decode change with PR-context CodSpeed simulation.
+- Isolate allocator state before `mul_u8_nonnull` if its CodSpeed regression must be removed.
 - Recheck the native list/filter wall-time gap after removing the measured call path.
 - Identify the spatial `envelope` regression that begins when numeric RowFn code enters the linked
   binary.
@@ -460,3 +484,4 @@ move a report without removing a measured cause.
 [focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
 [offsets fix check]: https://github.com/vortex-data/vortex/actions/runs/31317322594
 [numeric ID check]: https://github.com/vortex-data/vortex/actions/runs/31318131466
+[masked tensor check]: https://github.com/vortex-data/vortex/actions/runs/31318825883
