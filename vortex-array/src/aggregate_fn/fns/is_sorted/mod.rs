@@ -411,12 +411,6 @@ impl AggregateFnVTable for IsSorted {
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.is_sorted = true;
-        partial.first_value = None;
-        partial.last_value = None;
-    }
-
     #[inline]
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         !partial.is_sorted

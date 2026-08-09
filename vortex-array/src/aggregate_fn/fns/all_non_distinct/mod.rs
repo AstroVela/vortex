@@ -176,10 +176,6 @@ impl AggregateFnVTable for AllNonDistinct {
         ))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.all_non_distinct = true;
-    }
-
     #[inline]
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         !partial.all_non_distinct

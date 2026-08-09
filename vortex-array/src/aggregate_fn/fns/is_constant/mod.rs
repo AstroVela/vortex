@@ -353,11 +353,6 @@ impl AggregateFnVTable for IsConstant {
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.is_constant = true;
-        partial.first_value = None;
-    }
-
     #[inline]
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         !partial.is_constant

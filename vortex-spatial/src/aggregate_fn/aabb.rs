@@ -187,10 +187,6 @@ impl AggregateFnVTable for GeometryAabb {
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.rect = None;
-    }
-
     fn is_saturated(&self, _partial: &Self::Partial) -> bool {
         // An AABB can always grow, so it is never saturated.
         false

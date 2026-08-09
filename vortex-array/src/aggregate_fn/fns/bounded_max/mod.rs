@@ -273,10 +273,6 @@ impl AggregateFnVTable for BoundedMax {
         }
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.state = BoundedMaxState::Empty;
-    }
-
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         matches!(partial.state, BoundedMaxState::Unknown)
     }

@@ -164,10 +164,6 @@ impl AggregateFnVTable for Min {
         }
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.min = None;
-    }
-
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         // A poisoned NaN-including minimum is fully determined.
         partial.is_poisoned()

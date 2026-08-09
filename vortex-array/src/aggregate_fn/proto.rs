@@ -137,8 +137,6 @@ mod tests {
             vortex_panic!("TestAgg is for serde tests only");
         }
 
-        fn reset(&self, _partial: &mut Self::Partial) {}
-
         fn is_saturated(&self, _partial: &Self::Partial) -> bool {
             true
         }

@@ -284,12 +284,6 @@ impl AggregateFnVTable for Sum {
         ))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.sum = make_zero_state(&partial.return_dtype);
-        partial.is_overflow = false;
-        partial.is_empty = true;
-    }
-
     #[inline]
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         partial.is_overflow || matches!(&partial.sum, SumState::Float(v) if v.is_nan())

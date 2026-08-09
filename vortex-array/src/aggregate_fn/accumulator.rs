@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -38,7 +39,10 @@ pub struct Accumulator<V: AggregateFnVTable> {
     /// The DType of the accumulator state.
     partial_dtype: DType,
     /// The partial state of the accumulator, updated after each accumulate/merge call.
-    partial: V::Partial,
+    ///
+    /// `None` is the empty-group state; a live partial is only materialized when a batch is
+    /// accumulated in place, so empty accumulators and folds never construct one.
+    partial: Option<V::Partial>,
 }
 
 impl<V: AggregateFnVTable> Accumulator<V> {
@@ -57,7 +61,6 @@ impl<V: AggregateFnVTable> Accumulator<V> {
                 dtype
             )
         })?;
-        let partial = vtable.reduce_partials(&options, &dtype, &[])?;
         let aggregate_fn = AggregateFn::new(vtable.clone(), options.clone()).erased();
 
         Ok(Self {
@@ -67,19 +70,33 @@ impl<V: AggregateFnVTable> Accumulator<V> {
             dtype,
             return_dtype,
             partial_dtype,
-            partial,
+            partial: None,
         })
+    }
+
+    /// The identity partial state: the state of a group with no accumulated values.
+    fn empty_partial(&self) -> VortexResult<V::Partial> {
+        self.vtable.reduce_partials(&self.options, &self.dtype, &[])
+    }
+
+    /// Materialize the partial state in place so a batch can be accumulated into it.
+    fn ensure_partial(&mut self) -> VortexResult<()> {
+        if self.partial.is_none() {
+            self.partial = Some(self.empty_partial()?);
+        }
+        Ok(())
     }
 
     /// Reduce an incoming partial state into the accumulator's current state.
     pub(crate) fn fold_partial(&mut self, other: V::Partial) -> VortexResult<()> {
-        let empty = self
-            .vtable
-            .reduce_partials(&self.options, &self.dtype, &[])?;
-        let current = std::mem::replace(&mut self.partial, empty);
-        self.partial =
-            self.vtable
-                .reduce_partials(&self.options, &self.dtype, &[current, other])?;
+        self.partial = Some(match self.partial.take() {
+            // Reducing the incoming partial with the empty state is the identity.
+            None => other,
+            Some(current) => {
+                self.vtable
+                    .reduce_partials(&self.options, &self.dtype, &[current, other])?
+            }
+        });
         Ok(())
     }
 }
@@ -138,8 +155,12 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         // chance to consume that cache before dispatching an encoding kernel.
         let checked_cached_sum = Stat::from_aggregate_fn(&self.aggregate_fn) == Some(Stat::Sum)
             && batch.statistics().get(Stat::Sum).is_exact();
-        if checked_cached_sum && self.vtable.try_accumulate(&mut self.partial, batch, ctx)? {
-            return Ok(());
+        if checked_cached_sum {
+            self.ensure_partial()?;
+            let partial = self.partial.as_mut().vortex_expect("partial materialized");
+            if self.vtable.try_accumulate(partial, batch, ctx)? {
+                return Ok(());
+            }
         }
 
         // 0. Cached stats bridge: consume an exact partial from the aggregate's Stat slot before
@@ -197,8 +218,12 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         }
 
         // 2. Allow the vtable to short-circuit on the raw array before decompression.
-        if !checked_cached_sum && self.vtable.try_accumulate(&mut self.partial, batch, ctx)? {
-            return Ok(());
+        if !checked_cached_sum {
+            self.ensure_partial()?;
+            let partial = self.partial.as_mut().vortex_expect("partial materialized");
+            if self.vtable.try_accumulate(partial, batch, ctx)? {
+                return Ok(());
+            }
         }
 
         // 3. Iteratively check the registry against each intermediate encoding, executing one
@@ -236,7 +261,9 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         // 4. Otherwise, execute the batch until it is columnar and accumulate it into the state.
         let columnar = batch.execute::<Columnar>(ctx)?;
 
-        self.vtable.accumulate(&mut self.partial, &columnar, ctx)
+        self.ensure_partial()?;
+        let partial = self.partial.as_mut().vortex_expect("partial materialized");
+        self.vtable.accumulate(partial, &columnar, ctx)
     }
 
     fn merge_from(&mut self, other: &mut dyn DynAccumulator) -> VortexResult<()> {
@@ -254,15 +281,20 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
     }
 
     fn is_saturated(&self) -> bool {
-        self.vtable.is_saturated(&self.partial)
+        self.partial
+            .as_ref()
+            .is_some_and(|partial| self.vtable.is_saturated(partial))
     }
 
     fn reset(&mut self) {
-        self.vtable.reset(&mut self.partial);
+        self.partial = None;
     }
 
     fn partial_scalar(&self) -> VortexResult<Scalar> {
-        let partial = self.vtable.to_scalar(&self.partial)?;
+        let partial = match &self.partial {
+            Some(partial) => self.vtable.to_scalar(partial)?,
+            None => self.vtable.to_scalar(&self.empty_partial()?)?,
+        };
 
         #[cfg(debug_assertions)]
         {
@@ -278,7 +310,10 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
     }
 
     fn final_scalar(&self) -> VortexResult<Scalar> {
-        let result = self.vtable.finalize_scalar(&self.partial)?;
+        let result = match &self.partial {
+            Some(partial) => self.vtable.finalize_scalar(partial)?,
+            None => self.vtable.finalize_scalar(&self.empty_partial()?)?,
+        };
 
         vortex_ensure!(
             result.dtype() == &self.return_dtype,

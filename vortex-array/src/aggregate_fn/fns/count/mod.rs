@@ -89,10 +89,6 @@ impl AggregateFnVTable for Count {
         Ok(Scalar::primitive(partial.count, Nullability::NonNullable))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.count = 0;
-    }
-
     #[inline]
     fn is_saturated(&self, _partial: &Self::Partial) -> bool {
         false

@@ -93,10 +93,6 @@ impl AggregateFnVTable for Last {
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.value = None;
-    }
-
     #[inline]
     fn is_saturated(&self, _partial: &Self::Partial) -> bool {
         // Last can never short-circuit: a later batch can always supersede the current value.

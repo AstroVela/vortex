@@ -255,11 +255,6 @@ impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
         Ok(Scalar::struct_(dtype, vec![l_scalar, r_scalar]))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.0.reset();
-        partial.1.reset();
-    }
-
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         partial.0.is_saturated() && partial.1.is_saturated()
     }

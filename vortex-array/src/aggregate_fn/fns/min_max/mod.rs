@@ -356,11 +356,6 @@ impl AggregateFnVTable for MinMax {
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.min = None;
-        partial.max = None;
-    }
-
     #[inline]
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         // A poisoned NaN-including min/max is fully determined.

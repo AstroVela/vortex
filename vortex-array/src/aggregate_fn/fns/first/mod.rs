@@ -90,10 +90,6 @@ impl AggregateFnVTable for First {
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.value = None;
-    }
-
     #[inline]
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         partial.value.is_some()

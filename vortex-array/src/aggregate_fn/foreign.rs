@@ -99,8 +99,6 @@ impl AggregateFnVTable for ForeignAggregateFnVTable {
         vortex_bail!("Cannot execute unknown aggregate function '{}'", self.id)
     }
 
-    fn reset(&self, _partial: &mut Self::Partial) {}
-
     fn is_saturated(&self, _state: &Self::Partial) -> bool {
         false
     }

@@ -82,10 +82,6 @@ impl AggregateFnVTable for AllNan {
         Ok(Scalar::bool(*partial, Nullability::Nullable))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        *partial = true;
-    }
-
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         !*partial
     }

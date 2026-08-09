@@ -164,10 +164,6 @@ impl AggregateFnVTable for Max {
         }
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.max = None;
-    }
-
     fn is_saturated(&self, partial: &Self::Partial) -> bool {
         // A poisoned NaN-including maximum is fully determined.
         partial.is_poisoned()

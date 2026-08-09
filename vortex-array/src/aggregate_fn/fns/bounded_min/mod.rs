@@ -189,10 +189,6 @@ impl AggregateFnVTable for BoundedMin {
         }
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.state = BoundedMinState::Empty;
-    }
-
     fn is_saturated(&self, _partial: &Self::Partial) -> bool {
         false
     }

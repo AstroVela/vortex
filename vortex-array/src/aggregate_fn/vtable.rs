@@ -146,9 +146,6 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
     /// [`partial_from_scalar`]: AggregateFnVTable::partial_from_scalar
     fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar>;
 
-    /// Reset the state of the accumulator to an empty group.
-    fn reset(&self, partial: &mut Self::Partial);
-
     /// Is the partial accumulator state is "saturated", i.e. has it reached a state where the
     /// final result is fully determined.
     fn is_saturated(&self, state: &Self::Partial) -> bool;
