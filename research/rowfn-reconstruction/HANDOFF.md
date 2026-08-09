@@ -14,6 +14,7 @@ read [`DESIGN.md`](DESIGN.md), [`OPTIMIZATION.md`](OPTIMIZATION.md), and
 - Documentation head before the offsets fix: `bdf95a77e`.
 - Comparison revision: develop at `66d096b5d`.
 - The offsets fix does not change the RowFn API or implementation.
+- `ct/row-fn-api` has one later optimization commit, `df8fcbe1a`.
 
 Three temporary remote refs exist for the CodSpeed ablation:
 
@@ -149,20 +150,57 @@ and 133.294 microseconds. The total increases from 238.050 to 284.093 microsecon
 `ListArrayExt::reset_offsets` now decodes offsets once and subtracts the first offset in a typed
 loop. It no longer allocates a constant array or invokes the generic scalar-function path.
 
-The AVX2 release binary auto-vectorizes the benchmark's `u16` loop. The loop uses two packed
-`psubw` instructions per iteration and processes 16 offsets. This is code-generation evidence,
-not a local timing result.
+The AVX2 release binary auto-vectorizes every supported integer width. Each unrolled iteration has
+two 128-bit packed subtracts:
+
+- `psubb` handles 32 `i8` or `u8` offsets.
+- `psubw` handles 16 `i16` or `u16` offsets.
+- `psubd` handles 8 `i32` or `u32` offsets.
+- `psubq` handles 4 `i64` or `u64` offsets.
+
+Signed and unsigned monomorphs share machine code. This is code-generation evidence, not a local
+timing result.
 
 A new test covers nonzero `u16` offsets. The existing list and list-view tests cover other offset
-types and conversion behavior. A push to PR #9255 is still required for CodSpeed validation.
+types and conversion behavior.
+
+The [offsets fix check] validates the change in CodSpeed CPU simulation. The representative case
+measures 176.524 microseconds, compared with 233.737 microseconds on develop and 280.793
+microseconds before the fix. It changes from a 16.76% regression to a 32.41% improvement against
+develop. All 14 `take_filter_list_*` cases improve by 25.61% to 35.54% against develop.
+
+The representative callgraph components after the fix are:
+
+| Revision | Instructions | Cache | Memory | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Develop `66d096b5d` | 21.312 us | 83.443 us | 133.294 us | 238.050 us |
+| Before fix `bdf95a77e` | 26.210 us | 104.293 us | 155.172 us | 285.675 us |
+| Offsets fix `61410ef21` | 15.462 us | 59.031 us | 103.767 us | 178.259 us |
+
+The generic scalar-function stack is absent after the fix. The typed `reset_offsets` function
+costs 0.933 microseconds self and 7.629 microseconds total. On develop, the old primitive numeric
+function alone costs 0.741 microseconds self and 18.639 microseconds total. The larger reduction in
+`list_view_from_list`, from 79.144 to 29.634 microseconds total, includes the lazy scalar-function
+array and optimizer work removed by the direct operation.
+
+## Numeric helper ID
+
+The focused numeric profile also found 6.820 microseconds of new inclusive cost in
+`CachedId::deref`. The new `vortex.numeric_binary` ID initializes during the measured call.
+Develop's ID lookup costs 0.702 microseconds total. The numeric RowFn revision costs 7.522
+microseconds.
+
+`NumericBinary` is an internal helper for the registered `Binary` function. Commit `df8fcbe1a` on
+`ct/row-fn-api` reuses `Binary`'s ID. This removes the second interner initialization and gives
+errors the public function's name. It does not change the arithmetic loop or the public API.
+
+This is a first-execution cost, not a per-row cost. Its CodSpeed effect is not verified yet.
 
 ## Recommended next steps
 
-1. Push the focused offsets fix to `ct/row-fn` so PR #9255 creates a CodSpeed comparison.
-2. Verify the representative benchmark's report value and callgraph components.
-3. Check the remaining `take_filter_list_*` cases for a consistent recovery.
-4. Keep local wall time separate from CodSpeed CPU simulation.
-5. Continue investigating the native wall-time gap only if it remains after the measured call path
+1. Validate the internal numeric-helper ID change in a PR-context CodSpeed comparison.
+2. Keep local wall time separate from CodSpeed CPU simulation.
+3. Continue investigating the native wall-time gap only if it remains after the measured call path
    is removed.
 
 ## Mixed-constant optimization
@@ -185,5 +223,6 @@ source-placement sensitivity remains unknown.
 [#9298]: https://github.com/vortex-data/vortex/pull/9298
 [Focused framework check]: https://github.com/vortex-data/vortex/actions/runs/31316492455
 [Focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
+[offsets fix check]: https://github.com/vortex-data/vortex/actions/runs/31317322594
 [run `31289620637`]: https://github.com/vortex-data/vortex/actions/runs/31289620637
 [run `31289622392`]: https://github.com/vortex-data/vortex/actions/runs/31289622392

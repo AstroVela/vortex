@@ -256,8 +256,11 @@ cargo codspeed run -m simulation
 ```
 
 Local simulation requires `cargo-codspeed` and CodSpeed's Valgrind fork. A standard Valgrind
-installation is not equivalent. If those tools are unavailable, dispatch the repository CodSpeed
-workflow for the exact revision. Do not substitute a native timing run and label it CodSpeed.
+installation is not equivalent. If those tools are unavailable, push the exact revision to a
+branch with an open pull request. That push gives CodSpeed the comparison context it needs.
+
+A plain `workflow_dispatch` run does not update a pull request's CodSpeed report. Do not use its
+partial output as comparison evidence. Do not substitute a native timing run and label it CodSpeed.
 
 Use the CodSpeed benchmark page to compare the candidate with the same develop baseline. Inspect
 the differential flame graph and record these values for the changed stack:

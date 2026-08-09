@@ -9,7 +9,6 @@
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_session::registry::CachedId;
 
 use super::primitive::CheckedAdd;
 use super::primitive::CheckedArithmetic;
@@ -29,6 +28,7 @@ use crate::scalar_fn::RowVisitor;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::VecExecutionArgs;
+use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::row::InitializedElement;
 use crate::scalar_fn::row::UninitElementSink;
 
@@ -56,8 +56,7 @@ impl RowFn for NumericBinary {
     const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
-        static ID: CachedId = CachedId::new("vortex.numeric_binary");
-        *ID
+        ScalarFnVTable::id(&Binary)
     }
 
     fn dispatch<V: RowVisitor>(

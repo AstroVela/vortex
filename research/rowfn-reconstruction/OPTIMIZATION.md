@@ -354,13 +354,41 @@ microseconds for cache, and 154.728 microseconds for memory. Its total is 284.09
 and builds the replacement primitive array. This removes the constant allocation, batch planning,
 dispatch, argument decoding, and output reconciliation from this small internal operation.
 
-The AVX2 release binary auto-vectorizes the benchmark's `u16` subtraction. The generated loop has
-two packed `psubw` operations and handles 16 offsets per iteration. No SIMD claim is made for the
-other integer types without inspecting their machine code.
+The AVX2 release binary auto-vectorizes every integer width. Each unrolled iteration contains two
+128-bit packed subtracts. `psubb` handles 32 offsets, `psubw` handles 16, `psubd` handles 8, and
+`psubq` handles 4. Signed and unsigned monomorphs share their machine code.
 
 This fix targets the measured changed call path. It does not add padding or unrelated structural
-changes. Its local tests establish correctness only. A PR-context CodSpeed run must establish its
-simulation effect.
+changes.
+
+The [offsets fix check] validates the result in CodSpeed CPU simulation. The representative case
+measures 176.524 microseconds, compared with 233.737 microseconds on develop and 280.793
+microseconds before the fix. It changes from a 16.76% regression to a 32.41% improvement against
+develop. All 14 `take_filter_list_*` cases improve by 25.61% to 35.54% against develop.
+
+The representative post-fix callgraph totals are 15.462 microseconds for instructions, 59.031
+microseconds for cache, and 103.767 microseconds for memory. Its total is 178.259 microseconds.
+The generic scalar-function stack is absent. The typed `reset_offsets` path costs 0.933
+microseconds self and 7.629 microseconds total. `list_view_from_list` drops from 79.144 to 29.634
+microseconds total.
+
+This result is larger than a recovery to develop because develop also uses generic scalar-function
+subtraction for this internal offset adjustment. The direct typed operation removes that older
+overhead as well as the additional RowFn work.
+
+### Avoid a second ID for an internal helper
+
+The focused numeric profile shows another fixed cost. `CachedId::deref` increases from 0.702 to
+7.522 microseconds inclusive. The new `vortex.numeric_binary` ID initializes inside the measured
+call.
+
+`NumericBinary` is not registered. It executes the registered `Binary` operation's primitive path.
+Commit `df8fcbe1a` on `ct/row-fn-api` therefore reuses `Binary`'s existing ID. This removes a second
+interner initialization and makes internal errors name the public function.
+
+This change does not alter dispatch or the row loop. The cost occurs on first execution, so it is
+separate from per-row vectorization. The 6.820-microsecond profile delta is evidence for the source
+of the fixed cost. It is not a verified end-to-end improvement until CodSpeed measures the change.
 
 AVX2 wall-time runs on CPU 4 provide a separate native-runtime observation:
 
@@ -387,7 +415,7 @@ move a report without removing a measured cause.
 ## Current unresolved work
 
 - Reduce the mixed-constant LLVM sensitivity while preserving the production monomorph.
-- Validate the offsets fix with PR-context CodSpeed simulation.
+- Validate the numeric-helper ID change with PR-context CodSpeed simulation.
 - Recheck the native list/filter wall-time gap after removing the measured call path.
 - Identify the spatial `envelope` regression that begins when numeric RowFn code enters the linked
   binary.
@@ -401,3 +429,4 @@ move a report without removing a measured cause.
 [#9298]: https://github.com/vortex-data/vortex/pull/9298
 [focused framework check]: https://github.com/vortex-data/vortex/actions/runs/31316492455
 [focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
+[offsets fix check]: https://github.com/vortex-data/vortex/actions/runs/31317322594
