@@ -457,16 +457,17 @@ mod tests {
     fn bounded_max_empty_partial_does_not_poison_existing_bound() -> VortexResult<()> {
         let mut ctx = fresh_session().create_execution_ctx();
         let values = VarBinViewArray::from_iter_bin([&[1u8][..]]).into_array();
-        let mut acc = Accumulator::try_new(
-            BoundedMax,
-            BoundedMaxOptions {
-                max_bytes: max_bytes(2),
-            },
-            values.dtype().clone(),
-        )?;
+        let options = BoundedMaxOptions {
+            max_bytes: max_bytes(2),
+        };
+        let mut acc = Accumulator::try_new(BoundedMax, options.clone(), values.dtype().clone())?;
 
         acc.accumulate(&values, &mut ctx)?;
-        acc.combine_partials(Scalar::null(make_bounded_max_partial_dtype(values.dtype())))?;
+        acc.fold_partial(BoundedMax.partial_from_scalar(
+            &options,
+            values.dtype(),
+            Scalar::null(make_bounded_max_partial_dtype(values.dtype())),
+        )?)?;
 
         assert_eq!(
             acc.finish()?,
@@ -479,13 +480,10 @@ mod tests {
     fn bounded_max_unknown_partial_poisons_existing_bound() -> VortexResult<()> {
         let mut ctx = fresh_session().create_execution_ctx();
         let values = VarBinViewArray::from_iter_bin([&[1u8][..]]).into_array();
-        let mut acc = Accumulator::try_new(
-            BoundedMax,
-            BoundedMaxOptions {
-                max_bytes: max_bytes(2),
-            },
-            values.dtype().clone(),
-        )?;
+        let options = BoundedMaxOptions {
+            max_bytes: max_bytes(2),
+        };
+        let mut acc = Accumulator::try_new(BoundedMax, options.clone(), values.dtype().clone())?;
 
         let partial_dtype = make_bounded_max_partial_dtype(values.dtype());
         let unknown = Scalar::struct_(
@@ -497,7 +495,7 @@ mod tests {
         );
 
         acc.accumulate(&values, &mut ctx)?;
-        acc.combine_partials(unknown)?;
+        acc.fold_partial(BoundedMax.partial_from_scalar(&options, values.dtype(), unknown)?)?;
 
         assert_eq!(acc.finish()?, Scalar::null(values.dtype().as_nullable()));
         Ok(())

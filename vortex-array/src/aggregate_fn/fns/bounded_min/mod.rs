@@ -334,16 +334,17 @@ mod tests {
     fn bounded_min_null_partial_does_not_poison_existing_bound() -> VortexResult<()> {
         let mut ctx = fresh_session().create_execution_ctx();
         let values = VarBinViewArray::from_iter_bin([&[1u8][..]]).into_array();
-        let mut acc = Accumulator::try_new(
-            BoundedMin,
-            BoundedMinOptions {
-                max_bytes: max_bytes(2),
-            },
-            values.dtype().clone(),
-        )?;
+        let options = BoundedMinOptions {
+            max_bytes: max_bytes(2),
+        };
+        let mut acc = Accumulator::try_new(BoundedMin, options.clone(), values.dtype().clone())?;
 
         acc.accumulate(&values, &mut ctx)?;
-        acc.combine_partials(Scalar::null(values.dtype().as_nullable()))?;
+        acc.fold_partial(BoundedMin.partial_from_scalar(
+            &options,
+            values.dtype(),
+            Scalar::null(values.dtype().as_nullable()),
+        )?)?;
 
         assert_eq!(
             acc.finish()?,

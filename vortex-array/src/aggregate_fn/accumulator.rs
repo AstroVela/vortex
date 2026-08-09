@@ -71,11 +71,8 @@ impl<V: AggregateFnVTable> Accumulator<V> {
         })
     }
 
-    /// Parse a partial scalar and reduce it into the accumulator's state.
-    fn merge_partial_scalar(&mut self, other: Scalar) -> VortexResult<()> {
-        let other = self
-            .vtable
-            .partial_from_scalar(&self.options, &self.dtype, other)?;
+    /// Reduce an incoming partial state into the accumulator's current state.
+    pub(crate) fn fold_partial(&mut self, other: V::Partial) -> VortexResult<()> {
         let empty = self
             .vtable
             .reduce_partials(&self.options, &self.dtype, &[])?;
@@ -93,11 +90,11 @@ pub trait DynAccumulator: 'static + Send {
     /// Accumulate a new array into the accumulator's state.
     fn accumulate(&mut self, batch: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()>;
 
-    /// Fold an external partial-state scalar into this accumulator's state.
+    /// Drain another accumulator's state into this one, resetting `other`.
     ///
-    /// The scalar must have the dtype reported by the vtable's `partial_dtype` for the
-    /// options and input dtype used to construct this accumulator.
-    fn combine_partials(&mut self, other: Scalar) -> VortexResult<()>;
+    /// The other accumulator must have been constructed for the same aggregate function,
+    /// options, and input dtype as this one.
+    fn merge_from(&mut self, other: &mut dyn DynAccumulator) -> VortexResult<()>;
 
     /// Whether the accumulator's result is fully determined.
     fn is_saturated(&self) -> bool;
@@ -164,7 +161,10 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                 );
                 partial.cast(&self.partial_dtype)?
             };
-            self.merge_partial_scalar(partial)?;
+            let parsed = self
+                .vtable
+                .partial_from_scalar(&self.options, &self.dtype, partial)?;
+            self.fold_partial(parsed)?;
             return Ok(());
         }
 
@@ -188,7 +188,10 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                     result.dtype(),
                     self.partial_dtype,
                 );
-                self.merge_partial_scalar(result)?;
+                let parsed = self
+                    .vtable
+                    .partial_from_scalar(&self.options, &self.dtype, result)?;
+                self.fold_partial(parsed)?;
                 return Ok(());
             }
         }
@@ -220,7 +223,10 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
                     result.dtype(),
                     self.partial_dtype,
                 );
-                self.merge_partial_scalar(result)?;
+                let parsed = self
+                    .vtable
+                    .partial_from_scalar(&self.options, &self.dtype, result)?;
+                self.fold_partial(parsed)?;
                 return Ok(());
             }
 
@@ -233,8 +239,18 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         self.vtable.accumulate(&mut self.partial, &columnar, ctx)
     }
 
-    fn combine_partials(&mut self, other: Scalar) -> VortexResult<()> {
-        self.merge_partial_scalar(other)
+    fn merge_from(&mut self, other: &mut dyn DynAccumulator) -> VortexResult<()> {
+        let scalar = other.flush()?;
+        vortex_ensure!(
+            scalar.dtype() == &self.partial_dtype,
+            "Cannot merge accumulator with partial dtype {}, expected {}",
+            scalar.dtype(),
+            self.partial_dtype,
+        );
+        let parsed = self
+            .vtable
+            .partial_from_scalar(&self.options, &self.dtype, scalar)?;
+        self.fold_partial(parsed)
     }
 
     fn is_saturated(&self) -> bool {

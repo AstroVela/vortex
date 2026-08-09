@@ -19,9 +19,9 @@ use crate::ArrayRef;
 use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::aggregate_fn::Accumulator;
-use crate::aggregate_fn::AccumulatorRef;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::DynAccumulator;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
@@ -48,6 +48,11 @@ type LeftOptions<T> = <<T as BinaryCombined>::Left as AggregateFnVTable>::Option
 type RightOptions<T> = <<T as BinaryCombined>::Right as AggregateFnVTable>::Options;
 /// Combined options for a [`BinaryCombined`] aggregate.
 pub type CombinedOptions<T> = PairOptions<LeftOptions<T>, RightOptions<T>>;
+/// Pair of typed child accumulators holding the partial state of a [`BinaryCombined`] aggregate.
+type ChildAccumulators<T> = (
+    Accumulator<<T as BinaryCombined>::Left>,
+    Accumulator<<T as BinaryCombined>::Right>,
+);
 
 /// Declare an aggregate function in terms of two child aggregates.
 pub trait BinaryCombined: 'static + Send + Sync + Clone {
@@ -142,22 +147,19 @@ impl<T: BinaryCombined> Combined<T> {
         &self,
         options: &CombinedOptions<T>,
         input_dtype: &DType,
-    ) -> VortexResult<(AccumulatorRef, AccumulatorRef)> {
+    ) -> VortexResult<ChildAccumulators<T>> {
         let left = Accumulator::try_new(self.0.left(), options.0.clone(), input_dtype.clone())?;
         let right = Accumulator::try_new(self.0.right(), options.1.clone(), input_dtype.clone())?;
-        Ok((
-            Box::new(left) as AccumulatorRef,
-            Box::new(right) as AccumulatorRef,
-        ))
+        Ok((left, right))
     }
 }
 
 impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
     type Options = CombinedOptions<T>;
-    // Each child is held as a fully-fledged `AccumulatorRef` so that batches dispatched through
+    // Each child is held as a fully-fledged `Accumulator` so that batches dispatched through
     // `try_accumulate` consult the kernel registry per-child (e.g. a `(Dict, Sum)` kernel fires
     // for the inner `Sum` child of `Combined<Mean>`).
-    type Partial = (AccumulatorRef, AccumulatorRef);
+    type Partial = ChildAccumulators<T>;
 
     fn id(&self) -> AggregateFnId {
         self.0.id()
@@ -203,8 +205,16 @@ impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
             let r_field = s
                 .field(rname)
                 .ok_or_else(|| vortex_err!("BinaryCombined partial missing `{}` field", rname))?;
-            left.combine_partials(l_field)?;
-            right.combine_partials(r_field)?;
+            left.fold_partial(self.0.left().partial_from_scalar(
+                &options.0,
+                input_dtype,
+                l_field,
+            )?)?;
+            right.fold_partial(self.0.right().partial_from_scalar(
+                &options.1,
+                input_dtype,
+                r_field,
+            )?)?;
         }
         Ok((left, right))
     }
@@ -216,11 +226,22 @@ impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
         partials: &[Self::Partial],
     ) -> VortexResult<Self::Partial> {
         let (mut left, mut right) = self.new_child_accumulators(options, input_dtype)?;
-        // The children are type-erased accumulators, so their partial scalars are the only
-        // interchange format available to fold one accumulator's state into another.
+        // Partial scalars are the interchange format between child accumulators: the slice is
+        // immutable, so each child's state is read out with `partial_scalar`, re-parsed with the
+        // child vtable, and folded into the fresh accumulator.
+        let lv = self.0.left();
+        let rv = self.0.right();
         for (l, r) in partials {
-            left.combine_partials(l.partial_scalar()?)?;
-            right.combine_partials(r.partial_scalar()?)?;
+            left.fold_partial(lv.partial_from_scalar(
+                &options.0,
+                input_dtype,
+                l.partial_scalar()?,
+            )?)?;
+            right.fold_partial(rv.partial_from_scalar(
+                &options.1,
+                input_dtype,
+                r.partial_scalar()?,
+            )?)?;
         }
         Ok((left, right))
     }

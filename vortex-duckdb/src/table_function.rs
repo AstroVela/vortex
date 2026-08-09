@@ -558,7 +558,7 @@ fn scan_aggregate(
         {
             let mut partials = global_state.partials.lock();
             for (global, local) in partials.iter_mut().zip(&mut local_state.partials) {
-                global.combine_partials(local.flush()?)?;
+                global.merge_from(local.as_mut())?;
             }
         }
 
