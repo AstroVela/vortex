@@ -10,7 +10,9 @@ use num_traits::Float;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::arrays::ExtensionArray;
+use vortex_array::arrays::Masked;
 use vortex_array::arrays::extension::ExtensionArrayExt;
+use vortex_array::arrays::masked::MaskedArraySlotsExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
@@ -76,6 +78,13 @@ impl<T: Float + NativePType> InputElement for TensorRow<T> {
     }
 
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+        // Dense batch execution owns the mask and restores it on the result. Decode the values
+        // directly so a nullable tensor does not rebuild its extension storage under that mask.
+        let array = match array.as_opt::<Masked>() {
+            Some(masked) => masked.child().clone(),
+            None => array,
+        };
+
         let rows = array.len();
         let list_size = validate_tensor_float_input(array.dtype())?.list_size() as usize;
         let ext: ExtensionArray = array.execute(ctx)?;

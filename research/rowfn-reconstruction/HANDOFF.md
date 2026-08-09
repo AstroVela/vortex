@@ -194,11 +194,40 @@ microseconds.
 `ct/row-fn-api` reuses `Binary`'s ID. This removes the second interner initialization and gives
 errors the public function's name. It does not change the arithmetic loop or the public API.
 
-This is a first-execution cost, not a per-row cost. Its CodSpeed effect is not verified yet.
+This is a first-execution cost, not a per-row cost. The [numeric ID check] validates it:
+
+- `sub_i64_constant` improves from 675.849 to 670.968 microseconds.
+- `CachedId::deref` drops from 5.327 to 0.376 microseconds total.
+- `Id::new_static`, previously 3.723 microseconds total, disappears from the callgraph.
+- CodSpeed still classifies the complete benchmark as no change against develop. The fixed 4.881
+  microseconds is less than 1% of this operation.
+
+The take/filter control remains improved by 33.93% against develop.
+
+## Nullable tensor decode
+
+The current report has two remaining nullable tensor regressions at width 256. The differential
+profile for `inner_product::nullable[256]` records these component increases:
+
+| Component | Develop | RowFn | Increase |
+| --- | ---: | ---: | ---: |
+| Instructions | 13.146 us | 14.378 us | 1.232 us |
+| Cache | 62.165 us | 71.844 us | 9.679 us |
+| Memory | 158.567 us | 186.622 us | 28.056 us |
+| Total | 233.878 us | 272.845 us | 38.966 us |
+
+The floating-point row work is approximately unchanged. `TensorRow::decode` costs 33.553
+microseconds total, including 19.956 microseconds in `ArrayRef::mask`. The input is a `Masked`
+tensor, but dense RowFn execution owns its validity and restores it on the output. Decoding the
+child values directly avoids rebuilding extension storage under the same mask.
+
+The local `f64` inner-product loop is scalar-unrolled by four. It emits `mulsd` and `addsd` in the
+source fold order, not packed floating-point SIMD. Reassociating this reduction could enable wider
+SIMD, but it would change floating-point results. It is not a free RowFn code-generation change.
 
 ## Recommended next steps
 
-1. Validate the internal numeric-helper ID change in a PR-context CodSpeed comparison.
+1. Validate the masked tensor decode change in a PR-context CodSpeed comparison.
 2. Keep local wall time separate from CodSpeed CPU simulation.
 3. Continue investigating the native wall-time gap only if it remains after the measured call path
    is removed.
@@ -224,5 +253,6 @@ source-placement sensitivity remains unknown.
 [Focused framework check]: https://github.com/vortex-data/vortex/actions/runs/31316492455
 [Focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
 [offsets fix check]: https://github.com/vortex-data/vortex/actions/runs/31317322594
+[numeric ID check]: https://github.com/vortex-data/vortex/actions/runs/31318131466
 [run `31289620637`]: https://github.com/vortex-data/vortex/actions/runs/31289620637
 [run `31289622392`]: https://github.com/vortex-data/vortex/actions/runs/31289622392

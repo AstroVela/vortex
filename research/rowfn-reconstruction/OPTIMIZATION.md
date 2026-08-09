@@ -387,8 +387,37 @@ Commit `df8fcbe1a` on `ct/row-fn-api` therefore reuses `Binary`'s existing ID. T
 interner initialization and makes internal errors name the public function.
 
 This change does not alter dispatch or the row loop. The cost occurs on first execution, so it is
-separate from per-row vectorization. The 6.820-microsecond profile delta is evidence for the source
-of the fixed cost. It is not a verified end-to-end improvement until CodSpeed measures the change.
+separate from per-row vectorization. The [numeric ID check] validates the result:
+
+- `sub_i64_constant` improves from 675.849 to 670.968 microseconds.
+- `CachedId::deref` drops from 5.327 to 0.376 microseconds total.
+- `Id::new_static`, previously 3.723 microseconds total, disappears from the callgraph.
+- CodSpeed still classifies the complete benchmark as no change against develop. The fixed 4.881
+  microseconds is less than 1% of this operation.
+
+The take/filter control remains improved by 33.93% against develop.
+
+### Decode masked tensor values directly
+
+The report also shows 14.77% and 12.46% regressions for nullable width-256 inner product and L2
+norm. For `inner_product::nullable[256]`, the callgraph components are:
+
+| Component | Develop | RowFn | Increase |
+| --- | ---: | ---: | ---: |
+| Instructions | 13.146 us | 14.378 us | 1.232 us |
+| Cache | 62.165 us | 71.844 us | 9.679 us |
+| Memory | 158.567 us | 186.622 us | 28.056 us |
+| Total | 233.878 us | 272.845 us | 38.966 us |
+
+The floating-point row work is approximately unchanged. `TensorRow::decode` costs 33.553
+microseconds total, including 19.956 microseconds in `ArrayRef::mask`. The benchmark passes a
+`Masked` tensor. Dense RowFn execution owns that validity and restores it on the result, so the
+tensor decoder can read the mask's child values directly.
+
+The linked `f64` inner-product loop is scalar-unrolled by four. It uses `mulsd` and `addsd` in the
+source fold order, not packed floating-point SIMD. LLVM cannot reassociate the strict reduction.
+Changing that order could enable wider SIMD, but it would change floating-point results and needs
+an explicit numerical contract.
 
 AVX2 wall-time runs on CPU 4 provide a separate native-runtime observation:
 
@@ -415,7 +444,7 @@ move a report without removing a measured cause.
 ## Current unresolved work
 
 - Reduce the mixed-constant LLVM sensitivity while preserving the production monomorph.
-- Validate the numeric-helper ID change with PR-context CodSpeed simulation.
+- Validate the masked tensor decode change with PR-context CodSpeed simulation.
 - Recheck the native list/filter wall-time gap after removing the measured call path.
 - Identify the spatial `envelope` regression that begins when numeric RowFn code enters the linked
   binary.
@@ -430,3 +459,4 @@ move a report without removing a measured cause.
 [focused framework check]: https://github.com/vortex-data/vortex/actions/runs/31316492455
 [focused numeric check]: https://github.com/vortex-data/vortex/actions/runs/31316710479
 [offsets fix check]: https://github.com/vortex-data/vortex/actions/runs/31317322594
+[numeric ID check]: https://github.com/vortex-data/vortex/actions/runs/31318131466
