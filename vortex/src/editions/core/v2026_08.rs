@@ -49,4 +49,5 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         &"vortex.uncompressed_size_in_bytes",
     ],
     added_expressions: &[],
+    added_extension_dtypes: &[],
 };

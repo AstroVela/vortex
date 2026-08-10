@@ -20,4 +20,6 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     added_layouts: &[],
     added_aggregations: &[],
     added_expressions: &[],
+    // The UUID extension dtype shipped in 0.65.0, this edition's minimum reader.
+    added_extension_dtypes: &[&"vortex.uuid"],
 };

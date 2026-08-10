@@ -168,6 +168,27 @@ fn core_2026_08_aggregation_set_is_pinned() {
     );
 }
 
+/// The extension-dtype set of the newest frozen `core` edition, pinned like the array set
+/// above.
+#[test]
+fn core_2026_08_extension_dtype_set_is_pinned() {
+    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
+    let extension_dtypes = session.extension_dtypes_in(&CORE_2026_08);
+    let ids: Vec<&str> = extension_dtypes
+        .iter()
+        .map(|inclusion| inclusion.object_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "vortex.date",
+            "vortex.time",
+            "vortex.timestamp",
+            "vortex.uuid",
+        ]
+    );
+}
+
 #[test]
 fn encodings_in_editions_unions_families() {
     let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
@@ -217,6 +238,17 @@ fn tensor_scalar_fns_are_expression_members() {
                 |inclusion| !inclusion.object_id.as_str().starts_with("vortex.tensor.")
                     || inclusion.object_id.as_str() == "vortex.tensor.normalized"
             )
+    );
+
+    // The tensor extension dtypes join the same cohort under their own kind.
+    let extension_dtypes = session.extension_dtypes_in(&UNSTABLE_2026_06_0);
+    let ids: Vec<&str> = extension_dtypes
+        .iter()
+        .map(|inclusion| inclusion.object_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["vortex.tensor.fixed_shape_tensor", "vortex.tensor.vector",]
     );
 }
 
@@ -300,6 +332,26 @@ fn core_edition_ids_are_registered_serializable_aggregate_fns() {
     }
 }
 
+#[test]
+fn core_edition_ids_are_registered_extension_dtypes() {
+    use vortex_array::dtype::session::DTypeSessionExt;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    for inclusion in session.editions().extension_dtypes_in(&CORE_2026_08) {
+        assert!(
+            session
+                .dtypes()
+                .registry()
+                .get(&inclusion.object_id)
+                .is_some(),
+            "{} is declared in core but not registered as an extension dtype",
+            inclusion.object_id
+        );
+    }
+}
+
 fn baseline_core_session() -> VortexResult<VortexSession> {
     use crate::VortexSessionDefault;
 
@@ -330,6 +382,7 @@ static WRITER_TEST_DECLARATION: EditionDeclaration = EditionDeclaration {
     added_layouts: &[],
     added_aggregations: &[],
     added_expressions: &[],
+    added_extension_dtypes: &[],
 };
 
 fn writer_test_session() -> VortexResult<VortexSession> {

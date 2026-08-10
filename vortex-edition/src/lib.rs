@@ -6,10 +6,11 @@
 //!
 //! Editions cover every kind of object whose identifier can appear in serialized Vortex
 //! data: array encodings, layout encodings, aggregate functions (stored in zone maps and
-//! file statistics), and the scalar functions named by serialized expressions. Each member
-//! is an [`EditionInclusion`] identified by an [`ObjectKind`] plus an object id; ids are
-//! unique within a kind, and the same id may name different objects of different kinds
-//! (`vortex.dict` is both an array encoding and a layout encoding).
+//! file statistics), extension dtypes (stored in every serialized `DType`), and the scalar
+//! functions named by serialized expressions. Each member is an [`EditionInclusion`]
+//! identified by an [`ObjectKind`] plus an object id; ids are unique within a kind, and
+//! the same id may name different objects of different kinds (`vortex.dict` is both an
+//! array encoding and a layout encoding).
 //!
 //! Editions live on the session, like encodings do: [`EditionSession`] holds the registered
 //! editions and [`EnabledEditions`] selects which of them a writer may emit. Declarations
@@ -138,15 +139,20 @@ pub enum ObjectKind {
     /// storage), so most scalar functions never join an edition. Functions whose serialized
     /// form can reach durable data carry the same guarantee as the other kinds.
     Expression,
+    /// An extension dtype, e.g. `vortex.timestamp`. Extension dtype ids and metadata are
+    /// serialized wherever a [`DType`](https://docs.vortex.dev/specs/dtype-format.html)
+    /// is, including every file's schema.
+    ExtensionDType,
 }
 
 impl ObjectKind {
     /// Every object kind, in declaration order.
-    pub const ALL: [ObjectKind; 4] = [
+    pub const ALL: [ObjectKind; 5] = [
         ObjectKind::Array,
         ObjectKind::Layout,
         ObjectKind::Aggregation,
         ObjectKind::Expression,
+        ObjectKind::ExtensionDType,
     ];
 }
 
@@ -157,6 +163,7 @@ impl Display for ObjectKind {
             ObjectKind::Layout => "layout",
             ObjectKind::Aggregation => "aggregation",
             ObjectKind::Expression => "expression",
+            ObjectKind::ExtensionDType => "extension dtype",
         })
     }
 }
@@ -257,6 +264,8 @@ pub struct EditionDeclaration {
     /// The scalar functions (named by serialized expressions) that join the family at this
     /// edition.
     pub added_expressions: &'static [&'static dyn AsObjectId],
+    /// The extension dtypes that join the family at this edition.
+    pub added_extension_dtypes: &'static [&'static dyn AsObjectId],
 }
 
 impl EditionInclusion {

@@ -29,4 +29,5 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         &"vortex.tensor.inner_product",
         &"vortex.tensor.l2_norm",
     ],
+    added_extension_dtypes: &[&"vortex.tensor.fixed_shape_tensor", &"vortex.tensor.vector"],
 };

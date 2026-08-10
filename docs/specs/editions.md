@@ -12,6 +12,7 @@ An edition covers every kind of object whose identifier appears in serialized Vo
 | `layout`     | Layout encodings                          | `vortex.zoned`, `vortex.flat`      | The file's layout tree                    |
 | `aggregation`| Aggregate functions                       | `vortex.sum`, `vortex.bounded_max` | Zone maps and file statistics             |
 | `expression` | Scalar functions in serialized expressions| `vortex.tensor.l2_norm`            | Rarely durable; usually scan-time only    |
+| `extension dtype` | Extension dtypes                     | `vortex.timestamp`, `vortex.uuid`  | Every serialized `DType`, incl. file schemas |
 
 Object ids are unique within a kind. The same id may name different objects of different
 kinds: `vortex.dict` is both an array encoding and a layout encoding.
@@ -30,9 +31,9 @@ version of Vortex required to read the file.
 
 ## Resolving an unknown-object error
 
-If a read failed with an unknown ID (an encoding, layout, aggregate function, or expression
-function) and pointed you here, the reader met an object it does not support. Find the ID in
-the [registry](#edition-registry) below:
+If a read failed with an unknown ID (an encoding, layout, aggregate function, expression
+function, or extension dtype) and pointed you here, the reader met an object it does not
+support. Find the ID in the [registry](#edition-registry) below:
 
 1. **The ID is listed under an edition.** The file is newer than your Vortex build. Upgrade
    to at least that edition's required Vortex release and the file will read.
@@ -50,8 +51,8 @@ versions, giving a delay before the newest objects are written to disk.
 Every file you write carries the read-forever guarantee. If a file would contain an array
 encoding outside the targeted editions, the write fails immediately; edition violations
 never surface as someone else's read error later. (Arrays are enforced at write time today;
-layout and aggregation membership is declared and validated, with write-time enforcement
-staged — see [enforcement status](#enforcement-status).)
+layout, aggregation, and extension-dtype membership is declared and validated, with
+write-time enforcement staged — see [enforcement status](#enforcement-status).)
 
 The enabled editions are stored on the writer's Vortex session. Registering an edition makes
 its declaration available to the session; enabling it separately allows the writer to emit
@@ -85,7 +86,7 @@ carrying `vortex.stats` remains readable.
 
 Editions name *which* objects a file may contain. This section defines how the serialized
 form of those objects — array metadata, layout metadata, aggregate options, expression
-options — is allowed to change over time.
+options, extension dtype metadata — is allowed to change over time.
 
 ### Reading: deserialize to the latest version
 
@@ -148,6 +149,13 @@ fails immediately rather than emitting a file the target reader could not load.
   most scalar functions never join an edition. A scalar function joins only when its
   serialized form can reach durable data (for example the tensor similarity functions used
   by vector indexes); it then carries the same guarantee as every other member.
+- **Extension dtypes.** Every serialized `DType` — including every file's schema — embeds
+  the ids and metadata of the extension dtypes it uses, so an extension dtype in durable
+  data needs the same guarantee as an encoding. Readers resolve ids against the session's
+  dtype registry; under `allow_unknown` an unrecognised extension deserializes as an opaque
+  foreign dtype over its storage type, which is always readable. Extension dtypes shipped
+  by opt-in crates (`vortex.st.*` spatial types, `vortex.json`) sit outside the editions
+  system until their crates declare a family, exactly like their encodings.
 
 ### Enforcement status
 
@@ -157,6 +165,7 @@ fails immediately rather than emitting a file the target reader could not load.
 | `layout`     | yes                  | staged; strategies choose layouts   |
 | `aggregation`| yes                  | staged; defaults stay in `core`     |
 | `expression` | yes                  | not applicable to file writes today |
+| `extension dtype` | yes             | staged; schemas come from the input |
 
 Declared membership is validated by unit tests against the session registries (every `core`
 member must be registered, layouts and aggregations included) and pinned so a frozen edition
@@ -234,6 +243,10 @@ Frozen editions: `core2025.05.0` (Vortex `0.36.0`), `core2025.06.0` (`0.40.0`),
 | `vortex.null_count`                 | aggregation  | `core2026.08.0`|
 | `vortex.sum`                        | aggregation  | `core2026.08.0`|
 | `vortex.uncompressed_size_in_bytes` | aggregation  | `core2026.08.0`|
+| `vortex.date`                       | extension dtype | `core2025.05.0`|
+| `vortex.time`                       | extension dtype | `core2025.05.0`|
+| `vortex.timestamp`                  | extension dtype | `core2025.05.0`|
+| `vortex.uuid`                       | extension dtype | `core2026.07.0`|
 
 Note that some layouts shipped long before the edition recorded here (`vortex.zoned` dates
 back to the stable-format release), but their *current* serialized form is only guaranteed
@@ -256,3 +269,5 @@ yet, and are written only when the `unstable_encodings` feature is selected.
 | `vortex.tensor.cosine_similarity`  | expression   | `unstable2026.04.0`|
 | `vortex.tensor.inner_product`      | expression   | `unstable2026.04.0`|
 | `vortex.tensor.l2_norm`            | expression   | `unstable2026.04.0`|
+| `vortex.tensor.fixed_shape_tensor` | extension dtype | `unstable2026.04.0`|
+| `vortex.tensor.vector`             | extension dtype | `unstable2026.04.0`|

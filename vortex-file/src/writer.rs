@@ -658,6 +658,7 @@ mod tests {
             added_layouts: &[],
             added_aggregations: &[],
             added_expressions: &[],
+            added_extension_dtypes: &[],
         };
 
         let session = array_session().with::<EditionSession>();

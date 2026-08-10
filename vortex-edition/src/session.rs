@@ -91,6 +91,10 @@ impl EditionSession {
             (ObjectKind::Layout, declaration.added_layouts),
             (ObjectKind::Aggregation, declaration.added_aggregations),
             (ObjectKind::Expression, declaration.added_expressions),
+            (
+                ObjectKind::ExtensionDType,
+                declaration.added_extension_dtypes,
+            ),
         ];
         for (kind, added) in added_by_kind {
             for object in added {
@@ -201,6 +205,11 @@ impl EditionSession {
     /// function id.
     pub fn expressions_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
         self.members_of_kind_in(ObjectKind::Expression, edition)
+    }
+
+    /// The extension dtypes in an edition, sorted by dtype id.
+    pub fn extension_dtypes_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        self.members_of_kind_in(ObjectKind::ExtensionDType, edition)
     }
 
     /// Backwards-compatible name for [`EditionSession::arrays_in`].
