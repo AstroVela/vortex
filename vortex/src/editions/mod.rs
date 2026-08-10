@@ -18,6 +18,8 @@
 
 pub mod core;
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
 mod tests;
 pub mod unstable;
 

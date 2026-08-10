@@ -108,6 +108,13 @@ input, alongside a deserializer for every earlier form. Removing or repurposing 
 fields is never allowed; new fields must be optional or gated behind a new form that old
 data simply does not carry.
 
+Both directions are enforced by golden files: every edition member has a directory of
+serialized fixtures under `vortex/goldenfiles/editions/`, one file per historical form. The
+current serialization must match the newest golden byte-for-byte, and every older golden
+must keep deserializing forever. Whenever a serialized format changes — e.g. a field is
+added — a **new** golden version must be added (never edit or delete an existing one); see
+`vortex/goldenfiles/editions/AGENTS.md`.
+
 ### Writing: translate down, or convert to canonical and recompress
 
 Writers emit the **newest serialized form permitted by the target editions**. An object (or
@@ -169,9 +176,10 @@ fails immediately rather than emitting a file the target reader could not load.
 
 Declared membership is validated by unit tests against the session registries (every `core`
 member must be registered, layouts and aggregations included) and pinned so a frozen edition
-cannot silently change. Write-time enforcement for layouts and aggregations follows the
-array mechanism: strategies will consult the enabled editions and translate or degrade,
-exactly as described above.
+cannot silently change, and every member's serialized form is pinned by the golden-file
+suite in `vortex/goldenfiles/editions/`. Write-time enforcement for layouts and aggregations
+follows the array mechanism: strategies will consult the enabled editions and translate or
+degrade, exactly as described above.
 
 ## Edition registry
 
@@ -227,16 +235,11 @@ Frozen editions: `core2025.05.0` (Vortex `0.36.0`), `core2025.06.0` (`0.40.0`),
 | `vortex.struct`                     | layout       | `core2025.05.0`|
 | `vortex.zoned`                      | layout       | `core2026.08.0`|
 | `vortex.all_nan`                    | aggregation  | `core2026.08.0`|
-| `vortex.all_non_distinct`           | aggregation  | `core2026.08.0`|
 | `vortex.all_non_nan`                | aggregation  | `core2026.08.0`|
 | `vortex.all_non_null`               | aggregation  | `core2026.08.0`|
 | `vortex.all_null`                   | aggregation  | `core2026.08.0`|
 | `vortex.bounded_max`                | aggregation  | `core2026.08.0`|
 | `vortex.bounded_min`                | aggregation  | `core2026.08.0`|
-| `vortex.first`                      | aggregation  | `core2026.08.0`|
-| `vortex.is_constant`                | aggregation  | `core2026.08.0`|
-| `vortex.is_sorted`                  | aggregation  | `core2026.08.0`|
-| `vortex.last`                       | aggregation  | `core2026.08.0`|
 | `vortex.max`                        | aggregation  | `core2026.08.0`|
 | `vortex.min`                        | aggregation  | `core2026.08.0`|
 | `vortex.nan_count`                  | aggregation  | `core2026.08.0`|

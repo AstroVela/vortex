@@ -27,20 +27,16 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     // edition's min_vortex_version reads its current serialized form.
     added_layouts: &[&"vortex.dict", &"vortex.list", &"vortex.zoned"],
     // Every aggregate function registered by the default session whose options serialize:
-    // the set a zoned layout's zone maps may store. `vortex.min_max` is deliberately
-    // absent (it is not serializable) and stays a purely in-memory aggregate.
+    // the set a zoned layout's zone maps may store. In-memory-only aggregates (e.g.
+    // `vortex.min_max`, `vortex.first`, `vortex.is_sorted`) are deliberately absent; they
+    // join a future edition if and when they become serializable.
     added_aggregations: &[
         &"vortex.all_nan",
-        &"vortex.all_non_distinct",
         &"vortex.all_non_nan",
         &"vortex.all_non_null",
         &"vortex.all_null",
         &"vortex.bounded_max",
         &"vortex.bounded_min",
-        &"vortex.first",
-        &"vortex.is_constant",
-        &"vortex.is_sorted",
-        &"vortex.last",
         &"vortex.max",
         &"vortex.min",
         &"vortex.nan_count",
