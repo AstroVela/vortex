@@ -108,34 +108,13 @@ fn generate_indices(dataset: &dyn BenchDataset, pattern: AccessPattern) -> Vec<u
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark configuration
-// ---------------------------------------------------------------------------
-
-/// Controls whether the file handle is reused or reopened each iteration.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpenMode {
-    /// Reuse the file handle across iterations (cached metadata).
-    #[clap(name = "cached")]
-    Cached,
-    /// Reopen the file each iteration (includes footer parsing).
-    #[clap(name = "reopen")]
-    Reopen,
-    /// Run both cached and reopen variants.
-    #[clap(name = "both")]
-    Both,
-}
-
-// ---------------------------------------------------------------------------
 // Benchmark core
 // ---------------------------------------------------------------------------
 
 /// Run a random access benchmark.
 ///
-/// Runs the take operation repeatedly until the time limit is reached,
-/// collecting timing for each run. When `reopen` is true, the accessor is
-/// recreated from scratch before each iteration so that file metadata
-/// parsing is included in the timing.
-#[expect(clippy::too_many_arguments)]
+/// The accessor is opened once and reused, so the timed region covers the take
+/// itself against warm file metadata.
 async fn benchmark_random_access(
     dataset: &dyn BenchDataset,
     format: Format,
@@ -144,12 +123,11 @@ async fn benchmark_random_access(
     indices: &[u64],
     time_limit_secs: u64,
     storage: &str,
-    reopen: bool,
 ) -> Result<RandomAccessRun> {
     let time_limit = Duration::from_secs(time_limit_secs);
     let overall_start = Instant::now();
     let mut runs = Vec::new();
-    let mut accessor = open_accessor(dataset, format).await?;
+    let accessor = open_accessor(dataset, format).await?;
 
     loop {
         let start = Instant::now();
@@ -159,10 +137,6 @@ async fn benchmark_random_access(
 
         if overall_start.elapsed() >= time_limit {
             break;
-        }
-
-        if reopen {
-            accessor = open_accessor(dataset, format).await?;
         }
     }
 
@@ -176,7 +150,6 @@ async fn benchmark_random_access(
         display_name: display_name(dataset.name(), pattern),
         dataset: dataset.name().to_string(),
         pattern,
-        reopen,
         timing,
     })
 }
@@ -218,10 +191,6 @@ fn v3_random_access_dataset_name(dataset: &str, pattern: Option<AccessPattern>) 
 }
 
 fn push_v3_random_access_record(records: &mut Vec<v3::V3Record>, run: &RandomAccessRun) {
-    if run.reopen {
-        return;
-    }
-
     let dataset = v3_random_access_dataset_name(&run.dataset, run.pattern);
     records.push(v3::random_access_record(&run.timing, &dataset));
 }
@@ -287,8 +256,6 @@ pub struct RunConfig {
     pub patterns: Vec<AccessPattern>,
     /// Maximum duration of each benchmark target in seconds.
     pub time_limit: u64,
-    /// Whether each benchmark run reuses or reopens its file handle.
-    pub open_mode: OpenMode,
     /// Format used to emit measurements.
     pub display_format: DisplayFormat,
     /// Optional path for the primary result output.
@@ -304,23 +271,16 @@ pub async fn run(config: RunConfig) -> Result<()> {
         formats,
         patterns,
         time_limit,
-        open_mode,
         display_format,
         output_path,
         ingest_output,
     } = config;
 
-    let reopen_variants: &[bool] = match open_mode {
-        OpenMode::Cached => &[false],
-        OpenMode::Reopen => &[true],
-        OpenMode::Both => &[false, true],
-    };
-
     let total_steps: usize = datasets
         .iter()
         .map(|d| {
             let legacy_extra = if d.name() == "taxi" { formats.len() } else { 0 };
-            (formats.len() * patterns.len() + legacy_extra) * reopen_variants.len()
+            formats.len() * patterns.len() + legacy_extra
         })
         .sum();
     let progress = ProgressBar::new(total_steps as u64);
@@ -334,55 +294,39 @@ pub async fn run(config: RunConfig) -> Result<()> {
         for format in &formats {
             if dataset.name() == "taxi" {
                 let name = measurement_name(dataset.name(), None, *format);
-                for &reopen in reopen_variants {
-                    let bench_name = if reopen {
-                        format!("{name}-footer")
-                    } else {
-                        name.clone()
-                    };
-                    let run = benchmark_random_access(
-                        dataset.as_ref(),
-                        *format,
-                        &bench_name,
-                        None,
-                        &FIXED_TAXI_INDICES,
-                        time_limit,
-                        STORAGE_NVME,
-                        reopen,
-                    )
-                    .await?;
+                let run = benchmark_random_access(
+                    dataset.as_ref(),
+                    *format,
+                    &name,
+                    None,
+                    &FIXED_TAXI_INDICES,
+                    time_limit,
+                    STORAGE_NVME,
+                )
+                .await?;
 
-                    push_v3_random_access_record(&mut v3_records, &run);
-                    runs.push(run);
-                    progress.inc(1);
-                }
+                push_v3_random_access_record(&mut v3_records, &run);
+                runs.push(run);
+                progress.inc(1);
             }
 
             for pattern in &patterns {
                 let indices = generate_indices(dataset.as_ref(), *pattern);
                 let name = measurement_name(dataset.name(), Some(*pattern), *format);
-                for &reopen in reopen_variants {
-                    let bench_name = if reopen {
-                        format!("{name}-footer")
-                    } else {
-                        name.clone()
-                    };
-                    let run = benchmark_random_access(
-                        dataset.as_ref(),
-                        *format,
-                        &bench_name,
-                        Some(*pattern),
-                        &indices,
-                        time_limit,
-                        STORAGE_NVME,
-                        reopen,
-                    )
-                    .await?;
+                let run = benchmark_random_access(
+                    dataset.as_ref(),
+                    *format,
+                    &name,
+                    Some(*pattern),
+                    &indices,
+                    time_limit,
+                    STORAGE_NVME,
+                )
+                .await?;
 
-                    push_v3_random_access_record(&mut v3_records, &run);
-                    runs.push(run);
-                    progress.inc(1);
-                }
+                push_v3_random_access_record(&mut v3_records, &run);
+                runs.push(run);
+                progress.inc(1);
             }
         }
     }
@@ -397,7 +341,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     match display_format {
         DisplayFormat::Table => {
-            render_random_access_table(&mut writer, &runs, &formats, reopen_variants)?;
+            render_random_access_table(&mut writer, &runs, &formats)?;
         }
         DisplayFormat::GhJson => {
             let timings: Vec<TimingMeasurement> = runs.into_iter().map(|r| r.timing).collect();
@@ -425,7 +369,7 @@ mod tests {
         );
     }
 
-    fn fake_run(dataset: &str, pattern: Option<AccessPattern>, reopen: bool) -> RandomAccessRun {
+    fn fake_run(dataset: &str, pattern: Option<AccessPattern>) -> RandomAccessRun {
         RandomAccessRun {
             timing: TimingMeasurement {
                 name: format!("random-access/{dataset}/parquet-tokio-local-disk"),
@@ -435,23 +379,18 @@ mod tests {
             },
             dataset: dataset.to_string(),
             pattern,
-            reopen,
             display_name: display_name(dataset, pattern),
         }
     }
 
     #[test]
-    fn v3_random_access_records_skip_reopen_variants() {
+    fn v3_random_access_records_carry_pattern_qualified_datasets() {
         let mut records = Vec::new();
 
-        push_v3_random_access_record(&mut records, &fake_run("taxi", None, false));
+        push_v3_random_access_record(&mut records, &fake_run("taxi", None));
         push_v3_random_access_record(
             &mut records,
-            &fake_run("taxi", Some(AccessPattern::Uniform), false),
-        );
-        push_v3_random_access_record(
-            &mut records,
-            &fake_run("taxi", Some(AccessPattern::Correlated), true),
+            &fake_run("taxi", Some(AccessPattern::Uniform)),
         );
 
         assert_eq!(records.len(), 2);

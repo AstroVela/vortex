@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 """
-Run random-access-bench once per (dataset, format, pattern, open-mode)
+Run random-access-bench once per (dataset, format, pattern)
 then merge the per-combination outputs
 """
 
@@ -20,7 +20,6 @@ PARTS_DIR = Path("parts")
 DATASETS = ["taxi", "feature-vectors", "nested-lists", "nested-structs"]
 FORMATS = ["parquet", "lance", "vortex"]
 PATTERNS = ["correlated", "uniform"]
-OPEN_MODES = ["cached", "reopen"]
 
 
 def run_combinations(emit_ingest_records: bool) -> None:
@@ -29,29 +28,26 @@ def run_combinations(emit_ingest_records: bool) -> None:
     for dataset in DATASETS:
         for fmt in FORMATS:
             for pattern in PATTERNS:
-                for open_mode in OPEN_MODES:
-                    args = [
-                        "bash",
-                        str(SCRIPT_DIR / "bench-taskset.sh"),
-                        BINARY,
-                        "--datasets",
-                        dataset,
-                        "--formats",
-                        fmt,
-                        "--patterns",
-                        pattern,
-                        "--open-mode",
-                        open_mode,
-                        "-d",
-                        "gh-json",
-                        "-o",
-                        str(PARTS_DIR / f"{i}.gh.json"),
-                    ]
-                    if emit_ingest_records:
-                        args += ["--ingest-jsonl", str(PARTS_DIR / f"{i}.ingest.jsonl")]
-                    print("+", " ".join(args), flush=True)
-                    subprocess.run(args, check=True)
-                    i += 1
+                args = [
+                    "bash",
+                    str(SCRIPT_DIR / "bench-taskset.sh"),
+                    BINARY,
+                    "--datasets",
+                    dataset,
+                    "--formats",
+                    fmt,
+                    "--patterns",
+                    pattern,
+                    "-d",
+                    "gh-json",
+                    "-o",
+                    str(PARTS_DIR / f"{i}.gh.json"),
+                ]
+                if emit_ingest_records:
+                    args += ["--ingest-jsonl", str(PARTS_DIR / f"{i}.ingest.jsonl")]
+                print("+", " ".join(args), flush=True)
+                subprocess.run(args, check=True)
+                i += 1
 
 
 """

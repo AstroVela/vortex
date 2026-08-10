@@ -3,16 +3,13 @@
 
 //! Custom console-table rendering for random-access benchmark results.
 //!
-//! Random-access has two extra dimensions beyond what the shared
-//! [`vortex_bench::display::render_table`] handles: the access pattern (which
-//! we keep on the row) and the open mode (cached vs reopen), which becomes a
-//! second-level column header inlined into the format label (e.g.
-//! `parquet-cached`, `parquet-reopen`). Rather than push those concerns into
-//! the shared renderer, we keep this layout local.
+//! Random-access has one extra dimension beyond what the shared
+//! [`vortex_bench::display::render_table`] handles: the access pattern, which
+//! we keep on the row. Rather than push that concern into the shared renderer,
+//! we keep this layout local.
 //!
 //! Rows are keyed by `(dataset, Option<AccessPattern>)` in the order they are
-//! first observed in `runs`; columns are the cartesian product of `formats`
-//! and `reopen_variants`.
+//! first observed in `runs`; columns are the `formats`.
 
 use std::io::Write;
 
@@ -28,13 +25,12 @@ use vortex_bench::utils::aliases::hash_map::HashMap;
 use crate::AccessPattern;
 
 /// One row of random-access timing for a `(dataset, pattern)` benchmark and a
-/// specific `(format, reopen)` combination. Carries the same
-/// [`TimingMeasurement`] used for JSON output so the two emitters stay in sync.
+/// specific format. Carries the same [`TimingMeasurement`] used for JSON output
+/// so the two emitters stay in sync.
 pub struct RandomAccessRun {
     pub timing: TimingMeasurement,
     pub dataset: String,
     pub pattern: Option<AccessPattern>,
-    pub reopen: bool,
     /// Row label for this run (e.g. `random-access/taxi/uniform`). Format is
     /// implied by the column header, so it is not part of the label.
     pub display_name: String,
@@ -42,29 +38,22 @@ pub struct RandomAccessRun {
 
 /// Render a random-access benchmark result table.
 ///
-/// Columns are `formats × reopen_variants` with `{format-ext}-{open-mode}`
-/// headers (e.g. `vortex-cached`, `parquet-reopen`). Rows are unique
-/// `(dataset, pattern)` pairs in the order they were observed in `runs`.
+/// Columns are the `formats`, headed by `{format-ext}` (e.g. `vortex`,
+/// `parquet`). Rows are unique `(dataset, pattern)` pairs in the order they
+/// were observed in `runs`.
 ///
-/// The first column (the baseline) is the leftmost format / cached variant;
-/// each non-baseline cell is colored relative to the baseline value in its
-/// row.
+/// The first column (the baseline) is the leftmost format; each non-baseline
+/// cell is colored relative to the baseline value in its row.
 pub fn render_random_access_table<W: Write>(
     writer: &mut W,
     runs: &[RandomAccessRun],
     formats: &[Format],
-    reopen_variants: &[bool],
 ) -> Result<()> {
-    // Columns: cartesian product of (format, reopen) in the user-supplied
-    // ordering. Storing the cell key alongside its display label keeps the
-    // lookup loop straightforward.
-    let columns: Vec<(Format, bool, String)> = formats
+    // Storing the cell key alongside its display label keeps the lookup loop
+    // straightforward.
+    let columns: Vec<(Format, String)> = formats
         .iter()
-        .flat_map(|format| {
-            reopen_variants
-                .iter()
-                .map(move |&reopen| (*format, reopen, column_label(*format, reopen)))
-        })
+        .map(|format| (*format, column_label(*format)))
         .collect();
 
     // Rows: unique (dataset, pattern) keys in insertion order. Insertion
@@ -72,7 +61,7 @@ pub fn render_random_access_table<W: Write>(
     // rows appear before pattern rows.
     let mut rows: Vec<(String, Option<AccessPattern>, String)> = Vec::new();
     let mut row_index: HashMap<(String, Option<AccessPattern>), usize> = HashMap::new();
-    let mut cells: HashMap<(usize, Format, bool), u128> = HashMap::new();
+    let mut cells: HashMap<(usize, Format), u128> = HashMap::new();
 
     for run in runs {
         let key = (run.dataset.clone(), run.pattern);
@@ -86,34 +75,29 @@ pub fn render_random_access_table<W: Write>(
             }
         };
         let format = run.timing.target.format;
-        cells.insert(
-            (idx, format, run.reopen),
-            run.timing.median_time().as_micros(),
-        );
+        cells.insert((idx, format), run.timing.median_time().as_micros());
     }
 
     let mut table_builder = Builder::default();
 
-    // Single header row: `Benchmark | format-mode | format-mode | ...`.
+    // Single header row: `Benchmark | format | format | ...`.
     let header: Vec<String> = std::iter::once("Benchmark".to_owned())
-        .chain(columns.iter().map(|(_, _, label)| label.clone()))
+        .chain(columns.iter().map(|(_, label)| label.clone()))
         .collect();
     table_builder.push_record(header);
 
     // Baseline for each row is the leftmost column. We capture it before
     // emitting the row so non-baseline cells can be colored relative to it.
-    let baseline_column = columns
-        .first()
-        .map(|(format, reopen, _)| (*format, *reopen));
+    let baseline_column = columns.first().map(|(format, _)| *format);
 
     let mut colors = Vec::new();
     for (row_idx, (_, _, label)) in rows.iter().enumerate() {
-        let baseline_value = baseline_column
-            .and_then(|(format, reopen)| cells.get(&(row_idx, format, reopen)).copied());
+        let baseline_value =
+            baseline_column.and_then(|format| cells.get(&(row_idx, format)).copied());
 
         let mut record = vec![label.clone()];
-        for (col_idx, (format, reopen, _)) in columns.iter().enumerate() {
-            let value = cells.get(&(row_idx, *format, *reopen)).copied();
+        for (col_idx, (format, _)) in columns.iter().enumerate() {
+            let value = cells.get(&(row_idx, *format)).copied();
             record.push(match (value, baseline_value) {
                 (Some(v), Some(base)) if base > 0 => {
                     let ratio = v as f64 / base as f64;
@@ -142,12 +126,10 @@ pub fn render_random_access_table<W: Write>(
     Ok(())
 }
 
-/// `{format-ext}-{mode}` (e.g. `vortex-cached`, `parquet-reopen`). Using
-/// `Format::ext()` keeps headers narrow (`vortex` rather than
-/// `vortex-file-compressed`).
-fn column_label(format: Format, reopen: bool) -> String {
-    let mode = if reopen { "reopen" } else { "cached" };
-    format!("{}-{}", format.ext(), mode)
+/// `{format-ext}` (e.g. `vortex`, `parquet`). Using `Format::ext()` keeps
+/// headers narrow (`vortex` rather than `vortex-file-compressed`).
+fn column_label(format: Format) -> String {
+    format.ext().to_string()
 }
 
 /// Mirror of the coloring used by `vortex_bench::display::render_table`:
@@ -192,7 +174,6 @@ mod tests {
         dataset: &str,
         pattern: Option<AccessPattern>,
         format: Format,
-        reopen: bool,
         micros: u64,
     ) -> RandomAccessRun {
         RandomAccessRun {
@@ -204,7 +185,6 @@ mod tests {
             },
             dataset: dataset.to_string(),
             pattern,
-            reopen,
             display_name: match pattern {
                 Some(p) => format!("random-access/{dataset}/{}", p.name()),
                 None => format!("random-access/{dataset}"),
@@ -213,64 +193,31 @@ mod tests {
     }
 
     #[test]
-    fn column_label_uses_format_ext_and_mode() {
-        assert_eq!(column_label(Format::Parquet, false), "parquet-cached");
-        assert_eq!(column_label(Format::Parquet, true), "parquet-reopen");
-        assert_eq!(column_label(Format::OnDiskVortex, false), "vortex-cached");
+    fn column_label_uses_format_ext() {
+        assert_eq!(column_label(Format::Parquet), "parquet");
+        assert_eq!(column_label(Format::OnDiskVortex), "vortex");
     }
 
     #[test]
-    fn render_emits_single_header_row_with_format_mode_columns() -> Result<()> {
+    fn render_emits_single_header_row_with_format_columns() -> Result<()> {
         let runs = vec![
-            run("taxi", None, Format::Parquet, false, 100),
-            run("taxi", None, Format::Parquet, true, 200),
-            run("taxi", None, Format::OnDiskVortex, false, 50),
-            run("taxi", None, Format::OnDiskVortex, true, 110),
-            run(
-                "taxi",
-                Some(AccessPattern::Uniform),
-                Format::Parquet,
-                false,
-                300,
-            ),
-            run(
-                "taxi",
-                Some(AccessPattern::Uniform),
-                Format::Parquet,
-                true,
-                600,
-            ),
+            run("taxi", None, Format::Parquet, 100),
+            run("taxi", None, Format::OnDiskVortex, 50),
+            run("taxi", Some(AccessPattern::Uniform), Format::Parquet, 300),
             run(
                 "taxi",
                 Some(AccessPattern::Uniform),
                 Format::OnDiskVortex,
-                false,
                 150,
-            ),
-            run(
-                "taxi",
-                Some(AccessPattern::Uniform),
-                Format::OnDiskVortex,
-                true,
-                330,
             ),
         ];
 
         let mut buf = Vec::new();
-        render_random_access_table(
-            &mut buf,
-            &runs,
-            &[Format::Parquet, Format::OnDiskVortex],
-            &[false, true],
-        )?;
+        render_random_access_table(&mut buf, &runs, &[Format::Parquet, Format::OnDiskVortex])?;
         let rendered = strip_ansi(&String::from_utf8(buf)?);
 
         assert!(
-            rendered.contains("parquet-cached") && rendered.contains("parquet-reopen"),
-            "expected format-mode column headers, got:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("vortex-cached") && rendered.contains("vortex-reopen"),
+            rendered.contains("parquet") && rendered.contains("vortex"),
             "expected ext-based column headers, got:\n{rendered}"
         );
         assert!(
@@ -283,14 +230,12 @@ mod tests {
 
     #[test]
     fn render_renders_dash_for_missing_cells() -> Result<()> {
-        let runs = vec![
-            run("taxi", None, Format::Parquet, false, 100),
-            // No reopen variant supplied for taxi, but the column is still
-            // listed in `reopen_variants` — that cell should render as `-`.
-        ];
+        // No vortex run supplied, but the column is still listed in `formats`
+        // — that cell should render as `-`.
+        let runs = vec![run("taxi", None, Format::Parquet, 100)];
 
         let mut buf = Vec::new();
-        render_random_access_table(&mut buf, &runs, &[Format::Parquet], &[false, true])?;
+        render_random_access_table(&mut buf, &runs, &[Format::Parquet, Format::OnDiskVortex])?;
         let rendered = strip_ansi(&String::from_utf8(buf)?);
 
         assert!(

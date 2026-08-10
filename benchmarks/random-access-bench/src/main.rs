@@ -7,7 +7,6 @@ use anyhow::Result;
 use clap::Parser;
 use clap::ValueEnum;
 use random_access_bench::AccessPattern;
-use random_access_bench::OpenMode;
 use random_access_bench::RunConfig;
 use vortex_bench::Format;
 use vortex_bench::datasets::feature_vectors::FeatureVectorsData;
@@ -82,9 +81,6 @@ struct Args {
         default_values_t = vec![AccessPattern::Correlated, AccessPattern::Uniform]
     )]
     patterns: Vec<AccessPattern>,
-    /// Whether to reopen the file on each iteration, use a cached handle, or run both.
-    #[arg(long, value_enum, default_value_t = OpenMode::Both)]
-    open_mode: OpenMode,
 }
 
 #[tokio::main]
@@ -101,7 +97,6 @@ async fn main() -> Result<()> {
         formats: args.formats,
         patterns: args.patterns,
         time_limit: args.time_limit,
-        open_mode: args.open_mode,
         display_format: args.display_format,
         output_path: args.output_path,
         ingest_output: args.ingest_output,
