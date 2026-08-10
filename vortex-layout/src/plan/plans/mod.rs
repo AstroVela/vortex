@@ -35,6 +35,7 @@ pub use segment_scan::SegmentScanData;
 pub use segment_scan::SegmentScanPlan;
 pub(crate) use take::ExpressionTakeRule;
 pub use take::Take;
+pub use take::TakeData;
 pub use take::TakePlan;
 pub use zoned::Zoned;
 pub use zoned::ZonedPlan;
