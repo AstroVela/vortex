@@ -20,6 +20,9 @@ mod batch;
 mod row_fn;
 pub use row_fn::RowFn;
 
+mod typed;
+pub use typed::TypedRowFn;
+
 mod types;
 pub use types::DeferredError;
 pub use types::ElementTuple;
