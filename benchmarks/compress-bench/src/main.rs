@@ -128,7 +128,7 @@ fn get_compressor(format: Format, gpu_decompress: bool) -> Box<dyn Compressor> {
     }
 
     match format {
-        Format::OnDiskVortex => Box::new(VortexCompressor),
+        Format::OnDiskVortex => Box::new(VortexCompressor::default()),
         Format::Parquet => Box::new(ParquetCompressor::new()),
         #[cfg(feature = "lance")]
         Format::Lance => Box::new(LanceCompressor),
