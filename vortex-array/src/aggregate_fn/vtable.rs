@@ -71,6 +71,11 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
 
     /// Return whether this stored aggregate can satisfy `requested`.
     ///
+    /// Satisfaction is a claim about stored state, not just result semantics: consumers read this
+    /// aggregate's persisted partial state in place of ever accumulating `requested`, so anything
+    /// other than [`AggregateFnSatisfaction::No`] requires that a partial state for `requested`
+    /// can be created from this aggregate's partial state.
+    ///
     /// The default implementation only treats exactly equal aggregate functions as satisfying the
     /// request. Approximate pruning aggregates can override this to expose looser-but-sound bounds.
     fn can_satisfy(
