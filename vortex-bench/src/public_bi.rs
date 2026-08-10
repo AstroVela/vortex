@@ -139,6 +139,10 @@ pub fn fetch_schemas_and_queries() -> anyhow::Result<PathBuf> {
 /// Upstream stores one URL per table, but all 206 of them are
 /// `{DATA_URL_PREFIX}/{dataset}/{table}.csv.bz2`, so only the table names are
 /// recorded here and [`data_urls`] rebuilds the URL.
+///
+/// Derived from the Public BI benchmark (<https://github.com/cwida/public_bi_benchmark>),
+/// MIT licensed, Copyright (c) 2019 CWI Database Architectures Group. The underlying table
+/// dumps are anonymized Tableau Public workbooks and carry their own provenance.
 const DATASET_TABLES: &[(&str, &[&str])] = &[
     ("Arade", &["Arade_1"]),
     ("Bimbo", &["Bimbo_1"]),
