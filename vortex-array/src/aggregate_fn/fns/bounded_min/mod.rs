@@ -266,6 +266,8 @@ mod tests {
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::bounded_min::BoundedMin;
     use crate::aggregate_fn::fns::bounded_min::BoundedMinOptions;
+    use crate::aggregate_fn::fns::bounded_min::BoundedMinPartial;
+    use crate::aggregate_fn::fns::bounded_min::BoundedMinState;
     use crate::aggregate_fn::fns::max::Max;
     use crate::aggregate_fn::fns::min::Min;
     use crate::array_session;
@@ -330,17 +332,20 @@ mod tests {
     fn bounded_min_null_partial_does_not_poison_existing_bound() -> VortexResult<()> {
         let mut ctx = fresh_session().create_execution_ctx();
         let values = VarBinViewArray::from_iter_bin([&[1u8][..]]).into_array();
-        let options = BoundedMinOptions {
-            max_bytes: max_bytes(2),
-        };
-        let mut acc = Accumulator::try_new(BoundedMin, options.clone(), values.dtype().clone())?;
+        let mut acc = Accumulator::try_new(
+            BoundedMin,
+            BoundedMinOptions {
+                max_bytes: max_bytes(2),
+            },
+            values.dtype().clone(),
+        )?;
 
         acc.accumulate(&values, &mut ctx)?;
-        acc.fold_partial(BoundedMin.partial_from_scalar(
-            &options,
-            values.dtype(),
-            Scalar::null(values.dtype().as_nullable()),
-        )?)?;
+        acc.fold_partial(BoundedMinPartial {
+            state: BoundedMinState::Empty,
+            element_dtype: values.dtype().clone(),
+            max_bytes: max_bytes(2),
+        })?;
 
         assert_eq!(
             acc.finish()?,

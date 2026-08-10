@@ -179,7 +179,7 @@ fn sum_state_empty_is_null() -> VortexResult<()> {
             .and_then(|is_empty| is_empty.as_bool().value()),
         Some(true)
     );
-    let other = Sum.partial_from_scalar(&options, &dtype, empty)?;
+    let other = Sum.reduce_partials(&options, &dtype, &[])?;
     let state = Sum.reduce_partials(&options, &dtype, &[state, other])?;
     let partial = Sum.to_scalar(&state)?;
     assert_eq!(

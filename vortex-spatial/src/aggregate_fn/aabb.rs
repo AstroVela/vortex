@@ -253,7 +253,6 @@ mod tests {
 
     use super::AabbPartial;
     use super::GeometryAabb;
-    use super::aabb_dtype;
     use super::rect_from_storage;
     use crate::test_harness::linestring_column;
     use crate::test_harness::multilinestring_column;
@@ -416,12 +415,11 @@ mod tests {
         Ok(())
     }
 
-    /// A null partial (an empty group's AABB) parses empty and is a no-op in `reduce_partials`.
+    /// An empty partial (an empty group's AABB) is a no-op in `reduce_partials`.
     #[test]
-    fn reduce_partials_ignores_null() -> VortexResult<()> {
+    fn reduce_partials_ignores_empty() -> VortexResult<()> {
         let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
-        let empty =
-            GeometryAabb.partial_from_scalar(&EmptyOptions, &dtype, Scalar::null(aabb_dtype()))?;
+        let empty = AabbPartial { rect: None };
         let value = AabbPartial {
             rect: Some(SpatialRect::new((0.0, 0.0), (1.0, 1.0))),
         };
