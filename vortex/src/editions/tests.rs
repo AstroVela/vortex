@@ -62,16 +62,16 @@ fn every_declared_edition_validates() -> Result<(), EditionError> {
     Ok(())
 }
 
-/// The full encoding set of the newest frozen `core` edition. This set is frozen: the only
-/// way it may change is by declaring a *new* edition, so a failure here means a frozen
-/// declaration was edited.
+/// The full array-encoding set of the July 2026 frozen `core` edition. This set is frozen:
+/// the only way it may change is by declaring a *new* edition, so a failure here means a
+/// frozen declaration was edited.
 #[test]
 fn core_2026_07_encoding_set_is_pinned() {
     let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
-    let encodings = session.encodings_in(&CORE_2026_07_0);
+    let encodings = session.arrays_in(&CORE_2026_07_0);
     let ids: Vec<&str> = encodings
         .iter()
-        .map(|inclusion| inclusion.encoding_id.as_str())
+        .map(|inclusion| inclusion.object_id.as_str())
         .collect();
     assert_eq!(
         ids,
@@ -111,20 +111,77 @@ fn core_2026_07_encoding_set_is_pinned() {
     );
 }
 
+/// The layout set of the newest frozen `core` edition, pinned like the array set above.
+#[test]
+fn core_2026_08_layout_set_is_pinned() {
+    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
+    let layouts = session.layouts_in(&CORE_2026_08);
+    let ids: Vec<&str> = layouts
+        .iter()
+        .map(|inclusion| inclusion.object_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "vortex.chunked",
+            "vortex.dict",
+            "vortex.flat",
+            "vortex.list",
+            "vortex.stats",
+            "vortex.struct",
+            "vortex.zoned",
+        ]
+    );
+}
+
+/// The aggregate-function set of the newest frozen `core` edition, pinned like the array
+/// set above.
+#[test]
+fn core_2026_08_aggregation_set_is_pinned() {
+    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
+    let aggregations = session.aggregations_in(&CORE_2026_08);
+    let ids: Vec<&str> = aggregations
+        .iter()
+        .map(|inclusion| inclusion.object_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "vortex.all_nan",
+            "vortex.all_non_distinct",
+            "vortex.all_non_nan",
+            "vortex.all_non_null",
+            "vortex.all_null",
+            "vortex.bounded_max",
+            "vortex.bounded_min",
+            "vortex.first",
+            "vortex.is_constant",
+            "vortex.is_sorted",
+            "vortex.last",
+            "vortex.max",
+            "vortex.min",
+            "vortex.nan_count",
+            "vortex.null_count",
+            "vortex.sum",
+            "vortex.uncompressed_size_in_bytes",
+        ]
+    );
+}
+
 #[test]
 fn encodings_in_editions_unions_families() {
     let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
     let core_only: Vec<_> = session
-        .encodings_in(&CORE_2026_07_0)
+        .arrays_in(&CORE_2026_07_0)
         .into_iter()
-        .map(|inclusion| inclusion.encoding_id)
+        .map(|inclusion| inclusion.object_id)
         .collect();
     let mut both = core_only.clone();
     both.extend(
         session
-            .encodings_in(&UNSTABLE_2026_06_0)
+            .arrays_in(&UNSTABLE_2026_06_0)
             .into_iter()
-            .map(|inclusion| inclusion.encoding_id),
+            .map(|inclusion| inclusion.object_id),
     );
     both.sort_unstable();
     both.dedup();
@@ -136,14 +193,42 @@ fn encodings_in_editions_unions_families() {
 }
 
 #[test]
+fn tensor_scalar_fns_are_expression_members() {
+    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
+    let expressions = session.expressions_in(&UNSTABLE_2026_06_0);
+    let ids: Vec<&str> = expressions
+        .iter()
+        .map(|inclusion| inclusion.object_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "vortex.tensor.cosine_similarity",
+            "vortex.tensor.inner_product",
+            "vortex.tensor.l2_norm",
+        ]
+    );
+    // The scalar functions are expression members, not array encodings.
+    assert!(
+        session
+            .arrays_in(&UNSTABLE_2026_06_0)
+            .iter()
+            .all(
+                |inclusion| !inclusion.object_id.as_str().starts_with("vortex.tensor.")
+                    || inclusion.object_id.as_str() == "vortex.tensor.normalized"
+            )
+    );
+}
+
+#[test]
 fn earlier_editions_are_subsets() {
     let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
-    let first = session.encodings_in(&CORE_2025_05_0);
-    let latest = session.encodings_in(&CORE_2026_08);
+    let first = session.members_in(&CORE_2025_05_0);
+    let latest = session.members_in(&CORE_2026_08);
     assert!(first.iter().all(|inclusion| {
         latest
             .iter()
-            .any(|latest| latest.encoding_id == inclusion.encoding_id)
+            .any(|latest| latest.kind == inclusion.kind && latest.object_id == inclusion.object_id)
     }));
     assert!(first.len() < latest.len());
 }
@@ -170,11 +255,47 @@ fn core_edition_ids_are_registered_array_encodings() {
 
     let session = VortexSession::default();
     let registry = session.arrays().registry().clone();
-    for inclusion in session.editions().encodings_in(&CORE_2026_08) {
+    for inclusion in session.editions().arrays_in(&CORE_2026_08) {
         assert!(
-            registry.contains_key(&inclusion.encoding_id),
+            registry.contains_key(&inclusion.object_id),
             "{} is declared in core but not registered as an array encoding",
-            inclusion.encoding_id
+            inclusion.object_id
+        );
+    }
+}
+
+#[test]
+fn core_edition_ids_are_registered_layouts() {
+    use vortex_layout::session::LayoutSessionExt;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    for inclusion in session.editions().layouts_in(&CORE_2026_08) {
+        assert!(
+            session
+                .layouts()
+                .registry()
+                .read(|registry| registry.contains_key(&inclusion.object_id)),
+            "{} is declared in core but not registered as a layout encoding",
+            inclusion.object_id
+        );
+    }
+}
+
+#[test]
+fn core_edition_ids_are_registered_serializable_aggregate_fns() {
+    use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    for inclusion in session.editions().aggregations_in(&CORE_2026_08) {
+        let plugin = session.aggregate_fns().find_plugin(&inclusion.object_id);
+        assert!(
+            plugin.is_some(),
+            "{} is declared in core but not registered as an aggregate function",
+            inclusion.object_id
         );
     }
 }
@@ -200,12 +321,15 @@ static WRITER_TEST_DECLARATION: EditionDeclaration = EditionDeclaration {
         id: WRITER_TEST_EDITION,
         min_vortex_version: None,
     },
-    added: &[
+    added_arrays: &[
         &"vortex.chunked",
         &"vortex.constant",
         &"vortex.primitive",
         &"vortex.struct",
     ],
+    added_layouts: &[],
+    added_aggregations: &[],
+    added_expressions: &[],
 };
 
 fn writer_test_session() -> VortexResult<VortexSession> {

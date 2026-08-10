@@ -10,18 +10,23 @@ use vortex_edition::EditionId;
 /// The April 2026 draft edition of the `unstable` family.
 pub const UNSTABLE_2026_04_0: EditionId = EditionId::new("unstable", 2026, 4, 0);
 
-/// The declaration of [`UNSTABLE_2026_04_0`] and the encodings that join the family at it.
+/// The declaration of [`UNSTABLE_2026_04_0`] and the objects that join the family at it.
 pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: UNSTABLE_2026_04_0,
         min_vortex_version: None,
     },
-    added: &[
+    added_arrays: &[
         &"vortex.parquet.variant",
         &"vortex.patched",
+        &"vortex.tensor.normalized",
+    ],
+    added_layouts: &[],
+    added_aggregations: &[],
+    // The tensor scalar functions referenced by serialized vector-search expressions.
+    added_expressions: &[
         &"vortex.tensor.cosine_similarity",
         &"vortex.tensor.inner_product",
-        &"vortex.tensor.normalized",
         &"vortex.tensor.l2_norm",
     ],
 };

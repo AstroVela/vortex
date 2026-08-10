@@ -204,6 +204,7 @@ pub(crate) fn enable_all_registered_array_encodings(session: &VortexSession) {
     use vortex_edition::EditionId;
     use vortex_edition::EditionInclusion;
     use vortex_edition::EditionSessionExt;
+    use vortex_edition::ObjectKind;
     use vortex_error::VortexExpect;
     use vortex_error::vortex_err;
 
@@ -223,7 +224,7 @@ pub(crate) fn enable_all_registered_array_encodings(session: &VortexSession) {
         .read(|map| map.keys().copied().collect::<Vec<_>>());
     for id in ids {
         editions
-            .declare_inclusion(EditionInclusion::new(&id, TEST_EDITION))
+            .declare_inclusion(EditionInclusion::new(ObjectKind::Array, &id, TEST_EDITION))
             .map_err(|error| vortex_err!("{error}"))
             .vortex_expect("registered array encoding has one test-edition inclusion");
     }

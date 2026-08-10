@@ -12,7 +12,7 @@ use crate::EditionSession;
 
 /// Validate one edition's constraints: its identifier is well-formed, it is declared in the
 /// given session, and the session's declarations as a whole validate (chronology, version
-/// forms, membership constraints).
+/// forms, membership constraints across every object kind).
 ///
 /// ```ignore
 /// #[cfg(test)]

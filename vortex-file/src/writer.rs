@@ -654,7 +654,10 @@ mod tests {
                 id: EDITION,
                 min_vortex_version: None,
             },
-            added: &[&"vortex.primitive"],
+            added_arrays: &[&"vortex.primitive"],
+            added_layouts: &[],
+            added_aggregations: &[],
+            added_expressions: &[],
         };
 
         let session = array_session().with::<EditionSession>();

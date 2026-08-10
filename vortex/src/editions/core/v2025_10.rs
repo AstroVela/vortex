@@ -10,16 +10,19 @@ use vortex_edition::EditionId;
 /// The October 2025 edition of the `core` family.
 pub const CORE_2025_10_0: EditionId = EditionId::new("core", 2025, 10, 0);
 
-/// The declaration of [`CORE_2025_10_0`] and the encodings that join the family at it.
+/// The declaration of [`CORE_2025_10_0`] and the objects that join the family at it.
 pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: CORE_2025_10_0,
         min_vortex_version: Some("0.54.0"),
     },
-    added: &[
+    added_arrays: &[
         &"fastlanes.rle",
         &"vortex.fixed_size_list",
         &"vortex.listview",
         &"vortex.masked",
     ],
+    added_layouts: &[],
+    added_aggregations: &[],
+    added_expressions: &[],
 };

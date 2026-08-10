@@ -19,15 +19,16 @@ use crate::EditionDeclaration;
 use crate::EditionError;
 use crate::EditionId;
 use crate::EditionInclusion;
+use crate::ObjectKind;
 use crate::parse_release;
 
 /// The session's registry of editions and edition inclusions.
 ///
 /// Starts empty and is populated at initialization time: the `vortex` facade seeds the
 /// first-party declarations (`vortex::editions`), and crates registering additional
-/// encodings declare their inclusions (and, for new families, editions) alongside their
-/// encoding registration. Clones share the same underlying registry, matching the other
-/// session registries.
+/// objects declare their inclusions (and, for new families, editions) alongside their
+/// registration. Clones share the same underlying registry, matching the other session
+/// registries.
 #[derive(Clone, Debug, Default)]
 pub struct EditionSession {
     inner: Arc<RwLock<Inner>>,
@@ -37,8 +38,9 @@ pub struct EditionSession {
 struct Inner {
     /// Keyed by the display form of the edition id.
     editions: BTreeMap<String, Edition>,
-    /// Keyed by interned encoding id; ordered by the id's string form.
-    inclusions: BTreeMap<Id, EditionInclusion>,
+    /// Keyed by object kind and interned object id; ordered by kind, then the id's string
+    /// form. Ids are unique within a kind, never across kinds.
+    inclusions: BTreeMap<(ObjectKind, Id), EditionInclusion>,
 }
 
 /// Registry of enabled editions, keyed by interned edition family.
@@ -79,13 +81,25 @@ impl EditionSession {
         }
     }
 
-    /// Declare an edition together with the encodings that join the family at it. Each
-    /// added encoding's membership (`since`) is the declared edition; members of earlier
-    /// editions are inherited and must not be restated.
+    /// Declare an edition together with the objects that join the family at it. Each added
+    /// object's membership (`since`) is the declared edition; members of earlier editions
+    /// are inherited and must not be restated.
     pub fn declare(&self, declaration: &EditionDeclaration) -> Result<(), EditionError> {
         self.declare_edition(declaration.edition)?;
-        for encoding in declaration.added {
-            self.declare_inclusion(EditionInclusion::new(*encoding, declaration.edition.id))?;
+        let added_by_kind = [
+            (ObjectKind::Array, declaration.added_arrays),
+            (ObjectKind::Layout, declaration.added_layouts),
+            (ObjectKind::Aggregation, declaration.added_aggregations),
+            (ObjectKind::Expression, declaration.added_expressions),
+        ];
+        for (kind, added) in added_by_kind {
+            for object in added {
+                self.declare_inclusion(EditionInclusion::new(
+                    kind,
+                    *object,
+                    declaration.edition.id,
+                ))?;
+            }
         }
         Ok(())
     }
@@ -101,17 +115,19 @@ impl EditionSession {
         Ok(())
     }
 
-    /// Declare an edition inclusion. Errors if the encoding already has one: an encoding
-    /// belongs to exactly one family, with one membership interval.
+    /// Declare an edition inclusion. Errors if the object already has one: an object
+    /// belongs to exactly one family, with one membership interval. Objects of different
+    /// kinds never conflict, even when their ids are equal.
     pub fn declare_inclusion(&self, inclusion: EditionInclusion) -> Result<(), EditionError> {
         let mut inner = self.inner.write();
-        if inner.inclusions.contains_key(&inclusion.encoding_id) {
+        let key = (inclusion.kind, inclusion.object_id);
+        if inner.inclusions.contains_key(&key) {
             return Err(EditionError::new(format!(
-                "duplicate edition inclusion for encoding {}",
-                inclusion.encoding_id
+                "duplicate edition inclusion for {} {}",
+                inclusion.kind, inclusion.object_id
             )));
         }
-        inner.inclusions.insert(inclusion.encoding_id, inclusion);
+        inner.inclusions.insert(key, inclusion);
         Ok(())
     }
 
@@ -137,10 +153,11 @@ impl EditionSession {
             .next_back()
     }
 
-    /// Compute the full encoding set of an edition: every declared inclusion of the
-    /// edition's family whose `since` is at or before it, sorted by encoding id.
-    pub fn encodings_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
-        // The map is keyed by encoding id, so the values are already sorted by it.
+    /// Compute the full member set of an edition across every object kind: every declared
+    /// inclusion of the edition's family whose `since` is at or before it, sorted by kind
+    /// and then object id.
+    pub fn members_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        // The map is keyed by (kind, object id), so the values are already sorted by it.
         self.inner
             .read()
             .inclusions
@@ -148,6 +165,51 @@ impl EditionSession {
             .filter(|inclusion| inclusion.since.is_at_or_before(edition))
             .copied()
             .collect()
+    }
+
+    /// The members of an edition of one object kind, sorted by object id.
+    pub fn members_of_kind_in(
+        &self,
+        kind: ObjectKind,
+        edition: &EditionId,
+    ) -> Vec<EditionInclusion> {
+        self.inner
+            .read()
+            .inclusions
+            .values()
+            .filter(|inclusion| inclusion.kind == kind && inclusion.since.is_at_or_before(edition))
+            .copied()
+            .collect()
+    }
+
+    /// The array encodings in an edition, sorted by encoding id.
+    pub fn arrays_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        self.members_of_kind_in(ObjectKind::Array, edition)
+    }
+
+    /// The layout encodings in an edition, sorted by encoding id.
+    pub fn layouts_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        self.members_of_kind_in(ObjectKind::Layout, edition)
+    }
+
+    /// The aggregate functions in an edition, sorted by function id.
+    pub fn aggregations_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        self.members_of_kind_in(ObjectKind::Aggregation, edition)
+    }
+
+    /// The scalar functions (named by serialized expressions) in an edition, sorted by
+    /// function id.
+    pub fn expressions_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        self.members_of_kind_in(ObjectKind::Expression, edition)
+    }
+
+    /// Backwards-compatible name for [`EditionSession::arrays_in`].
+    #[deprecated(
+        note = "use arrays_in, or members_in for every object kind; editions now also cover \
+                layouts, aggregations and expressions"
+    )]
+    pub fn encodings_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
+        self.arrays_in(edition)
     }
 
     /// Validate all registered declarations. Errors on inclusions referencing undeclared
@@ -187,8 +249,8 @@ impl EditionSession {
 
             let Some(edition) = inner.editions.get(&inclusion.since.to_string()) else {
                 return Err(EditionError::new(format!(
-                    "encoding {} is included in undeclared edition {}",
-                    inclusion.encoding_id, inclusion.since
+                    "{} {} is included in undeclared edition {}",
+                    inclusion.kind, inclusion.object_id, inclusion.since
                 )));
             };
 
@@ -197,9 +259,10 @@ impl EditionSession {
                 && required > declared
             {
                 return Err(EditionError::new(format!(
-                    "encoding {} requires release {}, newer than edition {}'s declared \
+                    "{} {} requires release {}, newer than edition {}'s declared \
                      min_vortex_version",
-                    inclusion.encoding_id,
+                    inclusion.kind,
+                    inclusion.object_id,
                     inclusion.required_vortex_release.unwrap_or_default(),
                     edition.id,
                 )));
@@ -265,11 +328,11 @@ pub trait EditionSessionExt: SessionExt {
         Ok(())
     }
 
-    /// Resolve the encodings in all enabled editions.
+    /// Resolve the object ids of one kind in all enabled editions.
     ///
     /// When the enabled-editions variable is absent or no editions are enabled, this returns an
-    /// empty vector and therefore permits no edition encodings.
-    fn enabled_encoding_ids(&self) -> Vec<Id> {
+    /// empty vector and therefore permits no edition objects of that kind.
+    fn enabled_ids_of(&self, kind: ObjectKind) -> Vec<Id> {
         let Some(enabled) = self.get_opt::<EnabledEditions>() else {
             return vec![];
         };
@@ -277,12 +340,18 @@ pub trait EditionSessionExt: SessionExt {
         let mut ids: Vec<Id> = enabled
             .editions()
             .iter()
-            .flat_map(|edition| editions.encodings_in(edition))
-            .map(|inclusion| inclusion.encoding_id)
+            .flat_map(|edition| editions.members_of_kind_in(kind, edition))
+            .map(|inclusion| inclusion.object_id)
             .collect();
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Resolve the array encodings in all enabled editions, i.e.
+    /// [`EditionSessionExt::enabled_ids_of`] for [`ObjectKind::Array`].
+    fn enabled_encoding_ids(&self) -> Vec<Id> {
+        self.enabled_ids_of(ObjectKind::Array)
     }
 }
 

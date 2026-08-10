@@ -10,6 +10,7 @@ use crate::EditionInclusion;
 use crate::EditionSession;
 use crate::EditionSessionExt;
 use crate::EnabledEditions;
+use crate::ObjectKind;
 
 const FIRST: EditionId = EditionId::new("test", 2026, 1, 0);
 const SECOND: EditionId = EditionId::new("test", 2026, 7, 0);
@@ -20,14 +21,22 @@ static DECLARATIONS: &[EditionDeclaration] = &[
             id: FIRST,
             min_vortex_version: None,
         },
-        added: &[&"test.alpha", &"test.beta"],
+        added_arrays: &[&"test.alpha", &"test.beta"],
+        added_layouts: &[&"test.flat"],
+        added_aggregations: &[],
+        added_expressions: &[],
     },
     EditionDeclaration {
         edition: Edition {
             id: SECOND,
             min_vortex_version: None,
         },
-        added: &[&"test.gamma"],
+        added_arrays: &[&"test.gamma"],
+        // An id may join once per kind: `test.alpha` is an array member since FIRST and a
+        // layout member since SECOND.
+        added_layouts: &[&"test.alpha"],
+        added_aggregations: &[&"test.sum"],
+        added_expressions: &[&"test.contains"],
     },
 ];
 
@@ -56,19 +65,19 @@ fn editions_pass_the_test_harness() -> Result<(), crate::EditionError> {
 fn membership_is_transitive() {
     let editions = session();
 
-    let first = editions.encodings_in(&FIRST);
-    let ids: Vec<&str> = first.iter().map(|i| i.encoding_id.as_str()).collect();
+    let first = editions.arrays_in(&FIRST);
+    let ids: Vec<&str> = first.iter().map(|i| i.object_id.as_str()).collect();
     assert_eq!(ids, ["test.alpha", "test.beta"]);
 
     // Members of the first edition are members of the second by inheritance, with their
     // `since` still recording the edition they actually joined in.
-    let second = editions.encodings_in(&SECOND);
-    let ids: Vec<&str> = second.iter().map(|i| i.encoding_id.as_str()).collect();
+    let second = editions.arrays_in(&SECOND);
+    let ids: Vec<&str> = second.iter().map(|i| i.object_id.as_str()).collect();
     assert_eq!(ids, ["test.alpha", "test.beta", "test.gamma"]);
     assert!(
         second
             .iter()
-            .filter(|i| i.encoding_id.as_str() != "test.gamma")
+            .filter(|i| i.object_id.as_str() != "test.gamma")
             .all(|i| i.since == FIRST)
     );
 
@@ -76,7 +85,7 @@ fn membership_is_transitive() {
     let added: Vec<&str> = second
         .iter()
         .filter(|i| i.since == SECOND)
-        .map(|i| i.encoding_id.as_str())
+        .map(|i| i.object_id.as_str())
         .collect();
     assert_eq!(added, ["test.gamma"]);
 
@@ -84,9 +93,47 @@ fn membership_is_transitive() {
     // never crosses families.
     assert!(first.iter().all(|i| i.since == FIRST));
     let third = EditionId::new("test", 2026, 10, 0);
-    assert_eq!(editions.encodings_in(&third).len(), 3);
+    assert_eq!(editions.arrays_in(&third).len(), 3);
     let other = EditionId::new("other", 2026, 10, 0);
-    assert!(editions.encodings_in(&other).is_empty());
+    assert!(editions.members_in(&other).is_empty());
+}
+
+#[test]
+fn members_are_partitioned_by_kind() {
+    let editions = session();
+
+    // The full member set spans every kind, sorted by kind and then id.
+    let all_members = editions.members_in(&SECOND);
+    let members: Vec<(ObjectKind, &str)> = all_members
+        .iter()
+        .map(|i| (i.kind, i.object_id.as_str()))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            (ObjectKind::Array, "test.alpha"),
+            (ObjectKind::Array, "test.beta"),
+            (ObjectKind::Array, "test.gamma"),
+            (ObjectKind::Layout, "test.alpha"),
+            (ObjectKind::Layout, "test.flat"),
+            (ObjectKind::Aggregation, "test.sum"),
+            (ObjectKind::Expression, "test.contains"),
+        ]
+    );
+
+    // Per-kind views filter without crossing kinds, even for the shared `test.alpha` id.
+    let layouts = editions.layouts_in(&SECOND);
+    let ids: Vec<&str> = layouts.iter().map(|i| i.object_id.as_str()).collect();
+    assert_eq!(ids, ["test.alpha", "test.flat"]);
+    assert!(
+        layouts
+            .iter()
+            .find(|i| i.object_id.as_str() == "test.alpha")
+            .is_some_and(|i| i.since == SECOND)
+    );
+    assert!(editions.aggregations_in(&FIRST).is_empty());
+    assert_eq!(editions.aggregations_in(&SECOND).len(), 1);
+    assert_eq!(editions.expressions_in(&SECOND).len(), 1);
 }
 
 #[test]
@@ -151,12 +198,43 @@ fn registered_and_enabled_editions_are_separate() -> Result<(), crate::EditionEr
     assert_eq!(session.enabled_encoding_ids().len(), 3);
 
     // Selecting an older edition in the same family replaces the newer one and removes
-    // encodings that joined after it.
+    // objects that joined after it.
     session.enable_edition(FIRST)?;
     assert_eq!(session.enabled_editions().editions(), [FIRST]);
     let enabled = session.enabled_encoding_ids();
     assert_eq!(enabled.len(), 2);
     assert!(enabled.iter().all(|id| id.as_str() != "test.gamma"));
+    Ok(())
+}
+
+#[test]
+fn enabled_ids_are_resolved_per_kind() -> Result<(), crate::EditionError> {
+    let session = VortexSession::empty().with::<EditionSession>();
+    for declaration in DECLARATIONS {
+        session.register_edition(declaration)?;
+    }
+
+    for kind in ObjectKind::ALL {
+        assert!(session.enabled_ids_of(kind).is_empty());
+    }
+
+    session.enable_edition(SECOND)?;
+    assert_eq!(session.enabled_ids_of(ObjectKind::Array).len(), 3);
+    assert_eq!(
+        session
+            .enabled_ids_of(ObjectKind::Layout)
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        ["test.alpha", "test.flat"]
+    );
+    assert_eq!(session.enabled_ids_of(ObjectKind::Aggregation).len(), 1);
+    assert_eq!(session.enabled_ids_of(ObjectKind::Expression).len(), 1);
+    // The array-encoding convenience accessor matches the Array kind.
+    assert_eq!(
+        session.enabled_encoding_ids(),
+        session.enabled_ids_of(ObjectKind::Array)
+    );
     Ok(())
 }
 
@@ -175,7 +253,10 @@ fn enabled_editions_are_independent_across_families() -> Result<(), crate::Editi
             id: OTHER,
             min_vortex_version: None,
         },
-        added: &[&"other.delta"],
+        added_arrays: &[&"other.delta"],
+        added_layouts: &[],
+        added_aggregations: &[],
+        added_expressions: &[],
     };
 
     let session = VortexSession::empty().with::<EditionSession>();
@@ -202,10 +283,24 @@ fn duplicate_declarations_error() {
             })
             .is_err()
     );
+    // A duplicate within a kind errors; the same id under another kind is a new object.
     assert!(
         editions
-            .declare_inclusion(EditionInclusion::new("test.alpha", FIRST))
+            .declare_inclusion(EditionInclusion::new(
+                ObjectKind::Array,
+                "test.alpha",
+                FIRST
+            ))
             .is_err()
+    );
+    assert!(
+        editions
+            .declare_inclusion(EditionInclusion::new(
+                ObjectKind::Aggregation,
+                "test.alpha",
+                FIRST
+            ))
+            .is_ok()
     );
 }
 
@@ -213,7 +308,11 @@ fn duplicate_declarations_error() {
 fn validate_rejects_inconsistent_declarations() -> Result<(), crate::EditionError> {
     // An inclusion referencing an undeclared edition.
     let editions = EditionSession::empty();
-    editions.declare_inclusion(EditionInclusion::new("test.alpha", FIRST))?;
+    editions.declare_inclusion(EditionInclusion::new(
+        ObjectKind::Array,
+        "test.alpha",
+        FIRST,
+    ))?;
     assert!(editions.validate().is_err());
 
     // A member requiring a release newer than its edition declares.
@@ -224,7 +323,7 @@ fn validate_rejects_inconsistent_declarations() -> Result<(), crate::EditionErro
     })?;
     editions.declare_inclusion(EditionInclusion {
         required_vortex_release: Some("0.80.0"),
-        ..EditionInclusion::new("test.alpha", FIRST)
+        ..EditionInclusion::new(ObjectKind::Layout, "test.alpha", FIRST)
     })?;
     assert!(editions.validate().is_err());
 
@@ -248,13 +347,17 @@ fn validate_rejects_inconsistent_declarations() -> Result<(), crate::EditionErro
     })?;
     assert!(editions.validate().is_err());
 
-    // A malformed encoding id.
+    // A malformed object id.
     let editions = EditionSession::empty();
     editions.declare_edition(Edition {
         id: FIRST,
         min_vortex_version: None,
     })?;
-    editions.declare_inclusion(EditionInclusion::new("Test.ALPHA", FIRST))?;
+    editions.declare_inclusion(EditionInclusion::new(
+        ObjectKind::Expression,
+        "Test.ALPHA",
+        FIRST,
+    ))?;
     assert!(editions.validate().is_err());
 
     Ok(())

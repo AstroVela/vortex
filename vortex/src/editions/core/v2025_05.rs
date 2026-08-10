@@ -10,13 +10,13 @@ use vortex_edition::EditionId;
 /// The first edition of the `core` family, matching the first stable Vortex file release.
 pub const CORE_2025_05_0: EditionId = EditionId::new("core", 2025, 5, 0);
 
-/// The declaration of [`CORE_2025_05_0`] and the encodings that join the family at it.
+/// The declaration of [`CORE_2025_05_0`] and the objects that join the family at it.
 pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: CORE_2025_05_0,
         min_vortex_version: Some("0.36.0"),
     },
-    added: &[
+    added_arrays: &[
         &"fastlanes.bitpacked",
         &"fastlanes.for",
         &"vortex.alp",
@@ -41,4 +41,17 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         &"vortex.varbinview",
         &"vortex.zigzag",
     ],
+    // The founding layouts of the stable file format: every file written since 0.36.0 is
+    // structured from these. Writers have since moved from `vortex.stats` to
+    // `vortex.zoned`, but files carrying it stay readable forever.
+    added_layouts: &[
+        &"vortex.chunked",
+        &"vortex.flat",
+        &"vortex.stats",
+        &"vortex.struct",
+    ],
+    // 0.36.0 stats layouts identified statistics by a closed enum rather than by aggregate
+    // function ids, so no aggregate functions join at the baseline.
+    added_aggregations: &[],
+    added_expressions: &[],
 };

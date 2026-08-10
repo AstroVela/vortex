@@ -28,6 +28,7 @@ use vortex_edition::Edition;
 use vortex_edition::EditionId;
 use vortex_edition::EditionInclusion;
 use vortex_edition::EditionSessionExt;
+use vortex_edition::ObjectKind;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::VortexFile;
 use vortex_file::WriteOptionsSessionExt;
@@ -85,7 +86,7 @@ fn enable_all_registered_array_encodings(session: &VortexSession) {
         .read(|map| map.keys().copied().collect::<Vec<_>>());
     for id in ids {
         editions
-            .declare_inclusion(EditionInclusion::new(&id, BENCH_EDITION))
+            .declare_inclusion(EditionInclusion::new(ObjectKind::Array, &id, BENCH_EDITION))
             .unwrap();
     }
     session.enable_edition(BENCH_EDITION).unwrap();
