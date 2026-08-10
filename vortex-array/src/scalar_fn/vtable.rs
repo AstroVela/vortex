@@ -22,7 +22,6 @@ use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::ExpressionReduceNode;
 use crate::expr::display::ExprDisplay;
-use crate::expr::traversal::Node;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::TypedScalarFnInstance;
