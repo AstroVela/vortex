@@ -13,7 +13,9 @@ Two access patterns are generated with a fixed seed (see [`src/main.rs`](./src/m
 Each pattern runs over four datasets (`taxi`, `feature-vectors`, `nested-lists`,
 `nested-structs`) in Parquet, Lance, and Vortex. The file handle is opened once per
 benchmark target and reused, so the timed region covers the lookup against warm file
-metadata. CI drives the full matrix via
+metadata. For Vortex the scan is prepared inside the first timed run and reused by the
+rest, so only that first run pays for expression binding and split computation. CI drives
+the full matrix via
 [`scripts/random-access-split.py`](../../scripts/random-access-split.py).
 
 ## Running locally

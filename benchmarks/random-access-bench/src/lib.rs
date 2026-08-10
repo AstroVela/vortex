@@ -114,7 +114,9 @@ fn generate_indices(dataset: &dyn BenchDataset, pattern: AccessPattern) -> Vec<u
 /// Run a random access benchmark.
 ///
 /// The accessor is opened once and reused, so the timed region covers the take
-/// itself against warm file metadata.
+/// itself against warm file metadata. Since the indices are fixed for the whole
+/// loop, the Vortex accessor prepares its scan during the first timed run and
+/// reuses it thereafter; that first run is the only one to include preparation.
 async fn benchmark_random_access(
     dataset: &dyn BenchDataset,
     format: Format,

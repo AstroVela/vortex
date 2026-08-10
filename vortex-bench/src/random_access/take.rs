@@ -12,12 +12,14 @@ use arrow_select::take::take_record_batch;
 use async_trait::async_trait;
 use futures::stream;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::file::metadata::PageIndexPolicy;
 use stream::StreamExt;
 use tokio::fs::File;
+use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
@@ -25,6 +27,7 @@ use vortex::array::stream::ArrayStreamExt;
 use vortex::buffer::Buffer;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
+use vortex::layout::scan::repeated_scan::RepeatedScan;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::utils::aliases::hash_map::HashMap;
 
@@ -33,13 +36,25 @@ use crate::SESSION;
 use crate::random_access::RandomAccessor;
 use crate::random_access::RandomAccessorRet;
 
+/// A scan prepared for a fixed set of row indices.
+struct PreparedTake {
+    indices: Arc<[u64]>,
+    scan: Arc<RepeatedScan<ArrayRef>>,
+}
+
 /// Random accessor for Vortex format files.
 ///
-/// The file handle is opened at construction time and reused across `take()` calls.
+/// The file handle is opened at construction time and reused across `take()` calls, as is the
+/// [`RepeatedScan`] prepared by the first `take()`.
 pub struct VortexRandomAccessor {
     name: String,
     format: Format,
     file: VortexFile,
+    /// Scan prepared by the first `take()` and reused while the indices are unchanged.
+    ///
+    /// A prepared scan pins its selection, and with row indices the split ranges are derived
+    /// from that selection, so a new index set requires preparing again.
+    prepared: Mutex<Option<PreparedTake>>,
 }
 
 impl VortexRandomAccessor {
@@ -58,7 +73,33 @@ impl VortexRandomAccessor {
             name: name.into(),
             format,
             file,
+            prepared: Mutex::new(None),
         })
+    }
+
+    /// Return the prepared scan for `indices`, preparing one if the cache does not hold it.
+    fn prepared_scan(&self, indices: &[u64]) -> anyhow::Result<Arc<RepeatedScan<ArrayRef>>> {
+        let mut prepared = self.prepared.lock();
+
+        if let Some(prepared) = prepared.as_ref()
+            && prepared.indices.as_ref() == indices
+        {
+            return Ok(Arc::clone(&prepared.scan));
+        }
+
+        let indices_buf: Buffer<u64> = Buffer::from(indices.to_vec());
+        let scan = Arc::new(
+            self.file
+                .scan()?
+                .with_row_indices(StrictSortedBuffer::try_new(indices_buf)?)
+                .prepare()?,
+        );
+        *prepared = Some(PreparedTake {
+            indices: Arc::from(indices),
+            scan: Arc::clone(&scan),
+        });
+
+        Ok(scan)
     }
 }
 
@@ -73,12 +114,9 @@ impl RandomAccessor for VortexRandomAccessor {
     }
 
     async fn take(&self, indices: &[u64]) -> anyhow::Result<RandomAccessorRet> {
-        let indices_buf: Buffer<u64> = Buffer::from(indices.to_vec());
         let array = self
-            .file
-            .scan()?
-            .with_row_indices(StrictSortedBuffer::try_new(indices_buf)?)
-            .into_array_stream()?
+            .prepared_scan(indices)?
+            .execute_array_stream(None)?
             .read_all()
             .await?;
 
@@ -188,5 +226,92 @@ impl RandomAccessor for ParquetRandomAccessor {
 
         let result = concat_batches(&schema, &batches)?;
         Ok(RandomAccessorRet::RecordBatch(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex::array::IntoArray as _;
+    use vortex::array::arrays::PrimitiveArray;
+    use vortex::array::stream::ArrayStreamAdapter;
+    use vortex::file::WriteOptionsSessionExt;
+
+    use super::*;
+
+    /// Write `0..count` as a single-column Vortex file and return its path.
+    async fn write_vortex_file(dir: &tempfile::TempDir, count: i32) -> anyhow::Result<PathBuf> {
+        let array = Buffer::from((0..count).collect::<Vec<i32>>()).into_array();
+        let mut buf = Vec::new();
+        SESSION
+            .write_options()
+            .write(
+                &mut buf,
+                ArrayStreamAdapter::new(array.dtype().clone(), stream::iter([Ok(array)])),
+            )
+            .await?;
+
+        let path = dir.path().join("data.vortex");
+        std::fs::write(&path, buf)?;
+        Ok(path)
+    }
+
+    async fn take_values(
+        accessor: &VortexRandomAccessor,
+        indices: &[u64],
+    ) -> anyhow::Result<Vec<i32>> {
+        let RandomAccessorRet::ArrayRef(array) = accessor.take(indices).await? else {
+            anyhow::bail!("expected an ArrayRef from the Vortex accessor")
+        };
+        let mut ctx = SESSION.create_execution_ctx();
+        let primitive = array.execute::<PrimitiveArray>(&mut ctx)?;
+        Ok(primitive.as_slice::<i32>().to_vec())
+    }
+
+    #[tokio::test]
+    async fn prepared_scan_is_reused_for_repeated_indices() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_vortex_file(&dir, 1_000).await?;
+        let accessor = VortexRandomAccessor::open(&path, "test", Format::OnDiskVortex).await?;
+
+        let indices = [3u64, 7, 42];
+        let first = accessor.prepared_scan(&indices)?;
+        let second = accessor.prepared_scan(&indices)?;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated takes must reuse the prepared scan"
+        );
+
+        // The reused scan must keep returning the rows it was prepared for.
+        assert_eq!(take_values(&accessor, &indices).await?, vec![3, 7, 42]);
+        assert_eq!(take_values(&accessor, &indices).await?, vec![3, 7, 42]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_indices_prepare_a_new_scan() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = write_vortex_file(&dir, 1_000).await?;
+        let accessor = VortexRandomAccessor::open(&path, "test", Format::OnDiskVortex).await?;
+
+        let first = accessor.prepared_scan(&[3u64, 7, 42])?;
+        let second = accessor.prepared_scan(&[4u64, 8, 43])?;
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a new index set must prepare a new scan"
+        );
+
+        // A prepared scan pins its selection, so the second index set must not
+        // return the rows cached for the first.
+        assert_eq!(
+            take_values(&accessor, &[4u64, 8, 43]).await?,
+            vec![4, 8, 43]
+        );
+        assert_eq!(
+            take_values(&accessor, &[3u64, 7, 42]).await?,
+            vec![3, 7, 42]
+        );
+
+        Ok(())
     }
 }
