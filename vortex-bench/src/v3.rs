@@ -165,7 +165,7 @@ pub struct CompressionTimeRecord {
     pub format: String,
     /// `encode` or `decode`.
     pub op: String,
-    /// Best-of-N wall time in nanoseconds.
+    /// Median per-iteration wall time in nanoseconds.
     pub value_ns: u64,
     /// Per-iteration wall times in nanoseconds.
     pub all_runtimes_ns: Vec<u64>,

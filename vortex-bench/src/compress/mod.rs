@@ -15,6 +15,7 @@ use vortex::utils::aliases::hash_map::HashMap;
 use crate::Format;
 use crate::measurements::CompressionTimingMeasurement;
 use crate::measurements::CustomUnitMeasurement;
+use crate::measurements::median;
 
 /// Number of top-level columns in the wide-table decompression projection benchmark.
 pub const READ_PROJECTION_ROOT_COLUMNS: usize = 100_000;
@@ -133,7 +134,7 @@ pub trait Compressor: Send + Sync {
 
 /// Run a compression benchmark for the given compressor.
 ///
-/// Executes compression `iterations` times and returns timing statistics.
+/// Executes compression `iterations` times and reports the [`median`] run.
 pub async fn benchmark_compress(
     compressor: &dyn Compressor,
     parquet_path: &Path,
@@ -141,7 +142,6 @@ pub async fn benchmark_compress(
     bench_name: &str,
 ) -> Result<CompressResult> {
     let format = compressor.format();
-    let mut fastest = Duration::MAX;
     let mut compressed_size = 0u64;
     let mut all_runs = Vec::with_capacity(iterations);
 
@@ -149,9 +149,10 @@ pub async fn benchmark_compress(
         let (size, elapsed) = compressor.compress(parquet_path).await?;
 
         compressed_size = size;
-        fastest = fastest.min(elapsed);
         all_runs.push(elapsed);
     }
+
+    let time = median(&all_runs);
 
     let ratios = vec![CustomUnitMeasurement {
         name: format!("{} size/{bench_name}", format.name()),
@@ -162,12 +163,12 @@ pub async fn benchmark_compress(
 
     let timing = CompressionTimingMeasurement {
         name: format!("compress time/{bench_name}"),
-        time: fastest,
+        time,
         format,
     };
 
     Ok(CompressResult {
-        time: fastest,
+        time,
         compressed_size,
         timing,
         all_runs,
@@ -177,7 +178,7 @@ pub async fn benchmark_compress(
 
 /// Run a decompression benchmark for the given compressor.
 ///
-/// Benchmarks decompression `iterations` times.
+/// Executes decompression `iterations` times and reports the [`median`] run.
 pub async fn benchmark_decompress(
     compressor: &dyn Compressor,
     parquet_path: &Path,
@@ -185,24 +186,22 @@ pub async fn benchmark_decompress(
     bench_name: &str,
 ) -> Result<DecompressResult> {
     let format = compressor.format();
-    let mut fastest = Duration::MAX;
     let mut all_runs = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
-        let elapsed = compressor.decompress(parquet_path).await?;
-
-        fastest = fastest.min(elapsed);
-        all_runs.push(elapsed);
+        all_runs.push(compressor.decompress(parquet_path).await?);
     }
+
+    let time = median(&all_runs);
 
     let timing = CompressionTimingMeasurement {
         name: format!("decompress time/{bench_name}"),
-        time: fastest,
+        time,
         format,
     };
 
     Ok(DecompressResult {
-        time: fastest,
+        time,
         timing,
         all_runs,
     })
@@ -313,9 +312,91 @@ fn calculate_vortex_lance_ratios(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use rstest::rstest;
+
     use super::*;
+
+    /// Replays a scripted sequence of run times so the reported statistic can be asserted
+    /// without running a real codec.
+    struct ScriptedCompressor {
+        runs: Vec<Duration>,
+        next: AtomicUsize,
+    }
+
+    impl ScriptedCompressor {
+        fn new(runs: &[u64]) -> Self {
+            Self {
+                runs: runs.iter().copied().map(Duration::from_nanos).collect(),
+                next: AtomicUsize::new(0),
+            }
+        }
+
+        fn next_run(&self) -> Result<Duration> {
+            let idx = self.next.fetch_add(1, Ordering::Relaxed);
+            self.runs
+                .get(idx)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("benchmark asked for more runs than scripted"))
+        }
+    }
+
+    #[async_trait]
+    impl Compressor for ScriptedCompressor {
+        fn format(&self) -> Format {
+            Format::OnDiskVortex
+        }
+
+        async fn compress(&self, _parquet_path: &Path) -> Result<(u64, Duration)> {
+            Ok((1024, self.next_run()?))
+        }
+
+        async fn decompress(&self, _parquet_path: &Path) -> Result<Duration> {
+            self.next_run()
+        }
+    }
+
+    /// The reported time is the median, not the fastest run. A best-of-N minimum would
+    /// report 10 for both of these scripts.
+    #[rstest]
+    #[case::odd(&[50, 10, 30, 40, 20], 30)]
+    #[case::even(&[40, 10, 30, 20], 25)]
+    #[tokio::test]
+    async fn benchmark_compress_reports_the_median_run(
+        #[case] runs: &[u64],
+        #[case] expected_ns: u64,
+    ) -> Result<()> {
+        let compressor = ScriptedCompressor::new(runs);
+        let result =
+            benchmark_compress(&compressor, Path::new("unused.parquet"), runs.len(), "demo")
+                .await?;
+
+        assert_eq!(result.time, Duration::from_nanos(expected_ns));
+        assert_eq!(result.timing.time, Duration::from_nanos(expected_ns));
+        assert_eq!(result.all_runs.len(), runs.len());
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::odd(&[50, 10, 30, 40, 20], 30)]
+    #[case::even(&[40, 10, 30, 20], 25)]
+    #[tokio::test]
+    async fn benchmark_decompress_reports_the_median_run(
+        #[case] runs: &[u64],
+        #[case] expected_ns: u64,
+    ) -> Result<()> {
+        let compressor = ScriptedCompressor::new(runs);
+        let result =
+            benchmark_decompress(&compressor, Path::new("unused.parquet"), runs.len(), "demo")
+                .await?;
+
+        assert_eq!(result.time, Duration::from_nanos(expected_ns));
+        assert_eq!(result.timing.time, Duration::from_nanos(expected_ns));
+        Ok(())
+    }
 
     #[test]
     fn calculate_ratios_adds_vortex_lance_metrics() {

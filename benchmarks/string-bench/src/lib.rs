@@ -148,21 +148,7 @@ fn validate_iterations(iterations: usize) -> Result<()> {
     Ok(())
 }
 
-/// Median of `runs` (the two middle values are averaged for an even count).
-/// Empty → zero.
-pub(crate) fn median(runs: &[Duration]) -> Duration {
-    if runs.is_empty() {
-        return Duration::ZERO;
-    }
-    let mut sorted = runs.to_vec();
-    sorted.sort_unstable();
-    let n = sorted.len();
-    if n % 2 == 1 {
-        sorted[n / 2]
-    } else {
-        (sorted[n / 2 - 1] + sorted[n / 2]) / 2
-    }
-}
+pub(crate) use vortex_bench::measurements::median;
 
 /// Return the non-empty, all-valid Utf8 input in compact canonical form, plus
 /// the canonical baseline every metric normalizes against: one 16-byte view per

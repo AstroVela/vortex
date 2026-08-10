@@ -14,6 +14,12 @@ The two suites are `compress` and `random-access`. They share the output flags
 (`-d/--display-format`, `-o/--output-path`, `--ingest-jsonl`, `-v/--verbose`, `--tracing`,
 `--log-format`); everything else is per-suite.
 
+Both report the **median** run, via `vortex_bench::measurements::median`, as does `string-bench`.
+Every per-iteration time is still emitted in `all_runtimes_ns` for anything that wants to compute
+a different statistic downstream. The suites differ only in how they decide when to stop:
+`compress` runs a fixed `--iterations` count, while `random-access` runs until `--time-limit`
+seconds have elapsed.
+
 ## `compress`
 
 Measures compression and decompression throughput, plus resulting file sizes, for Vortex versus

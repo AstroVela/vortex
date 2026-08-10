@@ -25,6 +25,29 @@ use crate::Target;
 use crate::memory::MemoryMeasurementResult;
 use crate::utils::GIT_COMMIT_ID;
 
+/// Median of `runs`, averaging the two middle values for an even count.
+///
+/// This is the statistic every suite reports. Prefer it over a best-of-N minimum: the minimum
+/// tracks the luckiest run, so it moves with the tail of the machine's noise rather than with
+/// the change under test, and it is not comparable against a median collected elsewhere.
+///
+/// Returns [`Duration::ZERO`] for an empty slice.
+pub fn median(runs: &[Duration]) -> Duration {
+    if runs.is_empty() {
+        return Duration::ZERO;
+    }
+
+    let mut sorted = runs.to_vec();
+    sorted.sort_unstable();
+
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2
+    }
+}
+
 pub trait ToJson {
     fn to_json(&self) -> serde_json::Value;
 }
@@ -192,21 +215,11 @@ impl TimingMeasurement {
     }
 
     pub fn median_time(&self) -> Duration {
-        let len = self.runs.len();
-        if len == 0 {
+        if self.runs.is_empty() {
             vortex_panic!("cannot have no runs");
         }
 
-        let mut sorted_runs = self.runs.clone();
-        sorted_runs.sort();
-
-        if len % 2 == 1 {
-            sorted_runs[len / 2]
-        } else {
-            let mid1 = sorted_runs[len / 2 - 1];
-            let mid2 = sorted_runs[len / 2];
-            (mid1 + mid2) / 2
-        }
+        median(&self.runs)
     }
 }
 
@@ -251,27 +264,11 @@ pub struct QueryMeasurement {
 
 impl QueryMeasurement {
     pub fn median_run(&self) -> Duration {
-        let len = self.runs.len();
-        if len == 0 {
+        if self.runs.is_empty() {
             vortex_panic!("cannot have no runs");
         }
 
-        let mut sorted_runs = self.runs.clone();
-        sorted_runs.sort();
-
-        if len % 2 == 1 {
-            sorted_runs[len / 2]
-        } else {
-            let mid1 = sorted_runs[len / 2 - 1];
-            let mid2 = sorted_runs[len / 2];
-            let avg_nanos = (mid1.as_nanos() + mid2.as_nanos()) / 2;
-            Duration::new(
-                u64::try_from(avg_nanos / 1_000_000_000)
-                    .vortex_expect("nanosecond conversion must fit in u64/u32"),
-                u32::try_from(avg_nanos % 1_000_000_000)
-                    .vortex_expect("nanosecond conversion must fit in u64/u32"),
-            )
-        }
+        median(&self.runs)
     }
 }
 
@@ -507,6 +504,50 @@ impl ToTable for MemoryMeasurement {
             unit: Cow::from("MB"),
             value: MeasurementValue::Float(self.peak_physical_memory as f64 / 1024.0 / 1024.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn nanos(values: &[u64]) -> Vec<Duration> {
+        values.iter().copied().map(Duration::from_nanos).collect()
+    }
+
+    #[rstest]
+    #[case::odd(&[30, 10, 20], 20)]
+    #[case::even_averages_the_middle_pair(&[10, 30], 20)]
+    #[case::unsorted(&[50, 10, 40, 20, 30], 30)]
+    #[case::single(&[7], 7)]
+    #[case::empty(&[], 0)]
+    fn median_of(#[case] runs: &[u64], #[case] expected_ns: u64) {
+        assert_eq!(median(&nanos(runs)), Duration::from_nanos(expected_ns));
+    }
+
+    #[test]
+    fn median_measurements_agree_with_the_shared_helper() {
+        let runs = nanos(&[40, 10, 30, 20]);
+
+        let timing = TimingMeasurement {
+            name: "demo".to_string(),
+            target: Target::new(Engine::default(), Format::OnDiskVortex),
+            storage: "nvme".to_string(),
+            runs: runs.clone(),
+        };
+        assert_eq!(timing.median_time(), median(&runs));
+
+        let query = QueryMeasurement {
+            query_idx: 1,
+            target: Target::new(Engine::default(), Format::OnDiskVortex),
+            benchmark_dataset: BenchmarkDataset::Fineweb,
+            benchmark_runner: "test".to_string(),
+            storage: "nvme".to_string(),
+            runs: runs.clone(),
+        };
+        assert_eq!(query.median_run(), median(&runs));
     }
 }
 
