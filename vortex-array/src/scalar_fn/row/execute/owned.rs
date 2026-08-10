@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! Execution that stores one owned output value per row.
+
+use std::ops::BitOrAssign;
+
+use vortex_compute::lane_kernels::IndexedSourceExt;
+use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
+
+use super::RowExecution;
+use crate::ExecutionCtx;
+use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::IndexedElementTuple;
+use crate::scalar_fn::OutputElement;
+use crate::scalar_fn::row::visitor::assert_owned_output_needs_no_drop;
+
+/// Zero-sized evidence used to erase failure reduction from infallible owned visits.
+#[derive(Clone, Copy, Default)]
+struct NoFailure;
+
+impl BitOrAssign for NoFailure {
+    fn bitor_assign(&mut self, _rhs: Self) {}
+}
+
+/// Decode every input column once, then store one infallible owned output per row.
+pub fn execute_owned_infallible<Args, Out, Prepared>(
+    args: &dyn ExecutionArgs,
+    ctx: &mut ExecutionCtx,
+    prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
+    apply: impl Fn(&Prepared, Args::Elems<'_>) -> Out,
+) -> VortexResult<RowExecution>
+where
+    Args: IndexedElementTuple,
+    Out: OutputElement,
+{
+    execute_owned::<Args, Out, Prepared, NoFailure>(
+        args,
+        ctx,
+        prepare,
+        move |prepared, args| (apply(prepared, args), NoFailure),
+        |_| Ok(()),
+    )
+}
+
+/// Decode every input column once, then store owned row outputs and reduce deferred failures.
+pub fn execute_owned<Args, Out, Prepared, Fail>(
+    args: &dyn ExecutionArgs,
+    ctx: &mut ExecutionCtx,
+    prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
+    apply: impl Fn(&Prepared, Args::Elems<'_>) -> (Out, Fail),
+    finish_failure: impl FnOnce(Fail) -> VortexResult<()>,
+) -> VortexResult<RowExecution>
+where
+    Args: IndexedElementTuple,
+    Out: OutputElement,
+    Fail: Copy + Default + BitOrAssign,
+{
+    const { assert_owned_output_needs_no_drop::<Out>() };
+
+    // Keep the vector length at zero until every row succeeds. An unwind then abandons partially
+    // initialized spare capacity without treating it as initialized output. The no-drop assertion
+    // above proves that no initialized value requires its destructor to run.
+    let row_count = args.row_count();
+    let mut values = Vec::<Out>::with_capacity(row_count);
+    let columns = Args::decode(args, ctx)?;
+    let prepared = prepare(Args::constants(&columns));
+    let failure;
+
+    {
+        let output = &mut values.spare_capacity_mut()[..row_count];
+
+        // When every input varies, the indexed source removes argument-shape dispatch from the hot
+        // loop and lets the lane kernel optimize the traversal as one operation. Keep the varying
+        // view and its length proof in this branch: hoisting them through the shared validation
+        // helper produces slower mixed-constant code with LLVM 21.1.2.
+        // Evidence:
+        // https://github.com/vortex-data/vortex/blob/ef3fc1/research/rowfn-regressions-2026-08-08/README.md
+        if let Some(varying) = Args::varying(&columns) {
+            vortex_ensure!(
+                Args::varying_len_matches(&varying, row_count),
+                "a decoded row input does not address exactly {row_count} rows",
+            );
+
+            failure = Args::indexed_source(&varying)
+                .map_checked_into(output, |elements| apply(&prepared, elements));
+        } else {
+            // A batch-constant input was collapsed to one row during decoding. This path reads that
+            // row repeatedly while indexing only the inputs that vary.
+            vortex_ensure!(
+                Args::decoded_lens_match(&columns, row_count),
+                "a decoded row input does not address exactly {row_count} rows",
+            );
+
+            let mut accumulated = Fail::default();
+            for index in 0..row_count {
+                let (value, row_failure) = apply(&prepared, Args::get(&columns, index));
+                output[index].write(value);
+                accumulated |= row_failure;
+            }
+            failure = accumulated;
+        }
+    }
+
+    // SAFETY: normal completion of either loop initializes every slot in `0..row_count` exactly
+    // once, and `values` was allocated with at least `row_count` capacity.
+    unsafe { values.set_len(row_count) };
+
+    // Failure evidence is reduced inside the loop so its richer error construction stays cold.
+    // Preserve that provenance so batch execution may retry over only valid rows.
+    match finish_failure(failure) {
+        Ok(()) => Ok(RowExecution::Output(Out::build(values))),
+        Err(error) => Ok(RowExecution::DeferredError(error)),
+    }
+}
