@@ -49,6 +49,7 @@ pub use plans::Take;
 pub use plans::TakeData;
 pub use plans::TakePlan;
 pub use plans::Zoned;
+pub use plans::ZonedData;
 pub use plans::ZonedPlan;
 pub use plans::plan_row_idx_expression;
 pub use plans::row_idx_dtype;
