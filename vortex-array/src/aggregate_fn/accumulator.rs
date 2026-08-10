@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::Any;
+
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
@@ -136,6 +139,16 @@ pub trait DynAccumulator: 'static + Send {
     ///
     /// Resets the accumulator state back to the initial state.
     fn finish(&mut self) -> VortexResult<Scalar>;
+
+    /// Access the accumulator as [`Any`], so it can be downcast to a typed [`Accumulator`].
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl dyn DynAccumulator {
+    /// Downcast to the typed [`Accumulator`] of the aggregate vtable `V`.
+    pub fn downcast_mut<V: AggregateFnVTable>(&mut self) -> Option<&mut Accumulator<V>> {
+        self.as_any_mut().downcast_mut()
+    }
 }
 
 impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
@@ -267,17 +280,25 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
     }
 
     fn merge_from(&mut self, other: &mut dyn DynAccumulator) -> VortexResult<()> {
-        let scalar = other.flush()?;
+        let Some(other) = other.downcast_mut::<V>() else {
+            vortex_bail!(
+                "Cannot merge into a {} accumulator from an accumulator of a different aggregate",
+                self.aggregate_fn,
+            );
+        };
         vortex_ensure!(
-            scalar.dtype() == &self.partial_dtype,
-            "Cannot merge accumulator with partial dtype {}, expected {}",
-            scalar.dtype(),
-            self.partial_dtype,
+            other.options == self.options && other.dtype == self.dtype,
+            "Cannot merge {} accumulators with different options or input dtypes",
+            self.aggregate_fn,
         );
-        let parsed = self
-            .vtable
-            .partial_from_scalar(&self.options, &self.dtype, scalar)?;
-        self.fold_partial(parsed)
+        match other.partial.take() {
+            Some(partial) => self.fold_partial(partial),
+            None => Ok(()),
+        }
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn is_saturated(&self) -> bool {
@@ -350,6 +371,7 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::Accumulator;
+    use crate::aggregate_fn::AccumulatorRef;
     use crate::aggregate_fn::AggregateFnRef;
     use crate::aggregate_fn::AggregateFnVTable;
     use crate::aggregate_fn::DynAccumulator;
@@ -357,6 +379,7 @@ mod tests {
     use crate::aggregate_fn::combined::Combined;
     use crate::aggregate_fn::combined::PairOptions;
     use crate::aggregate_fn::fns::mean::Mean;
+    use crate::aggregate_fn::fns::min::Min;
     use crate::aggregate_fn::fns::sum::Sum;
     use crate::aggregate_fn::fns::sum::SumAggregateOpts;
     use crate::aggregate_fn::kernels::DynAggregateKernel;
@@ -581,6 +604,56 @@ mod tests {
         acc.accumulate(&batch, &mut ctx)?;
 
         assert_eq!(acc.finish()?.as_primitive().as_::<f64>(), Some(11.0));
+        Ok(())
+    }
+
+    fn sum_i32_accumulator(options: SumAggregateOpts) -> VortexResult<AccumulatorRef> {
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        Ok(Box::new(Accumulator::try_new(Sum, options, dtype)?))
+    }
+
+    #[test]
+    fn merge_from_drains_other_accumulator() -> VortexResult<()> {
+        let mut ctx = fresh_session().create_execution_ctx();
+        let mut global = sum_i32_accumulator(SumAggregateOpts::default())?;
+        let mut local = sum_i32_accumulator(SumAggregateOpts::default())?;
+
+        global.accumulate(&buffer![10i32, 20].into_array(), &mut ctx)?;
+        local.accumulate(&buffer![5i32].into_array(), &mut ctx)?;
+        global.merge_from(local.as_mut())?;
+
+        assert_eq!(
+            global.finish()?,
+            Scalar::primitive(35i64, Nullability::Nullable)
+        );
+        // The merged-from accumulator is reset back to the empty state.
+        assert_eq!(
+            local.finish()?,
+            Scalar::null(DType::Primitive(PType::I64, Nullability::Nullable))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_from_rejects_a_different_aggregate() -> VortexResult<()> {
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let mut sum = sum_i32_accumulator(SumAggregateOpts::default())?;
+        let mut min: AccumulatorRef = Box::new(Accumulator::try_new(
+            Min,
+            NumericalAggregateOpts::default(),
+            dtype,
+        )?);
+
+        assert!(sum.merge_from(min.as_mut()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_from_rejects_mismatched_options() -> VortexResult<()> {
+        let mut skipping = sum_i32_accumulator(SumAggregateOpts::skip_nans())?;
+        let mut including = sum_i32_accumulator(SumAggregateOpts::include_nans())?;
+
+        assert!(skipping.merge_from(including.as_mut()).is_err());
         Ok(())
     }
 }
