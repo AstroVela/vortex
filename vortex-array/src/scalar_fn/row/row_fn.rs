@@ -39,11 +39,15 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// The arguments in display order. Its length is the function's exact arity.
     const ARG_NAMES: &'static [&'static str];
 
-    /// Whether any legal dispatch can raise a semantic error as defined by
-    /// [`ScalarFnVTable::is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible).
+    /// Whether any legal dispatch or encoding-aware execution can raise a semantic error as
+    /// defined by [`ScalarFnVTable::is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible).
     ///
     /// The framework checks this at compile time for every fallible dispatched element or result.
     /// A conservative `true` is allowed when only some dtype choices are fallible.
+    ///
+    /// Set this to `true` when [`reduce_encoded`](Self::reduce_encoded) can return a semantic
+    /// error or [`RowExecution::DeferredError`]. Compile-time checks cover dispatched element and
+    /// result types, but cannot inspect that hook.
     const FALLIBLE: bool = false;
 
     /// Returns the ID of the scalar function.

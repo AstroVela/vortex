@@ -33,6 +33,9 @@ use crate::scalar_fn::OutputElement;
 ///   substitutable for another row.
 /// - A present [`SKIPPED_ROWS_INITIALIZER`](Self::SKIPPED_ROWS_INITIALIZER) **must** initialize
 ///   every row handed to it.
+/// - `Self` and every borrowed [`Rows`](Self::Rows) view **must** remain safe to drop if decoding,
+///   preparation, skipped-row initialization, or a row callback returns an error or unwinds. The
+///   executor can abandon a sink after any prefix of rows.
 /// - [`finish`](Self::finish) **must** be sound once every visited callback returned its required
 ///   token and the skipped-row initializer, when present, ran successfully.
 ///
@@ -146,8 +149,9 @@ impl InitializedElement {
 /// The row closure must return the [`InitializedElement`] from [`InitializedElement::write`] on
 /// success. The token is zero-sized, so the proof adds no runtime row state.
 ///
-/// Skip-invalid execution initializes placeholders before omitting rows. Immediate failures are
-/// safe because [`OutputSink::finish`] is not called after one.
+/// Skip-invalid execution initializes placeholders before omitting rows. Errors and unwinds are
+/// safe because `values` keeps length zero until `finish`; `T: Copy` means initialized
+/// spare-capacity elements require no destruction.
 pub struct UninitElementSink<T> {
     /// Spare storage written in increasing row order.
     values: Vec<T>,
