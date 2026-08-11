@@ -222,6 +222,42 @@ impl<A: 'static + Send> ScanBuilder<A> {
         self
     }
 
+    /// Optimizes the projection, pruning, and filter plans over the row-index-aware source.
+    fn optimized_plans(&self) -> VortexResult<OptimizedPlans> {
+        let source = RowIdxPlan::new(self.row_offset, self.base_plan.clone()).into_plan();
+        tracing::debug!(
+            target: "vortex_scan_v2::planner",
+            row_offset = self.row_offset,
+            plan = %source.display_tree(),
+            "planning expressions over the row-index-aware source"
+        );
+        let projection = optimize_projection_plan(self.projection.clone(), &source)?;
+        let filter_expression = optimize_filter_expression(self.filter.clone(), &source)?;
+        let pruning = optimize_pruning_plan(
+            filter_expression.as_ref(),
+            &source,
+            self.execution.session(),
+        )?;
+        let filter = optimize_filter_plan(filter_expression.as_ref(), &source, self.filter_mode)?;
+        Ok(OptimizedPlans {
+            projection,
+            pruning,
+            filter,
+        })
+    }
+
+    /// Returns the split boundaries the scan would use over the whole file, ignoring any
+    /// configured row range or selection.
+    ///
+    /// Callers that partition one file across several scans use these boundaries to divide the
+    /// file into disjoint row ranges, so they must be computed from the full row count rather
+    /// than from an already-restricted range.
+    pub fn full_file_splits(&self) -> VortexResult<Vec<u64>> {
+        let plans = self.optimized_plans()?;
+        self.split_by
+            .splits(&plans.split_sources(), &(0..self.base_plan.row_count()))
+    }
+
     /// Returns the dtype produced by the projection expression.
     pub fn dtype(&self) -> VortexResult<DType> {
         self.projection.return_dtype(self.base_plan.dtype())
@@ -261,21 +297,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             vortex_bail!("Vortex doesn't support scans with both a filter and a limit")
         }
 
-        let source = RowIdxPlan::new(self.row_offset, self.base_plan.clone()).into_plan();
-        tracing::debug!(
-            target: "vortex_scan_v2::planner",
-            row_offset = self.row_offset,
-            plan = %source.display_tree(),
-            "planning expressions over the row-index-aware source"
-        );
-        let projection = optimize_projection_plan(self.projection, &source)?;
-        let filter_expression = optimize_filter_expression(self.filter, &source)?;
-        let pruning = optimize_pruning_plan(
-            filter_expression.as_ref(),
-            &source,
-            self.execution.session(),
-        )?;
-        let filter = optimize_filter_plan(filter_expression.as_ref(), &source, self.filter_mode)?;
+        let plans = self.optimized_plans()?;
 
         let splits =
             if let Some(ranges) = attempt_split_ranges(&self.selection, self.row_range.as_ref()) {
@@ -285,12 +307,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
                     .row_range
                     .clone()
                     .unwrap_or_else(|| 0..self.base_plan.row_count());
-                let mut plans = vec![&projection];
-                if let Some(filter) = &filter {
-                    plans.extend(filter.plans());
-                }
-                plans.extend(pruning.as_ref());
-                Splits::Natural(self.split_by.splits(&plans, &row_range)?)
+                Splits::Natural(self.split_by.splits(&plans.split_sources(), &row_range)?)
             };
         match &splits {
             Splits::Natural(boundaries) => tracing::debug!(
@@ -307,6 +324,11 @@ impl<A: 'static + Send> ScanBuilder<A> {
             ),
         }
 
+        let OptimizedPlans {
+            projection,
+            pruning,
+            filter,
+        } = plans;
         Ok(RepeatedScan::new(
             self.execution,
             projection,
@@ -343,6 +365,26 @@ impl<A: 'static + Send> ScanBuilder<A> {
         runtime: &B,
     ) -> VortexResult<impl Iterator<Item = VortexResult<A>> + 'static> {
         Ok(runtime.block_on_stream(self.into_stream()?))
+    }
+}
+
+/// The optimized plans a scan executes: the projection, the optional pruning plan, and the
+/// optional filter plan.
+struct OptimizedPlans {
+    projection: PlanRef,
+    pruning: Option<PlanRef>,
+    filter: Option<FilterPlan>,
+}
+
+impl OptimizedPlans {
+    /// The plans whose layout boundaries contribute to the scan's natural splits.
+    fn split_sources(&self) -> Vec<&PlanRef> {
+        let mut plans = vec![&self.projection];
+        if let Some(filter) = &self.filter {
+            plans.extend(filter.plans());
+        }
+        plans.extend(self.pruning.as_ref());
+        plans
     }
 }
 

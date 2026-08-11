@@ -10553,6 +10553,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "parking_lot",
+ "rstest",
  "tracing",
  "tracing-subscriber",
  "vortex-array",

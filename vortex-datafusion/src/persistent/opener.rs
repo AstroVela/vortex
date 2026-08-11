@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::Weak;
 
 use arrow_array::RecordBatchOptions;
@@ -375,18 +376,6 @@ impl FileOpener for VortexOpener {
                         "plan-v2 scans do not support VortexAccessPlan"
                     ));
                 }
-                if let Some(file_range) = file.range.as_ref() {
-                    let start = u64::try_from(file_range.start)
-                        .map_err(|_| exec_datafusion_err!("Vortex file range start is negative"))?;
-                    let end = u64::try_from(file_range.end)
-                        .map_err(|_| exec_datafusion_err!("Vortex file range end is negative"))?;
-                    if start != 0 || end != file.object_meta.size {
-                        return Err(exec_datafusion_err!(
-                            "plan-v2 scans require DataFusion file-scan repartitioning to be disabled"
-                        ));
-                    }
-                }
-
                 let filter_mode = if std::env::var("VORTEX_PLAN_V2_FILTER_MODE").as_deref()
                     == Ok("adaptive")
                 {
@@ -419,6 +408,42 @@ impl FileOpener for VortexOpener {
                 }
                 if let Some(concurrency) = scan_concurrency {
                     scan_builder = scan_builder.with_concurrency(concurrency);
+                }
+
+                announce_plan_v2(filter_mode);
+
+                // DataFusion hands each partition a byte range of the file. Translate it to the
+                // row range whose natural splits that byte range owns, so partitions of one file
+                // cover it exactly once.
+                if let Some(file_range) = file.range.as_ref() {
+                    let byte_range = Range {
+                        start: u64::try_from(file_range.start).map_err(|_| {
+                            exec_datafusion_err!("Vortex file range start is negative")
+                        })?,
+                        end: u64::try_from(file_range.end).map_err(|_| {
+                            exec_datafusion_err!("Vortex file range end is negative")
+                        })?,
+                    };
+                    if byte_range.start != 0 || byte_range.end != file.object_meta.size {
+                        let file_splits = natural_splits_for_file(
+                            natural_splits.as_ref(),
+                            &file.object_meta.location,
+                            file.object_meta.size,
+                            || {
+                                scan_builder.full_file_splits().map_err(|e| {
+                                    exec_datafusion_err!(
+                                        "Failed to compute plan-v2 natural splits: {e}"
+                                    )
+                                })
+                            },
+                        )?;
+                        let Some(row_range) =
+                            split_aligned_row_range(byte_range, file_splits.as_ref())
+                        else {
+                            return Ok(stream::empty().boxed());
+                        };
+                        scan_builder = scan_builder.with_row_range(row_range);
+                    }
                 }
 
                 let location = file.object_meta.location.clone();
@@ -505,8 +530,14 @@ impl FileOpener for VortexOpener {
                         let natural_splits = natural_splits_for_file(
                             natural_splits.as_ref(),
                             &file.object_meta.location,
-                            &scan_builder,
                             file.object_meta.size,
+                            || {
+                                scan_builder.full_file_splits().map_err(|e| {
+                                    exec_datafusion_err!(
+                                        "Failed to compute Vortex natural splits: {e}"
+                                    )
+                                })
+                            },
                         )?;
                         let Some(row_range) =
                             split_aligned_row_range(byte_range, natural_splits.as_ref())
@@ -644,11 +675,11 @@ impl NaturalSplits {
 }
 
 /// Return the cached [`NaturalSplits`] for `path`, computing and caching them on first use.
-fn natural_splits_for_file<A: 'static + Send>(
+fn natural_splits_for_file(
     natural_splits: &DashMap<Path, Arc<NaturalSplits>>,
     path: &Path,
-    scan_builder: &ScanBuilder<A>,
     total_size: u64,
+    row_boundaries: impl FnOnce() -> DFResult<Vec<u64>>,
 ) -> DFResult<Arc<NaturalSplits>> {
     if let Some(splits) = natural_splits.get(path) {
         return Ok(Arc::clone(splits.value()));
@@ -660,27 +691,23 @@ fn natural_splits_for_file<A: 'static + Send>(
     match natural_splits.entry(path.clone()) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
-            let splits = compute_natural_splits(scan_builder, total_size)?;
+            let splits = Arc::new(NaturalSplits::new(row_boundaries()?.into(), total_size));
             entry.insert(Arc::clone(&splits));
             Ok(splits)
         }
     }
 }
 
-/// Walk the layout tree to compute the file's full natural split boundaries for the fields
-/// referenced by the scan's projection and filter.
-fn compute_natural_splits<A: 'static + Send>(
-    scan_builder: &ScanBuilder<A>,
-    total_size: u64,
-) -> DFResult<Arc<NaturalSplits>> {
-    let row_boundaries = scan_builder
-        .full_file_splits()
-        .map_err(|e| exec_datafusion_err!("Failed to compute Vortex natural splits: {e}"))?;
-
-    Ok(Arc::new(NaturalSplits::new(
-        row_boundaries.into(),
-        total_size,
-    )))
+/// Logs once per process that scans are running through plan-v2, so a benchmark or CI job log
+/// records which scan path produced its timings.
+fn announce_plan_v2(filter_mode: FilterMode) {
+    static ANNOUNCED: Once = Once::new();
+    ANNOUNCED.call_once(|| {
+        tracing::info!(
+            ?filter_mode,
+            "Vortex file scans are using the plan-v2 scan path (VORTEX_USE_PLAN_V2=1)"
+        );
+    });
 }
 
 /// Translate a DataFusion byte range to the contiguous natural split ranges it owns.

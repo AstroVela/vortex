@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use rstest::rstest;
 use vortex_array::ArrayContext;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -404,6 +406,100 @@ fn scans_selected_rows_from_a_list_plan() -> VortexResult<()> {
         )?
         .into_array();
 
+        assert_arrays_eq!(actual, expected, &mut session.create_execution_ctx());
+        Ok(())
+    })
+}
+
+#[test]
+fn full_file_splits_ignore_the_configured_row_range() -> VortexResult<()> {
+    block_on(|handle| async {
+        let session = array_session()
+            .with::<LayoutSession>()
+            .with::<RuntimeSession>()
+            .with_handle(handle);
+        let segments = Arc::new(TestSegments::default());
+        let (sequence, eof) = SequenceId::root().split();
+        let input = ChunkedArray::from_iter([
+            buffer![1_i32, 2, 3].into_array(),
+            buffer![4_i32, 5, 6].into_array(),
+            buffer![7_i32, 8, 9].into_array(),
+        ])
+        .into_array();
+        let layout = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default())
+            .write_stream(
+                ArrayContext::empty().into(),
+                Arc::<TestSegments>::clone(&segments),
+                input.to_array_stream().sequenced(sequence),
+                eof,
+                &session,
+            )
+            .await?;
+
+        let whole_file = ScanBuilder::try_new(
+            &layout,
+            Arc::<TestSegments>::clone(&segments) as Arc<dyn SegmentSource>,
+            session.clone(),
+        )?
+        .full_file_splits()?;
+        let restricted = ScanBuilder::try_new(&layout, segments, session.clone())?
+            .with_row_range(3..5)
+            .full_file_splits()?;
+
+        assert_eq!(whole_file, restricted);
+        assert_eq!(whole_file.first(), Some(&0));
+        assert_eq!(whole_file.last(), Some(&9));
+        Ok(())
+    })
+}
+
+#[rstest]
+#[case(vec![0..9])]
+#[case(vec![0..3, 3..9])]
+#[case(vec![0..4, 4..7, 7..9])]
+fn row_ranges_partition_the_file_exactly_once(
+    #[case] row_ranges: Vec<Range<u64>>,
+) -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = array_session()
+            .with::<LayoutSession>()
+            .with::<RuntimeSession>()
+            .with_handle(handle);
+        let segments = Arc::new(TestSegments::default());
+        let (sequence, eof) = SequenceId::root().split();
+        let input = ChunkedArray::from_iter([
+            buffer![1_i32, 2, 3].into_array(),
+            buffer![4_i32, 5, 6].into_array(),
+            buffer![7_i32, 8, 9].into_array(),
+        ])
+        .into_array();
+        let layout = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default())
+            .write_stream(
+                ArrayContext::empty().into(),
+                Arc::<TestSegments>::clone(&segments),
+                input.to_array_stream().sequenced(sequence),
+                eof,
+                &session,
+            )
+            .await?;
+
+        let mut scanned = Vec::new();
+        for row_range in row_ranges {
+            let chunk = ScanBuilder::try_new(
+                &layout,
+                Arc::<TestSegments>::clone(&segments) as Arc<dyn SegmentSource>,
+                session.clone(),
+            )?
+            .with_filter(gt(root(), lit(2_i32)))
+            .with_row_range(row_range)
+            .into_array_stream()?
+            .read_all()
+            .await?;
+            scanned.push(chunk);
+        }
+
+        let actual = ChunkedArray::from_iter(scanned).into_array();
+        let expected = PrimitiveArray::from_iter(3_i32..10).into_array();
         assert_arrays_eq!(actual, expected, &mut session.create_execution_ctx());
         Ok(())
     })
