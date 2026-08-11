@@ -53,7 +53,6 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     // 0.36.0 stats layouts identified statistics by a closed enum rather than by aggregate
     // function ids, so no aggregate functions join at the baseline.
     added_aggregations: &[],
-    added_expressions: &[],
     // The founding temporal extension dtypes, serialized in file schemas since 0.36.0.
     added_extension_dtypes: &[&"vortex.date", &"vortex.time", &"vortex.timestamp"],
 };

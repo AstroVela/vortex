@@ -9526,7 +9526,6 @@ dependencies = [
  "fastlanes",
  "mimalloc",
  "parquet 58.4.0",
- "prost 0.14.4",
  "rand 0.10.2",
  "serde_json",
  "tokio",

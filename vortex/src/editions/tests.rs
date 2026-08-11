@@ -205,46 +205,8 @@ fn encodings_in_editions_unions_families() {
     assert!(both.len() > core_only.len());
     assert!(both.iter().any(|id| id.as_str() == "fastlanes.delta"));
     assert!(both.iter().any(|id| id.as_str() == "vortex.onpair"));
+    assert!(both.iter().any(|id| id.as_str() == "vortex.tensor.l2_norm"));
     assert!(core_only.iter().all(|id| both.contains(id)));
-}
-
-#[test]
-fn tensor_scalar_fns_are_expression_members() {
-    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
-    let expressions = session.expressions_in(&UNSTABLE_2026_06_0);
-    let ids: Vec<&str> = expressions
-        .iter()
-        .map(|inclusion| inclusion.object_id.as_str())
-        .collect();
-    assert_eq!(
-        ids,
-        [
-            "vortex.tensor.cosine_similarity",
-            "vortex.tensor.inner_product",
-            "vortex.tensor.l2_norm",
-        ]
-    );
-    // The scalar functions are expression members, not array encodings.
-    assert!(
-        session
-            .arrays_in(&UNSTABLE_2026_06_0)
-            .iter()
-            .all(
-                |inclusion| !inclusion.object_id.as_str().starts_with("vortex.tensor.")
-                    || inclusion.object_id.as_str() == "vortex.tensor.normalized"
-            )
-    );
-
-    // The tensor extension dtypes join the same cohort under their own kind.
-    let extension_dtypes = session.extension_dtypes_in(&UNSTABLE_2026_06_0);
-    let ids: Vec<&str> = extension_dtypes
-        .iter()
-        .map(|inclusion| inclusion.object_id.as_str())
-        .collect();
-    assert_eq!(
-        ids,
-        ["vortex.tensor.fixed_shape_tensor", "vortex.tensor.vector",]
-    );
 }
 
 #[test]
@@ -376,7 +338,6 @@ static WRITER_TEST_DECLARATION: EditionDeclaration = EditionDeclaration {
     ],
     added_layouts: &[],
     added_aggregations: &[],
-    added_expressions: &[],
     added_extension_dtypes: &[],
 };
 

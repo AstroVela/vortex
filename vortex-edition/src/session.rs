@@ -90,7 +90,6 @@ impl EditionSession {
             (ObjectKind::Array, declaration.added_arrays),
             (ObjectKind::Layout, declaration.added_layouts),
             (ObjectKind::Aggregation, declaration.added_aggregations),
-            (ObjectKind::Expression, declaration.added_expressions),
             (
                 ObjectKind::ExtensionDType,
                 declaration.added_extension_dtypes,
@@ -201,12 +200,6 @@ impl EditionSession {
         self.members_of_kind_in(ObjectKind::Aggregation, edition)
     }
 
-    /// The scalar functions (named by serialized expressions) in an edition, sorted by
-    /// function id.
-    pub fn expressions_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
-        self.members_of_kind_in(ObjectKind::Expression, edition)
-    }
-
     /// The extension dtypes in an edition, sorted by dtype id.
     pub fn extension_dtypes_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
         self.members_of_kind_in(ObjectKind::ExtensionDType, edition)
@@ -215,7 +208,7 @@ impl EditionSession {
     /// Backwards-compatible name for [`EditionSession::arrays_in`].
     #[deprecated(
         note = "use arrays_in, or members_in for every object kind; editions now also cover \
-                layouts, aggregations and expressions"
+                layouts, aggregations and extension dtypes"
     )]
     pub fn encodings_in(&self, edition: &EditionId) -> Vec<EditionInclusion> {
         self.arrays_in(edition)

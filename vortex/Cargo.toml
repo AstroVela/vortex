@@ -62,7 +62,6 @@ divan = { workspace = true }
 fastlanes = { workspace = true }
 mimalloc = { workspace = true }
 parquet = { workspace = true }
-prost = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

@@ -6,10 +6,9 @@
 //! [`vortex_edition`] provides the types, session variables, and test harness. The actual
 //! first-party declarations live here, one module per edition. Each edition declares the
 //! serializable objects that join its family at it, per object kind: array encodings,
-//! layout encodings, aggregate functions, and (rarely) the scalar functions named by
-//! serialized expressions. The default session first registers them with
-//! [`crate::editions::register_default_editions`] and then selects its write policy with
-//! [`crate::editions::enable_default_editions`].
+//! layout encodings, aggregate functions, and extension dtypes. The default session first
+//! registers them with [`crate::editions::register_default_editions`] and then selects its
+//! write policy with [`crate::editions::enable_default_editions`].
 //!
 //! The default file writer resolves the session's enabled editions at write time. The
 //! facade enables the newest frozen `core` edition, [`crate::editions::CORE_2026_08`], and

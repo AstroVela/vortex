@@ -19,6 +19,5 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     added_arrays: &[&"vortex.onpair"],
     added_layouts: &[],
     added_aggregations: &[],
-    added_expressions: &[],
     added_extension_dtypes: &[],
 };

@@ -16,7 +16,6 @@ Every object reachable from any edition — `core` and `unstable` alike — has 
 | `arrays`           | IPC stream of a single-chunk array (dtype + id table + array body)  |
 | `layouts`          | A whole tiny Vortex file whose footer tree contains the layout      |
 | `aggregations`     | The aggregate function's serialized options, as stored in zone maps |
-| `expressions`      | IPC stream of a scalar-fn array (how expressions persist in files)  |
 | `extension_dtypes` | FlatBuffer encoding of a `DType` using the extension                |
 
 The tests assert two things for every object:

@@ -3,8 +3,8 @@
 
 //! Golden-file serialization tests for every object reachable from an edition.
 //!
-//! Every edition member — array encodings, layouts, aggregate functions, expressions, and
-//! extension dtypes, `core` and `unstable` alike — has a directory of golden files under
+//! Every edition member — array encodings, layouts, aggregate functions, and extension
+//! dtypes, `core` and `unstable` alike — has a directory of golden files under
 //! `vortex/goldenfiles/editions/<kind>/<id>/`. Each file `vNNN.bin` pins one historical
 //! serialized form of that object:
 //!
@@ -56,7 +56,6 @@ fn kind_dir_name(kind: ObjectKind) -> &'static str {
         ObjectKind::Array => "arrays",
         ObjectKind::Layout => "layouts",
         ObjectKind::Aggregation => "aggregations",
-        ObjectKind::Expression => "expressions",
         ObjectKind::ExtensionDType => "extension_dtypes",
     }
 }
@@ -153,7 +152,6 @@ fn declared_members(kind: ObjectKind) -> Vec<(&'static str, Id)> {
                 ObjectKind::Array => declaration.added_arrays,
                 ObjectKind::Layout => declaration.added_layouts,
                 ObjectKind::Aggregation => declaration.added_aggregations,
-                ObjectKind::Expression => declaration.added_expressions,
                 ObjectKind::ExtensionDType => declaration.added_extension_dtypes,
             };
             added

@@ -24,7 +24,6 @@ static DECLARATIONS: &[EditionDeclaration] = &[
         added_arrays: &[&"test.alpha", &"test.beta"],
         added_layouts: &[&"test.flat"],
         added_aggregations: &[],
-        added_expressions: &[],
         added_extension_dtypes: &[],
     },
     EditionDeclaration {
@@ -37,7 +36,6 @@ static DECLARATIONS: &[EditionDeclaration] = &[
         // layout member since SECOND.
         added_layouts: &[&"test.alpha"],
         added_aggregations: &[&"test.sum"],
-        added_expressions: &[&"test.contains"],
         added_extension_dtypes: &[&"test.ts"],
     },
 ];
@@ -119,7 +117,6 @@ fn members_are_partitioned_by_kind() {
             (ObjectKind::Layout, "test.alpha"),
             (ObjectKind::Layout, "test.flat"),
             (ObjectKind::Aggregation, "test.sum"),
-            (ObjectKind::Expression, "test.contains"),
             (ObjectKind::ExtensionDType, "test.ts"),
         ]
     );
@@ -136,7 +133,6 @@ fn members_are_partitioned_by_kind() {
     );
     assert!(editions.aggregations_in(&FIRST).is_empty());
     assert_eq!(editions.aggregations_in(&SECOND).len(), 1);
-    assert_eq!(editions.expressions_in(&SECOND).len(), 1);
     assert!(editions.extension_dtypes_in(&FIRST).is_empty());
     assert_eq!(editions.extension_dtypes_in(&SECOND).len(), 1);
 }
@@ -234,7 +230,6 @@ fn enabled_ids_are_resolved_per_kind() -> Result<(), crate::EditionError> {
         ["test.alpha", "test.flat"]
     );
     assert_eq!(session.enabled_ids_of(ObjectKind::Aggregation).len(), 1);
-    assert_eq!(session.enabled_ids_of(ObjectKind::Expression).len(), 1);
     assert_eq!(session.enabled_ids_of(ObjectKind::ExtensionDType).len(), 1);
     // The array-encoding convenience accessor matches the Array kind.
     assert_eq!(
@@ -262,7 +257,6 @@ fn enabled_editions_are_independent_across_families() -> Result<(), crate::Editi
         added_arrays: &[&"other.delta"],
         added_layouts: &[],
         added_aggregations: &[],
-        added_expressions: &[],
         added_extension_dtypes: &[],
     };
 
@@ -361,7 +355,7 @@ fn validate_rejects_inconsistent_declarations() -> Result<(), crate::EditionErro
         min_vortex_version: None,
     })?;
     editions.declare_inclusion(EditionInclusion::new(
-        ObjectKind::Expression,
+        ObjectKind::Aggregation,
         "Test.ALPHA",
         FIRST,
     ))?;

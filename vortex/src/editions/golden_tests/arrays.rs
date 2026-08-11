@@ -93,7 +93,23 @@ fn golden_session() -> VortexSession {
     // behind an experiment flag.
     session.arrays().register(Patched);
     #[cfg(feature = "unstable_encodings")]
-    vortex_parquet_variant::initialize(&session);
+    {
+        use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
+        use vortex_tensor::scalar_fns::cosine_similarity::CosineSimilarity;
+        use vortex_tensor::scalar_fns::inner_product::InnerProduct;
+        use vortex_tensor::scalar_fns::l2_norm::L2Norm;
+
+        vortex_parquet_variant::initialize(&session);
+        // The tensor scalar-fn array plugins are normally registered behind
+        // `vortex_tensor::SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV`.
+        session
+            .arrays()
+            .register(ScalarFnArrayPlugin::new(CosineSimilarity));
+        session
+            .arrays()
+            .register(ScalarFnArrayPlugin::new(InnerProduct));
+        session.arrays().register(ScalarFnArrayPlugin::new(L2Norm));
+    }
     session
 }
 
@@ -400,6 +416,9 @@ fn unstable_fixtures(ctx: &mut ExecutionCtx) -> VortexResult<Vec<(&'static str, 
     use vortex_onpair::onpair_compress;
     use vortex_parquet_variant::ParquetVariant;
     use vortex_tensor::encodings::normalized::normalize;
+    use vortex_tensor::scalar_fns::cosine_similarity::CosineSimilarity;
+    use vortex_tensor::scalar_fns::inner_product::InnerProduct;
+    use vortex_tensor::scalar_fns::l2_norm::L2Norm;
     use vortex_tensor::vector::Vector;
 
     let mut fixtures: Vec<(&'static str, ArrayRef)> = Vec::new();
@@ -441,13 +460,32 @@ fn unstable_fixtures(ctx: &mut ExecutionCtx) -> VortexResult<Vec<(&'static str, 
         Patched::from_array_and_patches(base, &patches, ctx)?.into_array(),
     ));
 
-    let vec_elements: PrimitiveArray = (0..12).map(|i| (i as f32) * 0.5 + 1.0).collect();
-    let vec_storage =
-        FixedSizeListArray::try_new(vec_elements.into_array(), 4, Validity::NonNullable, 3)?;
-    let vectors = Vector::try_new_vector_array(vec_storage.into_array())?;
+    let vectors = |seed: f32| -> VortexResult<ArrayRef> {
+        let elements: PrimitiveArray = (0..12).map(|i| (i as f32) * 0.5 + seed).collect();
+        let storage =
+            FixedSizeListArray::try_new(elements.into_array(), 4, Validity::NonNullable, 3)?;
+        Vector::try_new_vector_array(storage.into_array())
+    };
+
+    // The tensor scalar functions persist as scalar-fn arrays: the array encoding id is
+    // the scalar function id, and the serialized metadata is the function's options plus
+    // its child structure.
+    fixtures.push((
+        "vortex.tensor.cosine_similarity",
+        CosineSimilarity::try_new_array(vectors(1.0)?, vectors(2.0)?)?.into_array(),
+    ));
+    fixtures.push((
+        "vortex.tensor.inner_product",
+        InnerProduct::try_new_array(vectors(1.0)?, vectors(2.0)?)?.into_array(),
+    ));
+    fixtures.push((
+        "vortex.tensor.l2_norm",
+        L2Norm::try_new_array(vectors(1.0)?)?.into_array(),
+    ));
+
     fixtures.push((
         "vortex.tensor.normalized",
-        normalize(vectors, ctx)?.into_array(),
+        normalize(vectors(1.0)?, ctx)?.into_array(),
     ));
 
     #[cfg(feature = "zstd")]

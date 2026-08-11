@@ -657,7 +657,6 @@ mod tests {
             added_arrays: &[&"vortex.primitive"],
             added_layouts: &[],
             added_aggregations: &[],
-            added_expressions: &[],
             added_extension_dtypes: &[],
         };
 

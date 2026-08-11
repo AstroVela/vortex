@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Golden serialization fixtures for layouts, aggregate functions, expressions, and
-//! extension dtypes.
+//! Golden serialization fixtures for layouts, aggregate functions, and extension dtypes.
 //!
 //! - **Layouts** are pinned as whole (tiny) Vortex files: a file's footer is the durable
 //!   serialized form of its layout tree, and the read-forever check is a plain open + scan.
 //!   Each layout id owns a golden file whose tree contains that layout.
 //! - **Aggregate functions** are pinned as their serialized options bytes, the exact
 //!   payload zone maps store next to the function id.
-//! - **Expressions** are pinned as their protobuf encoding.
 //! - **Extension dtypes** are pinned as the flatbuffer encoding of a `DType` using them,
 //!   the form embedded in every file schema.
 
@@ -321,82 +319,6 @@ fn aggregation_goldens() -> VortexResult<()> {
         });
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------------------
-// Expressions
-// ---------------------------------------------------------------------------------------
-
-#[cfg(feature = "unstable_encodings")]
-#[cfg_attr(miri, ignore)]
-#[test]
-fn expression_goldens() -> VortexResult<()> {
-    use vortex_array::arrays::FixedSizeListArray;
-    use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
-    use vortex_array::session::ArraySessionExt;
-    use vortex_array::validity::Validity;
-    use vortex_tensor::scalar_fns::cosine_similarity::CosineSimilarity;
-    use vortex_tensor::scalar_fns::inner_product::InnerProduct;
-    use vortex_tensor::scalar_fns::l2_norm::L2Norm;
-    use vortex_tensor::vector::Vector;
-
-    use super::arrays::decode_ipc;
-    use super::arrays::ipc_bytes;
-
-    // Expressions persist as scalar-fn arrays: the array encoding id is the scalar
-    // function id, and the serialized metadata is the function's options plus the expression
-    // structure. Registering the plugins is normally gated behind
-    // `vortex_tensor::SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV`.
-    let session = golden_session();
-    session
-        .arrays()
-        .register(ScalarFnArrayPlugin::new(CosineSimilarity));
-    session
-        .arrays()
-        .register(ScalarFnArrayPlugin::new(InnerProduct));
-    session.arrays().register(ScalarFnArrayPlugin::new(L2Norm));
-
-    let vectors = |seed: f32| -> VortexResult<ArrayRef> {
-        let elements: PrimitiveArray = (0..12).map(|i| (i as f32) * 0.5 + seed).collect();
-        let storage =
-            FixedSizeListArray::try_new(elements.into_array(), 4, Validity::NonNullable, 3)?;
-        Vector::try_new_vector_array(storage.into_array())
-    };
-
-    let fixtures: Vec<(&'static str, ArrayRef)> = vec![
-        (
-            "vortex.tensor.cosine_similarity",
-            CosineSimilarity::try_new_array(vectors(1.0)?, vectors(2.0)?)?.into_array(),
-        ),
-        (
-            "vortex.tensor.inner_product",
-            InnerProduct::try_new_array(vectors(1.0)?, vectors(2.0)?)?.into_array(),
-        ),
-        (
-            "vortex.tensor.l2_norm",
-            L2Norm::try_new_array(vectors(1.0)?)?.into_array(),
-        ),
-    ];
-
-    let ids: Vec<&str> = fixtures.iter().map(|(id, _)| *id).collect();
-    assert_fixture_completeness(ObjectKind::Expression, &ids);
-
-    for (id, array) in &fixtures {
-        assert_eq!(array.encoding_id().as_str(), *id);
-        let current = ipc_bytes(array, &session)?;
-        check_golden(ObjectKind::Expression, id, &current, |bytes| {
-            decode_ipc(bytes, array, &session)
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "unstable_encodings"))]
-#[test]
-fn expression_goldens_completeness() {
-    // Without the unstable feature no expression members are required; keep the
-    // completeness check running so a core expression member cannot land uncovered.
-    assert_fixture_completeness(ObjectKind::Expression, &[]);
 }
 
 // ---------------------------------------------------------------------------------------

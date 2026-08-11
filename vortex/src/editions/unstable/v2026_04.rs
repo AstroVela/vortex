@@ -19,15 +19,15 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     added_arrays: &[
         &"vortex.parquet.variant",
         &"vortex.patched",
+        // The tensor scalar functions persist as scalar-fn array encodings whose ids are
+        // the function ids (registration is gated behind
+        // `vortex_tensor::SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV`).
+        &"vortex.tensor.cosine_similarity",
+        &"vortex.tensor.inner_product",
+        &"vortex.tensor.l2_norm",
         &"vortex.tensor.normalized",
     ],
     added_layouts: &[],
     added_aggregations: &[],
-    // The tensor scalar functions referenced by serialized vector-search expressions.
-    added_expressions: &[
-        &"vortex.tensor.cosine_similarity",
-        &"vortex.tensor.inner_product",
-        &"vortex.tensor.l2_norm",
-    ],
     added_extension_dtypes: &[&"vortex.tensor.fixed_shape_tensor", &"vortex.tensor.vector"],
 };

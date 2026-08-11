@@ -11,7 +11,6 @@ An edition covers every kind of object whose identifier appears in serialized Vo
 | `array`      | Array encodings                           | `vortex.alp`, `fastlanes.for`      | Array segments                            |
 | `layout`     | Layout encodings                          | `vortex.zoned`, `vortex.flat`      | The file's layout tree                    |
 | `aggregation`| Aggregate functions                       | `vortex.sum`, `vortex.bounded_max` | Zone maps and file statistics             |
-| `expression` | Scalar functions in serialized expressions| `vortex.tensor.l2_norm`            | Rarely durable; usually scan-time only    |
 | `extension dtype` | Extension dtypes                     | `vortex.timestamp`, `vortex.uuid`  | Every serialized `DType`, incl. file schemas |
 
 Object ids are unique within a kind. The same id may name different objects of different
@@ -31,9 +30,9 @@ version of Vortex required to read the file.
 
 ## Resolving an unknown-object error
 
-If a read failed with an unknown ID (an encoding, layout, aggregate function, expression
-function, or extension dtype) and pointed you here, the reader met an object it does not
-support. Find the ID in the [registry](#edition-registry) below:
+If a read failed with an unknown ID (an encoding, layout, aggregate function, or extension
+dtype) and pointed you here, the reader met an object it does not support. Find the ID in
+the [registry](#edition-registry) below:
 
 1. **The ID is listed under an edition.** The file is newer than your Vortex build. Upgrade
    to at least that edition's required Vortex release and the file will read.
@@ -85,8 +84,8 @@ carrying `vortex.stats` remains readable.
 ## How serialized objects evolve
 
 Editions name *which* objects a file may contain. This section defines how the serialized
-form of those objects — array metadata, layout metadata, aggregate options, expression
-options, extension dtype metadata — is allowed to change over time.
+form of those objects — array metadata, layout metadata, aggregate options, extension
+dtype metadata — is allowed to change over time.
 
 ### Reading: deserialize to the latest version
 
@@ -151,11 +150,6 @@ fails immediately rather than emitting a file the target reader could not load.
   translate to an older stats schema; readers meeting an unknown aggregate disable pruning
   for that zone map (under `allow_unknown`) rather than failing the scan, since dropping
   statistics is always sound.
-- **Expressions.** Expressions serialize as trees of scalar-function ids with options, but
-  they are usually transient — scan predicates cross process boundaries, not storage — so
-  most scalar functions never join an edition. A scalar function joins only when its
-  serialized form can reach durable data (for example the tensor similarity functions used
-  by vector indexes); it then carries the same guarantee as every other member.
 - **Extension dtypes.** Every serialized `DType` — including every file's schema — embeds
   the ids and metadata of the extension dtypes it uses, so an extension dtype in durable
   data needs the same guarantee as an encoding. Readers resolve ids against the session's
@@ -171,7 +165,6 @@ fails immediately rather than emitting a file the target reader could not load.
 | `array`      | yes                  | yes                                 |
 | `layout`     | yes                  | staged; strategies choose layouts   |
 | `aggregation`| yes                  | staged; defaults stay in `core`     |
-| `expression` | yes                  | not applicable to file writes today |
 | `extension dtype` | yes             | staged; schemas come from the input |
 
 Declared membership is validated by unit tests against the session registries (every `core`
@@ -267,10 +260,10 @@ yet, and are written only when the `unstable_encodings` feature is selected.
 | `vortex.onpair`                    | array        | `unstable2026.06.0`|
 | `vortex.parquet.variant`           | array        | `unstable2026.04.0`|
 | `vortex.patched`                   | array        | `unstable2026.04.0`|
+| `vortex.tensor.cosine_similarity`  | array        | `unstable2026.04.0`|
+| `vortex.tensor.inner_product`      | array        | `unstable2026.04.0`|
+| `vortex.tensor.l2_norm`            | array        | `unstable2026.04.0`|
 | `vortex.tensor.normalized`         | array        | `unstable2026.04.0`|
 | `vortex.zstd_buffers`              | array        | `unstable2026.02.0`|
-| `vortex.tensor.cosine_similarity`  | expression   | `unstable2026.04.0`|
-| `vortex.tensor.inner_product`      | expression   | `unstable2026.04.0`|
-| `vortex.tensor.l2_norm`            | expression   | `unstable2026.04.0`|
 | `vortex.tensor.fixed_shape_tensor` | extension dtype | `unstable2026.04.0`|
 | `vortex.tensor.vector`             | extension dtype | `unstable2026.04.0`|
