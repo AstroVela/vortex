@@ -465,6 +465,7 @@ mod tests {
     use crate::arrays::ChunkedArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::DecimalArray;
+    use crate::arrays::ExtensionArray;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListArray;
     use crate::arrays::NullArray;
@@ -476,7 +477,10 @@ mod tests {
     use crate::dtype::PType;
     use crate::expr::stats::Precision;
     use crate::expr::stats::Stat;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
     use crate::scalar::DecimalValue;
+    use crate::scalar::PValue;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
     use crate::validity::Validity;
@@ -1090,6 +1094,32 @@ mod tests {
             )?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_min_max_beyond_jiff_range() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let ext_dtype = Timestamp::new(TimeUnit::Microseconds, Nullability::NonNullable).erased();
+        // 9999-12-30T22:00:00Z is jiff's maximum, 9999-12-31T00:00:00Z is past it.
+        let in_range = 253_402_207_200_000_000i64;
+        let out_of_range = 253_402_214_400_000_000i64;
+        let storage = buffer![out_of_range, in_range].into_array();
+        let array = ExtensionArray::try_new(ext_dtype.clone(), storage)?.into_array();
+
+        let result = min_max(&array, &mut ctx, NumericalAggregateOpts::default())?
+            .vortex_expect("should have result");
+        let dtype = DType::Extension(ext_dtype);
+        let expected_min = Scalar::try_new(
+            dtype.clone(),
+            Some(ScalarValue::Primitive(PValue::I64(in_range))),
+        )?;
+        let expected_max = Scalar::try_new(
+            dtype,
+            Some(ScalarValue::Primitive(PValue::I64(out_of_range))),
+        )?;
+        assert_eq!(result.min, expected_min);
+        assert_eq!(result.max, expected_max);
         Ok(())
     }
 }

@@ -91,20 +91,44 @@ pub enum TimestampValue<'a> {
 
 impl fmt::Display for TimestampValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (span, tz) = match self {
-            TimestampValue::Seconds(v, tz) => (Span::new().seconds(*v), *tz),
-            TimestampValue::Milliseconds(v, tz) => (Span::new().milliseconds(*v), *tz),
-            TimestampValue::Microseconds(v, tz) => (Span::new().microseconds(*v), *tz),
-            TimestampValue::Nanoseconds(v, tz) => (Span::new().nanoseconds(*v), *tz),
+        let (span, raw, unit, tz) = match self {
+            TimestampValue::Seconds(v, tz) => {
+                (Span::new().try_seconds(*v), *v, TimeUnit::Seconds, *tz)
+            }
+            TimestampValue::Milliseconds(v, tz) => (
+                Span::new().try_milliseconds(*v),
+                *v,
+                TimeUnit::Milliseconds,
+                *tz,
+            ),
+            TimestampValue::Microseconds(v, tz) => (
+                Span::new().try_microseconds(*v),
+                *v,
+                TimeUnit::Microseconds,
+                *tz,
+            ),
+            TimestampValue::Nanoseconds(v, tz) => (
+                Span::new().try_nanoseconds(*v),
+                *v,
+                TimeUnit::Nanoseconds,
+                *tz,
+            ),
         };
-        let ts = jiff::Timestamp::UNIX_EPOCH + span;
+
+        let Some(ts) = span
+            .ok()
+            .and_then(|span| jiff::Timestamp::UNIX_EPOCH.checked_add(span).ok())
+        else {
+            // storage values may exceed jiff's Timestamp range
+            return write!(f, "{raw}{unit} since Unix epoch");
+        };
 
         match tz {
             None => write!(f, "{ts}"),
-            Some(tz) => {
-                let adjusted_ts = ts.in_tz(tz.as_ref()).vortex_expect("unknown timezone");
-                write!(f, "{adjusted_ts}",)
-            }
+            Some(tz) => match ts.in_tz(tz.as_ref()) {
+                Ok(adjusted_ts) => write!(f, "{adjusted_ts}"),
+                Err(_) => write!(f, "{ts}"),
+            },
         }
     }
 }
@@ -226,37 +250,18 @@ impl ExtVTable for Timestamp {
         let ts_value = storage_value.as_primitive().cast::<i64>()?;
         let tz = metadata.tz.as_ref();
 
-        let (span, value) = match metadata.unit {
-            TimeUnit::Nanoseconds => (
-                Span::new().nanoseconds(ts_value),
-                TimestampValue::Nanoseconds(ts_value, tz),
-            ),
-            TimeUnit::Microseconds => (
-                Span::new().microseconds(ts_value),
-                TimestampValue::Microseconds(ts_value, tz),
-            ),
-            TimeUnit::Milliseconds => (
-                Span::new().milliseconds(ts_value),
-                TimestampValue::Milliseconds(ts_value, tz),
-            ),
-            TimeUnit::Seconds => (
-                Span::new().seconds(ts_value),
-                TimestampValue::Seconds(ts_value, tz),
-            ),
-            TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
-        };
-
-        // Validate the storage value is within the valid range for Timestamp.
-        let ts = jiff::Timestamp::UNIX_EPOCH
-            .checked_add(span)
-            .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
-
         if let Some(tz) = tz {
-            ts.in_tz(tz.as_ref())
+            jiff::tz::TimeZone::get(tz.as_ref())
                 .map_err(|e| vortex_err!("Invalid timezone for timestamp scalar: {}", e))?;
         }
 
-        Ok(value)
+        Ok(match metadata.unit {
+            TimeUnit::Nanoseconds => TimestampValue::Nanoseconds(ts_value, tz),
+            TimeUnit::Microseconds => TimestampValue::Microseconds(ts_value, tz),
+            TimeUnit::Milliseconds => TimestampValue::Milliseconds(ts_value, tz),
+            TimeUnit::Seconds => TimestampValue::Seconds(ts_value, tz),
+            TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
+        })
     }
 }
 
@@ -278,6 +283,17 @@ mod tests {
     fn validate_timestamp_scalar() -> VortexResult<()> {
         let dtype = DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullable).erased());
         Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(0))))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn validate_timestamp_scalar_beyond_jiff_range() -> VortexResult<()> {
+        let dtype = DType::Extension(Timestamp::new(TimeUnit::Microseconds, Nullable).erased());
+        Scalar::try_new(
+            dtype,
+            Some(ScalarValue::Primitive(PValue::I64(253_402_214_400_000_000))),
+        )?;
 
         Ok(())
     }
@@ -318,6 +334,20 @@ mod tests {
         assert_eq!(
             format!("{}", scalar.as_extension()),
             "1969-12-31T19:00:00-05:00[America/New_York]"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn display_timestamp_scalar_beyond_jiff_range() {
+        let dtype = DType::Extension(Timestamp::new(TimeUnit::Microseconds, Nullable).erased());
+        let scalar = Scalar::new(
+            dtype,
+            Some(ScalarValue::Primitive(PValue::I64(253_402_214_400_000_000))),
+        );
+        assert_eq!(
+            format!("{}", scalar.as_extension()),
+            "253402214400000000µs since Unix epoch"
         );
     }
 

@@ -8,6 +8,7 @@ use crate::array::ArrayView;
 use crate::array::OperationsVTable;
 use crate::arrays::Extension;
 use crate::arrays::extension::ExtensionArrayExt;
+use crate::dtype::DType;
 use crate::scalar::Scalar;
 
 impl OperationsVTable<Extension> for Extension {
@@ -16,9 +17,10 @@ impl OperationsVTable<Extension> for Extension {
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        Ok(Scalar::extension_ref(
-            array.ext_dtype().clone(),
-            array.storage_array().execute_scalar(index, ctx)?,
-        ))
+        let storage_scalar = array.storage_array().execute_scalar(index, ctx)?;
+        Scalar::try_new(
+            DType::Extension(array.ext_dtype().clone()),
+            storage_scalar.into_value(),
+        )
     }
 }
