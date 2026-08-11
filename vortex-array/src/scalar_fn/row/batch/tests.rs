@@ -581,7 +581,7 @@ fn test_resolve_validity_array_masks(#[case] validity: [bool; 2]) -> VortexResul
 
     let actual = batch.execute(
         |_args, _ctx| Ok(None),
-        |args, _ctx| Ok(RowExecution::Output(args.arrays[0].clone())),
+        |args, _ctx| Ok(RowExecution::Output(args.arrays()[0].clone())),
         |_args, _valid, _ctx| Ok(None),
         &mut ctx,
     )?;
@@ -610,7 +610,7 @@ fn test_valid_only_filters_and_scatters() -> VortexResult<()> {
 
     let actual = batch.execute(
         |_args, _ctx| Ok(None),
-        |args, _ctx| Ok(RowExecution::Output(args.arrays[0].clone())),
+        |args, _ctx| Ok(RowExecution::Output(args.arrays()[0].clone())),
         |_args, _valid, _ctx| Ok(None),
         &mut ctx,
     )?;
@@ -745,8 +745,12 @@ fn test_strategy_matrix(#[case] policy: RowPolicy) -> VortexResult<()> {
 
     let actual = batch.execute(
         |_args, _ctx| Ok(None),
-        |args, _ctx| Ok(RowExecution::Output(args.arrays[0].fill_null(0_i64)?)),
-        |args, _valid, _ctx| Ok(Some(RowExecution::Output(args.arrays[0].fill_null(0_i64)?))),
+        |args, _ctx| Ok(RowExecution::Output(args.arrays()[0].fill_null(0_i64)?)),
+        |args, _valid, _ctx| {
+            Ok(Some(RowExecution::Output(
+                args.arrays()[0].fill_null(0_i64)?,
+            )))
+        },
         &mut ctx,
     )?;
 

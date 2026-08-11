@@ -329,41 +329,6 @@ pub trait ExecutionArgs {
     fn row_count(&self) -> usize;
 }
 
-/// An [`ExecutionArgs`] view over borrowed arrays with an explicit row count.
-pub(crate) struct BorrowedExecutionArgs<'a> {
-    /// The arrays exposed through this execution view.
-    inputs: &'a [ArrayRef],
-
-    /// The row count reported for this execution view.
-    row_count: usize,
-}
-
-impl<'a> BorrowedExecutionArgs<'a> {
-    pub(crate) fn new(inputs: &'a [ArrayRef], row_count: usize) -> Self {
-        Self { inputs, row_count }
-    }
-}
-
-impl ExecutionArgs for BorrowedExecutionArgs<'_> {
-    fn get(&self, index: usize) -> VortexResult<ArrayRef> {
-        self.inputs.get(index).cloned().ok_or_else(|| {
-            vortex_err!(
-                "Input index {} out of bounds (num_inputs={})",
-                index,
-                self.inputs.len()
-            )
-        })
-    }
-
-    fn num_inputs(&self) -> usize {
-        self.inputs.len()
-    }
-
-    fn row_count(&self) -> usize {
-        self.row_count
-    }
-}
-
 /// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
 pub struct VecExecutionArgs {
     /// The owned arrays exposed through this execution view.
@@ -382,15 +347,21 @@ impl VecExecutionArgs {
 
 impl ExecutionArgs for VecExecutionArgs {
     fn get(&self, index: usize) -> VortexResult<ArrayRef> {
-        BorrowedExecutionArgs::new(&self.inputs, self.row_count).get(index)
+        self.inputs.get(index).cloned().ok_or_else(|| {
+            vortex_err!(
+                "Input index {} out of bounds (num_inputs={})",
+                index,
+                self.inputs.len()
+            )
+        })
     }
 
     fn num_inputs(&self) -> usize {
-        BorrowedExecutionArgs::new(&self.inputs, self.row_count).num_inputs()
+        self.inputs.len()
     }
 
     fn row_count(&self) -> usize {
-        BorrowedExecutionArgs::new(&self.inputs, self.row_count).row_count()
+        self.row_count
     }
 }
 

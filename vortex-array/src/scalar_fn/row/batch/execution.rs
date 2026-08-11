@@ -12,7 +12,7 @@ use vortex_error::vortex_ensure_eq;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
-use super::args::KernelArgs;
+use super::args::BorrowedExecutionArgs;
 use super::policy::BatchPlan;
 use super::policy::RowPolicy;
 use crate::ArrayRef;
@@ -126,10 +126,13 @@ impl Batch {
     /// validity mask; `Ok(None)` selects filter-and-scatter.
     pub fn execute(
         &self,
-        reduce: impl FnOnce(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<Option<RowExecution>>,
-        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        reduce: impl FnOnce(
+            BorrowedExecutionArgs<'_>,
+            &mut ExecutionCtx,
+        ) -> VortexResult<Option<RowExecution>>,
+        kernel: impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         try_unfiltered: impl FnOnce(
-            KernelArgs<'_>,
+            BorrowedExecutionArgs<'_>,
             &Mask,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<RowExecution>>,
@@ -148,7 +151,7 @@ impl Batch {
 
         // The function-owned encoded path takes precedence over the generic all-constant
         // broadcast and sees the original inputs before slicing or filtering changes them.
-        if let Some(execution) = reduce(self.kernel_args(&self.inputs, self.row_count), ctx)? {
+        if let Some(execution) = reduce(self.execution_args(&self.inputs, self.row_count), ctx)? {
             match execution {
                 RowExecution::Output(values) => return self.finalize_reduced(values, ctx),
                 RowExecution::DeferredError(error) => {
@@ -183,7 +186,7 @@ impl Batch {
     /// paper over a disagreement.
     fn broadcast_one_row(
         &self,
-        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        kernel: impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let one_row: SmallVec<[ArrayRef; 4]> = self
@@ -192,7 +195,7 @@ impl Batch {
             .map(|input| input.slice(0..1))
             .collect::<VortexResult<_>>()?;
 
-        let result = VortexResult::from(kernel(self.kernel_args(&one_row, 1), ctx)?)?;
+        let result = VortexResult::from(kernel(self.execution_args(&one_row, 1), ctx)?)?;
         let result = self.validate_kernel_output(result, 1, ctx)?;
         let result = self.finalize_output(result, 1)?;
         let scalar = result.execute_scalar(0, ctx)?;
@@ -207,11 +210,11 @@ impl Batch {
     /// [`Mask`] first.
     fn execute_dense(
         &self,
-        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        kernel: impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         retry_deferred_error: bool,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let values = match kernel(self.kernel_args(&self.inputs, self.row_count), ctx)? {
+        let values = match kernel(self.execution_args(&self.inputs, self.row_count), ctx)? {
             RowExecution::Output(values) => values,
             RowExecution::DeferredError(error) if retry_deferred_error => {
                 let valid = self.validity.clone().execute_mask(self.row_count, ctx)?;
@@ -248,7 +251,7 @@ impl Batch {
     /// strategy.
     fn resolve_validity(
         &self,
-        kernel: &impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        kernel: &impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ResolvedMask> {
         let valid = self.validity.clone().execute_mask(self.row_count, ctx)?;
@@ -256,8 +259,10 @@ impl Batch {
         // Check all-true before all-false: an empty mask is both, and must not be treated as
         // all-null (a zero-length non-nullable execution keeps its non-nullable dtype).
         if valid.all_true() {
-            let values =
-                VortexResult::from(kernel(self.kernel_args(&self.inputs, self.row_count), ctx)?)?;
+            let values = VortexResult::from(kernel(
+                self.execution_args(&self.inputs, self.row_count),
+                ctx,
+            )?)?;
             let values = self.validate_kernel_output(values, self.row_count, ctx)?;
             let values = self.finalize_output(values, self.row_count)?;
 
@@ -274,9 +279,9 @@ impl Batch {
     /// Resolve validity, try unfiltered execution, then fall back to filtering.
     fn execute_valid_only(
         &self,
-        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        kernel: impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         try_unfiltered: impl FnOnce(
-            KernelArgs<'_>,
+            BorrowedExecutionArgs<'_>,
             &Mask,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<RowExecution>>,
@@ -298,15 +303,18 @@ impl Batch {
     fn try_execute_unfiltered(
         &self,
         try_unfiltered: impl FnOnce(
-            KernelArgs<'_>,
+            BorrowedExecutionArgs<'_>,
             &Mask,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<RowExecution>>,
         valid: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let Some(execution) =
-            try_unfiltered(self.kernel_args(&self.inputs, self.row_count), valid, ctx)?
+        let Some(execution) = try_unfiltered(
+            self.execution_args(&self.inputs, self.row_count),
+            valid,
+            ctx,
+        )?
         else {
             return Ok(None);
         };
@@ -322,7 +330,7 @@ impl Batch {
     /// run the kernel over those, and scatter its results back into a null-padded output.
     fn filter_and_scatter(
         &self,
-        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        kernel: impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         valid: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
@@ -333,7 +341,7 @@ impl Batch {
             .collect::<VortexResult<_>>()?;
 
         let values = VortexResult::from(kernel(
-            self.kernel_args(&filtered, valid.true_count()),
+            self.execution_args(&filtered, valid.true_count()),
             ctx,
         )?)?;
         let values = self.validate_kernel_output(values, valid.true_count(), ctx)?;
@@ -372,9 +380,9 @@ impl Batch {
     fn resolve_reduced_error(
         &self,
         error: VortexError,
-        kernel: impl Fn(KernelArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
+        kernel: impl Fn(BorrowedExecutionArgs<'_>, &mut ExecutionCtx) -> VortexResult<RowExecution>,
         try_unfiltered: impl FnOnce(
-            KernelArgs<'_>,
+            BorrowedExecutionArgs<'_>,
             &Mask,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<RowExecution>>,
@@ -397,13 +405,12 @@ impl Batch {
     }
 
     /// Pair an input view with this batch's planning metadata.
-    fn kernel_args<'b>(&'b self, arrays: &'b [ArrayRef], row_count: usize) -> KernelArgs<'b> {
-        KernelArgs {
-            arrays,
-            row_count,
-            dtypes: &self.arg_dtypes,
-            output_dtype: &self.output_dtype,
-        }
+    fn execution_args<'b>(
+        &'b self,
+        arrays: &'b [ArrayRef],
+        row_count: usize,
+    ) -> BorrowedExecutionArgs<'b> {
+        BorrowedExecutionArgs::new(arrays, row_count, &self.arg_dtypes, &self.output_dtype)
     }
 
     /// Finalize an output against this batch's expected length and declared return dtype.

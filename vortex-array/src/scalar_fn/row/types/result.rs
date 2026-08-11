@@ -18,25 +18,20 @@ pub trait SinkResult: 'static + private::Sealed {
     /// The [`OutputSink::WriteToken`](super::OutputSink::WriteToken) carried by a success.
     type WriteToken: 'static;
 
-    /// Loop-local state used while accumulating row results.
-    type Accumulated: 'static + Copy + Default;
-
     /// Whether this return type can carry an error.
     const FALLIBLE: bool;
 
-    /// Merge this row's outcome into the batch-wide reduction.
-    fn accumulate(self, accumulated: &mut Self::Accumulated) -> VortexResult<()>;
+    /// Convert this row's outcome into immediate success or failure.
+    fn into_result(self) -> VortexResult<()>;
 }
 
 impl private::Sealed for () {}
 
 impl SinkResult for () {
     type WriteToken = ();
-    type Accumulated = ();
-
     const FALLIBLE: bool = false;
 
-    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+    fn into_result(self) -> VortexResult<()> {
         Ok(())
     }
 }
@@ -45,11 +40,9 @@ impl private::Sealed for InitializedElement {}
 
 impl SinkResult for InitializedElement {
     type WriteToken = InitializedElement;
-    type Accumulated = ();
-
     const FALLIBLE: bool = false;
 
-    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+    fn into_result(self) -> VortexResult<()> {
         Ok(())
     }
 }
@@ -58,11 +51,9 @@ impl private::Sealed for VortexResult<()> {}
 
 impl SinkResult for VortexResult<()> {
     type WriteToken = ();
-    type Accumulated = ();
-
     const FALLIBLE: bool = true;
 
-    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+    fn into_result(self) -> VortexResult<()> {
         self
     }
 }
@@ -71,11 +62,9 @@ impl private::Sealed for VortexResult<InitializedElement> {}
 
 impl SinkResult for VortexResult<InitializedElement> {
     type WriteToken = InitializedElement;
-    type Accumulated = ();
-
     const FALLIBLE: bool = true;
 
-    fn accumulate(self, _accumulated: &mut ()) -> VortexResult<()> {
+    fn into_result(self) -> VortexResult<()> {
         self.map(|_| ())
     }
 }

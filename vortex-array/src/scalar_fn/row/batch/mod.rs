@@ -11,7 +11,7 @@
 //! applies that strategy, and [`args`] pairs each kernel invocation with its planning metadata.
 
 mod args;
-pub(super) use args::KernelArgs;
+pub(super) use args::BorrowedExecutionArgs;
 
 mod execution;
 pub(super) use execution::Batch;

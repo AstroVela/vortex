@@ -14,10 +14,9 @@ use super::row_fn::RowFn;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::scalar_fn::BorrowedExecutionArgs;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::row::batch::Batch;
-use crate::scalar_fn::row::batch::KernelArgs;
+use crate::scalar_fn::row::batch::BorrowedExecutionArgs;
 use crate::scalar_fn::row::batch::finalize_kernel_output;
 use crate::scalar_fn::row::execute::RowExecution;
 use crate::scalar_fn::row::visitor::ExecuteRows;
@@ -138,12 +137,7 @@ pub fn execute_rows<F: RowFn>(
     // Nullary functions have no input validity to propagate, so they skip batch execution.
     if args.num_inputs() == 0 {
         let result_dtype = row_fn_return_dtype(function, options, &[])?;
-        let nullary_args = KernelArgs {
-            arrays: &[],
-            row_count: args.row_count(),
-            dtypes: &[],
-            output_dtype: &result_dtype,
-        };
+        let nullary_args = BorrowedExecutionArgs::new(&[], args.row_count(), &[], &result_dtype);
 
         let execution = execute_row_kernel(function, options, nullary_args, ctx)?;
         let values = VortexResult::from(execution)?;
@@ -159,7 +153,7 @@ pub fn execute_rows<F: RowFn>(
 
     let batch = prepare_batch(function, options, args)?;
     batch.execute(
-        |args, ctx| function.reduce_encoded(options, args.arrays, ctx),
+        |args, ctx| function.reduce_encoded(options, args.arrays(), ctx),
         |args, ctx| execute_row_kernel(function, options, args, ctx),
         |args, valid, ctx| try_execute_rows_unfiltered(function, options, args, valid, ctx),
         ctx,
@@ -170,15 +164,13 @@ pub fn execute_rows<F: RowFn>(
 fn execute_row_kernel<F: RowFn>(
     function: &F,
     options: &F::Options,
-    args: KernelArgs<'_>,
+    args: BorrowedExecutionArgs<'_>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<RowExecution> {
-    let execution = BorrowedExecutionArgs::new(args.arrays, args.row_count);
-
     function.dispatch(
         options,
-        args.dtypes,
-        ExecuteRows::<F>::new(&execution, args.output_dtype, ctx),
+        args.dtypes(),
+        ExecuteRows::<F>::new(&args, args.output_dtype(), ctx),
     )
 }
 
@@ -186,16 +178,14 @@ fn execute_row_kernel<F: RowFn>(
 fn try_execute_rows_unfiltered<F: RowFn>(
     function: &F,
     options: &F::Options,
-    args: KernelArgs<'_>,
+    args: BorrowedExecutionArgs<'_>,
     valid: &Mask,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<RowExecution>> {
-    let execution = BorrowedExecutionArgs::new(args.arrays, args.row_count);
-
     function.dispatch(
         options,
-        args.dtypes,
-        ExecuteValidRows::<F>::new(&execution, args.output_dtype, valid, ctx),
+        args.dtypes(),
+        ExecuteValidRows::<F>::new(&args, args.output_dtype(), valid, ctx),
     )
 }
 

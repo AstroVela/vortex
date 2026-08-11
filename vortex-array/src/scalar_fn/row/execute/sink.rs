@@ -40,7 +40,6 @@ where
     let prepared = prepare(Args::constants(&columns));
     let varying = Args::varying(&columns);
     ensure_decoded_lengths::<Args>(&columns, varying.as_ref(), row_count)?;
-    let mut accumulated = ApplyResult::Accumulated::default();
 
     {
         // Borrow the sink once so its shape and buffer descriptor remain loop invariants. This
@@ -63,7 +62,7 @@ where
                     elements,
                     <Sink as OutputSink<Options>>::row(&mut rows, index),
                 )
-                .accumulate(&mut accumulated)?;
+                .into_result()?;
             }
         } else {
             for index in 0..row_count {
@@ -72,7 +71,7 @@ where
                     Args::get(&columns, index),
                     <Sink as OutputSink<Options>>::row(&mut rows, index),
                 )
-                .accumulate(&mut accumulated)?;
+                .into_result()?;
             }
         }
     }
@@ -109,7 +108,6 @@ where
     let prepared = prepare(Args::constants(&columns));
     let row_count = args.row_count();
     let mut sink = <Sink as OutputSink<Options>>::with_capacity(row_count, sink_dtype)?;
-    let mut accumulated = ApplyResult::Accumulated::default();
 
     // Batch execution resolves all-valid and all-null inputs before selecting this path.
     let AllOr::Some(valid) = valid.bit_buffer() else {
@@ -156,7 +154,7 @@ where
                     <Sink as OutputSink<Options>>::row(&mut rows, index),
                 ),
             };
-            if let Err(err) = result.accumulate(&mut accumulated) {
+            if let Err(err) = result.into_result() {
                 error = Some(err);
             }
         });
