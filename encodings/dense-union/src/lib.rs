@@ -5,7 +5,8 @@
 //!
 //! [`DenseUnionArray`] stores one type ID and one child offset per logical row. Variant children
 //! are compact: unlike the canonical sparse union, they do not contain placeholders for rows that
-//! select a different variant. The array still has the logical [`DType::Union`] dtype.
+//! select a different variant. The array still has the logical
+//! [`DType::Union`](vortex_array::dtype::DType::Union) dtype.
 
 mod array;
 mod canonical;
