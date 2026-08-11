@@ -4,9 +4,14 @@
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::cast_possible_truncation)]
 
+use std::sync::LazyLock;
+
 use divan::Bencher;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
+use vortex_array::RecursiveCanonical;
+use vortex_array::VortexSessionExecute;
+use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::UnionArray;
 use vortex_array::dtype::DType;
@@ -15,14 +20,23 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::UnionVariants;
 use vortex_dense_union::DenseUnion;
+use vortex_dense_union::initialize;
+use vortex_session::VortexSession;
 
 const LEN: usize = 65_536;
 const N_VARIANTS: usize = 28;
 const TAKE_LEN: usize = 4_096;
 
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = array_session();
+    initialize(&session);
+    session
+});
 
 fn variants() -> UnionVariants {
     let names = FieldNames::from_iter((0..N_VARIANTS).map(|index| format!("variant_{index}")));
@@ -82,16 +96,23 @@ fn indices() -> ArrayRef {
     PrimitiveArray::from_iter((0..TAKE_LEN).rev().map(|index| index as u32)).into_array()
 }
 
+fn bench_take(bencher: Bencher, array: ArrayRef, indices: ArrayRef) {
+    bencher
+        .with_inputs(|| (&array, &indices, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, indices, ctx)| {
+            array
+                .take((*indices).clone())
+                .unwrap()
+                .execute::<RecursiveCanonical>(ctx)
+        });
+}
+
 #[divan::bench]
 fn dense_take(bencher: Bencher) {
-    bencher
-        .with_inputs(|| (dense_union(), indices()))
-        .bench_values(|(array, indices)| divan::black_box(array.take(indices).unwrap()));
+    bench_take(bencher, dense_union(), indices());
 }
 
 #[divan::bench]
 fn sparse_take(bencher: Bencher) {
-    bencher
-        .with_inputs(|| (sparse_union(), indices()))
-        .bench_values(|(array, indices)| divan::black_box(array.take(indices).unwrap()));
+    bench_take(bencher, sparse_union(), indices());
 }
