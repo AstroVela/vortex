@@ -123,6 +123,12 @@ jobs:
         with:
           ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: ${{ inputs.mode == 'pr' && '0' || '1' }}
+      # Resolved early so the failure comment below has a target even when an
+      # earlier step fails.
+      - name: Resolve PR number
+        id: pr
+        if: inputs.mode == 'pr'
+        uses: ./.github/actions/resolve-pr-number
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -258,10 +264,11 @@ jobs:
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment PR
-        if: inputs.mode == 'pr' && github.event.pull_request.head.repo.fork == false
+        if: inputs.mode == 'pr' && steps.pr.outputs.number != '' && github.event.pull_request.head.repo.fork == false
         uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
         with:
           file-path: comment.md
+          pr-number: ${{ steps.pr.outputs.number }}
           # There is exactly one comment per comment-tag. If a comment with this tag already exists,
           # this action will *update* the comment instead of posting a new comment. The preset is
           # part of the tag because presets overlap on benchmark ids (`pr` and `pr-compact` share
@@ -269,9 +276,10 @@ jobs:
           comment-tag: bench-pr-comment-${{ matrix.id }}-${{ inputs.matrix_preset }}
 
       - name: Comment PR on failure
-        if: failure() && inputs.mode == 'pr' && github.event.pull_request.head.repo.fork == false
+        if: failure() && inputs.mode == 'pr' && steps.pr.outputs.number != '' && github.event.pull_request.head.repo.fork == false
         uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
         with:
+          pr-number: ${{ steps.pr.outputs.number }}
           message: |
             # 🚨🚨🚨❌❌❌ SQL BENCHMARK FAILED ❌❌❌🚨🚨🚨
 

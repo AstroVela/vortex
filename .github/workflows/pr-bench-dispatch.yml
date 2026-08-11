@@ -9,8 +9,9 @@ run-name: >-
 
 on:
   pull_request:
+    # Not restricted to a base branch: stacked pull requests target another
+    # feature branch rather than develop, and they still need benchmarks.
     types: [labeled]
-    branches: ["develop"]
 
 permissions:
   actions: write

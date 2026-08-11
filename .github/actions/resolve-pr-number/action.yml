@@ -1,0 +1,37 @@
+name: "Resolve PR Number"
+description: "Resolve the pull request number for the current run, including runs with no pull_request event context"
+
+outputs:
+  number:
+    description: "Pull request number, or an empty string when no open pull request matches this run"
+    value: ${{ steps.resolve.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: resolve
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+      with:
+        result-encoding: string
+        script: |
+          if (context.payload.pull_request) {
+            return String(context.payload.pull_request.number);
+          }
+
+          // workflow_dispatch and other non-pull_request events carry no pull
+          // request payload, so look up the open pull request whose head is the
+          // branch this run was dispatched on.
+          const branch = context.ref.replace(/^refs\/heads\//, "");
+          const { data } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            head: `${context.repo.owner}:${branch}`,
+            state: "open",
+            per_page: 1,
+          });
+
+          if (data.length === 0) {
+            core.info(`No open pull request found for branch ${branch}`);
+            return "";
+          }
+          return String(data[0].number);

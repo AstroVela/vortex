@@ -28,6 +28,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # Resolved early so the failure comment below has a target even when an
+      # earlier step fails.
+      - name: Resolve PR number
+        id: pr
+        uses: ./.github/actions/resolve-pr-number
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -71,15 +76,17 @@ jobs:
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment PR
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        if: steps.pr.outputs.number != '' && github.event.pull_request.head.repo.fork == false
         uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
         with:
           file-path: comment.md
+          pr-number: ${{ steps.pr.outputs.number }}
           comment-tag: bench-pr-comment-gpu-compress
       - name: Comment PR on failure
-        if: failure() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        if: failure() && steps.pr.outputs.number != '' && github.event.pull_request.head.repo.fork == false
         uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
         with:
+          pr-number: ${{ steps.pr.outputs.number }}
           message: |
             # BENCHMARK FAILED
 
