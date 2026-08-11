@@ -15,8 +15,6 @@
 
 pub mod core;
 #[cfg(test)]
-mod records;
-#[cfg(test)]
 mod tests;
 pub mod unstable;
 
