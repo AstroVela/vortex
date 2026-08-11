@@ -22,6 +22,7 @@ geo-types = { workspace = true }
 geoarrow = { workspace = true }
 geoarrow-cast = { workspace = true }
 prost = { workspace = true }
+serde_json = { workspace = true }
 vortex-array = { workspace = true }
 vortex-arrow = { workspace = true }
 vortex-buffer = { workspace = true }

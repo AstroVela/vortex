@@ -18,7 +18,6 @@ use geoarrow::array::IntoArrow;
 use geoarrow::array::MultiPolygonArray;
 use geoarrow::datatypes::CoordType;
 use geoarrow::datatypes::MultiPolygonType;
-use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -49,9 +48,9 @@ use super::SpatialMetadata;
 use super::coordinate::Dimension;
 use super::coordinate::coordinate_dimension;
 use super::coordinate::coordinate_storage_dtype;
-use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
-use super::spatial_metadata_from_arrow;
+use super::metadata::from_geoarrow;
+use super::metadata::to_geoarrow;
 
 /// A multipolygon (`geoarrow.multipolygon`); a single `Polygon` is a one-element multipolygon.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -68,11 +67,11 @@ impl ExtVTable for MultiPolygon {
     }
 
     fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-        Ok(metadata.encode_to_vec())
+        Ok(metadata.serialize())
     }
 
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(SpatialMetadata::decode(metadata)?)
+        SpatialMetadata::deserialize(metadata)
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
@@ -112,16 +111,23 @@ pub(crate) fn multipolygon_dimension(dtype: &DType) -> VortexResult<Dimension> {
 static ARROW_MULTIPOLYGON: CachedId = CachedId::new(MultiPolygonType::NAME);
 
 /// The `geoarrow.multipolygon` type for `dimension`, with separated (struct) coordinates.
-fn multipolygon_type(spatial_metadata: &SpatialMetadata, dimension: Dimension) -> MultiPolygonType {
-    MultiPolygonType::new(dimension.into(), geoarrow_metadata(spatial_metadata))
+fn multipolygon_type(
+    metadata: &SpatialMetadata,
+    dimension: Dimension,
+) -> VortexResult<MultiPolygonType> {
+    Ok(MultiPolygonType::new(
+        dimension.into(),
+        to_geoarrow(metadata)?,
+    ))
 }
 
-/// Decode storage to `geo_types` for the spatial scalar functions (CRS is irrelevant to planar ops).
+/// Decode multipolygon storage to `geo_types`.
 pub(crate) fn multipolygon_geometries(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<Geometry<f64>>> {
-    multipolygon_array(storage, ctx)?
+    multipolygon_array(storage, metadata, ctx)?
         .iter()
         .map(|geometry| -> VortexResult<Geometry<f64>> {
             Ok(geometry
@@ -135,12 +141,10 @@ pub(crate) fn multipolygon_geometries(
 /// Build a geoarrow `MultiPolygonArray` from the `MultiPolygon` storage.
 fn multipolygon_array(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<MultiPolygonArray> {
-    let multipolygon_type = multipolygon_type(
-        &SpatialMetadata::default(),
-        multipolygon_dimension(storage.dtype())?,
-    );
+    let multipolygon_type = multipolygon_type(metadata, multipolygon_dimension(storage.dtype())?)?;
     let session = ctx.session().clone();
     let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
     MultiPolygonArray::try_from((arrow.as_ref(), multipolygon_type))
@@ -165,7 +169,11 @@ impl TryFrom<ExtensionArray> for MultiPolygonData {
 impl MultiPolygonData {
     /// Serialize multipolygons to WKB (a view array) — the form DuckDB `GEOMETRY` takes.
     pub fn to_wkb(&self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        geoarrow_to_wkb(&multipolygon_array(self.0.storage_array(), ctx)?)
+        geoarrow_to_wkb(&multipolygon_array(
+            self.0.storage_array(),
+            self.0.ext_dtype().metadata::<MultiPolygon>(),
+            ctx,
+        )?)
     }
 }
 
@@ -185,11 +193,11 @@ impl ArrowExportVTable for MultiPolygon {
         session: &ArrowSession,
     ) -> VortexResult<Option<Field>> {
         let ext_type = dtype.as_extension();
-        let spatial_metadata = ext_type.metadata::<MultiPolygon>();
+        let metadata = ext_type.metadata::<MultiPolygon>();
         let dimension = multipolygon_dimension(ext_type.storage_dtype())?;
 
         let mut field = session.to_arrow_field(name, ext_type.storage_dtype())?;
-        field.try_with_extension_type(multipolygon_type(spatial_metadata, dimension))?;
+        field.try_with_extension_type(multipolygon_type(metadata, dimension)?)?;
 
         Ok(Some(field))
     }
@@ -258,7 +266,7 @@ impl ArrowImportVTable for MultiPolygon {
                 );
                 (
                     multipolygon_meta.dimension().into(),
-                    spatial_metadata_from_arrow(multipolygon_meta.metadata()),
+                    from_geoarrow(multipolygon_meta.metadata()),
                 )
             } else {
                 // Literal: peel the three `List` layers to the coordinate struct and read its
@@ -335,6 +343,7 @@ mod tests {
     fn spatial_meta() -> SpatialMetadata {
         SpatialMetadata {
             crs: Some("EPSG:4326".to_string()),
+            ..Default::default()
         }
     }
 

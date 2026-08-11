@@ -3,8 +3,8 @@
 
 //! The [`Point`] geometry extension type (`vortex.st.point`): a location stored columnarly as
 //! `Struct<x, y[, z][, m]>` of non-nullable `f64` — the four GeoArrow dimensions XY, XYZ, XYM,
-//! XYZM — tagged with [`SpatialMetadata`] (CRS). `z` is an optional elevation and `m` an optional
-//! measure: an arbitrary per-point value such as distance along a route or a timestamp.
+//! XYZM — tagged with [`SpatialMetadata`]. `z` is an optional elevation and `m` an optional measure:
+//! an arbitrary per-point value such as distance along a route or a timestamp.
 
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_schema::DataType;
@@ -17,7 +17,6 @@ use geoarrow::array::IntoArrow;
 use geoarrow::array::PointArray;
 use geoarrow::datatypes::CoordType;
 use geoarrow::datatypes::PointType;
-use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -49,9 +48,9 @@ use super::coordinate::Dimension;
 use super::coordinate::coordinate_dimension;
 use super::coordinate::coordinate_from_struct;
 use super::coordinate::coordinate_storage_dtype;
-use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
-use super::spatial_metadata_from_arrow;
+use super::metadata::from_geoarrow;
+use super::metadata::to_geoarrow;
 
 /// A single location: `geoarrow.point`, stored as `Struct<x, y[, z][, m]>` of non-nullable `f64`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -67,11 +66,11 @@ impl ExtVTable for Point {
     }
 
     fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-        Ok(metadata.encode_to_vec())
+        Ok(metadata.serialize())
     }
 
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(SpatialMetadata::decode(metadata)?)
+        SpatialMetadata::deserialize(metadata)
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
@@ -94,8 +93,8 @@ static ARROW_POINT: CachedId = CachedId::new(PointType::NAME);
 
 /// The `geoarrow.point` extension type for `dimension`, with separated (struct) coordinates
 /// matching `Point` storage.
-fn point_type(spatial_metadata: &SpatialMetadata, dimension: Dimension) -> PointType {
-    PointType::new(dimension.into(), geoarrow_metadata(spatial_metadata))
+fn point_type(metadata: &SpatialMetadata, dimension: Dimension) -> VortexResult<PointType> {
+    Ok(PointType::new(dimension.into(), to_geoarrow(metadata)?))
 }
 
 pub struct PointData(ExtensionArray);
@@ -115,29 +114,35 @@ impl TryFrom<ExtensionArray> for PointData {
 impl PointData {
     /// Serialize points to WKB (a view array) — the form DuckDB `GEOMETRY` takes.
     pub fn to_wkb(&self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        geoarrow_to_wkb(&point_array(self.0.storage_array(), ctx)?)
+        geoarrow_to_wkb(&point_array(
+            self.0.storage_array(),
+            self.0.ext_dtype().metadata::<Point>(),
+            ctx,
+        )?)
     }
 }
 
 /// Build a geoarrow `PointArray` from a `Point`'s `Struct<x, y[, ..]>` storage, shared by WKB export
 /// and `geo_types` decoding.
-fn point_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<PointArray> {
-    let point_type = point_type(
-        &SpatialMetadata::default(),
-        coordinate_dimension(storage.dtype())?,
-    );
+fn point_array(
+    storage: &ArrayRef,
+    metadata: &SpatialMetadata,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PointArray> {
+    let point_type = point_type(metadata, coordinate_dimension(storage.dtype())?)?;
     let session = ctx.session().clone();
     let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
     PointArray::try_from((arrow.as_ref(), point_type))
         .map_err(|e| vortex_err!("failed to construct PointArray: {e}"))
 }
 
-/// Decode `Point` storage to `geo_types` points, for the spatial scalar functions.
+/// Decode point storage to `geo_types`.
 pub(crate) fn point_geometries(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<Geometry<f64>>> {
-    point_array(storage, ctx)?
+    point_array(storage, metadata, ctx)?
         .iter()
         .map(|geometry| -> VortexResult<Geometry<f64>> {
             Ok(geometry
@@ -164,11 +169,11 @@ impl ArrowExportVTable for Point {
         session: &ArrowSession,
     ) -> VortexResult<Option<Field>> {
         let ext_type = dtype.as_extension();
-        let spatial_metadata = ext_type.metadata::<Point>();
+        let metadata = ext_type.metadata::<Point>();
         let dimension = coordinate_dimension(ext_type.storage_dtype())?;
 
         let mut field = session.to_arrow_field(name, ext_type.storage_dtype())?;
-        field.try_with_extension_type(point_type(spatial_metadata, dimension))?;
+        field.try_with_extension_type(point_type(metadata, dimension)?)?;
 
         Ok(Some(field))
     }
@@ -240,7 +245,7 @@ impl ArrowImportVTable for Point {
             );
             (
                 point_meta.dimension().into(),
-                spatial_metadata_from_arrow(point_meta.metadata()),
+                from_geoarrow(point_meta.metadata()),
             )
         } else {
             // Infer the dimension from the field names, not the canonical storage check: a literal's
@@ -312,6 +317,7 @@ mod tests {
     fn spatial_meta() -> SpatialMetadata {
         SpatialMetadata {
             crs: Some("EPSG:4326".to_string()),
+            ..Default::default()
         }
     }
 

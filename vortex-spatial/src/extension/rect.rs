@@ -4,7 +4,7 @@
 //! The [`Rect`] bounding-box extension type (`vortex.st.box`): an axis-aligned envelope stored
 //! columnarly as `Struct<xmin, ymin[, zmin][, mmin], xmax, ymax[, zmax][, mmax]>` of non-nullable
 //! `f64` — the lower corner's ordinates followed by the upper corner's — tagged with
-//! [`SpatialMetadata`] (CRS). Its GeoArrow wire type is `geoarrow.box`.
+//! [`SpatialMetadata`]. Its GeoArrow wire type is `geoarrow.box`.
 //!
 //! Decoding to `geo_types` yields a 2D [`Geometry::Rect`]; any `z`/`m`
 //! bounds are dropped, as for the other geometry types.
@@ -21,7 +21,6 @@ use geoarrow::array::GeoArrowArrayAccessor;
 use geoarrow::array::IntoArrow;
 use geoarrow::array::RectArray;
 use geoarrow::datatypes::BoxType;
-use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -54,8 +53,8 @@ use vortex_session::registry::Id;
 
 use super::SpatialMetadata;
 use super::coordinate::Dimension;
-use super::geoarrow_metadata;
-use super::spatial_metadata_from_arrow;
+use super::metadata::from_geoarrow;
+use super::metadata::to_geoarrow;
 
 /// An axis-aligned bounding box (`geoarrow.box`), stored as `Struct<xmin, ymin[, ..], xmax, ymax[, ..]>`.
 // Named `Rect`, not `Box`: matches `geo::Rect` / geoarrow-rs `RectArray`, and `Box` is a std name.
@@ -73,11 +72,11 @@ impl ExtVTable for Rect {
     }
 
     fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-        Ok(metadata.encode_to_vec())
+        Ok(metadata.serialize())
     }
 
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(SpatialMetadata::decode(metadata)?)
+        SpatialMetadata::deserialize(metadata)
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
@@ -177,25 +176,30 @@ pub(crate) fn build_rect_array(
 static ARROW_BOX: CachedId = CachedId::new(BoxType::NAME);
 
 /// The `geoarrow.box` extension type for `dimension`.
-fn box_type(spatial_metadata: &SpatialMetadata, dimension: Dimension) -> BoxType {
-    BoxType::new(dimension.into(), geoarrow_metadata(spatial_metadata))
+fn box_type(metadata: &SpatialMetadata, dimension: Dimension) -> VortexResult<BoxType> {
+    Ok(BoxType::new(dimension.into(), to_geoarrow(metadata)?))
 }
 
 /// Build a geoarrow `RectArray` from a `Rect`'s box `Struct` storage.
-fn rect_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<RectArray> {
-    let box_type = box_type(&SpatialMetadata::default(), box_dimension(storage.dtype())?);
+fn rect_array(
+    storage: &ArrayRef,
+    metadata: &SpatialMetadata,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<RectArray> {
+    let box_type = box_type(metadata, box_dimension(storage.dtype())?)?;
     let session = ctx.session().clone();
     let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
     RectArray::try_from((arrow.as_ref(), box_type))
         .map_err(|e| vortex_err!("failed to construct RectArray: {e}"))
 }
 
-/// Decode `Rect` storage to `geo_types` (2D [`Geometry::Rect`]), for the spatial scalar functions.
+/// Decode box storage to 2D [`Geometry::Rect`] values.
 pub(crate) fn rect_geometries(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<Geometry<f64>>> {
-    rect_array(storage, ctx)?
+    rect_array(storage, metadata, ctx)?
         .iter()
         .map(|geometry| -> VortexResult<Geometry<f64>> {
             Ok(geometry
@@ -222,11 +226,11 @@ impl ArrowExportVTable for Rect {
         session: &ArrowSession,
     ) -> VortexResult<Option<Field>> {
         let ext_type = dtype.as_extension();
-        let spatial_metadata = ext_type.metadata::<Rect>();
+        let metadata = ext_type.metadata::<Rect>();
         let dimension = box_dimension(ext_type.storage_dtype())?;
 
         let mut field = session.to_arrow_field(name, ext_type.storage_dtype())?;
-        field.try_with_extension_type(box_type(spatial_metadata, dimension))?;
+        field.try_with_extension_type(box_type(metadata, dimension)?)?;
 
         Ok(Some(field))
     }
@@ -287,7 +291,7 @@ impl ArrowImportVTable for Rect {
         let (dimension, metadata) = if let Ok(box_meta) = field.try_extension_type::<BoxType>() {
             (
                 box_meta.dimension().into(),
-                spatial_metadata_from_arrow(box_meta.metadata()),
+                from_geoarrow(box_meta.metadata()),
             )
         } else {
             if field.extension_type_name() != Some(BoxType::NAME) {
@@ -358,6 +362,7 @@ mod tests {
     fn spatial_meta() -> SpatialMetadata {
         SpatialMetadata {
             crs: Some("EPSG:4326".to_string()),
+            ..Default::default()
         }
     }
 
@@ -405,12 +410,13 @@ mod tests {
         let mut ctx = session.create_execution_ctx();
 
         let rects = crate::test_harness::rect_column(vec![(0.0, 0.0, 2.0, 3.0)])?;
+        let metadata = rects.dtype().as_extension().metadata::<Rect>().clone();
         let storage = rects
             .execute::<ExtensionArray>(&mut ctx)?
             .storage_array()
             .clone();
 
-        let geometries = rect_geometries(&storage, &mut ctx)?;
+        let geometries = rect_geometries(&storage, &metadata, &mut ctx)?;
         assert!(matches!(geometries.as_slice(), [Geometry::Rect(_)]));
         Ok(())
     }

@@ -10603,6 +10603,7 @@ dependencies = [
  "mimalloc",
  "prost 0.14.4",
  "rstest",
+ "serde_json",
  "vortex-array",
  "vortex-arrow",
  "vortex-buffer",

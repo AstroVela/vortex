@@ -10,10 +10,12 @@ use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::extension::ExtensionType;
 use geoarrow::array::GenericWkbArray;
+use geoarrow::array::GeoArrowArray;
 use geoarrow::array::IntoArrow;
 use geoarrow::array::WkbViewArray;
+use geoarrow::datatypes::GeoArrowType;
 use geoarrow::datatypes::WkbType;
-use prost::Message;
+use geoarrow_cast::cast::cast;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -40,8 +42,8 @@ use vortex_session::registry::Id;
 use wkb::reader::GeometryType;
 
 use crate::extension::SpatialMetadata;
-use crate::extension::geoarrow_metadata;
-use crate::extension::spatial_metadata_from_arrow;
+use crate::extension::metadata::from_geoarrow;
+use crate::extension::metadata::to_geoarrow;
 
 /// A typed handle to an [`ExtensionArray`] that contains WKB-encoded data.
 ///
@@ -141,11 +143,11 @@ impl ExtVTable for WellKnownBinary {
     }
 
     fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-        Ok(metadata.encode_to_vec())
+        Ok(metadata.serialize())
     }
 
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(SpatialMetadata::decode(metadata)?)
+        SpatialMetadata::deserialize(metadata)
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
@@ -184,10 +186,10 @@ impl ArrowExportVTable for WellKnownBinary {
         session: &ArrowSession,
     ) -> VortexResult<Option<Field>> {
         let ext_type = dtype.as_extension();
-        let spatial_metadata = ext_type.metadata::<WellKnownBinary>();
+        let metadata = ext_type.metadata::<WellKnownBinary>();
 
         let mut field = session.to_arrow_field(name, ext_type.storage_dtype())?;
-        field.try_with_extension_type(wkb_type(spatial_metadata))?;
+        field.try_with_extension_type(wkb_type(metadata)?)?;
 
         Ok(Some(field))
     }
@@ -266,8 +268,12 @@ impl ArrowImportVTable for WellKnownBinary {
 
         let storage_dtype = DType::Binary(field.is_nullable().into());
         Ok(Some(DType::Extension(
-            ExtDType::try_with_vtable(WellKnownBinary, spatial_metadata(&wkb_meta), storage_dtype)?
-                .erased(),
+            ExtDType::try_with_vtable(
+                WellKnownBinary,
+                from_geoarrow(wkb_meta.metadata()),
+                storage_dtype,
+            )?
+            .erased(),
         )))
     }
 
@@ -297,10 +303,15 @@ impl ArrowImportVTable for WellKnownBinary {
     }
 }
 
-fn wkb_type(spatial_metadata: &SpatialMetadata) -> WkbType {
-    WkbType::new(geoarrow_metadata(spatial_metadata))
+fn wkb_type(metadata: &SpatialMetadata) -> VortexResult<WkbType> {
+    Ok(WkbType::new(to_geoarrow(metadata)?))
 }
 
-fn spatial_metadata(wkb_type: &WkbType) -> SpatialMetadata {
-    spatial_metadata_from_arrow(wkb_type.metadata())
+/// Serialize a native geometry array to WKB.
+pub(crate) fn geoarrow_to_wkb(geoarrow_array: &dyn GeoArrowArray) -> VortexResult<ArrayRef> {
+    let data_type = geoarrow_array.data_type();
+    let wkb_type = GeoArrowType::WkbView(WkbType::new(Arc::clone(data_type.metadata())));
+    let wkb = cast(geoarrow_array, &wkb_type)
+        .map_err(|e| vortex_err!("failed to cast geometry to WKB: {e}"))?;
+    ArrayRef::from_arrow(wkb.to_array_ref().as_ref(), false)
 }

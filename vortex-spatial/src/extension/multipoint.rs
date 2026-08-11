@@ -3,8 +3,8 @@
 
 //! The [`MultiPoint`] geometry extension type (`vortex.st.multipoint`): an unordered set of the
 //! [`Point`](super::Point) coordinate struct, stored as `List<Struct<x, y[, z][, m]>>` and tagged
-//! with [`SpatialMetadata`] (CRS). The storage layout matches [`LineString`](super::LineString); the
-//! two are distinguished by their GeoArrow extension name, not their shape.
+//! with [`SpatialMetadata`]. The storage layout matches [`LineString`](super::LineString); the two
+//! are distinguished by their GeoArrow extension name, not their shape.
 
 use std::sync::Arc;
 
@@ -19,7 +19,6 @@ use geoarrow::array::IntoArrow;
 use geoarrow::array::MultiPointArray;
 use geoarrow::datatypes::CoordType;
 use geoarrow::datatypes::MultiPointType;
-use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -50,9 +49,9 @@ use super::SpatialMetadata;
 use super::coordinate::Dimension;
 use super::coordinate::coordinate_dimension;
 use super::coordinate::coordinate_storage_dtype;
-use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
-use super::spatial_metadata_from_arrow;
+use super::metadata::from_geoarrow;
+use super::metadata::to_geoarrow;
 
 /// A multipoint: `geoarrow.multipoint`, stored as `List<Struct<x, y[, z][, m]>>` (a set of points).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -69,11 +68,11 @@ impl ExtVTable for MultiPoint {
     }
 
     fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-        Ok(metadata.encode_to_vec())
+        Ok(metadata.serialize())
     }
 
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(SpatialMetadata::decode(metadata)?)
+        SpatialMetadata::deserialize(metadata)
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
@@ -105,16 +104,23 @@ pub(crate) fn multipoint_dimension(dtype: &DType) -> VortexResult<Dimension> {
 static ARROW_MULTIPOINT: CachedId = CachedId::new(MultiPointType::NAME);
 
 /// The `geoarrow.multipoint` extension type for `dimension`, with separated (struct) coordinates.
-fn multipoint_type(spatial_metadata: &SpatialMetadata, dimension: Dimension) -> MultiPointType {
-    MultiPointType::new(dimension.into(), geoarrow_metadata(spatial_metadata))
+fn multipoint_type(
+    metadata: &SpatialMetadata,
+    dimension: Dimension,
+) -> VortexResult<MultiPointType> {
+    Ok(MultiPointType::new(
+        dimension.into(),
+        to_geoarrow(metadata)?,
+    ))
 }
 
-/// Decode `MultiPoint` storage (`List<coordinate>`) to `geo_types`, for the spatial scalar functions.
+/// Decode multipoint storage to `geo_types`.
 pub(crate) fn multipoint_geometries(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<Geometry<f64>>> {
-    multipoint_array(storage, ctx)?
+    multipoint_array(storage, metadata, ctx)?
         .iter()
         .map(|geometry| -> VortexResult<Geometry<f64>> {
             Ok(geometry
@@ -126,11 +132,12 @@ pub(crate) fn multipoint_geometries(
 }
 
 /// Build a geoarrow `MultiPointArray` from a `MultiPoint`'s `List<coordinate>` storage.
-fn multipoint_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<MultiPointArray> {
-    let multipoint_type = multipoint_type(
-        &SpatialMetadata::default(),
-        multipoint_dimension(storage.dtype())?,
-    );
+fn multipoint_array(
+    storage: &ArrayRef,
+    metadata: &SpatialMetadata,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<MultiPointArray> {
+    let multipoint_type = multipoint_type(metadata, multipoint_dimension(storage.dtype())?)?;
     let session = ctx.session().clone();
     let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
     MultiPointArray::try_from((arrow.as_ref(), multipoint_type))
@@ -155,7 +162,11 @@ impl TryFrom<ExtensionArray> for MultiPointData {
 impl MultiPointData {
     /// Serialize multipoints to WKB (a view array) — the form DuckDB `GEOMETRY` takes.
     pub fn to_wkb(&self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        geoarrow_to_wkb(&multipoint_array(self.0.storage_array(), ctx)?)
+        geoarrow_to_wkb(&multipoint_array(
+            self.0.storage_array(),
+            self.0.ext_dtype().metadata::<MultiPoint>(),
+            ctx,
+        )?)
     }
 }
 
@@ -175,11 +186,11 @@ impl ArrowExportVTable for MultiPoint {
         session: &ArrowSession,
     ) -> VortexResult<Option<Field>> {
         let ext_type = dtype.as_extension();
-        let spatial_metadata = ext_type.metadata::<MultiPoint>();
+        let metadata = ext_type.metadata::<MultiPoint>();
         let dimension = multipoint_dimension(ext_type.storage_dtype())?;
 
         let mut field = session.to_arrow_field(name, ext_type.storage_dtype())?;
-        field.try_with_extension_type(multipoint_type(spatial_metadata, dimension))?;
+        field.try_with_extension_type(multipoint_type(metadata, dimension)?)?;
 
         Ok(Some(field))
     }
@@ -249,7 +260,7 @@ impl ArrowImportVTable for MultiPoint {
                 );
                 (
                     multipoint_meta.dimension().into(),
-                    spatial_metadata_from_arrow(multipoint_meta.metadata()),
+                    from_geoarrow(multipoint_meta.metadata()),
                 )
             } else {
                 if field.extension_type_name() != Some(MultiPointType::NAME) {
@@ -315,6 +326,7 @@ mod tests {
     fn spatial_meta() -> SpatialMetadata {
         SpatialMetadata {
             crs: Some("EPSG:4326".to_string()),
+            ..Default::default()
         }
     }
 

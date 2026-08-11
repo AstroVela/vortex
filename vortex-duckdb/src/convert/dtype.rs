@@ -173,7 +173,10 @@ impl FromLogicalType for DType {
                 let crs = logical_type.geometry_crs().map(|crs| crs.to_string());
                 DType::Extension(
                     ExtDType::<WellKnownBinary>::try_new(
-                        SpatialMetadata { crs },
+                        SpatialMetadata {
+                            crs,
+                            ..Default::default()
+                        },
                         DType::Binary(nullability),
                     )?
                     .erased(),
@@ -616,6 +619,7 @@ mod tests {
             ExtDType::<WellKnownBinary>::try_new(
                 SpatialMetadata {
                     crs: Some("EPSG:4326".to_string()),
+                    ..Default::default()
                 },
                 DType::Binary(Nullability::NonNullable),
             )?

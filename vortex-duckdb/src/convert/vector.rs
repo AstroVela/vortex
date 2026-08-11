@@ -262,7 +262,10 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
                 vector_as_string_blob(vector, len, DType::Binary(Nullability::Nullable));
             let crs = logical_type.geometry_crs().map(|crs| crs.to_string());
             let wkb_type = ExtDType::<WellKnownBinary>::try_new(
-                SpatialMetadata { crs },
+                SpatialMetadata {
+                    crs,
+                    ..Default::default()
+                },
                 DType::Binary(Nullability::Nullable),
             )?
             .erased();

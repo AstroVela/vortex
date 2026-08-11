@@ -19,7 +19,6 @@ use geoarrow::array::IntoArrow;
 use geoarrow::array::MultiLineStringArray;
 use geoarrow::datatypes::CoordType;
 use geoarrow::datatypes::MultiLineStringType;
-use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -50,9 +49,9 @@ use super::SpatialMetadata;
 use super::coordinate::Dimension;
 use super::coordinate::coordinate_dimension;
 use super::coordinate::coordinate_storage_dtype;
-use super::geoarrow_metadata;
 use super::geoarrow_to_wkb;
-use super::spatial_metadata_from_arrow;
+use super::metadata::from_geoarrow;
+use super::metadata::to_geoarrow;
 
 /// A multilinestring: `geoarrow.multilinestring`, stored as `List<List<Struct<x, y[, z][, m]>>>`
 /// (line strings of vertices).
@@ -70,11 +69,11 @@ impl ExtVTable for MultiLineString {
     }
 
     fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-        Ok(metadata.encode_to_vec())
+        Ok(metadata.serialize())
     }
 
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(SpatialMetadata::decode(metadata)?)
+        SpatialMetadata::deserialize(metadata)
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
@@ -112,18 +111,22 @@ static ARROW_MULTILINESTRING: CachedId = CachedId::new(MultiLineStringType::NAME
 
 /// The `geoarrow.multilinestring` type for `dimension`, with separated (struct) coordinates.
 fn multilinestring_type(
-    spatial_metadata: &SpatialMetadata,
+    metadata: &SpatialMetadata,
     dimension: Dimension,
-) -> MultiLineStringType {
-    MultiLineStringType::new(dimension.into(), geoarrow_metadata(spatial_metadata))
+) -> VortexResult<MultiLineStringType> {
+    Ok(MultiLineStringType::new(
+        dimension.into(),
+        to_geoarrow(metadata)?,
+    ))
 }
 
-/// Decode storage to `geo_types` for the spatial scalar functions (CRS is irrelevant to planar ops).
+/// Decode multi-line string storage to `geo_types`.
 pub(crate) fn multilinestring_geometries(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<Geometry<f64>>> {
-    multilinestring_array(storage, ctx)?
+    multilinestring_array(storage, metadata, ctx)?
         .iter()
         .map(|geometry| -> VortexResult<Geometry<f64>> {
             Ok(geometry
@@ -137,12 +140,11 @@ pub(crate) fn multilinestring_geometries(
 /// Build a geoarrow `MultiLineStringArray` from the `MultiLineString` storage.
 fn multilinestring_array(
     storage: &ArrayRef,
+    metadata: &SpatialMetadata,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<MultiLineStringArray> {
-    let multilinestring_type = multilinestring_type(
-        &SpatialMetadata::default(),
-        multilinestring_dimension(storage.dtype())?,
-    );
+    let multilinestring_type =
+        multilinestring_type(metadata, multilinestring_dimension(storage.dtype())?)?;
     let session = ctx.session().clone();
     let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
     MultiLineStringArray::try_from((arrow.as_ref(), multilinestring_type))
@@ -167,7 +169,11 @@ impl TryFrom<ExtensionArray> for MultiLineStringData {
 impl MultiLineStringData {
     /// Serialize multilinestrings to WKB (a view array) — the form DuckDB `GEOMETRY` takes.
     pub fn to_wkb(&self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        geoarrow_to_wkb(&multilinestring_array(self.0.storage_array(), ctx)?)
+        geoarrow_to_wkb(&multilinestring_array(
+            self.0.storage_array(),
+            self.0.ext_dtype().metadata::<MultiLineString>(),
+            ctx,
+        )?)
     }
 }
 
@@ -187,11 +193,11 @@ impl ArrowExportVTable for MultiLineString {
         session: &ArrowSession,
     ) -> VortexResult<Option<Field>> {
         let ext_type = dtype.as_extension();
-        let spatial_metadata = ext_type.metadata::<MultiLineString>();
+        let metadata = ext_type.metadata::<MultiLineString>();
         let dimension = multilinestring_dimension(ext_type.storage_dtype())?;
 
         let mut field = session.to_arrow_field(name, ext_type.storage_dtype())?;
-        field.try_with_extension_type(multilinestring_type(spatial_metadata, dimension))?;
+        field.try_with_extension_type(multilinestring_type(metadata, dimension)?)?;
 
         Ok(Some(field))
     }
@@ -262,7 +268,7 @@ impl ArrowImportVTable for MultiLineString {
                 );
                 (
                     multilinestring_meta.dimension().into(),
-                    spatial_metadata_from_arrow(multilinestring_meta.metadata()),
+                    from_geoarrow(multilinestring_meta.metadata()),
                 )
             } else {
                 // Literal: peel the two `List` layers to the coordinate struct and read its dimension
@@ -336,6 +342,7 @@ mod tests {
     fn spatial_meta() -> SpatialMetadata {
         SpatialMetadata {
             crs: Some("EPSG:4326".to_string()),
+            ..Default::default()
         }
     }
 

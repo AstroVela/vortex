@@ -293,6 +293,7 @@ mod tests {
         let dtype = ExtDType::<Point>::try_new(
             SpatialMetadata {
                 crs: crs.map(str::to_owned),
+                ..Default::default()
             },
             storage.dtype().clone(),
         )?;

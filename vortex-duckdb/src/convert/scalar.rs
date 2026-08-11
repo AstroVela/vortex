@@ -482,6 +482,7 @@ mod tests {
         Scalar::extension::<WellKnownBinary>(
             SpatialMetadata {
                 crs: crs.map(str::to_string),
+                ..Default::default()
             },
             Scalar::binary(bytes.to_vec(), Nullability::Nullable),
         )
@@ -533,6 +534,7 @@ mod tests {
         let dtype = ExtDType::<WellKnownBinary>::try_new(
             SpatialMetadata {
                 crs: Some("EPSG:4326".to_string()),
+                ..Default::default()
             },
             DType::Binary(Nullability::Nullable),
         )

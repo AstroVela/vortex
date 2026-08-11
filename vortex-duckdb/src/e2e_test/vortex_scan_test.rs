@@ -994,6 +994,7 @@ fn test_geometry() {
             ExtDType::<WellKnownBinary>::try_new(
                 SpatialMetadata {
                     crs: Some("EPSG:32600".to_string()),
+                    ..Default::default()
                 },
                 geometry.dtype().clone(),
             )

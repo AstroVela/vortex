@@ -49,6 +49,7 @@ pub fn spatial_session() -> VortexSession {
 fn wgs84() -> SpatialMetadata {
     SpatialMetadata {
         crs: Some("EPSG:4326".to_string()),
+        ..Default::default()
     }
 }
 
