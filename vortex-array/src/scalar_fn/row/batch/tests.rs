@@ -48,6 +48,9 @@ struct RetryConstantAdd;
 struct NullarySeven;
 
 #[derive(Clone)]
+struct AddThree;
+
+#[derive(Clone)]
 struct OriginalInputReducer;
 
 #[derive(Clone)]
@@ -178,6 +181,26 @@ impl RowFn for NullarySeven {
         visitor.visit_into::<(), I64Sink, _>(|(), output| {
             *output = 7;
         })
+    }
+}
+
+impl RowFn for AddThree {
+    type Options = EmptyOptions;
+
+    const ARG_NAMES: &'static [&'static str] = &["first", "second", "third"];
+
+    fn id(&self) -> ScalarFnId {
+        static ID: CachedId = CachedId::new("test.add_three");
+        *ID
+    }
+
+    fn dispatch<V: RowVisitor<Self::Options>>(
+        &self,
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::VisitResult> {
+        visitor.visit::<(i64, i64, i64), i64>(|(first, second, third)| first + second + third)
     }
 }
 
@@ -740,5 +763,24 @@ fn test_nullary_row_function_broadcasts() -> VortexResult<()> {
     let expected = PrimitiveArray::from_iter([7i64, 7, 7]).into_array();
 
     assert_arrays_eq!(&actual, &expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn test_owned_execution_traverses_three_varying_inputs() -> VortexResult<()> {
+    let args = VecExecutionArgs::new(
+        vec![
+            PrimitiveArray::from_iter([1_i64, 2, 3]).into_array(),
+            PrimitiveArray::from_iter([10_i64, 20, 30]).into_array(),
+            PrimitiveArray::from_iter([100_i64, 200, 300]).into_array(),
+        ],
+        3,
+    );
+    let mut ctx = array_session().create_execution_ctx();
+
+    let actual = execute_rows(&AddThree, &EmptyOptions, &args, &mut ctx)?;
+    let expected = PrimitiveArray::from_iter([111_i64, 222, 333]);
+
+    assert_arrays_eq!(&actual, expected.as_ref(), &mut ctx);
     Ok(())
 }
