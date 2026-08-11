@@ -6,6 +6,7 @@
 //! A row-oriented consumer (e.g. bulk-loading an in-memory R-tree in a spatial-join operator)
 //! reads the resulting box column back row by row.
 
+use geo::BoundingRect;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -37,6 +38,7 @@ use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::extension::Geometry;
 use crate::extension::Rect;
 use crate::extension::SpatialMetadata;
 use crate::extension::box_field_names;
@@ -45,6 +47,7 @@ use crate::extension::build_rect_array;
 use crate::extension::coordinate::Dimension;
 use crate::extension::coordinate::box_corners;
 use crate::extension::coordinate::ordinates;
+use crate::extension::decode_mixed_geometries;
 use crate::extension::flatten_row_offsets;
 use crate::extension::is_native_geometry;
 use crate::scalar_fn::execute::Execution;
@@ -138,6 +141,55 @@ fn row_boxes(
     ))
 }
 
+fn mixed_geometry_boxes(
+    array: ArrayRef,
+    valid: Mask,
+    output_dtype: &ExtDType<Rect>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let len = array.len();
+    let decoded = decode_mixed_geometries(&array.filter(valid.clone())?, ctx)?;
+    let mut decoded = decoded.into_iter();
+    let mut xmins = BufferMut::zeroed(len);
+    let mut ymins = BufferMut::zeroed(len);
+    let mut xmaxs = BufferMut::zeroed(len);
+    let mut ymaxs = BufferMut::zeroed(len);
+    let mut output_validity = vec![false; len];
+
+    for (row, valid) in valid.iter().enumerate() {
+        if !valid {
+            continue;
+        }
+        let geometry = decoded
+            .next()
+            .ok_or_else(|| vortex_err!("Geometry decode returned too few rows"))?;
+        let Some(rect) = geometry.bounding_rect() else {
+            continue;
+        };
+        xmins[row] = rect.min().x;
+        ymins[row] = rect.min().y;
+        xmaxs[row] = rect.max().x;
+        ymaxs[row] = rect.max().y;
+        output_validity[row] = true;
+    }
+    vortex_ensure!(
+        decoded.next().is_none(),
+        "Geometry decode returned too many rows"
+    );
+
+    build_rect_array(
+        output_dtype,
+        vec![
+            xmins.freeze().into_array(),
+            ymins.freeze().into_array(),
+            xmaxs.freeze().into_array(),
+            ymaxs.freeze().into_array(),
+        ],
+        len,
+        Validity::from_iter(output_validity),
+    )
+}
+
 /// Compute boxes directly over a non-constant native geometry column.
 fn envelope_array(
     array: ArrayRef,
@@ -146,11 +198,15 @@ fn envelope_array(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let len = array.len();
-    let is_rect = array
+    let ext_dtype = array
         .dtype()
         .as_extension_opt()
-        .ok_or_else(|| vortex_err!("spatial: envelope operand is not a geometry extension type"))?
-        .is::<Rect>();
+        .ok_or_else(|| vortex_err!("spatial: envelope operand is not a geometry extension type"))?;
+    if ext_dtype.is::<Geometry>() {
+        let valid = validity.execute_mask(len, ctx)?;
+        return mixed_geometry_boxes(array, valid, output_dtype, ctx);
+    }
+    let is_rect = ext_dtype.is::<Rect>();
     let storage = array
         .execute::<ExtensionArray>(ctx)?
         .storage_array()
@@ -237,9 +293,9 @@ impl ScalarFnVTable for SpatialEnvelope {
         Ok(DType::Extension(output_box_dtype()?.erased()))
     }
 
-    /// Compute each row's box directly over the native coordinate storage — no decode to
-    /// `geo_types`, no Arrow round-trip. A null row, or a valid row that owns no coordinate (an
-    /// empty geometry), yields a null box.
+    /// Compute each row's box directly over homogeneous native coordinate storage. Geometry
+    /// unions use the row-oriented fallback. A null row, or a valid row that owns no coordinate
+    /// (an empty geometry), yields a null box.
     fn execute(
         &self,
         _: &Self::Options,
