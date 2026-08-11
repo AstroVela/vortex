@@ -10022,6 +10022,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-dense-union"
+version = "0.1.0"
+dependencies = [
+ "codspeed-divan-compat",
+ "prost 0.14.4",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-mask",
+ "vortex-session",
+]
+
+[[package]]
 name = "vortex-duckdb"
 version = "0.1.0"
 dependencies = [
@@ -10151,6 +10164,7 @@ dependencies = [
  "vortex-bytebool",
  "vortex-datetime-parts",
  "vortex-decimal-byte-parts",
+ "vortex-dense-union",
  "vortex-edition",
  "vortex-error",
  "vortex-fastlanes",
