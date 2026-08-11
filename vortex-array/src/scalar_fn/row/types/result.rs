@@ -7,10 +7,6 @@ use vortex_error::VortexResult;
 
 use super::InitializedElement;
 
-mod private {
-    pub trait Sealed {}
-}
-
 /// The result of writing one row: success or an immediate error.
 ///
 /// This trait is sealed; row functions choose one of its supplied implementations.
@@ -67,4 +63,8 @@ impl SinkResult for VortexResult<InitializedElement> {
     fn into_result(self) -> VortexResult<()> {
         self.map(|_| ())
     }
+}
+
+mod private {
+    pub trait Sealed {}
 }
