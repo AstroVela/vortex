@@ -129,10 +129,6 @@ name = "binary_ops"
 harness = false
 
 [[bench]]
-name = "row_fn_executor"
-harness = false
-
-[[bench]]
 name = "kleene_bool"
 harness = false
 
@@ -204,10 +200,6 @@ harness = false
 
 [[bench]]
 name = "validity_is_valid"
-harness = false
-
-[[bench]]
-name = "strict_validity"
 harness = false
 
 [[bench]]
