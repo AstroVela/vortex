@@ -9711,6 +9711,7 @@ dependencies = [
  "parquet 56.2.1",
  "parquet 58.4.0",
  "rand 0.10.2",
+ "rand_distr 0.6.0",
  "regex",
  "reqwest 0.13.4",
  "rstest",
