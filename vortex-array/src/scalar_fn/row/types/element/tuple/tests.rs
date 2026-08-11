@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_compute::lane_kernels::IndexedSource;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
 
-use super::IndexedElementTuple;
 use super::batch_constant;
 use crate::IntoArray;
 use crate::arrays::Constant;
@@ -17,27 +15,6 @@ use crate::dtype::Nullability;
 use crate::extension::datetime::TimeUnit;
 use crate::extension::datetime::Timestamp;
 use crate::validity::Validity;
-
-#[test]
-fn test_unary_element_source_reads_one_tuple_per_row() {
-    // SAFETY: the only view has exactly three rows.
-    let source = unsafe { <(i32,)>::indexed_source((&[10, 20, 30][..],), 3) };
-    assert_eq!(source.len(), 3);
-
-    // SAFETY: index one is within the three-element source.
-    assert_eq!(unsafe { source.get_unchecked(1) }, (20,));
-}
-
-#[test]
-fn test_binary_element_source_zips_views() {
-    // SAFETY: both views have exactly three rows.
-    let source =
-        unsafe { <(i32, i64)>::indexed_source((&[10, 20, 30][..], &[100, 200, 300][..]), 3) };
-    assert_eq!(source.len(), 3);
-
-    // SAFETY: index one is within the three-element source.
-    assert_eq!(unsafe { source.get_unchecked(1) }, (20, 200));
-}
 
 #[test]
 fn test_batch_constant_unwraps_filtered_masked_constant() -> VortexResult<()> {

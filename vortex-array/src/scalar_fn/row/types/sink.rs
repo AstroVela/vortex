@@ -18,29 +18,32 @@ use crate::scalar_fn::OutputElement;
 /// state out of its capture.
 ///
 /// Rows arrive in increasing index order. Ordinary execution visits `0..row_count` exactly once;
-/// skip-invalid execution can omit invalid rows when
-/// [`skipped_rows_initializer`](Self::skipped_rows_initializer) returns an initializer.
+/// skip-invalid execution can omit invalid rows when [`skipped_rows_initializer`] returns an
+/// initializer.
 ///
 /// # Safety
 ///
 /// An implementation must uphold all of these requirements:
 ///
-/// - When [`row_count_matches`](Self::row_count_matches) returns `true`, every index in
-///   `0..row_count` **must** identify one distinct row owned by this sink.
+/// - When [`row_count_matches`] returns `true`, every index in `0..row_count` **must** identify one
+///   distinct row owned by this sink.
 /// - A row must either be initialized before the callback or require a
-///   [`WriteToken`](Self::WriteToken) that safe code cannot produce without initializing that exact
-///   row. Evidence for an uninitialized row **must not** be safely forgeable, reusable, or
-///   substitutable for another row.
-/// - An initializer returned by
-///   [`skipped_rows_initializer`](Self::skipped_rows_initializer) **must** initialize every row
-///   handed to it.
-/// - `Self` and every borrowed [`Rows`](Self::Rows) view **must** remain safe to drop if decoding,
+///   [`WriteToken`] that safe code cannot produce without initializing that exact row. Evidence for
+///   an uninitialized row **must not** be safely forgeable, reusable, or substitutable.
+/// - An initializer returned by [`skipped_rows_initializer`] **must** initialize every row.
+/// - `Self` and every borrowed [`Rows`] view **must** remain safe to drop if decoding,
 ///   preparation, skipped-row initialization, or a row callback returns an error or unwinds. The
 ///   executor can abandon a sink after any prefix of rows.
-/// - [`finish`](Self::finish) **must** be sound once every visited callback returned its required
-///   token and the skipped-row initializer, when present, ran successfully.
+/// - [`finish`] **must** be sound once every visited callback returned its required token and the
+///   skipped-row initializer, when present, ran successfully.
 ///
 /// The executor relies on these guarantees when it calls `finish`.
+///
+/// [`Rows`]: Self::Rows
+/// [`WriteToken`]: Self::WriteToken
+/// [`finish`]: Self::finish
+/// [`row_count_matches`]: Self::row_count_matches
+/// [`skipped_rows_initializer`]: Self::skipped_rows_initializer
 pub unsafe trait OutputSink<Options>: 'static + Sized {
     /// A loop-local view of all output rows.
     ///
@@ -65,10 +68,11 @@ pub unsafe trait OutputSink<Options>: 'static + Sized {
 
     /// The operation that initializes every output position before skip-invalid execution.
     ///
-    /// `None` declines skip-invalid execution before input decoding or sink allocation. A present
-    /// initializer **must** leave a legal arbitrary value in every row. Encoding support as the
-    /// initializer's presence prevents a separate capability flag from disagreeing with a no-op
-    /// method.
+    /// `Some(initializer)` enables skip-invalid execution and supplies the operation that prepares
+    /// output storage before callbacks run. The initializer **must** make every row safe to finish.
+    /// Callbacks overwrite valid rows, and batch execution masks skipped rows.
+    ///
+    /// `None` makes the executor fall back to filtering the inputs.
     fn skipped_rows_initializer() -> Option<for<'a> fn(&mut Self::Rows<'a>)> {
         None
     }

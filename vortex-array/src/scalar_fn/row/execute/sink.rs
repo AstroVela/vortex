@@ -10,13 +10,30 @@ use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use super::RowExecution;
-use super::ensure_decoded_lengths;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::OutputSink;
 use crate::scalar_fn::SinkResult;
+
+/// Ensure that every decoded input addresses the complete row loop.
+fn ensure_decoded_lengths<Args: ElementTuple>(
+    columns: &Args::Columns,
+    views: Option<&Args::Views<'_>>,
+    row_count: usize,
+) -> VortexResult<()> {
+    let lengths_match = match views {
+        Some(views) => Args::view_lens_match(views, row_count),
+        None => Args::decoded_lens_match(columns, row_count),
+    };
+    vortex_ensure!(
+        lengths_match,
+        "a decoded row input does not address exactly {row_count} rows",
+    );
+
+    Ok(())
+}
 
 /// Decode every input column once, allocate the sink once, then write one row at a time.
 ///
@@ -178,4 +195,73 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
+    use vortex_mask::Mask;
+
+    use super::execute_sink_valid_rows;
+    use crate::ArrayRef;
+    use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
+    use crate::arrays::PrimitiveArray;
+    use crate::dtype::DType;
+    use crate::dtype::NativePType;
+    use crate::scalar_fn::EmptyOptions;
+    use crate::scalar_fn::OutputSink;
+    use crate::scalar_fn::VecExecutionArgs;
+    use crate::validity::Validity;
+
+    struct NonSkippingSink;
+
+    // SAFETY: `with_capacity` always returns an error, so no sink value can reach `rows`, `row`, or
+    // `finish` through the executor. The row-initialization requirements are therefore vacuous.
+    unsafe impl<Options> OutputSink<Options> for NonSkippingSink {
+        type Rows<'a> = ();
+        type Row<'a> = ();
+        type WriteToken = ();
+
+        fn sink_dtype(_options: &Options, _args: &[DType]) -> VortexResult<DType> {
+            Ok(DType::from(i64::PTYPE))
+        }
+
+        fn with_capacity(_rows: usize, _dtype: &DType) -> VortexResult<Self> {
+            Err(vortex_err!(
+                "a non-skipping sink must decline before allocation"
+            ))
+        }
+
+        fn rows(&mut self) -> Self::Rows<'_> {}
+
+        fn row_count_matches(_rows: &Self::Rows<'_>, _row_count: usize) -> bool {
+            true
+        }
+
+        fn row<'a>(_rows: &'a mut Self::Rows<'_>, _index: usize) -> Self::Row<'a> {}
+
+        unsafe fn finish(self) -> VortexResult<ArrayRef> {
+            Err(vortex_err!("a non-skipping sink must not finish"))
+        }
+    }
+
+    #[test]
+    fn test_non_skipping_sink_declines_before_allocation() -> VortexResult<()> {
+        let input = PrimitiveArray::new(vec![1_i64, 2], Validity::NonNullable).into_array();
+        let args = VecExecutionArgs::new(vec![input], 2);
+        let valid = Mask::from_iter([true, false]);
+        let mut ctx = array_session().create_execution_ctx();
+
+        let execution = execute_sink_valid_rows::<(i64,), (), NonSkippingSink, (), EmptyOptions>(
+            &args,
+            &DType::from(i64::PTYPE),
+            &valid,
+            &mut ctx,
+            |_| (),
+            |_, _, _| (),
+        )?;
+
+        assert!(execution.is_none());
+        Ok(())
+    }
+}

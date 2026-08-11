@@ -17,7 +17,7 @@ use super::RowVisitor;
 use super::check::assert_deferred_visit_contract;
 use super::check::assert_owned_visit_contract;
 use super::check::assert_sink_visit_contract;
-use super::private;
+use super::row_visitor::private;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::scalar_fn::ElementTuple;

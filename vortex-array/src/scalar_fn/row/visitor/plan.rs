@@ -14,7 +14,7 @@ use super::check::assert_owned_visit_contract;
 use super::check::assert_sink_visit_contract;
 use super::check::validate_owned_visit;
 use super::check::validate_sink_visit;
-use super::private;
+use super::row_visitor::private;
 use crate::dtype::DType;
 use crate::scalar_fn::ElementTuple;
 use crate::scalar_fn::IndexedElementTuple;

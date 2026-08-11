@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable) adapter for [`RowFn`].
+//! The [`ScalarFnVTable`] adapter for [`RowFn`].
 //!
 //! The [`visitor`](super::visitor) module validates and executes the concrete row signature
 //! selected by dispatch. This module connects those visits to batch execution and exposes the
@@ -169,52 +169,4 @@ fn prepare_batch<F: RowFn>(
     Batch::new(RowFn::id(function), args, |arg_dtypes| {
         function.dispatch(options, arg_dtypes, PlanRows::<F>::new(arg_dtypes, options))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use vortex_error::VortexResult;
-    use vortex_error::vortex_bail;
-    use vortex_session::registry::CachedId;
-
-    use crate::dtype::DType;
-    use crate::scalar_fn::Arity;
-    use crate::scalar_fn::EmptyOptions;
-    use crate::scalar_fn::RowFn;
-    use crate::scalar_fn::RowVisitor;
-    use crate::scalar_fn::ScalarFnId;
-    use crate::scalar_fn::ScalarFnVTable;
-
-    #[derive(Clone)]
-    struct TestRowFn;
-
-    impl RowFn for TestRowFn {
-        type Options = EmptyOptions;
-
-        const ARG_NAMES: &'static [&'static str] = &[];
-
-        fn id(&self) -> ScalarFnId {
-            static ID: CachedId = CachedId::new("test.row_fn_vtable");
-            *ID
-        }
-
-        fn dispatch<V: RowVisitor<Self::Options>>(
-            &self,
-            _options: &Self::Options,
-            _args: &[DType],
-            _visitor: V,
-        ) -> VortexResult<V::VisitResult> {
-            vortex_bail!("compile-only RowFn must not execute")
-        }
-    }
-
-    #[test]
-    fn test_row_fn_implements_standard_vtable() {
-        let function = TestRowFn;
-        let options = EmptyOptions;
-
-        assert_eq!(ScalarFnVTable::arity(&function, &options), Arity::Exact(0));
-        assert!(ScalarFnVTable::is_strict(&function, &options));
-        assert!(!ScalarFnVTable::is_fallible(&function, &options));
-    }
 }

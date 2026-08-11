@@ -23,22 +23,22 @@ use crate::scalar_fn::ScalarFnId;
 /// Declare the argument names and use [`dispatch`](Self::dispatch) to choose concrete element and
 /// sink types for each accepted dtype combination.
 ///
-/// Every `RowFn` receives the standard [`ScalarFnVTable`](crate::scalar_fn::ScalarFnVTable)
-/// implementation. A function that needs custom scalar-function hooks instead implements
-/// `ScalarFnVTable` on its public type and delegates row execution to a private `RowFn` kernel with
-/// [`row_fn_return_dtype`](crate::scalar_fn::row_fn_return_dtype) and
-/// [`execute_rows`](crate::scalar_fn::execute_rows). Implement only `ScalarFnVTable` when the
-/// natural kernel is columnar rather than row-oriented.
+/// Every `RowFn` receives the standard [`ScalarFnVTable`] implementation. A function that needs
+/// custom scalar-function hooks instead implements `ScalarFnVTable` on its public type and
+/// delegates row execution to a private `RowFn` kernel with [`row_fn_return_dtype`] and
+/// [`execute_rows`]. Implement only `ScalarFnVTable` when the natural kernel is columnar.
+///
+/// [`ScalarFnVTable`]: crate::scalar_fn::ScalarFnVTable
+/// [`execute_rows`]: crate::scalar_fn::execute_rows
+/// [`row_fn_return_dtype`]: crate::scalar_fn::row_fn_return_dtype
 pub trait RowFn: 'static + Sized + Clone + Send + Sync {
-    /// Options for this function, if any. Use [`EmptyOptions`](crate::scalar_fn::EmptyOptions)
-    /// for none.
+    /// Options for this function, or [`EmptyOptions`](crate::scalar_fn::EmptyOptions) for none.
     type Options: 'static + Send + Sync + Clone + Debug + Display + PartialEq + Eq + Hash;
 
     /// The arguments in display order. Its length is the function's exact arity.
     const ARG_NAMES: &'static [&'static str];
 
-    /// Whether any legal dispatch or encoding-aware execution can raise a semantic error as
-    /// defined by [`ScalarFnVTable::is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible).
+    /// Whether any legal dispatch or encoding-aware execution can raise a semantic error.
     ///
     /// The framework checks this at compile time for every fallible dispatched element or result.
     /// A conservative `true` is allowed when only some dtype choices are fallible.
@@ -46,6 +46,9 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// Set this to `true` when [`reduce_encoded`](Self::reduce_encoded) can return a semantic
     /// error or [`RowExecution::DeferredError`]. Compile-time checks cover dispatched element and
     /// result types, but cannot inspect that hook.
+    ///
+    /// Semantic errors are defined by
+    /// [`ScalarFnVTable::is_fallible`](crate::scalar_fn::ScalarFnVTable::is_fallible).
     const FALLIBLE: bool = false;
 
     /// Returns the ID of the scalar function.

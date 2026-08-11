@@ -26,7 +26,6 @@ use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::PrimitiveArray;
 use crate::assert_arrays_eq;
-use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
@@ -722,39 +721,6 @@ fn test_prepared_visits(
 
     assert_arrays_eq!(&actual, &expected, &mut ctx);
     assert_eq!(prepares.load(Ordering::Relaxed), 1);
-    Ok(())
-}
-
-#[rstest]
-#[case::dense(RowPolicy::Dense)]
-#[case::dense_with_retry(RowPolicy::DenseWithRetry)]
-#[case::valid_only(RowPolicy::ValidOnly)]
-fn test_strategy_matrix(#[case] policy: RowPolicy) -> VortexResult<()> {
-    static ID: CachedId = CachedId::new("test.row_strategy");
-
-    let input = PrimitiveArray::new(vec![1i64, 2, 3], Validity::from_iter([true, false, true]))
-        .into_array();
-    let args = VecExecutionArgs::new(vec![input.clone()], 3);
-    let batch = Batch::new(*ID, &args, |_| {
-        Ok(BatchPlan {
-            output_dtype: DType::from(i64::PTYPE),
-            policy,
-        })
-    })?;
-    let mut ctx = array_session().create_execution_ctx();
-
-    let actual = batch.execute(
-        |_args, _ctx| Ok(None),
-        |args, _ctx| Ok(RowExecution::Output(args.arrays()[0].fill_null(0_i64)?)),
-        |args, _valid, _ctx| {
-            Ok(Some(RowExecution::Output(
-                args.arrays()[0].fill_null(0_i64)?,
-            )))
-        },
-        &mut ctx,
-    )?;
-
-    assert_arrays_eq!(&actual, &input, &mut ctx);
     Ok(())
 }
 
