@@ -376,13 +376,12 @@ impl FileOpener for VortexOpener {
                         "plan-v2 scans do not support VortexAccessPlan"
                     ));
                 }
-                let filter_mode = if std::env::var("VORTEX_PLAN_V2_FILTER_MODE").as_deref()
-                    == Ok("adaptive")
-                {
-                    FilterMode::Adaptive
-                } else {
-                    FilterMode::Parallel
-                };
+                let filter_mode =
+                    if std::env::var("VORTEX_PLAN_V2_FILTER_MODE").as_deref() == Ok("adaptive") {
+                        FilterMode::Adaptive
+                    } else {
+                        FilterMode::Parallel
+                    };
                 let mut scan_builder = PlanScanBuilder::try_new(
                     vxf.footer().layout(),
                     vxf.segment_source(),
@@ -438,10 +437,19 @@ impl FileOpener for VortexOpener {
                             },
                         )?;
                         let Some(row_range) =
-                            split_aligned_row_range(byte_range, file_splits.as_ref())
+                            split_aligned_row_range(byte_range.clone(), file_splits.as_ref())
                         else {
+                            tracing::debug!(
+                                ?byte_range,
+                                "plan-v2 byte range owns no natural split"
+                            );
                             return Ok(stream::empty().boxed());
                         };
+                        tracing::debug!(
+                            ?byte_range,
+                            ?row_range,
+                            "plan-v2 scanning a partial file range"
+                        );
                         scan_builder = scan_builder.with_row_range(row_range);
                     }
                 }
@@ -568,9 +576,9 @@ impl FileOpener for VortexOpener {
                     .into_stream()
                     .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
                     .map_err(move |e: VortexError| {
-                        DataFusionError::External(Box::new(e.with_context(format!(
-                            "Failed to read Vortex file: {location}"
-                        ))))
+                        DataFusionError::External(Box::new(
+                            e.with_context(format!("Failed to read Vortex file: {location}")),
+                        ))
                     })
                     .boxed()
             };
