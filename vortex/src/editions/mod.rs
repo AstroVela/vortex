@@ -15,6 +15,8 @@
 
 pub mod core;
 #[cfg(test)]
+mod frozen;
+#[cfg(test)]
 mod tests;
 pub mod unstable;
 
