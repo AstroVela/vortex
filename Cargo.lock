@@ -9990,6 +9990,7 @@ dependencies = [
  "url",
  "vortex",
  "vortex-arrow",
+ "vortex-scan-v2",
  "vortex-utils",
 ]
 
