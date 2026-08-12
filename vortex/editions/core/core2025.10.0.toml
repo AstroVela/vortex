@@ -6,7 +6,7 @@
 
 edition = "core2025.10.0"
 family = "core"
-min_vortex_version = "0.54.0"
+min_vortex_version = "0.55.0"
 
 # The encodings that join the family at this edition.
 added = [
