@@ -7,8 +7,12 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
@@ -20,6 +24,7 @@ use vortex_session::SessionExt;
 use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_session::VortexSession;
+use vortex_utils::aliases::hash_map::HashMap;
 
 /// Mutable host buffer contract used by [`WritableHostBuffer`].
 pub trait HostBufferMut: Send + 'static {
@@ -286,11 +291,242 @@ impl HostBufferMut for DefaultWritableHostBuffer {
     }
 }
 
+/// A [`HostAllocator`] that recycles freed buffers instead of returning them to the system
+/// allocator.
+///
+/// Coalesced reads request buffers spanning up to [`CoalesceConfig::max_size`] bytes (4MiB for
+/// local files, 16MiB for object storage). Allocations that large bypass the system allocator's
+/// free lists and are served by fresh `mmap` regions, so every read pays for page faults and every
+/// free returns the pages to the kernel.
+///
+/// This allocator keeps freed buffers in per-(size class, alignment) free lists. Because buffers
+/// are handed back through the [`ByteBuffer`] owner, a buffer only returns to the pool once the
+/// last zero-copy slice referencing it has been dropped.
+///
+/// Pooling is bounded on three axes: allocations outside `[min_pooled_size, max_pooled_size]` are
+/// never pooled, each class holds at most `max_buffers_per_class` buffers, and the pool as a whole
+/// holds at most `max_pooled_bytes`.
+///
+/// This is **not** the default allocator. On Linux/glibc, recycling read buffers does not measure
+/// faster than allocating them: a freshly mapped region arrives pre-zeroed and its page faults are
+/// paid by the `pread` that has to fill the buffer anyway, so the pool trades those faults for an
+/// equivalent write to cold memory. See `vortex/examples/alloc_profile.rs` for the measurement.
+/// It is retained as an opt-in for allocators and platforms where large-allocation handling is
+/// more expensive, and for workloads that want a bounded, reusable buffer budget.
+///
+/// [`CoalesceConfig::max_size`]: https://docs.rs/vortex-io/latest/vortex_io/struct.CoalesceConfig.html
+#[derive(Debug)]
+pub struct PoolingHostAllocator {
+    inner: Arc<Pool>,
+}
+
+/// Tuning for a [`PoolingHostAllocator`].
+#[derive(Clone, Copy, Debug)]
+pub struct PoolConfig {
+    /// Allocations smaller than this are served directly by the system allocator.
+    pub min_pooled_size: usize,
+    /// Allocations larger than this are served directly by the system allocator.
+    pub max_pooled_size: usize,
+    /// The maximum number of buffers retained per (size class, alignment) pair.
+    pub max_buffers_per_class: usize,
+    /// The maximum number of bytes retained across every class.
+    pub max_pooled_bytes: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            // Below this the system allocator's free lists are already effective.
+            min_pooled_size: 64 * 1024,
+            max_pooled_size: 32 * 1024 * 1024,
+            max_buffers_per_class: 8,
+            max_pooled_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PoolStats {
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+#[derive(Debug)]
+struct Pool {
+    config: PoolConfig,
+    classes: Mutex<HashMap<(usize, usize), Vec<ByteBufferMut>>>,
+    pooled_bytes: AtomicUsize,
+    stats: PoolStats,
+}
+
+impl Pool {
+    /// Requests are rounded up to a power of two so that near-identical reads share a class.
+    fn size_class(&self, len: usize) -> Option<usize> {
+        (len >= self.config.min_pooled_size && len <= self.config.max_pooled_size)
+            .then(|| len.next_power_of_two())
+            .filter(|class| *class <= self.config.max_pooled_size)
+    }
+
+    fn take(&self, class: usize, alignment: Alignment) -> ByteBufferMut {
+        let mut classes = self.classes.lock();
+        while let Some(buffer) = classes
+            .get_mut(&(class, *alignment))
+            .and_then(|slot| slot.pop())
+        {
+            self.pooled_bytes.fetch_sub(class, Ordering::Relaxed);
+            // A recycled buffer that somehow lost capacity is dropped rather than trusted.
+            if buffer.capacity() >= class {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                return buffer;
+            }
+        }
+        drop(classes);
+
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        ByteBufferMut::with_capacity_aligned(class, alignment)
+    }
+
+    fn put(&self, class: usize, alignment: Alignment, mut buffer: ByteBufferMut) {
+        if self.pooled_bytes.load(Ordering::Relaxed) + class > self.config.max_pooled_bytes {
+            return;
+        }
+        buffer.clear();
+
+        let mut classes = self.classes.lock();
+        let slot = classes.entry((class, *alignment)).or_default();
+        if slot.len() < self.config.max_buffers_per_class {
+            slot.push(buffer);
+            self.pooled_bytes.fetch_add(class, Ordering::Relaxed);
+        }
+    }
+}
+
+impl PoolingHostAllocator {
+    /// Create a pooling allocator with the given configuration.
+    pub fn new(config: PoolConfig) -> Self {
+        Self {
+            inner: Arc::new(Pool {
+                config,
+                classes: Mutex::new(HashMap::default()),
+                pooled_bytes: AtomicUsize::new(0),
+                stats: PoolStats::default(),
+            }),
+        }
+    }
+
+    /// The number of allocations served from the pool.
+    pub fn hits(&self) -> u64 {
+        self.inner.stats.hits.load(Ordering::Relaxed)
+    }
+
+    /// The number of pool-eligible allocations that had to be served by the system allocator.
+    pub fn misses(&self) -> u64 {
+        self.inner.stats.misses.load(Ordering::Relaxed)
+    }
+
+    /// The number of bytes currently retained by the pool.
+    pub fn pooled_bytes(&self) -> usize {
+        self.inner.pooled_bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for PoolingHostAllocator {
+    fn default() -> Self {
+        Self::new(PoolConfig::default())
+    }
+}
+
+impl HostAllocator for PoolingHostAllocator {
+    fn allocate(&self, len: usize, alignment: Alignment) -> VortexResult<WritableHostBuffer> {
+        let Some(class) = self.inner.size_class(len) else {
+            return DefaultHostAllocator.allocate(len, alignment);
+        };
+
+        let mut buffer = self.inner.take(class, alignment);
+        // SAFETY: `take` returns a buffer with at least `class >= len` bytes of capacity, and the
+        // caller fully initializes the slice before freezing it.
+        unsafe { buffer.set_len(len) };
+
+        Ok(WritableHostBuffer::new(Box::new(PooledHostBuffer {
+            buffer,
+            alignment,
+            class,
+            pool: Arc::clone(&self.inner),
+        })))
+    }
+}
+
+#[derive(Debug)]
+struct PooledHostBuffer {
+    buffer: ByteBufferMut,
+    alignment: Alignment,
+    class: usize,
+    pool: Arc<Pool>,
+}
+
+impl HostBufferMut for PooledHostBuffer {
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn alignment(&self) -> Alignment {
+        self.alignment
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buffer.as_mut_slice()
+    }
+
+    fn freeze(self: Box<Self>) -> ByteBuffer {
+        let Self {
+            buffer,
+            alignment,
+            class,
+            pool,
+        } = *self;
+        let bytes = Bytes::from_owner(PooledHostBufferOwner {
+            buffer: Some(buffer),
+            class,
+            alignment,
+            pool,
+        });
+        ByteBuffer::from_bytes_aligned(bytes, alignment)
+    }
+}
+
+/// Owns a frozen pooled allocation, returning it to the pool once every slice of it is dropped.
+#[derive(Debug)]
+struct PooledHostBufferOwner {
+    buffer: Option<ByteBufferMut>,
+    class: usize,
+    alignment: Alignment,
+    pool: Arc<Pool>,
+}
+
+impl AsRef<[u8]> for PooledHostBufferOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer
+            .as_ref()
+            .map(ByteBufferMut::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for PooledHostBufferOwner {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.put(self.class, self.alignment, buffer);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+
+    use rstest::rstest;
 
     use super::*;
 
@@ -386,5 +622,105 @@ mod tests {
         let err = writable.freeze_typed::<u32>().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not a multiple of"));
+    }
+
+    fn write_and_freeze(
+        allocator: &PoolingHostAllocator,
+        len: usize,
+        fill: u8,
+    ) -> VortexResult<ByteBuffer> {
+        let mut writable = allocator.allocate(len, Alignment::new(64))?;
+        writable.as_mut_slice().fill(fill);
+        Ok(writable.freeze())
+    }
+
+    #[test]
+    fn pool_recycles_freed_buffers() -> VortexResult<()> {
+        let allocator = PoolingHostAllocator::default();
+
+        let first = write_and_freeze(&allocator, 1 << 20, 1)?;
+        assert_eq!((allocator.hits(), allocator.misses()), (0, 1));
+        drop(first);
+
+        let second = write_and_freeze(&allocator, 1 << 20, 2)?;
+        assert_eq!((allocator.hits(), allocator.misses()), (1, 1));
+        assert!(second.as_slice().iter().all(|byte| *byte == 2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn pool_retains_buffer_until_last_slice_drops() -> VortexResult<()> {
+        let allocator = PoolingHostAllocator::default();
+
+        let buffer = write_and_freeze(&allocator, 1 << 20, 7)?;
+        let slice = buffer.slice(0..1024);
+        drop(buffer);
+        // The slice still references the allocation, so it must not have been recycled.
+        assert_eq!(allocator.pooled_bytes(), 0);
+        assert!(slice.as_slice().iter().all(|byte| *byte == 7));
+
+        drop(slice);
+        assert_eq!(allocator.pooled_bytes(), 1 << 20);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::below_min(1024)]
+    #[case::above_max(64 * 1024 * 1024)]
+    fn pool_skips_out_of_range_sizes(#[case] len: usize) -> VortexResult<()> {
+        let allocator = PoolingHostAllocator::default();
+        drop(write_and_freeze(&allocator, len, 3)?);
+        assert_eq!(allocator.pooled_bytes(), 0);
+        assert_eq!((allocator.hits(), allocator.misses()), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn pool_bounds_retained_buffers_per_class() -> VortexResult<()> {
+        let allocator = PoolingHostAllocator::new(PoolConfig {
+            max_buffers_per_class: 2,
+            ..PoolConfig::default()
+        });
+
+        let buffers = (0..4)
+            .map(|_| write_and_freeze(&allocator, 1 << 20, 4))
+            .collect::<VortexResult<Vec<_>>>()?;
+        drop(buffers);
+
+        assert_eq!(allocator.pooled_bytes(), 2 << 20);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_bounds_total_retained_bytes() -> VortexResult<()> {
+        let allocator = PoolingHostAllocator::new(PoolConfig {
+            max_pooled_bytes: 2 << 20,
+            ..PoolConfig::default()
+        });
+
+        let buffers = (0..4)
+            .map(|_| write_and_freeze(&allocator, 1 << 20, 5))
+            .collect::<VortexResult<Vec<_>>>()?;
+        drop(buffers);
+
+        assert!(allocator.pooled_bytes() <= 2 << 20);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_rounds_request_up_to_size_class() -> VortexResult<()> {
+        let allocator = PoolingHostAllocator::default();
+
+        // A 1.5MiB request lands in the 2MiB class, so a 2MiB request can reuse it.
+        drop(write_and_freeze(&allocator, 1536 * 1024, 6)?);
+        assert_eq!(allocator.pooled_bytes(), 2 << 20);
+
+        let reused = write_and_freeze(&allocator, 2 << 20, 8)?;
+        assert_eq!(allocator.hits(), 1);
+        assert_eq!(reused.len(), 2 << 20);
+
+        Ok(())
     }
 }

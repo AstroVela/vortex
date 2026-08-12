@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Instrumentation harness that attributes large (>= 256KiB) heap allocations made during a
-//! file scan to the Rust call site that requested them.
+//! Allocation instrumentation for the file scan path.
 //!
-//! Run with:
+//! Installs a global allocator shim that records every allocation above a size threshold and
+//! attributes it to the Vortex call site that requested it, then reports the largest sites for a
+//! full file scan. Finally it A/B benchmarks the same scan under [`DefaultHostAllocator`] and
+//! [`PoolingHostAllocator`], opening the file fresh on each iteration so the segment cache does
+//! not hide the I/O read path.
+//!
 //! ```text
-//! cargo run --release -p vortex-file --example alloc_profile
+//! cargo run --release -p vortex --example alloc_profile
 //! ```
+//!
+//! `VORTEX_ALLOC_PROFILE_CHUNKS` controls the size of the generated file.
 
 #![allow(clippy::print_stdout, clippy::cast_precision_loss, clippy::unwrap_used)]
 
@@ -16,13 +22,15 @@ use std::alloc::Layout;
 use std::alloc::System;
 use std::backtrace::Backtrace;
 use std::cell::Cell;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
-use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use vortex::VortexSessionDefault;
@@ -37,16 +45,16 @@ use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::dtype::DType;
 use vortex::array::dtype::Nullability;
+use vortex::array::memory::DefaultHostAllocator;
 use vortex::array::memory::HostAllocator;
-use vortex::array::memory::HostBufferMut;
 use vortex::array::memory::MemorySessionExt;
-use vortex::array::memory::WritableHostBuffer;
+use vortex::array::memory::PoolingHostAllocator;
 use vortex::buffer::Alignment;
 use vortex::buffer::Buffer;
-use vortex::buffer::ByteBuffer;
 use vortex::buffer::ByteBufferMut;
 use vortex::error::VortexResult;
 use vortex::file::OpenOptionsSessionExt;
+use vortex::file::VortexFile;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -58,17 +66,15 @@ const THRESHOLD: usize = 256 * 1024;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
-static BATCHES: AtomicU64 = AtomicU64::new(0);
-static ROWS: AtomicU64 = AtomicU64::new(0);
-static ALL_COUNT: AtomicU64 = AtomicU64::new(0);
-static BIG4K: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Default)]
 struct Site {
     count: u64,
     bytes: u64,
 }
 
-static SITES: LazyLock<Mutex<HashMap<String, Site>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static SITES: LazyLock<Mutex<HashMap<String, Site>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 
 thread_local! {
     /// Guards against re-entering the recorder from the allocations the recorder itself makes.
@@ -79,39 +85,32 @@ struct Profiler;
 
 impl Profiler {
     fn record(size: usize) {
-        if ENABLED.load(Ordering::Relaxed) {
-            ALL_COUNT.fetch_add(1, Ordering::Relaxed);
-            if size >= 4096 {
-                BIG4K.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         if size < THRESHOLD || !ENABLED.load(Ordering::Relaxed) {
             return;
         }
-        let reentrant = RECORDING.with(|r| r.replace(true));
-        if reentrant {
+        if RECORDING.with(|recording| recording.replace(true)) {
             return;
         }
 
         TOTAL_BYTES.fetch_add(size as u64, Ordering::Relaxed);
         TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        let bt = Backtrace::force_capture().to_string();
-        let key = summarize(&bt);
+        let site = summarize(&Backtrace::force_capture().to_string());
         let mut sites = SITES.lock();
-        let entry = sites.entry(key).or_insert(Site { count: 0, bytes: 0 });
+        let entry = sites.entry(site).or_default();
         entry.count += 1;
         entry.bytes += size as u64;
         drop(sites);
 
-        RECORDING.with(|r| r.set(false));
+        RECORDING.with(|recording| recording.set(false));
     }
 }
 
 /// Keep the first few `vortex` frames of the backtrace: enough to identify the call site without
 /// splitting one logical site across many async-poll spellings.
-fn summarize(bt: &str) -> String {
-    bt.lines()
+fn summarize(backtrace: &str) -> String {
+    backtrace
+        .lines()
         .filter_map(|line| {
             let line = line.trim();
             let frame = line.strip_prefix("at ").unwrap_or(line);
@@ -152,142 +151,25 @@ unsafe impl GlobalAlloc for Profiler {
 #[global_allocator]
 static GLOBAL: Profiler = Profiler;
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(|| VortexSession::default().with_tokio());
-
-/// Prototype pooling host allocator: recycles aligned byte buffers by (size-class, alignment)
-/// instead of returning them to the system allocator.
-#[derive(Debug, Default)]
-struct PoolingHostAllocator {
-    classes: Mutex<HashMap<(usize, usize), Vec<ByteBufferMut>>>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-}
-
-/// Round a request up to the next power of two so that similarly-sized reads share a class.
-fn size_class(len: usize) -> usize {
-    len.next_power_of_two().max(4096)
-}
-
-impl PoolingHostAllocator {
-    fn take(&self, class: usize, alignment: Alignment) -> ByteBufferMut {
-        let mut classes = self.classes.lock();
-        if let Some(buf) = classes
-            .get_mut(&(class, *alignment))
-            .and_then(|slot| slot.pop())
-        {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return buf;
-        }
-        drop(classes);
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        ByteBufferMut::with_capacity_aligned(class, alignment)
-    }
-
-    fn put(&self, class: usize, alignment: Alignment, mut buffer: ByteBufferMut) {
-        buffer.clear();
-        let mut classes = self.classes.lock();
-        let slot = classes.entry((class, *alignment)).or_default();
-        // Bound the pool so a burst of wide reads cannot pin memory forever.
-        if slot.len() < 32 {
-            slot.push(buffer);
-        }
-    }
-}
-
-impl HostAllocator for PoolingHostAllocator {
-    fn allocate(&self, len: usize, alignment: Alignment) -> VortexResult<WritableHostBuffer> {
-        let class = size_class(len);
-        let mut buffer = self.take(class, alignment);
-        // SAFETY: `take` returns a buffer with at least `class >= len` bytes of capacity, and the
-        // caller fully initializes the slice before freezing it.
-        unsafe { buffer.set_len(len) };
-        Ok(WritableHostBuffer::new(Box::new(PooledBuffer {
-            buffer,
-            alignment,
-            class,
-            pool: POOL.clone(),
-        })))
-    }
-}
-
-struct PooledBuffer {
-    buffer: ByteBufferMut,
-    alignment: Alignment,
-    class: usize,
-    pool: Arc<PoolingHostAllocator>,
-}
-
-impl HostBufferMut for PooledBuffer {
-    fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn alignment(&self) -> Alignment {
-        self.alignment
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer.as_mut_slice()
-    }
-
-    fn freeze(self: Box<Self>) -> ByteBuffer {
-        let Self {
-            buffer,
-            alignment,
-            class,
-            pool,
-        } = *self;
-        let bytes = Bytes::from_owner(PooledOwner {
-            buffer: Some(buffer),
-            class,
-            alignment,
-            pool,
-        });
-        ByteBuffer::from_bytes_aligned(bytes, alignment)
-    }
-}
-
-/// Owns the frozen allocation: the buffer returns to the pool when the last slice is dropped.
-struct PooledOwner {
-    buffer: Option<ByteBufferMut>,
-    class: usize,
-    alignment: Alignment,
-    pool: Arc<PoolingHostAllocator>,
-}
-
-impl AsRef<[u8]> for PooledOwner {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer
-            .as_ref()
-            .map(|b| b.as_slice())
-            .unwrap_or_default()
-    }
-}
-
-impl Drop for PooledOwner {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            self.pool.put(self.class, self.alignment, buffer);
-        }
-    }
-}
-
-static POOL: LazyLock<Arc<PoolingHostAllocator>> =
-    LazyLock::new(|| Arc::new(PoolingHostAllocator::default()));
-
 const CHUNK: usize = 65_536;
-const CHUNKS: usize = 64;
 
-fn sample_data() -> VortexResult<ArrayRef> {
-    let ints = ChunkedArray::from_iter((0..CHUNKS).map(|c| {
-        Buffer::<i64>::from_iter((0..CHUNK).map(|i| ((c * CHUNK + i) % 100_000) as i64))
+fn chunks() -> usize {
+    std::env::var("VORTEX_ALLOC_PROFILE_CHUNKS")
+        .ok()
+        .and_then(|chunks| chunks.parse().ok())
+        .unwrap_or(256)
+}
+
+fn sample_data(chunks: usize) -> VortexResult<ArrayRef> {
+    let ints = ChunkedArray::from_iter((0..chunks).map(|chunk| {
+        Buffer::<i64>::from_iter((0..CHUNK).map(|i| ((chunk * CHUNK + i) % 100_000) as i64))
             .into_array()
     }))
     .into_array();
 
-    let strings = ChunkedArray::from_iter((0..CHUNKS).map(|c| {
+    let strings = ChunkedArray::from_iter((0..chunks).map(|chunk| {
         VarBinArray::from_iter(
-            (0..CHUNK).map(|i| Some(format!("value-{}-{}", c, i % 5_000))),
+            (0..CHUNK).map(|i| Some(format!("value-{}-{}", chunk, i % 5_000))),
             DType::Utf8(Nullability::Nullable),
         )
         .into_array()
@@ -300,12 +182,12 @@ fn sample_data() -> VortexResult<ArrayRef> {
 /// Fully canonicalize a scan batch so decode work (and its allocations) actually happens.
 fn consume(session: &VortexSession, array: ArrayRef) -> VortexResult<()> {
     let mut ctx = session.create_execution_ctx();
-    let st = array.execute::<StructArray>(&mut ctx)?;
-    let ints = st
+    let batch = array.execute::<StructArray>(&mut ctx)?;
+    let ints = batch
         .unmasked_field_by_name("ints")?
         .clone()
         .execute::<PrimitiveArray>(&mut ctx)?;
-    let strings = st
+    let strings = batch
         .unmasked_field_by_name("strings")?
         .clone()
         .execute::<VarBinViewArray>(&mut ctx)?;
@@ -313,91 +195,58 @@ fn consume(session: &VortexSession, array: ArrayRef) -> VortexResult<()> {
     Ok(())
 }
 
-async fn time_scans(
-    session: &VortexSession,
-    file: &vortex::file::VortexFile,
-    iterations: usize,
-) -> VortexResult<std::time::Duration> {
-    // Warm up once so neither configuration pays page-cache or pool-fill costs in the measurement.
-    for _ in 0..(iterations + 1) {
-        let mut stream = Box::pin(file.scan()?.into_array_stream()?);
-        while let Some(array) = stream.next().await {
-            consume(session, array?)?;
-        }
+async fn scan_file(session: &VortexSession, file: &VortexFile) -> VortexResult<()> {
+    let mut stream = Box::pin(file.scan()?.into_array_stream()?);
+    while let Some(array) = stream.next().await {
+        consume(session, array?)?;
     }
+    Ok(())
+}
 
-    let start = std::time::Instant::now();
-    for _ in 0..iterations {
-        let mut stream = Box::pin(file.scan()?.into_array_stream()?);
-        while let Some(array) = stream.next().await {
-            consume(session, array?)?;
-        }
-    }
+/// Time one open-and-scan. The file is reopened per iteration so that the segment cache does not
+/// serve the reads that the host allocator is responsible for.
+async fn timed_cold_scan(session: &VortexSession, path: &Path) -> VortexResult<Duration> {
+    let start = Instant::now();
+    let file = session.open_options().open_path(path).await?;
+    scan_file(session, &file).await?;
     Ok(start.elapsed())
+}
+
+fn median(mut samples: Vec<Duration>) -> Duration {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> VortexResult<()> {
-    let data = sample_data()?;
+    let chunks = chunks();
+    let session = VortexSession::default().with_tokio();
 
     let mut buf = ByteBufferMut::empty();
-    SESSION
+    session
         .write_options()
-        .write(&mut buf, data.to_array_stream())
+        .write(&mut buf, sample_data(chunks)?.to_array_stream())
         .await?;
     let buf = buf.freeze();
-    println!("file size: {:.1} MiB", buf.len() as f64 / (1024.0 * 1024.0));
+    let file_size = buf.len();
+    println!(
+        "file: {} rows, {:.1} MiB",
+        chunks * CHUNK,
+        file_size as f64 / (1024.0 * 1024.0)
+    );
 
     let path = std::env::temp_dir().join("vortex_alloc_profile.vortex");
     std::fs::write(&path, buf.as_ref())?;
-    let file = SESSION.open_options().open_path(&path).await?;
+    drop(buf);
 
-    // Warm up, then profile the scan only.
-    for _ in 0..2 {
-        let mut stream = Box::pin(file.scan()?.into_array_stream()?);
-        while let Some(array) = stream.next().await {
-            consume(&SESSION, array?)?;
-        }
-    }
+    // 1. Attribute the large allocations of a scan to their call sites.
+    let file = session.open_options().open_path(&path).await?;
+    scan_file(&session, &file).await?;
 
     ENABLED.store(true, Ordering::SeqCst);
-    for _ in 0..5 {
-        let mut stream = Box::pin(file.scan()?.into_array_stream()?);
-        while let Some(array) = stream.next().await {
-            let array = array?;
-            BATCHES.fetch_add(1, Ordering::Relaxed);
-            ROWS.fetch_add(array.len() as u64, Ordering::Relaxed);
-            consume(&SESSION, array)?;
-        }
-    }
+    scan_file(&session, &file).await?;
     ENABLED.store(false, Ordering::SeqCst);
-    println!(
-        "batches: {}, rows: {}, allocs: {}, >=4K: {}",
-        BATCHES.load(Ordering::Relaxed),
-        ROWS.load(Ordering::Relaxed),
-        ALL_COUNT.load(Ordering::Relaxed),
-        BIG4K.load(Ordering::Relaxed)
-    );
-
-    // A/B: default system allocator vs. the pooled allocator, same workload.
-    let pooled_session = VortexSession::default()
-        .with_tokio()
-        .with_allocator(POOL.clone());
-    let pooled_file = pooled_session.open_options().open_path(&path).await?;
-
-    let default_time = time_scans(&SESSION, &file, 5).await?;
-    let pooled_time = time_scans(&pooled_session, &pooled_file, 5).await?;
-    println!(
-        "scan x5: default {:.2}s, pooled {:.2}s (pool hits {}, misses {})",
-        default_time.as_secs_f64(),
-        pooled_time.as_secs_f64(),
-        POOL.hits.load(Ordering::Relaxed),
-        POOL.misses.load(Ordering::Relaxed)
-    );
-
-    let sites = SITES.lock();
-    let mut ranked: Vec<_> = sites.iter().collect();
-    ranked.sort_by_key(|(_, s)| std::cmp::Reverse(s.bytes));
+    drop(file);
 
     println!(
         "\n{} allocations >= {}KiB, {:.1} MiB total\n",
@@ -406,15 +255,88 @@ async fn main() -> VortexResult<()> {
         TOTAL_BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
     );
 
-    for (site, stat) in ranked.iter().take(25) {
+    let mut ranked: Vec<_> = SITES
+        .lock()
+        .iter()
+        .map(|(name, site)| (name.clone(), site.count, site.bytes))
+        .collect();
+    ranked.sort_by_key(|(_, _, bytes)| std::cmp::Reverse(*bytes));
+    for (name, count, bytes) in ranked.iter().take(10) {
         println!(
             "{:>6} allocs {:>9.1} MiB (avg {:>6.0} KiB)\n    {}\n",
-            stat.count,
-            stat.bytes as f64 / (1024.0 * 1024.0),
-            stat.bytes as f64 / stat.count as f64 / 1024.0,
-            site
+            count,
+            *bytes as f64 / (1024.0 * 1024.0),
+            *bytes as f64 / *count as f64 / 1024.0,
+            name
         );
     }
 
+    // 2. A/B the same cold-cache scan under both host allocators.
+    let pool = Arc::new(PoolingHostAllocator::default());
+    let pooled = VortexSession::default()
+        .with_tokio()
+        .with_allocator(Arc::clone(&pool) as _);
+    let unpooled = VortexSession::default()
+        .with_tokio()
+        .with_allocator(Arc::new(DefaultHostAllocator));
+
+    const ITERATIONS: usize = 20;
+    let mut pooled_samples = Vec::with_capacity(ITERATIONS);
+    let mut unpooled_samples = Vec::with_capacity(ITERATIONS);
+
+    // Warm the page cache and fill the pool before measuring.
+    for _ in 0..3 {
+        timed_cold_scan(&pooled, &path).await?;
+        timed_cold_scan(&unpooled, &path).await?;
+    }
+
+    // Alternate so that drift affects both configurations equally.
+    for _ in 0..ITERATIONS {
+        unpooled_samples.push(timed_cold_scan(&unpooled, &path).await?);
+        pooled_samples.push(timed_cold_scan(&pooled, &path).await?);
+    }
+
+    let unpooled_median = median(unpooled_samples);
+    let pooled_median = median(pooled_samples);
+    let throughput =
+        |elapsed: Duration| file_size as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64() / 1024.0;
+    println!(
+        "cold-cache scan (median of {ITERATIONS}):\n  \
+         default {:>8.2}ms  {:>5.2} GiB/s\n  \
+         pooled  {:>8.2}ms  {:>5.2} GiB/s  ({:+.1}%, pool hits {}, misses {}, retained {:.0} MiB)",
+        unpooled_median.as_secs_f64() * 1e3,
+        throughput(unpooled_median),
+        pooled_median.as_secs_f64() * 1e3,
+        throughput(pooled_median),
+        (unpooled_median.as_secs_f64() / pooled_median.as_secs_f64() - 1.0) * 100.0,
+        pool.hits(),
+        pool.misses(),
+        pool.pooled_bytes() as f64 / (1024.0 * 1024.0),
+    );
+
+    // 3. Isolate the raw per-allocation cost the pool removes.
+    const ALLOCATIONS: usize = 2_000;
+    const SIZE: usize = 4 << 20;
+    let raw = |allocator: &dyn HostAllocator| -> VortexResult<Duration> {
+        let start = Instant::now();
+        for _ in 0..ALLOCATIONS {
+            let mut writable = allocator.allocate(SIZE, Alignment::new(64))?;
+            // Touch every page: an mmap-backed allocation faults here, a recycled one does not.
+            writable.as_mut_slice().fill(1);
+            drop(writable.freeze());
+        }
+        Ok(start.elapsed())
+    };
+    let raw_default = raw(&DefaultHostAllocator)?;
+    let raw_pool = raw(&PoolingHostAllocator::default())?;
+    println!(
+        "raw {SIZE}B alloc+touch+free x{ALLOCATIONS}: default {:.2}ms ({:.1}us each), pooled {:.2}ms ({:.1}us each)",
+        raw_default.as_secs_f64() * 1e3,
+        raw_default.as_secs_f64() * 1e6 / ALLOCATIONS as f64,
+        raw_pool.as_secs_f64() * 1e3,
+        raw_pool.as_secs_f64() * 1e6 / ALLOCATIONS as f64,
+    );
+
+    std::fs::remove_file(&path)?;
     Ok(())
 }
