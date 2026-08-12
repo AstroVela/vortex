@@ -23,10 +23,8 @@ use vortex_buffer::Alignment;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 
 use crate::CoalesceConfig;
-use crate::ReadAtRequest;
 use crate::VortexReadAt;
 use crate::runtime::Handle;
 #[cfg(not(target_arch = "wasm32"))]
@@ -247,62 +245,6 @@ impl VortexReadAt for ObjectStoreReadAt {
         }
         .boxed()
     }
-
-    fn read_ranges(
-        &self,
-        requests: Arc<[ReadAtRequest]>,
-    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
-        let store = Arc::clone(&self.store);
-        let path = self.path.clone();
-        let handle = self.handle.clone();
-        let allocator = Arc::clone(&self.allocator);
-
-        handle
-            .spawn_io(async move {
-                let ranges = requests
-                    .iter()
-                    .map(|request| {
-                        let end = request
-                            .offset
-                            .checked_add(request.length as u64)
-                            .ok_or_else(|| {
-                                vortex_err!(
-                                    "Read range overflows u64: offset={}, length={}",
-                                    request.offset,
-                                    request.length
-                                )
-                            })?;
-                        Ok(request.offset..end)
-                    })
-                    .collect::<VortexResult<Vec<_>>>()?;
-                let bytes = store.get_ranges(&path, &ranges).await?;
-                vortex_ensure!(
-                    bytes.len() == requests.len(),
-                    "Object store returned {} ranges but expected {}",
-                    bytes.len(),
-                    requests.len()
-                );
-
-                requests
-                    .iter()
-                    .zip(bytes)
-                    .map(|(request, bytes)| {
-                        vortex_ensure!(
-                            bytes.len() == request.length,
-                            "Object store returned {} bytes but expected {} for range {}..{}",
-                            bytes.len(),
-                            request.length,
-                            request.offset,
-                            request.offset + request.length as u64
-                        );
-                        let mut buffer = allocator.allocate(request.length, request.alignment)?;
-                        buffer.as_mut_slice().copy_from_slice(&bytes);
-                        Ok(BufferHandle::new_host(buffer.freeze()))
-                    })
-                    .collect()
-            })
-            .boxed()
-    }
 }
 
 #[cfg(test)]
@@ -375,32 +317,6 @@ mod tests {
         let buffer = reader.read_at(7, 5, Alignment::new(1)).await?;
 
         assert_eq!(buffer.to_host().await.as_slice(), b"store");
-        assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
-        assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_ranges_uses_spawn_io() -> anyhow::Result<()> {
-        let executor = Arc::new(CountingExecutor::default());
-        let runtime = Arc::clone(&executor) as Arc<dyn Executor>;
-        let handle = Handle::new(Arc::downgrade(&runtime));
-
-        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let path = ObjectPath::from("test.bin");
-        store.put(&path, PutPayload::from_static(TEST_DATA)).await?;
-
-        let reader = ObjectStoreReadAt::new(store, path, handle);
-        let buffers = reader
-            .read_ranges(Arc::from([
-                ReadAtRequest::new(7, 5, Alignment::new(1)),
-                ReadAtRequest::new(0, 6, Alignment::new(1)),
-            ]))
-            .await?;
-
-        assert_eq!(buffers[0].to_host().await.as_slice(), b"store");
-        assert_eq!(buffers[1].to_host().await.as_slice(), b"object");
         assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
         assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
 

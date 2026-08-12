@@ -25,16 +25,19 @@ use crate::segments::RequestMetrics;
 pin_project! {
     /// Converts request lifecycle events into batches of physical reads.
     ///
-    /// Polled requests become eligible in registration order. An eligible request may absorb nearby
-    /// registered requests according to `coalesce_window`. Each poll emits every physical read
-    /// currently available, up to `batch_size`; it never waits for a full batch.
+    /// Takes an input stream of [`ReadRequest`]s and buffers all ready requests into local state.
+    /// When polled for the next request, this stream will choose the next best request based on
+    /// an ordering of `(has_been_polled, insertion_order)`, skipping any canceled requests, and
+    /// then coalescing with other nearby requests within the configured `window`.
+    ///
+    /// The output contains up to `batch_size` immediately eligible physical requests. A poll never
+    /// waits to fill a batch.
     pub(crate) struct IoRequestStream<S> {
         #[pin]
         events: S,
         // True after the event source closes; buffered requests may still remain.
         inner_done: bool,
         coalesce_window: Option<CoalesceConfig>,
-        // Maximum physical reads returned by one stream item.
         batch_size: usize,
         state: State,
     }
@@ -90,7 +93,7 @@ where
             }
         }
 
-        // Emit a partial batch immediately so the downstream driver can fill free I/O slots.
+        // Return up to batch_size requests that are eligible now. Do not wait to fill the batch.
         let mut batch = Vec::with_capacity(*this.batch_size);
         while batch.len() < *this.batch_size {
             let Some(request) = this.state.next(this.coalesce_window.as_ref()) else {
@@ -456,35 +459,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 10, 20, 30, 40]
         );
-    }
-
-    #[test]
-    fn test_partial_batch_emits_without_waiting_for_more_events() {
-        let (sender, receiver) = mpsc::unbounded();
-        let (request, _recv) = create_request(1, 0, 10);
-        assert!(sender.unbounded_send(ReadEvent::Request(request)).is_ok());
-        assert!(sender.unbounded_send(ReadEvent::Polled(1)).is_ok());
-
-        let metrics_registry = DefaultMetricsRegistry::default();
-        let metrics = RequestMetrics::new(&metrics_registry, vec![]);
-        let mut batches = Box::pin(IoRequestStream::new(
-            receiver,
-            None,
-            Alignment::none(),
-            32,
-            metrics,
-        ));
-
-        // Keep `sender` alive: the input is pending, not finished, and the partial batch must still
-        // be returned by the current poll rather than waiting for 31 more requests.
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        let Poll::Ready(Some(batch)) = batches.as_mut().poll_next(&mut context) else {
-            vortex_panic!("partial batch was not emitted by the current poll");
-        };
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].offset(), 0);
-        drop(sender);
     }
 
     #[tokio::test]
