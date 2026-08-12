@@ -15,12 +15,22 @@ pub fn label_infallible(expr: &Expression) -> BooleanLabels<'_> {
         expr,
         |expr| match expr {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.signature().is_infallible(),
-            // These add no fallibility of their own. A lambda's body is one of its children, so
-            // the folded label at a lambda node is the body's infallibility.
-            Expression::Root | Expression::Variable(_) | Expression::Lambda(_) => true,
+            Expression::Lambda(lambda) => is_infallible(lambda.body()),
+            Expression::Root | Expression::Variable(_) => true,
         },
         |acc, &child| acc & child,
     )
+}
+
+fn is_infallible(expr: &Expression) -> bool {
+    match expr {
+        Expression::Scalar {
+            scalar_fn,
+            children,
+        } => scalar_fn.signature().is_infallible() && children.iter().all(is_infallible),
+        Expression::Lambda(lambda) => is_infallible(lambda.body()),
+        Expression::Root | Expression::Variable(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -30,9 +40,11 @@ mod tests {
     use crate::expr::col;
     use crate::expr::eq;
     use crate::expr::is_null;
+    use crate::expr::lambda;
     use crate::expr::lit;
     use crate::expr::merge_opts;
     use crate::expr::not;
+    use crate::expr::var;
     use crate::scalar_fn::fns::merge::DuplicateHandling;
 
     #[test]
@@ -87,21 +99,11 @@ mod tests {
         assert_eq!(labels.get(&child), Some(&true));
         assert_eq!(labels.get(&expr), Some(&true));
     }
-}
 
-#[cfg(test)]
-mod lambda_tests {
-    use super::*;
-    use crate::expr::checked_add;
-    use crate::expr::lambda;
-    use crate::expr::lit;
-    use crate::expr::var;
-
-    /// A lambda is a scope boundary, so generic analysis does not inspect its body.
     #[test]
-    fn a_lambdas_label_does_not_include_its_body() -> vortex_error::VortexResult<()> {
+    fn lambda_infallibility_from_body() -> vortex_error::VortexResult<()> {
         let fallible = lambda(["x"], checked_add(var("x"), lit(1i32)))?;
-        assert_eq!(label_infallible(&fallible).get(&fallible), Some(&true));
+        assert_eq!(label_infallible(&fallible).get(&fallible), Some(&false));
 
         let infallible = lambda(["x"], var("x"))?;
         assert_eq!(
