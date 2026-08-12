@@ -47,6 +47,9 @@ use super::UNSTABLE_2026_06_0;
 
 fn session() -> Result<EditionSession, EditionError> {
     let session = EditionSession::empty();
+    for family in super::EDITION_FAMILIES {
+        session.declare_family(family)?;
+    }
     for declaration in EDITION_DECLARATIONS {
         session.declare(declaration)?;
     }
