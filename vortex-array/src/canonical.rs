@@ -282,9 +282,8 @@ impl Canonical {
     /// This is mostly relevant for the variable-length types such as Utf8, Binary or List where
     /// they can accumulate wasted space after slicing and taking operations.
     ///
-    /// This operation is very expensive and can result in things like allocations, full-scans
-    /// and copy operations. The exception is `Bool`, whose packed bit buffer is trimmed to the
-    /// nearest byte without copying.
+    /// This operation can be very expensive and can result in things like allocations, full-scans
+    /// and copy operations.
     pub fn compact(&self, ctx: &mut ExecutionCtx) -> VortexResult<Canonical> {
         match self {
             Canonical::Bool(array) => Ok(Canonical::Bool(array.trim_bits()?)),
