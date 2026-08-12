@@ -143,11 +143,30 @@ where
     V: RowVisitor<CompareOperator>,
 {
     match op {
-        CompareOperator::Eq => visitor.visit::<(T, T), bool>(|(lhs, rhs)| lhs.is_eq(rhs)),
-        CompareOperator::NotEq => visitor.visit::<(T, T), bool>(|(lhs, rhs)| !lhs.is_eq(rhs)),
-        CompareOperator::Gt => visitor.visit::<(T, T), bool>(|(lhs, rhs)| lhs.is_gt(rhs)),
-        CompareOperator::Gte => visitor.visit::<(T, T), bool>(|(lhs, rhs)| lhs.is_ge(rhs)),
-        CompareOperator::Lt => visitor.visit::<(T, T), bool>(|(lhs, rhs)| lhs.is_lt(rhs)),
-        CompareOperator::Lte => visitor.visit::<(T, T), bool>(|(lhs, rhs)| lhs.is_le(rhs)),
+        CompareOperator::Eq => visit_predicate(visitor, T::is_eq),
+        CompareOperator::NotEq => visit_predicate(visitor, |lhs: T, rhs: T| !lhs.is_eq(rhs)),
+        CompareOperator::Gt => visit_predicate(visitor, T::is_gt),
+        CompareOperator::Gte => visit_predicate(visitor, T::is_ge),
+        CompareOperator::Lt => visit_predicate(visitor, T::is_lt),
+        CompareOperator::Lte => visit_predicate(visitor, T::is_le),
     }
+}
+
+/// Visit one `(ptype, operator)` row loop as its own function.
+///
+/// Every dispatched pair expands to a complete decode, row loop, and output build. Inlining all of
+/// them into one [`RowFn::dispatch`] body produced a single 35k-line LLVM function; outlining keeps
+/// each body near the size of one loop. This call runs once per batch, outside the row loop, so the
+/// call itself costs nothing, and the row closure still inlines into the loop it is visited with.
+#[inline(never)]
+fn visit_predicate<T, V, Predicate>(
+    visitor: V,
+    predicate: Predicate,
+) -> VortexResult<V::VisitResult>
+where
+    T: NativePType,
+    V: RowVisitor<CompareOperator>,
+    Predicate: Fn(T, T) -> bool,
+{
+    visitor.visit::<(T, T), bool>(move |(lhs, rhs)| predicate(lhs, rhs))
 }
