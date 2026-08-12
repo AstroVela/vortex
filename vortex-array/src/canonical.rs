@@ -283,9 +283,11 @@ impl Canonical {
     /// they can accumulate wasted space after slicing and taking operations.
     ///
     /// This operation is very expensive and can result in things like allocations, full-scans
-    /// and copy operations.
+    /// and copy operations. The exception is `Bool`, whose packed bit buffer is trimmed to the
+    /// nearest byte without copying.
     pub fn compact(&self, ctx: &mut ExecutionCtx) -> VortexResult<Canonical> {
         match self {
+            Canonical::Bool(array) => Ok(Canonical::Bool(array.trim_bits()?)),
             Canonical::VarBinView(array) => Ok(Canonical::VarBinView(array.compact_buffers(ctx)?)),
             Canonical::List(array) => Ok(Canonical::List(
                 array.rebuild(ListViewRebuildMode::TrimElements, ctx)?,
