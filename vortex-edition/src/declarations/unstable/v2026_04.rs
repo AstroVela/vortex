@@ -3,9 +3,9 @@
 
 //! The April 2026 `unstable` encoding cohort.
 
-use vortex_edition::Edition;
-use vortex_edition::EditionDeclaration;
-use vortex_edition::EditionId;
+use crate::Edition;
+use crate::EditionDeclaration;
+use crate::EditionId;
 
 /// The April 2026 draft edition of the `unstable` family.
 pub const UNSTABLE_2026_04_0: EditionId = EditionId::new("unstable", 2026, 4, 0);

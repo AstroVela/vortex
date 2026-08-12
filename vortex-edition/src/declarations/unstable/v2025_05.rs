@@ -3,9 +3,9 @@
 
 //! The May 2025 `unstable` encoding cohort.
 
-use vortex_edition::Edition;
-use vortex_edition::EditionDeclaration;
-use vortex_edition::EditionId;
+use crate::Edition;
+use crate::EditionDeclaration;
+use crate::EditionId;
 
 /// The May 2025 draft edition of the `unstable` family.
 pub const UNSTABLE_2025_05_0: EditionId = EditionId::new("unstable", 2025, 5, 0);
