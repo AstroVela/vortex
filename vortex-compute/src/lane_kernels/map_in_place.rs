@@ -4,7 +4,11 @@
 //! In-place lane kernels: read from an [`IndexedSink`] and write back through
 //! the same sink (no separate output buffer).
 //!
+//! As in [`map_into`], the closures are `Fn`, not `FnMut`: mutable captured state
+//! is a loop-carried dependence that keeps the loop scalar.
+//!
 //! [`IndexedSink`]: crate::lane_kernels::sink::IndexedSink
+//! [`map_into`]: crate::lane_kernels::map_into
 
 use vortex_buffer::BitBuffer;
 
@@ -33,15 +37,15 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
     ///
     /// [`IndexedSourceExt::map_into`]: crate::lane_kernels::map_into::IndexedSourceExt::map_into
     #[inline]
-    fn map_into_in_place<F>(self, mut f: F)
+    fn map_into_in_place<F>(self, f: F)
     where
-        F: FnMut(Self::Item) -> Self::Write,
+        F: Fn(Self::Item) -> Self::Write,
     {
         #[inline(always)]
-        fn chunk<S, F>(values: &mut S, f: &mut F, base: usize, count: usize)
+        fn chunk<S, F>(values: &mut S, f: &F, base: usize, count: usize)
         where
             S: IndexedSink,
-            F: FnMut(S::Item) -> S::Write,
+            F: Fn(S::Item) -> S::Write,
         {
             for bit_idx in 0..count {
                 let idx = base + bit_idx;
@@ -59,10 +63,10 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
         let remainder = len % CHUNK_LEN;
 
         for chunk_idx in 0..chunks_count {
-            chunk(&mut values, &mut f, chunk_idx * CHUNK_LEN, CHUNK_LEN);
+            chunk(&mut values, &f, chunk_idx * CHUNK_LEN, CHUNK_LEN);
         }
         if remainder != 0 {
-            chunk(&mut values, &mut f, chunks_count * CHUNK_LEN, remainder);
+            chunk(&mut values, &f, chunks_count * CHUNK_LEN, remainder);
         }
     }
 
@@ -83,17 +87,17 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
     /// [`try_map_masked_in_place`]: IndexedSinkExt::try_map_masked_in_place
     /// [`IndexedSourceExt::try_map_into`]: crate::lane_kernels::map_into::IndexedSourceExt::try_map_into
     #[inline]
-    fn try_map_in_place<F>(self, mut f: F) -> Result<(), usize>
+    fn try_map_in_place<F>(self, f: F) -> Result<(), usize>
     where
         Self::Write: Default,
-        F: FnMut(Self::Item) -> Option<Self::Write>,
+        F: Fn(Self::Item) -> Option<Self::Write>,
     {
         #[inline(always)]
-        fn chunk<S, F>(values: &mut S, base: usize, count: usize, f: &mut F) -> Option<usize>
+        fn chunk<S, F>(values: &mut S, base: usize, count: usize, f: &F) -> Option<usize>
         where
             S: IndexedSink,
             S::Write: Default,
-            F: FnMut(S::Item) -> Option<S::Write>,
+            F: Fn(S::Item) -> Option<S::Write>,
         {
             let mut fail_bits: u64 = 0;
             for bit_idx in 0..count {
@@ -115,12 +119,12 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
         let remainder = len % 64;
 
         for chunk_idx in 0..chunks_count {
-            if let Some(failing) = chunk(&mut values, chunk_idx * 64, 64, &mut f) {
+            if let Some(failing) = chunk(&mut values, chunk_idx * 64, 64, &f) {
                 return Err(failing);
             }
         }
         if remainder != 0
-            && let Some(failing) = chunk(&mut values, chunks_count * 64, remainder, &mut f)
+            && let Some(failing) = chunk(&mut values, chunks_count * 64, remainder, &f)
         {
             return Err(failing);
         }
@@ -154,10 +158,10 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
     ///
     /// Panics if `self.len() != mask.len()`.
     #[inline]
-    fn try_map_masked_in_place<F>(self, mask: &BitBuffer, mut f: F) -> Result<(), usize>
+    fn try_map_masked_in_place<F>(self, mask: &BitBuffer, f: F) -> Result<(), usize>
     where
         Self::Write: Default,
-        F: FnMut(Self::Item) -> Option<Self::Write>,
+        F: Fn(Self::Item) -> Option<Self::Write>,
     {
         /// Bit-pack `is_none()` flags per lane, then AND with `src_chunk` post-loop to
         /// drop null-lane failures. The per-lane attribution work is `OR + shift`
@@ -168,12 +172,12 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
             src_chunk: u64,
             base: usize,
             count: usize,
-            f: &mut F,
+            f: &F,
         ) -> Option<usize>
         where
             S: IndexedSink,
             S::Write: Default,
-            F: FnMut(S::Item) -> Option<S::Write>,
+            F: Fn(S::Item) -> Option<S::Write>,
         {
             let mut fail_bits: u64 = 0;
             for bit_idx in 0..count {
@@ -198,7 +202,7 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
         let remainder = len % 64;
 
         for (chunk_idx, src_chunk) in chunks.iter().enumerate() {
-            if let Some(failing) = chunk(&mut values, src_chunk, chunk_idx * 64, 64, &mut f) {
+            if let Some(failing) = chunk(&mut values, src_chunk, chunk_idx * 64, 64, &f) {
                 return Err(failing);
             }
         }
@@ -208,7 +212,7 @@ pub trait IndexedSinkExt: IndexedSink + Sized {
                 chunks.remainder_bits(),
                 chunks_count * 64,
                 remainder,
-                &mut f,
+                &f,
             )
         {
             return Err(failing);

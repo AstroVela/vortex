@@ -245,10 +245,13 @@ impl<T> Buffer<T> {
     }
 
     /// Map each element of the buffer with a closure.
-    pub fn map_each_in_place<R, F>(self, mut f: F) -> BufferMut<R>
+    ///
+    /// `F` is `Fn`, not `FnMut`: the closure runs once per element, so captured mutable state
+    /// would be a loop-carried dependence and keep the loop scalar.
+    pub fn map_each_in_place<R, F>(self, f: F) -> BufferMut<R>
     where
         T: Copy,
-        F: FnMut(T) -> R,
+        F: Fn(T) -> R,
     {
         match self.try_into_mut() {
             Ok(mut_buf) => mut_buf.map_each_in_place(f),

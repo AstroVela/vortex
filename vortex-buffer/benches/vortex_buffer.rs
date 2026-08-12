@@ -48,7 +48,7 @@ trait MapEach<T, R> {
 
     fn map_each<F>(self, f: F) -> Self::Output
     where
-        F: FnMut(T) -> R;
+        F: Fn(T) -> R;
 }
 
 impl<T: ArrowNativeType, R: ArrowNativeType> MapEach<T, R> for Arrow<ScalarBuffer<T>> {
@@ -56,7 +56,7 @@ impl<T: ArrowNativeType, R: ArrowNativeType> MapEach<T, R> for Arrow<ScalarBuffe
 
     fn map_each<F>(self, f: F) -> Self::Output
     where
-        F: FnMut(T) -> R,
+        F: Fn(T) -> R,
     {
         Arrow(ScalarBuffer::from(
             self.0
@@ -76,7 +76,7 @@ impl<T: Copy, R> MapEach<T, R> for Buffer<T> {
 
     fn map_each<F>(self, f: F) -> Self::Output
     where
-        F: FnMut(T) -> R,
+        F: Fn(T) -> R,
     {
         Buffer::<T>::map_each_in_place(self, f)
     }
@@ -87,7 +87,7 @@ impl<T: Copy, R> MapEach<T, R> for BufferMut<T> {
 
     fn map_each<F>(self, f: F) -> Self::Output
     where
-        F: FnMut(T) -> R,
+        F: Fn(T) -> R,
     {
         BufferMut::<T>::map_each_in_place(self, f)
     }

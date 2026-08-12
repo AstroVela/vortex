@@ -209,15 +209,14 @@ impl<T: PhysicalPType, S: UnpackStrategy<T>> UnpackedChunks<T, S> {
     }
 
     /// Decode all chunks (initial, full, and trailer), mapping each unpacked value through f.
-    pub(crate) fn decode_map_into<U>(
-        &mut self,
-        output: &mut [MaybeUninit<U>],
-        mut f: impl FnMut(T) -> U,
-    ) {
+    ///
+    /// `f` is `Fn`, not `FnMut`: it runs once per element in the innermost loop, where captured
+    /// mutable state would be a loop-carried dependence and keep [`write_map`] scalar.
+    pub(crate) fn decode_map_into<U>(&mut self, output: &mut [MaybeUninit<U>], f: impl Fn(T) -> U) {
         debug_assert_eq!(output.len(), self.len);
 
         self.for_each_unpacked_chunk(|chunk, range| {
-            write_map(chunk, &mut output[range], &mut f);
+            write_map(chunk, &mut output[range], &f);
         });
     }
 
@@ -412,7 +411,7 @@ fn buffer_as_slice<T>(buffer: &ByteBuffer) -> &[T] {
     unsafe { std::slice::from_raw_parts(packed_ptr, packed_len) }
 }
 
-fn write_map<T: Copy, U>(src: &[T], dst: &mut [MaybeUninit<U>], f: &mut impl FnMut(T) -> U) {
+fn write_map<T: Copy, U>(src: &[T], dst: &mut [MaybeUninit<U>], f: &impl Fn(T) -> U) {
     for (dst, &src) in dst.iter_mut().zip(src.iter()) {
         dst.write(f(src));
     }
