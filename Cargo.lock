@@ -10240,6 +10240,7 @@ dependencies = [
  "glob",
  "itertools 0.14.0",
  "kanal",
+ "libc",
  "object_store",
  "oneshot",
  "parking_lot",

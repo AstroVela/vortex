@@ -25,6 +25,8 @@ use vortex_error::VortexResult;
 use crate::CoalesceConfig;
 use crate::VortexReadAt;
 use crate::runtime::Handle;
+use crate::std_file::nowait::max_nowait_bytes;
+use crate::std_file::nowait::read_at_nowait;
 
 /// Read exactly `buffer.len()` bytes from `file` starting at `offset`.
 /// This is a platform-specific helper that uses the most efficient method available.
@@ -124,6 +126,39 @@ impl VortexReadAt for FileReadAt {
         let file = Arc::clone(&self.file);
         let handle = self.handle.clone();
         let allocator = Arc::clone(&self.allocator);
+
+        // Fast path: try to serve the read straight from the page cache on the calling thread.
+        // `read_at_nowait` never blocks, so the only cost of a miss is one extra syscall, while a
+        // hit avoids a task spawn, a thread hand-off, and the wake-up that comes back with it.
+        // Larger reads skip this entirely so that their copy still fans out across the blocking
+        // pool; see `max_nowait_bytes`.
+        if length <= max_nowait_bytes() {
+            let mut buffer = match allocator.allocate(length, alignment) {
+                Ok(buffer) => buffer,
+                Err(e) => return futures::future::ready(Err(e.into())).boxed(),
+            };
+            let filled = read_at_nowait(&file, buffer.as_mut_slice(), offset);
+            if filled == length {
+                return futures::future::ready(Ok(BufferHandle::new_host(buffer.freeze()))).boxed();
+            }
+
+            // Miss (or partial hit): finish the read on a blocking thread, keeping whatever the
+            // fast path already filled.
+            return async move {
+                handle
+                    .spawn_blocking(move || {
+                        read_exact_at(
+                            &file,
+                            &mut buffer.as_mut_slice()[filled..],
+                            offset + filled as u64,
+                        )?;
+                        Ok(BufferHandle::new_host(buffer.freeze()))
+                    })
+                    .await
+            }
+            .boxed();
+        }
+
         async move {
             handle
                 .spawn_blocking(move || {

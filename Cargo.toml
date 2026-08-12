@@ -182,6 +182,7 @@ jni = { version = "0.22.0" }
 kanal = "0.1.1"
 lasso = { version = "0.7", features = ["multi-threaded", "inline-more"] }
 lending-iterator = "0.1.7"
+libc = "0.2.189"
 libfuzzer-sys = "0.4"
 libloading = "0.8"
 liblzma = "0.4"
