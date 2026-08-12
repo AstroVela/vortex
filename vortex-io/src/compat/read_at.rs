@@ -10,6 +10,7 @@ use vortex_buffer::Alignment;
 use vortex_error::VortexResult;
 
 use crate::CoalesceConfig;
+use crate::ReadAtRequest;
 use crate::VortexReadAt;
 use crate::compat::Compat;
 
@@ -39,5 +40,12 @@ impl<R: VortexReadAt> VortexReadAt for Compat<R> {
         alignment: Alignment,
     ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
         Compat::new(self.inner().read_at(offset, length, alignment)).boxed()
+    }
+
+    fn read_ranges(
+        &self,
+        requests: Arc<[ReadAtRequest]>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        Compat::new(self.inner().read_ranges(requests)).boxed()
     }
 }

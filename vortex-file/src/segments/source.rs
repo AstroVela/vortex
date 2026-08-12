@@ -20,10 +20,11 @@ use parking_lot::Mutex;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
+use vortex_io::ReadAtRequest;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
 use vortex_io::runtime::JoinOutcome;
@@ -140,29 +141,52 @@ impl FileSegmentSource {
 
         let drive_fut = async move {
             stream
-                .map(move |req| {
+                .ready_chunks(concurrency)
+                .for_each(move |reqs| {
                     let reader = reader.clone();
                     async move {
-                        let result = reader
-                            .read_at(req.offset(), req.len(), req.alignment())
-                            .await;
-                        let result = result.and_then(|buffer| {
-                            if req.len() != buffer.len() {
-                                vortex_bail!(
-                                    "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
-                                    req.len(),
-                                    buffer.len(),
-                                    req
-                                )
+                        let requests = reqs
+                            .iter()
+                            .map(|req| {
+                                ReadAtRequest::new(req.offset(), req.len(), req.alignment())
+                            })
+                            .collect::<Vec<_>>()
+                            .into();
+                        match reader.read_ranges(requests).await {
+                            Ok(buffers) if buffers.len() == reqs.len() => {
+                                for (req, buffer) in reqs.into_iter().zip(buffers) {
+                                    let result = if req.len() == buffer.len() {
+                                        Ok(buffer)
+                                    } else {
+                                        Err(vortex_err!(
+                                            "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
+                                            req.len(),
+                                            buffer.len(),
+                                            req
+                                        ))
+                                    };
+                                    req.resolve(result);
+                                }
                             }
-                            Ok(buffer)
-                        });
-
-                        req.resolve(result);
+                            Ok(buffers) => {
+                                let error = Arc::new(vortex_err!(
+                                    "FileSegmentSource: expected {} buffers but received {}",
+                                    reqs.len(),
+                                    buffers.len()
+                                ));
+                                for req in reqs {
+                                    req.resolve(Err(VortexError::from(Arc::clone(&error))));
+                                }
+                            }
+                            Err(error) => {
+                                let error = Arc::new(error);
+                                for req in reqs {
+                                    req.resolve(Err(VortexError::from(Arc::clone(&error))));
+                                }
+                            }
+                        }
                     }
                 })
-                .buffer_unordered(concurrency)
-                .collect::<()>()
                 .await
         };
 
@@ -383,6 +407,7 @@ mod tests {
     use std::panic::AssertUnwindSafe;
 
     use futures::future::BoxFuture;
+    use vortex_error::vortex_bail;
     use vortex_io::runtime::tokio::TokioRuntime;
     use vortex_layout::segments::SegmentSource;
     use vortex_metrics::DefaultMetricsRegistry;
@@ -508,6 +533,77 @@ mod tests {
             original_panics, 1,
             "exactly one reader should re-raise the original driver panic"
         );
+    }
+
+    #[derive(Clone)]
+    struct ReadRangesOnly {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl VortexReadAt for ReadRangesOnly {
+        fn concurrency(&self) -> usize {
+            4
+        }
+
+        fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+            async { Ok(16) }.boxed()
+        }
+
+        fn read_at(
+            &self,
+            _offset: u64,
+            _length: usize,
+            _alignment: Alignment,
+        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+            async { panic!("read_at should not be called") }.boxed()
+        }
+
+        fn read_ranges(
+            &self,
+            requests: Arc<[ReadAtRequest]>,
+        ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                Ok(requests
+                    .iter()
+                    .map(|request| {
+                        BufferHandle::new_host(
+                            ByteBuffer::from(vec![0; request.length]).aligned(request.alignment),
+                        )
+                    })
+                    .collect())
+            }
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn read_driver_batches_ready_requests() -> VortexResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let segments: Arc<[SegmentSpec]> = (0..4)
+            .map(|i| SegmentSpec {
+                offset: i * 4,
+                length: 4,
+                alignment: Alignment::none(),
+            })
+            .collect();
+        let metrics = DefaultMetricsRegistry::default();
+        let source = FileSegmentSource::open(
+            segments,
+            ReadRangesOnly {
+                calls: Arc::clone(&calls),
+            },
+            TokioRuntime::current(),
+            RequestMetrics::new(&metrics, vec![]),
+        );
+
+        let results = future::join_all((0..4).map(|i| source.request(SegmentId::from(i)))).await;
+
+        for result in results {
+            assert_eq!(result?.len(), 4);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
     }
 
     #[derive(Clone)]

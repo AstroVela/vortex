@@ -4,7 +4,10 @@
 use std::sync::Arc;
 
 use futures::FutureExt;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use futures::future::BoxFuture;
+use futures::stream;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
@@ -25,6 +28,28 @@ pub struct CoalesceConfig {
     pub distance: u64,
     /// The maximum total size spanned by a coalesced request.
     pub max_size: u64,
+}
+
+/// A positional read request used by [`VortexReadAt::read_ranges`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadAtRequest {
+    /// The byte offset at which to start reading.
+    pub offset: u64,
+    /// The exact number of bytes to read.
+    pub length: usize,
+    /// The required alignment of the returned buffer.
+    pub alignment: Alignment,
+}
+
+impl ReadAtRequest {
+    /// Creates a positional read request.
+    pub const fn new(offset: u64, length: usize, alignment: Alignment) -> Self {
+        Self {
+            offset,
+            length,
+            alignment,
+        }
+    }
 }
 
 impl CoalesceConfig {
@@ -89,6 +114,26 @@ pub trait VortexReadAt: Send + Sync + 'static {
         length: usize,
         alignment: Alignment,
     ) -> BoxFuture<'static, VortexResult<BufferHandle>>;
+
+    /// Request multiple asynchronous positional reads.
+    ///
+    /// Results are returned in request order. The default implementation executes
+    /// [`VortexReadAt::read_at`] calls concurrently, bounded by [`VortexReadAt::concurrency`].
+    /// If any request fails, the entire operation fails. Implementations can override this to use
+    /// a native multi-range operation.
+    fn read_ranges(
+        &self,
+        requests: Arc<[ReadAtRequest]>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        let reads = requests
+            .iter()
+            .map(|request| self.read_at(request.offset, request.length, request.alignment))
+            .collect::<Vec<_>>();
+        stream::iter(reads)
+            .buffered(self.concurrency().max(1))
+            .try_collect()
+            .boxed()
+    }
 }
 
 impl VortexReadAt for Arc<dyn VortexReadAt> {
@@ -116,6 +161,13 @@ impl VortexReadAt for Arc<dyn VortexReadAt> {
     ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
         self.as_ref().read_at(offset, length, alignment)
     }
+
+    fn read_ranges(
+        &self,
+        requests: Arc<[ReadAtRequest]>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        self.as_ref().read_ranges(requests)
+    }
 }
 
 impl<R: VortexReadAt> VortexReadAt for Arc<R> {
@@ -142,6 +194,13 @@ impl<R: VortexReadAt> VortexReadAt for Arc<R> {
         alignment: Alignment,
     ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
         self.as_ref().read_at(offset, length, alignment)
+    }
+
+    fn read_ranges(
+        &self,
+        requests: Arc<[ReadAtRequest]>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        self.as_ref().read_ranges(requests)
     }
 }
 
@@ -316,6 +375,26 @@ impl<T: VortexReadAt + Clone> VortexReadAt for InstrumentedReadAt<T> {
         }
         .boxed()
     }
+
+    fn read_ranges(
+        &self,
+        requests: Arc<[ReadAtRequest]>,
+    ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        let durations = self.metrics.durations.clone();
+        let sizes = self.metrics.sizes.clone();
+        let total_size = self.metrics.total_size.clone();
+        let read_fut = self.read.read_ranges(Arc::clone(&requests));
+        async move {
+            let _timer = durations.time();
+            let buffers = read_fut.await;
+            for request in requests.iter() {
+                sizes.update(request.length as f64);
+                total_size.add(request.length as u64);
+            }
+            buffers
+        }
+        .boxed()
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +433,23 @@ mod tests {
 
         let result = data.read_at(1, 3, Alignment::none()).await.unwrap();
         assert_eq!(result.to_host().await.as_ref(), &[2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_byte_buffer_read_ranges() -> VortexResult<()> {
+        let data = ByteBuffer::from(vec![1, 2, 3, 4, 5, 6]);
+        let requests = Arc::from([
+            ReadAtRequest::new(4, 2, Alignment::none()),
+            ReadAtRequest::new(0, 1, Alignment::none()),
+            ReadAtRequest::new(2, 3, Alignment::none()),
+        ]);
+
+        let results = data.read_ranges(requests).await?;
+        let expected: [&[u8]; 3] = [&[5, 6], &[1], &[3, 4, 5]];
+        for (result, expected) in results.into_iter().zip(expected) {
+            assert_eq!(result.to_host().await.as_ref(), expected);
+        }
+        Ok(())
     }
 
     #[tokio::test]
