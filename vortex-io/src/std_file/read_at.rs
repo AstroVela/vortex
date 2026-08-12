@@ -67,6 +67,45 @@ pub fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<
     }
 }
 
+/// Largest read serviced inline on the calling thread when the page cache can satisfy it.
+///
+/// The inline path trades the blocking pool's parallelism for the latency of a thread handoff, so
+/// it only pays while the copy is cheaper than the handoff it avoids, which is tens of
+/// microseconds. Above this size the copy dominates and is better spread across the pool, where it
+/// also stops a large memcpy from monopolising a runtime worker.
+const INLINE_READ_LIMIT: usize = 256 * 1024;
+
+/// Read as much of `buffer` as the kernel can supply without blocking, returning the byte count.
+///
+/// `RWF_NOWAIT` fails with `EAGAIN` rather than waiting whenever the data is not already in the
+/// page cache, which makes it safe to call on a runtime thread: it either completes at memory
+/// speed or does nothing. Anything it declines to do is left to the caller's blocking path, which
+/// is also where a genuine I/O error will be reported.
+#[cfg(target_os = "linux")]
+fn read_cached_at(file: &File, buffer: &mut [u8], offset: u64) -> usize {
+    use std::io::IoSliceMut;
+
+    use rustix::io::ReadWriteFlags;
+
+    let mut done = 0usize;
+    while done < buffer.len() {
+        let mut iov = [IoSliceMut::new(&mut buffer[done..])];
+        match rustix::io::preadv2(file, &mut iov, offset + done as u64, ReadWriteFlags::NOWAIT) {
+            // Zero means end of file. Leave it to the blocking path to raise the error, so that
+            // short-file handling lives in exactly one place.
+            Ok(0) => break,
+            Ok(read) => done += read,
+            Err(_) => break,
+        }
+    }
+    done
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cached_at(_file: &File, _buffer: &mut [u8], _offset: u64) -> usize {
+    0
+}
+
 /// Default number of concurrent requests to allow for local file I/O.
 pub const DEFAULT_CONCURRENCY: usize = 32;
 
@@ -298,10 +337,28 @@ impl VortexReadAt for FileReadAt {
                 let handle = self.handle.clone();
                 let allocator = Arc::clone(&self.allocator);
                 async move {
+                    let mut buffer = allocator.allocate(length, alignment)?;
+
+                    // A small read the kernel can already satisfy from the page cache takes about
+                    // a microsecond, while handing it to the blocking pool costs tens of them in
+                    // scheduling alone. Try to service those inline and only pay for a thread when
+                    // the data is not resident.
+                    let done = if length <= INLINE_READ_LIMIT {
+                        read_cached_at(&file, buffer.as_mut_slice(), offset)
+                    } else {
+                        0
+                    };
+                    if done == length {
+                        return Ok(BufferHandle::new_host(buffer.freeze()));
+                    }
+
                     handle
                         .spawn_blocking(move || {
-                            let mut buffer = allocator.allocate(length, alignment)?;
-                            read_exact_at(&file, buffer.as_mut_slice(), offset)?;
+                            read_exact_at(
+                                &file,
+                                &mut buffer.as_mut_slice()[done..],
+                                offset + done as u64,
+                            )?;
                             Ok(BufferHandle::new_host(buffer.freeze()))
                         })
                         .await
@@ -462,6 +519,68 @@ mod tests {
                 start + length
             );
         }
+        Ok(())
+    }
+
+    /// The inline page-cache path must return exactly the same bytes as the blocking path, for
+    /// reads that straddle its size limit as well as reads under it.
+    #[tokio::test]
+    async fn inline_cached_reads_match() -> VortexResult<()> {
+        let (path, data) = write_temp(INLINE_READ_LIMIT * 2 + 4096)?;
+        let reader = FileReadAt::open_with_options(
+            &path,
+            TokioRuntime::current(),
+            Arc::new(DefaultHostAllocator),
+            FileReadAtOptions::default().with_io_mode(FileIoMode::Buffered),
+        )?;
+
+        // Warm the cache so the inline path is the one actually taken for the small reads.
+        drop(reader.read_at(0, data.len(), Alignment::none()).await?);
+
+        for (offset, length) in [
+            (0u64, 1usize),
+            (7, INLINE_READ_LIMIT - 7),
+            (0, INLINE_READ_LIMIT),
+            (1, INLINE_READ_LIMIT + 1),
+            (4096, INLINE_READ_LIMIT * 2),
+            ((data.len() - 10) as u64, 10),
+        ] {
+            let start = usize::try_from(offset)?;
+            let buffer = reader
+                .read_at(offset, length, Alignment::new(256))
+                .await?
+                .into_host()
+                .await;
+            assert_eq!(
+                buffer.as_slice(),
+                &data[start..start + length],
+                "mismatch at {start}..{}",
+                start + length
+            );
+        }
+        Ok(())
+    }
+
+    /// A read past the end of the file must still fail, even though the inline path deliberately
+    /// stays silent about end-of-file and leaves that to the blocking path.
+    #[tokio::test]
+    async fn reads_past_end_of_file_fail() -> VortexResult<()> {
+        let (path, data) = write_temp(8192)?;
+        let reader = FileReadAt::open_with_options(
+            &path,
+            TokioRuntime::current(),
+            Arc::new(DefaultHostAllocator),
+            FileReadAtOptions::default().with_io_mode(FileIoMode::Buffered),
+        )?;
+        drop(reader.read_at(0, data.len(), Alignment::none()).await?);
+
+        assert!(
+            reader
+                .read_at(0, data.len() + 1, Alignment::none())
+                .await
+                .is_err(),
+            "reading past the end of the file must be an error"
+        );
         Ok(())
     }
 
