@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
-use vortex_error::VortexError;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
@@ -135,13 +135,13 @@ impl FileSegmentSource {
             StreamExt::boxed(recv),
             coalesce_config,
             max_alignment,
+            concurrency,
             metrics,
         )
         .boxed();
 
         let drive_fut = async move {
             stream
-                .ready_chunks(concurrency)
                 .for_each(move |reqs| {
                     let reader = reader.clone();
                     async move {
@@ -152,38 +152,41 @@ impl FileSegmentSource {
                             })
                             .collect::<Vec<_>>()
                             .into();
-                        match reader.read_ranges(requests).await {
-                            Ok(buffers) if buffers.len() == reqs.len() => {
-                                for (req, buffer) in reqs.into_iter().zip(buffers) {
-                                    let result = if req.len() == buffer.len() {
-                                        Ok(buffer)
-                                    } else {
-                                        Err(vortex_err!(
-                                            "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
-                                            req.len(),
-                                            buffer.len(),
-                                            req
-                                        ))
-                                    };
-                                    req.resolve(result);
+                        let mut remaining = reqs.into_iter().map(Some).collect::<Vec<_>>();
+                        let mut results = reader.read_ranges(requests);
+                        while let Some((request, result)) = results.next().await {
+                            let Some(position) = remaining.iter().position(|req| {
+                                req.as_ref().is_some_and(|req| {
+                                    req.offset() == request.offset
+                                        && req.len() == request.length
+                                        && req.alignment() == request.alignment
+                                })
+                            }) else {
+                                tracing::warn!(?request, "reader returned an unknown range");
+                                continue;
+                            };
+                            let req = remaining[position]
+                                .take()
+                                .vortex_expect("matched request is present");
+                            let result = result.and_then(|buffer| {
+                                if req.len() != buffer.len() {
+                                    return Err(vortex_err!(
+                                        "FileSegmentSource: expected buffer of length {} but received {}. {:?}",
+                                        req.len(),
+                                        buffer.len(),
+                                        req
+                                    ));
                                 }
-                            }
-                            Ok(buffers) => {
-                                let error = Arc::new(vortex_err!(
-                                    "FileSegmentSource: expected {} buffers but received {}",
-                                    reqs.len(),
-                                    buffers.len()
-                                ));
-                                for req in reqs {
-                                    req.resolve(Err(VortexError::from(Arc::clone(&error))));
-                                }
-                            }
-                            Err(error) => {
-                                let error = Arc::new(error);
-                                for req in reqs {
-                                    req.resolve(Err(VortexError::from(Arc::clone(&error))));
-                                }
-                            }
+                                Ok(buffer)
+                            });
+                            req.resolve(result);
+                        }
+                        for req in remaining.into_iter().flatten() {
+                            let error = vortex_err!(
+                                "FileSegmentSource: read_ranges ended before resolving request. {:?}",
+                                req
+                            );
+                            req.resolve(Err(error));
                         }
                     }
                 })
@@ -558,22 +561,19 @@ mod tests {
             async { panic!("read_at should not be called") }.boxed()
         }
 
-        fn read_ranges(
-            &self,
-            requests: Arc<[ReadAtRequest]>,
-        ) -> BoxFuture<'static, VortexResult<Vec<BufferHandle>>> {
+        fn read_ranges(&self, requests: Arc<[ReadAtRequest]>) -> vortex_io::ReadAtStream {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            async move {
-                Ok(requests
-                    .iter()
-                    .map(|request| {
-                        BufferHandle::new_host(
-                            ByteBuffer::from(vec![0; request.length]).aligned(request.alignment),
-                        )
-                    })
-                    .collect())
-            }
-            .boxed()
+            let results = requests
+                .iter()
+                .copied()
+                .map(|request| {
+                    let buffer = BufferHandle::new_host(
+                        ByteBuffer::from(vec![0; request.length]).aligned(request.alignment),
+                    );
+                    (request, Ok(buffer))
+                })
+                .collect::<Vec<_>>();
+            futures::stream::iter(results).boxed()
         }
     }
 
