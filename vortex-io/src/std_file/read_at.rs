@@ -135,7 +135,7 @@ impl VortexReadAt for FileReadAt {
         if length <= max_nowait_bytes() {
             let mut buffer = match allocator.allocate(length, alignment) {
                 Ok(buffer) => buffer,
-                Err(e) => return futures::future::ready(Err(e.into())).boxed(),
+                Err(e) => return futures::future::ready(Err(e)).boxed(),
             };
             let filled = read_at_nowait(&file, buffer.as_mut_slice(), offset);
             if filled == length {

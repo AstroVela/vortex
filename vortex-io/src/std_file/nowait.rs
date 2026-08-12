@@ -103,13 +103,14 @@ fn preadv2_nowait(file: &File, buffer: &mut [u8], offset: u64) -> Option<usize> 
         iov_base: buffer.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: buffer.len(),
     };
+    let iov_ptr = std::ptr::addr_of!(iov);
     // SAFETY: `iov` describes exactly the `buffer` slice, which is valid and writable for the
     // duration of the call, and `file` owns a valid file descriptor. `preadv2` does not modify
     // the file offset, so concurrent readers of the same `File` are unaffected.
     let read = unsafe {
         libc::preadv2(
             file.as_raw_fd(),
-            &iov,
+            iov_ptr,
             1,
             offset as libc::off_t,
             libc::RWF_NOWAIT,
@@ -138,7 +139,7 @@ mod tests {
     #[test]
     fn reads_cached_data() -> std::io::Result<()> {
         let mut tmp = tempfile::NamedTempFile::new()?;
-        let data = (0..4096u32).map(|i| i as u8).collect::<Vec<_>>();
+        let data = (0..4096usize).map(|i| i.to_le_bytes()[0]).collect::<Vec<_>>();
         tmp.write_all(&data)?;
         tmp.flush()?;
 

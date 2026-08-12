@@ -15,6 +15,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use futures::stream;
 use vortex_buffer::Alignment;
+use vortex_error::VortexExpect;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
 use vortex_io::std_file::FileReadAt;
@@ -40,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tmp.flush()?;
 
-    let handle = Handle::find().expect("tokio handle");
+    let handle = Handle::find().vortex_expect("example must run on a tokio runtime");
     let reader = FileReadAt::open(tmp.path(), handle)?;
 
     // Deterministic pseudo-random offsets, aligned to the read size.
@@ -84,7 +85,7 @@ async fn run(
         .map(|offset| reader.read_at(offset, read_size, Alignment::none()))
         .buffer_unordered(concurrency)
         .for_each(|r| async move {
-            r.expect("read failed");
+            r.vortex_expect("read failed");
         })
         .await;
     Ok(())
