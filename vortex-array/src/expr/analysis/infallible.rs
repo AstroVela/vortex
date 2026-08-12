@@ -97,17 +97,17 @@ mod lambda_tests {
     use crate::expr::lit;
     use crate::expr::var;
 
-    /// A lambda contributes no fallibility of its own, but its body is one of its children, so the
-    /// label at the lambda node is the body's.
+    /// A lambda is a scope boundary, so generic analysis does not inspect its body.
     #[test]
-    fn a_lambdas_label_is_its_bodys_infallibility() {
-        let fallible = Expression::from(lambda(["x"], checked_add(var("x"), lit(1i32))));
-        assert_eq!(label_infallible(&fallible).get(&fallible), Some(&false));
+    fn a_lambdas_label_does_not_include_its_body() -> vortex_error::VortexResult<()> {
+        let fallible = lambda(["x"], checked_add(var("x"), lit(1i32)))?;
+        assert_eq!(label_infallible(&fallible).get(&fallible), Some(&true));
 
-        let infallible = Expression::from(lambda(["x"], var("x")));
+        let infallible = lambda(["x"], var("x"))?;
         assert_eq!(
             label_infallible(&infallible).get(&infallible),
             Some(&true)
         );
+        Ok(())
     }
 }
