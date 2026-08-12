@@ -136,7 +136,7 @@ impl FileSegmentSource {
             coalesce_config,
             max_alignment,
             concurrency,
-            metrics,
+            metrics.clone(),
         )
         .boxed();
 
@@ -144,7 +144,18 @@ impl FileSegmentSource {
             stream
                 .for_each(move |reqs| {
                     let reader = reader.clone();
+                    let metrics = metrics.clone();
                     async move {
+                        metrics.read_ranges_calls.add(1);
+                        metrics.read_ranges_num_ranges.update(reqs.len() as f64);
+                        if reqs.len() > 1 {
+                            metrics.read_ranges_multi.add(1);
+                        }
+                        tracing::trace!(
+                            target: "vortex_file::read_ranges",
+                            num_ranges = reqs.len(),
+                            "submitting positional read batch"
+                        );
                         let requests = reqs
                             .iter()
                             .map(|req| {
@@ -336,6 +347,7 @@ impl Drop for ReadFuture {
 }
 
 /// Metrics emitted by the file segment request driver.
+#[derive(Clone)]
 pub struct RequestMetrics {
     /// Number of individual segment requests observed by the driver.
     pub individual_requests: Counter,
@@ -343,6 +355,12 @@ pub struct RequestMetrics {
     pub coalesced_requests: Counter,
     /// Distribution of how many segment requests were merged into each physical read.
     pub num_requests_coalesced: Histogram,
+    /// Number of calls made to [`VortexReadAt::read_ranges`](vortex_io::VortexReadAt::read_ranges).
+    pub read_ranges_calls: Counter,
+    /// Number of `read_ranges` calls containing more than one physical range.
+    pub read_ranges_multi: Counter,
+    /// Distribution of physical range counts submitted per `read_ranges` call.
+    pub read_ranges_num_ranges: Histogram,
 }
 
 impl RequestMetrics {
@@ -356,8 +374,17 @@ impl RequestMetrics {
                 .add_labels(labels.clone())
                 .counter("io.requests.coalesced"),
             num_requests_coalesced: MetricBuilder::new(metrics_registry)
-                .add_labels(labels)
+                .add_labels(labels.clone())
                 .histogram("io.requests.coalesced.num_coalesced"),
+            read_ranges_calls: MetricBuilder::new(metrics_registry)
+                .add_labels(labels.clone())
+                .counter("io.read_ranges.calls"),
+            read_ranges_multi: MetricBuilder::new(metrics_registry)
+                .add_labels(labels.clone())
+                .counter("io.read_ranges.multi_range_calls"),
+            read_ranges_num_ranges: MetricBuilder::new(metrics_registry)
+                .add_labels(labels)
+                .histogram("io.read_ranges.num_ranges"),
         }
     }
 }
@@ -588,13 +615,14 @@ mod tests {
             })
             .collect();
         let metrics = DefaultMetricsRegistry::default();
+        let request_metrics = RequestMetrics::new(&metrics, vec![]);
         let source = FileSegmentSource::open(
             segments,
             ReadRangesOnly {
                 calls: Arc::clone(&calls),
             },
             TokioRuntime::current(),
-            RequestMetrics::new(&metrics, vec![]),
+            request_metrics.clone(),
         );
 
         let results = future::join_all((0..4).map(|i| source.request(SegmentId::from(i)))).await;
@@ -603,6 +631,10 @@ mod tests {
             assert_eq!(result?.len(), 4);
         }
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(request_metrics.read_ranges_calls.value(), 1);
+        assert_eq!(request_metrics.read_ranges_multi.value(), 1);
+        assert_eq!(request_metrics.read_ranges_num_ranges.count(), 1);
+        assert_eq!(request_metrics.read_ranges_num_ranges.total(), 4.0);
         Ok(())
     }
 

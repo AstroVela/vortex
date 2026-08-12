@@ -337,10 +337,12 @@ impl State {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
+    use futures::channel::mpsc;
     use futures::stream;
     use vortex_array::buffer::BufferHandle;
     use vortex_buffer::Alignment;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_panic;
     use vortex_metrics::DefaultMetricsRegistry;
     use vortex_metrics::MetricValue;
     use vortex_metrics::MetricsRegistry;
@@ -455,6 +457,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 10, 20, 30, 40]
         );
+    }
+
+    #[test]
+    fn test_partial_batch_emits_without_waiting_for_more_events() {
+        let (sender, receiver) = mpsc::unbounded();
+        let (request, _recv) = create_request(1, 0, 10);
+        assert!(sender.unbounded_send(ReadEvent::Request(request)).is_ok());
+        assert!(sender.unbounded_send(ReadEvent::Polled(1)).is_ok());
+
+        let metrics_registry = DefaultMetricsRegistry::default();
+        let metrics = RequestMetrics::new(&metrics_registry, vec![]);
+        let mut batches = Box::pin(IoRequestStream::new(
+            receiver,
+            None,
+            Alignment::none(),
+            32,
+            metrics,
+        ));
+
+        // Keep `sender` alive: the input is pending, not finished, and the partial batch must still
+        // be returned by the current poll rather than waiting for 31 more requests.
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let Poll::Ready(Some(batch)) = batches.as_mut().poll_next(&mut context) else {
+            vortex_panic!("partial batch was not emitted by the current poll");
+        };
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].offset(), 0);
+        drop(sender);
     }
 
     #[tokio::test]
