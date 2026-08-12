@@ -141,7 +141,10 @@ unsafe impl GlobalAlloc for Profiler {
         }
         let start = Instant::now();
         let ptr = unsafe { System.alloc(layout) };
-        ALLOC_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ALLOC_NANOS.fetch_add(
+            start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         ptr
     }
 
@@ -152,7 +155,10 @@ unsafe impl GlobalAlloc for Profiler {
         }
         let start = Instant::now();
         unsafe { System.dealloc(ptr, layout) };
-        FREE_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        FREE_NANOS.fetch_add(
+            start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
