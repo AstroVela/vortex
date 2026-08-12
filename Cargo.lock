@@ -9522,9 +9522,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array 58.4.0",
+ "bytes",
  "codspeed-divan-compat",
  "fastlanes",
+ "futures",
  "mimalloc",
+ "parking_lot",
  "parquet 58.4.0",
  "rand 0.10.2",
  "serde_json",
