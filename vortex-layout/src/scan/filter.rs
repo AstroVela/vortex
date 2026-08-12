@@ -186,12 +186,12 @@ mod tests {
         assert_eq!(
             conjuncts
                 .iter()
-                .map(|expr| expr.dtype().cloned())
+                .map(|expr| expr.dtype().clone())
                 .collect::<Vec<_>>(),
             vec![
-                Some(DType::Bool(Nullability::Nullable)),
-                Some(DType::Bool(Nullability::Nullable)),
-                Some(DType::Bool(Nullability::NonNullable)),
+                DType::Bool(Nullability::Nullable),
+                DType::Bool(Nullability::Nullable),
+                DType::Bool(Nullability::NonNullable),
             ]
         );
         Ok(())
