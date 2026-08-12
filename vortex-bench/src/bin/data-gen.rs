@@ -46,6 +46,13 @@ struct Args {
     #[arg(long, value_delimiter = ',', value_parser = value_parser!(Format))]
     formats: Vec<Format>,
 
+    /// Convert whatever base data is already on disk instead of fetching it first.
+    ///
+    /// Useful when working against a subset of a dataset whose full download would not fit, or
+    /// when the base files were staged by some other means.
+    #[arg(long, default_value_t = false)]
+    skip_base_data: bool,
+
     #[arg(long = "opt", value_delimiter = ',', value_parser = value_parser!(Opt))]
     options: Vec<Opt>,
 }
@@ -60,7 +67,11 @@ async fn main() -> anyhow::Result<()> {
     let benchmark = create_benchmark(args.benchmark, &opts)?;
 
     // Generate base Parquet data - this is the source for all other formats
-    benchmark.generate_base_data().await?;
+    if args.skip_base_data {
+        info!("skipping base data generation, converting what is already on disk");
+    } else {
+        benchmark.generate_base_data().await?;
+    }
 
     // Convert to other formats as needed (only for local file URLs)
     if benchmark.data_url().scheme() == "file" {

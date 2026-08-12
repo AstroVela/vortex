@@ -28,6 +28,7 @@ use vortex_array::stream::ArrayStream;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::stream::SendableArrayStream;
+use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_edition::EditionSessionExt;
 use vortex_error::VortexError;
@@ -76,6 +77,7 @@ pub struct VortexWriteOptions {
     max_variable_length_statistics_size: usize,
     file_statistics: Vec<Stat>,
     metadata: HashMap<String, ByteBuffer>,
+    block_alignment: Option<Alignment>,
 }
 
 /// Extension trait for constructing [`VortexWriteOptions`] from a session.
@@ -101,7 +103,28 @@ impl VortexWriteOptions {
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
             metadata: HashMap::default(),
+            block_alignment: None,
         }
+    }
+
+    /// Align every segment to a storage block boundary.
+    ///
+    /// Segments are ordinarily padded only as far as the alignment their own buffers require,
+    /// which is 256 bytes for most encodings. Raising that to the filesystem block size lets a
+    /// direct-I/O reader transfer a segment without widening the request across a block that
+    /// belongs to a neighbouring segment.
+    ///
+    /// This trades file size for read efficiency: each segment gains up to `alignment - 1` bytes
+    /// of zero padding, so the cost is roughly `alignment / 2` per segment, or about 1% of a file
+    /// whose segments average 200KiB at a 4KiB alignment. It is worth paying only when the file
+    /// will actually be read with [`FileIoMode::Direct`][vortex_io::std_file::FileIoMode::Direct]
+    /// or better; buffered reads gain nothing from it.
+    ///
+    /// The alignment is recorded per segment in the footer, so files written this way stay
+    /// readable by readers that know nothing about it.
+    pub fn with_block_alignment(mut self, alignment: Alignment) -> Self {
+        self.block_alignment = Some(alignment);
+        self
     }
 
     /// Replace the default layout strategy with the provided one.
@@ -242,7 +265,11 @@ impl VortexWriteOptions {
         // Create a channel to send buffers from the segment sink to the output stream.
         let (send, recv) = kanal::bounded_async(1);
 
-        let segments = Arc::new(BufferedSegmentSink::new(send, position));
+        let segments = Arc::new(BufferedSegmentSink::new(
+            send,
+            position,
+            self.block_alignment,
+        ));
 
         // We spawn the layout future so it is driven in the background while we write the
         // buffer stream, so we don't need to poll it until all buffers have been drained.

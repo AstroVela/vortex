@@ -80,6 +80,11 @@ pub struct SqlBenchmarkRunner {
     memory_measurements: Vec<MemoryMeasurement>,
 }
 
+/// Whether to skip validating query row counts against the full-dataset expectations.
+fn skip_row_count_check() -> bool {
+    std::env::var("VORTEX_BENCH_SKIP_ROW_COUNT_CHECK").is_ok_and(|value| value != "0")
+}
+
 impl SqlBenchmarkRunner {
     /// Create a new benchmark runner.
     pub fn new<B: Benchmark + ?Sized>(
@@ -103,7 +108,12 @@ impl SqlBenchmarkRunner {
             benchmark_dataset: benchmark.dataset(),
             benchmark_runner,
             storage,
-            expected_row_counts: benchmark.expected_row_counts().map(|s| s.to_vec()),
+            // Expected row counts describe the complete dataset. Running against a subset (for
+            // example a handful of ClickBench shards) legitimately produces different counts, so
+            // `VORTEX_BENCH_SKIP_ROW_COUNT_CHECK` opts out instead of failing the run.
+            expected_row_counts: (!skip_row_count_check())
+                .then(|| benchmark.expected_row_counts().map(|s| s.to_vec()))
+                .flatten(),
             formats,
             memory_tracker,
             hide_progress_bar,

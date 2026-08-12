@@ -2800,3 +2800,51 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     assert_eq!(result.len(), 1);
     Ok(())
 }
+
+/// Block alignment must page-align every segment while leaving the file readable, and must be
+/// visible in the footer so a direct-I/O reader can rely on it.
+#[rstest]
+#[case(4096)]
+#[case(512)]
+#[tokio::test]
+async fn test_block_aligned_segments(#[case] alignment: usize) -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let array = StructArray::from_fields(&[
+        ("a", buffer![1i64, 2, 3, 4, 5, 6, 7, 8].into_array()),
+        ("b", buffer![9i64, 10, 11, 12, 13, 14, 15, 16].into_array()),
+    ])?
+    .into_array();
+
+    let block = vortex_buffer::Alignment::new(alignment);
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_block_alignment(block)
+        .write(&mut buf, array.to_array_stream())
+        .await?;
+
+    let file = SESSION.open_options().open_buffer(ByteBuffer::from(buf))?;
+    let segments = file.footer().segment_map();
+    assert!(!segments.is_empty(), "expected at least one segment");
+    for segment in segments.iter() {
+        assert!(
+            segment.alignment >= block,
+            "segment alignment {} is below the requested block alignment {block}",
+            segment.alignment
+        );
+        assert!(
+            block.is_offset_aligned(segment.offset as usize),
+            "segment offset {} is not aligned to {block}",
+            segment.offset
+        );
+    }
+
+    let actual = file
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?
+        .execute::<StructArray>(&mut ctx)?;
+    assert_arrays_eq!(actual, array.execute::<StructArray>(&mut ctx)?, &mut ctx);
+    Ok(())
+}

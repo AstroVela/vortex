@@ -21,14 +21,22 @@ pub struct BufferedSegmentSink {
     buffers: kanal::AsyncSender<ByteBuffer>,
     byte_offset: AtomicU64,
     segment_specs: Mutex<Vec<SegmentSpec>>,
+    /// Minimum alignment applied to every segment, raising whatever the buffers themselves ask
+    /// for. See [`VortexWriteOptions::with_block_alignment`][crate::VortexWriteOptions::with_block_alignment].
+    block_alignment: Option<Alignment>,
 }
 
 impl BufferedSegmentSink {
-    pub fn new(send: kanal::AsyncSender<ByteBuffer>, byte_offset: u64) -> Self {
+    pub fn new(
+        send: kanal::AsyncSender<ByteBuffer>,
+        byte_offset: u64,
+        block_alignment: Option<Alignment>,
+    ) -> Self {
         Self {
             buffers: send,
             byte_offset: AtomicU64::new(byte_offset),
             segment_specs: Default::default(),
+            block_alignment,
         }
     }
 
@@ -64,7 +72,8 @@ impl SegmentSink for BufferedSegmentSink {
             let alignment = buffers
                 .first()
                 .map(|buffer| buffer.alignment())
-                .unwrap_or_else(Alignment::none);
+                .unwrap_or_else(Alignment::none)
+                .max(self.block_alignment.unwrap_or_else(Alignment::none));
             let length = u32::try_from(buffers.iter().map(|buffer| buffer.len()).sum::<usize>())
                 .map_err(|_| vortex_err!("segment buffer length exceeds maximum u32"))?;
 
