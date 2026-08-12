@@ -16,22 +16,15 @@ use vortex_array::IntoArray;
 use vortex_array::VTable;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ChunkedArray;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
-use vortex_array::arrays::List;
-use vortex_array::arrays::ListArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::Struct;
-use vortex_array::arrays::list::ListMetadata;
 use vortex_array::buffer::BufferHandle;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::Nullability;
 use vortex_array::expr::stats::Stat;
 use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesMetadata;
-use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::serde::SerializedArray;
 use vortex_array::serde::SerializedBuffer;
 use vortex_array::validity::Validity;
@@ -63,7 +56,6 @@ pub(super) struct PartialReadPlan {
 enum PartialReadKind {
     Fixed(Arc<[PlannedBuffer]>),
     Alprd(Box<ALPRDReadPlan>),
-    List(ListReadPlan),
 }
 
 #[derive(Clone)]
@@ -72,15 +64,6 @@ struct PlannedBuffer {
     bytes_per_row: usize,
     row_granularity: usize,
     bytes_per_granule: usize,
-}
-
-#[derive(Clone)]
-struct ListReadPlan {
-    descriptors: Arc<[SerializedBuffer]>,
-    element_buffer: SerializedBuffer,
-    bytes_per_element: usize,
-    offset_buffers: Arc<[SerializedBuffer]>,
-    offset_dtype: DType,
 }
 
 #[derive(Clone)]
@@ -129,14 +112,6 @@ enum RegisteredReadKind {
         patch_buffers: Vec<(SegmentFuture, SerializedBuffer)>,
         plan: ALPRDReadPlan,
     },
-    List {
-        pages: Vec<Range<usize>>,
-        offset_buffers: Vec<(SegmentFuture, SerializedBuffer)>,
-        plan: ListReadPlan,
-        source: Arc<dyn SegmentSource>,
-        segment_id: SegmentId,
-        layout_len: usize,
-    },
 }
 
 struct RegisteredALPRDPage {
@@ -175,21 +150,6 @@ impl PartialReadPlan {
                 bytes_per_row,
                 row_granularity: 1,
                 kind: PartialReadKind::Alprd(Box::new(plan)),
-            }));
-        }
-
-        if let Some((plan, bytes_per_row)) = try_list_plan(
-            &serialized,
-            layout.dtype(),
-            layout.array_ctx(),
-            row_count,
-            Arc::clone(&descriptors),
-        )? {
-            return Ok(Some(Self {
-                array_tree,
-                bytes_per_row,
-                row_granularity: 1,
-                kind: PartialReadKind::List(plan),
             }));
         }
 
@@ -386,39 +346,6 @@ impl PartialReadPlan {
                     plan: plan.as_ref().clone(),
                 }
             }
-            PartialReadKind::List(plan) => {
-                let offset_specs = plan
-                    .offset_buffers
-                    .iter()
-                    .map(|descriptor| {
-                        Some((
-                            u64::try_from(descriptor.range().start).ok()?
-                                ..u64::try_from(descriptor.range().end).ok()?,
-                            descriptor.clone(),
-                        ))
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                let offset_requests = source.request_ranges(
-                    segment_id,
-                    offset_specs
-                        .iter()
-                        .map(|(range, _)| range.clone())
-                        .collect(),
-                );
-                let offset_buffers = offset_requests
-                    .into_iter()
-                    .zip(offset_specs)
-                    .map(|(request, (_, descriptor))| (request, descriptor))
-                    .collect();
-                RegisteredReadKind::List {
-                    pages,
-                    offset_buffers,
-                    plan: plan.clone(),
-                    source: Arc::clone(source),
-                    segment_id,
-                    layout_len,
-                }
-            }
         };
 
         Some(RegisteredPartialRead {
@@ -430,7 +357,7 @@ impl PartialReadPlan {
     fn estimated_partial_io(
         &self,
         pages: &[Range<usize>],
-        layout_len: usize,
+        _layout_len: usize,
     ) -> Option<(usize, usize)> {
         match &self.kind {
             PartialReadKind::Fixed(buffers) => {
@@ -466,27 +393,6 @@ impl PartialReadPlan {
                         .len()
                         .checked_mul(2)?
                         .checked_add(plan.patch_buffers.len())?,
-                ))
-            }
-            PartialReadKind::List(plan) => {
-                let offset_bytes = plan
-                    .offset_buffers
-                    .iter()
-                    .try_fold(0usize, |total, buffer| {
-                        total.checked_add(buffer.range().len())
-                    })?;
-                let covered_rows = pages
-                    .iter()
-                    .try_fold(0usize, |total, rows| total.checked_add(rows.len()))?;
-                let estimated_element_bytes = plan
-                    .element_buffer
-                    .range()
-                    .len()
-                    .checked_mul(covered_rows)?
-                    .div_ceil(layout_len.max(1));
-                Some((
-                    offset_bytes.checked_add(estimated_element_bytes)?,
-                    plan.offset_buffers.len().checked_add(pages.len())?,
                 ))
             }
         }
@@ -527,30 +433,6 @@ impl RegisteredPartialRead {
                     pages,
                     patch_buffers,
                     plan,
-                    dtype,
-                    row_range,
-                    mask,
-                    ctx,
-                    session,
-                )
-                .await?
-            }
-            RegisteredReadKind::List {
-                pages,
-                offset_buffers,
-                plan,
-                source,
-                segment_id,
-                layout_len,
-            } => {
-                resolve_list_pages(
-                    self.array_tree,
-                    pages,
-                    offset_buffers,
-                    plan,
-                    source,
-                    segment_id,
-                    layout_len,
                     dtype,
                     row_range,
                     mask,
@@ -718,119 +600,6 @@ async fn resolve_alprd_pages(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn resolve_list_pages(
-    array_tree: ByteBuffer,
-    pages: Vec<Range<usize>>,
-    offset_requests: Vec<(SegmentFuture, SerializedBuffer)>,
-    plan: ListReadPlan,
-    source: Arc<dyn SegmentSource>,
-    segment_id: SegmentId,
-    layout_len: usize,
-    dtype: &DType,
-    row_range: &Range<usize>,
-    mask: &Mask,
-    ctx: &ReadContext,
-    session: &VortexSession,
-) -> VortexResult<Vec<ArrayRef>> {
-    if pages.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let resolved_offsets = try_join_all(offset_requests.into_iter().map(
-        |(future, descriptor)| async move {
-            Ok::<_, vortex_error::VortexError>((
-                descriptor.index(),
-                future.await?.ensure_aligned(descriptor.alignment())?,
-            ))
-        },
-    ))
-    .await?;
-    let mut offset_handles = empty_handles(plan.descriptors.len());
-    for (index, handle) in resolved_offsets {
-        offset_handles[index] = handle;
-    }
-    let offsets =
-        SerializedArray::from_flatbuffer_with_buffers(array_tree.clone(), offset_handles)?
-            .child(1)
-            .decode(&plan.offset_dtype, layout_len + 1, ctx, session)?;
-
-    let mut exec = session.create_execution_ctx();
-    let mut page_specs = Vec::new();
-    for rows in pages {
-        let local_mask = page_mask(&rows, row_range, mask.indices())?;
-        if local_mask.all_false() {
-            continue;
-        }
-        let first = offset_at(&offsets, rows.start, &mut exec)?;
-        let last = offset_at(&offsets, rows.end, &mut exec)?;
-        let start = plan.element_buffer.range().start
-            + first
-                .checked_mul(plan.bytes_per_element)
-                .ok_or_else(|| vortex_err!("List element offset overflow"))?;
-        let end = plan.element_buffer.range().start
-            + last
-                .checked_mul(plan.bytes_per_element)
-                .ok_or_else(|| vortex_err!("List element offset overflow"))?;
-        page_specs.push((
-            rows,
-            local_mask,
-            first,
-            last,
-            u64::try_from(start)?..u64::try_from(end)?,
-        ));
-    }
-    let element_requests = source.request_ranges(
-        segment_id,
-        page_specs
-            .iter()
-            .map(|(_, _, _, _, range)| range.clone())
-            .collect(),
-    );
-    let mut page_futures = Vec::new();
-    for ((rows, local_mask, first, last, _), elements_future) in
-        page_specs.into_iter().zip(element_requests)
-    {
-        let array_tree = array_tree.clone();
-        let offsets = offsets.clone();
-        let plan = plan.clone();
-        let dtype = dtype.clone();
-        let ctx = ctx.clone();
-        let session = session.clone();
-        page_futures.push(
-            async move {
-                let elements_handle = elements_future
-                    .await?
-                    .ensure_aligned(plan.element_buffer.alignment())?;
-                let mut handles = empty_handles(plan.descriptors.len());
-                handles[plan.element_buffer.index()] = elements_handle;
-                let element_dtype = match &dtype {
-                    DType::List(element_dtype, _) => element_dtype.as_ref(),
-                    _ => return Err(vortex_err!("List partial plan used with non-list dtype")),
-                };
-                let elements = SerializedArray::from_flatbuffer_with_buffers(array_tree, handles)?
-                    .child(0)
-                    .decode(element_dtype, last - first, &ctx, &session)?;
-                clear_stats(&elements);
-
-                let page_offsets = offsets.slice(rows.start..rows.end + 1)?;
-                let mut exec = session.create_execution_ctx();
-                let first_offset = page_offsets.execute_scalar(0, &mut exec)?;
-                let adjusted_offsets = page_offsets.binary(
-                    ConstantArray::new(first_offset, page_offsets.len()).into_array(),
-                    Operator::Sub,
-                )?;
-                let validity = Validity::from(dtype.nullability());
-                let array = ListArray::try_new(elements, adjusted_offsets, validity)?.into_array();
-                clear_stats(&array);
-                apply_page_mask(array, local_mask)
-            }
-            .boxed(),
-        );
-    }
-    try_join_all(page_futures).await
-}
-
 fn finish_chunks(
     mut chunks: Vec<ArrayRef>,
     dtype: &DType,
@@ -869,18 +638,6 @@ fn empty_handles(len: usize) -> Vec<BufferHandle> {
     (0..len)
         .map(|_| BufferHandle::new_host(ByteBuffer::empty()))
         .collect()
-}
-
-fn offset_at(
-    offsets: &ArrayRef,
-    index: usize,
-    ctx: &mut vortex_array::ExecutionCtx,
-) -> VortexResult<usize> {
-    offsets
-        .execute_scalar(index, ctx)?
-        .as_primitive()
-        .as_::<usize>()
-        .ok_or_else(|| vortex_err!("List offset does not fit usize"))
 }
 
 fn selected_pages(
@@ -1108,83 +865,6 @@ fn bitpacked_range(plan: &BitPackedReadPlan, values: Range<usize>) -> Option<Ran
         .start
         .checked_add((values.end / 1024).checked_mul(bytes_per_block)?)?;
     Some(start..end)
-}
-
-fn try_list_plan(
-    node: &SerializedArray,
-    dtype: &DType,
-    ctx: &ReadContext,
-    row_count: usize,
-    descriptors: Arc<[SerializedBuffer]>,
-) -> VortexResult<Option<(ListReadPlan, usize)>> {
-    if ctx.resolve(node.encoding_id()) != Some(List.id()) {
-        return Ok(None);
-    }
-    let DType::List(element_dtype, _) = dtype else {
-        return Ok(None);
-    };
-    if node.nbuffers() != 0 || node.nchildren() != 2 {
-        return Ok(None);
-    }
-    let elements = node.child(0);
-    let DType::Primitive(element_ptype, _) = element_dtype.as_ref() else {
-        return Ok(None);
-    };
-    if ctx.resolve(elements.encoding_id()) != Some(Primitive.id())
-        || elements.nchildren() != 0
-        || elements.buffer_indices().len() != 1
-    {
-        return Ok(None);
-    }
-
-    let metadata = ListMetadata::decode(node.metadata())?;
-    let element_index = elements.buffer_indices()[0];
-    let Some(element_buffer) = descriptors.get(element_index).cloned() else {
-        return Ok(None);
-    };
-    let elements_len = usize::try_from(metadata.elements_len())?;
-    let expected_elements_len = elements_len
-        .checked_mul(element_ptype.byte_width())
-        .ok_or_else(|| vortex_err!("List elements length overflow"))?;
-    if element_buffer.range().len() != expected_elements_len {
-        return Ok(None);
-    }
-
-    let offsets = node.child(1);
-    let mut offset_indices = BTreeSet::new();
-    collect_buffer_indices(&offsets, &mut offset_indices);
-    if offset_indices.is_empty() || offset_indices.contains(&element_index) {
-        return Ok(None);
-    }
-    let Some(offset_buffers) = offset_indices
-        .into_iter()
-        .map(|index| descriptors.get(index).cloned())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
-    let offset_dtype = DType::Primitive(metadata.offset_ptype(), Nullability::NonNullable);
-    let offset_bytes: usize = offset_buffers
-        .iter()
-        .map(|buffer| buffer.range().len())
-        .sum();
-    let bytes_per_row = element_buffer
-        .range()
-        .len()
-        .saturating_add(offset_bytes)
-        .div_ceil(row_count.max(1))
-        .max(1);
-
-    Ok(Some((
-        ListReadPlan {
-            descriptors,
-            element_buffer,
-            bytes_per_element: element_ptype.byte_width(),
-            offset_buffers: offset_buffers.into(),
-            offset_dtype,
-        },
-        bytes_per_row,
-    )))
 }
 
 fn collect_buffer_indices(node: &SerializedArray, output: &mut BTreeSet<usize>) {

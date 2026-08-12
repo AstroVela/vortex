@@ -388,7 +388,6 @@ mod test {
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
-    use vortex_array::arrays::ListArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::expr::gt;
@@ -703,47 +702,6 @@ mod test {
                 [0..16, 32..48],
                 "one in-flight request should serve filter and projection"
             );
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn sparse_list_projection_reads_offsets_then_selected_elements() -> VortexResult<()> {
-        block_on(|handle| async {
-            let session = new_session().with_handle(handle);
-            let mut ctx = session.create_execution_ctx();
-            let array_ctx = ArrayContext::empty();
-            let source = RangedTestSource::default();
-            let (ptr, eof) = SequenceId::root().split();
-            let elements = PrimitiveArray::from_iter(0i64..32).into_array();
-            let offsets = PrimitiveArray::from_iter((0u32..=16).map(|v| v * 2)).into_array();
-            let array = ListArray::try_new(elements, offsets, Validity::NonNullable)?.into_array();
-            let layout = FlatLayoutStrategy::default()
-                .write_stream(
-                    array_ctx.into(),
-                    Arc::<TestSegments>::clone(&source.inner),
-                    array.to_array_stream().sequenced(ptr),
-                    eof,
-                    &session,
-                )
-                .await?;
-
-            let reader = layout.new_reader(
-                "".into(),
-                Arc::new(source.clone()),
-                &session,
-                &Default::default(),
-            )?;
-            let expr = root().bind(reader.dtype())?;
-            let mask = Mask::from_indices(16, [1, 10]);
-            let result = reader
-                .projection_evaluation(&(0..16), &expr, MaskFuture::ready(mask.clone()))?
-                .await?;
-
-            let expected = array.filter(mask)?;
-            assert_arrays_eq!(result, expected, &mut ctx);
-            assert_eq!(source.whole_requests.load(Ordering::Relaxed), 0);
-            assert!(source.ranges.lock().len() >= 3);
             Ok(())
         })
     }
