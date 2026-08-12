@@ -3,7 +3,6 @@
 
 //! `ST_Distance(geom, const) <op> radius` pruning.
 
-use geo::Rect as SpatialRect;
 use vortex_array::expr::BoundExpression;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
@@ -24,6 +23,7 @@ use super::lt_eq;
 use super::max_dist_sq;
 use super::min_dist_sq;
 use super::query_aabb;
+use crate::algorithms::Aabb;
 use crate::scalar_fn::distance::SpatialDistance;
 
 /// Prunes chunks for `ST_Distance(geom, const) <op> r` filters.
@@ -95,7 +95,7 @@ impl StatsRewriteRule for SpatialDistancePrune {
 /// A distance is always `>= 0`, which decides the degenerate radii up front.
 fn distance_prune_proof(
     geom: &BoundExpression,
-    query: SpatialRect<f64>,
+    query: Aabb,
     op: Operator,
     radius: f64,
 ) -> Option<BoundExpression> {

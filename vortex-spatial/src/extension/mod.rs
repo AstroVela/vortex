@@ -64,6 +64,15 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 pub use wkb::*;
 
+use crate::algorithms::Aabb;
+use crate::algorithms::Coord;
+use crate::algorithms::Coords;
+use crate::algorithms::GeometryRef;
+use crate::algorithms::MultiLineStringRef;
+use crate::algorithms::MultiPolygonRef;
+use crate::algorithms::PolygonRef;
+use crate::extension::coordinate::ordinates;
+
 /// Whether `dtype` is one of the native geometry extension types the spatial kernels operate on.
 pub(crate) fn is_native_geometry(dtype: &DType) -> bool {
     dtype.as_extension_opt().is_some_and(|ext| {
@@ -141,6 +150,241 @@ pub(crate) fn flatten_row_offsets(
         level = list.elements().clone();
     }
     Ok((row_offsets, level.execute::<StructArray>(ctx)?))
+}
+
+/// A native geometry column canonicalized for row-view access: the leaf ordinate buffers plus
+/// every list level's offsets, outer to inner, each absolute into the next level. [`Self::row`]
+/// borrows a [`GeometryRef`] without copying coordinates.
+///
+/// Row validity is not represented here: a null row's storage holds structurally valid
+/// placeholder data, so callers compute over every row and mask the results separately (see
+/// `ST_Length` for the pattern).
+pub(crate) enum GeometryBatch {
+    /// `Point` storage: one coordinate per row.
+    Point { xs: Buffer<f64>, ys: Buffer<f64> },
+    /// `LineString` storage: `rows` maps each row to its vertex run.
+    LineString {
+        rows: Vec<usize>,
+        xs: Buffer<f64>,
+        ys: Buffer<f64>,
+    },
+    /// `MultiPoint` storage: `rows` maps each row to its vertex run.
+    MultiPoint {
+        rows: Vec<usize>,
+        xs: Buffer<f64>,
+        ys: Buffer<f64>,
+    },
+    /// `Polygon` storage: `rows` maps each row to its rings, `rings` each ring to its vertices.
+    Polygon {
+        rows: Vec<usize>,
+        rings: Vec<usize>,
+        xs: Buffer<f64>,
+        ys: Buffer<f64>,
+    },
+    /// `MultiLineString` storage: `rows` maps each row to its lines, `lines` each line to its
+    /// vertices.
+    MultiLineString {
+        rows: Vec<usize>,
+        lines: Vec<usize>,
+        xs: Buffer<f64>,
+        ys: Buffer<f64>,
+    },
+    /// `MultiPolygon` storage: `rows` maps each row to its polygons, `polygons` each polygon to
+    /// its rings, and `rings` each ring to its vertices.
+    MultiPolygon {
+        rows: Vec<usize>,
+        polygons: Vec<usize>,
+        rings: Vec<usize>,
+        xs: Buffer<f64>,
+        ys: Buffer<f64>,
+    },
+    /// `Rect` storage: the four corner ordinates per row.
+    Rect {
+        xmin: Buffer<f64>,
+        ymin: Buffer<f64>,
+        xmax: Buffer<f64>,
+        ymax: Buffer<f64>,
+    },
+}
+
+impl GeometryBatch {
+    /// Canonicalize a native geometry column for view access. A non-geometry operand is an
+    /// error.
+    pub(crate) fn try_from_array(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
+        let Some(ext) = array.dtype().as_extension_opt() else {
+            vortex_bail!(
+                "spatial: operand is not a geometry extension type, was {}",
+                array.dtype()
+            );
+        };
+        let storage = array
+            .clone()
+            .execute::<ExtensionArray>(ctx)?
+            .storage_array()
+            .clone();
+        if ext.is::<Point>() {
+            let (xs, ys) = leaf_ordinates(storage, ctx)?;
+            Ok(GeometryBatch::Point { xs, ys })
+        } else if ext.is::<LineString>() {
+            let (rows, coords) = list_level(storage, ctx)?;
+            let (xs, ys) = leaf_ordinates(coords, ctx)?;
+            Ok(GeometryBatch::LineString { rows, xs, ys })
+        } else if ext.is::<MultiPoint>() {
+            let (rows, coords) = list_level(storage, ctx)?;
+            let (xs, ys) = leaf_ordinates(coords, ctx)?;
+            Ok(GeometryBatch::MultiPoint { rows, xs, ys })
+        } else if ext.is::<Polygon>() {
+            let (rows, ring_lists) = list_level(storage, ctx)?;
+            let (rings, coords) = list_level(ring_lists, ctx)?;
+            let (xs, ys) = leaf_ordinates(coords, ctx)?;
+            Ok(GeometryBatch::Polygon {
+                rows,
+                rings,
+                xs,
+                ys,
+            })
+        } else if ext.is::<MultiLineString>() {
+            let (rows, line_lists) = list_level(storage, ctx)?;
+            let (lines, coords) = list_level(line_lists, ctx)?;
+            let (xs, ys) = leaf_ordinates(coords, ctx)?;
+            Ok(GeometryBatch::MultiLineString {
+                rows,
+                lines,
+                xs,
+                ys,
+            })
+        } else if ext.is::<MultiPolygon>() {
+            let (rows, polygon_lists) = list_level(storage, ctx)?;
+            let (polygons, ring_lists) = list_level(polygon_lists, ctx)?;
+            let (rings, coords) = list_level(ring_lists, ctx)?;
+            let (xs, ys) = leaf_ordinates(coords, ctx)?;
+            Ok(GeometryBatch::MultiPolygon {
+                rows,
+                polygons,
+                rings,
+                xs,
+                ys,
+            })
+        } else if ext.is::<Rect>() {
+            let corners = storage.execute::<StructArray>(ctx)?;
+            Ok(GeometryBatch::Rect {
+                xmin: ordinates(&corners, "xmin", ctx)?,
+                ymin: ordinates(&corners, "ymin", ctx)?,
+                xmax: ordinates(&corners, "xmax", ctx)?,
+                ymax: ordinates(&corners, "ymax", ctx)?,
+            })
+        } else {
+            vortex_bail!("spatial: unsupported geometry extension {}", array.dtype())
+        }
+    }
+
+    /// Canonicalize one non-null geometry scalar as a single-row batch (the constant-operand
+    /// path).
+    pub(crate) fn try_from_scalar(scalar: &Scalar, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
+        Self::try_from_array(&ConstantArray::new(scalar.clone(), 1).into_array(), ctx)
+    }
+
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            GeometryBatch::Point { xs, .. } => xs.len(),
+            GeometryBatch::LineString { rows, .. }
+            | GeometryBatch::MultiPoint { rows, .. }
+            | GeometryBatch::Polygon { rows, .. }
+            | GeometryBatch::MultiLineString { rows, .. }
+            | GeometryBatch::MultiPolygon { rows, .. } => rows.len() - 1,
+            GeometryBatch::Rect { xmin, .. } => xmin.len(),
+        }
+    }
+
+    /// Borrow row `index` as a [`GeometryRef`] view.
+    pub(crate) fn row(&self, index: usize) -> GeometryRef<'_> {
+        match self {
+            GeometryBatch::Point { xs, ys } => GeometryRef::Point(Coord {
+                x: xs[index],
+                y: ys[index],
+            }),
+            GeometryBatch::LineString { rows, xs, ys } => {
+                let (start, end) = (rows[index], rows[index + 1]);
+                GeometryRef::LineString(Coords::new(&xs[start..end], &ys[start..end]))
+            }
+            GeometryBatch::MultiPoint { rows, xs, ys } => {
+                let (start, end) = (rows[index], rows[index + 1]);
+                GeometryRef::MultiPoint(Coords::new(&xs[start..end], &ys[start..end]))
+            }
+            GeometryBatch::Polygon {
+                rows,
+                rings,
+                xs,
+                ys,
+            } => GeometryRef::Polygon(PolygonRef::new(
+                xs,
+                ys,
+                &rings[rows[index]..=rows[index + 1]],
+            )),
+            GeometryBatch::MultiLineString {
+                rows,
+                lines,
+                xs,
+                ys,
+            } => GeometryRef::MultiLineString(MultiLineStringRef::new(
+                xs,
+                ys,
+                &lines[rows[index]..=rows[index + 1]],
+            )),
+            GeometryBatch::MultiPolygon {
+                rows,
+                polygons,
+                rings,
+                xs,
+                ys,
+            } => GeometryRef::MultiPolygon(MultiPolygonRef::new(
+                xs,
+                ys,
+                &polygons[rows[index]..=rows[index + 1]],
+                rings,
+            )),
+            GeometryBatch::Rect {
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+            } => GeometryRef::Rect(Aabb::new(
+                xmin[index],
+                ymin[index],
+                xmax[index],
+                ymax[index],
+            )),
+        }
+    }
+}
+
+/// Convert one list level to canonical offsets, returning them with the elements underneath.
+/// The offsets are position-aligned with the level's rows and absolute into the elements.
+fn list_level(level: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<(Vec<usize>, ArrayRef)> {
+    let list = list_from_list_view(level.execute::<ListViewArray>(ctx)?, ctx)?;
+    let offsets = list
+        .offsets()
+        .clone()
+        .cast(DType::Primitive(PType::U64, Nullability::NonNullable))?
+        .execute::<Buffer<u64>>(ctx)?;
+    debug_assert_eq!(offsets.len(), list.len() + 1);
+    let offsets = offsets
+        .iter()
+        .map(|&offset| {
+            usize::try_from(offset).map_err(|_| vortex_err!("spatial: list offset exceeds usize"))
+        })
+        .collect::<VortexResult<Vec<usize>>>()?;
+    Ok((offsets, list.elements().clone()))
+}
+
+/// The `x`/`y` ordinate buffers of a coordinate leaf.
+fn leaf_ordinates(
+    leaf: ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<(Buffer<f64>, Buffer<f64>)> {
+    let coords = leaf.execute::<StructArray>(ctx)?;
+    Ok((ordinates(&coords, "x", ctx)?, ordinates(&coords, "y", ctx)?))
 }
 
 /// Decode a native geometry column to `geo_types`. A non-geometry operand is an error.

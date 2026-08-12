@@ -3,7 +3,6 @@
 
 //! The 2D axis-aligned bounding-box (AABB) aggregate for native geometry columns.
 
-use geo::Rect as SpatialRect;
 use vortex_array::ArrayRef;
 use vortex_array::Columnar;
 use vortex_array::ExecutionCtx;
@@ -23,11 +22,12 @@ use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::algorithms::Aabb;
+use crate::algorithms::coords_aabb;
 use crate::extension::Rect;
 use crate::extension::SpatialMetadata;
 use crate::extension::box_storage_dtype;
 use crate::extension::coordinate::Dimension;
-use crate::extension::coordinate::box_corners;
 use crate::extension::coordinate::ordinates;
 use crate::extension::flatten_coordinates;
 use crate::extension::is_native_geometry;
@@ -39,26 +39,15 @@ use crate::extension::is_native_geometry;
 pub struct GeometryAabb;
 
 /// Running union of geometry AABBs, or `None` until the first row. A transient
-/// `geo::Rect` value - the persisted stat is the native box (see `to_scalar`).
+/// [`Aabb`] value - the persisted stat is the native box (see `to_scalar`).
 pub struct AabbPartial {
-    rect: Option<SpatialRect<f64>>,
+    rect: Option<Aabb>,
 }
 
 impl AabbPartial {
     /// Grow the accumulated box to also cover `other`.
-    fn merge(&mut self, other: SpatialRect<f64>) {
-        self.rect = Some(self.rect.map_or(other, |cur| {
-            SpatialRect::new(
-                (
-                    cur.min().x.min(other.min().x),
-                    cur.min().y.min(other.min().y),
-                ),
-                (
-                    cur.max().x.max(other.max().x),
-                    cur.max().y.max(other.max().y),
-                ),
-            )
-        }));
+    fn merge(&mut self, other: Aabb) {
+        self.rect = Some(self.rect.map_or(other, |cur| cur.union(other)));
     }
 }
 
@@ -76,17 +65,9 @@ fn aabb_storage_dtype() -> DType {
     box_storage_dtype(Dimension::Xy, Nullability::Nullable)
 }
 
-/// The AABB of the raw `x`/`y` slices, or `None` when empty.
-fn aabb_of(xs: &[f64], ys: &[f64]) -> Option<SpatialRect<f64>> {
-    (!xs.is_empty()).then(|| {
-        let [xmin, ymin, xmax, ymax] = box_corners(xs, ys);
-        SpatialRect::new((xmin, ymin), (xmax, ymax))
-    })
-}
-
-/// Read an AABB stat scalar (a nullable native `geoarrow.box`) into a [`SpatialRect`], or `None` when
+/// Read an AABB stat scalar (a nullable native `geoarrow.box`) into an [`Aabb`], or `None` when
 /// the scalar is null (an empty group).
-fn rect_from_storage(scalar: &Scalar) -> VortexResult<Option<SpatialRect<f64>>> {
+fn rect_from_storage(scalar: &Scalar) -> VortexResult<Option<Aabb>> {
     if scalar.is_null() {
         return Ok(None);
     }
@@ -99,21 +80,23 @@ fn rect_from_storage(scalar: &Scalar) -> VortexResult<Option<SpatialRect<f64>>> 
                 .ok_or_else(|| vortex_err!("AABB missing {name}"))?,
         )
     };
-    Ok(Some(SpatialRect::new(
-        (read("xmin")?, read("ymin")?),
-        (read("xmax")?, read("ymax")?),
+    Ok(Some(Aabb::new(
+        read("xmin")?,
+        read("ymin")?,
+        read("xmax")?,
+        read("ymax")?,
     )))
 }
 
-/// Serialize a [`SpatialRect`] as a native `geoarrow.box` stat scalar (inverse of [`rect_from_storage`]).
-fn rect_to_storage(rect: SpatialRect<f64>) -> Scalar {
+/// Serialize an [`Aabb`] as a native `geoarrow.box` stat scalar (inverse of [`rect_from_storage`]).
+fn rect_to_storage(rect: Aabb) -> Scalar {
     let storage = Scalar::struct_(
         aabb_storage_dtype(),
         vec![
-            Scalar::primitive(rect.min().x, Nullability::NonNullable),
-            Scalar::primitive(rect.min().y, Nullability::NonNullable),
-            Scalar::primitive(rect.max().x, Nullability::NonNullable),
-            Scalar::primitive(rect.max().y, Nullability::NonNullable),
+            Scalar::primitive(rect.min_x, Nullability::NonNullable),
+            Scalar::primitive(rect.min_y, Nullability::NonNullable),
+            Scalar::primitive(rect.max_x, Nullability::NonNullable),
+            Scalar::primitive(rect.max_y, Nullability::NonNullable),
         ],
     );
     Scalar::extension::<Rect>(SpatialMetadata::default(), storage)
@@ -211,7 +194,7 @@ impl AggregateFnVTable for GeometryAabb {
         let coords = flatten_coordinates(&array, ctx)?;
         let xs = ordinates(&coords, "x", ctx)?;
         let ys = ordinates(&coords, "y", ctx)?;
-        if let Some(rect) = aabb_of(&xs, &ys) {
+        if let Some(rect) = coords_aabb(&xs, &ys) {
             partial.merge(rect);
         }
         Ok(())
@@ -229,7 +212,6 @@ impl AggregateFnVTable for GeometryAabb {
 
 #[cfg(test)]
 mod tests {
-    use geo::Rect as SpatialRect;
     use vortex_array::ArrayRef;
     use vortex_array::VortexSessionExecute;
     use vortex_array::aggregate_fn::Accumulator;
@@ -247,6 +229,7 @@ mod tests {
     use super::GeometryAabb;
     use super::aabb_dtype;
     use super::rect_from_storage;
+    use crate::algorithms::Aabb;
     use crate::test_harness::linestring_column;
     use crate::test_harness::multilinestring_column;
     use crate::test_harness::multipoint_column;
@@ -284,7 +267,7 @@ mod tests {
     /// The AABB result's corners as `(xmin, ymin, xmax, ymax)`.
     fn aabb(result: &Scalar) -> VortexResult<(f64, f64, f64, f64)> {
         let rect = rect_from_storage(result)?.expect("non-null AABB");
-        Ok((rect.min().x, rect.min().y, rect.max().x, rect.max().y))
+        Ok((rect.min_x, rect.min_y, rect.max_x, rect.max_y))
     }
 
     /// The AABB of a Point column is the min/max of its coordinates, accumulated across batches.
@@ -393,7 +376,7 @@ mod tests {
     #[test]
     fn combine_partials_unions_boxes() -> VortexResult<()> {
         let bbox = |xmin, ymin, xmax, ymax| AabbPartial {
-            rect: Some(SpatialRect::new((xmin, ymin), (xmax, ymax))),
+            rect: Some(Aabb::new(xmin, ymin, xmax, ymax)),
         };
         let mut partial = AabbPartial { rect: None };
         GeometryAabb.combine_partials(
@@ -415,7 +398,7 @@ mod tests {
     #[test]
     fn combine_partials_ignores_null() -> VortexResult<()> {
         let mut partial = AabbPartial {
-            rect: Some(SpatialRect::new((0.0, 0.0), (1.0, 1.0))),
+            rect: Some(Aabb::new(0.0, 0.0, 1.0, 1.0)),
         };
         GeometryAabb.combine_partials(&mut partial, Scalar::null(aabb_dtype()))?;
         assert_eq!(

@@ -221,20 +221,6 @@ pub(crate) fn ordinates(
         .execute::<Buffer<f64>>(ctx)
 }
 
-/// The corners of the box containing the `(xs, ys)` coordinates, in
-/// `[xmin, ymin, xmax, ymax]` order.
-pub(crate) fn box_corners(xs: &[f64], ys: &[f64]) -> [f64; 4] {
-    let (mut xmin, mut ymin) = (f64::INFINITY, f64::INFINITY);
-    let (mut xmax, mut ymax) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for (&x, &y) in xs.iter().zip(ys) {
-        xmin = xmin.min(x);
-        ymin = ymin.min(y);
-        xmax = xmax.max(x);
-        ymax = ymax.max(y);
-    }
-    [xmin, ymin, xmax, ymax]
-}
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;

@@ -16,8 +16,6 @@ mod intersects;
 mod test_harness;
 
 pub use distance::SpatialDistancePrune;
-use geo::BoundingRect;
-use geo::Rect as SpatialRect;
 pub use intersects::SpatialIntersectsPrune;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnVTableExt;
@@ -41,8 +39,10 @@ use vortex_array::stats::rewrite::StatsRewriteCtx;
 use vortex_error::VortexResult;
 
 use crate::aggregate_fn::GeometryAabb;
+use crate::algorithms::Aabb;
+use crate::algorithms::bounding_rect;
+use crate::extension::GeometryBatch;
 use crate::extension::is_native_geometry;
-use crate::extension::single_geometry;
 
 /// Splits a symmetric two-operand spatial predicate into the scope-rooted geometry column and the
 /// constant operand's scalar.
@@ -80,18 +80,17 @@ fn geometry_and_constant<'a>(
 ///
 /// Prove claims against this box rather than the constant itself: the constant lies inside it,
 /// so whatever holds for the box holds for the geometry.
-fn query_aabb(
-    constant: &Scalar,
-    ctx: &StatsRewriteCtx<'_>,
-) -> VortexResult<Option<SpatialRect<f64>>> {
+fn query_aabb(constant: &Scalar, ctx: &StatsRewriteCtx<'_>) -> VortexResult<Option<Aabb>> {
     // A null geometry literal has no extent to prove against, so it can never prune.
     if constant.is_null() {
         return Ok(None);
     }
-    // Decoding the constant into a concrete geometry runs through the compute stack, which needs
-    // an execution context.
+    // Canonicalizing the constant's storage runs through the compute stack, which needs an
+    // execution context.
     let mut exec = ctx.session().create_execution_ctx();
-    Ok(single_geometry(constant, &mut exec)?.bounding_rect())
+    Ok(bounding_rect(
+        GeometryBatch::try_from_scalar(constant, &mut exec)?.row(0),
+    ))
 }
 
 /// The chunk's AABB statistic, as the storage struct with `xmin`/`ymin`/`xmax`/`ymax` fields.
@@ -108,7 +107,7 @@ fn aabb_stat(geom: &BoundExpression) -> BoundExpression {
 /// touch, positive iff they are strictly separated.
 ///
 /// Prunes "near" predicates: `min_dist_sq > r^2` proves every row is farther than `r`.
-fn min_dist_sq(aabb: &BoundExpression, query: SpatialRect<f64>) -> BoundExpression {
+fn min_dist_sq(aabb: &BoundExpression, query: Aabb) -> BoundExpression {
     let field = |name: &str| get_item(name, aabb.clone());
     // Per axis: gap = max(0, q_lo - aabb_hi, aabb_lo - q_hi), positive only when the intervals
     // are separated. The nearest two points of the boxes are one axis-gap apart per axis, so the
@@ -122,15 +121,15 @@ fn min_dist_sq(aabb: &BoundExpression, query: SpatialRect<f64>) -> BoundExpressi
             ),
         )
     };
-    let dx = gap(query.min().x, query.max().x, field("xmin"), field("xmax"));
-    let dy = gap(query.min().y, query.max().y, field("ymin"), field("ymax"));
+    let dx = gap(query.min_x, query.max_x, field("xmin"), field("xmax"));
+    let dy = gap(query.min_y, query.max_y, field("ymin"), field("ymax"));
     checked_add(square(dx), square(dy))
 }
 
 /// Upper bound on every row's squared distance to the query AABB.
 ///
 /// Prunes "far" predicates: `max_dist_sq < r^2` proves every row is within `r`.
-fn max_dist_sq(aabb: &BoundExpression, query: SpatialRect<f64>) -> BoundExpression {
+fn max_dist_sq(aabb: &BoundExpression, query: Aabb) -> BoundExpression {
     let field = |name: &str| get_item(name, aabb.clone());
     // Per axis: span = max(q_hi, aabb_hi) - min(q_lo, aabb_lo), the farthest two points of the
     // boxes can be apart. The nullable AABB field is the second `maximum`/`minimum` argument so
@@ -142,8 +141,8 @@ fn max_dist_sq(aabb: &BoundExpression, query: SpatialRect<f64>) -> BoundExpressi
             minimum(lit(q_lo), lo),
         )
     };
-    let dx = span(query.min().x, query.max().x, field("xmin"), field("xmax"));
-    let dy = span(query.min().y, query.max().y, field("ymin"), field("ymax"));
+    let dx = span(query.min_x, query.max_x, field("xmin"), field("xmax"));
+    let dy = span(query.min_y, query.max_y, field("ymin"), field("ymax"));
     checked_add(square(dx), square(dy))
 }
 

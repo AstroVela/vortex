@@ -3,9 +3,11 @@
 
 //! `ST_Area`: unsigned planar area of native geometries.
 
-use geo::Area;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
+use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
@@ -18,13 +20,19 @@ use vortex_array::scalar_fn::ExecutionArgs;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
+use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::algorithms::unsigned_area;
+use crate::extension::GeometryBatch;
 use crate::extension::is_native_geometry;
-use crate::scalar_fn::execute::execute_unary_geo_types;
+use crate::scalar_fn::execute::Execution;
+use crate::scalar_fn::execute::Operand;
+use crate::scalar_fn::execute::dispatch_unary;
 
 /// Validate the native geometry operand accepted by `ST_Area`.
 fn validate_area_operand(dtypes: &[DType]) -> VortexResult<()> {
@@ -39,6 +47,32 @@ fn validate_area_operand(dtypes: &[DType]) -> VortexResult<()> {
         dtypes[0]
     );
     Ok(())
+}
+
+/// Compute unsigned areas directly over the canonicalized geometry batch.
+fn area_array(
+    array: ArrayRef,
+    validity: Validity,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let batch = GeometryBatch::try_from_array(&array, ctx)?;
+    let areas = Buffer::from_iter((0..batch.len()).map(|index| unsigned_area(batch.row(index))));
+    Ok(PrimitiveArray::new(areas, validity).into_array())
+}
+
+/// Execute area after shared constant/column and null dispatch.
+fn execute_area(
+    execution: Execution<1, Validity>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    match execution.operands {
+        [Operand::Constant(geometry)] => {
+            let validity = Validity::from(execution.nullability);
+            let one = area_array(ConstantArray::new(geometry, 1).into_array(), validity, ctx)?;
+            Ok(ConstantArray::new(one.execute_scalar(0, ctx)?, execution.len).into_array())
+        }
+        [Operand::Column(geometries)] => area_array(geometries, execution.valid, ctx),
+    }
 }
 
 /// Unsigned planar `ST_Area` of native geometries.
@@ -97,7 +131,12 @@ impl ScalarFnVTable for SpatialArea {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let array = args.get(0)?;
-        execute_unary_geo_types(&array, Area::unsigned_area, ctx)
+        dispatch_unary(
+            &array,
+            DType::Primitive(PType::F64, array.dtype().nullability()),
+            execute_area,
+            ctx,
+        )
     }
 
     fn validity(
@@ -220,6 +259,43 @@ mod tests {
         let expected =
             PrimitiveArray::new(vec![4.0f64, 0.0], Validity::from_iter([true, false])).into_array();
 
+        assert_arrays_eq!(areas, expected, &mut ctx);
+        Ok(())
+    }
+
+    /// A sliced column measures only its rows - the canonicalized offsets stay row-aligned even
+    /// when they do not start at zero.
+    #[test]
+    fn sliced_column_measures_sliced_rows() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+        let polygons = polygon_column(vec![
+            vec![vec![
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+            ]],
+            vec![vec![
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 2.0),
+                (0.0, 2.0),
+                (0.0, 0.0),
+            ]],
+            vec![vec![
+                (0.0, 0.0),
+                (3.0, 0.0),
+                (3.0, 3.0),
+                (0.0, 3.0),
+                (0.0, 0.0),
+            ]],
+        ])?
+        .slice(1..3)?;
+
+        let areas = SpatialArea::try_new_array(polygons)?.into_array();
+        let expected = PrimitiveArray::from_iter([4.0f64, 9.0]).into_array();
         assert_arrays_eq!(areas, expected, &mut ctx);
         Ok(())
     }

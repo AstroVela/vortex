@@ -37,13 +37,13 @@ use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::algorithms::box_corners;
 use crate::extension::Rect;
 use crate::extension::SpatialMetadata;
 use crate::extension::box_field_names;
 use crate::extension::box_storage_dtype;
 use crate::extension::build_rect_array;
 use crate::extension::coordinate::Dimension;
-use crate::extension::coordinate::box_corners;
 use crate::extension::coordinate::ordinates;
 use crate::extension::flatten_row_offsets;
 use crate::extension::is_native_geometry;

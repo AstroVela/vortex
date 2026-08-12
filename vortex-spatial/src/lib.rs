@@ -32,6 +32,7 @@ use crate::scalar_fn::length::SpatialLength;
 use crate::scalar_fn::make_line::SpatialMakeLine;
 
 pub mod aggregate_fn;
+mod algorithms;
 pub mod extension;
 pub mod prune;
 pub mod scalar_fn;
