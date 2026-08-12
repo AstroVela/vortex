@@ -11290,7 +11290,7 @@ dependencies = [
  "anyhow",
  "clap",
  "prost-build",
- "vortex",
+ "vortex-edition",
  "xshell",
 ]
 
