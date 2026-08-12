@@ -66,6 +66,10 @@ const THRESHOLD: usize = 256 * 1024;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds spent inside the system allocator for blocks at or above [`THRESHOLD`]. This is the
+/// exact ceiling on what a buffer pool for those blocks could save.
+static ALLOC_NANOS: AtomicU64 = AtomicU64::new(0);
+static FREE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Site {
@@ -84,6 +88,10 @@ thread_local! {
 struct Profiler;
 
 impl Profiler {
+    fn timing(size: usize) -> bool {
+        size >= THRESHOLD && ENABLED.load(Ordering::Relaxed)
+    }
+
     fn record(size: usize) {
         if size < THRESHOLD || !ENABLED.load(Ordering::Relaxed) {
             return;
@@ -128,11 +136,23 @@ fn summarize(backtrace: &str) -> String {
 unsafe impl GlobalAlloc for Profiler {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::record(layout.size());
-        unsafe { System.alloc(layout) }
+        if !Self::timing(layout.size()) {
+            return unsafe { System.alloc(layout) };
+        }
+        let start = Instant::now();
+        let ptr = unsafe { System.alloc(layout) };
+        ALLOC_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
+        if !Self::timing(layout.size()) {
+            unsafe { System.dealloc(ptr, layout) };
+            return;
+        }
+        let start = Instant::now();
+        unsafe { System.dealloc(ptr, layout) };
+        FREE_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -212,6 +232,22 @@ async fn timed_cold_scan(session: &VortexSession, path: &Path) -> VortexResult<D
     Ok(start.elapsed())
 }
 
+/// Minor page faults taken by this process so far.
+///
+/// A fresh mapping serves its first write with a fault; a recycled buffer is already mapped and
+/// faulted in. The fault delta across a scan is therefore an upper bound on what any buffer pool
+/// can remove.
+fn minor_faults() -> u64 {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            stat.split_whitespace()
+                .nth(9)
+                .and_then(|faults| faults.parse().ok())
+        })
+        .unwrap_or_default()
+}
+
 fn median(mut samples: Vec<Duration>) -> Duration {
     samples.sort_unstable();
     samples[samples.len() / 2]
@@ -249,6 +285,11 @@ async fn main() -> VortexResult<()> {
     drop(file);
 
     println!(
+        "time inside the system allocator for those blocks: {:.2}ms alloc + {:.2}ms free",
+        ALLOC_NANOS.load(Ordering::Relaxed) as f64 / 1e6,
+        FREE_NANOS.load(Ordering::Relaxed) as f64 / 1e6,
+    );
+    println!(
         "\n{} allocations >= {}KiB, {:.1} MiB total\n",
         TOTAL_COUNT.load(Ordering::Relaxed),
         THRESHOLD / 1024,
@@ -271,7 +312,25 @@ async fn main() -> VortexResult<()> {
         );
     }
 
-    // 2. A/B the same cold-cache scan under both host allocators.
+    // 2. Bound the prize: how many page faults does a scan actually take?
+    let file = session.open_options().open_path(&path).await?;
+    scan_file(&session, &file).await?;
+    let before = minor_faults();
+    let start = Instant::now();
+    scan_file(&session, &file).await?;
+    let elapsed = start.elapsed();
+    let faults = minor_faults() - before;
+    println!(
+        "warm scan: {:.1}ms, {} minor faults ({:.1} MiB faulted, ~{:.2}ms at 0.5us/fault, {:.1}% of scan)",
+        elapsed.as_secs_f64() * 1e3,
+        faults,
+        (faults * 4096) as f64 / (1024.0 * 1024.0),
+        faults as f64 * 0.5 / 1e3,
+        (faults as f64 * 0.5e-6) / elapsed.as_secs_f64() * 100.0,
+    );
+    drop(file);
+
+    // 3. A/B the same cold-cache scan under both host allocators.
     let pool = Arc::new(PoolingHostAllocator::default());
     let pooled = VortexSession::default()
         .with_tokio()
@@ -314,7 +373,7 @@ async fn main() -> VortexResult<()> {
         pool.pooled_bytes() as f64 / (1024.0 * 1024.0),
     );
 
-    // 3. Isolate the raw per-allocation cost the pool removes.
+    // 4. Isolate the raw per-allocation cost the pool removes.
     const ALLOCATIONS: usize = 2_000;
     const SIZE: usize = 4 << 20;
     let raw = |allocator: &dyn HostAllocator| -> VortexResult<Duration> {
