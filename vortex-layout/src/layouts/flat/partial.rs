@@ -614,8 +614,33 @@ async fn resolve_alprd_pages(
                 future.await?.ensure_aligned(descriptor.alignment())?,
             ))
         },
-    ))
-    .await?;
+    ));
+    let page_handles = try_join_all(pages.into_iter().filter_map(|page| {
+        let local_mask = match page_mask(&page.rows, row_range, mask.indices()) {
+            Ok(local_mask) if !local_mask.all_false() => local_mask,
+            Ok(_) => return None,
+            Err(error) => return Some(futures::future::ready(Err(error)).left_future()),
+        };
+        let left_alignment = plan.left.descriptor.alignment();
+        let right_alignment = plan.right.descriptor.alignment();
+        Some(
+            async move {
+                let (left, right) = futures::try_join!(page.left, page.right)?;
+                Ok::<_, vortex_error::VortexError>((
+                    page.rows,
+                    local_mask,
+                    left.ensure_aligned(left_alignment)?,
+                    right.ensure_aligned(right_alignment)?,
+                ))
+            }
+            .right_future(),
+        )
+    }));
+
+    // Every range for this Flat layout is registered before resolution. Poll the complete set
+    // together so the driver can issue and coalesce patch, left-part, and right-part reads in one
+    // I/O round; array reconstruction starts only after that set has resolved.
+    let (patch_handles, page_handles) = futures::try_join!(patch_handles, page_handles)?;
     let mut handles = empty_handles(plan.descriptors.len());
     for (index, handle) in patch_handles {
         handles[index] = handle;
@@ -644,72 +669,53 @@ async fn resolve_alprd_pages(
         None,
     )?;
 
-    let mut page_futures = Vec::new();
-    for page in pages {
-        let local_mask = page_mask(&page.rows, row_range, mask.indices())?;
-        if local_mask.all_false() {
-            continue;
-        }
-        let plan = plan.clone();
-        let dtype = dtype.clone();
-        let page_patches = full_patches.clone();
-        page_futures.push(
-            async move {
-                let left = page
-                    .left
-                    .await?
-                    .ensure_aligned(plan.left.descriptor.alignment())?;
-                let right = page
-                    .right
-                    .await?
-                    .ensure_aligned(plan.right.descriptor.alignment())?;
-                let inner_start = page.rows.start * plan.list_size as usize;
-                let inner_end = page.rows.end * plan.list_size as usize;
-                let inner_len = inner_end - inner_start;
-                let left = BitPacked::try_new(
-                    left,
-                    plan.left.ptype,
-                    Validity::from(plan.left_parts_dtype.nullability()),
-                    None,
-                    plan.left.bit_width,
-                    inner_len,
-                    0,
-                )?
-                .into_array();
-                let right = BitPacked::try_new(
-                    right,
-                    plan.right.ptype,
-                    Validity::NonNullable,
-                    None,
-                    plan.right.bit_width,
-                    inner_len,
-                    0,
-                )?
-                .into_array();
-                let patches = page_patches.slice(inner_start..inner_end)?;
-                let elements = ALPRD::try_new(
-                    plan.element_dtype.clone(),
-                    left,
-                    plan.left_parts_dictionary.clone(),
-                    right,
-                    plan.right_bit_width,
-                    patches,
-                )?
-                .into_array();
-                let array = FixedSizeListArray::try_new(
-                    elements,
-                    plan.list_size,
-                    Validity::from(dtype.nullability()),
-                    page.rows.len(),
-                )?
-                .into_array();
-                clear_stats(&array);
-                apply_page_mask(array, local_mask)
-            }
-            .boxed(),
-        );
-    }
-    try_join_all(page_futures).await
+    page_handles
+        .into_iter()
+        .map(|(rows, local_mask, left, right)| {
+            let inner_start = rows.start * plan.list_size as usize;
+            let inner_end = rows.end * plan.list_size as usize;
+            let inner_len = inner_end - inner_start;
+            let left = BitPacked::try_new(
+                left,
+                plan.left.ptype,
+                Validity::from(plan.left_parts_dtype.nullability()),
+                None,
+                plan.left.bit_width,
+                inner_len,
+                0,
+            )?
+            .into_array();
+            let right = BitPacked::try_new(
+                right,
+                plan.right.ptype,
+                Validity::NonNullable,
+                None,
+                plan.right.bit_width,
+                inner_len,
+                0,
+            )?
+            .into_array();
+            let patches = full_patches.slice(inner_start..inner_end)?;
+            let elements = ALPRD::try_new(
+                plan.element_dtype.clone(),
+                left,
+                plan.left_parts_dictionary.clone(),
+                right,
+                plan.right_bit_width,
+                patches,
+            )?
+            .into_array();
+            let array = FixedSizeListArray::try_new(
+                elements,
+                plan.list_size,
+                Validity::from(dtype.nullability()),
+                rows.len(),
+            )?
+            .into_array();
+            clear_stats(&array);
+            apply_page_mask(array, local_mask)
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
