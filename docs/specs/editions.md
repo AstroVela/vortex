@@ -62,6 +62,19 @@ edition; each encoding's registry entry records the edition it joined in. In the
 encoding may be *deprecated*, meaning writers stop emitting it — but readers keep decoding it
 indefinitely, so deprecation never invalidates existing files.
 
+## The `unstable` family
+
+Alongside `core` there is an `unstable` family, holding encodings that are still being
+evaluated. It is the exception to everything above: every `unstable` edition is a permanent
+draft, so the family never freezes and carries no read-compatibility guarantee at all. A file
+written with these encodings is readable only by a build that knows them, and a future release
+may stop supporting one.
+
+Because of that, the writer only emits them when you opt in — the default session enables the
+newest `unstable` edition solely when the `unstable_encodings` cargo feature is selected.
+Encodings graduate by being declared in a new `core` edition, which is where they pick up the
+read-forever guarantee.
+
 ## Edition registry
 
 Coming soon..
