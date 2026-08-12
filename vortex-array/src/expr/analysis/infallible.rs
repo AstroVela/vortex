@@ -15,22 +15,10 @@ pub fn label_infallible(expr: &Expression) -> BooleanLabels<'_> {
         expr,
         |expr| match expr {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.signature().is_infallible(),
-            Expression::Lambda(lambda) => is_infallible(lambda.body()),
             Expression::Root | Expression::Variable(_) => true,
         },
         |acc, &child| acc & child,
     )
-}
-
-fn is_infallible(expr: &Expression) -> bool {
-    match expr {
-        Expression::Scalar {
-            scalar_fn,
-            children,
-        } => scalar_fn.signature().is_infallible() && children.iter().all(is_infallible),
-        Expression::Lambda(lambda) => is_infallible(lambda.body()),
-        Expression::Root | Expression::Variable(_) => true,
-    }
 }
 
 #[cfg(test)]
@@ -40,11 +28,9 @@ mod tests {
     use crate::expr::col;
     use crate::expr::eq;
     use crate::expr::is_null;
-    use crate::expr::lambda;
     use crate::expr::lit;
     use crate::expr::merge_opts;
     use crate::expr::not;
-    use crate::expr::var;
     use crate::scalar_fn::fns::merge::DuplicateHandling;
 
     #[test]
@@ -98,18 +84,5 @@ mod tests {
         let labels = label_infallible(&expr);
         assert_eq!(labels.get(&child), Some(&true));
         assert_eq!(labels.get(&expr), Some(&true));
-    }
-
-    #[test]
-    fn lambda_infallibility_from_body() -> vortex_error::VortexResult<()> {
-        let fallible = lambda(["x"], checked_add(var("x"), lit(1i32)))?;
-        assert_eq!(label_infallible(&fallible).get(&fallible), Some(&false));
-
-        let infallible = lambda(["x"], var("x"))?;
-        assert_eq!(
-            label_infallible(&infallible).get(&infallible),
-            Some(&true)
-        );
-        Ok(())
     }
 }
