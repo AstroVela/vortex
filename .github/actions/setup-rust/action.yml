@@ -20,6 +20,10 @@ inputs:
     description: "Should sccache be enabled."
     required: false
     default: "false"
+  mold-version:
+    description: "Version of the mold linker to install on Linux."
+    required: false
+    default: "2.41.0"
 
 runs:
   using: "composite"
@@ -34,9 +38,52 @@ runs:
       env:
         TOOLCHAIN_OVERRIDE: ${{ inputs.toolchain }}
 
+    # The mold release tarball is cached rather than fetched from GitHub releases on every
+    # job: release downloads intermittently return 503, which failed the whole job.
+    - name: Cache Mold
+      if: runner.os == 'Linux'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: ~/.cache/mold-dist
+        key: mold-${{ inputs.mold-version }}-${{ runner.arch }}
+
     - name: Install Mold
       if: runner.os == 'Linux'
-      uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+      shell: bash
+      env:
+        MOLD_VERSION: ${{ inputs.mold-version }}
+      run: |
+        set -euo pipefail
+
+        arch=$(uname -m)
+        cache_dir="$HOME/.cache/mold-dist"
+        tarball="$cache_dir/mold-$MOLD_VERSION-$arch-linux.tar.gz"
+        mkdir -p "$cache_dir"
+
+        if [[ ! -s "$tarball" ]]; then
+          url="https://github.com/rui314/mold/releases/download/v$MOLD_VERSION/mold-$MOLD_VERSION-$arch-linux.tar.gz"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-connrefused -o "$tarball.tmp" "$url"; then
+              mv "$tarball.tmp" "$tarball"
+              break
+            fi
+            rm -f "$tarball.tmp"
+            if [[ "$attempt" == 5 ]]; then
+              echo "failed to download mold from $url" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+        fi
+
+        SUDO=""
+        if [[ "$(whoami)" != root ]]; then SUDO=sudo; fi
+        $SUDO tar -C /usr/local --strip-components=1 --no-overwrite-dir -xzf "$tarball"
+
+        # Make mold the default linker, matching rui314/setup-mold's `make-default`.
+        if [[ "$(realpath /usr/bin/ld)" != /usr/local/bin/mold ]]; then
+          $SUDO ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"
+        fi
 
     - name: Check for rustup
       id: check-rustup
