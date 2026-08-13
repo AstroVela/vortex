@@ -377,16 +377,23 @@ impl<T: VortexReadAt + Clone> VortexReadAt for InstrumentedReadAt<T> {
         let durations = self.metrics.durations.clone();
         let sizes = self.metrics.sizes.clone();
         let total_size = self.metrics.total_size.clone();
-        let start = Instant::now();
-        self.read
-            .read_ranges(requests)
-            .map(move |(request, result)| {
-                durations.update(start.elapsed());
-                sizes.update(request.length as f64);
-                total_size.add(request.length as u64);
-                (request, result)
+        let mut reads = self.read.read_ranges(requests);
+        // The clock starts on the first poll rather than here. The caller may hold the stream for a
+        // while before polling it, and the underlying reads do not begin until then, so timing from
+        // construction charges that idle gap to every range in the batch.
+        let mut start = None;
+        stream::poll_fn(move |cx| {
+            let start = *start.get_or_insert_with(Instant::now);
+            reads.poll_next_unpin(cx).map(|item| {
+                item.map(|(request, result)| {
+                    durations.update(start.elapsed());
+                    sizes.update(request.length as f64);
+                    total_size.add(request.length as u64);
+                    (request, result)
+                })
             })
-            .boxed()
+        })
+        .boxed()
     }
 }
 
@@ -397,6 +404,7 @@ mod tests {
 
     use vortex_buffer::Alignment;
     use vortex_buffer::ByteBuffer;
+    use vortex_metrics::DefaultMetricsRegistry;
 
     use super::*;
 
@@ -536,5 +544,35 @@ mod tests {
 
         let size = data.size().await.unwrap();
         assert_eq!(size, 5);
+    }
+
+    #[tokio::test]
+    async fn test_instrumented_read_ranges_excludes_time_before_first_poll() -> VortexResult<()> {
+        const IDLE: Duration = Duration::from_millis(400);
+
+        let read = InstrumentedReadAt::new(
+            ByteBuffer::from(vec![1, 2, 3, 4]),
+            &DefaultMetricsRegistry::default(),
+        );
+        let requests = Arc::from([
+            ReadAtRequest::new(0, 2, Alignment::none()),
+            ReadAtRequest::new(2, 2, Alignment::none()),
+        ]);
+
+        // Mimic a caller that constructs the stream and only polls it once a slot frees up.
+        let results = read.read_ranges(requests);
+        tokio::time::sleep(IDLE).await;
+        assert_eq!(results.count().await, 2);
+
+        let durations = &read.metrics.durations;
+        assert_eq!(durations.count(), 2);
+        let slowest = durations
+            .quantile(1.0)
+            .vortex_expect("durations are recorded");
+        assert!(
+            slowest < IDLE,
+            "recorded {slowest:?} for an in-memory read, which charges the pre-poll idle gap"
+        );
+        Ok(())
     }
 }
