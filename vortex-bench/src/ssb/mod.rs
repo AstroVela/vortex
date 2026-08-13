@@ -9,7 +9,7 @@
 //! the suite a direct test of filter pushdown, zone-map pruning, and dimension-join throughput —
 //! the axes on which a columnar format is supposed to win.
 //!
-//! Data generation lives in [`datagen`].
+//! Data generation lives in [`datagen`], over the native generator in `ssbgen`.
 
 use std::fs;
 use std::path::Path;
@@ -26,6 +26,7 @@ use crate::datasets::SSB_TABLES;
 use crate::utils::file::resolve_data_url;
 
 pub mod datagen;
+pub(crate) mod ssbgen;
 
 /// The 13 SSB queries, stored as `q1.sql` ... `q13.sql`. The framework keys queries on a plain
 /// index, so the flight-and-query numbering from the paper (Q1.1 ... Q4.3) maps onto 1 ... 13 in

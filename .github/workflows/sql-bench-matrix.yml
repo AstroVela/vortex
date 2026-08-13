@@ -136,12 +136,6 @@ jobs:
           chmod +x duckdb
           echo "$PWD" >> "$GITHUB_PATH"
 
-      # SSB has no Rust generator; `vx-bench prepare-data ssb` builds the reference C `dbgen`
-      # from source. See vortex-bench/sql/ssb/README.md.
-      - name: Install cmake
-        if: matrix.subcommand == 'ssb'
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
       - uses: ./.github/actions/system-info
 
       - name: Download binaries

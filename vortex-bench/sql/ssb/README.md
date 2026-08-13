@@ -42,17 +42,25 @@ for the same reason. Column names (`d_datekey`, `d_year`, ...) are unchanged.
 
 ## Data
 
-There is no Rust SSB generator, and SSB is not derivable from TPC-H output — the dimension
-cardinalities differ (`customer` is SF x 30k rather than SF x 150k, `supplier` SF x 2k rather than
-SF x 10k, `part` is `200000 * floor(1 + log2(SF))`) and `dwdate` has no TPC-H analogue. So
-[`src/ssb/datagen.rs`](../../src/ssb/datagen.rs) clones and builds the pinned reference C `dbgen`,
-runs it, and converts its `.tbl` output to Parquet with the `duckdb` CLI. Generating data
-therefore needs a C compiler, `cmake`, `git`, and the `duckdb` CLI on `PATH`; everything is
-cached and idempotent after the first run.
+SSB has no upstream Rust generator, so [`src/ssb/ssbgen/`](../../src/ssb/ssbgen/mod.rs) is an in-house one,
+built on the `dbgen` stream primitives the
+[`tpchgen`](https://github.com/clflushopt/tpchgen-rs) crate already ports;
+[`src/ssb/datagen.rs`](../../src/ssb/datagen.rs) writes it straight to Parquet. No `.tbl`
+intermediates, no `cmake`, no C compiler, no `duckdb` CLI.
 
-SSB has no official upstream, only a tree of unsynchronized `dbgen` forks, and they are not
-interchangeable — the module docs record which fork is pinned and why. At SF 10 the source
-Parquet is ~1.7 GB, dominated by `lineorder`'s 59,986,217 rows.
+Only the machinery is shared with TPC-H, not the data. SSB's dimension cardinalities differ
+(`customer` is SF x 30k rather than SF x 150k, `supplier` SF x 2k rather than SF x 10k, `part` is
+`200000 * floor(1 + log2(SF))`), `dwdate` has no TPC-H analogue, and generating the date dimension
+advances the order streams, so even columns drawn from the same stream as TPC-H hold different
+values.
+
+Output is byte-for-byte identical to the reference C `dbgen`, including its quirks; the module
+docs in `src/ssb/ssbgen/mod.rs` state which reference revision, which behaviours are reproduced
+deliberately, and where the port diverges, and `src/ssb/ssbgen/tests.rs` owns the digests that
+enforce it.
+
+At SF 10 the source Parquet is ~1.7 GB, dominated by `lineorder`'s 59,986,217 rows, and generation
+takes about a sixth as long as building and running the C generator did.
 
 ## CI variant
 
