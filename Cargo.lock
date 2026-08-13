@@ -10617,6 +10617,7 @@ dependencies = [
  "vortex-array",
  "vortex-arrow",
  "vortex-buffer",
+ "vortex-edition",
  "vortex-error",
  "vortex-layout",
  "vortex-mask",
