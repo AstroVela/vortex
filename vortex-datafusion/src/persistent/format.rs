@@ -51,8 +51,6 @@ use vortex::dtype::PType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex::expr::stats::Precision;
-use vortex::expr::stats::Stat;
 use vortex::file::EOF_SIZE;
 use vortex::file::MAX_POSTSCRIPT_SIZE;
 use vortex::file::OpenOptionsSessionExt;
@@ -62,6 +60,8 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
+use vortex::stats::Precision;
+use vortex::stats::Stat;
 use vortex_arrow::ArrowSessionExt;
 
 use super::cache::CachedVortexMetadata;

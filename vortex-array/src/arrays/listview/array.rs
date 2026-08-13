@@ -35,11 +35,11 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::dtype::PType;
-use crate::expr::stats::Stat;
 use crate::legacy_session;
 use crate::match_each_integer_ptype;
 use crate::match_each_unsigned_integer_ptype;
 use crate::scalar_fn::fns::operators::Operator;
+use crate::stats::Stat;
 use crate::validity::Validity;
 
 #[array_slots(ListView)]

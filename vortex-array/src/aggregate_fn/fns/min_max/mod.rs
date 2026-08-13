@@ -35,13 +35,13 @@ use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::StructFields;
 use crate::dtype::half::f16;
-use crate::expr::stats::Precision;
-use crate::expr::stats::Stat;
-use crate::expr::stats::StatsProvider;
-use crate::expr::stats::StatsProviderExt;
 use crate::partial_ord::partial_max;
 use crate::partial_ord::partial_min;
 use crate::scalar::Scalar;
+use crate::stats::Precision;
+use crate::stats::Stat;
+use crate::stats::StatsProvider;
+use crate::stats::StatsProviderExt;
 
 static NAMES: LazyLock<FieldNames> = LazyLock::new(|| FieldNames::from(["min", "max"]));
 
@@ -474,11 +474,11 @@ mod tests {
     use crate::dtype::DecimalDType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
-    use crate::expr::stats::Precision;
-    use crate::expr::stats::Stat;
     use crate::scalar::DecimalValue;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
+    use crate::stats::Precision;
+    use crate::stats::Stat;
     use crate::validity::Validity;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);

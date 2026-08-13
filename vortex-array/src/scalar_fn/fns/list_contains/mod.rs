@@ -425,12 +425,12 @@ mod tests {
     use crate::expr::lt;
     use crate::expr::or;
     use crate::expr::root;
-    use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::list_contains::BoolArray;
     use crate::scalar_fn::fns::list_contains::ConstantArray;
     use crate::scalar_fn::fns::list_contains::ListViewArray;
     use crate::scalar_fn::fns::list_contains::PrimitiveArray;
+    use crate::stats::Stat;
     use crate::stats::StatsSession;
     use crate::stats::stat as stat_expr;
     use crate::validity::Validity;

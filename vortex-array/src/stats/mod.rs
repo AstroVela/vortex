@@ -21,17 +21,25 @@ pub use stats_set::*;
 
 mod array;
 pub mod bind;
+mod bounds;
 pub mod expr;
 pub mod flatbuffers;
+mod precision;
+mod provider;
 pub mod rewrite;
 pub mod session;
+mod stat;
+mod stat_bound;
 mod stats_set;
 
 pub use array::*;
+pub use bounds::*;
+pub use precision::*;
+pub use provider::*;
 pub use session::*;
+pub use stat::*;
+pub use stat_bound::*;
 use vortex_error::VortexExpect;
-
-use crate::expr::stats::Stat;
 
 /// Statistics that are used for pruning files (i.e., we want to ensure they are computed when compressing/writing).
 /// Sum is included for boolean arrays.

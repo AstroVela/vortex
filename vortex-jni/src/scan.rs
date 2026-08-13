@@ -35,7 +35,6 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::expr::Expression;
 use vortex::expr::root;
-use vortex::expr::stats::Precision;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::layout::scan::arrow::RecordBatchIteratorAdapter;
 use vortex::scan::DataSourceScan;
@@ -44,6 +43,7 @@ use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
+use vortex::stats::Precision;
 use vortex_arrow::ArrowSessionExt;
 
 use crate::POOL;

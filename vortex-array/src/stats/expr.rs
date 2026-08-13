@@ -197,10 +197,10 @@ mod tests {
     use crate::dtype::PType;
     use crate::expr::bound as bound_expr;
     use crate::expr::root;
-    use crate::expr::stats::Precision;
-    use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
+    use crate::stats::Precision;
+    use crate::stats::Stat;
     use crate::validity::Validity;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);

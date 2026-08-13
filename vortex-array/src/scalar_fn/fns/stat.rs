@@ -21,10 +21,6 @@ use crate::aggregate_fn::fns::all_null::AllNull;
 use crate::arrays::ConstantArray;
 use crate::dtype::DType;
 use crate::expr::display::ExprDisplay;
-use crate::expr::stats::Precision;
-use crate::expr::stats::Stat;
-use crate::expr::stats::StatsProvider;
-use crate::expr::stats::StatsProviderExt;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 use crate::scalar_fn::Arity;
@@ -32,6 +28,10 @@ use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::stats::Precision;
+use crate::stats::Stat;
+use crate::stats::StatsProvider;
+use crate::stats::StatsProviderExt;
 
 /// Options for the `stat` scalar function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

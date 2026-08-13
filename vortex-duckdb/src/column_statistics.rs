@@ -4,10 +4,10 @@
 use vortex::array::stats::StatsSet;
 use vortex::dtype::DType;
 use vortex::error::VortexExpect as _;
-use vortex::expr::stats::Precision;
-use vortex::expr::stats::Stat;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue;
+use vortex::stats::Precision;
+use vortex::stats::Stat;
 
 use crate::convert::ToDuckDBScalar as _;
 use crate::duckdb::Value;

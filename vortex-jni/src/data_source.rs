@@ -23,13 +23,13 @@ use jni::sys::jlong;
 use url::Url;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex::expr::stats::Precision;
 use vortex::file::multi::MultiFileDataSource;
 use vortex::file::multi::parse_uri_or_path;
 use vortex::io::filesystem::FileSystemRef;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
+use vortex::stats::Precision;
 use vortex_arrow::ArrowSessionExt;
 
 use crate::RUNTIME;

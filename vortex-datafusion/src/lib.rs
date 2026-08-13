@@ -86,7 +86,7 @@
 use std::fmt::Debug;
 
 use datafusion_common::stats::Precision as DFPrecision;
-use vortex::expr::stats::Precision;
+use vortex::stats::Precision;
 
 pub mod convert;
 mod persistent;
@@ -100,7 +100,7 @@ pub use persistent::*;
 /// Extension trait to convert our [`Precision`] to DataFusion's
 /// [`DataFusionPrecision`].
 ///
-/// [`Precision`]: vortex::expr::stats::Precision
+/// [`Precision`]: vortex::stats::Precision
 /// [`DataFusionPrecision`]: datafusion_common::stats::Precision
 trait PrecisionExt<T>
 where

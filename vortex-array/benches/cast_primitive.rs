@@ -17,7 +17,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-use vortex_array::expr::stats::Stat;
+use vortex_array::stats::Stat;
 use vortex_session::VortexSession;
 
 fn main() {

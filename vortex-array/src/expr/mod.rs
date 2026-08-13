@@ -65,7 +65,6 @@ pub mod forms;
 mod optimize;
 pub mod proto;
 pub mod scope;
-pub mod stats;
 pub mod transform;
 pub mod traversal;
 

@@ -15,10 +15,10 @@ use crate::aggregate_fn::session::AggregateFnSessionExt;
 use crate::columnar::AnyColumnar;
 use crate::dtype::DType;
 use crate::executor::max_iterations;
-use crate::expr::stats::Precision;
-use crate::expr::stats::Stat;
-use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
+use crate::stats::Precision;
+use crate::stats::Stat;
+use crate::stats::StatsProvider;
 
 /// Reference-counted type-erased accumulator.
 pub type AccumulatorRef = Box<dyn DynAccumulator>;

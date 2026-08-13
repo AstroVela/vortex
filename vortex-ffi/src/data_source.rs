@@ -9,14 +9,14 @@ use bytes::Bytes;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
-use vortex::expr::stats::Precision::Absent;
-use vortex::expr::stats::Precision::Exact;
-use vortex::expr::stats::Precision::Inexact;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::multi::MultiFileDataSource;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::layout::scan::multi::MultiLayoutDataSource;
 use vortex::scan::DataSource;
+use vortex::stats::Precision::Absent;
+use vortex::stats::Precision::Exact;
+use vortex::stats::Precision::Inexact;
 
 use crate::RUNTIME;
 use crate::box_wrapper;

@@ -39,7 +39,6 @@ use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::expr::Expression;
-use vortex::expr::stats::Precision;
 use vortex::file::v2::FileStatsLayoutReader;
 use vortex::io::kanal_ext::KanalExt as _;
 use vortex::io::runtime::BlockingRuntime as _;
@@ -53,6 +52,7 @@ use vortex::scalar_fn::fns::operators::Operator;
 use vortex::scalar_fn::fns::pack::Pack;
 use vortex::scan::DataSource;
 use vortex::scan::ScanRequest;
+use vortex::stats::Precision;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::parallelism::get_available_parallelism;
 

@@ -105,7 +105,7 @@ mod tests {
     use crate::expr::lit;
     use crate::expr::or;
     use crate::expr::root;
-    use crate::expr::stats::Stat;
+    use crate::stats::Stat;
     use crate::stats::all_non_nan;
     use crate::stats::nan_count;
 

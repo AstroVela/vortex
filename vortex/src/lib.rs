@@ -113,6 +113,7 @@ use vortex_array::optimizer::kernels::KernelSession;
 pub use vortex_array::scalar_fn;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
+pub use vortex_array::stats;
 use vortex_array::stats::session::StatsSession;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;

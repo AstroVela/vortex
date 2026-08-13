@@ -180,10 +180,10 @@ mod tests {
     use vortex_array::expr::is_null;
     use vortex_array::expr::lit;
     use vortex_array::expr::root;
-    use vortex_array::expr::stats::Precision;
-    use vortex_array::expr::stats::Stat;
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::scalar::ScalarValue;
+    use vortex_array::stats::Precision;
+    use vortex_array::stats::Stat;
     use vortex_array::stats::StatsSet;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;

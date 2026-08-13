@@ -108,12 +108,12 @@ use vortex::expr::and as vx_and;
 use vortex::expr::get_item;
 use vortex::expr::pack;
 use vortex::expr::root;
-use vortex::expr::stats::Precision;
 use vortex::expr::transform::replace;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
 use vortex::scan::ScanRequest;
 use vortex::session::VortexSession;
+use vortex::stats::Precision;
 use vortex_arrow::ArrowSessionExt;
 use vortex_utils::parallelism::get_available_parallelism;
 

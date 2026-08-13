@@ -52,11 +52,11 @@ use crate::dtype::DType;
 use crate::dtype::DecimalType;
 use crate::dtype::Nullability::NonNullable;
 use crate::dtype::PType;
-use crate::expr::stats::Precision;
-use crate::expr::stats::Stat;
-use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
+use crate::stats::Precision;
+use crate::stats::Stat;
+use crate::stats::StatsProvider;
 
 /// Return the uncompressed size of an array in bytes.
 ///
@@ -367,13 +367,13 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::dtype::UnionVariants;
-    use crate::expr::stats::Precision;
-    use crate::expr::stats::Stat;
-    use crate::expr::stats::StatsProvider;
     use crate::extension::datetime::Date;
     use crate::extension::datetime::TimeUnit;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
+    use crate::stats::Precision;
+    use crate::stats::Stat;
+    use crate::stats::StatsProvider;
     use crate::validity::Validity;
 
     fn materialized_uncompressed_size_in_bytes(array: &ArrayRef) -> u64 {

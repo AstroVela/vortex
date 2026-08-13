@@ -27,7 +27,6 @@ use crate::expr::bound::lt;
 use crate::expr::bound::lt_eq;
 use crate::expr::bound::or;
 use crate::expr::bound::or_collect;
-use crate::expr::stats::Stat;
 use crate::scalar::StringLike;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnId;
@@ -47,6 +46,7 @@ use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
 use crate::scalar_fn::internal::row_count::RowCount;
+use crate::stats::Stat;
 use crate::stats::bound::stat;
 use crate::stats::rewrite::StatsRewriteCtx;
 use crate::stats::rewrite::StatsRewriteRule;
@@ -734,7 +734,6 @@ mod tests {
     use crate::expr::lt;
     use crate::expr::lt_eq;
     use crate::expr::or;
-    use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar_fn::EmptyOptions;
     use crate::scalar_fn::ScalarFnVTableExt;
@@ -744,6 +743,7 @@ mod tests {
     use crate::scalar_fn::fns::dynamic::DynamicComparisonExpr;
     use crate::scalar_fn::fns::operators::CompareOperator;
     use crate::scalar_fn::internal::row_count::RowCount;
+    use crate::stats::Stat;
     use crate::stats::expr::StatFn;
     use crate::stats::expr::StatOptions;
 

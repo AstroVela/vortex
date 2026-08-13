@@ -9,9 +9,9 @@ use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
-use vortex::expr::stats::Precision as VortexPrecision;
-use vortex::expr::stats::Stat;
 use vortex::scalar::Scalar;
+use vortex::stats::Precision as VortexPrecision;
+use vortex::stats::Stat;
 
 use crate::PrecisionExt;
 use crate::convert::TryToDataFusion;
@@ -90,7 +90,7 @@ pub(crate) fn is_constant_to_distinct_count(
 
 #[cfg(test)]
 mod tests {
-    use vortex::expr::stats::Precision as VortexPrecision;
+    use vortex::stats::Precision as VortexPrecision;
 
     use super::*;
 

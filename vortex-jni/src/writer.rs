@@ -43,8 +43,6 @@ use vortex::dtype::DType;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex::expr::stats::Stat;
-use vortex::expr::stats::StatsProvider;
 use vortex::file::CountingVortexWrite;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
@@ -57,6 +55,8 @@ use vortex::io::runtime::Task;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::BufferedBytesTracker;
 use vortex::session::VortexSession;
+use vortex::stats::Stat;
+use vortex::stats::StatsProvider;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex_arrow::ArrowSessionExt;
 

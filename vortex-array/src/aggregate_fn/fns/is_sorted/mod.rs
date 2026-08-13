@@ -36,10 +36,10 @@ use crate::dtype::DType;
 use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
 use crate::dtype::StructFields;
-use crate::expr::stats::Precision;
-use crate::expr::stats::Stat;
-use crate::expr::stats::StatsProviderExt;
 use crate::scalar::Scalar;
+use crate::stats::Precision;
+use crate::stats::Stat;
+use crate::stats::StatsProviderExt;
 
 /// Options for the `is_sorted` aggregate function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

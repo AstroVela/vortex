@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::VortexSessionExecute;
-use vortex_array::expr::stats::Stat;
+use vortex_array::stats::Stat;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_error::VortexResult;
 use vortex_io::session::RuntimeSessionExt;
