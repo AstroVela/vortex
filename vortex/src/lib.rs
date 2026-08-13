@@ -117,6 +117,7 @@ pub use vortex_array::stats;
 use vortex_array::stats::session::StatsSession;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
+pub use vortex_scalar_fn_core as scalar_fn_core;
 use vortex_session::VortexSession;
 
 // We re-export like so in order to allow users to search inside subcrates when using the Rust docs.
@@ -318,6 +319,7 @@ impl VortexSessionDefault for VortexSession {
             .with::<MemorySession>()
             .with::<RuntimeSession>();
         vortex_arrow::initialize(&session);
+        vortex_scalar_fn_core::register_scalar_fns(&session);
         editions::register_default_editions(&session);
         editions::enable_default_editions(&session);
 

@@ -373,7 +373,6 @@ mod tests {
     use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
     use vortex_array::expr::bound::pack as bound_pack;
-    use vortex_array::expr::byte_length;
     use vortex_array::expr::cast;
     use vortex_array::expr::eq;
     use vortex_array::expr::get_item;
@@ -390,6 +389,7 @@ mod tests {
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSession;
     use vortex_io::session::RuntimeSessionExt;
+    use vortex_scalar_fn_core::exprs::byte_length;
     use vortex_session::VortexSession;
 
     use crate::LayoutId;

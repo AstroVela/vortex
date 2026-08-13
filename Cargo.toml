@@ -15,6 +15,7 @@ members = [
     "vortex-cloud",
     "vortex-proto",
     "vortex-array",
+    "vortex-scalar-fn-core",
     "vortex-arrow",
     "vortex-row",
     "vortex-tensor",
@@ -324,6 +325,7 @@ vortex-pco = { version = "0.1.0", path = "./encodings/pco", default-features = f
 vortex-proto = { version = "0.1.0", path = "./vortex-proto", default-features = false }
 vortex-row = { version = "0.1.0", path = "./vortex-row", default-features = false }
 vortex-runend = { version = "0.1.0", path = "./encodings/runend", default-features = false }
+vortex-scalar-fn-core = { version = "0.1.0", path = "./vortex-scalar-fn-core", default-features = false }
 vortex-scan = { version = "0.1.0", path = "./vortex-scan", default-features = false }
 vortex-sequence = { version = "0.1.0", path = "encodings/sequence", default-features = false }
 vortex-session = { version = "0.1.0", path = "./vortex-session", default-features = false }

@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::ArrayRef;
+use vortex_array::Canonical;
+use vortex_array::Columnar;
+use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
+use vortex_array::aggregate_fn::AggregateFnVTable;
+use vortex_array::aggregate_fn::DynGroupedAccumulator;
+use vortex_array::aggregate_fn::GroupRanges;
+use vortex_array::aggregate_fn::GroupedAccumulator;
+use vortex_array::aggregate_fn::GroupedArray;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::FixedSizeList;
+use vortex_array::arrays::ListView;
+use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
+use vortex_array::scalar_fn::Arity;
+use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ExecutionArgs;
+use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::scalar_fn::ScalarFnVTable;
+use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -8,31 +32,6 @@ use vortex_error::vortex_err;
 use vortex_mask::AllOr;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
-
-use crate::ArrayRef;
-use crate::Canonical;
-use crate::Columnar;
-use crate::ExecutionCtx;
-use crate::IntoArray;
-use crate::aggregate_fn::AggregateFnVTable;
-use crate::aggregate_fn::DynGroupedAccumulator;
-use crate::aggregate_fn::GroupRanges;
-use crate::aggregate_fn::GroupedAccumulator;
-use crate::aggregate_fn::GroupedArray;
-use crate::aggregate_fn::NumericalAggregateOpts;
-use crate::aggregate_fn::fns::sum::Sum;
-use crate::arrays::BoolArray;
-use crate::arrays::ConstantArray;
-use crate::arrays::FixedSizeList;
-use crate::arrays::ListView;
-use crate::builtins::ArrayBuiltins;
-use crate::dtype::DType;
-use crate::scalar_fn::Arity;
-use crate::scalar_fn::ChildName;
-use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::ScalarFnId;
-use crate::scalar_fn::ScalarFnVTable;
-use crate::validity::Validity;
 
 /// Sum of the elements in each list of a `List` or `FixedSizeList` typed array.
 ///
@@ -196,34 +195,34 @@ mod tests {
 
     use prost::Message;
     use rstest::rstest;
+    use vortex_array::ArrayRef;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::NumericalAggregateOpts;
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ConstantArray;
+    use vortex_array::arrays::FixedSizeListArray;
+    use vortex_array::arrays::ListArray;
+    use vortex_array::arrays::ListViewArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::expr::Expression;
+    use vortex_array::expr::proto::ExprSerializeProtoExt;
+    use vortex_array::expr::root;
+    use vortex_array::scalar::Scalar;
+    use vortex_array::scalar_fn::ScalarFnVTable;
+    use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
     use vortex_proto::expr as pb;
 
-    use crate::ArrayRef;
-    use crate::IntoArray;
-    use crate::VortexSessionExecute;
-    use crate::aggregate_fn::NumericalAggregateOpts;
-    use crate::array_session;
-    use crate::arrays::BoolArray;
-    use crate::arrays::ConstantArray;
-    use crate::arrays::FixedSizeListArray;
-    use crate::arrays::ListArray;
-    use crate::arrays::ListViewArray;
-    use crate::arrays::PrimitiveArray;
-    use crate::assert_arrays_eq;
-    use crate::dtype::DType;
-    use crate::dtype::Nullability;
-    use crate::dtype::PType;
-    use crate::expr::Expression;
-    use crate::expr::list_sum;
-    use crate::expr::list_sum_opts;
-    use crate::expr::proto::ExprSerializeProtoExt;
-    use crate::expr::root;
-    use crate::scalar::Scalar;
-    use crate::scalar_fn::ScalarFnVTable;
-    use crate::scalar_fn::fns::list_sum::ListSum;
-    use crate::validity::Validity;
+    use crate::exprs::list_sum;
+    use crate::exprs::list_sum_opts;
+    use crate::fns::list_sum::ListSum;
+    use crate::scalar_fn_session as array_session;
 
     fn create_list_elements() -> ArrayRef {
         PrimitiveArray::from_option_iter::<i32, _>([

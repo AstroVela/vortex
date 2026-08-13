@@ -16,6 +16,29 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use prost::Message;
+use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
+use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::bool::BoolArrayExt;
+use vortex_array::builders::ArrayBuilder;
+use vortex_array::builders::builder_with_capacity;
+use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
+use vortex_array::expr::Expression;
+use vortex_array::expr::display::ExprDisplay;
+use vortex_array::scalar::Scalar;
+use vortex_array::scalar_fn::Arity;
+use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ExecutionArgs;
+use vortex_array::scalar_fn::ScalarFnId;
+use vortex_array::scalar_fn::ScalarFnVTable;
+use vortex_array::scalar_fn::SimplifyCtx;
+use vortex_array::scalar_fn::fns::is_not_null::IsNotNull;
+use vortex_array::scalar_fn::fns::is_null::IsNull;
+use vortex_array::scalar_fn::fns::literal::Literal;
+use vortex_array::scalar_fn::fns::zip::zip_impl;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::AllOr;
@@ -23,30 +46,6 @@ use vortex_mask::Mask;
 use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
-
-use crate::ArrayRef;
-use crate::ExecutionCtx;
-use crate::IntoArray;
-use crate::arrays::BoolArray;
-use crate::arrays::ConstantArray;
-use crate::arrays::bool::BoolArrayExt;
-use crate::builders::ArrayBuilder;
-use crate::builders::builder_with_capacity;
-use crate::builtins::ArrayBuiltins;
-use crate::dtype::DType;
-use crate::expr::Expression;
-use crate::expr::display::ExprDisplay;
-use crate::scalar::Scalar;
-use crate::scalar_fn::Arity;
-use crate::scalar_fn::ChildName;
-use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::ScalarFnId;
-use crate::scalar_fn::ScalarFnVTable;
-use crate::scalar_fn::SimplifyCtx;
-use crate::scalar_fn::fns::is_not_null::IsNotNull;
-use crate::scalar_fn::fns::is_null::IsNull;
-use crate::scalar_fn::fns::literal::Literal;
-use crate::scalar_fn::fns::zip::zip_impl;
 
 /// Options for the n-ary CaseWhen expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -298,7 +297,7 @@ impl ScalarFnVTable for CaseWhen {
             return Ok(Some(x.clone()));
         }
 
-        Ok(Some(crate::expr::fill_null(x.clone(), fill.clone())))
+        Ok(Some(vortex_array::expr::fill_null(x.clone(), fill.clone())))
     }
 
     fn is_strict(&self, _options: &Self::Options) -> bool {
@@ -445,37 +444,37 @@ fn merge_run_by_run(
 mod tests {
     use std::sync::LazyLock;
 
+    use vortex_array::Canonical;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::StructArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::dtype::StructFields;
+    use vortex_array::expr::col;
+    use vortex_array::expr::eq;
+    use vortex_array::expr::get_item;
+    use vortex_array::expr::gt;
+    use vortex_array::expr::is_not_null;
+    use vortex_array::expr::is_null;
+    use vortex_array::expr::lit;
+    use vortex_array::expr::root;
+    use vortex_array::expr::test_harness;
+    use vortex_array::scalar::Scalar;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect as _;
     use vortex_session::VortexSession;
 
     use super::*;
-    use crate::Canonical;
-    use crate::IntoArray;
-    use crate::VortexSessionExecute;
-    use crate::arrays::BoolArray;
-    use crate::arrays::PrimitiveArray;
-    use crate::arrays::StructArray;
-    use crate::assert_arrays_eq;
-    use crate::dtype::DType;
-    use crate::dtype::Nullability;
-    use crate::dtype::PType;
-    use crate::dtype::StructFields;
-    use crate::expr::case_when;
-    use crate::expr::case_when_no_else;
-    use crate::expr::col;
-    use crate::expr::eq;
-    use crate::expr::get_item;
-    use crate::expr::gt;
-    use crate::expr::is_not_null;
-    use crate::expr::is_null;
-    use crate::expr::lit;
-    use crate::expr::nested_case_when;
-    use crate::expr::root;
-    use crate::expr::test_harness;
-    use crate::scalar::Scalar;
+    use crate::exprs::case_when;
+    use crate::exprs::case_when_no_else;
+    use crate::exprs::nested_case_when;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::scalar_fn_session);
 
     /// Helper to evaluate an expression using the apply+execute pattern
     fn evaluate_expr(expr: &Expression, array: &ArrayRef) -> ArrayRef {
@@ -1490,6 +1489,51 @@ mod tests {
             PrimitiveArray::from_option_iter(expected).into_array(),
             &mut ctx
         );
+        Ok(())
+    }
+
+    use vortex_array::expr::Expression;
+    use vortex_array::expr::bound;
+
+    use crate::exprs::bound_case_when;
+
+    #[test]
+    fn bound_constructors_preserve_order_and_types() -> VortexResult<()> {
+        let value_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let scope = DType::Struct(
+            StructFields::from_iter([("value", value_dtype.clone())]),
+            Nullability::NonNullable,
+        );
+
+        let root = bound::root(scope.clone());
+        let value = bound::get_item("value", root);
+        let literal = bound::lit(5i32);
+        let condition = bound::gt(value.clone(), literal.clone());
+        assert_eq!(condition.dtype(), &DType::Bool(Nullability::NonNullable));
+        assert_eq!(condition.children(), &[value.clone(), literal.clone()]);
+
+        let case = bound_case_when(condition.clone(), value.clone(), literal.clone());
+        assert_eq!(case.dtype(), &value_dtype);
+        assert_eq!(case.children(), &[condition.clone(), value, literal]);
+
+        let packed = bound::pack(
+            [("condition", condition.clone()), ("value", case.clone())],
+            Nullability::NonNullable,
+        );
+        assert_eq!(packed.children(), &[condition, case.clone()]);
+        assert_eq!(
+            packed.dtype(),
+            &DType::Struct(
+                StructFields::from_iter([
+                    ("condition", DType::Bool(Nullability::NonNullable)),
+                    ("value", value_dtype),
+                ]),
+                Nullability::NonNullable,
+            )
+        );
+
+        let unbound = case_when(gt(col("value"), lit(5i32)), col("value"), lit(5i32));
+        assert_eq!(unbound.bind(&scope)?, case);
         Ok(())
     }
 }

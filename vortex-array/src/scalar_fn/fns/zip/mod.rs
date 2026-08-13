@@ -167,7 +167,7 @@ impl ScalarFnVTable for Zip {
     }
 }
 
-pub(crate) fn zip_impl(
+pub fn zip_impl(
     if_true: &ArrayRef,
     if_false: &ArrayRef,
     mask: &Mask,

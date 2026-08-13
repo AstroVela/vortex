@@ -8,8 +8,8 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::fns::byte_length::ByteLengthKernel;
 use vortex_array::validity::Validity;
+use vortex_scalar_fn_core::fns::byte_length::ByteLengthKernel;
 
 use crate::OnPair;
 use crate::OnPairArraySlotsExt;

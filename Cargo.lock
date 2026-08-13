@@ -9555,6 +9555,7 @@ dependencies = [
  "vortex-pco",
  "vortex-proto",
  "vortex-runend",
+ "vortex-scalar-fn-core",
  "vortex-scan",
  "vortex-sequence",
  "vortex-session",
@@ -10196,6 +10197,7 @@ dependencies = [
  "vortex-buffer",
  "vortex-error",
  "vortex-mask",
+ "vortex-scalar-fn-core",
  "vortex-session",
 ]
 
@@ -10354,6 +10356,7 @@ dependencies = [
  "vortex-mask",
  "vortex-metrics",
  "vortex-runend",
+ "vortex-scalar-fn-core",
  "vortex-scan",
  "vortex-sequence",
  "vortex-session",
@@ -10405,6 +10408,7 @@ dependencies = [
  "vortex-buffer",
  "vortex-error",
  "vortex-mask",
+ "vortex-scalar-fn-core",
  "vortex-session",
 ]
 
@@ -10541,6 +10545,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-scalar-fn-core"
+version = "0.1.0"
+dependencies = [
+ "codspeed-divan-compat",
+ "itertools 0.14.0",
+ "num-traits",
+ "prost 0.14.4",
+ "rand 0.10.2",
+ "rstest",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-mask",
+ "vortex-proto",
+ "vortex-session",
+]
+
+[[package]]
 name = "vortex-scan"
 version = "0.1.0"
 dependencies = [
@@ -10620,6 +10642,7 @@ dependencies = [
  "vortex-error",
  "vortex-layout",
  "vortex-mask",
+ "vortex-scalar-fn-core",
  "vortex-session",
  "vortex-spatial",
  "wkb",
