@@ -419,7 +419,7 @@ pub struct RequestMetrics {
     pub coalesced_requests: Counter,
     /// Distribution of how many segment requests were merged into each physical read.
     pub num_requests_coalesced: Histogram,
-    /// Number of calls made to [`VortexReadAt::read_ranges`](vortex_io::VortexReadAt::read_ranges).
+    /// Number of calls made to [`VortexReadAt::read_ranges`].
     pub read_ranges_calls: Counter,
     /// Number of `read_ranges` calls containing more than one physical range.
     pub read_ranges_multi: Counter,
