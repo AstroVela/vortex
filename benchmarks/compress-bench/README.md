@@ -86,5 +86,7 @@ cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress --gpu-verify --iterations 1
 ```
 
-A verifying run reports on every dataset rather than stopping at the first failure, so one run
-shows which datasets decode correctly on the GPU and which do not.
+Any `--gpu-decompress` run reports on every dataset rather than stopping at the first failure, so
+one run shows which datasets decode correctly on the GPU and which do not. The timing tables are
+rendered before the failure summary, so a dataset the GPU cannot decode still leaves the rest of
+the matrix with numbers — the process exits non-zero either way.
