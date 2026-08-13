@@ -444,6 +444,34 @@ fn test_write_timestamps() {
     );
 }
 
+/// A filter pushed down onto a `TIMESTAMPTZ` column must be evaluated, not abort the process.
+/// See <https://github.com/vortex-data/vortex/issues/9396>.
+#[test]
+fn test_filter_pushdown_timestamptz() {
+    let conn = database_connection();
+    let tempdir = tempfile::tempdir().unwrap();
+    let file_path = format!("{}/tz.vortex", tempdir.path().to_string_lossy());
+
+    conn.query(&format!(
+        "COPY (SELECT i AS id, TIMESTAMPTZ '2024-01-01' + to_seconds(i) AS ts_tz \
+         FROM range(100000) t(i)) TO '{file_path}' (FORMAT VORTEX);",
+    ))
+    .unwrap();
+
+    let result = conn
+        .query(&format!(
+            "SELECT count(*) FROM read_vortex('{file_path}') \
+             WHERE ts_tz >= TIMESTAMPTZ '2024-01-01 06:00:00';",
+        ))
+        .unwrap();
+    let chunk = result.into_iter().next().unwrap();
+    let vec = chunk.get_vector(0);
+    let count = vec.as_slice_with_len::<i64>(chunk.len().as_())[0];
+
+    // 6 hours in, so the first 6 * 3600 rows are excluded.
+    assert_eq!(count, 100_000 - 6 * 3600);
+}
+
 #[test]
 fn test_vortex_scan_fixed_size_list_utf8() {
     // Test a simple FixedSizeList of Utf8 strings to ensure proper materialization.

@@ -3,7 +3,6 @@
 
 use std::fmt;
 
-use jiff::Span;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -67,10 +66,20 @@ pub enum DateValue {
 
 impl fmt::Display for DateValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let date = match self {
-            DateValue::Days(days) => EPOCH + Span::new().days(*days),
-            DateValue::Milliseconds(ms) => EPOCH + Span::new().milliseconds(*ms),
+        let (unit, value) = match self {
+            DateValue::Days(days) => (TimeUnit::Days, i64::from(*days)),
+            DateValue::Milliseconds(ms) => (TimeUnit::Milliseconds, *ms),
         };
+
+        // Out-of-range values must not panic, since scalars are formatted in error paths.
+        let Some(date) = unit
+            .to_jiff_span(value)
+            .ok()
+            .and_then(|span| EPOCH.checked_add(span).ok())
+        else {
+            return write!(f, "<invalid date {value}{unit}>");
+        };
+
         write!(f, "{}", date)
     }
 }
@@ -137,13 +146,28 @@ impl ExtVTable for Date {
         storage_value: &'a ScalarValue,
     ) -> VortexResult<Self::NativeValue<'a>> {
         let metadata = ext_dtype.metadata();
-        match metadata {
-            TimeUnit::Milliseconds => Ok(DateValue::Milliseconds(
-                storage_value.as_primitive().cast::<i64>()?,
-            )),
-            TimeUnit::Days => Ok(DateValue::Days(storage_value.as_primitive().cast::<i32>()?)),
+        let (value, date_value) = match metadata {
+            TimeUnit::Milliseconds => {
+                let millis = storage_value.as_primitive().cast::<i64>()?;
+                (millis, DateValue::Milliseconds(millis))
+            }
+            TimeUnit::Days => {
+                let days = storage_value.as_primitive().cast::<i32>()?;
+                (i64::from(days), DateValue::Days(days))
+            }
             _ => vortex_bail!("Date type does not support time unit {}", metadata),
-        }
+        };
+
+        // Validate the storage value is within the valid range for Date. Note that the span itself
+        // is fallible: a value too large for the time unit must error, not panic.
+        let span = metadata
+            .to_jiff_span(value)
+            .map_err(|e| vortex_err!("Invalid date scalar: {}", e))?;
+        EPOCH
+            .checked_add(span)
+            .map_err(|e| vortex_err!("Invalid date scalar: {}", e))?;
+
+        Ok(date_value)
     }
 }
 

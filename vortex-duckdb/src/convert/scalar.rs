@@ -215,7 +215,22 @@ impl ToDuckDBScalar for ExtScalar<'_> {
                             "Currently only UTC timezone is supported for duckdb timestamp(tz) conversion"
                         );
                     }
-                    return Ok(Value::new_timestamp_tz(value()?));
+                    // DuckDB's TIMESTAMP_TZ is always microseconds since the epoch, so unlike the
+                    // non-tz branch below we cannot tag the value with its unit and must rescale.
+                    let micros = match unit {
+                        TimeUnit::Microseconds => value()?,
+                        TimeUnit::Nanoseconds => value()?.div_euclid(1_000),
+                        TimeUnit::Milliseconds => value()?.checked_mul(1_000).ok_or_else(|| {
+                            vortex_err!("timestamp(ms, tz) overflows microseconds")
+                        })?,
+                        TimeUnit::Seconds => value()?.checked_mul(1_000_000).ok_or_else(|| {
+                            vortex_err!("timestamp(s, tz) overflows microseconds")
+                        })?,
+                        TimeUnit::Days => {
+                            vortex_bail!("timestamp(d, tz) cannot be converted to duckdb scalar")
+                        }
+                    };
+                    return Ok(Value::new_timestamp_tz(micros));
                 }
                 match unit {
                     TimeUnit::Nanoseconds => Value::new_timestamp_ns(value()?),
@@ -466,6 +481,46 @@ mod tests {
 
             assert_eq!(original_scalar, roundtrip_scalar);
         }
+    }
+
+    /// DuckDB's `TIMESTAMP_TZ` is always microseconds, so the Vortex time unit must be applied
+    /// rather than passing the raw storage value through.
+    /// See <https://github.com/vortex-data/vortex/issues/9396>.
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds, 1_703_980_800, 1_703_980_800_000_000)]
+    #[case::milliseconds(TimeUnit::Milliseconds, 1_703_980_800_123, 1_703_980_800_123_000)]
+    #[case::microseconds(TimeUnit::Microseconds, 1_703_980_800_123_456, 1_703_980_800_123_456)]
+    #[case::nanoseconds(
+        TimeUnit::Nanoseconds,
+        1_703_980_800_123_456_789,
+        1_703_980_800_123_456
+    )]
+    fn test_timestamp_tz_to_duckdb(
+        #[case] time_unit: TimeUnit,
+        #[case] storage_value: i64,
+        #[case] expected_micros: i64,
+    ) {
+        let scalar = Scalar::extension::<Timestamp>(
+            TimestampOptions {
+                unit: time_unit,
+                tz: Some("UTC".into()),
+            },
+            Scalar::try_new(
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+                Some(ScalarValue::from(storage_value)),
+            )
+            .unwrap(),
+        );
+
+        let value = scalar.try_to_duckdb_scalar().unwrap();
+        assert_eq!(
+            value.logical_type().as_type_id(),
+            DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ
+        );
+        assert!(matches!(
+            value.extract(),
+            ExtractedValue::TimestampTz(micros) if micros == expected_micros
+        ));
     }
 
     /// Sample WKB bytes for `POINT(1 2)` little-endian.

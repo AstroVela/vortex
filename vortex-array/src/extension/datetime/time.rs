@@ -3,7 +3,6 @@
 
 use std::fmt;
 
-use jiff::Span;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -62,13 +61,20 @@ pub enum TimeValue {
 
 impl fmt::Display for TimeValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let min = jiff::civil::Time::MIN;
+        let (unit, value) = match self {
+            TimeValue::Seconds(s) => (TimeUnit::Seconds, i64::from(*s)),
+            TimeValue::Milliseconds(ms) => (TimeUnit::Milliseconds, i64::from(*ms)),
+            TimeValue::Microseconds(us) => (TimeUnit::Microseconds, *us),
+            TimeValue::Nanoseconds(ns) => (TimeUnit::Nanoseconds, *ns),
+        };
 
-        let time = match self {
-            TimeValue::Seconds(s) => min + Span::new().seconds(*s),
-            TimeValue::Milliseconds(ms) => min + Span::new().milliseconds(*ms),
-            TimeValue::Microseconds(us) => min + Span::new().microseconds(*us),
-            TimeValue::Nanoseconds(ns) => min + Span::new().nanoseconds(*ns),
+        // Out-of-range values must not panic, since scalars are formatted in error paths.
+        let Some(time) = unit
+            .to_jiff_span(value)
+            .ok()
+            .and_then(|span| jiff::civil::Time::MIN.checked_add(span).ok())
+        else {
+            return write!(f, "<invalid time {value}{unit}>");
         };
 
         write!(f, "{}", time)
@@ -138,29 +144,28 @@ impl ExtVTable for Time {
     ) -> VortexResult<Self::NativeValue<'a>> {
         let length_of_time = storage_value.as_primitive().cast::<i64>()?;
 
-        let (span, value) = match *ext_dtype.metadata() {
+        let unit = *ext_dtype.metadata();
+        let value = match unit {
             TimeUnit::Seconds => {
                 let v = i32::try_from(length_of_time)
                     .map_err(|e| vortex_err!("Time seconds value out of i32 range: {e}"))?;
-                (Span::new().seconds(v), TimeValue::Seconds(v))
+                TimeValue::Seconds(v)
             }
             TimeUnit::Milliseconds => {
                 let v = i32::try_from(length_of_time)
                     .map_err(|e| vortex_err!("Time milliseconds value out of i32 range: {e}"))?;
-                (Span::new().milliseconds(v), TimeValue::Milliseconds(v))
+                TimeValue::Milliseconds(v)
             }
-            TimeUnit::Microseconds => (
-                Span::new().microseconds(length_of_time),
-                TimeValue::Microseconds(length_of_time),
-            ),
-            TimeUnit::Nanoseconds => (
-                Span::new().nanoseconds(length_of_time),
-                TimeValue::Nanoseconds(length_of_time),
-            ),
+            TimeUnit::Microseconds => TimeValue::Microseconds(length_of_time),
+            TimeUnit::Nanoseconds => TimeValue::Nanoseconds(length_of_time),
             d @ TimeUnit::Days => vortex_bail!("Time type does not support time unit {d}"),
         };
 
-        // Validate the storage value is within the valid range for Time.
+        // Validate the storage value is within the valid range for Time. Note that the span itself
+        // is fallible: a value too large for the time unit must error, not panic.
+        let span = unit
+            .to_jiff_span(length_of_time)
+            .map_err(|e| vortex_err!("Invalid time scalar: {}", e))?;
         jiff::civil::Time::MIN
             .checked_add(span)
             .map_err(|e| vortex_err!("Invalid time scalar: {}", e))?;

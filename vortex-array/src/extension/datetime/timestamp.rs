@@ -6,7 +6,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use jiff::Span;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -91,20 +90,28 @@ pub enum TimestampValue<'a> {
 
 impl fmt::Display for TimestampValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (span, tz) = match self {
-            TimestampValue::Seconds(v, tz) => (Span::new().seconds(*v), *tz),
-            TimestampValue::Milliseconds(v, tz) => (Span::new().milliseconds(*v), *tz),
-            TimestampValue::Microseconds(v, tz) => (Span::new().microseconds(*v), *tz),
-            TimestampValue::Nanoseconds(v, tz) => (Span::new().nanoseconds(*v), *tz),
+        let (unit, value, tz) = match self {
+            TimestampValue::Seconds(v, tz) => (TimeUnit::Seconds, *v, *tz),
+            TimestampValue::Milliseconds(v, tz) => (TimeUnit::Milliseconds, *v, *tz),
+            TimestampValue::Microseconds(v, tz) => (TimeUnit::Microseconds, *v, *tz),
+            TimestampValue::Nanoseconds(v, tz) => (TimeUnit::Nanoseconds, *v, *tz),
         };
-        let ts = jiff::Timestamp::UNIX_EPOCH + span;
+
+        // Out-of-range values must not panic, since scalars are formatted in error paths.
+        let Some(ts) = unit
+            .to_jiff_span(value)
+            .ok()
+            .and_then(|span| jiff::Timestamp::UNIX_EPOCH.checked_add(span).ok())
+        else {
+            return write!(f, "<invalid timestamp {value}{unit}>");
+        };
 
         match tz {
             None => write!(f, "{ts}"),
-            Some(tz) => {
-                let adjusted_ts = ts.in_tz(tz.as_ref()).vortex_expect("unknown timezone");
-                write!(f, "{adjusted_ts}",)
-            }
+            Some(tz) => match ts.in_tz(tz.as_ref()) {
+                Ok(adjusted_ts) => write!(f, "{adjusted_ts}"),
+                Err(_) => write!(f, "<invalid timezone {tz} for timestamp {value}{unit}>"),
+            },
         }
     }
 }
@@ -226,27 +233,20 @@ impl ExtVTable for Timestamp {
         let ts_value = storage_value.as_primitive().cast::<i64>()?;
         let tz = metadata.tz.as_ref();
 
-        let (span, value) = match metadata.unit {
-            TimeUnit::Nanoseconds => (
-                Span::new().nanoseconds(ts_value),
-                TimestampValue::Nanoseconds(ts_value, tz),
-            ),
-            TimeUnit::Microseconds => (
-                Span::new().microseconds(ts_value),
-                TimestampValue::Microseconds(ts_value, tz),
-            ),
-            TimeUnit::Milliseconds => (
-                Span::new().milliseconds(ts_value),
-                TimestampValue::Milliseconds(ts_value, tz),
-            ),
-            TimeUnit::Seconds => (
-                Span::new().seconds(ts_value),
-                TimestampValue::Seconds(ts_value, tz),
-            ),
+        let value = match metadata.unit {
+            TimeUnit::Nanoseconds => TimestampValue::Nanoseconds(ts_value, tz),
+            TimeUnit::Microseconds => TimestampValue::Microseconds(ts_value, tz),
+            TimeUnit::Milliseconds => TimestampValue::Milliseconds(ts_value, tz),
+            TimeUnit::Seconds => TimestampValue::Seconds(ts_value, tz),
             TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
         };
 
-        // Validate the storage value is within the valid range for Timestamp.
+        // Validate the storage value is within the valid range for Timestamp. Note that the span
+        // itself is fallible: a value too large for the time unit must error, not panic.
+        let span = metadata
+            .unit
+            .to_jiff_span(ts_value)
+            .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
         let ts = jiff::Timestamp::UNIX_EPOCH
             .checked_add(span)
             .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
@@ -264,12 +264,14 @@ impl ExtVTable for Timestamp {
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
     use vortex_error::VortexResult;
 
     use crate::dtype::DType;
     use crate::dtype::Nullability::Nullable;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
+    use crate::extension::datetime::timestamp::TimestampValue;
     use crate::scalar::PValue;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
@@ -280,6 +282,33 @@ mod tests {
         Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(0))))?;
 
         Ok(())
+    }
+
+    /// A storage value too large for its time unit must produce an error, never a panic.
+    /// See <https://github.com/vortex-data/vortex/issues/9396>.
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds, 1_704_088_800_000_000)]
+    #[case::milliseconds(TimeUnit::Milliseconds, i64::MAX)]
+    #[case::microseconds(TimeUnit::Microseconds, i64::MAX)]
+    fn reject_timestamp_out_of_range(#[case] unit: TimeUnit, #[case] value: i64) {
+        for tz in [None, Some(Arc::from("UTC"))] {
+            let dtype =
+                DType::Extension(Timestamp::new_with_tz(unit, tz.clone(), Nullable).erased());
+            let result = Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(value))));
+            assert!(
+                result.is_err(),
+                "expected an error for {value}{unit} (tz={tz:?})"
+            );
+        }
+    }
+
+    /// Formatting an out-of-range value must not panic either.
+    #[test]
+    fn display_timestamp_out_of_range() {
+        assert_eq!(
+            format!("{}", TimestampValue::Seconds(i64::MAX, None)),
+            format!("<invalid timestamp {}s>", i64::MAX)
+        );
     }
 
     #[cfg_attr(miri, ignore)]
