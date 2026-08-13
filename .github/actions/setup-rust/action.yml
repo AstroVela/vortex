@@ -24,6 +24,12 @@ inputs:
     description: "Version of the mold linker to install on Linux."
     required: false
     default: "2.41.0"
+  sccache-version:
+    description: >-
+      Version of sccache to install. Pinned rather than resolved to the latest release so
+      that the tool cache key is stable.
+    required: false
+    default: "v0.17.0"
 
 runs:
   using: "composite"
@@ -118,9 +124,21 @@ runs:
         mkdir -p ~/.config/sccache
         echo 'server_startup_timeout_ms = 60000' > ~/.config/sccache/config
 
+    # sccache-action downloads the sccache binary from GitHub releases, which has failed
+    # jobs with "socket hang up". It checks the runner tool cache first, so priming that
+    # from the S3-backed cache skips the download entirely.
+    - name: Cache sccache Binary
+      if: inputs.enable-sccache == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: ${{ runner.tool_cache }}/sccache
+        key: sccache-${{ inputs.sccache-version }}-${{ runner.os }}-${{ runner.arch }}
+
     - name: Rust Compile Cache
       if: inputs.enable-sccache == 'true'
       uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+      with:
+        version: ${{ inputs.sccache-version }}
 
     - name: Pre-start sccache server
       if: inputs.enable-sccache == 'true'
