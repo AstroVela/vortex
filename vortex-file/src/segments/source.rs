@@ -208,6 +208,13 @@ impl FileSegmentSource {
                 }
 
                 while num_active < concurrency && !pending.is_empty() {
+                    // A partial batch is submitted through one `read_ranges` stream. Do not
+                    // refill individual slots from another partial batch as each range finishes:
+                    // that turns a queued group into one syscall submission per completion. Let
+                    // the current group drain, then submit all ready partial ranges together.
+                    if num_active != 0 && pending.front().is_some_and(IoRequest::is_partial) {
+                        break;
+                    }
                     let batch_len =
                         if num_active == 0 && pending.front().is_some_and(IoRequest::is_partial) {
                             partial_submission_len(&pending)
