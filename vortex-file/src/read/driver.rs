@@ -23,20 +23,18 @@ use crate::segments::ReadEvent;
 use crate::segments::RequestMetrics;
 
 pin_project! {
-    /// A stream that performs coalescing and prioritization of I/O requests.
+    /// Converts request lifecycle events into batches of physical reads.
     ///
-    /// Takes an input stream of [`ReadRequest`]s and buffers all ready requests into local state.
-    /// When polled for the next request, this stream will choose the next best request based on
-    /// an ordering of `(has_been_polled, insertion_order)`, skipping any canceled requests, and
-    /// then coalescing with other nearby requests within the configured `window`.
-    ///
-    /// The output contains up to `batch_size` immediately eligible physical requests. A poll never
-    /// waits to fill a batch.
+    /// Polled requests become eligible in registration order. An eligible request may absorb nearby
+    /// registered requests according to `coalesce_window`. Each poll emits every physical read
+    /// currently available, up to `batch_size`; it never waits for a full batch.
     pub(crate) struct IoRequestStream<S> {
         #[pin]
         events: S,
+        // True after the event source closes; buffered requests may still remain.
         inner_done: bool,
         coalesce_window: Option<CoalesceConfig>,
+        // Maximum physical reads returned by one stream item.
         batch_size: usize,
         state: State,
     }
@@ -75,7 +73,8 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
-        // First, try to drain all immediately available requests from the inner stream
+        // Apply all events already available before choosing work. This gives coalescing visibility
+        // into registered neighbors without delaying emission for future events.
         loop {
             match this.events.as_mut().poll_next(cx) {
                 Poll::Ready(Some(event)) => {
@@ -91,7 +90,7 @@ where
             }
         }
 
-        // Return up to batch_size requests that are eligible now. Do not wait to fill the batch.
+        // Emit a partial batch immediately so the downstream driver can fill free I/O slots.
         let mut batch = Vec::with_capacity(*this.batch_size);
         while batch.len() < *this.batch_size {
             let Some(request) = this.state.next(this.coalesce_window.as_ref()) else {
@@ -103,12 +102,12 @@ where
             return Poll::Ready(Some(batch));
         }
 
-        // If the inner stream is done, and we have no more _polled_ requests, we're done
+        // Unpolled requests cannot initiate I/O, so a closed source is done once none are eligible.
         if *this.inner_done && this.state.polled_requests.is_empty() {
             return Poll::Ready(None);
         }
 
-        // Otherwise, we need more data from the inner stream
+        // A new poll/drop/register event will wake us.
         Poll::Pending
     }
 }
