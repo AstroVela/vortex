@@ -7,6 +7,6 @@ pub use lance_bench::compress::LanceCompressor;
 pub mod gpu_parquet;
 #[cfg(feature = "cuda")]
 pub mod gpu_vortex;
+pub mod gpu_writer;
 pub mod parquet;
-pub mod parquet_pages;
 pub mod vortex;

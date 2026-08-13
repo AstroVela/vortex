@@ -23,55 +23,58 @@ GPU dataset list in `src/main.rs`. It measures decompression only, for two backe
 - **Vortex** — the file is written with CUDA-compatible BtrBlocks encodings only
   (`only_cuda_compatible`) and a CUDA flat layout, then decoded on the device all the way to
   canonical arrays.
-- **Parquet** — the file is rewritten with GPU-friendly writer settings (see below) and every
-  page body is decompressed on the device with nvCOMP's batched Snappy or Zstd entrypoints,
-  the same decomposition cuDF's Parquet reader uses: column chunks are staged on the device,
-  then all pages go through a single batched launch.
+- **Parquet** — the file is rewritten with GPU-friendly writer settings (see below) and read
+  back with [cuDF](https://github.com/rapidsai/cudf)'s `read_parquet`, which performs the
+  whole read on the device: page header decode, codec decompression, dictionary/RLE/plain
+  decoding and column assembly.
+
+Both sides therefore decode all the way to device-resident arrays, which is what makes the
+`vortex:parquet-<codec> gpu ratio decompress time` metric a like-for-like comparison.
 
 ```bash
 cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress
 
-# pick the Parquet page codec (default: snappy)
+# pick the Parquet page codec the GPU file is written with (default: snappy)
 cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress --gpu-parquet-codec zstd
 ```
 
-On Linux both backends read through the same pinned, direct-I/O (`O_DIRECT`) reader, so
-repeated iterations measure storage bandwidth rather than page-cache hits.
+### cuDF
 
-### What the Parquet GPU number does and does not include
+cuDF is reached through its prebuilt `cudf-cu12` wheel, so it is a runtime dependency of the
+benchmark and never enters the Rust build:
 
-Included: column chunk I/O, the host-to-device transfer, and the batched codec launch.
+```bash
+uv pip install --extra-index-url https://pypi.nvidia.com cudf-cu12 pandas pyarrow
+```
 
-Not included: page *decoding* — the dictionary, RLE and plain decoders that turn a
-decompressed page into an Arrow array — because there is no Rust GPU Parquet page decoder to
-call. The Vortex backend it is compared against decodes all the way to canonical arrays, so
-the Parquet figure is an upper bound on what a full GPU Parquet reader could reach, and the
-`vortex:parquet-<codec> gpu ratio decompress time` metric is biased in Parquet's favour.
+`scripts/cudf-parquet-read.py` performs and times the read. Timing is taken inside that
+script, so interpreter start, `import cudf` and CUDA context creation are excluded; a warm-up
+read runs first for the same reason.
 
-Walking the per-page Thrift headers also happens on the host, once per file, outside the
-measurement; a real GPU Parquet reader decodes page headers on the device.
+Note that the two backends do not share an I/O path: the Vortex reader uses pinned buffers and
+direct I/O (`O_DIRECT`) on Linux, while cuDF does its own host read and host-to-device
+transfer.
 
 ### GPU-friendly Parquet writer settings
 
-Set in `src/parquet_pages.rs`:
+Set in `src/gpu_writer.rs`:
 
 | Setting | Value | Why |
 | --- | --- | --- |
-| writer version | `PARQUET_1_0` | v1 pages compress the whole page body, which is the unit nvCOMP decompresses. v2 pages put uncompressed levels ahead of the compressed values in the same body. |
-| compression | Snappy (default) or Zstd | The two Parquet codecs nvCOMP implements. Snappy has the higher device throughput and is the Parquet default. |
+| writer version | `PARQUET_1_0` | v1 pages compress the whole page body; v2 pages put uncompressed levels ahead of the compressed values in the same body. |
+| compression | Snappy (default) or Zstd | Snappy is the Parquet default and has the higher device-side throughput. |
 | dictionary | enabled | Keeps the decompressed payload small; the encoding GPU Parquet readers decode fastest. |
-| data page size | 1 MiB | Large enough to amortize per-chunk setup, small enough to keep every SM fed. Matches the page size cuDF targets. |
+| data page size | 1 MiB | Large enough to amortize per-page setup, small enough to keep every SM fed. Matches the page size cuDF targets. |
 | data page row limit | 1,000,000 | The 20k-row default caps narrow columns' pages far below 1 MiB. |
-| statistics | chunk-level | Page statistics only inflate the headers that have to be walked on the host. |
+| statistics | chunk-level | Page statistics only inflate the headers a reader has to walk. |
 
 ### Correctness
 
 `--gpu-verify` cross-checks device output against the CPU decoders on every iteration:
 
-- Parquet: each decompressed page is copied back and compared byte-for-byte against the host
-  Snappy/Zstd output for the same compressed bytes.
+- Parquet: the cuDF-read frame is compared against a CPU Parquet read of the same file.
 - Vortex: each GPU-decoded field is copied back and compared against the same field decoded
   on the CPU, through Arrow with a pinned target type.
 
@@ -83,10 +86,5 @@ cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress --gpu-verify --iterations 1
 ```
 
-Independently of `--gpu-verify`, every Parquet GPU run checks nvCOMP's per-page status and
-output-size arrays after the measurement, because a batched launch reports per-page failures
-in device memory rather than by failing the launch.
-
-Page-header scanning is covered by CPU-only unit tests in `src/parquet_pages.rs`, which
-assert the located page bodies decompress to exactly the bytes `parquet`'s own page reader
-produces.
+A verifying run reports on every dataset rather than stopping at the first failure, so one run
+shows which datasets decode correctly on the GPU and which do not.

@@ -14,8 +14,8 @@ use compress_bench::LanceCompressor;
 use compress_bench::gpu_parquet::GpuParquetCompressor;
 #[cfg(feature = "cuda")]
 use compress_bench::gpu_vortex::GpuVortexCompressor;
+use compress_bench::gpu_writer::GpuCodec;
 use compress_bench::parquet::ParquetCompressor;
-use compress_bench::parquet_pages::GpuCodec;
 use compress_bench::vortex::VortexCompressor;
 use futures::FutureExt;
 use indicatif::ProgressBar;
@@ -81,9 +81,9 @@ struct Args {
     /// decompression only, for both Vortex and Parquet.
     #[arg(long)]
     gpu_decompress: bool,
-    /// Page codec the GPU Parquet backend writes and decompresses with.
+    /// Page codec the GPU Parquet file is written with.
     ///
-    /// Snappy is the Parquet default and the codec nvCOMP decompresses fastest.
+    /// Snappy is the Parquet default and the codec GPU readers decompress fastest.
     #[arg(long, value_enum, default_value_t)]
     gpu_parquet_codec: GpuCodec,
     /// Cross-check every GPU-decompressed result against the CPU decoder.
@@ -147,13 +147,9 @@ async fn main() -> anyhow::Result<()> {
 /// Settings for the GPU decompression mode.
 #[derive(Clone, Copy, Debug)]
 struct GpuOptions {
-    /// Parquet page codec to write and decompress on the device.
+    /// Parquet page codec to write the GPU file with.
     codec: GpuCodec,
     /// Cross-check decompressed output against the CPU decoders.
-    #[cfg_attr(
-        not(feature = "cuda"),
-        expect(dead_code, reason = "only the CUDA backends read this")
-    )]
     verify: bool,
 }
 

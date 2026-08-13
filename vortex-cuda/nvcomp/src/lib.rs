@@ -30,13 +30,9 @@ use std::sync::OnceLock;
 )]
 pub mod sys;
 
-mod backend;
 mod error;
-pub mod snappy;
 pub mod zstd;
 
-pub use backend::AlignmentRequirements;
-pub use backend::DecompressBackend;
 pub use error::NvcompError;
 
 /// The loaded nvcomp library instance.

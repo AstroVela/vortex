@@ -5,12 +5,32 @@
 
 use std::ffi::c_void;
 
-use crate::backend::AlignmentRequirements;
-pub use crate::backend::DecompressBackend;
 use crate::error::NvcompError;
 use crate::error::check_status;
 use crate::nvcomp_library;
 use crate::sys;
+
+/// Backend selection for nvcomp decompression.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DecompressBackend {
+    /// Let nvcomp auto-select the best backend for the hardware.
+    #[default]
+    Default,
+    /// Use hardware decompression
+    Hardware,
+    /// Use CUDA
+    Cuda,
+}
+
+impl DecompressBackend {
+    fn to_nvcomp(self) -> sys::nvcompDecompressBackend_t {
+        match self {
+            Self::Default => sys::nvcompDecompressBackend_t_NVCOMP_DECOMPRESS_BACKEND_DEFAULT,
+            Self::Hardware => sys::nvcompDecompressBackend_t_NVCOMP_DECOMPRESS_BACKEND_HARDWARE,
+            Self::Cuda => sys::nvcompDecompressBackend_t_NVCOMP_DECOMPRESS_BACKEND_CUDA,
+        }
+    }
+}
 
 /// Options for batched ZSTD decompression.
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,29 +105,6 @@ pub fn get_decompress_temp_size_with_opts(
 
     check_status(status)?;
     Ok(temp_bytes)
-}
-
-/// Returns the minimum buffer alignments required by batched ZSTD decompression.
-pub fn decompress_alignment_requirements(
-    opts: ZstdDecompressOpts,
-) -> Result<AlignmentRequirements, NvcompError> {
-    let library = nvcomp_library()?;
-
-    let mut requirements = sys::nvcompAlignmentRequirements_t {
-        input: 0,
-        output: 0,
-        temp: 0,
-    };
-
-    let status = unsafe {
-        library.nvcompBatchedZstdDecompressGetRequiredAlignments(
-            opts.to_nvcomp(),
-            &raw mut requirements,
-        )
-    };
-
-    check_status(status)?;
-    Ok(requirements.into())
 }
 
 /// Launches batched ZSTD decompression asynchronously on the GPU.

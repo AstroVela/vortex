@@ -1566,15 +1566,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
- "cudarc",
  "futures",
  "indicatif",
  "itertools 0.14.0",
  "lance-bench",
  "parquet 58.4.0",
  "regex",
- "rstest",
- "snap",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -1582,7 +1581,6 @@ dependencies = [
  "vortex-arrow",
  "vortex-bench",
  "vortex-cuda",
- "zstd",
 ]
 
 [[package]]
