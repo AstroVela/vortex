@@ -55,6 +55,17 @@ impl IoRequest {
         }
     }
 
+    /// Whether this physical request was assembled exclusively from partial segment ranges.
+    pub(crate) fn is_partial(&self) -> bool {
+        match &self.0 {
+            IoRequestInner::Single(request) => request.coalesce_distance.is_some(),
+            IoRequestInner::Coalesced(request) => request
+                .requests
+                .iter()
+                .all(|request| request.coalesce_distance.is_some()),
+        }
+    }
+
     /// Resolves the request with the given result.
     pub fn resolve(self, result: VortexResult<BufferHandle>) {
         match self.0 {
