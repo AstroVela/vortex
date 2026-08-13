@@ -96,6 +96,8 @@ pub struct ReadRequest {
     pub(crate) offset: u64,
     pub(crate) length: usize,
     pub(crate) alignment: Alignment,
+    /// Optional per-request cap on the empty gap this request may coalesce across.
+    pub(crate) coalesce_distance: Option<u64>,
     pub(crate) callback: oneshot::Sender<VortexResult<BufferHandle>>,
 }
 
@@ -106,6 +108,7 @@ impl Debug for ReadRequest {
             .field("offset", &self.offset)
             .field("length", &self.length)
             .field("alignment", &self.alignment)
+            .field("coalesce_distance", &self.coalesce_distance)
             .field("is_closed", &self.callback.is_closed())
             .finish()
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -22,25 +23,60 @@ use crate::segments::SegmentSource;
 /// request.
 pub struct SharedSegmentSource<S> {
     inner: S,
-    in_flight: DashMap<SegmentId, WeakShared<SharedSegmentFuture>>,
+    in_flight: Arc<DashMap<SegmentRequest, WeakShared<SharedSegmentFuture>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SegmentRequest {
+    Whole(SegmentId),
+    Range(SegmentId, Range<u64>),
 }
 
 type SharedSegmentFuture = BoxFuture<'static, SharedVortexResult<BufferHandle>>;
+
+struct InFlightGuard {
+    in_flight: Arc<DashMap<SegmentRequest, WeakShared<SharedSegmentFuture>>>,
+    request: SegmentRequest,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.remove(&self.request);
+    }
+}
 
 impl<S: SegmentSource> SharedSegmentSource<S> {
     /// Create a new `SharedSegmentSource` wrapping the provided inner source.
     pub fn new(inner: S) -> Self {
         Self {
             inner,
-            in_flight: DashMap::default(),
+            in_flight: Arc::default(),
         }
     }
 }
 
 impl<S: SegmentSource> SegmentSource for SharedSegmentSource<S> {
+    fn preferred_read_size(&self) -> Option<u64> {
+        self.inner.preferred_read_size()
+    }
+
+    fn segment_len(&self, id: SegmentId) -> Option<u64> {
+        self.inner.segment_len(id)
+    }
+
     fn request(&self, id: SegmentId) -> SegmentFuture {
+        self.request_shared(SegmentRequest::Whole(id))
+    }
+
+    fn request_range(&self, id: SegmentId, range: Range<u64>) -> SegmentFuture {
+        self.request_shared(SegmentRequest::Range(id, range))
+    }
+}
+
+impl<S: SegmentSource> SharedSegmentSource<S> {
+    fn request_shared(&self, request: SegmentRequest) -> SegmentFuture {
         loop {
-            match self.in_flight.entry(id) {
+            match self.in_flight.entry(request.clone()) {
                 Entry::Occupied(e) => {
                     if let Some(shared_future) = e.get().upgrade() {
                         return shared_future.map_err(VortexError::from).boxed();
@@ -50,7 +86,22 @@ impl<S: SegmentSource> SegmentSource for SharedSegmentSource<S> {
                     }
                 }
                 Entry::Vacant(e) => {
-                    let future = self.inner.request(id).map_err(Arc::new).boxed().shared();
+                    let inner_future = match &request {
+                        SegmentRequest::Whole(id) => self.inner.request(*id),
+                        SegmentRequest::Range(id, range) => {
+                            self.inner.request_range(*id, range.clone())
+                        }
+                    };
+                    let guard = InFlightGuard {
+                        in_flight: Arc::clone(&self.in_flight),
+                        request: request.clone(),
+                    };
+                    let future = async move {
+                        let _guard = guard;
+                        inner_future.await.map_err(Arc::new)
+                    }
+                    .boxed()
+                    .shared();
                     e.insert(
                         future
                             .downgrade()
@@ -69,6 +120,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use vortex_buffer::ByteBuffer;
+    use vortex_error::VortexResult;
 
     use super::*;
     use crate::segments::SegmentSink;
@@ -80,12 +132,18 @@ mod tests {
     struct CountingSegmentSource {
         segments: TestSegments,
         request_count: Arc<AtomicUsize>,
+        range_request_count: Arc<AtomicUsize>,
     }
 
     impl SegmentSource for CountingSegmentSource {
         fn request(&self, id: SegmentId) -> SegmentFuture {
             self.request_count.fetch_add(1, Ordering::SeqCst);
             self.segments.request(id)
+        }
+
+        fn request_range(&self, id: SegmentId, range: Range<u64>) -> SegmentFuture {
+            self.range_request_count.fetch_add(1, Ordering::SeqCst);
+            self.segments.request_range(id, range)
         }
     }
 
@@ -116,6 +174,7 @@ mod tests {
 
         // The inner source should have been called only once
         assert_eq!(source.request_count.load(Ordering::Relaxed), 1);
+        assert!(shared_source.in_flight.is_empty());
     }
 
     #[tokio::test]
@@ -139,6 +198,7 @@ mod tests {
             let _future = shared_source.request(id);
             // Future is dropped here
         }
+        assert!(shared_source.in_flight.is_empty());
 
         // A new request should still work correctly
         let result = shared_source.request(id).await;
@@ -146,5 +206,25 @@ mod tests {
 
         // Should have made 2 requests since the first was dropped before completion
         assert_eq!(source.request_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_shared_source_deduplicates_identical_ranges() -> VortexResult<()> {
+        let source = CountingSegmentSource::default();
+        let data = ByteBuffer::from(vec![1, 2, 3, 4]);
+        let seq_id = SequenceId::root().downgrade();
+        source.segments.write(seq_id, vec![data]).await?;
+
+        let shared_source = SharedSegmentSource::new(source.clone());
+        let id = SegmentId::from(0);
+        let (first, second) = futures::join!(
+            shared_source.request_range(id, 1..3),
+            shared_source.request_range(id, 1..3)
+        );
+        assert_eq!(first?.unwrap_host(), ByteBuffer::from(vec![2, 3]));
+        assert_eq!(second?.unwrap_host(), ByteBuffer::from(vec![2, 3]));
+        assert_eq!(source.range_request_count.load(Ordering::Relaxed), 1);
+        assert!(shared_source.in_flight.is_empty());
+        Ok(())
     }
 }
