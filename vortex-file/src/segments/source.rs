@@ -848,6 +848,78 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn read_driver_keeps_slots_full_while_a_straggler_is_in_flight() -> VortexResult<()> {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let segments: Arc<[SegmentSpec]> = (0..8)
+            .map(|i| SegmentSpec {
+                offset: i * 4,
+                length: 4,
+                alignment: Alignment::none(),
+            })
+            .collect();
+        let metrics = DefaultMetricsRegistry::default();
+        let source = FileSegmentSource::open(
+            segments,
+            ControlledReadRanges {
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+                batch_sizes: Arc::clone(&batch_sizes),
+                permits: Arc::clone(&permits),
+            },
+            TokioRuntime::current(),
+            RequestMetrics::new(&metrics, vec![]),
+        );
+        let reads = TokioRuntime::current().spawn(async move {
+            future::join_all((0..8).map(|i| source.request(SegmentId::from(i)))).await
+        });
+
+        wait_for_active_reads(&active, 4).await;
+
+        // Complete three reads while leaving one original read blocked as a straggler. Each freed
+        // slot must be refilled before the next completion; a batch-barrier implementation would
+        // instead fall from four active reads to one and submit no replacement work.
+        for expected_calls in 2..=4 {
+            permits.add_permits(1);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while batch_sizes.lock().len() < expected_calls
+                        || active.load(Ordering::SeqCst) != 4
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok()
+            );
+        }
+
+        assert_eq!(batch_sizes.lock().as_slice(), [4, 1, 1, 1]);
+        assert_eq!(active.load(Ordering::SeqCst), 4);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+        permits.add_permits(5);
+        for result in reads.await {
+            assert_eq!(result?.len(), 4);
+        }
+        Ok(())
+    }
+
+    async fn wait_for_active_reads(active: &AtomicUsize, expected: usize) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while active.load(Ordering::SeqCst) != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        );
+    }
+
     #[derive(Clone)]
     struct SlowErrReadAt;
 

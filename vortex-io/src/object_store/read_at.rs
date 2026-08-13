@@ -25,6 +25,8 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
 use crate::CoalesceConfig;
+use crate::ReadAtRequest;
+use crate::ReadAtStream;
 use crate::VortexReadAt;
 use crate::runtime::Handle;
 #[cfg(not(target_arch = "wasm32"))]
@@ -317,6 +319,40 @@ mod tests {
         let buffer = reader.read_at(7, 5, Alignment::new(1)).await?;
 
         assert_eq!(buffer.to_host().await.as_slice(), b"store");
+        assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_ranges_uses_one_io_task() -> anyhow::Result<()> {
+        let executor = Arc::new(CountingExecutor::default());
+        let runtime = Arc::clone(&executor) as Arc<dyn Executor>;
+        let handle = Handle::new(Arc::downgrade(&runtime));
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("test.bin");
+        store.put(&path, PutPayload::from_static(TEST_DATA)).await?;
+
+        let reader = ObjectStoreReadAt::new(store, path, handle);
+        let requests: Arc<[ReadAtRequest]> = Arc::from([
+            ReadAtRequest::new(0, 6, Alignment::new(1)),
+            ReadAtRequest::new(7, 5, Alignment::new(1)),
+            ReadAtRequest::new(18, 4, Alignment::new(1)),
+        ]);
+        let results = reader.read_ranges(requests).collect::<Vec<_>>().await;
+
+        assert_eq!(results.len(), 3);
+        for (request, result) in results {
+            let buffer = result?;
+            let offset = usize::try_from(request.offset)?;
+            assert_eq!(buffer.len(), request.length);
+            assert_eq!(
+                buffer.to_host().await.as_slice(),
+                &TEST_DATA[offset..offset + request.length]
+            );
+        }
         assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
         assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
 
