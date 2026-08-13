@@ -20,6 +20,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import date
 
 
 def synchronize() -> None:
@@ -36,13 +37,31 @@ def synchronize() -> None:
         pass
 
 
+def normalize(frame):
+    """Collapses representation differences that are not value differences.
+
+    A Parquet DATE column comes back from pyarrow as a column of `datetime.date`
+    objects but from cuDF as `datetime64[s]`. Those hold the same instants, yet
+    `check_dtype=False` does not bridge them because one side is `object`, so the
+    comparison reports every row as different. Coercing both sides to datetime64
+    compares the dates themselves.
+    """
+    import pandas as pd
+
+    for name in frame.columns:
+        column = frame[name]
+        if column.dtype == object and len(column) and isinstance(column.iloc[0], date):
+            frame[name] = pd.to_datetime(column)
+    return frame
+
+
 def verify(path: str, frame) -> None:
     """Fails unless the GPU read matches a CPU Parquet read of the same file."""
     import pandas as pd
     from pandas.testing import assert_frame_equal
 
-    expected = pd.read_parquet(path)
-    actual = frame.to_pandas()
+    expected = normalize(pd.read_parquet(path))
+    actual = normalize(frame.to_pandas())
 
     # cuDF and pyarrow can land on different-but-equivalent dtypes (nullable vs numpy
     # backed, for instance), so compare values and leave dtype policy out of it.

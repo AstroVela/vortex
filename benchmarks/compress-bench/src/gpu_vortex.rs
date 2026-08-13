@@ -42,6 +42,7 @@ use vortex_cuda::layout::register_cuda_layout;
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
 pub struct GpuVortexCompressor {
     verify: bool,
+    direct_io: bool,
 }
 
 impl GpuVortexCompressor {
@@ -50,8 +51,8 @@ impl GpuVortexCompressor {
     /// When `verify` is set, each GPU-decoded field is copied back to the host and compared
     /// against the same field decoded on the CPU. Verification runs inline, so timings from a
     /// verifying run are not comparable to a plain one.
-    pub fn new(verify: bool) -> Self {
-        Self { verify }
+    pub fn new(verify: bool, direct_io: bool) -> Self {
+        Self { verify, direct_io }
     }
 }
 
@@ -84,12 +85,12 @@ impl Compressor for GpuVortexCompressor {
         drop(output);
 
         if self.verify {
-            return verify_against_host_scan(gpu_file.path()).await;
+            return verify_against_host_scan(gpu_file.path(), self.direct_io).await;
         }
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
         let start = Instant::now();
-        let file = open_gpu(gpu_file.path()).await?;
+        let file = open_gpu(gpu_file.path(), self.direct_io).await?;
         let mut batches = file.scan()?.into_array_stream()?;
 
         while let Some(batch) = batches.next().await {
@@ -106,13 +107,20 @@ impl Compressor for GpuVortexCompressor {
 
 /// Opens a Vortex file for CUDA execution.
 ///
-/// On Linux direct IO keeps repeated iterations measuring storage bandwidth rather than
-/// page-cache hits.
-async fn open_gpu(path: &Path) -> Result<vortex::file::VortexFile> {
+/// `direct_io` is off by default so this backend is comparable with the cuDF one: cuDF reads
+/// through the page cache after an untimed warm-up read, so leaving direct IO on would compare
+/// a Vortex read of the disk against a cuDF read of RAM. Turning it on measures storage
+/// bandwidth instead, which is a different question and not comparable across the two.
+async fn open_gpu(path: &Path, direct_io: bool) -> Result<vortex::file::VortexFile> {
     let open_options = SESSION.open_options().with_cuda();
     #[cfg(target_os = "linux")]
-    let open_options =
-        open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io());
+    let open_options = if direct_io {
+        open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io())
+    } else {
+        open_options
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = direct_io;
     Ok(open_options.open_path(path).await?)
 }
 
@@ -123,7 +131,7 @@ async fn open_gpu(path: &Path) -> Result<vortex::file::VortexFile> {
 /// which the host decoders cannot read.
 ///
 /// Verification runs inline, so the returned duration is not comparable to a plain run.
-async fn verify_against_host_scan(path: &Path) -> Result<Duration> {
+async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<Duration> {
     let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
     // Everything on the reference side — the host scan and both Arrow conversions — has to run
     // through a plain host context. A CUDA context allocates its outputs in device memory, and
@@ -137,7 +145,7 @@ async fn verify_against_host_scan(path: &Path) -> Result<Duration> {
     let host_path = NamedTempFile::new()?;
     std::fs::copy(path, host_path.path())?;
 
-    let gpu_file = open_gpu(path).await?;
+    let gpu_file = open_gpu(path, direct_io).await?;
     let mut gpu_batches = gpu_file.scan()?.into_array_stream()?;
     let host_file = SESSION.open_options().open_path(host_path.path()).await?;
     let mut host_batches = host_file.scan()?.into_array_stream()?;

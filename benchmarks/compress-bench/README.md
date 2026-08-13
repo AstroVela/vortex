@@ -53,9 +53,14 @@ uv pip install --extra-index-url https://pypi.nvidia.com cudf-cu12 pandas pyarro
 script, so interpreter start, `import cudf` and CUDA context creation are excluded; a warm-up
 read runs first for the same reason.
 
-Note that the two backends do not share an I/O path: the Vortex reader uses pinned buffers and
-direct I/O (`O_DIRECT`) on Linux, while cuDF does its own host read and host-to-device
-transfer.
+Both backends read a warm file by default. cuDF runs an untimed warm-up read before the timed
+one, so its timed read hits the page cache; the Vortex reader therefore does **not** use direct
+I/O by default, because `O_DIRECT` would bypass the page cache and compare a Vortex read of the
+disk against a cuDF read of RAM. `--gpu-direct-io` turns it back on to measure storage bandwidth
+instead — a different question, and the resulting ratio is not a decode comparison.
+
+The remaining asymmetry is the transfer path: the Vortex reader uses pinned buffers, while cuDF
+does its own host read and host-to-device copy.
 
 ### GPU-friendly Parquet writer settings
 

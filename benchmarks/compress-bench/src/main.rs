@@ -92,6 +92,13 @@ struct Args {
     /// plain one. Intended to be run as its own pass.
     #[arg(long)]
     gpu_verify: bool,
+    /// Read the Vortex GPU file with direct IO, bypassing the page cache.
+    ///
+    /// Off by default: cuDF reads through the page cache after an untimed warm-up, so direct
+    /// IO would compare a Vortex read of the disk against a cuDF read of RAM. Turn it on to
+    /// measure storage bandwidth instead, and do not read the ratio as a decode comparison.
+    #[arg(long)]
+    gpu_direct_io: bool,
     #[arg(short, long, default_value_t, value_enum)]
     display_format: DisplayFormat,
     #[arg(short, long)]
@@ -120,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
     let gpu = args.gpu_decompress.then_some(GpuOptions {
         codec: args.gpu_parquet_codec,
         verify: args.gpu_verify,
+        direct_io: args.gpu_direct_io,
     });
 
     let (formats, ops) = if gpu.is_some() {
@@ -151,6 +159,8 @@ struct GpuOptions {
     codec: GpuCodec,
     /// Cross-check decompressed output against the CPU decoders.
     verify: bool,
+    /// Read the Vortex file with direct IO instead of through the page cache.
+    direct_io: bool,
 }
 
 /// Get a compressor for the given format.
@@ -159,7 +169,7 @@ fn get_compressor(format: Format, gpu: Option<GpuOptions>) -> Box<dyn Compressor
         #[cfg(feature = "cuda")]
         return match format {
             Format::OnDiskVortex => {
-                Box::new(GpuVortexCompressor::new(gpu.verify)) as Box<dyn Compressor>
+                Box::new(GpuVortexCompressor::new(gpu.verify, gpu.direct_io)) as Box<dyn Compressor>
             }
             Format::Parquet => Box::new(GpuParquetCompressor::new(gpu.codec, gpu.verify)),
             _ => unimplemented!("GPU compress bench not implemented for {format}"),
