@@ -17,9 +17,11 @@ use vortex_error::vortex_ensure;
 use crate::dtype::DType;
 use crate::expr::display::DisplayTreeExpr;
 use crate::expr::is_not_null;
+use crate::expr::lambda::Lambda;
 use crate::expr::traversal::TraversalOrder;
 use crate::expr::traversal::pre_order_visit_down;
 use crate::expr::variable::Variable;
+use crate::higher_order_fn::HigherOrderFunctionRef;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::ScalarFnVTable;
 
@@ -40,6 +42,12 @@ pub enum Expression {
         scalar_fn: ScalarFnRef,
         /// Any children of this expression.
         children: Arc<Vec<Expression>>,
+    },
+    /// A higher-order function applied to ordinary children and owned lambda syntax.
+    HigherOrder {
+        higher_order_fn: HigherOrderFunctionRef,
+        children: Arc<Vec<Expression>>,
+        lambdas: Arc<Vec<Lambda>>,
     },
     /// The full scope of the expression evaluation.
     Root,
@@ -68,6 +76,33 @@ impl Expression {
         })
     }
 
+    /// Create a higher-order function from ordinary children and owned lambdas.
+    pub fn try_new_higher_order(
+        higher_order_fn: HigherOrderFunctionRef,
+        children: impl IntoIterator<Item = Expression>,
+        lambdas: impl IntoIterator<Item = Lambda>,
+    ) -> VortexResult<Self> {
+        let children = Vec::from_iter(children);
+        let lambdas = Vec::from_iter(lambdas);
+        vortex_ensure!(
+            higher_order_fn.arity().matches(children.len()),
+            "Higher-order expression arity mismatch: expected {} children but got {}",
+            higher_order_fn.arity(),
+            children.len()
+        );
+        vortex_ensure!(
+            higher_order_fn.lambda_arity() == lambdas.len(),
+            "Higher-order expression lambda arity mismatch: expected {} lambdas but got {}",
+            higher_order_fn.lambda_arity(),
+            lambdas.len()
+        );
+        Ok(Self::HigherOrder {
+            higher_order_fn,
+            children: children.into(),
+            lambdas: lambdas.into(),
+        })
+    }
+
     /// Whether this expression is the scope root.
     pub fn is_root(&self) -> bool {
         matches!(self, Self::Root)
@@ -78,6 +113,22 @@ impl Expression {
         match self {
             Self::Variable(variable) => Some(variable),
             _ => None,
+        }
+    }
+
+    pub fn as_higher_order(&self) -> Option<&HigherOrderFunctionRef> {
+        match self {
+            Self::HigherOrder {
+                higher_order_fn, ..
+            } => Some(higher_order_fn),
+            _ => None,
+        }
+    }
+
+    pub fn lambdas(&self) -> &[Lambda] {
+        match self {
+            Self::HigherOrder { lambdas, .. } => lambdas,
+            _ => &[],
         }
     }
 
@@ -112,7 +163,9 @@ impl Expression {
     /// Returns the sub-expressions of this node.
     pub fn children(&self) -> &[Expression] {
         match self {
-            Self::Scalar { children, .. } => children.as_slice(),
+            Self::Scalar { children, .. } | Self::HigherOrder { children, .. } => {
+                children.as_slice()
+            }
             _ => NO_CHILDREN,
         }
     }
@@ -141,6 +194,11 @@ impl Expression {
                     children: children.into(),
                 })
             }
+            Self::HigherOrder {
+                higher_order_fn,
+                lambdas,
+                ..
+            } => Self::try_new_higher_order(higher_order_fn.clone(), children, lambdas.to_vec()),
             _ => {
                 vortex_ensure!(
                     children.is_empty(),
@@ -159,6 +217,7 @@ impl Expression {
             Self::Variable(variable) => vortex_bail!(
                 "variable '{variable}' can only be typed by binding against a scope with bindings"
             ),
+            Self::HigherOrder { .. } => Ok(self.bind(scope)?.dtype().clone()),
             Self::Scalar {
                 scalar_fn,
                 children,
@@ -182,6 +241,7 @@ impl Expression {
             // This is evaluated later against the array bound to the variable by a higher-order
             // function, yielding that array's validity as a non-nullable boolean mask.
             Self::Variable(_) => Ok(is_not_null(self.clone())),
+            Self::HigherOrder { .. } => Ok(is_not_null(self.clone())),
             Self::Scalar { scalar_fn, .. } => scalar_fn.validity(self),
         }
     }
@@ -194,6 +254,26 @@ impl Expression {
         match self {
             Self::Root => write!(f, "$"),
             Self::Variable(variable) => write!(f, "${variable}"),
+            Self::HigherOrder {
+                higher_order_fn,
+                children,
+                lambdas,
+            } => {
+                write!(f, "{higher_order_fn}(")?;
+                for (index, child) in children.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    Display::fmt(child, f)?;
+                }
+                for (index, lambda) in lambdas.iter().enumerate() {
+                    if !children.is_empty() || index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    Display::fmt(lambda, f)?;
+                }
+                write!(f, ")")
+            }
             Self::Scalar { scalar_fn, .. } => scalar_fn.fmt_sql(self, f),
         }
     }
@@ -291,7 +371,7 @@ impl Drop for Expression {
     fn drop(&mut self) {
         let mut children_to_drop = Vec::new();
         match self {
-            Self::Scalar { children, .. } => {
+            Self::Scalar { children, .. } | Self::HigherOrder { children, .. } => {
                 if let Some(children) = Arc::get_mut(children) {
                     children_to_drop.append(children);
                 }
@@ -301,7 +381,7 @@ impl Drop for Expression {
 
         while let Some(mut child) = children_to_drop.pop() {
             match &mut child {
-                Self::Scalar { children, .. } => {
+                Self::Scalar { children, .. } | Self::HigherOrder { children, .. } => {
                     if let Some(expr_children) = Arc::get_mut(children) {
                         children_to_drop.append(expr_children);
                     }

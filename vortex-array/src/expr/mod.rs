@@ -58,6 +58,7 @@ pub mod analysis;
 pub mod arbitrary;
 pub mod bound_expression;
 pub mod display;
+pub mod evaluator;
 pub(crate) mod expression;
 mod exprs;
 pub(crate) mod field;
@@ -73,6 +74,7 @@ pub mod variable;
 
 pub use analysis::*;
 pub use bound_expression::*;
+pub use evaluator::*;
 pub use expression::*;
 pub use exprs::and;
 pub use exprs::and_collect;
@@ -104,6 +106,7 @@ pub use exprs::list_contains;
 pub use exprs::list_length;
 pub use exprs::list_sum;
 pub use exprs::list_sum_opts;
+pub use exprs::list_transform;
 pub use exprs::lit;
 pub use exprs::lt;
 pub use exprs::lt_eq;
@@ -181,6 +184,22 @@ impl PartialEq for ExactExpr {
                     children: rhs_children,
                 },
             ) => lhs_fn == rhs_fn && Arc::ptr_eq(lhs_children, rhs_children),
+            (
+                Expression::HigherOrder {
+                    higher_order_fn: lhs_fn,
+                    children: lhs_children,
+                    lambdas: lhs_lambdas,
+                },
+                Expression::HigherOrder {
+                    higher_order_fn: rhs_fn,
+                    children: rhs_children,
+                    lambdas: rhs_lambdas,
+                },
+            ) => {
+                lhs_fn == rhs_fn
+                    && Arc::ptr_eq(lhs_children, rhs_children)
+                    && Arc::ptr_eq(lhs_lambdas, rhs_lambdas)
+            }
             _ => false,
         }
     }
@@ -202,6 +221,16 @@ impl Hash for ExactExpr {
                 state.write_u8(1);
                 scalar_fn.hash(state);
                 Arc::as_ptr(children).hash(state);
+            }
+            Expression::HigherOrder {
+                higher_order_fn,
+                children,
+                lambdas,
+            } => {
+                state.write_u8(4);
+                higher_order_fn.hash(state);
+                Arc::as_ptr(children).hash(state);
+                Arc::as_ptr(lambdas).hash(state);
             }
         }
     }

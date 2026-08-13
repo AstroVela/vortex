@@ -68,6 +68,9 @@ impl DisplayTreeNode for Expression {
     fn tree_child_name(&self, index: usize) -> ChildName {
         match self {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.signature().child_name(index),
+            Expression::HigherOrder {
+                higher_order_fn, ..
+            } => higher_order_fn.child_name(index),
             Expression::Root | Expression::Variable(_) => {
                 unreachable!("a leaf expression has no children")
             }
@@ -77,6 +80,9 @@ impl DisplayTreeNode for Expression {
     fn fmt_tree_node(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Expression::Scalar { scalar_fn, .. } => Display::fmt(scalar_fn, f),
+            Expression::HigherOrder {
+                higher_order_fn, ..
+            } => Display::fmt(higher_order_fn, f),
             Expression::Root => write!(f, "{ROOT_DISPLAY}"),
             Expression::Variable(variable) => write!(f, "${variable}"),
         }
@@ -91,6 +97,9 @@ impl DisplayTreeNode for BoundExpression {
     fn tree_child_name(&self, index: usize) -> ChildName {
         match self {
             BoundExpression::Scalar { scalar_fn, .. } => scalar_fn.signature().child_name(index),
+            BoundExpression::HigherOrder {
+                higher_order_fn, ..
+            } => higher_order_fn.child_name(index),
             BoundExpression::Root { .. } | BoundExpression::Variable { .. } => {
                 unreachable!("a leaf bound node has no children")
             }
@@ -100,6 +109,9 @@ impl DisplayTreeNode for BoundExpression {
     fn fmt_tree_node(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             BoundExpression::Scalar { scalar_fn, .. } => Display::fmt(scalar_fn, f),
+            BoundExpression::HigherOrder {
+                higher_order_fn, ..
+            } => Display::fmt(higher_order_fn, f),
             BoundExpression::Root { .. } => write!(f, "{ROOT_DISPLAY}"),
             BoundExpression::Variable { variable, .. } => write!(f, "${variable}"),
         }

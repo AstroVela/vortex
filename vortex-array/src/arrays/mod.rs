@@ -66,6 +66,10 @@ pub mod fixed_size_list;
 pub use fixed_size_list::FixedSizeList;
 pub use fixed_size_list::FixedSizeListArray;
 
+pub mod higher_order_fn;
+pub use higher_order_fn::HigherOrderFn;
+pub use higher_order_fn::HigherOrderFnArray;
+
 pub mod interleave;
 pub use interleave::Interleave;
 pub use interleave::InterleaveArray;

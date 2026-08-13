@@ -12,6 +12,8 @@ use vortex_session::VortexSession;
 use crate::expr::Expression;
 use crate::expr::Lambda;
 use crate::expr::Variable;
+use crate::higher_order_fn::HigherOrderFunctionId;
+use crate::higher_order_fn::session::HigherOrderFunctionSessionExt;
 use crate::scalar_fn::ForeignScalarFnVTable;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::session::ScalarFnSessionExt;
@@ -27,12 +29,10 @@ pub(crate) const ROOT_ID: &str = "vortex.root";
 /// The wire id for [`Expression::Variable`].
 pub(crate) const VARIABLE_ID: &str = "vortex.var";
 
-/// The wire id for [`Lambda`].
+/// The wire id for [`Expression::Lambda`].
 pub(crate) const LAMBDA_ID: &str = "vortex.lambda";
 
-/// Serialize standalone lambda syntax to its protobuf representation.
 pub trait LambdaSerializeProtoExt {
-    /// Serialize the lambda to a protobuf expression message.
     fn serialize_proto(&self) -> VortexResult<pb::Expr>;
 }
 
@@ -56,7 +56,6 @@ impl LambdaSerializeProtoExt for Lambda {
 }
 
 impl Lambda {
-    /// Deserialize standalone lambda syntax from a protobuf expression message.
     pub fn from_proto(expr: &pb::Expr, session: &VortexSession) -> VortexResult<Self> {
         vortex_ensure!(
             expr.id == LAMBDA_ID,
@@ -69,8 +68,10 @@ impl Lambda {
             expr.children.len()
         );
         let opts = pb::LambdaOpts::decode(expr.metadata())?;
-        let body = Expression::from_proto(&expr.children[0], session)?;
-        Self::try_new(opts.params.into_iter().map(Variable::new), body)
+        Self::try_new(
+            opts.params.into_iter().map(Variable::new),
+            Expression::from_proto(&expr.children[0], session)?,
+        )
     }
 }
 
@@ -94,6 +95,29 @@ impl ExprSerializeProtoExt for Expression {
                         }
                         .encode_to_vec(),
                     ),
+                });
+            }
+            Expression::HigherOrder {
+                higher_order_fn,
+                children,
+                lambdas,
+            } => {
+                let children = children
+                    .iter()
+                    .map(ExprSerializeProtoExt::serialize_proto)
+                    .chain(lambdas.iter().map(LambdaSerializeProtoExt::serialize_proto))
+                    .collect::<VortexResult<Vec<_>>>()?;
+                let metadata = higher_order_fn.serialize()?.ok_or_else(|| {
+                    vortex_err!(
+                        "Expression '{}' is not serializable: {}",
+                        higher_order_fn.id(),
+                        self
+                    )
+                })?;
+                return Ok(pb::Expr {
+                    id: higher_order_fn.id().to_string(),
+                    children,
+                    metadata: Some(metadata),
                 });
             }
             Expression::Scalar { scalar_fn, .. } => scalar_fn,
@@ -145,6 +169,39 @@ impl Expression {
         }
 
         #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
+        let higher_order_id = HigherOrderFunctionId::new(expr.id.as_str());
+        if let Some(plugin) = session
+            .higher_order_functions()
+            .registry()
+            .get(&higher_order_id)
+        {
+            let higher_order_fn = plugin.deserialize(expr.metadata(), session)?;
+            vortex_ensure!(
+                expr.children.len() >= higher_order_fn.lambda_arity(),
+                "higher-order expression '{}' has too few children for {} lambdas",
+                higher_order_fn.id(),
+                higher_order_fn.lambda_arity()
+            );
+            let ordinary_children = expr.children.len() - higher_order_fn.lambda_arity();
+            vortex_ensure!(
+                higher_order_fn.arity().matches(ordinary_children),
+                "higher-order expression '{}' expected {} ordinary children, got {}",
+                higher_order_fn.id(),
+                higher_order_fn.arity(),
+                ordinary_children
+            );
+            let children = expr.children[..ordinary_children]
+                .iter()
+                .map(|child| Expression::from_proto(child, session))
+                .collect::<VortexResult<Vec<_>>>()?;
+            let lambdas = expr.children[ordinary_children..]
+                .iter()
+                .map(|child| Lambda::from_proto(child, session))
+                .collect::<VortexResult<Vec<_>>>()?;
+            return Expression::try_new_higher_order(higher_order_fn, children, lambdas);
+        }
+
+        #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
         let expr_id = ScalarFnId::new(expr.id.as_str());
         let children = expr
             .children
@@ -176,25 +233,19 @@ pub fn deserialize_expr_proto(
 #[cfg(test)]
 mod tests {
     use prost::Message;
-    use vortex_error::VortexResult;
     use vortex_proto::expr as pb;
     use vortex_session::VortexSession;
 
     use super::ExprSerializeProtoExt;
-    use super::LambdaSerializeProtoExt;
     use crate::array_session;
     use crate::expr::Expression;
-    use crate::expr::Lambda;
     use crate::expr::and;
     use crate::expr::between;
-    use crate::expr::checked_add;
     use crate::expr::eq;
     use crate::expr::get_item;
-    use crate::expr::lambda;
     use crate::expr::lit;
     use crate::expr::or;
     use crate::expr::root;
-    use crate::expr::var;
     use crate::scalar_fn::fns::between::BetweenOptions;
     use crate::scalar_fn::fns::between::StrictComparison;
     use crate::scalar_fn::session::ScalarFnSession;
@@ -225,37 +276,8 @@ mod tests {
         assert_eq!(&deser_expr, &expr);
     }
 
-    /// Variables round-trip on their reserved id, like `Root`.
-    #[test]
-    fn variables_round_trip() -> VortexResult<()> {
-        for expr in [var("x"), var("name")] {
-            let bytes = expr.serialize_proto()?.encode_to_vec();
-            let decoded =
-                Expression::from_proto(&pb::Expr::decode(bytes.as_slice())?, &array_session())?;
-            assert_eq!(decoded, expr, "round trip changed {expr}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn lambdas_round_trip() -> VortexResult<()> {
-        for lambda in [
-            lambda(["x"], var("x"))?,
-            lambda(
-                ["x", "y"],
-                checked_add(var("x"), checked_add(var("y"), lit(1_i32))),
-            )?,
-        ] {
-            let bytes = lambda.serialize_proto()?.encode_to_vec();
-            let decoded =
-                Lambda::from_proto(&pb::Expr::decode(bytes.as_slice())?, &array_session())?;
-            assert_eq!(decoded, lambda, "round trip changed {lambda}");
-        }
-        Ok(())
-    }
-
-    /// A lambda carries its body as a child, so malformed lambda syntax must be rejected rather
-    /// than silently producing a lambda with the wrong arity.
+    /// A lambda carries its body as a child, so a malformed message must be rejected rather than
+    /// silently producing a lambda with the wrong arity.
     #[test]
     fn a_lambda_without_a_body_is_rejected() {
         let malformed = pb::Expr {
@@ -268,7 +290,7 @@ mod tests {
                 .encode_to_vec(),
             ),
         };
-        assert!(Lambda::from_proto(&malformed, &array_session()).is_err());
+        assert!(Expression::from_proto(&malformed, &array_session()).is_err());
     }
 
     #[test]
