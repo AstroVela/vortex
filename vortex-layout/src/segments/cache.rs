@@ -200,4 +200,34 @@ impl SegmentSource for SegmentCacheSourceAdapter {
         }
         .boxed()
     }
+
+    fn request_ranges(&self, id: SegmentId, ranges: Vec<Range<u64>>) -> Vec<SegmentFuture> {
+        let delegates = self.source.request_ranges(id, ranges.clone());
+        ranges
+            .into_iter()
+            .zip(delegates)
+            .map(|(range, delegate)| {
+                let cache = Arc::clone(&self.cache);
+                async move {
+                    if let Ok(Some(segment)) = cache.get(id).await {
+                        let start = usize::try_from(range.start)?;
+                        let end = usize::try_from(range.end)?;
+                        if start > end || end > segment.len() {
+                            return Err(vortex_error::vortex_err!(
+                                "Segment {} range {}..{} is out of bounds for cached segment length {}",
+                                id,
+                                range.start,
+                                range.end,
+                                segment.len()
+                            ));
+                        }
+                        tracing::debug!("Resolved segment {} range {:?} from cache", id, range);
+                        return Ok(BufferHandle::new_host(segment.slice(start..end)));
+                    }
+                    delegate.await
+                }
+                .boxed()
+            })
+            .collect()
+    }
 }
