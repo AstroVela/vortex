@@ -21,7 +21,7 @@ use vortex_io::runtime::Handle;
 use vortex_io::std_file::FileReadAt;
 
 const FILE_SIZE: usize = 512 << 20;
-const READS: usize = 200_000;
+const DEFAULT_READS: usize = 200_000;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -33,6 +33,10 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16);
+    let reads: usize = std::env::var("READS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_READS);
 
     let mut tmp = tempfile::NamedTempFile::new()?;
     let chunk = vec![0xABu8; 1 << 20];
@@ -46,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Deterministic pseudo-random offsets, aligned to the read size.
     let slots = (FILE_SIZE / read_size) as u64;
-    let offsets: Vec<u64> = (0..READS)
+    let offsets: Vec<u64> = (0..reads)
         .scan(0x243F6A8885A308D3u64, |s, _| {
             *s ^= *s << 13;
             *s ^= *s >> 7;
@@ -65,12 +69,12 @@ async fn main() -> anyhow::Result<()> {
     let elapsed = start.elapsed();
 
     println!(
-        "nowait={} read_size={read_size} concurrency={concurrency} reads={READS} \
-         elapsed={:.3}s throughput={:.0} reads/s mean_latency={:.2}us",
+        "nowait={} read_size={read_size} concurrency={concurrency} \
+         reads={reads} elapsed={:.3}s throughput={:.0} reads/s mean_latency={:.2}us",
         std::env::var("VORTEX_IO_NOWAIT").unwrap_or_else(|_| "1".into()),
         elapsed.as_secs_f64(),
-        READS as f64 / elapsed.as_secs_f64(),
-        elapsed.as_secs_f64() * 1e6 / READS as f64,
+        reads as f64 / elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() * 1e6 / reads as f64,
     );
     Ok(())
 }

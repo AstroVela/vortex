@@ -31,11 +31,26 @@ fn enabled() -> bool {
 
 /// Largest read served on the calling thread.
 ///
-/// The fast path trades the blocking pool's parallelism for a saved hand-off: the `memcpy` out of
-/// the page cache runs on the caller instead of being fanned out across pool threads. Below this
-/// size the hand-off dominates and the fast path wins; above it the copy dominates and serializing
-/// it costs more than the spawn. Measured crossover on a warm page cache is around 64KiB, so the
-/// default sits one step below that. Override with `VORTEX_IO_NOWAIT_MAX_BYTES`.
+/// The cap is not about syscall cost, which is flat in the read size. It is about where the
+/// `memcpy` out of the page cache runs. Taking the fast path moves that copy onto the thread
+/// polling the read, so concurrent reads that the blocking pool would have copied in parallel
+/// become serial. The saved hand-off is a fixed benefit; the lost parallelism grows with the
+/// copy. The two cross over once the copy is large enough to dominate.
+///
+/// Measured on a warm page cache, as fast path versus blocking pool (>1 favours the fast path):
+///
+/// | read size | 4 concurrent | 16 concurrent |
+/// |-----------|--------------|---------------|
+/// | 8KiB      | 6.1x         | 3.4x          |
+/// | 128KiB    | 1.43x        | 1.29x         |
+/// | 256KiB    | 0.76x        | 1.37x         |
+/// | 1MiB      | 0.82x        | 0.80x         |
+/// | 4MiB      | 0.51x        | —             |
+///
+/// 128KiB is the largest size that still wins at every concurrency measured; past it the result
+/// depends on how many reads are in flight, which this code cannot know. Machines with more cores
+/// have more parallelism to lose and will cross over sooner, so tune with
+/// `VORTEX_IO_NOWAIT_MAX_BYTES` rather than assuming this default transfers.
 pub fn max_nowait_bytes() -> usize {
     #[cfg(target_os = "linux")]
     {
@@ -45,7 +60,7 @@ pub fn max_nowait_bytes() -> usize {
             std::env::var("VORTEX_IO_NOWAIT_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32 * 1024)
+                .unwrap_or(128 * 1024)
         });
         *MAX
     }
