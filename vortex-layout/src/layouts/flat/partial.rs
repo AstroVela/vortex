@@ -19,6 +19,7 @@ use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Primitive;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::Struct;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
@@ -534,6 +535,9 @@ async fn resolve_alprd_pages(
         alprd
             .child(2)
             .decode(&plan.patch_indices_dtype, patch_len, ctx, session)?;
+    let patch_indices = patch_indices
+        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?
+        .into_array();
     let patch_values = alprd.child(3).decode(
         &plan.left_parts_dtype.as_nonnullable(),
         patch_len,
