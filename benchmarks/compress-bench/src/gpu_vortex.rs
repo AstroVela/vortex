@@ -18,6 +18,7 @@ use tempfile::NamedTempFile;
 use vortex::array::ArrayRef;
 use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
+use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
@@ -124,6 +125,10 @@ async fn open_gpu(path: &Path) -> Result<vortex::file::VortexFile> {
 /// Verification runs inline, so the returned duration is not comparable to a plain run.
 async fn verify_against_host_scan(path: &Path) -> Result<Duration> {
     let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
+    // Everything on the reference side — the host scan and both Arrow conversions — has to run
+    // through a plain host context. A CUDA context allocates its outputs in device memory, and
+    // the Arrow conversion then reads those buffers on the host.
+    let mut host_ctx = SESSION.create_execution_ctx();
     let start = Instant::now();
 
     // The host scan reads a copy rather than the same path. The session's segment cache is
@@ -148,7 +153,7 @@ async fn verify_against_host_scan(path: &Path) -> Result<Duration> {
         };
 
         let gpu_record = gpu_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
-        let host_record = host_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
+        let host_record = host_batch.execute::<StructArray>(&mut host_ctx)?;
         ensure!(
             gpu_record.len() == host_record.len(),
             "batch {batch_index} length differs between the GPU and CPU scans: {} vs {}",
@@ -180,7 +185,7 @@ async fn verify_against_host_scan(path: &Path) -> Result<Duration> {
             verify_field(
                 &host_field,
                 decoded,
-                cuda_ctx.execution_ctx(),
+                &mut host_ctx,
                 batch_index,
                 field_index,
             )?;
