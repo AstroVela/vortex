@@ -285,9 +285,9 @@ async fn run_compress(
     let mut measurements = vec![];
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
-    // A verification pass reports on every dataset rather than stopping at the first failure:
-    // one run then says exactly which datasets decode correctly on the GPU and which do not.
-    let survey_all = gpu.is_some_and(|gpu| gpu.verify);
+    // A GPU pass reports on every dataset rather than stopping at the first failure, so one run
+    // says which datasets decode correctly on the GPU and still yields numbers for the rest.
+    let survey_all = gpu.is_some();
     let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
 
     for dataset_handle in datasets.into_iter() {
@@ -322,30 +322,14 @@ async fn run_compress(
 
     progress.finish();
 
-    if !failures.is_empty() {
-        eprintln!(
-            "\nGPU verification failed for {} dataset(s):",
-            failures.len()
-        );
-        for (dataset, error) in &failures {
-            eprintln!("  - {dataset}: {error:#}");
-        }
-        anyhow::bail!(
-            "GPU verification failed for: {}",
-            failures
-                .iter()
-                .map(|(dataset, _)| dataset.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
     if let Some(path) = ingest_output {
         v3::write_jsonl_to_path(&path, &v3_records)?;
     }
 
     let mut writer = create_output_writer(&display_format, output_path, BENCHMARK_ID)?;
 
+    // The tables render before any failure is reported, so a partially failing GPU matrix still
+    // publishes the numbers for the datasets that did decode.
     match display_format {
         DisplayFormat::Table => {
             render_table(&mut writer, measurements.timings, &targets)?;
@@ -357,13 +341,33 @@ async fn run_compress(
                 } else {
                     vec![]
                 },
-            )
+            )?;
         }
         DisplayFormat::GhJson => {
             print_measurements_json(&mut writer, measurements.timings, DOC_PATH)?;
-            print_measurements_json(&mut writer, measurements.ratios, DOC_PATH)
+            print_measurements_json(&mut writer, measurements.ratios, DOC_PATH)?;
         }
     }
+
+    if !failures.is_empty() {
+        eprintln!(
+            "\nGPU decompression failed for {} dataset(s):",
+            failures.len()
+        );
+        for (dataset, error) in &failures {
+            eprintln!("  - {dataset}: {error:#}");
+        }
+        anyhow::bail!(
+            "GPU decompression failed for: {}",
+            failures
+                .iter()
+                .map(|(dataset, _)| dataset.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 async fn run_benchmark_for_dataset(

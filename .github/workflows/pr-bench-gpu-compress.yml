@@ -105,14 +105,13 @@ jobs:
         with:
           file-path: verify-comment.md
           comment-tag: bench-pr-comment-gpu-verify
-      - name: Fail if verification failed
-        if: steps.verify.outcome == 'failure'
-        shell: bash
-        run: |
-          echo "GPU decompression verification failed; see the verification comment." >&2
-          exit 1
       - name: Run GPU compression benchmark
+        id: bench
         shell: bash
+        # A dataset the GPU cannot decode is reported per dataset and still fails the run, but
+        # the timing tables are printed first, so the datasets that do decode publish their
+        # numbers. The gate at the end of the job turns either failure into a job failure.
+        continue-on-error: true
         env:
           RUST_BACKTRACE: full
           # Do not enable VORTEX_EXPERIMENTAL_PATCHED_ARRAY here: it rewrites interior
@@ -152,3 +151,11 @@ jobs:
 
             GPU Compression failed. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
           comment-tag: bench-pr-comment-gpu-compress
+      - name: Fail if verification or the benchmark failed
+        if: steps.verify.outcome == 'failure' || steps.bench.outcome == 'failure'
+        shell: bash
+        # Last, so both the verification matrix and the timing tables are already published.
+        run: |
+          echo "verify=${{ steps.verify.outcome }} bench=${{ steps.bench.outcome }}" >&2
+          echo "GPU decompression failed; see the verification and results comments." >&2
+          exit 1
