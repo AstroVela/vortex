@@ -1,0 +1,51 @@
+[package]
+name = "vortex-layout-commons"
+authors = { workspace = true }
+categories = { workspace = true }
+description = "Core traits and types for Vortex layouts"
+edition = { workspace = true }
+homepage = { workspace = true }
+include = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+arcref = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true, features = ["alloc", "async-await"] }
+flatbuffers = { workspace = true }
+itertools = { workspace = true }
+moka = { workspace = true, features = ["future"] }
+once_cell = { workspace = true, features = ["parking_lot"] }
+parking_lot = { workspace = true }
+pin-project-lite = { workspace = true }
+rustc-hash = { workspace = true }
+termtree = { workspace = true }
+tokio = { workspace = true, features = ["rt"], optional = true }
+tracing = { workspace = true }
+vortex-array = { workspace = true }
+vortex-buffer = { workspace = true }
+vortex-error = { workspace = true }
+vortex-flatbuffers = { workspace = true, features = ["layout"] }
+vortex-mask = { workspace = true }
+vortex-metrics = { workspace = true }
+vortex-session = { workspace = true }
+vortex-utils = { workspace = true, features = ["dashmap"] }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+_test-harness = []
+tokio = ["dep:tokio", "vortex-error/tokio"]
+
+[lints]
+workspace = true
