@@ -27,7 +27,6 @@ use vortex_array::expr::label_bound_tree;
 use vortex_array::expr::root;
 use vortex_array::expr::transform::partition_bound_annotations;
 use vortex_array::optimizer::ArrayOptimizer;
-use vortex_array::scalar_fn::is_negative_cost;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -197,7 +196,7 @@ fn split_expression_for_pushdown(
         let signature = scalar_fn.signature();
         if !signature.is_fallible()
             && signature.is_strict()
-            && is_negative_cost(scalar_fn.id())
+            && signature.is_negative_cost()
             && references_root
                 .get(&ExactBoundExpr(expr.clone()))
                 .copied()

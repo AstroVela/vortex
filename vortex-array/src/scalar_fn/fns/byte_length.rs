@@ -138,6 +138,10 @@ impl ScalarFnVTable for ByteLength {
     fn is_fallible(&self, _options: &Self::Options) -> bool {
         false
     }
+
+    fn is_negative_cost(&self, _options: &Self::Options) -> bool {
+        true
+    }
 }
 
 fn scalar_byte_length(scalar: &Scalar, nullability: Nullability) -> VortexResult<Scalar> {

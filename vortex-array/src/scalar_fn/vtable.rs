@@ -233,6 +233,19 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
         _ = options;
         true
     }
+
+    /// Returns whether applying this scalar function before canonicalization is cheaper than
+    /// canonicalizing the input and applying it afterwards.
+    ///
+    /// Return `true` when the cost of the function does not depend on the size of its input.
+    /// `byte_length`, `ext_storage` and `get_item` read metadata rather than values, so they are
+    /// negative cost. `like` is linear in its input, so it is not.
+    ///
+    /// The default is conservatively `false`.
+    fn is_negative_cost(&self, options: &Self::Options) -> bool {
+        _ = options;
+        false
+    }
 }
 
 /// A node used for implementing abstract reduction rules over a tree of scalar functions.

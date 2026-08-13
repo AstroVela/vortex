@@ -32,4 +32,10 @@ impl ScalarFnSignature<'_> {
     pub fn is_fallible(&self) -> bool {
         self.inner.is_fallible()
     }
+
+    /// Returns whether this expression itself is negative cost.
+    /// See [`crate::scalar_fn::ScalarFnVTable::is_negative_cost`].
+    pub fn is_negative_cost(&self) -> bool {
+        self.inner.is_negative_cost()
+    }
 }

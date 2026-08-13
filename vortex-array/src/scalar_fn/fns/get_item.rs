@@ -188,6 +188,10 @@ impl ScalarFnVTable for GetItem {
         // If this type-checks its infallible.
         false
     }
+
+    fn is_negative_cost(&self, _field_name: &FieldName) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

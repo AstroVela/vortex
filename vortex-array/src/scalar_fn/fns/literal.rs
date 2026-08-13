@@ -109,6 +109,10 @@ impl ScalarFnVTable for Literal {
     fn is_fallible(&self, _instance: &Self::Options) -> bool {
         false
     }
+
+    fn is_negative_cost(&self, _instance: &Self::Options) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

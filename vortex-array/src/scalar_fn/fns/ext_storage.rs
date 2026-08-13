@@ -100,6 +100,10 @@ impl ScalarFnVTable for ExtStorage {
     fn is_fallible(&self, _options: &Self::Options) -> bool {
         false
     }
+
+    fn is_negative_cost(&self, _options: &Self::Options) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
