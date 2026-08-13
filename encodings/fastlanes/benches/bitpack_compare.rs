@@ -6,6 +6,9 @@
 //! "decompress, then compare" baseline.
 //!
 //! Sized to finish quickly. Run with `cargo bench -p vortex-fastlanes --bench bitpack_compare`.
+//!
+//! Every benchmark here carries `#[cpu_features(simulation)]`: both the fast path and the
+//! decompress-then-compare baseline are lane loops whose vectorization is decided by the build.
 
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::cast_possible_truncation)]
@@ -86,6 +89,7 @@ fn build_inputs<const BW: u8>(len: usize) -> (ArrayRef, ArrayRef, ExecutionCtx) 
     (array, rhs, ctx)
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LENS, consts = BIT_WIDTHS)]
 fn fast_eq_out_of_range<const BW: u8>(bencher: Bencher, len: usize) {
     let (array, rhs, mut ctx) = build_inputs::<BW>(len);
@@ -99,6 +103,7 @@ fn fast_eq_out_of_range<const BW: u8>(bencher: Bencher, len: usize) {
     });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LENS, consts = BIT_WIDTHS)]
 fn baseline_eq<const BW: u8>(bencher: Bencher, len: usize) {
     let (array, rhs, mut ctx) = build_inputs::<BW>(len);
@@ -115,6 +120,7 @@ fn baseline_eq<const BW: u8>(bencher: Bencher, len: usize) {
     });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LENS, consts = BIT_WIDTHS)]
 fn fast_lt_out_of_range<const BW: u8>(bencher: Bencher, len: usize) {
     let (array, rhs, mut ctx) = build_inputs::<BW>(len);
@@ -128,6 +134,7 @@ fn fast_lt_out_of_range<const BW: u8>(bencher: Bencher, len: usize) {
     });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LENS, consts = BIT_WIDTHS)]
 fn baseline_lt<const BW: u8>(bencher: Bencher, len: usize) {
     let (array, rhs, mut ctx) = build_inputs::<BW>(len);

@@ -81,9 +81,9 @@ jobs:
       - name: Build benchmarks
         env:
           RUSTFLAGS: "-C target-feature=+avx2"
-          # Benchmarks carrying `#[cpu_features]` belong to a walltime leg below and are
-          # skipped here. Untagged ones run as they always have, under bare names, so this
-          # job's CodSpeed history is unaffected.
+          # Benchmarks carrying a bare `#[cpu_features]` belong to a walltime leg below and are
+          # skipped here. `#[cpu_features(simulation)]` ones run in both places. Either way the
+          # names here stay bare, so this job's CodSpeed history is unaffected.
           VORTEX_BENCH_VARIANT: simulation
         run: cargo codspeed build --locked ${{ matrix.features }} $(printf -- '-p %s ' ${{ matrix.packages }}) --profile bench
       - name: Run benchmarks
@@ -124,7 +124,9 @@ jobs:
             image: ubuntu24-full-arm64-pre-v2
             rustflags: "-C target-feature=+neon"
     name: "Benchmark with Codspeed (${{ matrix.features }})"
-    timeout-minutes: 60
+    # A leg now builds five crates' benchmarks and measures every tagged one at 1,000 samples,
+    # so it has more to do than when the tagged set was a single file.
+    timeout-minutes: 90
     runs-on: >-
       runs-on=${{ github.run_id }}/runner=bench-dedicated/family=${{ matrix.family }}/image=${{ matrix.image }}/disk=large/extras=s3-cache/tag=bench-codspeed-cpu-features-${{ matrix.features }}
     steps:
@@ -148,20 +150,31 @@ jobs:
         id: select
         run: |
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
-          import json, pathlib, subprocess
+          import json, pathlib, re, subprocess
+
+          # `#[cpu_features]` and `#[cpu_features(simulation)]` both belong to this job; the
+          # argument only decides whether the simulation job keeps the benchmark too.
+          TAG = re.compile(r"cpu_features\s*[\](]")
 
           meta = json.loads(subprocess.check_output(
               ["cargo", "metadata", "--no-deps", "--format-version", "1"]))
-          tagged = sorted(
-              package["name"]
-              for package in meta["packages"]
-              for target in package["targets"]
-              if "bench" in target["kind"]
-              and "cpu_features]" in pathlib.Path(target["src_path"]).read_text()
-          )
-          if not tagged:
+          packages, features = {}, {}
+          for package in meta["packages"]:
+              for target in package["targets"]:
+                  if "bench" not in target["kind"]:
+                      continue
+                  if not TAG.search(pathlib.Path(target["src_path"]).read_text()):
+                      continue
+                  packages[package["name"]] = None
+                  # A bench target behind `required-features` is silently skipped unless the
+                  # build enables them, so ask for whatever the tagged targets declare.
+                  for feature in target.get("required-features", []):
+                      features[f"{package['name']}/{feature}"] = None
+          if not packages:
               raise SystemExit("no benchmark carries `#[cpu_features]`; this job has nothing to measure")
-          print("packages=" + " ".join(f"-p {name}" for name in dict.fromkeys(tagged)))
+          print("packages=" + " ".join(f"-p {name}" for name in sorted(packages)))
+          print("features=" + (
+              "--features " + ",".join(sorted(features)) if features else ""))
           EOF
       - name: Build benchmarks
         env:
@@ -170,7 +183,7 @@ jobs:
           VORTEX_BENCH_PREFIX: "${{ matrix.features }}::"
         run: |
           cargo codspeed build --locked -m walltime --profile bench \
-            ${{ steps.select.outputs.packages }}
+            ${{ steps.select.outputs.packages }} ${{ steps.select.outputs.features }}
       # Pinning clocks and reserving CPUs only pays off for walltime measurements, so this
       # runs here but not in the simulation job. It must come after setup, which itself
       # spawns processes that would otherwise be pinned to the housekeeping CPUs.

@@ -8,6 +8,9 @@
 //! range into a value range. The cost is dominated by counting set bits in the
 //! prefix `[0, slice_stop)`, so a SIMD popcount over the bit buffer should beat
 //! a bit-by-bit walk handily for large `slice_stop`.
+//!
+//! Both benchmarks carry `#[cpu_features(simulation)]`: they are popcount over words, dispatched
+//! to a kernel chosen from the CPU's features.
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
@@ -30,6 +33,7 @@ fn create_mask(len: usize, density: f64) -> Mask {
 
 /// The pco/zstd slice pattern: two indices bracketing a sub-range. The prefix
 /// up to `slice_stop` must be counted, so `slice_stop` near the end is worst case.
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = BENCH_SIZES)]
 fn slice_bounds(bencher: Bencher, (len, density): (usize, f64)) {
     let mask = create_mask(len, density);
@@ -40,6 +44,7 @@ fn slice_bounds(bencher: Bencher, (len, density): (usize, f64)) {
 }
 
 /// Many monotonically increasing indices spread across the whole mask.
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = BENCH_SIZES)]
 fn many_indices(bencher: Bencher, (len, density): (usize, f64)) {
     let mask = create_mask(len, density);

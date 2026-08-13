@@ -2,6 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Benchmarks for primitive take and [`DictArray`] canonicalization.
+//!
+//! `primitive_take_u32` carries `#[cpu_features(simulation)]`: primitive take gathers through an
+//! AVX2 kernel where the build allows it and a portable loop otherwise. The dict canonicalization
+//! benchmarks are left untagged — their explicit sample counts are sized for simulation, not for a
+//! walltime leg.
 
 #![expect(clippy::cast_possible_truncation)]
 #![expect(clippy::unwrap_used)]
@@ -34,6 +39,7 @@ const VECTOR_SIZE: &[usize] = &[16, 256, 2048, 8192];
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(sample_count = 200)]
 fn primitive_take_u32(bencher: Bencher) {
     const NUM_INDICES: usize = 1_000_000;

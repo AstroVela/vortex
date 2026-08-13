@@ -5,6 +5,10 @@
 //!
 //! The cases cover the dispatch dimensions without a large Cartesian product so CodSpeed's
 //! instruction-count simulation remains inexpensive.
+//!
+//! Every benchmark here carries `#[cpu_features(simulation)]`: fixed-width filtering gathers
+//! through an AVX2 kernel where the build allows it and a portable loop otherwise, so the walltime
+//! CPU-feature legs measure the choice per instruction set.
 
 #![expect(
     clippy::cast_possible_truncation,
@@ -128,6 +132,7 @@ fn i256_array() -> ArrayRef {
 
 macro_rules! random_density_benchmark {
     ($name:ident, $array:ident) => {
+        #[vortex_bench_support::cpu_features(simulation)]
         #[divan::bench(args = DENSITIES)]
         fn $name(bencher: Bencher, density: f64) {
             bench_filter(bencher, $array(), || random_mask(density), false);
@@ -142,16 +147,19 @@ random_density_benchmark!(random_i64, i64_array);
 random_density_benchmark!(random_i128, i128_array);
 random_density_benchmark!(random_i256, i256_array);
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = PATTERNS)]
 fn patterns_i128(bencher: Bencher, pattern: Pattern) {
     bench_filter(bencher, i128_array(), || pattern_mask(pattern), false);
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = CACHED_DENSITIES)]
 fn cached_indices_i32(bencher: Bencher, density: f64) {
     bench_filter(bencher, i32_array(), || random_mask(density), true);
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = CACHED_DENSITIES)]
 fn cached_indices_i128(bencher: Bencher, density: f64) {
     bench_filter(bencher, i128_array(), || random_mask(density), true);

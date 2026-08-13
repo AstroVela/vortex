@@ -15,6 +15,10 @@
 //! * `set_indices`        — iterate set positions (`set_indices`)
 //!
 //! Run across densities to expose the dense-vs-sparse crossover.
+//!
+//! Every benchmark here carries `#[cpu_features(simulation)]`: these are word loops over a
+//! `BitBuffer`, several of them reaching popcount and select kernels chosen from the CPU's
+//! features.
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
@@ -40,6 +44,7 @@ fn make(len: usize, density: f64) -> (BitBuffer, Vec<u64>) {
     (buf, values)
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = ARGS)]
 fn per_element_value(bencher: Bencher, (len, density): (usize, f64)) {
     let (buf, values) = make(len, density);
@@ -56,6 +61,7 @@ fn per_element_value(bencher: Bencher, (len, density): (usize, f64)) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = ARGS)]
 fn bit_iterator(bencher: Bencher, (len, density): (usize, f64)) {
     let (buf, values) = make(len, density);
@@ -72,6 +78,7 @@ fn bit_iterator(bencher: Bencher, (len, density): (usize, f64)) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = ARGS)]
 fn word_trailing_zeros(bencher: Bencher, (len, density): (usize, f64)) {
     let (buf, values) = make(len, density);
@@ -110,6 +117,7 @@ fn word_trailing_zeros(bencher: Bencher, (len, density): (usize, f64)) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = ARGS)]
 fn for_each_set_index(bencher: Bencher, (len, density): (usize, f64)) {
     let (buf, values) = make(len, density);
@@ -122,6 +130,7 @@ fn for_each_set_index(bencher: Bencher, (len, density): (usize, f64)) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = ARGS)]
 fn set_slices(bencher: Bencher, (len, density): (usize, f64)) {
     let (buf, values) = make(len, density);
@@ -138,6 +147,7 @@ fn set_slices(bencher: Bencher, (len, density): (usize, f64)) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = ARGS)]
 fn set_indices(bencher: Bencher, (len, density): (usize, f64)) {
     let (buf, values) = make(len, density);

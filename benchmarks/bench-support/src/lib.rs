@@ -12,18 +12,31 @@ use quote::quote;
 use syn::ItemFn;
 use syn::parse_macro_input;
 
-/// Measure this benchmark on every walltime CPU-feature leg instead of in simulation.
+/// Measure this benchmark on every walltime CPU-feature leg.
 ///
-/// Takes no argument: the benchmark runs on all of them. Write it *above* `#[divan::bench]`,
-/// whose arguments it fills in — the name is qualified with the leg that produced it, so the
-/// legs report one series each rather than fighting over a shared name, and `ignore` takes
-/// the benchmark out of the sharded simulation job. A plain `cargo bench` runs it as before,
-/// under its bare name.
+/// Every tagged benchmark runs on all of the legs; the argument decides only whether it *also*
+/// stays in the sharded simulation job:
+///
+/// * `#[cpu_features]` — walltime legs only. For a benchmark added to measure the feature sets
+///   in the first place, with no simulation history worth keeping.
+/// * `#[cpu_features(simulation)]` — both. For a benchmark that already reports to CodSpeed in
+///   simulation: the walltime legs add per-feature-set series next to it, and the existing
+///   simulation series keeps its name and its history, so PRs still get the instruction-count
+///   comparison they got before.
+///
+/// Write it *above* `#[divan::bench]`, whose arguments it fills in — the name is qualified with
+/// the leg that produced it, so the legs report one series each rather than fighting over a
+/// shared name, and (without `simulation`) `ignore` takes the benchmark out of the sharded
+/// simulation job. A plain `cargo bench` runs it as before, under its bare name.
 ///
 /// ```ignore
 /// #[vortex_bench_support::cpu_features]
 /// #[divan::bench(args = INPUT_SIZE)]
 /// fn words_gather_dispatch(bencher: Bencher, len: usize) { /* ... */ }
+///
+/// #[vortex_bench_support::cpu_features(simulation)]
+/// #[divan::bench]
+/// fn compare_int(bencher: Bencher) { /* ... */ }
 /// ```
 ///
 /// Spell it out in full rather than importing it: benchmark files are read a function at a
@@ -36,15 +49,20 @@ use syn::parse_macro_input;
 /// does not belong here. Keep those on `#[cfg(not(codspeed))]` for local A/B runs.
 #[proc_macro_attribute]
 pub fn cpu_features(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        let attr = TokenStream2::from(attr);
-        return syn::Error::new_spanned(
-            attr,
-            "`#[cpu_features]` takes no argument; a tagged benchmark runs on every feature-set leg",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let attr = TokenStream2::from(attr);
+    let keep_simulation = match attr.to_string().as_str() {
+        "" => false,
+        "simulation" => true,
+        _ => {
+            return syn::Error::new_spanned(
+                attr,
+                "`#[cpu_features]` takes at most `simulation`, which keeps the benchmark in the \
+                 simulation job as well as on every feature-set leg",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
 
     let mut function = parse_macro_input!(item as ItemFn);
 
@@ -96,17 +114,30 @@ pub fn cpu_features(attr: TokenStream, item: TokenStream) -> TokenStream {
     // in the workflow alone. `env!` rather than reading the environment during expansion:
     // rustc records it as a dependency of the crate, so changing legs rebuilds the benchmarks.
     let name = function.sig.ident.to_string();
-    let separator = if existing.is_empty() {
+    // A multi-line `#[divan::bench(..)]` usually ends in a trailing comma; adding another
+    // would leave `,,` behind.
+    let trailing_comma = matches!(
+        existing.clone().into_iter().last(),
+        Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == ','
+    );
+    let separator = if existing.is_empty() || trailing_comma {
         quote!()
     } else {
         quote!(,)
     };
     let bench_path = bench.path().clone();
+    // With `simulation` there is nothing to skip: the walltime legs pick the benchmark out by
+    // the name prefix, and the simulation job runs it under its bare name as it always has.
+    let ignore = if keep_simulation {
+        quote!()
+    } else {
+        quote!(ignore = env!("VORTEX_BENCH_VARIANT") == "simulation",)
+    };
     bench.meta = syn::parse_quote! {
         #bench_path(
             #existing #separator
             name = concat!(env!("VORTEX_BENCH_PREFIX"), #name),
-            ignore = env!("VORTEX_BENCH_VARIANT") == "simulation",
+            #ignore
         )
     };
 

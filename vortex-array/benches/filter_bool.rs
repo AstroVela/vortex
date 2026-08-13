@@ -5,6 +5,10 @@
 //!
 //! Tests multiple mask patterns (mostly-true, mostly-false, random, correlated runs)
 //! with both uniform-random and power-law distributions, across array sizes from 1K to 250K.
+//!
+//! Every benchmark here carries `#[cpu_features(simulation)]`. Boolean filtering selects its
+//! kernel through `cfg(target_feature)`, so which one runs — and how well it vectorizes — is a
+//! property of the build, measured per instruction set on the walltime legs.
 
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::cast_possible_truncation)]
@@ -140,6 +144,7 @@ fn mask_rng() -> StdRng {
 
 // --- Benchmarks: Random source array ---
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_random_by_mostly_true(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -160,6 +165,7 @@ fn filter_random_by_mostly_true(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_random_by_mostly_false(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -180,6 +186,7 @@ fn filter_random_by_mostly_false(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_random_by_random(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -200,6 +207,7 @@ fn filter_random_by_random(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_random_by_correlated_runs(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -220,6 +228,7 @@ fn filter_random_by_correlated_runs(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_random_by_power_law(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -242,6 +251,7 @@ fn filter_random_by_power_law(bencher: Bencher, n: usize) {
 
 // --- Benchmarks: Power-law source array ---
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_powerlaw_by_mostly_true(bencher: Bencher, n: usize) {
     let array = make_power_law_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -262,6 +272,7 @@ fn filter_powerlaw_by_mostly_true(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_powerlaw_by_mostly_false(bencher: Bencher, n: usize) {
     let array = make_power_law_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -282,6 +293,7 @@ fn filter_powerlaw_by_mostly_false(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_powerlaw_by_random(bencher: Bencher, n: usize) {
     let array = make_power_law_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -302,6 +314,7 @@ fn filter_powerlaw_by_random(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_powerlaw_by_correlated_runs(bencher: Bencher, n: usize) {
     let array = make_power_law_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -322,6 +335,7 @@ fn filter_powerlaw_by_correlated_runs(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn filter_powerlaw_by_power_law(bencher: Bencher, n: usize) {
     let array = make_power_law_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -348,6 +362,7 @@ const DENSITIES: &[f64] = &[
     0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.5, 0.9, 0.95, 0.99, 0.999, 0.9999,
 ];
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = DENSITIES)]
 fn density_sweep_random(bencher: Bencher, density: f64) {
     let array = make_random_bool_array(DENSITY_SWEEP_SIZE, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -368,6 +383,7 @@ fn density_sweep_random(bencher: Bencher, density: f64) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = DENSITIES)]
 fn density_sweep_dense_runs(bencher: Bencher, density: f64) {
     let array = make_random_bool_array(DENSITY_SWEEP_SIZE, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -389,6 +405,7 @@ fn density_sweep_dense_runs(bencher: Bencher, density: f64) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = DENSITIES)]
 fn density_sweep_single_slice(bencher: Bencher, density: f64) {
     let array = make_random_bool_array(DENSITY_SWEEP_SIZE, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -413,6 +430,7 @@ fn density_sweep_single_slice(bencher: Bencher, density: f64) {
 
 const LARGE_SIZES: &[usize] = &[10_000, 100_000, 250_000];
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LARGE_SIZES)]
 fn filter_all_true(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -433,6 +451,7 @@ fn filter_all_true(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LARGE_SIZES)]
 fn filter_one_false(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));
@@ -455,6 +474,7 @@ fn filter_one_false(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = LARGE_SIZES)]
 fn filter_ultra_sparse(bencher: Bencher, n: usize) {
     let array = make_random_bool_array(n, &mut StdRng::seed_from_u64(ARRAY_SEED));

@@ -12,6 +12,11 @@
 //! Each Vortex kernel bench has a sibling `arrow_*` baseline bench using the
 //! equivalent arrow-rs kernel over the same data shape, so the divan report
 //! lines up side-by-side.
+//!
+//! The `try_map_*`, `map_with_mask_*` and `lanezip_*` benchmarks carry
+//! `#[cpu_features(simulation)]`: lane kernels exist to be auto-vectorized, so they are measured on
+//! every walltime CPU-feature leg as well as in simulation. The `arrow_*` baselines stay in
+//! simulation only.
 
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::clone_on_ref_ptr)]
@@ -112,6 +117,7 @@ fn uninit_out<T>(n: usize) -> Vec<MaybeUninit<T>> {
 // Cast benches (single-input, source -> output).
 // -----------------------------------------------------------------------------
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn try_map_into_narrow_u64_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
@@ -141,6 +147,7 @@ fn arrow_narrow_u64_u32(bencher: Bencher, n: usize) {
         .bench_values(|arr| cast_with_options(&arr, &DataType::UInt32, &opts).unwrap());
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn map_with_mask_narrow_u64_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
@@ -156,6 +163,7 @@ fn map_with_mask_narrow_u64_u32(bencher: Bencher, n: usize) {
 /// `try_map_masked_into_widen_u16_u32` and `map_with_mask_widen_u16_u32` have the
 /// same runtime — for always-true map operations `try_map_masked_into` is
 /// sufficient.
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn try_map_masked_into_widen_u16_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
@@ -171,6 +179,7 @@ fn try_map_masked_into_widen_u16_u32(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn map_with_mask_widen_u16_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
@@ -206,6 +215,7 @@ fn arrow_widen_u16_u32(bencher: Bencher, n: usize) {
 // delta is allocation + memory-traffic overhead.
 // -----------------------------------------------------------------------------
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn try_map_masked_into_narrow_i32_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
@@ -221,6 +231,7 @@ fn try_map_masked_into_narrow_i32_u32(bencher: Bencher, n: usize) {
         });
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn try_map_masked_in_place_narrow_i32_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
@@ -324,6 +335,7 @@ fn add_fixture(n: usize) -> AddFixture {
     }
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = SIZES)]
 fn lanezip_checked_add_u32(bencher: Bencher, n: usize) {
     let f = add_fixture(n);

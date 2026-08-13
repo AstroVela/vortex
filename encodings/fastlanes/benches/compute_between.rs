@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! Every benchmark here carries `#[cpu_features(simulation)]`: `between` is multiversioned over
+//! the primitive kernels, and the bit-packed and ALP cases add unpacking on top, all of it
+//! vectorized according to the build.
 #![expect(clippy::unwrap_used)]
 
 use std::sync::LazyLock;
@@ -96,6 +100,7 @@ mod primitive {
     use crate::SESSION;
     use crate::generate_primitive_array;
 
+    #[vortex_bench_support::cpu_features(simulation)]
     #[divan::bench(
         types = [i32, i64, u32, u64, f32, f64],
         args = BENCH_ARGS,
@@ -149,6 +154,7 @@ mod bitpack {
     use crate::SESSION;
     use crate::generate_bit_pack_primitive_array;
 
+    #[vortex_bench_support::cpu_features(simulation)]
     #[divan::bench(
         types = [i16, i32, i64],
         args = BENCH_ARGS,
@@ -201,6 +207,7 @@ mod alp {
     use crate::SESSION;
     use crate::generate_alp_bit_pack_primitive_array;
 
+    #[vortex_bench_support::cpu_features(simulation)]
     #[divan::bench(
         types = [f32, f64],
         args = BENCH_ARGS,

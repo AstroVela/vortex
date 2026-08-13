@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Benchmarks for `Mask::rank`.
+//!
+//! `rank_single` carries `#[cpu_features(simulation)]`: rank is popcount over words, dispatched to
+//! a kernel chosen from the CPU's features.
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
@@ -35,6 +38,7 @@ fn create_mask(len: usize, density: f64) -> Mask {
 }
 
 /// Single rank lookup at the midpoint.
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench(args = BENCH_SIZES)]
 fn rank_single(bencher: Bencher, (len, density): (usize, f64)) {
     let mask = create_mask(len, density);

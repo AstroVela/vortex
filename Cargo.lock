@@ -9635,6 +9635,7 @@ dependencies = [
  "uuid",
  "vortex-array",
  "vortex-array-macros",
+ "vortex-bench-support",
  "vortex-buffer",
  "vortex-compute",
  "vortex-error",
@@ -9889,6 +9890,7 @@ dependencies = [
  "codspeed-divan-compat",
  "num-traits",
  "rand 0.10.2",
+ "vortex-bench-support",
  "vortex-buffer",
 ]
 
@@ -10095,6 +10097,7 @@ dependencies = [
  "rstest",
  "vortex-alp",
  "vortex-array",
+ "vortex-bench-support",
  "vortex-buffer",
  "vortex-error",
  "vortex-fastlanes",
@@ -10367,6 +10370,7 @@ dependencies = [
  "itertools 0.14.0",
  "rstest",
  "serde",
+ "vortex-bench-support",
  "vortex-buffer",
  "vortex-error",
 ]

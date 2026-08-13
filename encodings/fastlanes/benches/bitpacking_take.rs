@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+//! Every benchmark here carries `#[cpu_features(simulation)]`: FastLanes unpacking is written to
+//! be auto-vectorized, so the walltime CPU-feature legs measure it per instruction set.
+
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::cast_possible_truncation)]
 
@@ -32,6 +35,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn take_10_stratified(bencher: Bencher) {
     let values = fixture(65_536, 8);
@@ -51,6 +55,7 @@ fn take_10_stratified(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn take_10_contiguous(bencher: Bencher) {
     let values = fixture(65_536, 8);
@@ -70,6 +75,7 @@ fn take_10_contiguous(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn take_10k_random(bencher: Bencher) {
     let values = fixture(65_536, 8);
@@ -92,6 +98,7 @@ fn take_10k_random(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn take_10k_contiguous(bencher: Bencher) {
     let values = fixture(65_536, 8);
@@ -111,6 +118,7 @@ fn take_10k_contiguous(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn take_10k_dispersed(bencher: Bencher) {
     let values = fixture(65_536, 8);
@@ -130,6 +138,7 @@ fn take_10k_dispersed(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn take_10k_first_chunk_only(bencher: Bencher) {
     let values = fixture(65_536, 8);
@@ -169,6 +178,7 @@ fn fixture(len: usize, bits: usize) -> Buffer<u32> {
 const BIG_BASE2: u32 = 65536;
 const NUM_EXCEPTIONS: u32 = 1024;
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10_stratified(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -195,6 +205,7 @@ fn patched_take_10_stratified(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10_contiguous(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -221,6 +232,7 @@ fn patched_take_10_contiguous(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10k_random(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -243,6 +255,7 @@ fn patched_take_10k_random(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10k_contiguous_not_patches(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -262,6 +275,7 @@ fn patched_take_10k_contiguous_not_patches(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10k_contiguous_patches(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -289,6 +303,7 @@ fn patched_take_10k_contiguous_patches(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10k_dispersed(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -308,6 +323,7 @@ fn patched_take_10k_dispersed(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10k_first_chunk_only(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
@@ -327,6 +343,7 @@ fn patched_take_10k_first_chunk_only(bencher: Bencher) {
         })
 }
 
+#[vortex_bench_support::cpu_features(simulation)]
 #[divan::bench]
 fn patched_take_10k_adversarial(bencher: Bencher) {
     let values = (0u32..BIG_BASE2 + NUM_EXCEPTIONS).collect::<Buffer<u32>>();
