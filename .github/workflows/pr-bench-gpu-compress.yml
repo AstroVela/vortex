@@ -94,9 +94,22 @@ jobs:
             fi
             echo
             echo '```text'
-            grep -E "verified [0-9]+|GPU verification failed|^  - " gpu-verify.txt | tail -40 \
+            grep -E "verified [0-9]+|GPU decompression failed|^  - " gpu-verify.txt | tail -40 \
               || tail -40 gpu-verify.txt
             echo '```'
+            # The per-dataset lines above carry only the first line of each error. Python
+            # tracebacks, Rust backtraces and first-differing-row dumps span several lines, so
+            # the tail of the raw output goes in a collapsed block rather than back in the log.
+            if [ "${{ steps.verify.outcome }}" != "success" ]; then
+              echo
+              echo "<details><summary>Full error detail</summary>"
+              echo
+              echo '```text'
+              tail -200 gpu-verify.txt
+              echo '```'
+              echo
+              echo "</details>"
+            fi
           } > verify-comment.md
           cat verify-comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment PR with verification result
