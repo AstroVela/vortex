@@ -139,7 +139,9 @@ mod tests {
     #[test]
     fn reads_cached_data() -> std::io::Result<()> {
         let mut tmp = tempfile::NamedTempFile::new()?;
-        let data = (0..4096usize).map(|i| i.to_le_bytes()[0]).collect::<Vec<_>>();
+        let data = (0..4096usize)
+            .map(|i| i.to_le_bytes()[0])
+            .collect::<Vec<_>>();
         tmp.write_all(&data)?;
         tmp.flush()?;
 

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -39,13 +40,42 @@ impl CoalesceConfig {
     }
 
     /// Configuration appropriate for local filesystem access.
+    ///
+    /// The distance is deliberately much smaller than [`CoalesceConfig::object_storage`]. Merging
+    /// across a gap reads the bytes in that gap too, which is worth it only when a request costs
+    /// far more than the wasted bytes. That holds for object storage and spinning disks; on NVMe a
+    /// request is cheap and the queue is deep, so a wide window buys little and risks amplification.
     pub const fn file() -> Self {
-        Self::new(1 << 20, 4 << 20) // 1MB distance, 4MB max
+        Self::new(64 << 10, 4 << 20) // 64KB distance, 4MB max
     }
 
     /// Configuration appropriate for object storage (S3, GCS, etc.).
     pub const fn object_storage() -> Self {
         Self::new(1 << 20, 16 << 20) // 1MB distance, 16MB max
+    }
+
+    /// [`CoalesceConfig::file`], overridden by `VORTEX_IO_COALESCE_DISTANCE` and
+    /// `VORTEX_IO_COALESCE_MAX_SIZE` when they are set.
+    ///
+    /// Coalescing trades read amplification for fewer requests. That is the right trade on a
+    /// spinning disk or over the network, where per-request latency dwarfs the cost of the bytes
+    /// in the gaps. On NVMe the balance shifts: requests are cheap and parallel, so merging across
+    /// a 1MB gap can read far more than the scan asked for. These knobs exist so the trade-off can
+    /// be measured on real hardware rather than assumed. A distance of `0` disables coalescing.
+    pub fn file_from_env() -> Option<Self> {
+        static CONFIG: LazyLock<Option<CoalesceConfig>> = LazyLock::new(|| {
+            let default = CoalesceConfig::file();
+            let var = |name: &str, fallback: u64| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(fallback)
+            };
+            let distance = var("VORTEX_IO_COALESCE_DISTANCE", default.distance);
+            let max_size = var("VORTEX_IO_COALESCE_MAX_SIZE", default.max_size);
+            (distance > 0).then(|| CoalesceConfig::new(distance, max_size))
+        });
+        *CONFIG
     }
 }
 
@@ -337,7 +367,7 @@ mod tests {
     #[test]
     fn test_coalesce_config_file() {
         let config = CoalesceConfig::file();
-        assert_eq!(config.distance, 1 << 20); // 1MB
+        assert_eq!(config.distance, 64 << 10); // 64KB
         assert_eq!(config.max_size, 4 << 20); // 4MB
     }
 

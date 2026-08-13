@@ -101,7 +101,7 @@ impl VortexReadAt for FileReadAt {
     }
 
     fn coalesce_config(&self) -> Option<CoalesceConfig> {
-        Some(CoalesceConfig::file())
+        CoalesceConfig::file_from_env()
     }
 
     fn concurrency(&self) -> usize {
