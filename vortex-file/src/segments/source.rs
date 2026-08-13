@@ -12,11 +12,14 @@ use std::task::Context;
 use std::task::Poll;
 
 use futures::FutureExt;
+use futures::Stream;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use futures::stream::BoxStream;
+use futures::stream::Fuse;
 use futures::stream::SelectAll;
 use parking_lot::Mutex;
 use vortex_array::buffer::BufferHandle;
@@ -106,6 +109,139 @@ fn validate_read_result(
     })
 }
 
+type IoBatchStream = Fuse<BoxStream<'static, Vec<IoRequest>>>;
+type IoResultStream = BoxStream<'static, (IoRequest, VortexResult<BufferHandle>)>;
+
+/// Drives request batches while keeping the reader's concurrency slots occupied.
+struct ReadDriver<R> {
+    reader: Arc<R>,
+    batches: IoBatchStream,
+    pending: VecDeque<IoRequest>,
+    reads: SelectAll<IoResultStream>,
+    num_active: usize,
+    batches_done: bool,
+    concurrency: usize,
+    metrics: RequestMetrics,
+}
+
+impl<R: VortexReadAt> ReadDriver<R> {
+    fn new(
+        reader: R,
+        batches: BoxStream<'static, Vec<IoRequest>>,
+        concurrency: usize,
+        metrics: RequestMetrics,
+    ) -> Self {
+        Self {
+            reader: Arc::new(reader),
+            batches: batches.fuse(),
+            pending: VecDeque::new(),
+            reads: SelectAll::new(),
+            num_active: 0,
+            batches_done: false,
+            concurrency,
+            metrics,
+        }
+    }
+
+    fn submit_pending(&mut self) {
+        while self.num_active < self.concurrency && !self.pending.is_empty() {
+            let batch_len = (self.concurrency - self.num_active).min(self.pending.len());
+            let reqs = self.pending.drain(..batch_len).collect::<Vec<_>>();
+            self.num_active += batch_len;
+
+            self.metrics.read_ranges_calls.add(1);
+            self.metrics.read_ranges_num_ranges.update(batch_len as f64);
+            if batch_len > 1 {
+                self.metrics.read_ranges_multi.add(1);
+            }
+            tracing::trace!(
+                target: "vortex_file::read_ranges",
+                num_ranges = batch_len,
+                num_active = self.num_active,
+                "submitting positional read batch"
+            );
+
+            let requests = reqs
+                .iter()
+                .map(|req| ReadAtRequest::new(req.offset(), req.len(), req.alignment()))
+                .collect::<Vec<_>>()
+                .into();
+            let mut remaining = reqs.into_iter().map(Some).collect::<Vec<_>>();
+            let mut results = self.reader.read_ranges(requests);
+            self.reads.push(
+                async_stream::stream! {
+                    while let Some((request, result)) = results.next().await {
+                        let Some(position) = remaining.iter().position(|req| {
+                            req.as_ref().is_some_and(|req| {
+                                req.offset() == request.offset
+                                    && req.len() == request.length
+                                    && req.alignment() == request.alignment
+                            })
+                        }) else {
+                            tracing::warn!(?request, "reader returned an unknown range");
+                            continue;
+                        };
+                        let req = remaining[position]
+                            .take()
+                            .vortex_expect("matched request is present");
+                        yield (req, result);
+                    }
+                    for req in remaining.into_iter().flatten() {
+                        let error = vortex_err!(
+                            "FileSegmentSource: read_ranges ended before resolving request. {:?}",
+                            req
+                        );
+                        yield (req, Err(error));
+                    }
+                }
+                .boxed(),
+            );
+        }
+    }
+}
+
+impl<R: VortexReadAt> Stream for ReadDriver<R> {
+    type Item = ();
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+
+        // Observe every batch already available so submission can fill all free slots at once.
+        if !this.batches_done {
+            loop {
+                match this.batches.poll_next_unpin(cx) {
+                    Poll::Ready(Some(batch)) => this.pending.extend(batch),
+                    Poll::Ready(None) => {
+                        this.batches_done = true;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+        }
+
+        this.submit_pending();
+
+        if this.batches_done && this.num_active == 0 {
+            return Poll::Ready(None);
+        }
+
+        match this.reads.poll_next_unpin(cx) {
+            Poll::Ready(Some((req, result))) => {
+                this.num_active -= 1;
+                let result = validate_read_result(&req, result);
+                req.resolve(result);
+                Poll::Ready(Some(()))
+            }
+            Poll::Ready(None) if this.num_active == 0 => Poll::Pending,
+            Poll::Ready(None) => {
+                vortex_panic!("read result streams ended with active requests")
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 pub struct FileSegmentSource {
     segments: Arc<[SegmentSpec]>,
     /// A queue for sending read request events to the I/O stream.
@@ -160,113 +296,7 @@ impl FileSegmentSource {
         )
         .boxed();
 
-        let drive_fut = async move {
-            let mut batches = stream.fuse();
-            let mut pending = VecDeque::<IoRequest>::new();
-            let mut reads = SelectAll::new();
-            let mut num_active = 0usize;
-            let mut batches_done = false;
-
-            loop {
-                if !batches_done {
-                    loop {
-                        match batches.next().now_or_never() {
-                            Some(Some(batch)) => pending.extend(batch),
-                            Some(None) => {
-                                batches_done = true;
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-
-                while num_active < concurrency && !pending.is_empty() {
-                    let batch_len = (concurrency - num_active).min(pending.len());
-                    let reqs = pending.drain(..batch_len).collect::<Vec<_>>();
-                    num_active += batch_len;
-
-                    metrics.read_ranges_calls.add(1);
-                    metrics.read_ranges_num_ranges.update(batch_len as f64);
-                    if batch_len > 1 {
-                        metrics.read_ranges_multi.add(1);
-                    }
-                    tracing::trace!(
-                        target: "vortex_file::read_ranges",
-                        num_ranges = batch_len,
-                        num_active,
-                        "submitting positional read batch"
-                    );
-
-                    let requests = reqs
-                        .iter()
-                        .map(|req| ReadAtRequest::new(req.offset(), req.len(), req.alignment()))
-                        .collect::<Vec<_>>()
-                        .into();
-                    let mut remaining = reqs.into_iter().map(Some).collect::<Vec<_>>();
-                    let mut results = reader.read_ranges(requests);
-                    reads.push(
-                        async_stream::stream! {
-                            while let Some((request, result)) = results.next().await {
-                                let Some(position) = remaining.iter().position(|req| {
-                                    req.as_ref().is_some_and(|req| {
-                                        req.offset() == request.offset
-                                            && req.len() == request.length
-                                            && req.alignment() == request.alignment
-                                    })
-                                }) else {
-                                    tracing::warn!(?request, "reader returned an unknown range");
-                                    continue;
-                                };
-                                let req = remaining[position]
-                                    .take()
-                                    .vortex_expect("matched request is present");
-                                yield (req, result);
-                            }
-                            for req in remaining.into_iter().flatten() {
-                                let error = vortex_err!(
-                                    "FileSegmentSource: read_ranges ended before resolving request. {:?}",
-                                    req
-                                );
-                                yield (req, Err(error));
-                            }
-                        }
-                        .boxed(),
-                    );
-                }
-
-                if batches_done && num_active == 0 {
-                    break;
-                }
-                if num_active == 0 {
-                    match batches.next().await {
-                        Some(batch) => pending.extend(batch),
-                        None => batches_done = true,
-                    }
-                    continue;
-                }
-
-                let next_read = reads.next();
-                let next = if batches_done {
-                    future::Either::Left((next_read.await, batches.next()))
-                } else {
-                    future::select(next_read, batches.next()).await
-                };
-                match next {
-                    future::Either::Left((result, _)) => {
-                        if let Some((req, result)) = result {
-                            num_active -= 1;
-                            let result = validate_read_result(&req, result);
-                            req.resolve(result);
-                        }
-                    }
-                    future::Either::Right((batch, _)) => match batch {
-                        Some(batch) => pending.extend(batch),
-                        None => batches_done = true,
-                    },
-                }
-            }
-        };
+        let drive_fut = ReadDriver::new(reader, stream, concurrency, metrics).collect::<()>();
 
         // Spawn the driver so the runtime makes I/O progress independently of any reader. Readers
         // join it (below) only to surface a panic raised while driving reads.
