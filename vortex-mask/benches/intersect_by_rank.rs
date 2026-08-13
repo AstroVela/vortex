@@ -3,7 +3,7 @@
 
 //! Benchmarks for `intersect_by_rank`.
 //!
-//! Every benchmark here carries `#[cpu_features(simulation)]`: `intersect_by_rank` monomorphizes
+//! Every benchmark here carries `#[cpu_features(with_simulation)]`: `intersect_by_rank` monomorphizes
 //! its word loop over a BMI2 and a portable implementation, so which one runs is decided by the
 //! build and measured per instruction set on the walltime legs.
 
@@ -126,7 +126,7 @@ fn create_rank_indices_fixture(size: usize, self_density: f64, mask_density: f64
 }
 
 /// Standard patterns (random / runs)
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = BENCH_ARGS)]
 fn intersect_by_rank(bencher: Bencher, (size, pattern): (usize, &str)) {
     let (base, rank) = create_fixture(size, pattern);
@@ -136,7 +136,7 @@ fn intersect_by_rank(bencher: Bencher, (size, pattern): (usize, &str)) {
 }
 
 /// Sparse base masks (varying selectivity)
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = SPARSE_ARGS)]
 fn sparse(bencher: Bencher, (size, selectivity, _name): (usize, f64, &str)) {
     let (base, rank) = create_sparse_fixture(size, selectivity);
@@ -146,7 +146,7 @@ fn sparse(bencher: Bencher, (size, selectivity, _name): (usize, f64, &str)) {
 }
 
 /// Density matrix (self_density x mask_density)
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = DENSITY_MATRIX_ARGS)]
 fn density_matrix(bencher: Bencher, (self_density, mask_density, _name): (f64, f64, &str)) {
     let (base, rank) = create_density_matrix_fixture(100_000, self_density, mask_density);
@@ -156,7 +156,7 @@ fn density_matrix(bencher: Bencher, (self_density, mask_density, _name): (f64, f
 }
 
 /// Density matrix where the rank mask is backed by cached indices.
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = RANK_INDICES_ARGS)]
 fn rank_indices(bencher: Bencher, (self_density, mask_density, _name): (f64, f64, &str)) {
     let (base, rank) = create_rank_indices_fixture(100_000, self_density, mask_density);
@@ -167,7 +167,7 @@ fn rank_indices(bencher: Bencher, (self_density, mask_density, _name): (f64, f64
 
 /// Very-sparse mask backed only by a BitBuffer (no cached indices). Targets the
 /// mask-driven dispatch path.
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = VERY_SPARSE_MASK_ARGS)]
 fn very_sparse_mask_uncached(
     bencher: Bencher,
@@ -181,7 +181,7 @@ fn very_sparse_mask_uncached(
 
 /// Very-sparse mask carrying cached indices. Targets the mask-driven dispatch path
 /// when the caller has already paid for index materialization.
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = VERY_SPARSE_MASK_ARGS)]
 fn very_sparse_mask_cached(
     bencher: Bencher,

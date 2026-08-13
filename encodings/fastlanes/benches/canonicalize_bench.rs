@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Every benchmark here carries `#[cpu_features(simulation)]`: canonicalization is bulk FastLanes
+//! Every benchmark here carries `#[cpu_features(with_simulation)]`: canonicalization is bulk FastLanes
 //! unpacking, written to be auto-vectorized and therefore compiled differently per feature set.
 
 use std::sync::LazyLock;
@@ -44,7 +44,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 });
 
 #[cfg(not(codspeed))]
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = BENCH_ARGS)]
 fn into_canonical_non_nullable(
     bencher: Bencher,
@@ -76,7 +76,7 @@ fn into_canonical_non_nullable(
 }
 
 #[cfg(not(codspeed))]
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = BENCH_ARGS)]
 fn canonical_into_non_nullable(
     bencher: Bencher,
@@ -125,7 +125,7 @@ const NULLABLE_BENCH_ARGS: &[(usize, usize, f64)] = &[
 ];
 
 #[cfg(not(codspeed))]
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = NULLABLE_BENCH_ARGS)]
 fn into_canonical_nullable(
     bencher: Bencher,
@@ -157,7 +157,7 @@ fn into_canonical_nullable(
 }
 
 #[cfg(not(codspeed))]
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = NULLABLE_BENCH_ARGS)]
 fn canonical_into_nullable(
     bencher: Bencher,

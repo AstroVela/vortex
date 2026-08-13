@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! The `*_vortex_buffer` benchmarks that reach a multiversioned kernel — bit packing, popcount,
-//! the bitwise word loops and set-index iteration — carry `#[cpu_features(simulation)]`, so they
+//! the bitwise word loops and set-index iteration — carry `#[cpu_features(with_simulation)]`, so they
 //! are measured on every walltime CPU-feature leg as well as in simulation. The `*_arrow_buffer`
 //! baselines stay in simulation only.
 
@@ -55,7 +55,7 @@ fn from_iter_arrow(n: usize) {
     Arrow::<BooleanBuffer>::from_iter((0..n).map(|i| i % 2 == 0));
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn from_iter_bit_buffer(n: usize) {
     BitBuffer::from_iter((0..n).map(|i| i % 2 == 0));
@@ -197,7 +197,7 @@ fn slice_arrow_buffer(bencher: Bencher) {
 /// rather than the popcount, so it moves when the count itself has not changed.
 const TRUE_COUNT_INPUT_SIZE: &[usize] = &[16_384, 65_536];
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = TRUE_COUNT_INPUT_SIZE)]
 fn true_count_vortex_buffer(bencher: Bencher, length: usize) {
     let buffer = BitBuffer::from_iter((0..length).map(true_count_pattern));
@@ -220,7 +220,7 @@ fn true_count_arrow_buffer(bencher: Bencher, length: usize) {
         .bench_refs(|buffer| buffer.0.count_set_bits());
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn bitwise_and_vortex_buffer(bencher: Bencher, length: usize) {
     let a = BitBuffer::from_iter((0..length).map(|i| i % 2 == 0));
@@ -242,7 +242,7 @@ fn bitwise_and_arrow_buffer(bencher: Bencher, length: usize) {
 /// Owned-LHS AND: the left operand is a fresh, uniquely-owned `BitBuffer` each iteration, so
 /// `bitwise_binary_op_lhs_owned` takes the in-place (zero-allocation) fast path. Compare against
 /// `bitwise_and_vortex_buffer` (reference-LHS, which always allocates a result buffer).
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn bitand_owned_lhs_vortex_buffer(bencher: Bencher, length: usize) {
     let b = BitBuffer::from_iter((0..length).map(|i| i % 3 == 0));
@@ -251,7 +251,7 @@ fn bitand_owned_lhs_vortex_buffer(bencher: Bencher, length: usize) {
         .bench_values(|a| a & &b);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn bitwise_or_vortex_buffer(bencher: Bencher, length: usize) {
     let a = BitBuffer::from_iter((0..length).map(|i| i % 2 == 0));
@@ -270,7 +270,7 @@ fn bitwise_or_arrow_buffer(bencher: Bencher, length: usize) {
         .bench_refs(|(a, b)| &a.0 | &b.0);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn bitwise_not_vortex_buffer(bencher: Bencher, length: usize) {
     bencher
@@ -283,7 +283,7 @@ fn bitwise_not_vortex_buffer(bencher: Bencher, length: usize) {
 /// than the loop itself. Only the sizes where the loop dominates are worth measuring.
 const NOT_MUT_INPUT_SIZE: &[usize] = &[16_384, 65_536];
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = NOT_MUT_INPUT_SIZE)]
 fn bitwise_not_vortex_buffer_mut(bencher: Bencher, length: usize) {
     bencher
@@ -298,7 +298,7 @@ fn bitwise_not_arrow_buffer(bencher: Bencher, length: usize) {
         .bench_values(|buffer| !&buffer.0);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn iter_vortex_buffer(bencher: Bencher, length: usize) {
     let buffer = BitBuffer::from_iter((0..length).map(|i| i % 2 == 0));
@@ -319,7 +319,7 @@ fn iter_arrow_buffer(bencher: Bencher, length: usize) {
     });
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn set_indices_vortex_buffer(bencher: Bencher, length: usize) {
     let buffer = BitBuffer::from_iter((0..length).map(|i| i % 2 == 0));

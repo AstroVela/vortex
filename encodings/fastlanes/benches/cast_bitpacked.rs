@@ -10,7 +10,7 @@
 //! - `canonicalize_then_cast`: explicitly canonicalizes to a full-length `u16` `PrimitiveArray` and
 //!   then casts that to `u32`.
 //!
-//! `cast_execute` carries `#[cpu_features(simulation)]`: it unpacks and widens in a lane loop the
+//! `cast_execute` carries `#[cpu_features(with_simulation)]`: it unpacks and widens in a lane loop the
 //! compiler vectorizes according to the build.
 
 #![expect(clippy::unwrap_used)]
@@ -97,7 +97,7 @@ fn single(chunks: &[BitPackedArray]) -> ArrayRef {
     }
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = ARGS)]
 fn cast_execute(bencher: Bencher, (chunk_len, chunk_count, frac): (usize, usize, f64)) {
     let chunks = make_chunks(chunk_len, chunk_count, frac);

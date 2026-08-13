@@ -82,8 +82,8 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=+avx2"
           # Benchmarks carrying a bare `#[cpu_features]` belong to a walltime leg below and are
-          # skipped here. `#[cpu_features(simulation)]` ones run in both places. Either way the
-          # names here stay bare, so this job's CodSpeed history is unaffected.
+          # skipped here. `#[cpu_features(with_simulation)]` ones run in both places. Either way
+          # the names here stay bare, so this job's CodSpeed history is unaffected.
           VORTEX_BENCH_VARIANT: simulation
         run: cargo codspeed build --locked ${{ matrix.features }} $(printf -- '-p %s ' ${{ matrix.packages }}) --profile bench
       - name: Run benchmarks
@@ -152,7 +152,7 @@ jobs:
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, pathlib, re, subprocess
 
-          # `#[cpu_features]` and `#[cpu_features(simulation)]` both belong to this job; the
+          # `#[cpu_features]` and `#[cpu_features(with_simulation)]` both belong to this job; the
           # argument only decides whether the simulation job keeps the benchmark too.
           TAG = re.compile(r"cpu_features\s*[\](]")
 

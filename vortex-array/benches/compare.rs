@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The bool, integer, float and decimal comparisons carry `#[cpu_features(simulation)]`: the
+//! The bool, integer, float and decimal comparisons carry `#[cpu_features(with_simulation)]`: the
 //! comparison kernels are plain lane loops whose vectorization is decided entirely by the build,
 //! so the walltime CPU-feature legs measure them per instruction set while the existing simulation
 //! series keeps its history. String and struct comparisons are left out: they are dominated by
@@ -111,7 +111,7 @@ fn decimal_array(rng: &mut StdRng) -> ArrayRef {
     .into_array()
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_bool(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -120,7 +120,7 @@ fn compare_bool(bencher: Bencher) {
     bench_compare(bencher, arr1, arr2, Operator::Gte);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_bool_nullable(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -129,7 +129,7 @@ fn compare_bool_nullable(bencher: Bencher) {
     bench_compare(bencher, arr1, arr2, Operator::Gte);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_bool_constant(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -138,7 +138,7 @@ fn compare_bool_constant(bencher: Bencher) {
     bench_compare(bencher, arr, constant, Operator::Eq);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_int(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -147,7 +147,7 @@ fn compare_int(bencher: Bencher) {
     bench_compare(bencher, arr1, arr2, Operator::Gte);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_int_nullable(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -156,7 +156,7 @@ fn compare_int_nullable(bencher: Bencher) {
     bench_compare(bencher, arr1, arr2, Operator::Gte);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_int_constant(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -165,7 +165,7 @@ fn compare_int_constant(bencher: Bencher) {
     bench_compare(bencher, arr, constant, Operator::Gte);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_int_eq(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -174,7 +174,7 @@ fn compare_int_eq(bencher: Bencher) {
     bench_compare(bencher, arr1, arr2, Operator::Eq);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_float(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
@@ -183,7 +183,7 @@ fn compare_float(bencher: Bencher) {
     bench_compare(bencher, arr1, arr2, Operator::Gte);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn compare_decimal(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);

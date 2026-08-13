@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Every benchmark here carries `#[cpu_features(simulation)]`. Arithmetic over primitive and
+//! Every benchmark here carries `#[cpu_features(with_simulation)]`. Arithmetic over primitive and
 //! decimal buffers is a lane loop the compiler vectorizes according to the build, which is exactly
 //! what the walltime CPU-feature legs vary.
 
@@ -46,7 +46,7 @@ const LEN: usize = 32_768;
 /// the instrumented CodSpeed runs quick.
 const DECIMAL_MUL_DIV_LEN: usize = 8_192;
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_i64_nonnull(bencher: Bencher) {
     let lhs = primitive_nonnull(0).into_array();
@@ -55,7 +55,7 @@ fn add_i64_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_i64_nullable(bencher: Bencher) {
     let lhs = primitive_nullable(0, 7).into_array();
@@ -64,7 +64,7 @@ fn add_i64_nullable(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_i64_constant(bencher: Bencher) {
     let lhs = primitive_nonnull(0).into_array();
@@ -73,7 +73,7 @@ fn add_i64_constant(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_i32_nonnull(bencher: Bencher) {
     let lhs = primitive_i32_small_nonnull(1).into_array();
@@ -82,7 +82,7 @@ fn add_i32_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_u32_nonnull(bencher: Bencher) {
     let lhs = primitive_u32_small_nonnull(1).into_array();
@@ -91,7 +91,7 @@ fn add_u32_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_i64_nonnull(bencher: Bencher) {
     let lhs = primitive_small_nonnull(1).into_array();
@@ -100,7 +100,7 @@ fn mul_i64_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_i8_nonnull(bencher: Bencher) {
     let lhs = primitive_i8_small_nonnull(1).into_array();
@@ -109,7 +109,7 @@ fn mul_i8_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_u8_nonnull(bencher: Bencher) {
     let lhs = primitive_u8_small_nonnull(1).into_array();
@@ -118,7 +118,7 @@ fn mul_u8_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_i16_nonnull(bencher: Bencher) {
     let lhs = primitive_i16_small_nonnull(1).into_array();
@@ -127,7 +127,7 @@ fn mul_i16_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_u16_nonnull(bencher: Bencher) {
     let lhs = primitive_u16_small_nonnull(1).into_array();
@@ -136,7 +136,7 @@ fn mul_u16_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_i32_nonnull(bencher: Bencher) {
     let lhs = primitive_i32_small_nonnull(1).into_array();
@@ -145,7 +145,7 @@ fn mul_i32_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_u32_nonnull(bencher: Bencher) {
     let lhs = primitive_u32_small_nonnull(1).into_array();
@@ -154,7 +154,7 @@ fn mul_u32_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_u64_nonnull(bencher: Bencher) {
     let lhs = primitive_u64_small_nonnull(1).into_array();
@@ -163,7 +163,7 @@ fn mul_u64_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_i32_nullable(bencher: Bencher) {
     let lhs = primitive_i32_small_nullable(1, 7).into_array();
@@ -172,7 +172,7 @@ fn mul_i32_nullable(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_i32_constant(bencher: Bencher) {
     let lhs = primitive_i32_small_nonnull(1).into_array();
@@ -181,7 +181,7 @@ fn mul_i32_constant(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn div_i64_nonnull(bencher: Bencher) {
     let lhs = primitive_nonnull(1_000_000).into_array();
@@ -190,7 +190,7 @@ fn div_i64_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Div);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn sub_i64_constant(bencher: Bencher) {
     let lhs = primitive_nonnull(0).into_array();
@@ -199,7 +199,7 @@ fn sub_i64_constant(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Sub);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_decimal_i64_nonnull(bencher: Bencher) {
     let lhs = decimal_i64_nonnull(0, LEN).into_array();
@@ -208,7 +208,7 @@ fn add_decimal_i64_nonnull(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn add_decimal_i128_nullable(bencher: Bencher) {
     let lhs = decimal_i128_nullable(0, 7, LEN).into_array();
@@ -217,7 +217,7 @@ fn add_decimal_i128_nullable(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Add);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_decimal_i64_nonnull(bencher: Bencher) {
     let lhs = decimal_i64_nonnull(0, DECIMAL_MUL_DIV_LEN).into_array();
@@ -226,7 +226,7 @@ fn mul_decimal_i64_nonnull(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn mul_decimal_i128_nullable(bencher: Bencher) {
     let lhs = decimal_i128_nullable(0, 7, DECIMAL_MUL_DIV_LEN).into_array();
@@ -235,7 +235,7 @@ fn mul_decimal_i128_nullable(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn div_decimal_i64_nonnull(bencher: Bencher) {
     let lhs = decimal_i64_nonnull(0, DECIMAL_MUL_DIV_LEN).into_array();
@@ -244,7 +244,7 @@ fn div_decimal_i64_nonnull(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Div);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn div_decimal_i128_nullable(bencher: Bencher) {
     let lhs = decimal_i128_nullable(0, 7, DECIMAL_MUL_DIV_LEN).into_array();
@@ -253,7 +253,7 @@ fn div_decimal_i128_nullable(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Div);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn eq_i64_constant(bencher: Bencher) {
     let lhs = primitive_nonnull(0).into_array();
@@ -262,7 +262,7 @@ fn eq_i64_constant(bencher: Bencher) {
     bench_bool(bencher, lhs, rhs, Operator::Eq);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn lt_i64_nullable(bencher: Bencher) {
     let lhs = primitive_nullable(0, 7).into_array();
@@ -271,7 +271,7 @@ fn lt_i64_nullable(bencher: Bencher) {
     bench_bool(bencher, lhs, rhs, Operator::Lt);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn and_bool_nullable(bencher: Bencher) {
     let lhs = bool_nullable(2, 7).into_array();
@@ -280,7 +280,7 @@ fn and_bool_nullable(bencher: Bencher) {
     bench_bool(bencher, lhs, rhs, Operator::And);
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench]
 fn or_bool_constant(bencher: Bencher) {
     let lhs = bool_nullable(2, 7).into_array();

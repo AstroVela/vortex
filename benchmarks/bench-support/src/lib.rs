@@ -19,14 +19,16 @@ use syn::parse_macro_input;
 ///
 /// * `#[cpu_features]` — walltime legs only. For a benchmark added to measure the feature sets
 ///   in the first place, with no simulation history worth keeping.
-/// * `#[cpu_features(simulation)]` — both. For a benchmark that already reports to CodSpeed in
-///   simulation: the walltime legs add per-feature-set series next to it, and the existing
+/// * `#[cpu_features(with_simulation)]` — both. For a benchmark that already reports to CodSpeed
+///   in simulation: the walltime legs add per-feature-set series next to it, and the existing
 ///   simulation series keeps its name and its history, so PRs still get the instruction-count
 ///   comparison they got before.
 ///
+/// An untagged benchmark is unaffected by any of this and runs in the simulation job alone.
+///
 /// Write it *above* `#[divan::bench]`, whose arguments it fills in — the name is qualified with
 /// the leg that produced it, so the legs report one series each rather than fighting over a
-/// shared name, and (without `simulation`) `ignore` takes the benchmark out of the sharded
+/// shared name, and (without `with_simulation`) `ignore` takes the benchmark out of the sharded
 /// simulation job. A plain `cargo bench` runs it as before, under its bare name.
 ///
 /// ```ignore
@@ -34,7 +36,7 @@ use syn::parse_macro_input;
 /// #[divan::bench(args = INPUT_SIZE)]
 /// fn words_gather_dispatch(bencher: Bencher, len: usize) { /* ... */ }
 ///
-/// #[vortex_bench_support::cpu_features(simulation)]
+/// #[vortex_bench_support::cpu_features(with_simulation)]
 /// #[divan::bench]
 /// fn compare_int(bencher: Bencher) { /* ... */ }
 /// ```
@@ -52,12 +54,12 @@ pub fn cpu_features(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = TokenStream2::from(attr);
     let keep_simulation = match attr.to_string().as_str() {
         "" => false,
-        "simulation" => true,
+        "with_simulation" => true,
         _ => {
             return syn::Error::new_spanned(
                 attr,
-                "`#[cpu_features]` takes at most `simulation`, which keeps the benchmark in the \
-                 simulation job as well as on every feature-set leg",
+                "`#[cpu_features]` takes at most `with_simulation`, which keeps the benchmark in \
+                 the simulation job as well as on every feature-set leg",
             )
             .to_compile_error()
             .into();
@@ -126,7 +128,7 @@ pub fn cpu_features(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote!(,)
     };
     let bench_path = bench.path().clone();
-    // With `simulation` there is nothing to skip: the walltime legs pick the benchmark out by
+    // With `with_simulation` there is nothing to skip: the walltime legs pick the benchmark out by
     // the name prefix, and the simulation job runs it under its bare name as it always has.
     let ignore = if keep_simulation {
         quote!()

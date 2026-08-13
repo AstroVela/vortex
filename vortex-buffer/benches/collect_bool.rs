@@ -20,7 +20,7 @@
 //! the build. Comparing them across legs is the point.
 //!
 //! The public entry points `from_bool_slice` and `collect_bool_u32_gt` carry
-//! `#[cpu_features(simulation)]`: they reach the same multiversioned kernels, so they are
+//! `#[cpu_features(with_simulation)]`: they reach the same multiversioned kernels, so they are
 //! worth measuring per leg, but they also predate the legs and keep their simulation series.
 //!
 //! The hand-written per-kernel benchmarks are not tagged. Each one needs an instruction set
@@ -198,7 +198,7 @@ fn from_bool_slice_old_scalar(bencher: Bencher, len: usize) {
         .bench_refs(|words| collect_bool_words_old(words, len, |i| bools[i]));
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn from_bool_slice(bencher: Bencher, len: usize) {
     let bools = make_bools(len);
@@ -214,7 +214,7 @@ fn collect_bool_u32_gt_old_scalar(bencher: Bencher, len: usize) {
         .bench_refs(|words| collect_bool_words_old(words, len, |i| values[i] > u32::MAX / 2));
 }
 
-#[vortex_bench_support::cpu_features(simulation)]
+#[vortex_bench_support::cpu_features(with_simulation)]
 #[divan::bench(args = INPUT_SIZE)]
 fn collect_bool_u32_gt(bencher: Bencher, len: usize) {
     let values = make_u32s(len);
