@@ -13,9 +13,14 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use futures::FutureExt;
+use futures::StreamExt;
+use futures::channel::mpsc;
 use futures::future::BoxFuture;
+use futures::stream;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::memory::DefaultHostAllocator;
 use vortex_array::memory::HostAllocatorRef;
@@ -24,6 +29,8 @@ use vortex_error::VortexResult;
 
 use crate::CoalesceConfig;
 use crate::FILE_PREFERRED_READ_SIZE;
+use crate::ReadAtRequest;
+use crate::ReadAtStream;
 use crate::VortexReadAt;
 use crate::runtime::Handle;
 
@@ -151,6 +158,51 @@ impl VortexReadAt for FileReadAt {
                 })
                 .await
         }
+        .boxed()
+    }
+
+    fn read_ranges(&self, requests: Arc<[ReadAtRequest]>) -> ReadAtStream {
+        if requests.is_empty() {
+            return stream::empty().boxed();
+        }
+
+        let worker_count = requests.len().min(DEFAULT_CONCURRENCY);
+        let next = Arc::new(AtomicUsize::new(0));
+        let (send, recv) = mpsc::unbounded();
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            let file = Arc::clone(&self.file);
+            let allocator = Arc::clone(&self.allocator);
+            let requests = Arc::clone(&requests);
+            let next = Arc::clone(&next);
+            let send = send.clone();
+            workers.push(self.handle.spawn_blocking(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(request) = requests.get(index).copied() else {
+                        break;
+                    };
+                    let result = (|| -> VortexResult<BufferHandle> {
+                        let mut buffer = allocator.allocate(request.length, request.alignment)?;
+                        read_exact_at(&file, buffer.as_mut_slice(), request.offset)?;
+                        Ok(BufferHandle::new_host(buffer.freeze()))
+                    })();
+                    if send.unbounded_send((request, result)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(send);
+
+        // Retaining task handles in the stream state aborts workers that have not started their
+        // next range if the consumer drops the response stream.
+        stream::unfold((recv, workers), |(mut recv, workers)| async move {
+            recv.next()
+                .await
+                .map(|response| (response, (recv, workers)))
+        })
         .boxed()
     }
 }
