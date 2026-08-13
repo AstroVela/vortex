@@ -126,14 +126,9 @@ jobs:
             pytest --benchmark-disable test/test_hf_datasets.py
         working-directory: vortex-python/
 
-      - name: Doctest - PyVortex
+      - name: Check Python documentation
         run: |
-          uv run --all-packages make doctest
-        working-directory: docs/
-
-      - name: Ensure docs build - PyVortex
-        run: |
-          uv run --all-packages make html
+          uv run --all-packages make check
         working-directory: docs/
 
       # Keep this last: setup-benchmark.sh confines everything except the wrapped
@@ -294,6 +289,27 @@ jobs:
         with:
           enable-sccache: "true"
       - run: cargo minimal-versions check --direct --workspace --ignore-private
+
+  rust-msrv:
+    name: "Rust (MSRV)"
+    timeout-minutes: 30
+    runs-on: >-
+      ${{ github.repository == 'vortex-data/vortex'
+          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-msrv', github.run_id)
+          || 'ubuntu-latest' }}
+    env:
+      RUSTFLAGS: "-A warnings"
+    steps:
+      - uses: runs-on/action@v2
+        if: github.repository == 'vortex-data/vortex'
+        with:
+          sccache: s3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-prebuild
+        with:
+          enable-sccache: "true"
+      - name: Check publishable crates against the MSRV
+        run: cargo hack --rust-version --no-dev-deps --ignore-private check --profile ci --all-features
 
   rust-lint:
     name: "Rust (lint)"

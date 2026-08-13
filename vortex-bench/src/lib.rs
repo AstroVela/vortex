@@ -80,7 +80,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_tokio();
-    vortex_geo::initialize(&session);
+    vortex_spatial::initialize(&session);
     session
 });
 
@@ -149,9 +149,9 @@ pub enum Format {
     #[clap(name = "vortex-compact")]
     #[serde(rename = "vortex-compact")]
     VortexCompact,
-    #[clap(name = "vortex-geo-native")]
-    #[serde(rename = "vortex-geo-native")]
-    VortexNative,
+    #[clap(name = "vortex-spatial-native")]
+    #[serde(rename = "vortex-spatial-native")]
+    VortexSpatialNative,
     #[clap(name = "duckdb")]
     #[serde(rename = "duckdb")]
     OnDiskDuckDB,
@@ -190,7 +190,7 @@ impl Format {
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex-file-compressed",
             Format::VortexCompact => "vortex-compact",
-            Format::VortexNative => "vortex-geo-native",
+            Format::VortexSpatialNative => "vortex-spatial-native",
             Format::OnDiskDuckDB => "duckdb",
             Format::Lance => "lance",
         }
@@ -202,7 +202,7 @@ impl Format {
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex",
             Format::VortexCompact => "vortex",
-            Format::VortexNative => "vortex",
+            Format::VortexSpatialNative => "vortex",
             Format::OnDiskDuckDB => "duckdb",
             Format::Lance => "lance",
         }
@@ -250,6 +250,66 @@ impl CompactionStrategy {
             CompactionStrategy::Default => options,
         }
     }
+}
+
+/// Verify that local data has already been prepared for the requested benchmark formats.
+///
+/// Engine-specific benchmark binaries call this before running queries. Data generation itself
+/// belongs to the `data-gen` binary.
+pub fn require_prepared_data<B>(benchmark: &B, formats: &[Format]) -> anyhow::Result<()>
+where
+    B: Benchmark + ?Sized,
+{
+    if benchmark.data_url().scheme() != "file" {
+        return Ok(());
+    }
+
+    let base_path = benchmark
+        .data_url()
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", benchmark.data_url()))?;
+
+    let mut missing = Vec::new();
+    for format in formats.iter().copied().unique() {
+        let required_path = match format {
+            Format::Parquet => base_path.join(Format::Parquet.name()),
+            Format::OnDiskVortex => base_path.join(Format::OnDiskVortex.name()),
+            Format::VortexCompact => base_path.join(Format::VortexCompact.name()),
+            Format::OnDiskDuckDB => base_path
+                .join(Format::OnDiskDuckDB.name())
+                .join("duckdb.db"),
+            format => base_path.join(format.name()),
+        };
+
+        if !required_path.exists() {
+            missing.push((format, required_path));
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let missing_data = missing
+        .iter()
+        .map(|(format, path)| format!("{format} ({})", path.display()))
+        .join(", ");
+    let requested_formats = formats
+        .iter()
+        .copied()
+        .unique()
+        .map(|format| format!("\"{format}\""))
+        .join(",");
+
+    anyhow::bail!(
+        "prepared data is missing for {}: {missing_data}. Generate it first with \
+         `vx-bench prepare-data {} --formats-json '[{requested_formats}]'` or \
+         `cargo run --bin data-gen -- {} --formats {}` using the same --opt values.",
+        benchmark.dataset_display(),
+        benchmark.dataset_name(),
+        benchmark.dataset_name(),
+        formats.iter().copied().unique().join(","),
+    );
 }
 
 /// CLI argument for selecting which benchmark to run.

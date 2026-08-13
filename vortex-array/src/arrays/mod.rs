@@ -5,7 +5,7 @@
 //!
 //! Canonical arrays are the default uncompressed representation for a logical dtype:
 //! [`NullArray`], [`BoolArray`], [`PrimitiveArray`], [`DecimalArray`], [`VarBinViewArray`],
-//! [`ListViewArray`], [`FixedSizeListArray`], [`StructArray`], [`UnionArray`],
+//! [`ListViewArray`], [`MapArray`], [`FixedSizeListArray`], [`StructArray`], [`UnionArray`],
 //! [`ExtensionArray`], and [`VariantArray`].
 //!
 //! Utility and lazy arrays represent common transformations without immediately materializing
@@ -60,6 +60,8 @@ pub mod filter;
 pub use filter::Filter;
 pub use filter::FilterArray;
 
+pub(crate) mod fixed_width;
+
 pub mod fixed_size_list;
 pub use fixed_size_list::FixedSizeList;
 pub use fixed_size_list::FixedSizeListArray;
@@ -75,6 +77,10 @@ pub use list::ListArray;
 pub mod listview;
 pub use listview::ListView;
 pub use listview::ListViewArray;
+
+pub mod map;
+pub use map::Map;
+pub use map::MapArray;
 
 pub mod masked;
 pub use masked::Masked;
@@ -139,6 +145,7 @@ pub(crate) fn initialize(session: &VortexSession) {
     fixed_size_list::initialize(session);
     list::initialize(session);
     listview::initialize(session);
+    map::initialize(session);
     patched::initialize(session);
     primitive::initialize(session);
     struct_::initialize(session);

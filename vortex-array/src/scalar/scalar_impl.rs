@@ -135,6 +135,7 @@ impl Scalar {
     /// - `Utf8`: `""`
     /// - `Binary`: An empty buffer
     /// - `List`: An empty list
+    /// - `Map`: An empty map
     /// - `FixedSizeList`: A list (with correct size) of zero values, which is determined by the
     ///   element [`DType`]
     /// - `Struct`: A struct where each field has a zero value, which is determined by the field
@@ -212,6 +213,7 @@ impl Scalar {
             DType::Utf8(_) => value.as_utf8().is_empty(),
             DType::Binary(_) => value.as_binary().is_empty(),
             DType::List(..) => value.as_list().is_empty(),
+            DType::Map(..) => self.as_map().is_empty(),
             // A fixed-size list is zero only if it has the expected number of elements and every
             // element is itself a non-null zero value.1
             DType::FixedSizeList(_, list_size, _) => {
@@ -298,6 +300,11 @@ impl Scalar {
                 .elements()
                 .map(|fields| fields.into_iter().map(|f| f.approx_nbytes()).sum::<usize>())
                 .unwrap_or_default(),
+            DType::Map(..) => self
+                .as_map()
+                .entries()
+                .map(|(key, value)| key.approx_nbytes() + value.approx_nbytes())
+                .sum(),
             DType::Struct(..) => self
                 .as_struct()
                 .fields_iter()
@@ -444,6 +451,8 @@ fn partial_cmp_tuple_values(
             partial_cmp_list_values(element_dtype, lhs, rhs)
         }
         DType::Struct(fields, _) => partial_cmp_struct_values(fields, lhs, rhs),
+        // A map compares as the list of its `{key, value}` entry structs.
+        DType::Map(map_dtype, _) => partial_cmp_list_values(&map_dtype.entries_dtype(), lhs, rhs),
         DType::Extension(ext_dtype) => {
             partial_cmp_tuple_values(ext_dtype.storage_dtype(), lhs, rhs)
         }
@@ -489,9 +498,11 @@ fn partial_cmp_struct_values(
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
     use std::sync::Arc;
 
     use rstest::rstest;
+    use vortex_error::VortexResult;
 
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -508,6 +519,61 @@ mod tests {
             Some(value) => Scalar::primitive::<i32>(value, Nullability::Nullable),
             None => Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable)),
         }
+    }
+
+    fn map_dtype(nullability: Nullability) -> VortexResult<DType> {
+        DType::map(
+            DType::Primitive(PType::I32, Nullability::NonNullable),
+            DType::Utf8(Nullability::Nullable),
+            false,
+            nullability,
+        )
+    }
+
+    fn map_scalar(entries: Vec<(i32, Option<&str>)>) -> VortexResult<Scalar> {
+        Scalar::try_map(
+            map_dtype(Nullability::Nullable)?,
+            entries.into_iter().map(|(key, value)| {
+                (
+                    i32_scalar(key),
+                    match value {
+                        Some(value) => Scalar::utf8(value, Nullability::Nullable),
+                        None => Scalar::null(DType::Utf8(Nullability::Nullable)),
+                    },
+                )
+            }),
+        )
+    }
+
+    /// Maps order entry-wise, then by entry count.
+    #[rstest]
+    #[case(vec![(1, Some("a"))], vec![(1, Some("a"))], Ordering::Equal)]
+    #[case(vec![(1, Some("a"))], vec![(1, Some("b"))], Ordering::Less)]
+    #[case(vec![(2, Some("a"))], vec![(1, Some("z"))], Ordering::Greater)]
+    #[case(vec![(1, Some("a"))], vec![(1, Some("a")), (2, Some("b"))], Ordering::Less)]
+    #[case(vec![], vec![], Ordering::Equal)]
+    #[case(vec![], vec![(1, Some("a"))], Ordering::Less)]
+    #[case(vec![(1, Some("a"))], vec![(1, None)], Ordering::Greater)]
+    fn map_ordering(
+        #[case] lhs: Vec<(i32, Option<&str>)>,
+        #[case] rhs: Vec<(i32, Option<&str>)>,
+        #[case] expected: Ordering,
+    ) -> VortexResult<()> {
+        assert_eq!(
+            map_scalar(lhs)?.partial_cmp(&map_scalar(rhs)?),
+            Some(expected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn null_map_orders_before_every_non_null_map() -> VortexResult<()> {
+        let null = Scalar::null(map_dtype(Nullability::Nullable)?);
+
+        assert_eq!(null.partial_cmp(&map_scalar(vec![])?), Some(Ordering::Less));
+        assert_eq!(null.partial_cmp(&null), Some(Ordering::Equal));
+
+        Ok(())
     }
 
     fn ab_struct_dtype(nullability: Nullability) -> DType {

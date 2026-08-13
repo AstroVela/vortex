@@ -47,7 +47,7 @@ use vortex::scalar::PrimitiveScalar;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue;
 use vortex::scalar::Utf8Scalar;
-use vortex_geo::extension::WellKnownBinary;
+use vortex_spatial::extension::WellKnownBinary;
 
 use crate::convert::dtype::FromLogicalType;
 use crate::duckdb::LogicalType;
@@ -82,6 +82,7 @@ impl ToDuckDBScalar for Scalar {
             DType::FixedSizeList(..) => {
                 vortex_bail!("Vortex FixedSizeList scalars aren't supported")
             }
+            DType::Map(..) => vortex_bail!("Vortex Map scalars aren't supported"),
             DType::Variant(_) => vortex_bail!("Vortex Variant scalars aren't supported"),
             DType::Struct(..) => vortex_bail!("Vortex Struct scalars aren't supported"),
             // TODO(connor): Union
@@ -354,6 +355,16 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
                     Some(ScalarValue::from(seconds)),
                 )?,
             )),
+            ExtractedValue::TimestampTz(micros) => Ok(Scalar::extension::<Timestamp>(
+                TimestampOptions {
+                    unit: TimeUnit::Microseconds,
+                    tz: Some("UTC".into()),
+                },
+                Scalar::try_new(
+                    DType::Primitive(I64, Nullable),
+                    Some(ScalarValue::from(micros)),
+                )?,
+            )),
             ExtractedValue::Decimal(precision, scale, value) => Ok(Scalar::decimal(
                 DecimalValue::I128(value),
                 DecimalDType::try_new(precision, scale)?,
@@ -377,6 +388,9 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
                     vortex_bail!("List value must be a list or struct dtype")
                 }
             },
+            ExtractedValue::Unsupported(type_id) => {
+                vortex_bail!("Unsupported DuckDB value type {type_id:?}")
+            }
         }
     }
 }
@@ -395,8 +409,8 @@ mod tests {
     use vortex::extension::datetime::TimestampOptions;
     use vortex::scalar::Scalar;
     use vortex::scalar::ScalarValue;
-    use vortex_geo::extension::GeoMetadata;
-    use vortex_geo::extension::WellKnownBinary;
+    use vortex_spatial::extension::SpatialMetadata;
+    use vortex_spatial::extension::WellKnownBinary;
 
     use crate::convert::ToDuckDBScalar;
     use crate::cpp::DUCKDB_TYPE;
@@ -466,7 +480,7 @@ mod tests {
 
     fn wkb_scalar(crs: Option<&str>, bytes: &[u8]) -> Scalar {
         Scalar::extension::<WellKnownBinary>(
-            GeoMetadata {
+            SpatialMetadata {
                 crs: crs.map(str::to_string),
             },
             Scalar::binary(bytes.to_vec(), Nullability::Nullable),
@@ -517,7 +531,7 @@ mod tests {
     #[test]
     fn test_null_geometry_to_duckdb_scalar() {
         let dtype = ExtDType::<WellKnownBinary>::try_new(
-            GeoMetadata {
+            SpatialMetadata {
                 crs: Some("EPSG:4326".to_string()),
             },
             DType::Binary(Nullability::Nullable),

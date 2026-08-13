@@ -36,7 +36,11 @@ fn main() {
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 
-const LEN: usize = 65_536;
+const LEN: usize = 32_768;
+
+/// Decimal Mul and Div cost far more per lane than Add, so they run over a shorter array to keep
+/// the instrumented CodSpeed runs quick.
+const DECIMAL_MUL_DIV_LEN: usize = 8_192;
 
 #[divan::bench]
 fn add_i64_nonnull(bencher: Bencher) {
@@ -50,6 +54,30 @@ fn add_i64_nonnull(bencher: Bencher) {
 fn add_i64_nullable(bencher: Bencher) {
     let lhs = primitive_nullable(0, 7).into_array();
     let rhs = primitive_nullable(1_000_000, 5).into_array();
+
+    bench_primitive(bencher, lhs, rhs, Operator::Add);
+}
+
+#[divan::bench]
+fn add_i64_constant(bencher: Bencher) {
+    let lhs = primitive_nonnull(0).into_array();
+    let rhs = ConstantArray::new(1_000_000i64, LEN).into_array();
+
+    bench_primitive(bencher, lhs, rhs, Operator::Add);
+}
+
+#[divan::bench]
+fn add_i32_nonnull(bencher: Bencher) {
+    let lhs = primitive_i32_small_nonnull(1).into_array();
+    let rhs = primitive_i32_small_nonnull(17).into_array();
+
+    bench_primitive(bencher, lhs, rhs, Operator::Add);
+}
+
+#[divan::bench]
+fn add_u32_nonnull(bencher: Bencher) {
+    let lhs = primitive_u32_small_nonnull(1).into_array();
+    let rhs = primitive_u32_small_nonnull(17).into_array();
 
     bench_primitive(bencher, lhs, rhs, Operator::Add);
 }
@@ -111,6 +139,14 @@ fn mul_u32_nonnull(bencher: Bencher) {
 }
 
 #[divan::bench]
+fn mul_u64_nonnull(bencher: Bencher) {
+    let lhs = primitive_u64_small_nonnull(1).into_array();
+    let rhs = primitive_u64_small_nonnull(17).into_array();
+
+    bench_primitive(bencher, lhs, rhs, Operator::Mul);
+}
+
+#[divan::bench]
 fn mul_i32_nullable(bencher: Bencher) {
     let lhs = primitive_i32_small_nullable(1, 7).into_array();
     let rhs = primitive_i32_small_nullable(17, 5).into_array();
@@ -144,18 +180,50 @@ fn sub_i64_constant(bencher: Bencher) {
 
 #[divan::bench]
 fn add_decimal_i64_nonnull(bencher: Bencher) {
-    let lhs = decimal_i64_nonnull(0).into_array();
-    let rhs = decimal_i64_nonnull(1_000_000).into_array();
+    let lhs = decimal_i64_nonnull(0, LEN).into_array();
+    let rhs = decimal_i64_nonnull(1_000_000, LEN).into_array();
 
     bench_decimal(bencher, lhs, rhs, Operator::Add);
 }
 
 #[divan::bench]
 fn add_decimal_i128_nullable(bencher: Bencher) {
-    let lhs = decimal_i128_nullable(0, 7).into_array();
-    let rhs = decimal_i128_nullable(1_000_000, 5).into_array();
+    let lhs = decimal_i128_nullable(0, 7, LEN).into_array();
+    let rhs = decimal_i128_nullable(1_000_000, 5, LEN).into_array();
 
     bench_decimal(bencher, lhs, rhs, Operator::Add);
+}
+
+#[divan::bench]
+fn mul_decimal_i64_nonnull(bencher: Bencher) {
+    let lhs = decimal_i64_nonnull(0, DECIMAL_MUL_DIV_LEN).into_array();
+    let rhs = decimal_i64_nonnull(1_000_000, DECIMAL_MUL_DIV_LEN).into_array();
+
+    bench_decimal(bencher, lhs, rhs, Operator::Mul);
+}
+
+#[divan::bench]
+fn mul_decimal_i128_nullable(bencher: Bencher) {
+    let lhs = decimal_i128_nullable(0, 7, DECIMAL_MUL_DIV_LEN).into_array();
+    let rhs = decimal_i128_nullable(1_000_000, 5, DECIMAL_MUL_DIV_LEN).into_array();
+
+    bench_decimal(bencher, lhs, rhs, Operator::Mul);
+}
+
+#[divan::bench]
+fn div_decimal_i64_nonnull(bencher: Bencher) {
+    let lhs = decimal_i64_nonnull(0, DECIMAL_MUL_DIV_LEN).into_array();
+    let rhs = decimal_i64_nonnull(1_000_000, DECIMAL_MUL_DIV_LEN).into_array();
+
+    bench_decimal(bencher, lhs, rhs, Operator::Div);
+}
+
+#[divan::bench]
+fn div_decimal_i128_nullable(bencher: Bencher) {
+    let lhs = decimal_i128_nullable(0, 7, DECIMAL_MUL_DIV_LEN).into_array();
+    let rhs = decimal_i128_nullable(1_000_000, 5, DECIMAL_MUL_DIV_LEN).into_array();
+
+    bench_decimal(bencher, lhs, rhs, Operator::Div);
 }
 
 #[divan::bench]
@@ -209,8 +277,9 @@ fn bench_binary<T: Executable + 'static>(
     operator: Operator,
 ) {
     let mut ctx = SESSION.create_execution_ctx();
+    let len = lhs.len();
 
-    bencher.counter(ItemsCount::new(LEN)).bench_local(|| {
+    bencher.counter(ItemsCount::new(len)).bench_local(|| {
         lhs.clone()
             .binary(rhs.clone(), operator)
             .unwrap()
@@ -223,13 +292,13 @@ fn primitive_nonnull(base: i64) -> PrimitiveArray {
     PrimitiveArray::from_iter((0..LEN as i64).map(|i| base + i))
 }
 
-fn decimal_i64_nonnull(base: i64) -> DecimalArray {
-    DecimalArray::from_iter::<i64, _>((0..LEN as i64).map(|i| base + i), DecimalDType::new(18, 2))
+fn decimal_i64_nonnull(base: i64, len: usize) -> DecimalArray {
+    DecimalArray::from_iter::<i64, _>((0..len as i64).map(|i| base + i), DecimalDType::new(18, 2))
 }
 
-fn decimal_i128_nullable(base: i128, null_every: usize) -> DecimalArray {
+fn decimal_i128_nullable(base: i128, null_every: usize, len: usize) -> DecimalArray {
     DecimalArray::from_option_iter::<i128, _>(
-        (0..LEN as i128).map(|i| (!(i as usize).is_multiple_of(null_every)).then_some(base + i)),
+        (0..len as i128).map(|i| (!(i as usize).is_multiple_of(null_every)).then_some(base + i)),
         DecimalDType::new(38, 2),
     )
 }
@@ -260,6 +329,10 @@ fn primitive_i32_small_nonnull(offset: i32) -> PrimitiveArray {
 
 fn primitive_u32_small_nonnull(offset: u32) -> PrimitiveArray {
     PrimitiveArray::from_iter((0..LEN).map(|i| ((i + offset as usize) % 4096 + 1) as u32))
+}
+
+fn primitive_u64_small_nonnull(offset: u64) -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..LEN).map(|i| ((i + offset as usize) % 4096 + 1) as u64))
 }
 
 fn primitive_nonzero() -> PrimitiveArray {

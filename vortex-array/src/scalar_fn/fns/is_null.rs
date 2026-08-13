@@ -238,19 +238,21 @@ mod tests {
     #[test]
     fn test_is_null_falsification() -> VortexResult<()> {
         let expr = is_null(col("a"));
+        let dtype = test_harness::struct_dtype();
 
         assert_eq!(
-            expr.falsify(&test_harness::struct_dtype(), &STATS_SESSION)?,
-            Some(or(
-                eq(null_count(col("a")), lit(0u64)),
-                all_non_null(col("a")),
-            ))
+            expr.bind(&dtype)?.falsify(&STATS_SESSION)?,
+            Some(or(eq(null_count(col("a")), lit(0u64)), all_non_null(col("a")),).bind(&dtype)?)
         );
         Ok(())
     }
 
     #[test]
     fn test_is_null_is_not_strict() {
-        assert!(!is_null(col("a")).signature().is_strict());
+        assert!(
+            !is_null(col("a"))
+                .as_scalar()
+                .is_some_and(|f| f.signature().is_strict())
+        );
     }
 }

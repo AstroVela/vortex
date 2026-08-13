@@ -9,8 +9,9 @@
 //! 1. configuration is resolved out of environment variables case-insensitively, matching how the
 //!    various `Store::from_env` builders behave (see
 //!    <https://github.com/apache/arrow-rs-object-store/issues/529>);
-//! 2. schemes that `object_store` does not recognize natively — the OpenDAL-backed `cos://` and
-//!    `oss://` — are served by the crate's `opendal` module under the matching service feature.
+//! 2. schemes that `object_store` does not recognize natively — the OpenDAL-backed `cos://`,
+//!    `oss://`, and `goosefs://`, and the Hugging Face Hub's `hf://` — are served by the crate's
+//!    `opendal` and `hf` modules under the matching service feature.
 
 use std::sync::Arc;
 
@@ -85,27 +86,21 @@ pub struct Registry {
 }
 
 /// Source of the configuration variables consulted when building a store.
-///
-/// Tests construct a registry over a fixed set of variables rather than mutating the process
-/// environment, which is unsound when tests run on multiple threads within one process (the
-/// `std::env::set_var` block became `unsafe` in Rust 2024 for exactly this reason).
 #[derive(Debug, Default)]
 enum EnvSource {
     /// Read from the process environment.
     #[default]
     Process,
     /// A fixed set of variables.
-    #[cfg(test)]
     Fixed(Vec<(String, String)>),
 }
 
 impl EnvSource {
     /// Case-insensitive lookup of a single configuration variable.
-    #[cfg(any(feature = "cos", feature = "oss"))]
+    #[cfg(any(feature = "cos", feature = "goosefs", feature = "hf", feature = "oss"))]
     fn lookup(&self, key: &str) -> Option<String> {
         match self {
             EnvSource::Process => std::env::var(key).ok(),
-            #[cfg(test)]
             EnvSource::Fixed(vars) => vars
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(key))
@@ -119,7 +114,6 @@ impl EnvSource {
             EnvSource::Process => std::env::vars()
                 .map(|(k, v)| (k.to_ascii_lowercase(), v))
                 .collect(),
-            #[cfg(test)]
             EnvSource::Fixed(vars) => vars
                 .iter()
                 .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -176,9 +170,12 @@ impl Registry {
         Self::default()
     }
 
-    /// Create a registry over a fixed set of configuration variables.
-    #[cfg(test)]
-    fn with_env<I>(vars: I) -> Self
+    /// Create a registry over a fixed set of configuration variables, consulted instead of the
+    /// process environment when building stores.
+    ///
+    /// Lookups are case-insensitive. Pass each key at most once — the set's consumers disagree
+    /// on which duplicate wins.
+    pub fn with_vars<I>(vars: I) -> Self
     where
         I: IntoIterator<Item = (String, String)>,
     {
@@ -218,17 +215,30 @@ impl Registry {
     /// the one caching rule in [`Registry::resolve`]: a scheme says where its store is rooted, and
     /// the registry decides how to cache it.
     fn build_store(&self, to_resolve: &Url) -> object_store::Result<(Arc<dyn ObjectStore>, Path)> {
-        // OpenDAL-backed schemes (Tencent COS, Alibaba OSS) are not recognized by `object_store`,
-        // so build them from OpenDAL's own environment-variable configuration (e.g.
-        // `TENCENTCLOUD_SECRET_ID`). The operator is rooted at the bucket, which lives in the URL
-        // authority, so — exactly as for `s3://bucket/path` — the whole URL path is the object key.
-        #[cfg(any(feature = "cos", feature = "oss"))]
+        // OpenDAL-backed schemes (Tencent COS, Alibaba OSS, Tencent GooseFS) are not recognized
+        // by `object_store`, so build them from OpenDAL's own environment-variable configuration
+        // (e.g. `TENCENTCLOUD_SECRET_ID`, `GOOSEFS_MASTER_ADDR`). The operator is rooted at the
+        // bucket, which lives in the URL authority, so — exactly as for `s3://bucket/path` —
+        // the whole URL path is the object key.
+        #[cfg(any(feature = "cos", feature = "goosefs", feature = "oss"))]
         if crate::opendal::supports_scheme(to_resolve.scheme()) {
             let store =
                 crate::opendal::make_opendal_store_with_env(to_resolve, &HashMap::new(), |key| {
                     self.env.lookup(key)
                 })?;
             return Ok((store, Path::from_url_path(to_resolve.path())?));
+        }
+
+        // The Hugging Face Hub is not recognized by `object_store` either. Unlike the OpenDAL
+        // schemes its store is not rooted at the URL authority — a repository and revision occupy
+        // path segments too — so it reports the in-repository path itself and the registry mounts
+        // the store as deep as that implies.
+        #[cfg(feature = "hf")]
+        if crate::hf::supports_scheme(to_resolve.scheme()) {
+            return Ok(crate::hf::make_hf_store_from_url_with_env(
+                to_resolve,
+                |key| self.env.lookup(key),
+            )?);
         }
 
         let (store, path) = parse_url_opts(to_resolve, self.env.normalized_vars())?;

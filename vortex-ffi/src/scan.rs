@@ -31,8 +31,8 @@ use vortex::scan::Partition;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
+use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_arrow::ArrowSessionExt;
-use vortex_arrow::ToArrowType;
 
 use crate::RUNTIME;
 use crate::array::vx_array;
@@ -179,13 +179,13 @@ fn scan_request(opts: *const vx_scan_options) -> VortexResult<ScanRequest> {
             vortex_ensure!(!selection.idx.is_null());
             let buf = unsafe { slice::from_raw_parts(selection.idx, selection.idx_len) };
             let buf = Buffer::copy_from(buf);
-            Selection::IncludeByIndex(buf)
+            Selection::IncludeByIndex(StrictSortedBuffer::try_new(buf)?)
         }
         vx_scan_selection_include::VX_SELECTION_EXCLUDE_RANGE => {
             vortex_ensure!(!selection.idx.is_null());
             let buf = unsafe { slice::from_raw_parts(selection.idx, selection.idx_len) };
             let buf = Buffer::copy_from(buf);
-            Selection::ExcludeByIndex(buf)
+            Selection::ExcludeByIndex(StrictSortedBuffer::try_new(buf)?)
         }
     };
 
@@ -366,11 +366,11 @@ pub unsafe extern "C-unwind" fn vx_partition_scan_arrow(
         let array_stream = partition.execute()?;
         let dtype = array_stream.dtype();
 
-        let schema = dtype.to_arrow_schema()?;
+        let session = vx_session::as_ref(session);
+
+        let schema = session.arrow().to_arrow_schema(dtype)?;
         let schema = Arc::new(schema);
         let target = Field::new_struct("", schema.fields().clone(), false);
-
-        let session = vx_session::as_ref(session);
 
         let on_chunk = move |chunk: VortexResult<ArrayRef>| -> VortexResult<RecordBatch> {
             let chunk: ArrayRef = chunk?;

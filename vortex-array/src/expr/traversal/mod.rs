@@ -17,12 +17,12 @@ pub use fold::FoldDownContext;
 pub use fold::FoldUp;
 pub use fold::NodeFolder;
 pub use fold::NodeFolderContext;
-use itertools::Itertools;
 pub use references::ReferenceCollector;
 pub use visitor::pre_order_visit_down;
 pub use visitor::pre_order_visit_up;
 use vortex_error::VortexResult;
 
+use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::traversal::fold::NodeFolderContextWrapper;
 
@@ -499,19 +499,14 @@ impl Node for Expression {
         &'a self,
         mut f: F,
     ) -> VortexResult<TraversalOrder> {
-        self.children().as_ref().apply_elements(&mut f)
+        self.children().apply_ref_elements(&mut f)
     }
 
     fn map_children<F: FnMut(Self) -> VortexResult<Transformed<Self>>>(
         self,
         f: F,
     ) -> VortexResult<Transformed<Self>> {
-        let transformed = self
-            .children()
-            .iter()
-            .cloned()
-            .collect_vec()
-            .map_elements(f)?;
+        let transformed = self.children().to_vec().map_elements(f)?;
 
         if transformed.changed {
             Ok(Transformed {
@@ -530,6 +525,74 @@ impl Node for Expression {
 
     fn children_count(&self) -> usize {
         self.children().len()
+    }
+}
+
+impl Node for BoundExpression {
+    fn apply_children<'a, F: FnMut(&'a Self) -> VortexResult<TraversalOrder>>(
+        &'a self,
+        mut f: F,
+    ) -> VortexResult<TraversalOrder> {
+        let BoundExpression::Scalar { children, .. } = self else {
+            return Ok(TraversalOrder::Continue);
+        };
+
+        for child in children.iter() {
+            match f(child)? {
+                TraversalOrder::Continue | TraversalOrder::Skip => {}
+                TraversalOrder::Stop => return Ok(TraversalOrder::Stop),
+            }
+        }
+
+        Ok(TraversalOrder::Continue)
+    }
+
+    fn map_children<F: FnMut(Self) -> VortexResult<Transformed<Self>>>(
+        self,
+        mut f: F,
+    ) -> VortexResult<Transformed<Self>> {
+        let BoundExpression::Scalar { children, .. } = &self else {
+            return Ok(Transformed::no(self));
+        };
+
+        let mut order = TraversalOrder::Continue;
+        let mut changed = false;
+        let children = children
+            .iter()
+            .cloned()
+            .map(|child| match order {
+                TraversalOrder::Continue | TraversalOrder::Skip => f(child).map(|result| {
+                    order = result.order;
+                    changed |= result.changed;
+                    result.value
+                }),
+                TraversalOrder::Stop => Ok(child),
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        if changed {
+            Ok(Transformed {
+                value: self.with_children(children)?,
+                order,
+                changed: true,
+            })
+        } else {
+            Ok(Transformed::no(self))
+        }
+    }
+
+    fn iter_children<T>(&self, f: impl FnOnce(&mut dyn Iterator<Item = &Self>) -> T) -> T {
+        match self {
+            BoundExpression::Scalar { children, .. } => f(&mut children.iter()),
+            BoundExpression::Root { .. } => f(&mut std::iter::empty()),
+        }
+    }
+
+    fn children_count(&self) -> usize {
+        match self {
+            BoundExpression::Scalar { children, .. } => children.len(),
+            BoundExpression::Root { .. } => 0,
+        }
     }
 }
 

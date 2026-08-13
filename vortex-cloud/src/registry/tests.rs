@@ -14,7 +14,7 @@ use super::Registry;
 /// A registry whose S3 configuration comes from a fixed map rather than the process environment,
 /// so these tests neither read nor mutate global state.
 fn registry() -> Registry {
-    Registry::with_env([("AWS_REGION".to_string(), "us-east-3".to_string())])
+    Registry::with_vars([("AWS_REGION".to_string(), "us-east-3".to_string())])
 }
 
 /// A percent-encoded segment (as HuggingFace dataset URLs use for `refs/convert/parquet`) decodes
@@ -146,23 +146,75 @@ fn test_registered_store_wins_over_build() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// An `hf://` URL must resolve to a store rooted at the repository revision, leaving the
+/// in-repository path as the object key. The repository and revision occupy URL path segments, so
+/// this is the one scheme whose store is not mounted at the URL authority — getting the depth wrong
+/// would send the repository name to the Hub as part of the file path.
+#[cfg(feature = "hf")]
+#[rstest::rstest]
+#[case("hf://datasets/org/name/data/train.vortex", "data/train.vortex")]
+#[case(
+    "hf://datasets/org/name@refs%2Fconvert%2Fparquet/data/train.vortex",
+    "data/train.vortex"
+)]
+#[case("hf://org/name/model.vortex", "model.vortex")]
+fn test_hf_scheme_mounts_at_the_repository(
+    #[case] url: &str,
+    #[case] expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = registry();
+    let url = Url::parse(url)?;
+
+    // First resolution builds and caches the store; the second takes the cached-store branch.
+    // Both must report the same key, since the cached branch recomputes it from the mount depth.
+    let (_store, path) = registry.resolve(&url)?;
+    assert_eq!(path, Path::from(expected));
+    let (_store, path) = registry.resolve(&url)?;
+    assert_eq!(path, Path::from(expected));
+    Ok(())
+}
+
+/// Two revisions of one repository are different stores, since the revision is part of the prefix
+/// the store is rooted at.
+#[cfg(feature = "hf")]
+#[test]
+fn test_hf_revisions_do_not_share_a_store() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = registry();
+
+    let (main, _) = registry.resolve(&Url::parse("hf://datasets/org/name/train.vortex")?)?;
+    let (tagged, _) = registry.resolve(&Url::parse("hf://datasets/org/name@v2/train.vortex")?)?;
+
+    assert!(!Arc::ptr_eq(&main, &tagged));
+    Ok(())
+}
+
 /// The OpenDAL-backed schemes must resolve through the registry rather than falling through to
-/// `parse_url_opts`, which does not recognize them. Without an endpoint the build fails, but the
-/// error must come from the OpenDAL builder ("missing required OpenDAL store configuration"), not
-/// from `object_store`'s unrecognized-scheme path.
-#[cfg(any(feature = "cos", feature = "oss"))]
+/// `parse_url_opts`, which does not recognize them.
+///
+/// COS and OSS need an endpoint that is not derivable from the URL, so a bare
+/// `scheme://bucket/key.vortex` URL fails the build; that failure must come from the OpenDAL
+/// builder ("missing required OpenDAL store configuration"), not from `object_store`'s
+/// unrecognized-scheme path. GooseFS is different: its `master_addr` is taken from the URL
+/// authority, so the same URL builds a store successfully — which itself proves it reached the
+/// OpenDAL builder, since `parse_url_opts` would have rejected `goosefs://`.
+#[cfg(any(feature = "cos", feature = "oss", feature = "goosefs"))]
 #[test]
 fn test_opendal_schemes_reach_the_opendal_builder() -> Result<(), Box<dyn std::error::Error>> {
     for scheme in crate::opendal::SUPPORTED_SCHEMES {
         let url = Url::parse(&format!("{scheme}://bucket/key.vortex"))?;
-        let err = registry()
-            .resolve(&url)
-            .expect_err("no endpoint is configured, so the build must fail");
-        let message = err.to_string();
-        assert!(
-            message.contains("OpenDAL"),
-            "{scheme} did not reach the OpenDAL builder: {message}"
-        );
+        match registry().resolve(&url) {
+            // GooseFS derives `master_addr` from the URL authority, so the store builds
+            // successfully. `parse_url_opts` does not recognize `goosefs://`, so an `Ok`
+            // here proves the OpenDAL builder ran.
+            Ok(_) => {}
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("OpenDAL"),
+                    "{scheme} did not reach the OpenDAL builder: {message}"
+                );
+            }
+        }
     }
     Ok(())
 }

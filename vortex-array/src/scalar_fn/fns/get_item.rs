@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::fmt::Display;
 use std::fmt::Formatter;
 
 use prost::Message;
@@ -20,14 +21,13 @@ use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::Nullability;
 use crate::expr::Expression;
+use crate::expr::display::ExprDisplay;
 use crate::expr::lit;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::ReduceCtx;
 use crate::scalar_fn::ReduceNode;
-use crate::scalar_fn::ReduceNodeRef;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -78,10 +78,10 @@ impl ScalarFnVTable for GetItem {
     fn fmt_sql(
         &self,
         field_name: &FieldName,
-        expr: &Expression,
+        expr: &dyn ExprDisplay,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
-        expr.children()[0].fmt_sql(f)?;
+        Display::fmt(expr.display_child(0), f)?;
         write!(f, ".{}", field_name)
     }
 
@@ -120,12 +120,7 @@ impl ScalarFnVTable for GetItem {
         }
     }
 
-    fn reduce(
-        &self,
-        field_name: &FieldName,
-        node: &dyn ReduceNode,
-        ctx: &dyn ReduceCtx,
-    ) -> VortexResult<Option<ReduceNodeRef>> {
+    fn reduce<T: ReduceNode>(&self, field_name: &FieldName, node: &T) -> VortexResult<Option<T>> {
         let child = node.child(0);
         if let Some(child_fn) = child.scalar_fn()
             && let Some(pack) = child_fn.as_opt::<Pack>()
@@ -135,9 +130,9 @@ impl ScalarFnVTable for GetItem {
 
             // Possibly mask the field if the pack is nullable
             if pack.nullability.is_nullable() {
-                field = ctx.new_node(
+                field = node.new_node(
                     Mask.bind(EmptyOptions),
-                    &[field, ctx.new_node(Literal.bind(true.into()), &[])?],
+                    &[field, node.new_node(Literal.bind(true.into()), &[])?],
                 )?;
             }
 
@@ -198,6 +193,7 @@ impl ScalarFnVTable for GetItem {
 #[cfg(test)]
 mod tests {
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
 
     use crate::IntoArray;
     use crate::dtype::DType;
@@ -226,7 +222,11 @@ mod tests {
     fn get_item_by_name() {
         let st = test_array();
         let get_item = get_item("a", root());
-        assert!(get_item.signature().is_strict());
+        assert!(
+            get_item
+                .as_scalar()
+                .is_some_and(|f| f.signature().is_strict())
+        );
         let item = st.into_array().apply(&get_item).unwrap();
         assert_eq!(item.dtype(), &DType::from(PType::I32))
     }
@@ -256,6 +256,24 @@ mod tests {
             item.dtype(),
             &DType::Primitive(PType::I32, Nullability::Nullable)
         );
+    }
+
+    #[test]
+    fn get_non_nullable_field_from_all_valid_nullable_struct() -> VortexResult<()> {
+        let st = StructArray::try_new(
+            FieldNames::from(["a"]),
+            vec![buffer![1i32].into_array()],
+            1,
+            Validity::AllValid,
+        )?
+        .into_array();
+
+        let item = st.apply(&get_item("a", root()))?;
+        assert_eq!(
+            item.dtype(),
+            &DType::Primitive(PType::I32, Nullability::Nullable)
+        );
+        Ok(())
     }
 
     #[test]

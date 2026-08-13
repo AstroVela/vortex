@@ -28,9 +28,12 @@ use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::buffer::BufferHandle;
+use vortex_array::builders::ArrayBuilder;
+use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
+use vortex_array::match_each_varbin_builder;
 use vortex_array::patches::PatchSlotIndices;
 use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesData;
@@ -57,6 +60,8 @@ use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::canonical::append_sparse_to_varbin;
+use crate::canonical::append_sparse_to_varbinview;
 use crate::canonical::execute_sparse;
 use crate::rules::RULES;
 
@@ -352,6 +357,33 @@ impl VTable for Sparse {
         let parts = array.into_parts()?;
         // TODO(joe): remove ctx from execute_sparse since all slots should be canonical.
         execute_sparse(parts, ctx).map(ExecutionResult::done)
+    }
+
+    fn append_to_builder(
+        array: ArrayView<'_, Self>,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        // Strings decode as a scatter over the fill value; appending that scatter straight into
+        // a variable-binary builder skips materializing the canonical intermediate.
+        if matches!(array.dtype(), DType::Utf8(_) | DType::Binary(_)) {
+            if let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() {
+                return append_sparse_to_varbinview(array, builder, ctx);
+            }
+            if let Some(result) = match_each_varbin_builder!(builder, |builder| {
+                append_sparse_to_varbin(array, builder, ctx)
+            }) {
+                return result;
+            }
+        }
+
+        // Everything else decodes through the canonical array, like the default implementation.
+        array
+            .array()
+            .clone()
+            .execute::<Canonical>(ctx)?
+            .into_array()
+            .append_to_builder(builder, ctx)
     }
 }
 
@@ -702,7 +734,7 @@ mod test {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_array::builders::DynVarBinBuilder;
+    use vortex_array::builders::VarBinBuilder;
     use vortex_array::builtins::ArrayBuiltins;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
@@ -926,8 +958,7 @@ mod test {
             Some("last"),
         ])
         .into_array();
-        let mut builder =
-            DynVarBinBuilder::with_capacity(array.dtype().clone(), false, array.len());
+        let mut builder = VarBinBuilder::<i32>::with_capacity(array.dtype().clone(), array.len());
         array.append_to_builder(&mut builder, &mut ctx).unwrap();
         assert_arrays_eq!(builder.finish_into_varbin(), expected, &mut ctx);
     }
@@ -944,8 +975,7 @@ mod test {
         )
         .unwrap();
         let expected = VarBinViewArray::from_iter_str(["fill", "second"]).into_array();
-        let mut builder =
-            DynVarBinBuilder::with_capacity(array.dtype().clone(), false, array.len());
+        let mut builder = VarBinBuilder::<i32>::with_capacity(array.dtype().clone(), array.len());
         array.append_to_builder(&mut builder, &mut ctx).unwrap();
         assert_arrays_eq!(builder.finish_into_varbin(), expected, &mut ctx);
     }

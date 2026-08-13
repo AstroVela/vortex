@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::fmt::Display;
 use std::fmt::Formatter;
 
 use vortex_error::VortexResult;
@@ -13,7 +14,7 @@ use crate::IntoArray;
 use crate::arrays::ConstantArray;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
-use crate::expr::Expression;
+use crate::expr::display::ExprDisplay;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
@@ -60,11 +61,11 @@ impl ScalarFnVTable for IsNotNull {
     fn fmt_sql(
         &self,
         _options: &Self::Options,
-        expr: &Expression,
+        expr: &dyn ExprDisplay,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
         write!(f, "is_not_null(")?;
-        expr.child(0).fmt_sql(f)?;
+        Display::fmt(expr.display_child(0), f)?;
         write!(f, ")")
     }
 
@@ -246,19 +247,27 @@ mod tests {
 
     #[test]
     fn test_is_not_null_is_not_strict() {
-        assert!(!is_not_null(col("a")).signature().is_strict());
+        assert!(
+            !is_not_null(col("a"))
+                .as_scalar()
+                .is_some_and(|f| f.signature().is_strict())
+        );
     }
 
     #[test]
     fn test_is_not_null_falsification() -> VortexResult<()> {
         let expr = is_not_null(col("a"));
+        let dtype = test_harness::struct_dtype();
 
         assert_eq!(
-            expr.falsify(&test_harness::struct_dtype(), &STATS_SESSION)?,
-            Some(or(
-                eq(null_count(col("a")), RowCount.new_expr(EmptyOptions, []),),
-                all_null(col("a")),
-            ))
+            expr.bind(&dtype)?.falsify(&STATS_SESSION)?,
+            Some(
+                or(
+                    eq(null_count(col("a")), RowCount.new_expr(EmptyOptions, []),),
+                    all_null(col("a")),
+                )
+                .bind(&dtype)?
+            )
         );
         Ok(())
     }

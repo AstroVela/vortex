@@ -3,6 +3,7 @@
 
 mod kernel;
 
+use std::fmt::Display;
 use std::fmt::Formatter;
 
 pub use kernel::*;
@@ -26,20 +27,20 @@ use crate::arrays::Decimal;
 use crate::arrays::Extension;
 use crate::arrays::FixedSizeList;
 use crate::arrays::ListView;
+use crate::arrays::Map;
 use crate::arrays::Null;
 use crate::arrays::Primitive;
 use crate::arrays::VarBinView;
 use crate::arrays::struct_::compute::cast::struct_cast;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
+use crate::expr::display::ExprDisplay;
 use crate::expr::expression::Expression;
 use crate::expr::lit;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::ReduceCtx;
 use crate::scalar_fn::ReduceNode;
-use crate::scalar_fn::ReduceNodeRef;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::literal::Literal;
@@ -90,9 +91,14 @@ impl ScalarFnVTable for Cast {
         }
     }
 
-    fn fmt_sql(&self, dtype: &DType, expr: &Expression, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt_sql(
+        &self,
+        dtype: &DType,
+        expr: &dyn ExprDisplay,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
         write!(f, "cast(")?;
-        expr.children()[0].fmt_sql(f)?;
+        Display::fmt(expr.display_child(0), f)?;
         write!(f, " as {}", dtype)?;
         write!(f, ")")
     }
@@ -136,12 +142,7 @@ impl ScalarFnVTable for Cast {
         }
     }
 
-    fn reduce(
-        &self,
-        target_dtype: &DType,
-        node: &dyn ReduceNode,
-        _ctx: &dyn ReduceCtx,
-    ) -> VortexResult<Option<ReduceNodeRef>> {
+    fn reduce<T: ReduceNode>(&self, target_dtype: &DType, node: &T) -> VortexResult<Option<T>> {
         // Collapse node if child is already the target type
         let child = node.child(0);
         if &child.node_dtype()? == target_dtype {
@@ -197,6 +198,7 @@ fn cast_canonical(
         CanonicalView::Decimal(a) => <Decimal as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::VarBinView(a) => <VarBinView as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::List(a) => <ListView as CastKernel>::cast(a, dtype, ctx),
+        CanonicalView::Map(a) => <Map as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::FixedSizeList(a) => <FixedSizeList as CastKernel>::cast(a, dtype, ctx),
         CanonicalView::Struct(a) => struct_cast(a, dtype, ctx),
         CanonicalView::Union(_) => {
