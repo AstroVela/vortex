@@ -108,14 +108,12 @@ impl<V: ExtVTable> ExtDType<V> {
         V::validate_scalar_value(self, storage_value)
     }
 
-    /// Can a value of `other` be implicitly coerced into this extension type?
-    pub fn can_coerce_from(&self, other: &DType) -> bool {
-        V::can_coerce_from(self, other)
+    pub fn can_coerce_from(&self, source: &DType) -> bool {
+        V::can_coerce_from(self, source)
     }
 
-    /// Can this extension type be implicitly coerced into `other`?
-    pub fn can_coerce_to(&self, other: &DType) -> bool {
-        V::can_coerce_to(self, other)
+    pub fn can_coerce_to(&self, target: &DType) -> bool {
+        V::can_coerce_to(self, target)
     }
 
     /// Compute the least supertype of this extension type and another type.
@@ -148,8 +146,8 @@ pub(super) trait DynExtDType: 'static + Send + Sync + super::sealed::Sealed {
     fn validate_scalar_value(&self, storage_value: &ScalarValue) -> VortexResult<()>;
     fn value_display(&self, f: &mut fmt::Formatter<'_>, storage_value: &ScalarValue)
     -> fmt::Result;
-    fn can_coerce_from(&self, other: &DType) -> bool;
-    fn can_coerce_to(&self, other: &DType) -> bool;
+    fn can_coerce_from(&self, source: &DType) -> bool;
+    fn can_coerce_to(&self, target: &DType) -> bool;
     fn least_supertype(&self, other: &DType) -> Option<DType>;
 }
 
@@ -221,12 +219,12 @@ impl<V: ExtVTable> DynExtDType for ExtDType<V> {
         }
     }
 
-    fn can_coerce_from(&self, other: &DType) -> bool {
-        self.can_coerce_from(other)
+    fn can_coerce_from(&self, source: &DType) -> bool {
+        self.can_coerce_from(source)
     }
 
-    fn can_coerce_to(&self, other: &DType) -> bool {
-        self.can_coerce_to(other)
+    fn can_coerce_to(&self, target: &DType) -> bool {
+        self.can_coerce_to(target)
     }
 
     fn least_supertype(&self, other: &DType) -> Option<DType> {

@@ -181,17 +181,18 @@ impl ExtVTable for Timestamp {
         })
     }
 
-    fn can_coerce_from(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
-        let DType::Extension(other_ext) = other else {
+    fn can_coerce_from(target: &ExtDType<Self>, source: &DType) -> bool {
+        let DType::Extension(source_ext) = source else {
             return false;
         };
-        let Some(other_opts) = other_ext.metadata_opt::<Timestamp>() else {
+        let Some(source_options) = source_ext.metadata_opt::<Timestamp>() else {
             return false;
         };
-        let our_opts = ext_dtype.metadata();
-        our_opts.tz == other_opts.tz
-            && our_opts.unit <= other_opts.unit
-            && (ext_dtype.storage_dtype().is_nullable() || !other.is_nullable())
+
+        let target_options = target.metadata();
+        target_options.tz == source_options.tz
+            && target_options.unit <= source_options.unit
+            && (target.storage_dtype().is_nullable() || !source.is_nullable())
     }
 
     fn least_supertype(ext_dtype: &ExtDType<Self>, other: &DType) -> Option<DType> {

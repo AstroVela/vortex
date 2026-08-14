@@ -108,14 +108,12 @@ impl ExtDTypeRef {
         self.0.validate_scalar_value(storage_value)
     }
 
-    /// Can a value of `other` be implicitly coerced into this extension type?
-    pub fn can_coerce_from(&self, other: &DType) -> bool {
-        self.0.can_coerce_from(other)
+    pub fn can_coerce_from(&self, source: &DType) -> bool {
+        self.0.can_coerce_from(source)
     }
 
-    /// Can this extension type be implicitly coerced into `other`?
-    pub fn can_coerce_to(&self, other: &DType) -> bool {
-        self.0.can_coerce_to(other)
+    pub fn can_coerce_to(&self, target: &DType) -> bool {
+        self.0.can_coerce_to(target)
     }
 
     /// Compute the least supertype of this extension type and another type.

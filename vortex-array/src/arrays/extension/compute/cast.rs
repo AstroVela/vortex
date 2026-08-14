@@ -16,9 +16,25 @@ use crate::scalar_fn::fns::cast::CastReduce;
 impl CastReduce for Extension {
     fn cast(array: ArrayView<'_, Extension>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         if !array.dtype().eq_ignore_nullability(dtype) {
-            // Target is not the same extension type.
-            // Delegate to the storage array's cast.
-            return Ok(Some(array.storage_array().cast(dtype.clone())?));
+            let DType::Extension(target_ext_dtype) = dtype else {
+                return Ok(Some(array.storage_array().cast(dtype.clone())?));
+            };
+
+            let source_ext_dtype = array.dtype().as_extension();
+
+            // `can_coerce_from` may require an extension-specific value conversion. This generic
+            // cast only supports `can_coerce_to`, where casting the storage is sufficient.
+            if !source_ext_dtype.can_coerce_to(dtype) {
+                return Ok(None);
+            }
+
+            let target_storage = array
+                .storage_array()
+                .cast(target_ext_dtype.storage_dtype().clone())?;
+
+            return Ok(Some(
+                ExtensionArray::new(target_ext_dtype.clone(), target_storage).into_array(),
+            ));
         }
 
         let DType::Extension(ext_dtype) = dtype else {
@@ -49,9 +65,11 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
+    use vortex_error::vortex_ensure;
     use vortex_session::VortexSession;
 
     use super::*;
+    use crate::EmptyMetadata;
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
     use crate::assert_arrays_eq;
@@ -60,11 +78,67 @@ mod tests {
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
+    use crate::dtype::extension::ExtDType;
+    use crate::dtype::extension::ExtId;
+    use crate::dtype::extension::ExtVTable;
     use crate::executor::VortexSessionExecute;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
+    use crate::scalar::ScalarValue;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    struct MillisecondTimestamp;
+
+    impl ExtVTable for MillisecondTimestamp {
+        type Metadata = EmptyMetadata;
+        type NativeValue<'a> = &'a ScalarValue;
+
+        #[expect(clippy::disallowed_methods, reason = "test-only extension ID")]
+        fn id(&self) -> ExtId {
+            ExtId::new("vortex.test.millisecond_timestamp")
+        }
+
+        fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn deserialize_metadata(&self, _metadata: &[u8]) -> VortexResult<Self::Metadata> {
+            Ok(EmptyMetadata)
+        }
+
+        fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            vortex_ensure!(
+                matches!(ext_dtype.storage_dtype(), DType::Primitive(PType::I64, _)),
+                "MillisecondTimestamp storage must be i64, got {}",
+                ext_dtype.storage_dtype(),
+            );
+            Ok(())
+        }
+
+        fn can_coerce_to(source: &ExtDType<Self>, target: &DType) -> bool {
+            let Some(target) = target.as_extension_opt() else {
+                return false;
+            };
+            let Some(options) = target.metadata_opt::<Timestamp>() else {
+                return false;
+            };
+
+            options.unit == TimeUnit::Milliseconds
+                && options.tz.is_none()
+                && target
+                    .storage_dtype()
+                    .can_coerce_from(source.storage_dtype())
+        }
+
+        fn unpack_native<'a>(
+            _ext_dtype: &'a ExtDType<Self>,
+            storage_value: &'a ScalarValue,
+        ) -> VortexResult<Self::NativeValue<'a>> {
+            Ok(storage_value)
+        }
+    }
 
     #[test]
     fn cast_same_ext_dtype() {
@@ -117,6 +191,34 @@ mod tests {
                     .map(|c| c.into_array())
             });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cast_uses_source_extension_coercion() -> VortexResult<()> {
+        let source_dtype = ExtDType::<MillisecondTimestamp>::try_new(
+            EmptyMetadata,
+            DType::Primitive(PType::I64, Nullability::NonNullable),
+        )?
+        .erased();
+        let target_dtype =
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased();
+        let source = ExtensionArray::new(source_dtype, buffer![1i64].into_array()).into_array();
+        let target = DType::Extension(target_dtype);
+        let incompatible_target = DType::Extension(
+            Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased(),
+        );
+
+        assert!(target.can_coerce_from(source.dtype()));
+        assert!(source.dtype().can_coerce_to(&target));
+        assert!(!source.dtype().can_coerce_from(&target));
+        assert!(!target.can_coerce_to(source.dtype()));
+        assert!(!incompatible_target.can_coerce_from(source.dtype()));
+        let result = source
+            .cast(target.clone())?
+            .execute::<ExtensionArray>(&mut SESSION.create_execution_ctx())?;
+
+        assert_eq!(result.dtype(), &target);
+        Ok(())
     }
 
     #[test]

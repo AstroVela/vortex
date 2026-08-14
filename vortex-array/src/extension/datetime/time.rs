@@ -110,15 +110,16 @@ impl ExtVTable for Time {
         Ok(())
     }
 
-    fn can_coerce_from(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
-        let DType::Extension(other_ext) = other else {
+    fn can_coerce_from(target: &ExtDType<Self>, source: &DType) -> bool {
+        let DType::Extension(source_ext) = source else {
             return false;
         };
-        let Some(other_unit) = other_ext.metadata_opt::<Time>() else {
+        let Some(source_unit) = source_ext.metadata_opt::<Time>() else {
             return false;
         };
-        let our_unit = ext_dtype.metadata();
-        our_unit <= other_unit && (ext_dtype.storage_dtype().is_nullable() || !other.is_nullable())
+
+        target.metadata() <= source_unit
+            && (target.storage_dtype().is_nullable() || !source.is_nullable())
     }
 
     fn least_supertype(ext_dtype: &ExtDType<Self>, other: &DType) -> Option<DType> {

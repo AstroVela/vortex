@@ -198,93 +198,100 @@ impl DType {
             .try_fold(types[0].clone(), |acc, t| acc.least_supertype(t))
     }
 
-    /// Is there any implicit coercion path from `other` to `self`?
-    pub fn can_coerce_from(&self, other: &DType) -> bool {
+    /// Returns whether `source` has an implicit coercion path to this target dtype.
+    pub fn can_coerce_from(&self, source: &DType) -> bool {
         if let (
             DType::FixedSizeList(target_elem, target_size, _),
             DType::FixedSizeList(source_elem, source_size, _),
-        ) = (self, other)
+        ) = (self, source)
         {
             return target_size == source_size
-                && (self.is_nullable() || !other.is_nullable())
+                && (self.is_nullable() || !source.is_nullable())
                 && target_elem.can_coerce_from(source_elem);
         }
 
-        if let (DType::List(target_elem, _), DType::List(source_elem, _)) = (self, other) {
-            return (self.is_nullable() || !other.is_nullable())
+        if let (DType::List(target_elem, _), DType::List(source_elem, _)) = (self, source) {
+            return (self.is_nullable() || !source.is_nullable())
                 && target_elem.can_coerce_from(source_elem);
         }
 
-        if let (DType::Map(target, _), DType::Map(source, _)) = (self, other) {
-            return (self.is_nullable() || !other.is_nullable())
-                && (!target.keys_sorted() || source.keys_sorted())
-                && target.key_dtype().can_coerce_from(&source.key_dtype())
-                && target.value_dtype().can_coerce_from(&source.value_dtype());
+        if let (DType::Map(target, _), DType::Map(source_map, _)) = (self, source) {
+            return (self.is_nullable() || !source.is_nullable())
+                && (!target.keys_sorted() || source_map.keys_sorted())
+                && target.key_dtype().can_coerce_from(&source_map.key_dtype())
+                && target
+                    .value_dtype()
+                    .can_coerce_from(&source_map.value_dtype());
         }
 
-        if let (DType::Struct(target, _), DType::Struct(source, _)) = (self, other) {
-            return (self.is_nullable() || !other.is_nullable())
-                && target.nfields() == source.nfields()
-                && target.names() == source.names()
+        if let (DType::Struct(target, _), DType::Struct(source_struct, _)) = (self, source) {
+            return (self.is_nullable() || !source.is_nullable())
+                && target.nfields() == source_struct.nfields()
+                && target.names() == source_struct.names()
                 && target
                     .fields()
-                    .zip(source.fields())
+                    .zip(source_struct.fields())
                     .all(|(target, source)| target.can_coerce_from(&source));
         }
 
         // Same type (ignoring nullability): check nullability compatibility
-        if self.eq_ignore_nullability(other) {
-            return self.is_nullable() || !other.is_nullable();
+        if self.eq_ignore_nullability(source) {
+            return self.is_nullable() || !source.is_nullable();
         }
 
         // Null → nullable target
-        if matches!(other, DType::Null) {
+        if matches!(source, DType::Null) {
             return self.is_nullable();
         }
 
         // Bool → numeric
-        if other.is_boolean() && self.is_numeric() {
-            return self.is_nullable() || !other.is_nullable();
+        if source.is_boolean() && self.is_numeric() {
+            return self.is_nullable() || !source.is_nullable();
         }
 
         // Primitive widening: true if least_supertype(source, target) == target
-        if let (DType::Primitive(..), DType::Primitive(..)) = (self, other) {
-            return other
+        if let (DType::Primitive(..), DType::Primitive(..)) = (self, source) {
+            return source
                 .least_supertype(self)
                 .is_some_and(|st| st.eq_ignore_nullability(self))
-                && (self.is_nullable() || !other.is_nullable());
+                && (self.is_nullable() || !source.is_nullable());
         }
 
         // Decimal widening
-        if let (DType::Decimal(target, _), DType::Decimal(source, _)) = (self, other) {
+        if let (DType::Decimal(target, _), DType::Decimal(source_decimal, _)) = (self, source) {
             let target_integral = target.precision() as i16 - target.scale() as i16;
-            let source_integral = source.precision() as i16 - source.scale() as i16;
+            let source_integral = source_decimal.precision() as i16 - source_decimal.scale() as i16;
             return target_integral >= source_integral
-                && target.scale() >= source.scale()
-                && (self.is_nullable() || !other.is_nullable());
+                && target.scale() >= source_decimal.scale()
+                && (self.is_nullable() || !source.is_nullable());
         }
 
         // Integer → Decimal
-        if let (DType::Decimal(dec, _), DType::Primitive(p, _)) = (self, other)
+        if let (DType::Decimal(dec, _), DType::Primitive(p, _)) = (self, source)
             && p.is_int()
         {
             let needed = integer_decimal_precision(*p);
             let integral_digits = dec.precision() as i16 - dec.scale() as i16;
             return integral_digits >= needed as i16
-                && (self.is_nullable() || !other.is_nullable());
+                && (self.is_nullable() || !source.is_nullable());
         }
 
-        // Extension: delegate to vtable
-        if let DType::Extension(ext) = self {
-            return ext.can_coerce_from(other);
+        if let DType::Extension(target_ext) = self
+            && target_ext.can_coerce_from(source)
+        {
+            return true;
+        }
+
+        if let DType::Extension(source_ext) = source {
+            return source_ext.can_coerce_to(self);
         }
 
         false
     }
 
-    /// Convenience — is there a path from `self` to `other`?
-    pub fn can_coerce_to(&self, other: &DType) -> bool {
-        other.can_coerce_from(self)
+    /// Returns whether this source dtype has an implicit coercion path to `target`.
+    pub fn can_coerce_to(&self, target: &DType) -> bool {
+        target.can_coerce_from(self)
     }
 
     /// Are all types in the slice mutually coercible to a common type?

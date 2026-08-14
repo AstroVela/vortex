@@ -22,6 +22,10 @@ use crate::scalar::ScalarValue;
 /// [`DType`] plus metadata. Implementations should keep [`validate_dtype`](Self::validate_dtype)
 /// strict enough that every valid storage scalar can be interpreted by
 /// [`unpack_native`](Self::unpack_native).
+///
+/// The target defines a coercion with [`can_coerce_from`](Self::can_coerce_from), and the source
+/// defines one with [`can_coerce_to`](Self::can_coerce_to). Implementors only need to override one
+/// of these methods.
 pub trait ExtVTable: 'static + Sized + Send + Sync + Clone + Debug + Eq + Hash {
     /// Associated type containing the deserialized metadata for this extension type.
     type Metadata: 'static + Send + Sync + Clone + Debug + Display + Eq + Hash;
@@ -48,22 +52,15 @@ pub trait ExtVTable: 'static + Sized + Send + Sync + Clone + Debug + Eq + Hash {
     /// extension metadata.
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()>;
 
-    /// Can a value of `other` be implicitly widened into this type? (e.g. GeographyType might
-    /// accept Point, LineString, etc.)
-    ///
-    /// Implementors only need to override one of `can_coerce_from` or `can_coerce_to`. We have both
-    /// so that either side of the coercion can provide the logic.
-    fn can_coerce_from(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
-        let _ = (ext_dtype, other);
+    /// Returns whether `source` can be coerced into this target.
+    fn can_coerce_from(target: &ExtDType<Self>, source: &DType) -> bool {
+        let _ = (target, source);
         false
     }
 
-    /// Can this type be implicitly widened into `other`?
-    ///
-    /// Implementors only need to override one of `can_coerce_from` or `can_coerce_to`. We have both
-    /// so that either side of the coercion can provide the logic.
-    fn can_coerce_to(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
-        let _ = (ext_dtype, other);
+    /// Returns whether this source can be coerced into `target` by casting its storage.
+    fn can_coerce_to(source: &ExtDType<Self>, target: &DType) -> bool {
+        let _ = (source, target);
         false
     }
 
