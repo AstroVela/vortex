@@ -11,6 +11,7 @@ use arrow_array::Array as _;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::UnionArray as ArrowUnionArray;
 use arrow_array::new_empty_array;
+use arrow_buffer::NullBuffer;
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use arrow_schema::Field;
@@ -32,7 +33,6 @@ use vortex_array::arrays::UnionArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::union::UnionArrayExt;
 use vortex_array::arrays::union::UnionArraySlotsExt;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
@@ -77,6 +77,8 @@ use super::spatial_metadata_from_arrow;
 use crate::dense_union::DenseUnion;
 use crate::dense_union::DenseUnionArrayExt;
 use crate::dense_union::DenseUnionArraySlotsExt;
+use crate::dense_union::compact_for_arrow;
+use crate::dense_union::union_variants;
 
 /// A mixed native geometry column whose logical union variants are Point, LineString, Polygon,
 /// MultiPoint, MultiLineString, and MultiPolygon extension arrays. GeoArrow GeometryCollection
@@ -206,15 +208,7 @@ fn native_child_dtype(
             vortex_bail!("GeoArrow GeometryCollection values are not supported yet")
         }
     };
-    validate_variant_dtype(type_id, &dtype)?;
     Ok(dtype)
-}
-
-fn geometry_variants(dtype: &DType) -> VortexResult<(&UnionVariants, Nullability)> {
-    let DType::Union(variants, nullability) = dtype else {
-        vortex_bail!("Geometry storage must be a union, got {dtype}");
-    };
-    Ok((variants, *nullability))
 }
 
 struct GeometryUnionParts {
@@ -222,14 +216,6 @@ struct GeometryUnionParts {
     type_ids: PrimitiveArray,
     offsets: PrimitiveArray,
     children: Vec<ArrayRef>,
-}
-
-impl GeometryUnionParts {
-    fn child(&self, type_id: u8) -> Option<&ArrayRef> {
-        self.variants
-            .tag_to_child_index(type_id)
-            .and_then(|child_index| self.children.get(child_index))
-    }
 }
 
 fn geometry_union_parts(
@@ -245,30 +231,17 @@ fn geometry_union_parts(
         });
     }
 
-    // Other physical encodings execute to the canonical sparse union. Its row-aligned children
-    // can use row indices as dense-union offsets, so export does not need to compact them.
+    // Other physical encodings execute to the canonical sparse union, whose children are
+    // row-aligned. Row indices are therefore valid dense-union offsets, and compaction gathers
+    // each child down to the rows that select it.
     let sparse = storage.execute::<UnionArray>(ctx)?;
-    let offsets = (0..sparse.len())
-        .map(|offset| {
-            i32::try_from(offset)
-                .map_err(|_| vortex_err!("Geometry row offset {offset} exceeds i32"))
-        })
-        .collect::<VortexResult<Vec<_>>>()?;
-    let type_ids = sparse.type_ids().clone().execute::<PrimitiveArray>(ctx)?;
-    let outer_validity = type_ids
-        .validity()?
-        .execute_mask(type_ids.len(), ctx)?
-        .into_array();
-    let children = sparse
-        .iter_children()
-        .cloned()
-        .map(|child| child.mask(outer_validity.clone()))
-        .collect::<VortexResult<Vec<_>>>()?;
+    let len = i32::try_from(sparse.len())
+        .map_err(|_| vortex_err!("Geometry column of {} rows exceeds i32", sparse.len()))?;
     Ok(GeometryUnionParts {
         variants: sparse.variants().clone(),
-        type_ids,
-        offsets: PrimitiveArray::from_iter(offsets),
-        children,
+        type_ids: sparse.type_ids().clone().execute::<PrimitiveArray>(ctx)?,
+        offsets: PrimitiveArray::from_iter(0..len),
+        children: sparse.iter_children().cloned().collect(),
     })
 }
 
@@ -290,7 +263,7 @@ impl ExtVTable for Geometry {
     }
 
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
-        let (variants, _) = geometry_variants(ext_dtype.storage_dtype())?;
+        let (variants, _) = union_variants(ext_dtype.storage_dtype())?;
         for (type_id, dtype) in variants.type_ids().iter().zip(variants.variants()) {
             validate_variant_dtype(*type_id, &dtype)?;
         }
@@ -387,7 +360,7 @@ impl ArrowExportVTable for Geometry {
     ) -> VortexResult<Option<Field>> {
         let ext_dtype = dtype.as_extension();
         let metadata = ext_dtype.metadata::<Geometry>();
-        let (_, nullability) = geometry_variants(ext_dtype.storage_dtype())?;
+        let (_, nullability) = union_variants(ext_dtype.storage_dtype())?;
         Ok(Some(
             geoarrow_geometry_type(metadata).to_field(name, nullability.is_nullable()),
         ))
@@ -417,9 +390,7 @@ impl ArrowExportVTable for Geometry {
 
         let extension = array.execute::<ExtensionArray>(ctx)?;
         let parts = geometry_union_parts(extension.storage_array().clone(), ctx)?;
-        let mut known_type_ids = [false; 256];
         for source_id in parts.variants.type_ids() {
-            known_type_ids[usize::from(*source_id)] = true;
             let source_id = i8::try_from(*source_id)
                 .map_err(|_| vortex_err!("GeoArrow geometry type ID {source_id} exceeds i8"))?;
             vortex_ensure!(
@@ -429,42 +400,22 @@ impl ArrowExportVTable for Geometry {
                 "target GeoArrow geometry union is missing type ID {source_id}"
             );
         }
-
-        let validity = parts
-            .type_ids
-            .validity()?
-            .execute_mask(parts.type_ids.len(), ctx)?;
-        let fallback_type_id = parts
-            .variants
-            .type_ids()
-            .first()
-            .copied()
-            .ok_or_else(|| vortex_err!("Geometry union has no variants"))?;
-        let arrow_type_ids = parts
-            .type_ids
-            .as_slice::<u8>()
-            .iter()
-            .zip(validity.iter())
-            .map(|(type_id, valid)| {
-                let type_id = match (known_type_ids[usize::from(*type_id)], valid) {
-                    (true, _) => *type_id,
-                    (false, false) => fallback_type_id,
-                    (false, true) => {
-                        vortex_bail!("Geometry row has unknown type ID {type_id}")
-                    }
-                };
-                i8::try_from(type_id)
-                    .map_err(|_| vortex_err!("GeoArrow geometry type ID {type_id} exceeds i8"))
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-        let arrow_offsets = parts.offsets.as_slice::<i32>().to_vec();
+        let parts = compact_for_arrow(
+            parts.variants,
+            &parts.type_ids,
+            &parts.offsets,
+            parts.children,
+            ctx,
+        )?;
 
         let session = ctx.session().clone();
         let mut arrow_children = Vec::with_capacity(target_fields.len());
         for (type_id, child_field) in target_fields.iter() {
             let source_id = u8::try_from(type_id)
                 .map_err(|_| vortex_err!("GeoArrow geometry type ID {type_id} is negative"))?;
-            let Some(child) = parts.child(source_id) else {
+            // A mixed column rarely holds every one of the 24 declared variants, and exporting a
+            // zero-row nested coordinate child costs the same dispatch as a populated one.
+            let Some(child) = parts.child(source_id).filter(|child| !child.is_empty()) else {
                 arrow_children.push(new_empty_array(child_field.data_type()));
                 continue;
             };
@@ -478,24 +429,16 @@ impl ArrowExportVTable for Geometry {
 
         let union = ArrowUnionArray::try_new(
             target_fields.clone(),
-            ScalarBuffer::from(arrow_type_ids),
-            Some(ScalarBuffer::from(arrow_offsets)),
+            ScalarBuffer::from(parts.type_ids),
+            Some(ScalarBuffer::from(parts.offsets)),
             arrow_children,
         )
         .map_err(|e| vortex_err!("failed to construct Arrow dense union: {e}"))?;
 
         if !target.is_nullable() {
             vortex_ensure!(
-                validity.all_true(),
+                parts.validity.all_true(),
                 "cannot export nullable Geometry values to a non-nullable Arrow field"
-            );
-        }
-        for (row, _) in validity.iter().enumerate().filter(|(_, valid)| !valid) {
-            let type_id = union.type_id(row);
-            let offset = union.value_offset(row);
-            vortex_ensure!(
-                union.child(type_id).is_null(offset),
-                "GeoArrow Geometry null at row {row} is not represented by a null selected child"
             );
         }
 
@@ -584,7 +527,7 @@ impl ArrowImportVTable for Geometry {
             })
             .collect::<VortexResult<Vec<_>>>()?;
 
-        let (variants, nullability) = geometry_variants(ext_dtype.storage_dtype())?;
+        let (variants, nullability) = union_variants(ext_dtype.storage_dtype())?;
         let mut children = Vec::with_capacity(variants.len());
         for (type_id, child_dtype) in variants.type_ids().iter().zip(variants.variants()) {
             let arrow_id = i8::try_from(*type_id)
@@ -599,20 +542,32 @@ impl ArrowImportVTable for Geometry {
             children.push(ExtensionArray::try_new(child_ext.clone(), storage)?.into_array());
         }
 
-        let row_validity = union
-            .type_ids()
+        // Arrow expresses a union row's nullity through the child it selects, so row validity is a
+        // gather. Materialize each child's length and null buffer once: `UnionArray::child` and
+        // `Array::is_valid` are both dynamically dispatched, and this runs once per imported row.
+        let mut child_nulls: [Option<&NullBuffer>; 256] = [None; 256];
+        let mut child_lens = [0usize; 256];
+        for (arrow_id, _) in fields.iter() {
+            let Ok(tag) = u8::try_from(arrow_id) else {
+                continue;
+            };
+            let child = union.child(arrow_id);
+            child_lens[usize::from(tag)] = child.len();
+            child_nulls[usize::from(tag)] = child.nulls();
+        }
+        let row_validity = type_ids
             .iter()
             .zip(offsets.iter())
             .enumerate()
             .map(|(row, (type_id, offset))| {
                 let offset = usize::try_from(*offset)
                     .map_err(|_| vortex_err!("negative GeoArrow union offset at row {row}"))?;
-                let child = union.child(*type_id);
+                let tag = usize::from(*type_id);
                 vortex_ensure!(
-                    offset < child.len(),
+                    offset < child_lens[tag],
                     "GeoArrow union offset {offset} is out of bounds at row {row}"
                 );
-                Ok(child.is_valid(offset))
+                Ok(child_nulls[tag].is_none_or(|nulls| nulls.is_valid(offset)))
             })
             .collect::<VortexResult<Vec<_>>>()?;
         if !field.is_nullable() {

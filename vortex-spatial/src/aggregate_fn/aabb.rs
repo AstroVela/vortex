@@ -24,7 +24,6 @@ use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::Geometry;
 use crate::extension::Rect;
 use crate::extension::SpatialMetadata;
 use crate::extension::box_storage_dtype;
@@ -33,6 +32,7 @@ use crate::extension::coordinate::box_corners;
 use crate::extension::coordinate::ordinates;
 use crate::extension::decode_mixed_geometries;
 use crate::extension::flatten_coordinates;
+use crate::extension::is_mixed_geometry;
 use crate::extension::is_native_geometry;
 
 /// Aggregates a native geometry column's 2D axis-aligned bounding box (AABB) as a native
@@ -208,11 +208,7 @@ impl AggregateFnVTable for GeometryAabb {
         // non-nullable case already costs nothing (the all-true mask makes `filter` a no-op).
         let valid = array.validity()?.execute_mask(array.len(), ctx)?;
         let array = array.filter(valid)?;
-        if array
-            .dtype()
-            .as_extension_opt()
-            .is_some_and(|ext| ext.is::<Geometry>())
-        {
+        if is_mixed_geometry(array.dtype()) {
             for geometry in decode_mixed_geometries(&array, ctx)? {
                 if let Some(rect) = geometry.bounding_rect() {
                     partial.merge(rect);

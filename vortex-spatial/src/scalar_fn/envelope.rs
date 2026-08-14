@@ -7,6 +7,7 @@
 //! reads the resulting box column back row by row.
 
 use geo::BoundingRect;
+use geo::Rect as SpatialRect;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -34,11 +35,11 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::Geometry;
 use crate::extension::Rect;
 use crate::extension::SpatialMetadata;
 use crate::extension::box_field_names;
@@ -49,6 +50,7 @@ use crate::extension::coordinate::box_corners;
 use crate::extension::coordinate::ordinates;
 use crate::extension::decode_mixed_geometries;
 use crate::extension::flatten_row_offsets;
+use crate::extension::is_mixed_geometry;
 use crate::extension::is_native_geometry;
 use crate::scalar_fn::execute::Execution;
 use crate::scalar_fn::execute::Operand;
@@ -141,53 +143,60 @@ fn row_boxes(
     ))
 }
 
+/// Compute each valid row's box over a mixed geometry column and scatter the results back into
+/// full-length corner columns.
+///
+/// Union storage has no single coordinate layout to read straight through, so this decodes to
+/// `geo_types` per row rather than folding raw ordinate slices like [`row_boxes`].
 fn mixed_geometry_boxes(
     array: ArrayRef,
-    valid: Mask,
-    output_dtype: &ExtDType<Rect>,
+    valid: &Mask,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
+) -> VortexResult<(Vec<ArrayRef>, Validity)> {
     let len = array.len();
     let decoded = decode_mixed_geometries(&array.filter(valid.clone())?, ctx)?;
-    let mut decoded = decoded.into_iter();
+    let rects = decoded.iter().map(BoundingRect::bounding_rect);
+
     let mut xmins = BufferMut::zeroed(len);
     let mut ymins = BufferMut::zeroed(len);
     let mut xmaxs = BufferMut::zeroed(len);
     let mut ymaxs = BufferMut::zeroed(len);
-    let mut output_validity = vec![false; len];
-
-    for (row, valid) in valid.iter().enumerate() {
-        if !valid {
-            continue;
+    // A row has a box iff it is valid and owns at least one coordinate (an empty geometry has
+    // no box).
+    let mut has_box = vec![false; len];
+    let mut scatter = |row: usize, rect: Option<SpatialRect<f64>>| {
+        if let Some(rect) = rect {
+            xmins[row] = rect.min().x;
+            ymins[row] = rect.min().y;
+            xmaxs[row] = rect.max().x;
+            ymaxs[row] = rect.max().y;
+            has_box[row] = true;
         }
-        let geometry = decoded
-            .next()
-            .ok_or_else(|| vortex_err!("Geometry decode returned too few rows"))?;
-        let Some(rect) = geometry.bounding_rect() else {
-            continue;
-        };
-        xmins[row] = rect.min().x;
-        ymins[row] = rect.min().y;
-        xmaxs[row] = rect.max().x;
-        ymaxs[row] = rect.max().y;
-        output_validity[row] = true;
-    }
-    vortex_ensure!(
-        decoded.next().is_none(),
-        "Geometry decode returned too many rows"
-    );
+    };
 
-    build_rect_array(
-        output_dtype,
+    match valid.indices() {
+        AllOr::All => {
+            for (row, rect) in rects.enumerate() {
+                scatter(row, rect);
+            }
+        }
+        AllOr::None => {}
+        AllOr::Some(rows) => {
+            for (&row, rect) in rows.iter().zip(rects) {
+                scatter(row, rect);
+            }
+        }
+    }
+
+    Ok((
         vec![
             xmins.freeze().into_array(),
             ymins.freeze().into_array(),
             xmaxs.freeze().into_array(),
             ymaxs.freeze().into_array(),
         ],
-        len,
-        Validity::from_iter(output_validity),
-    )
+        Validity::from_iter(has_box),
+    ))
 }
 
 /// Compute boxes directly over a non-constant native geometry column.
@@ -198,15 +207,16 @@ fn envelope_array(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let len = array.len();
-    let ext_dtype = array
+    if is_mixed_geometry(array.dtype()) {
+        let valid = validity.execute_mask(len, ctx)?;
+        let (corners, output_validity) = mixed_geometry_boxes(array, &valid, ctx)?;
+        return build_rect_array(output_dtype, corners, len, output_validity);
+    }
+    let is_rect = array
         .dtype()
         .as_extension_opt()
-        .ok_or_else(|| vortex_err!("spatial: envelope operand is not a geometry extension type"))?;
-    if ext_dtype.is::<Geometry>() {
-        let valid = validity.execute_mask(len, ctx)?;
-        return mixed_geometry_boxes(array, valid, output_dtype, ctx);
-    }
-    let is_rect = ext_dtype.is::<Rect>();
+        .ok_or_else(|| vortex_err!("spatial: envelope operand is not a geometry extension type"))?
+        .is::<Rect>();
     let storage = array
         .execute::<ExtensionArray>(ctx)?
         .storage_array()

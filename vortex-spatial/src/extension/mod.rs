@@ -80,6 +80,16 @@ pub(crate) fn is_native_geometry(dtype: &DType) -> bool {
     })
 }
 
+/// Whether `dtype` is the mixed [`Geometry`] union rather than a homogeneous geometry type.
+///
+/// The mixed column has union storage, so the kernels that read coordinates straight out of a
+/// homogeneous layout have to take a different path for it.
+pub(crate) fn is_mixed_geometry(dtype: &DType) -> bool {
+    dtype
+        .as_extension_opt()
+        .is_some_and(|ext| ext.is::<Geometry>())
+}
+
 /// Flatten a native geometry column into a single coordinate `Struct<x, y, ...>` containing
 /// every vertex of every geometry.
 pub(crate) fn flatten_coordinates(
@@ -157,7 +167,7 @@ pub(crate) fn decode_geometries(
             array.dtype()
         );
     };
-    if ext.is::<Geometry>() {
+    if is_mixed_geometry(array.dtype()) {
         return decode_mixed_geometries(array, ctx);
     }
     let storage = array

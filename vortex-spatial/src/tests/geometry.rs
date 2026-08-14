@@ -25,6 +25,7 @@ use geoarrow::datatypes::CoordType;
 use geoarrow::datatypes::Crs;
 use geoarrow::datatypes::GeometryType as GeoArrowGeometryType;
 use geoarrow::datatypes::Metadata;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::Accumulator;
@@ -32,6 +33,7 @@ use vortex_array::aggregate_fn::DynAccumulator;
 use vortex_array::aggregate_fn::EmptyOptions;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ExtensionArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::UnionArray as SparseUnionArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::assert_arrays_eq;
@@ -103,6 +105,25 @@ fn decode_arrow(
         .collect()
 }
 
+/// The [`supported_geometries`] fixture imported as a `vortex.st.geometry` column, alongside the
+/// GeoArrow field it came from and the geometries it should read back as.
+struct Fixture {
+    imported: ArrayRef,
+    field: Field,
+    expected: Vec<Option<GeoGeometry<f64>>>,
+}
+
+fn imported_fixture() -> VortexResult<Fixture> {
+    let expected = supported_geometries();
+    let (arrow, field) = arrow_fixture(&expected)?;
+    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    Ok(Fixture {
+        imported,
+        field,
+        expected,
+    })
+}
+
 fn aabb(result: &Scalar) -> VortexResult<(f64, f64, f64, f64)> {
     let storage = result.as_extension().to_storage_scalar();
     let fields = storage.as_struct();
@@ -161,9 +182,11 @@ fn infers_canonical_geoarrow_field() -> VortexResult<()> {
 
 #[test]
 fn roundtrips_supported_kinds_and_nulls() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
-    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let Fixture {
+        imported,
+        field,
+        expected,
+    } = imported_fixture()?;
 
     let mut ctx = SESSION.create_execution_ctx();
     let extension = imported.clone().execute::<ExtensionArray>(&mut ctx)?;
@@ -216,9 +239,11 @@ fn preserves_non_first_type_id_for_nulls() -> VortexResult<()> {
 
 #[test]
 fn slice_preserves_dense_union_storage() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
-    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let Fixture {
+        imported,
+        field,
+        expected,
+    } = imported_fixture()?;
     let sliced = imported.slice(1..5)?;
 
     let mut ctx = SESSION.create_execution_ctx();
@@ -233,10 +258,45 @@ fn slice_preserves_dense_union_storage() -> VortexResult<()> {
 }
 
 #[test]
-fn exports_canonical_sparse_union() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
+fn take_compacts_dense_union_for_arrow() -> VortexResult<()> {
+    let geometries = vec![
+        Some(GeoGeometry::Point(Point::new(1.0, 2.0))),
+        Some(GeoGeometry::Point(Point::new(3.0, 4.0))),
+        Some(GeoGeometry::Point(Point::new(5.0, 6.0))),
+    ];
+    let (arrow, field) = arrow_fixture(&geometries)?;
     let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let taken = imported.take(PrimitiveArray::from_iter([2u32, 0, 2]).into_array())?;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let exported = SESSION
+        .arrow()
+        .execute_arrow(taken, Some(&field), &mut ctx)?;
+    let union = exported
+        .as_any()
+        .downcast_ref::<ArrowUnionArray>()
+        .ok_or_else(|| vortex_err!("exported GeoArrow Geometry must use a UnionArray"))?;
+
+    assert_eq!(union.offsets().unwrap().as_ref(), &[0, 1, 2]);
+    assert_eq!(union.child(1).len(), 3);
+    assert_eq!(
+        decode_arrow(&exported, &field)?,
+        vec![
+            geometries[2].clone(),
+            geometries[0].clone(),
+            geometries[2].clone()
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn exports_canonical_sparse_union() -> VortexResult<()> {
+    let Fixture {
+        imported,
+        field,
+        expected,
+    } = imported_fixture()?;
     let mut ctx = SESSION.create_execution_ctx();
 
     let extension = imported.execute::<ExtensionArray>(&mut ctx)?;
@@ -255,9 +315,9 @@ fn exports_canonical_sparse_union() -> VortexResult<()> {
 
 #[test]
 fn exports_constant_nulls() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
-    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let Fixture {
+        imported, field, ..
+    } = imported_fixture()?;
     let mut ctx = SESSION.create_execution_ctx();
     let nulls = ConstantArray::new(Scalar::null(imported.dtype().clone()), 2).into_array();
     let exported = SESSION
@@ -269,9 +329,9 @@ fn exports_constant_nulls() -> VortexResult<()> {
 
 #[test]
 fn decodes_supported_variants() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
-    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let Fixture {
+        imported, expected, ..
+    } = imported_fixture()?;
     let mut ctx = SESSION.create_execution_ctx();
 
     let non_null = imported.slice(0..6)?;
@@ -285,9 +345,7 @@ fn decodes_supported_variants() -> VortexResult<()> {
 
 #[test]
 fn computes_aabb_across_variants() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
-    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let Fixture { imported, .. } = imported_fixture()?;
     let mut ctx = SESSION.create_execution_ctx();
     let mut accumulator =
         Accumulator::try_new(GeometryAabb, EmptyOptions, imported.dtype().clone())?;
@@ -298,9 +356,7 @@ fn computes_aabb_across_variants() -> VortexResult<()> {
 
 #[test]
 fn computes_envelopes_across_variants() -> VortexResult<()> {
-    let expected = supported_geometries();
-    let (arrow, field) = arrow_fixture(&expected)?;
-    let imported = SESSION.arrow().from_arrow_array(arrow, &field)?;
+    let Fixture { imported, .. } = imported_fixture()?;
     let mut ctx = SESSION.create_execution_ctx();
     let envelopes = SpatialEnvelope::try_new_array(imported)?
         .into_array()
