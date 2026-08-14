@@ -17,5 +17,8 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         id: UNSTABLE_2026_06_0,
         min_vortex_version: None,
     },
-    added: &[EditionMember::array(&"vortex.onpair")],
+    added: &[
+        EditionMember::array(&"vortex.dense_union"),
+        EditionMember::array(&"vortex.onpair"),
+    ],
 };

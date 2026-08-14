@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+//! Selector-only take for dense unions.
+//!
+//! For performance, take gathers only the row selectors and retains every compact child in full.
+//! This is O(selected rows) but may reorder per-child offsets; Arrow dense unions instead require
+//! those offsets to increase.
+
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::IntoArray;

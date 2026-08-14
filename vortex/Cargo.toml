@@ -32,6 +32,7 @@ vortex-bytebool = { workspace = true }
 vortex-cloud = { workspace = true, optional = true }
 vortex-datetime-parts = { workspace = true }
 vortex-decimal-byte-parts = { workspace = true }
+vortex-dense-union = { workspace = true }
 vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use rstest::rstest;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -11,6 +12,7 @@ use vortex_array::arrays::Dict;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::UnionArray;
 use vortex_array::arrays::union::UnionArraySlotsExt;
+use vortex_array::assert_arrays_eq;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
@@ -82,6 +84,7 @@ fn session() -> VortexSession {
     session
 }
 
+#[track_caller]
 fn assert_rows(
     array: &ArrayRef,
     expected: Vec<Scalar>,
@@ -94,19 +97,20 @@ fn assert_rows(
     Ok(())
 }
 
+#[track_caller]
 fn assert_same_rows(
     left: &ArrayRef,
     right: &ArrayRef,
     session: &VortexSession,
 ) -> VortexResult<()> {
-    assert_eq!(left.dtype(), right.dtype());
-    assert_eq!(left.len(), right.len());
     let mut ctx = session.create_execution_ctx();
-    for index in 0..left.len() {
-        assert_eq!(
-            left.execute_scalar(index, &mut ctx)?,
-            right.execute_scalar(index, &mut ctx)?
-        );
+    assert_eq!(left.dtype(), right.dtype());
+    let left = left.clone().execute::<UnionArray>(&mut ctx)?;
+    let right = right.clone().execute::<UnionArray>(&mut ctx)?;
+    assert_arrays_eq!(left.type_ids(), right.type_ids(), &mut ctx);
+    assert_eq!(left.children().len(), right.children().len());
+    for (left, right) in left.children().iter().zip(right.children().iter()) {
+        assert_arrays_eq!(left, right, &mut ctx);
     }
     Ok(())
 }
@@ -257,82 +261,94 @@ fn canonicalization_handles_unselected_empty_child() -> VortexResult<()> {
     assert_same_rows(&array, &canonical, &session)
 }
 
-#[test]
-fn invalid_type_id_and_offsets_return_errors() -> VortexResult<()> {
+#[rstest]
+#[case::unknown_type_id(7, 0, "unknown type ID 7")]
+#[case::negative_offset(5, -1, "negative offset -1")]
+#[case::out_of_bounds_offset(9, 1, "out of bounds for child 1 of length 1")]
+fn invalid_type_id_and_offsets_return_errors(
+    #[case] type_id: u8,
+    #[case] offset: i32,
+    #[case] expected: &str,
+) -> VortexResult<()> {
     let session = session();
     let mut ctx = session.create_execution_ctx();
-
-    let unknown_type_id = DenseUnion::try_new(
-        PrimitiveArray::from_iter([7u8]).into_array(),
-        PrimitiveArray::from_iter([0i32]).into_array(),
+    let array = DenseUnion::try_new(
+        PrimitiveArray::from_iter([type_id]).into_array(),
+        PrimitiveArray::from_iter([offset]).into_array(),
         variants()?,
         vec![
             PrimitiveArray::from_iter([10i32]).into_array(),
             BoolArray::from_iter([true]).into_array(),
         ],
     )?;
-    assert!(unknown_type_id.execute_scalar(0, &mut ctx).is_err());
+    let Err(error) = array.execute_scalar(0, &mut ctx) else {
+        panic!("DenseUnion must reject {expected}");
+    };
+    assert!(
+        error.to_string().contains(expected),
+        "error should mention {expected:?}, got: {error}"
+    );
+    Ok(())
+}
 
-    let negative_offset = DenseUnion::try_new(
-        PrimitiveArray::from_iter([5u8]).into_array(),
-        PrimitiveArray::from_iter([-1i32]).into_array(),
-        variants()?,
-        vec![
-            PrimitiveArray::from_iter([10i32]).into_array(),
-            BoolArray::from_iter([true]).into_array(),
-        ],
-    )?;
-    assert!(negative_offset.execute_scalar(0, &mut ctx).is_err());
+#[derive(Clone, Copy)]
+enum InvalidStructure {
+    TypeIdsDType,
+    OffsetsDType,
+    ChildCount,
+}
 
-    let out_of_bounds = DenseUnion::try_new(
-        PrimitiveArray::from_iter([9u8]).into_array(),
-        PrimitiveArray::from_iter([1i32]).into_array(),
-        variants()?,
-        vec![
-            PrimitiveArray::from_iter([10i32]).into_array(),
-            BoolArray::from_iter([true]).into_array(),
-        ],
-    )?;
-    assert!(out_of_bounds.execute_scalar(0, &mut ctx).is_err());
+#[rstest]
+#[case::type_ids_dtype(InvalidStructure::TypeIdsDType, "type_ids have dtype u16")]
+#[case::offsets_dtype(InvalidStructure::OffsetsDType, "offsets have dtype u32")]
+#[case::child_count(InvalidStructure::ChildCount, "3 slots, expected 4")]
+fn validates_structural_components(
+    #[case] invalid: InvalidStructure,
+    #[case] expected: &str,
+) -> VortexResult<()> {
+    let type_ids = match invalid {
+        InvalidStructure::TypeIdsDType => PrimitiveArray::from_iter([5u16]).into_array(),
+        _ => PrimitiveArray::from_iter([5u8]).into_array(),
+    };
+    let offsets = match invalid {
+        InvalidStructure::OffsetsDType => PrimitiveArray::from_iter([0u32]).into_array(),
+        _ => PrimitiveArray::from_iter([0i32]).into_array(),
+    };
+    let mut children = vec![
+        PrimitiveArray::from_iter([10i32]).into_array(),
+        BoolArray::from_iter([true]).into_array(),
+    ];
+    if matches!(invalid, InvalidStructure::ChildCount) {
+        children.pop();
+    }
+
+    let Err(error) = DenseUnion::try_new(type_ids, offsets, variants()?, children) else {
+        panic!("DenseUnion must reject {expected}");
+    };
+    assert!(
+        error.to_string().contains(expected),
+        "error should mention {expected:?}, got: {error}"
+    );
     Ok(())
 }
 
 #[test]
-fn validates_structural_components() -> VortexResult<()> {
-    assert!(
-        DenseUnion::try_new(
-            PrimitiveArray::from_iter([5u16]).into_array(),
-            PrimitiveArray::from_iter([0i32]).into_array(),
-            variants()?,
-            vec![
-                PrimitiveArray::from_iter([10i32]).into_array(),
-                BoolArray::from_iter([true]).into_array(),
-            ],
-        )
-        .is_err()
-    );
-    assert!(
-        DenseUnion::try_new(
-            PrimitiveArray::from_iter([5u8]).into_array(),
-            PrimitiveArray::from_iter([0u32]).into_array(),
-            variants()?,
-            vec![
-                PrimitiveArray::from_iter([10i32]).into_array(),
-                BoolArray::from_iter([true]).into_array(),
-            ],
-        )
-        .is_err()
-    );
-    assert!(
-        DenseUnion::try_new(
-            PrimitiveArray::from_iter([5u8]).into_array(),
-            PrimitiveArray::from_iter([0i32]).into_array(),
-            variants()?,
-            vec![PrimitiveArray::from_iter([10i32]).into_array()],
-        )
-        .is_err()
-    );
-    Ok(())
+fn canonicalization_handles_zero_length_array() -> VortexResult<()> {
+    let session = session();
+    let array = DenseUnion::try_new(
+        PrimitiveArray::from_iter(Vec::<u8>::new()).into_array(),
+        PrimitiveArray::from_iter(Vec::<i32>::new()).into_array(),
+        variants()?,
+        vec![
+            PrimitiveArray::from_iter(Vec::<i32>::new()).into_array(),
+            BoolArray::from_iter(Vec::<bool>::new()).into_array(),
+        ],
+    )?
+    .into_array();
+    let mut ctx = session.create_execution_ctx();
+    let canonical = array.clone().execute::<Canonical>(&mut ctx)?.into_array();
+
+    assert_same_rows(&array, &canonical, &session)
 }
 
 #[test]
