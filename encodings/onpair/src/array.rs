@@ -199,7 +199,12 @@ impl OnPairData {
     /// `offsets` must be the widened values of the `dict_offsets` child the
     /// caller attaches to the array; validation proves only that they are
     /// structurally safe against `dict_bytes`.
-    pub(crate) fn try_new_with_dictionary(
+    ///
+    /// Callers that share one dictionary across many arrays — the `vortex.onpair`
+    /// layout, across the chunks of a column — build this once and clone it into
+    /// every array, so the widening and validation happen once rather than per
+    /// array. [`OnPairData::new`] instead defers both to the first decode.
+    pub fn try_new_with_dictionary(
         dict_bytes: BufferHandle,
         offsets: Buffer<u32>,
     ) -> VortexResult<Self> {

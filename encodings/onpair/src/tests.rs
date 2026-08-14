@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use onpair::CompactDictionaryView;
 use prost::Message;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
@@ -25,20 +26,25 @@ use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::test_harness::check_metadata;
 use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
+use vortex_buffer::ByteBuffer;
 use vortex_session::VortexSession;
 
 use crate::DEFAULT_CONFIG;
 use crate::OnPair;
 use crate::OnPairArrayExt;
 use crate::OnPairArraySlotsExt;
+use crate::OnPairData;
 use crate::OnPairMetadata;
 use crate::compress::onpair_compress;
+use crate::compress::onpair_encode;
+use crate::compress::onpair_train;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
 fn compress_onpair(
-    array: &vortex_array::ArrayRef,
+    array: &ArrayRef,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> vortex_error::VortexResult<crate::OnPairArray> {
     onpair_compress(array, DEFAULT_CONFIG, ctx)?
@@ -623,6 +629,84 @@ fn test_onpair_slice_canonicalize() -> vortex_error::VortexResult<()> {
                 "window {start}..{end} row {i}"
             );
         }
+    }
+    Ok(())
+}
+
+/// Train on one chunk and encode several against that dictionary — the write side
+/// of the `vortex.onpair` layout, which shares one dictionary across a whole
+/// column instead of storing one per chunk.
+///
+/// Each chunk is reassembled from the *same* [`OnPairData`], which is how the
+/// layout reader pays for widening and validating the dictionary once per column
+/// rather than once per chunk.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn test_onpair_shared_dictionary_across_chunks() -> vortex_error::VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+
+    // Chunk 0 trains the dictionary; the others are encoded with it. Chunk 2's
+    // strings share no substrings with chunk 0, exercising the guarantee that any
+    // string encodes under any dictionary via the 256 single-byte tokens.
+    let chunks: Vec<Vec<Option<&str>>> = vec![
+        vec![
+            Some("https://www.example.com/a"),
+            Some("https://www.example.com/b"),
+            Some("https://www.example.com/c"),
+        ],
+        vec![
+            Some("https://www.example.com/d"),
+            None,
+            Some("https://www.example.com/e"),
+        ],
+        vec![Some("~!@#$%^&*()"), Some("\u{1f980}\u{1f980}"), None],
+    ];
+    let arrays: Vec<ArrayRef> = chunks
+        .iter()
+        .map(|rows| {
+            VarBinArray::from_iter(rows.iter().copied(), DType::Utf8(Nullability::Nullable))
+                .into_array()
+        })
+        .collect();
+
+    let parser = onpair_train(&arrays[0], DEFAULT_CONFIG, &mut ctx)?;
+    let dict_bytes = BufferHandle::new_host(ByteBuffer::copy_from(parser.dict.bytes()));
+    let dict_offsets = Buffer::copy_from(parser.dict.offsets());
+    // Built once, cloned into every chunk: one widen, one validate.
+    let data = OnPairData::try_new_with_dictionary(dict_bytes.clone(), dict_offsets.clone())?;
+
+    for (rows, array) in chunks.iter().zip(&arrays) {
+        let encoded = onpair_encode(&parser, array, &mut ctx)?;
+        let reassembled = OnPair::try_new_with_data(
+            array.dtype().clone(),
+            data.clone(),
+            dict_offsets.clone().into_array(),
+            encoded.codes.into_array(),
+            encoded.codes_offsets.into_array(),
+            encoded.uncompressed_lengths.into_array(),
+            encoded.validity,
+        )?;
+
+        assert_eq!(
+            reassembled.dict_bytes().as_slice(),
+            dict_bytes.as_host().as_slice(),
+            "every chunk must reference the same dictionary blob"
+        );
+
+        let canonical = reassembled
+            .into_array()
+            .execute::<VarBinViewArray>(&mut ctx)?;
+        let mask = canonical
+            .validity()?
+            .execute_mask(canonical.len(), &mut ctx)?;
+        let got: Vec<Option<Vec<u8>>> = (0..canonical.len())
+            .map(|i| mask.value(i).then(|| canonical.bytes_at(i).to_vec()))
+            .collect();
+        let want: Vec<Option<Vec<u8>>> = rows
+            .iter()
+            .map(|row| row.map(|s| s.as_bytes().to_vec()))
+            .collect();
+        assert_eq!(got, want);
     }
     Ok(())
 }

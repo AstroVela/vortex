@@ -26,6 +26,7 @@ pub use onpair::Config;
 pub use onpair::DEFAULT_CONFIG;
 pub use onpair::Error as OnPairError;
 pub use onpair::MaxDictBits;
+pub use onpair::Parser;
 pub use onpair::Threshold;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;
