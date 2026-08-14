@@ -10,7 +10,6 @@ use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::UnionVariants;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 /// A Vortex array encoded as a [`DenseUnion`].
@@ -83,21 +82,6 @@ impl<T: TypedArrayRef<DenseUnion>> DenseUnionArrayExt for T {}
 pub struct DenseUnion;
 
 impl DenseUnion {
-    /// Construct a dense union array.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the components do not satisfy the invariants documented by [`Self::try_new`].
-    pub fn new(
-        type_ids: ArrayRef,
-        offsets: ArrayRef,
-        variants: UnionVariants,
-        children: impl IntoIterator<Item = ArrayRef>,
-    ) -> DenseUnionArray {
-        Self::try_new(type_ids, offsets, variants, children)
-            .vortex_expect("DenseUnion construction failed")
-    }
-
     /// Try to construct a dense union array.
     ///
     /// The logical union's nullability is inherited from `type_ids`; nullable type IDs represent
