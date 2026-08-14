@@ -74,6 +74,23 @@ Set in `src/gpu_writer.rs`:
 | data page size | 1 MiB | Large enough to amortize per-page setup, small enough to keep every SM fed. Matches the page size cuDF targets. |
 | data page row limit | 1,000,000 | The 20k-row default caps narrow columns' pages far below 1 MiB. |
 | statistics | chunk-level | Page statistics only inflate the headers a reader has to walk. |
+| row group size | 1,048,576 rows | Shared with the Vortex side as `GPU_ROW_GROUP_SIZE` — see below. |
+
+### Matching physical partitions
+
+A Parquet row group and a Vortex chunk are the same thing for this comparison: the unit the
+reader plans and dispatches over. Both formats are pinned to `GPU_ROW_GROUP_SIZE`
+(1,048,576 rows, Parquet's `DEFAULT_MAX_ROW_GROUP_ROW_COUNT`).
+
+Without this the two are not comparable. Parquet reads ~1M-row row groups, while the Vortex
+side inherits the Arrow reader's ~8K-row batches — each of which becomes its own chunk, its own
+compressed blocks and its own kernel launches, so a single dispatch turns into hundreds.
+
+Setting the Arrow reader's batch size alone is not enough: the reader also breaks at the source
+file's row group boundaries, so short batches survive. `parquet_to_vortex_chunks_with_batch_size`
+therefore concatenates the source batches and re-slices them on exact boundaries. Those batches
+are written straight through as root chunks via `ChunkedLayoutStrategy`, and read back with
+`SplitBy::RowCount(GPU_ROW_GROUP_SIZE)` so a scan batch is one whole partition.
 
 ### Correctness
 

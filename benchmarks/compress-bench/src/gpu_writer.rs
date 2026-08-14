@@ -9,6 +9,7 @@
 use clap::ValueEnum;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
+use parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
 use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
 use parquet::file::properties::WriterVersion;
@@ -25,6 +26,14 @@ pub const GPU_DATA_PAGE_SIZE: usize = 1024 * 1024;
 /// `parquet`'s default caps pages at 20k rows, which produces pages far below
 /// [`GPU_DATA_PAGE_SIZE`] for narrow columns and leaves the device underfed.
 const GPU_DATA_PAGE_ROW_COUNT_LIMIT: usize = 1_000_000;
+
+/// Rows per physical partition in both GPU benchmark formats.
+///
+/// A Parquet row group and a Vortex chunk are the same thing for this comparison: the unit the
+/// reader plans and dispatches over. Pinning both to one value is what makes the two numbers
+/// comparable — otherwise Parquet reads ~1M-row row groups while Vortex inherits the Arrow
+/// reader's ~8K-row batches, turning one launch into hundreds.
+pub const GPU_ROW_GROUP_SIZE: usize = DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
 
 /// Parquet page codecs the GPU benchmark can write.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -67,6 +76,9 @@ pub fn gpu_writer_properties(codec: GpuCodec) -> WriterProperties {
         .set_dictionary_enabled(true)
         .set_data_page_size_limit(GPU_DATA_PAGE_SIZE)
         .set_data_page_row_count_limit(GPU_DATA_PAGE_ROW_COUNT_LIMIT)
+        // Stated explicitly rather than left to the default, because the Vortex side is
+        // rebatched to the same constant and the two have to move together.
+        .set_max_row_group_row_count(Some(GPU_ROW_GROUP_SIZE))
         // Per-page statistics only inflate the page headers a reader has to walk.
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .build()

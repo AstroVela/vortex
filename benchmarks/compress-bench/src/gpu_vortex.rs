@@ -24,12 +24,14 @@ use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
-use vortex::file::WriteStrategyBuilder;
+use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex::layout::layouts::compressed::CompressingStrategy;
+use vortex::layout::scan::split_by::SplitBy;
 use vortex_arrow::ArrowSessionExt;
 use vortex_bench::Format;
 use vortex_bench::SESSION;
 use vortex_bench::compress::Compressor;
-use vortex_bench::conversions::parquet_to_vortex_chunks;
+use vortex_bench::conversions::parquet_to_vortex_chunks_with_batch_size;
 use vortex_cuda::CanonicalCudaExt;
 use vortex_cuda::CudaOpenOptionsExt;
 use vortex_cuda::CudaSession;
@@ -38,6 +40,8 @@ use vortex_cuda::PooledFileReadAtOptions;
 use vortex_cuda::executor::CudaArrayExt;
 use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
+
+use crate::gpu_writer::GPU_ROW_GROUP_SIZE;
 
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
 pub struct GpuVortexCompressor {
@@ -69,13 +73,24 @@ impl Compressor for GpuVortexCompressor {
     async fn decompress(&self, parquet_path: &Path) -> Result<Duration> {
         register_cuda_layout(&SESSION);
 
-        let uncompressed = parquet_to_vortex_chunks(parquet_path.to_path_buf()).await?;
+        // Rebatch to the same partition size the GPU Parquet file is written with. Left alone,
+        // the Arrow reader hands back ~8K-row batches, each of which becomes its own Vortex
+        // chunk and its own set of kernel launches.
+        let uncompressed = parquet_to_vortex_chunks_with_batch_size(
+            parquet_path.to_path_buf(),
+            Some(GPU_ROW_GROUP_SIZE),
+        )
+        .await?;
         let gpu_file = NamedTempFile::new()?;
         let mut output = tokio::fs::File::create(gpu_file.path()).await?;
-        let strategy = WriteStrategyBuilder::default()
-            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().only_cuda_compatible())
-            .with_flat_strategy(Arc::new(CudaFlatLayoutStrategy::default()))
-            .build();
+        // Write those batches straight through as root chunks, so a chunk on disk is one
+        // partition rather than whatever the default strategy would regroup them into.
+        let strategy = Arc::new(ChunkedLayoutStrategy::new(CompressingStrategy::new(
+            CudaFlatLayoutStrategy::default(),
+            BtrBlocksCompressorBuilder::default()
+                .only_cuda_compatible()
+                .build(),
+        )));
         SESSION
             .write_options()
             .with_strategy(strategy)
@@ -91,7 +106,12 @@ impl Compressor for GpuVortexCompressor {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
         let start = Instant::now();
         let file = open_gpu(gpu_file.path(), self.direct_io).await?;
-        let mut batches = file.scan()?.into_array_stream()?;
+        // Split reads on the same boundary the file was written with, so a scan batch is one
+        // partition instead of a sub-slice of one.
+        let mut batches = file
+            .scan()?
+            .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+            .into_array_stream()?;
 
         while let Some(batch) = batches.next().await {
             let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
@@ -146,9 +166,15 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<Durati
     std::fs::copy(path, host_path.path())?;
 
     let gpu_file = open_gpu(path, direct_io).await?;
-    let mut gpu_batches = gpu_file.scan()?.into_array_stream()?;
+    let mut gpu_batches = gpu_file
+        .scan()?
+        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .into_array_stream()?;
     let host_file = SESSION.open_options().open_path(host_path.path()).await?;
-    let mut host_batches = host_file.scan()?.into_array_stream()?;
+    let mut host_batches = host_file
+        .scan()?
+        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .into_array_stream()?;
 
     let mut fields_checked = 0usize;
     let mut batch_index = 0usize;
