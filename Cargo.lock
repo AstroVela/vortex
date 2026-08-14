@@ -7298,6 +7298,7 @@ dependencies = [
  "rand_distr 0.6.0",
  "tabled",
  "tokio",
+ "url",
  "vortex-bench",
 ]
 
@@ -9706,6 +9707,7 @@ dependencies = [
  "mimalloc",
  "noodles-bgzf",
  "noodles-vcf",
+ "object_store",
  "parking_lot",
  "parquet 56.2.1",
  "parquet 58.4.0",
