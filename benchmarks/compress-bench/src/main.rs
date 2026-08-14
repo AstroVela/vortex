@@ -25,6 +25,8 @@ use vortex::utils::aliases::hash_map::HashMap;
 use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::LogFormat;
+#[cfg(feature = "cuda")]
+use vortex_bench::SESSION;
 use vortex_bench::Target;
 use vortex_bench::compress::CompressMeasurements;
 use vortex_bench::compress::CompressOp;
@@ -52,6 +54,8 @@ use vortex_bench::public_bi::PBIDataset::Food;
 use vortex_bench::public_bi::PBIDataset::HashTags;
 use vortex_bench::setup_logging_and_tracing_with_format;
 use vortex_bench::v3;
+#[cfg(feature = "cuda")]
+use vortex_cuda::CudaSession;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -129,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
         verify: args.gpu_verify,
         direct_io: args.gpu_direct_io,
     });
+
+    #[cfg(feature = "cuda")]
+    if gpu.is_some() {
+        SESSION.register(CudaSession::try_single_stream()?);
+    }
 
     let (formats, ops) = if gpu.is_some() {
         for format in &args.formats {
