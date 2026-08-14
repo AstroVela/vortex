@@ -25,6 +25,7 @@ use crate::conversions::write_parquet_as_vortex;
 use crate::idempotent_async;
 use crate::random_access::BenchDataset;
 use crate::random_access::data_path;
+use crate::random_access::random_access_writer_properties;
 
 /// Dataset identifier used for data path generation.
 pub const DATASET: &str = "feature_vectors";
@@ -60,6 +61,9 @@ const VECTOR_DIM: i32 = 1024;
 /// Batch size for data generation.
 const BATCH_SIZE: usize = 100_000;
 
+/// Approximate encoded size of one row: `id` plus `VECTOR_DIM` uncompressed `f32` values.
+const APPROX_ROW_BYTES: usize = 8 + (VECTOR_DIM as usize) * 4;
+
 /// Generate a synthetic feature vectors parquet file.
 ///
 /// Schema: `id: Int64, embedding: FixedSizeList<Float32, VECTOR_DIM>`.
@@ -81,7 +85,11 @@ pub async fn feature_vectors_parquet() -> Result<PathBuf> {
             ]));
 
             let file = File::create(&temp_path)?;
-            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
+            let mut writer = ArrowWriter::try_new(
+                file,
+                Arc::clone(&schema),
+                Some(random_access_writer_properties(APPROX_ROW_BYTES)),
+            )?;
             let mut rng = StdRng::seed_from_u64(42);
 
             for batch_start in (0..ROW_COUNT).step_by(BATCH_SIZE) {

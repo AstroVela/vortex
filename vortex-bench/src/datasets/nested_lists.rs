@@ -24,6 +24,7 @@ use crate::conversions::write_parquet_as_vortex;
 use crate::idempotent_async;
 use crate::random_access::BenchDataset;
 use crate::random_access::data_path;
+use crate::random_access::random_access_writer_properties;
 
 /// Dataset identifier used for data path generation.
 pub const DATASET: &str = "nested_lists";
@@ -59,6 +60,9 @@ const MAX_LIST_LEN: usize = 20;
 /// Batch size for data generation.
 const BATCH_SIZE: usize = 100_000;
 
+/// Approximate encoded size of one row: `id` plus an average-length list of `i64` values.
+const APPROX_ROW_BYTES: usize = 8 + (MAX_LIST_LEN / 2) * 8;
+
 /// Generate a synthetic nested lists parquet file.
 ///
 /// Schema: `id: Int64, values: List<Int64>`.
@@ -77,7 +81,11 @@ pub async fn nested_lists_parquet() -> Result<PathBuf> {
             ]));
 
             let file = std::fs::File::create(&temp_path)?;
-            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
+            let mut writer = ArrowWriter::try_new(
+                file,
+                Arc::clone(&schema),
+                Some(random_access_writer_properties(APPROX_ROW_BYTES)),
+            )?;
             let mut rng = StdRng::seed_from_u64(42);
 
             for batch_start in (0..ROW_COUNT).step_by(BATCH_SIZE) {

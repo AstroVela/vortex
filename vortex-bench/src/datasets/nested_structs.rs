@@ -25,6 +25,7 @@ use crate::conversions::write_parquet_as_vortex;
 use crate::idempotent_async;
 use crate::random_access::BenchDataset;
 use crate::random_access::data_path;
+use crate::random_access::random_access_writer_properties;
 
 /// Dataset identifier used for data path generation.
 pub const DATASET: &str = "nested_structs";
@@ -56,6 +57,9 @@ impl BenchDataset for NestedStructsData {
 
 /// Batch size for data generation.
 const BATCH_SIZE: usize = 100_000;
+
+/// Approximate encoded size of one row: `id`, `a`, `b`, and the three inner `f64` fields.
+const APPROX_ROW_BYTES: usize = 8 * 6;
 
 /// Generate a synthetic nested structs parquet file.
 ///
@@ -92,7 +96,11 @@ pub async fn nested_structs_parquet() -> Result<PathBuf> {
             ]));
 
             let file = std::fs::File::create(&temp_path)?;
-            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
+            let mut writer = ArrowWriter::try_new(
+                file,
+                Arc::clone(&schema),
+                Some(random_access_writer_properties(APPROX_ROW_BYTES)),
+            )?;
             let mut rng = StdRng::seed_from_u64(42);
 
             for batch_start in (0..ROW_COUNT).step_by(BATCH_SIZE) {
