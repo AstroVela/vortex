@@ -13,6 +13,8 @@ use anyhow::ensure;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_schema::Field;
 use async_trait::async_trait;
+use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+use cudarc::nvtx::safe::scoped_range;
 use futures::StreamExt;
 use tempfile::NamedTempFile;
 use vortex::array::ArrayRef;
@@ -24,20 +26,25 @@ use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
-use vortex::file::WriteStrategyBuilder;
+use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex::layout::layouts::compressed::CompressingStrategy;
+use vortex::layout::scan::split_by::SplitBy;
 use vortex_arrow::ArrowSessionExt;
 use vortex_bench::Format;
 use vortex_bench::SESSION;
 use vortex_bench::compress::Compressor;
-use vortex_bench::conversions::parquet_to_vortex_chunks;
+use vortex_bench::conversions::parquet_to_vortex_chunks_with_batch_size;
 use vortex_cuda::CanonicalCudaExt;
 use vortex_cuda::CudaOpenOptionsExt;
 use vortex_cuda::CudaSession;
 #[cfg(target_os = "linux")]
 use vortex_cuda::PooledFileReadAtOptions;
 use vortex_cuda::executor::CudaArrayExt;
+use vortex_cuda::executor::CudaExecutionCtx;
 use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
+
+use crate::gpu_writer::GPU_ROW_GROUP_SIZE;
 
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
 pub struct GpuVortexCompressor {
@@ -69,13 +76,26 @@ impl Compressor for GpuVortexCompressor {
     async fn decompress(&self, parquet_path: &Path) -> Result<Duration> {
         register_cuda_layout(&SESSION);
 
-        let uncompressed = parquet_to_vortex_chunks(parquet_path.to_path_buf()).await?;
+        // Match the Parquet writer's row-group size so both formats expose the same number of
+        // independently readable row partitions to their GPU decoder. The default Arrow reader
+        // batch size is only 8K rows, which otherwise creates hundreds of tiny CUDA-flat layouts
+        // and thousands of tiny kernel launches for Vortex.
+        let uncompressed = parquet_to_vortex_chunks_with_batch_size(
+            parquet_path.to_path_buf(),
+            Some(GPU_ROW_GROUP_SIZE),
+        )
+        .await?;
         let gpu_file = NamedTempFile::new()?;
         let mut output = tokio::fs::File::create(gpu_file.path()).await?;
-        let strategy = WriteStrategyBuilder::default()
-            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().only_cuda_compatible())
-            .with_flat_strategy(Arc::new(CudaFlatLayoutStrategy::default()))
-            .build();
+        // Preserve the exact input partitions at the root. The general-purpose file strategy
+        // splits struct fields and may introduce field-specific chunk boundaries, which makes a
+        // fixed-row GPU scan yield ChunkedArray fields that have no CUDA execution kernel.
+        let strategy = Arc::new(ChunkedLayoutStrategy::new(CompressingStrategy::new(
+            CudaFlatLayoutStrategy::default(),
+            BtrBlocksCompressorBuilder::default()
+                .only_cuda_compatible()
+                .build(),
+        )));
         SESSION
             .write_options()
             .with_strategy(strategy)
@@ -89,20 +109,151 @@ impl Compressor for GpuVortexCompressor {
         }
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
+        // Match cuDF's untimed read: pay CUDA module loading, allocator initialization and page
+        // faults before measuring. The helper opens and scans the file afresh each time, and the
+        // CUDA opener disables its data-segment cache, so no decoded arrays are reused.
+        decode_gpu_file(gpu_file.path(), self.direct_io, &mut cuda_ctx, "warmup").await?;
+
         let start = Instant::now();
-        let file = open_gpu(gpu_file.path(), self.direct_io).await?;
-        let mut batches = file.scan()?.into_array_stream()?;
-
-        while let Some(batch) = batches.next().await {
-            let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
-            for field in record.iter_unmasked_fields() {
-                black_box(field.clone().execute_cuda(&mut cuda_ctx).await?);
-            }
-        }
-        cuda_ctx.synchronize_stream()?;
-
+        decode_gpu_file(gpu_file.path(), self.direct_io, &mut cuda_ctx, "timed").await?;
         Ok(start.elapsed())
     }
+}
+
+/// Decode every row and column from a fresh file open into device-resident canonical arrays.
+async fn decode_gpu_file(
+    path: &Path,
+    direct_io: bool,
+    cuda_ctx: &mut CudaExecutionCtx,
+    phase: &'static str,
+) -> Result<()> {
+    let open_start = Instant::now();
+    let file = open_gpu(path, direct_io).await?;
+    let open_time = open_start.elapsed();
+
+    let scan_start = Instant::now();
+    let mut batches = file
+        .scan()?
+        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .into_array_stream()?;
+    let scan_time = scan_start.elapsed();
+
+    let mut read_time = Duration::ZERO;
+    let mut struct_time = Duration::ZERO;
+    let mut execute_time = Duration::ZERO;
+    let mut batch_count = 0usize;
+    let mut field_count = 0usize;
+    // Diagnostic modes: `wall` times the host call, `gpu` also brackets its stream work with
+    // CUDA events, and `nsys` labels every call with NVTX. All modes perturb the benchmark and
+    // print their records only after the final stream synchronization.
+    let profile_mode = (phase == "timed")
+        .then(|| std::env::var("VORTEX_GPU_PROFILE_FIELDS").ok())
+        .flatten();
+    let profile_fields = profile_mode.is_some();
+    let profile_gpu_spans = profile_mode.as_deref() == Some("gpu");
+    let profile_nsys = profile_mode.as_deref() == Some("nsys");
+    let mut field_timings = Vec::new();
+    loop {
+        let read_start = Instant::now();
+        let Some(batch) = batches.next().await else {
+            read_time += read_start.elapsed();
+            break;
+        };
+        read_time += read_start.elapsed();
+
+        let struct_start = Instant::now();
+        let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
+        struct_time += struct_start.elapsed();
+        batch_count += 1;
+        if phase == "warmup" && std::env::var_os("VORTEX_GPU_DUMP_ARRAY_TREES").is_some() {
+            eprintln!(
+                "VORTEX_GPU_ARRAY_TREE batch={}\n{}",
+                batch_count - 1,
+                record.clone().into_array().display_tree()
+            );
+        }
+
+        for (field_index, (field, field_name)) in record
+            .iter_unmasked_fields()
+            .zip(record.struct_fields().names().iter())
+            .enumerate()
+        {
+            let metadata = profile_fields.then(|| {
+                (
+                    field.encoding_id().to_string(),
+                    field
+                        .display_tree_encodings_only()
+                        .to_string()
+                        .replace('\n', " | "),
+                )
+            });
+            let before = profile_gpu_spans
+                .then(|| cuda_ctx.stream().record_event(Some(CU_EVENT_DEFAULT)))
+                .transpose()?;
+            let nsys_range = profile_nsys.then(|| {
+                scoped_range(format!(
+                    "vortex_field batch={} field={field_index} name={field_name} encoding={}",
+                    batch_count - 1,
+                    field.encoding_id(),
+                ))
+            });
+            let execute_start = Instant::now();
+            black_box(field.clone().execute_cuda(cuda_ctx).await?);
+            let wall_time = execute_start.elapsed();
+            drop(nsys_range);
+            execute_time += wall_time;
+            let timing_events = if let Some(before) = before {
+                let after = cuda_ctx.stream().record_event(Some(CU_EVENT_DEFAULT))?;
+                Some((before, after))
+            } else {
+                None
+            };
+            if let Some((encoding, tree)) = metadata {
+                field_timings.push((
+                    batch_count - 1,
+                    field_index,
+                    field_name.to_string(),
+                    field.len(),
+                    encoding,
+                    tree,
+                    wall_time,
+                    timing_events,
+                ));
+            }
+            field_count += 1;
+        }
+    }
+
+    let sync_start = Instant::now();
+    cuda_ctx.synchronize_stream()?;
+    let sync_time = sync_start.elapsed();
+
+    for (batch, field, name, rows, encoding, tree, wall_time, timing_events) in field_timings {
+        let gpu_span_us = timing_events
+            .map(|(before, after)| before.elapsed_ms(&after))
+            .transpose()?
+            .map(|milliseconds| Duration::from_secs_f32(milliseconds / 1000.0))
+            .map(|duration| duration.as_micros().to_string())
+            .unwrap_or_else(|| "NA".to_string());
+        eprintln!(
+            "VORTEX_GPU_FIELD_TIMING\tbatch={batch}\tfield={field}\tname={name}\trows={rows}\tencoding={encoding}\twall_us={}\tgpu_span_us={gpu_span_us}\ttree={tree}",
+            wall_time.as_micros(),
+        );
+    }
+
+    tracing::debug!(
+        phase,
+        batch_count,
+        field_count,
+        ?open_time,
+        ?scan_time,
+        ?read_time,
+        ?struct_time,
+        ?execute_time,
+        ?sync_time,
+        "GPU Vortex decode stages"
+    );
+    Ok(())
 }
 
 /// Opens a Vortex file for CUDA execution.
@@ -146,9 +297,15 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<Durati
     std::fs::copy(path, host_path.path())?;
 
     let gpu_file = open_gpu(path, direct_io).await?;
-    let mut gpu_batches = gpu_file.scan()?.into_array_stream()?;
+    let mut gpu_batches = gpu_file
+        .scan()?
+        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .into_array_stream()?;
     let host_file = SESSION.open_options().open_path(host_path.path()).await?;
-    let mut host_batches = host_file.scan()?.into_array_stream()?;
+    let mut host_batches = host_file
+        .scan()?
+        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .into_array_stream()?;
 
     let mut fields_checked = 0usize;
     let mut batch_index = 0usize;

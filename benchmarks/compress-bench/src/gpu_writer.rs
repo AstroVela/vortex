@@ -9,6 +9,7 @@
 use clap::ValueEnum;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
+use parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
 use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
 use parquet::file::properties::WriterVersion;
@@ -19,6 +20,11 @@ use parquet::file::properties::WriterVersion;
 /// to amortize per-page setup and numerous enough to fill the device. ~1 MiB is the page size
 /// cuDF's Parquet reader is tuned around.
 pub const GPU_DATA_PAGE_SIZE: usize = 1024 * 1024;
+
+/// Rows per independently readable partition in both GPU benchmark formats.
+///
+/// Parquet calls these row groups and the CUDA Vortex layout stores one chunk per partition.
+pub const GPU_ROW_GROUP_SIZE: usize = DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
 
 /// Row cap per data page.
 ///
@@ -67,6 +73,7 @@ pub fn gpu_writer_properties(codec: GpuCodec) -> WriterProperties {
         .set_dictionary_enabled(true)
         .set_data_page_size_limit(GPU_DATA_PAGE_SIZE)
         .set_data_page_row_count_limit(GPU_DATA_PAGE_ROW_COUNT_LIMIT)
+        .set_max_row_group_row_count(Some(GPU_ROW_GROUP_SIZE))
         // Per-page statistics only inflate the page headers a reader has to walk.
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .build()
@@ -84,5 +91,9 @@ mod tests {
         assert_eq!(properties.writer_version(), WriterVersion::PARQUET_1_0);
         assert_eq!(properties.compression(&"x".into()), Compression::SNAPPY);
         assert_eq!(properties.data_page_size_limit(), GPU_DATA_PAGE_SIZE);
+        assert_eq!(
+            properties.max_row_group_row_count(),
+            Some(GPU_ROW_GROUP_SIZE)
+        );
     }
 }

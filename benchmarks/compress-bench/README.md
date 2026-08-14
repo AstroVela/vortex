@@ -30,6 +30,9 @@ GPU dataset list in `src/main.rs`. It measures decompression only, for two backe
 
 Both sides therefore decode all the way to device-resident arrays, which is what makes the
 `vortex:parquet-<codec> gpu ratio decompress time` metric a like-for-like comparison.
+The generated files also use the same 1,048,576-row physical partition size: Parquet row groups
+and Vortex root chunks. Vortex input batches are concatenated and sliced at those exact boundaries
+before writing, so smaller source batches cannot leak into its on-disk layout.
 
 ```bash
 cargo run -p compress-bench --profile release_debug \
@@ -53,11 +56,13 @@ uv pip install --extra-index-url https://pypi.nvidia.com cudf-cu12 pandas pyarro
 script, so interpreter start, `import cudf` and CUDA context creation are excluded; a warm-up
 read runs first for the same reason.
 
-Both backends read a warm file by default. cuDF runs an untimed warm-up read before the timed
-one, so its timed read hits the page cache; the Vortex reader therefore does **not** use direct
-I/O by default, because `O_DIRECT` would bypass the page cache and compare a Vortex read of the
-disk against a cuDF read of RAM. `--gpu-direct-io` turns it back on to measure storage bandwidth
-instead — a different question, and the resulting ratio is not a decode comparison.
+Both backends read a warm file by default. Each runs an untimed full read before a separately
+opened timed read, warming the OS page cache, allocator, and CUDA modules. Neither reuses decoded
+arrays, and the Vortex CUDA opener disables its data-segment cache. The Vortex reader therefore
+does **not** use direct I/O by default, because `O_DIRECT` would bypass the page cache and compare
+a Vortex read of the disk against a cuDF read of RAM. `--gpu-direct-io` turns it back on to measure
+storage bandwidth instead — a different question, and the resulting ratio is not a decode
+comparison.
 
 The remaining asymmetry is the transfer path: the Vortex reader uses pinned buffers, while cuDF
 does its own host read and host-to-device copy.
@@ -73,6 +78,7 @@ Set in `src/gpu_writer.rs`:
 | dictionary | enabled | Keeps the decompressed payload small; the encoding GPU Parquet readers decode fastest. |
 | data page size | 1 MiB | Large enough to amortize per-page setup, small enough to keep every SM fed. Matches the page size cuDF targets. |
 | data page row limit | 1,000,000 | The 20k-row default caps narrow columns' pages far below 1 MiB. |
+| row-group / root-chunk rows | 1,048,576 | Gives both formats the same independently readable physical partitions and amortizes GPU launch overhead. |
 | statistics | chunk-level | Page statistics only inflate the headers a reader has to walk. |
 
 ### Correctness
