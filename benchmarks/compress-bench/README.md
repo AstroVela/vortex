@@ -47,6 +47,51 @@ cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress --formats vortex
 ```
 
+### Vortex GPU profiling
+
+`--gpu-vortex-profile wall|gpu|nsys` enables opt-in diagnostics for the Vortex backend. `wall`
+records host timings, `gpu` also brackets every field dispatch with CUDA events, and `nsys` adds
+per-field NVTX ranges. These modes perturb the measured run; use them to explain a result, then
+rerun without the flag for the comparison number.
+
+After each timed stream synchronization, the benchmark writes one JSON record to stderr with
+`record="vortex_gpu_decompress_profile"`. It includes file/layout sizes and counts, decoded rows,
+batches and field dispatches; `stages` contains microsecond wall times; and `encodings` groups calls,
+rows and wall time by full encoding tree and field name. In `gpu` mode, each encoding group also has
+`gpu_us`; it is `null` in the other modes.
+
+```bash
+cargo run -p compress-bench --profile release_debug \
+  --features cuda,unstable_encodings -- --gpu-decompress --formats vortex \
+  --datasets '^(Arade|Bimbo|CMSprovider)$' --iterations 3 \
+  --gpu-vortex-profile gpu 2> /tmp/vortex-gpu-profile.log
+
+# Ignore non-JSON progress/log lines and average the main stages by dataset.
+jq -Rs '
+  [split("\n")[] | fromjson? |
+   select(.record == "vortex_gpu_decompress_profile")]
+  | group_by(.dataset)
+  | map({
+      dataset: .[0].dataset,
+      runs: length,
+      total_us: (map(.stages.total_us) | add / length),
+      read_us: (map(.stages.read_us) | add / length),
+      dispatch_us: (map(.stages.field_dispatch_us) | add / length),
+      gpu_us: (map([.encodings[].gpu_us // empty] | add) | add / length)
+    })
+' /tmp/vortex-gpu-profile.log
+```
+
+`open_us` covers opening and footer metadata, `scan_plan_us` builds the scan stream, `read_us`
+awaits batches, `struct_dispatch_us` materializes each struct batch, `field_dispatch_us` measures
+CPU planning/enqueue time for field decodes, and `final_sync_us` is the remaining device tail.
+`profile_overhead_us` is the remainder spent collecting diagnostics, primarily encoding-tree
+formatting and CUDA-event bookkeeping; it makes the profiler's own perturbation explicit.
+Because CUDA work is asynchronous, `read_us` can include I/O, layout execution, backpressure, and
+waiting for earlier device work; it is not pure storage time. `gpu_us` is the device-stream time
+between field events. Allocation/free, upload, wait, event, and callback counts are not available
+from this record; use Nsight Systems for those runtime-wide counts.
+
 ### cuDF
 
 cuDF is reached through its prebuilt `cudf-cu12` wheel, so it is a runtime dependency of the

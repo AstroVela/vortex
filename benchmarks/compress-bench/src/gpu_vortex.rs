@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -13,9 +17,12 @@ use anyhow::ensure;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_schema::Field;
 use async_trait::async_trait;
+use clap::ValueEnum;
+use cudarc::driver::CudaEvent;
 use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
 use cudarc::nvtx::safe::scoped_range;
 use futures::StreamExt;
+use serde::Serialize;
 use tempfile::NamedTempFile;
 use vortex::array::ArrayRef;
 use vortex::array::ExecutionCtx;
@@ -46,10 +53,34 @@ use vortex_cuda::layout::register_cuda_layout;
 
 use crate::gpu_writer::GPU_ROW_GROUP_SIZE;
 
+/// Optional diagnostics for the Vortex GPU decompression path.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum GpuVortexProfile {
+    /// Record host wall time for each stage and encoding dispatch group.
+    Wall,
+    /// Also bracket each field dispatch with CUDA events and report device-stream elapsed time.
+    Gpu,
+    /// Add NVTX ranges for correlating field dispatches with an Nsight Systems capture.
+    Nsys,
+}
+
+impl GpuVortexProfile {
+    fn records_gpu_spans(self) -> bool {
+        matches!(self, Self::Gpu)
+    }
+
+    fn records_nsys_ranges(self) -> bool {
+        matches!(self, Self::Nsys)
+    }
+}
+
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
 pub struct GpuVortexCompressor {
     verify: bool,
     direct_io: bool,
+    profile: Option<GpuVortexProfile>,
+    dataset: Arc<str>,
+    iteration: AtomicUsize,
 }
 
 impl GpuVortexCompressor {
@@ -58,8 +89,19 @@ impl GpuVortexCompressor {
     /// When `verify` is set, each GPU-decoded field is copied back to the host and compared
     /// against the same field decoded on the CPU. Verification runs inline, so timings from a
     /// verifying run are not comparable to a plain one.
-    pub fn new(verify: bool, direct_io: bool) -> Self {
-        Self { verify, direct_io }
+    pub fn new(
+        verify: bool,
+        direct_io: bool,
+        profile: Option<GpuVortexProfile>,
+        dataset: &str,
+    ) -> Self {
+        Self {
+            verify,
+            direct_io,
+            profile,
+            dataset: dataset.into(),
+            iteration: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -112,12 +154,102 @@ impl Compressor for GpuVortexCompressor {
         // Match cuDF's untimed read: pay CUDA module loading, allocator initialization and page
         // faults before measuring. The helper opens and scans the file afresh each time, and the
         // CUDA opener disables its data-segment cache, so no decoded arrays are reused.
-        decode_gpu_file(gpu_file.path(), self.direct_io, &mut cuda_ctx, "warmup").await?;
+        decode_gpu_file(
+            gpu_file.path(),
+            self.direct_io,
+            &mut cuda_ctx,
+            "warmup",
+            None,
+        )
+        .await?;
 
+        let profile = self.profile.map(|mode| ProfileRun {
+            mode,
+            dataset: self.dataset.as_ref(),
+            iteration: self.iteration.fetch_add(1, Ordering::Relaxed),
+        });
         let start = Instant::now();
-        decode_gpu_file(gpu_file.path(), self.direct_io, &mut cuda_ctx, "timed").await?;
+        decode_gpu_file(
+            gpu_file.path(),
+            self.direct_io,
+            &mut cuda_ctx,
+            "timed",
+            profile,
+        )
+        .await?;
         Ok(start.elapsed())
     }
+}
+
+/// Runtime information attached to one profiled timed decode.
+#[derive(Clone, Copy)]
+struct ProfileRun<'a> {
+    mode: GpuVortexProfile,
+    dataset: &'a str,
+    iteration: usize,
+}
+
+struct FieldTiming {
+    field_name: String,
+    rows: usize,
+    encoding: String,
+    tree: String,
+    wall_time: Duration,
+    gpu_events: Option<(CudaEvent, CudaEvent)>,
+}
+
+#[derive(Default)]
+struct EncodingAggregate {
+    calls: usize,
+    rows: usize,
+    fields: BTreeSet<String>,
+    wall_time: Duration,
+    gpu_time_us: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct EncodingProfileRecord {
+    encoding: String,
+    tree: String,
+    fields: Vec<String>,
+    calls: usize,
+    rows: usize,
+    wall_us: u64,
+    gpu_us: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StageProfileRecord {
+    total_us: u64,
+    open_us: u64,
+    scan_plan_us: u64,
+    read_us: u64,
+    struct_dispatch_us: u64,
+    field_dispatch_us: u64,
+    final_sync_us: u64,
+    profile_overhead_us: u64,
+}
+
+#[derive(Serialize)]
+struct GpuProfileRecord<'a> {
+    record: &'static str,
+    version: u8,
+    dataset: &'a str,
+    iteration: usize,
+    mode: &'static str,
+    direct_io: bool,
+    file_bytes: u64,
+    data_segment_bytes: u64,
+    data_segments: usize,
+    root_layout: String,
+    root_layout_children: usize,
+    file_rows: u64,
+    decoded_rows: usize,
+    batches: usize,
+    fields_per_batch: usize,
+    field_dispatches: usize,
+    stages: StageProfileRecord,
+    encodings: Vec<EncodingProfileRecord>,
 }
 
 /// Decode every row and column from a fresh file open into device-resident canonical arrays.
@@ -126,10 +258,34 @@ async fn decode_gpu_file(
     direct_io: bool,
     cuda_ctx: &mut CudaExecutionCtx,
     phase: &'static str,
+    profile: Option<ProfileRun<'_>>,
 ) -> Result<()> {
+    let total_start = profile.map(|_| Instant::now());
     let open_start = Instant::now();
     let file = open_gpu(path, direct_io).await?;
     let open_time = open_start.elapsed();
+
+    let file_bytes = profile
+        .is_some()
+        .then(|| std::fs::metadata(path).map(|metadata| metadata.len()))
+        .transpose()?;
+    let (data_segments, data_segment_bytes, root_layout, root_layout_children, file_rows) =
+        if profile.is_some() {
+            let footer = file.footer();
+            (
+                footer.segment_map().len(),
+                footer
+                    .segment_map()
+                    .iter()
+                    .map(|segment| u64::from(segment.length))
+                    .sum(),
+                footer.layout().encoding_id().to_string(),
+                footer.layout().nchildren(),
+                file.row_count(),
+            )
+        } else {
+            (0, 0, String::new(), 0, 0)
+        };
 
     let scan_start = Instant::now();
     let mut batches = file
@@ -142,16 +298,11 @@ async fn decode_gpu_file(
     let mut struct_time = Duration::ZERO;
     let mut execute_time = Duration::ZERO;
     let mut batch_count = 0usize;
+    let mut decoded_rows = 0usize;
+    let mut fields_per_batch = 0usize;
     let mut field_count = 0usize;
-    // Diagnostic modes: `wall` times the host call, `gpu` also brackets its stream work with
-    // CUDA events, and `nsys` labels every call with NVTX. All modes perturb the benchmark and
-    // print their records only after the final stream synchronization.
-    let profile_mode = (phase == "timed")
-        .then(|| std::env::var("VORTEX_GPU_PROFILE_FIELDS").ok())
-        .flatten();
-    let profile_fields = profile_mode.is_some();
-    let profile_gpu_spans = profile_mode.as_deref() == Some("gpu");
-    let profile_nsys = profile_mode.as_deref() == Some("nsys");
+    let profile_gpu_spans = profile.is_some_and(|run| run.mode.records_gpu_spans());
+    let profile_nsys = profile.is_some_and(|run| run.mode.records_nsys_ranges());
     let mut field_timings = Vec::new();
     loop {
         let read_start = Instant::now();
@@ -165,6 +316,10 @@ async fn decode_gpu_file(
         let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
         struct_time += struct_start.elapsed();
         batch_count += 1;
+        decoded_rows += record.len();
+        if batch_count == 1 {
+            fields_per_batch = record.struct_fields().names().len();
+        }
         if phase == "warmup" && std::env::var_os("VORTEX_GPU_DUMP_ARRAY_TREES").is_some() {
             eprintln!(
                 "VORTEX_GPU_ARRAY_TREE batch={}\n{}",
@@ -178,7 +333,7 @@ async fn decode_gpu_file(
             .zip(record.struct_fields().names().iter())
             .enumerate()
         {
-            let metadata = profile_fields.then(|| {
+            let metadata = profile.map(|_| {
                 (
                     field.encoding_id().to_string(),
                     field
@@ -202,23 +357,21 @@ async fn decode_gpu_file(
             let wall_time = execute_start.elapsed();
             drop(nsys_range);
             execute_time += wall_time;
-            let timing_events = if let Some(before) = before {
+            let gpu_events = if let Some(before) = before {
                 let after = cuda_ctx.stream().record_event(Some(CU_EVENT_DEFAULT))?;
                 Some((before, after))
             } else {
                 None
             };
             if let Some((encoding, tree)) = metadata {
-                field_timings.push((
-                    batch_count - 1,
-                    field_index,
-                    field_name.to_string(),
-                    field.len(),
+                field_timings.push(FieldTiming {
+                    field_name: field_name.to_string(),
+                    rows: field.len(),
                     encoding,
                     tree,
                     wall_time,
-                    timing_events,
-                ));
+                    gpu_events,
+                });
             }
             field_count += 1;
         }
@@ -227,18 +380,76 @@ async fn decode_gpu_file(
     let sync_start = Instant::now();
     cuda_ctx.synchronize_stream()?;
     let sync_time = sync_start.elapsed();
+    let total_time = total_start.map(|start| start.elapsed());
 
-    for (batch, field, name, rows, encoding, tree, wall_time, timing_events) in field_timings {
-        let gpu_span_us = timing_events
-            .map(|(before, after)| before.elapsed_ms(&after))
-            .transpose()?
-            .map(|milliseconds| Duration::from_secs_f32(milliseconds / 1000.0))
-            .map(|duration| duration.as_micros().to_string())
-            .unwrap_or_else(|| "NA".to_string());
-        eprintln!(
-            "VORTEX_GPU_FIELD_TIMING\tbatch={batch}\tfield={field}\tname={name}\trows={rows}\tencoding={encoding}\twall_us={}\tgpu_span_us={gpu_span_us}\ttree={tree}",
-            wall_time.as_micros(),
-        );
+    if let Some(profile) = profile {
+        let mut encodings: BTreeMap<(String, String), EncodingAggregate> = BTreeMap::new();
+        for timing in field_timings {
+            let gpu_time_us = timing
+                .gpu_events
+                .map(|(before, after)| before.elapsed_ms(&after))
+                .transpose()?
+                .map(|milliseconds| duration_us(Duration::from_secs_f32(milliseconds / 1_000.0)));
+            let aggregate = encodings.entry((timing.encoding, timing.tree)).or_default();
+            aggregate.calls += 1;
+            aggregate.rows += timing.rows;
+            aggregate.fields.insert(timing.field_name);
+            aggregate.wall_time += timing.wall_time;
+            aggregate.gpu_time_us = match (aggregate.gpu_time_us, gpu_time_us) {
+                (Some(total), Some(elapsed)) => Some(total.saturating_add(elapsed)),
+                (None, Some(elapsed)) => Some(elapsed),
+                (total, None) => total,
+            };
+        }
+        let encodings = encodings
+            .into_iter()
+            .map(|((encoding, tree), aggregate)| EncodingProfileRecord {
+                encoding,
+                tree,
+                fields: aggregate.fields.into_iter().collect(),
+                calls: aggregate.calls,
+                rows: aggregate.rows,
+                wall_us: duration_us(aggregate.wall_time),
+                gpu_us: aggregate.gpu_time_us,
+            })
+            .collect();
+        let accounted_time =
+            open_time + scan_time + read_time + struct_time + execute_time + sync_time;
+        let total_time = total_time.unwrap_or_default();
+        let record = GpuProfileRecord {
+            record: "vortex_gpu_decompress_profile",
+            version: 1,
+            dataset: profile.dataset,
+            iteration: profile.iteration,
+            mode: match profile.mode {
+                GpuVortexProfile::Wall => "wall",
+                GpuVortexProfile::Gpu => "gpu",
+                GpuVortexProfile::Nsys => "nsys",
+            },
+            direct_io,
+            file_bytes: file_bytes.unwrap_or_default(),
+            data_segment_bytes,
+            data_segments,
+            root_layout,
+            root_layout_children,
+            file_rows,
+            decoded_rows,
+            batches: batch_count,
+            fields_per_batch,
+            field_dispatches: field_count,
+            stages: StageProfileRecord {
+                total_us: duration_us(total_time),
+                open_us: duration_us(open_time),
+                scan_plan_us: duration_us(scan_time),
+                read_us: duration_us(read_time),
+                struct_dispatch_us: duration_us(struct_time),
+                field_dispatch_us: duration_us(execute_time),
+                final_sync_us: duration_us(sync_time),
+                profile_overhead_us: duration_us(total_time.saturating_sub(accounted_time)),
+            },
+            encodings,
+        };
+        eprintln!("{}", serde_json::to_string(&record)?);
     }
 
     tracing::debug!(
@@ -254,6 +465,10 @@ async fn decode_gpu_file(
         "GPU Vortex decode stages"
     );
     Ok(())
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Opens a Vortex file for CUDA execution.

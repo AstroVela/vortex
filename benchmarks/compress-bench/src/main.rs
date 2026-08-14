@@ -14,6 +14,8 @@ use compress_bench::LanceCompressor;
 use compress_bench::gpu_parquet::GpuParquetCompressor;
 #[cfg(feature = "cuda")]
 use compress_bench::gpu_vortex::GpuVortexCompressor;
+#[cfg(feature = "cuda")]
+use compress_bench::gpu_vortex::GpuVortexProfile;
 use compress_bench::gpu_writer::GpuCodec;
 use compress_bench::parquet::ParquetCompressor;
 use compress_bench::vortex::VortexCompressor;
@@ -103,6 +105,13 @@ struct Args {
     /// measure storage bandwidth instead, and do not read the ratio as a decode comparison.
     #[arg(long)]
     gpu_direct_io: bool,
+    /// Emit machine-readable Vortex GPU decode metrics after each timed stream synchronization.
+    ///
+    /// `wall` reports stage and encoding dispatch wall time, `gpu` additionally records CUDA
+    /// event spans around each field, and `nsys` adds per-field NVTX ranges.
+    #[cfg(feature = "cuda")]
+    #[arg(long, value_enum)]
+    gpu_vortex_profile: Option<GpuVortexProfile>,
     #[arg(short, long, default_value_t, value_enum)]
     display_format: DisplayFormat,
     #[arg(short, long)]
@@ -127,11 +136,21 @@ async fn main() -> anyhow::Result<()> {
     if args.gpu_decompress && !cfg!(feature = "cuda") {
         anyhow::bail!("--gpu-decompress requires building compress-bench with --features cuda");
     }
+    #[cfg(feature = "cuda")]
+    if args.gpu_vortex_profile.is_some() && !args.gpu_decompress {
+        anyhow::bail!("--gpu-vortex-profile requires --gpu-decompress");
+    }
+    #[cfg(feature = "cuda")]
+    if args.gpu_vortex_profile.is_some() && args.gpu_verify {
+        anyhow::bail!("--gpu-vortex-profile cannot be combined with --gpu-verify");
+    }
 
     let gpu = args.gpu_decompress.then_some(GpuOptions {
         codec: args.gpu_parquet_codec,
         verify: args.gpu_verify,
         direct_io: args.gpu_direct_io,
+        #[cfg(feature = "cuda")]
+        vortex_profile: args.gpu_vortex_profile,
     });
 
     #[cfg(feature = "cuda")]
@@ -173,16 +192,22 @@ struct GpuOptions {
     verify: bool,
     /// Read the Vortex file with direct IO instead of through the page cache.
     direct_io: bool,
+    /// Optional diagnostics for the Vortex GPU path.
+    #[cfg(feature = "cuda")]
+    vortex_profile: Option<GpuVortexProfile>,
 }
 
 /// Get a compressor for the given format.
-fn get_compressor(format: Format, gpu: Option<GpuOptions>) -> Box<dyn Compressor> {
+fn get_compressor(format: Format, gpu: Option<GpuOptions>, _dataset: &str) -> Box<dyn Compressor> {
     if let Some(gpu) = gpu {
         #[cfg(feature = "cuda")]
         return match format {
-            Format::OnDiskVortex => {
-                Box::new(GpuVortexCompressor::new(gpu.verify, gpu.direct_io)) as Box<dyn Compressor>
-            }
+            Format::OnDiskVortex => Box::new(GpuVortexCompressor::new(
+                gpu.verify,
+                gpu.direct_io,
+                gpu.vortex_profile,
+                _dataset,
+            )) as Box<dyn Compressor>,
             Format::Parquet => Box::new(GpuParquetCompressor::new(gpu.codec, gpu.verify)),
             _ => unimplemented!("GPU compress bench not implemented for {format}"),
         };
@@ -414,7 +439,7 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, gpu);
+        let compressor = get_compressor(*format, gpu, bench_name);
 
         for op in ops {
             let time = match op {
