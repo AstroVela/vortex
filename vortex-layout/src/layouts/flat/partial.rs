@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures::FutureExt;
 use futures::future::try_join_all;
@@ -81,6 +82,7 @@ struct ALPRDReadPlan {
     element_dtype: DType,
     list_size: u32,
     row_count: usize,
+    patches: Arc<OnceLock<Patches>>,
 }
 
 struct PageResolveContext<'a> {
@@ -314,17 +316,20 @@ impl PartialReadPlan {
                         ))
                     })
                     .collect::<Option<Vec<_>>>()?;
-                let patch_specs = plan
-                    .patch_buffers
-                    .iter()
-                    .map(|descriptor| {
-                        Some((
-                            u64::try_from(descriptor.range().start).ok()?
-                                ..u64::try_from(descriptor.range().end).ok()?,
-                            descriptor.clone(),
-                        ))
-                    })
-                    .collect::<Option<Vec<_>>>()?;
+                let patch_specs = if plan.patches.get().is_some() {
+                    Vec::new()
+                } else {
+                    plan.patch_buffers
+                        .iter()
+                        .map(|descriptor| {
+                            Some((
+                                u64::try_from(descriptor.range().start).ok()?
+                                    ..u64::try_from(descriptor.range().end).ok()?,
+                                descriptor.clone(),
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()?
+                };
                 let ranges = page_specs
                     .iter()
                     .flat_map(|(_, left, right)| [left.clone(), right.clone()])
@@ -526,36 +531,42 @@ async fn resolve_alprd_pages(
     // together so the driver can issue and coalesce patch, left-part, and right-part reads in one
     // I/O round; array reconstruction starts only after that set has resolved.
     let (patch_handles, page_handles) = futures::try_join!(patch_handles, page_handles)?;
-    let mut handles = empty_handles(plan.descriptors.len());
-    for (index, handle) in patch_handles {
-        handles[index] = handle;
-    }
-    let serialized = plan.serialized.with_buffers(handles);
-    let alprd = serialized.child(0);
-    let patch_len = plan.patch_metadata.len()?;
-    let patch_indices =
-        alprd
-            .child(2)
-            .decode(&plan.patch_indices_dtype, patch_len, ctx, session)?;
-    let patch_indices = patch_indices
-        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?
-        .into_array();
-    let patch_values = alprd.child(3).decode(
-        &plan.left_parts_dtype.as_nonnullable(),
-        patch_len,
-        ctx,
-        session,
-    )?;
-    let full_inner_len = usize::try_from(plan.list_size)?
-        .checked_mul(plan.row_count)
-        .ok_or_else(|| vortex_err!("ALPRD inner length overflow"))?;
-    let full_patches = Patches::new(
-        full_inner_len,
-        plan.patch_metadata.offset()?,
-        patch_indices,
-        patch_values,
-        None,
-    )?;
+    let full_patches = if let Some(patches) = plan.patches.get() {
+        patches.clone()
+    } else {
+        let mut handles = empty_handles(plan.descriptors.len());
+        for (index, handle) in patch_handles {
+            handles[index] = handle;
+        }
+        let serialized = plan.serialized.with_buffers(handles);
+        let alprd = serialized.child(0);
+        let patch_len = plan.patch_metadata.len()?;
+        let patch_indices =
+            alprd
+                .child(2)
+                .decode(&plan.patch_indices_dtype, patch_len, ctx, session)?;
+        let patch_indices = patch_indices
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?
+            .into_array();
+        let patch_values = alprd.child(3).decode(
+            &plan.left_parts_dtype.as_nonnullable(),
+            patch_len,
+            ctx,
+            session,
+        )?;
+        let full_inner_len = usize::try_from(plan.list_size)?
+            .checked_mul(plan.row_count)
+            .ok_or_else(|| vortex_err!("ALPRD inner length overflow"))?;
+        let patches = Patches::new(
+            full_inner_len,
+            plan.patch_metadata.offset()?,
+            patch_indices,
+            patch_values,
+            None,
+        )?;
+        drop(plan.patches.set(patches.clone()));
+        patches
+    };
 
     page_handles
         .into_iter()
@@ -844,6 +855,7 @@ fn try_alprd_plan(
             element_dtype: element_dtype.as_ref().clone(),
             list_size: *list_size,
             row_count,
+            patches: Arc::new(OnceLock::new()),
         },
         bytes_per_row,
     )))
