@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::io;
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -30,7 +29,7 @@ use crate::ReadAtStream;
 use crate::VortexReadAt;
 use crate::runtime::Handle;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::std_file::read_exact_at;
+use crate::std_file::read_exact_at_pooled;
 
 /// Default number of concurrent requests to allow.
 pub const DEFAULT_CONCURRENCY: usize = 192;
@@ -97,7 +96,6 @@ async fn read_object_store_range(
         alignment,
     } = request;
     let range = offset..(offset + length as u64);
-    let mut buffer = allocator.allocate(length, alignment)?;
 
     let response = store
         .get_opts(
@@ -110,19 +108,20 @@ async fn read_object_store_range(
         .await?;
 
     let buffer = match response.payload {
+        // A local store hands back a real file, so this is the same read as `FileReadAt`: take
+        // whatever the page cache already holds here, and only pay for the blocking pool if there
+        // is a tail left to read.
         #[cfg(not(target_arch = "wasm32"))]
-        GetResultPayload::File(file, _) => io_handle
-            .spawn_blocking(move || {
-                read_exact_at(&file, buffer.as_mut_slice(), range.start)?;
-                Ok::<_, io::Error>(buffer)
-            })
-            .await
-            .map_err(io::Error::other)?,
+        GetResultPayload::File(file, _) => {
+            read_exact_at_pooled(&io_handle, file, allocator, length, alignment, range.start)
+                .await?
+        }
         #[cfg(target_arch = "wasm32")]
         GetResultPayload::File(..) => {
             unreachable!("File payload not supported on wasm32")
         }
         GetResultPayload::Stream(mut byte_stream) => {
+            let mut buffer = allocator.allocate(length, alignment)?;
             let mut written = 0usize;
             while let Some(bytes) = byte_stream.next().await {
                 let bytes = bytes?;
@@ -251,17 +250,22 @@ impl VortexReadAt for ObjectStoreReadAt {
 
 #[cfg(test)]
 mod tests {
+    // Test offsets and lengths are small literals, so narrowing casts cannot lose information.
+    #![expect(clippy::cast_possible_truncation)]
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use object_store::PutPayload;
     use object_store::memory::InMemory;
+    use rstest::rstest;
 
     use super::*;
     use crate::runtime::AbortHandle;
     use crate::runtime::AbortHandleRef;
     use crate::runtime::Executor;
+    use crate::std_file::NOWAIT_MAX_READ_LENGTH;
+    use crate::std_file::NOWAIT_MIN_READ_LENGTH;
 
     const TEST_DATA: &[u8] = b"object store test data";
 
@@ -305,11 +309,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn read_at_uses_spawn_io() -> anyhow::Result<()> {
+    /// A [`Handle`] only holds a weak reference to its runtime, so the caller must keep the
+    /// returned executor alive for the duration of the test.
+    fn test_handle() -> (Arc<CountingExecutor>, Handle) {
         let executor = Arc::new(CountingExecutor::default());
         let runtime = Arc::clone(&executor) as Arc<dyn Executor>;
         let handle = Handle::new(Arc::downgrade(&runtime));
+        (executor, handle)
+    }
+
+    #[tokio::test]
+    async fn read_at_uses_spawn_io() -> anyhow::Result<()> {
+        let (executor, handle) = test_handle();
 
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let path = ObjectPath::from("test.bin");
@@ -327,9 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_ranges_uses_one_io_task() -> anyhow::Result<()> {
-        let executor = Arc::new(CountingExecutor::default());
-        let runtime = Arc::clone(&executor) as Arc<dyn Executor>;
-        let handle = Handle::new(Arc::downgrade(&runtime));
+        let (executor, handle) = test_handle();
 
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let path = ObjectPath::from("test.bin");
@@ -355,6 +364,64 @@ mod tests {
         }
         assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
         assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    /// A local store returns a real file, so reads can take the page-cache fast path. Reads inside
+    /// and outside the fast-path window must return the same bytes as the file holds.
+    #[rstest]
+    #[case(0, 1024)]
+    #[case(11, NOWAIT_MIN_READ_LENGTH)]
+    #[case(4096, NOWAIT_MAX_READ_LENGTH)]
+    #[case(4096, 4 * NOWAIT_MAX_READ_LENGTH)]
+    #[tokio::test]
+    async fn local_file_read_at_returns_file_contents(
+        #[case] offset: u64,
+        #[case] length: usize,
+    ) -> anyhow::Result<()> {
+        let total = offset as usize + length + 7;
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("test.bin"), &data)?;
+
+        let (_executor, handle) = test_handle();
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+            dir.path(),
+        )?) as _;
+        let reader = ObjectStoreReadAt::new(store, ObjectPath::from("test.bin"), handle);
+
+        let buffer = reader.read_at(offset, length, Alignment::new(1)).await?;
+        assert_eq!(
+            buffer.to_host().await.as_slice(),
+            &data[offset as usize..][..length]
+        );
+
+        Ok(())
+    }
+
+    /// A fast-path read that runs past the end of the file must still error rather than returning
+    /// a partially filled buffer.
+    #[tokio::test]
+    async fn local_file_read_at_past_eof_is_an_error() -> anyhow::Result<()> {
+        let length = 2 * NOWAIT_MIN_READ_LENGTH;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("test.bin"), vec![7u8; length])?;
+
+        let (_executor, handle) = test_handle();
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+            dir.path(),
+        )?) as _;
+        let reader = ObjectStoreReadAt::new(store, ObjectPath::from("test.bin"), handle);
+
+        assert!(
+            reader
+                .read_at(0, length + 1, Alignment::new(1))
+                .await
+                .is_err(),
+            "expected a read past EOF to fail"
+        );
 
         Ok(())
     }
