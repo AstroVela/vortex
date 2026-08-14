@@ -18,15 +18,18 @@ use vortex_session::VortexSession;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::Constant;
 use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
 use crate::dtype::DType;
 use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::display::ExprDisplay;
+use crate::scalar::Scalar;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::TypedScalarFnInstance;
+use crate::scalar_fn::fns::literal::Literal;
 
 /// This trait defines the interface for scalar function vtables, including methods for
 /// serialization, deserialization, validation, child naming, return type computation,
@@ -249,6 +252,17 @@ pub trait ReduceNode: Clone {
     /// Return this node's scalar function if it is indeed a scalar fn.
     fn scalar_fn(&self) -> Option<&ScalarFnRef>;
 
+    /// Return this node's constant value if it is indeed a constant.
+    ///
+    /// Each tree kind spells constants differently: expression trees always use a [`Literal`]
+    /// scalar function, while array trees use a [`ConstantArray`] once the literal has been
+    /// lowered. Rules that fold constant operands must go through this method, since
+    /// [`ReduceNode::scalar_fn`] does not observe a lowered constant.
+    ///
+    /// [`Literal`]: crate::scalar_fn::fns::literal::Literal
+    /// [`ConstantArray`]: crate::arrays::ConstantArray
+    fn as_constant(&self) -> Option<Scalar>;
+
     /// Descend to the child of this node.
     fn child(&self, idx: usize) -> Self;
 
@@ -294,6 +308,10 @@ impl ReduceNode for ExpressionReduceNode<'_> {
 
     fn scalar_fn(&self) -> Option<&ScalarFnRef> {
         self.expression.as_scalar()
+    }
+
+    fn as_constant(&self) -> Option<Scalar> {
+        self.expression.as_opt::<Literal>().cloned()
     }
 
     fn child(&self, idx: usize) -> Self {
@@ -360,6 +378,16 @@ impl ReduceNode for ArrayReduceNode<'_> {
         self.array
             .as_opt::<ScalarFn>()
             .map(|a| a.data().scalar_fn())
+    }
+
+    fn as_constant(&self) -> Option<Scalar> {
+        if let Some(constant) = self.array.as_opt::<Constant>() {
+            return Some(constant.scalar().clone());
+        }
+        // A literal that has not been lowered to a constant array yet.
+        self.scalar_fn()
+            .and_then(|scalar_fn| scalar_fn.as_opt::<Literal>())
+            .cloned()
     }
 
     fn child(&self, idx: usize) -> Self {

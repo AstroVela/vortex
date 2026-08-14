@@ -97,6 +97,49 @@ where
     }
 }
 
+/// The result of folding a Kleene `And`/`Or` that has at least one constant operand.
+pub(crate) enum BooleanFold {
+    /// The operator always evaluates to this value. `None` is a boolean null.
+    Constant(Option<bool>),
+    /// The operator always evaluates to its child at this index.
+    Child(usize),
+}
+
+/// Fold a Kleene `And`/`Or` over operands that may be boolean constants.
+///
+/// Each operand is `Some(value)` when it is a boolean constant, where the inner [`Option`] carries
+/// a boolean null. Returns `None` when the operator cannot be folded.
+///
+/// This is the single source of truth for constant folding of the boolean operators, shared by
+/// the untyped expression simplification and the typed reduction rule.
+pub(crate) fn fold_boolean_constants(
+    operator: Operator,
+    lhs: Option<Option<bool>>,
+    rhs: Option<Option<bool>>,
+) -> Option<BooleanFold> {
+    // Under Kleene semantics the annihilator absorbs a null operand, so `false AND null` is
+    // `false` and `true OR null` is `true`. The identity element is its complement.
+    let annihilator = match operator {
+        Operator::And => false,
+        Operator::Or => true,
+        _ => return None,
+    };
+
+    match (lhs, rhs) {
+        (Some(Some(value)), _) | (_, Some(Some(value))) if value == annihilator => {
+            Some(BooleanFold::Constant(Some(annihilator)))
+        }
+        // Booleans are two-valued, so any remaining non-null constant is the identity element
+        // and leaves the other operand unchanged.
+        (Some(Some(_)), _) => Some(BooleanFold::Child(1)),
+        (_, Some(Some(_))) => Some(BooleanFold::Child(0)),
+        (Some(None), Some(None)) => Some(BooleanFold::Constant(None)),
+        // A single null cannot be folded: `null AND x` is `false` when `x` is false and `null`
+        // otherwise, and symmetrically `null OR x` is `true` when `x` is true.
+        _ => None,
+    }
+}
+
 /// Point-wise Kleene logical _and_ between two Boolean arrays.
 #[deprecated(note = "Use `ArrayBuiltins::binary` instead")]
 pub fn and_kleene(lhs: &ArrayRef, rhs: &ArrayRef) -> VortexResult<ArrayRef> {
@@ -717,7 +760,11 @@ fn is_boolean_operator(operator: Operator) -> bool {
 mod tests {
     use rstest::rstest;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
 
+    use super::BooleanFold;
+    use super::boolean_scalar_scalar;
+    use super::fold_boolean_constants;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
@@ -730,6 +777,68 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::operators::Operator;
+
+    #[rstest]
+    #[case(Operator::And)]
+    #[case(Operator::Or)]
+    fn fold_agrees_with_kleene_semantics(#[case] operator: Operator) -> VortexResult<()> {
+        // Every pair of constants is foldable, and the fold must agree with the semantics that
+        // execution would produce for the same pair.
+        for lhs in [Some(true), Some(false), None] {
+            for rhs in [Some(true), Some(false), None] {
+                let expected = boolean_scalar_scalar(lhs, rhs, operator)?;
+                let folded = fold_boolean_constants(operator, Some(lhs), Some(rhs))
+                    .ok_or_else(|| vortex_err!("{operator}: {lhs:?}/{rhs:?} should fold"))?;
+
+                let actual = match folded {
+                    BooleanFold::Constant(value) => value,
+                    BooleanFold::Child(0) => lhs,
+                    BooleanFold::Child(_) => rhs,
+                };
+                assert_eq!(actual, expected, "{operator} over {lhs:?} and {rhs:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(Operator::And, false)]
+    #[case(Operator::Or, true)]
+    fn fold_with_one_non_constant_operand(#[case] operator: Operator, #[case] annihilator: bool) {
+        // The annihilator absorbs an unknown operand from either side.
+        for fold in [
+            fold_boolean_constants(operator, Some(Some(annihilator)), None),
+            fold_boolean_constants(operator, None, Some(Some(annihilator))),
+        ] {
+            assert!(matches!(
+                fold,
+                Some(BooleanFold::Constant(Some(value))) if value == annihilator
+            ));
+        }
+
+        // The identity element leaves the unknown operand as the result.
+        assert!(matches!(
+            fold_boolean_constants(operator, Some(Some(!annihilator)), None),
+            Some(BooleanFold::Child(1))
+        ));
+        assert!(matches!(
+            fold_boolean_constants(operator, None, Some(Some(!annihilator))),
+            Some(BooleanFold::Child(0))
+        ));
+
+        // A lone null is value-dependent, so it cannot fold.
+        assert!(fold_boolean_constants(operator, Some(None), None).is_none());
+        assert!(fold_boolean_constants(operator, None, Some(None)).is_none());
+        assert!(fold_boolean_constants(operator, None, None).is_none());
+    }
+
+    #[test]
+    fn fold_ignores_non_boolean_operators() {
+        assert!(
+            fold_boolean_constants(Operator::Add, Some(Some(true)), Some(Some(false))).is_none()
+        );
+        assert!(fold_boolean_constants(Operator::Eq, Some(Some(true)), None).is_none());
+    }
 
     #[test]
     fn test_kleene_truth_table() -> VortexResult<()> {

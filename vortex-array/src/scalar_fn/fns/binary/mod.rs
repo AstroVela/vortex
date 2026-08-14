@@ -26,8 +26,10 @@ use crate::expr::lit;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ReduceNode;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::SimplifyCtx;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::CompareOperator;
@@ -35,8 +37,10 @@ use crate::scalar_fn::fns::operators::Operator;
 
 pub mod boolean;
 pub use boolean::BooleanExecuteAdaptor;
+use boolean::BooleanFold;
 pub use boolean::BooleanKernel;
 pub(crate) use boolean::execute_boolean;
+use boolean::fold_boolean_constants;
 pub use boolean::kleene_boolean_buffer_scalar;
 pub use boolean::kleene_boolean_buffers;
 mod compare;
@@ -47,6 +51,7 @@ mod primitive_operand;
 
 use crate::scalar::NumericOperator;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 
 #[derive(Clone)]
 pub struct Binary;
@@ -177,52 +182,60 @@ impl ScalarFnVTable for Binary {
         }
     }
 
+    fn reduce<T: ReduceNode>(&self, operator: &Operator, node: &T) -> VortexResult<Option<T>> {
+        let bool_constant = |node: &T| node.as_constant()?.as_bool_opt().map(|value| value.value());
+
+        let Some(fold) = fold_boolean_constants(
+            *operator,
+            bool_constant(&node.child(0)),
+            bool_constant(&node.child(1)),
+        ) else {
+            return Ok(None);
+        };
+
+        let dtype = node.node_dtype()?;
+        Ok(match fold {
+            BooleanFold::Constant(value) => {
+                let scalar = Scalar::try_new(dtype, value.map(ScalarValue::from))?;
+                Some(node.new_node(Literal.bind(scalar), &[])?)
+            }
+            BooleanFold::Child(idx) => {
+                // Only collapse into the child when it already carries the operator's result
+                // dtype. A nullable constant widens the result, and dropping this node would
+                // narrow it back, so leave the widening case for execution to handle.
+                let child = node.child(idx);
+                (child.node_dtype()? == dtype).then_some(child)
+            }
+        })
+    }
+
     fn simplify_untyped(
         &self,
         operator: &Operator,
         expr: &Expression,
     ) -> VortexResult<Option<Expression>> {
-        let lhs = expr.child(0);
-        let rhs = expr.child(1);
-
         let bool_literal = |expr: &Expression| {
             expr.as_opt::<Literal>()?
                 .as_bool_opt()
                 .map(|value| value.value())
         };
 
-        // AND/OR use Kleene three-valued logic. `None` below is a boolean null.
-        //
-        // AND:
-        // - false AND x => false
-        // - true  AND x => x
-        // - null  AND null => null
-        //
-        // OR:
-        // - true  OR x => true
-        // - false OR x => x
-        // - null  OR null => null
-        //
-        // Other null cases either fall out of the identity/annihilator rules
-        // above (`null AND true`, `null OR false`) or cannot be simplified under
-        // Kleene semantics (`null AND x`, `null OR x` for non-literal `x`).
-        Ok(match operator {
-            Operator::And => match (bool_literal(lhs), bool_literal(rhs)) {
-                (Some(Some(false)), _) | (_, Some(Some(false))) => Some(lit(false)),
-                (Some(Some(true)), _) => Some(rhs.clone()),
-                (_, Some(Some(true))) => Some(lhs.clone()),
-                (Some(None), Some(None)) => Some(lhs.clone()),
-                _ => None,
-            },
-            Operator::Or => match (bool_literal(lhs), bool_literal(rhs)) {
-                (Some(Some(true)), _) | (_, Some(Some(true))) => Some(lit(true)),
-                (Some(Some(false)), _) => Some(rhs.clone()),
-                (_, Some(Some(false))) => Some(lhs.clone()),
-                (Some(None), Some(None)) => Some(lhs.clone()),
-                _ => None,
-            },
-            _ => None,
-        })
+        let Some(fold) = fold_boolean_constants(
+            *operator,
+            bool_literal(expr.child(0)),
+            bool_literal(expr.child(1)),
+        ) else {
+            return Ok(None);
+        };
+
+        Ok(Some(match fold {
+            // Without type information the folded literal cannot inherit the operator's
+            // nullability, so a non-null result is spelled as a non-nullable literal. A null
+            // boolean literal is always nullable, so it needs no such widening.
+            BooleanFold::Constant(Some(value)) => lit(value),
+            BooleanFold::Constant(None) => lit(Scalar::null(DType::Bool(Nullability::Nullable))),
+            BooleanFold::Child(idx) => expr.child(idx).clone(),
+        }))
     }
 
     fn simplify(
@@ -530,6 +543,110 @@ mod tests {
             Scalar::bool(false, Nullability::NonNullable),
             "Different structs should not be equal"
         );
+    }
+
+    /// A single non-nullable boolean field, for reducing expressions over an array tree.
+    fn bool_array() -> VortexResult<ArrayRef> {
+        use crate::IntoArray;
+        use crate::arrays::BoolArray;
+        use crate::arrays::StructArray;
+
+        let field = BoolArray::from_iter([true, false, true]).into_array();
+        Ok(StructArray::from_fields(&[("a", field)])?.into_array())
+    }
+
+    #[test]
+    fn boolean_reduce_drops_annihilated_operand() -> VortexResult<()> {
+        use crate::arrays::BoolArray;
+
+        let mut ctx = array_session().create_execution_ctx();
+        let array = bool_array()?;
+
+        // `false AND x` is `false` for every `x`, so `x` must not survive in the array tree.
+        let reduced = array.clone().apply(&and(lit(false), col("a")))?;
+        assert_eq!(reduced.nchildren(), 0, "operand should have been dropped");
+        assert_eq!(reduced.dtype(), &DType::Bool(Nullability::NonNullable));
+        assert_arrays_eq!(
+            reduced,
+            BoolArray::from_iter([false, false, false]),
+            &mut ctx
+        );
+
+        // `true OR x` is `true` for every `x`, from either side.
+        let reduced = array.clone().apply(&or(col("a"), lit(true)))?;
+        assert_eq!(reduced.nchildren(), 0, "operand should have been dropped");
+        assert_arrays_eq!(reduced, BoolArray::from_iter([true, true, true]), &mut ctx);
+
+        // The identity element collapses to the other operand.
+        let reduced = array.apply(&and(lit(true), col("a")))?;
+        assert_arrays_eq!(reduced, BoolArray::from_iter([true, false, true]), &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_reduce_collapses_transitively() -> VortexResult<()> {
+        use crate::arrays::BoolArray;
+
+        let mut ctx = array_session().create_execution_ctx();
+
+        // Pruning falsifiers nest a guard above the predicate it guards, so a constant guard
+        // has to collapse the operands above it too, not just its own node.
+        let guarded = and(
+            and(col("a"), lit(false)),
+            or(col("a"), not_eq(col("a"), col("a"))),
+        );
+        let reduced = bool_array()?.apply(&guarded)?;
+
+        assert_eq!(reduced.nchildren(), 0, "whole tree should have collapsed");
+        assert_arrays_eq!(
+            reduced,
+            BoolArray::from_iter([false, false, false]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_reduce_preserves_nullable_result_dtype() -> VortexResult<()> {
+        use crate::arrays::BoolArray;
+
+        let mut ctx = array_session().create_execution_ctx();
+
+        // A nullable `true` widens the result to nullable, so collapsing into the non-nullable
+        // operand would narrow the dtype of the node being replaced.
+        let expr = and(lit(Scalar::bool(true, Nullability::Nullable)), col("a"));
+        let reduced = bool_array()?.apply(&expr)?;
+
+        assert_eq!(reduced.dtype(), &DType::Bool(Nullability::Nullable));
+        assert_arrays_eq!(
+            reduced,
+            BoolArray::from_iter([Some(true), Some(false), Some(true)]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_reduce_folds_two_null_operands() -> VortexResult<()> {
+        let null_bool = || lit(Scalar::null(DType::Bool(Nullability::Nullable)));
+        let reduced = bool_array()?.apply(&and(null_bool(), null_bool()))?;
+
+        assert_eq!(reduced.dtype(), &DType::Bool(Nullability::Nullable));
+        assert_eq!(reduced.nchildren(), 0, "operands should have been dropped");
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_reduce_keeps_value_dependent_null() -> VortexResult<()> {
+        // `null AND x` is `false` where `x` is false and `null` elsewhere, so it cannot fold.
+        let expr = and(
+            lit(Scalar::null(DType::Bool(Nullability::Nullable))),
+            col("a"),
+        );
+        let reduced = bool_array()?.apply(&expr)?;
+
+        assert_eq!(reduced.nchildren(), 2, "neither operand should be dropped");
+        Ok(())
     }
 
     #[test]
