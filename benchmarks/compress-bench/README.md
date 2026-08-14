@@ -41,6 +41,10 @@ cargo run -p compress-bench --profile release_debug \
 # pick the Parquet page codec the GPU file is written with (default: snappy)
 cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress --gpu-parquet-codec zstd
+
+# isolate one backend for diagnostics; the default remains parquet,vortex
+cargo run -p compress-bench --profile release_debug \
+  --features cuda,unstable_encodings -- --gpu-decompress --formats vortex
 ```
 
 ### cuDF

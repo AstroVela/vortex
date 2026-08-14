@@ -131,10 +131,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (formats, ops) = if gpu.is_some() {
-        (
-            vec![Format::Parquet, Format::OnDiskVortex],
-            vec![CompressOp::Decompress],
-        )
+        for format in &args.formats {
+            anyhow::ensure!(
+                matches!(format, Format::Parquet | Format::OnDiskVortex),
+                "GPU decompression supports only parquet and vortex, found {format}"
+            );
+        }
+        (args.formats, vec![CompressOp::Decompress])
     } else {
         (args.formats, args.ops)
     };
