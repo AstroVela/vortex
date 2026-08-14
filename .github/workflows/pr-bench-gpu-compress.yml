@@ -135,9 +135,29 @@ jobs:
           # (cuda.yaml), which also sets only FLAT_LAYOUT_INLINE_ARRAY_NODE.
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         run: |
+          # `shell: bash` implies -e, so a non-zero benchmark exit would skip the cat and leave
+          # the timing tables out of the job log entirely. Capture the status instead.
+          status=0
           bash scripts/bench-taskset.sh target/release_debug/compress-bench \
-            --gpu-decompress -d table > gpu-compress.txt
+            --gpu-decompress -d table > gpu-compress.txt || status=$?
           cat gpu-compress.txt
+          exit "$status"
+      - name: Run CPU decompression baseline
+        id: cpu-bench
+        continue-on-error: true
+        shell: bash
+        env:
+          RUST_BACKTRACE: full
+          FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
+        # Same binary, same datasets, same machine, CPU decoders. Without this the GPU ratio
+        # says which of two GPU readers is faster but not whether either beats the CPU, which
+        # is the only number that says whether GPU decoding is worth doing at all.
+        run: |
+          bash scripts/bench-taskset.sh target/release_debug/compress-bench \
+            --ops decompress \
+            --datasets 'TPC-H l_comment|taxi|Arade|Bimbo|CMSprovider|Euro2016|Food|HashTags' \
+            -d table > cpu-compress.txt
+          cat cpu-compress.txt
       - name: Publish results
         shell: bash
         run: |
@@ -146,6 +166,12 @@ jobs:
             echo
             echo '```text'
             cat gpu-compress.txt
+            echo '```'
+            echo
+            echo "## CPU baseline (same machine, same datasets)"
+            echo
+            echo '```text'
+            cat cpu-compress.txt || echo "CPU baseline did not produce output"
             echo '```'
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
