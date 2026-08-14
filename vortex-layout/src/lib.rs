@@ -29,6 +29,8 @@ mod reader {
 }
 pub mod scan;
 pub mod session;
+mod strategy;
+pub use strategy::*;
 #[cfg(test)]
 mod test;
 
@@ -37,10 +39,8 @@ pub mod display {
     pub use vortex_layout_commons::display::*;
 }
 
-/// Segment access abstractions used by layout readers and writers.
-pub mod segments {
-    pub use vortex_layout_commons::segments::*;
-}
+/// Segment access contracts and runtime implementations used by layout readers and writers.
+pub mod segments;
 
 /// Sequence types used to preserve writer ordering.
 pub mod sequence {

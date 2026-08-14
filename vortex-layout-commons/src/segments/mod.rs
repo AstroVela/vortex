@@ -1,30 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Segment access abstractions for layouts.
+//! Segment access contracts for layouts.
 //!
 //! Layouts refer to byte ranges by [`SegmentId`]. A [`SegmentSource`] resolves those ids to buffer
-//! handles for readers, while a [`SegmentSink`] assigns ids when writers emit buffers.
-//! [`SegmentCache`] implementations can sit in front of sources to reuse segment bytes across
-//! scans.
+//! handles for readers, while a [`SegmentSink`] assigns ids when writers emit buffers. Cache and
+//! request-sharing policies belong to the runtime using these contracts.
 
-mod cache;
-mod shared;
 mod sink;
 mod source;
-
-#[cfg(any(test, feature = "_test-harness"))]
-mod test;
 
 use std::fmt::Display;
 use std::ops::Deref;
 
-pub use cache::*;
-pub use shared::*;
 pub use sink::*;
 pub use source::*;
-#[cfg(any(test, feature = "_test-harness"))]
-pub use test::*;
 use vortex_error::VortexError;
 
 /// Identifier for a single physical segment referenced by a layout.

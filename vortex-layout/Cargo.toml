@@ -26,11 +26,13 @@ flatbuffers = { workspace = true }
 futures = { workspace = true, features = ["alloc", "async-await", "executor"] }
 itertools = { workspace = true }
 kanal = { workspace = true }
+moka = { workspace = true, features = ["future"] }
 once_cell = { workspace = true, features = ["parking_lot"] }
 oneshot = { workspace = true }
 parking_lot = { workspace = true }
 paste = { workspace = true }
 prost = { workspace = true }
+rustc-hash = { workspace = true }
 sketches-ddsketch = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }
 tracing = { workspace = true }
@@ -57,11 +59,10 @@ rstest = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 vortex-array = { path = "../vortex-array", features = ["_test-harness"] }
 vortex-io = { path = "../vortex-io", features = ["tokio"] }
-vortex-layout-commons = { workspace = true, features = ["_test-harness"] }
 
 [features]
-_test-harness = ["vortex-layout-commons/_test-harness"]
-tokio = ["dep:tokio", "vortex-error/tokio", "vortex-layout-commons/tokio"]
+_test-harness = []
+tokio = ["dep:tokio", "vortex-error/tokio"]
 
 [lints]
 workspace = true
