@@ -14,7 +14,6 @@ use std::task::Context;
 use std::task::Poll;
 
 use futures::FutureExt;
-use futures::Stream;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future;
@@ -680,35 +679,68 @@ mod tests {
 
     use super::*;
 
-    fn io_request(id: RequestId, offset: u64, length: usize) -> IoRequest {
-        let (callback, _receiver) = oneshot::channel();
-        IoRequest::new_single(ReadRequest {
-            id,
-            offset,
-            length,
-            alignment: Alignment::none(),
-            callback,
-        })
+    #[derive(Clone)]
+    struct MissingAndUnknownReadRanges;
+
+    impl VortexReadAt for MissingAndUnknownReadRanges {
+        fn concurrency(&self) -> usize {
+            2
+        }
+
+        fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+            async { Ok(8) }.boxed()
+        }
+
+        fn read_at(
+            &self,
+            _offset: u64,
+            _length: usize,
+            _alignment: Alignment,
+        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+            async { panic!("read_at should not be called") }.boxed()
+        }
+
+        fn read_ranges(&self, _requests: Arc<[ReadAtRequest]>) -> vortex_io::ReadAtStream {
+            let unknown = ReadAtRequest::new(8, 4, Alignment::none());
+            let returned = ReadAtRequest::new(4, 4, Alignment::none());
+            let buffer = BufferHandle::new_host(ByteBuffer::from(vec![0; 4]));
+            futures::stream::iter([(unknown, Ok(buffer.clone())), (returned, Ok(buffer))]).boxed()
+        }
     }
 
     #[tokio::test]
-    async fn read_range_results_matches_results_and_reports_missing_requests() {
-        let requests = vec![io_request(0, 0, 4), io_request(1, 4, 4)];
-        let unknown = ReadAtRequest::new(8, 4, Alignment::none());
-        let returned = ReadAtRequest::new(4, 4, Alignment::none());
-        let buffer = BufferHandle::new_host(ByteBuffer::from(vec![0; 4]));
-        let results =
-            futures::stream::iter([(unknown, Ok(buffer.clone())), (returned, Ok(buffer))]).boxed();
+    async fn read_driver_ignores_unknown_results_and_reports_missing_requests() {
+        let segments: Arc<[SegmentSpec]> = Arc::from([
+            SegmentSpec {
+                offset: 0,
+                length: 4,
+                alignment: Alignment::none(),
+            },
+            SegmentSpec {
+                offset: 4,
+                length: 4,
+                alignment: Alignment::none(),
+            },
+        ]);
+        let metrics = DefaultMetricsRegistry::default();
+        let source = FileSegmentSource::open(
+            segments,
+            MissingAndUnknownReadRanges,
+            TokioRuntime::current(),
+            RequestMetrics::new(&metrics, vec![]),
+        );
 
-        let resolved = ReadRangeResults::new(results, requests)
-            .collect::<Vec<_>>()
-            .await;
+        let results = future::join_all([
+            source.request(SegmentId::from(0)),
+            source.request(SegmentId::from(1)),
+        ])
+        .await;
 
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].0.offset(), 4);
-        assert!(resolved[0].1.is_ok());
-        assert_eq!(resolved[1].0.offset(), 0);
-        assert!(resolved[1].1.is_err());
+        assert!(results[0].is_err());
+        match &results[1] {
+            Ok(buffer) => assert_eq!(buffer.len(), 4),
+            Err(error) => vortex_panic!("second request must resolve: {error}"),
+        }
     }
 
     #[derive(Clone)]
