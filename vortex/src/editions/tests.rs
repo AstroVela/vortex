@@ -7,25 +7,17 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::array_session;
-#[cfg(feature = "unstable_encodings")]
-use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
-#[cfg(feature = "unstable_encodings")]
-use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-#[cfg(feature = "unstable_encodings")]
-use vortex_array::dtype::UnionVariants;
 use vortex_array::field_path;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
-#[cfg(feature = "unstable_encodings")]
-use vortex_dense_union::DenseUnion;
 use vortex_edition::ComponentKind;
 use vortex_edition::Edition;
 use vortex_edition::EditionDeclaration;
@@ -145,7 +137,6 @@ fn encodings_in_editions_unions_families() {
 
     assert!(both.len() > core_only.len());
     assert!(both.iter().any(|id| id.as_str() == "fastlanes.delta"));
-    assert!(both.iter().any(|id| id.as_str() == "vortex.dense_union"));
     assert!(both.iter().any(|id| id.as_str() == "vortex.onpair"));
     assert!(core_only.iter().all(|id| both.contains(id)));
 }
@@ -290,46 +281,6 @@ fn baseline_core_session() -> VortexResult<VortexSession> {
 
 fn sequential_integers() -> PrimitiveArray {
     PrimitiveArray::from_iter(0..65_536i32)
-}
-
-#[cfg(feature = "unstable_encodings")]
-#[tokio::test]
-async fn default_unstable_edition_writes_dense_union() -> VortexResult<()> {
-    use crate::VortexSessionDefault;
-
-    let session = VortexSession::default();
-    let variants = UnionVariants::try_new(
-        FieldNames::from(["number", "flag"]),
-        vec![
-            DType::Primitive(PType::I32, Nullability::NonNullable),
-            DType::Bool(Nullability::NonNullable),
-        ],
-        vec![5, 9],
-    )?;
-    let array = DenseUnion::try_new(
-        PrimitiveArray::from_iter([5u8, 9, 5]).into_array(),
-        PrimitiveArray::from_iter([0i32, 0, 1]).into_array(),
-        variants,
-        vec![
-            PrimitiveArray::from_iter([10i32, 30]).into_array(),
-            BoolArray::from_iter([true]).into_array(),
-        ],
-    )?
-    .into_array();
-    let dtype = array.dtype().clone();
-    let mut buffer = ByteBufferMut::empty();
-
-    session
-        .write_options()
-        .with_strategy(Arc::new(FlatLayoutStrategy::default()))
-        .write(&mut buffer, array.to_array_stream())
-        .await?;
-
-    let file = session.open_options().open_buffer(buffer)?;
-    assert_eq!(file.dtype(), &dtype);
-    let round_tripped = file.scan()?.into_array_stream()?.read_all().await?;
-    assert!(round_tripped.is::<DenseUnion>());
-    Ok(())
 }
 
 const WRITER_TEST_EDITION: EditionId = EditionId::new("writer-test", 2026, 7, 0);

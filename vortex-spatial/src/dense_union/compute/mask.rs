@@ -8,9 +8,9 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar_fn::fns::mask::MaskReduce;
 use vortex_error::VortexResult;
 
-use crate::DenseUnion;
-use crate::DenseUnionArrayExt;
-use crate::DenseUnionArraySlotsExt;
+use crate::dense_union::DenseUnion;
+use crate::dense_union::DenseUnionArrayExt;
+use crate::dense_union::DenseUnionArraySlotsExt;
 
 impl MaskReduce for DenseUnion {
     fn mask(array: ArrayView<'_, Self>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {

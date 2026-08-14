@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! A dense physical encoding for Vortex union arrays.
+//! A dense physical encoding for spatial union arrays.
 //!
 //! [`DenseUnionArray`] stores one type ID and one child offset per logical row. Variant children
 //! are compact: unlike the canonical sparse union, they do not contain placeholders for rows that
@@ -22,8 +22,7 @@ pub use array::*;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;
 
-/// Register the dense union encoding in a Vortex session.
-pub fn initialize(session: &VortexSession) {
+pub(crate) fn initialize(session: &VortexSession) {
     session.arrays().register(DenseUnion);
 }
 

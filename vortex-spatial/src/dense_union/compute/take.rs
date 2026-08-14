@@ -15,9 +15,9 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
-use crate::DenseUnion;
-use crate::DenseUnionArrayExt;
-use crate::DenseUnionArraySlotsExt;
+use crate::dense_union::DenseUnion;
+use crate::dense_union::DenseUnionArrayExt;
+use crate::dense_union::DenseUnionArraySlotsExt;
 
 impl TakeReduce for DenseUnion {
     fn take(array: ArrayView<'_, Self>, indices: &ArrayRef) -> VortexResult<Option<ArrayRef>> {

@@ -9,9 +9,9 @@ use vortex_array::IntoArray;
 use vortex_array::arrays::slice::SliceReduce;
 use vortex_error::VortexResult;
 
-use crate::DenseUnion;
-use crate::DenseUnionArrayExt;
-use crate::DenseUnionArraySlotsExt;
+use crate::dense_union::DenseUnion;
+use crate::dense_union::DenseUnionArrayExt;
+use crate::dense_union::DenseUnionArraySlotsExt;
 
 impl SliceReduce for DenseUnion {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {

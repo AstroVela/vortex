@@ -33,13 +33,13 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::array::DenseUnion;
-use crate::array::DenseUnionArrayExt;
-use crate::array::DenseUnionArraySlotsExt;
-use crate::array::DenseUnionSlots;
-use crate::array::make_parts;
-use crate::canonical::canonicalize;
-use crate::rules::PARENT_RULES;
+use super::array::DenseUnion;
+use super::array::DenseUnionArrayExt;
+use super::array::DenseUnionArraySlotsExt;
+use super::array::DenseUnionSlots;
+use super::array::make_parts;
+use super::canonical::canonicalize;
+use super::rules::PARENT_RULES;
 
 const OFFSETS_DTYPE: DType = DType::Primitive(PType::I32, Nullability::NonNullable);
 
@@ -117,7 +117,7 @@ impl VTable for DenseUnion {
     type ValidityVTable = Self;
 
     fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.dense_union");
+        static ID: CachedId = CachedId::new("vortex.st.dense_union");
         *ID
     }
 

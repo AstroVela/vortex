@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::Arc;
+
 use rstest::rstest;
+use vortex::VortexSessionDefault;
+use vortex::file::OpenOptionsSessionExt;
+use vortex::file::WriteOptionsSessionExt;
+use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -21,16 +27,16 @@ use vortex_array::dtype::UnionVariants;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::SerializeOptions;
 use vortex_array::serde::SerializedArray;
+use vortex_array::stream::ArrayStreamExt;
 use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 
-use crate::DenseUnion;
-use crate::DenseUnionArray;
-use crate::DenseUnionArraySlotsExt;
-use crate::initialize;
+use super::DenseUnion;
+use super::DenseUnionArray;
+use super::DenseUnionArraySlotsExt;
 
 fn variants() -> VortexResult<UnionVariants> {
     UnionVariants::try_new(
@@ -80,7 +86,7 @@ fn nullable_dense_union() -> VortexResult<DenseUnionArray> {
 
 fn session() -> VortexSession {
     let session = vortex_array::array_session();
-    initialize(&session);
+    crate::initialize(&session);
     session
 }
 
@@ -372,4 +378,25 @@ fn serde_roundtrip() -> VortexResult<()> {
 
     assert!(decoded.is::<DenseUnion>());
     assert_same_rows(&array, &decoded, &session)
+}
+
+#[tokio::test]
+async fn file_roundtrip_preserves_dense_union() -> VortexResult<()> {
+    let session = VortexSession::default();
+    crate::initialize(&session);
+    let array = nullable_dense_union()?.into_array();
+    let dtype = array.dtype().clone();
+    let mut buffer = ByteBufferMut::empty();
+
+    session
+        .write_options()
+        .with_strategy(Arc::new(FlatLayoutStrategy::default()))
+        .write(&mut buffer, array.clone().to_array_stream())
+        .await?;
+
+    let file = session.open_options().open_buffer(buffer)?;
+    assert_eq!(file.dtype(), &dtype);
+    let round_tripped = file.scan()?.into_array_stream()?.read_all().await?;
+    assert!(round_tripped.is::<DenseUnion>());
+    assert_same_rows(&array, &round_tripped, &session)
 }

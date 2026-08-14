@@ -62,7 +62,6 @@ members = [
     "encodings/bytebool",
     "encodings/parquet-variant",
     "encodings/onpair",
-    "encodings/dense-union",
     # Benchmarks
     "benchmarks/bench-support",
     "benchmarks/lance-bench",
@@ -307,7 +306,6 @@ vortex-compute = { version = "0.1.0", path = "./vortex-compute", default-feature
 vortex-datafusion = { version = "0.1.0", path = "./vortex-datafusion", default-features = false }
 vortex-datetime-parts = { version = "0.1.0", path = "./encodings/datetime-parts", default-features = false }
 vortex-decimal-byte-parts = { version = "0.1.0", path = "encodings/decimal-byte-parts", default-features = false }
-vortex-dense-union = { version = "0.1.0", path = "./encodings/dense-union", default-features = false }
 vortex-edition = { version = "0.1.0", path = "./vortex-edition", default-features = false }
 vortex-error = { version = "0.1.0", path = "./vortex-error", default-features = false }
 vortex-fastlanes = { version = "0.1.0", path = "./encodings/fastlanes", default-features = false }

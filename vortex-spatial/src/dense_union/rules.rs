@@ -7,7 +7,7 @@ use vortex_array::arrays::slice::SliceReduceAdaptor;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar_fn::fns::mask::MaskReduceAdaptor;
 
-use crate::DenseUnion;
+use super::DenseUnion;
 
 pub(crate) const PARENT_RULES: ParentRuleSet<DenseUnion> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&FilterReduceAdaptor(DenseUnion)),

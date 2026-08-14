@@ -11,7 +11,6 @@ use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::UnionArray;
 use vortex_array::dtype::DType;
@@ -19,9 +18,9 @@ use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::UnionVariants;
-use vortex_dense_union::DenseUnion;
-use vortex_dense_union::initialize;
 use vortex_session::VortexSession;
+use vortex_spatial::test_harness::DenseUnion;
+use vortex_spatial::test_harness::spatial_session;
 
 const LEN: usize = 65_536;
 const N_VARIANTS: usize = 28;
@@ -32,11 +31,7 @@ fn main() {
     divan::main();
 }
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = array_session();
-    initialize(&session);
-    session
-});
+static SESSION: LazyLock<VortexSession> = LazyLock::new(spatial_session);
 
 fn variants() -> UnionVariants {
     let names = FieldNames::from_iter((0..N_VARIANTS).map(|index| format!("variant_{index}")));

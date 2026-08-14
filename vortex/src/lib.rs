@@ -255,11 +255,6 @@ pub mod encodings {
         pub use vortex_decimal_byte_parts::*;
     }
 
-    /// Dense physical encoding for union arrays.
-    pub mod dense_union {
-        pub use vortex_dense_union::*;
-    }
-
     /// FastLanes integer encodings: bit-packing, delta, frame-of-reference, and RLE.
     pub mod fastlanes {
         pub use vortex_fastlanes::*;

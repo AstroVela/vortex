@@ -12,13 +12,13 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::UnionVariants;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_err;
 
-/// A [`DenseUnion`]-encoded Vortex array.
+/// A Vortex array encoded as a [`DenseUnion`].
 pub type DenseUnionArray = Array<DenseUnion>;
 
 /// Slot layout of a dense union array.
 #[array_slots(DenseUnion)]
+#[allow(dead_code)]
 pub struct DenseUnionSlots {
     /// The row-aligned type IDs selecting union variants.
     #[slot(0)]
@@ -28,18 +28,6 @@ pub struct DenseUnionSlots {
     pub offsets: ArrayRef,
     /// The compact children in variant order.
     #[slot(2..)]
-    pub children: Vec<ArrayRef>,
-}
-
-/// Concrete parts of a [`DenseUnionArray`].
-pub struct DenseUnionDataParts {
-    /// The union variant schema.
-    pub variants: UnionVariants,
-    /// The row-aligned type IDs.
-    pub type_ids: ArrayRef,
-    /// The row-aligned compact-child offsets.
-    pub offsets: ArrayRef,
-    /// The compact children in variant order.
     pub children: Vec<ArrayRef>,
 }
 
@@ -86,27 +74,6 @@ pub trait DenseUnionArrayExt: DenseUnionArraySlotsExt {
     fn child(&self, index: usize) -> Option<&ArrayRef> {
         self.children().get(index)
     }
-
-    /// Return a compact child selected by a data-level type ID.
-    fn child_by_type_id(&self, type_id: u8) -> Option<&ArrayRef> {
-        self.child(self.variants().tag_to_child_index(type_id)?)
-    }
-
-    /// Return a compact child selected by variant name, if present.
-    fn child_by_name_opt(&self, name: impl AsRef<str>) -> Option<&ArrayRef> {
-        self.child(self.variants().find(name)?)
-    }
-
-    /// Return a compact child selected by variant name.
-    fn child_by_name(&self, name: impl AsRef<str>) -> VortexResult<&ArrayRef> {
-        let name = name.as_ref();
-        self.child_by_name_opt(name).ok_or_else(|| {
-            vortex_err!(
-                "Variant {name} not found in dense union array with names {:?}",
-                self.variants().names()
-            )
-        })
-    }
 }
 
 impl<T: TypedArrayRef<DenseUnion>> DenseUnionArrayExt for T {}
@@ -151,26 +118,5 @@ impl DenseUnion {
         children: impl IntoIterator<Item = ArrayRef>,
     ) -> VortexResult<DenseUnionArray> {
         Array::try_from_parts(make_parts(type_ids, offsets, variants, children))
-    }
-}
-
-/// Owned accessors for a dense union array.
-pub trait DenseUnionArrayOwnedExt {
-    /// Deconstruct this array into its type IDs, offsets, schema, and compact children.
-    fn into_data_parts(self) -> DenseUnionDataParts;
-}
-
-impl DenseUnionArrayOwnedExt for Array<DenseUnion> {
-    fn into_data_parts(self) -> DenseUnionDataParts {
-        let variants = self.variants().clone();
-        let type_ids = self.type_ids().clone();
-        let offsets = self.offsets().clone();
-        let children = self.iter_children().cloned().collect();
-        DenseUnionDataParts {
-            variants,
-            type_ids,
-            offsets,
-            children,
-        }
     }
 }

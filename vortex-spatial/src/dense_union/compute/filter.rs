@@ -8,9 +8,9 @@ use vortex_array::arrays::filter::FilterReduce;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::DenseUnion;
-use crate::DenseUnionArrayExt;
-use crate::DenseUnionArraySlotsExt;
+use crate::dense_union::DenseUnion;
+use crate::dense_union::DenseUnionArrayExt;
+use crate::dense_union::DenseUnionArraySlotsExt;
 
 impl FilterReduce for DenseUnion {
     fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {

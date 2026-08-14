@@ -18,9 +18,9 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_mask::AllOr;
 
-use crate::array::DenseUnion;
-use crate::array::DenseUnionArrayExt;
-use crate::array::DenseUnionArraySlotsExt;
+use super::array::DenseUnion;
+use super::array::DenseUnionArrayExt;
+use super::array::DenseUnionArraySlotsExt;
 
 /// Converts a dense union to its canonical sparse representation.
 ///
