@@ -3,8 +3,8 @@
 
 //! Selects a batch execution strategy.
 //!
-//! [`RowFnExecutionArgs::execute`] handles universal fast paths, then delegates to dense or
-//! valid-only execution.
+//! [`RowFnExecutionArgs::execute`] handles universal fast paths and encoded reductions, then
+//! delegates to dense or valid-only execution.
 
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
@@ -27,12 +27,14 @@ mod output;
 pub(crate) use output::finalize_kernel_output;
 
 impl RowFnExecutionArgs {
-    /// Apply constant folding and null handling around `kernel`.
+    /// Apply encoded reductions, constant folding, and null handling around `kernel`.
     ///
-    /// For a partially valid batch, `try_valid_rows` executes only valid rows over the original
-    /// inputs. Every result is checked against the planned shape and dtype.
+    /// `reduce` receives the original inputs before constant broadcasting. For a partially valid
+    /// batch, `try_valid_rows` executes only valid rows over the original inputs. Every result is
+    /// checked against the planned shape and dtype.
     pub(crate) fn execute(
         &self,
+        reduce: impl FnOnce(BorrowedRowFnArgs<'_>, &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>>,
         kernel: impl Fn(BorrowedRowFnArgs<'_>, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
@@ -51,6 +53,13 @@ impl RowFnExecutionArgs {
             })
         {
             return Ok(self.all_null());
+        }
+
+        // Let the ordinary policy construct the typed output for an empty batch.
+        if self.row_count > 0
+            && let Some(values) = reduce(self.execution_args(&self.inputs, self.row_count), ctx)?
+        {
+            return self.finalize_reduced(values, ctx);
         }
 
         // All inputs are constant, and their conjoined validity proves that every row is non-null.

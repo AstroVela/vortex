@@ -4,8 +4,8 @@
 //! The [`RowFn`] contract for scalar functions whose natural kernel computes one row at a time.
 //!
 //! Implementations declare their arity and fallibility, then use [`RowFn::dispatch`] to select the
-//! typed row signature for each supported dtype combination. Optional methods provide
-//! serialization without putting persistence plumbing in the row kernel.
+//! typed row signature for each supported dtype combination. Optional hooks provide serialization
+//! and encoding-aware execution without putting columnar plumbing in the row kernel.
 
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -16,6 +16,8 @@ use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
 
 use super::visitor::RowVisitor;
+use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::scalar_fn::ScalarFnId;
 
@@ -47,12 +49,14 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// The arguments in display order. Its length is the function's exact arity.
     const ARG_NAMES: &'static [&'static str];
 
-    /// Whether every dispatch is infallible.
+    /// Whether every dispatch and encoded reduction is infallible.
     ///
     /// See [`ScalarFnVTable::is_infallible`](crate::scalar_fn::ScalarFnVTable::is_infallible) for
     /// a more detailed explanation of semantic errors.
     ///
-    /// The framework checks dispatched element and result types. A conservative `false` is allowed.
+    /// The framework checks dispatched element and result types, but cannot inspect
+    /// [`reduce_encoded`](Self::reduce_encoded). Set this to `false` when that hook can return a
+    /// semantic error. A conservative `false` is allowed.
     const INFALLIBLE: bool;
 
     /// Returns the ID of the scalar function.
@@ -83,4 +87,29 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
         args: &[DType],
         visitor: V,
     ) -> VortexResult<V::VisitResult>;
+
+    /// Try an encoding-aware implementation before decoding the inputs into row elements.
+    ///
+    /// `None` continues to the row loop. The returned array can remain encoded or lazy. Batch
+    /// execution calls this hook at most once with the original nonempty inputs. Nullary functions,
+    /// empty batches, slices, and compacted retries skip it.
+    ///
+    /// Like a dense row closure, this hook must be total over every stored payload, including
+    /// payloads behind null rows. An `Err` is immediately user-visible and is never suppressed or
+    /// retried through the row layer.
+    ///
+    /// # Requirements
+    ///
+    /// - `output.len()` **must** equal `args[0].len()`.
+    /// - The output dtype **must** match the planned dtype when ignoring outer nullability.
+    /// - The output **must not** introduce a null where every input is valid.
+    fn reduce_encoded(
+        &self,
+        options: &Self::Options,
+        args: &[ArrayRef],
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        _ = (options, args, ctx);
+        Ok(None)
+    }
 }
