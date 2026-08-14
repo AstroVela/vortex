@@ -611,6 +611,13 @@ impl SerializedArray {
         })
     }
 
+    /// Attach pre-resolved buffer handles to this already-validated array tree.
+    pub fn with_buffers(&self, buffers: Vec<BufferHandle>) -> Self {
+        let mut serialized = self.clone();
+        serialized.buffers = buffers.into();
+        serialized
+    }
+
     /// Create an [`SerializedArray`] from a raw array tree flatbuffer (metadata only).
     ///
     /// This constructor creates a `SerializedArray` with no buffer data, useful for

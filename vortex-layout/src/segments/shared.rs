@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::TryFutureExt;
-use futures::channel::oneshot;
 use futures::future::BoxFuture;
+use futures::future::Shared;
 use futures::future::WeakShared;
+use futures::future::join_all;
 use vortex_array::buffer::BufferHandle;
 use vortex_error::SharedVortexResult;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
-use vortex_error::vortex_err;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
@@ -25,19 +25,45 @@ use crate::segments::SegmentSource;
 /// request.
 pub struct SharedSegmentSource<S> {
     inner: S,
-    in_flight: Arc<DashMap<SegmentRequest, WeakShared<SharedSegmentFuture>>>,
+    in_flight: Arc<DashMap<SegmentRequest, WeakInFlight>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum SegmentRequest {
     Whole(SegmentId),
     Range(SegmentId, Range<u64>),
+    Ranges(SegmentId, Arc<[Range<u64>]>),
 }
 
 type SharedSegmentFuture = BoxFuture<'static, SharedVortexResult<BufferHandle>>;
+type SharedBatchResult = Arc<[SharedVortexResult<BufferHandle>]>;
+type SharedBatchFuture = BoxFuture<'static, SharedBatchResult>;
+
+enum WeakInFlight {
+    Segment(WeakShared<SharedSegmentFuture>),
+    Batch(WeakShared<SharedBatchFuture>),
+}
+
+impl WeakInFlight {
+    fn upgrade_segment(&self) -> Option<SegmentFuture> {
+        let Self::Segment(future) = self else {
+            return None;
+        };
+        future
+            .upgrade()
+            .map(|future| future.map_err(VortexError::from).boxed())
+    }
+
+    fn upgrade_batch(&self) -> Option<Shared<SharedBatchFuture>> {
+        let Self::Batch(future) = self else {
+            return None;
+        };
+        future.upgrade()
+    }
+}
 
 struct InFlightGuard {
-    in_flight: Arc<DashMap<SegmentRequest, WeakShared<SharedSegmentFuture>>>,
+    in_flight: Arc<DashMap<SegmentRequest, WeakInFlight>>,
     request: SegmentRequest,
 }
 
@@ -75,60 +101,59 @@ impl<S: SegmentSource> SegmentSource for SharedSegmentSource<S> {
     }
 
     fn request_ranges(&self, id: SegmentId, ranges: Vec<Range<u64>>) -> Vec<SegmentFuture> {
-        let mut outputs = (0..ranges.len()).map(|_| None).collect::<Vec<_>>();
-        let mut missing = Vec::new();
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+        let len = ranges.len();
+        let request = SegmentRequest::Ranges(id, Arc::from(ranges.clone()));
 
-        for (index, range) in ranges.into_iter().enumerate() {
-            let request = SegmentRequest::Range(id, range.clone());
-            loop {
-                match self.in_flight.entry(request.clone()) {
-                    Entry::Occupied(entry) => {
-                        if let Some(future) = entry.get().upgrade() {
-                            outputs[index] = Some(future.map_err(VortexError::from).boxed());
-                            break;
-                        }
-                        entry.remove();
+        loop {
+            match self.in_flight.entry(request.clone()) {
+                Entry::Occupied(entry) => {
+                    if let Some(batch) = entry.get().upgrade_batch() {
+                        return batch_outputs(batch, len);
                     }
-                    Entry::Vacant(entry) => {
-                        let (send, receive) = oneshot::channel::<SegmentFuture>();
-                        let guard = InFlightGuard {
-                            in_flight: Arc::clone(&self.in_flight),
-                            request: request.clone(),
-                        };
-                        let future = async move {
-                            let _guard = guard;
-                            let inner = receive.await.map_err(|_| {
-                                Arc::new(vortex_err!("Batched segment request was dropped"))
-                            })?;
-                            inner.await.map_err(Arc::new)
-                        }
-                        .boxed()
-                        .shared();
-                        entry.insert(
-                            future
-                                .downgrade()
-                                .vortex_expect("new shared future cannot be complete"),
-                        );
-                        outputs[index] = Some(future.map_err(VortexError::from).boxed());
-                        missing.push((range, send));
-                        break;
+                    entry.remove();
+                }
+                Entry::Vacant(entry) => {
+                    let futures = self.inner.request_ranges(id, ranges);
+                    let guard = InFlightGuard {
+                        in_flight: Arc::clone(&self.in_flight),
+                        request,
+                    };
+                    let batch = async move {
+                        let _guard = guard;
+                        Arc::from(
+                            join_all(
+                                futures
+                                    .into_iter()
+                                    .map(|future| async move { future.await.map_err(Arc::new) }),
+                            )
+                            .await,
+                        )
                     }
+                    .boxed()
+                    .shared();
+                    entry.insert(WeakInFlight::Batch(
+                        batch
+                            .downgrade()
+                            .vortex_expect("new shared batch cannot be complete"),
+                    ));
+                    return batch_outputs(batch, len);
                 }
             }
         }
-
-        let inner = self
-            .inner
-            .request_ranges(id, missing.iter().map(|(range, _)| range.clone()).collect());
-        for ((_, send), future) in missing.into_iter().zip(inner) {
-            drop(send.send(future));
-        }
-
-        outputs
-            .into_iter()
-            .map(|future| future.vortex_expect("every requested range has a future"))
-            .collect()
     }
+}
+
+fn batch_outputs(batch: Shared<SharedBatchFuture>, len: usize) -> Vec<SegmentFuture> {
+    (0..len)
+        .map(|index| {
+            let batch = batch.clone();
+            async move { batch.await[index].clone().map_err(VortexError::from) }.boxed()
+                as SegmentFuture
+        })
+        .collect()
 }
 
 impl<S: SegmentSource> SharedSegmentSource<S> {
@@ -136,8 +161,8 @@ impl<S: SegmentSource> SharedSegmentSource<S> {
         loop {
             match self.in_flight.entry(request.clone()) {
                 Entry::Occupied(e) => {
-                    if let Some(shared_future) = e.get().upgrade() {
-                        return shared_future.map_err(VortexError::from).boxed();
+                    if let Some(shared_future) = e.get().upgrade_segment() {
+                        return shared_future;
                     } else {
                         // The future has been dropped, remove the entry and try again.
                         e.remove();
@@ -149,10 +174,11 @@ impl<S: SegmentSource> SharedSegmentSource<S> {
                         SegmentRequest::Range(id, range) => {
                             self.inner.request_range(*id, range.clone())
                         }
+                        SegmentRequest::Ranges(..) => unreachable!(),
                     };
                     let guard = InFlightGuard {
                         in_flight: Arc::clone(&self.in_flight),
-                        request: request.clone(),
+                        request,
                     };
                     let future = async move {
                         let _guard = guard;
@@ -160,11 +186,11 @@ impl<S: SegmentSource> SharedSegmentSource<S> {
                     }
                     .boxed()
                     .shared();
-                    e.insert(
+                    e.insert(WeakInFlight::Segment(
                         future
                             .downgrade()
                             .vortex_expect("just created, cannot be polled to completion"),
-                    );
+                    ));
                     return future.map_err(VortexError::from).boxed();
                 }
             }
@@ -304,7 +330,7 @@ mod tests {
 
         let shared_source = SharedSegmentSource::new(source.clone());
         let reads = shared_source.request_ranges(SegmentId::from(0), vec![0..1, 2..4]);
-        let mut results = futures::future::join_all(reads).await.into_iter();
+        let mut results = join_all(reads).await.into_iter();
         assert_eq!(results.next().vortex_expect("first range")?.len(), 1);
         assert_eq!(results.next().vortex_expect("second range")?.len(), 2);
         assert_eq!(source.range_batch_count.load(Ordering::Relaxed), 1);

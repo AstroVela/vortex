@@ -23,7 +23,6 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::Struct;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
-use vortex_array::expr::stats::Stat;
 use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesMetadata;
 use vortex_array::serde::SerializedArray;
@@ -69,6 +68,7 @@ struct PlannedBuffer {
 
 #[derive(Clone)]
 struct ALPRDReadPlan {
+    serialized: SerializedArray,
     descriptors: Arc<[SerializedBuffer]>,
     left: BitPackedReadPlan,
     right: BitPackedReadPlan,
@@ -221,6 +221,10 @@ impl PartialReadPlan {
             .div_ceil(self.row_granularity)
             .saturating_mul(self.row_granularity);
         let pages = selected_pages(page_rows, layout_len, row_range, mask)?;
+        let pages = match &self.kind {
+            PartialReadKind::Alprd(_) => selected_page_runs(&pages, row_range, mask)?,
+            PartialReadKind::Fixed(_) => pages,
+        };
         let (partial_bytes, request_count) = self.estimated_partial_io(&pages, layout_len)?;
         let partial_cost = partial_bytes.checked_add(
             request_count
@@ -430,7 +434,6 @@ impl RegisteredPartialRead {
                 plan,
             } => {
                 resolve_alprd_pages(
-                    self.array_tree,
                     pages,
                     patch_buffers,
                     plan,
@@ -480,7 +483,6 @@ async fn resolve_fixed_pages(
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_alprd_pages(
-    array_tree: ByteBuffer,
     pages: Vec<RegisteredALPRDPage>,
     patch_requests: Vec<(SegmentFuture, SerializedBuffer)>,
     plan: ALPRDReadPlan,
@@ -528,7 +530,7 @@ async fn resolve_alprd_pages(
     for (index, handle) in patch_handles {
         handles[index] = handle;
     }
-    let serialized = SerializedArray::from_flatbuffer_with_buffers(array_tree, handles)?;
+    let serialized = plan.serialized.with_buffers(handles);
     let alprd = serialized.child(0);
     let patch_len = plan.patch_metadata.len()?;
     let patch_indices =
@@ -632,9 +634,7 @@ fn apply_page_mask(array: ArrayRef, mask: Mask) -> VortexResult<ArrayRef> {
 
 fn clear_stats(array: &ArrayRef) {
     for child in array.depth_first_traversal() {
-        for stat in Stat::all() {
-            child.statistics().clear(stat);
-        }
+        child.statistics().clear_all();
     }
 }
 
@@ -677,6 +677,39 @@ fn selected_pages(
             })
             .collect(),
     )
+}
+
+fn selected_page_runs(
+    pages: &[Range<usize>],
+    row_range: &Range<usize>,
+    mask: &Mask,
+) -> Option<Vec<Range<usize>>> {
+    let selected = mask.slices();
+    let mut runs = Vec::new();
+    for page in pages {
+        match selected {
+            AllOr::All => {
+                let start = page.start.max(row_range.start);
+                let end = page.end.min(row_range.end);
+                if start < end {
+                    runs.push(start..end);
+                }
+            }
+            AllOr::None => {}
+            AllOr::Some(slices) => {
+                for &(start, end) in slices {
+                    let global_start = row_range.start.checked_add(start)?;
+                    let global_end = row_range.start.checked_add(end)?;
+                    let run_start = page.start.max(global_start);
+                    let run_end = page.end.min(global_end);
+                    if run_start < run_end {
+                        runs.push(run_start..run_end);
+                    }
+                }
+            }
+        }
+    }
+    Some(runs)
 }
 
 fn page_mask(
@@ -798,6 +831,7 @@ fn try_alprd_plan(
         .ok_or_else(|| vortex_err!("ALPRD row width overflow"))?;
     Ok(Some((
         ALPRDReadPlan {
+            serialized: node.clone(),
             descriptors,
             left,
             right,
@@ -1013,4 +1047,20 @@ fn checked_lcm(left: usize, right: usize) -> VortexResult<usize> {
     left.checked_div(gcd(left, right))
         .and_then(|value| value.checked_mul(right))
         .ok_or_else(|| vortex_err!("Partial row granularity overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_page_runs_are_exact_and_coalesced() {
+        let pages = [10..14, 14..18];
+        let mask = Mask::from_indices(8, [1, 2, 6]);
+
+        assert_eq!(
+            selected_page_runs(&pages, &(10..18), &mask),
+            Some(vec![11..13, 16..17])
+        );
+    }
 }

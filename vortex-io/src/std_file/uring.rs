@@ -3,6 +3,7 @@
 
 //! Process-wide `io_uring` engine for local positional reads.
 
+use std::collections::VecDeque;
 use std::env;
 use std::fs::File;
 use std::io;
@@ -13,23 +14,49 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::sync::mpsc::TryRecvError;
 use std::thread;
 
+use futures::FutureExt;
+use futures::StreamExt;
+use futures::future;
+use futures::future::BoxFuture;
+use futures::stream;
 use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types;
+use vortex_array::buffer::BufferHandle;
+use vortex_array::memory::HostAllocatorRef;
 use vortex_array::memory::WritableHostBuffer;
+use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::parallelism::get_available_parallelism;
+
+use crate::ReadAtRequest;
+use crate::ReadAtStream;
 
 const DEFAULT_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MIN_READ_SIZE: usize = 1024 * 1024;
 const MAX_RINGS: usize = 4;
+const MAX_BATCH_REQUESTS: usize = 512;
+const MAX_BATCH_BYTES: usize = 16 << 20;
 
 type Completion = oneshot::Sender<io::Result<WritableHostBuffer>>;
 
 static ENGINE: OnceLock<Option<Arc<UringEngine>>> = OnceLock::new();
+
+fn engine() -> Option<&'static Arc<UringEngine>> {
+    ENGINE
+        .get_or_init(|| match UringEngine::from_environment() {
+            Ok(engine) => engine.map(Arc::new),
+            Err(error) => {
+                tracing::debug!(%error, "io_uring unavailable; using blocking positional reads");
+                None
+            }
+        })
+        .as_ref()
+}
 
 /// Submit a positional read to the shared engine.
 ///
@@ -40,21 +67,105 @@ static ENGINE: OnceLock<Option<Arc<UringEngine>>> = OnceLock::new();
 /// spill back to the blocking-I/O path and `VORTEX_IO_URING_MIN_READ_SIZE` controls the minimum
 /// request size.
 pub(super) fn try_admit(length: usize) -> Option<Submission> {
-    let engine = ENGINE
-        .get_or_init(|| match UringEngine::from_environment() {
-            Ok(engine) => engine.map(Arc::new),
-            Err(error) => {
-                tracing::debug!(%error, "io_uring unavailable; using blocking positional reads");
-                None
-            }
-        })
-        .as_ref()?;
+    let engine = engine()?;
     let admission = engine.try_admit(length)?;
 
     Some(Submission {
         engine: Arc::clone(engine),
         admission,
     })
+}
+
+/// Submit a complete small-range batch to the ring before waiting for any completion.
+///
+/// The batch limits match the file segment driver's partial-read limits, bounding both the
+/// submission queue and the memory allocated before I/O begins.
+pub(super) fn try_read_ranges(
+    file: Arc<File>,
+    allocator: HostAllocatorRef,
+    requests: Arc<[ReadAtRequest]>,
+) -> Option<ReadAtStream> {
+    let engine = engine()?;
+    let total_bytes = requests
+        .iter()
+        .try_fold(0usize, |sum, request| sum.checked_add(request.length))?;
+    if requests.len() > MAX_BATCH_REQUESTS
+        || total_bytes > MAX_BATCH_BYTES
+        || requests
+            .iter()
+            .any(|request| request.length < engine.min_read_size)
+    {
+        return None;
+    }
+    let mut admissions = engine.try_admit_count(requests.len())?.into_iter();
+
+    let mut batches = (0..engine.senders.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<_>>();
+    let mut responses: Vec<BoxFuture<'static, (ReadAtRequest, VortexResult<BufferHandle>)>> =
+        Vec::with_capacity(requests.len());
+    let first_sender = engine.next.fetch_add(1, Ordering::Relaxed) % engine.senders.len();
+
+    for (index, request) in requests.iter().copied().enumerate() {
+        let admission = admissions
+            .next()
+            .vortex_expect("one admission reserved per range");
+        let buffer = match allocator.allocate(request.length, request.alignment) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                responses.push(future::ready((request, Err(error))).boxed());
+                continue;
+            }
+        };
+        if buffer.is_empty() {
+            responses.push(
+                future::ready((request, Ok(BufferHandle::new_host(buffer.freeze())))).boxed(),
+            );
+            continue;
+        }
+
+        let (complete, receive) = oneshot::channel();
+        let sender_index = (first_sender + index) % batches.len();
+        batches[sender_index].push(Request {
+            file: Arc::clone(&file),
+            offset: request.offset,
+            buffer,
+            filled: 0,
+            complete,
+            _admission: Some(admission),
+        });
+        responses.push(
+            async move {
+                let result = match receive.into_future().await {
+                    Ok(Ok(buffer)) => Ok(BufferHandle::new_host(buffer.freeze())),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(vortex_err!("io_uring completion dropped")),
+                };
+                (request, result)
+            }
+            .boxed(),
+        );
+    }
+
+    for (sender, batch) in engine.senders.iter().zip(batches) {
+        if batch.is_empty() {
+            continue;
+        }
+        if let Err(error) = sender.send(batch) {
+            for request in error.0 {
+                drop(request.complete.send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "io_uring worker stopped",
+                ))));
+            }
+        }
+    }
+
+    Some(
+        stream::iter(responses)
+            .buffer_unordered(requests.len().max(1))
+            .boxed(),
+    )
 }
 
 pub(super) struct Submission {
@@ -76,22 +187,24 @@ impl Submission {
             buffer,
             filled: 0,
             complete,
-            _admission: self.admission,
+            _admission: Some(self.admission),
         };
         let sender_index =
             self.engine.next.fetch_add(1, Ordering::Relaxed) % self.engine.senders.len();
-        if let Err(error) = self.engine.senders[sender_index].send(request) {
-            drop(error.0.complete.send(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "io_uring worker stopped",
-            ))));
+        if let Err(error) = self.engine.senders[sender_index].send(vec![request]) {
+            for request in error.0 {
+                drop(request.complete.send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "io_uring worker stopped",
+                ))));
+            }
         }
         receive
     }
 }
 
 struct UringEngine {
-    senders: Vec<mpsc::Sender<Request>>,
+    senders: Vec<mpsc::Sender<Vec<Request>>>,
     next: AtomicUsize,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: usize,
@@ -162,12 +275,22 @@ impl UringEngine {
         if length < self.min_read_size {
             return None;
         }
+        self.try_admit_count(1)?.pop()
+    }
+
+    fn try_admit_count(&self, count: usize) -> Option<Vec<Admission>> {
         self.in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < self.max_in_flight).then_some(current + 1)
+                current
+                    .checked_add(count)
+                    .filter(|&next| next <= self.max_in_flight)
             })
             .ok()?;
-        Some(Admission(Arc::clone(&self.in_flight)))
+        Some(
+            (0..count)
+                .map(|_| Admission(Arc::clone(&self.in_flight)))
+                .collect(),
+        )
     }
 }
 
@@ -207,18 +330,19 @@ struct Request {
     buffer: WritableHostBuffer,
     filled: usize,
     complete: Completion,
-    _admission: Admission,
+    _admission: Option<Admission>,
 }
 
-fn worker(ring: IoUring, receive: Receiver<Request>, depth: usize) {
+fn worker(ring: IoUring, receive: Receiver<Vec<Request>>, depth: usize) {
     let result = run_worker(ring, &receive, depth);
     if let Err(error) = result {
         tracing::warn!(%error, "local-file io_uring worker stopped");
     }
 }
 
-fn run_worker(ring: IoUring, receive: &Receiver<Request>, depth: usize) -> io::Result<()> {
+fn run_worker(ring: IoUring, receive: &Receiver<Vec<Request>>, depth: usize) -> io::Result<()> {
     let mut pending: HashMap<u64, Request> = HashMap::with_capacity(depth);
+    let mut queued = VecDeque::new();
     // Declared after `pending` so the ring is closed (and the kernel has released all requests)
     // before any in-flight buffers are dropped on an error return.
     let mut ring = ring;
@@ -258,27 +382,20 @@ fn run_worker(ring: IoUring, receive: &Receiver<Request>, depth: usize) -> io::R
             }
         }
 
-        let mut accepted = 0;
+        if pending.is_empty() && queued.is_empty() {
+            match receive.recv() {
+                Ok(batch) => queued.extend(batch),
+                Err(_) => return Ok(()),
+            }
+        }
+        while let Ok(batch) = receive.try_recv() {
+            queued.extend(batch);
+        }
         while pending.len() < depth {
-            let request = if pending.is_empty() && accepted == 0 {
-                match receive.recv() {
-                    Ok(request) => request,
-                    Err(_) => return Ok(()),
-                }
-            } else {
-                match receive.try_recv() {
-                    Ok(request) => request,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        if pending.is_empty() {
-                            return Ok(());
-                        }
-                        break;
-                    }
-                }
+            let Some(request) = queued.pop_front() else {
+                break;
             };
             push(&mut ring, request, &mut pending, &mut next_id)?;
-            accepted += 1;
         }
 
         if !pending.is_empty() {
@@ -335,19 +452,63 @@ mod tests {
 
         let buffer = DefaultHostAllocator.allocate(4, Alignment::none())?;
         let (complete, completed) = oneshot::channel();
-        send.send(Request {
+        send.send(vec![Request {
             file,
             offset: 2,
             buffer,
             filled: 0,
             complete,
-            _admission: Admission(Arc::new(AtomicUsize::new(1))),
-        })
+            _admission: Some(Admission(Arc::new(AtomicUsize::new(1)))),
+        }])
         .map_err(|_| anyhow::anyhow!("io_uring request channel closed"))?;
 
         let buffer = futures::executor::block_on(completed.into_future())
             .map_err(|_| anyhow::anyhow!("io_uring completion channel closed"))??;
         assert_eq!(buffer.freeze().as_slice(), b"cdef");
+        drop(send);
+        owner
+            .join()
+            .map_err(|_| anyhow::anyhow!("io_uring owner panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn reads_batch_larger_than_queue_depth() -> anyhow::Result<()> {
+        let mut file = tempfile::tempfile()?;
+        let data = (0_u8..32).collect::<Vec<_>>();
+        file.write_all(&data)?;
+        let file = Arc::new(file);
+        let (send, receive) = mpsc::channel();
+        let owner = thread::spawn(move || {
+            let ring = new_ring(8)?;
+            run_worker(ring, &receive, 8)
+        });
+
+        let in_flight = Arc::new(AtomicUsize::new(16));
+        let mut requests = Vec::new();
+        let mut completions = Vec::new();
+        for offset in (0_u64..32).step_by(2) {
+            let buffer = DefaultHostAllocator.allocate(2, Alignment::none())?;
+            let (complete, completed) = oneshot::channel();
+            requests.push(Request {
+                file: Arc::clone(&file),
+                offset,
+                buffer,
+                filled: 0,
+                complete,
+                _admission: Some(Admission(Arc::clone(&in_flight))),
+            });
+            completions.push((offset as usize, completed));
+        }
+        send.send(requests)
+            .map_err(|_| anyhow::anyhow!("io_uring worker stopped"))?;
+
+        for (offset, completed) in completions {
+            let buffer = futures::executor::block_on(completed.into_future())
+                .map_err(|_| anyhow::anyhow!("io_uring completion channel closed"))??;
+            assert_eq!(buffer.freeze().as_slice(), &data[offset..offset + 2]);
+        }
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
         drop(send);
         owner
             .join()
