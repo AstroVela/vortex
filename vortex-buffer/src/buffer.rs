@@ -161,7 +161,7 @@ impl<T> Buffer<T> {
         if !alignment.is_ptr_aligned(bytes.as_ptr()) {
             vortex_panic!("Foreign buffer is not aligned to {alignment}");
         }
-        let length = bytes.len() / size_of::<T>();
+        let length = bytes.len().checked_div(size_of::<T>()).unwrap_or(0);
         Self {
             bytes,
             length,
@@ -549,6 +549,11 @@ impl<T> Buffer<T> {
     /// too, but the round trip is lossy in two ways: a `Bytes` carries no alignment, so the
     /// buffer that comes back reports an alignment of 1, and it comes back read-only, since all
     /// we can recover from a `Bytes` is a shared view of this buffer's bytes.
+    ///
+    /// Each round trip also wraps the buffer in one more owner, and those owners drop
+    /// recursively, so round-tripping the *same* buffer thousands of times over will eventually
+    /// overflow the stack on drop. Converting a buffer to `Bytes` and back a bounded number of
+    /// times - which is all any caller here does - is fine.
     pub fn into_bytes(self) -> Bytes {
         Bytes::from_owner(self.into_byte_buffer())
     }
@@ -615,7 +620,8 @@ impl<T> Buffer<T> {
     ///
     /// When this is true, [`try_into_mut`](Self::try_into_mut) succeeds for any buffer over
     /// writable memory, and [`try_into_vec`](Self::try_into_vec) succeeds for any buffer that
-    /// starts at the front of a `T`-aligned allocation.
+    /// starts at the front of an allocation made with *exactly* `align_of::<T>()`. Note that an
+    /// over-aligned allocation does not qualify, even though it satisfies `T`'s alignment.
     pub fn is_unique(&self) -> bool {
         self.bytes.is_unique()
     }

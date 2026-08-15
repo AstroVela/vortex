@@ -68,7 +68,9 @@ use vortex_array::validity::Validity;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::string::StringDictScheme;
+use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
@@ -2037,8 +2039,8 @@ async fn test_file_metadata_roundtrip() -> VortexResult<()> {
         StructArray::from_fields(&[("numbers", buffer![1u32, 2, 3].into_array())])?.into_array();
     let small = ByteBuffer::copy_from(b"{\"source\":\"test\"}");
     let large = ByteBuffer::copy_from(vec![7u8; usize::from(MAX_POSTSCRIPT_SIZE) + 1024]);
-    let empty = ByteBuffer::empty_aligned(vortex_buffer::Alignment::new(16));
-    let aligned = ByteBuffer::copy_from_aligned(b"aligned", vortex_buffer::Alignment::new(64));
+    let empty = ByteBuffer::empty_aligned(Alignment::new(16));
+    let aligned = ByteBuffer::copy_from_aligned(b"aligned", Alignment::new(64));
 
     let mut buf = ByteBufferMut::empty();
     let summary = SESSION
@@ -2085,7 +2087,7 @@ async fn test_file_metadata_roundtrip() -> VortexResult<()> {
     );
     let resolved_aligned = file.metadata_segment("aligned").vortex_expect("aligned");
     assert_eq!(resolved_aligned.as_slice(), aligned.as_slice());
-    assert!(resolved_aligned.is_aligned(vortex_buffer::Alignment::new(64)));
+    assert!(resolved_aligned.is_aligned(Alignment::new(64)));
     assert!(file.metadata_segment("missing").is_none());
 
     // Resolved values are copied out, not sliced from the file buffer.
@@ -2801,35 +2803,40 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     Ok(())
 }
 
-/// The round trip from https://github.com/vortex-data/vortex/issues/4719: a caller that owns a
-/// `Vec<T>` should be able to compress and decompress it without Vortex copying the data in or
-/// out on its behalf.
+/// The round trip from https://github.com/vortex-data/vortex/issues/4719, leg by leg.
+///
+/// The two legs that hand a `Vec` *to* Vortex are zero-copy. The two that take one back are not,
+/// and for the same reason both times: the buffer is over-aligned to `DEFAULT_ALIGNMENT` for
+/// SIMD and CUDA, and a `Vec<T>` frees its allocation with `align_of::<T>()`, so the allocation
+/// cannot be given away. Every leg is asserted in both directions, so that a change in either -
+/// a regression, or a fix that makes one of the copies go away - fails this test rather than
+/// passing silently.
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn test_vec_round_trip_is_zero_copy() -> VortexResult<()> {
+async fn test_vec_round_trip_copies_only_where_alignment_forces_it() -> VortexResult<()> {
     let values: Vec<i32> = (0..4096).collect();
     let values_ptr = values.as_ptr();
 
     // In: the caller's `Vec` becomes the array's buffer without a copy.
     let buffer = Buffer::from(values);
-    assert_eq!(buffer.as_ptr(), values_ptr);
+    assert_eq!(buffer.as_ptr(), values_ptr, "adopting a Vec must not copy");
     let array = PrimitiveArray::new(buffer, Validity::NonNullable).into_array();
 
-    let mut compressed = ByteBufferMut::empty();
+    // The issue's own code writes straight into a `Vec<u8>`, which needs no conversion at all.
+    let mut compressed: Vec<u8> = Vec::new();
     SESSION
         .write_options()
         .write(&mut compressed, array.to_array_stream())
         .await?;
-
-    // Out: the written bytes come back out as a `Vec<u8>`. This one copies: the writer's buffer
-    // is over-aligned to `DEFAULT_ALIGNMENT`, and a `Vec<u8>` would free it with an alignment of
-    // 1. Only a buffer allocated with exactly `align_of::<T>()` can be given away.
-    let compressed: Vec<u8> = compressed.into_vec();
     let compressed_ptr = compressed.as_ptr();
 
     // In again: opening the file from that `Vec` adopts it without a copy.
     let compressed = ByteBuffer::from(compressed);
-    assert_eq!(compressed.as_ptr(), compressed_ptr);
+    assert_eq!(
+        compressed.as_ptr(),
+        compressed_ptr,
+        "adopting the compressed Vec must not copy"
+    );
 
     let file = SESSION.open_options().open_buffer(compressed)?;
 
@@ -2841,13 +2848,32 @@ async fn test_vec_round_trip_is_zero_copy() -> VortexResult<()> {
         .await?
         .execute::<PrimitiveArray>(&mut ctx)?;
 
-    // Out: and the decoded buffer becomes a `Vec<i32>` again. The buffer is the sole handle to
-    // its allocation, so the only thing standing between this and a zero-copy hand-off is the
-    // same over-alignment - the read path allocates through the session's host allocator, which
-    // over-aligns for SIMD and CUDA.
+    // Out: the decoded buffer is the sole handle to its allocation, so uniqueness is not what
+    // stops it being handed over - the over-alignment is.
     let decoded = decoded.into_buffer::<i32>();
-    assert!(decoded.is_unique());
+    let decoded_ptr = decoded.as_ptr();
+    assert!(decoded.is_unique(), "nothing else holds the decoded buffer");
+    assert!(
+        decoded.is_aligned(Alignment::DEFAULT_ALIGNMENT),
+        "the read path over-aligns, which is what forces the copy below"
+    );
+    assert!(
+        decoded.clone().try_into_vec().is_err(),
+        "an over-aligned allocation cannot be freed as a Vec<i32>"
+    );
+
     let decoded: Vec<i32> = decoded.into_vec();
+    assert_ne!(decoded.as_ptr(), decoded_ptr, "so into_vec copies");
     assert_eq!(decoded, (0..4096).collect::<Vec<i32>>());
+
+    // A buffer the caller allocated with exactly `align_of::<T>()` does round-trip for free,
+    // which is the escape hatch for anyone who needs the whole path to be copy-free.
+    let exact = BufferMut::<i32>::with_capacity_preferred_aligned(4, Alignment::of::<i32>(), None);
+    let mut exact = exact;
+    exact.extend_from_slice(&[1, 2, 3, 4]);
+    let exact_ptr = exact.as_ptr();
+    let exact: Vec<i32> = exact.freeze().try_into_vec().expect("exactly T-aligned");
+    assert_eq!(exact.as_ptr(), exact_ptr, "and that one is zero-copy");
+
     Ok(())
 }

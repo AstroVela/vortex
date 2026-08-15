@@ -275,7 +275,7 @@ impl<T> BufferMut<T> {
         if !alignment.is_ptr_aligned(bytes.as_ptr()) {
             vortex_panic!("Foreign buffer is not aligned to {alignment}");
         }
-        let length = bytes.len() / size_of::<T>();
+        let length = bytes.len().checked_div(size_of::<T>()).unwrap_or(0);
         Self {
             bytes,
             length,
