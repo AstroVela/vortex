@@ -1,5 +1,20 @@
 # Vortex Buffer
 
-For now, a Vortex buffer is implemented as a very thin wrapper around the Tokio bytes crate.
-In the future, we may re-implement this ourselves to have more control over alignment
-(see https://github.com/tokio-rs/bytes/issues/437)
+A Vortex buffer is a window into a reference-counted region of memory, in the same model as the
+Tokio `bytes` crate: cloning is a refcount bump and slicing is pointer arithmetic. It used to be a
+thin wrapper around `bytes` itself; it now manages the region directly through `std::alloc`
+(see https://github.com/tokio-rs/bytes/issues/437), which buys three things `bytes` cannot give us:
+
+- **Custom alignment.** A region remembers the `Layout` it was allocated with, so a buffer that
+  needs 256-byte alignment is allocated that way rather than over-allocated and offset into.
+  `BufferMut<T>` maintains its alignment across every operation that reallocates.
+- **Mutable foreign buffers.** A region records whether it may be written through, so memory
+  adopted from a `Vec<T>`, an Arrow buffer, a writable memory map, or an FFI allocation can be
+  turned back into a `BufferMut<T>` without a copy whenever the buffer is its only handle.
+  `bytes::Bytes::try_into_mut` only ever succeeds for bytes that came out of `BytesMut::freeze`.
+- **`Vec<T>` round-trips.** A region allocated with exactly `Layout::array::<T>(cap)` is
+  indistinguishable from a `Vec<T>`'s allocation, so `Buffer::into_vec` can hand it straight back
+  out.
+
+`bytes::Bytes` remains a zero-copy conversion in both directions, via `Buffer::into_bytes` and
+`impl From<bytes::Bytes> for ByteBuffer`.
