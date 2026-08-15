@@ -137,9 +137,15 @@ impl UniqueBytes {
         // SAFETY: we have just created `owner` and nothing else can free it or reach into it.
         let slice: &mut [T] = unsafe { &mut *owner }.as_mut();
         let size = size_of_val(slice);
-        // Note that an empty owner is still kept alive: its `Drop` may release resources the
-        // caller expects the buffer to hold on to.
-        let base = NonNull::from(slice).cast::<u8>();
+        // An empty window never dereferences its pointer, so prefer the maximally aligned
+        // dangling address over the owner's, which may be aligned to nothing in particular. The
+        // owner is kept alive either way: its `Drop` may release resources the caller expects the
+        // buffer to hold on to.
+        let base = if size == 0 {
+            dangling()
+        } else {
+            NonNull::from(slice).cast::<u8>()
+        };
         // SAFETY: `slice` points into the leaked owner, which the allocation keeps alive for
         // exactly as long as the region, and `base` is derived from a unique reference so it may
         // be written through.
@@ -357,8 +363,20 @@ impl UniqueBytes {
     /// Append `slice` to the window, growing it if needed.
     pub(crate) fn extend_from_slice(&mut self, slice: &[u8], alignment: Alignment) {
         self.reserve(slice.len(), alignment);
-        // SAFETY: we just reserved `slice.len()` bytes past `len`, and `slice` cannot overlap the
-        // spare capacity of a window we own exclusively.
+        // `unsplit` is the one caller that can hand us a slice from our own region, so the
+        // non-overlap argument is worth spelling out: live windows into a region are disjoint, so
+        // `slice` starts at or after our window's end, while the copy below stays within
+        // `len..len + slice.len() <= cap`. `reserve` cannot have widened our window over `slice`
+        // either - the other half still holds an `Arc` clone, so both `reclaim` and
+        // `grow_in_place` fail their uniqueness check and we get a fresh region instead.
+        debug_assert!(
+            slice.is_empty()
+                || slice.as_ptr().addr() + slice.len() <= self.ptr.as_ptr().addr() + self.len
+                || slice.as_ptr().addr() >= self.ptr.as_ptr().addr() + self.len + slice.len(),
+            "extend_from_slice source overlaps the destination"
+        );
+        // SAFETY: we just reserved `slice.len()` bytes past `len`, and per the argument above
+        // `slice` cannot overlap them.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 slice.as_ptr(),

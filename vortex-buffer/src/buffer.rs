@@ -326,10 +326,16 @@ impl<T> Buffer<T> {
         buffer.freeze()
     }
 
-    /// Map each element of the buffer with a closure.
+    /// Map each element of the buffer with a closure, reusing the allocation where possible.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if `R` does not have the same size and alignment as `T`. See
+    /// [`BufferMut::map_each_in_place`].
     pub fn map_each_in_place<R, F>(self, mut f: F) -> BufferMut<R>
     where
         T: Copy,
+        R: Copy,
         F: FnMut(T) -> R,
     {
         match self.try_into_mut() {

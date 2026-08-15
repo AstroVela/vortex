@@ -71,9 +71,15 @@ impl SharedBytes {
         // SAFETY: we have just created `owner` and nothing else can free it.
         let slice: &[T] = unsafe { &*owner }.as_ref();
         let size = size_of_val(slice);
-        // Note that an empty owner is still kept alive: its `Drop` may release resources the
-        // caller expects the buffer to hold on to.
-        let base = NonNull::from(slice).cast::<u8>();
+        // An empty window never dereferences its pointer, so prefer the maximally aligned
+        // dangling address over the owner's, which may be aligned to nothing in particular. The
+        // owner is kept alive either way: its `Drop` may release resources the caller expects the
+        // buffer to hold on to.
+        let base = if size == 0 {
+            dangling()
+        } else {
+            NonNull::from(slice).cast::<u8>()
+        };
         // SAFETY: `slice` points into the leaked owner, which the allocation keeps alive for
         // exactly as long as the region. We record the region as read-only, because `base` is
         // derived from a shared reference.

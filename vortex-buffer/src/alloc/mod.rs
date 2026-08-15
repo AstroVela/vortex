@@ -200,8 +200,11 @@ impl Drop for Allocation {
     fn drop(&mut self) {
         match &self.release {
             Release::Global(layout) => {
-                // SAFETY: `base` was allocated by `Allocation::global` with exactly this layout,
-                // and no handle to the region survives the last `Arc`.
+                // SAFETY: `base` and `layout` are always kept in step with the allocator call
+                // that produced them - `Allocation::global`, the `Vec`'s own
+                // `Layout::array::<T>(capacity)` in `UniqueBytes::from_vec`, or the `realloc` in
+                // `UniqueBytes::grow_in_place` - so this frees the region with exactly the layout
+                // it was allocated with. No handle to it survives the last `Arc`.
                 unsafe { dealloc(self.base.as_ptr(), *layout) }
             }
             Release::Owner { owner, drop } => {
