@@ -546,8 +546,9 @@ impl<T> Buffer<T> {
     ///
     /// The `Bytes` keeps this buffer's allocation alive, so it is safe to hand out even for
     /// buffers backed by foreign memory. Converting back with `ByteBuffer::from` is zero-copy
-    /// too, but a `Bytes` carries no alignment, so the buffer that comes back reports an
-    /// alignment of 1.
+    /// too, but the round trip is lossy in two ways: a `Bytes` carries no alignment, so the
+    /// buffer that comes back reports an alignment of 1, and it comes back read-only, since all
+    /// we can recover from a `Bytes` is a shared view of this buffer's bytes.
     pub fn into_bytes(self) -> Bytes {
         Bytes::from_owner(self.into_byte_buffer())
     }

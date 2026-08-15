@@ -707,13 +707,6 @@ impl<T> PartialEq for BufferMut<T> {
 
 impl<T> Eq for BufferMut<T> {}
 
-impl<T> From<Vec<T>> for BufferMut<T> {
-    #[inline]
-    fn from(value: Vec<T>) -> Self {
-        Self::from_vec(value)
-    }
-}
-
 impl<T: Debug> Debug for BufferMut<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(&format!("BufferMut<{}>", type_name::<T>()))
