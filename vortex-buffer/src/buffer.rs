@@ -11,6 +11,7 @@ use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ops::RangeBounds;
+use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -27,12 +28,44 @@ use crate::trusted_len::TrustedLen;
 /// An immutable buffer of items of `T`.
 ///
 /// Elements are treated as plain data: the buffer never runs `T`'s destructor.
+///
+/// A `Buffer<T>` is a shared handle - it is `Clone`, and every clone hands out `&[T]` - so it
+/// crosses threads under the same rule as `Arc<T>`: `T` must be both `Send` and `Sync`. A buffer
+/// of a `Send`-but-not-`Sync` element therefore cannot be sent, because its clone would still be
+/// readable here:
+///
+/// ```compile_fail,E0277
+/// use std::cell::Cell;
+/// use vortex_buffer::Buffer;
+///
+/// let a: Buffer<Cell<u8>> = Buffer::copy_from(vec![Cell::new(0u8); 8]);
+/// let b = a.clone();
+/// std::thread::spawn(move || b[0].set(1));
+/// a[0].set(2);
+/// ```
+///
+/// [`BufferMut`] is uniquely owned and follows `Vec<T>` instead, so the same element type is fine
+/// there:
+///
+/// ```
+/// use std::cell::Cell;
+/// use vortex_buffer::BufferMut;
+///
+/// let mut b = BufferMut::<Cell<u8>>::empty();
+/// b.push(Cell::new(0));
+/// std::thread::spawn(move || b[0].set(1)).join().unwrap();
+/// ```
 #[derive(Clone)]
 pub struct Buffer<T> {
     pub(crate) bytes: SharedBytes,
     pub(crate) length: usize,
     pub(crate) alignment: Alignment,
-    pub(crate) _marker: PhantomData<T>,
+    /// Carries `T`'s variance and auto traits. The marker is `Arc<T>` rather than `T` because
+    /// this is a *shared* handle: it is `Clone`, and every clone hands out `&[T]`, so sending one
+    /// to another thread shares the elements exactly as an `Arc<T>` would. With a bare
+    /// `PhantomData<T>` a `Buffer<Cell<u8>>` would be `Send`, and two threads could then write
+    /// through the same `&[Cell<u8>]`.
+    pub(crate) _marker: PhantomData<Arc<T>>,
 }
 
 impl<T> Default for Buffer<T> {
@@ -338,6 +371,19 @@ impl<T> Buffer<T> {
         R: Copy,
         F: FnMut(T) -> R,
     {
+        // Assert here as well as in `BufferMut::map_each_in_place`, so that the contract does not
+        // depend on which arm we take: only the in-place arm reuses `T`'s allocation, so without
+        // this a mismatched `R` would panic or not depending on the buffer's refcount.
+        assert_eq!(
+            size_of::<T>(),
+            size_of::<R>(),
+            "Size of T and R do not match"
+        );
+        assert_eq!(
+            align_of::<T>(),
+            align_of::<R>(),
+            "Alignment of T and R do not match"
+        );
         match self.try_into_mut() {
             Ok(mut_buf) => mut_buf.map_each_in_place(f),
             Err(buf) => {
@@ -911,10 +957,13 @@ mod tests {
         assert_eq!(aligned.as_slice(), &[0, 1, 2]);
     }
 
-    /// The storage types are unconditionally `Send`/`Sync` via `unsafe impl`, so it is the
-    /// `PhantomData<T>` that keeps a buffer's auto traits tied to its element type. `Cell` is
-    /// `Send` but not `Sync`, so a buffer of it must compile as `Send` and, were the bound ever
-    /// widened, the `Sync` assertion below would start compiling for it too.
+    /// The storage types are unconditionally `Send`/`Sync` via `unsafe impl`, so the markers are
+    /// the only thing tying a buffer's auto traits to its element type. `Buffer` is a shared
+    /// handle and follows the `Arc<T>` rule; `BufferMut` is uniquely owned and follows `Vec<T>`.
+    ///
+    /// The negative half of that cannot be asserted here - `Buffer<Cell<u8>>: Send` is what makes
+    /// the data race possible, and there is no stable way to assert a type is *not* `Send` - so
+    /// it is covered by `tests/compile_fail_send.rs` instead.
     #[test]
     fn auto_traits_follow_the_element_type() {
         const fn assert_send_sync<T: Send + Sync>() {}
@@ -923,7 +972,8 @@ mod tests {
         assert_send_sync::<Buffer<u8>>();
         assert_send_sync::<Buffer<i64>>();
         assert_send_sync::<crate::BufferMut<i64>>();
-        assert_send::<Buffer<Cell<u8>>>();
+        // `Cell` is `Send` but not `Sync`. A uniquely owned buffer of it is still `Send`, exactly
+        // as a `Vec<Cell<u8>>` is.
         assert_send::<crate::BufferMut<Cell<u8>>>();
     }
 
