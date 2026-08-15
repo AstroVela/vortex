@@ -2821,8 +2821,9 @@ async fn test_vec_round_trip_is_zero_copy() -> VortexResult<()> {
         .write(&mut compressed, array.to_array_stream())
         .await?;
 
-    // Out: the written bytes come back out as a `Vec<u8>`. This one still copies, because the
-    // writer's buffer is over-aligned and `Vec<u8>` would free it with the wrong layout.
+    // Out: the written bytes come back out as a `Vec<u8>`. This one copies: the writer's buffer
+    // is over-aligned to `DEFAULT_ALIGNMENT`, and a `Vec<u8>` would free it with an alignment of
+    // 1. Only a buffer allocated with exactly `align_of::<T>()` can be given away.
     let compressed: Vec<u8> = compressed.into_vec();
     let compressed_ptr = compressed.as_ptr();
 
@@ -2840,8 +2841,13 @@ async fn test_vec_round_trip_is_zero_copy() -> VortexResult<()> {
         .await?
         .execute::<PrimitiveArray>(&mut ctx)?;
 
-    // Out: and the decoded buffer becomes a `Vec<i32>` again.
-    let decoded: Vec<i32> = decoded.into_buffer::<i32>().into_vec();
+    // Out: and the decoded buffer becomes a `Vec<i32>` again. The buffer is the sole handle to
+    // its allocation, so the only thing standing between this and a zero-copy hand-off is the
+    // same over-alignment - the read path allocates through the session's host allocator, which
+    // over-aligns for SIMD and CUDA.
+    let decoded = decoded.into_buffer::<i32>();
+    assert!(decoded.is_unique());
+    let decoded: Vec<i32> = decoded.into_vec();
     assert_eq!(decoded, (0..4096).collect::<Vec<i32>>());
     Ok(())
 }
