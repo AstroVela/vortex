@@ -196,10 +196,10 @@ enum ActorMessage {
     Finish(SequenceId),
 }
 
-/// Drives one independent child writer on the runtime without applying channel backpressure to
-/// its parent. The unbounded mailbox is accounted by [`BufferedBytesTracker`], and the explicit
-/// finish message is the terminal barrier, so an ordered segment sink cannot form a
-/// bounded-channel cycle with its producer.
+/// Drives one independent child writer on the runtime. Its capacity-one mailbox lets backpressure
+/// from the segment sink propagate up to the public writer while retaining enough slack for
+/// sibling writers to make progress independently. Queued arrays are accounted by
+/// [`BufferedBytesTracker`].
 pub(crate) struct LayoutWriterActor {
     sender: Option<kanal::AsyncSender<ActorMessage>>,
     task: Option<Task<VortexResult<LayoutRef>>>,
@@ -213,7 +213,7 @@ impl LayoutWriterActor {
         buffered_bytes: BufferedBytesTracker,
         handle: &Handle,
     ) -> Self {
-        let (sender, receiver) = kanal::unbounded_async::<ActorMessage>();
+        let (sender, receiver) = kanal::bounded_async::<ActorMessage>(1);
         let task = handle.spawn(async move {
             loop {
                 match receiver.recv().await {
