@@ -65,16 +65,18 @@ impl SharedBytes {
     where
         O: AsRef<[T]> + Send + 'static,
     {
-        // Box first so the owner's final address is fixed before we read the slice out of it.
-        let owner: Box<O> = Box::new(owner);
-        let slice: &[T] = (*owner).as_ref();
+        // Leak the box before reading the slice out of it, so that the pointer we keep is derived
+        // from a raw pointer that nothing reborrows again.
+        let owner: *mut O = Box::into_raw(Box::new(owner));
+        // SAFETY: we have just created `owner` and nothing else can free it.
+        let slice: &[T] = unsafe { &*owner }.as_ref();
         let size = size_of_val(slice);
-        if size == 0 {
-            return Self::empty();
-        }
+        // Note that an empty owner is still kept alive: its `Drop` may release resources the
+        // caller expects the buffer to hold on to.
         let base = NonNull::from(slice).cast::<u8>();
-        // SAFETY: `slice` points into the boxed owner, which we keep alive for exactly as long as
-        // the allocation. We record the region as read-only.
+        // SAFETY: `slice` points into the leaked owner, which the allocation keeps alive for
+        // exactly as long as the region. We record the region as read-only, because `base` is
+        // derived from a shared reference.
         let alloc = unsafe { Allocation::owned(base, size, false, owner) };
         Self {
             ptr: base,

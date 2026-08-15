@@ -24,7 +24,6 @@ use std::alloc::alloc;
 use std::alloc::alloc_zeroed;
 use std::alloc::dealloc;
 use std::alloc::handle_alloc_error;
-use std::any::Any;
 use std::ptr::NonNull;
 
 use vortex_error::vortex_panic;
@@ -61,15 +60,27 @@ enum Release {
     Global(Layout),
     /// Kept alive by an owner value; dropping the owner releases the memory.
     ///
-    /// We never hand out a reference to the owner, we only drop it, so `Send` alone is enough
-    /// for the region to be shared across threads.
-    Owner(
-        #[expect(
-            dead_code,
-            reason = "the owner is held solely so that dropping it releases the region"
-        )]
-        Box<dyn Any + Send>,
-    ),
+    /// The owner is held as a leaked `Box<O>` rather than a `Box<dyn Any>` so that no reborrow of
+    /// it ever happens after we have derived the region's pointer from it: moving a `Box` asserts
+    /// unique access to its contents, which would invalidate that pointer. This mirrors what
+    /// `bytes::Bytes::from_owner` does.
+    ///
+    /// We never hand out a reference to the owner, we only drop it, so `Send` alone is enough for
+    /// the region to be shared across threads.
+    Owner {
+        owner: *mut (),
+        drop: unsafe fn(*mut ()),
+    },
+}
+
+/// Drop a leaked `Box<O>` that was erased to a `*mut ()`.
+///
+/// ## Safety
+///
+/// `ptr` must be the result of `Box::into_raw(Box::<O>::new(..))`, and must not have been dropped.
+unsafe fn drop_owner<O>(ptr: *mut ()) {
+    // SAFETY: the caller guarantees `ptr` came from `Box::<O>::into_raw` and is still live.
+    drop(unsafe { Box::from_raw(ptr.cast::<O>()) })
 }
 
 /// A region of memory shared by one or more buffer handles.
@@ -127,25 +138,29 @@ impl Allocation {
         }
     }
 
-    /// Adopt a region kept alive by `owner`.
+    /// Adopt a region kept alive by a leaked `Box<O>`.
     ///
     /// ## Safety
     ///
-    /// `base..base + size` must remain valid for reads for as long as `owner` is alive, and must
-    /// not be aliased by anything reachable other than through `owner`. When `writable` is true,
-    /// the region must additionally be valid for writes, and `base` must have been derived from a
-    /// unique (`&mut`) reference or a raw pointer with write provenance.
-    unsafe fn owned(
+    /// `owner` must be the result of `Box::into_raw(Box::<O>::new(..))` and must not be dropped by
+    /// anyone else. `base..base + size` must lie within memory that stays valid for reads for as
+    /// long as that box is alive, and must not be aliased by anything reachable other than through
+    /// it. When `writable` is true, the region must additionally be valid for writes, and `base`
+    /// must carry write provenance.
+    unsafe fn owned<O: Send + 'static>(
         base: NonNull<u8>,
         size: usize,
         writable: bool,
-        owner: Box<dyn Any + Send>,
+        owner: *mut O,
     ) -> Self {
         Self {
             base,
             size,
             writable,
-            release: Release::Owner(owner),
+            release: Release::Owner {
+                owner: owner.cast::<()>(),
+                drop: drop_owner::<O>,
+            },
         }
     }
 
@@ -176,19 +191,25 @@ impl Allocation {
     fn global_layout(&self) -> Option<Layout> {
         match &self.release {
             Release::Global(layout) => Some(*layout),
-            Release::Owner(_) => None,
+            Release::Owner { .. } => None,
         }
     }
 }
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        if let Release::Global(layout) = &self.release {
-            // SAFETY: `base` was allocated by `Allocation::global` with exactly this layout, and
-            // no handle to the region survives the last `Arc`.
-            unsafe { dealloc(self.base.as_ptr(), *layout) }
+        match &self.release {
+            Release::Global(layout) => {
+                // SAFETY: `base` was allocated by `Allocation::global` with exactly this layout,
+                // and no handle to the region survives the last `Arc`.
+                unsafe { dealloc(self.base.as_ptr(), *layout) }
+            }
+            Release::Owner { owner, drop } => {
+                // SAFETY: `Allocation::owned` requires `owner` to be a live leaked box that only
+                // we may drop, and this runs once, when the last `Arc` goes away.
+                unsafe { drop(*owner) }
+            }
         }
-        // `Release::Owner` releases the region by dropping the boxed owner.
     }
 }
 

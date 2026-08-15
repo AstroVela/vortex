@@ -53,9 +53,17 @@ impl ByteBuffer {
     ///
     /// Panics if the Arrow buffer is not sufficiently aligned.
     pub fn from_arrow_buffer(arrow: arrow_buffer::Buffer, alignment: Alignment) -> Self {
-        let buffer = match arrow.into_mutable() {
-            Ok(mutable) => ByteBufferMut::from_owner(MutableBufferOwner(mutable)).freeze(),
-            Err(arrow) => ByteBuffer::from_owner(ArrowOwner(arrow)),
+        // `Buffer::into_mutable` hands back the buffer's whole allocation, and asserts outright
+        // that the buffer is not offset into it, so only reach for it when the buffer covers its
+        // allocation exactly. Any other Arrow buffer is adopted read-only.
+        let covers_allocation = arrow.ptr_offset() == 0 && arrow.len() == arrow.capacity();
+        let buffer = if covers_allocation {
+            match arrow.into_mutable() {
+                Ok(mutable) => ByteBufferMut::from_owner(MutableBufferOwner(mutable)).freeze(),
+                Err(arrow) => ByteBuffer::from_owner(ArrowOwner(arrow)),
+            }
+        } else {
+            ByteBuffer::from_owner(ArrowOwner(arrow))
         };
 
         if !alignment.is_ptr_aligned(buffer.as_ptr()) {
@@ -133,5 +141,29 @@ mod tests {
         buf[0] = 10;
         assert_eq!(buf.as_slice(), &[10, 1, 2, 3]);
         assert_eq!(buf.as_ptr(), ptr, "still no copy");
+    }
+
+    #[test]
+    fn truncated_arrow_slice_keeps_its_length() {
+        // A sole-owner Arrow buffer that does not span its whole allocation must not be widened
+        // back out to the allocation: `Buffer::into_mutable` would hand us all ten bytes.
+        let arrow = ArrowBuffer::from_vec(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let sliced = arrow.slice_with_length(0, 3);
+        drop(arrow);
+
+        let buf = ByteBuffer::from_arrow_buffer(sliced, Alignment::of::<u8>());
+        assert_eq!(buf.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn offset_arrow_slice_is_adopted_read_only() {
+        // `Buffer::into_mutable` asserts that the buffer is not offset into its allocation, so an
+        // offset slice must take the read-only path rather than panicking.
+        let arrow = ArrowBuffer::from_vec(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let sliced = arrow.slice_with_length(4, 4);
+        drop(arrow);
+
+        let buf = ByteBuffer::from_arrow_buffer(sliced, Alignment::of::<u8>());
+        assert_eq!(buf.as_slice(), &[5, 6, 7, 8]);
     }
 }

@@ -539,8 +539,9 @@ impl<T> Buffer<T> {
     /// Convert this buffer into a `bytes::Bytes`, without copying.
     ///
     /// The `Bytes` keeps this buffer's allocation alive, so it is safe to hand out even for
-    /// buffers backed by foreign memory. Note that a `Bytes` carries no alignment, so converting
-    /// back is not free.
+    /// buffers backed by foreign memory. Converting back with `ByteBuffer::from` is zero-copy
+    /// too, but a `Bytes` carries no alignment, so the buffer that comes back reports an
+    /// alignment of 1.
     pub fn into_bytes(self) -> Bytes {
         Bytes::from_owner(self.into_byte_buffer())
     }
@@ -601,8 +602,8 @@ impl<T> Buffer<T> {
     /// Returns whether this is the only handle to the buffer's allocation.
     ///
     /// When this is true, [`try_into_mut`](Self::try_into_mut) succeeds for any buffer over
-    /// writable memory, and [`try_into_vec`](Self::try_into_vec) succeeds for any buffer over a
-    /// `T`-aligned allocation.
+    /// writable memory, and [`try_into_vec`](Self::try_into_vec) succeeds for any buffer that
+    /// starts at the front of a `T`-aligned allocation.
     pub fn is_unique(&self) -> bool {
         self.bytes.is_unique()
     }

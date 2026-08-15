@@ -1228,6 +1228,32 @@ mod tests {
     }
 
     #[test]
+    fn unsplit_into_an_empty_buffer_with_capacity() {
+        // `self` owns an allocation but holds no elements: absorbing `other` must not lose it.
+        let mut a = BufferMut::<u8>::with_capacity(64);
+        let b = BufferMut::<u8>::copy_from([1u8, 2, 3].as_slice());
+        a.unsplit(b);
+        assert_eq!(a.as_slice(), &[1, 2, 3]);
+        assert_eq!(a.len(), 3);
+    }
+
+    #[test]
+    fn split_off_past_the_length_keeps_both_lengths() {
+        let mut a = BufferMut::<u8>::with_capacity(64);
+        a.extend_from_slice(&[1, 2, 3, 4]);
+
+        // Splitting inside the spare capacity leaves `a` whole and `b` empty.
+        let b = a.split_off(32);
+        assert_eq!(a.len(), 4);
+        assert_eq!(a.capacity(), 32);
+        assert_eq!(b.len(), 0);
+
+        // The halves are not adjacent (`a` has a gap), so this falls back to a copy of nothing.
+        a.unsplit(b);
+        assert_eq!(a.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
     fn reserve_preserves_over_alignment() {
         let alignment = Alignment::new(512);
         let mut buf = BufferMut::<u8>::with_capacity_aligned(4, alignment);

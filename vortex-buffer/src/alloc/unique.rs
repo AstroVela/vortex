@@ -129,17 +129,18 @@ impl UniqueBytes {
     where
         O: AsMut<[T]> + Send + 'static,
     {
-        // Box first so the owner's final address is fixed before we read the slice out of it.
-        let mut owner: Box<O> = Box::new(owner);
-        let slice: &mut [T] = (*owner).as_mut();
+        // Leak the box before reading the slice out of it, so that the pointer we keep is derived
+        // from a raw pointer that nothing reborrows again.
+        let owner: *mut O = Box::into_raw(Box::new(owner));
+        // SAFETY: we have just created `owner` and nothing else can free it or reach into it.
+        let slice: &mut [T] = unsafe { &mut *owner }.as_mut();
         let size = size_of_val(slice);
-        if size == 0 {
-            return Self::empty();
-        }
+        // Note that an empty owner is still kept alive: its `Drop` may release resources the
+        // caller expects the buffer to hold on to.
         let base = NonNull::from(slice).cast::<u8>();
-        // SAFETY: `slice` points into the boxed owner, which we keep alive for exactly as long as
-        // the allocation, and `base` is derived from a unique reference so it may be written
-        // through.
+        // SAFETY: `slice` points into the leaked owner, which the allocation keeps alive for
+        // exactly as long as the region, and `base` is derived from a unique reference so it may
+        // be written through.
         let alloc = unsafe { Allocation::owned(base, size, true, owner) };
         Self {
             ptr: base,
