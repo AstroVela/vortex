@@ -8,7 +8,6 @@ use std::fmt::Debug;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
@@ -255,17 +254,6 @@ struct DefaultWritableHostBuffer {
     alignment: Alignment,
 }
 
-#[derive(Debug)]
-struct HostBufferOwner {
-    buffer: ByteBufferMut,
-}
-
-impl AsRef<[u8]> for HostBufferOwner {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer.as_slice()
-    }
-}
-
 impl HostBufferMut for DefaultWritableHostBuffer {
     fn len(&self) -> usize {
         self.buffer.len()
@@ -281,8 +269,8 @@ impl HostBufferMut for DefaultWritableHostBuffer {
 
     fn freeze(self: Box<Self>) -> ByteBuffer {
         let Self { buffer, alignment } = *self;
-        let bytes = Bytes::from_owner(HostBufferOwner { buffer });
-        ByteBuffer::from_bytes_aligned(bytes, alignment)
+        debug_assert_eq!(buffer.alignment(), alignment);
+        buffer.freeze()
     }
 }
 

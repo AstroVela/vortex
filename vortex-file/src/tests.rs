@@ -2800,3 +2800,48 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     assert_eq!(result.len(), 1);
     Ok(())
 }
+
+/// The round trip from https://github.com/vortex-data/vortex/issues/4719: a caller that owns a
+/// `Vec<T>` should be able to compress and decompress it without Vortex copying the data in or
+/// out on its behalf.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_vec_round_trip_is_zero_copy() -> VortexResult<()> {
+    let values: Vec<i32> = (0..4096).collect();
+    let values_ptr = values.as_ptr();
+
+    // In: the caller's `Vec` becomes the array's buffer without a copy.
+    let buffer = Buffer::from(values);
+    assert_eq!(buffer.as_ptr(), values_ptr);
+    let array = PrimitiveArray::new(buffer, Validity::NonNullable).into_array();
+
+    let mut compressed = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut compressed, array.to_array_stream())
+        .await?;
+
+    // Out: the written bytes come back out as a `Vec<u8>`. This one still copies, because the
+    // writer's buffer is over-aligned and `Vec<u8>` would free it with the wrong layout.
+    let compressed: Vec<u8> = compressed.into_vec();
+    let compressed_ptr = compressed.as_ptr();
+
+    // In again: opening the file from that `Vec` adopts it without a copy.
+    let compressed = ByteBuffer::from(compressed);
+    assert_eq!(compressed.as_ptr(), compressed_ptr);
+
+    let file = SESSION.open_options().open_buffer(compressed)?;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let decoded = file
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?
+        .execute::<PrimitiveArray>(&mut ctx)?;
+
+    // Out: and the decoded buffer becomes a `Vec<i32>` again.
+    let decoded: Vec<i32> = decoded.into_buffer::<i32>().into_vec();
+    assert_eq!(decoded, (0..4096).collect::<Vec<i32>>());
+    Ok(())
+}

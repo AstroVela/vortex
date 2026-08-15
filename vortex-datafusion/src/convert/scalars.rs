@@ -112,15 +112,15 @@ impl TryToDataFusion<ScalarValue> for Scalar {
                 }
             }
             // SAFETY: By construction Utf8 scalar values are utf8
-            DType::Utf8(_) => ScalarValue::Utf8(self.as_utf8().value().cloned().map(|s| unsafe {
-                String::from_utf8_unchecked(Vec::<u8>::from(s.into_inner().into_inner()))
-            })),
-            DType::Binary(_) => ScalarValue::Binary(
-                self.as_binary()
+            DType::Utf8(_) => ScalarValue::Utf8(
+                self.as_utf8()
                     .value()
                     .cloned()
-                    .map(|b| Vec::<u8>::from(b.into_inner())),
+                    .map(|s| unsafe { String::from_utf8_unchecked(s.into_inner().into_vec()) }),
             ),
+            DType::Binary(_) => {
+                ScalarValue::Binary(self.as_binary().value().cloned().map(|b| b.into_vec()))
+            }
             dtype @ DType::List(..) => vortex_bail!(
                 "cannot convert Vortex scalar dtype {dtype} to DataFusion ScalarValue: unsupported scalar type"
             ),
@@ -789,13 +789,7 @@ mod tests {
     #[case::fixed_size_binary(ScalarValue::FixedSizeBinary(5, Some(vec![1u8, 2, 3, 4, 5])))]
     fn test_binary_variants(#[case] variant: ScalarValue) {
         let result = from_df(&variant);
-        let result_bytes: Vec<u8> = result
-            .as_binary()
-            .value()
-            .cloned()
-            .unwrap()
-            .into_inner()
-            .into();
+        let result_bytes: Vec<u8> = result.as_binary().value().cloned().unwrap().into_vec();
         assert_eq!(result_bytes, vec![1u8, 2, 3, 4, 5]);
     }
 
