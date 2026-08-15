@@ -600,7 +600,6 @@ async fn resolve_alprd_pages(
                 rows.len(),
             )?
             .into_array();
-            clear_stats(&array);
             apply_page_mask(array, local_mask)
         })
         .collect()
