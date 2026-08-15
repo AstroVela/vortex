@@ -35,10 +35,11 @@ use vortex_error::vortex_err;
 use vortex_io::IoBuf;
 use vortex_io::VortexWrite;
 use vortex_io::runtime::BlockingRuntime;
+use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::BufferedBytesTracker;
 use vortex_layout::LayoutContext;
 use vortex_layout::LayoutStrategy;
-use vortex_layout::LayoutWriter;
+use vortex_layout::LayoutWriterActor;
 use vortex_layout::LayoutWriterContext;
 use vortex_layout::layouts::file_stats::FileStatsAccumulator;
 use vortex_layout::sequence::SequenceId;
@@ -240,6 +241,8 @@ impl VortexWriteOptions {
             dtype.clone(),
             &self.session,
         )?;
+        let layout =
+            LayoutWriterActor::spawn(layout, self.buffered_bytes.clone(), &self.session.handle());
         let sequence = SequenceId::root();
         let file_stats = FileStatsAccumulator::new(
             &dtype,
@@ -338,7 +341,7 @@ pub struct Writer<W> {
     write: CountingVortexWrite<W>,
     buffers: kanal::AsyncReceiver<ByteBuffer>,
     segment_sink: Arc<BufferedSegmentSink>,
-    layout: Option<Box<dyn LayoutWriter>>,
+    layout: Option<LayoutWriterActor>,
     sequence: SequencePointer,
     ctx: LayoutWriterContext,
     layout_ctx: LayoutContext,
@@ -512,7 +515,7 @@ impl<W: VortexWrite + Unpin> Writer<W> {
             position,
             async move {
                 layout.finish(sequence_id).await?;
-                layout.close().await
+                layout.take_layout()
             },
             "segment buffer channel closed while closing",
         )

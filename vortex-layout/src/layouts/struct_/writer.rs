@@ -194,9 +194,17 @@ impl LayoutWriter for StructLayoutWriter {
         columns.extend(struct_chunk.iter_unmasked_fields().cloned());
 
         let mut sequence = sequence_id.descend();
-        for (writer, column) in self.children.iter_mut().zip_eq(columns) {
-            writer.write(sequence.advance(), column).await?;
-        }
+        let child_sequences = (0..self.children.len())
+            .map(|_| sequence.advance())
+            .collect::<Vec<_>>();
+        try_join_all(
+            self.children
+                .iter_mut()
+                .zip_eq(columns)
+                .zip(child_sequences)
+                .map(|((writer, column), sequence_id)| writer.write(sequence_id, column)),
+        )
+        .await?;
         Ok(())
     }
 

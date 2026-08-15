@@ -218,11 +218,13 @@ enum ActorMessage {
     Finish(SequenceId),
 }
 
-/// Drives one independent child writer on the runtime. Its capacity-one mailbox lets backpressure
+const CHILD_WRITER_QUEUE_CAPACITY: usize = 1;
+
+/// Drives one independent child writer on the runtime. Its bounded mailbox lets backpressure
 /// from the segment sink propagate up to the public writer while retaining enough slack for
 /// sibling writers to make progress independently. Queued arrays are accounted by
 /// [`BufferedBytesTracker`].
-pub(crate) struct LayoutWriterActor {
+pub struct LayoutWriterActor {
     sender: Option<kanal::AsyncSender<ActorMessage>>,
     task: Option<Task<VortexResult<LayoutRef>>>,
     layout: Option<LayoutRef>,
@@ -230,18 +232,19 @@ pub(crate) struct LayoutWriterActor {
 }
 
 impl LayoutWriterActor {
-    pub(crate) fn spawn(
+    /// Spawn a writer with a bounded input mailbox on `handle`.
+    pub fn spawn(
         mut writer: Box<dyn LayoutWriter>,
         buffered_bytes: BufferedBytesTracker,
         handle: &Handle,
     ) -> Self {
-        let (sender, receiver) = kanal::bounded_async::<ActorMessage>(1);
+        let (sender, receiver) = kanal::bounded_async::<ActorMessage>(CHILD_WRITER_QUEUE_CAPACITY);
         let task = handle.spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(ActorMessage::Write(sequence_id, chunk, reservation)) => {
-                        drop(reservation);
                         writer.write(sequence_id, chunk).await?;
+                        drop(reservation);
                     }
                     Ok(ActorMessage::Finish(sequence_id)) => {
                         writer.finish(sequence_id).await?;
@@ -259,11 +262,8 @@ impl LayoutWriterActor {
         }
     }
 
-    pub(crate) async fn write(
-        &mut self,
-        sequence_id: SequenceId,
-        chunk: ArrayRef,
-    ) -> VortexResult<()> {
+    /// Push an array into the child, waiting when its mailbox is full.
+    pub async fn write(&mut self, sequence_id: SequenceId, chunk: ArrayRef) -> VortexResult<()> {
         let reservation = self.buffered_bytes.reserve(chunk.nbytes());
         self.sender
             .as_ref()
@@ -273,7 +273,8 @@ impl LayoutWriterActor {
             .map_err(|_| vortex_err!("layout child finished before all chunks were pushed"))
     }
 
-    pub(crate) async fn finish(&mut self, sequence_id: SequenceId) -> VortexResult<()> {
+    /// Finish the child and wait for its layout to be produced.
+    pub async fn finish(&mut self, sequence_id: SequenceId) -> VortexResult<()> {
         if self.layout.is_some() {
             return Ok(());
         }
@@ -291,7 +292,8 @@ impl LayoutWriterActor {
         Ok(())
     }
 
-    pub(crate) fn take_layout(&mut self) -> VortexResult<LayoutRef> {
+    /// Take the completed layout after [`Self::finish`].
+    pub fn take_layout(&mut self) -> VortexResult<LayoutRef> {
         self.layout
             .take()
             .ok_or_else(|| vortex_err!("layout child was not finished"))
@@ -393,7 +395,58 @@ struct EncodingValidatorWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::FutureExt;
+    use tokio::sync::Semaphore;
+    use vortex_array::ArrayRef;
+    use vortex_array::IntoArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
+    use vortex_io::session::RuntimeSessionExt;
+
+    use crate::LayoutRef;
+    use crate::LayoutWriter;
+    use crate::children::OwnedLayoutChildren;
+    use crate::layouts::chunked::ChunkedLayout;
+    use crate::sequence::SequenceId;
     use crate::strategy::BufferedBytesTracker;
+    use crate::strategy::CHILD_WRITER_QUEUE_CAPACITY;
+    use crate::strategy::LayoutWriterActor;
+    use crate::test::new_session;
+
+    struct BlockingWriter {
+        permits: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl LayoutWriter for BlockingWriter {
+        async fn write(&mut self, _sequence_id: SequenceId, _chunk: ArrayRef) -> VortexResult<()> {
+            self.permits
+                .acquire()
+                .await
+                .map_err(|_| vortex_err!("test semaphore closed"))?
+                .forget();
+            Ok(())
+        }
+
+        async fn finish(&mut self, _sequence_id: SequenceId) -> VortexResult<()> {
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> VortexResult<LayoutRef> {
+            Ok(ChunkedLayout::new(
+                0,
+                DType::Bool(Nullability::NonNullable),
+                OwnedLayoutChildren::layout_children(vec![]),
+            )
+            .into_layout())
+        }
+    }
 
     #[test]
     fn reservations_accumulate_and_release() {
@@ -422,5 +475,44 @@ mod tests {
 
         drop(reservation);
         assert_eq!(observer.buffered_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn child_writer_mailbox_applies_backpressure_when_full() -> VortexResult<()> {
+        let permits = Arc::new(Semaphore::new(0));
+        let tracker = BufferedBytesTracker::new();
+        let session = new_session().with_tokio();
+        let mut actor = LayoutWriterActor::spawn(
+            Box::new(BlockingWriter {
+                permits: Arc::clone(&permits),
+            }),
+            tracker.clone(),
+            &session.handle(),
+        );
+        let chunk = buffer![1u64].into_array();
+        let chunk_bytes = chunk.nbytes();
+        let mut sequence = SequenceId::root();
+
+        for _ in 0..=CHILD_WRITER_QUEUE_CAPACITY {
+            actor.write(sequence.advance(), chunk.clone()).await?;
+        }
+        assert_eq!(
+            tracker.buffered_bytes(),
+            (CHILD_WRITER_QUEUE_CAPACITY as u64 + 1) * chunk_bytes
+        );
+
+        assert!(
+            actor
+                .write(sequence.advance(), chunk)
+                .now_or_never()
+                .is_none(),
+            "a full mailbox must block the producer"
+        );
+
+        permits.add_permits(CHILD_WRITER_QUEUE_CAPACITY + 1);
+        actor.finish(sequence.advance()).await?;
+        actor.take_layout()?;
+        assert_eq!(tracker.buffered_bytes(), 0);
+        Ok(())
     }
 }
