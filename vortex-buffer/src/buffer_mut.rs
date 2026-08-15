@@ -602,10 +602,20 @@ impl<T> BufferMut<T> {
         })
     }
 
-    /// Map each element of the buffer with a closure.
+    /// Map each element of the buffer with a closure, reusing the buffer's allocation.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if `R` does not have the same size and alignment as `T`. Both are required: the
+    /// mapped buffer keeps `T`'s pointer, so a wider `R` would be read and written through a
+    /// pointer that is not aligned for it.
     pub fn map_each_in_place<R, F>(self, mut f: F) -> BufferMut<R>
     where
         T: Copy,
+        // `R: Copy` is what makes the in-place write below sound. Assigning through the
+        // reinterpreted slice drops the old value, which is `T`'s bits viewed as an `R` - for an
+        // `R` with a destructor that means running it over bits that were never a valid `R`.
+        R: Copy,
         F: FnMut(T) -> R,
     {
         assert_eq!(
@@ -613,10 +623,20 @@ impl<T> BufferMut<T> {
             size_of::<R>(),
             "Size of T and R do not match"
         );
-        // SAFETY: we have checked that `size_of::<T>` == `size_of::<R>`.
+        assert_eq!(
+            align_of::<T>(),
+            align_of::<R>(),
+            "Alignment of T and R do not match"
+        );
+        // SAFETY: `T` and `R` have the same size and alignment, so the buffer's pointer, length
+        // and capacity are all equally valid for `R`, and `BufferMut` stores `R` only in a
+        // `PhantomData`.
         let mut buf: BufferMut<R> = unsafe { std::mem::transmute(self) };
-        buf.iter_mut()
-            .for_each(|item| *item = f(unsafe { std::mem::transmute_copy(item) }));
+        buf.iter_mut().for_each(|item| {
+            // SAFETY: the element still holds a `T`, and `T` and `R` have the same size.
+            let value = unsafe { std::mem::transmute_copy::<R, T>(item) };
+            *item = f(value);
+        });
         buf
     }
 
@@ -1101,6 +1121,15 @@ mod tests {
         // Uses as_mut
         buf.as_mut()[2] = 0;
         assert_eq!(buf.as_slice(), &[0, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Alignment of T and R do not match")]
+    fn map_each_rejects_a_wider_alignment() {
+        // Reinterpreting a 1-aligned buffer as `u32` in place would build a `&mut [u32]` from a
+        // pointer that is not aligned for it.
+        let buf = BufferMut::<[u8; 4]>::copy_from([[1, 2, 3, 4], [5, 6, 7, 8]].as_slice());
+        drop(buf.map_each_in_place(u32::from_le_bytes));
     }
 
     #[test]
