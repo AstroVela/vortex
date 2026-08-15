@@ -30,6 +30,8 @@ use vortex_error::vortex_panic;
 
 use crate::Alignment;
 
+#[cfg(test)]
+mod property_tests;
 mod shared;
 #[cfg(test)]
 mod tests;

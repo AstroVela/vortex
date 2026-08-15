@@ -234,6 +234,12 @@ impl UniqueBytes {
     }
 
     /// Advance the start of the window by `cnt` bytes, giving up the bytes skipped over.
+    ///
+    /// This does not preserve alignment: advancing by anything that is not a multiple of the
+    /// buffer's alignment leaves the window unaligned. Keeping to a multiple is the caller's
+    /// business - [`BufferMut`](crate::BufferMut)'s `Buf::advance` rejects the rest - and a
+    /// subsequent [`reserve`](Self::reserve) will re-align by reallocating rather than
+    /// reclaiming in place.
     pub(crate) fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
             vortex_panic!(

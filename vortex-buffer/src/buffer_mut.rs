@@ -63,11 +63,17 @@ impl<T> BufferMut<T> {
         preferred_alignment: Option<Alignment>,
     ) -> Self {
         let actual = Self::check_alignment(alignment, preferred_alignment);
-        // Round the first allocation up to the alignment, so that a buffer built by pushing onto
-        // an empty one still lands on the preferred alignment. The buffer only carries its own
+        // A zero-capacity buffer still allocates a small slab, so that a buffer built by pushing
+        // onto an empty one lands on the preferred alignment. The buffer only carries its own
         // declared `alignment`, so once the region exists its layout is the only record of the
-        // preferred one - an empty buffer that allocated nothing would have nothing to grow from.
-        let initial = (capacity * size_of::<T>()).max(*actual.min(Alignment::DEFAULT_ALIGNMENT));
+        // preferred one, and an empty buffer that allocated nothing would have nothing to grow
+        // from. Any other capacity is allocated exactly: the region is aligned either way.
+        let requested = capacity * size_of::<T>();
+        let initial = if requested == 0 {
+            *actual.min(Alignment::DEFAULT_ALIGNMENT)
+        } else {
+            requested
+        };
         Self {
             bytes: UniqueBytes::with_capacity(initial, actual),
             length: 0,

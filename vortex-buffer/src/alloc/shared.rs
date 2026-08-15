@@ -173,6 +173,8 @@ impl SharedBytes {
 
     /// Advance the start of the window by `cnt` bytes.
     ///
+    /// This does not preserve alignment; see [`UniqueBytes::advance`].
+    ///
     /// ## Panics
     ///
     /// Panics if `cnt > len`.
