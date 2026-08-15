@@ -25,6 +25,7 @@ prost = { workspace = true }
 vortex-array = { workspace = true }
 vortex-arrow = { workspace = true }
 vortex-buffer = { workspace = true }
+vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-session = { workspace = true }
@@ -69,5 +70,14 @@ harness = false
 [[bench]]
 name = "length"
 harness = false
+
+[[bench]]
+name = "collect"
+harness = false
+
+[[bench]]
+name = "convex_hull"
+harness = false
+
 [lints]
 workspace = true
