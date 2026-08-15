@@ -62,11 +62,14 @@ impl<T> BufferMut<T> {
         alignment: Alignment,
         preferred_alignment: Option<Alignment>,
     ) -> Self {
+        let actual = Self::check_alignment(alignment, preferred_alignment);
+        // Round the first allocation up to the alignment, so that a buffer built by pushing onto
+        // an empty one still lands on the preferred alignment. The buffer only carries its own
+        // declared `alignment`, so once the region exists its layout is the only record of the
+        // preferred one - an empty buffer that allocated nothing would have nothing to grow from.
+        let initial = (capacity * size_of::<T>()).max(*actual.min(Alignment::DEFAULT_ALIGNMENT));
         Self {
-            bytes: UniqueBytes::with_capacity(
-                capacity * size_of::<T>(),
-                Self::check_alignment(alignment, preferred_alignment),
-            ),
+            bytes: UniqueBytes::with_capacity(initial, actual),
             length: 0,
             alignment,
             _marker: Default::default(),
@@ -246,6 +249,10 @@ impl<T> BufferMut<T> {
     /// (releasing the memory) when the last handle to the buffer goes away. Unlike
     /// [`Buffer::from_owner`], the resulting buffer is mutable: taking `owner` by value and
     /// reaching the memory through [`AsMut`] proves that nothing else may be observing it.
+    ///
+    /// The whole of the owner's memory becomes the buffer's capacity, so writes past the buffer's
+    /// length still land in it rather than in a fresh allocation. For a writable memory map that
+    /// means `extend_from_slice` writes through to the mapped file.
     ///
     /// The buffer reports an alignment of `align_of::<T>()`, and panics if the owner's memory does
     /// not meet it.

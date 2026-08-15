@@ -32,7 +32,9 @@ pub(crate) struct UniqueBytes {
     len: usize,
     /// The size of the window in bytes.
     cap: usize,
-    /// The region the window points into, or `None` when the window owns nothing (`cap == 0`).
+    /// The region the window points into, or `None` when there is no region to release - an
+    /// unallocated buffer. Note that the converse does not hold: an adopted owner whose slice is
+    /// empty has a region (which must still be released) but no capacity.
     alloc: Option<Arc<Allocation>>,
 }
 
@@ -426,12 +428,10 @@ impl UniqueBytes {
         if elem == 0 || !self.len.is_multiple_of(elem) {
             return Err(self);
         }
-        if self.alloc.is_none() {
-            return if self.len == 0 {
-                Ok(Vec::new())
-            } else {
-                Err(self)
-            };
+        // Nothing to hand over, so an empty `Vec` is trivially a zero-copy answer. This also
+        // covers windows that own no region at all.
+        if self.len == 0 {
+            return Ok(Vec::new());
         }
 
         let ptr = self.ptr;

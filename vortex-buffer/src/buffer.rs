@@ -551,6 +551,11 @@ impl<T> Buffer<T> {
     /// Unlike `bytes::Bytes`, this succeeds for buffers built over foreign memory - a `Vec<T>`
     /// adopted with [`from_vec`](Self::from_vec), or any owner handed to
     /// [`BufferMut::from_owner`] - as long as nothing else holds a reference to it.
+    ///
+    /// The recovered capacity runs from the start of this buffer to the end of its allocation, so
+    /// a buffer that is a slice of a larger region regains the rest of it. Nothing else can see
+    /// those bytes, but note that for adopted foreign memory they are the owner's: writing past
+    /// the buffer's length writes into the `Vec`, mapping, or Arrow buffer it came from.
     pub fn try_into_mut(self) -> Result<BufferMut<T>, Self> {
         let length = self.length;
         let alignment = self.alignment;
@@ -1077,6 +1082,31 @@ mod tests {
         let mut mutable = buf.into_mut();
         mutable[0] = 10;
         assert_eq!(shared.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn small_buffers_keep_the_default_alignment() {
+        // A buffer grown from empty must still land on `DEFAULT_ALIGNMENT`: that is what lets the
+        // SIMD and CUDA paths take it without a re-aligning copy.
+        let collected: Buffer<i32> = (0i32..4).collect();
+        assert!(collected.is_aligned(Alignment::DEFAULT_ALIGNMENT));
+
+        let mut built = crate::BufferMut::<i32>::empty();
+        built.extend(0i32..4);
+        assert!(built.freeze().is_aligned(Alignment::DEFAULT_ALIGNMENT));
+    }
+
+    #[test]
+    fn cloned_static_buffer_is_not_unique() {
+        // A `'static` buffer carries no refcount, so we cannot claim to be its only handle.
+        static VALUES: [i32; 3] = [1, 2, 3];
+        let buf = Buffer::from_static(&VALUES);
+        let clone = buf.clone();
+        assert!(!buf.is_unique());
+        drop(clone);
+        assert!(!buf.is_unique());
+        // Empty buffers own nothing at all, so they are trivially exclusive.
+        assert!(Buffer::<i32>::empty().is_unique());
     }
 
     #[test]

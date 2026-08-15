@@ -192,7 +192,9 @@ impl SharedBytes {
     /// Whether this is the only handle to the underlying region.
     pub(crate) fn is_unique(&self) -> bool {
         match &self.alloc {
-            None => true,
+            // A zero-length window is trivially exclusive, but a borrowed `'static` slice carries
+            // no refcount, so we cannot claim to be its only handle.
+            None => self.len == 0,
             Some(alloc) => Arc::strong_count(alloc) == 1 && Arc::weak_count(alloc) == 0,
         }
     }
