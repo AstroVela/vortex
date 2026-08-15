@@ -875,6 +875,8 @@ impl<T> From<BufferMut<T>> for Buffer<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use bytes::Buf;
     use bytes::Bytes;
 
@@ -889,6 +891,22 @@ mod tests {
         let aligned = buf.aligned(Alignment::new(32));
         assert_eq!(aligned.alignment(), Alignment::new(32));
         assert_eq!(aligned.as_slice(), &[0, 1, 2]);
+    }
+
+    /// The storage types are unconditionally `Send`/`Sync` via `unsafe impl`, so it is the
+    /// `PhantomData<T>` that keeps a buffer's auto traits tied to its element type. `Cell` is
+    /// `Send` but not `Sync`, so a buffer of it must compile as `Send` and, were the bound ever
+    /// widened, the `Sync` assertion below would start compiling for it too.
+    #[test]
+    fn auto_traits_follow_the_element_type() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        const fn assert_send<T: Send>() {}
+
+        assert_send_sync::<Buffer<u8>>();
+        assert_send_sync::<Buffer<i64>>();
+        assert_send_sync::<crate::BufferMut<i64>>();
+        assert_send::<Buffer<Cell<u8>>>();
+        assert_send::<crate::BufferMut<Cell<u8>>>();
     }
 
     #[test]
