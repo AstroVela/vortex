@@ -233,6 +233,21 @@ fn adopt_vec_then_mutate_vortex(bencher: Bencher, size: usize) {
         });
 }
 
+/// Adoption on its own, to separate it from the hand-back below.
+#[divan::bench(args = SIZES)]
+fn adopt_vec_bytes(bencher: Bencher, size: usize) {
+    bencher
+        .with_inputs(|| payload(size))
+        .bench_values(|values: Vec<u8>| black_box(Bytes::from(values)));
+}
+
+#[divan::bench(args = SIZES)]
+fn adopt_vec_vortex(bencher: Bencher, size: usize) {
+    bencher
+        .with_inputs(|| payload(size))
+        .bench_values(|values: Vec<u8>| black_box(ByteBuffer::from(values)));
+}
+
 /// Hand a buffer back out as a `Vec<u8>`.
 #[divan::bench(args = SIZES)]
 fn into_vec_bytes(bencher: Bencher, n: usize) {

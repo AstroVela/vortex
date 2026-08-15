@@ -109,6 +109,26 @@ impl<T> Hash for Buffer<T> {
     }
 }
 
+/// Copy a buffer's contents into a fresh, equally aligned [`BufferMut`].
+///
+/// Cold for the same reason as [`copy_to_vec`]: it is the fallback [`Buffer::into_mut`] takes
+/// only when the buffer is shared or read-only.
+#[cold]
+#[inline(never)]
+fn copy_to_mut<T>(buffer: &Buffer<T>) -> BufferMut<T> {
+    BufferMut::<T>::copy_from_aligned(buffer, buffer.alignment)
+}
+
+/// Copy a buffer's contents into a fresh `Vec`.
+///
+/// Kept out of line and marked cold so that the zero-copy paths in [`Buffer::into_vec`] and
+/// [`BufferMut::into_vec`] do not have to reserve registers for a `memcpy` they will not run.
+#[cold]
+#[inline(never)]
+pub(crate) fn copy_to_vec<T: Copy>(buffer: &[T]) -> Vec<T> {
+    buffer.to_vec()
+}
+
 impl<T> Buffer<T> {
     /// Returns a new `Buffer<T>` copied from the provided `Vec<T>`, `&[T]`, etc.
     ///
@@ -636,7 +656,7 @@ impl<T> Buffer<T> {
     /// Convert self into `BufferMut<T>`, cloning the data if there are multiple strong references.
     pub fn into_mut(self) -> BufferMut<T> {
         self.try_into_mut()
-            .unwrap_or_else(|buffer| BufferMut::<T>::copy_from_aligned(&buffer, buffer.alignment))
+            .unwrap_or_else(|buffer| copy_to_mut(&buffer))
     }
 
     /// Convert the buffer into a `Vec<T>`, without copying where possible.
@@ -649,7 +669,7 @@ impl<T> Buffer<T> {
     {
         match self.try_into_mut() {
             Ok(buffer) => buffer.into_vec(),
-            Err(buffer) => buffer.as_slice().to_vec(),
+            Err(buffer) => copy_to_vec(buffer.as_slice()),
         }
     }
 

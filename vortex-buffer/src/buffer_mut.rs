@@ -20,6 +20,7 @@ use crate::Alignment;
 use crate::Buffer;
 use crate::ByteBufferMut;
 use crate::alloc::UniqueBytes;
+use crate::buffer::copy_to_vec;
 use crate::debug::TruncatedDebug;
 use crate::trusted_len::TrustedLen;
 
@@ -591,7 +592,7 @@ impl<T> BufferMut<T> {
         T: Copy,
     {
         self.try_into_vec()
-            .unwrap_or_else(|buffer| buffer.as_slice().to_vec())
+            .unwrap_or_else(|buffer| copy_to_vec(buffer.as_slice()))
     }
 
     /// Convert the buffer into a `Vec<T>` without copying, or give it back.

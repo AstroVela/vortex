@@ -5,41 +5,58 @@ use std::cmp::Ordering;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 use vortex_error::vortex_panic;
 
-use super::Allocation;
+use super::Release;
+use super::Shared;
+use super::State;
 use super::UniqueBytes;
 use super::dangling;
+use super::drop_owner;
 
-/// An immutable, reference-counted window into an [`Allocation`].
+/// An immutable, reference-counted window into a region.
 ///
 /// This is the storage behind [`Buffer`](crate::Buffer). Cloning and slicing are `O(1)`.
+///
+/// A handle that has never been shared describes its region inline (see [`State`]) and allocates
+/// no refcount; the first [`clone`](Clone::clone) promotes it.
 pub(crate) struct SharedBytes {
     /// The first byte of the window.
     ptr: NonNull<u8>,
     /// The length of the window in bytes.
     len: usize,
-    /// The region the window points into, or `None` when the window borrows memory that outlives
-    /// every handle (a `'static` slice, or a zero-length dangling window).
-    alloc: Option<Arc<Allocation>>,
+    /// The first byte of the region, when `state` is `OWNED`. Promotion never rewrites this, which
+    /// is what lets it happen behind a shared reference.
+    base: NonNull<u8>,
+    /// The ownership state. Written only by promotion, which is why it is atomic. Holding a
+    /// pointer rather than a `usize` is what keeps the `SHARED` case's provenance.
+    state: AtomicPtr<()>,
 }
 
-// SAFETY: `Allocation` is `Send`/`Sync`, and a `SharedBytes` only ever hands out `&[u8]` into a
-// region that no live handle may write to (`try_into_unique` requires unique ownership).
+// SAFETY: `Shared` is `Send`/`Sync`, and a `SharedBytes` only ever hands out `&[u8]` into a region
+// that no live handle may write to (`try_into_unique` requires unique ownership).
 unsafe impl Send for SharedBytes {}
-// SAFETY: see above.
+// SAFETY: see above. The state word is only ever mutated through atomics.
 unsafe impl Sync for SharedBytes {}
 
 impl SharedBytes {
+    #[inline]
+    fn state(&self) -> State {
+        State(self.state.load(AtomicOrdering::Acquire))
+    }
+
     /// An empty window that owns nothing, aligned to [`Alignment::MAX`](crate::Alignment::MAX).
     #[inline]
     pub(crate) fn empty() -> Self {
         Self {
             ptr: dangling(),
             len: 0,
-            alloc: None,
+            base: dangling(),
+            state: AtomicPtr::new(State::STATIC.0),
         }
     }
 
@@ -48,19 +65,24 @@ impl SharedBytes {
         if slice.is_empty() {
             return Self::empty();
         }
+        let ptr = NonNull::from(slice).cast();
         Self {
-            ptr: NonNull::from(slice).cast(),
+            ptr,
             len: slice.len(),
-            alloc: None,
+            base: ptr,
+            state: AtomicPtr::new(State::STATIC.0),
         }
     }
 
     /// Adopt a region kept alive by `owner`, without copying it.
     ///
-    /// The window covers exactly the bytes `owner` currently references. The region is recorded
-    /// as read-only, so [`try_into_unique`](Self::try_into_unique) will refuse it: `slice` is
-    /// derived from a shared reference, and writing through such a pointer is undefined
-    /// behaviour even when the memory itself is writable.
+    /// The window covers exactly the bytes `owner` currently references. The region is recorded as
+    /// read-only, so [`try_into_unique`](Self::try_into_unique) will refuse it: the pointer is
+    /// derived from a shared reference, and writing through such a pointer is undefined behaviour
+    /// even when the memory itself is writable.
+    ///
+    /// Foreign memory is always held through a [`Shared`]: adoption already allocates a box for
+    /// the owner, so there is nothing to be gained by describing it inline.
     pub(crate) fn from_owner<O, T>(owner: O) -> Self
     where
         O: AsRef<[T]> + Send + 'static,
@@ -71,38 +93,56 @@ impl SharedBytes {
         // SAFETY: we have just created `owner` and nothing else can free it.
         let slice: &[T] = unsafe { &*owner }.as_ref();
         let size = size_of_val(slice);
-        // An empty window never dereferences its pointer, so prefer the maximally aligned
-        // dangling address over the owner's, which may be aligned to nothing in particular. The
-        // owner is kept alive either way: its `Drop` may release resources the caller expects the
-        // buffer to hold on to.
+        // An empty window never dereferences its pointer, so prefer the maximally aligned dangling
+        // address over the owner's, which may be aligned to nothing in particular. The owner is
+        // kept alive either way: its `Drop` may release resources the caller expects us to hold.
         let base = if size == 0 {
             dangling()
         } else {
             NonNull::from(slice).cast::<u8>()
         };
-        // SAFETY: `slice` points into the leaked owner, which the allocation keeps alive for
-        // exactly as long as the region. We record the region as read-only, because `base` is
-        // derived from a shared reference.
-        let alloc = unsafe { Allocation::owned(base, size, false, owner) };
+
+        let shared = Shared {
+            refcount: AtomicUsize::new(1),
+            base,
+            size,
+            // Read-only: `base` is derived from a shared reference.
+            writable: false,
+            release: Release::Owner {
+                owner: owner.cast::<()>(),
+                drop: drop_owner::<O>,
+            },
+        }
+        .into_raw();
+
         Self {
             ptr: base,
             len: size,
-            alloc: Some(Arc::new(alloc)),
+            base,
+            // SAFETY: we just created `shared` and take over its single reference.
+            state: AtomicPtr::new(unsafe { State::shared(shared) }.0),
         }
     }
 
-    /// Construct from a window into an allocation.
+    /// Construct from a window into a region.
     ///
     /// ## Safety
     ///
-    /// `ptr..ptr + len` must lie within `alloc`'s region.
+    /// `ptr..ptr + len` must lie within the region `state` describes, `base` must be its first
+    /// byte when `state` is `OWNED`, and the caller must hand over one reference to it.
     #[inline]
     pub(super) unsafe fn from_parts(
         ptr: NonNull<u8>,
         len: usize,
-        alloc: Option<Arc<Allocation>>,
+        base: NonNull<u8>,
+        state: State,
     ) -> Self {
-        Self { ptr, len, alloc }
+        Self {
+            ptr,
+            len,
+            base,
+            state: AtomicPtr::new(state.0),
+        }
     }
 
     #[inline]
@@ -123,11 +163,52 @@ impl SharedBytes {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
+    /// Promote an inline-described region to a refcounted one, so a second handle can exist.
+    ///
+    /// Returns the `Shared` with an extra reference already taken for the caller's new handle.
+    #[cold]
+    fn promote(&self, state: State) -> *mut Shared {
+        debug_assert!(state.is_owned());
+        // Two references: this handle, and the one the caller is about to create.
+        let shared = super::shared_global(self.base, state.owned_layout(), 2).into_raw();
+
+        // SAFETY: we just created `shared`.
+        let new = unsafe { State::shared(shared) };
+        match self.state.compare_exchange(
+            state.0,
+            new.0,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => shared,
+            Err(actual) => {
+                // Another thread promoted this handle first. Throw ours away without releasing
+                // the region - the winner owns it now - and take a reference to theirs instead.
+                // SAFETY: nothing ever saw this `Shared`, and its `Release` has not run.
+                unsafe {
+                    drop(Box::from_raw(
+                        shared.cast::<std::mem::ManuallyDrop<Shared>>(),
+                    ))
+                };
+
+                let actual = State(actual);
+                debug_assert!(!actual.is_owned(), "promotion only ever happens once");
+                // SAFETY: the winner published a live `Shared` and holds a reference to it, so it
+                // cannot have been freed while we hold a handle of our own.
+                let shared = unsafe { actual.as_shared() };
+                // SAFETY: as above; we take the reference for the caller's new handle.
+                unsafe { Shared::retain(shared) };
+                shared
+            }
+        }
+    }
+
     /// Returns a new handle to `self[begin..end]`.
     ///
     /// ## Panics
     ///
     /// Panics if the range is out of bounds.
+    #[inline]
     pub(crate) fn slice(&self, begin: usize, end: usize) -> Self {
         if begin > end {
             vortex_panic!("range start must not be greater than end: {begin} <= {end}");
@@ -138,12 +219,12 @@ impl SharedBytes {
         if begin == end {
             return Self::empty();
         }
-        Self {
-            // SAFETY: `begin < len`, so the offset stays inside the window.
-            ptr: unsafe { self.ptr.add(begin) },
-            len: end - begin,
-            alloc: self.alloc.clone(),
-        }
+        // SAFETY: `begin < len`, so the offset stays inside the window.
+        let ptr = unsafe { self.ptr.add(begin) };
+        let mut sliced = self.clone();
+        sliced.ptr = ptr;
+        sliced.len = end - begin;
+        sliced
     }
 
     /// Returns a new handle to `subset`, which must be contained within this window.
@@ -151,6 +232,7 @@ impl SharedBytes {
     /// ## Panics
     ///
     /// Panics if `subset` is not contained within this window.
+    #[inline]
     pub(crate) fn slice_ref(&self, subset: &[u8]) -> Self {
         // An empty subset carries no address we can meaningfully check against.
         if subset.is_empty() {
@@ -178,6 +260,7 @@ impl SharedBytes {
     /// ## Panics
     ///
     /// Panics if `cnt > len`.
+    #[inline]
     pub(crate) fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
             vortex_panic!(
@@ -186,7 +269,7 @@ impl SharedBytes {
             );
         }
         // SAFETY: `cnt <= len`, so the new start stays inside (or exactly at the end of) the
-        // window.
+        // window. The region's start is tracked separately, so this cannot lose it.
         self.ptr = unsafe { self.ptr.add(cnt) };
         self.len -= cnt;
     }
@@ -198,61 +281,121 @@ impl SharedBytes {
     }
 
     /// Whether this is the only handle to the underlying region.
+    #[inline]
     pub(crate) fn is_unique(&self) -> bool {
-        match &self.alloc {
+        let state = self.state();
+        if state.is_owned() {
+            // Never shared, so there is nothing else to hold it.
+            return true;
+        }
+        if state.is_static() {
             // A zero-length window is trivially exclusive, but a borrowed `'static` slice carries
             // no refcount, so we cannot claim to be its only handle.
-            None => self.len == 0,
-            Some(alloc) => Arc::strong_count(alloc) == 1 && Arc::weak_count(alloc) == 0,
+            return self.len == 0;
         }
+        // SAFETY: we hold a reference to the `Shared`, so it is live.
+        unsafe { &*state.as_shared() }.is_unique()
     }
 
     /// Take exclusive ownership of the region, if this is the only handle to writable memory.
     ///
-    /// The returned buffer's capacity runs from the start of this window to the end of the
-    /// region, so a handle onto the front of a partially filled allocation regains the whole of
-    /// its spare capacity.
-    pub(crate) fn try_into_unique(mut self) -> Result<UniqueBytes, Self> {
-        let capacity = match self.alloc.as_mut() {
-            // Nothing owns the memory: a zero-length window is trivially exclusive, but a
-            // borrowed `'static` slice can never be written to.
-            None => {
-                if self.len != 0 {
-                    return Err(self);
-                }
-                0
-            }
-            Some(alloc) => {
-                if !alloc.writable || Arc::get_mut(alloc).is_none() {
-                    return Err(self);
-                }
-                alloc.capacity_from(self.ptr)
-            }
-        };
+    /// The returned buffer's capacity runs from the start of this window to the end of the region,
+    /// so a handle onto the front of a partially filled allocation regains its spare capacity.
+    #[inline]
+    pub(crate) fn try_into_unique(self) -> Result<UniqueBytes, Self> {
+        let state = self.state();
 
-        // SAFETY: we hold the only handle to the region, and the window lies within it.
-        Ok(unsafe { UniqueBytes::from_parts(self.ptr, self.len, capacity, self.alloc) })
-    }
-}
+        if state.is_static() {
+            return if self.len == 0 {
+                Ok(UniqueBytes::empty())
+            } else {
+                Err(self)
+            };
+        }
 
-impl std::fmt::Debug for SharedBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedBytes")
-            .field("ptr", &self.ptr)
-            .field("len", &self.len)
-            .field("owned", &self.alloc.is_some())
-            .finish()
+        if state.is_owned() {
+            // Never shared: hand the inline description straight over, no atomics involved.
+            let capacity =
+                self.base.as_ptr().addr() + state.owned_size() - self.ptr.as_ptr().addr();
+            let this = std::mem::ManuallyDrop::new(self);
+            // SAFETY: we hold the only handle, the window lies in the region, and a region we
+            // allocated ourselves is always writable. `this` will not release it.
+            return Ok(unsafe {
+                UniqueBytes::from_parts(this.ptr, this.len, capacity, this.base, state)
+            });
+        }
+
+        // SAFETY: we hold a reference to the `Shared`, so it is live.
+        let shared = unsafe { &*state.as_shared() };
+        if !shared.writable || !shared.is_unique() {
+            return Err(self);
+        }
+        let capacity = shared.end_addr() - self.ptr.as_ptr().addr();
+        let base = shared.base;
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: the refcount is one, so we hold the only handle and take over its reference.
+        Ok(unsafe { UniqueBytes::from_parts(this.ptr, this.len, capacity, base, state) })
     }
 }
 
 impl Clone for SharedBytes {
     #[inline]
     fn clone(&self) -> Self {
+        let state = self.state();
+        let state = if state.is_static() {
+            state
+        } else if state.is_owned() {
+            // SAFETY: `promote` returns a `Shared` with a reference already taken for us.
+            unsafe { State::shared(self.promote(state)) }
+        } else {
+            // SAFETY: we hold a reference to the `Shared`, so it is live.
+            unsafe { Shared::retain(state.as_shared()) };
+            state
+        };
+
         Self {
             ptr: self.ptr,
             len: self.len,
-            alloc: self.alloc.clone(),
+            base: self.base,
+            state: AtomicPtr::new(state.0),
         }
+    }
+}
+
+impl Drop for SharedBytes {
+    #[inline]
+    fn drop(&mut self) {
+        let state = State(*self.state.get_mut());
+        if state.is_static() {
+            return;
+        }
+        if state.is_owned() {
+            // SAFETY: we hold the only handle to a region we allocated with exactly this layout.
+            unsafe { std::alloc::dealloc(self.base.as_ptr(), state.owned_layout()) };
+            return;
+        }
+        // SAFETY: we hold one reference to a live `Shared`, and give it up here.
+        unsafe { Shared::release(state.as_shared()) };
+    }
+}
+
+impl std::fmt::Debug for SharedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state();
+        f.debug_struct("SharedBytes")
+            .field("ptr", &self.ptr)
+            .field("len", &self.len)
+            .field(
+                "state",
+                &if state.is_static() {
+                    "static"
+                } else if state.is_owned() {
+                    "owned"
+                } else {
+                    "shared"
+                },
+            )
+            .finish()
     }
 }
 

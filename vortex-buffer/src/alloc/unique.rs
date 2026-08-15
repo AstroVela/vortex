@@ -8,23 +8,29 @@ use std::cmp::max;
 use std::mem::ManuallyDrop;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
-use super::Allocation;
 use super::Release;
+use super::Shared;
 use super::SharedBytes;
+use super::State;
+use super::allocate;
 use super::dangling;
-use super::same_allocation;
+use super::drop_owner;
+use super::shared_global;
 use crate::Alignment;
 
-/// A uniquely owned, writable window into an [`Allocation`].
+/// A uniquely owned, writable window into a region.
 ///
 /// This is the storage behind [`BufferMut`](crate::BufferMut). The window `ptr..ptr + cap` is
 /// exclusively ours: no other handle may read or write it, even when the underlying region is
 /// shared with the other half of a [`split_off`](Self::split_off).
+///
+/// Like [`SharedBytes`], a window that has never been split describes its region inline and
+/// allocates no refcount.
 pub(crate) struct UniqueBytes {
     /// The first byte of the window.
     ptr: NonNull<u8>,
@@ -32,13 +38,13 @@ pub(crate) struct UniqueBytes {
     len: usize,
     /// The size of the window in bytes.
     cap: usize,
-    /// The region the window points into, or `None` when there is no region to release - an
-    /// unallocated buffer. Note that the converse does not hold: an adopted owner whose slice is
-    /// empty has a region (which must still be released) but no capacity.
-    alloc: Option<Arc<Allocation>>,
+    /// The first byte of the region, when `state` is `OWNED`.
+    base: NonNull<u8>,
+    /// The ownership state. Plain rather than atomic: this handle is never shared by reference.
+    state: State,
 }
 
-// SAFETY: `Allocation` is `Send`/`Sync`, and the window is exclusively owned by this handle.
+// SAFETY: `Shared` is `Send`/`Sync`, and the window is exclusively owned by this handle.
 unsafe impl Send for UniqueBytes {}
 // SAFETY: see above.
 unsafe impl Sync for UniqueBytes {}
@@ -51,11 +57,13 @@ impl UniqueBytes {
             ptr: dangling(),
             len: 0,
             cap: 0,
-            alloc: None,
+            base: dangling(),
+            state: State::STATIC,
         }
     }
 
     /// Allocate an empty window with room for `capacity` bytes, aligned to `alignment`.
+    #[inline]
     pub(crate) fn with_capacity(capacity: usize, alignment: Alignment) -> Self {
         Self::allocate(capacity, alignment, false)
     }
@@ -72,19 +80,40 @@ impl UniqueBytes {
             // Nothing to allocate, but the dangling pointer still satisfies `alignment`.
             return Self::empty();
         }
-        let alloc = Allocation::global(capacity, alignment, zeroed);
+        let (base, layout) = allocate(capacity, alignment, zeroed);
+        // SAFETY: we hold the only handle to a region we just allocated with `layout`.
+        unsafe { Self::adopt_global(base, layout) }
+    }
+
+    /// Take sole ownership of a region we allocated ourselves.
+    ///
+    /// ## Safety
+    ///
+    /// `base` must be a live allocation made with exactly `layout`, and the caller must hand over
+    /// its ownership.
+    unsafe fn adopt_global(base: NonNull<u8>, layout: Layout) -> Self {
+        let size = layout.size();
+        let state = match State::owned(size, Alignment::new(layout.align())) {
+            Some(state) => state,
+            // Too large to describe inline; fall back to a refcounted description.
+            None => {
+                // SAFETY: we take over the region, and hand its single reference to this handle.
+                unsafe { State::shared(shared_global(base, layout, 1).into_raw()) }
+            }
+        };
         Self {
-            ptr: alloc.base,
+            ptr: base,
             len: 0,
-            cap: capacity,
-            alloc: Some(Arc::new(alloc)),
+            cap: size,
+            base,
+            state,
         }
     }
 
     /// Take ownership of a `Vec<T>`'s allocation without copying it.
     ///
-    /// The buffer treats the elements as plain bytes and never runs `T`'s destructor. Callers
-    /// that need destructors must keep the `Vec` alive themselves, e.g. through
+    /// The buffer treats the elements as plain bytes and never runs `T`'s destructor. Callers that
+    /// need destructors must keep the `Vec` alive themselves, e.g. through
     /// [`SharedBytes::from_owner`].
     pub(crate) fn from_vec<T>(vec: Vec<T>) -> Self {
         let mut vec = ManuallyDrop::new(vec);
@@ -100,7 +129,6 @@ impl UniqueBytes {
         // SAFETY: `as_mut_ptr` is derived from a unique reference to the `Vec`'s buffer, giving
         // the pointer write provenance over the whole `capacity`.
         let base = unsafe { NonNull::new_unchecked(vec.as_mut_ptr().cast::<u8>()) };
-        let size = capacity * size_of::<T>();
 
         // `Vec<T>` allocates its buffer through the global allocator with exactly this layout, so
         // recording it as one of our own allocations is enough to free it correctly - and lets
@@ -108,25 +136,16 @@ impl UniqueBytes {
         let layout = Layout::array::<T>(capacity)
             .unwrap_or_else(|_| vortex_panic!("a live Vec's layout is always representable"));
 
-        let alloc = Allocation {
-            base,
-            size,
-            writable: true,
-            release: Release::Global(layout),
-        };
-
-        Self {
-            ptr: base,
-            len: len * size_of::<T>(),
-            cap: size,
-            alloc: Some(Arc::new(alloc)),
-        }
+        // SAFETY: we took the `Vec`'s allocation, which matches `layout` exactly.
+        let mut this = unsafe { Self::adopt_global(base, layout) };
+        this.len = len * size_of::<T>();
+        this
     }
 
     /// Adopt a writable region kept alive by `owner`, without copying it.
     ///
-    /// Taking `owner` by value and going through [`AsMut`] is what makes this safe: it proves
-    /// that nothing else can be observing the region while we hold it.
+    /// Taking `owner` by value and going through [`AsMut`] is what makes this safe: it proves that
+    /// nothing else can be observing the region while we hold it.
     pub(crate) fn from_owner<O, T>(owner: O) -> Self
     where
         O: AsMut<[T]> + Send + 'static,
@@ -137,48 +156,60 @@ impl UniqueBytes {
         // SAFETY: we have just created `owner` and nothing else can free it or reach into it.
         let slice: &mut [T] = unsafe { &mut *owner }.as_mut();
         let size = size_of_val(slice);
-        // An empty window never dereferences its pointer, so prefer the maximally aligned
-        // dangling address over the owner's, which may be aligned to nothing in particular. The
-        // owner is kept alive either way: its `Drop` may release resources the caller expects the
-        // buffer to hold on to.
+        // An empty window never dereferences its pointer, so prefer the maximally aligned dangling
+        // address over the owner's. The owner is kept alive either way: its `Drop` may release
+        // resources the caller expects us to hold.
         let base = if size == 0 {
             dangling()
         } else {
             NonNull::from(slice).cast::<u8>()
         };
-        // SAFETY: `slice` points into the leaked owner, which the allocation keeps alive for
-        // exactly as long as the region, and `base` is derived from a unique reference so it may
-        // be written through.
-        let alloc = unsafe { Allocation::owned(base, size, true, owner) };
+
+        let shared = Shared {
+            refcount: AtomicUsize::new(1),
+            base,
+            size,
+            // `base` is derived from a unique reference, so it may be written through.
+            writable: true,
+            release: Release::Owner {
+                owner: owner.cast::<()>(),
+                drop: drop_owner::<O>,
+            },
+        }
+        .into_raw();
+
         Self {
             ptr: base,
             len: size,
             cap: size,
-            alloc: Some(Arc::new(alloc)),
+            base,
+            // SAFETY: we just created `shared` and take over its single reference.
+            state: unsafe { State::shared(shared) },
         }
     }
 
-    /// Construct from a window into an allocation.
+    /// Construct from a window into a region.
     ///
     /// ## Safety
     ///
-    /// The caller must hold the only handle to `ptr..ptr + cap`, that range must lie within
-    /// `alloc`'s region, the region must be writable, and the first `len` bytes must be
-    /// initialised.
+    /// The caller must hold the only handle to `ptr..ptr + cap`, that range must lie within the
+    /// region `state` describes, the region must be writable, the first `len` bytes must be
+    /// initialised, and the caller must hand over its ownership.
     #[inline]
     pub(super) unsafe fn from_parts(
         ptr: NonNull<u8>,
         len: usize,
         cap: usize,
-        alloc: Option<Arc<Allocation>>,
+        base: NonNull<u8>,
+        state: State,
     ) -> Self {
         debug_assert!(len <= cap);
-        debug_assert!(alloc.as_ref().is_none_or(|a| a.writable));
         Self {
             ptr,
             len,
             cap,
-            alloc,
+            base,
+            state,
         }
     }
 
@@ -238,8 +269,9 @@ impl UniqueBytes {
     /// This does not preserve alignment: advancing by anything that is not a multiple of the
     /// buffer's alignment leaves the window unaligned. Keeping to a multiple is the caller's
     /// business - [`BufferMut`](crate::BufferMut)'s `Buf::advance` rejects the rest - and a
-    /// subsequent [`reserve`](Self::reserve) will re-align by reallocating rather than
-    /// reclaiming in place.
+    /// subsequent [`reserve`](Self::reserve) will re-align by reallocating rather than reclaiming
+    /// in place.
+    #[inline]
     pub(crate) fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
             vortex_panic!(
@@ -247,10 +279,50 @@ impl UniqueBytes {
                 self.len
             );
         }
-        // SAFETY: `cnt <= len <= cap`, so the new start stays inside the window.
+        // SAFETY: `cnt <= len <= cap`, so the new start stays inside the window. The region's
+        // start is tracked separately, so this cannot lose it.
         self.ptr = unsafe { self.ptr.add(cnt) };
         self.len -= cnt;
         self.cap -= cnt;
+    }
+
+    /// The address one past the last byte of the region this window lies in.
+    #[inline]
+    fn region_end(&self) -> usize {
+        if self.state.is_owned() {
+            self.base.as_ptr().addr() + self.state.owned_size()
+        } else if self.state.is_static() {
+            self.ptr.as_ptr().addr() + self.cap
+        } else {
+            // SAFETY: we hold a reference to the `Shared`, so it is live.
+            unsafe { &*self.state.as_shared() }.end_addr()
+        }
+    }
+
+    /// Whether nothing else holds the region, so we are free to grow back over all of it.
+    #[inline]
+    fn owns_region(&self) -> bool {
+        if self.state.is_owned() {
+            return true;
+        }
+        if self.state.is_static() {
+            return false;
+        }
+        // SAFETY: we hold a reference to the `Shared`, so it is live.
+        unsafe { &*self.state.as_shared() }.is_unique()
+    }
+
+    /// The layout the region was allocated with, if we allocated it ourselves.
+    #[inline]
+    fn global_layout(&self) -> Option<Layout> {
+        if self.state.is_owned() {
+            Some(self.state.owned_layout())
+        } else if self.state.is_static() {
+            None
+        } else {
+            // SAFETY: we hold a reference to the `Shared`, so it is live.
+            unsafe { &*self.state.as_shared() }.global_layout()
+        }
     }
 
     /// Ensure the window has room for `additional` more bytes past its length.
@@ -291,10 +363,9 @@ impl UniqueBytes {
     }
 
     /// The alignment the current region was allocated with, or 1 when we did not allocate it.
+    #[inline]
     fn allocation_alignment(&self) -> Alignment {
-        self.alloc
-            .as_ref()
-            .and_then(|alloc| alloc.global_layout())
+        self.global_layout()
             .map(|layout| Alignment::new(layout.align()))
             .unwrap_or_else(Alignment::none)
     }
@@ -304,16 +375,10 @@ impl UniqueBytes {
     /// After `a.split_off(n)` the two halves share one region. Once the other half is dropped we
     /// are free to grow back over it without touching the allocator.
     fn reclaim(&mut self, required: usize, alignment: Alignment) -> bool {
-        if !alignment.is_ptr_aligned(self.ptr.as_ptr()) {
+        if !alignment.is_ptr_aligned(self.ptr.as_ptr()) || !self.owns_region() {
             return false;
         }
-        let Some(arc) = self.alloc.as_mut() else {
-            return false;
-        };
-        if Arc::get_mut(arc).is_none() {
-            return false;
-        }
-        let available = arc.capacity_from(self.ptr);
+        let available = self.region_end() - self.ptr.as_ptr().addr();
         if available < required {
             return false;
         }
@@ -323,23 +388,14 @@ impl UniqueBytes {
 
     /// Ask the allocator to grow our region in place.
     ///
-    /// Only possible when we hold the region exclusively, our window starts at the front of it,
-    /// and we allocated it ourselves: `realloc` preserves the original layout's alignment, so it
-    /// cannot satisfy a stronger request than the region already meets.
+    /// Only possible when we hold the region exclusively and inline - our window starts at the
+    /// front of it, and we allocated it ourselves. `realloc` preserves the original layout's
+    /// alignment, so it cannot satisfy a stronger request than the region already meets.
     fn grow_in_place(&mut self, target: usize, alignment: Alignment) -> bool {
-        let Some(arc) = self.alloc.as_mut() else {
-            return false;
-        };
-        let Some(alloc) = Arc::get_mut(arc) else {
-            return false;
-        };
-        if self.ptr != alloc.base {
+        if !self.state.is_owned() || self.ptr != self.base {
             return false;
         }
-        let Release::Global(layout) = &alloc.release else {
-            return false;
-        };
-        let layout = *layout;
+        let layout = self.state.owned_layout();
         if layout.align() < *alignment {
             return false;
         }
@@ -350,31 +406,34 @@ impl UniqueBytes {
         let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
             return false;
         };
+        let Some(new_state) = State::owned(new_size, Alignment::new(layout.align())) else {
+            return false;
+        };
 
-        // SAFETY: `alloc.base` was allocated by us with `layout`, `new_size` is non-zero, and
+        // SAFETY: `base` was allocated by us with `layout`, `new_size` is non-zero, and
         // `new_layout` is a valid layout for it.
-        let ptr = unsafe { realloc(alloc.base.as_ptr(), layout, new_size) };
+        let ptr = unsafe { realloc(self.base.as_ptr(), layout, new_size) };
         let Some(base) = NonNull::new(ptr) else {
             handle_alloc_error(new_layout)
         };
 
-        alloc.base = base;
-        alloc.size = new_size;
-        alloc.release = Release::Global(new_layout);
+        self.base = base;
         self.ptr = base;
         self.cap = new_size;
+        self.state = new_state;
         true
     }
 
     /// Append `slice` to the window, growing it if needed.
+    #[inline]
     pub(crate) fn extend_from_slice(&mut self, slice: &[u8], alignment: Alignment) {
         self.reserve(slice.len(), alignment);
         // `unsplit` is the one caller that can hand us a slice from our own region, so the
         // non-overlap argument is worth spelling out: live windows into a region are disjoint, so
         // `slice` starts at or after our window's end, while the copy below stays within
         // `len..len + slice.len() <= cap`. `reserve` cannot have widened our window over `slice`
-        // either - the other half still holds an `Arc` clone, so both `reclaim` and
-        // `grow_in_place` fail their uniqueness check and we get a fresh region instead.
+        // either - the other half still holds a reference, so `owns_region` is false and we get a
+        // fresh region instead.
         debug_assert!(
             slice.is_empty()
                 || slice.as_ptr().addr() + slice.len() <= self.ptr.as_ptr().addr() + self.len
@@ -393,19 +452,46 @@ impl UniqueBytes {
         self.len += slice.len();
     }
 
+    /// Promote an inline-described region to a refcounted one, so two windows can share it.
+    ///
+    /// Returns the `Shared` with `refcount` references already taken.
+    #[cold]
+    fn promote(&mut self, refcount: usize) -> *mut Shared {
+        debug_assert!(self.state.is_owned());
+        let shared = shared_global(self.base, self.state.owned_layout(), refcount).into_raw();
+        // SAFETY: we just created `shared` and hand one of its references to this handle.
+        self.state = unsafe { State::shared(shared) };
+        shared
+    }
+
     /// Split the window in two at `at`, keeping `..at` and returning `at..`.
     ///
     /// Both halves keep pointing into the same region; neither moves.
+    #[inline]
     pub(crate) fn split_off(&mut self, at: usize) -> Self {
         if at > self.cap {
             vortex_panic!("cannot split buffer of capacity {} at {at}", self.cap);
         }
+
+        let state = if self.state.is_static() {
+            debug_assert_eq!(self.cap, 0);
+            State::STATIC
+        } else if self.state.is_owned() {
+            // SAFETY: `promote` takes two references, one for each half.
+            unsafe { State::shared(self.promote(2)) }
+        } else {
+            // SAFETY: we hold a reference to the `Shared`, and take one more for the new half.
+            unsafe { Shared::retain(self.state.as_shared()) };
+            self.state
+        };
+
         let other = Self {
             // SAFETY: `at <= cap`, so the split point is inside (or at the end of) the window.
             ptr: unsafe { self.ptr.add(at) },
             len: self.len.saturating_sub(at),
             cap: self.cap - at,
-            alloc: self.alloc.clone(),
+            base: self.base,
+            state,
         };
         self.cap = at;
         self.len = self.len.min(at);
@@ -424,11 +510,17 @@ impl UniqueBytes {
         if other.cap == 0 {
             return;
         }
-        if same_allocation(self.alloc.as_ref(), other.alloc.as_ref())
+        // Only a `SHARED` state names a region; see [`State::is_shared`]. Two windows that both
+        // own their region outright can never be halves of the same one, however they are laid
+        // out in memory.
+        if self.state.is_shared()
+            && self.state == other.state
             && self.ptr.as_ptr().addr() + self.len == other.ptr.as_ptr().addr()
         {
             self.cap += other.cap;
             self.len += other.len;
+            // `other` gives up its reference to the region we now cover in full.
+            drop(other);
             return;
         }
         self.extend_from_slice(other.as_slice(), alignment);
@@ -437,8 +529,9 @@ impl UniqueBytes {
     /// Freeze the window into an immutable, shareable one.
     #[inline]
     pub(crate) fn freeze(self) -> SharedBytes {
-        // SAFETY: the window lies within the region.
-        unsafe { SharedBytes::from_parts(self.ptr, self.len, self.alloc) }
+        let this = ManuallyDrop::new(self);
+        // SAFETY: the window lies within the region, and we hand its reference over.
+        unsafe { SharedBytes::from_parts(this.ptr, this.len, this.base, this.state) }
     }
 
     /// Hand the region out as a `Vec<T>`, if it is exactly a `Vec<T>`'s allocation.
@@ -447,7 +540,7 @@ impl UniqueBytes {
     /// because it came from a `Vec<T>` in the first place, or because it was allocated with
     /// exactly `align_of::<T>()` - and our window starts at the front of it. An over-aligned
     /// buffer cannot be given away, because `Vec` would free it with the wrong layout.
-    pub(crate) fn try_into_vec<T>(mut self) -> Result<Vec<T>, Self> {
+    pub(crate) fn try_into_vec<T>(self) -> Result<Vec<T>, Self> {
         let elem = size_of::<T>();
         if elem == 0 || !self.len.is_multiple_of(elem) {
             return Err(self);
@@ -458,31 +551,52 @@ impl UniqueBytes {
             return Ok(Vec::new());
         }
 
-        let ptr = self.ptr;
-        let capacity = self.alloc.as_mut().and_then(|arc| {
-            // We must be the only handle before we can give the region away.
-            Arc::get_mut(arc)?;
-            let layout = arc.global_layout()?;
-            (ptr == arc.base
-                && layout.align() == align_of::<T>()
-                && layout.size().is_multiple_of(elem))
-            .then(|| layout.size() / elem)
-        });
-
-        let Some(capacity) = capacity else {
+        if !self.owns_region() || self.ptr != self.base {
+            return Err(self);
+        }
+        let Some(layout) = self.global_layout() else {
             return Err(self);
         };
-        let length = self.len / elem;
+        if layout.align() != align_of::<T>() || !layout.size().is_multiple_of(elem) {
+            return Err(self);
+        }
 
-        // The `Vec` takes the region over, so our allocation must not free it.
-        let alloc = self.alloc.take().vortex_expect("checked above");
-        let alloc = Arc::into_inner(alloc).vortex_expect("we hold the only handle");
-        let _defused = ManuallyDrop::new(alloc);
+        let capacity = layout.size() / elem;
+        let length = self.len / elem;
+        let ptr = self.ptr.cast::<T>().as_ptr();
+
+        // The `Vec` takes the region over, so neither this handle nor any `Shared` may free it.
+        let this = ManuallyDrop::new(self);
+        if !this.state.is_owned() {
+            // SAFETY: `owns_region` reported a refcount of one, so we free the box without ever
+            // running its `Release`.
+            unsafe {
+                drop(Box::from_raw(
+                    this.state.as_shared().cast::<ManuallyDrop<Shared>>(),
+                ))
+            };
+        }
 
         // SAFETY: the region was allocated by the global allocator with exactly
-        // `Layout::array::<T>(capacity)`, its first `length` elements are initialised, and we
-        // have just given up our own claim to it.
-        Ok(unsafe { Vec::from_raw_parts(ptr.cast::<T>().as_ptr(), length, capacity) })
+        // `Layout::array::<T>(capacity)`, its first `length` elements are initialised, and we have
+        // just given up our own claim to it.
+        Ok(unsafe { Vec::from_raw_parts(ptr, length, capacity) })
+    }
+}
+
+impl Drop for UniqueBytes {
+    #[inline]
+    fn drop(&mut self) {
+        if self.state.is_static() {
+            return;
+        }
+        if self.state.is_owned() {
+            // SAFETY: we hold the only handle to a region we allocated with exactly this layout.
+            unsafe { std::alloc::dealloc(self.base.as_ptr(), self.state.owned_layout()) };
+            return;
+        }
+        // SAFETY: we hold one reference to a live `Shared`, and give it up here.
+        unsafe { Shared::release(self.state.as_shared()) };
     }
 }
 
@@ -492,7 +606,7 @@ impl std::fmt::Debug for UniqueBytes {
             .field("ptr", &self.ptr)
             .field("len", &self.len)
             .field("cap", &self.cap)
-            .field("owned", &self.alloc.is_some())
+            .field("owned", &self.state.is_owned())
             .finish()
     }
 }
