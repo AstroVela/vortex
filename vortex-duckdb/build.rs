@@ -46,7 +46,7 @@ const SOURCE_FILES: [&str; 11] = [
 
 // Duckdb C API function we use.
 // This lowers codegen'd src/cpp.rs by four times.
-const DUCKDB_C_API_FUNCTIONS: [&str; 134] = [
+const DUCKDB_C_API_FUNCTIONS: &[&str] = &[
     "duckdb_array_type_array_size",
     "duckdb_array_type_child_type",
     "duckdb_array_vector_get_child",
@@ -77,6 +77,7 @@ const DUCKDB_C_API_FUNCTIONS: [&str; 134] = [
     "duckdb_create_logical_type",
     "duckdb_create_map_type",
     "duckdb_create_null_value",
+    "duckdb_create_table_function",
     "duckdb_create_selection_vector",
     "duckdb_create_struct_type",
     "duckdb_create_time",
@@ -107,6 +108,7 @@ const DUCKDB_C_API_FUNCTIONS: [&str; 134] = [
     "duckdb_destroy_logical_type",
     "duckdb_destroy_result",
     "duckdb_destroy_selection_vector",
+    "duckdb_destroy_table_function",
     "duckdb_destroy_value",
     "duckdb_destroy_vector",
     "duckdb_disconnect",
@@ -156,6 +158,7 @@ const DUCKDB_C_API_FUNCTIONS: [&str; 134] = [
     "duckdb_open",
     "duckdb_open_ext",
     "duckdb_query",
+    "duckdb_register_table_function",
     "duckdb_result_error",
     "duckdb_row_count",
     "duckdb_rows_changed",
@@ -181,6 +184,25 @@ const DUCKDB_C_API_FUNCTIONS: [&str; 134] = [
     "duckdb_vector_reference_value",
     "duckdb_vector_reference_vector",
     "duckdb_vector_size",
+    "duckdb_bind_add_result_column",
+    "duckdb_bind_get_parameter",
+    "duckdb_bind_set_bind_data",
+    "duckdb_bind_set_cardinality",
+    "duckdb_bind_set_error",
+    "duckdb_function_get_bind_data",
+    "duckdb_function_get_init_data",
+    "duckdb_function_get_local_init_data",
+    "duckdb_function_set_error",
+    "duckdb_init_get_bind_data",
+    "duckdb_init_set_error",
+    "duckdb_init_set_init_data",
+    "duckdb_init_set_max_threads",
+    "duckdb_table_function_add_parameter",
+    "duckdb_table_function_set_bind",
+    "duckdb_table_function_set_function",
+    "duckdb_table_function_set_init",
+    "duckdb_table_function_set_local_init",
+    "duckdb_table_function_set_name",
 ];
 
 const DUCKDB_C_API_HEADERS: [&str; 7] = [
@@ -503,7 +525,7 @@ fn bindgen_c2rust(crate_dir: &Path, duckdb_include_dir: &Path) {
         .generate_comments(true)
         .parse_callbacks(Box::new(BindgenCargoCallbacks));
 
-    for function in DUCKDB_C_API_FUNCTIONS {
+    for &function in DUCKDB_C_API_FUNCTIONS {
         builder = builder.allowlist_function(function);
     }
 

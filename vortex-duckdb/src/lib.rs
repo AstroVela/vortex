@@ -27,6 +27,8 @@ mod convert;
 pub mod duckdb;
 mod exporter;
 mod ffi;
+#[cfg(target_os = "linux")]
+pub mod io_bench;
 mod multi_file;
 mod projection;
 mod table_function;
