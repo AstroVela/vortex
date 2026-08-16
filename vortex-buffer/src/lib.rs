@@ -66,7 +66,7 @@ pub use bytes::*;
 pub use r#const::*;
 pub use dispatch::*;
 pub use string::*;
-pub use vortex_alloc::Alignment;
+pub use vortex_bytes::Alignment;
 #[cfg(feature = "arrow")]
 mod arrow;
 mod bit;

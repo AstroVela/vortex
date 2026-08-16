@@ -13,7 +13,7 @@ use std::ops::DerefMut;
 use bytes::Buf;
 use bytes::BufMut;
 use bytes::buf::UninitSlice;
-use vortex_alloc::UniqueBytes;
+use vortex_bytes::UniqueBytes;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 

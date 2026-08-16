@@ -1,4 +1,4 @@
-# Vortex Alloc
+# Vortex Bytes
 
 Aligned, reference-counted byte regions. This is the untyped layer beneath `vortex-buffer`: it
 owns memory and nothing else. Element types, lengths, and alignment policy belong to the layer

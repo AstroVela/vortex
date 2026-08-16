@@ -27,8 +27,8 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use vortex_alloc::Alignment;
-use vortex_alloc::UniqueBytes;
+use vortex_bytes::Alignment;
+use vortex_bytes::UniqueBytes;
 
 /// An odd size nothing but this test asks for.
 const PROBE_SIZE: usize = 4093;

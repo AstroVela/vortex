@@ -1,5 +1,5 @@
 [package]
-name = "vortex-alloc"
+name = "vortex-bytes"
 authors = { workspace = true }
 categories = { workspace = true }
 description = "Aligned, reference-counted byte regions for Vortex"

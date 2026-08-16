@@ -19,7 +19,7 @@ thin wrapper around `bytes` itself; the region is now managed directly through `
 `bytes::Bytes` remains a zero-copy conversion in both directions, via `Buffer::into_bytes` and
 `impl From<bytes::Bytes> for ByteBuffer`.
 
-The regions themselves live in [`vortex-alloc`](../vortex-alloc), which owns memory and nothing
+The regions themselves live in [`vortex-bytes`](../vortex-bytes), which owns memory and nothing
 else. This crate adds the typed layer on top: the element type, the element count, and the
 alignment a buffer declares. Keeping the two apart means all of the allocation `unsafe` is
 non-generic - it compiles once rather than once per element type, and it can be audited and

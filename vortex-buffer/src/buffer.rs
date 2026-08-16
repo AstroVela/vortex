@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
-use vortex_alloc::SharedBytes;
+use vortex_bytes::SharedBytes;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 

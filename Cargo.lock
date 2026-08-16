@@ -9637,15 +9637,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vortex-alloc"
-version = "0.1.0"
-dependencies = [
- "hegeltest",
- "rstest",
- "vortex-error",
-]
-
-[[package]]
 name = "vortex-alp"
 version = "0.1.0"
 dependencies = [
@@ -9879,8 +9870,8 @@ dependencies = [
  "serde",
  "simdutf8",
  "tracing",
- "vortex-alloc",
  "vortex-bench-support",
+ "vortex-bytes",
  "vortex-error",
 ]
 
@@ -9894,6 +9885,15 @@ dependencies = [
  "vortex-buffer",
  "vortex-error",
  "vortex-session",
+]
+
+[[package]]
+name = "vortex-bytes"
+version = "0.1.0"
+dependencies = [
+ "hegeltest",
+ "rstest",
+ "vortex-error",
 ]
 
 [[package]]
