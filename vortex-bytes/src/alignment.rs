@@ -1,14 +1,71 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::error::Error;
 use std::fmt::Display;
 use std::ops::Deref;
 
-use vortex_error::VortexError;
-use vortex_error::VortexExpect;
-use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
-use vortex_error::vortex_err;
+use crate::panic::bytes_panic;
+
+/// The reason a value could not be interpreted as an [`Alignment`].
+///
+/// `vortex-error` converts this into a `VortexError`, so callers working in `VortexResult` can
+/// keep using `?`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidAlignment {
+    /// `1 << exponent` does not fit in a `usize` on this target.
+    ExponentTooLarge {
+        /// The rejected exponent.
+        exponent: u8,
+        /// The width of a `usize` on this target.
+        bits: u32,
+    },
+    /// The alignment is larger than [`Alignment::MAX_UNTRUSTED`] allows for serialized input.
+    ExceedsUntrustedMaximum {
+        /// The rejected alignment.
+        alignment: usize,
+        /// The largest alignment accepted from untrusted input.
+        maximum: usize,
+    },
+    /// The value is zero, or is not a power of two.
+    NotAPowerOfTwo {
+        /// The rejected value.
+        value: u32,
+    },
+    /// The value does not fit in a `usize` on this target.
+    NotRepresentable {
+        /// The rejected value.
+        value: u32,
+    },
+}
+
+impl Display for InvalidAlignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExponentTooLarge { exponent, bits } => {
+                write!(
+                    f,
+                    "alignment exponent {exponent} is too large for a {bits}-bit usize"
+                )
+            }
+            Self::ExceedsUntrustedMaximum { alignment, maximum } => {
+                write!(
+                    f,
+                    "untrusted alignment {alignment} exceeds the {maximum}-byte maximum"
+                )
+            }
+            Self::NotAPowerOfTwo { value } => {
+                write!(f, "alignment must be a non-zero power of 2, got {value}")
+            }
+            Self::NotRepresentable { value } => {
+                write!(f, "alignment {value} does not fit into a usize")
+            }
+        }
+    }
+}
+
+impl Error for InvalidAlignment {}
 
 /// The alignment of a buffer.
 ///
@@ -115,8 +172,12 @@ impl Alignment {
 
     /// Returns the log2 of the alignment.
     pub fn exponent(&self) -> u8 {
-        u8::try_from(self.0.trailing_zeros())
-            .vortex_expect("alignment is a power of 2 within usize, so its exponent fits in u8")
+        u8::try_from(self.0.trailing_zeros()).unwrap_or_else(|_| {
+            bytes_panic!(
+                "alignment {} is a power of 2, so its exponent fits in u8",
+                self.0
+            )
+        })
     }
 
     /// Create from the log2 exponent of the alignment.
@@ -140,12 +201,12 @@ impl Alignment {
     /// Prefer this over [`from_exponent`](Self::from_exponent) when the exponent originates from
     /// untrusted input such as a serialized file, where a too-large value must not panic.
     #[inline]
-    pub fn try_from_exponent(exponent: u8) -> VortexResult<Self> {
+    pub fn try_from_exponent(exponent: u8) -> Result<Self, InvalidAlignment> {
         if u32::from(exponent) >= usize::BITS {
-            vortex_bail!(
-                "Alignment exponent {exponent} is too large for a {}-bit usize",
-                usize::BITS
-            );
+            return Err(InvalidAlignment::ExponentTooLarge {
+                exponent,
+                bits: usize::BITS,
+            });
         }
         Ok(Self::new(1 << exponent))
     }
@@ -156,13 +217,13 @@ impl Alignment {
     /// large enough to cause an unreasonable allocation when a buffer needs to be copied to
     /// satisfy the alignment.
     #[inline]
-    pub fn try_from_untrusted_exponent(exponent: u8) -> VortexResult<Self> {
+    pub fn try_from_untrusted_exponent(exponent: u8) -> Result<Self, InvalidAlignment> {
         let alignment = Self::try_from_exponent(exponent)?;
         if alignment > Self::MAX_UNTRUSTED {
-            vortex_bail!(
-                "Untrusted alignment {alignment} exceeds the {}-byte maximum",
-                Self::MAX_UNTRUSTED
-            );
+            return Err(InvalidAlignment::ExceedsUntrustedMaximum {
+                alignment: *alignment,
+                maximum: *Self::MAX_UNTRUSTED,
+            });
         }
         Ok(alignment)
     }
@@ -207,25 +268,23 @@ impl From<Alignment> for usize {
 impl From<Alignment> for u32 {
     #[inline]
     fn from(value: Alignment) -> Self {
-        u32::try_from(value.0).vortex_expect("Alignment must fit into u32")
+        u32::try_from(value.0)
+            .unwrap_or_else(|_| bytes_panic!("alignment {} does not fit into a u32", value.0))
     }
 }
 
 impl TryFrom<u32> for Alignment {
-    type Error = VortexError;
+    type Error = InvalidAlignment;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        let value = usize::try_from(value)
-            .map_err(|_| vortex_err!("Alignment must fit into usize, got {value}"))?;
+        let width =
+            usize::try_from(value).map_err(|_| InvalidAlignment::NotRepresentable { value })?;
 
-        if value == 0 {
-            return Err(vortex_err!("Alignment must be greater than 0"));
-        }
-        if !value.is_power_of_two() {
-            return Err(vortex_err!("Alignment must be a power of 2, got {value}"));
+        if width == 0 || !width.is_power_of_two() {
+            return Err(InvalidAlignment::NotAPowerOfTwo { value });
         }
 
-        Ok(Self(value))
+        Ok(Self(width))
     }
 }
 

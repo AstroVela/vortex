@@ -38,6 +38,12 @@ bit  63                              8   7  2   1 0
 
 ## Why it is its own crate
 
+The crate has no dependencies at all - not on `vortex-error`, not on anything else. Failures are
+reported as `InvalidAlignment` and through panics rather than through a shared error type, so it
+can be built, audited, and reused entirely on its own. `vortex-error` converts `InvalidAlignment`
+into a `VortexError` behind its `vortex-bytes` feature, which is what keeps `?` working for
+callers inside Vortex.
+
 Everything here is non-generic on purpose. All of the `unsafe` that manages regions — provenance,
 refcount discipline, promotion, `realloc` — compiles exactly once rather than once per element
 type, and it is small enough to audit as a unit and to test exhaustively under Miri and against a

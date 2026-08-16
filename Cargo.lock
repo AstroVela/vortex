@@ -9893,7 +9893,6 @@ version = "0.1.0"
 dependencies = [
  "hegeltest",
  "rstest",
- "vortex-error",
 ]
 
 [[package]]
@@ -10161,6 +10160,7 @@ dependencies = [
  "serial_test",
  "temp-env",
  "tokio",
+ "vortex-bytes",
 ]
 
 [[package]]

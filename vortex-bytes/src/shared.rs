@@ -9,14 +9,13 @@ use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
-use vortex_error::vortex_panic;
-
 use crate::Release;
 use crate::Shared;
 use crate::State;
 use crate::UniqueBytes;
 use crate::dangling;
 use crate::drop_owner;
+use crate::panic::bytes_panic;
 
 /// An immutable, reference-counted window into a region.
 ///
@@ -220,10 +219,10 @@ impl SharedBytes {
     #[inline]
     pub fn slice(&self, begin: usize, end: usize) -> Self {
         if begin > end {
-            vortex_panic!("range start must not be greater than end: {begin} <= {end}");
+            bytes_panic!("range start must not be greater than end: {begin} <= {end}");
         }
         if end > self.len {
-            vortex_panic!("range end out of bounds: {end} > {}", self.len);
+            bytes_panic!("range end out of bounds: {end} > {}", self.len);
         }
         if begin == end {
             return Self::empty();
@@ -252,10 +251,10 @@ impl SharedBytes {
         let sub_start = subset.as_ptr().addr();
 
         if sub_start < self_start {
-            vortex_panic!("subset pointer starts before the buffer");
+            bytes_panic!("subset pointer starts before the buffer");
         }
         if sub_start + subset.len() > self_start + self.len {
-            vortex_panic!("subset pointer ends past the end of the buffer");
+            bytes_panic!("subset pointer ends past the end of the buffer");
         }
 
         let offset = sub_start - self_start;
@@ -272,7 +271,7 @@ impl SharedBytes {
     #[inline]
     pub fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
-            vortex_panic!(
+            bytes_panic!(
                 "cannot advance past the end of the buffer: {cnt} > {}",
                 self.len
             );

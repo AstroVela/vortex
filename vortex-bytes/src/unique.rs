@@ -10,9 +10,6 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 
-use vortex_error::VortexExpect;
-use vortex_error::vortex_panic;
-
 use crate::Alignment;
 use crate::Release;
 use crate::Shared;
@@ -21,6 +18,7 @@ use crate::State;
 use crate::allocate;
 use crate::dangling;
 use crate::drop_owner;
+use crate::panic::bytes_panic;
 use crate::shared_global;
 
 /// A uniquely owned, writable window into a region.
@@ -134,7 +132,7 @@ impl UniqueBytes {
         // recording it as one of our own allocations is enough to free it correctly - and lets
         // `try_into_vec` hand it straight back out again.
         let layout = Layout::array::<T>(capacity)
-            .unwrap_or_else(|_| vortex_panic!("a live Vec's layout is always representable"));
+            .unwrap_or_else(|_| bytes_panic!("a live Vec's layout is always representable"));
 
         // SAFETY: we took the `Vec`'s allocation, which matches `layout` exactly.
         let mut this = unsafe { Self::adopt_global(base, layout) };
@@ -287,7 +285,7 @@ impl UniqueBytes {
     #[inline]
     pub fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
-            vortex_panic!(
+            bytes_panic!(
                 "cannot advance past the end of the buffer: {cnt} > {}",
                 self.len
             );
@@ -356,7 +354,7 @@ impl UniqueBytes {
         let required = self
             .len
             .checked_add(additional)
-            .vortex_expect("buffer capacity overflow");
+            .unwrap_or_else(|| bytes_panic!("buffer capacity overflow"));
         // Amortise the cost of growing by at least doubling each time.
         let target = max(required, self.cap.saturating_mul(2));
 
@@ -483,7 +481,7 @@ impl UniqueBytes {
     #[inline]
     pub fn split_off(&mut self, at: usize) -> Self {
         if at > self.cap {
-            vortex_panic!("cannot split buffer of capacity {} at {at}", self.cap);
+            bytes_panic!("cannot split buffer of capacity {} at {at}", self.cap);
         }
 
         let state = if self.state.is_static() {

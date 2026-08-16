@@ -32,7 +32,7 @@ serde = { workspace = true, optional = true }
 simdutf8 = { workspace = true }
 tracing = { workspace = true, optional = true }
 vortex-bytes = { workspace = true }
-vortex-error = { workspace = true }
+vortex-error = { workspace = true, features = ["vortex-bytes"] }
 
 [lints]
 workspace = true

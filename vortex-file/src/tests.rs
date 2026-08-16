@@ -2198,7 +2198,14 @@ async fn test_file_metadata_malformed_alignment_returns_error_on_default_open() 
             Ok(_) => panic!("invalid alignment exponent must fail open"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("Alignment exponent"));
+        // `InvalidAlignment` renders lowercase, per the convention for `Error` display.
+        assert!(
+            error
+                .to_string()
+                .to_lowercase()
+                .contains("alignment exponent"),
+            "unexpected error: {error}"
+        );
     }
 
     Ok(())

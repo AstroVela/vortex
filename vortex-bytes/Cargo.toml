@@ -16,9 +16,6 @@ version = { workspace = true }
 [package.metadata.docs.rs]
 all-features = true
 
-[dependencies]
-vortex-error = { workspace = true }
-
 [lints]
 workspace = true
 

@@ -549,6 +549,13 @@ impl From<tokio::task::JoinError> for VortexError {
     }
 }
 
+#[cfg(feature = "vortex-bytes")]
+impl From<vortex_bytes::InvalidAlignment> for VortexError {
+    fn from(value: vortex_bytes::InvalidAlignment) -> Self {
+        VortexError::InvalidArgument(value.to_string().into(), Box::new(Backtrace::capture()))
+    }
+}
+
 impl From<TryFromIntError> for VortexError {
     fn from(value: TryFromIntError) -> Self {
         VortexError::TryFromInt(value, Box::new(Backtrace::capture()))

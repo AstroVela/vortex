@@ -25,6 +25,12 @@
 //! provenance, refcount discipline, promotion, `realloc` - compiles exactly once, rather than once
 //! per element type, and it is small enough to audit and to test exhaustively under Miri.
 //!
+//! The crate has no dependencies at all, Vortex or otherwise. Failures are reported as
+//! [`InvalidAlignment`] and through panics, rather than through a shared error type, so nothing
+//! here has to agree with the rest of Vortex about how errors are represented. `vortex-error`
+//! converts [`InvalidAlignment`] into a `VortexError` behind its `vortex-bytes` feature, which is
+//! how `?` keeps working for callers that want it.
+//!
 //! [`vortex-buffer`]: https://docs.rs/vortex-buffer
 //!
 //! # Model
@@ -73,6 +79,7 @@ pub use shared::*;
 pub use unique::*;
 
 mod alignment;
+mod panic;
 mod region;
 mod shared;
 mod unique;

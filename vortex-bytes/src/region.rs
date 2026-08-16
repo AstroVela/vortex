@@ -14,9 +14,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::fence;
 
-use vortex_error::vortex_panic;
-
 use crate::Alignment;
+use crate::panic::bytes_panic;
 
 /// A dangling but maximally aligned address used by buffers that own no allocation.
 ///
@@ -321,10 +320,10 @@ impl Drop for Shared {
 /// Build the layout for a non-empty allocation, panicking on the (unrepresentable) edge cases.
 fn layout_for(size: usize, alignment: Alignment) -> Layout {
     if size == 0 {
-        vortex_panic!("Cannot allocate a zero-sized buffer region");
+        bytes_panic!("Cannot allocate a zero-sized buffer region");
     }
     Layout::from_size_align(size, *alignment).unwrap_or_else(|_| {
-        vortex_panic!("Buffer of {size} bytes aligned to {alignment} exceeds the maximum layout")
+        bytes_panic!("Buffer of {size} bytes aligned to {alignment} exceeds the maximum layout")
     })
 }
 

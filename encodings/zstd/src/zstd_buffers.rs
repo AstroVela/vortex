@@ -322,7 +322,7 @@ impl ZstdBuffersData {
             .buffer_alignments
             .iter()
             .map(|&alignment| Alignment::try_from(alignment))
-            .collect::<VortexResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         let (output_offsets, output_size_total) =
             compute_output_layout(&output_sizes, &output_alignments);
