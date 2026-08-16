@@ -3,10 +3,10 @@
 
 //! `unsplit` must only merge windows that really do share a region.
 //!
-//! A buffer that has never been split describes its region inline, as a size and an alignment.
-//! That word is a *description*, not an identity: two buffers allocated independently with the
+//! A window that has never been split describes its region inline, as a size and an alignment.
+//! That word is a *description*, not an identity: two windows allocated independently with the
 //! same layout carry the same word. If they also happen to sit next to each other in memory, a
-//! merge based on that word alone would extend the first buffer over the second's region and then
+//! merge based on that word alone would extend the first window over the second's region and then
 //! free it.
 //!
 //! Whether two independent allocations land adjacent is up to the allocator, so this test installs
@@ -27,8 +27,8 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use vortex_buffer::Alignment;
-use vortex_buffer::ByteBufferMut;
+use vortex_alloc::Alignment;
+use vortex_alloc::UniqueBytes;
 
 /// An odd size nothing but this test asks for.
 const PROBE_SIZE: usize = 4093;
@@ -89,11 +89,10 @@ unsafe impl GlobalAlloc for Adjacent {
 #[global_allocator]
 static ALLOCATOR: Adjacent = Adjacent;
 
-fn probe_buffer(fill: u8) -> ByteBufferMut {
-    let mut buffer =
-        ByteBufferMut::with_capacity_preferred_aligned(PROBE_SIZE, Alignment::none(), None);
-    buffer.extend_from_slice(&[fill; PROBE_SIZE]);
-    buffer
+fn probe_window(fill: u8) -> UniqueBytes {
+    let mut window = UniqueBytes::with_capacity(PROBE_SIZE, Alignment::none());
+    window.extend_from_slice(&[fill; PROBE_SIZE], Alignment::none());
+    window
 }
 
 /// Both cases live in one test so that the arena blocks they take stay consecutive: separate
@@ -105,38 +104,38 @@ fn unsplit_distinguishes_neighbouring_regions_from_split_halves() {
 }
 
 fn copies_out_of_a_neighbouring_region() {
-    let mut first = probe_buffer(1);
-    let second = probe_buffer(2);
+    let mut first = probe_window(1);
+    let second = probe_window(2);
 
     assert!(
         std::ptr::eq(first.as_ptr().wrapping_add(first.len()), second.as_ptr()),
         "the arena is supposed to hand out adjacent blocks"
     );
 
-    first.unsplit(second);
+    first.unsplit(second, Alignment::none());
 
     assert_eq!(first.len(), PROBE_SIZE * 2);
     assert!(
-        first[..PROBE_SIZE].iter().all(|&b| b == 1),
-        "the first buffer's own bytes must survive"
+        first.as_slice()[..PROBE_SIZE].iter().all(|&b| b == 1),
+        "the first window's own bytes must survive"
     );
     assert!(
-        first[PROBE_SIZE..].iter().all(|&b| b == 2),
-        "the second buffer's bytes must be copied out before its region is released"
+        first.as_slice()[PROBE_SIZE..].iter().all(|&b| b == 2),
+        "the second window's bytes must be copied out before its region is released"
     );
 }
 
 fn merges_the_two_halves_of_one_region() {
-    let mut first = probe_buffer(1);
+    let mut first = probe_window(1);
     let second = first.split_off(PROBE_SIZE / 2);
     let start = first.as_ptr();
 
-    first.unsplit(second);
+    first.unsplit(second, Alignment::none());
 
     assert_eq!(first.len(), PROBE_SIZE);
     assert!(
         std::ptr::eq(first.as_ptr(), start),
         "halves of one region merge in place, without copying"
     );
-    assert!(first.iter().all(|&b| b == 1));
+    assert!(first.as_slice().iter().all(|&b| b == 1));
 }

@@ -13,25 +13,25 @@ use std::sync::atomic::AtomicUsize;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
-use super::Release;
-use super::Shared;
-use super::SharedBytes;
-use super::State;
-use super::allocate;
-use super::dangling;
-use super::drop_owner;
-use super::shared_global;
 use crate::Alignment;
+use crate::Release;
+use crate::Shared;
+use crate::SharedBytes;
+use crate::State;
+use crate::allocate;
+use crate::dangling;
+use crate::drop_owner;
+use crate::shared_global;
 
 /// A uniquely owned, writable window into a region.
 ///
-/// This is the storage behind [`BufferMut`](crate::BufferMut). The window `ptr..ptr + cap` is
+/// This is the storage behind `vortex-buffer`'s `BufferMut<T>`. The window `ptr..ptr + cap` is
 /// exclusively ours: no other handle may read or write it, even when the underlying region is
 /// shared with the other half of a [`split_off`](Self::split_off).
 ///
 /// Like [`SharedBytes`], a window that has never been split describes its region inline and
 /// allocates no refcount.
-pub(crate) struct UniqueBytes {
+pub struct UniqueBytes {
     /// The first byte of the window.
     ptr: NonNull<u8>,
     /// The number of initialised bytes at the front of the window.
@@ -52,7 +52,7 @@ unsafe impl Sync for UniqueBytes {}
 impl UniqueBytes {
     /// A window that owns nothing, aligned to [`Alignment::MAX`].
     #[inline]
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             ptr: dangling(),
             len: 0,
@@ -64,12 +64,12 @@ impl UniqueBytes {
 
     /// Allocate an empty window with room for `capacity` bytes, aligned to `alignment`.
     #[inline]
-    pub(crate) fn with_capacity(capacity: usize, alignment: Alignment) -> Self {
+    pub fn with_capacity(capacity: usize, alignment: Alignment) -> Self {
         Self::allocate(capacity, alignment, false)
     }
 
     /// Allocate a window of `len` zeroed bytes, aligned to `alignment`.
-    pub(crate) fn zeroed(len: usize, alignment: Alignment) -> Self {
+    pub fn zeroed(len: usize, alignment: Alignment) -> Self {
         let mut this = Self::allocate(len, alignment, true);
         this.len = len;
         this
@@ -115,7 +115,7 @@ impl UniqueBytes {
     /// The buffer treats the elements as plain bytes and never runs `T`'s destructor. Callers that
     /// need destructors must keep the `Vec` alive themselves, e.g. through
     /// [`SharedBytes::from_owner`].
-    pub(crate) fn from_vec<T>(vec: Vec<T>) -> Self {
+    pub fn from_vec<T>(vec: Vec<T>) -> Self {
         let mut vec = ManuallyDrop::new(vec);
         let capacity = vec.capacity();
         let len = vec.len();
@@ -146,7 +146,7 @@ impl UniqueBytes {
     ///
     /// Taking `owner` by value and going through [`AsMut`] is what makes this safe: it proves that
     /// nothing else can be observing the region while we hold it.
-    pub(crate) fn from_owner<O, T>(owner: O) -> Self
+    pub fn from_owner<O, T>(owner: O) -> Self
     where
         O: AsMut<[T]> + Send + 'static,
     {
@@ -196,7 +196,7 @@ impl UniqueBytes {
     /// region `state` describes, the region must be writable, the first `len` bytes must be
     /// initialised, and the caller must hand over its ownership.
     #[inline]
-    pub(super) unsafe fn from_parts(
+    pub(crate) unsafe fn from_parts(
         ptr: NonNull<u8>,
         len: usize,
         cap: usize,
@@ -213,36 +213,49 @@ impl UniqueBytes {
         }
     }
 
+    /// The address of the first byte of the window.
     #[inline]
-    pub(crate) fn as_ptr(&self) -> *const u8 {
+    pub fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
+    /// Whether the window holds no initialised bytes.
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The number of initialised bytes in the window.
+    #[inline]
+    pub fn len(&self) -> usize {
         self.len
     }
 
+    /// The number of bytes the window can hold before it has to grow.
     #[inline]
-    pub(crate) fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.cap
     }
 
+    /// The window's initialised bytes.
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         // SAFETY: the first `len` bytes of the window are initialised and exclusively ours.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
+    /// The window's initialised bytes, mutably.
+    ///
+    /// Nothing else can see them: that is what [`UniqueBytes`] means.
     #[inline]
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: the first `len` bytes of the window are initialised and exclusively ours.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     /// The uninitialised tail of the window.
     #[inline]
-    pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         // SAFETY: `len..cap` is within the window, which is exclusively ours.
         unsafe {
             std::slice::from_raw_parts_mut(
@@ -259,7 +272,7 @@ impl UniqueBytes {
     /// `len` must not exceed [`capacity`](Self::capacity), and the bytes up to `len` must be
     /// initialised.
     #[inline]
-    pub(crate) unsafe fn set_len(&mut self, len: usize) {
+    pub unsafe fn set_len(&mut self, len: usize) {
         debug_assert!(len <= self.cap);
         self.len = len;
     }
@@ -268,11 +281,11 @@ impl UniqueBytes {
     ///
     /// This does not preserve alignment: advancing by anything that is not a multiple of the
     /// buffer's alignment leaves the window unaligned. Keeping to a multiple is the caller's
-    /// business - [`BufferMut`](crate::BufferMut)'s `Buf::advance` rejects the rest - and a
+    /// business - `vortex-buffer`'s `BufferMut::advance` rejects the rest - and a
     /// subsequent [`reserve`](Self::reserve) will re-align by reallocating rather than reclaiming
     /// in place.
     #[inline]
-    pub(crate) fn advance(&mut self, cnt: usize) {
+    pub fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
             vortex_panic!(
                 "cannot advance past the end of the buffer: {cnt} > {}",
@@ -330,7 +343,7 @@ impl UniqueBytes {
     /// The resulting window is aligned to at least `alignment`, and never less well aligned than
     /// it already was.
     #[inline]
-    pub(crate) fn reserve(&mut self, additional: usize, alignment: Alignment) {
+    pub fn reserve(&mut self, additional: usize, alignment: Alignment) {
         if additional <= self.cap - self.len {
             return;
         }
@@ -426,7 +439,7 @@ impl UniqueBytes {
 
     /// Append `slice` to the window, growing it if needed.
     #[inline]
-    pub(crate) fn extend_from_slice(&mut self, slice: &[u8], alignment: Alignment) {
+    pub fn extend_from_slice(&mut self, slice: &[u8], alignment: Alignment) {
         self.reserve(slice.len(), alignment);
         // `unsplit` is the one caller that can hand us a slice from our own region, so the
         // non-overlap argument is worth spelling out: live windows into a region are disjoint, so
@@ -468,7 +481,7 @@ impl UniqueBytes {
     ///
     /// Both halves keep pointing into the same region; neither moves.
     #[inline]
-    pub(crate) fn split_off(&mut self, at: usize) -> Self {
+    pub fn split_off(&mut self, at: usize) -> Self {
         if at > self.cap {
             vortex_panic!("cannot split buffer of capacity {} at {at}", self.cap);
         }
@@ -502,7 +515,7 @@ impl UniqueBytes {
     ///
     /// `O(1)` when the two windows are still adjacent in the same region; otherwise this
     /// degenerates to a copy.
-    pub(crate) fn unsplit(&mut self, other: Self, alignment: Alignment) {
+    pub fn unsplit(&mut self, other: Self, alignment: Alignment) {
         if self.cap == 0 {
             *self = other;
             return;
@@ -528,7 +541,7 @@ impl UniqueBytes {
 
     /// Freeze the window into an immutable, shareable one.
     #[inline]
-    pub(crate) fn freeze(self) -> SharedBytes {
+    pub fn freeze(self) -> SharedBytes {
         let this = ManuallyDrop::new(self);
         // SAFETY: the window lies within the region, and we hand its reference over.
         unsafe { SharedBytes::from_parts(this.ptr, this.len, this.base, this.state) }
@@ -540,7 +553,7 @@ impl UniqueBytes {
     /// because it came from a `Vec<T>` in the first place, or because it was allocated with
     /// exactly `align_of::<T>()` - and our window starts at the front of it. An over-aligned
     /// buffer cannot be given away, because `Vec` would free it with the wrong layout.
-    pub(crate) fn try_into_vec<T>(self) -> Result<Vec<T>, Self> {
+    pub fn try_into_vec<T>(self) -> Result<Vec<T>, Self> {
         let elem = size_of::<T>();
         if elem == 0 || !self.len.is_multiple_of(elem) {
             return Err(self);

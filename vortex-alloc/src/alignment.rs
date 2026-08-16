@@ -58,7 +58,7 @@ impl Alignment {
     /// ## Example
     ///
     /// ```
-    /// use vortex_buffer::Alignment;
+    /// use vortex_alloc::Alignment;
     ///
     /// assert_eq!(Alignment::new(4), Alignment::of::<i32>());
     /// assert_eq!(Alignment::new(8), Alignment::of::<i64>());
@@ -77,7 +77,7 @@ impl Alignment {
     /// ## Example
     ///
     /// ```
-    /// use vortex_buffer::Alignment;
+    /// use vortex_alloc::Alignment;
     ///
     /// let a = Alignment::new(4);
     /// let b = Alignment::new(2);
@@ -95,7 +95,7 @@ impl Alignment {
     /// ## Example
     ///
     /// ```
-    /// use vortex_buffer::Alignment;
+    /// use vortex_alloc::Alignment;
     ///
     /// let a = Alignment::new(4);
     /// assert!(a.is_offset_aligned(8));

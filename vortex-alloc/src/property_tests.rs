@@ -337,7 +337,7 @@ impl WindowModel {
         let shared = bytes.freeze();
         let clone = shared.clone();
         assert_eq!(clone.as_slice(), shared.as_slice());
-        assert!(!shared.is_unique() || shared.len() == 0);
+        assert!(!shared.is_unique() || shared.is_empty());
         drop(clone);
         self.bytes = shared
             .try_into_unique()

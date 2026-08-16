@@ -3,6 +3,7 @@ members = [
     # Core crates in dependency order
     "vortex-array-macros",
     "vortex-error",
+    "vortex-alloc",
     "vortex-buffer",
     "vortex-compute",
     "vortex-mask",
@@ -299,6 +300,7 @@ vortex-alp = { version = "0.1.0", path = "./encodings/alp", default-features = f
 vortex-array = { version = "0.1.0", path = "./vortex-array", default-features = false }
 vortex-arrow = { version = "0.1.0", path = "./vortex-arrow", default-features = false }
 vortex-btrblocks = { version = "0.1.0", path = "./vortex-btrblocks", default-features = false }
+vortex-alloc = { version = "0.1.0", path = "./vortex-alloc", default-features = false }
 vortex-buffer = { version = "0.1.0", path = "./vortex-buffer", default-features = false }
 vortex-bytebool = { version = "0.1.0", path = "./encodings/bytebool", default-features = false }
 vortex-cloud = { version = "0.1.0", path = "./vortex-cloud", default-features = false }

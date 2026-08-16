@@ -13,13 +13,13 @@ use std::ops::DerefMut;
 use bytes::Buf;
 use bytes::BufMut;
 use bytes::buf::UninitSlice;
+use vortex_alloc::UniqueBytes;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
 use crate::Alignment;
 use crate::Buffer;
 use crate::ByteBufferMut;
-use crate::alloc::UniqueBytes;
 use crate::buffer::copy_to_vec;
 use crate::debug::TruncatedDebug;
 use crate::trusted_len::TrustedLen;

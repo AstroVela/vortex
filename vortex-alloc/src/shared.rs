@@ -11,20 +11,20 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 
 use vortex_error::vortex_panic;
 
-use super::Release;
-use super::Shared;
-use super::State;
-use super::UniqueBytes;
-use super::dangling;
-use super::drop_owner;
+use crate::Release;
+use crate::Shared;
+use crate::State;
+use crate::UniqueBytes;
+use crate::dangling;
+use crate::drop_owner;
 
 /// An immutable, reference-counted window into a region.
 ///
-/// This is the storage behind [`Buffer`](crate::Buffer). Cloning and slicing are `O(1)`.
+/// This is the storage behind `vortex-buffer`'s `Buffer<T>`. Cloning and slicing are `O(1)`.
 ///
-/// A handle that has never been shared describes its region inline (see [`State`]) and allocates
-/// no refcount; the first [`clone`](Clone::clone) promotes it.
-pub(crate) struct SharedBytes {
+/// A handle that has never been shared describes its region inline (see the crate docs for the
+/// state encoding) and allocates no refcount; the first [`clone`](Clone::clone) promotes it.
+pub struct SharedBytes {
     /// The first byte of the window.
     ptr: NonNull<u8>,
     /// The length of the window in bytes.
@@ -51,7 +51,7 @@ impl SharedBytes {
 
     /// An empty window that owns nothing, aligned to [`Alignment::MAX`](crate::Alignment::MAX).
     #[inline]
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             ptr: dangling(),
             len: 0,
@@ -61,7 +61,7 @@ impl SharedBytes {
     }
 
     /// Borrow a `'static` slice without copying it.
-    pub(crate) fn from_static(slice: &'static [u8]) -> Self {
+    pub fn from_static(slice: &'static [u8]) -> Self {
         if slice.is_empty() {
             return Self::empty();
         }
@@ -81,9 +81,9 @@ impl SharedBytes {
     /// derived from a shared reference, and writing through such a pointer is undefined behaviour
     /// even when the memory itself is writable.
     ///
-    /// Foreign memory is always held through a [`Shared`]: adoption already allocates a box for
+    /// Foreign memory is always refcounted: adoption already allocates a box for
     /// the owner, so there is nothing to be gained by describing it inline.
-    pub(crate) fn from_owner<O, T>(owner: O) -> Self
+    pub fn from_owner<O, T>(owner: O) -> Self
     where
         O: AsRef<[T]> + Send + 'static,
     {
@@ -131,7 +131,7 @@ impl SharedBytes {
     /// `ptr..ptr + len` must lie within the region `state` describes, `base` must be its first
     /// byte when `state` is `OWNED`, and the caller must hand over one reference to it.
     #[inline]
-    pub(super) unsafe fn from_parts(
+    pub(crate) unsafe fn from_parts(
         ptr: NonNull<u8>,
         len: usize,
         base: NonNull<u8>,
@@ -145,18 +145,27 @@ impl SharedBytes {
         }
     }
 
+    /// The address of the first byte of the window.
     #[inline]
-    pub(crate) fn as_ptr(&self) -> *const u8 {
+    pub fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
+    /// Whether the window covers no bytes.
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The number of bytes in the window.
+    #[inline]
+    pub fn len(&self) -> usize {
         self.len
     }
 
+    /// The window's bytes.
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         // SAFETY: the window is a valid, initialised, immutable region of `len` bytes. When `len`
         // is zero `ptr` may dangle, which `from_raw_parts` permits so long as it is aligned and
         // non-null.
@@ -170,7 +179,7 @@ impl SharedBytes {
     fn promote(&self, state: State) -> *mut Shared {
         debug_assert!(state.is_owned());
         // Two references: this handle, and the one the caller is about to create.
-        let shared = super::shared_global(self.base, state.owned_layout(), 2).into_raw();
+        let shared = crate::shared_global(self.base, state.owned_layout(), 2).into_raw();
 
         // SAFETY: we just created `shared`.
         let new = unsafe { State::shared(shared) };
@@ -209,7 +218,7 @@ impl SharedBytes {
     ///
     /// Panics if the range is out of bounds.
     #[inline]
-    pub(crate) fn slice(&self, begin: usize, end: usize) -> Self {
+    pub fn slice(&self, begin: usize, end: usize) -> Self {
         if begin > end {
             vortex_panic!("range start must not be greater than end: {begin} <= {end}");
         }
@@ -233,7 +242,7 @@ impl SharedBytes {
     ///
     /// Panics if `subset` is not contained within this window.
     #[inline]
-    pub(crate) fn slice_ref(&self, subset: &[u8]) -> Self {
+    pub fn slice_ref(&self, subset: &[u8]) -> Self {
         // An empty subset carries no address we can meaningfully check against.
         if subset.is_empty() {
             return Self::empty();
@@ -261,7 +270,7 @@ impl SharedBytes {
     ///
     /// Panics if `cnt > len`.
     #[inline]
-    pub(crate) fn advance(&mut self, cnt: usize) {
+    pub fn advance(&mut self, cnt: usize) {
         if cnt > self.len {
             vortex_panic!(
                 "cannot advance past the end of the buffer: {cnt} > {}",
@@ -276,13 +285,13 @@ impl SharedBytes {
 
     /// Shorten the window to zero bytes, keeping the start.
     #[inline]
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.len = 0;
     }
 
     /// Whether this is the only handle to the underlying region.
     #[inline]
-    pub(crate) fn is_unique(&self) -> bool {
+    pub fn is_unique(&self) -> bool {
         let state = self.state();
         if state.is_owned() {
             // Never shared, so there is nothing else to hold it.
@@ -302,7 +311,7 @@ impl SharedBytes {
     /// The returned buffer's capacity runs from the start of this window to the end of the region,
     /// so a handle onto the front of a partially filled allocation regains its spare capacity.
     #[inline]
-    pub(crate) fn try_into_unique(self) -> Result<UniqueBytes, Self> {
+    pub fn try_into_unique(self) -> Result<UniqueBytes, Self> {
         let state = self.state();
 
         if state.is_static() {

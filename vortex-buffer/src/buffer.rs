@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
+use vortex_alloc::SharedBytes;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
 use crate::Alignment;
 use crate::BufferMut;
 use crate::ByteBuffer;
-use crate::alloc::SharedBytes;
 use crate::debug::TruncatedDebug;
 use crate::trusted_len::TrustedLen;
 

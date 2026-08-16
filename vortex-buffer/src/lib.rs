@@ -59,7 +59,6 @@
 //! including `arrow_buffer::Buffer`, `arrow_buffer::ScalarBuffer<T>`, and
 //! `arrow_buffer::OffsetBuffer`.
 
-pub use alignment::*;
 pub use bit::*;
 pub use buffer::*;
 pub use buffer_mut::*;
@@ -67,8 +66,7 @@ pub use bytes::*;
 pub use r#const::*;
 pub use dispatch::*;
 pub use string::*;
-mod alignment;
-mod alloc;
+pub use vortex_alloc::Alignment;
 #[cfg(feature = "arrow")]
 mod arrow;
 mod bit;

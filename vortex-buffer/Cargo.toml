@@ -30,6 +30,7 @@ itertools = { workspace = true }
 memmap2 = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 simdutf8 = { workspace = true }
+vortex-alloc = { workspace = true }
 tracing = { workspace = true, optional = true }
 vortex-error = { workspace = true }
 

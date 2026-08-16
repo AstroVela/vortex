@@ -1,47 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The allocation primitives that back [`Buffer`](crate::Buffer) and
-//! [`BufferMut`](crate::BufferMut).
-//!
-//! These types mirror the model of `bytes::Bytes` and `bytes::BytesMut`: a handle is a window
-//! `(ptr, len)` into a region, cloning is a refcount bump, and slicing is pointer arithmetic. They
-//! differ in that the region is managed directly through [`std::alloc`], which buys three things
-//! `bytes` cannot give us:
-//!
-//! * **Native alignment.** A region records the alignment it was allocated with, so an
-//!   over-aligned buffer no longer has to over-allocate by `alignment` bytes and offset into the
-//!   middle of a `Vec<u8>`.
-//! * **Mutable foreign buffers.** A region adopted from foreign memory records whether it may be
-//!   written through. `bytes::Bytes::try_into_mut` only succeeds for bytes that came out of
-//!   `BytesMut::freeze`, so an adopted `Vec<T>`, Arrow buffer, or mmap could never be made
-//!   mutable again without a copy.
-//! * **`Vec<T>` round-trips.** A region allocated with exactly `Layout::array::<T>(cap)` is
-//!   indistinguishable from a `Vec<T>`'s allocation, so it can be handed back out as one.
-//!
-//! # Deferred sharing
-//!
-//! A handle that has never been shared owns its region outright, and describes it inline: no
-//! refcount is allocated until a second handle actually exists. This is the same trick `bytes`
-//! plays with its "promotable" vtables, and it is what keeps the common
-//! build-freeze-read-drop path down to a single allocation.
-//!
-//! The ownership state is one word, [`State`]:
-//!
-//! ```text
-//! bit  63                              8   7  2   1 0
-//!     ┌─────────────────────────────────┬───────┬─────┐
-//!     │ size                            │ align │ 0 1 │  OWNED  - inline description
-//!     └─────────────────────────────────┴───────┴─────┘
-//!     ┌───────────────────────────────────────────┬───┐
-//!     │ *mut Shared                               │ 0 │  SHARED - refcounted, 8-aligned
-//!     └───────────────────────────────────────────┴───┘
-//!                                               0b10    STATIC - owns nothing
-//! ```
-//!
-//! `OWNED` keeps the region's start in the handle's own `base` field, so advancing or truncating a
-//! handle never has to allocate. Promotion to `SHARED` only ever rewrites the state word, never
-//! `base`, which is what lets it happen through a shared reference with a single compare-exchange.
+//! The region primitives the handle types are built on: the tagged ownership word, the lazily
+//! allocated refcount, and the global-allocator helpers. See the crate docs for the encoding.
 
 use std::alloc::Layout;
 use std::alloc::alloc;
@@ -56,16 +17,6 @@ use std::sync::atomic::fence;
 use vortex_error::vortex_panic;
 
 use crate::Alignment;
-
-#[cfg(test)]
-mod property_tests;
-mod shared;
-#[cfg(test)]
-mod tests;
-mod unique;
-
-pub(crate) use shared::SharedBytes;
-pub(crate) use unique::UniqueBytes;
 
 /// A dangling but maximally aligned address used by buffers that own no allocation.
 ///
@@ -113,18 +64,18 @@ const _: () = assert!((1usize << ALIGN_BITS) > (usize::BITS - 1) as usize);
 /// `OWNED` and `STATIC` cases are pure bit patterns that are never dereferenced, so they carry no
 /// provenance and do not need any.
 #[derive(Clone, Copy)]
-pub(super) struct State(*mut ());
+pub(crate) struct State(pub(crate) *mut ());
 
 impl State {
     /// The state of a handle that owns nothing.
-    const STATIC: Self = Self(std::ptr::without_provenance_mut(KIND_STATIC));
+    pub(crate) const STATIC: Self = Self(std::ptr::without_provenance_mut(KIND_STATIC));
 
     /// Describe a global allocation inline, if it is small enough to fit in the word.
     ///
     /// Callers must pass the size and alignment of a `Layout` that is known to be valid, so that
     /// [`owned_layout`](Self::owned_layout) can rebuild it without re-checking.
     #[inline]
-    fn owned(size: usize, alignment: Alignment) -> Option<Self> {
+    pub(crate) fn owned(size: usize, alignment: Alignment) -> Option<Self> {
         (size <= MAX_OWNED_SIZE).then(|| {
             Self(std::ptr::without_provenance_mut(
                 KIND_OWNED
@@ -141,7 +92,7 @@ impl State {
     /// `shared` must be a live pointer from [`Shared::into_raw`], and this state takes over one
     /// of its references.
     #[inline]
-    unsafe fn shared(shared: *mut Shared) -> Self {
+    pub(crate) unsafe fn shared(shared: *mut Shared) -> Self {
         debug_assert_eq!(shared.addr() & KIND_MASK, KIND_SHARED, "Shared is aligned");
         Self(shared.cast())
     }
@@ -157,12 +108,12 @@ impl State {
     }
 
     #[inline]
-    fn is_owned(self) -> bool {
+    pub(crate) fn is_owned(self) -> bool {
         self.kind() == KIND_OWNED
     }
 
     #[inline]
-    fn is_static(self) -> bool {
+    pub(crate) fn is_static(self) -> bool {
         self.kind() == KIND_STATIC
     }
 
@@ -170,13 +121,13 @@ impl State {
     /// compared on. `OWNED` words describe a region rather than naming one: two handles that
     /// allocated the same layout independently carry the same word.
     #[inline]
-    fn is_shared(self) -> bool {
+    pub(crate) fn is_shared(self) -> bool {
         self.kind() == KIND_SHARED
     }
 
     /// The size of the inline-described region.
     #[inline]
-    fn owned_size(self) -> usize {
+    pub(crate) fn owned_size(self) -> usize {
         debug_assert!(self.is_owned());
         self.addr() >> SIZE_SHIFT
     }
@@ -194,7 +145,7 @@ impl State {
 
     /// The layout the inline-described region was allocated with.
     #[inline]
-    fn owned_layout(self) -> Layout {
+    pub(crate) fn owned_layout(self) -> Layout {
         // SAFETY: every `State::owned` caller passes the parts of a valid `Layout`, and the size
         // round-trips exactly because `owned` rejects anything wider than `MAX_OWNED_SIZE`.
         unsafe { Layout::from_size_align_unchecked(self.owned_size(), *self.owned_alignment()) }
@@ -206,7 +157,7 @@ impl State {
     ///
     /// The state must be `SHARED`, and the pointer must still be live.
     #[inline]
-    unsafe fn as_shared(self) -> *mut Shared {
+    pub(crate) unsafe fn as_shared(self) -> *mut Shared {
         debug_assert_eq!(self.kind(), KIND_SHARED);
         self.0.cast::<Shared>()
     }
@@ -226,7 +177,7 @@ impl Eq for State {}
 // -------------------------------------------------------------------------------------------
 
 /// How the memory behind a region is released.
-enum Release {
+pub(crate) enum Release {
     /// Allocated by us through the global allocator, and freed with this exact layout.
     Global(Layout),
     /// Kept alive by an owner value; dropping the owner releases the memory.
@@ -249,7 +200,7 @@ enum Release {
 /// ## Safety
 ///
 /// `ptr` must be the result of `Box::into_raw(Box::<O>::new(..))`, and must not have been dropped.
-unsafe fn drop_owner<O>(ptr: *mut ()) {
+pub(crate) unsafe fn drop_owner<O>(ptr: *mut ()) {
     // SAFETY: the caller guarantees `ptr` came from `Box::<O>::into_raw` and is still live.
     drop(unsafe { Box::from_raw(ptr.cast::<O>()) })
 }
@@ -258,20 +209,20 @@ unsafe fn drop_owner<O>(ptr: *mut ()) {
 ///
 /// This is allocated lazily: a handle that has never been shared describes its region inline in
 /// its [`State`] instead.
-pub(super) struct Shared {
+pub(crate) struct Shared {
     /// Number of live handles.
-    refcount: AtomicUsize,
+    pub(crate) refcount: AtomicUsize,
     /// The first byte of the region.
-    base: NonNull<u8>,
+    pub(crate) base: NonNull<u8>,
     /// The size of the region in bytes.
-    size: usize,
+    pub(crate) size: usize,
     /// Whether the region may be written through.
     ///
     /// This is `false` for regions we only ever obtained a shared reference to. Writing through a
     /// pointer derived from a shared reference is undefined behaviour, and the memory itself may
     /// genuinely be read-only (a `PROT_READ` mapping, a `.rodata` static).
-    writable: bool,
-    release: Release,
+    pub(crate) writable: bool,
+    pub(crate) release: Release,
 }
 
 // SAFETY: `Shared` owns its region exclusively and hands out access only through the handles in
@@ -285,7 +236,7 @@ unsafe impl Sync for Shared {}
 impl Shared {
     /// Move this description onto the heap, where handles can point at it.
     #[inline]
-    fn into_raw(self) -> *mut Shared {
+    pub(crate) fn into_raw(self) -> *mut Shared {
         Box::into_raw(Box::new(self))
     }
 
@@ -295,7 +246,7 @@ impl Shared {
     ///
     /// `shared` must be live, and the caller must already hold a reference to it.
     #[inline]
-    unsafe fn retain(shared: *mut Shared) {
+    pub(crate) unsafe fn retain(shared: *mut Shared) {
         // SAFETY: the caller guarantees the pointer is live.
         let old = unsafe { &*shared }.refcount.fetch_add(1, Ordering::Relaxed);
         // The count can only overflow if handles are leaked in a loop; abort rather than wrap
@@ -311,7 +262,7 @@ impl Shared {
     ///
     /// `shared` must be live, and the caller must hold the reference being given up.
     #[inline]
-    unsafe fn release(shared: *mut Shared) {
+    pub(crate) unsafe fn release(shared: *mut Shared) {
         // SAFETY: the caller guarantees the pointer is live.
         if unsafe { &*shared }.refcount.fetch_sub(1, Ordering::Release) != 1 {
             return;
@@ -325,13 +276,13 @@ impl Shared {
 
     /// Whether this is the only handle to the region.
     #[inline]
-    fn is_unique(&self) -> bool {
+    pub(crate) fn is_unique(&self) -> bool {
         self.refcount.load(Ordering::Acquire) == 1
     }
 
     /// The layout this region was allocated with, if we allocated it ourselves.
     #[inline]
-    fn global_layout(&self) -> Option<Layout> {
+    pub(crate) fn global_layout(&self) -> Option<Layout> {
         match &self.release {
             Release::Global(layout) => Some(*layout),
             Release::Owner { .. } => None,
@@ -340,7 +291,7 @@ impl Shared {
 
     /// The address one past the last byte of the region.
     #[inline]
-    fn end_addr(&self) -> usize {
+    pub(crate) fn end_addr(&self) -> usize {
         self.base.as_ptr().addr() + self.size
     }
 }
@@ -378,7 +329,7 @@ fn layout_for(size: usize, alignment: Alignment) -> Layout {
 }
 
 /// Allocate `size` bytes aligned to `alignment` through the global allocator.
-fn allocate(size: usize, alignment: Alignment, zeroed: bool) -> (NonNull<u8>, Layout) {
+pub(crate) fn allocate(size: usize, alignment: Alignment, zeroed: bool) -> (NonNull<u8>, Layout) {
     let layout = layout_for(size, alignment);
     // SAFETY: `layout_for` rejects zero-sized layouts.
     let ptr = unsafe {
@@ -395,7 +346,7 @@ fn allocate(size: usize, alignment: Alignment, zeroed: bool) -> (NonNull<u8>, La
 }
 
 /// Build the `Shared` for a region we allocated ourselves.
-fn shared_global(base: NonNull<u8>, layout: Layout, refcount: usize) -> Shared {
+pub(crate) fn shared_global(base: NonNull<u8>, layout: Layout, refcount: usize) -> Shared {
     Shared {
         refcount: AtomicUsize::new(refcount),
         base,

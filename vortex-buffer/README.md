@@ -2,7 +2,7 @@
 
 A Vortex buffer is a window into a reference-counted region of memory, in the same model as the
 Tokio `bytes` crate: cloning is a refcount bump and slicing is pointer arithmetic. It used to be a
-thin wrapper around `bytes` itself; it now manages the region directly through `std::alloc`
+thin wrapper around `bytes` itself; the region is now managed directly through `std::alloc`
 (see https://github.com/tokio-rs/bytes/issues/437), which buys three things `bytes` cannot give us:
 
 - **Custom alignment.** A region remembers the `Layout` it was allocated with, so a buffer that
@@ -18,3 +18,9 @@ thin wrapper around `bytes` itself; it now manages the region directly through `
 
 `bytes::Bytes` remains a zero-copy conversion in both directions, via `Buffer::into_bytes` and
 `impl From<bytes::Bytes> for ByteBuffer`.
+
+The regions themselves live in [`vortex-alloc`](../vortex-alloc), which owns memory and nothing
+else. This crate adds the typed layer on top: the element type, the element count, and the
+alignment a buffer declares. Keeping the two apart means all of the allocation `unsafe` is
+non-generic - it compiles once rather than once per element type, and it can be audited and
+Miri-tested as a closed unit.
