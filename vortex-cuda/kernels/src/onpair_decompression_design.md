@@ -95,3 +95,61 @@ The benchmark metadata records the actual per-cell values as `code_bytes`,
 - `onpair_decompress.cu`: packed-length, low/high-plane candidate.
 - `onpair_decompress_u8_lens.cu`: preserved previous split candidate.
 - `onpair_old_2.cu`: preserved legacy comparison kernel.
+
+## Shared-memory drain capacity and handoff
+
+For the six-token kernel, each warp owns 192 tokens. Static shared memory has
+two independent consumers:
+
+~~~text
+drain staging = 8 warps * (192 * bytes_per_token + 32 alignment bytes)
+high requests = 8 warps * 192 requests * 4 bytes
+~~~
+
+The original 16-byte worst-case drain uses 24,832 bytes for staging and 6,144
+bytes for high requests, or 30,976 bytes/block. The compact candidate sets
+`bytes_per_token = 12`, reducing staging to 18,688 bytes and total static shared
+memory to 24,832 bytes/block. The launch bound then makes ptxas allocate 48
+rather than 64 registers/thread with zero spills.
+
+The compact size is not a format restriction. After the warp prefix scan, the
+kernel compares `warp_total` with the 2,304-byte payload capacity. Warps that
+fit retain the existing dense high-request queue and coalesced shared-memory
+drain. An overflowing warp writes complete low/high token ranges directly to
+global memory and returns, so every legal 1-16-byte dictionary distribution
+remains correct.
+
+### Partial high-drain experiment
+
+A more aggressive experiment staged only the first eight bytes/token (1,536
+payload bytes/warp) and sent the suffix directly to global memory. Only high
+requests whose destination began inside that prefix were queued. At most
+`floor(1536 / 9) = 170` such requests can exist because every high-bearing
+token consumes at least nine output bytes. This reduced shared memory to:
+
+~~~text
+drain staging = 8 * (1536 + 32) = 12,544 bytes
+high requests = 8 * 170 * 4    =  5,440 bytes
+total                                  17,984 bytes/block
+~~~
+
+The result compiled to 48 registers with zero spills and validated byte-exactly,
+but it was slower: 1,189.0 GB/s on TPC-H `l_comment` and 927.8 GB/s on
+ClickBench `URL`. Per-byte routing was much worse (887.2 GB/s on `l_comment`);
+token-range routing recovered most of that loss but remained behind the
+12-byte compact kernel. The smaller allocation could support seven blocks by
+shared-memory capacity, but 48 registers still limit residency to five blocks,
+so direct/scattered stores and routing add cost without increasing occupancy.
+
+Another experiment reused the high-request queue as temporary destination
+scratch. It reached 40 registers, 21,760 bytes shared, zero spills, and 70.64%
+achieved occupancy. It nevertheless lost performance: L1 hit rate fell from
+85.36% to 80.54%, L2 read sectors rose from 18.8M to 33.6M, and long-scoreboard
+stall rose to 22.61%. Reordering low emission ahead of high compaction removed
+the baseline's first-high-load latency overlap and damaged dense cache reuse.
+
+The next useful optimization must preserve all three properties of the current
+fast path: six-token grid amortization, plane-major dense high requests, and
+the first high load overlapping low-byte emission. Merely reducing shared
+memory below 24,832 bytes does not help while the 48-register allocation
+already limits the kernel to five resident blocks.

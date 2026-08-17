@@ -18,10 +18,14 @@
 #ifndef ONPAIR_LAUNCH_BOUNDS
 #define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(256, 2)
 #endif
+#ifndef ONPAIR_BUF_BYTES_PER_TOKEN
+#define ONPAIR_BUF_BYTES_PER_TOKEN 16u
+#endif
 
 #define WARPS_PER_BLOCK_MAX 8u
 #define TOKENS_PER_WARP     (TOKENS_PER_THREAD * 32u)
-#define WARP_BUF_BYTES      (TOKENS_PER_WARP * 16u + 32u)
+#define WARP_PAYLOAD_BYTES  (TOKENS_PER_WARP * ONPAIR_BUF_BYTES_PER_TOKEN)
+#define WARP_BUF_BYTES      (WARP_PAYLOAD_BYTES + 32u)
 #define REQUESTS_PER_WARP   TOKENS_PER_WARP
 
 __device__ inline uint64_t warp_scan_four_u16_prefixes(uint64_t x, int lane) {
@@ -131,6 +135,36 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     const uint64_t out_start = chunk_offsets[chunk];
     const uint32_t head_pre = (16u - (uint32_t)(out_start & 15u)) & 15u;
     uint8_t *s_buf = s_buf_base + ((16u - head_pre) & 15u);
+
+#if ONPAIR_BUF_BYTES_PER_TOKEN < 16u
+    // The compact buffer covers the common case while preserving correctness
+    // for arbitrary length distributions. An overflowing warp writes its
+    // complete token ranges directly; it never indexes beyond shared memory.
+    if (warp_total > WARP_PAYLOAD_BYTES) {
+#pragma unroll
+        for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
+            const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+            const uint8_t *low_bytes = reinterpret_cast<const uint8_t *>(&lo[k]);
+#pragma unroll
+            for (int byte = 0; byte < 8; ++byte) {
+                if (byte < (int)low_length) {
+                    output_bytes[out_start + (uint64_t)excl[k] + (uint64_t)byte] = low_bytes[byte];
+                }
+            }
+            if (len[k] > 8u) {
+                const uint2 high = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)code[k] * 8u);
+                const uint8_t *high_bytes = reinterpret_cast<const uint8_t *>(&high);
+#pragma unroll
+                for (int byte = 0; byte < 8; ++byte) {
+                    if (byte < (int)(len[k] - 8u)) {
+                        output_bytes[out_start + (uint64_t)excl[k] + 8u + (uint64_t)byte] = high_bytes[byte];
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     // Build the identical plane-major request stream first, so dense lane N
     // still owns request N and the first high gather can be issued early.

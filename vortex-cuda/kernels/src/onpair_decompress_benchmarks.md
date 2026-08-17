@@ -425,3 +425,44 @@ Raw timings are under
 `/tmp/onpair-5tpt-lb4-20260817/{base-first,lb4-first}/`; the candidate profile
 is `/tmp/onpair-ncu-5tpt-lb4.csv` and the baseline profile is
 `/tmp/onpair-ncu-5tpt-resource.csv`.
+
+## Six TPT compact 12-byte drain
+
+The follow-on `onpair_decompress_6tpt_cap12_lb5` kernel reduces the per-warp
+drain allocation from the 16-byte/token maximum to 12 bytes/token and uses a
+correct direct-write fallback for overflowing warps.
+
+Compiler and representative `l_comment` profile:
+
+| metric | six-TPT baseline | compact 12-byte |
+|---|---:|---:|
+| registers/thread | 64 | 48 |
+| shared bytes/block | 30,976 | 24,832 |
+| spills | 0 | 0 |
+| register block limit | 4 | 5 |
+| shared block limit | 4 | 5 |
+| achieved occupancy | 45.87% | 56.72% |
+| long-scoreboard stall | 18.75% | 15.83% |
+| L1 hit rate | 85.36% | 85.36% |
+| executed instructions | 495.1M | 517.1M |
+
+Protocol: seven saved bits12 cells; 100 iterations/kernel; baseline-first and
+candidate-first orders; one discarded warm-up plus five fresh measured
+processes per order and row; serial execution; byte validation in all 70
+measured processes. Values below are medians in decimal GB/s.
+
+| dataset / column | baseline | compact 12-byte | change |
+|---|---:|---:|---:|
+| TPC-H `l_comment` | 1,225.8 | **1,243.8** | +1.47% |
+| TPC-H `l_shipmode` | 1,169.2 | **1,193.1** | +2.04% |
+| ClickBench `URL` | 977.2 | **994.0** | +1.72% |
+| ClickBench `SearchPhrase` | 1,096.7 | **1,122.4** | +2.35% |
+| FineWeb `text` | 836.6 | **846.5** | +1.18% |
+| FineWeb `url` | **775.8** | 763.5 | -1.58% |
+| Wikipedia `text` | 787.2 | **790.1** | +0.37% |
+| geomean | 966.0 | **976.3** | **+1.07%** |
+
+The two order-specific geomean changes were +1.05% and +1.08%. Raw timing
+artifacts are under `/tmp/onpair-cap12-20260817/`. The partial-drain and
+shared-destination follow-ups are documented in
+`onpair_decompression_design.md`; neither beat this kernel.
