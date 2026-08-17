@@ -216,12 +216,8 @@ where
     let validity = fsst.codes().validity()?;
     let len = fsst.len();
     let len_u64 = len as u64;
-    let symbols_u64 = fsst
-        .symbols()
-        .iter()
-        .map(|s| s.to_u64())
-        .collect::<Vec<_>>();
-    let symbol_lengths = fsst.padded_symbol_lengths().slice(0..fsst.n_symbols());
+    let symbols_handle = fsst.symbols_handle().clone();
+    let symbol_lengths_handle = fsst.symbol_lengths_handle().clone();
     let codes_bytes_handle = fsst.codes_bytes_handle().clone();
     let PrimitiveDataParts {
         buffer: codes_offsets_buffer,
@@ -230,8 +226,8 @@ where
     let (validity_bit_offset, validity_bits) = cuda_validity(&validity, len, ctx).await?;
 
     let (symbols, symbol_lengths, validity_device, codes_bytes, codes_offsets) = futures::try_join!(
-        ctx.copy_to_device(symbols_u64)?,
-        ctx.copy_to_device(symbol_lengths)?,
+        ctx.ensure_on_device(symbols_handle),
+        ctx.ensure_on_device(symbol_lengths_handle),
         ctx.ensure_on_device(validity_bits),
         ctx.ensure_on_device(codes_bytes_handle),
         ctx.ensure_on_device(codes_offsets_buffer),
@@ -305,12 +301,8 @@ where
         }));
     }
 
-    let symbols_u64 = fsst
-        .symbols()
-        .iter()
-        .map(|s| s.to_u64())
-        .collect::<Vec<_>>();
-    let symbol_lengths = fsst.padded_symbol_lengths().slice(0..fsst.n_symbols());
+    let symbols_handle = fsst.symbols_handle().clone();
+    let symbol_lengths_handle = fsst.symbol_lengths_handle().clone();
     let codes_bytes_handle = fsst.codes_bytes_handle().clone();
     let PrimitiveDataParts {
         buffer: codes_offsets_buffer,
@@ -320,8 +312,8 @@ where
     let (validity_bit_offset, validity_bits) = cuda_validity(&validity, num_strings, ctx).await?;
 
     let (symbols, symbol_lengths, output_offsets, validity_device, codes_bytes, codes_offsets) = futures::try_join!(
-        ctx.copy_to_device(symbols_u64)?,
-        ctx.copy_to_device(symbol_lengths)?,
+        ctx.ensure_on_device(symbols_handle),
+        ctx.ensure_on_device(symbol_lengths_handle),
         ctx.copy_to_device(output_offsets)?,
         ctx.ensure_on_device(validity_bits),
         ctx.ensure_on_device(codes_bytes_handle),
