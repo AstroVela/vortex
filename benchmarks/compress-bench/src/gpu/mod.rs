@@ -33,6 +33,8 @@ pub struct GpuOptions {
     pub verify: bool,
     /// Read the Vortex file with direct IO instead of through the page cache.
     pub direct_io: bool,
+    /// Approximate on-disk bytes per Vortex scan batch.
+    pub scan_segment_bytes: Option<usize>,
 }
 
 /// The GPU backend that measures `format`.
@@ -42,6 +44,7 @@ pub fn compressor(format: Format, options: GpuOptions) -> Box<dyn Compressor> {
         Format::OnDiskVortex => Box::new(vortex::GpuVortexCompressor::new(
             options.verify,
             options.direct_io,
+            options.scan_segment_bytes,
         )) as Box<dyn Compressor>,
         Format::Parquet => Box::new(parquet::GpuParquetCompressor::new(
             options.codec,
@@ -62,6 +65,7 @@ pub fn compressor(format: Format, options: GpuOptions) -> Box<dyn Compressor> {
         codec: _,
         verify: _,
         direct_io: _,
+        scan_segment_bytes: _,
     } = options;
     unreachable!("GPU mode requires the cuda feature, checked before selecting a {format} backend")
 }

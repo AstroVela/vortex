@@ -20,7 +20,11 @@ use vortex::array::ArrayRef;
 use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::Chunked;
+use vortex::array::arrays::Extension;
+use vortex::array::arrays::Struct;
 use vortex::array::arrays::StructArray;
+use vortex::array::arrays::chunked::ChunkedArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::error::VortexResult;
@@ -39,7 +43,12 @@ use vortex_cuda::CudaOpenOptionsExt;
 use vortex_cuda::CudaSession;
 #[cfg(target_os = "linux")]
 use vortex_cuda::PooledFileReadAtOptions;
+use vortex_cuda::dynamic_dispatch::DispatchPlan;
 use vortex_cuda::executor::CudaArrayExt;
+use vortex_cuda::executor::CudaExecutionCtx;
+use vortex_cuda::hybrid_dispatch::execute_fused_gpu_dispatch_batch;
+use vortex_cuda::hybrid_dispatch::execute_prepared_gpu_dispatch;
+use vortex_cuda::hybrid_dispatch::prepare_gpu_dispatch;
 use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
 
@@ -49,6 +58,7 @@ use crate::gpu::writer::GPU_ROW_GROUP_SIZE;
 pub struct GpuVortexCompressor {
     verify: bool,
     direct_io: bool,
+    scan_segment_bytes: Option<usize>,
 }
 
 impl GpuVortexCompressor {
@@ -58,8 +68,12 @@ impl GpuVortexCompressor {
     /// against the same field decoded on the CPU before the timed scan runs. The verification is
     /// not itself timed, so a verifying run reports the same measurement a plain one would — it
     /// just takes longer to get there.
-    pub fn new(verify: bool, direct_io: bool) -> Self {
-        Self { verify, direct_io }
+    pub fn new(verify: bool, direct_io: bool, scan_segment_bytes: Option<usize>) -> Self {
+        Self {
+            verify,
+            direct_io,
+            scan_segment_bytes,
+        }
     }
 }
 
@@ -106,29 +120,103 @@ impl Compressor for GpuVortexCompressor {
         // used to return its own elapsed time, which bundled a file copy, a second host scan and
         // every Arrow conversion into a number the table then published as a decode time.
         if self.verify {
-            verify_against_host_scan(gpu_file.path(), self.direct_io).await?;
+            verify_against_host_scan(gpu_file.path(), self.direct_io, self.scan_segment_bytes)
+                .await?;
         }
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
         let start = Instant::now();
         let file = open_gpu(gpu_file.path(), self.direct_io).await?;
+        let split_rows =
+            scan_split_rows(gpu_file.path(), file.row_count(), self.scan_segment_bytes)?;
         // Split reads on the same boundary the file was written with, so a scan batch is one
         // partition instead of a sub-slice of one.
         let mut batches = file
             .scan()?
-            .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+            .with_split_by(SplitBy::RowCount(split_rows))
             .into_array_stream()?;
 
         while let Some(batch) = batches.next().await {
             let record = batch?.execute::<StructArray>(cuda_ctx.execution_ctx())?;
             for field in record.iter_unmasked_fields() {
-                black_box(field.clone().execute_cuda(&mut cuda_ctx).await?);
+                execute_cuda_leaves(field.clone(), &mut cuda_ctx).await?;
             }
         }
         cuda_ctx.synchronize_stream()?;
 
         Ok(start.elapsed())
     }
+}
+
+async fn execute_cuda_leaves(array: ArrayRef, cuda_ctx: &mut CudaExecutionCtx) -> Result<()> {
+    let mut pending = vec![array];
+    let mut leaves = Vec::new();
+    while let Some(array) = pending.pop() {
+        match array.try_downcast::<Chunked>() {
+            Ok(chunked) => pending.extend(chunked.chunks().into_iter().rev()),
+            Err(array) => leaves.push(array),
+        }
+    }
+
+    if leaves.len() > 1
+        && leaves.iter().all(|array| {
+            !array.is_canonical()
+                && !array.is_empty()
+                && !array.is::<Struct>()
+                && !array.is::<Extension>()
+        })
+    {
+        let mode = cuda_ctx.dispatch_mode();
+        let planned = leaves
+            .into_iter()
+            .map(|array| {
+                let plan = prepare_gpu_dispatch(&array, mode)?;
+                Ok((array, plan))
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+        if planned
+            .iter()
+            .all(|(_, plan)| matches!(plan, DispatchPlan::Fused(_)))
+        {
+            let fused = planned
+                .into_iter()
+                .map(|(array, plan)| match plan {
+                    DispatchPlan::Fused(plan) => (array.len(), plan),
+                    _ => unreachable!("all plans were checked as fused"),
+                })
+                .collect();
+            black_box(execute_fused_gpu_dispatch_batch(fused, cuda_ctx).await?);
+            return Ok(());
+        }
+
+        for (array, plan) in planned {
+            black_box(execute_prepared_gpu_dispatch(&array, plan, cuda_ctx).await?);
+        }
+        return Ok(());
+    }
+
+    for array in leaves {
+        black_box(array.execute_cuda(cuda_ctx).await?);
+    }
+    Ok(())
+}
+
+fn scan_split_rows(path: &Path, rows: u64, target_bytes: Option<usize>) -> Result<usize> {
+    let Some(target_bytes) = target_bytes else {
+        return Ok(GPU_ROW_GROUP_SIZE);
+    };
+    ensure!(
+        rows > 0,
+        "cannot size scan batches for an empty Vortex file"
+    );
+    let file_bytes = std::fs::metadata(path)?.len().max(1);
+    let target_bytes = u64::try_from(target_bytes)?;
+    let split_rows = target_bytes
+        .saturating_mul(rows)
+        .checked_div(file_bytes)
+        .unwrap_or(0)
+        .max(1);
+    Ok(usize::try_from(split_rows.min(rows))?)
 }
 
 /// Opens a Vortex file for CUDA execution.
@@ -170,7 +258,11 @@ async fn open_gpu(path: &Path, direct_io: bool) -> Result<vortex::file::VortexFi
 ///
 /// This times nothing and reports no measurement: the caller runs its own timed scan afterwards,
 /// so a verifying run publishes the same kind of number as a plain one.
-async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<()> {
+async fn verify_against_host_scan(
+    path: &Path,
+    direct_io: bool,
+    scan_segment_bytes: Option<usize>,
+) -> Result<()> {
     let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
     // Everything on the reference side — the host scan and both Arrow conversions — has to run
     // through a plain host context. A CUDA context allocates its outputs in device memory, and
@@ -184,14 +276,15 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<()> {
     std::fs::copy(path, host_path.path())?;
 
     let gpu_file = open_gpu(path, direct_io).await?;
+    let split_rows = scan_split_rows(path, gpu_file.row_count(), scan_segment_bytes)?;
     let mut gpu_batches = gpu_file
         .scan()?
-        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .with_split_by(SplitBy::RowCount(split_rows))
         .into_array_stream()?;
     let host_file = SESSION.open_options().open_path(host_path.path()).await?;
     let mut host_batches = host_file
         .scan()?
-        .with_split_by(SplitBy::RowCount(GPU_ROW_GROUP_SIZE))
+        .with_split_by(SplitBy::RowCount(split_rows))
         .into_array_stream()?;
 
     let mut fields_checked = 0usize;
@@ -224,19 +317,15 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<()> {
         for (field_index, (gpu_field, host_field)) in
             gpu_fields.into_iter().zip(host_fields).enumerate()
         {
-            let decoded = gpu_field.execute_cuda(&mut cuda_ctx).await?;
-            // The decode is enqueued, not complete: make the writes visible before reading
-            // the buffers back to the host.
-            cuda_ctx.synchronize_stream()?;
-            let decoded = decoded.into_host().await?.into_array();
-            verify_field(
-                &host_field,
-                decoded,
+            fields_checked += verify_cuda_leaves(
+                gpu_field,
+                host_field,
+                &mut cuda_ctx,
                 &mut host_ctx,
                 batch_index,
                 field_index,
-            )?;
-            fields_checked += 1;
+            )
+            .await?;
         }
 
         batch_index += 1;
@@ -261,6 +350,45 @@ async fn next_batch_pair(
         (None, None) => Ok(None),
         _ => bail!("the GPU and CPU scans of the same file produced different batch counts"),
     }
+}
+
+async fn verify_cuda_leaves(
+    gpu: ArrayRef,
+    host: ArrayRef,
+    cuda_ctx: &mut CudaExecutionCtx,
+    host_ctx: &mut ExecutionCtx,
+    batch_index: usize,
+    field_index: usize,
+) -> Result<usize> {
+    let mut pending = vec![(gpu, host)];
+    let mut leaves_checked = 0;
+    while let Some((gpu, host)) = pending.pop() {
+        ensure!(
+            gpu.is::<Chunked>() == host.is::<Chunked>(),
+            "batch {batch_index} field {field_index} has different GPU and CPU chunk trees"
+        );
+        if gpu.is::<Chunked>() {
+            let gpu = gpu
+                .try_downcast::<Chunked>()
+                .map_err(|_| anyhow::anyhow!("GPU Chunked array could not be downcast"))?;
+            let host = host
+                .try_downcast::<Chunked>()
+                .map_err(|_| anyhow::anyhow!("CPU Chunked array could not be downcast"))?;
+            ensure!(
+                gpu.nchunks() == host.nchunks(),
+                "batch {batch_index} field {field_index} has different GPU and CPU chunk counts"
+            );
+            pending.extend(gpu.chunks().into_iter().zip(host.chunks()).rev());
+            continue;
+        }
+
+        let decoded = gpu.execute_cuda(cuda_ctx).await?;
+        cuda_ctx.synchronize_stream()?;
+        let decoded = decoded.into_host().await?.into_array();
+        verify_field(&host, decoded, host_ctx, batch_index, field_index)?;
+        leaves_checked += 1;
+    }
+    Ok(leaves_checked)
 }
 
 /// Fails unless a GPU-decoded field matches the same field decoded on the CPU.

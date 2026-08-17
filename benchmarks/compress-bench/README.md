@@ -40,6 +40,23 @@ cargo run -p compress-bench --profile release_debug \
   --features cuda,unstable_encodings -- --gpu-decompress --gpu-parquet-codec zstd
 ```
 
+### Scan segment sweep
+
+`--gpu-scan-segment-bytes` changes only Vortex reader batches and CUDA dispatch. It derives an
+approximate row count from the already-written file size; it does not change compression, root
+chunks, Parquet row groups, or either writer.
+
+```bash
+for bytes in 1048576 4194304 16777216 67108864 268435456 1073741824; do
+  cargo run -p compress-bench --profile release_debug \
+    --features cuda,unstable_encodings -- \
+    --gpu-decompress --gpu-scan-segment-bytes "$bytes" --iterations 1
+done
+```
+
+Chunked fields are planned independently and compatible fused plans are submitted together on the
+same CUDA stream. Other plan types retain the existing threaded execution path.
+
 ### cuDF
 
 cuDF has no Rust binding, so the benchmark drives it out of process: it spawns `python3` running

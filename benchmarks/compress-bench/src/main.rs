@@ -11,9 +11,9 @@ use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
 use compress_bench::gpu::GpuCodec;
-use compress_bench::gpu::datasets::large_gpu_datasets;
 use compress_bench::gpu::GpuOptions;
 use compress_bench::gpu::compressor as gpu_compressor;
+use compress_bench::gpu::datasets::large_gpu_datasets;
 use compress_bench::parquet::ParquetCompressor;
 use compress_bench::vortex::VortexCompressor;
 use futures::FutureExt;
@@ -104,6 +104,9 @@ struct Args {
     /// measure storage bandwidth instead, and do not read the ratio as a decode comparison.
     #[arg(long)]
     gpu_direct_io: bool,
+    /// Approximate on-disk bytes per Vortex reader batch.
+    #[arg(long, requires = "gpu_decompress")]
+    gpu_scan_segment_bytes: Option<usize>,
     #[arg(short, long, default_value_t, value_enum)]
     display_format: DisplayFormat,
     #[arg(short, long)]
@@ -129,11 +132,16 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--gpu-decompress requires building compress-bench with --features cuda");
     }
 
+    if matches!(args.gpu_scan_segment_bytes, Some(0)) {
+        anyhow::bail!("--gpu-scan-segment-bytes must be greater than zero");
+    }
+
     let mode = if args.gpu_decompress {
         BenchMode::Gpu(GpuOptions {
             codec: args.gpu_parquet_codec,
             verify: args.gpu_verify,
             direct_io: args.gpu_direct_io,
+            scan_segment_bytes: args.gpu_scan_segment_bytes,
         })
     } else {
         BenchMode::Cpu
