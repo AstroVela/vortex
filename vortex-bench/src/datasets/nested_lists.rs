@@ -61,7 +61,7 @@ const MAX_LIST_LEN: usize = 20;
 const BATCH_SIZE: usize = 100_000;
 
 /// Approximate encoded size of one row: `id` plus an average-length list of `i64` values.
-const APPROX_ROW_BYTES: usize = 8 + (MAX_LIST_LEN / 2) * 8;
+pub(crate) const APPROX_ROW_BYTES: usize = 8 + (MAX_LIST_LEN / 2) * 8;
 
 /// Generate a synthetic nested lists parquet file.
 ///

@@ -64,6 +64,7 @@ use wkb::writer::write_geometry;
 use crate::CompactionStrategy;
 use crate::Format;
 use crate::SESSION;
+use crate::random_access::PARQUET_READ_BATCH_SIZE;
 use crate::utils::file::idempotent_async;
 
 /// Memory budget per concurrent conversion stream in GB. This is somewhat arbitary.
@@ -98,7 +99,9 @@ fn calculate_concurrency() -> usize {
 pub async fn parquet_to_vortex_chunks(parquet_path: PathBuf) -> anyhow::Result<ChunkedArray> {
     let file = File::open(parquet_path).await?;
     let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
-    let reader = builder.build()?;
+    // Pinned rather than inherited from `parquet`'s default, because the random-access datasets
+    // size their row groups as a whole multiple of it to keep the derived Vortex files stable.
+    let reader = builder.with_batch_size(PARQUET_READ_BATCH_SIZE).build()?;
 
     let chunks: Vec<ArrayRef> = parquet_to_vortex_stream(reader)
         .map(|r| r.map_err(anyhow::Error::from))

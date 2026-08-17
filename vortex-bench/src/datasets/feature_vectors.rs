@@ -62,7 +62,7 @@ const VECTOR_DIM: i32 = 1024;
 const BATCH_SIZE: usize = 100_000;
 
 /// Approximate encoded size of one row: `id` plus `VECTOR_DIM` uncompressed `f32` values.
-const APPROX_ROW_BYTES: usize = 8 + (VECTOR_DIM as usize) * 4;
+pub(crate) const APPROX_ROW_BYTES: usize = 8 + (VECTOR_DIM as usize) * 4;
 
 /// Generate a synthetic feature vectors parquet file.
 ///

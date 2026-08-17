@@ -59,7 +59,7 @@ impl BenchDataset for NestedStructsData {
 const BATCH_SIZE: usize = 100_000;
 
 /// Approximate encoded size of one row: `id`, `a`, `b`, and the three inner `f64` fields.
-const APPROX_ROW_BYTES: usize = 8 * 6;
+pub(crate) const APPROX_ROW_BYTES: usize = 8 * 6;
 
 /// Generate a synthetic nested structs parquet file.
 ///
