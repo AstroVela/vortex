@@ -36,7 +36,10 @@ cargo run -p random-access-bench --profile release_debug --features lance -- \
   --remote-data-dir s3://my-bucket/my-prefix/
 ```
 
-Credentials and region come from the environment (`AWS_REGION`, `AWS_PROFILE`, ...).
+URLs are resolved through Vortex's own object store registry, so any scheme it serves works
+(`s3://`, `gs://`, `az://`, `hf://`, ...), configured from the environment the same way it is for
+the other bindings. Only Lance restricts this to `s3://`, since it resolves URLs with its own
+object store rather than through the registry.
 
 Remote measurements are named `...-tokio-s3` instead of `...-tokio-local-disk` and are
 reported with `s3` storage, so they form a series separate from the local-disk numbers. In CI

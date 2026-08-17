@@ -13,7 +13,6 @@ use arrow_select::take::take_record_batch;
 use async_trait::async_trait;
 use futures::stream;
 use itertools::Itertools;
-use object_store::path::Path as ObjectStorePath;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -73,10 +72,11 @@ impl VortexRandomAccessor {
         name: impl Into<String>,
         format: Format,
     ) -> anyhow::Result<Self> {
+        let (store, key) = remote.resolve(path)?;
         let file = SESSION
             .open_options()
             .with_layout_reader_cache()
-            .open_object_store(remote.store(), &remote.key(path)?)
+            .open_object_store(&store, key.as_ref())
             .await?;
         Ok(Self {
             name: name.into(),
@@ -149,10 +149,8 @@ impl ParquetRandomAccessor {
         path: &Path,
         name: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let mut reader = ParquetObjectReader::new(
-            Arc::clone(remote.store()),
-            ObjectStorePath::from(remote.key(path)?),
-        );
+        let (store, key) = remote.resolve(path)?;
+        let mut reader = ParquetObjectReader::new(store, key);
         let arrow_metadata = load_metadata(&mut reader).await?;
         Ok(Self::new(
             name,
