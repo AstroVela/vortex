@@ -54,14 +54,19 @@ __device__ inline uint32_t pack_high_request(uint32_t code, uint32_t destination
 }
 
 __device__ inline void
-emit_high_bytes(uint8_t *s_buf, uint32_t destination, uint32_t high_length, const uint2 &high) {
-    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&high);
+emit_shared_bytes(uint8_t *s_buf, uint32_t destination, uint32_t length, const uint2 &value) {
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&value);
 #pragma unroll
     for (int byte = 0; byte < 8; ++byte) {
-        if (byte < (int)high_length) {
+        if (byte < (int)length) {
             s_buf[destination + (uint32_t)byte] = bytes[byte];
         }
     }
+}
+
+__device__ inline void
+emit_high_bytes(uint8_t *s_buf, uint32_t destination, uint32_t high_length, const uint2 &high) {
+    emit_shared_bytes(s_buf, destination, high_length, high);
 }
 
 extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_t *__restrict codes,
@@ -85,7 +90,14 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     uint32_t *requests = s_requests[warp_id];
 
     const uint64_t base_i = chunk * TOKENS_PER_WARP + (uint64_t)lane;
+#ifdef ONPAIR_KEEP_LO_COUNT
+    static_assert(TOKENS_PER_THREAD == 6u, "partial low retention is specialized for six tokens/thread");
+    static_assert(ONPAIR_KEEP_LO_COUNT > 0 && ONPAIR_KEEP_LO_COUNT < 6,
+                  "retained low count must be in [1, 5]");
+    uint2 lo[ONPAIR_KEEP_LO_COUNT];
+#else
     uint2 lo[TOKENS_PER_THREAD];
+#endif
     uint32_t code[TOKENS_PER_THREAD];
     uint32_t len[TOKENS_PER_THREAD];
 #pragma unroll
@@ -93,14 +105,26 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
         const uint64_t i = base_i + (uint64_t)(k * 32);
         if (i < total_tokens) {
             code[k] = (uint32_t)codes[i];
+#ifndef ONPAIR_KEEP_LO_COUNT
             lo[k] = *reinterpret_cast<const uint2 *>(dict_s8_lo + (size_t)code[k] * 8u);
+#endif
             len[k] = unpack_length(packed_lens, code[k]);
         } else {
             code[k] = 0u;
+#ifndef ONPAIR_KEEP_LO_COUNT
             lo[k] = make_uint2(0u, 0u);
+#endif
             len[k] = 0u;
         }
     }
+#ifdef ONPAIR_KEEP_LO_COUNT
+#pragma unroll
+    for (int k = 0; k < (int)ONPAIR_KEEP_LO_COUNT; ++k) {
+        const uint64_t i = base_i + (uint64_t)(k * 32);
+        lo[k] = i < total_tokens ? *reinterpret_cast<const uint2 *>(dict_s8_lo + (size_t)code[k] * 8u)
+                                 : make_uint2(0u, 0u);
+    }
+#endif
 
     constexpr uint64_t field_mask = 0xffffull;
     static_assert(32u * 16u <= field_mask, "packed fields must hold a full plane prefix");
@@ -136,7 +160,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     const uint32_t head_pre = (16u - (uint32_t)(out_start & 15u)) & 15u;
     uint8_t *s_buf = s_buf_base + ((16u - head_pre) & 15u);
 
-#if ONPAIR_BUF_BYTES_PER_TOKEN < 16u
+#if ONPAIR_BUF_BYTES_PER_TOKEN < 16u && !defined(ONPAIR_ASSUME_BUFFER_FITS)
     // The compact buffer covers the common case while preserving correctness
     // for arbitrary length distributions. An overflowing warp writes its
     // complete token ranges directly; it never indexes beyond shared memory.
@@ -144,7 +168,14 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
 #pragma unroll
         for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
             const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+#ifdef ONPAIR_KEEP_LO_COUNT
+            const uint2 low = k < (int)ONPAIR_KEEP_LO_COUNT
+                                  ? lo[k]
+                                  : *reinterpret_cast<const uint2 *>(dict_s8_lo + (size_t)code[k] * 8u);
+            const uint8_t *low_bytes = reinterpret_cast<const uint8_t *>(&low);
+#else
             const uint8_t *low_bytes = reinterpret_cast<const uint8_t *>(&lo[k]);
+#endif
 #pragma unroll
             for (int byte = 0; byte < 8; ++byte) {
                 if (byte < (int)low_length) {
@@ -196,17 +227,25 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
 
     // The first high value is deliberately not consumed until all owners have
     // emitted their low bytes, creating independent instructions after LDG.
+#ifdef ONPAIR_KEEP_LO_COUNT
+#pragma unroll
+    for (int k = 0; k < (int)ONPAIR_KEEP_LO_COUNT; ++k) {
+        const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+        emit_shared_bytes(s_buf, excl[k], low_length, lo[k]);
+    }
+#pragma unroll
+    for (int k = (int)ONPAIR_KEEP_LO_COUNT; k < 6; ++k) {
+        const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+        const uint2 low = *reinterpret_cast<const uint2 *>(dict_s8_lo + (size_t)code[k] * 8u);
+        emit_shared_bytes(s_buf, excl[k], low_length, low);
+    }
+#else
 #pragma unroll
     for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
         const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
-        const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&lo[k]);
-#pragma unroll
-        for (int byte = 0; byte < 8; ++byte) {
-            if (byte < (int)low_length) {
-                s_buf[excl[k] + (uint32_t)byte] = bytes[byte];
-            }
-        }
+        emit_shared_bytes(s_buf, excl[k], low_length, lo[k]);
     }
+#endif
 
     if (first_active) {
         emit_high_bytes(s_buf, first_destination, first_high_length, first_high);

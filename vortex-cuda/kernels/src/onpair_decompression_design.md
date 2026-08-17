@@ -153,3 +153,46 @@ fast path: six-token grid amortization, plane-major dense high requests, and
 the first high load overlapping low-byte emission. Merely reducing shared
 memory below 24,832 bytes does not help while the 48-register allocation
 already limits the kernel to five resident blocks.
+
+## Adaptive nine-byte drain
+
+Most measured code occurrences decode to at most eight bytes, but retaining all
+six per-thread low-plane values keeps twelve 32-bit words live. Reducing the
+shared drain alone is insufficient if those values keep register residency at
+five blocks/SM. The adaptive kernel combines two changes:
+
+- allocate nine output bytes/token, or 1,728 payload bytes per 192-token warp;
+- keep only the first `uint2` low value live across the prefix scan and dense
+  high gather, then reload the other five low values while draining.
+
+Keeping one low value preserves independent work after the first dense
+high-plane load. Reloading the remaining five short values costs global-load
+instructions, but their 32 KiB plane is reusable and cache-resident; shortening
+their live ranges reduces the compiled allocation from 48 to 40
+registers/thread. The dense high-request queue and the first-high-load overlap
+are unchanged.
+
+Static shared memory becomes:
+
+~~~text
+drain staging = 8 * (192 * 9 + 32) = 14,080 bytes
+high requests = 8 * 192 * 4        =  6,144 bytes
+total                                      20,224 bytes/block
+~~~
+
+On sm_90, `onpair_decompress_6tpt_cap9_keep1_lb6` compiles with 40 registers,
+20,224 bytes static shared memory, and no spills. Both registers and shared
+memory permit six blocks/SM, versus five for the 48-register, 24,832-byte
+cap-12 kernel.
+
+This kernel deliberately has no device overflow path: compiling the fallback
+back in raises register pressure and loses the residency gain. The caller must
+compute the maximum adjacent `chunk_offsets` difference for the same 192-token
+chunking and use cap-9 only when it is at most 1,728. Otherwise it must launch
+`onpair_decompress_6tpt_cap12_lb5`. The offsets are already produced during
+host staging, so this is a whole-column selection and does not change or
+annotate individual codes.
+
+The code stream remains the original two-byte `u16` sequence. Lengths still
+come from the separate packed four-bit table. No code bits, dictionary entries,
+or serialized data are changed.
