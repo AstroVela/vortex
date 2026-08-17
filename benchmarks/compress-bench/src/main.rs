@@ -122,13 +122,17 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--gpu-decompress requires building compress-bench with --features cuda");
     }
 
-    let gpu_options = args.gpu_decompress.then_some(GpuOptions {
-        codec: args.gpu_parquet_codec,
-        verify: args.gpu_verify,
-        direct_io: args.gpu_direct_io,
-    });
+    let mode = if args.gpu_decompress {
+        BenchMode::Gpu(GpuOptions {
+            codec: args.gpu_parquet_codec,
+            verify: args.gpu_verify,
+            direct_io: args.gpu_direct_io,
+        })
+    } else {
+        BenchMode::Cpu
+    };
 
-    let (formats, ops) = if gpu_options.is_some() {
+    let (formats, ops) = if mode.is_gpu() {
         (
             vec![Format::Parquet, Format::OnDiskVortex],
             vec![CompressOp::Decompress],
@@ -142,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         args.datasets.map(|d| Regex::new(&d)).transpose()?,
         formats,
         ops,
-        gpu_options,
+        mode,
         args.display_format,
         args.output_path,
         args.ingest_output,
@@ -150,11 +154,30 @@ async fn main() -> anyhow::Result<()> {
     .await
 }
 
-/// Get a compressor for the given format.
+/// Which suite a run measures.
 ///
-/// `options` is `Some` only in GPU mode; `None` selects the ordinary CPU suite.
-fn get_compressor(format: Format, options: Option<GpuOptions>) -> Box<dyn Compressor> {
-    if let Some(options) = options {
+/// GPU mode is not a setting on the CPU suite: it selects a different dataset list, restricts the
+/// ops to decompression, swaps both compressors and labels its ratio differently. A variant says
+/// that; an `Option<GpuOptions>` only said "maybe some GPU settings", leaving "which suite is
+/// this?" and "how is the GPU configured?" to be the same question.
+#[derive(Clone, Copy, Debug)]
+enum BenchMode {
+    /// The ordinary host suite.
+    Cpu,
+    /// Device decompression, configured by the `--gpu-*` flags.
+    Gpu(GpuOptions),
+}
+
+impl BenchMode {
+    /// Whether this run measures the GPU.
+    fn is_gpu(self) -> bool {
+        matches!(self, BenchMode::Gpu(_))
+    }
+}
+
+/// Get a compressor for the given format.
+fn get_compressor(format: Format, mode: BenchMode) -> Box<dyn Compressor> {
+    if let BenchMode::Gpu(options) = mode {
         return gpu_compressor(format, options);
     }
 
@@ -182,7 +205,7 @@ async fn run_compress(
     datasets_filter: Option<Regex>,
     formats: Vec<Format>,
     ops: Vec<CompressOp>,
-    gpu_options: Option<GpuOptions>,
+    mode: BenchMode,
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
     ingest_output: Option<PathBuf>,
@@ -250,7 +273,7 @@ async fn run_compress(
     .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
     .collect();
 
-    let datasets: Vec<&dyn Dataset> = if gpu_options.is_some() {
+    let datasets: Vec<&dyn Dataset> = if mode.is_gpu() {
         gpu_datasets.to_vec()
     } else {
         all_datasets
@@ -274,12 +297,12 @@ async fn run_compress(
 
     // A GPU pass reports on every dataset rather than stopping at the first failure, so one run
     // says which datasets decode correctly on the GPU and still yields numbers for the rest.
-    let survey_all = gpu_options.is_some();
+    let survey_all = mode.is_gpu();
     let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
 
     for dataset_handle in datasets.into_iter() {
         let run =
-            run_benchmark_for_dataset(&progress, &formats, &ops, iterations, dataset_handle, gpu_options);
+            run_benchmark_for_dataset(&progress, &formats, &ops, iterations, dataset_handle, mode);
 
         // Missing CUDA kernel support surfaces as a panic rather than an error, so the survey
         // has to catch those too or the first unsupported dataset ends the run.
@@ -363,7 +386,7 @@ async fn run_benchmark_for_dataset(
     ops: &[CompressOp],
     iterations: usize,
     dataset_handle: &dyn Dataset,
-    gpu_options: Option<GpuOptions>,
+    mode: BenchMode,
 ) -> anyhow::Result<(CompressMeasurements, Vec<v3::V3Record>)> {
     let bench_name = dataset_handle.name();
     let (v3_dataset, v3_variant) = dataset_handle.v3_dataset_dims();
@@ -379,7 +402,7 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, gpu_options);
+        let compressor = get_compressor(*format, mode);
 
         for op in ops {
             let time = match op {
@@ -432,7 +455,7 @@ async fn run_benchmark_for_dataset(
                     v3_records.push(v3::compression_time_record(
                         &result.timing,
                         v3_dataset,
-                        if gpu_options.is_some() {
+                        if mode.is_gpu() {
                             Some("gpu")
                         } else {
                             v3_variant
@@ -451,11 +474,13 @@ async fn run_benchmark_for_dataset(
     }
 
     // Calculate cross-format ratios after all measurements.
-    match gpu_options {
+    match mode {
         // The shared ratio labels name the CPU suite's codec, which the GPU run does not
         // necessarily use, so GPU mode emits its own correctly-labelled ratio.
-        Some(options) => push_gpu_ratio(&measurements_map, options, bench_name, &mut ratios),
-        None => calculate_ratios(
+        BenchMode::Gpu(options) => {
+            push_gpu_ratio(&measurements_map, options, bench_name, &mut ratios)
+        }
+        BenchMode::Cpu => calculate_ratios(
             &measurements_map,
             &compressed_sizes,
             bench_name,
