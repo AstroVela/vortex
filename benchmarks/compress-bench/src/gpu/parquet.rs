@@ -32,8 +32,8 @@ use tempfile::NamedTempFile;
 use vortex_bench::Format;
 use vortex_bench::compress::Compressor;
 
-use crate::gpu_writer::GpuCodec;
-use crate::gpu_writer::gpu_writer_properties;
+use crate::gpu::writer::GpuCodec;
+use crate::gpu::writer::gpu_writer_properties;
 
 /// Repo-relative path of the script that performs and times the cuDF read.
 const CUDF_SCRIPT: &str = "scripts/cudf-parquet-read.py";

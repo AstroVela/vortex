@@ -64,7 +64,7 @@ does its own host read and host-to-device copy.
 
 ### GPU-friendly Parquet writer settings
 
-Set in `src/gpu_writer.rs`:
+Set in `src/gpu/writer.rs`:
 
 | Setting | Value | Why |
 | --- | --- | --- |

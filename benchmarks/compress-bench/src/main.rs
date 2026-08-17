@@ -10,11 +10,9 @@ use anyhow::Context;
 use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
-#[cfg(feature = "cuda")]
-use compress_bench::gpu_parquet::GpuParquetCompressor;
-#[cfg(feature = "cuda")]
-use compress_bench::gpu_vortex::GpuVortexCompressor;
-use compress_bench::gpu_writer::GpuCodec;
+use compress_bench::gpu::GpuCodec;
+use compress_bench::gpu::GpuOptions;
+use compress_bench::gpu::compressor as gpu_compressor;
 use compress_bench::parquet::ParquetCompressor;
 use compress_bench::vortex::VortexCompressor;
 use futures::FutureExt;
@@ -152,33 +150,10 @@ async fn main() -> anyhow::Result<()> {
     .await
 }
 
-/// Settings for the GPU decompression mode.
-#[derive(Clone, Copy, Debug)]
-struct GpuOptions {
-    /// Parquet page codec to write the GPU file with.
-    codec: GpuCodec,
-    /// Cross-check decompressed output against the CPU decoders.
-    verify: bool,
-    /// Read the Vortex file with direct IO instead of through the page cache.
-    direct_io: bool,
-}
-
 /// Get a compressor for the given format.
 fn get_compressor(format: Format, gpu: Option<GpuOptions>) -> Box<dyn Compressor> {
     if let Some(gpu) = gpu {
-        #[cfg(feature = "cuda")]
-        return match format {
-            Format::OnDiskVortex => {
-                Box::new(GpuVortexCompressor::new(gpu.verify, gpu.direct_io)) as Box<dyn Compressor>
-            }
-            Format::Parquet => Box::new(GpuParquetCompressor::new(gpu.codec, gpu.verify)),
-            _ => unimplemented!("GPU compress bench not implemented for {format}"),
-        };
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = gpu;
-            unreachable!("GPU feature validation happens before selecting compressors");
-        }
+        return gpu_compressor(format, gpu);
     }
 
     match format {

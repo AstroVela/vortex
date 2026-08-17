@@ -3,10 +3,6 @@
 
 #[cfg(feature = "lance")]
 pub use lance_bench::compress::LanceCompressor;
-#[cfg(feature = "cuda")]
-pub mod gpu_parquet;
-#[cfg(feature = "cuda")]
-pub mod gpu_vortex;
-pub mod gpu_writer;
+pub mod gpu;
 pub mod parquet;
 pub mod vortex;

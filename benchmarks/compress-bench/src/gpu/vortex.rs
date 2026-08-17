@@ -41,7 +41,7 @@ use vortex_cuda::executor::CudaArrayExt;
 use vortex_cuda::layout::CudaFlatLayoutStrategy;
 use vortex_cuda::layout::register_cuda_layout;
 
-use crate::gpu_writer::GPU_ROW_GROUP_SIZE;
+use crate::gpu::writer::GPU_ROW_GROUP_SIZE;
 
 /// Vortex compressor whose decompression measurement executes CUDA-compatible files on the GPU.
 pub struct GpuVortexCompressor {
