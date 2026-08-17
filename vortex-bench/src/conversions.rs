@@ -101,68 +101,59 @@ pub async fn parquet_to_vortex_chunks(parquet_path: PathBuf) -> anyhow::Result<C
     parquet_to_vortex_chunks_with_batch_size(parquet_path, None).await
 }
 
-/// Read a Parquet file as a Vortex [`ChunkedArray`] with chunks of exactly `batch_size` rows.
+/// Read a Parquet file into Vortex chunks, using `batch_size` as the maximum rows per chunk.
 ///
-/// With `batch_size` set, the source batches are concatenated and re-sliced on exact boundaries,
-/// so every chunk but the last has the requested length. Setting the Arrow reader's batch size
-/// is not enough on its own: the reader also breaks at the source file's row group boundaries,
-/// so a file whose row groups are not a multiple of the batch size still yields short batches.
-///
-/// This matters when comparing against a format whose physical partitioning is explicit. Chunk
-/// size becomes the Vortex file's partition size, and small chunks mean many small compressed
-/// blocks — and, on the GPU, many small kernel launches.
-///
-/// `None` keeps whatever batches the Parquet reader produces.
+/// This is useful when the physical row partitions of a generated Vortex file need to match
+/// another format's row groups. `None` preserves the Parquet reader's default batch size.
 pub async fn parquet_to_vortex_chunks_with_batch_size(
     parquet_path: PathBuf,
     batch_size: Option<usize>,
 ) -> anyhow::Result<ChunkedArray> {
     let file = File::open(parquet_path).await?;
     let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
+    let batch_size = batch_size.filter(|size| *size > 0);
+    let schema = Arc::clone(builder.schema());
+    let builder = if let Some(batch_size) = batch_size {
+        builder.with_batch_size(batch_size)
+    } else {
+        builder
+    };
+    let reader = builder.build()?;
 
-    let Some(batch_size) = batch_size.filter(|size| *size > 0) else {
-        let chunks: Vec<ArrayRef> = parquet_to_vortex_stream(builder.build()?)
+    let chunks: Vec<ArrayRef> = if let Some(batch_size) = batch_size {
+        let mut reader = reader;
+        let mut chunks = Vec::new();
+        let mut pending = Vec::new();
+        let mut pending_rows = 0usize;
+        while let Some(batch) = reader.next().await {
+            let batch = batch?;
+            let mut offset = 0usize;
+            while offset < batch.num_rows() {
+                let len = (batch_size - pending_rows).min(batch.num_rows() - offset);
+                pending.push(batch.slice(offset, len));
+                pending_rows += len;
+                offset += len;
+
+                if pending_rows == batch_size {
+                    chunks.push(record_batch_to_vortex(concat_batches(&schema, &pending)?)?);
+                    pending.clear();
+                    pending_rows = 0;
+                }
+            }
+        }
+        if pending_rows > 0 {
+            chunks.push(record_batch_to_vortex(concat_batches(&schema, &pending)?)?);
+        }
+        anyhow::ensure!(!chunks.is_empty(), "cannot convert an empty Parquet file");
+        chunks
+    } else {
+        parquet_to_vortex_stream(reader)
             .map(|r| r.map_err(anyhow::Error::from))
             .try_collect()
-            .await?;
-        return Ok(ChunkedArray::from_iter(chunks));
+            .await?
     };
 
-    let batches: Vec<RecordBatch> = builder
-        .with_batch_size(batch_size)
-        .build()?
-        .map_err(anyhow::Error::from)
-        .try_collect()
-        .await?;
-
-    let schema = batches
-        .first()
-        .map(RecordBatch::schema)
-        .ok_or_else(|| anyhow::anyhow!("cannot convert an empty Parquet file"))?;
-    let combined = concat_batches(&schema, &batches)?;
-
-    let mut chunks = Vec::with_capacity(combined.num_rows().div_ceil(batch_size));
-    for start in (0..combined.num_rows()).step_by(batch_size) {
-        let len = batch_size.min(combined.num_rows() - start);
-        chunks.push(record_batch_to_vortex(combined.slice(start, len))?);
-    }
-
     Ok(ChunkedArray::from_iter(chunks))
-}
-
-/// Convert one Arrow [`RecordBatch`] into a canonical Vortex array.
-fn record_batch_to_vortex(batch: RecordBatch) -> VortexResult<ArrayRef> {
-    let schema = batch.schema();
-    let chunk = SESSION.arrow().from_arrow_record_batch(batch, &schema)?;
-    let mut builder = builder_with_capacity(chunk.dtype(), chunk.len());
-
-    // Canonicalize the chunk.
-    chunk.append_to_builder(
-        builder.as_mut(),
-        &mut VortexSession::default().create_execution_ctx(),
-    )?;
-
-    Ok(builder.finish())
 }
 
 /// Create a streaming Vortex array from a Parquet reader.
@@ -177,6 +168,20 @@ pub fn parquet_to_vortex_stream(
             .map_err(|e| vortex_err!(External: e))
             .and_then(record_batch_to_vortex)
     })
+}
+
+fn record_batch_to_vortex(rb: RecordBatch) -> VortexResult<ArrayRef> {
+    let schema = rb.schema();
+    let chunk = SESSION.arrow().from_arrow_record_batch(rb, &schema)?;
+    let mut builder = builder_with_capacity(chunk.dtype(), chunk.len());
+
+    // Canonicalize the chunk.
+    chunk.append_to_builder(
+        builder.as_mut(),
+        &mut VortexSession::default().create_execution_ctx(),
+    )?;
+
+    Ok(builder.finish())
 }
 
 /// Convert a single Parquet file to Vortex format using streaming.

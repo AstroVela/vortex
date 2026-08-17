@@ -55,17 +55,60 @@ def normalize(frame):
     return frame
 
 
-def verify(path: str, frame) -> None:
-    """Fails unless the GPU read matches a CPU Parquet read of the same file."""
-    import pandas as pd
+def verify(path: str, row_group: int, frame) -> None:
+    """Fails unless one GPU-decoded row group matches the CPU Parquet decoder."""
+    import pyarrow.parquet as pq
     from pandas.testing import assert_frame_equal
 
-    expected = normalize(pd.read_parquet(path))
+    expected = normalize(pq.ParquetFile(path).read_row_group(row_group).to_pandas())
     actual = normalize(frame.to_pandas())
 
     # cuDF and pyarrow can land on different-but-equivalent dtypes (nullable vs numpy
     # backed, for instance), so compare values and leave dtype policy out of it.
     assert_frame_equal(actual, expected, check_dtype=False)
+
+
+def read_all_row_groups(path: str, verify_output: bool) -> tuple[int, int]:
+    """Materializes and optionally verifies every row group independently."""
+    import cudf
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(path)
+    rows = 0
+    columns = 0
+    for row_group in range(parquet.num_row_groups):
+        frame = cudf.read_parquet(path, row_groups=[row_group])
+        synchronize()
+        if verify_output:
+            verify(path, row_group, frame)
+        rows += len(frame)
+        columns = len(frame.columns)
+        del frame
+    return rows, columns
+
+
+def read_all_chunks(path: str) -> tuple[int, int]:
+    """Scans one open Parquet source through libcudf's bounded chunked reader."""
+    import pylibcudf as plc
+
+    options = plc.io.parquet.ParquetReaderOptions.builder(
+        plc.io.SourceInfo([path])
+    ).build()
+    reader = plc.io.parquet.ChunkedParquetReader(
+        options,
+        chunk_read_limit=8 * 1024**3,
+        pass_read_limit=1024**3,
+    )
+
+    rows = 0
+    columns = 0
+    while reader.has_next():
+        chunk = reader.read_chunk().tbl
+        synchronize()
+        rows += chunk.num_rows()
+        columns = chunk.num_columns()
+        del chunk
+    return rows, columns
 
 
 def main() -> int:
@@ -79,26 +122,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    import cudf
-
     # Warm-up: pays CUDA context creation and any first-call JIT so they stay out of
-    # the timed reads below.
-    warmup = cudf.read_parquet(args.path)
-    synchronize()
-
+    # the timed reads below. Reading one row group at a time keeps scans larger than device
+    # memory bounded while still materializing every row and column on the GPU.
     if args.verify:
-        verify(args.path, warmup)
-
-    rows, columns = warmup.shape
-    del warmup
+        rows, columns = read_all_row_groups(args.path, True)
+    else:
+        rows, columns = read_all_chunks(args.path)
 
     runs_ns = []
     for _ in range(max(args.iterations, 1)):
         start = time.perf_counter_ns()
-        frame = cudf.read_parquet(args.path)
-        synchronize()
+        timed_rows, timed_columns = read_all_chunks(args.path)
         runs_ns.append(time.perf_counter_ns() - start)
-        del frame
+        if (timed_rows, timed_columns) != (rows, columns):
+            raise RuntimeError(
+                "timed scan shape differs from warm-up: "
+                f"{(timed_rows, timed_columns)} != {(rows, columns)}"
+            )
 
     json.dump(
         {
