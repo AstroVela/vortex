@@ -71,9 +71,7 @@ def verify(path: str, frame) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", help="Parquet file to read")
-    parser.add_argument(
-        "--iterations", type=int, default=1, help="timed reads to perform"
-    )
+    parser.add_argument("--iterations", type=int, default=1, help="timed reads to perform")
     parser.add_argument(
         "--verify",
         action="store_true",
