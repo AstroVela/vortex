@@ -226,11 +226,21 @@ impl KernelLoader {
         type_suffixes: &[&str],
         cuda_context: &Arc<CudaContext>,
     ) -> VortexResult<CudaFunction> {
-        // Kernel name pattern: `<module>_<type_1>_..<type_n>`.
+        self.load_named_function(module_name, module_name, type_suffixes, cuda_context)
+    }
+
+    /// Loads a CUDA function whose entrypoint prefix differs from its PTX module name.
+    pub fn load_named_function(
+        &self,
+        module_name: &str,
+        function_name: &str,
+        type_suffixes: &[&str],
+        cuda_context: &Arc<CudaContext>,
+    ) -> VortexResult<CudaFunction> {
         let kernel_name = if type_suffixes.is_empty() {
-            module_name.to_string()
+            function_name.to_string()
         } else {
-            format!("{}_{}", module_name, type_suffixes.join("_"))
+            format!("{}_{}", function_name, type_suffixes.join("_"))
         };
 
         // Check if module is already cached

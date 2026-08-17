@@ -22,6 +22,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use cudarc::driver::DeviceRepr;
 use cudarc::driver::LaunchConfig;
 use cudarc::driver::PushKernelArg;
 use vortex::array::Canonical;
@@ -52,6 +54,10 @@ pub use plan_builder::FusedPlan;
 pub use plan_builder::MaterializedPlan;
 
 include!(concat!(env!("OUT_DIR"), "/dynamic_dispatch.rs"));
+
+// SAFETY: `BatchDispatchItem` is a bindgen-generated `#[repr(C)]` structure containing only
+// integer-valued device pointers and lengths, matching `dynamic_dispatch.h` exactly.
+unsafe impl DeviceRepr for BatchDispatchItem {}
 
 /// Convert a Rust `PType` to the C `PTypeTag` constant.
 pub fn ptype_to_tag(ptype: PType) -> PTypeTag {
@@ -440,17 +446,41 @@ impl MaterializedPlan {
                 .execute::<Canonical>(ctx.execution_ctx());
         }
 
-        // The CUDA kernels are instantiated for unsigned integer types only;
-        // map signed/float ptypes to their same-width unsigned counterpart.
-        let unsigned_ptype = match output_ptype {
-            PType::U8 | PType::I8 => PType::U8,
-            PType::U16 | PType::I16 => PType::U16,
-            PType::U32 | PType::I32 | PType::F32 => PType::U32,
-            PType::U64 | PType::I64 | PType::F64 => PType::U64,
-            other => vortex_bail!("dynamic dispatch does not support PType {:?}", other),
-        };
+        let unsigned_ptype = unsigned_dispatch_ptype(output_ptype)?;
         match_each_unsigned_integer_ptype!(unsigned_ptype, |T| {
             self.execute_typed::<T>(output_ptype, len, ctx)
+        })
+    }
+
+    /// Execute compatible materialized plans with one descriptor upload and one kernel launch.
+    pub fn execute_batch(
+        plans: Vec<(usize, Self)>,
+        ctx: &mut CudaExecutionCtx,
+    ) -> VortexResult<Vec<Canonical>> {
+        if plans.len() < 2
+            || plans
+                .iter()
+                .any(|(len, plan)| *len == 0 || plan.validity.definitely_all_null())
+        {
+            return plans
+                .into_iter()
+                .map(|(len, plan)| plan.execute(len, ctx))
+                .collect();
+        }
+
+        let output_ptype = plans[0].1.dispatch_plan.output_ptype();
+        let unsigned_ptype = unsigned_dispatch_ptype(output_ptype)?;
+        if plans.iter().any(|(_, plan)| {
+            unsigned_dispatch_ptype(plan.dispatch_plan.output_ptype()).ok() != Some(unsigned_ptype)
+        }) {
+            return plans
+                .into_iter()
+                .map(|(len, plan)| plan.execute(len, ctx))
+                .collect();
+        }
+
+        match_each_unsigned_integer_ptype!(unsigned_ptype, |T| {
+            execute_materialized_batch_typed::<T>(plans, ctx)
         })
     }
 
@@ -461,7 +491,7 @@ impl MaterializedPlan {
         ctx: &mut CudaExecutionCtx,
     ) -> VortexResult<Canonical>
     where
-        T: cudarc::driver::DeviceRepr + vortex::dtype::NativePType,
+        T: DeviceRepr + vortex::dtype::NativePType,
     {
         let nullability = self.validity.nullability();
 
@@ -521,6 +551,122 @@ impl MaterializedPlan {
             self.validity,
         )))
     }
+}
+
+fn unsigned_dispatch_ptype(output_ptype: PType) -> VortexResult<PType> {
+    match output_ptype {
+        PType::U8 | PType::I8 => Ok(PType::U8),
+        PType::U16 | PType::I16 => Ok(PType::U16),
+        PType::U32 | PType::I32 | PType::F32 => Ok(PType::U32),
+        PType::U64 | PType::I64 | PType::F64 => Ok(PType::U64),
+        other => vortex_bail!("dynamic dispatch does not support PType {:?}", other),
+    }
+}
+
+fn execute_materialized_batch_typed<T>(
+    plans: Vec<(usize, MaterializedPlan)>,
+    ctx: &mut CudaExecutionCtx,
+) -> VortexResult<Vec<Canonical>>
+where
+    T: DeviceRepr + vortex::dtype::NativePType,
+{
+    let output_offsets = plans
+        .iter()
+        .scan(0usize, |offset, (len, _)| {
+            let current = *offset;
+            *offset = offset.checked_add(len.next_multiple_of(1024))?;
+            Some(Some(current))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| vortex_err!("batched dynamic-dispatch output size overflow"))?;
+    let total_output_len = plans
+        .iter()
+        .map(|(len, _)| len.next_multiple_of(1024))
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| vortex_err!("batched dynamic-dispatch output size overflow"))?;
+    let mut output = ctx.device_alloc::<T>(total_output_len)?;
+    let stream = ctx.stream().clone();
+    let (output_base_ptr, output_write_record) = output.device_ptr_mut(&stream);
+
+    let mut packed_plans = Vec::new();
+    let mut plan_offsets = Vec::with_capacity(plans.len());
+    for (_, plan) in &plans {
+        while !Alignment::of::<u32>().is_offset_aligned(packed_plans.len()) {
+            packed_plans.push(0);
+        }
+        plan_offsets.push(packed_plans.len());
+        packed_plans.extend_from_slice(plan.dispatch_plan.as_bytes());
+    }
+    let device_plans = stream
+        .clone_htod(&packed_plans)
+        .map_err(|e| vortex_err!("copy batched plans to device: {e}"))?;
+    let (plan_base_ptr, plan_read_record) = device_plans.device_ptr(&stream);
+
+    let items = plans
+        .iter()
+        .zip(&output_offsets)
+        .zip(&plan_offsets)
+        .map(
+            |(((len, _), output_offset), plan_offset)| BatchDispatchItem {
+                output_ptr: output_base_ptr + (output_offset * size_of::<T>()) as u64,
+                array_len: *len as u64,
+                plan_ptr: plan_base_ptr + *plan_offset as u64,
+            },
+        )
+        .collect::<Vec<_>>();
+    let device_items = stream
+        .clone_htod(&items)
+        .map_err(|e| vortex_err!("copy batched dispatch descriptors to device: {e}"))?;
+
+    let source_views = plans
+        .iter()
+        .flat_map(|(_, plan)| plan.device_buffers.iter())
+        .map(|buffer| buffer.cuda_view::<u8>())
+        .collect::<VortexResult<Vec<_>>>()?;
+    let source_read_records = source_views
+        .iter()
+        .map(|view| view.device_ptr(&stream).1)
+        .collect::<Vec<_>>();
+
+    let max_blocks = plans
+        .iter()
+        .map(|(len, _)| len.div_ceil(ELEMENTS_PER_BLOCK as usize))
+        .max()
+        .unwrap_or(1);
+    let shared_mem_bytes = plans
+        .iter()
+        .map(|(_, plan)| plan.shared_mem_bytes)
+        .max()
+        .unwrap_or(0);
+    let function = ctx.load_named_function_with_suffixes(
+        "dynamic_dispatch",
+        "dynamic_dispatch_batch",
+        &[&T::PTYPE.to_string()],
+    )?;
+    let config = LaunchConfig {
+        grid_dim: (u32::try_from(max_blocks)?, u32::try_from(plans.len())?, 1),
+        block_dim: (BLOCK_SIZE, 1, 1),
+        shared_mem_bytes,
+    };
+    let total_len = plans.iter().map(|(len, _)| *len).sum();
+    ctx.launch_kernel_config(&function, config, total_len, |args| {
+        args.arg(&device_items);
+    })?;
+    drop((source_read_records, plan_read_record, output_write_record));
+
+    let output = CudaDeviceBuffer::new(output);
+    plans
+        .into_iter()
+        .zip(output_offsets)
+        .map(|((len, plan), offset)| {
+            let ptype = plan.dispatch_plan.output_ptype();
+            Ok(Canonical::Primitive(PrimitiveArray::from_buffer_handle(
+                BufferHandle::new_device(output.slice_typed::<T>(offset..offset + len)),
+                ptype,
+                plan.validity,
+            )))
+        })
+        .collect()
 }
 
 #[cfg(test)]

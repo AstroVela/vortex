@@ -670,3 +670,17 @@ dynamic_dispatch(T *__restrict output, uint64_t array_len, const uint8_t *__rest
     }
 
 FOR_EACH_UNSIGNED_INT(GENERATE_KERNEL)
+
+#define GENERATE_BATCH_KERNEL(suffix, Type)                                                                  \
+    extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, 32)                                             \
+        dynamic_dispatch_batch_##suffix(const BatchDispatchItem *__restrict items) {                         \
+        const BatchDispatchItem item = items[blockIdx.y];                                                    \
+        const uint64_t block_start = static_cast<uint64_t>(blockIdx.x) * ELEMENTS_PER_BLOCK;                 \
+        if (block_start < item.array_len) {                                                                  \
+            dynamic_dispatch<Type>(reinterpret_cast<Type *>(item.output_ptr),                                \
+                                   item.array_len,                                                           \
+                                   reinterpret_cast<const uint8_t *>(item.plan_ptr));                        \
+        }                                                                                                    \
+    }
+
+FOR_EACH_UNSIGNED_INT(GENERATE_BATCH_KERNEL)

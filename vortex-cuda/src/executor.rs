@@ -237,6 +237,19 @@ impl CudaExecutionCtx {
             .load_function_with_suffixes(module_name, type_suffixes)
     }
 
+    pub(crate) fn load_named_function_with_suffixes(
+        &self,
+        module_name: &str,
+        function_name: &str,
+        type_suffixes: &[&str],
+    ) -> VortexResult<CudaFunction> {
+        self.cuda_session.load_named_function_with_suffixes(
+            module_name,
+            function_name,
+            type_suffixes,
+        )
+    }
+
     /// Returns a launch builder for a CUDA kernel function.
     ///
     /// Arguments can be added to the kernel launch with `.arg(&buffer)`. Buffers written by the

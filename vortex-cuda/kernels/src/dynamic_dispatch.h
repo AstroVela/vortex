@@ -119,6 +119,13 @@ PTYPE_HOST_DEVICE constexpr uint8_t ptype_byte_width(PTypeTag tag) {
 /// expressions involving other macros or sizeof).
 #define KERNEL_FIXED_SHARED_BYTES 512
 
+/// One independently decoded array in a batched dynamic-dispatch launch.
+struct BatchDispatchItem {
+    uint64_t output_ptr;
+    uint64_t array_len;
+    uint64_t plan_ptr;
+};
+
 #ifdef __cplusplus
 extern "C" {
 #endif
