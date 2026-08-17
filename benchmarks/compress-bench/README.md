@@ -115,3 +115,9 @@ Any `--gpu-decompress` run reports on every dataset rather than stopping at the 
 one run shows which datasets decode correctly on the GPU and which do not. The timing tables are
 rendered before the failure summary, so a dataset the GPU cannot decode still leaves the rest of
 the matrix with numbers — the process exits non-zero either way.
+
+The dataset list in `src/main.rs` therefore holds only datasets a `--gpu-verify` run has confirmed.
+Several others are waiting on `vortex-cuda` kernel gaps (`u16` in `date_time_parts`, a
+`vortex.masked` kernel, and a CPU fallback reached with device-resident buffers); they are listed
+with their reasons next to `gpu_datasets`. Add one there once its gap is closed and verification
+passes.
