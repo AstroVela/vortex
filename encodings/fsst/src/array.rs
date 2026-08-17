@@ -143,18 +143,8 @@ impl VTable for FSST {
 
     fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
         match idx {
-            0 => BufferHandle::new_host(
-                array
-                    .padded_symbols()
-                    .slice(0..array.n_symbols())
-                    .into_byte_buffer(),
-            ),
-            1 => BufferHandle::new_host(
-                array
-                    .padded_symbol_lengths()
-                    .slice(0..array.n_symbols())
-                    .into_byte_buffer(),
-            ),
+            0 => array.symbols_handle().clone(),
+            1 => array.symbol_lengths_handle().clone(),
             2 => array.codes_bytes_handle().clone(),
             _ => vortex_panic!("FSSTArray buffer index {idx} out of bounds"),
         }
@@ -179,9 +169,13 @@ impl VTable for FSST {
             "Expected 3 buffers, got {}",
             buffers.len()
         );
-        let symbols = Buffer::<Symbol>::from_byte_buffer(buffers[0].clone().try_to_host_sync()?);
-        let symbol_lengths = Buffer::<u8>::from_byte_buffer(buffers[1].clone().try_to_host_sync()?);
-        let data = FSSTData::try_new(symbols, symbol_lengths, buffers[2].clone(), array.len())?;
+        let symbol_table = Arc::new(FSSTSymbolTable::from_handles(
+            buffers[0].clone(),
+            buffers[1].clone(),
+        )?);
+        let data = unsafe {
+            FSSTData::new_unchecked_with_symbol_table(symbol_table, buffers[2].clone(), array.len())
+        };
         Ok(
             ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
                 .with_slots(array.slots().iter().cloned().collect()),
@@ -236,11 +230,18 @@ impl VTable for FSST {
         session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = FSSTMetadata::decode(metadata)?;
-        let symbols = Buffer::<Symbol>::from_byte_buffer(buffers[0].clone().try_to_host_sync()?);
-        let symbol_lengths = Buffer::<u8>::from_byte_buffer(buffers[1].clone().try_to_host_sync()?);
+        vortex_ensure!(
+            buffers.len() >= 2,
+            "Expected at least 2 buffers, got {}",
+            buffers.len()
+        );
 
         let mut ctx = session.create_execution_ctx();
         if buffers.len() == 2 {
+            let symbols =
+                Buffer::<Symbol>::from_byte_buffer(buffers[0].clone().try_to_host_sync()?);
+            let symbol_lengths =
+                Buffer::<u8>::from_byte_buffer(buffers[1].clone().try_to_host_sync()?);
             return Self::deserialize_legacy(
                 self,
                 dtype,
@@ -254,6 +255,10 @@ impl VTable for FSST {
         }
 
         if buffers.len() == 3 {
+            let symbol_table = Arc::new(FSSTSymbolTable::from_handles(
+                buffers[0].clone(),
+                buffers[1].clone(),
+            )?);
             let uncompressed_lengths = children.get(
                 0,
                 &DType::Primitive(
@@ -284,8 +289,8 @@ impl VTable for FSST {
             };
 
             FSSTData::validate_parts(
-                symbols.as_slice(),
-                symbol_lengths.as_slice(),
+                symbol_table.n_symbols,
+                None,
                 &codes_bytes,
                 &codes_offsets,
                 dtype.nullability(),
@@ -300,7 +305,9 @@ impl VTable for FSST {
                 codes_validity: validity_to_child(&codes_validity, len),
             }
             .into_slots();
-            let data = FSSTData::try_new(symbols, symbol_lengths, codes_bytes, len)?;
+            let data = unsafe {
+                FSSTData::new_unchecked_with_symbol_table(symbol_table, codes_bytes, len)
+            };
             return Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots));
         }
 
@@ -453,12 +460,11 @@ impl Debug for FSSTData {
 }
 
 pub struct FSSTSymbolTable {
-    /// Symbols padded out to [`FSST_SYMBOL_TABLE_LEN`] entries, zero-filled past `n_symbols`,
-    /// so that a [`Decompressor`] can borrow them without copying.
-    padded_symbols: Buffer<Symbol>,
-    /// Symbol lengths padded out to [`FSST_SYMBOL_TABLE_LEN`] entries, zero-filled past
-    /// `n_symbols`.
-    padded_symbol_lengths: Buffer<u8>,
+    symbols: BufferHandle,
+    symbol_lengths: BufferHandle,
+    /// Host copies are populated eagerly for CPU-created tables and lazily for device tables.
+    padded_symbols: OnceLock<Buffer<Symbol>>,
+    padded_symbol_lengths: OnceLock<Buffer<u8>>,
     /// The number of populated symbols. Entries at or past this index are padding.
     n_symbols: usize,
     /// Memoized compressor used for push-down of compute by compressing the RHS.
@@ -473,10 +479,17 @@ impl FSSTSymbolTable {
     /// longer than [`FSST_SYMBOL_TABLE_LEN`] are truncated; callers are expected to have rejected
     /// them already (see [`FSSTData::try_new`]).
     pub fn new(symbols: Buffer<Symbol>, symbol_lengths: Buffer<u8>, n_symbols: usize) -> Self {
+        let n_symbols = n_symbols.min(FSST_SYMBOL_TABLE_LEN);
+        let padded_symbols = pad_symbol_table(symbols, Symbol::ZERO);
+        let padded_symbol_lengths = pad_symbol_table(symbol_lengths, 0);
         Self {
-            padded_symbols: pad_symbol_table(symbols, Symbol::ZERO),
-            padded_symbol_lengths: pad_symbol_table(symbol_lengths, 0),
-            n_symbols: n_symbols.min(FSST_SYMBOL_TABLE_LEN),
+            symbols: BufferHandle::new_host(padded_symbols.slice(0..n_symbols).into_byte_buffer()),
+            symbol_lengths: BufferHandle::new_host(
+                padded_symbol_lengths.slice(0..n_symbols).into_byte_buffer(),
+            ),
+            padded_symbols: OnceLock::from(padded_symbols),
+            padded_symbol_lengths: OnceLock::from(padded_symbol_lengths),
+            n_symbols,
             compressor: OnceLock::new(),
         }
     }
@@ -504,8 +517,39 @@ impl FSSTSymbolTable {
             InvalidArgument: "n_symbols must be <= {FSST_SYMBOL_TABLE_LEN}, found {n_symbols}"
         );
         Ok(Self {
-            padded_symbols,
-            padded_symbol_lengths,
+            symbols: BufferHandle::new_host(padded_symbols.slice(0..n_symbols).into_byte_buffer()),
+            symbol_lengths: BufferHandle::new_host(
+                padded_symbol_lengths.slice(0..n_symbols).into_byte_buffer(),
+            ),
+            padded_symbols: OnceLock::from(padded_symbols),
+            padded_symbol_lengths: OnceLock::from(padded_symbol_lengths),
+            n_symbols,
+            compressor: OnceLock::new(),
+        })
+    }
+
+    fn from_handles(symbols: BufferHandle, symbol_lengths: BufferHandle) -> VortexResult<Self> {
+        vortex_ensure!(
+            symbols.len().is_multiple_of(size_of::<Symbol>()),
+            InvalidArgument: "symbols buffer length {} is not a multiple of {}",
+            symbols.len(),
+            size_of::<Symbol>()
+        );
+        let n_symbols = symbols.len() / size_of::<Symbol>();
+        vortex_ensure!(
+            symbol_lengths.len() == n_symbols,
+            InvalidArgument: "symbols and symbol lengths must have the same number of entries, found {n_symbols} and {}",
+            symbol_lengths.len()
+        );
+        vortex_ensure!(
+            n_symbols <= FSST_SYMBOL_TABLE_LEN,
+            InvalidArgument: "symbols array must have length <= {FSST_SYMBOL_TABLE_LEN}, found {n_symbols}"
+        );
+        Ok(Self {
+            symbols,
+            symbol_lengths,
+            padded_symbols: OnceLock::new(),
+            padded_symbol_lengths: OnceLock::new(),
             n_symbols,
             compressor: OnceLock::new(),
         })
@@ -513,23 +557,51 @@ impl FSSTSymbolTable {
 
     /// The populated symbols, excluding the padding added by [`Self::new`].
     fn symbols(&self) -> &[Symbol] {
-        &self.padded_symbols.as_slice()[..self.n_symbols]
+        &self.padded_symbols().as_slice()[..self.n_symbols]
     }
 
     /// The populated symbol lengths, excluding the padding added by [`Self::new`].
     fn symbol_lengths(&self) -> &[u8] {
-        &self.padded_symbol_lengths.as_slice()[..self.n_symbols]
+        &self.padded_symbol_lengths().as_slice()[..self.n_symbols]
     }
 
     /// The symbols buffer, padded to exactly [`FSST_SYMBOL_TABLE_LEN`] entries with
     /// [`Symbol::ZERO`].
     fn padded_symbols(&self) -> &Buffer<Symbol> {
-        &self.padded_symbols
+        self.padded_symbols.get_or_init(|| {
+            pad_symbol_table(
+                Buffer::<Symbol>::from_byte_buffer(
+                    self.symbols
+                        .clone()
+                        .try_to_host_sync()
+                        .vortex_expect("copy FSST symbols to host"),
+                ),
+                Symbol::ZERO,
+            )
+        })
     }
 
     /// The symbol lengths buffer, padded to exactly [`FSST_SYMBOL_TABLE_LEN`] entries with zeros.
     fn padded_symbol_lengths(&self) -> &Buffer<u8> {
-        &self.padded_symbol_lengths
+        self.padded_symbol_lengths.get_or_init(|| {
+            pad_symbol_table(
+                Buffer::<u8>::from_byte_buffer(
+                    self.symbol_lengths
+                        .clone()
+                        .try_to_host_sync()
+                        .vortex_expect("copy FSST symbol lengths to host"),
+                ),
+                0,
+            )
+        })
+    }
+
+    fn symbols_handle(&self) -> &BufferHandle {
+        &self.symbols
+    }
+
+    fn symbol_lengths_handle(&self) -> &BufferHandle {
+        &self.symbol_lengths
     }
 
     /// Borrow the padded symbol table as the fixed-size arrays expected by [`Decompressor`].
@@ -539,12 +611,12 @@ impl FSSTSymbolTable {
     fn decompressor(&self) -> Decompressor<'_> {
         const PADDED: &str = "FSST symbol table is padded to FSST_SYMBOL_TABLE_LEN entries";
         let symbols = self
-            .padded_symbols
+            .padded_symbols()
             .as_slice()
             .first_chunk::<FSST_SYMBOL_TABLE_LEN>()
             .vortex_expect(PADDED);
         let symbol_lengths = self
-            .padded_symbol_lengths
+            .padded_symbol_lengths()
             .as_slice()
             .first_chunk::<FSST_SYMBOL_TABLE_LEN>()
             .vortex_expect(PADDED);
@@ -776,9 +848,14 @@ impl FSSTData {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         let fsst_slots = FSSTSlotsView::from_slots(slots);
+        let symbol_lengths = self
+            .symbol_table
+            .symbol_lengths_handle()
+            .is_on_host()
+            .then(|| self.symbol_table.symbol_lengths());
         Self::validate_parts(
-            self.symbol_table.symbols(),
-            self.symbol_table.symbol_lengths(),
+            self.symbol_table.n_symbols,
+            symbol_lengths,
             &self.codes_bytes,
             fsst_slots.codes_offsets,
             dtype.nullability(),
@@ -792,8 +869,8 @@ impl FSSTData {
     /// Validate using the decomposed components (codes bytes + offsets + nullability).
     #[expect(clippy::too_many_arguments)]
     fn validate_parts(
-        symbols: &[Symbol],
-        symbol_lengths: &[u8],
+        n_symbols: usize,
+        symbol_lengths: Option<&[u8]>,
         codes_bytes: &BufferHandle,
         codes_offsets: &ArrayRef,
         codes_nullability: Nullability,
@@ -807,15 +884,17 @@ impl FSSTData {
             "FSST arrays must be Binary or Utf8, found {dtype}"
         );
 
-        if symbols.len() > FSST_SYMBOL_TABLE_LEN {
+        if n_symbols > FSST_SYMBOL_TABLE_LEN {
             vortex_bail!(InvalidArgument: "symbols array must have length <= {FSST_SYMBOL_TABLE_LEN}");
         }
 
-        if symbols.len() != symbol_lengths.len() {
-            vortex_bail!(InvalidArgument: "symbols and symbol_lengths arrays must have same length");
-        }
+        if let Some(symbol_lengths) = symbol_lengths {
+            if n_symbols != symbol_lengths.len() {
+                vortex_bail!(InvalidArgument: "symbols and symbol_lengths arrays must have same length");
+            }
 
-        Self::validate_symbol_lengths(symbol_lengths)?;
+            Self::validate_symbol_lengths(symbol_lengths)?;
+        }
 
         // codes_offsets.len() - 1 == number of elements
         let codes_len = codes_offsets.len().saturating_sub(1);
@@ -895,8 +974,8 @@ impl FSSTData {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         Self::validate_parts(
-            symbols,
-            symbol_lengths,
+            symbols.len(),
+            Some(symbol_lengths),
             codes.bytes_handle(),
             codes.offsets(),
             codes.dtype().nullability(),
@@ -955,6 +1034,16 @@ impl FSSTData {
     /// zeros. Entries at or past [`Self::n_symbols`] are padding.
     pub fn padded_symbol_lengths(&self) -> &Buffer<u8> {
         self.symbol_table.padded_symbol_lengths()
+    }
+
+    /// Access the populated symbols buffer without changing its memory location.
+    pub fn symbols_handle(&self) -> &BufferHandle {
+        self.symbol_table.symbols_handle()
+    }
+
+    /// Access the populated symbol lengths buffer without changing its memory location.
+    pub fn symbol_lengths_handle(&self) -> &BufferHandle {
+        self.symbol_table.symbol_lengths_handle()
     }
 
     /// The number of populated entries in the symbol table.
