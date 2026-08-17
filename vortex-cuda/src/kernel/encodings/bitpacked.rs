@@ -206,11 +206,6 @@ where
             .arg(&patches_arg);
     })?;
 
-    // Patch-free decodes need no host synchronization.
-    if device_patches.is_some() {
-        ctx.synchronize_stream()?;
-    }
-
     let output_buf = CudaDeviceBuffer::new(output_slice);
     let output_handle =
         BufferHandle::new_device(output_buf.slice_typed::<A>(offset..(offset + len)));
