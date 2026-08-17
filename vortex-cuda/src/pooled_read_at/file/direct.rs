@@ -16,7 +16,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 
-use super::FileReadBackend;
+use super::HostFileReadBackend;
 use super::PooledHostRead;
 use crate::pinned::PinnedByteBufferPool;
 
@@ -70,7 +70,7 @@ impl DirectFileReadBackend {
     }
 }
 
-impl FileReadBackend for DirectFileReadBackend {
+impl HostFileReadBackend for DirectFileReadBackend {
     fn size(&self) -> VortexResult<u64> {
         Ok(self.file.metadata()?.len())
     }

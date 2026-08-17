@@ -9923,6 +9923,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "kanal",
+ "libloading 0.8.9",
  "num-traits",
  "object_store",
  "parking_lot",

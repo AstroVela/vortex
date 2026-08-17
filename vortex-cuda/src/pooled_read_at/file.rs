@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #[cfg(target_os = "linux")]
+mod cufile;
+#[cfg(target_os = "linux")]
 mod direct;
 
 use std::fs::File;
@@ -20,6 +22,8 @@ use vortex::io::runtime::Handle;
 use vortex::io::std_file::read_exact_at;
 
 #[cfg(target_os = "linux")]
+use self::cufile::CuFileReadBackend;
+#[cfg(target_os = "linux")]
 use self::direct::DirectFileReadBackend;
 use crate::pinned::PinnedByteBufferPool;
 use crate::pinned::PooledPinnedBuffer;
@@ -32,6 +36,7 @@ pub const DEFAULT_FILE_CONCURRENCY: usize = 32;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PooledFileReadAtOptions {
     direct_io: bool,
+    cufile: bool,
 }
 
 impl PooledFileReadAtOptions {
@@ -45,6 +50,16 @@ impl PooledFileReadAtOptions {
         self.direct_io = true;
         self
     }
+
+    /// Read file data into CUDA device memory with cuFile's POSIX compatibility path.
+    ///
+    /// This works on storage without native GPUDirect Storage support, but cuFile may bounce the
+    /// data through internal host memory.
+    #[cfg(target_os = "linux")]
+    pub fn with_cufile(mut self) -> Self {
+        self.cufile = true;
+        self
+    }
 }
 
 struct PooledHostRead {
@@ -52,7 +67,7 @@ struct PooledHostRead {
     requested_range: Range<usize>,
 }
 
-trait FileReadBackend: Send + Sync {
+trait HostFileReadBackend: Send + Sync {
     fn size(&self) -> VortexResult<u64>;
 
     fn read(
@@ -75,7 +90,7 @@ impl BufferedFileReadBackend {
     }
 }
 
-impl FileReadBackend for BufferedFileReadBackend {
+impl HostFileReadBackend for BufferedFileReadBackend {
     fn size(&self) -> VortexResult<u64> {
         Ok(self.file.metadata()?.len())
     }
@@ -95,38 +110,58 @@ impl FileReadBackend for BufferedFileReadBackend {
     }
 }
 
+enum FileReadBackend {
+    Host(Arc<dyn HostFileReadBackend>),
+    #[cfg(target_os = "linux")]
+    CuFile(Arc<CuFileReadBackend>),
+}
+
+impl FileReadBackend {
+    fn size(&self) -> VortexResult<u64> {
+        match self {
+            Self::Host(backend) => backend.size(),
+            #[cfg(target_os = "linux")]
+            Self::CuFile(backend) => backend.size(),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn open_backend(
-    path: &Path,
-    options: PooledFileReadAtOptions,
-) -> VortexResult<Arc<dyn FileReadBackend>> {
+fn open_backend(path: &Path, options: PooledFileReadAtOptions) -> VortexResult<FileReadBackend> {
+    if options.cufile {
+        return Ok(FileReadBackend::CuFile(Arc::new(CuFileReadBackend::open(
+            path,
+        )?)));
+    }
     if options.direct_io {
-        Ok(Arc::new(DirectFileReadBackend::open(path)?))
+        Ok(FileReadBackend::Host(Arc::new(
+            DirectFileReadBackend::open(path)?,
+        )))
     } else {
-        Ok(Arc::new(BufferedFileReadBackend::open(path)?))
+        Ok(FileReadBackend::Host(Arc::new(
+            BufferedFileReadBackend::open(path)?,
+        )))
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_backend(
-    path: &Path,
-    _options: PooledFileReadAtOptions,
-) -> VortexResult<Arc<dyn FileReadBackend>> {
-    Ok(Arc::new(BufferedFileReadBackend::open(path)?))
+fn open_backend(path: &Path, _options: PooledFileReadAtOptions) -> VortexResult<FileReadBackend> {
+    Ok(FileReadBackend::Host(Arc::new(
+        BufferedFileReadBackend::open(path)?,
+    )))
 }
 
-/// File reader that uses CUDA pinned host memory for I/O buffers and transfers
-/// directly to the GPU.
+/// File reader that returns local file data in CUDA device memory.
 ///
-/// Reads into a pooled pinned (page-locked) buffer, then submits a non-blocking
-/// H2D DMA transfer and returns a device `BufferHandle`.
+/// The default backend reads into a pooled pinned buffer and submits an H2D transfer. On Linux,
+/// [`PooledFileReadAtOptions::with_cufile`] selects cuFile's POSIX compatibility path instead.
 ///
 /// This is a data-plane reader. To open a complete local Vortex file, prefer
 /// [`crate::CudaOpenOptionsExt::with_cuda`], which keeps the footer and zone maps on the host.
 #[derive(Clone)]
 pub struct PooledFileReadAt {
     uri: Arc<str>,
-    backend: Arc<dyn FileReadBackend>,
+    backend: Arc<FileReadBackend>,
     handle: Handle,
     pool: Arc<PinnedByteBufferPool>,
     stream: VortexCudaStream,
@@ -159,7 +194,7 @@ impl PooledFileReadAt {
     ) -> VortexResult<Self> {
         let path = path.as_ref();
         let uri = Arc::from(path.to_string_lossy().to_string());
-        let backend = open_backend(path, options)?;
+        let backend = Arc::new(open_backend(path, options)?);
         Ok(Self {
             uri,
             backend,
@@ -200,11 +235,23 @@ impl VortexReadAt for PooledFileReadAt {
         let pool = Arc::clone(&self.pool);
 
         async move {
-            let read = handle
-                .spawn_blocking(move || backend.read(&pool, offset, length))
-                .await?;
-            let cuda_buf = read.buffer.transfer_to_device(&stream)?;
-            Ok(BufferHandle::new_device(Arc::new(cuda_buf)).slice(read.requested_range))
+            match backend.as_ref() {
+                FileReadBackend::Host(backend) => {
+                    let backend = Arc::clone(backend);
+                    let read = handle
+                        .spawn_blocking(move || backend.read(&pool, offset, length))
+                        .await?;
+                    let cuda_buf = read.buffer.transfer_to_device(&stream)?;
+                    Ok(BufferHandle::new_device(Arc::new(cuda_buf)).slice(read.requested_range))
+                }
+                #[cfg(target_os = "linux")]
+                FileReadBackend::CuFile(backend) => {
+                    let backend = Arc::clone(backend);
+                    handle
+                        .spawn_blocking(move || backend.read(&stream, offset, length))
+                        .await
+                }
+            }
         }
         .boxed()
     }
@@ -217,6 +264,7 @@ mod tests {
     #[test]
     fn pooled_file_read_options_default_to_buffered_io() {
         assert!(!PooledFileReadAtOptions::default().direct_io);
+        assert!(!PooledFileReadAtOptions::default().cufile);
     }
 
     #[cfg(target_os = "linux")]
@@ -227,5 +275,11 @@ mod tests {
                 .with_direct_io()
                 .direct_io
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pooled_file_read_options_enable_cufile() {
+        assert!(PooledFileReadAtOptions::default().with_cufile().cufile);
     }
 }

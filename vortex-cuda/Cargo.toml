@@ -45,6 +45,7 @@ vortex-error = { workspace = true, features = ["object_store"] }
 vortex-nvcomp = { path = "nvcomp" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libloading = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
