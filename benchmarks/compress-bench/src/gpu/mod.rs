@@ -14,6 +14,7 @@
 use vortex_bench::Format;
 use vortex_bench::compress::Compressor;
 
+pub mod datasets;
 pub mod writer;
 
 #[cfg(feature = "cuda")]

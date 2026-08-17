@@ -11,6 +11,7 @@ use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
 use compress_bench::gpu::GpuCodec;
+use compress_bench::gpu::datasets::large_gpu_datasets;
 use compress_bench::gpu::GpuOptions;
 use compress_bench::gpu::compressor as gpu_compressor;
 use compress_bench::parquet::ParquetCompressor;
@@ -79,6 +80,12 @@ struct Args {
     /// decompression only, for both Vortex and Parquet.
     #[arg(long)]
     gpu_decompress: bool,
+    /// Add large full-table datasets to the GPU decompression suite.
+    ///
+    /// This opt-in prepares FineWeb, ClickBench, and TPC-H SF10 and is deliberately excluded
+    /// from the default GPU CI invocation.
+    #[arg(long, requires = "gpu_decompress")]
+    gpu_large_datasets: bool,
     /// Page codec the GPU Parquet file is written with.
     ///
     /// Snappy is the Parquet default and the codec GPU readers decompress fastest.
@@ -147,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         formats,
         ops,
         mode,
+        args.gpu_large_datasets,
         args.display_format,
         args.output_path,
         args.ingest_output,
@@ -206,6 +214,7 @@ async fn run_compress(
     formats: Vec<Format>,
     ops: Vec<CompressOp>,
     mode: BenchMode,
+    gpu_large_datasets: bool,
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
     ingest_output: Option<PathBuf>,
@@ -253,6 +262,12 @@ async fn run_compress(
         PBI_DATASETS.get(Food),
     ];
 
+    let large_gpu_datasets = if gpu_large_datasets {
+        large_gpu_datasets().await?
+    } else {
+        Vec::new()
+    };
+
     let all_datasets: Vec<&dyn Dataset> = [
         &TaxiData as &dyn Dataset,
         PBI_DATASETS.get(Arade),
@@ -276,7 +291,10 @@ async fn run_compress(
     .collect();
 
     let datasets: Vec<&dyn Dataset> = if mode.is_gpu() {
-        gpu_datasets.to_vec()
+        gpu_datasets
+            .into_iter()
+            .chain(large_gpu_datasets.iter().map(|d| d as &dyn Dataset))
+            .collect()
     } else {
         all_datasets
     }
