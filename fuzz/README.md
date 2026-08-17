@@ -15,3 +15,15 @@ input with the command `cargo fuzz run array_ops <path/to/artifact>` or `cargo f
 
 If there are any linking (on macOS) then run `cargo fuzz run --dev --sanitizer=none ...`. `--dev` runs the fuzzer in dev
 profile.
+
+### Replay without cargo-fuzz
+
+To replay an `array_ops` input on stable Rust, without `cargo-fuzz` or a nightly toolchain:
+
+```bash
+cargo run -p vortex-fuzz --example replay --release -- <path/to/artifact>
+```
+
+The example decodes the input the same way `libfuzzer-sys` does and runs the action directly, so it
+reproduces the panic under a normal debugger and works in environments where `cargo-fuzz` cannot
+build. It replays a single input; use `cargo fuzz run` for actual fuzzing.

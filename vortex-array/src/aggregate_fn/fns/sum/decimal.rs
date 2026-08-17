@@ -15,7 +15,6 @@ use vortex_mask::Mask;
 use super::SumState;
 use crate::ExecutionCtx;
 use crate::arrays::DecimalArray;
-use crate::dtype::DecimalDType;
 use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
 use crate::match_each_decimal_value_type;
@@ -47,7 +46,7 @@ pub(super) fn accumulate_decimal(
             let initial: I = value
                 .cast()
                 .vortex_expect("cannot fail to cast initial value");
-            match sum_decimal_value(initial, d.buffer::<T>(), validity, *dtype) {
+            match sum_decimal_value(initial, d.buffer::<T>(), validity) {
                 Some(v) => *value = v,
                 None => return Ok(true),
             }
@@ -56,11 +55,15 @@ pub(super) fn accumulate_decimal(
     })
 }
 
+/// Sums `values` into `initial`, returning `None` if the native accumulator overflows.
+///
+/// The running total is deliberately not checked against the output precision: an intermediate
+/// total may exceed it and be brought back into range by later values, so that check belongs on
+/// the finalized result in [`Sum::to_scalar`][super::Sum::to_scalar].
 fn sum_decimal_value<T, I>(
     initial: I,
     values: Buffer<T>,
     validity: Option<&BitBuffer>,
-    output_dtype: DecimalDType,
 ) -> Option<DecimalValue>
 where
     T: AsPrimitive<I>,
@@ -74,8 +77,6 @@ where
     };
 
     sum.map(DecimalValue::from)
-        // We have to make sure that the decimal value fits the precision of the decimal dtype.
-        .filter(|v| v.fits_in_precision(output_dtype))
 }
 
 fn sum_decimal<T: AsPrimitive<I>, I: Copy + CheckedAdd + 'static>(
@@ -107,6 +108,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
@@ -118,6 +120,7 @@ mod tests {
     use crate::aggregate_fn::fns::sum::Sum;
     use crate::aggregate_fn::fns::sum::sum;
     use crate::array_session;
+    use crate::arrays::ChunkedArray;
     use crate::arrays::DecimalArray;
     use crate::dtype::DType;
     use crate::dtype::DecimalDType;
@@ -432,6 +435,51 @@ mod tests {
 
         let result = Sum.to_scalar(&state)?;
         assert!(result.is_null());
+        Ok(())
+    }
+
+    /// Build `coefficient * 10^75`, a value that fits precision 76 but whose doubling does not.
+    fn scaled_i256(coefficient: i128) -> i256 {
+        i256::from_i128(coefficient)
+            * i256::from_i128(10)
+                .checked_pow(75)
+                .vortex_expect("10^75 fits in i256")
+    }
+
+    #[test]
+    fn sum_decimal_chunked_matches_unchunked() -> VortexResult<()> {
+        // Each value fits precision 76, and so does their total, but the running total after the
+        // first chunk does not. Precision saturation must not depend on chunk boundaries.
+        let dtype = DecimalDType::new(76, 0);
+        let values = [scaled_i256(6), scaled_i256(6), scaled_i256(-6)];
+
+        let chunked = ChunkedArray::try_new(
+            vec![
+                DecimalArray::new(
+                    Buffer::copy_from(&values[..2]),
+                    dtype,
+                    Validity::NonNullable,
+                )
+                .into_array(),
+                DecimalArray::new(
+                    Buffer::copy_from(&values[2..]),
+                    dtype,
+                    Validity::NonNullable,
+                )
+                .into_array(),
+            ],
+            DType::Decimal(dtype, Nullability::NonNullable),
+        )?
+        .into_array();
+
+        let flat =
+            DecimalArray::new(Buffer::copy_from(values), dtype, Validity::NonNullable).into_array();
+
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = Scalar::decimal(DecimalValue::I256(scaled_i256(6)), dtype, Nullable);
+
+        assert_eq!(sum(&flat, &mut ctx)?, expected);
+        assert_eq!(sum(&chunked, &mut ctx)?, expected);
         Ok(())
     }
 

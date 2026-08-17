@@ -188,15 +188,18 @@ impl AggregateFnVTable for Sum {
                 *acc += val;
                 false
             }
-            SumState::Decimal { value, dtype } => {
+            SumState::Decimal { value, .. } => {
                 let val = other
                     .as_decimal()
                     .decimal_value()
                     .vortex_expect("checked non-null");
+                // Only native overflow saturates. An intermediate total outside the return
+                // precision may be cancelled by later partials, so precision is checked once the
+                // result is finalized in `to_scalar`.
                 match value.checked_add(&val) {
                     Some(r) => {
                         *value = r;
-                        !value.fits_in_precision(*dtype)
+                        false
                     }
                     None => true,
                 }
@@ -219,7 +222,13 @@ impl AggregateFnVTable for Sum {
                     .return_dtype
                     .as_decimal_opt()
                     .vortex_expect("return dtype must be decimal");
-                Scalar::decimal(*value, decimal_dtype, Nullability::Nullable)
+                // The accumulator only guards against native overflow, so the finalized total is
+                // where a result outside the return precision becomes null.
+                if value.fits_in_precision(decimal_dtype) {
+                    Scalar::decimal(*value, decimal_dtype, Nullability::Nullable)
+                } else {
+                    Scalar::null(partial.return_dtype.as_nullable())
+                }
             }
         })
     }

@@ -124,7 +124,10 @@ jobs:
           fi
           FORK_FLAG=""
           if [ "${{ inputs.jobs }}" -gt 1 ]; then
-            FORK_FLAG="-fork=${{ inputs.jobs }}"
+            # -ignore_crashes keeps the parent fuzzing after a child crashes, so a single
+            # reproducible crash in the restored corpus cannot consume the whole time budget.
+            # Crashing inputs are still written to fuzz/artifacts and reported below.
+            FORK_FLAG="-fork=${{ inputs.jobs }} -ignore_crashes=1"
           fi
           ${{ inputs.extra_env }} RUST_BACKTRACE=1 \
             cargo +$NIGHTLY_TOOLCHAIN fuzz run --release --debug-assertions \
