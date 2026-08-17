@@ -3,8 +3,10 @@
 
 //! Parquet writer settings for the GPU benchmark.
 //!
-//! The GPU backend rewrites each dataset before reading it back with cuDF, so the file it
-//! reads is written the way a GPU reader wants it rather than the way the CPU suite writes it.
+//! The GPU backend rewrites each dataset before reading it back with cuDF. The CPU suite's
+//! settings are tuned for host reads, and reusing them would measure a device decoder on a file
+//! laid out for a different one; these settings size pages and row groups for a GPU read
+//! instead. Each choice and its reason is tabulated in the README.
 
 use clap::ValueEnum;
 use parquet::basic::Compression;
@@ -36,6 +38,12 @@ const GPU_DATA_PAGE_ROW_COUNT_LIMIT: usize = 1_000_000;
 pub const GPU_ROW_GROUP_SIZE: usize = DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
 
 /// Parquet page codecs the GPU benchmark can write.
+///
+/// A deliberate two-codec subset, not a limit of Parquet or of cuDF — both handle more. These
+/// two are the ones worth comparing: Snappy is the Parquet default and the fastest to decode on
+/// the device, and Zstd is what the CPU Parquet benchmark writes, so picking it answers "what
+/// does the GPU do with the file the CPU suite already measures?". Adding a codec here is a
+/// two-line change if another becomes interesting.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum GpuCodec {
     /// The Parquet default, and the codec with the highest device-side throughput.

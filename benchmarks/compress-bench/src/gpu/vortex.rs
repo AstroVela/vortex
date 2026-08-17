@@ -13,6 +13,7 @@ use anyhow::ensure;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_schema::Field;
 use async_trait::async_trait;
+use futures::Stream;
 use futures::StreamExt;
 use tempfile::NamedTempFile;
 use vortex::array::ArrayRef;
@@ -22,6 +23,7 @@ use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
+use vortex::error::VortexResult;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
@@ -53,8 +55,9 @@ impl GpuVortexCompressor {
     /// Create the backend.
     ///
     /// When `verify` is set, each GPU-decoded field is copied back to the host and compared
-    /// against the same field decoded on the CPU. Verification runs inline, so timings from a
-    /// verifying run are not comparable to a plain one.
+    /// against the same field decoded on the CPU before the timed scan runs. The verification is
+    /// not itself timed, so a verifying run reports the same measurement a plain one would — it
+    /// just takes longer to get there.
     pub fn new(verify: bool, direct_io: bool) -> Self {
         Self { verify, direct_io }
     }
@@ -99,8 +102,11 @@ impl Compressor for GpuVortexCompressor {
         output.sync_all().await?;
         drop(output);
 
+        // Verification is a precondition on the measurement below, not a substitute for it. It
+        // used to return its own elapsed time, which bundled a file copy, a second host scan and
+        // every Arrow conversion into a number the table then published as a decode time.
         if self.verify {
-            return verify_against_host_scan(gpu_file.path(), self.direct_io).await;
+            verify_against_host_scan(gpu_file.path(), self.direct_io).await?;
         }
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
@@ -131,16 +137,28 @@ impl Compressor for GpuVortexCompressor {
 /// through the page cache after an untimed warm-up read, so leaving direct IO on would compare
 /// a Vortex read of the disk against a cuDF read of RAM. Turning it on measures storage
 /// bandwidth instead, which is a different question and not comparable across the two.
+///
+/// Only the direct-IO path is Linux-only — `O_DIRECT` has no portable equivalent, so
+/// [`PooledFileReadAtOptions`] only offers it there. The rest of this module is not: CUDA runs on
+/// Windows too, and the whole crate still has to compile on a developer's macOS machine. Asking
+/// for `--gpu-direct-io` where it cannot be honoured is an error rather than a silent no-op,
+/// because the flag changes what the resulting number means.
 async fn open_gpu(path: &Path, direct_io: bool) -> Result<vortex::file::VortexFile> {
     let open_options = SESSION.open_options().with_cuda();
+
     #[cfg(target_os = "linux")]
     let open_options = if direct_io {
         open_options.with_read_at_options(PooledFileReadAtOptions::default().with_direct_io())
     } else {
         open_options
     };
+
     #[cfg(not(target_os = "linux"))]
-    let _ = direct_io;
+    anyhow::ensure!(
+        !direct_io,
+        "--gpu-direct-io needs O_DIRECT, which is only available on Linux"
+    );
+
     Ok(open_options.open_path(path).await?)
 }
 
@@ -150,14 +168,14 @@ async fn open_gpu(path: &Path, direct_io: bool) -> Result<vortex::file::VortexFi
 /// GPU scan's arrays: a CUDA scan hands back arrays whose buffers live in device memory,
 /// which the host decoders cannot read.
 ///
-/// Verification runs inline, so the returned duration is not comparable to a plain run.
-async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<Duration> {
+/// This times nothing and reports no measurement: the caller runs its own timed scan afterwards,
+/// so a verifying run publishes the same kind of number as a plain one.
+async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<()> {
     let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)?;
     // Everything on the reference side — the host scan and both Arrow conversions — has to run
     // through a plain host context. A CUDA context allocates its outputs in device memory, and
     // the Arrow conversion then reads those buffers on the host.
     let mut host_ctx = SESSION.create_execution_ctx();
-    let start = Instant::now();
 
     // The host scan reads a copy rather than the same path. The session's segment cache is
     // keyed by URI, and the CUDA reader deliberately bypasses it because its buffers are
@@ -178,14 +196,9 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<Durati
 
     let mut fields_checked = 0usize;
     let mut batch_index = 0usize;
-    loop {
-        let (gpu_batch, host_batch) = (gpu_batches.next().await, host_batches.next().await);
-        let (gpu_batch, host_batch) = match (gpu_batch, host_batch) {
-            (Some(gpu_batch), Some(host_batch)) => (gpu_batch?, host_batch?),
-            (None, None) => break,
-            _ => bail!("the GPU and CPU scans of the same file produced different batch counts"),
-        };
-
+    while let Some((gpu_batch, host_batch)) =
+        next_batch_pair(&mut gpu_batches, &mut host_batches).await?
+    {
         let gpu_record = gpu_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
         let host_record = host_batch.execute::<StructArray>(&mut host_ctx)?;
         ensure!(
@@ -231,7 +244,23 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<Durati
     cuda_ctx.synchronize_stream()?;
 
     tracing::info!("verified {fields_checked} GPU-decoded Vortex fields against the CPU decode");
-    Ok(start.elapsed())
+    Ok(())
+}
+
+/// Pulls one batch from each scan, or `None` once both are exhausted.
+///
+/// Both streams cover the same file, so one ending before the other is itself a failure rather
+/// than a stopping condition — that is why this returns `Result<Option<_>>` instead of letting
+/// the caller zip the two streams together.
+async fn next_batch_pair(
+    gpu: &mut (impl Stream<Item = VortexResult<ArrayRef>> + Unpin),
+    host: &mut (impl Stream<Item = VortexResult<ArrayRef>> + Unpin),
+) -> Result<Option<(ArrayRef, ArrayRef)>> {
+    match (gpu.next().await, host.next().await) {
+        (Some(gpu_batch), Some(host_batch)) => Ok(Some((gpu_batch?, host_batch?))),
+        (None, None) => Ok(None),
+        _ => bail!("the GPU and CPU scans of the same file produced different batch counts"),
+    }
 }
 
 /// Fails unless a GPU-decoded field matches the same field decoded on the CPU.

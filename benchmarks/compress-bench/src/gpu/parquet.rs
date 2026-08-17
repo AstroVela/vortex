@@ -8,16 +8,20 @@
 //! the like-for-like opponent for the Vortex GPU backend, which likewise decodes all the way
 //! to canonical arrays on device.
 //!
-//! cuDF is reached through its prebuilt `cudf-cu12` wheel rather than by linking libcudf, so
-//! it stays a runtime dependency of this benchmark and never enters the Rust build. The
-//! measurement is taken inside [`CUDF_SCRIPT`], so interpreter start, `import cudf` and CUDA
-//! context creation are excluded; only the reads themselves are timed.
+//! cuDF has no Rust binding, so this backend drives it out of process: it spawns `python3`
+//! running [`CUDF_SCRIPT`], which imports cuDF from the prebuilt `cudf-cu12` Python package
+//! and prints its timings back as JSON on stdout. Nothing here links against libcudf, so cuDF
+//! is a runtime requirement of the benchmark rather than a Rust build dependency — see the
+//! README for the install.
+//!
+//! The clock lives inside that script, not around the subprocess, so process spawn,
+//! interpreter start, `import cudf` and CUDA context creation are all excluded; only the reads
+//! themselves are timed.
 
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -38,16 +42,34 @@ use crate::gpu::writer::gpu_writer_properties;
 /// Repo-relative path of the script that performs and times the cuDF read.
 const CUDF_SCRIPT: &str = "scripts/cudf-parquet-read.py";
 
-/// Parquet compressor whose decompression measurement is a full cuDF GPU read.
+/// Parquet compressor whose decompression measurement is a whole-file cuDF GPU read.
+///
+/// "Whole-file" means every row and every column: no projection and no filter is pushed into
+/// the read, so the measurement covers decoding the entire table. That matches what the Vortex
+/// GPU backend does, which decodes every field of every batch it scans.
 pub struct GpuParquetCompressor {
     codec: GpuCodec,
+    /// Cross-check the GPU read against a CPU Parquet read of the same file.
+    ///
+    /// cuDF has no verification of its own — a `read_parquet` either succeeds or raises — so
+    /// [`CUDF_SCRIPT`] does the checking, comparing the frame it read on the device against
+    /// one pandas read on the host. Off by default: it is a correctness pass, not a benchmark.
     verify: bool,
 }
+
+/// Timed reads to ask [`CUDF_SCRIPT`] for per invocation.
+///
+/// One read is a noisy sample, and repeating inside the script is nearly free — the cost that
+/// dominates a cuDF read is process spawn and `import cudf`, which is paid once either way.
+const TIMED_READS: usize = 3;
 
 /// What the cuDF script reports back.
 #[derive(Debug, Deserialize)]
 struct CudfReadReport {
-    /// Fastest timed read, in nanoseconds.
+    /// Fastest of the script's [`TIMED_READS`] reads, in nanoseconds.
+    ///
+    /// The outer harness calls `decompress` once per `--iterations` and takes its own minimum,
+    /// so the published number is the fastest read across every process the run spawned.
     min_ns: u64,
     rows: u64,
     columns: u64,
@@ -90,10 +112,17 @@ impl Compressor for GpuParquetCompressor {
         Format::Parquet
     }
 
-    async fn compress(&self, parquet_path: &Path) -> Result<(u64, Duration)> {
-        let start = Instant::now();
-        let (_file, size) = self.write_gpu_parquet(parquet_path)?;
-        Ok((size, start.elapsed()))
+    /// Unsupported: GPU mode measures decompression only.
+    ///
+    /// `--gpu-decompress` restricts the suite to [`CompressOp::Decompress`], so nothing calls
+    /// this. It used to time [`Self::write_gpu_parquet`], but that measures the host Parquet
+    /// writer rather than anything on the device, and the result was never rendered — so it was
+    /// a number nobody could read and nobody should have compared. The Vortex GPU backend
+    /// refuses the same way.
+    ///
+    /// [`CompressOp::Decompress`]: vortex_bench::compress::CompressOp::Decompress
+    async fn compress(&self, _parquet_path: &Path) -> Result<(u64, Duration)> {
+        bail!("GPU compress-bench only supports decompression measurements")
     }
 
     async fn decompress(&self, parquet_path: &Path) -> Result<Duration> {
@@ -113,19 +142,20 @@ impl Compressor for GpuParquetCompressor {
 
 /// Runs the cuDF read script and returns the timing it measured.
 fn run_cudf_read(path: &Path, verify: bool) -> Result<CudfReadReport> {
-    let mut command = Command::new("python3");
-    command.arg(CUDF_SCRIPT).arg(path);
-    if verify {
-        command.arg("--verify");
-    }
+    let output = Command::new("python3")
+        .arg(CUDF_SCRIPT)
+        .arg(path)
+        .arg("--iterations")
+        .arg(TIMED_READS.to_string())
+        .args(verify.then_some("--verify"))
+        .output()
+        .with_context(|| format!("failed to spawn python3 to run {CUDF_SCRIPT}"))?;
 
-    let output = command.output().with_context(|| {
-        format!("failed to run {CUDF_SCRIPT}; is cudf-cu12 installed on this host?")
-    })?;
-
+    // A missing cuDF surfaces here rather than above: python3 starts fine and then fails on
+    // `import cudf`, so the traceback is on stderr and the install hint belongs with it.
     if !output.status.success() {
         bail!(
-            "{CUDF_SCRIPT} exited with {}:\n{}",
+            "{CUDF_SCRIPT} exited with {}; is cudf-cu12 installed on this host?\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );

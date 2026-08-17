@@ -42,16 +42,19 @@ cargo run -p compress-bench --profile release_debug \
 
 ### cuDF
 
-cuDF is reached through its prebuilt `cudf-cu12` wheel, so it is a runtime dependency of the
-benchmark and never enters the Rust build:
+cuDF has no Rust binding, so the benchmark drives it out of process: it spawns `python3` running
+`scripts/cudf-parquet-read.py`, which imports cuDF from the prebuilt `cudf-cu12` Python package,
+reads the file, and prints its timings back as JSON on stdout. Nothing links against libcudf, so
+cuDF is a runtime requirement rather than a Rust build dependency:
 
 ```bash
 uv pip install --extra-index-url https://pypi.nvidia.com cudf-cu12 pandas pyarrow
 ```
 
-`scripts/cudf-parquet-read.py` performs and times the read. Timing is taken inside that
-script, so interpreter start, `import cudf` and CUDA context creation are excluded; a warm-up
-read runs first for the same reason.
+The clock lives inside that script rather than around the subprocess, so process spawn,
+interpreter start, `import cudf` and CUDA context creation are all excluded; a warm-up read runs
+first for the same reason. The script performs several timed reads per invocation and reports the
+fastest, and the harness then takes its own minimum across `--iterations`.
 
 Both backends read a warm file by default. cuDF runs an untimed warm-up read before the timed
 one, so its timed read hits the page cache; the Vortex reader therefore does **not** use direct
@@ -100,8 +103,8 @@ are written straight through as root chunks via `ChunkedLayoutStrategy`, and rea
 - Vortex: each GPU-decoded field is copied back and compared against the same field decoded
   on the CPU, through Arrow with a pinned target type.
 
-Verification runs inline, so timings from a verifying run are not comparable to a plain one —
-run it as its own pass:
+The check runs before each timed measurement and is not included in it, so a verifying run
+still publishes comparable numbers — it just takes considerably longer:
 
 ```bash
 cargo run -p compress-bench --profile release_debug \
