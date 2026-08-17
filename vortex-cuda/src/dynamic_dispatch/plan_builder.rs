@@ -149,7 +149,11 @@ fn is_dyn_dispatch_cast_compatible(array: &ArrayRef) -> bool {
     // LOAD/BITUNPACK materialize directly into the target-width output type.
     matches!(
         (source_ptype, target_ptype),
-        (PType::U8, PType::I16) | (PType::U16, PType::I32) | (PType::U32, PType::I64)
+        (PType::U8, PType::U32)
+            | (PType::U16, PType::U32)
+            | (PType::U8, PType::I16)
+            | (PType::U16, PType::I32)
+            | (PType::U32, PType::I64)
     )
 }
 

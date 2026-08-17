@@ -184,6 +184,20 @@ impl CudaSession {
             .load_function(module_name, type_suffixes, &self.context)
     }
 
+    pub(crate) fn load_named_function_with_suffixes(
+        &self,
+        module_name: &str,
+        function_name: &str,
+        type_suffixes: &[&str],
+    ) -> VortexResult<cudarc::driver::CudaFunction> {
+        self.kernel_loader.load_named_function(
+            module_name,
+            function_name,
+            type_suffixes,
+            &self.context,
+        )
+    }
+
     /// Get a handle to the exporter that converts Vortex arrays to `ArrowDeviceArray`.
     pub fn export_device_array(&self) -> &Arc<dyn ExportDeviceArray> {
         &self.export_device_array

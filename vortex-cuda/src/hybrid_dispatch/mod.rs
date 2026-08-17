@@ -57,7 +57,10 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 
 use crate::dynamic_dispatch::plan_builder::DispatchPlan;
+use crate::dynamic_dispatch::plan_builder::FusedPlan;
+use crate::dynamic_dispatch::plan_builder::MaterializedPlan;
 use crate::executor::CudaArrayExt;
+use crate::executor::CudaDispatchMode;
 use crate::executor::CudaExecutionCtx;
 
 /// Try to execute `array` on the GPU, attempting four strategies in order:
@@ -77,8 +80,6 @@ pub async fn try_gpu_dispatch(
     array: &ArrayRef,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<Canonical> {
-    use crate::executor::CudaDispatchMode;
-
     trace!(encoding = %array.encoding_id(), dtype = ?array.dtype(), len = array.len(), "try GPU dispatch");
 
     // Short-circuit: standalone-only skips the plan builder entirely.
@@ -92,7 +93,28 @@ pub async fn try_gpu_dispatch(
             .await;
     }
 
-    match DispatchPlan::new(array, ctx.dispatch_mode())? {
+    let plan = prepare_gpu_dispatch(array, ctx.dispatch_mode())?;
+    execute_prepared_gpu_dispatch(array, plan, ctx).await
+}
+
+/// Build the CPU-only portion of a GPU dispatch.
+///
+/// This inspects array metadata and buffers but performs no CUDA allocation, copy, or launch, so
+/// callers may run it on planner threads before submitting the result to one CUDA stream owner.
+pub fn prepare_gpu_dispatch(
+    array: &ArrayRef,
+    mode: CudaDispatchMode,
+) -> VortexResult<DispatchPlan> {
+    DispatchPlan::new(array, mode)
+}
+
+/// Materialize and submit a dispatch plan previously built by [`prepare_gpu_dispatch`].
+pub async fn execute_prepared_gpu_dispatch(
+    array: &ArrayRef,
+    plan: DispatchPlan,
+    ctx: &mut CudaExecutionCtx,
+) -> VortexResult<Canonical> {
+    match plan {
         DispatchPlan::Standalone => {
             trace!(encoding = %array.encoding_id(), "standalone dispatch");
             ctx.cuda_session()
@@ -149,6 +171,18 @@ pub async fn try_gpu_dispatch(
     }
 }
 
+/// Materialize compatible fused plans and submit them as one batched CUDA kernel.
+pub async fn execute_fused_gpu_dispatch_batch(
+    plans: Vec<(usize, FusedPlan)>,
+    ctx: &mut CudaExecutionCtx,
+) -> VortexResult<Vec<Canonical>> {
+    let mut materialized = Vec::with_capacity(plans.len());
+    for (len, plan) in plans {
+        materialized.push((len, plan.materialize(ctx).await?));
+    }
+    MaterializedPlan::execute_batch(materialized, ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -174,8 +208,12 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
 
+    use super::execute_fused_gpu_dispatch_batch;
+    use super::prepare_gpu_dispatch;
     use crate::CanonicalCudaExt;
+    use crate::dynamic_dispatch::DispatchPlan;
     use crate::executor::CudaArrayExt;
+    use crate::executor::CudaDispatchMode;
     use crate::session::CudaSession;
 
     fn for_bp<T: NativePType + Into<Scalar>>(values: Vec<T>, reference: T) -> ArrayRef {
@@ -215,6 +253,37 @@ mod tests {
             .await?
             .into_array();
         assert_arrays_eq!(arr, gpu, &mut cpu_ctx);
+        Ok(())
+    }
+
+    #[crate::test]
+    async fn test_fused_batch() -> VortexResult<()> {
+        let mut cpu_ctx = array_session().create_execution_ctx();
+        let mut cuda_ctx =
+            CudaSession::create_execution_ctx(&crate::cuda_session()).vortex_expect("ctx");
+        let arrays = vec![
+            for_bp((0..4096).map(|i| (i % 127) as u32).collect(), 1000u32),
+            for_bp((0..3072).map(|i| (i % 113) as u32).collect(), 2000u32),
+        ];
+        let plans = arrays
+            .iter()
+            .map(|array| {
+                let plan = prepare_gpu_dispatch(array, CudaDispatchMode::DynDispatchOnly)?;
+                let DispatchPlan::Fused(plan) = plan else {
+                    vortex::error::vortex_bail!("expected a fully fused CUDA plan");
+                };
+                Ok((array.len(), plan))
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        let decoded = execute_fused_gpu_dispatch_batch(plans, &mut cuda_ctx).await?;
+        for (expected, actual) in arrays.into_iter().zip(decoded) {
+            assert_arrays_eq!(
+                expected,
+                actual.into_host().await?.into_array(),
+                &mut cpu_ctx
+            );
+        }
         Ok(())
     }
 
