@@ -119,3 +119,7 @@ harness = false
 [[bench]]
 name = "arrow_binary_cuda"
 harness = false
+
+[[bench]]
+name = "dispatch_micro_cuda"
+harness = false
