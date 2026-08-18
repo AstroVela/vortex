@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 
 use smallvec::smallvec;
@@ -11,12 +12,14 @@ use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use crate::ArrayRef;
@@ -123,34 +126,69 @@ pub struct VarBinViewDataParts {
     pub validity: Validity,
 }
 
-/// A validity mask that is only materialized when it is first queried.
-struct LazyNulls<'a> {
-    validity: &'a Validity,
-    len: usize,
-    mask: Option<Mask>,
+/// Invokes `f` for each maximal run of equal validity in `mask[from..]`, in order.
+fn for_each_validity_run(
+    mask: &Mask,
+    from: usize,
+    mut f: impl FnMut(Range<usize>, bool) -> VortexResult<()>,
+) -> VortexResult<()> {
+    let len = mask.len();
+    let bits = match mask.bit_buffer() {
+        AllOr::All => return f(from..len, true),
+        AllOr::None => return f(from..len, false),
+        AllOr::Some(bits) => bits,
+    };
+
+    let mut prev = from;
+    for (start, end) in bits.set_slices() {
+        if end <= from {
+            continue;
+        }
+        let start = start.max(from);
+        if start > prev {
+            f(prev..start, false)?;
+        }
+        f(start..end, true)?;
+        prev = end;
+    }
+    if prev < len {
+        f(prev..len, false)?;
+    }
+    Ok(())
 }
 
-impl<'a> LazyNulls<'a> {
-    fn new(validity: &'a Validity, len: usize) -> Self {
-        Self {
-            validity,
-            len,
-            mask: None,
-        }
+/// Validates a run of non-null views, `offset` being the index of its first view.
+fn validate_run(
+    views: &[BinaryView],
+    offset: usize,
+    buffers: &Arc<[ByteBuffer]>,
+    check_view: &impl Fn(&BinaryView) -> Result<(), &'static str>,
+) -> VortexResult<()> {
+    match views.iter().position(|view| check_view(view).is_err()) {
+        None => Ok(()),
+        Some(idx) => Err(invalid_view_error(
+            offset + idx,
+            &views[idx],
+            buffers,
+            check_view,
+        )),
     }
+}
 
-    #[allow(clippy::disallowed_methods)]
-    fn is_null(&mut self, idx: usize) -> VortexResult<bool> {
-        if self.mask.is_none() {
-            let mut ctx = legacy_session().create_execution_ctx();
-            self.mask = Some(self.validity.execute_mask(self.len, &mut ctx)?);
-        }
-        Ok(!self
-            .mask
-            .as_ref()
-            .vortex_expect("mask was just materialized")
-            .value(idx))
-    }
+/// Assembles the error for a malformed view. Kept out of the validation loops, which only ever
+/// need to know whether a view is malformed.
+#[cold]
+fn invalid_view_error(
+    idx: usize,
+    view: &BinaryView,
+    buffers: &Arc<[ByteBuffer]>,
+    check_view: &impl Fn(&BinaryView) -> Result<(), &'static str>,
+) -> VortexError {
+    let reason = check_view(view).err().unwrap_or("view is malformed");
+    let buffer_lens = buffers.iter().map(|buf| buf.len()).collect::<Vec<_>>();
+    vortex_err!(
+        InvalidArgument: "view at index {idx} is invalid: {reason}. view: {view:?}, buffer lengths: {buffer_lens:?}"
+    )
 }
 
 impl VarBinViewData {
@@ -327,9 +365,9 @@ impl VarBinViewData {
     ///
     /// This function checks all the invariants required by `VarBinViewArray::new_unchecked`,
     /// including the views of null elements: those are never read as values, but kernels are free
-    /// to touch them, so a malformed view is still an out-of-bounds read waiting to happen.
-    /// Since such views are commonly written by other producers, they are replaced with empty
-    /// views rather than rejected.
+    /// to touch them, so a malformed view is still an out-of-bounds read waiting to happen. Since
+    /// producers are allowed to leave anything in them, such views are replaced with empty views
+    /// rather than rejected.
     ///
     /// The returned buffer is the input buffer when nothing had to be fixed, is patched in place
     /// when this is the only reference to it, and is a fixed-up copy otherwise.
@@ -359,6 +397,7 @@ impl VarBinViewData {
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn validate_or_fix_views<F>(
         views: Buffer<BinaryView>,
         buffers: &Arc<[ByteBuffer]>,
@@ -368,102 +407,102 @@ impl VarBinViewData {
     where
         F: Fn(&[u8]) -> bool,
     {
-        let validate_view = |idx: usize, view: &BinaryView| -> VortexResult<()> {
+        // Returns a static reason rather than a `VortexError` so that the scans below never
+        // allocate: the message is only assembled by `invalid_view_error` when we actually bail.
+        let check_view = |view: &BinaryView| -> Result<(), &'static str> {
             if view.is_inlined() {
-                // Validate the inline bytestring
                 let bytes = &view.as_inlined().data[..view.len() as usize];
-                vortex_ensure!(
-                    validator(bytes),
-                    InvalidArgument: "view at index {idx}: inlined bytes failed utf-8 validation"
-                );
+                if !validator(bytes) {
+                    return Err("inlined bytes failed utf-8 validation");
+                }
             } else {
-                // Validate the view pointer
                 let view = view.as_view();
-                let buf_index = view.buffer_index as usize;
                 let start_offset = view.offset as usize;
                 let end_offset = start_offset.saturating_add(view.size as usize);
 
-                let buf = buffers.get(buf_index).ok_or_else(||
-                    vortex_err!(InvalidArgument: "view at index {idx} references invalid buffer: {buf_index} out of bounds for VarBinViewData with {} buffers",
-                        buffers.len()))?;
+                let Some(buf) = buffers.get(view.buffer_index as usize) else {
+                    return Err("buffer index out of bounds");
+                };
+                if start_offset >= buf.len() {
+                    return Err("start offset out of bounds for the referenced buffer");
+                }
+                if end_offset > buf.len() {
+                    return Err("end offset out of bounds for the referenced buffer");
+                }
 
-                vortex_ensure!(
-                    start_offset < buf.len(),
-                    InvalidArgument: "start offset {start_offset} out of bounds for buffer {buf_index} with size {}",
-                    buf.len(),
-                );
-
-                vortex_ensure!(
-                    end_offset <= buf.len(),
-                    InvalidArgument: "end offset {end_offset} out of bounds for buffer {buf_index} with size {}",
-                    buf.len(),
-                );
-
-                // Make sure the prefix data matches the buffer data.
                 let bytes = &buf[start_offset..end_offset];
-                vortex_ensure!(
-                    view.prefix == bytes[..4],
-                    InvalidArgument: "VarBinView prefix does not match full string"
-                );
-
-                // Validate the full string
-                vortex_ensure!(
-                    validator(bytes),
-                    InvalidArgument: "view at index {idx}: outlined bytes fails utf-8 validation"
-                );
+                if view.prefix != bytes[..4] {
+                    return Err("prefix does not match the referenced value");
+                }
+                if !validator(bytes) {
+                    return Err("outlined bytes failed utf-8 validation");
+                }
             }
             Ok(())
         };
 
         let len = views.len();
-        // Executing the validity can be expensive, and it is only needed to decide the fate of a
-        // malformed view, so it is materialized at most once and only when one is found.
-        let mut nulls = LazyNulls::new(validity, len);
+        let empty = BinaryView::empty_view();
 
+        // The overwhelmingly common case is a buffer with nothing to fix, so scan it in one pass
+        // that knows nothing about validity, and only materialize the mask if something is wrong.
+        let Some(first_bad) = views.iter().position(|view| check_view(view).is_err()) else {
+            return Ok(views);
+        };
+
+        let mut ctx = legacy_session().create_execution_ctx();
+        let mask = validity.execute_mask(len, &mut ctx)?;
+        if mask.value(first_bad) {
+            return Err(invalid_view_error(
+                first_bad,
+                &views[first_bad],
+                buffers,
+                &check_view,
+            ));
+        }
+
+        // Views before `first_bad` are known to be valid, the rest is validated a run of equal
+        // validity at a time, so that neither loop below branches on validity per element.
         match views.try_into_mut() {
-            // We hold the only reference to the views, so malformed views can be fixed in place as
-            // part of the single validation pass.
+            // We hold the only reference to the views, so they can be fixed up in place.
             Ok(mut views) => {
-                for (idx, view) in views.as_mut_slice().iter_mut().enumerate() {
-                    if let Err(e) = validate_view(idx, view) {
-                        if !nulls.is_null(idx)? {
-                            return Err(e);
+                let fixed = views.as_mut_slice();
+                for_each_validity_run(&mask, first_bad, |range, valid| {
+                    if valid {
+                        validate_run(&fixed[range.clone()], range.start, buffers, &check_view)
+                    } else {
+                        for view in &mut fixed[range] {
+                            *view = if check_view(view).is_ok() {
+                                *view
+                            } else {
+                                empty
+                            };
                         }
-                        *view = BinaryView::empty_view();
+                        Ok(())
                     }
-                }
+                })?;
                 Ok(views.freeze())
             }
-            // The views are shared, so validate them first and only pay for a copy if a malformed
-            // view under a null is actually found.
+            // The views are shared, so copy them over, dropping in an empty view for every
+            // malformed view under a null.
             Err(views) => {
-                let Some((first_bad, e)) = views
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, view)| validate_view(idx, view).err().map(|e| (idx, e)))
-                else {
-                    return Ok(views);
-                };
-                if !nulls.is_null(first_bad)? {
-                    return Err(e);
-                }
-
-                // Everything before the first malformed view is known to be valid, the rest is
-                // validated (and fixed) as it is copied over.
                 let mut fixed = BufferMut::with_capacity(len);
                 fixed.extend_from_slice(&views[..first_bad]);
-                fixed.push(BinaryView::empty_view());
-                for (idx, view) in views.iter().enumerate().skip(first_bad + 1) {
-                    match validate_view(idx, view) {
-                        Ok(()) => fixed.push(*view),
-                        Err(e) => {
-                            if !nulls.is_null(idx)? {
-                                return Err(e);
-                            }
-                            fixed.push(BinaryView::empty_view());
+                for_each_validity_run(&mask, first_bad, |range, valid| {
+                    if valid {
+                        validate_run(&views[range.clone()], range.start, buffers, &check_view)?;
+                        fixed.extend_from_slice(&views[range]);
+                    } else {
+                        for view in &views[range] {
+                            fixed.push(if check_view(view).is_ok() {
+                                *view
+                            } else {
+                                empty
+                            });
                         }
                     }
-                }
+                    Ok(())
+                })?;
                 Ok(fixed.freeze())
             }
         }

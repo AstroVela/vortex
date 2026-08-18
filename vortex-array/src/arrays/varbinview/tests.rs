@@ -194,6 +194,59 @@ fn validate_or_fix_all_invalid(#[case] shared: bool) -> VortexResult<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::owned(false)]
+#[case::shared(true)]
+fn validate_or_fix_alternating_validity_runs(#[case] shared: bool) -> VortexResult<()> {
+    let views = Buffer::copy_from(vec![
+        valid_view(),
+        invalid_view(),
+        valid_view(),
+        valid_view(),
+        invalid_view(),
+        valid_view(),
+    ]);
+    let _shared = shared.then(|| views.clone());
+
+    let fixed = VarBinViewData::validate_or_fix(
+        views,
+        &data_buffers(),
+        &nullable_utf8(),
+        &validity_from([true, false, false, true, false, true]),
+    )?;
+
+    assert_eq!(
+        fixed.as_slice(),
+        [
+            valid_view(),
+            BinaryView::empty_view(),
+            valid_view(),
+            valid_view(),
+            BinaryView::empty_view(),
+            valid_view(),
+        ]
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::owned(false)]
+#[case::shared(true)]
+fn validate_or_fix_rejects_invalid_non_null_view_after_a_fix(#[case] shared: bool) {
+    let views = Buffer::copy_from(vec![invalid_view(), valid_view(), invalid_view()]);
+    let _shared = shared.then(|| views.clone());
+
+    // The first malformed view is under a null and is fixed, the second one is not.
+    let result = VarBinViewData::validate_or_fix(
+        views,
+        &data_buffers(),
+        &nullable_utf8(),
+        &validity_from([false, true, true]),
+    );
+
+    assert!(matches!(result, Err(VortexError::InvalidArgument(_, _))));
+}
+
 #[test]
 fn decode_fixes_invalid_null_views() -> VortexResult<()> {
     let views = Buffer::copy_from(vec![valid_view(), invalid_view()]);
