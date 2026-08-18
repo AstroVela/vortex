@@ -85,9 +85,13 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     }
 
     __shared__ __align__(16) uint8_t s_buf_all[WARPS_PER_BLOCK_MAX * WARP_BUF_BYTES];
+#ifndef ONPAIR_DIRECT_HIGH
     __shared__ __align__(16) uint32_t s_requests[WARPS_PER_BLOCK_MAX][REQUESTS_PER_WARP];
+#endif
     uint8_t *s_buf_base = &s_buf_all[warp_id * WARP_BUF_BYTES];
+#ifndef ONPAIR_DIRECT_HIGH
     uint32_t *requests = s_requests[warp_id];
+#endif
 
     const uint64_t base_i = chunk * TOKENS_PER_WARP + (uint64_t)lane;
 #ifdef ONPAIR_KEEP_LO_COUNT
@@ -197,6 +201,37 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     }
 #endif
 
+#ifdef ONPAIR_DIRECT_HIGH
+    // Direct-high kernels trade the dense shared request queue for lower shared
+    // memory use. Each thread writes the suffixes belonging to its own codes.
+#ifdef ONPAIR_KEEP_LO_COUNT
+#pragma unroll
+    for (int k = 0; k < (int)ONPAIR_KEEP_LO_COUNT; ++k) {
+        const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+        emit_shared_bytes(s_buf, excl[k], low_length, lo[k]);
+    }
+#pragma unroll
+    for (int k = (int)ONPAIR_KEEP_LO_COUNT; k < 6; ++k) {
+        const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+        const uint2 low = *reinterpret_cast<const uint2 *>(dict_s8_lo + (size_t)code[k] * 8u);
+        emit_shared_bytes(s_buf, excl[k], low_length, low);
+    }
+#else
+#pragma unroll
+    for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
+        const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+        emit_shared_bytes(s_buf, excl[k], low_length, lo[k]);
+    }
+#endif
+#pragma unroll
+    for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
+        if (len[k] > 8u) {
+            const uint2 high = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)code[k] * 8u);
+            emit_high_bytes(s_buf, excl[k] + 8u, len[k] - 8u, high);
+        }
+    }
+    __syncwarp();
+#else
     // Build the identical plane-major request stream first, so dense lane N
     // still owns request N and the first high gather can be issued early.
     uint32_t high_count = 0u;
@@ -265,6 +300,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
         }
     }
     __syncwarp();
+#endif
 
     const uint32_t head = head_pre < warp_total ? head_pre : warp_total;
     if ((uint32_t)lane < head) {

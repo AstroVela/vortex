@@ -196,3 +196,59 @@ annotate individual codes.
 The code stream remains the original two-byte `u16` sequence. Lengths still
 come from the separate packed four-bit table. No code bits, dictionary entries,
 or serialized data are changed.
+
+## Data-to-kernel decision tree
+
+`onpair_decompress_selector.cuh` records the measured data-only dispatch
+policy as compiled `constexpr` code. The caller supplies:
+
+- `code_bits`: 12 or 16;
+- `max_chunk_bytes_192`: the maximum decoded span of any 192 adjacent codes
+  using the launch's actual chunk boundaries;
+- `dictionary_entries`: the number of entries in the staged dictionary;
+- `token_count` and `gt8_token_count`: the total code occurrences and the
+  occurrences whose decoded dictionary entry exceeds eight bytes.
+
+The division tree is:
+
+~~~text
+code_bits
+├── 12
+│   ├── max_chunk_bytes_192 <= 1728
+│   │   └── onpair_decompress_6tpt_cap9_keep1_lb6
+│   ├── max_chunk_bytes_192 <= 2304
+│   │   └── onpair_decompress_6tpt_cap12_lb5
+│   └── otherwise
+│       └── onpair_decompress_6tpt
+├── 16
+│   ├── dictionary_entries <= 384
+│   │   and gt8_token_count / token_count <= 1%
+│   │   └── onpair_decompress_6tpt_directhi_keep1_lb6
+│   └── otherwise
+│       └── onpair_decompress_6tpt_directhi_lb5
+└── unsupported or empty
+    └── onpair_old_2
+~~~
+
+The 12-bit branch uses a maximum rather than average length because the cap-9
+kernel has no overflow path. Even a rare cluster of long codes can exceed
+1,728 bytes and would make that launch incorrect. Cap-12 retains its direct
+overflow fallback; plain 6-TPT avoids the frequent fallback penalty when any
+192-code chunk exceeds 2,304 bytes.
+
+The 16-bit branch is a resource/latency tradeoff, not a correctness boundary.
+Direct-high removes the 6,144-byte shared request queue. The keep-one variant
+also delays five low-plane loads, reducing the live set to 40 registers and
+allowing greater occupancy. This helps small, almost-all-short dictionaries
+whose delayed loads remain cache-resident. Large dictionaries need the
+general 48-register variant to retain memory-level parallelism.
+
+The selector exposes `DirectHighKeep3Lb4` for explicit caller experiments,
+but the generic tree does not choose it. It was best for the measured TPC-H
+`l_comment` cell, while no robust cross-dataset data threshold justified
+making it a general branch. Likewise, Amazon book reviews favored the legacy
+kernel. These remain documented overrides, not dataset-name checks.
+
+No branch changes the codes, reorders the dictionary, embeds lengths into code
+bits, or changes serialized storage. All branches use the original u16 codes,
+the split 8-byte low/high planes, and packed four-bit lengths.

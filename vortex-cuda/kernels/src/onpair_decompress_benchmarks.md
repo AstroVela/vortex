@@ -531,3 +531,49 @@ Raw final timings are under
 `/tmp/onpair-cap9-final-controlled-20260817/`. Final profiles are
 `/tmp/onpair-cap9-final-ncu-{base,candidate}.csv`. The candidate PTX SHA-256 is
 `716966dc5ba9dbd2ff89cbe30715c7165ee72df67e43dd7fe2cd9d2793624c26`.
+
+## Final 12-bit and 16-bit selector search
+
+The final search covered 32 non-empty columns from Amazon book reviews,
+ClickBench, FineWeb, TPC-H SF10, and Wikipedia at both 12 and 16 bits. Each cell
+used ten fresh measured processes (five in each kernel order), 100 timed
+iterations/process, serial execution, and full GPU/CPU byte validation. Each
+bit width had 320 measured processes; all 640 processes validated. Results
+apply to the GH200 sm_90 system described above.
+
+The capacity-safe 12-bit selector reduced the sum of per-column medians from
+12.288316 ms to 10.751556 ms, a 14.29% throughput improvement. Its aggregate
+output rate was 1.004 TB/s. It won 27 of 32 columns.
+
+For 16-bit data, the general direct-high kernel compiled to 48 registers and
+24,832 bytes shared memory. Removing the dense high-request queue improved the
+32-column output rate from 0.823 TB/s for plain 6-TPT to 0.833 TB/s. Selecting
+the 40-register keep-one variant only for dictionaries with at most 384 entries
+and at most 1% token-weighted long codes reached 0.834 TB/s, 1.38% faster than
+plain 6-TPT by total time.
+
+Representative output rates are decimal TB/s:
+
+| column | 12-bit legacy | 12-bit selected | 16-bit legacy | 16-bit reported best |
+|---|---:|---:|---:|---:|
+| ClickBench `URL` | 0.835 | 0.974 | 0.900 | 1.006 |
+| TPC-H `l_comment` | 1.078 | 1.245 | 0.621 | 0.714 |
+| Amazon book-reviews `text` | 0.786 | 0.945 | 0.570 | 0.570 |
+| FineWeb `text` | 0.757 | 0.881 | 0.518 | 0.621 |
+| Wikipedia `text` | 0.707 | 0.817 | 0.510 | 0.591 |
+
+The 16-bit reported-best column uses two measured overrides that are not
+encoded in the generic selector: legacy for Amazon book reviews and
+`onpair_decompress_6tpt_directhi_keep3_lb4` for TPC-H `l_comment`. The
+data-only tree intentionally avoids dispatching on dataset names.
+
+The semantically renamed kernels reproduce the measured experimental aliases:
+
+| committed kernel | measured alias | registers | shared/block | spills |
+|---|---|---:|---:|---:|
+| `onpair_decompress_6tpt_directhi_lb5` | `onpair_decompress_6tpt_window32_lb5` | 48 | 24,832 B | 0 B |
+| `onpair_decompress_6tpt_directhi_keep1_lb6` | `onpair_decompress_6tpt_cap10_lb6` | 40 | 24,832 B | 0 B |
+| `onpair_decompress_6tpt_directhi_keep3_lb4` | `onpair_decompress_6tpt_lb2` | 64 | 24,832 B | 0 B |
+
+Raw controlled results are in `/tmp/onpair16-search/` and
+`/tmp/onpair-allcols-stages-20260817/`.
