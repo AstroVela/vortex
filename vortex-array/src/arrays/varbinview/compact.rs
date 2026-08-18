@@ -5,20 +5,103 @@
 //! be dropped.
 
 use std::ops::Range;
+use std::sync::Arc;
 
+use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
 use crate::ExecutionCtx;
 use crate::arrays::VarBinViewArray;
+use crate::arrays::varbinview::BinaryView;
 use crate::arrays::varbinview::Ref;
+use crate::arrays::varbinview::array::for_each_validity_run;
+use crate::buffer::BufferHandle;
 use crate::builders::VarBinViewBuilder;
 
 const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.5;
 const MIN_RETAINED_BYTES_PER_ROW_TO_CHECK_COMPACTION: u64 = 128;
 
 impl VarBinViewArray {
+    /// Returns a compacted copy of the input array: the views of null slots are emptied, and then
+    /// wasted buffer space is evicted.
+    ///
+    /// The two steps are ordered, not independent. Compaction decides which bytes of a buffer are
+    /// live from the views of the non-null slots alone, so it is free to
+    /// slice a buffer down, drop it, or renumber it out from under a view left behind in a null
+    /// slot: emptying afterwards would mean compacting an array whose null views may be dangling,
+    /// and remapping such a view indexes the buffer lookup by its (arbitrary) buffer index.
+    /// Emptying first removes those views before compaction ever looks at them, and costs
+    /// compaction nothing, since its measurements ignore null slots either way.
+    pub fn compact(&self, ctx: &mut ExecutionCtx) -> VortexResult<VarBinViewArray> {
+        self.empty_null_views(ctx)?.compact_buffers(ctx)
+    }
+
+    /// Returns a copy of the input array with the view of every null slot replaced by an empty
+    /// view.
+    ///
+    /// Producers are free to leave anything in the view of a null slot, and Vortex itself does:
+    /// masking an array keeps the views of the rows it nulls out. Those views are never read as
+    /// values, but they are still followed by anything that walks the views buffer, they keep the
+    /// bytes of the rows they point at alive, and they are written to disk as they are.
+    ///
+    /// The array is returned untouched when every null slot already holds an empty view, so the
+    /// common case neither copies the views nor touches the data buffers.
+    pub fn empty_null_views(&self, ctx: &mut ExecutionCtx) -> VortexResult<VarBinViewArray> {
+        // Device views are left to the caller: they cannot be inspected without a copy back.
+        if self.views_handle().is_on_device() {
+            return Ok(self.clone());
+        }
+
+        let validity = self.as_ref().validity()?;
+        let mask = validity.execute_mask(self.len(), ctx)?;
+        if mask.all_true() {
+            return Ok(self.clone());
+        }
+
+        let views = self.views();
+        let empty = BinaryView::empty_view();
+
+        // Find the first view to empty, walking a run of equal validity at a time so that the scan
+        // itself never branches on validity.
+        let mut first_dirty = None;
+        for_each_validity_run(&mask, 0, |range, valid| {
+            if !valid && first_dirty.is_none() {
+                first_dirty = views[range.clone()]
+                    .iter()
+                    .position(|view| *view != empty)
+                    .map(|idx| range.start + idx);
+            }
+            Ok(())
+        })?;
+        let Some(first_dirty) = first_dirty else {
+            return Ok(self.clone());
+        };
+
+        // Non-null runs are copied over as they are, null runs are filled with empty views.
+        let mut emptied = BufferMut::with_capacity(views.len());
+        emptied.extend_from_slice(&views[..first_dirty]);
+        for_each_validity_run(&mask, first_dirty, |range, valid| {
+            if valid {
+                emptied.extend_from_slice(&views[range]);
+            } else {
+                emptied.push_n(empty, range.len());
+            }
+            Ok(())
+        })?;
+
+        // SAFETY: only the views of null slots changed, and an empty view is always valid.
+        Ok(unsafe {
+            VarBinViewArray::new_handle_unchecked(
+                BufferHandle::new_host(emptied.freeze().into_byte_buffer()),
+                Arc::clone(self.data_buffers()),
+                self.dtype().clone(),
+                validity,
+            )
+        })
+    }
+
     /// Returns a compacted copy of the input array, where all wasted space has been cleaned up. This
     /// operation can be very expensive, in the worst case copying all existing string data into
     /// a new allocation.
@@ -199,17 +282,88 @@ impl BufferUtilization {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rstest::rstest;
+    use vortex_buffer::Buffer;
+    use vortex_buffer::ByteBuffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
     use crate::arrays::VarBinArray;
     use crate::arrays::VarBinViewArray;
+    use crate::arrays::varbinview::BinaryView;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
+    use crate::validity::Validity;
+
+    /// An array of three rows whose middle row is null, `null_view` being the view left in it.
+    /// The two non-null rows reference the last 20 bytes of a 1KiB buffer, which is wasteful
+    /// enough for compaction to slice the buffer down to just that range.
+    fn array_with_null_view(null_view: BinaryView) -> VarBinViewArray {
+        let data = ByteBuffer::copy_from(vec![b'a'; 1024]);
+        let valid_view = BinaryView::new_ref(20, *b"aaaa", 0, 900);
+        let views = Buffer::copy_from(vec![valid_view, null_view, valid_view]);
+
+        // SAFETY: the view of the null slot is deliberately left as the caller wants it, mimicking
+        // an array written by another producer. It is never read as a value.
+        unsafe {
+            VarBinViewArray::new_unchecked(
+                views,
+                Arc::from([data]),
+                DType::Utf8(Nullability::Nullable),
+                Validity::from_iter([true, false, true]),
+            )
+        }
+    }
+
+    /// Every shape of leftover view must come out empty. Note that emptying has to happen before
+    /// compaction, not after: compacting this array on its own panics remapping the null view,
+    /// whose buffer index is out of range for the buffers compaction keeps.
+    #[rstest]
+    #[case::out_of_range_buffer(BinaryView::new_ref(13, *b"AAAA", 7, 0))]
+    #[case::leftover_reference(BinaryView::new_ref(20, *b"aaaa", 0, 0))]
+    #[case::leftover_inlined(BinaryView::new_inlined(b"leftover"))]
+    fn compact_empties_null_views(#[case] null_view: BinaryView) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let array = array_with_null_view(null_view);
+
+        let compacted = array.compact(&mut ctx)?;
+
+        assert_eq!(compacted.views()[1], BinaryView::empty_view());
+        let compacted_bytes: usize = compacted.data_buffers().iter().map(|buf| buf.len()).sum();
+        assert!(compacted_bytes < 1024, "buffers were not compacted");
+        assert_arrays_eq!(
+            compacted,
+            VarBinViewArray::from_iter_nullable_str([
+                Some("aaaaaaaaaaaaaaaaaaaa"),
+                None,
+                Some("aaaaaaaaaaaaaaaaaaaa"),
+            ]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_null_views_leaves_clean_arrays_untouched() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let array = array_with_null_view(BinaryView::empty_view());
+
+        let emptied = array.empty_null_views(&mut ctx)?;
+
+        assert_eq!(
+            emptied.views().as_ptr(),
+            array.views().as_ptr(),
+            "clean views must not be copied"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_optimize_compacts_buffers() {
         let mut ctx = array_session().create_execution_ctx();

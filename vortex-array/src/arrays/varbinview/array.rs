@@ -127,7 +127,7 @@ pub struct VarBinViewDataParts {
 }
 
 /// Invokes `f` for each maximal run of equal validity in `mask[from..]`, in order.
-fn for_each_validity_run(
+pub(super) fn for_each_validity_run(
     mask: &Mask,
     from: usize,
     mut f: impl FnMut(Range<usize>, bool) -> VortexResult<()>,
