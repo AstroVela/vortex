@@ -2,7 +2,7 @@
 name = "vortex-float-quant"
 authors = { workspace = true }
 categories = { workspace = true }
-description = "Vortex float quantization array encoding"
+description = "Vortex lossless float transform array encodings"
 edition = { workspace = true }
 homepage = { workspace = true }
 include = { workspace = true }
@@ -18,6 +18,7 @@ vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
 vortex-session = { workspace = true }
+vortex-utils = { workspace = true }
 
 [dev-dependencies]
 vortex-array = { workspace = true, features = ["_test-harness"] }

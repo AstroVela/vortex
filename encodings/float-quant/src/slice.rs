@@ -10,6 +10,9 @@ use vortex_array::arrays::slice::SliceReduce;
 use vortex_array::dtype::PType;
 use vortex_error::VortexResult;
 
+use crate::FloatMult;
+use crate::FloatMultArrayExt;
+use crate::FloatMultArraySlotsExt;
 use crate::FloatQuant;
 use crate::FloatQuantArraySlotsExt;
 
@@ -21,6 +24,20 @@ impl SliceReduce for FloatQuant {
                 array.secondary().slice(range)?,
                 PType::try_from(array.dtype())?,
                 array.data().k,
+            )?
+            .into_array(),
+        ))
+    }
+}
+
+impl SliceReduce for FloatMult {
+    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+        Ok(Some(
+            FloatMult::try_new(
+                array.primary().slice(range.clone())?,
+                array.secondary().slice(range)?,
+                PType::try_from(array.dtype())?,
+                array.base(),
             )?
             .into_array(),
         ))

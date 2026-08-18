@@ -27,6 +27,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     },
     added: &[
         EditionMember::array(&"vortex.block_residual"),
+        EditionMember::array(&"vortex.float_mult"),
         EditionMember::array(&"vortex.float_quant"),
         EditionMember::array(&"vortex.map"),
         EditionMember::array(&"vortex.ordered_float"),

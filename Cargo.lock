@@ -10205,6 +10205,7 @@ dependencies = [
  "vortex-buffer",
  "vortex-error",
  "vortex-session",
+ "vortex-utils",
 ]
 
 [[package]]

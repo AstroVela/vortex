@@ -18,6 +18,7 @@ use vortex_array::dtype::Nullability;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+use vortex_float_quant::FloatMult;
 use vortex_float_quant::FloatQuant;
 use vortex_range_entropy::BlockResidual;
 use vortex_range_entropy::OrderedFloat;
@@ -103,6 +104,18 @@ fn test_f32_does_not_use_float_quant() -> VortexResult<()> {
     let compressed =
         BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
     assert!(!compressed.is::<FloatQuant>());
+    Ok(())
+}
+
+#[test]
+fn test_integer_f32_uses_float_mult() -> VortexResult<()> {
+    let values = (0u32..65_536)
+        .map(|index| ((index.wrapping_mul(7_919)) % 65_537) as f32)
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let compressed =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+    assert!(compressed.is::<FloatMult>());
     Ok(())
 }
 

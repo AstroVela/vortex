@@ -33,6 +33,7 @@ use vortex_arrow::ArrowSessionExt;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::float::FloatMultScheme;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
 use vortex_btrblocks::schemes::range_entropy::RangeEntropyScheme;
@@ -40,6 +41,9 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_float_quant::FloatMult;
+use vortex_float_quant::FloatMultArrayExt;
+use vortex_float_quant::estimate_float_mult_constant_base;
 use vortex_pco::Pco;
 use vortex_range_entropy::BitSplitCodec;
 use vortex_range_entropy::PatchedFoRCodec;
@@ -99,6 +103,13 @@ enum FloatMultPrototype {
 }
 
 impl FloatMultPrototype {
+    fn base(&self) -> f64 {
+        match self {
+            Self::F32 { base, .. } => f64::from(*base),
+            Self::F64 { base, .. } => *base,
+        }
+    }
+
     fn encoded_size(&self) -> u64 {
         let (primary, secondary) = match self {
             Self::F32 {
@@ -1018,14 +1029,25 @@ fn main() -> VortexResult<()> {
         .map(|column| column.primitive.nbytes())
         .sum::<u64>();
     let baseline = BtrBlocksCompressorBuilder::default()
-        .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
+        .exclude_schemes([
+            FloatMultScheme.id(),
+            FloatQuantScheme.id(),
+            OrderedBlockResidualScheme.id(),
+        ])
         .build();
     let range_candidate = BtrBlocksCompressorBuilder::default()
-        .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
+        .exclude_schemes([
+            FloatMultScheme.id(),
+            FloatQuantScheme.id(),
+            OrderedBlockResidualScheme.id(),
+        ])
         .with_new_scheme(&RangeEntropyScheme)
         .build();
     let default_without_block_residual = BtrBlocksCompressorBuilder::default()
         .exclude_schemes([OrderedBlockResidualScheme.id()])
+        .build();
+    let default_without_float_mult = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([FloatMultScheme.id()])
         .build();
     let float_candidate = BtrBlocksCompressor::default();
     let stacked_candidate = BtrBlocksCompressorBuilder::default()
@@ -1042,10 +1064,14 @@ fn main() -> VortexResult<()> {
             Encoder::BtrBlocks(&range_candidate),
         ),
         (
-            "default-off",
+            "default-without-block-residual",
             Encoder::BtrBlocks(&default_without_block_residual),
         ),
-        ("default-on", Encoder::BtrBlocks(&float_candidate)),
+        (
+            "default-without-float-mult",
+            Encoder::BtrBlocks(&default_without_float_mult),
+        ),
+        ("default", Encoder::BtrBlocks(&float_candidate)),
         (
             "default+range-entropy",
             Encoder::BtrBlocks(&stacked_candidate),
@@ -1073,6 +1099,12 @@ fn main() -> VortexResult<()> {
             column.name,
             describe_pco(column, &pco_config, &session)?
         );
+        if let Some(base) = estimate_float_mult_constant_base(column.primitive.as_view()) {
+            println!(
+                "float-mult-analysis\t{dataset}\t{}\tconstant-base\t{base}",
+                column.name
+            );
+        }
     }
     println!("structure\tdataset\tcolumn\tconfig\tencoding\tbytes");
     for (config_name, arrays) in &encoded {
@@ -1085,6 +1117,13 @@ fn main() -> VortexResult<()> {
                 encoding_tree(array),
                 array.nbytes()
             );
+            if let Some(float_mult) = array.as_opt::<FloatMult>() {
+                println!(
+                    "float-mult-base\t{dataset}\t{}\t{config_name}\t{}",
+                    column.name,
+                    float_mult.base()
+                );
+            }
         }
     }
     for (column, prototype) in &float_mult_prototypes {
@@ -1097,6 +1136,11 @@ fn main() -> VortexResult<()> {
             column.name,
             prototype.structure(),
             prototype.encoded_size(),
+        );
+        println!(
+            "float-mult-base\t{dataset}\t{}\tpco-prototype\t{}",
+            column.name,
+            prototype.base()
         );
         println!(
             "float-mult-backends\t{dataset}\t{}\tbit-split={}\tblock-residual={}\trange-entropy={}\trange-packed={}\trange-two-level={}",

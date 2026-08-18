@@ -4,14 +4,17 @@
 //! Lossless float quantization as two integer child arrays.
 
 mod array;
+mod float_mult;
 mod rules;
 mod slice;
 
 pub use array::*;
+pub use float_mult::*;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;
 
 /// Register the float quantization encoding in one session.
 pub fn initialize(session: &VortexSession) {
     session.arrays().register(FloatQuant);
+    session.arrays().register(FloatMult);
 }

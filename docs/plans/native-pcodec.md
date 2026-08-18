@@ -12,9 +12,11 @@ Pco remains a compression oracle. The new arrays do not preserve Pco byte compat
 
 Add `FloatQuantArray` and `FloatQuantScheme` to default BtrBlocks compression for `f64` arrays.
 
+Add `FloatMultArray` and a restricted `FloatMultScheme` to default BtrBlocks compression for `f32` arrays.
+
 Add `OrderedFloatArray`, `BlockResidualArray`, and their BtrBlocks scheme to the default compressor.
 
-Keep `BitSplitArray` and `FloatMultArray` as prototypes.
+Keep `BitSplitArray` as a prototype.
 
 Keep `RangeEntropyArray` and `RangeEntropyScheme` experimental. Their current full-decode and compression costs fail the throughput gate.
 
@@ -87,13 +89,29 @@ A common path uses `FloatQuant(FoR(BitPacked), Constant)`. This path targets `f3
 
 The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar access, and serialization.
 
-The automatic scheme currently accepts only `f64`. Native `f32` columns keep the current ALP and dictionary choices.
+The automatic FloatQuant scheme accepts only `f64`. Native `f32` columns remain eligible for the separate FloatMult scheme.
+
+### FloatMultArray
+
+`FloatMultArray` represents each float as an integer multiple of one base plus a signed ULP adjustment.
+
+The array stores the base in at most nine metadata bytes. Two unsigned child arrays store the multiples and adjustments.
+
+The default scheme accepts only `f32` inputs whose sampled adjustments all represent zero.
+
+This restriction lets the encoder omit the adjustment vector. It also lets the decoder skip adjustment materialization.
+
+The array retains general `f32` and `f64` support for experiments with nonconstant adjustments.
+
+The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar access, and serialization.
 
 ## Selection policy
 
 FloatQuant uses normal sample comparison against ALP, ALP-RD, dictionary, sparse, and RLE schemes.
 
-The scheme does not claim an unconditional win. This rule prevents poor choices on low-cardinality integer-valued floats.
+The selected encoding can displace ALP, ALP-RD, dictionary, sparse, or RLE.
+
+The selector compares estimated size after an encoding-specific speed penalty. It does not prefer an encoding identity.
 
 The full FloatQuant analysis runs only after the sample selects the scheme. Unselected `f64` columns pay only the sample cost.
 
@@ -118,6 +136,34 @@ let compressor = BtrBlocksCompressorBuilder::default()
 ```
 
 RangeEntropy also uses sample comparison. It remains outside `ALL_SCHEMES`.
+
+FloatMult tests decimal bases, one exact binary divisor, and one approximate common divisor.
+
+The default scheme requires these sample properties:
+
+- The source type is `f32`.
+- Every adjustment represents zero.
+- The primary span uses at most 17 bits.
+- The estimated compression ratio is at least 1.5.
+- The estimate beats the incumbent by at least 5 percent.
+
+The selector applies a 15 percent penalty to the FloatMult ratio before comparison.
+
+This penalty represents its measured encode cost. A sufficient size win can still displace ALP or another incumbent.
+
+The first implementation compresses the primary child through the normal integer cascade.
+
+A fused scheme can select a fixed integer layout for both latent children. Its internal layout does not need to consume the generic cascade depth.
+
+This fused design remains a benchmark candidate. It can trade more internal work for a better size and speed point.
+
+Callers can disable this scheme with this builder configuration:
+
+```rust
+let compressor = BtrBlocksCompressorBuilder::default()
+    .exclude_schemes([FloatMultScheme.id()])
+    .build();
+```
 
 ## Performance gate
 
@@ -343,7 +389,22 @@ The current `RangeEntropy` decoder is too slow for the default compressor. Float
 
 Block residual packing is the fastest specialized encoder. Its decode path is still too slow for the default compressor.
 
-The next FloatMult prototype will use normal integer children first. Its selector must reject Taxi-like inputs with larger encoded children.
+The native exact-multiple scheme uses normal integer compression for its primary child.
+
+It selects five California Housing columns. It rejects all Taxi and Air Quality columns.
+
+| Dataset | Configuration | Bytes | Encode MB/s | Decode MB/s |
+| --- | --- | ---: | ---: | ---: |
+| California Housing | Without FloatMult | 339,682 | 200.8 | 12,298.5 |
+| California Housing | Default | 309,499 | 164.5 | 12,728.7 |
+| April 2023 HVFHV Taxi | Without FloatMult | 28,540,793 | 873.4 | 21,651.0 |
+| April 2023 HVFHV Taxi | Default | 28,540,793 | 872.0 | 21,514.7 |
+| Air Quality | Without FloatMult | 6,135,414 | 536.4 | 23,568.2 |
+| Air Quality | Default | 6,135,414 | 530.4 | 23,548.0 |
+
+FloatMult reduces total Housing size by 8.9 percent. Compression throughput regresses by 16.5 percent.
+
+Housing decode changes by less than measurement noise. Unselected Taxi and Air Quality results remain effectively unchanged.
 
 ## Why Compact still wins
 
@@ -355,7 +416,7 @@ Pco selects adjacent Delta on three Housing columns and thirteen Air Quality col
 
 These transforms explain most of the remaining Compact size gap.
 
-FloatMult requires a new transform array. The current prototype scope includes this array.
+The restricted FloatMult scheme does not capture Pco's Taxi gains. Those gains require useful nonconstant adjustments and a stronger child codec.
 
 Pco adjacent Delta also differs from current FastLanes lane-stride Delta.
 
@@ -381,13 +442,15 @@ More datasets cannot satisfy the gate without a faster codec implementation.
 
 ## Default writer integration
 
-`FloatQuantScheme` belongs to `ALL_SCHEMES`. `BtrBlocksCompressor::default()` now evaluates it for `f64` arrays.
+`FloatQuantScheme` and `FloatMultScheme` belong to `ALL_SCHEMES`.
 
-The default file session registers `FloatQuantArray`. The August 2026 core edition permits the array.
+`BtrBlocksCompressor::default()` evaluates FloatQuant for `f64` and FloatMult for `f32`.
 
-The CUDA-compatible builder excludes FloatQuant because no CUDA decode kernel exists.
+The default file session registers both arrays. The August 2026 core edition permits both arrays.
 
-The default writer test writes, reads, and verifies an actual FloatQuant tree.
+The CUDA-compatible builder excludes both schemes because no CUDA decode kernels exist.
+
+The default writer tests write, read, and verify actual FloatQuant and FloatMult trees.
 
 ## Current prototype scope
 
