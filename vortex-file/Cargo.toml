@@ -44,6 +44,7 @@ vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
 vortex-flatbuffers = { workspace = true, features = ["file"] }
+vortex-float-quant = { workspace = true }
 vortex-fsst = { workspace = true }
 vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
@@ -51,6 +52,7 @@ vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
 vortex-onpair = { workspace = true }
 vortex-pco = { workspace = true }
+vortex-range-entropy = { workspace = true }
 vortex-runend = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-sequence = { workspace = true }

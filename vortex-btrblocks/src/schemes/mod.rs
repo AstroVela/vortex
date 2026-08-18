@@ -6,6 +6,7 @@
 pub mod binary;
 pub mod float;
 pub mod integer;
+pub mod range_entropy;
 pub mod string;
 
 pub mod decimal;

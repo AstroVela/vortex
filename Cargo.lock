@@ -9546,6 +9546,7 @@ dependencies = [
  "vortex-fastlanes",
  "vortex-file",
  "vortex-flatbuffers",
+ "vortex-float-quant",
  "vortex-fsst",
  "vortex-io",
  "vortex-ipc",
@@ -9554,6 +9555,7 @@ dependencies = [
  "vortex-metrics",
  "vortex-pco",
  "vortex-proto",
+ "vortex-range-entropy",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -9752,9 +9754,12 @@ name = "vortex-btrblocks"
 version = "0.1.0"
 dependencies = [
  "arrow-array 58.4.0",
+ "arrow-schema 58.4.0",
+ "arrow-select 58.4.0",
  "codspeed-divan-compat",
  "insta",
  "itertools 0.14.0",
+ "parquet 58.4.0",
  "pco",
  "rand 0.10.2",
  "rstest",
@@ -9770,10 +9775,12 @@ dependencies = [
  "vortex-decimal-byte-parts",
  "vortex-error",
  "vortex-fastlanes",
+ "vortex-float-quant",
  "vortex-fsst",
  "vortex-mask",
  "vortex-onpair",
  "vortex-pco",
+ "vortex-range-entropy",
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",
@@ -10161,6 +10168,7 @@ dependencies = [
  "vortex-error",
  "vortex-fastlanes",
  "vortex-flatbuffers",
+ "vortex-float-quant",
  "vortex-fsst",
  "vortex-io",
  "vortex-layout",
@@ -10168,6 +10176,7 @@ dependencies = [
  "vortex-metrics",
  "vortex-onpair",
  "vortex-pco",
+ "vortex-range-entropy",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -10186,6 +10195,16 @@ dependencies = [
  "flatbuffers",
  "vortex-buffer",
  "vortex-error",
+]
+
+[[package]]
+name = "vortex-float-quant"
+version = "0.1.0"
+dependencies = [
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-session",
 ]
 
 [[package]]
@@ -10507,6 +10526,17 @@ dependencies = [
  "vortex",
  "vortex-cuda",
  "vortex-python-abi",
+]
+
+[[package]]
+name = "vortex-range-entropy"
+version = "0.1.0"
+dependencies = [
+ "fastlanes",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-session",
 ]
 
 [[package]]

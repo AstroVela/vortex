@@ -44,6 +44,8 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     &float::ALPScheme,
     &float::ALPRDScheme,
+    &float::FloatQuantScheme,
+    &float::OrderedBlockResidualScheme,
     &float::FloatDictScheme,
     &float::NullDominatedSparseScheme,
     &float::FloatRLEScheme,
@@ -173,6 +175,8 @@ impl BtrBlocksCompressorBuilder {
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
             float::ALPRDScheme.id(),
+            float::FloatQuantScheme.id(),
+            float::OrderedBlockResidualScheme.id(),
             float::FloatRLEScheme.id(),
             float::NullDominatedSparseScheme.id(),
             string::StringDictScheme.id(),
@@ -236,6 +240,24 @@ mod tests {
     fn default_includes_all_schemes() {
         let builder = BtrBlocksCompressorBuilder::default();
         assert_eq!(builder.schemes.len(), ALL_SCHEMES.len());
+        assert!(
+            builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == float::FloatQuantScheme.id())
+        );
+    }
+
+    #[test]
+    fn float_quant_can_be_excluded() {
+        let builder =
+            BtrBlocksCompressorBuilder::default().exclude_schemes([float::FloatQuantScheme.id()]);
+        assert!(
+            !builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == float::FloatQuantScheme.id())
+        );
     }
 
     #[test]
@@ -267,6 +289,17 @@ mod tests {
                 .schemes
                 .iter()
                 .any(|s| s.id() == float::ALPRDScheme.id())
+        );
+    }
+
+    #[test]
+    fn cuda_compatible_excludes_float_quant() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        assert!(
+            !builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == float::FloatQuantScheme.id())
         );
     }
 

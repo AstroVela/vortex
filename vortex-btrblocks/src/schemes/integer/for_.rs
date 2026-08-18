@@ -31,6 +31,31 @@ use crate::CompressorContext;
 use crate::Scheme;
 use crate::SchemeExt;
 
+pub(crate) fn compress_for_primitive(
+    compressor: &CascadingCompressor,
+    primitive: PrimitiveArray,
+    compress_ctx: CompressorContext,
+    exec_ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let for_array = FoR::encode(primitive, exec_ctx)?;
+    let biased = for_array
+        .encoded()
+        .clone()
+        .execute::<PrimitiveArray>(exec_ctx)?;
+
+    let leaf_ctx = compress_ctx.clone().as_leaf();
+    let biased_data = ArrayAndStats::new(biased.into_array(), compress_ctx.merged_stats_options());
+    let compressed = BitPackingScheme.compress(compressor, &biased_data, leaf_ctx, exec_ctx)?;
+
+    let for_compressed = FoR::try_new(compressed, for_array.reference_scalar().clone())?;
+    for_compressed
+        .as_ref()
+        .statistics()
+        .inherit_from(for_array.as_ref().statistics());
+
+    Ok(for_compressed.into_array())
+}
+
 /// Frame of Reference encoding.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FoRScheme;
@@ -130,28 +155,6 @@ impl Scheme for FoRScheme {
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let primitive = data.array().clone().execute::<PrimitiveArray>(exec_ctx)?;
-        let for_array = FoR::encode(primitive, exec_ctx)?;
-        let biased = for_array
-            .encoded()
-            .clone()
-            .execute::<PrimitiveArray>(exec_ctx)?;
-
-        // Immediately bitpack. If any other scheme was preferable, it would be chosen instead
-        // of bitpacking.
-        // NOTE: we could delegate in the future if we had another downstream codec that performs
-        //  as well.
-        let leaf_ctx = compress_ctx.clone().as_leaf();
-        let biased_data =
-            ArrayAndStats::new(biased.into_array(), compress_ctx.merged_stats_options());
-        let compressed = BitPackingScheme.compress(compressor, &biased_data, leaf_ctx, exec_ctx)?;
-
-        // TODO(connor): This should really be `new_unchecked`.
-        let for_compressed = FoR::try_new(compressed, for_array.reference_scalar().clone())?;
-        for_compressed
-            .as_ref()
-            .statistics()
-            .inherit_from(for_array.as_ref().statistics());
-
-        Ok(for_compressed.into_array())
+        compress_for_primitive(compressor, primitive, compress_ctx, exec_ctx)
     }
 }

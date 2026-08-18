@@ -340,6 +340,24 @@ impl Pco {
         let data = PcoData::from_primitive(parray, level, values_per_page, ctx)?;
         Self::try_new(dtype, data, validity)
     }
+
+    /// Compress a primitive array with a custom Pco configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid or compression fails.
+    pub fn from_primitive_with_config(
+        parray: ArrayView<'_, Primitive>,
+        chunk_config: &ChunkConfig,
+        values_per_chunk: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<PcoArray> {
+        let dtype = parray.dtype().clone();
+        let validity = parray.validity()?;
+        let data =
+            PcoData::from_primitive_with_config(parray, chunk_config, values_per_chunk, ctx)?;
+        Self::try_new(dtype, data, validity)
+    }
 }
 
 #[array_slots(Pco)]
@@ -480,7 +498,6 @@ impl PcoData {
         values_per_page: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
-        let number_type = number_type_from_dtype(parray.dtype());
         let values_per_page = if values_per_page == 0 {
             values_per_chunk
         } else {
@@ -491,6 +508,21 @@ impl PcoData {
         let chunk_config = ChunkConfig::default()
             .with_compression_level(level)
             .with_paging_spec(PagingSpec::EqualPagesUpTo(values_per_page));
+
+        Self::from_primitive_with_config(parray, &chunk_config, values_per_chunk, ctx)
+    }
+
+    fn from_primitive_with_config(
+        parray: ArrayView<'_, Primitive>,
+        chunk_config: &ChunkConfig,
+        values_per_chunk: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self> {
+        vortex_ensure!(
+            values_per_chunk > 0,
+            "values per chunk must be greater than zero"
+        );
+        let number_type = number_type_from_dtype(parray.dtype());
 
         let values = collect_valid(parray, ctx)?;
         let n_values = values.len();
@@ -510,7 +542,7 @@ impl PcoData {
                     let values = values.to_buffer::<T>();
                     let chunk = &values.as_slice()[chunk_start..chunk_end];
                     fc
-                        .chunk_compressor(chunk, &chunk_config)
+                        .chunk_compressor(chunk, chunk_config)
                         .map_err(vortex_err_from_pco)?
                 }
             );

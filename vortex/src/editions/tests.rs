@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::f64::consts::TAU;
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -33,11 +35,14 @@ use vortex_error::vortex_err;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_file::WriteStrategyBuilder;
+use vortex_float_quant::FloatQuant;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::session::LayoutSession;
+use vortex_range_entropy::BlockResidual;
+use vortex_range_entropy::OrderedFloat;
 use vortex_sequence::Sequence;
 use vortex_session::VortexSession;
 use vortex_session::registry::Id;
@@ -488,6 +493,87 @@ async fn default_strategy_round_trip_uses_only_enabled_encodings() -> VortexResu
     let session = writer_test_session()?;
     assert_round_trip_encodings_are_enabled(&session, None, sequential_integers().into_array())
         .await
+}
+
+#[tokio::test]
+async fn default_writer_round_trips_float_quant() -> VortexResult<()> {
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    let values = (0u32..65_536)
+        .map(|index| {
+            let mantissa = index.wrapping_mul(7_919) & 0x007f_ffff;
+            f64::from(f32::from_bits(0x3f80_0000 | mantissa))
+        })
+        .collect::<Vec<_>>();
+    let expected = PrimitiveArray::from_iter(values.clone()).into_array();
+    let buffer = write_with(&session, expected.clone()).await?;
+    let actual = session
+        .open_options()
+        .open_buffer(buffer)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    assert!(
+        actual
+            .depth_first_traversal()
+            .any(|array| array.is::<FloatQuant>())
+    );
+    let decoded = actual.execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+    assert_eq!(decoded.as_slice::<f64>(), values);
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_writer_round_trips_ordered_block_residual() -> VortexResult<()> {
+    use crate::VortexSessionDefault;
+
+    fn uniform(state: &mut u64) -> f64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        ((*state >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
+    }
+
+    let session = VortexSession::default();
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    let mut value = 0.0_f64;
+    let values = (0..65_536)
+        .map(|_| {
+            let radius = (-2.0 * uniform(&mut state).ln()).sqrt();
+            let normal = radius * (TAU * uniform(&mut state)).cos();
+            value += normal * 0.01;
+            value
+        })
+        .collect::<Vec<_>>();
+    let expected = PrimitiveArray::from_iter(values.clone()).into_array();
+    let buffer = write_with(&session, expected).await?;
+    let actual = session
+        .open_options()
+        .open_buffer(buffer)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    let encoding_ids = actual
+        .depth_first_traversal()
+        .map(|array| array.encoding_id().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        actual
+            .depth_first_traversal()
+            .any(|array| array.is::<OrderedFloat>()),
+        "written tree does not contain OrderedFloat: {encoding_ids:?}"
+    );
+    assert!(
+        actual
+            .depth_first_traversal()
+            .any(|array| array.is::<BlockResidual>())
+    );
+    let decoded = actual.execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+    assert_eq!(decoded.as_slice::<f64>(), values);
+    Ok(())
 }
 
 #[tokio::test]

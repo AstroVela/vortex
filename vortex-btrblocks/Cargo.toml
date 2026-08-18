@@ -28,9 +28,11 @@ vortex-datetime-parts = { workspace = true }
 vortex-decimal-byte-parts = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
+vortex-float-quant = { workspace = true }
 vortex-fsst = { workspace = true }
 vortex-onpair = { workspace = true, optional = true }
 vortex-pco = { workspace = true, optional = true }
+vortex-range-entropy = { workspace = true }
 vortex-runend = { workspace = true }
 vortex-sequence = { workspace = true }
 vortex-sparse = { workspace = true }
@@ -40,8 +42,11 @@ vortex-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
 divan = { workspace = true }
 insta = { workspace = true }
+parquet = { workspace = true }
 rstest = { workspace = true }
 test-with = { workspace = true }
 tpchgen = { workspace = true }
@@ -69,3 +74,15 @@ test = false
 name = "compress_listview"
 harness = false
 test = false
+
+[[example]]
+name = "pco_probe"
+required-features = ["pco"]
+
+[[example]]
+name = "range_entropy_throughput"
+required-features = ["pco", "zstd"]
+
+[[example]]
+name = "float_quant_dataset"
+required-features = ["pco", "zstd"]
