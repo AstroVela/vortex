@@ -108,8 +108,8 @@ where
 The generated code is close to equivalent: one specialized loop per `(width, operator)` pair. The
 difference is where the runtime branch lives. Velox branches in the registry, once per compiled
 expression. Vortex branches in `match_each_native_ptype!` and the operator match, once per batch.
-The Vortex form also runs `dispatch` twice per call (once to plan the output dtype, once to
-execute), and the executor verifies the two runs agree (`ensure_plan`).
+The Vortex form also runs `dispatch` at least twice per call (once to plan the output dtype, once
+per execution attempt), and the executor verifies the runs agree (`ensure_plan`).
 
 ## 3. Checked arithmetic: where the error channel lives
 

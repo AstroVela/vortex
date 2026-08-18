@@ -111,7 +111,8 @@ pub(crate) const fn for_owned_output<Args: ElementTuple>() -> Self {
   columns provide for points and polygons), and otherwise filters every input, runs dense, and
   scatters the compact result back under a null mask.
 
-The philosophical difference: **Velox never evaluates a null row. Vortex prefers to.** Velox's
+The philosophical difference: **Velox does not evaluate a null row unless the function asks to see
+nulls (`callNullable`). Vortex prefers to evaluate it.** Velox's
 choice keeps semantics simple (no observable effects from garbage) at the price of a per-row branch
 or a row-set shrink. Vortex's choice keeps the hot loop branch-free and vectorizable at the price
 of real machinery: `DENSE_SAFE` as a trust contract on element types, the three-state

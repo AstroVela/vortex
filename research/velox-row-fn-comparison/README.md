@@ -64,8 +64,9 @@ nulls), or `callNullFree` (never sees nulls, even inside nested values). The eng
 sure-null rows above the function and the adapter re-checks per row. A Vortex `RowFn` is strict by
 contract, full stop. The planner derives one of three execution policies from declared element
 capabilities (`DENSE_SAFE`, `DECODE_INFALLIBLE`, sink fallibility), and `ValidOnly` further splits
-into skip-invalid and filter-and-scatter at runtime. The deepest contrast: Velox never evaluates a
-null row. Vortex's `Dense` policy deliberately evaluates the garbage behind nulls to keep the loop
+into skip-invalid and filter-and-scatter at runtime. The deepest contrast: under default null
+behavior, Velox never evaluates a null row (only a `callNullable` function sees one, by request).
+Vortex's `Dense` policy deliberately evaluates the garbage behind nulls to keep the loop
 branch-free, then masks the output. That choice is what forces the deferred-error and retry
 machinery that Velox does not need. See `ABSTRACTION.md` section 3.
 
