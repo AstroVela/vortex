@@ -95,7 +95,11 @@ The automatic FloatQuant scheme accepts only `f64`. Native `f32` columns remain 
 
 `FloatMultArray` represents each float as an integer multiple of one base plus a signed ULP adjustment.
 
-The array stores the base in at most nine metadata bytes. Two unsigned child arrays store the multiples and adjustments.
+The array stores the base in at most nine metadata bytes. One required unsigned child stores the multiples.
+
+An optional final child stores the adjustments. An absent child means that every adjustment is zero.
+
+The child count identifies this mode. The serialized metadata contains no separate flag.
 
 The default scheme accepts only `f32` inputs whose sampled adjustments all represent zero.
 
@@ -405,6 +409,35 @@ It selects five California Housing columns. It rejects all Taxi and Air Quality 
 FloatMult reduces total Housing size by 8.9 percent. Compression throughput regresses by 16.5 percent.
 
 Housing decode changes by less than measurement noise. Unselected Taxi and Air Quality results remain effectively unchanged.
+
+### Large-row throughput check
+
+The source Housing file contains 20,433 complete rows. That size is too small for stable throughput and scalar-access decisions.
+
+The larger check repeats the source distribution to two million rows. It uses 72 MB of source floats.
+
+This repetition preserves the value distribution. It also preserves cardinality, so it changes some outer dictionary choices.
+
+The size results above remain the source for compression policy. The larger check tests throughput and access costs.
+
+| Path | Bytes | Decode MB/s, run 1 | Decode MB/s, run 2 | Scalar access ns, run 1 | Scalar access ns, run 2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prior default, exact selected columns | 6,275,780 | 10,806.9 | 13,495.0 | 949.90 and 1,010.57 | 790.08 and 825.45 |
+| FloatMult, exact selected columns | 6,270,986 | 10,967.0 | 13,483.6 | 675.10 and 666.78 | 551.01 and 545.61 |
+| Prior default, nonzero adjustment column | 3,013,120 | 10,735.9 | 13,615.1 | 204.73 | 174.87 |
+| FloatMult, nonzero adjustment column | 3,219,980 | 3,916.4 | 4,847.8 | 1,551.78 | 1,310.13 |
+
+The absolute throughput changed between runs. The interleaved comparisons kept the relative exact-mode result near zero.
+
+Exact FloatMult reduced scalar-access latency by 29 to 34 percent on both selected columns.
+
+The nonzero-adjustment form decoded 64 percent slower. Its scalar access was more than seven times slower.
+
+The full default compressor encoded at 461 to 463 MB/s. The prior default encoded at 454 to 458 MB/s.
+
+The large check found no default encode regression. The compact compressor encoded at 225 to 226 MB/s.
+
+The nonzero result supports separate selection weights for the one-child and two-child forms.
 
 ## Why Compact still wins
 

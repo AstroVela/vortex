@@ -19,8 +19,6 @@ use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
-use vortex_array::arrays::Constant;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
@@ -60,7 +58,7 @@ pub struct FloatMultSlots {
     pub primary: ArrayRef,
     /// Signed ULP adjustments with zero moved to the unsigned midpoint.
     #[slot(1)]
-    pub secondary: ArrayRef,
+    pub secondary: Option<ArrayRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,21 +114,27 @@ impl VTable for FloatMult {
 
         let slots = FloatMultSlotsView::from_slots(slots);
         let expected_primary = DType::Primitive(latent_ptype, dtype.nullability());
-        let expected_secondary = DType::Primitive(latent_ptype, NonNullable);
         vortex_ensure!(
             slots.primary.dtype() == &expected_primary,
             "expected primary dtype {expected_primary}, got {}",
             slots.primary.dtype()
         );
         vortex_ensure!(
-            slots.secondary.dtype() == &expected_secondary,
-            "expected secondary dtype {expected_secondary}, got {}",
-            slots.secondary.dtype()
-        );
-        vortex_ensure!(
-            slots.primary.len() == len && slots.secondary.len() == len,
+            slots.primary.len() == len,
             "FloatMult child length differs from {len}"
         );
+        if let Some(secondary) = slots.secondary {
+            let expected_secondary = DType::Primitive(latent_ptype, NonNullable);
+            vortex_ensure!(
+                secondary.dtype() == &expected_secondary,
+                "expected secondary dtype {expected_secondary}, got {}",
+                secondary.dtype()
+            );
+            vortex_ensure!(
+                secondary.len() == len,
+                "FloatMult child length differs from {len}"
+            );
+        }
         Ok(())
     }
 
@@ -195,7 +199,10 @@ impl VTable for FloatMult {
             "unsupported FloatMult metadata version {}",
             metadata[0]
         );
-        vortex_ensure!(children.len() == 2, "FloatMult requires two children");
+        vortex_ensure!(
+            matches!(children.len(), 1 | 2),
+            "FloatMult requires one or two children"
+        );
 
         let base_bits = match ptype {
             PType::F32 => {
@@ -212,9 +219,13 @@ impl VTable for FloatMult {
         };
         let latent_ptype = latent_ptype(ptype)?;
         let primary_dtype = DType::Primitive(latent_ptype, dtype.nullability());
-        let secondary_dtype = DType::Primitive(latent_ptype, NonNullable);
         let primary = children.get(0, &primary_dtype, len)?;
-        let secondary = children.get(1, &secondary_dtype, len)?;
+        let secondary = if children.len() == 2 {
+            let secondary_dtype = DType::Primitive(latent_ptype, NonNullable);
+            Some(children.get(1, &secondary_dtype, len)?)
+        } else {
+            None
+        };
         let slots = FloatMultSlots { primary, secondary }.into_slots();
         Ok(ArrayParts::new(
             self.clone(),
@@ -254,36 +265,47 @@ impl OperationsVTable<FloatMult> for FloatMult {
         if primary.is_null() {
             return Ok(Scalar::null(array.dtype().clone()));
         }
-        let secondary = array.secondary().execute_scalar(index, ctx)?;
         Ok(match PType::try_from(array.dtype())? {
-            PType::F32 => Scalar::primitive(
-                join_f32(
-                    primary
-                        .as_primitive()
-                        .typed_value::<u32>()
-                        .vortex_expect("validated primary scalar"),
-                    secondary
-                        .as_primitive()
-                        .typed_value::<u32>()
-                        .vortex_expect("validated secondary scalar"),
-                    array.data().base_f32()?,
-                ),
-                array.dtype().nullability(),
-            ),
-            PType::F64 => Scalar::primitive(
-                join_f64(
-                    primary
-                        .as_primitive()
-                        .typed_value::<u64>()
-                        .vortex_expect("validated primary scalar"),
-                    secondary
-                        .as_primitive()
-                        .typed_value::<u64>()
-                        .vortex_expect("validated secondary scalar"),
-                    array.data().base_f64()?,
-                ),
-                array.dtype().nullability(),
-            ),
+            PType::F32 => {
+                let primary = primary
+                    .as_primitive()
+                    .typed_value::<u32>()
+                    .vortex_expect("validated primary scalar");
+                let value = if let Some(secondary) = array.secondary() {
+                    let secondary = secondary.execute_scalar(index, ctx)?;
+                    join_f32(
+                        primary,
+                        secondary
+                            .as_primitive()
+                            .typed_value::<u32>()
+                            .vortex_expect("validated secondary scalar"),
+                        array.data().base_f32()?,
+                    )
+                } else {
+                    int_float_from_u32(primary) * array.data().base_f32()?
+                };
+                Scalar::primitive(value, array.dtype().nullability())
+            }
+            PType::F64 => {
+                let primary = primary
+                    .as_primitive()
+                    .typed_value::<u64>()
+                    .vortex_expect("validated primary scalar");
+                let value = if let Some(secondary) = array.secondary() {
+                    let secondary = secondary.execute_scalar(index, ctx)?;
+                    join_f64(
+                        primary,
+                        secondary
+                            .as_primitive()
+                            .typed_value::<u64>()
+                            .vortex_expect("validated secondary scalar"),
+                        array.data().base_f64()?,
+                    )
+                } else {
+                    int_float_from_u64(primary) * array.data().base_f64()?
+                };
+                Scalar::primitive(value, array.dtype().nullability())
+            }
             ptype => vortex_panic!("unsupported FloatMult ptype {ptype}"),
         })
     }
@@ -333,10 +355,10 @@ pub trait FloatMultArrayExt: TypedArrayRef<FloatMult> + FloatMultArraySlotsExt {
 impl<T: TypedArrayRef<FloatMult>> FloatMultArrayExt for T {}
 
 impl FloatMult {
-    /// Construct a FloatMult array from two latent children.
+    /// Construct a FloatMult array from one or two latent children.
     pub fn try_new(
         primary: ArrayRef,
-        secondary: ArrayRef,
+        secondary: Option<ArrayRef>,
         float_ptype: PType,
         base: f64,
     ) -> VortexResult<FloatMultArray> {
@@ -374,7 +396,10 @@ impl FloatMult {
                     .unzip();
                 Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    PrimitiveArray::new(Buffer::from(secondary), NonNullable.into()).into_array(),
+                    Some(
+                        PrimitiveArray::new(Buffer::from(secondary), NonNullable.into())
+                            .into_array(),
+                    ),
                     PType::F32,
                     f64::from(base),
                 )
@@ -392,7 +417,10 @@ impl FloatMult {
                     .unzip();
                 Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    PrimitiveArray::new(Buffer::from(secondary), NonNullable.into()).into_array(),
+                    Some(
+                        PrimitiveArray::new(Buffer::from(secondary), NonNullable.into())
+                            .into_array(),
+                    ),
                     PType::F64,
                     base,
                 )
@@ -421,7 +449,7 @@ impl FloatMult {
                 }
                 Ok(Some(Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    ConstantArray::new(Scalar::from(1_u32 << 31), len).into_array(),
+                    None,
                     PType::F32,
                     f64::from(base),
                 )?))
@@ -437,7 +465,7 @@ impl FloatMult {
                 }
                 Ok(Some(Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    ConstantArray::new(Scalar::from(1_u64 << 63), len).into_array(),
+                    None,
                     PType::F64,
                     base,
                 )?))
@@ -920,7 +948,7 @@ fn join_f64(primary: u64, secondary: u64, base: f64) -> f64 {
 fn decode(array: ArrayView<'_, FloatMult>, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
     let primary = array.primary().clone().execute::<PrimitiveArray>(ctx)?;
     let validity = primary.validity()?;
-    if secondary_is_constant_zero(array) {
+    let Some(secondary) = array.secondary() else {
         return Ok(match PType::try_from(array.dtype())? {
             PType::F32 => {
                 let base = array.data().base_f32()?;
@@ -940,9 +968,9 @@ fn decode(array: ArrayView<'_, FloatMult>, ctx: &mut ExecutionCtx) -> VortexResu
             }
             ptype => vortex_panic!("unsupported FloatMult ptype {ptype}"),
         });
-    }
+    };
 
-    let secondary = array.secondary().clone().execute::<PrimitiveArray>(ctx)?;
+    let secondary = secondary.clone().execute::<PrimitiveArray>(ctx)?;
     Ok(match PType::try_from(array.dtype())? {
         PType::F32 => {
             let secondary_values = secondary.as_slice::<u32>();
@@ -974,21 +1002,6 @@ fn decode(array: ArrayView<'_, FloatMult>, ctx: &mut ExecutionCtx) -> VortexResu
         }
         ptype => vortex_panic!("unsupported FloatMult ptype {ptype}"),
     })
-}
-
-fn secondary_is_constant_zero(array: ArrayView<'_, FloatMult>) -> bool {
-    let Some(constant) = array.secondary().as_opt::<Constant>() else {
-        return false;
-    };
-    match PType::try_from(array.dtype()) {
-        Ok(PType::F32) => {
-            constant.scalar().as_primitive().typed_value::<u32>() == Some(1_u32 << 31)
-        }
-        Ok(PType::F64) => {
-            constant.scalar().as_primitive().typed_value::<u64>() == Some(1_u64 << 63)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -1025,12 +1038,24 @@ mod tests {
             -0.0,
             0.0,
             1.5,
+            1.234_567_89,
             f64::INFINITY,
             f64::from_bits(0x7ff8_0000_0000_1234),
             f64::from_bits(0xfff8_0000_0000_5678),
         ];
         let original = PrimitiveArray::from_iter(values);
         let encoded = FloatMult::from_primitive(original.as_view(), 0.01)?;
+        let secondary = encoded
+            .secondary()
+            .vortex_expect("general FloatMult must contain adjustments")
+            .clone()
+            .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
+        assert!(
+            secondary
+                .as_slice::<u64>()
+                .iter()
+                .any(|adjustment| *adjustment != 1_u64 << 63)
+        );
         let decoded = encoded
             .into_array()
             .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
@@ -1045,6 +1070,36 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_zero_adjustment_roundtrip() -> VortexResult<()> {
+        let original = PrimitiveArray::from_iter([0.0_f32, 1.0, 42.0, 65_536.0]);
+        let encoded = FloatMult::from_primitive_constant_secondary(original.as_view(), 1.0)?
+            .vortex_expect("integer floats use an implicit zero adjustment");
+        assert!(encoded.secondary().is_none());
+        assert_eq!(encoded.as_ref().nchildren(), 1);
+        assert_arrays_eq!(encoded, original, &mut SESSION.create_execution_ctx());
+
+        let encoded = encoded.into_array();
+        let dtype = encoded.dtype().clone();
+        let len = encoded.len();
+        let array_context = ArrayContext::empty();
+        let serialized =
+            encoded.serialize(&array_context, &SESSION, &SerializeOptions::default())?;
+        let mut bytes = ByteBufferMut::empty();
+        for buffer in serialized {
+            bytes.extend_from_slice(buffer.as_ref());
+        }
+        let decoded = SerializedArray::try_from(bytes.freeze())?.decode(
+            &dtype,
+            len,
+            &ReadContext::new(array_context.to_ids()),
+            &SESSION,
+        )?;
+        assert!(decoded.as_::<FloatMult>().secondary().is_none());
+        assert_arrays_eq!(decoded, original, &mut SESSION.create_execution_ctx());
         Ok(())
     }
 

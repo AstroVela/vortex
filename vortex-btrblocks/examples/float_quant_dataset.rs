@@ -150,6 +150,35 @@ impl FloatMultPrototype {
         }
     }
 
+    fn has_nonzero_adjustments(&self) -> bool {
+        let zero = match self {
+            Self::F32 { .. } => 1_u64 << 31,
+            Self::F64 { .. } => 1_u64 << 63,
+        };
+        self.latents()
+            .secondary
+            .iter()
+            .any(|adjustment| *adjustment != zero)
+    }
+
+    fn to_array(&self) -> VortexResult<ArrayRef> {
+        let (primary, secondary, ptype, base) = match self {
+            Self::F32 {
+                primary,
+                secondary,
+                base,
+                ..
+            } => (primary, secondary, PType::F32, f64::from(*base)),
+            Self::F64 {
+                primary,
+                secondary,
+                base,
+                ..
+            } => (primary, secondary, PType::F64, *base),
+        };
+        Ok(FloatMult::try_new(primary.clone(), Some(secondary.clone()), ptype, base)?.into_array())
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn reconstruct(&self, primary: &[u64], secondary: &[u64]) -> VortexResult<()> {
         vortex_ensure!(
@@ -369,7 +398,10 @@ impl Encoder<'_> {
     }
 }
 
-fn read_california_housing(path: &Path) -> VortexResult<Vec<Column>> {
+fn read_california_housing(
+    path: &Path,
+    target_row_count: Option<usize>,
+) -> VortexResult<Vec<Column>> {
     let reader = BufReader::new(File::open(path)?);
     let mut values = std::array::from_fn::<_, 9, _>(|_| Vec::<f32>::new());
     for (line_index, line) in reader.lines().enumerate() {
@@ -391,6 +423,17 @@ fn read_california_housing(path: &Path) -> VortexResult<Vec<Column>> {
                     error
                 )
             })?);
+        }
+    }
+
+    if let Some(target_row_count) = target_row_count {
+        for column in &mut values {
+            vortex_ensure!(!column.is_empty(), "California Housing input is empty");
+            column.truncate(target_row_count);
+            while column.len() < target_row_count {
+                let copy_len = (target_row_count - column.len()).min(column.len());
+                column.extend_from_within(..copy_len);
+            }
         }
     }
 
@@ -872,6 +915,152 @@ fn measure_decoders(
     Ok(())
 }
 
+fn measure_selected_float_mult(
+    dataset: &str,
+    columns: &[Column],
+    baseline: &[ArrayRef],
+    candidate: &[ArrayRef],
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let selected = candidate
+        .iter()
+        .enumerate()
+        .filter_map(|(index, array)| contains_float_mult(array).then_some(index))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let input_bytes = selected
+        .iter()
+        .map(|index| columns[*index].primitive.nbytes())
+        .sum::<u64>();
+    let selected_configs = [
+        (
+            "prior-default",
+            selected
+                .iter()
+                .map(|index| baseline[*index].clone())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "float-mult",
+            selected
+                .iter()
+                .map(|index| candidate[*index].clone())
+                .collect::<Vec<_>>(),
+        ),
+    ];
+    measure_decoders(
+        &format!("{dataset}-float-mult-selected"),
+        &selected_configs,
+        input_bytes,
+        session,
+    )?;
+
+    for index in selected {
+        measure_scalar_pair(
+            dataset,
+            &columns[index].name,
+            [
+                ("prior-default", &baseline[index]),
+                ("float-mult", &candidate[index]),
+            ],
+            session,
+        )?;
+    }
+    Ok(())
+}
+
+fn contains_float_mult(array: &ArrayRef) -> bool {
+    array.is::<FloatMult>() || array.children().iter().any(contains_float_mult)
+}
+
+fn measure_scalar_pair(
+    dataset: &str,
+    column: &str,
+    arrays: [(&str, &ArrayRef); 2],
+    session: &VortexSession,
+) -> VortexResult<()> {
+    const ACCESSES: usize = 200_000;
+    const REPETITIONS: usize = 7;
+    let mut durations = [
+        Vec::with_capacity(REPETITIONS),
+        Vec::with_capacity(REPETITIONS),
+    ];
+    for repetition in 0..REPETITIONS {
+        for offset in 0..arrays.len() {
+            let config_index = (repetition + offset) % arrays.len();
+            let array = arrays[config_index].1;
+            let mut ctx = session.create_execution_ctx();
+            let start = Instant::now();
+            let mut checksum = 0_u32;
+            for access in 0..ACCESSES {
+                let row = access.wrapping_mul(0x9e37_79b1) % array.len();
+                let value = array
+                    .execute_scalar(row, &mut ctx)?
+                    .as_primitive()
+                    .typed_value::<f32>()
+                    .ok_or_else(|| vortex_err!("benchmark value is null"))?;
+                checksum ^= black_box(value.to_bits());
+            }
+            durations[config_index].push(start.elapsed());
+            black_box(checksum);
+        }
+    }
+    for (config_index, (config, array)) in arrays.into_iter().enumerate() {
+        let median = percentile(&mut durations[config_index], 1, 2);
+        let nanoseconds = median.as_secs_f64() * 1_000_000_000.0 / ACCESSES as f64;
+        let accesses_per_second = ACCESSES as f64 / median.as_secs_f64() / 1_000_000.0;
+        println!(
+            "scalar-at\t{dataset}\t{column}\t{config}\t{}\t{}\t{nanoseconds:.2}\t{accesses_per_second:.1}",
+            array.encoding_id(),
+            array.nbytes(),
+        );
+    }
+    Ok(())
+}
+
+fn measure_nonzero_float_mult(
+    dataset: &str,
+    columns: &[Column],
+    prototypes: &[(&Column, FloatMultPrototype)],
+    baseline: &[ArrayRef],
+    session: &VortexSession,
+) -> VortexResult<()> {
+    for (column, prototype) in prototypes
+        .iter()
+        .filter(|(_, prototype)| prototype.has_nonzero_adjustments())
+    {
+        let index = columns
+            .iter()
+            .position(|candidate| candidate.name == column.name)
+            .ok_or_else(|| vortex_err!("missing benchmark column {}", column.name))?;
+        let candidate = prototype.to_array()?;
+        let mut verify_ctx = session.create_execution_ctx();
+        assert_arrays_eq!(candidate, column.array, &mut verify_ctx);
+        let configs = [
+            ("prior-default", vec![baseline[index].clone()]),
+            ("float-mult-nonzero", vec![candidate.clone()]),
+        ];
+        measure_decoders(
+            &format!("{dataset}-{}-nonzero", column.name),
+            &configs,
+            column.primitive.nbytes(),
+            session,
+        )?;
+        measure_scalar_pair(
+            dataset,
+            &column.name,
+            [
+                ("prior-default", &baseline[index]),
+                ("float-mult-nonzero", &candidate),
+            ],
+            session,
+        )?;
+    }
+    Ok(())
+}
+
 fn measure_float_mult_decoder(
     dataset: &str,
     prototypes: &[(&Column, FloatMultPrototype)],
@@ -1008,8 +1197,7 @@ fn main() -> VortexResult<()> {
                 .parse::<usize>()
                 .map_err(|error| vortex_err!("invalid row limit: {error}"))
         })
-        .transpose()?
-        .unwrap_or(DEFAULT_ROW_LIMIT);
+        .transpose()?;
     let path = Path::new(&path);
     let dataset = path
         .file_stem()
@@ -1020,9 +1208,9 @@ fn main() -> VortexResult<()> {
         .extension()
         .is_some_and(|extension| extension == "parquet")
     {
-        read_parquet_numeric(path, row_limit, &session)?
+        read_parquet_numeric(path, row_limit.unwrap_or(DEFAULT_ROW_LIMIT), &session)?
     } else {
-        read_california_housing(path)?
+        read_california_housing(path, row_limit)?
     };
     let input_bytes = columns
         .iter()
@@ -1154,6 +1342,28 @@ fn main() -> VortexResult<()> {
     }
     println!("operation\tdataset\tconfig\tbytes\tp10-ms\tmedian-ms\tp90-ms\tMB/s");
     measure_decoders(dataset, &encoded, input_bytes, &session)?;
+    let default_without_float_mult = encoded
+        .iter()
+        .find_map(|(name, arrays)| (*name == "default-without-float-mult").then_some(arrays))
+        .ok_or_else(|| vortex_err!("missing FloatMult baseline"))?;
+    let default = encoded
+        .iter()
+        .find_map(|(name, arrays)| (*name == "default").then_some(arrays))
+        .ok_or_else(|| vortex_err!("missing default candidate"))?;
+    measure_selected_float_mult(
+        dataset,
+        &columns,
+        default_without_float_mult,
+        default,
+        &session,
+    )?;
+    measure_nonzero_float_mult(
+        dataset,
+        &columns,
+        &float_mult_prototypes,
+        default_without_float_mult,
+        &session,
+    )?;
     measure_float_mult_decoder(dataset, &float_mult_prototypes, &session)?;
     measure_float_mult_backends(dataset, &float_mult_prototypes)?;
     measure_compressors(dataset, &configs, &columns, input_bytes, &session)?;

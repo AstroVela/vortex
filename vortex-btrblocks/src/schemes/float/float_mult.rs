@@ -52,7 +52,7 @@ impl Scheme for FloatMultScheme {
     }
 
     fn num_children(&self) -> usize {
-        2
+        1
     }
 
     fn expected_compression_ratio(
@@ -92,7 +92,7 @@ impl Scheme for FloatMultScheme {
                 )?;
                 let candidate = FloatMult::try_new(
                     compressed_primary,
-                    encoded.secondary().clone(),
+                    encoded.secondary().cloned(),
                     sample.ptype(),
                     base,
                 )?;
@@ -132,7 +132,7 @@ impl Scheme for FloatMultScheme {
             compressor.compress_child(encoded.primary(), &compress_ctx, self.id(), 0, exec_ctx)?;
         Ok(FloatMult::try_new(
             compressed_primary,
-            encoded.secondary().clone(),
+            encoded.secondary().cloned(),
             primitive.ptype(),
             base,
         )?

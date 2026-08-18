@@ -35,7 +35,10 @@ impl SliceReduce for FloatMult {
         Ok(Some(
             FloatMult::try_new(
                 array.primary().slice(range.clone())?,
-                array.secondary().slice(range)?,
+                array
+                    .secondary()
+                    .map(|secondary| secondary.slice(range))
+                    .transpose()?,
                 PType::try_from(array.dtype())?,
                 array.base(),
             )?
