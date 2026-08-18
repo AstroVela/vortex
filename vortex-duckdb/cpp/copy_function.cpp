@@ -11,6 +11,7 @@
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 
 unique_ptr<FunctionData> copy_to_bind(ClientContext &,
@@ -39,7 +40,9 @@ unique_ptr<FunctionData> copy_to_bind(ClientContext &,
         throw BinderException(IntoErrString(error_out));
     }
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
-    return make_uniq<VortexCopyBindData>(std::move(cdata));
+    auto bind = make_uniq<VortexCopyBindData>(std::move(cdata));
+    bind->column_names = names;
+    return bind;
 }
 
 unique_ptr<GlobalFunctionData>
@@ -77,14 +80,76 @@ void copy_to_sink(ExecutionContext &,
     }
 }
 
-void copy_to_finalize(ClientContext &, FunctionData &, GlobalFunctionData &gstate) {
-    const VortexCopyGlobalState &global = gstate.Cast<VortexCopyGlobalState>();
+// Called before the write (right after global init) when the plan requests
+// WRITTEN_FILE_STATISTICS. We stash the target struct and fill it at finalize, once the
+// footer statistics exist - mirroring the parquet writer's store-pointer-then-fill pattern.
+void copy_to_get_written_statistics(ClientContext &,
+                                    FunctionData &,
+                                    GlobalFunctionData &gstate,
+                                    CopyFunctionFileStatistics &statistics) {
+    gstate.Cast<VortexCopyGlobalState>().written_stats = &statistics;
+}
 
+void copy_to_finalize(ClientContext &, FunctionData &bind_data, GlobalFunctionData &gstate) {
+    auto &global = gstate.Cast<VortexCopyGlobalState>();
     void *const ffi_global = global.ffi_global->DataPtr();
     duckdb_vx_error error_out = nullptr;
     duckdb_copy_function_copy_to_finalize(ffi_global, &error_out);
     if (error_out) {
         throw ExecutorException(IntoErrString(error_out));
+    }
+
+    if (!global.written_stats) {
+        return;
+    }
+    // Fill the statistics captured in copy_to_get_written_statistics from the finished write's
+    // footer. min/max come back as owned duckdb values; DuckLake expects their string form.
+    auto &names = bind_data.Cast<VortexCopyBindData>().column_names;
+    duckdb_vx_written_file_statistics file_stats;
+    if (!duckdb_copy_function_get_written_file_statistics(ffi_global, &file_stats)) {
+        // Statistics were requested (written_stats is set) but the finished write produced none;
+        // that is an internal inconsistency, not a silently empty result.
+        throw InternalException("vortex COPY: written statistics were requested but not produced");
+    }
+    global.written_stats->row_count = file_stats.row_count;
+    global.written_stats->file_size_bytes = file_stats.file_size_bytes;
+    global.written_stats->footer_size_bytes = Value::UBIGINT(file_stats.footer_size_bytes);
+    // Keyed by top-level column name only. The vortex footer reports one statistics set per
+    // top-level field, so nested struct/list leaf columns get no statistics here (unlike parquet,
+    // which recurses to leaf paths). Flat tables are fully covered.
+    for (idx_t i = 0; i < file_stats.num_columns && i < names.size(); i++) {
+        duckdb_vx_written_column_statistics col_stats {};
+        duckdb_vx_error col_error = nullptr;
+        if (!duckdb_copy_function_get_written_column_statistics(ffi_global, i, &col_stats, &col_error)) {
+            if (col_error) {
+                throw ExecutorException(IntoErrString(col_error));
+            }
+            // No statistics for this column (e.g. a type without min/max); skip it.
+            continue;
+        }
+        case_insensitive_map_t<Value> column;
+        column["num_values"] = Value::UBIGINT(col_stats.num_values);
+        if (col_stats.has_column_size) {
+            column["column_size_bytes"] = Value::UBIGINT(col_stats.column_size_bytes);
+        }
+        if (col_stats.has_null_count) {
+            column["null_count"] = Value::UBIGINT(col_stats.null_count);
+        }
+        if (col_stats.min) {
+            column["min"] = Value(reinterpret_cast<Value *>(col_stats.min)->ToString());
+            duckdb_destroy_value(&col_stats.min);
+        }
+        if (col_stats.max) {
+            column["max"] = Value(reinterpret_cast<Value *>(col_stats.max)->ToString());
+            duckdb_destroy_value(&col_stats.max);
+        }
+        if (col_stats.has_nan_stat) {
+            column["has_nan"] = Value::BOOLEAN(col_stats.contains_nan);
+        }
+        // DuckLake keys column statistics by a quoted, dot-separated path (see
+        // DuckLakeUtil::ParseQuotedList); match the parquet writer, which quotes each name.
+        global.written_stats->column_statistics.emplace(KeywordHelper::WriteQuoted(names[i], '"'),
+                                                        std::move(column));
     }
 }
 
@@ -143,6 +208,7 @@ extern "C" duckdb_state duckdb_vx_register_copy_function(duckdb_database ffi_db)
     fn.copy_to_finalize = copy_to_finalize;
     fn.prepare_batch = copy_to_prepare_batch;
     fn.flush_batch = copy_to_flush_batch;
+    fn.copy_to_get_written_statistics = copy_to_get_written_statistics;
     fn.extension = "vortex";
 
     fn.execution_mode = [](bool preserve_insertion_order, bool supports_batch_index) {

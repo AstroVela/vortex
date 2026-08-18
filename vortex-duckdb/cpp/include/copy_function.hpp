@@ -11,12 +11,17 @@ struct VortexCopyBindData final : TableFunctionData {
     VortexCopyBindData(unique_ptr<CData> ffi_bind) : ffi_bind(std::move(ffi_bind)) {
     }
     unique_ptr<CData> ffi_bind;
+    // Column names in write order, used to key WRITTEN_FILE_STATISTICS.
+    vector<string> column_names;
 };
 
 struct VortexCopyGlobalState final : GlobalFunctionData {
     VortexCopyGlobalState(unique_ptr<CData> ffi_global) : ffi_global(std::move(ffi_global)) {
     }
     unique_ptr<CData> ffi_global;
+    // Non-owning; set in copy_to_get_written_statistics (before the write) and filled in
+    // copy_to_finalize (after the write). Null when the plan does not request statistics.
+    CopyFunctionFileStatistics *written_stats = nullptr;
 };
 
 struct VortexCopyPreparedBatchData final : PreparedBatchData {
