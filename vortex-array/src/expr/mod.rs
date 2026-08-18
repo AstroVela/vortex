@@ -104,6 +104,7 @@ pub use exprs::list_contains;
 pub use exprs::list_length;
 pub use exprs::list_sum;
 pub use exprs::list_sum_opts;
+pub use exprs::list_transform;
 pub use exprs::lit;
 pub use exprs::lt;
 pub use exprs::lt_eq;
@@ -171,6 +172,7 @@ impl PartialEq for ExactExpr {
         match (&self.0, &other.0) {
             (Expression::Root, Expression::Root) => true,
             (Expression::Variable(lhs), Expression::Variable(rhs)) => lhs == rhs,
+            (Expression::Lambda(lhs), Expression::Lambda(rhs)) => lhs == rhs,
             (
                 Expression::Scalar {
                     scalar_fn: lhs_fn,
@@ -181,6 +183,22 @@ impl PartialEq for ExactExpr {
                     children: rhs_children,
                 },
             ) => lhs_fn == rhs_fn && Arc::ptr_eq(lhs_children, rhs_children),
+            (
+                Expression::HigherOrder {
+                    higher_order_fn: lhs_fn,
+                    children: lhs_children,
+                    lambdas: lhs_lambdas,
+                },
+                Expression::HigherOrder {
+                    higher_order_fn: rhs_fn,
+                    children: rhs_children,
+                    lambdas: rhs_lambdas,
+                },
+            ) => {
+                lhs_fn == rhs_fn
+                    && Arc::ptr_eq(lhs_children, rhs_children)
+                    && Arc::ptr_eq(lhs_lambdas, rhs_lambdas)
+            }
             _ => false,
         }
     }
@@ -195,6 +213,10 @@ impl Hash for ExactExpr {
                 state.write_u8(2);
                 variable.hash(state);
             }
+            Expression::Lambda(lambda) => {
+                state.write_u8(3);
+                lambda.hash(state);
+            }
             Expression::Scalar {
                 scalar_fn,
                 children,
@@ -202,6 +224,16 @@ impl Hash for ExactExpr {
                 state.write_u8(1);
                 scalar_fn.hash(state);
                 Arc::as_ptr(children).hash(state);
+            }
+            Expression::HigherOrder {
+                higher_order_fn,
+                children,
+                lambdas,
+            } => {
+                state.write_u8(4);
+                higher_order_fn.hash(state);
+                Arc::as_ptr(children).hash(state);
+                Arc::as_ptr(lambdas).hash(state);
             }
         }
     }

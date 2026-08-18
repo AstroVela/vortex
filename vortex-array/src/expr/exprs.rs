@@ -19,6 +19,9 @@ use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::lambda::Lambda;
 use crate::expr::variable::Variable;
+use crate::higher_order_fn::EmptyOptions as HigherOrderEmptyOptions;
+use crate::higher_order_fn::HigherOrderFunctionVTableExt;
+use crate::higher_order_fn::fns::list_transform::ListTransform;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 use crate::scalar_fn::EmptyOptions;
@@ -61,7 +64,7 @@ use crate::scalar_fn::fns::zip::Zip;
 
 /// Creates an expression that references the root scope.
 ///
-/// Returns the entire input array as passed to the expression evaluator.
+/// Returns the entire input array as passed to the expression application context.
 /// This is commonly used as the starting point for field access and other operations.
 pub fn root() -> Expression {
     Expression::Root
@@ -83,8 +86,20 @@ pub fn var(name: impl AsRef<str>) -> Expression {
 pub fn lambda(
     params: impl IntoIterator<Item = impl Into<Variable>>,
     body: Expression,
-) -> VortexResult<Lambda> {
-    Lambda::try_new(params, body)
+) -> VortexResult<Expression> {
+    Ok(Expression::Lambda(Lambda::try_new(params, body)?))
+}
+
+/// Transform every element in a list with a single-parameter `lambda`.
+///
+/// The lambda is syntax rather than an ordinary expression child: its parameter type comes from
+/// the input list's element type when the expression is bound.
+pub fn list_transform(input: Expression, lambda: Expression) -> VortexResult<Expression> {
+    Expression::try_new_higher_order(
+        ListTransform.bind(HigherOrderEmptyOptions),
+        [input],
+        [lambda],
+    )
 }
 
 /// Return whether the expression is a root expression.

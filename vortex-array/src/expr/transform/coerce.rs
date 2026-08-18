@@ -4,13 +4,13 @@
 //! Expression-level type coercion pass.
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 
 use crate::dtype::DType;
 use crate::expr::Expression;
+use crate::expr::Scope;
 use crate::expr::cast;
-use crate::expr::traversal::NodeExt;
-use crate::expr::traversal::Transformed;
-use crate::scalar_fn::fns::literal::Literal;
 
 /// Rewrite an expression tree to insert casts where a scalar function's `coerce_args` demands
 /// a different type than what the child currently produces.
@@ -18,54 +18,118 @@ use crate::scalar_fn::fns::literal::Literal;
 /// The rewrite is bottom-up: children are coerced first, then each parent node checks whether
 /// its children match the coerced argument types.
 pub fn coerce_expression(expr: Expression, scope: &DType) -> VortexResult<Expression> {
-    // We capture scope by reference for the closure.
-    let scope = scope.clone();
+    coerce_expression_scope(expr, &Scope::new(scope.clone()))
+}
 
-    expr.transform_up(|node| {
-        // Leaf nodes have no children to coerce.
-        if node.is_root() || node.is::<Literal>() || node.children().is_empty() {
-            return Ok(Transformed::no(node));
+/// Rewrite an expression against a lexical scope, inserting casts demanded by scalar functions
+/// and by the ordinary inputs of higher-order functions.
+///
+/// A higher-order function's lambdas are bound only after its ordinary inputs have been coerced:
+/// those final input dtypes establish the lexical parameter scope of each lambda.
+pub fn coerce_expression_scope(expr: Expression, scope: &Scope) -> VortexResult<Expression> {
+    coerce_expression_inner(expr, scope)
+}
+
+fn coerce_expression_inner(expr: Expression, scope: &Scope) -> VortexResult<Expression> {
+    match &expr {
+        Expression::Root | Expression::Variable(_) | Expression::Lambda(_) => Ok(expr),
+        Expression::Scalar {
+            scalar_fn,
+            children,
+        } => {
+            let children = children
+                .iter()
+                .cloned()
+                .map(|child| coerce_expression_inner(child, scope))
+                .collect::<VortexResult<Vec<_>>>()?;
+            let children =
+                coerce_children(children, scope, |dtypes| scalar_fn.coerce_args(dtypes))?;
+            Expression::try_new(scalar_fn.clone(), children)
         }
+        Expression::HigherOrder {
+            higher_order_fn,
+            children,
+            lambdas,
+        } => {
+            let children = children
+                .iter()
+                .cloned()
+                .map(|child| coerce_expression_inner(child, scope))
+                .collect::<VortexResult<Vec<_>>>()?;
+            let children = coerce_children(children, scope, |dtypes| {
+                higher_order_fn.coerce_input_args(dtypes)
+            })?;
 
-        // Compute the current child return types.
-        let child_dtypes: Vec<DType> = node
-            .children()
-            .iter()
-            .map(|c| c.return_dtype(&scope))
-            .collect::<VortexResult<_>>()?;
+            let arg_dtypes = children
+                .iter()
+                .map(|child| child.return_dtype_scope(scope))
+                .collect::<VortexResult<Vec<_>>>()?;
+            let lambda_syntax = lambdas
+                .iter()
+                .map(|lambda| {
+                    lambda.as_lambda().ok_or_else(|| {
+                        vortex_err!(
+                            "higher-order expression '{}' contained a non-lambda argument",
+                            higher_order_fn.id()
+                        )
+                    })
+                })
+                .collect::<VortexResult<Vec<_>>>()?;
+            let signatures = higher_order_fn.lambda_signatures(&arg_dtypes, &lambda_syntax)?;
+            vortex_ensure!(
+                signatures.len() == lambda_syntax.len(),
+                "higher-order function '{}' produced {} lambda signatures for {} lambda arguments",
+                higher_order_fn.id(),
+                signatures.len(),
+                lambda_syntax.len(),
+            );
+            let lambdas = lambda_syntax
+                .into_iter()
+                .zip(signatures.iter())
+                .map(|(lambda, signature)| {
+                    let body = coerce_expression_inner(
+                        lambda.body().clone(),
+                        &signature.scope(lambda, scope)?,
+                    )?;
+                    Ok(Expression::Lambda(lambda.clone().with_body(body)))
+                })
+                .collect::<VortexResult<Vec<_>>>()?;
 
-        // Ask the scalar function what types it wants.
-        let Some(scalar_fn) = node.as_scalar() else {
-            return Ok(Transformed::no(node));
-        };
-        let coerced_dtypes = scalar_fn.coerce_args(&child_dtypes)?;
-
-        // If nothing changed, skip.
-        if child_dtypes == coerced_dtypes {
-            return Ok(Transformed::no(node));
+            Expression::try_new_higher_order(higher_order_fn.clone(), children, lambdas)
         }
+    }
+}
 
-        // Build new children, inserting casts where needed.
-        let new_children: Vec<Expression> = node
-            .children()
-            .iter()
-            .zip(coerced_dtypes.iter())
-            .map(|(child, target)| {
-                let child_dtype = child.return_dtype(&scope)?;
-                if child_dtype.eq_ignore_nullability(target)
-                    && child_dtype.nullability() == target.nullability()
-                {
-                    Ok(child.clone())
-                } else {
-                    Ok(cast(child.clone(), target.clone()))
-                }
-            })
-            .collect::<VortexResult<_>>()?;
+fn coerce_children(
+    children: Vec<Expression>,
+    scope: &Scope,
+    coerce: impl FnOnce(&[DType]) -> VortexResult<Vec<DType>>,
+) -> VortexResult<Vec<Expression>> {
+    let child_dtypes = children
+        .iter()
+        .map(|child| child.return_dtype_scope(scope))
+        .collect::<VortexResult<Vec<_>>>()?;
+    let coerced_dtypes = coerce(&child_dtypes)?;
+    vortex_ensure!(
+        child_dtypes.len() == coerced_dtypes.len(),
+        "argument coercion returned {} types for {} children",
+        coerced_dtypes.len(),
+        child_dtypes.len(),
+    );
 
-        let new_expr = node.with_children(new_children)?;
-        Ok(Transformed::yes(new_expr))
-    })
-    .map(|t| t.into_inner())
+    children
+        .into_iter()
+        .zip(child_dtypes.into_iter().zip(coerced_dtypes))
+        .map(|(child, (child_dtype, target))| {
+            if child_dtype.eq_ignore_nullability(&target)
+                && child_dtype.nullability() == target.nullability()
+            {
+                Ok(child)
+            } else {
+                Ok(cast(child, target))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

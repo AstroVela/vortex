@@ -96,6 +96,7 @@ use vortex_session::registry::Interner;
 
 use crate::aggregate_fn::session::AggregateFnSession;
 use crate::dtype::session::DTypeSession;
+use crate::higher_order_fn::session::HigherOrderFunctionSession;
 use crate::memory::MemorySession;
 use crate::optimizer::kernels::KernelSession;
 use crate::scalar_fn::session::ScalarFnSession;
@@ -119,9 +120,10 @@ pub mod display;
 pub mod dtype;
 mod executor;
 pub mod expr;
-mod expression;
+pub(crate) mod expression;
 pub mod extension;
 mod hash;
+pub mod higher_order_fn;
 pub mod iter;
 pub mod kernel;
 pub mod mask;
@@ -175,6 +177,7 @@ pub fn array_session() -> VortexSession {
         .with::<KernelSession>()
         .with::<DTypeSession>()
         .with::<ScalarFnSession>()
+        .with::<HigherOrderFunctionSession>()
         .with::<StatsSession>()
         .with::<AggregateFnSession>()
         .with::<MemorySession>()

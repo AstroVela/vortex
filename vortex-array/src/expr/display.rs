@@ -29,6 +29,18 @@ pub trait ExprDisplay: Display {
     fn display_children_count(&self) -> usize;
 }
 
+/// Read-only higher-order-expression interface used for SQL-style formatting.
+///
+/// Lambdas are deliberately separate from ordinary children: a higher-order function establishes
+/// their parameter scope, so callers must never mistake a lambda body for an ordinary argument.
+pub trait HigherOrderExprDisplay: ExprDisplay {
+    /// Return the lambda at `index`.
+    fn display_lambda(&self, index: usize) -> &dyn Display;
+
+    /// Return the number of lambda arguments.
+    fn display_lambdas_count(&self) -> usize;
+}
+
 impl ExprDisplay for Expression {
     fn display_child(&self, index: usize) -> &dyn ExprDisplay {
         Expression::child(self, index)
@@ -46,6 +58,54 @@ impl ExprDisplay for BoundExpression {
 
     fn display_children_count(&self) -> usize {
         self.children().len()
+    }
+}
+
+impl HigherOrderExprDisplay for Expression {
+    fn display_lambda(&self, index: usize) -> &dyn Display {
+        match self {
+            Expression::HigherOrder { lambdas, .. } => &lambdas[index],
+            Expression::Scalar { .. }
+            | Expression::Lambda(_)
+            | Expression::Root
+            | Expression::Variable(_) => {
+                unreachable!("only higher-order expressions have lambda arguments")
+            }
+        }
+    }
+
+    fn display_lambdas_count(&self) -> usize {
+        match self {
+            Expression::HigherOrder { lambdas, .. } => lambdas.len(),
+            Expression::Scalar { .. }
+            | Expression::Lambda(_)
+            | Expression::Root
+            | Expression::Variable(_) => 0,
+        }
+    }
+}
+
+impl HigherOrderExprDisplay for BoundExpression {
+    fn display_lambda(&self, index: usize) -> &dyn Display {
+        match self {
+            BoundExpression::HigherOrder { lambdas, .. } => &lambdas[index],
+            BoundExpression::Scalar { .. }
+            | BoundExpression::Lambda { .. }
+            | BoundExpression::Root { .. }
+            | BoundExpression::Variable { .. } => {
+                unreachable!("only higher-order expressions have lambda arguments")
+            }
+        }
+    }
+
+    fn display_lambdas_count(&self) -> usize {
+        match self {
+            BoundExpression::HigherOrder { lambdas, .. } => lambdas.len(),
+            BoundExpression::Scalar { .. }
+            | BoundExpression::Lambda { .. }
+            | BoundExpression::Root { .. }
+            | BoundExpression::Variable { .. } => 0,
+        }
     }
 }
 
@@ -68,7 +128,10 @@ impl DisplayTreeNode for Expression {
     fn tree_child_name(&self, index: usize) -> ChildName {
         match self {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.signature().child_name(index),
-            Expression::Root | Expression::Variable(_) => {
+            Expression::HigherOrder {
+                higher_order_fn, ..
+            } => higher_order_fn.child_name(index),
+            Expression::Lambda(_) | Expression::Root | Expression::Variable(_) => {
                 unreachable!("a leaf expression has no children")
             }
         }
@@ -77,6 +140,10 @@ impl DisplayTreeNode for Expression {
     fn fmt_tree_node(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Expression::Scalar { scalar_fn, .. } => Display::fmt(scalar_fn, f),
+            Expression::HigherOrder {
+                higher_order_fn, ..
+            } => Display::fmt(higher_order_fn, f),
+            Expression::Lambda(lambda) => Display::fmt(lambda, f),
             Expression::Root => write!(f, "{ROOT_DISPLAY}"),
             Expression::Variable(variable) => write!(f, "${variable}"),
         }
@@ -91,7 +158,12 @@ impl DisplayTreeNode for BoundExpression {
     fn tree_child_name(&self, index: usize) -> ChildName {
         match self {
             BoundExpression::Scalar { scalar_fn, .. } => scalar_fn.signature().child_name(index),
-            BoundExpression::Root { .. } | BoundExpression::Variable { .. } => {
+            BoundExpression::HigherOrder {
+                higher_order_fn, ..
+            } => higher_order_fn.child_name(index),
+            BoundExpression::Lambda { .. }
+            | BoundExpression::Root { .. }
+            | BoundExpression::Variable { .. } => {
                 unreachable!("a leaf bound node has no children")
             }
         }
@@ -100,6 +172,10 @@ impl DisplayTreeNode for BoundExpression {
     fn fmt_tree_node(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             BoundExpression::Scalar { scalar_fn, .. } => Display::fmt(scalar_fn, f),
+            BoundExpression::HigherOrder {
+                higher_order_fn, ..
+            } => Display::fmt(higher_order_fn, f),
+            BoundExpression::Lambda { lambda } => Display::fmt(lambda, f),
             BoundExpression::Root { .. } => write!(f, "{ROOT_DISPLAY}"),
             BoundExpression::Variable { variable, .. } => write!(f, "${variable}"),
         }
