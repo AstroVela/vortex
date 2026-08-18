@@ -34,7 +34,9 @@ use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
+use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
 use vortex_btrblocks::schemes::range_entropy::RangeEntropyScheme;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -74,18 +76,25 @@ struct FloatMultBackendSizes {
     range_two_level: usize,
 }
 
+struct FloatMultLatents {
+    primary: Vec<u64>,
+    secondary: Vec<u64>,
+}
+
 enum FloatMultPrototype {
     F32 {
         base: f32,
         primary: ArrayRef,
         secondary: ArrayRef,
         backend_sizes: FloatMultBackendSizes,
+        latents: FloatMultLatents,
     },
     F64 {
         base: f64,
         primary: ArrayRef,
         secondary: ArrayRef,
         backend_sizes: FloatMultBackendSizes,
+        latents: FloatMultLatents,
     },
 }
 
@@ -124,6 +133,43 @@ impl FloatMultPrototype {
         }
     }
 
+    fn latents(&self) -> &FloatMultLatents {
+        match self {
+            Self::F32 { latents, .. } | Self::F64 { latents, .. } => latents,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn reconstruct(&self, primary: &[u64], secondary: &[u64]) -> VortexResult<()> {
+        vortex_ensure!(
+            primary.len() == secondary.len(),
+            "FloatMult latent lengths differ"
+        );
+        match self {
+            Self::F32 { base, .. } => {
+                let values = primary
+                    .iter()
+                    .copied()
+                    .zip(secondary.iter().copied())
+                    .map(|(primary, secondary)| {
+                        join_float_mult_f32(primary as u32, secondary as u32, *base)
+                    })
+                    .collect::<Vec<_>>();
+                black_box(values);
+            }
+            Self::F64 { base, .. } => {
+                let values = primary
+                    .iter()
+                    .copied()
+                    .zip(secondary.iter().copied())
+                    .map(|(primary, secondary)| join_float_mult_f64(primary, secondary, *base))
+                    .collect::<Vec<_>>();
+                black_box(values);
+            }
+        }
+        Ok(())
+    }
+
     fn decode(&self, session: &VortexSession) -> VortexResult<ArrayRef> {
         match self {
             Self::F32 {
@@ -138,20 +184,20 @@ impl FloatMultPrototype {
                 let secondary = secondary
                     .clone()
                     .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
-                let mask = primary
-                    .as_view()
-                    .validity()?
-                    .execute_mask(primary.len(), &mut session.create_execution_ctx())?;
-                Ok(PrimitiveArray::from_option_iter(
-                    primary
-                        .as_slice::<u32>()
-                        .iter()
-                        .copied()
-                        .zip(secondary.as_slice::<u32>().iter().copied())
-                        .zip(mask.iter())
-                        .map(|((primary, secondary), valid)| {
-                            valid.then_some(join_float_mult_f32(primary, secondary, *base))
-                        }),
+                let validity = primary.as_view().validity()?;
+                Ok(PrimitiveArray::new(
+                    Buffer::from(
+                        primary
+                            .as_slice::<u32>()
+                            .iter()
+                            .copied()
+                            .zip(secondary.as_slice::<u32>().iter().copied())
+                            .map(|(primary, secondary)| {
+                                join_float_mult_f32(primary, secondary, *base)
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    validity,
                 )
                 .into_array())
             }
@@ -167,23 +213,117 @@ impl FloatMultPrototype {
                 let secondary = secondary
                     .clone()
                     .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
-                let mask = primary
-                    .as_view()
-                    .validity()?
-                    .execute_mask(primary.len(), &mut session.create_execution_ctx())?;
-                Ok(PrimitiveArray::from_option_iter(
-                    primary
-                        .as_slice::<u64>()
-                        .iter()
-                        .copied()
-                        .zip(secondary.as_slice::<u64>().iter().copied())
-                        .zip(mask.iter())
-                        .map(|((primary, secondary), valid)| {
-                            valid.then_some(join_float_mult_f64(primary, secondary, *base))
-                        }),
+                let validity = primary.as_view().validity()?;
+                Ok(PrimitiveArray::new(
+                    Buffer::from(
+                        primary
+                            .as_slice::<u64>()
+                            .iter()
+                            .copied()
+                            .zip(secondary.as_slice::<u64>().iter().copied())
+                            .map(|(primary, secondary)| {
+                                join_float_mult_f64(primary, secondary, *base)
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    validity,
                 )
                 .into_array())
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FloatMultLatentBackend {
+    BitSplit,
+    BlockResidual,
+    RangeEntropy,
+    RangePacked,
+    RangeTwoLevel,
+}
+
+impl FloatMultLatentBackend {
+    const ALL: [Self; 5] = [
+        Self::BitSplit,
+        Self::BlockResidual,
+        Self::RangeEntropy,
+        Self::RangePacked,
+        Self::RangeTwoLevel,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BitSplit => "bit-split",
+            Self::BlockResidual => "block-residual",
+            Self::RangeEntropy => "range-entropy",
+            Self::RangePacked => "range-packed",
+            Self::RangeTwoLevel => "range-two-level",
+        }
+    }
+
+    fn encode(self, latents: &FloatMultLatents) -> VortexResult<FloatMultCodecPair> {
+        Ok(match self {
+            Self::BitSplit => FloatMultCodecPair::BitSplit(
+                BitSplitCodec::encode(&latents.primary)?,
+                BitSplitCodec::encode(&latents.secondary)?,
+            ),
+            Self::BlockResidual => FloatMultCodecPair::BlockResidual(
+                PatchedFoRCodec::encode_single_base(&latents.primary)?,
+                PatchedFoRCodec::encode_single_base(&latents.secondary)?,
+            ),
+            Self::RangeEntropy => FloatMultCodecPair::RangeEntropy(
+                RangeEntropyCodec::encode(&latents.primary, 8_192)?,
+                RangeEntropyCodec::encode(&latents.secondary, 8_192)?,
+            ),
+            Self::RangePacked => FloatMultCodecPair::RangePacked(
+                RangePackedCodec::encode(&latents.primary, 8_192)?,
+                RangePackedCodec::encode(&latents.secondary, 8_192)?,
+            ),
+            Self::RangeTwoLevel => FloatMultCodecPair::RangeTwoLevel(
+                RangeTwoLevelCodec::encode(&latents.primary, 8_192)?,
+                RangeTwoLevelCodec::encode(&latents.secondary, 8_192)?,
+            ),
+        })
+    }
+}
+
+enum FloatMultCodecPair {
+    BitSplit(BitSplitCodec, BitSplitCodec),
+    BlockResidual(PatchedFoRCodec, PatchedFoRCodec),
+    RangeEntropy(RangeEntropyCodec, RangeEntropyCodec),
+    RangePacked(RangePackedCodec, RangePackedCodec),
+    RangeTwoLevel(RangeTwoLevelCodec, RangeTwoLevelCodec),
+}
+
+impl FloatMultCodecPair {
+    fn encoded_size(&self) -> usize {
+        match self {
+            Self::BitSplit(primary, secondary) => {
+                primary.encoded_size() + secondary.encoded_size() + 16
+            }
+            Self::BlockResidual(primary, secondary) => {
+                primary.encoded_size() + secondary.encoded_size() + 16
+            }
+            Self::RangeEntropy(primary, secondary) => {
+                primary.encoded_size() + secondary.encoded_size() + 16
+            }
+            Self::RangePacked(primary, secondary) => {
+                primary.encoded_size() + secondary.encoded_size() + 16
+            }
+            Self::RangeTwoLevel(primary, secondary) => {
+                primary.encoded_size() + secondary.encoded_size() + 16
+            }
+        }
+    }
+
+    fn decode(&self) -> VortexResult<(Vec<u64>, Vec<u64>)> {
+        match self {
+            Self::BitSplit(primary, secondary) => Ok((primary.decode()?, secondary.decode()?)),
+            Self::BlockResidual(primary, secondary) => Ok((primary.decode()?, secondary.decode()?)),
+            Self::RangeEntropy(primary, secondary) => Ok((primary.decode()?, secondary.decode()?)),
+            Self::RangePacked(primary, secondary) => Ok((primary.decode()?, secondary.decode()?)),
+            Self::RangeTwoLevel(primary, secondary) => Ok((primary.decode()?, secondary.decode()?)),
         }
     }
 }
@@ -608,14 +748,13 @@ fn float_mult_prototype(
                     + RangeTwoLevelCodec::encode(&secondary_u64, 8_192)?.encoded_size()
                     + 16,
             };
-            let primary = PrimitiveArray::from_option_iter(
-                primary
-                    .into_iter()
-                    .zip(mask.iter())
-                    .map(|(value, valid)| valid.then_some(value)),
-            )
-            .into_array();
-            let secondary = PrimitiveArray::from_iter(secondary).into_array();
+            let latents = FloatMultLatents {
+                primary: primary_u64,
+                secondary: secondary_u64,
+            };
+            let validity = column.primitive.as_view().validity()?;
+            let primary = PrimitiveArray::new(Buffer::from(primary), validity.clone()).into_array();
+            let secondary = PrimitiveArray::new(Buffer::from(secondary), validity).into_array();
             let primary = compressor.compress(&primary, &mut session.create_execution_ctx())?;
             let secondary = compressor.compress(&secondary, &mut session.create_execution_ctx())?;
             Ok(Some(FloatMultPrototype::$variant {
@@ -623,6 +762,7 @@ fn float_mult_prototype(
                 primary,
                 secondary,
                 backend_sizes,
+                latents,
             }))
         }};
     }
@@ -762,6 +902,90 @@ fn measure_float_mult_decoder(
     Ok(())
 }
 
+fn measure_float_mult_backends(
+    dataset: &str,
+    prototypes: &[(&Column, FloatMultPrototype)],
+) -> VortexResult<()> {
+    if prototypes.is_empty() {
+        return Ok(());
+    }
+    let input_bytes = prototypes
+        .iter()
+        .map(|(column, _)| column.primitive.nbytes())
+        .sum::<u64>();
+    let encoded = FloatMultLatentBackend::ALL
+        .into_iter()
+        .map(|backend| {
+            let codecs = prototypes
+                .iter()
+                .map(|(_, prototype)| backend.encode(prototype.latents()))
+                .collect::<VortexResult<Vec<_>>>()?;
+            Ok((backend, codecs))
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+
+    let decode_iterations = (1_000_000_000_u64 / input_bytes).clamp(5, 50) as usize;
+    for (backend, codecs) in &encoded {
+        for ((_, prototype), codec) in prototypes.iter().zip(codecs) {
+            let (primary, secondary) = codec.decode()?;
+            prototype.reconstruct(&primary, &secondary)?;
+        }
+        let mut durations = Vec::with_capacity(decode_iterations);
+        for _ in 0..decode_iterations {
+            let start = Instant::now();
+            for ((_, prototype), codec) in prototypes.iter().zip(codecs) {
+                let (primary, secondary) = codec.decode()?;
+                prototype.reconstruct(&primary, &secondary)?;
+            }
+            durations.push(start.elapsed());
+        }
+        let encoded_bytes = codecs
+            .iter()
+            .map(FloatMultCodecPair::encoded_size)
+            .sum::<usize>();
+        let p10 = percentile(&mut durations.clone(), 1, 10);
+        let p90 = percentile(&mut durations.clone(), 9, 10);
+        let median = percentile(&mut durations, 1, 2);
+        let throughput = input_bytes as f64 / median.as_secs_f64() / 1_000_000.0;
+        println!(
+            "float-mult-backend-decode\t{dataset}\t{}\t{encoded_bytes}\t{:.3}\t{:.3}\t{:.3}\t{throughput:.1}",
+            backend.name(),
+            p10.as_secs_f64() * 1_000.0,
+            median.as_secs_f64() * 1_000.0,
+            p90.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    let encode_iterations = (200_000_000_u64 / input_bytes).clamp(3, 20) as usize;
+    for backend in FloatMultLatentBackend::ALL {
+        let mut durations = Vec::with_capacity(encode_iterations);
+        for _ in 0..encode_iterations {
+            let start = Instant::now();
+            let encoded_bytes = prototypes
+                .iter()
+                .try_fold(0_usize, |size, (_, prototype)| {
+                    Ok::<_, vortex_error::VortexError>(
+                        size + backend.encode(prototype.latents())?.encoded_size(),
+                    )
+                })?;
+            durations.push(start.elapsed());
+            black_box(encoded_bytes);
+        }
+        let p10 = percentile(&mut durations.clone(), 1, 10);
+        let p90 = percentile(&mut durations.clone(), 9, 10);
+        let median = percentile(&mut durations, 1, 2);
+        let throughput = input_bytes as f64 / median.as_secs_f64() / 1_000_000.0;
+        println!(
+            "float-mult-backend-encode\t{dataset}\t{}\t{input_bytes}\t{:.3}\t{:.3}\t{:.3}\t{throughput:.1}",
+            backend.name(),
+            p10.as_secs_f64() * 1_000.0,
+            median.as_secs_f64() * 1_000.0,
+            p90.as_secs_f64() * 1_000.0,
+        );
+    }
+    Ok(())
+}
+
 fn main() -> VortexResult<()> {
     let path = std::env::args()
         .nth(1)
@@ -794,11 +1018,14 @@ fn main() -> VortexResult<()> {
         .map(|column| column.primitive.nbytes())
         .sum::<u64>();
     let baseline = BtrBlocksCompressorBuilder::default()
-        .exclude_schemes([FloatQuantScheme.id()])
+        .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
         .build();
     let range_candidate = BtrBlocksCompressorBuilder::default()
-        .exclude_schemes([FloatQuantScheme.id()])
+        .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
         .with_new_scheme(&RangeEntropyScheme)
+        .build();
+    let default_without_block_residual = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([OrderedBlockResidualScheme.id()])
         .build();
     let float_candidate = BtrBlocksCompressor::default();
     let stacked_candidate = BtrBlocksCompressorBuilder::default()
@@ -809,12 +1036,16 @@ fn main() -> VortexResult<()> {
         .with_mode_spec(ModeSpec::Auto)
         .with_delta_spec(DeltaSpec::Auto);
     let configs = [
-        ("default-without-float-quant", Encoder::BtrBlocks(&baseline)),
+        ("default-without-new-float", Encoder::BtrBlocks(&baseline)),
         (
-            "default-without-float-quant+range-entropy",
+            "default-without-new-float+range-entropy",
             Encoder::BtrBlocks(&range_candidate),
         ),
-        ("default", Encoder::BtrBlocks(&float_candidate)),
+        (
+            "default-off",
+            Encoder::BtrBlocks(&default_without_block_residual),
+        ),
+        ("default-on", Encoder::BtrBlocks(&float_candidate)),
         (
             "default+range-entropy",
             Encoder::BtrBlocks(&stacked_candidate),
@@ -880,6 +1111,7 @@ fn main() -> VortexResult<()> {
     println!("operation\tdataset\tconfig\tbytes\tp10-ms\tmedian-ms\tp90-ms\tMB/s");
     measure_decoders(dataset, &encoded, input_bytes, &session)?;
     measure_float_mult_decoder(dataset, &float_mult_prototypes, &session)?;
+    measure_float_mult_backends(dataset, &float_mult_prototypes)?;
     measure_compressors(dataset, &configs, &columns, input_bytes, &session)?;
     Ok(())
 }

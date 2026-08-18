@@ -164,39 +164,39 @@ The aggregate values below cover every supported numeric column in each download
 
 ### Size
 
-| Dataset | Without FloatQuant | Default | Default plus RangeEntropy | Compact | Pco Auto |
+| Dataset | Without new float schemes | Default | Default plus RangeEntropy | Compact | Pco Auto |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | California Housing | 339,682 | 339,682 | 319,705 | 230,197 | 242,414 |
-| April 2023 HVFHV Taxi | 20,894,253 | 20,894,253 | 16,443,089 | 14,533,638 | 15,403,694 |
+| April 2023 HVFHV Taxi | 28,540,793 | 28,540,793 | 23,331,922 | 21,127,765 | 21,994,290 |
 | Air Quality | 6,135,414 | 6,135,414 | 5,149,775 | 2,311,526 | 2,303,523 |
 
-FloatQuant makes no selection on these inputs. Their size and decode paths remain unchanged.
+FloatQuant and OrderedFloat with BlockResidual make no selection on these inputs. Their size and decode paths remain unchanged.
 
-RangeEntropy reduces Taxi size by 21.3 percent and Air Quality size by 16.1 percent.
+RangeEntropy reduces Taxi size by 18.3 percent and Air Quality size by 16.1 percent.
 
-RangeEntropy remains 13.1 percent larger than Compact on Taxi. It remains 122.8 percent larger on Air Quality.
+RangeEntropy remains 10.4 percent larger than Compact on Taxi. It remains 122.8 percent larger on Air Quality.
 
 ### Compression throughput
 
-| Dataset | Without FloatQuant | Default | Default plus RangeEntropy | Compact | Pco Auto |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| California Housing | 201.9 MB/s | 204.4 MB/s | 112.9 MB/s | 70.9 MB/s | 201.6 MB/s |
-| April 2023 HVFHV Taxi | 849.7 MB/s | 830.2 MB/s | 424.5 MB/s | 448.1 MB/s | 608.0 MB/s |
-| Air Quality | 573.0 MB/s | 574.8 MB/s | 328.4 MB/s | 310.1 MB/s | 433.9 MB/s |
+| Dataset | Without new float schemes | Without BlockResidual | Default | Default plus RangeEntropy | Compact | Pco Auto |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| California Housing | 205.8 MB/s | 208.5 MB/s | 210.0 MB/s | 114.8 MB/s | 72.1 MB/s | 206.3 MB/s |
+| April 2023 HVFHV Taxi | 886.2 MB/s | 838.4 MB/s | 828.8 MB/s | 421.7 MB/s | 432.3 MB/s | 574.0 MB/s |
+| Air Quality | 548.2 MB/s | 549.1 MB/s | 550.5 MB/s | 318.3 MB/s | 303.7 MB/s | 415.2 MB/s |
 
-FloatQuant changes unselected compression throughput by less than 3 percent on these inputs.
+The BlockResidual locality probe changes compression throughput by 1.2 percent or less on these inputs.
 
-RangeEntropy reduces compression throughput by 43 to 50 percent. This result fails the gate.
+RangeEntropy reduces compression throughput by 42 to 49 percent. This result fails the gate.
 
 ### Decode throughput
 
-| Dataset | Without FloatQuant | Default | Default plus RangeEntropy | Compact | Pco Auto |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| California Housing | 12,488.1 MB/s | 12,674.5 MB/s | 2,148.5 MB/s | 2,351.7 MB/s | 2,406.9 MB/s |
-| April 2023 HVFHV Taxi | 21,718.9 MB/s | 21,918.9 MB/s | 4,509.1 MB/s | 5,063.4 MB/s | 3,517.7 MB/s |
-| Air Quality | 27,375.7 MB/s | 27,799.2 MB/s | 1,557.1 MB/s | 2,199.1 MB/s | 2,170.5 MB/s |
+| Dataset | Without new float schemes | Without BlockResidual | Default | Default plus RangeEntropy | Compact | Pco Auto |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| California Housing | 12,392.7 MB/s | 12,531.9 MB/s | 12,558.4 MB/s | 2,221.6 MB/s | 2,336.9 MB/s | 2,413.8 MB/s |
+| April 2023 HVFHV Taxi | 23,963.4 MB/s | 23,879.0 MB/s | 24,200.2 MB/s | 3,809.3 MB/s | 4,825.0 MB/s | 3,644.8 MB/s |
+| Air Quality | 25,013.7 MB/s | 24,807.0 MB/s | 25,371.2 MB/s | 1,471.8 MB/s | 2,088.0 MB/s | 2,092.8 MB/s |
 
-RangeEntropy decode is 4.9 to 17.9 times slower than the current lightweight default.
+RangeEntropy decode is 5.7 to 17.2 times slower than the current lightweight default.
 
 RangeEntropy beats Pco Auto decode on Taxi. It loses to Pco Auto decode on Housing and Air Quality.
 
@@ -310,22 +310,40 @@ The four-cluster result is 1.4 percent larger than ALP-RD. It is 14.0 percent sm
 
 Pco selects FloatMult on seven Taxi columns. The selected source columns contain 112 MB of logical values.
 
-| Backend for FloatMult children | Aggregate bytes |
-| --- | ---: |
-| Normal BtrBlocks integer compression | 22,340,941 |
-| Block residual packing | 19,555,263 |
-| BitSplit | 24,105,632 |
-| Fixed range tags | 20,860,940 |
-| Two-level range tags | 19,052,586 |
-| RangeEntropy | 16,730,631 |
-| Current default on source floats | 20,104,147 |
-| Pco Auto on source floats | 15,061,783 |
+| Backend for FloatMult children | Aggregate bytes | Encode MB/s | Decode MB/s |
+| --- | ---: | ---: | ---: |
+| Normal BtrBlocks integer compression | 22,340,941 | Not isolated | 5,079.1 |
+| Block residual packing | 19,555,263 | 1,826.0 | 3,628.8 |
+| BitSplit | 24,105,632 | 814.7 | 2,487.2 |
+| Fixed range tags | 20,860,940 | 703.5 | 3,057.3 |
+| Two-level range tags | 19,052,586 | 477.3 | 2,088.3 |
+| RangeEntropy | 16,730,631 | 461.9 | 1,884.1 |
+| Current default on source floats | 20,104,147 | Not isolated | Not isolated |
+| Pco Auto on source floats | 15,061,783 | Not isolated | Not isolated |
 
 FloatMult does not create conventional integer distributions. Normal integer compression loses 11.1 percent against the current default.
 
-RangeEntropy recovers most of Pco's benefit. It remains 11.1 percent larger than Pco on these columns.
+Block residual packing saves only 2.7 percent against the current default on the Taxi source columns.
+
+RangeEntropy saves 16.8 percent against the current default. It remains 11.1 percent larger than Pco on these columns.
+
+The direct decode test includes child decode, FloatMult reconstruction, and output allocation.
+
+The isolated encode test excludes FloatMult base search and the split from floats to latent integers.
+
+California Housing gives a different result. Block residual packing uses 170,645 bytes for five FloatMult columns.
+
+The current default uses 209,265 bytes for those source columns. Block residual packing saves 18.5 percent.
+
+The full block residual path decodes at 2,941.6 MB/s and encodes its existing latent integers at 937.6 MB/s.
+
+Normal BtrBlocks children use 172,046 bytes and decode at 6,991.6 MB/s on those columns.
 
 The current `RangeEntropy` decoder is too slow for the default compressor. FloatMult therefore needs a faster entropy-like child codec.
+
+Block residual packing is the fastest specialized encoder. Its decode path is still too slow for the default compressor.
+
+The next FloatMult prototype will use normal integer children first. Its selector must reject Taxi-like inputs with larger encoded children.
 
 ## Why Compact still wins
 
