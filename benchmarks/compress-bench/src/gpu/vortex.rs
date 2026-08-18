@@ -35,6 +35,7 @@ use vortex_bench::SESSION;
 use vortex_bench::compress::Compressor;
 use vortex_bench::conversions::parquet_to_vortex_chunks_with_batch_size;
 use vortex_cuda::CanonicalCudaExt;
+use vortex_cuda::CudaExecutionCtx;
 use vortex_cuda::CudaOpenOptionsExt;
 use vortex_cuda::CudaSession;
 #[cfg(target_os = "linux")]
@@ -199,52 +200,58 @@ async fn verify_against_host_scan(path: &Path, direct_io: bool) -> Result<()> {
     while let Some((gpu_batch, host_batch)) =
         next_batch_pair(&mut gpu_batches, &mut host_batches).await?
     {
-        let gpu_record = gpu_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
-        let host_record = host_batch.execute::<StructArray>(&mut host_ctx)?;
-        ensure!(
-            gpu_record.len() == host_record.len(),
-            "batch {batch_index} length differs between the GPU and CPU scans: {} vs {}",
-            gpu_record.len(),
-            host_record.len()
-        );
-
-        let gpu_fields = gpu_record
-            .iter_unmasked_fields()
-            .cloned()
-            .collect::<Vec<_>>();
-        let host_fields = host_record
-            .iter_unmasked_fields()
-            .cloned()
-            .collect::<Vec<_>>();
-        ensure!(
-            gpu_fields.len() == host_fields.len(),
-            "batch {batch_index} field count differs between the GPU and CPU scans"
-        );
-
-        for (field_index, (gpu_field, host_field)) in
-            gpu_fields.into_iter().zip(host_fields).enumerate()
-        {
-            let decoded = gpu_field.execute_cuda(&mut cuda_ctx).await?;
-            // The decode is enqueued, not complete: make the writes visible before reading
-            // the buffers back to the host.
-            cuda_ctx.synchronize_stream()?;
-            let decoded = decoded.into_host().await?.into_array();
-            verify_field(
-                &host_field,
-                decoded,
-                &mut host_ctx,
-                batch_index,
-                field_index,
-            )?;
-            fields_checked += 1;
-        }
-
+        fields_checked += verify_batch(
+            gpu_batch,
+            host_batch,
+            &mut cuda_ctx,
+            &mut host_ctx,
+            batch_index,
+        )
+        .await?;
         batch_index += 1;
     }
     cuda_ctx.synchronize_stream()?;
 
     tracing::info!("verified {fields_checked} GPU-decoded Vortex fields against the CPU decode");
     Ok(())
+}
+
+/// Verifies every field of one batch, returning the number of fields checked.
+///
+/// A GPU decode is enqueued rather than immediate, so each field synchronises the stream before
+/// its buffers are read back to the host.
+async fn verify_batch(
+    gpu_batch: ArrayRef,
+    host_batch: ArrayRef,
+    cuda_ctx: &mut CudaExecutionCtx,
+    host_ctx: &mut ExecutionCtx,
+    batch_index: usize,
+) -> Result<usize> {
+    let gpu_record = gpu_batch.execute::<StructArray>(cuda_ctx.execution_ctx())?;
+    let host_record = host_batch.execute::<StructArray>(host_ctx)?;
+    ensure!(
+        gpu_record.len() == host_record.len(),
+        "batch {batch_index} length differs between the GPU and CPU scans: {} vs {}",
+        gpu_record.len(),
+        host_record.len()
+    );
+
+    let gpu_fields = gpu_record.iter_unmasked_fields();
+    let host_fields = host_record.iter_unmasked_fields();
+    let nfields = gpu_fields.len();
+    ensure!(
+        nfields == host_fields.len(),
+        "batch {batch_index} field count differs between the GPU and CPU scans"
+    );
+
+    for (field_index, (gpu_field, host_field)) in gpu_fields.zip(host_fields).enumerate() {
+        let decoded = gpu_field.clone().execute_cuda(cuda_ctx).await?;
+        cuda_ctx.synchronize_stream()?;
+        let decoded = decoded.into_host().await?.into_array();
+        verify_field(host_field, decoded, host_ctx, batch_index, field_index)?;
+    }
+
+    Ok(nfields)
 }
 
 /// Pulls one batch from each scan, or `None` once both are exhausted.
