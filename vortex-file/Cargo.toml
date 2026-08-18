@@ -35,6 +35,7 @@ url = { workspace = true }
 vortex-alp = { workspace = true }
 vortex-array = { workspace = true }
 vortex-btrblocks = { workspace = true }
+vortex-block-residual = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-bytebool = { workspace = true }
 
@@ -52,7 +53,6 @@ vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
 vortex-onpair = { workspace = true }
 vortex-pco = { workspace = true }
-vortex-range-entropy = { workspace = true }
 vortex-runend = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-sequence = { workspace = true }

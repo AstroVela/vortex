@@ -47,9 +47,9 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::BlockResidualCodec;
 use crate::BlockResidualParts;
-use crate::PatchedFoRCodec;
-use crate::patched_for::read_wide_bits;
+use crate::codec::read_wide_bits;
 
 const BLOCK_LEN: usize = 1024;
 const METADATA_VERSION: u8 = 1;
@@ -315,8 +315,7 @@ impl BlockResidual {
             "BlockResidual requires u64 values"
         );
         let validity = array.validity()?;
-        let parts = PatchedFoRCodec::encode_single_base(array.as_slice::<u64>())?
-            .into_single_base_parts()?;
+        let parts = BlockResidualCodec::encode(array.as_slice::<u64>())?.into_parts()?;
         Self::try_new(parts, validity)
     }
 

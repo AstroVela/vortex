@@ -275,9 +275,9 @@ pub mod encodings {
         pub use vortex_pco::*;
     }
 
-    /// Ordered-float, block-residual, and range-entropy numeric encodings.
-    pub mod range_entropy {
-        pub use vortex_range_entropy::*;
+    /// Ordered-float and block-residual numeric encodings.
+    pub mod block_residual {
+        pub use vortex_block_residual::*;
     }
 
     /// Arrow-compatible run-end encoding.

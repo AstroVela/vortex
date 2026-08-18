@@ -12,14 +12,14 @@ use vortex_array::VTable;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::PType;
+use vortex_block_residual::BlockResidual;
+use vortex_block_residual::OrderedFloat;
+use vortex_block_residual::OrderedFloatArraySlotsExt;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateScore;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexResult;
-use vortex_range_entropy::BlockResidual;
-use vortex_range_entropy::OrderedFloat;
-use vortex_range_entropy::OrderedFloatArraySlotsExt;
 
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;

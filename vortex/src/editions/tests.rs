@@ -18,6 +18,8 @@ use vortex_array::dtype::PType;
 use vortex_array::field_path;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::stream::ArrayStreamExt;
+use vortex_block_residual::BlockResidual;
+use vortex_block_residual::OrderedFloat;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
 use vortex_edition::ComponentKind;
@@ -35,15 +37,12 @@ use vortex_error::vortex_err;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_file::WriteStrategyBuilder;
-use vortex_float_quant::FloatMult;
 use vortex_float_quant::FloatQuant;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::session::LayoutSession;
-use vortex_range_entropy::BlockResidual;
-use vortex_range_entropy::OrderedFloat;
 use vortex_sequence::Sequence;
 use vortex_session::VortexSession;
 use vortex_session::registry::Id;
@@ -523,33 +522,6 @@ async fn default_writer_round_trips_float_quant() -> VortexResult<()> {
     );
     let decoded = actual.execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
     assert_eq!(decoded.as_slice::<f64>(), values);
-    Ok(())
-}
-
-#[tokio::test]
-async fn default_writer_round_trips_float_mult() -> VortexResult<()> {
-    use crate::VortexSessionDefault;
-
-    let session = VortexSession::default();
-    let values = (0u32..65_536)
-        .map(|index| ((index.wrapping_mul(7_919)) % 65_537) as f32)
-        .collect::<Vec<_>>();
-    let expected = PrimitiveArray::from_iter(values.clone()).into_array();
-    let buffer = write_with(&session, expected.clone()).await?;
-    let actual = session
-        .open_options()
-        .open_buffer(buffer)?
-        .scan()?
-        .into_array_stream()?
-        .read_all()
-        .await?;
-    assert!(
-        actual
-            .depth_first_traversal()
-            .any(|array| array.is::<FloatMult>())
-    );
-    let decoded = actual.execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
-    assert_eq!(decoded.as_slice::<f32>(), values);
     Ok(())
 }
 

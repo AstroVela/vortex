@@ -20,11 +20,9 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::schemes::float::PcoScheme;
-use vortex_btrblocks::schemes::range_entropy::RangeEntropyScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_pco::Pco;
-use vortex_range_entropy::RangeEntropyCodec;
 
 const N: usize = 1 << 18;
 const VALUES_PER_PAGE: usize = 8192;
@@ -213,39 +211,11 @@ fn report(
     Ok(())
 }
 
-fn ordered_f64(value: f64) -> u64 {
-    let bits = value.to_bits();
-    if bits & (1_u64 << 63) == 0 {
-        bits ^ (1_u64 << 63)
-    } else {
-        !bits
-    }
-}
-
-fn report_native(dataset: &str, values: &[f64], input_bytes: u64) -> VortexResult<()> {
-    let latents: Vec<_> = values.iter().copied().map(ordered_f64).collect();
-    let start = Instant::now();
-    let compressed = RangeEntropyCodec::encode(&latents, VALUES_PER_PAGE)?;
-    let elapsed = start.elapsed();
-    let encoded_bytes = u64::try_from(compressed.encoded_size())?;
-    let bits_per_value = 8.0 * encoded_bytes as f64 / N as f64;
-    let throughput = input_bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0;
-    eprintln!(
-        "{dataset}: native range entropy used {} bins",
-        compressed.bin_lowers().len()
-    );
-    println!("{dataset}\trange-entropy\t{encoded_bytes}\t{bits_per_value:.3}\t{throughput:.1}");
-    Ok(())
-}
-
 fn main() -> VortexResult<()> {
     let session = array_session();
     let default = BtrBlocksCompressor::default();
     let with_auto = BtrBlocksCompressorBuilder::default()
         .with_new_scheme(&PcoScheme)
-        .build();
-    let with_range_entropy = BtrBlocksCompressorBuilder::default()
-        .with_new_scheme(&RangeEntropyScheme)
         .build();
 
     println!("dataset\tencoder\tbytes\tbits/value\tMB/s");
@@ -265,18 +235,12 @@ fn main() -> VortexResult<()> {
             let config = selected_config(name).with_compression_level(level);
             report_pco_stages(name, &format!("selected-level-{level}"), &values, &config)?;
         }
-        report_native(name, &values, input_bytes)?;
-
         report(name, "btrblocks", input_bytes, || {
             default.compress(&array_ref, &mut session.create_execution_ctx())
         })?;
         report(name, "btrblocks+pco-auto", input_bytes, || {
             with_auto.compress(&array_ref, &mut session.create_execution_ctx())
         })?;
-        report(name, "btrblocks+range-entropy", input_bytes, || {
-            with_range_entropy.compress(&array_ref, &mut session.create_execution_ctx())
-        })?;
-
         for (encoder, config) in [
             (
                 "pco-classic",

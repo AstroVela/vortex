@@ -62,7 +62,7 @@ members = [
     "encodings/bytebool",
     "encodings/parquet-variant",
     "encodings/onpair",
-    "encodings/range-entropy",
+    "encodings/block-residual",
     "encodings/float-quant",
     # Benchmarks
     "benchmarks/bench-support",
@@ -323,7 +323,7 @@ vortex-metrics = { version = "0.1.0", path = "./vortex-metrics", default-feature
 vortex-onpair = { version = "0.1.0", path = "./encodings/onpair", default-features = false }
 vortex-parquet-variant = { version = "0.1.0", path = "./encodings/parquet-variant" }
 vortex-pco = { version = "0.1.0", path = "./encodings/pco", default-features = false }
-vortex-range-entropy = { version = "0.1.0", path = "./encodings/range-entropy", default-features = false }
+vortex-block-residual = { version = "0.1.0", path = "./encodings/block-residual", default-features = false }
 vortex-float-quant = { version = "0.1.0", path = "./encodings/float-quant", default-features = false }
 vortex-proto = { version = "0.1.0", path = "./vortex-proto", default-features = false }
 vortex-row = { version = "0.1.0", path = "./vortex-row", default-features = false }

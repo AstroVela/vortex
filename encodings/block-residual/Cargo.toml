@@ -1,8 +1,8 @@
 [package]
-name = "vortex-range-entropy"
+name = "vortex-block-residual"
 authors = { workspace = true }
 categories = { workspace = true }
-description = "Vortex range entropy array"
+description = "Vortex ordered-float and block-residual array encodings"
 edition = { workspace = true }
 homepage = { workspace = true }
 include = { workspace = true }

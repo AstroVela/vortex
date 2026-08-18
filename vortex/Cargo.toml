@@ -26,6 +26,7 @@ workspace = true
 vortex-alp = { workspace = true }
 vortex-array = { workspace = true }
 vortex-arrow = { workspace = true }
+vortex-block-residual = { workspace = true }
 vortex-btrblocks = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-bytebool = { workspace = true }
@@ -45,7 +46,6 @@ vortex-layout = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
 vortex-pco = { workspace = true }
-vortex-range-entropy = { workspace = true }
 vortex-proto = { workspace = true, default-features = true }
 vortex-runend = { workspace = true }
 vortex-scan = { workspace = true }

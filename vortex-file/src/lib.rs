@@ -191,7 +191,7 @@ pub fn register_default_encodings(session: &VortexSession) {
     vortex_decimal_byte_parts::initialize(session);
     vortex_fastlanes::initialize(session);
     vortex_float_quant::initialize(session);
-    vortex_range_entropy::initialize(session);
+    vortex_block_residual::initialize(session);
     vortex_runend::initialize(session);
     vortex_sequence::initialize(session);
     vortex_sparse::initialize(session);

@@ -9535,6 +9535,7 @@ dependencies = [
  "vortex-alp",
  "vortex-array",
  "vortex-arrow",
+ "vortex-block-residual",
  "vortex-btrblocks",
  "vortex-buffer",
  "vortex-bytebool",
@@ -9555,7 +9556,6 @@ dependencies = [
  "vortex-metrics",
  "vortex-pco",
  "vortex-proto",
- "vortex-range-entropy",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -9750,6 +9750,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-block-residual"
+version = "0.1.0"
+dependencies = [
+ "fastlanes",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-session",
+]
+
+[[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
 dependencies = [
@@ -9769,6 +9780,7 @@ dependencies = [
  "vortex-alp",
  "vortex-array",
  "vortex-arrow",
+ "vortex-block-residual",
  "vortex-buffer",
  "vortex-compressor",
  "vortex-datetime-parts",
@@ -9780,7 +9792,6 @@ dependencies = [
  "vortex-mask",
  "vortex-onpair",
  "vortex-pco",
- "vortex-range-entropy",
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",
@@ -10159,6 +10170,7 @@ dependencies = [
  "url",
  "vortex-alp",
  "vortex-array",
+ "vortex-block-residual",
  "vortex-btrblocks",
  "vortex-buffer",
  "vortex-bytebool",
@@ -10176,7 +10188,6 @@ dependencies = [
  "vortex-metrics",
  "vortex-onpair",
  "vortex-pco",
- "vortex-range-entropy",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -10527,17 +10538,6 @@ dependencies = [
  "vortex",
  "vortex-cuda",
  "vortex-python-abi",
-]
-
-[[package]]
-name = "vortex-range-entropy"
-version = "0.1.0"
-dependencies = [
- "fastlanes",
- "vortex-array",
- "vortex-buffer",
- "vortex-error",
- "vortex-session",
 ]
 
 [[package]]
