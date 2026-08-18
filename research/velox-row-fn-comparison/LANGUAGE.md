@@ -17,7 +17,7 @@ static constexpr bool udf_has_call_return_bool = util::has_method<
     const exec_arg_type<TArgs>&...>::value;
 ```
 
-(`velox/core/SimpleFunctionMetadata.h`.) There is no interface to implement. The same probing
+([`velox/core/SimpleFunctionMetadata.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/core/SimpleFunctionMetadata.h).) There is no interface to implement. The same probing
 detects `callNullable`, `callNullFree`, `callAscii`, and `initialize`, and derives the function's
 null semantics from which probes succeed. The benefits are real: the author writes one method with
 natural types, methods can themselves be templates or overload sets (`CeilFunction::call` is
@@ -67,7 +67,7 @@ generic-associated-type families with a `row_family!` macro and hit a language w
 > approach needed a trait *and* an adapter per width class, hand-written or macro-stamped. The
 > rank-2 visitor sidesteps the limit rather than writing around it.
 
-(`STRICT_SCALAR_FN_RESEARCH.md` on `ct/row-fn-history`.)
+([`STRICT_SCALAR_FN_RESEARCH.md`](https://github.com/vortex-data/vortex/blob/34d36b11a/STRICT_SCALAR_FN_RESEARCH.md) on `ct/row-fn-history`.)
 
 Verdict: the visitor is a design consequence of one genuine design choice (execution-time type
 binding, section 2 of `ABSTRACTION.md`) implemented in the only shape Rust offers. C++ avoids the
@@ -99,13 +99,13 @@ the loop produces is in bounds for every reader" exists only in the authors' hea
 Vortex has to earn each removed bounds check, and the framework turns that obligation into an
 explicit chain, documented as such in the code:
 
-1. `InputElement` is an `unsafe trait` whose contract states that every index below `ViewLen::len`
+1. [`InputElement`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/types/element/input.rs) is an `unsafe trait` whose contract states that every index below `ViewLen::len`
    is valid for `get_from_view_unchecked`.
 2. The executor performs one pre-loop check (`view_lens_match(&views, row_count)`), placed
    deliberately beside the loop so LLVM sees the dominating equality.
 3. `indexed_source` is an `unsafe fn` whose contract consumes that check.
 4. The lane kernel's `get_unchecked` needs only `i < len`, guaranteed by the loop bound.
-5. On the output side, `UninitElementSink` keeps `Vec::len` at zero until `finish`, a `const`
+5. On the output side, [`UninitElementSink`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/types/sink.rs) keeps `Vec::len` at zero until `finish`, a `const`
    assertion proves the element type needs no drop glue, and the `InitializedElement` token, whose
    only constructor is `unsafe`, is the per-row proof of initialization. A `compile_fail` doctest
    pins that safe code cannot forge it.
@@ -160,14 +160,18 @@ code as part of the contract. The visible commitments in the stack:
   code under one LLVM version.
 
 That last item names the tax Rust pays here that C++ mostly does not: sensitivity to CGU
-partitioning, LTO configuration, and LLVM version. The evidence branches document four cases. A
+partitioning, LTO configuration, and LLVM version. The
+[evidence](https://github.com/vortex-data/vortex/blob/2beac64a4/research/rowfn-regressions-2026-08-08/README.md)
+[branches](https://github.com/vortex-data/vortex/blob/5c302bce6/research/rowfn-review-followup/codegen/2026-08-14-framework-refinement.md)
+document four cases. A
 five-line refactor made mixed-constant loops 4.6 to 8.5x slower under LLVM 21, and an
 output-iterator fix recovered them under LLVM 22. A `T: Copy` bound, unused by codegen, cost 60% on
 one benchmark. A loop that crossed a cache-line boundary cost 26% with identical instruction mixes.
 Velox's
 header-only, always-inline, single-TU-per-signature adapter model gives the C++ compiler one big
 function per signature and makes placement comparatively stable. The Vortex answer is procedural
-rather than structural: a pinned two-worktree benchmark harness (`scripts/benchmark-rowfn.sh`),
+rather than structural: a pinned two-worktree benchmark harness
+([`scripts/benchmark-rowfn.sh`](https://github.com/vortex-data/vortex/blob/28d61448e/scripts/benchmark-rowfn.sh)),
 IR and assembly inspection as review evidence, and columnar fallbacks kept where the generated code
 still loses.
 

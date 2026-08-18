@@ -1,8 +1,9 @@
 # Where the abstractions differ
 
 This document compares the two designs one dimension at a time. Code citations name the file in
-either tree. Vortex paths are relative to the `ct/row-fn-*` stack. Velox paths are relative to
-`facebookincubator/velox` at `54fea71cc`.
+either tree. Vortex paths are relative to the [`ct/row-fn-*` stack](https://github.com/vortex-data/vortex/tree/28d61448e). Velox
+paths are relative to
+[`facebookincubator/velox` at `54fea71cc`](https://github.com/facebookincubator/velox/tree/54fea71cc).
 
 ## 1. The execution pipeline and who owns each step
 
@@ -30,7 +31,7 @@ boundary between them.
 
 **Velox: registration-time binding, registry-side dispatch.** `registerFunction<Fn, Ret, Args...>`
 instantiates `UDFHolder<Fn<VectorExec>, Ret, Args...>` and stores a factory in a map keyed by name
-and signature. At plan time, `SignatureBinder` matches call-site types against stored signatures,
+and signature. At [plan time](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/expression/SimpleFunctionRegistry.cpp), `SignatureBinder` matches call-site types against stored signatures,
 a priority lattice breaks ties (concrete signatures beat variadic, variadic beats generic, generic
 beats variadic-of-generic, then most concrete types wins), and the chosen entry constructs a
 monomorphic `VectorFunction`. After compilation the engine cannot tell the function was authored
@@ -83,13 +84,16 @@ This is the deepest design difference between the two frameworks.
 | `call` plus `callNullFree` | fast path | Adapter scans the batch once, uses the null-free loop when no input can contain nulls |
 
 Two levels cooperate: the expression evaluator removes rows it can prove null when the function
-propagates nulls, and the adapter picks one of its loop variants (`allNotNull`, null-free, ASCII,
-general) once per batch. In the mixed case the null check is a `LIKELY` branch per row, and a null
+propagates nulls
+([`Expr::removeSureNulls`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/expression/Expr.cpp#L1191)),
+and the adapter picks one of its loop variants (`allNotNull`, null-free, ASCII, general) once per
+batch. In the mixed case the null check is a `LIKELY` branch per row, and a null
 row's slot is skipped (nulls were optimistically cleared up front).
 
 **Vortex encodes null semantics in the planner.** The function has no choice: a `RowFn` is strict,
 and stricter than `ScalarFnVTable::is_strict`, because valid inputs must produce valid outputs.
-What varies is execution strategy, derived from capabilities the element and sink types declare:
+What varies is execution strategy, derived from capabilities the element and sink types declare
+([`plan.rs`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/visitor/plan.rs#L145)):
 
 ```rust
 pub(crate) const fn for_owned_output<Args: ElementTuple>() -> Self {
@@ -107,8 +111,8 @@ pub(crate) const fn for_owned_output<Args: ElementTuple>() -> Self {
 - `DenseWithRetry`: same, for kernels that defer failure evidence. A deferred failure can come from
   the garbage behind a null row, so the executor filters to valid rows and re-runs before reporting.
 - `ValidOnly`: never evaluate an invalid row. At runtime this tries skip-invalid first (needs a
-  null-tolerant decode for every input and a `skipped_rows_initializer` on the sink, as geometry
-  columns provide for points and polygons), and otherwise filters every input, runs dense, and
+  null-tolerant decode for every input and a `skipped_rows_initializer` on the sink, as
+  [geometry columns](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-spatial/src/scalar_fn/row.rs) provide for points and polygons), and otherwise filters every input, runs dense, and
   scatters the compact result back under a null mask.
 
 The philosophical difference: **Velox does not evaluate a null row unless the function asks to see
@@ -144,7 +148,7 @@ Vortex has two mechanisms at two lifetimes, both per batch:
 
 1. Whole-batch: if every input is constant and non-null, the executor evaluates one row and
    broadcasts the result as a `ConstantArray` (`broadcast_one_row`).
-2. Per argument: `ArgColumn::decode` detects a batch-constant input (looking through masked and
+2. Per argument: [`ArgColumn::decode`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/types/element/tuple/element_tuple.rs) detects a batch-constant input (looking through masked and
    extension wrappers), decodes exactly one row of it, and the tuple's `ConstElems` hands the
    `prepare` closure `Some(value)` per constant argument. The row loop then either drops constant
    checks entirely (`views_if_no_consts`, when nothing is constant) or keeps the constant selection
@@ -167,7 +171,7 @@ adapter specializes the whole row loop per flat/constant combination for up to t
 subscript returning a dictionary over its input, leave the simple framework.
 
 Vortex has an open-ended encoding zoo, so "decode" is a real step with real cost, and the framework
-makes it a typed contract: `InputElement::decode` canonicalizes one column into `Column` once per
+makes it a typed contract: [`InputElement::decode`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/types/element/input.rs) canonicalizes one column into `Column` once per
 kernel invocation, and `View` re-borrows it so the loop reads through loop-invariant pointers.
 Because decoding can be expensive and encoding-aware answers can be cheap, the escape hatch lives
 inside the function (`reduce_encoded`, probed once on the original arrays before any decode or
@@ -199,7 +203,7 @@ Vortex splits the output contract in two, and the split is measured rather than 
   `unsafe fn finish`. `UninitElementSink` exposes `MaybeUninit` slots and demands the
   `InitializedElement` token back.
 
-The history explains the split: the first shared executor was sink-only, and it cost 29% on
+The [history](https://github.com/vortex-data/vortex/blob/2beac64a4/research/rowfn-reconstruction/OPTIMIZATION.md) explains the split: the first shared executor was sink-only, and it cost 29% on
 signed and 59% on unsigned 64-bit checked multiply because it hid the independence of owned
 primitive outputs. The owned form was reinstated on that evidence. Velox's single writer model does
 not hit the same wall because its adapter writes fixed-width results through a raw pointer anyway,
@@ -234,7 +238,7 @@ accumulator must stay out of sink storage or it becomes a loop-carried dependenc
 
 ## 8. Metadata: derived versus declared
 
-Velox derives nearly everything from the C++ surface: null behavior from `callNullable`'s
+Velox derives nearly everything from the C++ surface: [null behavior](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/core/SimpleFunctionMetadata.h#L983) from `callNullable`'s
 existence, null-output capability from a `bool` return type, ASCII support from `callAscii`,
 determinism and ASCII propagation from opt-in constants, priority from the shape of the signature.
 The author states almost nothing twice. The failure mode is silence: after a signature typo, the
@@ -244,7 +248,7 @@ probe, and detection needed a dummy-type argument.
 
 Vortex declares capabilities as constants (`FALLIBLE` on the function, `DENSE_SAFE` and
 `DECODE_INFALLIBLE` on elements) and then cross-checks declarations against use with `const`
-assertions evaluated at monomorphization time: the visited tuple's arity must equal
+[assertions](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/visitor/check.rs) evaluated at monomorphization time: the visited tuple's arity must equal
 `ARG_NAMES.len()`, fallible decode requires `FALLIBLE`, deferred visits require `FALLIBLE`,
 evidence must fit in the output width, owned outputs must not need drop. Redundancy is the point:
 `is_fallible` must be answerable without input dtypes (dictionary push-down evaluates values no row
@@ -265,19 +269,19 @@ Vortex function object is a serialization boundary, not only a kernel. It is als
 
 One consequence surfaced in the stack: because every `RowFn` gets the vtable via a blanket impl, a
 type cannot implement both traits, and existing public functions (`Binary`) keep their registered
-identity by delegating to a private `RowFn` (`NumericBinary`) through the `execute_rows` and
-`row_fn_return_dtype` free functions. Velox has no analogous friction: the simple function was
+identity by delegating to a private `RowFn` (`NumericBinary`) through the
+[`execute_rows` and `row_fn_return_dtype`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/vtable.rs) free functions. Velox has no analogous friction: the simple function was
 never the registered identity in the first place, the adapter-produced `VectorFunction` is.
 
 ## 10. Stated scope limits
 
 Both projects wrote down what the row form is not for, and the lists agree almost item for item.
 
-Velox (`scalar-functions.rst`): functions that return an inner vector or buffer unchanged
+Velox ([`scalar-functions.rst`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/docs/develop/scalar-functions.rst)): functions that return an inner vector or buffer unchanged
 (`map_keys`, `cardinality` historically), encoding tricks (`element_at` as a dictionary), lambda
 functions, and anything needing a demonstrated benchmark win for the vector form.
 
-Vortex (#9128): columnar and zero-copy kernels (`not`, `list_length`), kernels with cross-row state
+Vortex ([#9128](https://github.com/vortex-data/vortex/issues/9128)): columnar and zero-copy kernels (`not`, `list_length`), kernels with cross-row state
 (`like`), heterogeneous variadic kernels, and non-strict functions. The early experiment confirmed
 the list the hard way: `byte_length`, `not`, `list_length`, and `list_sum` were all ported onto the
 prototype and then reverted off it.

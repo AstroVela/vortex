@@ -1,12 +1,13 @@
 # The same functions in both systems
 
 Each section writes one function in both frameworks and points at what the difference in shape
-reveals. Vortex code comes from the `ct/row-fn-*` stack. Velox code comes from
-`facebookincubator/velox` at `54fea71cc`, lightly trimmed.
+reveals. Vortex code comes from the [`ct/row-fn-*` stack](https://github.com/vortex-data/vortex/tree/28d61448e). Velox code comes
+from [`facebookincubator/velox` at `54fea71cc`](https://github.com/facebookincubator/velox/tree/54fea71cc),
+lightly trimmed.
 
 ## 1. The minimal function: `hypot`
 
-Vortex, from #9129 (the epic's running example):
+Vortex, from [#9129](https://github.com/vortex-data/vortex/issues/9129) (the epic's running example):
 
 ```rust
 impl RowFn for Hypot {
@@ -31,7 +32,7 @@ impl RowFn for Hypot {
 }
 ```
 
-Velox, in the shape of `velox/functions/prestosql/Arithmetic.h`:
+Velox, in the shape of [`velox/functions/prestosql/Arithmetic.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/Arithmetic.h):
 
 ```cpp
 template <typename T>
@@ -63,7 +64,7 @@ Both systems monomorphize the row closure per element width. They drive the mono
 opposite ends.
 
 Velox stamps the template at registration
-(`velox/functions/lib/RegistrationHelpers.h`):
+([`velox/functions/lib/RegistrationHelpers.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/lib/RegistrationHelpers.h)):
 
 ```cpp
 template <template <class> typename T>
@@ -76,7 +77,7 @@ void registerBinaryIntegral(const std::vector<std::string>& aliases) {
 ```
 
 Vortex stamps generic functions inside `dispatch`
-(`vortex-array/src/scalar_fn/fns/binary/compare/primitive.rs`):
+([`vortex-array/src/scalar_fn/fns/binary/compare/primitive.rs`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/fns/binary/compare/primitive.rs)):
 
 ```rust
 fn dispatch<V: RowVisitor<Self::Options>>(
@@ -116,7 +117,7 @@ per execution attempt), and the executor verifies the runs agree (`ensure_plan`)
 This is the sharpest behavioral difference between the two frameworks.
 
 Velox Presto `plus` uses a checked helper that throws
-(`velox/functions/prestosql/Arithmetic.h`):
+([`velox/functions/prestosql/Arithmetic.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/Arithmetic.h)):
 
 ```cpp
 template <typename T>
@@ -135,7 +136,7 @@ per-row branch inside `checkedPlus`, and a throwing row pays the full C++ except
 
 Vortex checked add cannot afford a per-row branch in the loop, because the branch blocks
 vectorization. It returns evidence instead
-(`vortex-array/src/scalar_fn/fns/binary/numeric/row.rs`):
+([`vortex-array/src/scalar_fn/fns/binary/numeric/row.rs`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/fns/binary/numeric/row.rs)):
 
 ```rust
 visitor.visit_deferred::<(T, T), T, Op::Fail>(
@@ -165,8 +166,8 @@ with one failing valid row fails as a batch. Velox reports the failing row.
 Both systems agree that division is different: it is scalar and expensive anyway, so a per-row check
 is free.
 
-Velox can return `Status` instead of throwing (`velox/functions/prestosql/Fail.h` shows the
-convention):
+Velox can return `Status` instead of throwing ([`velox/functions/prestosql/Fail.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/Fail.h)
+shows the convention):
 
 ```cpp
 FOLLY_ALWAYS_INLINE Status
@@ -175,8 +176,8 @@ call(out_type<UnknownValue>& /*result*/, const arg_type<Varchar>& message) {
 }
 ```
 
-Vortex stops at the first failure and writes into uninitialized storage, with a token proving each
-write happened (`fns/binary/numeric/row.rs`):
+Vortex stops at the first failure and writes into uninitialized storage, and a token proves that
+each write happened (`fns/binary/numeric/row.rs`):
 
 ```rust
 visitor.visit_into::<(T, T), UninitElementSink<T>, _>(|(lhs, rhs), output| {
@@ -191,9 +192,11 @@ visitor.visit_into::<(T, T), UninitElementSink<T>, _>(|(lhs, rhs), output| {
 ```
 
 The Velox output slot always exists (the adapter called `ensureWritable` and cleared nulls up
-front). The Vortex `UninitElementSink` skips initializing the output at all, and the type system
-carries the proof that a successful callback wrote its slot: `InitializedElement` has no safe
-constructor, which a `compile_fail` doctest pins.
+front). The Vortex
+[`UninitElementSink`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-array/src/scalar_fn/unstable/row/types/sink.rs) does not
+initialize the output before the loop, and the type system carries the proof that a successful
+callback wrote its slot: `InitializedElement` has no safe constructor, which a `compile_fail`
+doctest pins.
 
 ## 5. Hoisting constant-argument work
 
@@ -201,7 +204,7 @@ Both frameworks solve the same problem: work derived from a constant argument mu
 once per row. The mechanisms differ in scope and in state.
 
 Velox `date_trunc` pre-parses a constant unit string once per query and thread
-(`velox/functions/prestosql/DateTimeFunctions.h`):
+([`velox/functions/prestosql/DateTimeFunctions.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/DateTimeFunctions.h)):
 
 ```cpp
 const tz::TimeZone* timeZone_ = nullptr;
@@ -227,7 +230,7 @@ FOLLY_ALWAYS_INLINE void call(out_type<Timestamp>& result,
 ```
 
 Vortex `CosineSimilarity` hoists the norm of a constant operand once per batch
-(`vortex-tensor/src/scalar_fns/cosine_similarity.rs`):
+([`vortex-tensor/src/scalar_fns/cosine_similarity.rs`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-tensor/src/scalar_fns/cosine_similarity.rs)):
 
 ```rust
 visitor.visit_prepared_into::<(TensorRow<T>, TensorRow<T>), UninitElementSink<T>, _, _>(
@@ -257,7 +260,7 @@ Differences that matter:
   closure is `Fn`, not `FnMut`, so it cannot mutate shared state at all. That constraint is
   load-bearing: a captured `&mut` measured 8 to 11% slower because the mutable capture blocked
   loop vectorization.
-- **Laziness.** Vortex `SpatialContains` goes one step further and prepares a constant geometry's
+- **Laziness.** Vortex [`SpatialContains`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-spatial/src/scalar_fn/contains.rs) goes one step further and prepares a constant geometry's
   topology graph lazily in a `OnceCell`, on the first row that needs it, because eager preparation
   charges point-only batches for nothing. Velox `initialize` has no lazy form. A Velox function has
   to hand-roll the same `folly::once`-style pattern in a member.
@@ -268,7 +271,7 @@ Differences that matter:
 ## 6. Nullable outputs: the open question, answered two ways
 
 Presto `array_min` returns null for an empty array and for an array containing null. In Velox that
-is one `bool` return (`velox/functions/prestosql/ArrayFunctions.h`):
+is one `bool` return ([`velox/functions/prestosql/ArrayFunctions.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/ArrayFunctions.h#L131)):
 
 ```cpp
 bool call(out_type<Orderable<T1>>& out, const arg_type<Array<Orderable<T1>>>& array) {
@@ -281,7 +284,7 @@ bool call(out_type<Orderable<T1>>& out, const arg_type<Array<Orderable<T1>>>& ar
 
 `RowFn` cannot express this function today. Its contract is stronger than strictness: a row kernel
 must produce a valid value for every valid input row, and the framework derives output validity
-entirely from input validity. #9128 excludes `list_sum` and `variant_get` for exactly this reason
+entirely from input validity. [#9128](https://github.com/vortex-data/vortex/issues/9128) excludes `list_sum` and `variant_get` for exactly this reason
 and leaves nullable row outputs as the main unresolved question.
 
 The Velox design shows both the benefit and the bill. Benefit: row-level null decisions with no
@@ -296,7 +299,8 @@ be a straight-line `map` into uninitialized memory.
 Three Velox capabilities have no `RowFn` counterpart yet. Each is a preview of what an
 `InputElement`/`OutputSink` extension needs to cover.
 
-**Strings, with ASCII specialization and zero-copy output** (`StringFunctions.h`, `substr`):
+**Strings, with ASCII specialization and zero-copy output**
+([`StringFunctions.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/StringFunctions.h#L121), `substr`):
 
 ```cpp
 template <typename T>
@@ -325,7 +329,7 @@ attaches the input's string buffers to the result vector so `setNoCopy` views st
 `RowFn` analogues are: a per-batch input property in the plan, a second dispatch arm, and an
 `OutputSink` that holds a reference on an input buffer.
 
-**Complex outputs through writers** (`ArrayFunctions.h`, `array_cum_sum`):
+**Complex outputs through writers** ([`ArrayFunctions.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/ArrayFunctions.h#L468), `array_cum_sum`):
 
 ```cpp
 FOLLY_ALWAYS_INLINE void call(out_type<velox::Array<T>>& out,
@@ -350,7 +354,7 @@ of `OutputSink`: variable-width output built in place. Note `add_null()`: comple
 nulls inside a row's value, which is orthogonal to the row itself being null.
 
 **Variadic and generic signatures** (`concat(array...)` takes 2 to 252 arguments,
-`cardinality` takes `Array<Generic<T1>>` or `Map<Generic<T1>, Generic<T2>>`). `RowFn` fixes arity
+[`cardinality`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/Cardinality.h) takes `Array<Generic<T1>>` or `Map<Generic<T1>, Generic<T2>>`). `RowFn` fixes arity
 at `ARG_NAMES.len()` with sealed tuples through arity 12, and expresses genericity by dispatching
 on dtypes instead. Velox's registry needs a priority lattice (concrete beats variadic beats generic
 beats variadic-of-generic) to keep resolution deterministic once these features exist. Vortex's
@@ -362,7 +366,7 @@ Both frameworks accept that some kernels beat the row form, and both keep the ro
 default.
 
 Vortex puts the first hatch inside the function. `L2Norm` reads stored norms straight off a
-`Normalized` encoding (`vortex-tensor/src/scalar_fns/l2_norm.rs`):
+`Normalized` encoding ([`vortex-tensor/src/scalar_fns/l2_norm.rs`](https://github.com/vortex-data/vortex/blob/28d61448e/vortex-tensor/src/scalar_fns/l2_norm.rs)):
 
 ```rust
 fn reduce_encoded(&self, _options: &Self::Options, args: &[ArrayRef], _ctx: &mut ExecutionCtx)
@@ -382,10 +386,11 @@ cases to a fused columnar compare-and-bitpack kernel, per ptype, operator, const
 architecture, and keeps the row path for everything else.
 
 Velox's hatch is a separate registration. `is_null` flips the nulls buffer in bulk
-(`velox/functions/lib/IsNull.cpp`), subscript returns a dictionary view over the elements vector
-without copying (`SubscriptUtil.h`), and for comparisons an xsimd `ComparisonSimdFunction` covers
-the fixed-width types and outranks the simple functions at resolution
-(`velox/functions/prestosql/Comparisons.cpp`):
+([`velox/functions/lib/IsNull.cpp`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/lib/IsNull.cpp)), subscript returns a
+dictionary view over the elements vector without copying
+([`SubscriptUtil.h`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/lib/SubscriptUtil.h)), and for comparisons an xsimd
+`ComparisonSimdFunction` covers the fixed-width types and outranks the simple functions at
+resolution ([`velox/functions/prestosql/Comparisons.cpp`](https://github.com/facebookincubator/velox/blob/54fea71cc/velox/functions/prestosql/Comparisons.cpp#L148)):
 
 ```cpp
 template <typename ComparisonOp, typename Arch = xsimd::default_arch>
