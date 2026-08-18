@@ -224,6 +224,9 @@ code_bits
 │   ├── dictionary_entries <= 384
 │   │   and gt8_token_count / token_count <= 1%
 │   │   └── onpair_decompress_6tpt_directhi_keep1_lb6
+│   ├── dictionary_entries >= 32768
+│   │   and gt8_token_count / token_count <= 25%
+│   │   └── onpair_decompress_6tpt_directhi_highcg_lb5
 │   └── otherwise
 │       └── onpair_decompress_6tpt_directhi_lb5
 └── unsupported or empty
@@ -242,6 +245,14 @@ also delays five low-plane loads, reducing the live set to 40 registers and
 allowing greater occupancy. This helps small, almost-all-short dictionaries
 whose delayed loads remain cache-resident. Large dictionaries need the
 general 48-register variant to retain memory-level parallelism.
+
+For large split dictionaries with at most 25% long tokens, the high plane is
+sparse enough that caching its random loads displaces more reusable low-plane
+and packed-length data than it saves. The high-CG variant keeps the same
+48-register, 24,832-byte resource shape but uses cache-global loads for only
+the high plane. The 25% limit is data-derived: it selects Wikipedia and
+FineWeb's approximately 17--19% long-token streams while rejecting the
+measured 62% ClickBench OriginalURL case, where bypassing L1 regressed.
 
 The selector exposes `DirectHighKeep3Lb4` for explicit caller experiments,
 but the generic tree does not choose it. It was best for the measured TPC-H

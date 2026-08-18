@@ -226,7 +226,11 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
 #pragma unroll
     for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
         if (len[k] > 8u) {
+#ifdef ONPAIR_HIGH_LDCG
+            const uint2 high = __ldcg(reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)code[k] * 8u));
+#else
             const uint2 high = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)code[k] * 8u);
+#endif
             emit_high_bytes(s_buf, excl[k] + 8u, len[k] - 8u, high);
         }
     }

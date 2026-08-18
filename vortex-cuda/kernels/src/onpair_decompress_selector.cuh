@@ -11,6 +11,7 @@ enum class OnPairDecompressKernel : uint8_t {
     Cap12Lb5,
     Cap9Keep1Lb6,
     DirectHighLb5,
+    DirectHighCgLb5,
     DirectHighKeep1Lb6,
     DirectHighKeep3Lb4,
 };
@@ -46,6 +47,11 @@ constexpr OnPairDecompressKernel select_onpair_decompress_kernel(const OnPairDec
         if (stats.dictionary_entries <= 384u && at_most_one_percent_long) {
             return OnPairDecompressKernel::DirectHighKeep1Lb6;
         }
+        const bool large_split_dictionary = stats.dictionary_entries >= 32768u;
+        const bool at_most_twenty_five_percent_long = stats.gt8_token_count <= stats.token_count / 4u;
+        if (large_split_dictionary && at_most_twenty_five_percent_long) {
+            return OnPairDecompressKernel::DirectHighCgLb5;
+        }
         return OnPairDecompressKernel::DirectHighLb5;
     }
     return OnPairDecompressKernel::Legacy;
@@ -63,6 +69,8 @@ constexpr const char *onpair_decompress_kernel_symbol(const OnPairDecompressKern
         return "onpair_decompress_6tpt_cap9_keep1_lb6";
     case OnPairDecompressKernel::DirectHighLb5:
         return "onpair_decompress_6tpt_directhi_lb5";
+    case OnPairDecompressKernel::DirectHighCgLb5:
+        return "onpair_decompress_6tpt_directhi_highcg_lb5";
     case OnPairDecompressKernel::DirectHighKeep1Lb6:
         return "onpair_decompress_6tpt_directhi_keep1_lb6";
     case OnPairDecompressKernel::DirectHighKeep3Lb4:
@@ -82,4 +90,8 @@ static_assert(select_onpair_decompress_kernel({16u, 384u, 3072u, 1000u, 10u}) ==
 static_assert(select_onpair_decompress_kernel({16u, 385u, 3072u, 1000u, 0u}) ==
               OnPairDecompressKernel::DirectHighLb5);
 static_assert(select_onpair_decompress_kernel({16u, 384u, 3072u, 1000u, 11u}) ==
+              OnPairDecompressKernel::DirectHighLb5);
+static_assert(select_onpair_decompress_kernel({16u, 65536u, 3072u, 1000u, 250u}) ==
+              OnPairDecompressKernel::DirectHighCgLb5);
+static_assert(select_onpair_decompress_kernel({16u, 65536u, 3072u, 1000u, 251u}) ==
               OnPairDecompressKernel::DirectHighLb5);

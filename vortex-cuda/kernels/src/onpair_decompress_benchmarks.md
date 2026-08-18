@@ -577,3 +577,52 @@ The semantically renamed kernels reproduce the measured experimental aliases:
 
 Raw controlled results are in `/tmp/onpair16-search/` and
 `/tmp/onpair-allcols-stages-20260817/`.
+
+## Wikipedia code distribution and 16-bit high-plane cache policy
+
+The final Wikipedia-specific pass used the same GH200, saved Vortex cells, and
+original u16 code streams as the selector search. A read-only staging
+diagnostic counted all code occurrences before GPU upload; it did not relabel
+codes or change dictionary storage.
+
+| statistic | 12-bit | 16-bit |
+|---|---:|---:|
+| tokens | 92,579,734 | 53,459,252 |
+| distinct codes | 4,041 | 65,355 |
+| token length 1--4 | 80.189% | 44.135% |
+| token length 5--8 | 18.051% | 38.486% |
+| token length 9--12 | 1.605% | 14.075% |
+| token length 13--16 | 0.156% | 3.304% |
+| hottest 16 codes | 6.446% | 2.300% |
+| hottest 256 codes | 41.779% | 13.074% |
+| hottest 4,096 codes | 100.000% | 46.490% |
+| long codes per 192-token warp, p50 / p99 / max | 3 / 11 / 69 | 34 / 63 / 116 |
+| decoded bytes per 192-token warp, p50 / p99 / max | 634 / 760 / 1,494 | 1,097 / 1,361 / 1,813 |
+
+Moving from 16-byte to split 8-byte dictionary spacing saved only 1.080% of
+requested sectors at 12 bits and 0.330% at 16 bits for this stream, so further
+cache-line sharing was not a useful lever. At 16 bits, 17.379% of tokens use
+the high plane and 81.0% of those suffixes are at most four bytes.
+
+Nsight Compute on the 16-bit direct-high baseline reported 48
+registers/thread, 25.86 KiB allocated shared/block, 56.38% active-warps
+occupancy, 37.57% long-scoreboard stalls, 43.52% L1 sector hit rate, and
+93.37% L2 sector hit rate. Explicit L1 prefetching regressed throughput by
+9.7%; loading four bytes for short suffixes was neutral. Marking only
+high-plane loads cache-global (`__ldcg`) retained the same 48-register and
+24,832-byte static-shared resource shape and won.
+
+Ten order-balanced processes (five per order, 100 timed iterations/process)
+measured:
+
+| Wikipedia 16-bit kernel | mean runtime | output rate | change |
+|---|---:|---:|---:|
+| `onpair_decompress_6tpt_directhi_lb5` | 0.524678 ms | 571.78 GB/s | baseline |
+| `onpair_decompress_6tpt_directhi_highcg_lb5` | **0.516133 ms** | **581.24 GB/s** | **+1.66%** |
+
+All candidates passed full GPU/CPU byte validation. The same policy improved
+FineWeb text by 0.48% and FineWeb URL by 0.82%. It made ClickBench OriginalURL,
+whose long-token share is 62.03%, 12.9% slower by runtime. The selector
+therefore uses high-CG only for dictionaries with at least 32,768 entries and
+at most 25% long tokens. The 12-bit cap-8 follow-up was noise-equivalent to
+cap-9 (818.64 versus 818.57 GB/s), so cap-9 remains selected.
