@@ -9,6 +9,7 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -16,6 +17,7 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
+use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::ArraySlots;
@@ -121,6 +123,36 @@ pub struct VarBinViewDataParts {
     pub validity: Validity,
 }
 
+/// A validity mask that is only materialized when it is first queried.
+struct LazyNulls<'a> {
+    validity: &'a Validity,
+    len: usize,
+    mask: Option<Mask>,
+}
+
+impl<'a> LazyNulls<'a> {
+    fn new(validity: &'a Validity, len: usize) -> Self {
+        Self {
+            validity,
+            len,
+            mask: None,
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn is_null(&mut self, idx: usize) -> VortexResult<bool> {
+        if self.mask.is_none() {
+            let mut ctx = legacy_session().create_execution_ctx();
+            self.mask = Some(self.validity.execute_mask(self.len, &mut ctx)?);
+        }
+        Ok(!self
+            .mask
+            .as_ref()
+            .vortex_expect("mask was just materialized")
+            .value(idx))
+    }
+}
+
 impl VarBinViewData {
     fn dtype_parts(dtype: &DType) -> VortexResult<(bool, Nullability)> {
         match dtype {
@@ -181,9 +213,9 @@ impl VarBinViewData {
         dtype: DType,
         validity: Validity,
     ) -> VortexResult<Self> {
-        Self::validate(&views, &buffers, &dtype, &validity)?;
+        let views = Self::validate_or_fix(views, &buffers, &dtype, &validity)?;
 
-        // SAFETY: validate ensures all invariants are met.
+        // SAFETY: validate_or_fix ensures all invariants are met.
         Ok(unsafe { Self::new_unchecked(views, buffers, dtype, validity) })
     }
 
@@ -256,8 +288,12 @@ impl VarBinViewData {
         validity: Validity,
     ) -> Self {
         #[cfg(debug_assertions)]
-        Self::validate(&views, &buffers, &dtype, &validity)
-            .vortex_expect("[Debug Assertion]: Invalid `VarBinViewArray` parameters");
+        {
+            // The views are already owned here, so this only checks them: any view that would be
+            // fixed up is written into the discarded copy.
+            Self::validate_or_fix(views.clone(), &buffers, &dtype, &validity)
+                .vortex_expect("[Debug Assertion]: Invalid `VarBinViewArray` parameters");
+        }
 
         let handles: Vec<BufferHandle> = buffers
             .iter()
@@ -286,15 +322,27 @@ impl VarBinViewData {
         Self { buffers, views }
     }
 
-    /// Validates the components that would be used to create a `VarBinViewArray`.
+    /// Validates the components that would be used to create a `VarBinViewArray`, fixing up any
+    /// malformed view that sits under a null slot.
     ///
-    /// This function checks all the invariants required by `VarBinViewArray::new_unchecked`.
-    pub fn validate(
-        views: &Buffer<BinaryView>,
+    /// This function checks all the invariants required by `VarBinViewArray::new_unchecked`,
+    /// including the views of null elements: those are never read as values, but kernels are free
+    /// to touch them, so a malformed view is still an out-of-bounds read waiting to happen.
+    /// Since such views are commonly written by other producers, they are replaced with empty
+    /// views rather than rejected.
+    ///
+    /// The returned buffer is the input buffer when nothing had to be fixed, is patched in place
+    /// when this is the only reference to it, and is a fixed-up copy otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the components are inconsistent, or if any non-null view is malformed.
+    pub fn validate_or_fix(
+        views: Buffer<BinaryView>,
         buffers: &Arc<[ByteBuffer]>,
         dtype: &DType,
         validity: &Validity,
-    ) -> VortexResult<()> {
+    ) -> VortexResult<Buffer<BinaryView>> {
         vortex_ensure!(
             validity.nullability() == dtype.nullability(),
             InvalidArgument: "validity {:?} incompatible with nullability {:?}",
@@ -303,23 +351,20 @@ impl VarBinViewData {
         );
 
         match dtype {
-            DType::Utf8(_) => Self::validate_views(views, buffers, validity, |string| {
+            DType::Utf8(_) => Self::validate_or_fix_views(views, buffers, validity, |string| {
                 simdutf8::basic::from_utf8(string).is_ok()
-            })?,
-            DType::Binary(_) => Self::validate_views(views, buffers, validity, |_| true)?,
+            }),
+            DType::Binary(_) => Self::validate_or_fix_views(views, buffers, validity, |_| true),
             _ => vortex_bail!(InvalidArgument: "invalid DType {dtype} for `VarBinViewArray`"),
         }
-
-        Ok(())
     }
 
-    #[allow(clippy::disallowed_methods)]
-    fn validate_views<F>(
-        views: &Buffer<BinaryView>,
+    fn validate_or_fix_views<F>(
+        views: Buffer<BinaryView>,
         buffers: &Arc<[ByteBuffer]>,
         validity: &Validity,
         validator: F,
-    ) -> VortexResult<()>
+    ) -> VortexResult<Buffer<BinaryView>>
     where
         F: Fn(&[u8]) -> bool,
     {
@@ -370,30 +415,58 @@ impl VarBinViewData {
             Ok(())
         };
 
-        match validity {
-            // Array-backed validity is the only variant that needs an execution context: execute it
-            // into a mask once and zip it with the views, validating only the valid (non-null)
-            // entries.
-            Validity::Array(_) => {
-                let mut ctx = legacy_session().create_execution_ctx();
-                let mask = validity.execute_mask(views.len(), &mut ctx)?;
-                for ((idx, view), valid) in views.iter().enumerate().zip(mask.iter()) {
-                    if valid {
-                        validate_view(idx, view)?;
+        let len = views.len();
+        // Executing the validity can be expensive, and it is only needed to decide the fate of a
+        // malformed view, so it is materialized at most once and only when one is found.
+        let mut nulls = LazyNulls::new(validity, len);
+
+        match views.try_into_mut() {
+            // We hold the only reference to the views, so malformed views can be fixed in place as
+            // part of the single validation pass.
+            Ok(mut views) => {
+                for (idx, view) in views.as_mut_slice().iter_mut().enumerate() {
+                    if let Err(e) = validate_view(idx, view) {
+                        if !nulls.is_null(idx)? {
+                            return Err(e);
+                        }
+                        *view = BinaryView::empty_view();
                     }
                 }
+                Ok(views.freeze())
             }
-            // Every entry is null, so there is nothing to validate.
-            Validity::AllInvalid => {}
-            // No nulls: validate every view.
-            Validity::NonNullable | Validity::AllValid => {
-                for (idx, view) in views.iter().enumerate() {
-                    validate_view(idx, view)?;
+            // The views are shared, so validate them first and only pay for a copy if a malformed
+            // view under a null is actually found.
+            Err(views) => {
+                let Some((first_bad, e)) = views
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, view)| validate_view(idx, view).err().map(|e| (idx, e)))
+                else {
+                    return Ok(views);
+                };
+                if !nulls.is_null(first_bad)? {
+                    return Err(e);
                 }
+
+                // Everything before the first malformed view is known to be valid, the rest is
+                // validated (and fixed) as it is copied over.
+                let mut fixed = BufferMut::with_capacity(len);
+                fixed.extend_from_slice(&views[..first_bad]);
+                fixed.push(BinaryView::empty_view());
+                for (idx, view) in views.iter().enumerate().skip(first_bad + 1) {
+                    match validate_view(idx, view) {
+                        Ok(()) => fixed.push(*view),
+                        Err(e) => {
+                            if !nulls.is_null(idx)? {
+                                return Err(e);
+                            }
+                            fixed.push(BinaryView::empty_view());
+                        }
+                    }
+                }
+                Ok(fixed.freeze())
             }
         }
-
-        Ok(())
     }
 
     /// Returns the length of this array.
