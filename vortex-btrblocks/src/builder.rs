@@ -153,8 +153,9 @@ impl BtrBlocksCompressorBuilder {
         builder
     }
 
-    /// Excludes schemes without CUDA kernel support, keeps FSST for string compression,
-    /// and adds Zstd for binary compression.
+    /// Excludes schemes without CUDA kernel support, keeps FSST and (with the
+    /// `unstable_encodings` feature) OnPair for string compression, and adds Zstd for binary
+    /// compression.
     ///
     /// With the `unstable_encodings` feature, buffer-level Zstd compression is used for binary
     /// arrays, preserving their buffer layout for zero-conversion GPU decompression. Without it,
@@ -163,7 +164,9 @@ impl BtrBlocksCompressorBuilder {
     /// This preset is intended for files that will be decoded by CUDA kernels. It may choose a
     /// larger encoded representation than the default compressor.
     pub fn only_cuda_compatible(self) -> Self {
-        // Keep FSST, which has a CUDA decoder and direct Arrow offset-based export. Other
+        // Keep FSST and OnPair, which both have a CUDA decoder and direct Arrow offset-based
+        // export. OnPair is only registered with the `unstable_encodings` feature, which is also
+        // what enables the unstable edition that admits `vortex.onpair` to a written file. Other
         // string fragmentation and dictionary schemes still require unsupported decode paths.
         #[cfg_attr(
             not(any(feature = "pco", feature = "unstable_encodings")),
@@ -178,8 +181,6 @@ impl BtrBlocksCompressorBuilder {
             string::StringDictScheme.id(),
             binary::BinaryDictScheme.id(),
         ];
-        #[cfg(feature = "unstable_encodings")]
-        excluded.push(string::OnPairScheme.id());
         // Delta has no GPU decode kernel and its prefix-sum decode is inherently sequential, so it
         // is incompatible with pure-GPU decompression paths.
         #[cfg(feature = "unstable_encodings")]
@@ -285,6 +286,20 @@ mod tests {
                 .schemes
                 .iter()
                 .any(|scheme| scheme.id() == string::ZstdScheme.id())
+        );
+    }
+
+    /// OnPair has a CUDA decoder, so the CUDA-compatible preset keeps it: GPU benchmarks and
+    /// GPU-targeted writes exercise the OnPair kernels instead of falling back to FSST.
+    #[test]
+    #[cfg(feature = "unstable_encodings")]
+    fn cuda_compatible_keeps_onpair_for_strings() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        assert!(
+            builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == string::OnPairScheme.id())
         );
     }
 
