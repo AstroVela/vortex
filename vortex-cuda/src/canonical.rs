@@ -43,14 +43,18 @@ pub trait CanonicalCudaExt {
 /// Migrating the values of a nullable array without its validity leaves the mask on the
 /// device, and the first host read of it — canonicalising to Arrow, say — panics in
 /// `BufferHandle::unwrap_host`.
-#[allow(clippy::disallowed_methods)]
 async fn validity_into_host(validity: Validity) -> VortexResult<Validity> {
     let Validity::Array(array) = validity else {
         return Ok(validity);
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "CanonicalCudaExt threads no session through"
+    )]
+    let mut ctx = legacy_session().create_execution_ctx();
     Ok(Validity::Array(
         array
-            .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
+            .execute::<Canonical>(&mut ctx)?
             .into_host()
             .await?
             .into_array(),
@@ -59,7 +63,6 @@ async fn validity_into_host(validity: Validity) -> VortexResult<Validity> {
 
 #[async_trait]
 impl CanonicalCudaExt for Canonical {
-    #[allow(clippy::disallowed_methods)]
     async fn into_host(self) -> VortexResult<Self> {
         match self {
             Canonical::Struct(struct_array) => {
@@ -74,10 +77,15 @@ impl CanonicalCudaExt for Canonical {
 
                 let mut host_fields = vec![];
                 for field in fields.iter() {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "CanonicalCudaExt threads no session through"
+                    )]
+                    let mut ctx = legacy_session().create_execution_ctx();
                     host_fields.push(
                         field
                             .clone()
-                            .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
+                            .execute::<Canonical>(&mut ctx)?
                             .into_host()
                             .await?
                             .into_array(),
@@ -166,10 +174,15 @@ impl CanonicalCudaExt for Canonical {
             }
             Canonical::Extension(ext) => {
                 // Copy the storage array to host and rewrap in ExtensionArray.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "CanonicalCudaExt threads no session through"
+                )]
+                let mut ctx = legacy_session().create_execution_ctx();
                 let host_storage = ext
                     .storage_array()
                     .clone()
-                    .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
+                    .execute::<Canonical>(&mut ctx)?
                     .into_host()
                     .await?
                     .into_array();
