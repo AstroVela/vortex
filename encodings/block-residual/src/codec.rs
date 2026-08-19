@@ -32,6 +32,11 @@ pub struct BlockResidualParts {
     pub patch_highs: Vec<u8>,
 }
 
+pub(crate) struct BlockResidualCodecEstimate {
+    pub encoded_nbytes: usize,
+    pub patch_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockResidualBlock {
     len: u16,
@@ -62,6 +67,34 @@ impl BlockResidualCodec {
             len: values.len(),
             blocks,
         })
+    }
+
+    pub(crate) fn estimate_transformed<T: Copy>(
+        values: &[T],
+        transform: impl Fn(T) -> u64 + Copy,
+    ) -> BlockResidualCodecEstimate {
+        let mut encoded_nbytes = 3 * size_of::<u32>();
+        let mut total_patch_count = 0;
+        for values in values.chunks(CHUNK_LEN) {
+            let plan = estimate_block(values, transform);
+            let residual_nbytes = CHUNK_LEN * usize::from(plan.residual_width) / 8;
+            let patch_high_nbytes = if plan.patch_count == 0 {
+                0
+            } else {
+                (plan.patch_count * usize::from(plan.high_width)).div_ceil(8) + HIGH_PADDING
+            };
+            encoded_nbytes += size_of::<u64>()
+                + 2 * size_of::<u8>()
+                + 3 * size_of::<u32>()
+                + residual_nbytes
+                + plan.patch_count * size_of::<u16>()
+                + patch_high_nbytes;
+            total_patch_count += plan.patch_count;
+        }
+        BlockResidualCodecEstimate {
+            encoded_nbytes,
+            patch_count: total_patch_count,
+        }
     }
 
     /// Convert the codec into serialized array children.
@@ -366,7 +399,45 @@ fn encode_block(values: &[u64], word_width: u8) -> VortexResult<BlockResidualBlo
     }
     residuals.resize(CHUNK_LEN, 0);
 
-    let mut patch_count = values.len();
+    let width_plan = choose_width(&width_counts, maximum_width, values.len());
+
+    materialize_block(
+        values,
+        BlockPlan {
+            base,
+            residual_width: width_plan.residual_width,
+            high_width: width_plan.high_width,
+            residuals,
+            patch_count: width_plan.patch_count,
+        },
+        word_width,
+    )
+}
+
+struct BlockWidthPlan {
+    residual_width: u8,
+    high_width: u8,
+    patch_count: usize,
+}
+
+fn estimate_block<T: Copy>(values: &[T], transform: impl Fn(T) -> u64) -> BlockWidthPlan {
+    let base = values.iter().copied().map(&transform).min().unwrap_or(0);
+    let mut width_counts = [0usize; 65];
+    let mut maximum_width = 0u8;
+    for &value in values {
+        let width = bit_width(transform(value) - base);
+        width_counts[usize::from(width)] += 1;
+        maximum_width = maximum_width.max(width);
+    }
+    choose_width(&width_counts, maximum_width, values.len())
+}
+
+fn choose_width(
+    width_counts: &[usize; 65],
+    maximum_width: u8,
+    value_count: usize,
+) -> BlockWidthPlan {
+    let mut patch_count = value_count;
     let mut best = (usize::MAX, maximum_width, 0u8, 0usize);
     for residual_width in 0..=maximum_width {
         patch_count -= width_counts[usize::from(residual_width)];
@@ -385,18 +456,11 @@ fn encode_block(values: &[u64], word_width: u8) -> VortexResult<BlockResidualBlo
             best = (cost_bits, residual_width, high_width, patch_count);
         }
     }
-
-    materialize_block(
-        values,
-        BlockPlan {
-            base,
-            residual_width: best.1,
-            high_width: best.2,
-            residuals,
-            patch_count: best.3,
-        },
-        word_width,
-    )
+    BlockWidthPlan {
+        residual_width: best.1,
+        high_width: best.2,
+        patch_count: best.3,
+    }
 }
 
 fn validate_starts(

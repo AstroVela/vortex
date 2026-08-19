@@ -33,6 +33,7 @@ use vortex_array::vtable::OperationsVTable;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityChild;
 use vortex_array::vtable::ValidityVTableFromChild;
+use vortex_array::vtable::validity_to_child;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -43,8 +44,11 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::BlockResidual;
+use crate::BlockResidualCodec;
+use crate::BlockResidualEstimate;
 use crate::block_residual_array::decompress_ordered_f32;
 use crate::block_residual_array::decompress_ordered_f64;
+use crate::codec::BlockResidualCodecEstimate;
 
 /// IEEE floats mapped to unsigned integers that preserve numeric order.
 pub type OrderedFloatArray = Array<OrderedFloat>;
@@ -247,6 +251,32 @@ pub trait OrderedFloatArrayExt: TypedArrayRef<OrderedFloat> + OrderedFloatArrayS
 impl<T: TypedArrayRef<OrderedFloat>> OrderedFloatArrayExt for T {}
 
 impl OrderedFloat {
+    /// Estimate BlockResidual bytes for ordered float bits without materialized integer values.
+    pub fn estimate_block_residual(
+        array: ArrayView<'_, Primitive>,
+    ) -> VortexResult<BlockResidualEstimate> {
+        let BlockResidualCodecEstimate {
+            encoded_nbytes,
+            patch_count,
+        } = match array.ptype() {
+            PType::F32 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<f32>(), |value| {
+                    u64::from(ordered_u32(value.to_bits()))
+                })
+            }
+            PType::F64 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<f64>(), |value| {
+                    ordered_u64(value.to_bits())
+                })
+            }
+            ptype => vortex_bail!("OrderedFloat requires f32 or f64, got {ptype}"),
+        };
+        let validity_nbytes = validity_to_child(&array.validity()?, array.len())
+            .map(|validity| validity.nbytes())
+            .unwrap_or(0);
+        BlockResidualEstimate::try_new(encoded_nbytes, validity_nbytes, patch_count)
+    }
+
     /// Construct an ordered float array from an unsigned child.
     pub fn try_new(encoded: ArrayRef, float_ptype: PType) -> VortexResult<OrderedFloatArray> {
         vortex_ensure!(
@@ -382,6 +412,7 @@ mod tests {
     use super::OrderedFloat;
     use super::OrderedFloatArraySlotsExt;
     use crate::BlockResidual;
+    use crate::BlockResidualArraySlotsExt;
 
     #[test]
     fn roundtrip_special_values() -> VortexResult<()> {
@@ -394,7 +425,11 @@ mod tests {
             f64::INFINITY,
             f64::from_bits(0x7ff8_0000_0000_0042),
         ]);
+        let estimate = OrderedFloat::estimate_block_residual(primitive.as_view())?;
         let encoded = OrderedFloat::from_primitive(primitive.as_view())?;
+        let residuals = BlockResidual::from_primitive(encoded.encoded().as_::<Primitive>())?;
+        assert_eq!(estimate.nbytes(), residuals.nbytes());
+        assert_eq!(estimate.patch_count(), residuals.patch_positions().len());
         let session = array_session();
         crate::initialize(&session);
         let mut ctx = session.create_execution_ctx();
@@ -411,8 +446,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let primitive = PrimitiveArray::from_iter(values.clone());
+        let estimate = OrderedFloat::estimate_block_residual(primitive.as_view())?;
         let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
         let residuals = BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
+        assert_eq!(estimate.nbytes(), residuals.nbytes());
+        assert_eq!(estimate.patch_count(), residuals.patch_positions().len());
         let encoded = OrderedFloat::try_new(residuals.into_array(), PType::F32)?;
         let session = array_session();
         crate::initialize(&session);

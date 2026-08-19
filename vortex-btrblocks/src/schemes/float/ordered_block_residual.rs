@@ -25,7 +25,8 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 use crate::normalize_null_values;
-use crate::schemes::integer::patch_adjusted_nbytes;
+use crate::schemes::integer::patch_adjusted_estimate_nbytes;
+use crate::schemes::sample_primitive_blocks;
 
 const BLOCK_LEN: usize = 1024;
 const ESTIMATE_BLOCKS: usize = 8;
@@ -67,10 +68,8 @@ impl Scheme for OrderedBlockResidualScheme {
                 let sample = locality_sample(data.array_as_primitive(), exec_ctx)?;
                 let sample = normalize_null_values(sample.as_view(), exec_ctx)?;
                 let before_nbytes = sample.nbytes();
-                let ordered = OrderedFloat::from_primitive(sample.as_view())?;
-                let residuals =
-                    BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
-                let after_nbytes = patch_adjusted_nbytes(&residuals);
+                let estimate = OrderedFloat::estimate_block_residual(sample.as_view())?;
+                let after_nbytes = patch_adjusted_estimate_nbytes(estimate, sample.len());
                 if after_nbytes == 0 {
                     return Ok(EstimateVerdict::Skip);
                 }
@@ -121,16 +120,13 @@ fn locality_sample(
 
     let sample_blocks = ESTIMATE_BLOCKS.min(full_blocks);
     Ok(match_each_float_ptype!(primitive.ptype(), |T| {
-        let values = primitive.as_slice::<T>();
-        let mut sample = Vec::with_capacity(sample_blocks * BLOCK_LEN);
-        for sample_index in 0..sample_blocks {
-            let block_index = sample_index * full_blocks / sample_blocks;
-            let start = block_index * BLOCK_LEN;
-            sample.extend(
-                (start..start + BLOCK_LEN)
-                    .map(|index| validity.value(index).then_some(values[index])),
-            );
-        }
-        PrimitiveArray::from_option_iter(sample)
+        sample_primitive_blocks(
+            primitive.as_slice::<T>(),
+            validity.all_true(),
+            |index| validity.value(index),
+            full_blocks,
+            sample_blocks,
+            BLOCK_LEN,
+        )
     }))
 }

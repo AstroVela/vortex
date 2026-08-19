@@ -141,6 +141,12 @@ The scheme does not call the recursive integer selector.
 
 The ordinary BtrBlocks sample does not preserve the block-local float structure.
 
+The estimator runs the exact production width planner on native integer or float slices.
+
+It does not create packed payloads, patch payloads, temporary ordered integers, or child arrays.
+
+All-valid samples use direct block copies. Nullable samples retain the validity mask.
+
 The residual scheme requires a 1.05 compression ratio. Its adjusted score includes a 1.02 decode-cost factor.
 
 `BlockResidualScheme` uses the same locality probe for integer arrays.
@@ -520,6 +526,38 @@ Its measured aggregate encode throughput increased by 0.9 percent. Decode throug
 
 BlockResidual also composes with outer encodings. Sparse and RunEnd children selected BlockResidual in HashTags and the synthetic low-density sweep.
 
+### BlockResidual analysis cost
+
+California Housing contains 20,433 rows and nine nonnullable `f32` columns.
+
+Every new scheme rejects every column. The output remains 290,737 bytes.
+
+The first eight-block estimator reduced complete encode throughput by 14 to 15 percent.
+
+The exact width planner and direct all-valid copies reduced that cost to 6.3 percent.
+
+| Configuration | Encode MB/s |
+| --- | ---: |
+| Prior default | 214.4 |
+| FloatQuant only | 216.4 |
+| Ordered BlockResidual only | 208.1 |
+| Integer BlockResidual only | 213.2 |
+| Complete proposed default | 200.8 |
+
+A four-block trial reduced analysis cost further. It mis-ranked the California longitude column.
+
+The selected `ALP(BlockResidual)` tree saved only 5.7 percent against the prior tree.
+
+That result did not meet the intended 32-bit speed-adjusted margin. The production candidate retains eight sample blocks.
+
+The two-million-value random walk retained `OrderedFloat(BlockResidual)`.
+
+It used 10,428,451 bytes, encoded at 526.7 MB/s, and decoded at 22.29 GB/s.
+
+The prior default used 12,255,488 bytes, encoded at 595.8 MB/s, and decoded at 12.55 GB/s.
+
+The selected candidate remained inside both throughput gates.
+
 ### Complete parent compositions
 
 The finalized benchmark decodes every nested child to recursive canonical form.
@@ -794,6 +832,9 @@ This round completed these steps:
 - Added complete-compressor patch-density datasets and a column filter to the profiling benchmark.
 - Added complete temporal, FSST, Sparse, RunEnd, list, and ALP composition benchmarks.
 - Added selection tests for BlockResidual under ALP, Sparse, and RunEnd.
+- Added exact allocation-free BlockResidual size estimates.
+- Added an all-valid fast path for locality sample copies.
+- Rejected a four-block short-column estimate after a real mis-ranking.
 - Added patch-density statistics to the BlockResidual profile.
 - Replaced the global patch cost experiment with a nonlinear selector cost.
 - Removed the full patch scan from scalar access.
@@ -816,7 +857,7 @@ Complete these remaining steps:
 
 1. Validate the nonlinear patch cost on the complete corpus.
 2. Add a true ALP-RD child composition case if a real selected tree exposes one.
-3. Reduce analysis cost on short rejected columns.
+3. Validate the remaining rejected analysis cost in the complete corpus.
 4. Evaluate narrow BlockResidual as a Compact-only candidate.
 5. Prototype bounded scalar checkpoints for fixed-bin range packing.
 6. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.

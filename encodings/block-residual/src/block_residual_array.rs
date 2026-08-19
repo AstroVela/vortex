@@ -49,6 +49,7 @@ use vortex_session::registry::CachedId;
 
 use crate::BlockResidualCodec;
 use crate::BlockResidualParts;
+use crate::codec::BlockResidualCodecEstimate;
 use crate::codec::ResidualWord;
 use crate::codec::packed_words_as_native;
 use crate::codec::read_wide_bits;
@@ -130,6 +131,39 @@ impl ArrayEq for BlockResidualData {
 
 #[derive(Clone, Debug)]
 pub struct BlockResidual;
+
+/// Exact encoded size and patch count without materialized payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockResidualEstimate {
+    nbytes: u64,
+    patch_count: usize,
+}
+
+impl BlockResidualEstimate {
+    pub(crate) fn try_new(
+        encoded_nbytes: usize,
+        validity_nbytes: u64,
+        patch_count: usize,
+    ) -> VortexResult<Self> {
+        let nbytes = u64::try_from(encoded_nbytes)?
+            .checked_add(validity_nbytes)
+            .ok_or_else(|| vortex_error::vortex_err!("BlockResidual estimate size overflow"))?;
+        Ok(Self {
+            nbytes,
+            patch_count,
+        })
+    }
+
+    /// Return the estimated physical bytes.
+    pub fn nbytes(self) -> u64 {
+        self.nbytes
+    }
+
+    /// Return the estimated patch count.
+    pub fn patch_count(self) -> usize {
+        self.patch_count
+    }
+}
 
 impl VTable for BlockResidual {
     type TypedArrayData = BlockResidualData;
@@ -336,6 +370,58 @@ pub trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> + BlockResidualArr
 impl<T: TypedArrayRef<BlockResidual>> BlockResidualArrayExt for T {}
 
 impl BlockResidual {
+    /// Estimate the exact encoded size without materializing packed payloads.
+    pub fn estimate_primitive(
+        array: ArrayView<'_, Primitive>,
+    ) -> VortexResult<BlockResidualEstimate> {
+        vortex_ensure!(
+            array.ptype().is_int(),
+            "BlockResidual requires integer values"
+        );
+        let BlockResidualCodecEstimate {
+            encoded_nbytes,
+            patch_count,
+        } = match array.ptype() {
+            PType::U8 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<u8>(), u64::from)
+            }
+            PType::U16 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<u16>(), u64::from)
+            }
+            PType::U32 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<u32>(), u64::from)
+            }
+            PType::U64 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<u64>(), |value| value)
+            }
+            PType::I8 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<i8>(), |value| {
+                    u64::from((value as u8) ^ (1_u8 << 7))
+                })
+            }
+            PType::I16 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<i16>(), |value| {
+                    u64::from((value as u16) ^ (1_u16 << 15))
+                })
+            }
+            PType::I32 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<i32>(), |value| {
+                    u64::from((value as u32) ^ (1_u32 << 31))
+                })
+            }
+            PType::I64 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<i64>(), |value| {
+                    (value as u64) ^ (1_u64 << 63)
+                })
+            }
+            ptype => vortex_bail!("BlockResidual does not support {ptype}"),
+        };
+        let validity_nbytes = validity_to_child(&array.validity()?, array.len())
+            .map(|validity| validity.nbytes())
+            .unwrap_or(0);
+        BlockResidualEstimate::try_new(encoded_nbytes, validity_nbytes, patch_count)
+    }
+
     /// Encode an integer array in independent blocks.
     pub fn from_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<BlockResidualArray> {
         vortex_ensure!(
@@ -343,45 +429,7 @@ impl BlockResidual {
             "BlockResidual requires integer values"
         );
         let validity = array.validity()?;
-        let values = match array.ptype() {
-            PType::U8 => array
-                .as_slice::<u8>()
-                .iter()
-                .map(|&value| u64::from(value))
-                .collect(),
-            PType::U16 => array
-                .as_slice::<u16>()
-                .iter()
-                .map(|&value| u64::from(value))
-                .collect(),
-            PType::U32 => array
-                .as_slice::<u32>()
-                .iter()
-                .map(|&value| u64::from(value))
-                .collect(),
-            PType::U64 => array.as_slice::<u64>().to_vec(),
-            PType::I8 => array
-                .as_slice::<i8>()
-                .iter()
-                .map(|&value| u64::from((value as u8) ^ (1_u8 << 7)))
-                .collect(),
-            PType::I16 => array
-                .as_slice::<i16>()
-                .iter()
-                .map(|&value| u64::from((value as u16) ^ (1_u16 << 15)))
-                .collect(),
-            PType::I32 => array
-                .as_slice::<i32>()
-                .iter()
-                .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
-                .collect(),
-            PType::I64 => array
-                .as_slice::<i64>()
-                .iter()
-                .map(|&value| (value as u64) ^ (1_u64 << 63))
-                .collect(),
-            ptype => vortex_bail!("BlockResidual does not support {ptype}"),
-        };
+        let values = ordered_values(array)?;
         let parts = BlockResidualCodec::encode_with_word_width(
             &values,
             u8::try_from(array.ptype().bit_width())?,
@@ -426,6 +474,48 @@ impl BlockResidual {
             .with_slots(slots),
         )
     }
+}
+
+fn ordered_values(array: ArrayView<'_, Primitive>) -> VortexResult<Vec<u64>> {
+    Ok(match array.ptype() {
+        PType::U8 => array
+            .as_slice::<u8>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U16 => array
+            .as_slice::<u16>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U32 => array
+            .as_slice::<u32>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U64 => array.as_slice::<u64>().to_vec(),
+        PType::I8 => array
+            .as_slice::<i8>()
+            .iter()
+            .map(|&value| u64::from((value as u8) ^ (1_u8 << 7)))
+            .collect(),
+        PType::I16 => array
+            .as_slice::<i16>()
+            .iter()
+            .map(|&value| u64::from((value as u16) ^ (1_u16 << 15)))
+            .collect(),
+        PType::I32 => array
+            .as_slice::<i32>()
+            .iter()
+            .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
+            .collect(),
+        PType::I64 => array
+            .as_slice::<i64>()
+            .iter()
+            .map(|&value| (value as u64) ^ (1_u64 << 63))
+            .collect(),
+        ptype => vortex_bail!("BlockResidual does not support {ptype}"),
+    })
 }
 
 impl BlockResidualData {
@@ -1272,6 +1362,21 @@ mod tests {
             primitive.into_array().slice(1_022..1_025)?,
             &mut ctx
         );
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_matches_materialized_size() -> VortexResult<()> {
+        let mut values = vec![42_u32; 2_050];
+        values[1_023] = u32::MAX;
+        values[2_049] = u32::MAX - 1;
+        let validity = Validity::from_iter((0..values.len()).map(|index| index != 1_024));
+        let primitive = PrimitiveArray::new(Buffer::from(values), validity);
+        let estimate = BlockResidual::estimate_primitive(primitive.as_view())?;
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?;
+
+        assert_eq!(estimate.nbytes(), encoded.nbytes());
+        assert_eq!(estimate.patch_count(), encoded.patch_positions().len());
         Ok(())
     }
 

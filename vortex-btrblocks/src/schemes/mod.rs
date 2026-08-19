@@ -13,6 +13,8 @@ pub mod temporal;
 
 pub(crate) mod patches;
 
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::dtype::NativePType;
 use vortex_compressor::builtins::BinaryDictScheme;
 use vortex_compressor::builtins::FloatDictScheme;
 use vortex_compressor::builtins::IntDictScheme;
@@ -23,6 +25,35 @@ use vortex_compressor::scheme::DescendantExclusion;
 use vortex_compressor::scheme::SchemeExt;
 
 use crate::schemes::integer::SparseScheme;
+
+fn sample_primitive_blocks<T: NativePType>(
+    values: &[T],
+    all_valid: bool,
+    is_valid: impl Fn(usize) -> bool,
+    full_blocks: usize,
+    sample_blocks: usize,
+    block_len: usize,
+) -> PrimitiveArray {
+    if all_valid {
+        let mut sample = Vec::with_capacity(sample_blocks * block_len);
+        for sample_index in 0..sample_blocks {
+            let block_index = sample_index * full_blocks / sample_blocks;
+            let start = block_index * block_len;
+            sample.extend_from_slice(&values[start..start + block_len]);
+        }
+        PrimitiveArray::from_iter(sample)
+    } else {
+        let mut sample = Vec::with_capacity(sample_blocks * block_len);
+        for sample_index in 0..sample_blocks {
+            let block_index = sample_index * full_blocks / sample_blocks;
+            let start = block_index * block_len;
+            sample.extend(
+                (start..start + block_len).map(|index| is_valid(index).then_some(values[index])),
+            );
+        }
+        PrimitiveArray::from_option_iter(sample)
+    }
+}
 
 /// Shared descendant exclusion rules for RLE schemes.
 ///
