@@ -60,9 +60,11 @@ The production codec uses one reference per block. The multi-reference prototype
 
 `FloatQuantArray` splits each float into a primary quantum and a secondary adjustment.
 
-Bounded metadata stores the source type and split width. One or two child arrays store the integer latents.
+Metadata stores only the split width. The array dtype stores the source type.
 
-The BtrBlocks scheme compresses each present child through the normal cascade.
+One or two child arrays store the integer latents.
+
+The current BtrBlocks scheme accepts only a constant secondary. It uses a fixed `FoR(BitPacked)` primary tree.
 
 A common path uses `FloatQuant(FoR(BitPacked))` for `f32` values stored in `f64` columns.
 An absent secondary child represents zero low bits.
@@ -73,11 +75,11 @@ The automatic scheme accepts only `f64`. Native `f32` columns remain with ALP, A
 
 ## Selection policy
 
-`FloatQuantScheme` uses normal sample comparison against ALP, ALP-RD, dictionary, sparse, and RLE schemes.
+`FloatQuantScheme` uses the normal sample comparison against ALP, ALP-RD, dictionary, sparse, and RLE schemes.
 
-A strong constant split can use a direct `FoR(BitPacked)` primary and an implicit-zero secondary.
+The sample builds a direct `FoR(BitPacked)` primary and uses an implicit-zero secondary.
 
-Other splits compress both children through the normal integer cascade.
+The scheme rejects samples with a nonzero secondary. This avoids the recursive integer selector.
 
 `OrderedBlockResidualScheme` uses eight locality-preserving sample blocks.
 
@@ -85,7 +87,7 @@ The ordinary BtrBlocks sample does not preserve the block-local float structure.
 
 The residual scheme requires a 1.05 compression ratio and a 1.02 win over the incumbent.
 
-Both schemes remain eligible to displace ALP or ALP-RD when their adjusted size scores win.
+Both schemes remain eligible to displace ALP or ALP-RD when their sample size scores win.
 
 ## Performance requirements
 
@@ -107,45 +109,74 @@ Exclude source-array construction and storage input from codec throughput measur
 
 The input contains two million arbitrary `f32` values stored in an `f64` column.
 
-| Configuration | Bytes | Compression MB/s | Decode MB/s |
-| --- | ---: | ---: | ---: |
-| Prior default | 14,057,966 | 550.4 | 11,310.8 |
-| Default with FloatQuant | 8,753,920 | 244.9 | 14,664.3 |
-| Compact | 6,051,640 | 175.4 | 4,019.0 |
+| Configuration | Bytes | Compression MB/s | Decode MB/s | Scalar access ns |
+| --- | ---: | ---: | ---: | ---: |
+| Prior default | 14,057,966 | 553.6 | 10,944.5 | 208.7 |
+| Default with FloatQuant | 8,753,920 | 504.9 | 14,795.4 | 145.5 |
+| Compact | 6,051,737 | 280.0 | 4,022.0 | Not measured |
 
 FloatQuant reduced size by 37.7 percent. It remained 44.7 percent larger than Compact.
 
-Full compressor throughput decreased by 55.5 percent. Decode throughput increased by 29.6 percent.
+Full compressor throughput decreased by 8.8 percent. Decode throughput increased by 35.2 percent.
+
+Scalar access latency decreased by 30.3 percent.
 
 The selected tree was `FloatQuant(FoR(BitPacked))` with an implicit-zero secondary.
 
-The isolated tree compressed at 2,503 MB/s and decoded at 15,070 MB/s.
+The isolated tree compressed between 2,402 and 2,469 MB/s.
 
-Pco compressed the same input at 533 MB/s and decoded it at 3,973 MB/s.
+It decoded between 14,480 and 14,810 MB/s.
 
-The tree itself exceeded Pco throughput by 4.7 times during compression and 3.8 times during decode.
+Compact Pco compressed the same input at 280 MB/s and decoded it at 4,022 MB/s.
 
-The BtrBlocks analysis and candidate path caused most of the full compressor cost.
+The tree itself exceeded Compact throughput by at least 8.6 times for compression and 3.6 times for decode.
 
-FloatQuant cannot enter the default set until its selection path meets the compression throughput limit.
+FloatQuant recovered 66.2 percent of the size gap between the prior default and Compact Pco.
+
+The direct sample tree removed the recursive integer selector from the estimate and final compression paths.
+
+FloatQuant meets the selected-column throughput limit on this input.
+
+### FloatQuant with a nonzero secondary
+
+The prototype changed the lowest bit for ten percent of the widened-`f32` values.
+
+The fixed tree was `FloatQuant(FoR(BitPacked), BitPacked)`. The secondary used one bit per value.
+
+| Configuration | Bytes | Decode MB/s | Scalar access ns |
+| --- | ---: | ---: | ---: |
+| Prior ALP-RD default | 14,057,966 | 11,430 | 208.5 |
+| Two-child FloatQuant prototype | 9,004,032 | 8,375 | 192.2 |
+
+The prototype reduced size by 36.0 percent. It was 2.9 percent larger than the zero-secondary tree.
+
+The prototype recovered 64.1 percent of the size gap between ALP-RD and Compact Pco.
+
+The prototype reduced decode throughput by 26.7 percent against ALP-RD. It reduced decode throughput by 43.6 percent against zero-secondary FloatQuant.
+
+Scalar access remained competitive. The direct prototype tree compressed at 3,301 MB/s.
+
+The default scheme rejects this form. A fused one-bit-secondary decode is the next experiment.
 
 ### OrderedFloat with BlockResidual on random walks
 
 | Configuration | Bytes | Encode MB/s | Decode MB/s | Scalar access ns |
 | --- | ---: | ---: | ---: | ---: |
-| Prior default | 12,255,488 | 577.9 | 12,869.9 | 161.24 |
-| Default with the scheme | 10,425,690 | 516.1 | 18,019.7 | 129.06 |
-| Compact Pco | 9,342,749 | 316.3 | 4,611.7 | Not measured |
+| Prior default | 12,255,488 | 589.8 | 12,438.1 | 207.7 |
+| Default with the scheme | 10,425,690 | 529.6 | 21,728.1 | 166.7 |
+| Compact Pco | 9,342,749 | 318.1 | 4,559.8 | Not measured |
 
 The residual scheme saved 14.9 percent against the prior default. It remained 11.6 percent larger than Compact.
 
-Decode throughput increased by 40.0 percent. Random access latency decreased by 20.0 percent.
+Decode throughput increased by 74.7 percent. Random access latency decreased by 19.7 percent.
 
-Compression throughput decreased by 10.7 percent on the selected column.
+Compression throughput decreased by 10.2 percent on the selected column.
 
-The isolated tree compressed at 2,504 MB/s and decoded at 18,920 MB/s.
+The isolated tree compressed at 2,969 MB/s and decoded at 20,870 MB/s.
 
-Pco compressed the same input at 648 MB/s and decoded it at 4,635 MB/s.
+Compact Pco compressed the same input at 318 MB/s and decoded it at 4,560 MB/s.
+
+Ordered BlockResidual recovered 62.8 percent of the size gap between ALP-RD and Compact Pco.
 
 The selector rejected the scheme on Gaussian, lognormal, decimal, widened-f32, and four-cluster inputs.
 
@@ -157,7 +188,7 @@ It reduced the numeric subset by 6.0 percent with no isolated compressor regress
 
 ### Broad dataset revalidation
 
-The file benchmark compared the corrected default against the new schemes.
+The earlier file benchmark compared the corrected default against the new schemes.
 
 | Dataset | Prior bytes | Proposed bytes | Size change |
 | --- | ---: | ---: | ---: |
@@ -174,9 +205,85 @@ The focused two-million-row run selected no new schemes in Taxi, Air Quality, Ar
 
 Ordered BlockResidual selected two HashTags columns. FloatQuant selected no columns in these datasets.
 
-The FloatQuant probe reduced HashTags compression throughput by 2.4 percent without a selection.
+The earlier FloatQuant probe reduced HashTags compression throughput by 2.4 percent without a selection.
 
-This analysis cost needs optimization before FloatQuant can enter the default set.
+The direct sample tree removed that recursive analysis cost.
+
+### Pcodec paper corpus
+
+The focused benchmark reads the first two million numeric rows from each source.
+
+Timestamps use their integer representation. The California Housing size uses its original 20,640 rows.
+
+| Dataset | Input bytes | Prior bytes | Proposed bytes | Compact bytes | New selection |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Air Quality | 42,834,636 | 16,645,494 | 16,645,494 | 4,298,741 | None |
+| California Housing | 743,040 | 307,427 | 307,427 | 227,970 | None |
+| r/place | 56,000,000 | 16,266,697 | 16,266,697 | 8,891,886 | None |
+| NYC Taxi | 240,000,000 | 52,407,972 | 52,407,972 | 33,148,991 | None |
+| Twitter follower graph | 32,000,000 | 7,226,752 | 7,226,752 | 3,661,121 | None |
+| CMS Payments | 160,000,000 | 30,061,670 | 30,061,670 | 22,300,792 | None |
+
+Air Quality, California Housing, and r/place match the paper input sizes.
+
+The Taxi logical input matches the paper size. Vortex arrays also retain column validity.
+
+The Twitter source uses the first two million official edges. The paper used an unspecified ID sort.
+
+The Twitter result is not an exact size comparison. Independent column sort produced a 1,212,617-byte Compact result.
+
+The six inputs selected no new schemes. Four inputs contain no eligible `f64` column.
+
+Taxi contains `f64` columns, but both new schemes lost their sample comparisons.
+
+CMS Payments contains one `f64` column. ALP won that column.
+
+The current CMS source revision differs from the paper source snapshot.
+
+The CMS prior and proposed compressors both encoded at approximately 1,252 MB/s.
+
+Their decode results differed by less than two percent. They produced identical trees.
+
+## General real-float follow-up
+
+Target float columns where Compact Pco materially beats the complete default cascade.
+
+The default baseline includes ALP, ALP-RD, and compression of their children.
+
+Use a ten-percent Pco size advantage as the initial corpus filter. This filter is not a product threshold.
+
+Measure gap recovery as `(default bytes - candidate bytes) / (default bytes - Pco bytes)`.
+
+Retain a prototype only if it recovers a material gap across unrelated real datasets.
+
+The retained schemes cover lower-precision values in wider floats and locally narrow ordered ranges.
+
+They do not replace ALP-RD for generic non-decimal floats. No measured column moved from ALP to a new scheme.
+
+The first general prototype will use bounded multiple references per 1,024-value block.
+
+Each block will test one, two, or four references. Each value will store a small reference ID and one packed residual.
+
+All references will share one residual width per block. Sparse high-bit patches will contain rare outliers.
+
+Direct access will read one reference ID, one residual, and an optional patch. The one-reference form matches `BlockResidualArray`.
+
+This design approximates Pco bins without entropy coding. It also avoids a rank query into separate variable-width bin streams.
+
+Test these secondary candidates after the multi-reference prototype:
+
+- Use ordered-bit XOR suffixes instead of arithmetic residuals.
+- Use sign and exponent prefixes as fixed reference candidates.
+- Use block-local ALP-RD split widths.
+- Use independent entropy microblocks only in Compact.
+
+Build a gap corpus from columns where Compact Pco materially beats ALP-RD.
+
+Classify each gap by exponent count, prefix count, local range, low-bit entropy, and outlier rate.
+
+Require size, compression, decode, and scalar-access results on the same two-million-row inputs.
+
+Do not add a general codec to the default until it wins across several unrelated real datasets.
 
 ## Removed candidates
 
@@ -244,13 +351,22 @@ The corrected ALP selected `ALP(FoR(BitPacked))` for the integer-valued float co
 
 The control used 5,002,240 bytes with or without the new schemes.
 
+This round completed these steps:
+
+- Replaced the recursive FloatQuant child search with one fixed sample tree.
+- Added scalar-access benchmarks on two million values.
+- Added nonzero-secondary FloatQuant benchmarks.
+- Added all six Pcodec paper datasets.
+- Fixed the high-value defects from three adversarial reviews.
+
 Complete these remaining steps:
 
-1. Optimize the FloatQuant selection path.
-2. Repeat the broad file benchmark after that change.
-3. Measure random access on two million values for every retained tree.
-4. Add CMS Payments, r/place, and Twitter to the paper dataset matrix.
-5. Compare the geometric mean against Parquet with Zstd.
+1. Run the broad Vortex compression corpus after the selector change.
+2. Compare the geometric mean against Parquet with Zstd.
+3. Build the Pco-versus-ALP-RD gap corpus.
+4. Prototype the bounded multi-reference residual codec.
+5. Test a fused nonzero-secondary decode on qualifying gap columns.
+6. Update this plan after each experiment.
 
 ## Pull request structure
 

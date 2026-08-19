@@ -262,6 +262,9 @@ impl OperationsVTable<BlockResidual> for BlockResidual {
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        if !array.as_ref().is_valid(index, ctx)? {
+            return Ok(Scalar::null(array.dtype().clone()));
+        }
         let value = scalar_from_array(array, index, ctx)?;
         Ok(Scalar::primitive(value, array.dtype().nullability()))
     }
@@ -461,7 +464,9 @@ fn decode_array_values<T: NativePType>(
     let mut values = Vec::with_capacity(logical_range.len());
     let mut residuals = [0_u64; BLOCK_LEN];
 
-    for block_index in 0..bases.len() {
+    let first_block = logical_range.start / BLOCK_LEN;
+    let last_block = logical_range.end.div_ceil(BLOCK_LEN);
+    for block_index in first_block..last_block {
         let block_start = block_index * BLOCK_LEN;
         let block_len = (array.data().unsliced_len - block_start).min(BLOCK_LEN);
         let block_stop = block_start + block_len;
@@ -469,7 +474,6 @@ fn decode_array_values<T: NativePType>(
             continue;
         }
 
-        residuals.fill(0);
         let residual_width = residual_widths[block_index];
         let high_width = high_widths[block_index];
         vortex_ensure!(
@@ -497,6 +501,8 @@ fn decode_array_values<T: NativePType>(
                     &mut residuals,
                 );
             }
+        } else {
+            residuals.fill(0);
         }
 
         let patch_payload =
@@ -504,22 +510,13 @@ fn decode_array_values<T: NativePType>(
         let high_payload =
             payload_range(high_starts, block_index, patch_highs.len(), "patch high")?;
         let positions = &patch_positions[patch_payload];
-        vortex_ensure!(
-            positions
-                .iter()
-                .all(|&position| usize::from(position) < block_len)
-                && positions.windows(2).all(|pair| pair[0] < pair[1]),
-            "block residual patch positions are invalid"
-        );
-        let expected_high_len = if positions.is_empty() {
-            0
-        } else {
-            (positions.len() * usize::from(high_width)).div_ceil(8) + 15
-        };
-        vortex_ensure!(
-            high_payload.len() == expected_high_len,
-            "block residual patch high payload is invalid"
-        );
+        validate_patch_payload(
+            block_len,
+            residual_width,
+            high_width,
+            positions,
+            high_payload.len(),
+        )?;
         let highs = &patch_highs[high_payload];
         for (patch_index, &position) in positions.iter().enumerate() {
             // SAFETY: The payload includes fifteen readable padding bytes.
@@ -609,20 +606,24 @@ fn scalar_from_array(
         "patch",
     )?;
     let block_positions = &positions[patch_payload];
+    let block_start = block_index * BLOCK_LEN;
+    let block_len = (array.data().unsliced_len - block_start).min(BLOCK_LEN);
+    let highs = children.patch_highs.as_slice::<u8>();
+    let high_payload = payload_range(
+        children.high_starts.as_slice::<u32>(),
+        block_index,
+        highs.len(),
+        "patch high",
+    )?;
+    validate_patch_payload(
+        block_len,
+        residual_width,
+        high_width,
+        block_positions,
+        high_payload.len(),
+    )?;
     if let Ok(patch_index) = block_positions.binary_search(&u16::try_from(index_in_block)?) {
-        let highs = children.patch_highs.as_slice::<u8>();
-        let high_payload = payload_range(
-            children.high_starts.as_slice::<u32>(),
-            block_index,
-            highs.len(),
-            "patch high",
-        )?;
         let high_payload = &highs[high_payload];
-        vortex_ensure!(
-            high_payload.len()
-                >= (block_positions.len() * usize::from(high_width)).div_ceil(8) + 15,
-            "block residual patch high payload is invalid"
-        );
         // SAFETY: The payload includes fifteen readable padding bytes.
         let high = unsafe {
             read_wide_bits(
@@ -634,6 +635,36 @@ fn scalar_from_array(
         residual |= high << residual_width;
     }
     Ok(children.bases.as_slice::<u64>()[block_index].wrapping_add(residual))
+}
+
+fn validate_patch_payload(
+    block_len: usize,
+    residual_width: u8,
+    high_width: u8,
+    positions: &[u16],
+    high_payload_len: usize,
+) -> VortexResult<()> {
+    vortex_ensure!(
+        positions
+            .iter()
+            .all(|&position| usize::from(position) < block_len)
+            && positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "block residual patch positions are invalid"
+    );
+    vortex_ensure!(
+        positions.is_empty() || (high_width > 0 && residual_width < 64),
+        "block residual patches require nonzero high bits"
+    );
+    let expected_high_len = if positions.is_empty() {
+        0
+    } else {
+        (positions.len() * usize::from(high_width)).div_ceil(8) + 15
+    };
+    vortex_ensure!(
+        high_payload_len == expected_high_len,
+        "block residual patch high payload is invalid"
+    );
+    Ok(())
 }
 
 fn payload_range(
@@ -732,12 +763,19 @@ fn primitive_dtype(ptype: PType) -> DType {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::serde::SerializeOptions;
+    use vortex_array::serde::SerializedArray;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+    use vortex_buffer::ByteBufferMut;
     use vortex_error::VortexResult;
+    use vortex_session::registry::ReadContext;
 
     use super::BlockResidual;
 
@@ -759,6 +797,58 @@ mod tests {
                 Some(values[index])
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_slice_and_scalar_access() -> VortexResult<()> {
+        let values = (0..2_050)
+            .map(|index| Ok(u64::try_from(index * index)?))
+            .collect::<VortexResult<Vec<_>>>()?;
+        let validity = Validity::from_iter((0..values.len()).map(|index| index != 1_024));
+        let primitive = PrimitiveArray::new(Buffer::from(values), validity);
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        assert!(encoded.execute_scalar(1_024, &mut ctx)?.is_null());
+        let sliced = encoded.into_array().slice(1_023..1_026)?;
+        let expected = primitive.into_array().slice(1_023..1_026)?;
+        assert_arrays_eq!(sliced, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_slice_serialization_roundtrip() -> VortexResult<()> {
+        let values = (0..2_050)
+            .map(|index| Ok(u64::try_from(index * index)?))
+            .collect::<VortexResult<Vec<_>>>()?;
+        let validity = Validity::from_iter((0..values.len()).map(|index| index != 1_024));
+        let primitive = PrimitiveArray::new(Buffer::from(values), validity);
+        let sliced = BlockResidual::from_primitive(primitive.as_view())?
+            .into_array()
+            .slice(1_023..1_026)?;
+        let expected = primitive.into_array().slice(1_023..1_026)?;
+        let dtype = sliced.dtype().clone();
+        let len = sliced.len();
+        let array_context = ArrayContext::empty();
+        let session = array_session();
+        crate::initialize(&session);
+        let serialized =
+            sliced.serialize(&array_context, &session, &SerializeOptions::default())?;
+        let mut bytes = ByteBufferMut::empty();
+        for buffer in serialized {
+            bytes.extend_from_slice(buffer.as_ref());
+        }
+        let decoded = SerializedArray::try_from(bytes.freeze())?.decode(
+            &dtype,
+            len,
+            &ReadContext::new(array_context.to_ids()),
+            &session,
+        )?;
+        assert!(decoded.is::<BlockResidual>());
+        assert_arrays_eq!(decoded, expected, &mut session.create_execution_ctx());
         Ok(())
     }
 }

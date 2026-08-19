@@ -24,6 +24,9 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
+use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::PType;
 use vortex_arrow::ArrowSessionExt;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -69,6 +72,16 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
         let trend = (index % 10_000) as f32 * 0.001;
         f64::from(trend + widened_rng.random_range(-1.0_f32..1.0))
     }));
+    let nonzero_secondary =
+        PrimitiveArray::from_iter(widened_f32.as_slice::<f64>().iter().enumerate().map(
+            |(index, value)| {
+                if index % 10 == 0 {
+                    f64::from_bits(value.to_bits() | 1)
+                } else {
+                    *value
+                }
+            },
+        ));
 
     let mut walk_rng = StdRng::seed_from_u64(2);
     let mut value = 1_000.0_f64;
@@ -91,6 +104,10 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
         (
             "synthetic-widened-f32".to_string(),
             vec![column("value", widened_f32)],
+        ),
+        (
+            "synthetic-nonzero-secondary".to_string(),
+            vec![column("value", nonzero_secondary)],
         ),
         (
             "synthetic-random-walk".to_string(),
@@ -131,12 +148,15 @@ fn read_california(path: &Path, row_count: usize) -> VortexResult<Vec<Column>> {
             })?);
         }
     }
+    let repeat_short_input = std::env::var_os("VORTEX_BENCH_REPEAT_SHORT").is_some();
     for values in &mut values {
         vortex_ensure!(!values.is_empty(), "California Housing input is empty");
         values.truncate(row_count);
-        while values.len() < row_count {
-            let copy_len = (row_count - values.len()).min(values.len());
-            values.extend_from_within(..copy_len);
+        if repeat_short_input {
+            while values.len() < row_count {
+                let copy_len = (row_count - values.len()).min(values.len());
+                values.extend_from_within(..copy_len);
+            }
         }
     }
     Ok(CALIFORNIA_COLUMNS
@@ -169,6 +189,7 @@ fn read_parquet_numeric(
                     | DataType::UInt64
                     | DataType::Float32
                     | DataType::Float64
+                    | DataType::Timestamp(_, _)
             )
             .then_some(index)
         })
@@ -212,6 +233,11 @@ fn read_parquet_numeric(
             let combined = concat(&chunk_refs)
                 .map_err(|error| vortex_err!("cannot concatenate {}: {error}", field.name()))?;
             let array = session.arrow().from_arrow_array(combined, field.as_ref())?;
+            let array = if matches!(field.data_type(), DataType::Timestamp(_, _)) {
+                array.cast(DType::Primitive(PType::I64, array.dtype().nullability()))?
+            } else {
+                array
+            };
             let primitive = array.execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
             Ok(column(field.name(), primitive))
         })
@@ -264,10 +290,12 @@ fn measure_dataset(
     configs: &[(&str, BtrBlocksCompressor)],
     session: &VortexSession,
 ) -> VortexResult<()> {
-    let input_bytes = columns
-        .iter()
-        .map(|column| column.primitive.nbytes())
-        .sum::<u64>();
+    let mut input_bytes = 0_u64;
+    for column in columns {
+        input_bytes += u64::try_from(column.primitive.len())?
+            * u64::try_from(column.primitive.ptype().bit_width())?
+            / 8;
+    }
     let encoded = configs
         .iter()
         .map(|(name, compressor)| Ok((*name, encode_all(compressor, columns, session)?)))

@@ -132,8 +132,10 @@ impl BlockResidualCodec {
             let residual_width = parts.residual_widths[block_index];
             let high_width = parts.high_widths[block_index];
             vortex_error::vortex_ensure!(
-                residual_width <= 64 && high_width <= 64,
-                "block residual bit width exceeds 64"
+                residual_width <= 64
+                    && high_width <= 64
+                    && u16::from(residual_width) + u16::from(high_width) <= 64,
+                "block residual bit widths are invalid"
             );
             vortex_error::vortex_ensure!(
                 residual_stop - residual_start
@@ -141,6 +143,10 @@ impl BlockResidualCodec {
                 "block residual packed word count is invalid"
             );
             let patch_positions = &parts.patch_positions[patch_start..patch_stop];
+            vortex_error::vortex_ensure!(
+                patch_positions.is_empty() || (high_width > 0 && residual_width < 64),
+                "block residual patches require nonzero high bits"
+            );
             vortex_error::vortex_ensure!(
                 patch_positions
                     .iter()
@@ -581,6 +587,31 @@ mod tests {
         let parts = BlockResidualCodec::encode(&values)?.into_parts()?;
         let codec = BlockResidualCodec::try_from_parts(parts)?;
         assert_eq!(codec.decode()?, values);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_incompatible_patch_widths() -> VortexResult<()> {
+        let mut values = vec![0_u64; 1_024];
+        values[1_023] = u64::MAX;
+        let mut parts = BlockResidualCodec::encode(&values)?.into_parts()?;
+        assert!(!parts.patch_positions.is_empty());
+
+        parts.residual_widths[0] = 64;
+        parts.high_widths[0] = 1;
+        assert!(BlockResidualCodec::try_from_parts(parts).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_patches_without_high_bits() -> VortexResult<()> {
+        let mut values = vec![0_u64; 1_024];
+        values[1_023] = u64::MAX;
+        let mut parts = BlockResidualCodec::encode(&values)?.into_parts()?;
+        assert!(!parts.patch_positions.is_empty());
+
+        parts.high_widths[0] = 0;
+        assert!(BlockResidualCodec::try_from_parts(parts).is_err());
         Ok(())
     }
 }

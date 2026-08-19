@@ -5,6 +5,8 @@
 #![expect(clippy::cast_possible_truncation)]
 
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use divan::Bencher;
 #[cfg(not(codspeed))]
@@ -38,6 +40,7 @@ use vortex::encodings::fastlanes::FoR;
 use vortex::encodings::fastlanes::bitpack_compress::bitpack_encode_unchecked;
 use vortex::encodings::fastlanes::delta_compress;
 use vortex::encodings::float_quant::FloatQuant;
+use vortex::encodings::float_quant::FloatQuantArraySlotsExt;
 use vortex::encodings::float_quant::analyze_float_quant;
 use vortex::encodings::fsst::fsst_compress;
 use vortex::encodings::fsst::fsst_train_compressor;
@@ -49,6 +52,8 @@ use vortex::encodings::zstd::Zstd;
 use vortex::encodings::zstd::ZstdData;
 use vortex::scalar::Scalar;
 use vortex_array::VortexSessionExecute;
+use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
 use vortex_error::VortexResult;
 use vortex_sequence::Sequence;
@@ -115,6 +120,23 @@ fn setup_widened_f32_array() -> PrimitiveArray {
     }))
 }
 
+fn setup_nonzero_secondary_array() -> PrimitiveArray {
+    let widened = setup_widened_f32_array();
+    PrimitiveArray::from_iter(
+        widened
+            .as_slice::<f64>()
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if index % 10 == 0 {
+                    f64::from_bits(value.to_bits() | 1)
+                } else {
+                    *value
+                }
+            }),
+    )
+}
+
 fn setup_random_walk_array() -> PrimitiveArray {
     let mut rng = StdRng::seed_from_u64(2);
     let mut value = 1_000.0_f64;
@@ -153,6 +175,54 @@ fn encode_float_quant_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
     FloatQuant::try_new(primary.into_array(), None, PType::F64, analysis.k)
         .unwrap()
         .into_array()
+}
+
+fn encode_float_quant_nonzero_secondary_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
+    let analysis = analyze_float_quant(array.as_view()).unwrap();
+    assert!(!analysis.secondary_is_constant);
+    let split = FloatQuant::from_primitive(array.as_view(), analysis.k).unwrap();
+    let primary = split
+        .primary()
+        .clone()
+        .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())
+        .unwrap();
+    let secondary = split
+        .secondary()
+        .unwrap()
+        .clone()
+        .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())
+        .unwrap();
+    let biased_primary = PrimitiveArray::from_iter(
+        primary
+            .as_slice::<u64>()
+            .iter()
+            .map(|value| value - analysis.primary_min),
+    );
+    // SAFETY: The analysis computes this width from the exact primary range.
+    let primary = unsafe { bitpack_encode_unchecked(biased_primary, analysis.primary_bit_width) }
+        .unwrap()
+        .into_array();
+    let primary = FoR::try_new(primary, Scalar::from(analysis.primary_min))
+        .unwrap()
+        .into_array();
+    // SAFETY: The input generator changes only the lowest bit.
+    let secondary = unsafe { bitpack_encode_unchecked(secondary, 1) }
+        .unwrap()
+        .into_array();
+    FloatQuant::try_new(primary, Some(secondary), PType::F64, analysis.k)
+        .unwrap()
+        .into_array()
+}
+
+fn encode_prior_default(array: &PrimitiveArray) -> vortex::array::ArrayRef {
+    BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
+        .build()
+        .compress(
+            &array.clone().into_array(),
+            &mut SESSION.create_execution_ctx(),
+        )
+        .unwrap()
 }
 
 #[expect(clippy::cast_possible_truncation)]
@@ -443,6 +513,38 @@ fn bench_ordered_block_residual_decompress_f64(bencher: Bencher) {
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
 
+#[divan::bench(name = "ordered_block_residual_scalar_at_f64")]
+fn bench_ordered_block_residual_scalar_at_f64(bencher: Bencher) {
+    let encoded = encode_ordered_block_residual(&setup_random_walk_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "ordered_block_residual_prior_default_scalar_at_f64")]
+fn bench_ordered_block_residual_prior_default_scalar_at_f64(bencher: Bencher) {
+    let encoded = encode_prior_default(&setup_random_walk_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
 #[divan::bench(name = "ordered_block_residual_scheme_compress_f64")]
 fn bench_ordered_block_residual_scheme_compress_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
@@ -500,6 +602,129 @@ fn bench_float_quant_tree_decompress_f64(bencher: Bencher) {
     with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_tree_scalar_at_f64")]
+fn bench_float_quant_tree_scalar_at_f64(bencher: Bencher) {
+    let encoded = encode_float_quant_tree(&setup_widened_f32_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_split_compress_f64")]
+fn bench_float_quant_nonzero_secondary_split_compress_f64(bencher: Bencher) {
+    let float_array = setup_nonzero_secondary_array();
+    let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| FloatQuant::from_primitive(array.as_view(), k).unwrap());
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_split_decompress_f64")]
+fn bench_float_quant_nonzero_secondary_split_decompress_f64(bencher: Bencher) {
+    let float_array = setup_nonzero_secondary_array();
+    let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+    let encoded = FloatQuant::from_primitive(float_array.as_view(), k)
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_tree_compress_f64")]
+fn bench_float_quant_nonzero_secondary_tree_compress_f64(bencher: Bencher) {
+    let float_array = setup_nonzero_secondary_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| encode_float_quant_nonzero_secondary_tree(array));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_tree_decompress_f64")]
+fn bench_float_quant_nonzero_secondary_tree_decompress_f64(bencher: Bencher) {
+    let encoded = encode_float_quant_nonzero_secondary_tree(&setup_nonzero_secondary_array());
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_tree_scalar_at_f64")]
+fn bench_float_quant_nonzero_secondary_tree_scalar_at_f64(bencher: Bencher) {
+    let encoded = encode_float_quant_nonzero_secondary_tree(&setup_nonzero_secondary_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_prior_default_compress_f64")]
+fn bench_float_quant_nonzero_secondary_prior_default_compress_f64(bencher: Bencher) {
+    let float_array = setup_nonzero_secondary_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| encode_prior_default(array));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_prior_default_decompress_f64")]
+fn bench_float_quant_nonzero_secondary_prior_default_decompress_f64(bencher: Bencher) {
+    let encoded = encode_prior_default(&setup_nonzero_secondary_array());
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_prior_default_scalar_at_f64")]
+fn bench_float_quant_nonzero_secondary_prior_default_scalar_at_f64(bencher: Bencher) {
+    let encoded = encode_prior_default(&setup_nonzero_secondary_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "float_quant_prior_default_scalar_at_f64")]
+fn bench_float_quant_prior_default_scalar_at_f64(bencher: Bencher) {
+    let encoded = encode_prior_default(&setup_widened_f32_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
 }
 
 #[divan::bench(name = "pcodec_compress_f64")]

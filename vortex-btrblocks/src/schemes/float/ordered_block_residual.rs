@@ -45,7 +45,7 @@ impl Scheme for OrderedBlockResidualScheme {
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
-        vec![OrderedFloat.id()]
+        vec![OrderedFloat.id(), BlockResidual.id()]
     }
 
     fn num_children(&self) -> usize {

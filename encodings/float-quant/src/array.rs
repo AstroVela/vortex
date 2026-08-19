@@ -430,7 +430,7 @@ pub fn analyze_float_quant(array: ArrayView<'_, Primitive>) -> Option<FloatQuant
 }
 
 fn analyze_histogram(
-    mut histogram: Vec<usize>,
+    histogram: &mut [usize],
     precision_bits: u8,
     len: usize,
     primary_min: u64,
@@ -459,8 +459,6 @@ fn analyze_histogram(
         if savings > best_savings {
             best_k = k;
             best_savings = savings;
-        } else {
-            break;
         }
     }
     if best_savings <= 1.5 {
@@ -482,7 +480,7 @@ fn analyze_histogram(
 fn analyze_f32(values: &[f32]) -> Option<FloatQuantAnalysis> {
     let mut minimum = u32::MAX;
     let mut maximum = u32::MIN;
-    let mut histogram = vec![0usize; 24];
+    let mut histogram = [0usize; 24];
     for value in values {
         let bits = value.to_bits();
         let ordered = ordered_u32(bits);
@@ -492,7 +490,7 @@ fn analyze_f32(values: &[f32]) -> Option<FloatQuantAnalysis> {
         histogram[zeros as usize] += 1;
     }
     analyze_histogram(
-        histogram,
+        &mut histogram,
         23,
         values.len(),
         u64::from(minimum),
@@ -503,7 +501,7 @@ fn analyze_f32(values: &[f32]) -> Option<FloatQuantAnalysis> {
 fn analyze_f64(values: &[f64]) -> Option<FloatQuantAnalysis> {
     let mut minimum = u64::MAX;
     let mut maximum = u64::MIN;
-    let mut histogram = vec![0usize; 53];
+    let mut histogram = [0usize; 53];
     for value in values {
         let bits = value.to_bits();
         let ordered = ordered_u64(bits);
@@ -512,7 +510,7 @@ fn analyze_f64(values: &[f64]) -> Option<FloatQuantAnalysis> {
         let zeros = bits.trailing_zeros().min(52);
         histogram[zeros as usize] += 1;
     }
-    analyze_histogram(histogram, 52, values.len(), minimum, maximum)
+    analyze_histogram(&mut histogram, 52, values.len(), minimum, maximum)
 }
 
 fn category_entropy(probability: f64) -> f64 {
@@ -800,6 +798,20 @@ mod tests {
         crate::initialize(&session);
         session
     });
+
+    #[test]
+    fn histogram_search_continues_after_local_decline() -> VortexResult<()> {
+        let mut histogram = [0usize; 24];
+        histogram[0] = 10;
+        histogram[1] = 70;
+        histogram[20] = 20;
+
+        let Some(analysis) = analyze_histogram(&mut histogram, 23, 100, 0, (1 << 23) - 1) else {
+            vortex_bail!("a large trailing-zero group must be useful")
+        };
+        assert_eq!(analysis.k, 20);
+        Ok(())
+    }
 
     #[test]
     fn float_bit_patterns_roundtrip() -> VortexResult<()> {

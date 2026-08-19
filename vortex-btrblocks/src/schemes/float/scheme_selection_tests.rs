@@ -12,6 +12,7 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::assert_arrays_eq;
 use vortex_array::builders::ArrayBuilder;
 use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::dtype::Nullability;
@@ -71,9 +72,9 @@ fn test_null_dominated_compressed() -> VortexResult<()> {
     builder.append_nulls(95);
     let array = builder.finish_into_primitive();
     let btr = BtrBlocksCompressor::default();
-    let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
-    // Verify the compressed array preserves values.
-    assert_eq!(compressed.len(), 100);
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressed = btr.compress(&array.clone().into_array(), &mut ctx)?;
+    assert_arrays_eq!(compressed, array, &mut ctx);
     Ok(())
 }
 
