@@ -46,12 +46,11 @@ impl Scheme for FloatQuantScheme {
 
     fn expected_compression_ratio(
         &self,
-        data: &ArrayAndStats,
+        _data: &ArrayAndStats,
         compress_ctx: CompressorContext,
         _exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
-        let primitive = data.array_as_primitive();
-        if compress_ctx.finished_cascading() || primitive.ptype() != PType::F64 {
+        if compress_ctx.finished_cascading() {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
         CompressionEstimate::Deferred(DeferredEstimate::Sample)

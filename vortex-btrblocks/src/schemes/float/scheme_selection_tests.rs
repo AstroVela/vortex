@@ -135,6 +135,23 @@ fn test_f32_does_not_use_float_quant() -> VortexResult<()> {
 }
 
 #[test]
+fn test_quantized_f32_uses_float_quant() -> VortexResult<()> {
+    let values = (0_u32..65_536)
+        .map(|index| {
+            let mantissa = (index.wrapping_mul(7_919) & 0x7fff) << 8;
+            f32::from_bits(0x3f80_0000 | mantissa)
+        })
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let compressed =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    assert!(compressed.is::<FloatQuant>());
+    assert!(compressed.as_::<FloatQuant>().secondary().is_none());
+    Ok(())
+}
+
+#[test]
 fn test_repeated_f64_prefers_existing_scheme() -> VortexResult<()> {
     let values = (0u32..16_384)
         .map(|index| f64::from(index % 8))

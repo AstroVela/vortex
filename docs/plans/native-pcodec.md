@@ -24,6 +24,8 @@ Remove `RangeEntropyArray`, `RangeEntropyScheme`, and `BitSplitCodec` from the f
 
 The `wm/pcodec-entropy-experiments` branch preserves the complete entropy and bit-split prototypes.
 
+Keep fixed-bin range packing as an experimental Compact candidate. It is not a default candidate.
+
 Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution Delta.
 
 ## Current state
@@ -34,11 +36,15 @@ The default candidate set includes their three BtrBlocks schemes.
 
 `OrderedFloat(BlockResidual)` now supports `f32` and `f64` inputs.
 
+The current FloatQuant prototype also accepts native `f32` and `f64` inputs.
+
 Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
 
 The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
 
-The GloVe result identifies a separate gap inside the ALP integer child.
+The GloVe result identifies a separate entropy gap inside the ALP integer child.
+
+Generic quotient and remainder trees do not close that gap.
 
 The current selector factors and patch cost remain provisional. Final calibration requires the complete corpus and selected-tree evidence.
 
@@ -93,7 +99,9 @@ An absent secondary child represents zero low bits.
 
 The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar access, and serialization.
 
-The automatic scheme accepts only `f64`. Native `f32` columns remain with ALP, ALP-RD, and existing schemes.
+The automatic scheme accepts `f32` and `f64` inputs.
+
+Native `f32` selection remains provisional because the full compressor misses the compression throughput limit.
 
 ## Selection policy
 
@@ -102,6 +110,10 @@ The automatic scheme accepts only `f64`. Native `f32` columns remain with ALP, A
 The sample builds a direct `FoR(BitPacked)` primary and uses an implicit-zero secondary.
 
 The scheme rejects samples with a nonzero secondary. This avoids the recursive integer selector.
+
+The current native `f32` path uses the generic deferred sample.
+
+The next selector uses a cheap prefilter and an exact fixed-tree estimate on the same one-percent sample.
 
 `OrderedBlockResidualScheme` uses eight locality-preserving sample blocks.
 
@@ -310,6 +322,29 @@ The BtrBlocks candidate now accepts f32 and f64 inputs.
 
 These results remove the prior f32 type exclusion. Corpus comparisons against ALP and ALP-RD remain necessary.
 
+### Native f32 FloatQuant
+
+The input contains two million native `f32` values with eight zero low mantissa bits.
+
+| Configuration | Selected tree | Bytes | Encode MB/s | Decode MB/s |
+| --- | --- | ---: | ---: | ---: |
+| Prior default | `ALP-RD(BitPacked, BitPacked)` | 5,752,576 | 750.4 | 10,634.2 |
+| Default with FloatQuant | `FloatQuant(FoR(BitPacked))` | 3,751,680 | 542.1 | 18,970.4 |
+| FloatQuant only | `FloatQuant(FoR(BitPacked))` | 3,751,680 | 554.3 | 18,427.9 |
+| Compact Pco | `Pco` | 201,374 | About 304 | About 2,933 |
+
+FloatQuant reduced size by 34.8 percent against ALP-RD.
+
+Decode throughput increased by 78.4 percent.
+
+Full compression throughput decreased by 27.8 percent. This result exceeds the 20-percent limit.
+
+The isolated FloatQuant tree compressed at about 1.29 GB/s and decoded at about 19.6 GB/s.
+
+The large difference between isolated and full compression identifies selector and sample cost as the next target.
+
+The Compact size is specific to this synthetic pattern. It does not establish a general real-float result.
+
 ### Direct 32-bit comparison
 
 The direct benchmark compares two million block-local values against a whole-column FoR plus BitPacked tree.
@@ -373,6 +408,56 @@ The size gap comes from a decimal quotient and remainder split plus entropy codi
 
 GloVe therefore identifies an ALP-child compression gap. It does not identify a failure in the ALP float transform.
 
+### GloVe quotient and remainder prototypes
+
+The first prototype splits the exact ALP integer child with a constant base.
+
+| Candidate | Bytes |
+| --- | ---: |
+| Pco `IntMult(10)` child | 4,518,870 |
+| Base ten with ordinary integer children | 6,002,688 |
+| Best tested ordinary base, base 100 | 5,572,096 |
+| Base ten with bitmap-patched quotient and mode bitmap remainder | 5,221,476 |
+| Direct bitmap patches on the unsplit child | 5,541,496 |
+| Direct position patches on the unsplit child | 5,507,862 |
+
+Ordinary integer trees lose materially to Pco on the quotient and remainder.
+
+Bitmap patches improve size, but they do not match the Pco child.
+
+The results reject a general quotient and remainder array with ordinary children.
+
+They support a small-alphabet entropy experiment and a fixed-bin Compact experiment.
+
+### Fixed-bin range backend experiments
+
+The experimental branch compares ANS symbols with fixed-width bin identifiers.
+
+The packed variants retain variable-width offsets inside each bin.
+
+| Input and backend | Bytes | Encode MB/s | Decode MB/s |
+| --- | ---: | ---: | ---: |
+| GloVe ALP child, ANS | 5,264,329 | 414.2 | 3,476.5 |
+| GloVe ALP child, packed bins | 5,573,968 | 765.8 | 7,700.0 |
+| GloVe `IntMult(10)`, ANS | 4,716,002 | 457.8 | 1,944.6 |
+| GloVe `IntMult(10)`, packed bins | 5,562,181 | 821.1 | 3,661.7 |
+| CMS ALP child, ANS | 3,293,477 | 406.6 | 3,823.0 |
+| CMS ALP child, packed bins | 3,647,593 | 642.7 | 8,358.2 |
+| Food ALP child, ANS | 5,405,851 | 392.5 | 3,936.6 |
+| Food ALP child, packed bins | 5,525,544 | 607.4 | 8,525.6 |
+
+ANS approaches Pco size, but it retains an expensive decode path.
+
+Packed bins decode faster, but they lose part of the size benefit.
+
+Packed bins remain plausible for Compact on selected columns.
+
+Fast scalar access requires checkpoints for the variable offset stream.
+
+A checkpoint interval of 32 values bounds scalar work to 31 offset widths.
+
+This design adds about 0.5 bits per value with 16-bit checkpoints.
+
 ### Pcodec corpus gap analysis
 
 The focused benchmark reads the first two million numeric rows from each source.
@@ -391,6 +476,12 @@ Pco uses four principal mechanisms on these columns:
 - IntMult splits on selected integer children.
 
 No Pcodec paper gap used lookback Delta. Some Public BI columns used lookback Delta.
+
+GloVe, CMS Payments, and Food include important no-Delta wins.
+
+GloVe uses `IntMult(10)` plus entropy bins. CMS Payments and Food use classic entropy bins.
+
+Arade relies mainly on first-order consecutive Delta. Two columns combine `IntMult` with Delta.
 
 The current CMS source revision differs from the paper source snapshot.
 
@@ -524,25 +615,26 @@ This round completed these steps:
 - Excluded integer BlockResidual from the CUDA-compatible preset.
 - Added the real GloVe embeddings dataset to the compression corpus.
 
+The Pco mode profile and quotient and remainder experiments are complete.
+
 Complete these remaining steps:
 
-1. Profile the ALP integer child on GloVe and unrelated no-Delta Pco wins.
-2. Record each selected `IntMult` base, quotient distribution, remainder distribution, and Pco bit cost.
-3. Prototype a bounded-access quotient and remainder array with a constant base.
-4. Test existing integer trees for both children before a new entropy backend.
-5. Compare that prototype against `ALP(ZigZag(BitPacked))` and `ALP(Pco)` on the same inputs.
-6. If existing children lose materially, test a small-alphabet entropy child for the remainder.
-7. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
-8. Evaluate nonzero-secondary FloatQuant for the default compressor.
-9. Compare native f32 FloatQuant against ALP and ALP-RD on the same inputs.
-10. Compare alternate patch costs across the patch-density sweep.
-11. Evaluate narrow BlockResidual as a Compact-only candidate.
-12. Reduce the analysis cost on short rejected columns.
-13. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
-14. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-15. Compare the geometric mean against Parquet with Zstd.
-16. Calibrate all selector thresholds from the complete corpus and selected-tree evidence.
-17. Update this plan after each experiment.
+1. Replace the native `f32` FloatQuant deferred sample with a cheap prefilter and fixed-tree estimator.
+2. Add FloatQuant scheme analysis to `single_encoding_throughput`.
+3. Re-run the native `f32` size and throughput comparison.
+4. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
+5. Decide whether nonzero-secondary FloatQuant is a default candidate.
+6. Compare alternate BlockResidual patch costs across the patch-density sweep.
+7. Evaluate narrow BlockResidual as a Compact-only candidate.
+8. Reduce analysis cost on short rejected columns.
+9. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
+10. Prototype bounded scalar checkpoints for fixed-bin range packing.
+11. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
+12. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+13. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+14. Compare the geometric mean against Parquet with Zstd.
+15. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+16. Update this plan after each experiment.
 
 ## Pull request structure
 

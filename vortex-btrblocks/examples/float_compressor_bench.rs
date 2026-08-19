@@ -93,6 +93,10 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
                 }
             },
         ));
+    let quantized_f32 = PrimitiveArray::from_iter((0_u32..).take(row_count).map(|index| {
+        let mantissa = (index.wrapping_mul(7_919) & 0x7fff) << 8;
+        f32::from_bits(0x3f80_0000 | mantissa)
+    }));
 
     let mut walk_rng = StdRng::seed_from_u64(2);
     let mut value = 1_000.0_f64;
@@ -119,6 +123,10 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
         (
             "synthetic-nonzero-secondary".to_string(),
             vec![column("value", nonzero_secondary)],
+        ),
+        (
+            "synthetic-quantized-f32".to_string(),
+            vec![column("value", quantized_f32)],
         ),
         (
             "synthetic-random-walk".to_string(),
@@ -990,7 +998,14 @@ fn main() -> VortexResult<()> {
         "block-residual-profile\tdataset\tcolumn\tconfig\tpath\tptype\trows\tpatches\tblocks\taverage-residual-width\taverage-high-width\tbytes"
     );
     if std::env::var_os("VORTEX_BENCH_SKIP_SYNTHETIC").is_none() {
+        let synthetic_filter = std::env::var("VORTEX_BENCH_SYNTHETIC").ok();
         for (dataset, columns) in synthetic_datasets(row_count) {
+            if synthetic_filter
+                .as_deref()
+                .is_some_and(|filter| filter != dataset)
+            {
+                continue;
+            }
             measure_dataset(&dataset, &columns, &configs, &session)?;
         }
     }
