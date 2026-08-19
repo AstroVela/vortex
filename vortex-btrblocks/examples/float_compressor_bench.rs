@@ -47,6 +47,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
+use vortex_utils::aliases::hash_map::HashMap;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
 const CALIFORNIA_COLUMNS: [&str; 9] = [
@@ -577,6 +578,53 @@ fn ordered_values(values: &PrimitiveArray) -> Vec<u64> {
     }
 }
 
+fn profile_quotient_remainder(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    ptype: PType,
+    pco_bytes: u64,
+    ordered: &[u64],
+    session: &VortexSession,
+) -> VortexResult<()> {
+    const BASES: [u64; 9] = [2, 4, 5, 8, 10, 16, 32, 100, 1_000];
+
+    let compressor = BtrBlocksCompressor::default();
+    for base in BASES {
+        let mut remainder_counts = HashMap::<u64, usize>::new();
+        for value in ordered {
+            *remainder_counts.entry(value % base).or_default() += 1;
+        }
+        let remainder_entropy = remainder_counts
+            .values()
+            .map(|&count| {
+                let probability = count as f64 / ordered.len() as f64;
+                -probability * probability.log2()
+            })
+            .sum::<f64>();
+        let most_common_remainder_share =
+            remainder_counts.values().copied().max().unwrap_or_default() as f64
+                / ordered.len() as f64;
+        let quotients = PrimitiveArray::from_iter(ordered.iter().map(|value| value / base));
+        let remainders = PrimitiveArray::from_iter(ordered.iter().map(|value| value % base));
+        let quotient =
+            compressor.compress(&quotients.into_array(), &mut session.create_execution_ctx())?;
+        let remainder = compressor.compress(
+            &remainders.into_array(),
+            &mut session.create_execution_ctx(),
+        )?;
+        println!(
+            "quotient-remainder-estimate\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{pco_bytes}\t{remainder_entropy:.3}\t{most_common_remainder_share:.3}\t{}\t{}\t{}\t{}\t{}",
+            quotient.nbytes(),
+            remainder.nbytes(),
+            quotient.nbytes() + remainder.nbytes(),
+            encoding_tree(&quotient),
+            encoding_tree(&remainder),
+        );
+    }
+    Ok(())
+}
+
 fn profile_pco_array(
     dataset: &str,
     column: &str,
@@ -595,6 +643,15 @@ fn profile_pco_array(
             .filter(mask)?
             .execute::<PrimitiveArray>(&mut ctx)?;
         let ordered = ordered_values(&values);
+        profile_quotient_remainder(
+            dataset,
+            column,
+            path,
+            values.ptype(),
+            array.nbytes(),
+            &ordered,
+            session,
+        )?;
         let validity_bytes = array.children().iter().map(ArrayRef::nbytes).sum::<u64>();
         let bits = values.ptype().bit_width();
         let one_reference =
@@ -727,6 +784,10 @@ fn measure_dataset(
         }
     }
 
+    if std::env::var_os("VORTEX_BENCH_PROFILE_ONLY").is_some() {
+        return Ok(());
+    }
+
     let encode_iterations = (128_000_000_u64 / input_bytes).clamp(3, 10) as usize;
     let mut encode_durations = (0..configs.len())
         .map(|_| Vec::with_capacity(encode_iterations))
@@ -838,6 +899,9 @@ fn main() -> VortexResult<()> {
     );
     println!(
         "multi-ref-estimate\tdataset\tcolumn\tpath\tptype\tpco-child-bytes\tone-reference-bytes\ttwo-reference-bytes\tfour-reference-bytes\tbest-bytes"
+    );
+    println!(
+        "quotient-remainder-estimate\tdataset\tcolumn\tpath\tptype\tbase\tpco-child-bytes\tremainder-entropy\tmost-common-remainder-share\tquotient-bytes\tremainder-bytes\ttotal-bytes\tquotient-encoding\tremainder-encoding"
     );
     println!("result\tdataset\tconfig\trows\tinput-bytes\tencoded-bytes\tencode-MB/s\tdecode-MB/s");
     println!(
