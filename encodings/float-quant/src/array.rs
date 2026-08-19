@@ -37,6 +37,12 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
+use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::BitPackedArrayExt;
+use vortex_fastlanes::FoR;
+use vortex_fastlanes::FoRArrayExt;
+use vortex_fastlanes::FoRArraySlotsExt;
+use vortex_fastlanes::bitpack_decompress::unpack_pair_map;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -719,6 +725,10 @@ fn decode(
     array: ArrayView<'_, FloatQuant>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
+    if let Some(decoded) = decode_fastlanes_pair(array)? {
+        return Ok(decoded);
+    }
+
     let primary = array.primary().clone().execute::<PrimitiveArray>(ctx)?;
     let validity = primary.validity()?;
     let k = array.data().k;
@@ -771,6 +781,59 @@ fn decode(
         }
         ptype => vortex_panic!("unsupported FloatQuant ptype {ptype}"),
     })
+}
+
+fn decode_fastlanes_pair(array: ArrayView<'_, FloatQuant>) -> VortexResult<Option<PrimitiveArray>> {
+    let Some(secondary) = array
+        .secondary()
+        .and_then(|child| child.as_opt::<BitPacked>())
+    else {
+        return Ok(None);
+    };
+    let Some(primary_for) = array.primary().as_opt::<FoR>() else {
+        return Ok(None);
+    };
+    let Some(primary) = primary_for.encoded().as_opt::<BitPacked>() else {
+        return Ok(None);
+    };
+    if primary.patches().is_some()
+        || secondary.patches().is_some()
+        || primary.offset() != secondary.offset()
+    {
+        return Ok(None);
+    }
+
+    let validity = primary.validity()?;
+    let k = array.data().k;
+    Ok(Some(match PType::try_from(array.dtype())? {
+        PType::F32 => {
+            let reference = primary_for
+                .reference_scalar()
+                .as_primitive()
+                .typed_value::<u32>()
+                .vortex_expect("validated f32 primary reference");
+            PrimitiveArray::new(
+                unpack_pair_map::<u32, f32, _>(primary, secondary, |primary, secondary| {
+                    join_f32(primary.wrapping_add(reference), secondary, k)
+                })?,
+                validity,
+            )
+        }
+        PType::F64 => {
+            let reference = primary_for
+                .reference_scalar()
+                .as_primitive()
+                .typed_value::<u64>()
+                .vortex_expect("validated f64 primary reference");
+            PrimitiveArray::new(
+                unpack_pair_map::<u64, f64, _>(primary, secondary, |primary, secondary| {
+                    join_f64(primary.wrapping_add(reference), secondary, k)
+                })?,
+                validity,
+            )
+        }
+        ptype => vortex_panic!("unsupported FloatQuant ptype {ptype}"),
+    }))
 }
 
 #[cfg(test)]
@@ -898,6 +961,64 @@ mod tests {
         )?;
         assert!(decoded.as_::<FloatQuant>().secondary().is_none());
         assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn fastlanes_pair_decode_roundtrip_and_slice() -> VortexResult<()> {
+        let original = PrimitiveArray::from_iter((0_u32..4097).map(|index| {
+            let mantissa = index.wrapping_mul(7_919) & 0x007f_ffff;
+            let value = f64::from(f32::from_bits(0x3f80_0000 | mantissa));
+            if index % 10 == 0 {
+                f64::from_bits(value.to_bits() | 1)
+            } else {
+                value
+            }
+        }));
+        let analysis = analyze_float_quant(original.as_view()).vortex_expect("FloatQuant input");
+        assert!(!analysis.secondary_is_constant);
+        let split = FloatQuant::from_primitive(original.as_view(), analysis.k)?;
+        let primary = split
+            .primary()
+            .clone()
+            .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
+        let secondary = split
+            .secondary()
+            .vortex_expect("nonzero secondary")
+            .clone()
+            .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
+        let biased_primary = PrimitiveArray::from_iter(
+            primary
+                .as_slice::<u64>()
+                .iter()
+                .map(|value| value - analysis.primary_min),
+        );
+        // SAFETY: The analysis computes the exact primary width.
+        let primary = unsafe {
+            vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked(
+                biased_primary,
+                analysis.primary_bit_width,
+            )?
+        };
+        let primary = FoR::try_new(primary.into_array(), Scalar::from(analysis.primary_min))?;
+        // SAFETY: The test changes only one low bit.
+        let secondary =
+            unsafe { vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked(secondary, 1)? };
+        let encoded = FloatQuant::try_new(
+            primary.into_array(),
+            Some(secondary.into_array()),
+            PType::F64,
+            analysis.k,
+        )?
+        .into_array();
+
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(encoded, original, &mut ctx);
+        assert_arrays_eq!(
+            encoded.slice(3..2051)?,
+            original.into_array().slice(3..2051)?,
+            &mut ctx
+        );
         Ok(())
     }
 

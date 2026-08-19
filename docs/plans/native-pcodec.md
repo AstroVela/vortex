@@ -97,6 +97,10 @@ The current BtrBlocks scheme accepts only a constant secondary. It uses a fixed 
 A common path uses `FloatQuant(FoR(BitPacked))` for `f32` values stored in `f64` columns.
 An absent secondary child represents zero low bits.
 
+The array decode kernel also supports `FloatQuant(FoR(BitPacked), BitPacked)`.
+
+The kernel unpacks both aligned children and reconstructs each float in one pass.
+
 The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar access, and serialization.
 
 The automatic scheme accepts `f32` and `f64` inputs.
@@ -205,17 +209,27 @@ The fixed tree was `FloatQuant(FoR(BitPacked), BitPacked)`. The secondary used o
 | Configuration | Bytes | Decode MB/s | Scalar access ns |
 | --- | ---: | ---: | ---: |
 | Prior ALP-RD default | 14,057,966 | 11,430 | 208.5 |
-| Two-child FloatQuant prototype | 9,004,032 | 8,375 | 192.2 |
+| Two-child FloatQuant prototype | 9,004,032 | 13,350 | 192.2 |
 
 The prototype reduced size by 36.0 percent. It was 2.9 percent larger than the zero-secondary tree.
 
 The prototype recovered 64.1 percent of the size gap between ALP-RD and Compact Pco.
 
-The prototype reduced decode throughput by 26.7 percent against ALP-RD. It reduced decode throughput by 43.6 percent against zero-secondary FloatQuant.
+The first generic decode path reached 8,375 MB/s.
+
+The fused pair kernel increased decode throughput by 59.4 percent.
+
+The fused tree decoded 9.3 percent faster than ALP-RD. It decoded 13.5 percent slower than zero-secondary FloatQuant.
 
 Scalar access remained competitive. The direct prototype tree compressed at 3,301 MB/s.
 
-The default scheme rejects this form. A fused one-bit-secondary decode is the next experiment.
+The fused kernel supports aligned, patch-free BitPacked secondary children of any width.
+
+The measured input used a one-bit secondary. Real gap columns can require wider secondary values or patches.
+
+The result clears the isolated decode requirement. The default scheme still rejects this form.
+
+Default selection requires a fixed-tree estimator, a direct final encoder, and full-writer validation on real gap columns.
 
 ### OrderedFloat with BlockResidual on random walks
 
@@ -634,21 +648,25 @@ This round completed these steps:
 
 The Pco mode profile and quotient and remainder experiments are complete.
 
+The fused nonzero-secondary FloatQuant decode experiment is complete.
+
 Complete these remaining steps:
 
-1. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
-2. Decide whether nonzero-secondary FloatQuant is a default candidate.
-3. Compare alternate BlockResidual patch costs across the patch-density sweep.
-4. Evaluate narrow BlockResidual as a Compact-only candidate.
-5. Reduce analysis cost on short rejected columns.
-6. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
-7. Prototype bounded scalar checkpoints for fixed-bin range packing.
-8. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
-9. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-10. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-11. Compare the geometric mean against Parquet with Zstd.
-12. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-13. Update this plan after each experiment.
+1. Extend the FloatQuant estimator to small nonzero secondary widths.
+2. Add a direct final encoder for both FloatQuant children.
+3. Measure selected and rejected FloatQuant columns from the real gap corpus.
+4. Decide whether nonzero-secondary FloatQuant enters the default candidate set.
+5. Compare alternate BlockResidual patch costs across the patch-density sweep.
+6. Evaluate narrow BlockResidual as a Compact-only candidate.
+7. Reduce analysis cost on short rejected columns.
+8. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
+9. Prototype bounded scalar checkpoints for fixed-bin range packing.
+10. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
+11. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+12. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+13. Compare the geometric mean against Parquet with Zstd.
+14. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+15. Update this plan after each experiment.
 
 ## Pull request structure
 
