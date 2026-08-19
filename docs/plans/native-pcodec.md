@@ -1085,6 +1085,35 @@ Patch application is not the main cost. Reference-ID expansion and per-value ref
 
 The one-reference BlockResidual tree is both faster and simpler. The multi-reference prototype is rejected for Default.
 
+### Centered block residual prototype
+
+Euro2016 `subjectivity_confidence` contains a large cluster near `1.0`.
+
+About 36.5 percent of the first two million values equal `1.0`. Many other values sit close to that value.
+
+The prototype selects one median reference per 1,024-value block. It ZigZag-encodes each ordered-float distance from that reference.
+
+BlockResidual stores the transformed distances. The decoder fuses residual reconstruction, inverse ZigZag, and the ordered-float inverse.
+
+Null values use the block reference as their payload. They produce zero residuals and keep logical positions.
+
+The prototype tested extra patch costs from 16 through 96 bits. A 32-bit cost gives the best measured size and speed tradeoff.
+
+| Euro subjectivity tree | Bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: |
+| Current Default | 14,234,326 | 358 | 22,664 | 511 |
+| `OrderedFloat(BlockResidual)` | 13,293,263 | 2,171 | 24,128 | 196 |
+| Centered block residual | 13,071,137 | 1,068 | 14,028 | Direct codec: 12 |
+| Compact Pco | 6,860,457 | 424 | 2,711 | 17,582 |
+
+The centered form uses 1.7 percent fewer bytes than ordinary BlockResidual.
+
+Its decode throughput is 41.9 percent lower than ordinary BlockResidual. Its encode throughput is also about half as fast.
+
+The result rejects centered BlockResidual for Default. The extra transform does not recover enough of the Compact gap.
+
+Ordinary BlockResidual gives a strict size and throughput win on this column. The final selector calibration must include this case.
+
 ### Pcodec corpus gap analysis
 
 The focused benchmark reads the first two million numeric rows from each source.
@@ -1267,6 +1296,7 @@ This round completed these steps:
 - Rejected packed multi-reference blocks after patched and patch-free comparisons.
 - Rejected three bounded IntMult remainder layouts on GloVe.
 - Rejected the dense-remainder IntMult layout on CMS Payments.
+- Rejected centered block residuals after a complete Euro subjectivity comparison.
 
 The Pco mode profile and quotient and remainder experiments are complete.
 
@@ -1274,18 +1304,17 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these remaining steps:
 
-1. Prototype one bounded-access scheme for repeated classic-bin wins without Delta.
-2. Keep IntMult outside Default unless a new design removes the split reconstruction cost.
-3. Add a true ALP-RD child composition case if a real selected tree exposes one.
-4. Validate the remaining rejected analysis cost after the candidate set stabilizes.
-5. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-6. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-7. Run the complete compression corpus after the candidate set stabilizes.
-8. Compare the final geometric mean against Compact and Parquet with Zstd.
-9. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-10. Revisit the 32-bit and 64-bit BlockResidual factors with selected-tree evidence.
-11. Keep RangePacked outside writer selectors unless a new decode design changes the result.
-12. Update this plan after each experiment.
+1. Keep IntMult outside Default unless a new design removes the split reconstruction cost.
+2. Add a true ALP-RD child composition case if a real selected tree exposes one.
+3. Validate the remaining rejected analysis cost after the candidate set stabilizes.
+4. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+5. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+6. Run the complete compression corpus after the candidate set stabilizes.
+7. Compare the final geometric mean against Compact and Parquet with Zstd.
+8. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+9. Revisit the 32-bit and 64-bit BlockResidual factors with selected-tree evidence.
+10. Keep RangePacked outside writer selectors unless a new decode design changes the result.
+11. Update this plan after each experiment.
 
 ## Pull request structure
 

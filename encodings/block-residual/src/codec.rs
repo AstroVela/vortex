@@ -55,13 +55,33 @@ impl BlockResidualCodec {
     }
 
     pub(crate) fn encode_with_word_width(values: &[u64], word_width: u8) -> VortexResult<Self> {
+        Self::encode_with_word_width_and_patch_penalty(
+            values,
+            word_width,
+            PATCH_DECODE_PENALTY_BITS,
+        )
+    }
+
+    /// Encode values with an additional encoded-bit cost for each patch.
+    pub fn encode_with_patch_penalty(
+        values: &[u64],
+        patch_penalty_bits: usize,
+    ) -> VortexResult<Self> {
+        Self::encode_with_word_width_and_patch_penalty(values, 64, patch_penalty_bits)
+    }
+
+    fn encode_with_word_width_and_patch_penalty(
+        values: &[u64],
+        word_width: u8,
+        patch_penalty_bits: usize,
+    ) -> VortexResult<Self> {
         vortex_error::vortex_ensure!(
             matches!(word_width, 8 | 16 | 32 | 64),
             "block residual word width is invalid"
         );
         let blocks = values
             .chunks(CHUNK_LEN)
-            .map(|block| encode_block(block, word_width))
+            .map(|block| encode_block(block, word_width, patch_penalty_bits))
             .collect::<VortexResult<Vec<_>>>()?;
         Ok(Self {
             len: values.len(),
@@ -301,6 +321,52 @@ impl BlockResidualCodec {
         Ok(values)
     }
 
+    /// Decode centered ordered `f64` latents with fused inverse transforms.
+    pub fn decode_centered_ordered_f64(&self, references: &[u64]) -> VortexResult<Vec<f64>> {
+        vortex_error::vortex_ensure!(
+            references.len() == self.blocks.len(),
+            "centered residual reference count differs from block count"
+        );
+        let mut values = Vec::with_capacity(self.len);
+        let mut residuals = [0_u64; CHUNK_LEN];
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            residuals.fill(0);
+            if block.residual_width > 0 {
+                // SAFETY: The encoder creates one complete FastLanes chunk.
+                unsafe {
+                    u64::unchecked_unpack(
+                        usize::from(block.residual_width),
+                        &block.residuals,
+                        &mut residuals,
+                    );
+                }
+            }
+            let mut high_bit_position = 0_usize;
+            for &position in &block.patch_positions {
+                // SAFETY: The encoder appends fifteen readable padding bytes.
+                let high = unsafe {
+                    read_wide_bits(&block.patch_highs, high_bit_position, block.high_width)
+                };
+                residuals[usize::from(position)] |= high << block.residual_width;
+                high_bit_position += usize::from(block.high_width);
+            }
+            let reference = references[block_index];
+            let block_len = usize::from(block.len);
+            values.extend(residuals[..block_len].iter().map(|&residual| {
+                let zigzag = residual.wrapping_add(block.base);
+                let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                let ordered = reference.wrapping_add(delta as u64);
+                let bits = if ordered & (1_u64 << 63) == 0 {
+                    !ordered
+                } else {
+                    ordered ^ (1_u64 << 63)
+                };
+                f64::from_bits(bits)
+            }));
+        }
+        Ok(values)
+    }
+
     /// Decode one value with direct packed access and a binary patch search.
     pub fn scalar_at(&self, index: usize) -> VortexResult<u64> {
         vortex_error::vortex_ensure!(
@@ -385,7 +451,11 @@ impl BlockResidualCodec {
     }
 }
 
-fn encode_block(values: &[u64], word_width: u8) -> VortexResult<BlockResidualBlock> {
+fn encode_block(
+    values: &[u64],
+    word_width: u8,
+    patch_penalty_bits: usize,
+) -> VortexResult<BlockResidualBlock> {
     let base = values.iter().copied().min().unwrap_or(0);
     let mut residuals = Vec::with_capacity(CHUNK_LEN);
     let mut width_counts = [0usize; 65];
@@ -399,7 +469,12 @@ fn encode_block(values: &[u64], word_width: u8) -> VortexResult<BlockResidualBlo
     }
     residuals.resize(CHUNK_LEN, 0);
 
-    let width_plan = choose_width(&width_counts, maximum_width, values.len());
+    let width_plan = choose_width(
+        &width_counts,
+        maximum_width,
+        values.len(),
+        patch_penalty_bits,
+    );
 
     materialize_block(
         values,
@@ -429,13 +504,19 @@ fn estimate_block<T: Copy>(values: &[T], transform: impl Fn(T) -> u64) -> BlockW
         width_counts[usize::from(width)] += 1;
         maximum_width = maximum_width.max(width);
     }
-    choose_width(&width_counts, maximum_width, values.len())
+    choose_width(
+        &width_counts,
+        maximum_width,
+        values.len(),
+        PATCH_DECODE_PENALTY_BITS,
+    )
 }
 
 fn choose_width(
     width_counts: &[usize; 65],
     maximum_width: u8,
     value_count: usize,
+    patch_penalty_bits: usize,
 ) -> BlockWidthPlan {
     let mut patch_count = value_count;
     let mut best = (usize::MAX, maximum_width, 0u8, 0usize);
@@ -448,7 +529,7 @@ fn choose_width(
         };
         let cost_bits = usize::from(residual_width) * CHUNK_LEN
             + patch_count * (u16::BITS as usize + usize::from(high_width))
-            + patch_count * PATCH_DECODE_PENALTY_BITS
+            + patch_count * patch_penalty_bits
             + u64::BITS as usize
             + SERIALIZED_BLOCK_METADATA_BYTES * 8
             + usize::from(patch_count > 0) * HIGH_PADDING * 8;

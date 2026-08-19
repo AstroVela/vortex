@@ -54,6 +54,7 @@ use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
 use vortex_block_residual::BlockResidual;
 use vortex_block_residual::BlockResidualArrayExt;
+use vortex_block_residual::BlockResidualCodec;
 use vortex_block_residual::OrderedFloat;
 use vortex_block_residual::OrderedFloatArraySlotsExt;
 use vortex_btrblocks::BtrBlocksCompressor;
@@ -922,6 +923,355 @@ fn profile_quotient_remainder(
             64 => profile_int_mult_dense_codec64(dataset, column, path, ptype, pco_bytes, ordered)?,
             _ => {}
         }
+    }
+    if std::env::var_os("VORTEX_BENCH_CENTERED_RESIDUAL").is_some() && ptype.bit_width() == 64 {
+        profile_centered_residual(dataset, column, path, ptype, pco_bytes, ordered)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CenterReference {
+    Median,
+    UpperQuartile,
+    NinetiethPercentile,
+    Mode,
+}
+
+impl CenterReference {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Median => "median",
+            Self::UpperQuartile => "upper-quartile",
+            Self::NinetiethPercentile => "ninetieth-percentile",
+            Self::Mode => "mode",
+        }
+    }
+
+    fn select(self, values: &[u64]) -> u64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        match self {
+            Self::Median => sorted[sorted.len() / 2],
+            Self::UpperQuartile => sorted[sorted.len() * 3 / 4],
+            Self::NinetiethPercentile => sorted[sorted.len() * 9 / 10],
+            Self::Mode => {
+                let mut best_value = sorted[0];
+                let mut best_count = 1_usize;
+                let mut current_value = sorted[0];
+                let mut current_count = 1_usize;
+                for &value in &sorted[1..] {
+                    if value == current_value {
+                        current_count += 1;
+                    } else {
+                        if current_count > best_count {
+                            best_value = current_value;
+                            best_count = current_count;
+                        }
+                        current_value = value;
+                        current_count = 1;
+                    }
+                }
+                if current_count > best_count {
+                    current_value
+                } else {
+                    best_value
+                }
+            }
+        }
+    }
+}
+
+fn zigzag_distance(value: u64, reference: u64) -> u64 {
+    let delta = value.wrapping_sub(reference) as i64;
+    ((delta as u64) << 1) ^ ((delta >> 63) as u64)
+}
+
+fn inverse_zigzag_distance(value: u64, reference: u64) -> u64 {
+    let delta = ((value >> 1) as i64) ^ -((value & 1) as i64);
+    reference.wrapping_add(delta as u64)
+}
+
+struct CenteredResidualCodec64 {
+    len: usize,
+    references: Vec<u64>,
+    residuals: BlockResidualCodec,
+}
+
+impl CenteredResidualCodec64 {
+    fn encode(
+        values: &[u64],
+        strategy: CenterReference,
+        patch_penalty_bits: usize,
+    ) -> VortexResult<Self> {
+        let mut references = Vec::with_capacity(values.len().div_ceil(1_024));
+        let mut transformed = Vec::with_capacity(values.len());
+        for block in values.chunks(1_024) {
+            let reference = strategy.select(block);
+            references.push(reference);
+            transformed.extend(block.iter().map(|&value| zigzag_distance(value, reference)));
+        }
+        Ok(Self {
+            len: values.len(),
+            references,
+            residuals: BlockResidualCodec::encode_with_patch_penalty(
+                &transformed,
+                patch_penalty_bits,
+            )?,
+        })
+    }
+
+    fn decode(&self) -> VortexResult<Vec<u64>> {
+        let mut values = self.residuals.decode()?;
+        for (block_index, block) in values.chunks_mut(1_024).enumerate() {
+            let reference = self.references[block_index];
+            for value in block {
+                *value = inverse_zigzag_distance(*value, reference);
+            }
+        }
+        Ok(values)
+    }
+
+    fn decode_fused_f64(&self) -> VortexResult<Vec<f64>> {
+        self.residuals.decode_centered_ordered_f64(&self.references)
+    }
+
+    fn scalar_at(&self, index: usize) -> VortexResult<u64> {
+        vortex_ensure!(index < self.len, "centered residual index exceeds length");
+        let residual = self.residuals.scalar_at(index)?;
+        Ok(inverse_zigzag_distance(
+            residual,
+            self.references[index / 1_024],
+        ))
+    }
+
+    fn encoded_size(&self) -> usize {
+        self.residuals
+            .encoded_size()
+            .saturating_add(self.references.len() * size_of::<u64>())
+    }
+
+    fn patch_count(&self) -> usize {
+        self.residuals.patch_count()
+    }
+}
+
+fn encode_centered_nullable_f64(
+    primitive: &PrimitiveArray,
+    patch_penalty_bits: usize,
+    session: &VortexSession,
+) -> VortexResult<CenteredResidualCodec64> {
+    let mask = primitive
+        .validity()?
+        .execute_mask(primitive.len(), &mut session.create_execution_ctx())?;
+    let validity = mask.iter().collect::<Vec<_>>();
+    let ordered = primitive
+        .as_slice::<f64>()
+        .iter()
+        .copied()
+        .map(ordered_f64)
+        .collect::<Vec<_>>();
+    let mut references = Vec::with_capacity(primitive.len().div_ceil(1_024));
+    let mut transformed = Vec::with_capacity(primitive.len());
+    for (block_index, block) in ordered.chunks(1_024).enumerate() {
+        let start = block_index * 1_024;
+        let valid_block = &validity[start..start + block.len()];
+        let valid_values = block
+            .iter()
+            .zip(valid_block)
+            .filter_map(|(&value, &valid)| valid.then_some(value))
+            .collect::<Vec<_>>();
+        let reference = if valid_values.is_empty() {
+            0
+        } else {
+            CenterReference::Median.select(&valid_values)
+        };
+        references.push(reference);
+        transformed.extend(block.iter().zip(valid_block).map(|(&value, &valid)| {
+            zigzag_distance(if valid { value } else { reference }, reference)
+        }));
+    }
+    Ok(CenteredResidualCodec64 {
+        len: primitive.len(),
+        references,
+        residuals: BlockResidualCodec::encode_with_patch_penalty(&transformed, patch_penalty_bits)?,
+    })
+}
+
+fn profile_centered_residual(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    ptype: PType,
+    pco_bytes: u64,
+    values: &[u64],
+) -> VortexResult<()> {
+    for strategy in [
+        CenterReference::Median,
+        CenterReference::UpperQuartile,
+        CenterReference::NinetiethPercentile,
+        CenterReference::Mode,
+    ] {
+        let mut references = Vec::with_capacity(values.len().div_ceil(1_024));
+        let mut transformed = Vec::with_capacity(values.len());
+        for block in values.chunks(1_024) {
+            let reference = strategy.select(block);
+            references.push(reference);
+            transformed.extend(block.iter().map(|&value| zigzag_distance(value, reference)));
+        }
+        let penalties: &[usize] = if matches!(strategy, CenterReference::Median) {
+            &[16, 32, 64, 96]
+        } else {
+            &[16]
+        };
+        for &patch_penalty_bits in penalties {
+            let codec =
+                BlockResidualCodec::encode_with_patch_penalty(&transformed, patch_penalty_bits)?;
+            let encoded_bytes = codec
+                .encoded_size()
+                .saturating_add(references.len() * size_of::<u64>());
+            println!(
+                "centered-residual-estimate\t{dataset}\t{column}\t{path}\t{ptype}\t{}\t{patch_penalty_bits}\t{}\t{pco_bytes}\t{encoded_bytes}\t{}",
+                strategy.name(),
+                values.len(),
+                codec.patch_count(),
+            );
+            if matches!(strategy, CenterReference::Median | CenterReference::Mode) {
+                profile_centered_residual_codec(
+                    dataset,
+                    column,
+                    path,
+                    ptype,
+                    pco_bytes,
+                    values,
+                    strategy,
+                    patch_penalty_bits,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the benchmark output retains all dataset attribution fields"
+)]
+fn profile_centered_residual_codec(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    ptype: PType,
+    pco_bytes: u64,
+    values: &[u64],
+    strategy: CenterReference,
+    patch_penalty_bits: usize,
+) -> VortexResult<()> {
+    let mut encode_durations = Vec::with_capacity(5);
+    let mut codec = CenteredResidualCodec64::encode(values, strategy, patch_penalty_bits)?;
+    for _ in 0..5 {
+        let start = Instant::now();
+        codec = CenteredResidualCodec64::encode(black_box(values), strategy, patch_penalty_bits)?;
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    vortex_ensure!(
+        codec.decode()? == values,
+        "centered residual decode differs"
+    );
+
+    let decode_iterations = codec_decode_iterations()?;
+    let mut decode_durations = Vec::with_capacity(decode_iterations);
+    for _ in 0..decode_iterations {
+        let start = Instant::now();
+        black_box(codec.decode()?);
+        decode_durations.push(start.elapsed());
+    }
+    let decode_median = percentile(&mut decode_durations, 1, 2);
+
+    let mut fused_decode_durations = Vec::with_capacity(decode_iterations);
+    for _ in 0..decode_iterations {
+        let start = Instant::now();
+        black_box(codec.decode_fused_f64()?);
+        fused_decode_durations.push(start.elapsed());
+    }
+    let fused_decode_median = percentile(&mut fused_decode_durations, 1, 2);
+
+    let scalar_iterations = 200_000;
+    let mut scalar_index = 0_usize;
+    let mut scalar_checksum = 0_u64;
+    let scalar_start = Instant::now();
+    for _ in 0..scalar_iterations {
+        scalar_index = scalar_index.wrapping_add(2_654_435_761) % values.len();
+        scalar_checksum ^= black_box(codec.scalar_at(scalar_index)?);
+    }
+    black_box(scalar_checksum);
+    let scalar_duration = scalar_start.elapsed();
+
+    let input_bytes = values.len() * ptype.byte_width();
+    let encode_throughput = input_bytes as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    let decode_throughput = input_bytes as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+    let fused_decode_throughput =
+        input_bytes as f64 / fused_decode_median.as_secs_f64() / 1_000_000.0;
+    let scalar_nanoseconds =
+        scalar_duration.as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64;
+    println!(
+        "centered-residual-checkpoint\t{dataset}\t{column}\t{path}\t{ptype}\t{}\t{patch_penalty_bits}\t{}\t{pco_bytes}\t{}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}\t{fused_decode_throughput:.1}\t{scalar_nanoseconds:.1}",
+        strategy.name(),
+        values.len(),
+        codec.encoded_size(),
+        codec.patch_count(),
+    );
+    Ok(())
+}
+
+fn profile_centered_float_tree(
+    dataset: &str,
+    column: &str,
+    primitive: &PrimitiveArray,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    if primitive.ptype() != PType::F64 {
+        return Ok(());
+    }
+    let filled =
+        fill_float_nulls_with_first_valid(primitive.clone(), &mut session.create_execution_ctx())?;
+    let ordered_array = OrderedFloat::from_primitive(filled.as_view())?;
+    let ordinary = BlockResidual::from_primitive(ordered_array.encoded().as_::<Primitive>())?;
+    let validity_bytes = ordinary
+        .into_array()
+        .children()
+        .iter()
+        .map(ArrayRef::nbytes)
+        .sum::<u64>();
+    for patch_penalty_bits in [32, 64, 96] {
+        let mut codec = encode_centered_nullable_f64(primitive, patch_penalty_bits, session)?;
+        let mut encode_durations = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let start = Instant::now();
+            codec =
+                encode_centered_nullable_f64(black_box(primitive), patch_penalty_bits, session)?;
+            encode_durations.push(start.elapsed());
+        }
+        let encode_median = percentile(&mut encode_durations, 1, 2);
+
+        let decode_iterations = codec_decode_iterations()?;
+        let mut decode_durations = Vec::with_capacity(decode_iterations);
+        for _ in 0..decode_iterations {
+            let start = Instant::now();
+            black_box(codec.decode_fused_f64()?);
+            decode_durations.push(start.elapsed());
+        }
+        let decode_median = percentile(&mut decode_durations, 1, 2);
+        let input_bytes = primitive.len() * size_of::<f64>();
+        let encode_throughput = input_bytes as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+        let decode_throughput = input_bytes as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+        let encoded_bytes = u64::try_from(codec.encoded_size())?.saturating_add(validity_bytes);
+        println!(
+            "centered-float-tree\t{dataset}\t{column}\t{patch_penalty_bits}\t{}\t{encoded_bytes}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}",
+            primitive.len(),
+            codec.patch_count(),
+        );
     }
     Ok(())
 }
@@ -1841,6 +2191,9 @@ fn measure_dataset(
         {
             profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
         }
+        if std::env::var_os("VORTEX_BENCH_CENTERED_RESIDUAL").is_some() {
+            profile_centered_float_tree(dataset, &column.name, primitive, session)?;
+        }
         if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some() {
             measure_existing_tree(
                 dataset,
@@ -2000,6 +2353,15 @@ fn main() -> VortexResult<()> {
     println!("int-mult-decode-breakdown\tvariant\tdecode-MB/s");
     println!(
         "int-mult-dense64-checkpoint\tdataset\tcolumn\tpath\tptype\tbase\trows\tpco-child-bytes\tint-mult-bytes\tquotient-patches\tencode-MB/s\tdecode-MB/s\tscalar-ns"
+    );
+    println!(
+        "centered-residual-estimate\tdataset\tcolumn\tpath\tptype\treference\tpatch-penalty-bits\trows\tpco-child-bytes\tcentered-bytes\tpatches"
+    );
+    println!(
+        "centered-residual-checkpoint\tdataset\tcolumn\tpath\tptype\treference\tpatch-penalty-bits\trows\tpco-child-bytes\tcentered-bytes\tpatches\tencode-MB/s\tdecode-MB/s\tfused-f64-decode-MB/s\tscalar-ns"
+    );
+    println!(
+        "centered-float-tree\tdataset\tcolumn\tpatch-penalty-bits\trows\tbytes\tpatches\tencode-MB/s\tdecode-MB/s"
     );
     println!(
         "fixed-bin-checkpoint\tdataset\tcolumn\tpath\trows\tpco-bytes\tfixed-bin-bytes\tbins\tmax-offset-bits\toffset-widths\tencode-MB/s\tdecode-MB/s\tscalar-ns"
