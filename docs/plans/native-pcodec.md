@@ -36,7 +36,7 @@ The default candidate set includes their three BtrBlocks schemes.
 
 `OrderedFloat(BlockResidual)` now supports `f32` and `f64` inputs.
 
-The current FloatQuant prototype also accepts native `f32` and `f64` inputs.
+The FloatQuant candidate accepts native `f32` and `f64` inputs.
 
 Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
 
@@ -101,7 +101,9 @@ The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar acc
 
 The automatic scheme accepts `f32` and `f64` inputs.
 
-Native `f32` selection remains provisional because the full compressor misses the compression throughput limit.
+Native `f32` selection now meets the selected-column and rejected-column throughput limits.
+
+Final default inclusion still requires broad corpus validation.
 
 ## Selection policy
 
@@ -111,9 +113,13 @@ The sample builds a direct `FoR(BitPacked)` primary and uses an implicit-zero se
 
 The scheme rejects samples with a nonzero secondary. This avoids the recursive integer selector.
 
-The current native `f32` path uses the generic deferred sample.
+The scheme uses a cheap bit-pattern prefilter over a stratified one-percent sample.
 
-The next selector uses a cheap prefilter and an exact fixed-tree estimate on the same one-percent sample.
+If the sample qualifies, the estimator builds the exact fixed tree on that sample.
+
+The final encoder maps float blocks directly into the FastLanes packer.
+
+This fused path does not allocate a full primary integer buffer.
 
 `OrderedBlockResidualScheme` uses eight locality-preserving sample blocks.
 
@@ -164,25 +170,25 @@ The input contains two million arbitrary `f32` values stored in an `f64` column.
 
 | Configuration | Bytes | Compression MB/s | Decode MB/s | Scalar access ns |
 | --- | ---: | ---: | ---: | ---: |
-| Prior default | 14,057,966 | 553.6 | 10,944.5 | 208.7 |
-| Default with FloatQuant | 8,753,920 | 504.9 | 14,795.4 | 145.5 |
-| Compact | 6,051,737 | 280.0 | 4,022.0 | Not measured |
+| Prior default | 14,057,966 | 534.4 | 10,072.7 | 208.7 |
+| Default with FloatQuant | 8,753,920 | 565.4 | 14,032.5 | 145.5 |
+| Compact | 6,051,737 | 272.2 | 3,912.7 | Not measured |
 
 FloatQuant reduced size by 37.7 percent. It remained 44.7 percent larger than Compact.
 
-Full compressor throughput decreased by 8.8 percent. Decode throughput increased by 35.2 percent.
+Full compressor throughput increased by 5.8 percent. Decode throughput increased by 39.3 percent.
 
 Scalar access latency decreased by 30.3 percent.
 
 The selected tree was `FloatQuant(FoR(BitPacked))` with an implicit-zero secondary.
 
-The isolated tree compressed between 2,402 and 2,469 MB/s.
+The fused FloatQuant scheme compressed at 4,799 MB/s.
 
 It decoded between 14,480 and 14,810 MB/s.
 
-Compact Pco compressed the same input at 280 MB/s and decoded it at 4,022 MB/s.
+Compact Pco compressed the same input at 272 MB/s and decoded it at 3,913 MB/s.
 
-The tree itself exceeded Compact throughput by at least 8.6 times for compression and 3.6 times for decode.
+The scheme exceeded Compact throughput by 17.6 times for compression and 3.6 times for decode.
 
 FloatQuant recovered 66.2 percent of the size gap between the prior default and Compact Pco.
 
@@ -328,20 +334,28 @@ The input contains two million native `f32` values with eight zero low mantissa 
 
 | Configuration | Selected tree | Bytes | Encode MB/s | Decode MB/s |
 | --- | --- | ---: | ---: | ---: |
-| Prior default | `ALP-RD(BitPacked, BitPacked)` | 5,752,576 | 750.4 | 10,634.2 |
-| Default with FloatQuant | `FloatQuant(FoR(BitPacked))` | 3,751,680 | 542.1 | 18,970.4 |
-| FloatQuant only | `FloatQuant(FoR(BitPacked))` | 3,751,680 | 554.3 | 18,427.9 |
-| Compact Pco | `Pco` | 201,374 | About 304 | About 2,933 |
+| Prior default | `ALP-RD(BitPacked, BitPacked)` | 5,752,576 | 664.7 | 10,284.4 |
+| Default with FloatQuant | `FloatQuant(FoR(BitPacked))` | 3,751,680 | 745.4 | 18,461.6 |
+| FloatQuant only | `FloatQuant(FoR(BitPacked))` | 3,751,680 | 746.6 | 18,169.8 |
+| Compact Pco | `Pco` | 201,374 | 294.2 | 2,885.0 |
 
 FloatQuant reduced size by 34.8 percent against ALP-RD.
 
-Decode throughput increased by 78.4 percent.
+Decode throughput increased by 79.5 percent.
 
-Full compression throughput decreased by 27.8 percent. This result exceeds the 20-percent limit.
+Full compression throughput increased by 12.1 percent in the interleaved compressor benchmark.
 
-The isolated FloatQuant tree compressed at about 1.29 GB/s and decoded at about 19.6 GB/s.
+The fused FloatQuant scheme compressed at 2.33 GB/s.
 
-The large difference between isolated and full compression identifies selector and sample cost as the next target.
+The prior materialized tree compressed at 1.25 GB/s in the same direct benchmark.
+
+The proposed default compressed at 753 MB/s in the Divan benchmark.
+
+The prior default compressed at 776 MB/s in that benchmark. The difference is 2.9 percent.
+
+On rejected general `f32` data, the proposed default compressed at 390 MB/s.
+
+The prior default compressed at 394 MB/s. The difference is 1.2 percent.
 
 The Compact size is specific to this synthetic pattern. It does not establish a general real-float result.
 
@@ -614,27 +628,27 @@ This round completed these steps:
 - Made null payload bits neutral for the new default candidates.
 - Excluded integer BlockResidual from the CUDA-compatible preset.
 - Added the real GloVe embeddings dataset to the compression corpus.
+- Added native `f32` FloatQuant selection and scheme benchmarks.
+- Replaced the full primary buffer with fused FloatQuant and FastLanes packing.
+- Replaced the generic FloatQuant sample with a direct fixed-tree estimator.
 
 The Pco mode profile and quotient and remainder experiments are complete.
 
 Complete these remaining steps:
 
-1. Replace the native `f32` FloatQuant deferred sample with a cheap prefilter and fixed-tree estimator.
-2. Add FloatQuant scheme analysis to `single_encoding_throughput`.
-3. Re-run the native `f32` size and throughput comparison.
-4. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
-5. Decide whether nonzero-secondary FloatQuant is a default candidate.
-6. Compare alternate BlockResidual patch costs across the patch-density sweep.
-7. Evaluate narrow BlockResidual as a Compact-only candidate.
-8. Reduce analysis cost on short rejected columns.
-9. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
-10. Prototype bounded scalar checkpoints for fixed-bin range packing.
-11. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
-12. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-13. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-14. Compare the geometric mean against Parquet with Zstd.
-15. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-16. Update this plan after each experiment.
+1. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
+2. Decide whether nonzero-secondary FloatQuant is a default candidate.
+3. Compare alternate BlockResidual patch costs across the patch-density sweep.
+4. Evaluate narrow BlockResidual as a Compact-only candidate.
+5. Reduce analysis cost on short rejected columns.
+6. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
+7. Prototype bounded scalar checkpoints for fixed-bin range packing.
+8. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
+9. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+10. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+11. Compare the geometric mean against Parquet with Zstd.
+12. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+13. Update this plan after each experiment.
 
 ## Pull request structure
 

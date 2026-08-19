@@ -194,6 +194,59 @@ pub fn bitpack_primitive<T: NativePType + BitPacking>(array: &[T], bit_width: u8
     output.freeze()
 }
 
+/// Maps and bit-packs primitive values without a full intermediate buffer.
+///
+/// The mapped values must fit in `bit_width` bits. This function does not create patches.
+pub fn bitpack_primitive_map<S, T, F>(array: &[S], bit_width: u8, mut map: F) -> Buffer<T>
+where
+    T: NativePType + BitPacking,
+    F: FnMut(&S) -> T,
+{
+    if bit_width == 0 {
+        return Buffer::<T>::empty();
+    }
+
+    let bit_width = usize::from(bit_width);
+    let num_chunks = array.len().div_ceil(1024);
+    let num_full_chunks = array.len() / 1024;
+    let packed_len = 128 * bit_width / size_of::<T>();
+    let mut output = BufferMut::<T>::with_capacity(num_chunks * packed_len);
+    let mut mapped = [T::zero(); 1024];
+
+    for chunk_index in 0..num_full_chunks {
+        let start = chunk_index * 1024;
+        mapped
+            .iter_mut()
+            .zip(&array[start..start + 1024])
+            .for_each(|(output, input)| *output = map(input));
+        let output_len = output.len();
+        // SAFETY: The output has capacity for one packed vector and both slices have exact sizes.
+        unsafe {
+            output.set_len(output_len + packed_len);
+            BitPacking::unchecked_pack(bit_width, &mapped, &mut output[output_len..][..packed_len]);
+        }
+    }
+
+    if num_chunks != num_full_chunks {
+        let start = num_full_chunks * 1024;
+        let last_chunk_len = array.len() - start;
+        mapped[..last_chunk_len]
+            .iter_mut()
+            .zip(&array[start..])
+            .for_each(|(output, input)| *output = map(input));
+        mapped[last_chunk_len..].fill(T::zero());
+
+        let output_len = output.len();
+        // SAFETY: The output has capacity for one packed vector and both slices have exact sizes.
+        unsafe {
+            output.set_len(output_len + packed_len);
+            BitPacking::unchecked_pack(bit_width, &mapped, &mut output[output_len..][..packed_len]);
+        }
+    }
+
+    output.freeze()
+}
+
 pub fn gather_patches(
     parray: &PrimitiveArray,
     bit_width: u8,
@@ -462,6 +515,21 @@ mod test {
             best_bit_width(&freq, bytes_per_exception(PType::U8)).unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn bitpack_primitive_map_matches_materialized_input() {
+        for len in [0, 1, 1023, 1024, 1025, 4097] {
+            let input = (0..len).map(|value| value as u32).collect::<Vec<_>>();
+            let mapped = input
+                .iter()
+                .map(|value| value.wrapping_mul(31) & 0x3ff)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bitpack_primitive_map(&input, 10, |value| value.wrapping_mul(31) & 0x3ff),
+                bitpack_primitive(&mapped, 10),
+            );
+        }
     }
 
     #[test]
