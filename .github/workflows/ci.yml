@@ -461,7 +461,7 @@ jobs:
     name: "Rust tests (linux-arm64)"
     needs: duckdb-ready
     if: github.repository == 'vortex-data/vortex'
-    timeout-minutes: 45
+    timeout-minutes: 30
     runs-on: runs-on=${{ github.run_id }}/runner=arm64-medium/image=ubuntu24-full-arm64-pre-v2/extras=s3-cache/tag=rust-test-linux-arm64
     steps:
       - uses: runs-on/action@v2
@@ -471,12 +471,20 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      # This is the only test job that runs the `#[ignore]`d multi-GiB regression tests;
-      # every other job skips them. The `slow-multi-gib` nextest test group keeps them from
-      # running concurrently with each other, since each holds several GiB live.
       - name: Rust Tests
         run: |
-          cargo nextest run --cargo-profile ci --locked --workspace --all-features --no-fail-fast --run-ignored all --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest
+          cargo nextest run --cargo-profile ci --locked --workspace --all-features --no-fail-fast --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest
+      # The multi-GiB regression tests are `#[ignore]`d so that every other test job skips
+      # them; this is the only job that runs them. They are named explicitly rather than run
+      # with a bare `--run-ignored`, which would also pick up the CUDA tests that are ignored
+      # when the runner has no GPU. The cargo arguments match the step above so that nothing
+      # is rebuilt. The `slow-multi-gib` nextest test group keeps them from running
+      # concurrently with each other, since each holds several GiB live.
+      - name: Rust Tests (slow)
+        run: |
+          cargo nextest run --cargo-profile ci --locked --workspace --all-features --no-fail-fast --run-ignored only \
+            --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest \
+            -E 'test(build_views_offsets_overflow_i32) + test(compress_large_int) + test(fsst_compress_offsets_overflow_i32)'
       - uses: ./.github/actions/check-rebuild
         with:
           command: "cargo test --profile ci --locked --workspace --all-features --no-run --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest"
