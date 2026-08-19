@@ -334,6 +334,16 @@ fn encode_prior_default(array: &PrimitiveArray) -> vortex::array::ArrayRef {
         .unwrap()
 }
 
+fn encode_proposed_default(array: &PrimitiveArray) -> vortex::array::ArrayRef {
+    BtrBlocksCompressorBuilder::default()
+        .build()
+        .compress(
+            &array.clone().into_array(),
+            &mut SESSION.create_execution_ctx(),
+        )
+        .unwrap()
+}
+
 #[expect(clippy::cast_possible_truncation)]
 fn gen_varbin_words(len: usize, uniqueness: f64) -> Vec<String> {
     let mut rng = StdRng::seed_from_u64(0);
@@ -846,6 +856,42 @@ fn patch_density_block_residual_scalar_at_u32(bencher: Bencher, stride: u64) {
             )
         })
         .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(args = [256, 64, 16, 4, 1])]
+fn patch_density_prior_default_compress_u32(bencher: Bencher, stride: u64) {
+    let input = setup_patch_density_u32_array(stride);
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([BlockResidualScheme.id()])
+        .build();
+    bench_compressor(bencher, input, compressor);
+}
+
+#[divan::bench(args = [256, 64, 16, 4, 1])]
+fn patch_density_default_compress_u32(bencher: Bencher, stride: u64) {
+    bench_compressor(
+        bencher,
+        setup_patch_density_u32_array(stride),
+        BtrBlocksCompressorBuilder::default().build(),
+    );
+}
+
+#[divan::bench(args = [256, 64, 16, 4, 1])]
+fn patch_density_prior_default_decompress_u32(bencher: Bencher, stride: u64) {
+    let encoded = encode_prior_default(&setup_patch_density_u32_array(stride));
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(args = [256, 64, 16, 4, 1])]
+fn patch_density_default_decompress_u32(bencher: Bencher, stride: u64) {
+    let encoded = encode_proposed_default(&setup_patch_density_u32_array(stride));
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
 
 #[divan::bench(name = "block_local_block_residual_compress_i16")]

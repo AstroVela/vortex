@@ -38,7 +38,8 @@ use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTable;
 use vortex_array::vtable::child_to_validity;
 use vortex_array::vtable::validity_to_child;
-use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -516,7 +517,7 @@ impl ExecutedBlockResidual {
     }
 }
 
-fn decode_array_values<T: NativePType, U: ResidualWord>(
+fn decode_array_values<T: NativePType, U: NativePType + ResidualWord, const DIRECT_OUTPUT: bool>(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
     mut transform: impl FnMut(U) -> T,
@@ -532,7 +533,10 @@ fn decode_array_values<T: NativePType, U: ResidualWord>(
     let patch_positions = children.patch_positions.as_slice::<u16>();
     let patch_highs = children.patch_highs.as_slice::<u8>();
     let logical_range = array.data().slice_start..array.data().slice_stop;
-    let mut values = Vec::with_capacity(logical_range.len());
+    let mut direct_values =
+        DIRECT_OUTPUT.then(|| BufferMut::<U>::with_capacity(logical_range.len()));
+    let mut transformed_values =
+        (!DIRECT_OUTPUT).then(|| BufferMut::<T>::with_capacity(logical_range.len()));
     let mut residuals = [U::default(); BLOCK_LEN];
 
     let first_block = logical_range.start / BLOCK_LEN;
@@ -547,7 +551,7 @@ fn decode_array_values<T: NativePType, U: ResidualWord>(
 
         let residual_width = residual_widths[block_index];
         let high_width = high_widths[block_index];
-        let base = U::from_u64(bases[block_index]);
+        let base = <U as ResidualWord>::from_u64(bases[block_index]);
         vortex_ensure!(
             residual_width <= U::BITS
                 && high_width <= U::BITS
@@ -580,9 +584,14 @@ fn decode_array_values<T: NativePType, U: ResidualWord>(
         let local_stop = (logical_range.end - block_start).min(block_len);
 
         if residual_width == 0 {
-            let output_start = values.len();
-            values
-                .extend(std::iter::repeat_with(|| transform(base)).take(local_stop - local_start));
+            let output_start = decoded_len(direct_values.as_ref(), transformed_values.as_ref());
+            append_repeated_decoded::<T, U, DIRECT_OUTPUT>(
+                &mut direct_values,
+                &mut transformed_values,
+                base,
+                local_stop - local_start,
+                &mut transform,
+            );
             let mut previous_position = None;
             for (patch_index, &position) in positions.iter().enumerate() {
                 validate_patch_position(block_len, previous_position, position)?;
@@ -595,16 +604,48 @@ fn decode_array_values<T: NativePType, U: ResidualWord>(
                 let high = unsafe {
                     read_wide_bits(highs, patch_index * usize::from(high_width), high_width)
                 };
-                values[output_start + position - local_start] =
-                    transform(base.wrapping_add(U::from_u64(high)));
+                set_decoded::<T, U, DIRECT_OUTPUT>(
+                    &mut direct_values,
+                    &mut transformed_values,
+                    output_start + position - local_start,
+                    base.wrapping_add(<U as ResidualWord>::from_u64(high)),
+                    &mut transform,
+                );
             }
             continue;
         }
 
         let packed = packed_words_as_native::<U>(&residual_words[residual_payload]);
+        if positions.is_empty() && DIRECT_OUTPUT && local_start == 0 && local_stop == BLOCK_LEN {
+            // SAFETY: The encoder writes one complete FastLanes chunk, and the output has capacity.
+            unsafe {
+                append_unpacked_add(
+                    direct_values
+                        .as_mut()
+                        .vortex_expect("direct BlockResidual output is present"),
+                    usize::from(residual_width),
+                    packed,
+                    base,
+                );
+            }
+            continue;
+        }
         // SAFETY: The encoder writes one complete FastLanes chunk for each block.
         unsafe {
-            U::unchecked_unpack(usize::from(residual_width), packed, &mut residuals);
+            if positions.is_empty() && DIRECT_OUTPUT {
+                U::unpack_add(usize::from(residual_width), packed, base, &mut residuals);
+            } else {
+                U::unchecked_unpack(usize::from(residual_width), packed, &mut residuals);
+            }
+        }
+        if positions.is_empty() && DIRECT_OUTPUT {
+            append_decoded::<T, U, DIRECT_OUTPUT>(
+                &mut direct_values,
+                &mut transformed_values,
+                &residuals[local_start..local_stop],
+                &mut transform,
+            );
+            continue;
         }
         let mut previous_position = None;
         for (patch_index, &position) in positions.iter().enumerate() {
@@ -616,13 +657,182 @@ fn decode_array_values<T: NativePType, U: ResidualWord>(
             residuals[usize::from(position)].apply_high(high, residual_width);
         }
 
-        values.extend(
-            residuals[local_start..local_stop]
-                .iter()
-                .map(|&residual| transform(residual.wrapping_add(base))),
+        append_residuals::<T, U, DIRECT_OUTPUT>(
+            &mut direct_values,
+            &mut transformed_values,
+            &mut residuals[local_start..local_stop],
+            base,
+            &mut transform,
         );
     }
-    Ok(PrimitiveArray::new(Buffer::from(values), array.validity()?))
+    let validity = array.validity()?;
+    if DIRECT_OUTPUT {
+        Ok(PrimitiveArray::new(
+            direct_values
+                .vortex_expect("direct BlockResidual output is present")
+                .freeze(),
+            validity,
+        ))
+    } else {
+        Ok(PrimitiveArray::new(
+            transformed_values
+                .vortex_expect("transformed BlockResidual output is present")
+                .freeze(),
+            validity,
+        ))
+    }
+}
+
+fn decoded_len<T: NativePType, U: NativePType>(
+    direct: Option<&BufferMut<U>>,
+    transformed: Option<&BufferMut<T>>,
+) -> usize {
+    direct.map_or_else(|| transformed.map_or(0, BufferMut::len), BufferMut::len)
+}
+
+fn append_repeated_decoded<T: NativePType, U: NativePType, const DIRECT_OUTPUT: bool>(
+    direct: &mut Option<BufferMut<U>>,
+    transformed: &mut Option<BufferMut<T>>,
+    value: U,
+    count: usize,
+    transform: &mut impl FnMut(U) -> T,
+) {
+    if DIRECT_OUTPUT {
+        append_repeated(
+            direct
+                .as_mut()
+                .vortex_expect("direct BlockResidual output is present"),
+            value,
+            count,
+        );
+    } else {
+        let output = transformed
+            .as_mut()
+            .vortex_expect("transformed BlockResidual output is present");
+        let output_len = output.len();
+        for destination in &mut output.spare_capacity_mut()[..count] {
+            destination.write(transform(value));
+        }
+        // SAFETY: The loop initialized each new output value.
+        unsafe { output.set_len(output_len + count) };
+    }
+}
+
+fn append_decoded<T: NativePType, U: NativePType, const DIRECT_OUTPUT: bool>(
+    direct: &mut Option<BufferMut<U>>,
+    transformed: &mut Option<BufferMut<T>>,
+    values: &[U],
+    transform: &mut impl FnMut(U) -> T,
+) {
+    if DIRECT_OUTPUT {
+        append_values(
+            direct
+                .as_mut()
+                .vortex_expect("direct BlockResidual output is present"),
+            values,
+        );
+    } else {
+        let output = transformed
+            .as_mut()
+            .vortex_expect("transformed BlockResidual output is present");
+        let output_len = output.len();
+        for (destination, &value) in output.spare_capacity_mut()[..values.len()]
+            .iter_mut()
+            .zip(values)
+        {
+            destination.write(transform(value));
+        }
+        // SAFETY: The loop initialized each new output value.
+        unsafe { output.set_len(output_len + values.len()) };
+    }
+}
+
+fn append_residuals<T: NativePType, U: NativePType + ResidualWord, const DIRECT_OUTPUT: bool>(
+    direct: &mut Option<BufferMut<U>>,
+    transformed: &mut Option<BufferMut<T>>,
+    residuals: &mut [U],
+    base: U,
+    transform: &mut impl FnMut(U) -> T,
+) {
+    if DIRECT_OUTPUT {
+        for residual in residuals.iter_mut() {
+            *residual = residual.wrapping_add(base);
+        }
+        append_values(
+            direct
+                .as_mut()
+                .vortex_expect("direct BlockResidual output is present"),
+            residuals,
+        );
+    } else {
+        let output = transformed
+            .as_mut()
+            .vortex_expect("transformed BlockResidual output is present");
+        let output_len = output.len();
+        for (destination, &residual) in output.spare_capacity_mut()[..residuals.len()]
+            .iter_mut()
+            .zip(residuals.iter())
+        {
+            destination.write(transform(residual.wrapping_add(base)));
+        }
+        // SAFETY: The loop initialized each new output value.
+        unsafe { output.set_len(output_len + residuals.len()) };
+    }
+}
+
+fn set_decoded<T: NativePType, U: NativePType, const DIRECT_OUTPUT: bool>(
+    direct: &mut Option<BufferMut<U>>,
+    transformed: &mut Option<BufferMut<T>>,
+    index: usize,
+    value: U,
+    transform: &mut impl FnMut(U) -> T,
+) {
+    if DIRECT_OUTPUT {
+        direct
+            .as_mut()
+            .vortex_expect("direct BlockResidual output is present")[index] = value;
+    } else {
+        transformed
+            .as_mut()
+            .vortex_expect("transformed BlockResidual output is present")[index] = transform(value);
+    }
+}
+
+fn append_repeated<T: NativePType>(output: &mut BufferMut<T>, value: T, count: usize) {
+    let output_len = output.len();
+    for destination in &mut output.spare_capacity_mut()[..count] {
+        destination.write(value);
+    }
+    // SAFETY: The loop initialized each new output value.
+    unsafe { output.set_len(output_len + count) };
+}
+
+fn append_values<T: NativePType>(output: &mut BufferMut<T>, values: &[T]) {
+    let output_len = output.len();
+    for (destination, &value) in output.spare_capacity_mut()[..values.len()]
+        .iter_mut()
+        .zip(values)
+    {
+        destination.write(value);
+    }
+    // SAFETY: The loop initialized each new output value.
+    unsafe { output.set_len(output_len + values.len()) };
+}
+
+unsafe fn append_unpacked_add<T: NativePType + ResidualWord>(
+    output: &mut BufferMut<T>,
+    bit_width: usize,
+    packed: &[T],
+    base: T,
+) {
+    let output_len = output.len();
+    let destination = output.spare_capacity_mut()[..BLOCK_LEN].as_mut_ptr();
+    // SAFETY: The caller guarantees capacity. FastLanes initializes one complete output chunk.
+    let destination = unsafe { std::slice::from_raw_parts_mut(destination.cast::<T>(), BLOCK_LEN) };
+    // SAFETY: The caller provides one complete FastLanes input and output chunk.
+    unsafe { T::unpack_add(bit_width, packed, base, destination) };
+    // SAFETY: FastLanes initialized each new output value.
+    unsafe { output.set_len(output_len + BLOCK_LEN) };
 }
 
 fn decompress_array(
@@ -630,14 +840,22 @@ fn decompress_array(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
     match array.dtype().as_ptype() {
-        PType::U8 => decode_array_values(array, ctx, |value: u8| value),
-        PType::U16 => decode_array_values(array, ctx, |value: u16| value),
-        PType::U32 => decode_array_values(array, ctx, |value: u32| value),
-        PType::U64 => decode_array_values(array, ctx, |value: u64| value),
-        PType::I8 => decode_array_values(array, ctx, |value: u8| (value ^ (1_u8 << 7)) as i8),
-        PType::I16 => decode_array_values(array, ctx, |value: u16| (value ^ (1_u16 << 15)) as i16),
-        PType::I32 => decode_array_values(array, ctx, |value: u32| (value ^ (1_u32 << 31)) as i32),
-        PType::I64 => decode_array_values(array, ctx, |value: u64| (value ^ (1_u64 << 63)) as i64),
+        PType::U8 => decode_array_values::<u8, u8, false>(array, ctx, |value| value),
+        PType::U16 => decode_array_values::<u16, u16, false>(array, ctx, |value| value),
+        PType::U32 => decode_array_values::<u32, u32, true>(array, ctx, |value| value),
+        PType::U64 => decode_array_values::<u64, u64, false>(array, ctx, |value| value),
+        PType::I8 => {
+            decode_array_values::<i8, u8, false>(array, ctx, |value| (value ^ (1_u8 << 7)) as i8)
+        }
+        PType::I16 => decode_array_values::<i16, u16, false>(array, ctx, |value| {
+            (value ^ (1_u16 << 15)) as i16
+        }),
+        PType::I32 => decode_array_values::<i32, u32, false>(array, ctx, |value| {
+            (value ^ (1_u32 << 31)) as i32
+        }),
+        PType::I64 => decode_array_values::<i64, u64, false>(array, ctx, |value| {
+            (value ^ (1_u64 << 63)) as i64
+        }),
         ptype => vortex_bail!("BlockResidual decode does not support {ptype}"),
     }
 }
@@ -646,7 +864,7 @@ pub(crate) fn decompress_ordered_f32(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    decode_array_values(array, ctx, |ordered: u32| {
+    decode_array_values::<f32, u32, false>(array, ctx, |ordered| {
         let bits = if ordered & (1_u32 << 31) == 0 {
             !ordered
         } else {
@@ -660,7 +878,7 @@ pub(crate) fn decompress_ordered_f64(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    decode_array_values(array, ctx, |ordered: u64| {
+    decode_array_values::<f64, u64, false>(array, ctx, |ordered| {
         let bits = if ordered & (1_u64 << 63) == 0 {
             !ordered
         } else {
@@ -983,6 +1201,26 @@ mod tests {
 
         assert_arrays_eq!(signed_encoded, signed.into_array(), &mut ctx);
         assert_arrays_eq!(unsigned_encoded, unsigned.into_array(), &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn u32_direct_decode_roundtrip() -> VortexResult<()> {
+        let primitive = PrimitiveArray::from_iter((0..2_050_u32).map(|index| {
+            let block = index / 1_024;
+            block * 1_000_000 + (index * 7_919) % 1_024
+        }));
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        assert_arrays_eq!(encoded, primitive.clone().into_array(), &mut ctx);
+        assert_arrays_eq!(
+            encoded.into_array().slice(1_023..1_026)?,
+            primitive.into_array().slice(1_023..1_026)?,
+            &mut ctx
+        );
         Ok(())
     }
 

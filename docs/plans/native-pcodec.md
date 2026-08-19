@@ -46,7 +46,9 @@ The GloVe result identifies a separate entropy gap inside the ALP integer child.
 
 Generic quotient and remainder trees do not close that gap.
 
-The current selector factors and patch cost remain provisional. Final calibration requires the complete corpus and selected-tree evidence.
+The current selector factors and dense-patch cost remain provisional.
+
+Final calibration requires the complete corpus and selected-tree evidence.
 
 ## OrderedFloatArray
 
@@ -152,7 +154,13 @@ The integer selector divides the measured compression ratio by these decode-cost
 
 A 1.20 factor requires about 16.7 percent fewer estimated bytes. It does not require 20 percent fewer bytes.
 
-The block planner adds 16 synthetic cost bits per patch. This cost favors wider packed residuals when many patches slow decode.
+The block planner adds 16 synthetic cost bits per patch.
+
+This cost preserves useful sparse-patch trees. It does not prevent every dense-patch decode regression.
+
+A global 96-bit patch cost prevented the synthetic dense-patch regressions. It also removed useful sparse-patch compression on HashTags.
+
+The next planner experiment will add cost only after a block enters the measured slow patch-density region.
 
 The selector excludes BlockResidual from dictionary-code children. A complete BlockResidual tree can still displace a complete dictionary tree.
 
@@ -392,16 +400,28 @@ The prior default compressed at 394 MB/s. The difference is 1.2 percent.
 
 The Compact size is specific to this synthetic pattern. It does not establish a general real-float result.
 
-### Direct 32-bit comparison
+### Direct integer comparison after decode specialization
 
 The direct benchmark compares two million block-local values against a whole-column FoR plus BitPacked tree.
 
-| Type and tree | Encode GB/s | Decode GB/s | Scalar access ns |
-| --- | ---: | ---: | ---: |
-| i32 BlockResidual | 2.69 | 33.66 | 124 |
-| i32 FoR plus BitPacked | 2.59 | 26.93 | 119 |
-| u32 BlockResidual | 2.74 | 33.55 | 98 |
-| u32 FoR plus BitPacked | 2.62 | 39.70 | 87 |
+The `u32` decode path now unpacks residuals and adds the block base directly into the output buffer.
+
+Signed integers and ordered floats still require a transform after residual decode.
+
+| Type and tree | Decode GB/s | Difference |
+| --- | ---: | ---: |
+| `u32` BlockResidual | 46.27 | +16.1 percent |
+| `u32` FoR plus BitPacked | 39.85 | Baseline |
+| `i32` BlockResidual | 33.86 | +31.8 percent |
+| `i32` FoR plus BitPacked | 25.69 | Baseline |
+| `u64` BlockResidual | 36.88 | +0.6 percent |
+| `u64` FoR plus BitPacked | 36.65 | Baseline |
+| `i16` BlockResidual | 32.34 | -22.2 percent |
+| `i16` FoR plus BitPacked | 41.59 | Baseline |
+
+The specialization removes the prior `u32` decode disadvantage.
+
+The narrow integer exclusion remains valid. Native-width unpack does not close the `i16` gap.
 
 One width factor does not predict both signed and unsigned results.
 
@@ -423,7 +443,42 @@ Scalar access remains bounded across the sweep.
 
 Bulk decode has a severe patch-density cliff before the planner changes to packed residuals.
 
-The final selector calibration must compare alternate patch costs and separate zero-width blocks from packed blocks.
+Before the decode specialization, the complete selector exposed two failures with the 16-bit patch cost.
+
+| Outlier stride | Prior bytes | BlockResidual bytes | Prior decode GB/s | BlockResidual decode GB/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 5,508,488 | 3,072,310 | 18.11 | 9.01 |
+| 1 | 5,252,352 | 2,543,221 | 44.73 | 33.39 |
+
+The stride-4 tree remains a bad selection because one quarter of the values use patches.
+
+A 96-bit cost selected a near-full residual width for both cases.
+
+The complete selector then retained BitPacked at stride 4. It retained patch-free BlockResidual at stride 1.
+
+With the direct-output path, decode reached 18.06 GB/s at stride 4 and 45.94 GB/s at stride 1.
+
+These results combine the 96-bit planner with the decode specialization. The next sweep must isolate both effects.
+
+The global 96-bit cost also increased proposed-default size on real data:
+
+| Dataset | Size change from 16-bit cost |
+| --- | ---: |
+| Euro2016 | +0.1 percent |
+| HashTags | +3.2 percent |
+| Air Quality | +0.04 percent |
+
+On HashTags, size increased from 21,306,418 bytes to 21,989,476 bytes.
+
+Decode throughput changed from 22.54 GB/s to 22.77 GB/s. Encode throughput did not change materially.
+
+The global 96-bit cost is rejected.
+
+The next planner must preserve low-density patches and penalize the dense patch region.
+
+BlockResidual also composes with outer encodings. Sparse and RunEnd children selected BlockResidual in HashTags and the synthetic low-density sweep.
+
+This composition reduced size, but it requires parent-specific throughput validation.
 
 ### GloVe embeddings
 
@@ -454,6 +509,12 @@ The complete Pco child uses 4,518,870 bytes for two million values. This result 
 The size gap comes from a decimal quotient and remainder split plus entropy coding. Pco does not use a Delta or float mode here.
 
 GloVe therefore identifies an ALP-child compression gap. It does not identify a failure in the ALP float transform.
+
+The current Vortex tree does not leave the embedding values uncompressed.
+
+It uses ALP for the float transform, then ZigZag and BitPacked for the integer child.
+
+The Pco advantage comes from a different encoding of the same ALP integer child.
 
 ### GloVe quotient and remainder prototypes
 
@@ -675,17 +736,20 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these remaining steps:
 
-1. Compare alternate BlockResidual patch costs across the patch-density sweep.
-2. Evaluate narrow BlockResidual as a Compact-only candidate.
-3. Reduce analysis cost on short rejected columns.
-4. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
-5. Prototype bounded scalar checkpoints for fixed-bin range packing.
-6. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
-7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-8. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-9. Compare the geometric mean against Parquet with Zstd.
-10. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-11. Update this plan after each experiment.
+1. Prototype a density-aware BlockResidual patch cost.
+2. Re-run the patch sweep and the affected real columns after each planner change.
+3. Measure BlockResidual under temporal, FSST, Sparse, RunEnd, and list parents.
+4. Reduce analysis cost on short rejected columns.
+5. Evaluate narrow BlockResidual as a Compact-only candidate.
+6. Prototype bounded scalar checkpoints for fixed-bin range packing.
+7. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
+8. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+9. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+10. Prototype one lightweight scheme for the repeated real-float gap classes.
+11. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+12. Compare the geometric mean against Parquet with Zstd.
+13. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+14. Update this plan after each experiment.
 
 ## Pull request structure
 

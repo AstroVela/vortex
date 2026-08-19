@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use fastlanes::BitPacking;
+use fastlanes::FoR as FastLanesFoR;
 use vortex_error::VortexResult;
 
 const CHUNK_LEN: usize = 1024;
@@ -491,7 +492,7 @@ fn fast_pack_native<T: ResidualWord>(values: &[u64], width: u8) -> Vec<u64> {
     packed_words
 }
 
-pub(crate) trait ResidualWord: BitPacking + Copy + Default {
+pub(crate) trait ResidualWord: BitPacking + FastLanesFoR + Copy + Default {
     const BITS: u8;
 
     fn from_u64(value: u64) -> Self;
@@ -501,6 +502,8 @@ pub(crate) trait ResidualWord: BitPacking + Copy + Default {
     fn wrapping_add(self, other: Self) -> Self;
 
     fn apply_high(&mut self, high: u64, shift: u8);
+
+    unsafe fn unpack_add(bit_width: usize, packed: &[Self], base: Self, output: &mut [Self]);
 }
 
 macro_rules! impl_residual_word {
@@ -524,6 +527,16 @@ macro_rules! impl_residual_word {
             #[allow(clippy::cast_possible_truncation)]
             fn apply_high(&mut self, high: u64, shift: u8) {
                 *self |= (high as $T) << shift;
+            }
+
+            unsafe fn unpack_add(
+                bit_width: usize,
+                packed: &[Self],
+                base: Self,
+                output: &mut [Self],
+            ) {
+                // SAFETY: The caller provides one complete FastLanes input and output chunk.
+                unsafe { FastLanesFoR::unchecked_unfor_pack(bit_width, packed, base, output) };
             }
         }
     };
