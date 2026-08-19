@@ -516,6 +516,80 @@ fn estimate_multi_reference(values: &[u64], requested_references: usize, bits: u
         .sum()
 }
 
+fn estimate_bitmap_patches(values: &[u64], bits: usize) -> usize {
+    const BLOCK_LEN: usize = 1_024;
+    const METADATA_BYTES: usize = 12;
+    const HIGH_PADDING_BYTES: usize = 15;
+
+    values
+        .chunks(BLOCK_LEN)
+        .map(|block| {
+            let base = block.iter().copied().min().unwrap_or_default();
+            let mut width_counts = [0_usize; 65];
+            let mut maximum_width = 0_usize;
+            for value in block {
+                let residual = value - base;
+                let width = u64::BITS as usize - residual.leading_zeros() as usize;
+                width_counts[width] += 1;
+                maximum_width = maximum_width.max(width);
+            }
+
+            let mut patch_count = block.len();
+            let mut best_bits = usize::MAX;
+            for residual_width in 0..=maximum_width {
+                patch_count -= width_counts[residual_width];
+                let high_width = if patch_count == 0 {
+                    0
+                } else {
+                    maximum_width - residual_width
+                };
+                let cost_bits = residual_width * BLOCK_LEN
+                    + bits
+                    + usize::from(patch_count > 0) * BLOCK_LEN
+                    + patch_count * high_width
+                    + METADATA_BYTES * 8
+                    + usize::from(patch_count > 0) * HIGH_PADDING_BYTES * 8;
+                best_bits = best_bits.min(cost_bits);
+            }
+            best_bits.div_ceil(8)
+        })
+        .sum()
+}
+
+fn estimate_mode_bitmap(values: &[u64], bits: usize) -> usize {
+    const BLOCK_LEN: usize = 1_024;
+    const METADATA_BYTES: usize = 8;
+    const VALUE_PADDING_BYTES: usize = 15;
+
+    values
+        .chunks(BLOCK_LEN)
+        .map(|block| {
+            let mut counts = HashMap::<u64, usize>::new();
+            for value in block {
+                *counts.entry(*value).or_default() += 1;
+            }
+            let mode = counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(value, _)| value)
+                .unwrap_or_default();
+            let exceptions = block.iter().filter(|&&value| value != mode).count();
+            let exception_width = block
+                .iter()
+                .filter(|&&value| value != mode)
+                .map(|&value| u64::BITS as usize - value.leading_zeros() as usize)
+                .max()
+                .unwrap_or_default();
+            let cost_bits = bits
+                + BLOCK_LEN
+                + exceptions * exception_width
+                + METADATA_BYTES * 8
+                + usize::from(exceptions > 0) * VALUE_PADDING_BYTES * 8;
+            cost_bits.div_ceil(8)
+        })
+        .sum()
+}
+
 fn ordered_f32(value: f32) -> u64 {
     let bits = value.to_bits();
     u64::from(if bits & (1_u32 << 31) == 0 {
@@ -607,6 +681,10 @@ fn profile_quotient_remainder(
                 / ordered.len() as f64;
         let quotients = PrimitiveArray::from_iter(ordered.iter().map(|value| value / base));
         let remainders = PrimitiveArray::from_iter(ordered.iter().map(|value| value % base));
+        let quotient_bitmap_bytes =
+            estimate_bitmap_patches(quotients.as_slice::<u64>(), ptype.bit_width());
+        let remainder_mode_bitmap_bytes =
+            estimate_mode_bitmap(remainders.as_slice::<u64>(), ptype.bit_width());
         let quotient =
             compressor.compress(&quotients.into_array(), &mut session.create_execution_ctx())?;
         let remainder = compressor.compress(
@@ -614,10 +692,11 @@ fn profile_quotient_remainder(
             &mut session.create_execution_ctx(),
         )?;
         println!(
-            "quotient-remainder-estimate\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{pco_bytes}\t{remainder_entropy:.3}\t{most_common_remainder_share:.3}\t{}\t{}\t{}\t{}\t{}",
+            "quotient-remainder-estimate\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{pco_bytes}\t{remainder_entropy:.3}\t{most_common_remainder_share:.3}\t{}\t{}\t{}\t{quotient_bitmap_bytes}\t{remainder_mode_bitmap_bytes}\t{}\t{}\t{}",
             quotient.nbytes(),
             remainder.nbytes(),
             quotient.nbytes() + remainder.nbytes(),
+            quotient_bitmap_bytes + remainder_mode_bitmap_bytes,
             encoding_tree(&quotient),
             encoding_tree(&remainder),
         );
@@ -660,14 +739,17 @@ fn profile_pco_array(
             u64::try_from(estimate_multi_reference(&ordered, 2, bits))? + validity_bytes;
         let four_references =
             u64::try_from(estimate_multi_reference(&ordered, 4, bits))? + validity_bytes;
+        let bitmap_patches =
+            u64::try_from(estimate_bitmap_patches(&ordered, bits))? + validity_bytes;
         println!(
-            "multi-ref-estimate\t{dataset}\t{column}\t{path}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "multi-ref-estimate\t{dataset}\t{column}\t{path}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             values.ptype(),
             array.nbytes(),
             one_reference,
             two_references,
             four_references,
             one_reference.min(two_references).min(four_references),
+            bitmap_patches,
         );
         match values.ptype() {
             PType::F32 => {
@@ -898,10 +980,10 @@ fn main() -> VortexResult<()> {
         "pco-profile\tdataset\tcolumn\tpath\tptype\tchunk\trows\tmode\tdelta\tdelta-bins\tdelta-max-offset-bits\tdelta-average-bits\tprimary-bins\tprimary-ans-log\tprimary-max-offset-bits\tprimary-average-bits\tsecondary-bins\tsecondary-ans-log\tsecondary-max-offset-bits\tsecondary-average-bits"
     );
     println!(
-        "multi-ref-estimate\tdataset\tcolumn\tpath\tptype\tpco-child-bytes\tone-reference-bytes\ttwo-reference-bytes\tfour-reference-bytes\tbest-bytes"
+        "multi-ref-estimate\tdataset\tcolumn\tpath\tptype\tpco-child-bytes\tone-reference-bytes\ttwo-reference-bytes\tfour-reference-bytes\tbest-reference-bytes\tbitmap-patch-bytes"
     );
     println!(
-        "quotient-remainder-estimate\tdataset\tcolumn\tpath\tptype\tbase\tpco-child-bytes\tremainder-entropy\tmost-common-remainder-share\tquotient-bytes\tremainder-bytes\ttotal-bytes\tquotient-encoding\tremainder-encoding"
+        "quotient-remainder-estimate\tdataset\tcolumn\tpath\tptype\tbase\tpco-child-bytes\tremainder-entropy\tmost-common-remainder-share\tquotient-bytes\tremainder-bytes\ttotal-bytes\tquotient-bitmap-bytes\tremainder-mode-bitmap-bytes\tbitmap-total-bytes\tquotient-encoding\tremainder-encoding"
     );
     println!("result\tdataset\tconfig\trows\tinput-bytes\tencoded-bytes\tencode-MB/s\tdecode-MB/s");
     println!(
