@@ -17,16 +17,44 @@ use vortex::dtype::FieldNames;
 use vortex::expr::root;
 use vortex::expr::select;
 use vortex::file::OpenOptionsSessionExt;
+use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
+use vortex::file::WriteStrategyBuilder;
 use vortex_arrow::ArrowSessionExt;
 use vortex_bench::Format;
 use vortex_bench::SESSION;
 use vortex_bench::compress::Compressor;
 use vortex_bench::compress::read_projection;
 use vortex_bench::conversions::parquet_to_vortex_chunks;
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::float::FloatQuantScheme;
+use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
 
 /// Compressor implementation for Vortex format.
-pub struct VortexCompressor;
+pub struct VortexCompressor {
+    new_float_schemes: bool,
+}
+
+impl VortexCompressor {
+    pub fn new(new_float_schemes: bool) -> Self {
+        Self { new_float_schemes }
+    }
+
+    fn write_options(&self) -> VortexWriteOptions {
+        let options = SESSION.write_options();
+        if self.new_float_schemes {
+            return options;
+        }
+        let compressor = BtrBlocksCompressorBuilder::default()
+            .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()]);
+        options.with_strategy(
+            WriteStrategyBuilder::default()
+                .with_btrblocks_builder(compressor)
+                .build(),
+        )
+    }
+}
 
 #[async_trait]
 impl Compressor for VortexCompressor {
@@ -41,8 +69,7 @@ impl Compressor for VortexCompressor {
         let mut buf = Vec::new();
         let start = Instant::now();
         let mut cursor = Cursor::new(&mut buf);
-        SESSION
-            .write_options()
+        self.write_options()
             .write(&mut cursor, uncompressed.into_array().to_array_stream())
             .await?;
         let elapsed = start.elapsed();
@@ -55,8 +82,7 @@ impl Compressor for VortexCompressor {
         let uncompressed = parquet_to_vortex_chunks(parquet_path.to_path_buf()).await?;
         let mut buf = Vec::new();
         let mut cursor = Cursor::new(&mut buf);
-        SESSION
-            .write_options()
+        self.write_options()
             .write(&mut cursor, uncompressed.into_array().to_array_stream())
             .await?;
 

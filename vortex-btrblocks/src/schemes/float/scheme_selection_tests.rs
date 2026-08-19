@@ -21,6 +21,7 @@ use vortex_block_residual::OrderedFloat;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_float_quant::FloatQuant;
+use vortex_float_quant::FloatQuantArraySlotsExt;
 use vortex_session::VortexSession;
 
 use crate::BtrBlocksCompressor;
@@ -88,6 +89,7 @@ fn test_widened_f32_uses_float_quant() -> VortexResult<()> {
     let compressed =
         BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<FloatQuant>());
+    assert!(compressed.as_::<FloatQuant>().secondary().is_none());
     Ok(())
 }
 

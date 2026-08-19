@@ -78,3 +78,7 @@ test = false
 [[example]]
 name = "pco_probe"
 required-features = ["pco"]
+
+[[example]]
+name = "float_compressor_bench"
+required-features = ["pco", "zstd"]

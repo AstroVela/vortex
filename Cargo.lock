@@ -76,9 +76,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "alp"
-version = "0.0.2"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41ceb950ed9f82837662e3f3c470403987f32e3a25e5b741c8f17b3b0cca394d"
+checksum = "639486620c15f839f53206c75be0d1a5a79c743c3e2a097d5e9e4b67fdb966fe"
 dependencies = [
  "fastlanes",
  "itertools 0.15.0",
@@ -1584,6 +1584,7 @@ dependencies = [
  "vortex",
  "vortex-arrow",
  "vortex-bench",
+ "vortex-btrblocks",
  "vortex-cuda",
 ]
 

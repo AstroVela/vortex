@@ -9,13 +9,13 @@ use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VTable;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked;
@@ -96,14 +96,31 @@ impl Scheme for FloatQuantScheme {
                 _ => unreachable!(),
             };
             let compressed_primary = FoR::try_new(compressed_primary, reference)?.into_array();
-            let compressed_secondary = match primitive.ptype() {
-                PType::F32 => ConstantArray::new(Scalar::from(0u32), primitive.len()).into_array(),
-                PType::F64 => ConstantArray::new(Scalar::from(0u64), primitive.len()).into_array(),
-                _ => unreachable!(),
-            };
             return Ok(FloatQuant::try_new(
                 compressed_primary,
-                compressed_secondary,
+                None,
+                primitive.ptype(),
+                analysis.k,
+            )?
+            .into_array());
+        }
+
+        if analysis.secondary_is_constant {
+            let encoded = FloatQuant::from_primitive_constant_secondary(primitive, analysis.k)?;
+            let primary = encoded
+                .primary()
+                .clone()
+                .execute::<PrimitiveArray>(exec_ctx)?;
+            let compressed_primary = compressor.compress_child(
+                &primary.into_array(),
+                &compress_ctx,
+                self.id(),
+                0,
+                exec_ctx,
+            )?;
+            return Ok(FloatQuant::try_new(
+                compressed_primary,
+                None,
                 primitive.ptype(),
                 analysis.k,
             )?
@@ -117,6 +134,7 @@ impl Scheme for FloatQuantScheme {
             .execute::<PrimitiveArray>(exec_ctx)?;
         let secondary = encoded
             .secondary()
+            .vortex_expect("FloatQuant::from_primitive creates a secondary child")
             .clone()
             .execute::<PrimitiveArray>(exec_ctx)?;
         let compressed_primary = compressor.compress_child(
@@ -135,7 +153,7 @@ impl Scheme for FloatQuantScheme {
         )?;
         Ok(FloatQuant::try_new(
             compressed_primary,
-            compressed_secondary,
+            Some(compressed_secondary),
             primitive.ptype(),
             analysis.k,
         )?

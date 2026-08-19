@@ -60,11 +60,12 @@ The production codec uses one reference per block. The multi-reference prototype
 
 `FloatQuantArray` splits each float into a primary quantum and a secondary adjustment.
 
-Bounded metadata stores the source type and split width. Two child arrays store the integer latents.
+Bounded metadata stores the source type and split width. One or two child arrays store the integer latents.
 
-The BtrBlocks scheme compresses both children through the normal cascade.
+The BtrBlocks scheme compresses each present child through the normal cascade.
 
-A common path uses `FloatQuant(FoR(BitPacked), Constant)` for `f32` values stored in `f64` columns.
+A common path uses `FloatQuant(FoR(BitPacked))` for `f32` values stored in `f64` columns.
+An absent secondary child represents zero low bits.
 
 The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar access, and serialization.
 
@@ -74,7 +75,7 @@ The automatic scheme accepts only `f64`. Native `f32` columns remain with ALP, A
 
 `FloatQuantScheme` uses normal sample comparison against ALP, ALP-RD, dictionary, sparse, and RLE schemes.
 
-A strong constant split can use a direct `FoR(BitPacked)` primary and a constant secondary.
+A strong constant split can use a direct `FoR(BitPacked)` primary and an implicit-zero secondary.
 
 Other splits compress both children through the normal integer cascade.
 
@@ -104,41 +105,78 @@ Exclude source-array construction and storage input from codec throughput measur
 
 ### FloatQuant on widened f32 values
 
-The input contains 262,144 arbitrary `f32` values stored in an `f64` column.
+The input contains two million arbitrary `f32` values stored in an `f64` column.
 
 | Configuration | Bytes | Compression MB/s | Decode MB/s |
 | --- | ---: | ---: | ---: |
-| Default without FloatQuant | 1,638,436 | 762.4 | 12,932.1 |
-| Default with FloatQuant | 688,130 | 635.0 | 13,636.4 |
-| Compact | 658,758 | 336.8 | 5,117.1 |
+| Prior default | 14,057,966 | 550.4 | 11,310.8 |
+| Default with FloatQuant | 8,753,920 | 244.9 | 14,664.3 |
+| Compact | 6,051,640 | 175.4 | 4,019.0 |
 
-FloatQuant reduced size by 58.0 percent. It remained 4.5 percent larger than Compact.
+FloatQuant reduced size by 37.7 percent. It remained 44.7 percent larger than Compact.
 
-Compression throughput decreased by 16.7 percent. Decode throughput increased by 5.4 percent.
+Full compressor throughput decreased by 55.5 percent. Decode throughput increased by 29.6 percent.
 
-The selected tree was `FloatQuant(FoR(BitPacked), Constant)`.
+The selected tree was `FloatQuant(FoR(BitPacked))` with an implicit-zero secondary.
 
-This result needs a larger throughput test. The compression-ratio result remains strong.
+The isolated tree compressed at 2,503 MB/s and decoded at 15,070 MB/s.
+
+Pco compressed the same input at 533 MB/s and decoded it at 3,973 MB/s.
+
+The tree itself exceeded Pco throughput by 4.7 times during compression and 3.8 times during decode.
+
+The BtrBlocks analysis and candidate path caused most of the full compressor cost.
+
+FloatQuant cannot enter the default set until its selection path meets the compression throughput limit.
 
 ### OrderedFloat with BlockResidual on random walks
 
 | Configuration | Bytes | Encode MB/s | Decode MB/s | Scalar access ns |
 | --- | ---: | ---: | ---: | ---: |
-| Default without the scheme | 1,853,564 | 713.4 | 12,486.1 | 161.24 |
-| Default with the scheme | 1,663,831 | 635.6 | 17,355.8 | 129.06 |
-| Compact Pco | 1,551,142 | 296.2 | 3,777.2 | Not measured |
+| Prior default | 12,255,488 | 577.9 | 12,869.9 | 161.24 |
+| Default with the scheme | 10,425,690 | 516.1 | 18,019.7 | 129.06 |
+| Compact Pco | 9,342,749 | 316.3 | 4,611.7 | Not measured |
 
-The residual scheme saved 10.2 percent against ALP-RD. It remained 7.3 percent larger than Pco.
+The residual scheme saved 14.9 percent against the prior default. It remained 11.6 percent larger than Compact.
 
-Decode throughput increased by 39.0 percent. Random access latency decreased by 20.0 percent.
+Decode throughput increased by 40.0 percent. Random access latency decreased by 20.0 percent.
 
-Compression throughput decreased by 10.9 percent on the selected column.
+Compression throughput decreased by 10.7 percent on the selected column.
+
+The isolated tree compressed at 2,504 MB/s and decoded at 18,920 MB/s.
+
+Pco compressed the same input at 648 MB/s and decoded it at 4,635 MB/s.
 
 The selector rejected the scheme on Gaussian, lognormal, decimal, widened-f32, and four-cluster inputs.
 
 The rejected locality probe reduced compression throughput by 0.5 to 2.2 percent.
 
-This result needs several larger random walks and real time-series columns.
+The HashTags dataset selected this scheme for two columns.
+
+It reduced the numeric subset by 6.0 percent with no isolated compressor regression.
+
+### Broad dataset revalidation
+
+The file benchmark compared the corrected default against the new schemes.
+
+| Dataset | Prior bytes | Proposed bytes | Size change |
+| --- | ---: | ---: | ---: |
+| Taxi | 439,806,364 | 439,806,364 | 0.000 percent |
+| Air Quality | 15,848,420 | 15,848,420 | 0.000 percent |
+| Arade | 143,343,828 | 143,343,828 | 0.000 percent |
+| Euro2016 | 164,673,900 | 164,674,236 | +0.0002 percent |
+| Food | 38,894,360 | 38,922,408 | +0.072 percent |
+| HashTags | 195,035,692 | 194,753,372 | -0.145 percent |
+
+Separate benchmark processes introduced low single-digit throughput noise.
+
+The focused two-million-row run selected no new schemes in Taxi, Air Quality, Arade, Euro2016, or Food.
+
+Ordered BlockResidual selected two HashTags columns. FloatQuant selected no columns in these datasets.
+
+The FloatQuant probe reduced HashTags compression throughput by 2.4 percent without a selection.
+
+This analysis cost needs optimization before FloatQuant can enter the default set.
 
 ## Removed candidates
 
@@ -200,19 +238,19 @@ The experimental branch retains the prototype for possible ALP-RD decomposition 
 
 ## Revalidation after the ALP release
 
-After the corrected ALP release, perform these steps:
+The workspace now uses ALP 0.0.3.
 
-1. Update the workspace ALP dependency.
-2. Remove any remaining FloatMult compatibility code.
-3. Confirm that corrected ALP replaces the historical Housing FloatMult selections.
-4. Recheck FloatQuant on widened-f32 columns.
-5. Recheck OrderedFloat with BlockResidual on random walks and time-series columns.
-6. Repeat throughput and scalar-access measurements with at least two million rows.
-7. Compare each candidate against corrected default, Compact, and Pco Auto.
-8. Measure rejected-candidate analysis cost on every dataset.
-9. Add CMS Payments, r/place, and Twitter to the paper dataset matrix.
+The corrected ALP selected `ALP(FoR(BitPacked))` for the integer-valued float control.
 
-Record size, encode throughput, decode throughput, and scalar-access latency for each selected column.
+The control used 5,002,240 bytes with or without the new schemes.
+
+Complete these remaining steps:
+
+1. Optimize the FloatQuant selection path.
+2. Repeat the broad file benchmark after that change.
+3. Measure random access on two million values for every retained tree.
+4. Add CMS Payments, r/place, and Twitter to the paper dataset matrix.
+5. Compare the geometric mean against Parquet with Zstd.
 
 ## Pull request structure
 

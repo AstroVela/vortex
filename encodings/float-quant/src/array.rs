@@ -19,7 +19,6 @@ use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
@@ -56,7 +55,7 @@ pub struct FloatQuantSlots {
     pub primary: ArrayRef,
     /// Sign-normalized low `k` bits.
     #[slot(1)]
-    pub secondary: ArrayRef,
+    pub secondary: Option<ArrayRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,21 +112,27 @@ impl VTable for FloatQuant {
 
         let slots = FloatQuantSlotsView::from_slots(slots);
         let expected_primary = DType::Primitive(latent_ptype, dtype.nullability());
-        let expected_secondary = DType::Primitive(latent_ptype, NonNullable);
         vortex_ensure!(
             slots.primary.dtype() == &expected_primary,
             "expected primary dtype {expected_primary}, got {}",
             slots.primary.dtype()
         );
         vortex_ensure!(
-            slots.secondary.dtype() == &expected_secondary,
-            "expected secondary dtype {expected_secondary}, got {}",
-            slots.secondary.dtype()
+            slots.primary.len() == len,
+            "FloatQuant primary length differs"
         );
-        vortex_ensure!(
-            slots.primary.len() == len && slots.secondary.len() == len,
-            "FloatQuant child length differs from {len}"
-        );
+        if let Some(secondary) = slots.secondary {
+            let expected_secondary = DType::Primitive(latent_ptype, NonNullable);
+            vortex_ensure!(
+                secondary.dtype() == &expected_secondary,
+                "expected secondary dtype {expected_secondary}, got {}",
+                secondary.dtype()
+            );
+            vortex_ensure!(
+                secondary.len() == len,
+                "FloatQuant secondary length differs"
+            );
+        }
         Ok(())
     }
 
@@ -176,14 +181,21 @@ impl VTable for FloatQuant {
             "unsupported FloatQuant metadata version {}",
             metadata[0]
         );
-        vortex_ensure!(children.len() == 2, "FloatQuant requires two children");
+        vortex_ensure!(
+            matches!(children.len(), 1 | 2),
+            "FloatQuant requires one or two children"
+        );
 
         let ptype = PType::try_from(dtype)?;
         let latent_ptype = latent_ptype(ptype)?;
         let primary_dtype = DType::Primitive(latent_ptype, dtype.nullability());
-        let secondary_dtype = DType::Primitive(latent_ptype, NonNullable);
         let primary = children.get(0, &primary_dtype, len)?;
-        let secondary = children.get(1, &secondary_dtype, len)?;
+        let secondary = if children.len() == 2 {
+            let secondary_dtype = DType::Primitive(latent_ptype, NonNullable);
+            Some(children.get(1, &secondary_dtype, len)?)
+        } else {
+            None
+        };
         let slots = FloatQuantSlots { primary, secondary }.into_slots();
         Ok(ArrayParts::new(
             self.clone(),
@@ -223,7 +235,6 @@ impl OperationsVTable<FloatQuant> for FloatQuant {
         if primary.is_null() {
             return Ok(Scalar::null(array.dtype().clone()));
         }
-        let secondary = array.secondary().execute_scalar(index, ctx)?;
         let k = array.data().k;
         Ok(match PType::try_from(array.dtype())? {
             PType::F32 => Scalar::primitive(
@@ -232,10 +243,19 @@ impl OperationsVTable<FloatQuant> for FloatQuant {
                         .as_primitive()
                         .typed_value::<u32>()
                         .vortex_expect("validated primary scalar"),
-                    secondary
-                        .as_primitive()
-                        .typed_value::<u32>()
-                        .vortex_expect("validated secondary scalar"),
+                    array
+                        .secondary()
+                        .map(|secondary| {
+                            secondary
+                                .execute_scalar(index, ctx)?
+                                .as_primitive()
+                                .typed_value::<u32>()
+                                .ok_or_else(|| {
+                                    vortex_error::vortex_err!("validated secondary scalar is null")
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(0),
                     k,
                 ),
                 array.dtype().nullability(),
@@ -246,10 +266,19 @@ impl OperationsVTable<FloatQuant> for FloatQuant {
                         .as_primitive()
                         .typed_value::<u64>()
                         .vortex_expect("validated primary scalar"),
-                    secondary
-                        .as_primitive()
-                        .typed_value::<u64>()
-                        .vortex_expect("validated secondary scalar"),
+                    array
+                        .secondary()
+                        .map(|secondary| {
+                            secondary
+                                .execute_scalar(index, ctx)?
+                                .as_primitive()
+                                .typed_value::<u64>()
+                                .ok_or_else(|| {
+                                    vortex_error::vortex_err!("validated secondary scalar is null")
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(0),
                     k,
                 ),
                 array.dtype().nullability(),
@@ -275,10 +304,10 @@ pub trait FloatQuantArrayExt: TypedArrayRef<FloatQuant> + FloatQuantArraySlotsEx
 impl<T: TypedArrayRef<FloatQuant>> FloatQuantArrayExt for T {}
 
 impl FloatQuant {
-    /// Construct a float quantization array from two latent children.
+    /// Construct a float quantization array from one or two latent children.
     pub fn try_new(
         primary: ArrayRef,
-        secondary: ArrayRef,
+        secondary: Option<ArrayRef>,
         float_ptype: PType,
         k: u8,
     ) -> VortexResult<FloatQuantArray> {
@@ -298,7 +327,10 @@ impl FloatQuant {
                 let (primary, secondary) = split_f32(array.as_slice::<f32>(), k)?;
                 Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    PrimitiveArray::new(Buffer::from(secondary), NonNullable.into()).into_array(),
+                    Some(
+                        PrimitiveArray::new(Buffer::from(secondary), NonNullable.into())
+                            .into_array(),
+                    ),
                     PType::F32,
                     k,
                 )
@@ -307,7 +339,10 @@ impl FloatQuant {
                 let (primary, secondary) = split_f64(array.as_slice::<f64>(), k)?;
                 Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    PrimitiveArray::new(Buffer::from(secondary), NonNullable.into()).into_array(),
+                    Some(
+                        PrimitiveArray::new(Buffer::from(secondary), NonNullable.into())
+                            .into_array(),
+                    ),
                     PType::F64,
                     k,
                 )
@@ -322,13 +357,12 @@ impl FloatQuant {
         k: u8,
     ) -> VortexResult<FloatQuantArray> {
         let validity = array.validity()?;
-        let len = array.len();
         match array.ptype() {
             PType::F32 => {
                 let primary = split_primary_f32(array.as_slice::<f32>(), k)?;
                 Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    ConstantArray::new(Scalar::from(0u32), len).into_array(),
+                    None,
                     PType::F32,
                     k,
                 )
@@ -337,7 +371,7 @@ impl FloatQuant {
                 let primary = split_primary_f64(array.as_slice::<f64>(), k)?;
                 Self::try_new(
                     PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
-                    ConstantArray::new(Scalar::from(0u64), len).into_array(),
+                    None,
                     PType::F64,
                     k,
                 )
@@ -657,14 +691,59 @@ fn join_f64(primary: u64, secondary: u64, k: u8) -> f64 {
     f64::from_bits(bits)
 }
 
+fn join_zero_f32(primary: u32, k: u8) -> f32 {
+    let low_mask = (1_u32 << k) - 1;
+    let sign_cutoff = (1_u32 << 31) >> k;
+    let low = if primary >= sign_cutoff { 0 } else { low_mask };
+    let ordered = (primary << k).wrapping_add(low);
+    let bits = if ordered & (1_u32 << 31) == 0 {
+        !ordered
+    } else {
+        ordered ^ (1_u32 << 31)
+    };
+    f32::from_bits(bits)
+}
+
+fn join_zero_f64(primary: u64, k: u8) -> f64 {
+    let low_mask = (1_u64 << k) - 1;
+    let sign_cutoff = (1_u64 << 63) >> k;
+    let low = if primary >= sign_cutoff { 0 } else { low_mask };
+    let ordered = (primary << k).wrapping_add(low);
+    let bits = if ordered & (1_u64 << 63) == 0 {
+        !ordered
+    } else {
+        ordered ^ (1_u64 << 63)
+    };
+    f64::from_bits(bits)
+}
+
 fn decode(
     array: ArrayView<'_, FloatQuant>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
     let primary = array.primary().clone().execute::<PrimitiveArray>(ctx)?;
-    let secondary = array.secondary().clone().execute::<PrimitiveArray>(ctx)?;
     let validity = primary.validity()?;
     let k = array.data().k;
+    let Some(secondary) = array.secondary() else {
+        return Ok(match PType::try_from(array.dtype())? {
+            PType::F32 => PrimitiveArray::new(
+                primary
+                    .into_buffer::<u32>()
+                    .map_each_in_place(|primary| join_zero_f32(primary, k))
+                    .freeze(),
+                validity,
+            ),
+            PType::F64 => PrimitiveArray::new(
+                primary
+                    .into_buffer::<u64>()
+                    .map_each_in_place(|primary| join_zero_f64(primary, k))
+                    .freeze(),
+                validity,
+            ),
+            ptype => vortex_panic!("unsupported FloatQuant ptype {ptype}"),
+        });
+    };
+    let secondary = secondary.clone().execute::<PrimitiveArray>(ctx)?;
     Ok(match PType::try_from(array.dtype())? {
         PType::F32 => {
             let secondary_values = secondary.as_slice::<u32>();
@@ -768,6 +847,45 @@ mod tests {
         let sliced = encoded.into_array().slice(1..4)?;
         assert!(sliced.is::<FloatQuant>());
         assert_arrays_eq!(sliced, array.into_array().slice(1..4)?, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_zero_secondary_roundtrip() -> VortexResult<()> {
+        let original = PrimitiveArray::from_option_iter([
+            Some(f64::from(-10.5_f32)),
+            None,
+            Some(f64::from(-0.0_f32)),
+            Some(f64::from(42.25_f32)),
+        ]);
+        let encoded = FloatQuant::from_primitive_constant_secondary(original.as_view(), 29)?;
+        assert!(encoded.secondary().is_none());
+
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(encoded, original, &mut ctx);
+        assert_nth_scalar!(encoded, 3, 42.25_f64, &mut ctx);
+
+        let sliced = encoded.into_array().slice(1..4)?;
+        let expected = original.into_array().slice(1..4)?;
+        assert_arrays_eq!(sliced, expected, &mut ctx);
+
+        let dtype = sliced.dtype().clone();
+        let len = sliced.len();
+        let array_context = ArrayContext::empty();
+        let serialized =
+            sliced.serialize(&array_context, &SESSION, &SerializeOptions::default())?;
+        let mut bytes = ByteBufferMut::empty();
+        for buffer in serialized {
+            bytes.extend_from_slice(buffer.as_ref());
+        }
+        let decoded = SerializedArray::try_from(bytes.freeze())?.decode(
+            &dtype,
+            len,
+            &ReadContext::new(array_context.to_ids()),
+            &SESSION,
+        )?;
+        assert!(decoded.as_::<FloatQuant>().secondary().is_none());
+        assert_arrays_eq!(decoded, expected, &mut ctx);
         Ok(())
     }
 

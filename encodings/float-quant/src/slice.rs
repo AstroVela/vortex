@@ -18,7 +18,10 @@ impl SliceReduce for FloatQuant {
         Ok(Some(
             FloatQuant::try_new(
                 array.primary().slice(range.clone())?,
-                array.secondary().slice(range)?,
+                array
+                    .secondary()
+                    .map(|secondary| secondary.slice(range))
+                    .transpose()?,
                 PType::try_from(array.dtype())?,
                 array.data().k,
             )?
