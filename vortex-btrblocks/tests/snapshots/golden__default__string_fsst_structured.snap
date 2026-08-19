@@ -3,7 +3,7 @@ source: vortex-btrblocks/tests/golden.rs
 expression: rendered
 ---
 input: utf8, len=16384, nbytes=653785
-root: vortex.fsst(utf8, len=16384) nbytes=151382
+root: vortex.fsst(utf8, len=16384) nbytes=141400
   metadata: len: 16384, nsymbols: 223
   uncompressed_lengths: vortex.sparse(u8, len=16384) nbytes=3154
     metadata: fill_value: 24u8
@@ -11,5 +11,23 @@ root: vortex.fsst(utf8, len=16384) nbytes=151382
       metadata: ptype: u16
     patch_values: vortex.constant(u8, len=1575) nbytes=2
       metadata: scalar: 23u8
-  codes_offsets: fastlanes.bitpacked(u32, len=16385) nbytes=36992
-    metadata: bit_width: 17, offset: 0
+  codes_offsets: vortex.block_residual(u32, len=16385) nbytes=27010
+    metadata: blocks: 17, slice: 0..16385
+    bases: vortex.primitive(u64, len=17) nbytes=136
+      metadata: ptype: u64
+    residual_widths: vortex.primitive(u8, len=17) nbytes=17
+      metadata: ptype: u8
+    high_widths: vortex.primitive(u8, len=17) nbytes=17
+      metadata: ptype: u8
+    residual_starts: vortex.primitive(u32, len=18) nbytes=72
+      metadata: ptype: u32
+    patch_starts: vortex.primitive(u32, len=18) nbytes=72
+      metadata: ptype: u32
+    high_starts: vortex.primitive(u32, len=18) nbytes=72
+      metadata: ptype: u32
+    residual_words: vortex.primitive(u64, len=3328) nbytes=26624
+      metadata: ptype: u64
+    patch_positions: vortex.primitive(u16, len=0) nbytes=0
+      metadata: ptype: u16
+    patch_highs: vortex.primitive(u8, len=0) nbytes=0
+      metadata: ptype: u8

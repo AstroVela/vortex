@@ -6,6 +6,7 @@ use vortex_error::VortexResult;
 
 const CHUNK_LEN: usize = 1024;
 const HIGH_PADDING: usize = 15;
+const PATCH_DECODE_PENALTY_BITS: usize = 16;
 const SERIALIZED_BLOCK_METADATA_BYTES: usize = 12;
 
 /// Block-local residual codec for ordered unsigned latents.
@@ -44,9 +45,17 @@ struct BlockResidualBlock {
 impl BlockResidualCodec {
     /// Encode ordered unsigned latents in independent 1024-value blocks.
     pub fn encode(values: &[u64]) -> VortexResult<Self> {
+        Self::encode_with_word_width(values, 64)
+    }
+
+    pub(crate) fn encode_with_word_width(values: &[u64], word_width: u8) -> VortexResult<Self> {
+        vortex_error::vortex_ensure!(
+            matches!(word_width, 8 | 16 | 32 | 64),
+            "block residual word width is invalid"
+        );
         let blocks = values
             .chunks(CHUNK_LEN)
-            .map(encode_block)
+            .map(|block| encode_block(block, word_width))
             .collect::<VortexResult<Vec<_>>>()?;
         Ok(Self {
             len: values.len(),
@@ -342,7 +351,7 @@ impl BlockResidualCodec {
     }
 }
 
-fn encode_block(values: &[u64]) -> VortexResult<BlockResidualBlock> {
+fn encode_block(values: &[u64], word_width: u8) -> VortexResult<BlockResidualBlock> {
     let base = values.iter().copied().min().unwrap_or(0);
     let mut residuals = Vec::with_capacity(CHUNK_LEN);
     let mut width_counts = [0usize; 65];
@@ -367,6 +376,7 @@ fn encode_block(values: &[u64]) -> VortexResult<BlockResidualBlock> {
         };
         let cost_bits = usize::from(residual_width) * CHUNK_LEN
             + patch_count * (u16::BITS as usize + usize::from(high_width))
+            + patch_count * PATCH_DECODE_PENALTY_BITS
             + u64::BITS as usize
             + SERIALIZED_BLOCK_METADATA_BYTES * 8
             + usize::from(patch_count > 0) * HIGH_PADDING * 8;
@@ -384,6 +394,7 @@ fn encode_block(values: &[u64]) -> VortexResult<BlockResidualBlock> {
             residuals,
             patch_count: best.3,
         },
+        word_width,
     )
 }
 
@@ -416,14 +427,18 @@ struct BlockPlan {
     patch_count: usize,
 }
 
-fn materialize_block(values: &[u64], plan: BlockPlan) -> VortexResult<BlockResidualBlock> {
+fn materialize_block(
+    values: &[u64],
+    plan: BlockPlan,
+    word_width: u8,
+) -> VortexResult<BlockResidualBlock> {
     let residual_mask = low_mask(plan.residual_width);
     let low_residuals = plan
         .residuals
         .iter()
         .map(|&residual| residual & residual_mask)
         .collect::<Vec<_>>();
-    let residuals = fast_pack(&low_residuals, plan.residual_width);
+    let residuals = fast_pack(&low_residuals, plan.residual_width, word_width);
     let mut patch_positions = Vec::with_capacity(plan.patch_count);
     let mut patch_highs = BitWriter::with_capacity(plan.patch_count * 8);
     if plan.high_width > 0 {
@@ -454,14 +469,85 @@ fn materialize_block(values: &[u64], plan: BlockPlan) -> VortexResult<BlockResid
     })
 }
 
-fn fast_pack(values: &[u64], width: u8) -> Vec<u64> {
+fn fast_pack(values: &[u64], width: u8, word_width: u8) -> Vec<u64> {
     if width == 0 {
         return Vec::new();
     }
-    let mut packed = vec![0u64; CHUNK_LEN * usize::from(width) / u64::BITS as usize];
+    match word_width {
+        8 => fast_pack_native::<u8>(values, width),
+        16 => fast_pack_native::<u16>(values, width),
+        32 => fast_pack_native::<u32>(values, width),
+        64 => fast_pack_native::<u64>(values, width),
+        _ => unreachable!("validated block residual word width"),
+    }
+}
+
+fn fast_pack_native<T: ResidualWord>(values: &[u64], width: u8) -> Vec<u64> {
+    let mut packed_words = vec![0u64; CHUNK_LEN * usize::from(width) / u64::BITS as usize];
+    let unpacked = values.iter().copied().map(T::from_u64).collect::<Vec<_>>();
+    let packed_native = packed_words_as_native_mut::<T>(&mut packed_words);
     // SAFETY: Both slices have the exact lengths required for one FastLanes chunk.
-    unsafe { u64::unchecked_pack(usize::from(width), values, &mut packed) };
-    packed
+    unsafe { T::unchecked_pack(usize::from(width), &unpacked, packed_native) };
+    packed_words
+}
+
+pub(crate) trait ResidualWord: BitPacking + Copy + Default {
+    const BITS: u8;
+
+    fn from_u64(value: u64) -> Self;
+
+    fn to_u64(self) -> u64;
+
+    fn wrapping_add(self, other: Self) -> Self;
+
+    fn apply_high(&mut self, high: u64, shift: u8);
+}
+
+macro_rules! impl_residual_word {
+    ($T:ty, $bits:literal) => {
+        impl ResidualWord for $T {
+            const BITS: u8 = $bits;
+
+            #[allow(clippy::cast_possible_truncation)]
+            fn from_u64(value: u64) -> Self {
+                value as $T
+            }
+
+            fn to_u64(self) -> u64 {
+                u64::from(self)
+            }
+
+            fn wrapping_add(self, other: Self) -> Self {
+                self.wrapping_add(other)
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            fn apply_high(&mut self, high: u64, shift: u8) {
+                *self |= (high as $T) << shift;
+            }
+        }
+    };
+}
+
+impl_residual_word!(u8, 8);
+impl_residual_word!(u16, 16);
+impl_residual_word!(u32, 32);
+impl_residual_word!(u64, 64);
+
+pub(crate) fn packed_words_as_native<T: ResidualWord>(words: &[u64]) -> &[T] {
+    // SAFETY: Unsigned integer types permit every bit pattern. A `u64` slice has sufficient
+    // alignment, and packed FastLanes payloads always contain a whole number of bytes.
+    let (prefix, native, suffix) = unsafe { words.align_to::<T>() };
+    debug_assert!(prefix.is_empty() && suffix.is_empty());
+    native
+}
+
+fn packed_words_as_native_mut<T: ResidualWord>(words: &mut [u64]) -> &mut [T] {
+    // SAFETY: Unsigned integer types permit every bit pattern. A `u64` slice has sufficient
+    // alignment, and packed FastLanes payloads always contain a whole number of bytes.
+    let (prefix, native, suffix) = unsafe { words.align_to_mut::<T>() };
+    debug_assert!(prefix.is_empty() && suffix.is_empty());
+    native
 }
 
 fn bit_width(value: u64) -> u8 {
@@ -612,6 +698,17 @@ mod tests {
 
         parts.high_widths[0] = 0;
         assert!(BlockResidualCodec::try_from_parts(parts).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn patch_penalty_prefers_dense_residuals() -> VortexResult<()> {
+        let mut values = vec![0_u64; 1_024];
+        values[..307].fill(4_095);
+        let parts = BlockResidualCodec::encode(&values)?.into_parts()?;
+
+        assert_eq!(parts.residual_widths, [12]);
+        assert!(parts.patch_positions.is_empty());
         Ok(())
     }
 }

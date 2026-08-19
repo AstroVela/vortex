@@ -7,7 +7,6 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::ops::Range;
 
-use fastlanes::BitPacking;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
@@ -49,6 +48,8 @@ use vortex_session::registry::CachedId;
 
 use crate::BlockResidualCodec;
 use crate::BlockResidualParts;
+use crate::codec::ResidualWord;
+use crate::codec::packed_words_as_native;
 use crate::codec::read_wide_bits;
 
 const BLOCK_LEN: usize = 1024;
@@ -266,7 +267,30 @@ impl OperationsVTable<BlockResidual> for BlockResidual {
             return Ok(Scalar::null(array.dtype().clone()));
         }
         let value = scalar_from_array(array, index, ctx)?;
-        Ok(Scalar::primitive(value, array.dtype().nullability()))
+        let nullability = array.dtype().nullability();
+        Ok(match array.dtype().as_ptype() {
+            PType::U8 => Scalar::primitive(u8::try_from(value)?, nullability),
+            PType::U16 => Scalar::primitive(u16::try_from(value)?, nullability),
+            PType::U32 => Scalar::primitive(u32::try_from(value)?, nullability),
+            PType::U64 => Scalar::primitive(value, nullability),
+            PType::I8 => Scalar::primitive(
+                i8::from_le_bytes([(u8::try_from(value)? ^ (1_u8 << 7))]),
+                nullability,
+            ),
+            PType::I16 => Scalar::primitive(
+                i16::from_le_bytes((u16::try_from(value)? ^ (1_u16 << 15)).to_le_bytes()),
+                nullability,
+            ),
+            PType::I32 => Scalar::primitive(
+                i32::from_le_bytes((u32::try_from(value)? ^ (1_u32 << 31)).to_le_bytes()),
+                nullability,
+            ),
+            PType::I64 => Scalar::primitive(
+                i64::from_le_bytes((value ^ (1_u64 << 63)).to_le_bytes()),
+                nullability,
+            ),
+            ptype => vortex_bail!("BlockResidual scalar access does not support {ptype}"),
+        })
     }
 }
 
@@ -311,18 +335,65 @@ pub trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> + BlockResidualArr
 impl<T: TypedArrayRef<BlockResidual>> BlockResidualArrayExt for T {}
 
 impl BlockResidual {
-    /// Encode a non-negative `u64` array in independent blocks.
+    /// Encode an integer array in independent blocks.
     pub fn from_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<BlockResidualArray> {
         vortex_ensure!(
-            array.ptype() == PType::U64,
-            "BlockResidual requires u64 values"
+            array.ptype().is_int(),
+            "BlockResidual requires integer values"
         );
         let validity = array.validity()?;
-        let parts = BlockResidualCodec::encode(array.as_slice::<u64>())?.into_parts()?;
-        Self::try_new(parts, validity)
+        let values = match array.ptype() {
+            PType::U8 => array
+                .as_slice::<u8>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect(),
+            PType::U16 => array
+                .as_slice::<u16>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect(),
+            PType::U32 => array
+                .as_slice::<u32>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect(),
+            PType::U64 => array.as_slice::<u64>().to_vec(),
+            PType::I8 => array
+                .as_slice::<i8>()
+                .iter()
+                .map(|&value| u64::from((value as u8) ^ (1_u8 << 7)))
+                .collect(),
+            PType::I16 => array
+                .as_slice::<i16>()
+                .iter()
+                .map(|&value| u64::from((value as u16) ^ (1_u16 << 15)))
+                .collect(),
+            PType::I32 => array
+                .as_slice::<i32>()
+                .iter()
+                .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
+                .collect(),
+            PType::I64 => array
+                .as_slice::<i64>()
+                .iter()
+                .map(|&value| (value as u64) ^ (1_u64 << 63))
+                .collect(),
+            ptype => vortex_bail!("BlockResidual does not support {ptype}"),
+        };
+        let parts = BlockResidualCodec::encode_with_word_width(
+            &values,
+            u8::try_from(array.ptype().bit_width())?,
+        )?
+        .into_parts()?;
+        Self::try_new(parts, validity, array.ptype())
     }
 
-    fn try_new(parts: BlockResidualParts, validity: Validity) -> VortexResult<BlockResidualArray> {
+    fn try_new(
+        parts: BlockResidualParts,
+        validity: Validity,
+        ptype: PType,
+    ) -> VortexResult<BlockResidualArray> {
         let data = BlockResidualData {
             unsliced_len: parts.len,
             slice_start: 0,
@@ -347,7 +418,7 @@ impl BlockResidual {
         Array::try_from_parts(
             ArrayParts::new(
                 BlockResidual,
-                DType::Primitive(PType::U64, validity.nullability()),
+                DType::Primitive(ptype, validity.nullability()),
                 data.unsliced_len,
                 data,
             )
@@ -365,8 +436,8 @@ impl BlockResidualData {
         validity: &Validity,
     ) -> VortexResult<()> {
         vortex_ensure!(
-            dtype.as_ptype() == PType::U64,
-            "BlockResidualArray requires a u64 dtype"
+            dtype.is_int(),
+            "BlockResidualArray requires an integer dtype"
         );
         vortex_ensure!(
             self.slice_start <= self.slice_stop && self.slice_stop <= self.unsliced_len,
@@ -445,10 +516,10 @@ impl ExecutedBlockResidual {
     }
 }
 
-fn decode_array_values<T: NativePType>(
+fn decode_array_values<T: NativePType, U: ResidualWord>(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
-    mut transform: impl FnMut(u64) -> T,
+    mut transform: impl FnMut(U) -> T,
 ) -> VortexResult<PrimitiveArray> {
     let children = ExecutedBlockResidual::new(array, ctx)?;
     let bases = children.bases.as_slice::<u64>();
@@ -462,7 +533,7 @@ fn decode_array_values<T: NativePType>(
     let patch_highs = children.patch_highs.as_slice::<u8>();
     let logical_range = array.data().slice_start..array.data().slice_stop;
     let mut values = Vec::with_capacity(logical_range.len());
-    let mut residuals = [0_u64; BLOCK_LEN];
+    let mut residuals = [U::default(); BLOCK_LEN];
 
     let first_block = logical_range.start / BLOCK_LEN;
     let last_block = logical_range.end.div_ceil(BLOCK_LEN);
@@ -476,10 +547,11 @@ fn decode_array_values<T: NativePType>(
 
         let residual_width = residual_widths[block_index];
         let high_width = high_widths[block_index];
+        let base = U::from_u64(bases[block_index]);
         vortex_ensure!(
-            residual_width <= 64
-                && high_width <= 64
-                && u16::from(residual_width) + u16::from(high_width) <= 64,
+            residual_width <= U::BITS
+                && high_width <= U::BITS
+                && u16::from(residual_width) + u16::from(high_width) <= u16::from(U::BITS),
             "block residual bit widths are invalid"
         );
         let residual_payload = payload_range(
@@ -492,45 +564,62 @@ fn decode_array_values<T: NativePType>(
             residual_payload.len() == BLOCK_LEN * usize::from(residual_width) / 64,
             "block residual word count is invalid"
         );
-        if residual_width > 0 {
-            // SAFETY: The encoder writes one complete FastLanes chunk for each block.
-            unsafe {
-                u64::unchecked_unpack(
-                    usize::from(residual_width),
-                    &residual_words[residual_payload],
-                    &mut residuals,
-                );
-            }
-        } else {
-            residuals.fill(0);
-        }
-
         let patch_payload =
             payload_range(patch_starts, block_index, patch_positions.len(), "patch")?;
         let high_payload =
             payload_range(high_starts, block_index, patch_highs.len(), "patch high")?;
         let positions = &patch_positions[patch_payload];
-        validate_patch_payload(
-            block_len,
+        validate_patch_header(
             residual_width,
             high_width,
-            positions,
+            positions.len(),
             high_payload.len(),
         )?;
         let highs = &patch_highs[high_payload];
+        let local_start = logical_range.start.saturating_sub(block_start);
+        let local_stop = (logical_range.end - block_start).min(block_len);
+
+        if residual_width == 0 {
+            let output_start = values.len();
+            values
+                .extend(std::iter::repeat_with(|| transform(base)).take(local_stop - local_start));
+            let mut previous_position = None;
+            for (patch_index, &position) in positions.iter().enumerate() {
+                validate_patch_position(block_len, previous_position, position)?;
+                previous_position = Some(position);
+                let position = usize::from(position);
+                if position < local_start || position >= local_stop {
+                    continue;
+                }
+                // SAFETY: The payload includes fifteen readable padding bytes.
+                let high = unsafe {
+                    read_wide_bits(highs, patch_index * usize::from(high_width), high_width)
+                };
+                values[output_start + position - local_start] =
+                    transform(base.wrapping_add(U::from_u64(high)));
+            }
+            continue;
+        }
+
+        let packed = packed_words_as_native::<U>(&residual_words[residual_payload]);
+        // SAFETY: The encoder writes one complete FastLanes chunk for each block.
+        unsafe {
+            U::unchecked_unpack(usize::from(residual_width), packed, &mut residuals);
+        }
+        let mut previous_position = None;
         for (patch_index, &position) in positions.iter().enumerate() {
+            validate_patch_position(block_len, previous_position, position)?;
+            previous_position = Some(position);
             // SAFETY: The payload includes fifteen readable padding bytes.
             let high =
                 unsafe { read_wide_bits(highs, patch_index * usize::from(high_width), high_width) };
-            residuals[usize::from(position)] |= high << residual_width;
+            residuals[usize::from(position)].apply_high(high, residual_width);
         }
 
-        let local_start = logical_range.start.saturating_sub(block_start);
-        let local_stop = (logical_range.end - block_start).min(block_len);
         values.extend(
             residuals[local_start..local_stop]
                 .iter()
-                .map(|&residual| transform(bases[block_index].wrapping_add(residual))),
+                .map(|&residual| transform(residual.wrapping_add(base))),
         );
     }
     Ok(PrimitiveArray::new(Buffer::from(values), array.validity()?))
@@ -540,14 +629,24 @@ fn decompress_array(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    decode_array_values(array, ctx, |value| value)
+    match array.dtype().as_ptype() {
+        PType::U8 => decode_array_values(array, ctx, |value: u8| value),
+        PType::U16 => decode_array_values(array, ctx, |value: u16| value),
+        PType::U32 => decode_array_values(array, ctx, |value: u32| value),
+        PType::U64 => decode_array_values(array, ctx, |value: u64| value),
+        PType::I8 => decode_array_values(array, ctx, |value: u8| (value ^ (1_u8 << 7)) as i8),
+        PType::I16 => decode_array_values(array, ctx, |value: u16| (value ^ (1_u16 << 15)) as i16),
+        PType::I32 => decode_array_values(array, ctx, |value: u32| (value ^ (1_u32 << 31)) as i32),
+        PType::I64 => decode_array_values(array, ctx, |value: u64| (value ^ (1_u64 << 63)) as i64),
+        ptype => vortex_bail!("BlockResidual decode does not support {ptype}"),
+    }
 }
 
 pub(crate) fn decompress_ordered_f64(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    decode_array_values(array, ctx, |ordered| {
+    decode_array_values(array, ctx, |ordered: u64| {
         let bits = if ordered & (1_u64 << 63) == 0 {
             !ordered
         } else {
@@ -568,10 +667,11 @@ fn scalar_from_array(
     let children = ExecutedBlockResidual::new(array, ctx)?;
     let residual_width = children.residual_widths.as_slice::<u8>()[block_index];
     let high_width = children.high_widths.as_slice::<u8>()[block_index];
+    let logical_width = array.dtype().as_ptype().bit_width();
     vortex_ensure!(
-        residual_width <= 64
-            && high_width <= 64
-            && u16::from(residual_width) + u16::from(high_width) <= 64,
+        usize::from(residual_width) <= logical_width
+            && usize::from(high_width) <= logical_width
+            && usize::from(residual_width) + usize::from(high_width) <= logical_width,
         "block residual bit widths are invalid"
     );
     let residual_words = children.residual_words.as_slice::<u64>();
@@ -585,17 +685,28 @@ fn scalar_from_array(
         residual_payload.len() == BLOCK_LEN * usize::from(residual_width) / 64,
         "block residual word count is invalid"
     );
-    let mut residual = if residual_width == 0 {
-        0
-    } else {
-        // SAFETY: The encoder writes one complete FastLanes chunk for each block.
-        unsafe {
-            u64::unchecked_unpack_single(
-                usize::from(residual_width),
-                &residual_words[residual_payload],
-                index_in_block,
-            )
-        }
+    let mut residual = match logical_width {
+        8 => unpack_single_residual::<u8>(
+            residual_width,
+            &residual_words[residual_payload],
+            index_in_block,
+        ),
+        16 => unpack_single_residual::<u16>(
+            residual_width,
+            &residual_words[residual_payload],
+            index_in_block,
+        ),
+        32 => unpack_single_residual::<u32>(
+            residual_width,
+            &residual_words[residual_payload],
+            index_in_block,
+        ),
+        64 => unpack_single_residual::<u64>(
+            residual_width,
+            &residual_words[residual_payload],
+            index_in_block,
+        ),
+        _ => vortex_bail!("block residual logical bit width is invalid"),
     };
 
     let positions = children.patch_positions.as_slice::<u16>();
@@ -637,6 +748,15 @@ fn scalar_from_array(
     Ok(children.bases.as_slice::<u64>()[block_index].wrapping_add(residual))
 }
 
+fn unpack_single_residual<T: ResidualWord>(width: u8, packed_words: &[u64], index: usize) -> u64 {
+    if width == 0 {
+        return 0;
+    }
+    let packed = packed_words_as_native::<T>(packed_words);
+    // SAFETY: The encoder writes one complete FastLanes chunk for each block.
+    unsafe { T::unchecked_unpack_single(usize::from(width), packed, index).to_u64() }
+}
+
 fn validate_patch_payload(
     block_len: usize,
     residual_width: u8,
@@ -644,25 +764,51 @@ fn validate_patch_payload(
     positions: &[u16],
     high_payload_len: usize,
 ) -> VortexResult<()> {
+    validate_patch_header(
+        residual_width,
+        high_width,
+        positions.len(),
+        high_payload_len,
+    )?;
+    let mut previous_position = None;
+    for &position in positions {
+        validate_patch_position(block_len, previous_position, position)?;
+        previous_position = Some(position);
+    }
+    Ok(())
+}
+
+fn validate_patch_header(
+    residual_width: u8,
+    high_width: u8,
+    patch_count: usize,
+    high_payload_len: usize,
+) -> VortexResult<()> {
     vortex_ensure!(
-        positions
-            .iter()
-            .all(|&position| usize::from(position) < block_len)
-            && positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "block residual patch positions are invalid"
-    );
-    vortex_ensure!(
-        positions.is_empty() || (high_width > 0 && residual_width < 64),
+        patch_count == 0 || (high_width > 0 && residual_width < 64),
         "block residual patches require nonzero high bits"
     );
-    let expected_high_len = if positions.is_empty() {
+    let expected_high_len = if patch_count == 0 {
         0
     } else {
-        (positions.len() * usize::from(high_width)).div_ceil(8) + 15
+        (patch_count * usize::from(high_width)).div_ceil(8) + 15
     };
     vortex_ensure!(
         high_payload_len == expected_high_len,
         "block residual patch high payload is invalid"
+    );
+    Ok(())
+}
+
+fn validate_patch_position(
+    block_len: usize,
+    previous_position: Option<u16>,
+    position: u16,
+) -> VortexResult<()> {
+    vortex_ensure!(
+        usize::from(position) < block_len
+            && previous_position.is_none_or(|previous| previous < position),
+        "block residual patch positions are invalid"
     );
     Ok(())
 }
@@ -778,6 +924,7 @@ mod tests {
     use vortex_session::registry::ReadContext;
 
     use super::BlockResidual;
+    use super::BlockResidualArraySlotsExt;
 
     #[test]
     fn roundtrip_and_scalar_access() -> VortexResult<()> {
@@ -801,6 +948,55 @@ mod tests {
     }
 
     #[test]
+    fn signed_roundtrip_and_scalar_access() -> VortexResult<()> {
+        let values = (0..2_050)
+            .map(|index| match index {
+                0 => i64::MIN,
+                1_023 => -1,
+                1_024 => 0,
+                2_049 => i64::MAX,
+                _ => (index as i64 - 1_025) * 1_000_003,
+            })
+            .collect::<Vec<_>>();
+        let primitive = PrimitiveArray::from_iter(values.clone());
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        assert_arrays_eq!(encoded.clone(), primitive.into_array(), &mut ctx);
+        for index in [0, 1, 1_023, 1_024, 2_049] {
+            let scalar = encoded.execute_scalar(index, &mut ctx)?;
+            assert_eq!(
+                scalar.as_primitive().typed_value::<i64>(),
+                Some(values[index])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_integer_roundtrip() -> VortexResult<()> {
+        let signed = PrimitiveArray::from_iter((0..2_050).map(|index| {
+            let value = (index * 7919) % 65_521;
+            value - 32_760
+        }));
+        let unsigned = PrimitiveArray::from_iter((0..2_050).map(|index| {
+            let value = (index * 7907) % 65_521;
+            value as u16
+        }));
+        let signed_encoded = BlockResidual::from_primitive(signed.as_view())?;
+        let unsigned_encoded = BlockResidual::from_primitive(unsigned.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        assert_arrays_eq!(signed_encoded, signed.into_array(), &mut ctx);
+        assert_arrays_eq!(unsigned_encoded, unsigned.into_array(), &mut ctx);
+        Ok(())
+    }
+
+    #[test]
     fn nullable_slice_and_scalar_access() -> VortexResult<()> {
         let values = (0..2_050)
             .map(|index| Ok(u64::try_from(index * index)?))
@@ -816,6 +1012,38 @@ mod tests {
         let sliced = encoded.into_array().slice(1_023..1_026)?;
         let expected = primitive.into_array().slice(1_023..1_026)?;
         assert_arrays_eq!(sliced, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_width_patched_block_roundtrip() -> VortexResult<()> {
+        let mut values = vec![42_u32; 2_050];
+        values[1_023] = u32::MAX;
+        let validity = Validity::from_iter((0..values.len()).map(|index| index != 1_024));
+        let primitive = PrimitiveArray::new(Buffer::from(values.clone()), validity);
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+        let widths = encoded
+            .residual_widths()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+
+        assert_eq!(widths.as_slice::<u8>()[0], 0);
+        assert_eq!(
+            encoded
+                .execute_scalar(1_023, &mut ctx)?
+                .as_primitive()
+                .typed_value::<u32>(),
+            Some(u32::MAX)
+        );
+        assert!(encoded.execute_scalar(1_024, &mut ctx)?.is_null());
+        assert_arrays_eq!(
+            encoded.into_array().slice(1_022..1_025)?,
+            primitive.into_array().slice(1_022..1_025)?,
+            &mut ctx
+        );
         Ok(())
     }
 

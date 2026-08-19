@@ -31,6 +31,7 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
     &integer::BitPackingScheme,
+    &integer::BlockResidualScheme,
     &integer::SparseScheme,
     &integer::IntDictScheme,
     &integer::RunEndScheme,

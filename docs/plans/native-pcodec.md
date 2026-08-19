@@ -13,10 +13,10 @@ Pco remains a compression oracle. The new arrays do not preserve Pco byte compat
 Focus the production work on these encodings:
 
 - `OrderedFloatArray`.
-- `BlockResidualArray` with one reference per 1,024-value block.
+- `BlockResidualArray` for all integer types, with one reference per 1,024-value block.
 - `FloatQuantArray`.
 
-Keep `FloatQuantScheme` and `OrderedBlockResidualScheme` as BtrBlocks candidates.
+Keep `FloatQuantScheme`, `OrderedBlockResidualScheme`, and `BlockResidualScheme` as BtrBlocks candidates.
 
 Remove `FloatMultArray` and `FloatMultScheme` from the focused branch.
 
@@ -38,7 +38,9 @@ The array supports canonical decode, scalar access, slice reduction, serializati
 
 ## BlockResidualArray
 
-`BlockResidualArray` divides unsigned integers into independent blocks of 1,024 values.
+`BlockResidualArray` divides integers into independent blocks of 1,024 values.
+
+Unsigned values retain their bit pattern. Signed values first flip the sign bit to preserve numeric order.
 
 Each block stores one minimum value. Packed residuals store the difference from that minimum.
 
@@ -53,6 +55,10 @@ Fixed metadata stores only lengths and slice bounds. Variable tables remain in c
 The array supports canonical decode, scalar access, slice reduction, serialization, and validation.
 
 The `OrderedFloat(BlockResidual)` execute kernel combines residual decode with the inverse float transform.
+
+The residual payload uses the logical integer width. A 16-bit array uses 16-bit FastLanes pack and unpack operations.
+
+The serialized residual payload remains a `u64` child. The logical type defines the packed word interpretation.
 
 The production codec uses one reference per block. The multi-reference prototype did not justify its encode and decode costs.
 
@@ -85,7 +91,26 @@ The scheme rejects samples with a nonzero secondary. This avoids the recursive i
 
 The ordinary BtrBlocks sample does not preserve the block-local float structure.
 
-The residual scheme requires a 1.05 compression ratio and a 1.02 win over the incumbent.
+The residual scheme requires a 1.05 compression ratio. Its adjusted score includes a 1.02 decode-cost factor.
+
+`BlockResidualScheme` uses the same locality probe for integer arrays.
+
+The default scheme accepts only 32-bit and 64-bit integers. Direct 8-bit and 16-bit candidates cannot save enough absolute space.
+
+The scheme does not run inside trial compression for an outer scheme. Generic 64-row samples do not preserve 1,024-row locality.
+
+The selected outer scheme can still choose BlockResidual for its full child.
+
+The integer selector divides the measured compression ratio by these decode-cost factors:
+
+- 1.10 for 32-bit integers.
+- 1.20 for 64-bit integers.
+
+A 1.20 factor requires about 16.7 percent fewer estimated bytes. It does not require 20 percent fewer bytes.
+
+The block planner adds 16 synthetic cost bits per patch. This cost favors wider packed residuals when many patches slow decode.
+
+The selector excludes BlockResidual from dictionary-code children. A complete BlockResidual tree can still displace a complete dictionary tree.
 
 Both schemes remain eligible to displace ALP or ALP-RD when their sample size scores win.
 
@@ -186,63 +211,93 @@ The HashTags dataset selected this scheme for two columns.
 
 It reduced the numeric subset by 6.0 percent with no isolated compressor regression.
 
-### Broad dataset revalidation
+### Integer BlockResidual throughput
 
-The earlier file benchmark compared the corrected default against the new schemes.
+The direct benchmark uses two million block-local values.
 
-| Dataset | Prior bytes | Proposed bytes | Size change |
+| Logical type and tree | Encode GB/s | Decode GB/s | Scalar access ns |
 | --- | ---: | ---: | ---: |
-| Taxi | 439,806,364 | 439,806,364 | 0.000 percent |
-| Air Quality | 15,848,420 | 15,848,420 | 0.000 percent |
-| Arade | 143,343,828 | 143,343,828 | 0.000 percent |
-| Euro2016 | 164,673,900 | 164,674,236 | +0.0002 percent |
-| Food | 38,894,360 | 38,922,408 | +0.072 percent |
-| HashTags | 195,035,692 | 194,753,372 | -0.145 percent |
+| `u64` BlockResidual | 5.00 | 36.43 | 125 |
+| `u64` FoR plus BitPacked | 4.25 | 35.37 | 115 |
+| `i16` BlockResidual | 1.38 | 31.12 | 125 |
+| `i16` FoR plus BitPacked | 1.12 | 41.57 | 104 |
 
-Separate benchmark processes introduced low single-digit throughput noise.
+The first `i16` implementation unpacked through `u64` residuals. It decoded at 11.43 GB/s.
 
-The focused two-million-row run selected no new schemes in Taxi, Air Quality, Arade, Euro2016, or Food.
+Native-width unpack increased `i16` decode throughput by 2.78 times.
 
-Ordered BlockResidual selected two HashTags columns. FloatQuant selected no columns in these datasets.
+The synthetic `i16` BlockResidual tree uses 1,793,784 bytes. The FoR plus BitPacked tree uses 3,500,000 bytes.
 
-The earlier FloatQuant probe reduced HashTags compression throughput by 2.4 percent without a selection.
+BlockResidual is 48.7 percent smaller on that input.
 
-The direct sample tree removed that recursive analysis cost.
+Its `i16` decode throughput is 25.1 percent lower. The default selector therefore excludes direct 8-bit and 16-bit candidates.
 
-### Pcodec paper corpus
+The BlockResidual estimator measures its sampled tree exactly, with all child arrays.
+
+The incumbent and outer tree estimates remain approximate. Trial compression previously mis-ranked Dict and ALP on Taxi tips.
+
+The outer-sample exclusion removed that error from the measured tree.
+
+### Broad numeric revalidation
+
+The focused run uses two million rows when the source contains that many rows.
+
+The integer-only configuration adds `BlockResidualScheme` to the prior default.
+
+| Dataset | Prior bytes | Integer BlockResidual bytes | Complete default bytes | Integer size change | Complete size change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| California Housing | 307,427 | 301,125 | 301,125 | -2.0 percent | -2.0 percent |
+| NYC Taxi | 52,407,972 | 52,407,972 | 52,407,972 | 0.0 percent | 0.0 percent |
+| CMS Payments | 30,061,670 | 28,472,040 | 28,472,040 | -5.3 percent | -5.3 percent |
+| Arade | 26,937,026 | 26,937,026 | 26,937,026 | 0.0 percent | 0.0 percent |
+| Euro2016 | 44,698,131 | 39,566,892 | 39,566,892 | -11.5 percent | -11.5 percent |
+| Food | 13,579,790 | 13,579,790 | 13,579,790 | 0.0 percent | 0.0 percent |
+| HashTags | 22,602,522 | 22,193,089 | 21,018,949 | -1.8 percent | -7.0 percent |
+
+Across these numeric inputs, integer BlockResidual reduced size by 3.7 percent.
+
+Its aggregate encode throughput decreased by 0.4 percent. Its aggregate decode throughput increased by 1.7 percent.
+
+California Housing contains only 20,433 rows. Fixed analysis cost dominates its encode result.
+
+The complete default reduced aggregate size by 4.4 percent. Encode throughput decreased by 1.2 percent.
+
+Aggregate decode throughput increased by 2.3 percent.
+
+Euro2016 reduced size by 11.5 percent and increased decode throughput by 10.2 percent.
+
+CMS reduced size by 5.3 percent and increased decode throughput by 5.5 percent.
+
+HashTags reduced size by 7.0 percent and increased decode throughput by 4.9 percent.
+
+The direct narrow-type exclusion changed no selected tree in this corpus. The earlier 1.40 factor already rejected each direct `i16` candidate.
+
+A FastLanes fused FoR decode trial did not improve `u64` throughput. It reduced `i16` throughput, so the implementation retains native unpack.
+
+The zero-width residual path now writes base values and patches directly. It skips the scratch residual block.
+
+### Pcodec corpus gap analysis
 
 The focused benchmark reads the first two million numeric rows from each source.
 
-Timestamps use their integer representation. The California Housing size uses its original 20,640 rows.
+Air Quality, r/place, and the Twitter graph contain no float columns in the benchmark schema.
 
-| Dataset | Input bytes | Prior bytes | Proposed bytes | Compact bytes | New selection |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Air Quality | 42,834,636 | 16,645,494 | 16,645,494 | 4,298,741 | None |
-| California Housing | 743,040 | 307,427 | 307,427 | 227,970 | None |
-| r/place | 56,000,000 | 16,266,697 | 16,266,697 | 8,891,886 | None |
-| NYC Taxi | 240,000,000 | 52,407,972 | 52,407,972 | 33,148,991 | None |
-| Twitter follower graph | 32,000,000 | 7,226,752 | 7,226,752 | 3,661,121 | None |
-| CMS Payments | 160,000,000 | 30,061,670 | 30,061,670 | 22,300,792 | None |
+The float gap corpus includes California Housing, NYC Taxi, CMS Payments, and four Public BI datasets.
 
-Air Quality, California Housing, and r/place match the paper input sizes.
+Thirty float columns use at least ten percent fewer bytes with Compact Pco than with the prior default.
 
-The Taxi logical input matches the paper size. Vortex arrays also retain column validity.
+Pco uses four principal mechanisms on these columns:
 
-The Twitter source uses the first two million official edges. The paper used an unspecified ID sort.
+- Entropy bins on ALP integer children.
+- First-order Delta plus bins on raw floats or ALP integer children.
+- FloatMult plus bins on Taxi tips.
+- IntMult splits on selected integer children.
 
-The Twitter result is not an exact size comparison. Independent column sort produced a 1,212,617-byte Compact result.
-
-The six inputs selected no new schemes. Four inputs contain no eligible `f64` column.
-
-Taxi contains `f64` columns, but both new schemes lost their sample comparisons.
-
-CMS Payments contains one `f64` column. ALP won that column.
+No Pcodec paper gap used lookback Delta. Some Public BI columns used lookback Delta.
 
 The current CMS source revision differs from the paper source snapshot.
 
-The CMS prior and proposed compressors both encoded at approximately 1,252 MB/s.
-
-Their decode results differed by less than two percent. They produced identical trees.
+The Twitter source uses the first two million official edges. The paper used an unspecified ID sort.
 
 ## General real-float follow-up
 
@@ -256,19 +311,19 @@ Measure gap recovery as `(default bytes - candidate bytes) / (default bytes - Pc
 
 Retain a prototype only if it recovers a material gap across unrelated real datasets.
 
-The retained schemes cover lower-precision values in wider floats and locally narrow ordered ranges.
+The retained schemes cover lower-precision values in wider floats and locally narrow ordered or integer ranges.
 
-They do not replace ALP-RD for generic non-decimal floats. No measured column moved from ALP to a new scheme.
+The multi-reference estimator tested one, two, and four quantile references per block on thirty gap columns.
 
-The first general prototype will use bounded multiple references per 1,024-value block.
+The estimate includes reference identifiers, packed residuals, patch positions, patch highs, and block metadata.
 
-Each block will test one, two, or four references. Each value will store a small reference ID and one packed residual.
+One reference won 25 columns. Four references won five columns. Two references won no columns.
 
-All references will share one residual width per block. Sparse high-bit patches will contain rare outliers.
+The best estimate recovered 29.4 percent of the aggregate Pco size gap.
 
-Direct access will read one reference ID, one residual, and an optional patch. The one-reference form matches `BlockResidualArray`.
+It reduced default bytes by 7.9 percent across the gap columns.
 
-This design approximates Pco bins without entropy coding. It also avoids a rank query into separate variable-width bin streams.
+The extra references did not justify a new array. Generic integer BlockResidual became the next prototype.
 
 Test these secondary candidates after the multi-reference prototype:
 
@@ -277,9 +332,7 @@ Test these secondary candidates after the multi-reference prototype:
 - Use block-local ALP-RD split widths.
 - Use independent entropy microblocks only in Compact.
 
-Build a gap corpus from columns where Compact Pco materially beats ALP-RD.
-
-Classify each gap by exponent count, prefix count, local range, low-bit entropy, and outlier rate.
+Classify the other gaps by exponent count, prefix count, local range, low-bit entropy, and outlier rate.
 
 Require size, compression, decode, and scalar-access results on the same two-million-row inputs.
 
@@ -358,15 +411,25 @@ This round completed these steps:
 - Added nonzero-secondary FloatQuant benchmarks.
 - Added all six Pcodec paper datasets.
 - Fixed the high-value defects from three adversarial reviews.
+- Extended BlockResidual to every integer type.
+- Added native-width residual pack and unpack operations.
+- Added integer BlockResidual to `single_encoding_throughput`.
+- Measured the Pco gap across thirty float columns.
+- Rejected the multi-reference residual design.
+- Added the outer-sample exclusion and width-specific factors.
+- Added the patch-count decode cost.
+- Excluded direct 8-bit and 16-bit candidates.
+- Excluded BlockResidual from dictionary-code children.
 
 Complete these remaining steps:
 
-1. Run the broad Vortex compression corpus after the selector change.
+1. Run the complete `bench-vortex` compression corpus.
 2. Compare the geometric mean against Parquet with Zstd.
-3. Build the Pco-versus-ALP-RD gap corpus.
-4. Prototype the bounded multi-reference residual codec.
-5. Test a fused nonzero-secondary decode on qualifying gap columns.
-6. Update this plan after each experiment.
+3. Reduce the analysis cost on short rejected columns.
+4. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
+5. Evaluate nonzero-secondary FloatQuant for the default compressor.
+6. Investigate new schemes for real floats that Pco compresses better than ALP and ALP-RD.
+7. Update this plan after each experiment.
 
 ## Pull request structure
 

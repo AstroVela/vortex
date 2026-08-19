@@ -15,6 +15,13 @@ use arrow_schema::DataType;
 use arrow_select::concat::concat;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use pco::ChunkConfig;
+use pco::data_types::Number;
+use pco::metadata::ChunkLatentVarMeta;
+use pco::metadata::DeltaEncoding;
+use pco::metadata::DynBins;
+use pco::metadata::Mode;
+use pco::wrapped::FileCompressor;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -28,11 +35,14 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_arrow::ArrowSessionExt;
+use vortex_block_residual::BlockResidual;
+use vortex_block_residual::BlockResidualArraySlotsExt;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
+use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -257,6 +267,58 @@ fn encoding_tree(array: &ArrayRef) -> String {
     format!("{}({children})", array.encoding_id())
 }
 
+fn profile_block_residual_array(
+    dataset: &str,
+    column: &str,
+    config: &str,
+    path: &str,
+    array: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    if let Some(residuals) = array.as_typed::<BlockResidual>() {
+        let mut ctx = session.create_execution_ctx();
+        let residual_widths = residuals
+            .residual_widths()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let high_widths = residuals
+            .high_widths()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let blocks = residual_widths.len();
+        let average_residual_width = residual_widths
+            .as_slice::<u8>()
+            .iter()
+            .map(|&width| f64::from(width))
+            .sum::<f64>()
+            / blocks as f64;
+        let average_high_width = high_widths
+            .as_slice::<u8>()
+            .iter()
+            .map(|&width| f64::from(width))
+            .sum::<f64>()
+            / blocks as f64;
+        println!(
+            "block-residual-profile\t{dataset}\t{column}\t{config}\t{path}\t{}\t{}\t{}\t{blocks}\t{average_residual_width:.3}\t{average_high_width:.3}\t{}",
+            array.dtype().as_ptype(),
+            array.len(),
+            residuals.patch_positions().len(),
+            array.nbytes(),
+        );
+    }
+    for (child_index, child) in array.children().iter().enumerate() {
+        profile_block_residual_array(
+            dataset,
+            column,
+            config,
+            &format!("{path}/{child_index}"),
+            child,
+            session,
+        )?;
+    }
+    Ok(())
+}
+
 fn encode_all(
     compressor: &BtrBlocksCompressor,
     columns: &[Column],
@@ -284,6 +346,312 @@ fn percentile(durations: &mut [Duration], numerator: usize, denominator: usize) 
     durations[durations.len() * numerator / denominator]
 }
 
+struct BinProfile {
+    count: usize,
+    ans_size_log: u32,
+    max_offset_bits: u32,
+    average_bits: f64,
+}
+
+fn bin_profile(meta: &ChunkLatentVarMeta) -> BinProfile {
+    pco::match_latent_enum!(&meta.bins, DynBins<L>(bins) => {
+        let total_weight = (1_u64 << meta.ans_size_log) as f64;
+        let average_bits = bins
+            .iter()
+            .map(|bin| {
+                let ans_bits = f64::from(meta.ans_size_log) - f64::from(bin.weight).log2();
+                (ans_bits + f64::from(bin.offset_bits)) * f64::from(bin.weight) / total_weight
+            })
+            .sum();
+        BinProfile {
+            count: bins.len(),
+            ans_size_log: meta.ans_size_log,
+            max_offset_bits: bins
+                .iter()
+                .map(|bin| bin.offset_bits)
+                .max()
+                .unwrap_or_default(),
+            average_bits,
+        }
+    })
+}
+
+fn optional_bin_profile(meta: Option<&ChunkLatentVarMeta>) -> BinProfile {
+    meta.map(bin_profile).unwrap_or(BinProfile {
+        count: 0,
+        ans_size_log: 0,
+        max_offset_bits: 0,
+        average_bits: 0.0,
+    })
+}
+
+fn mode_name(mode: &Mode) -> String {
+    match mode {
+        Mode::Classic => "classic".to_string(),
+        Mode::IntMult(_) => "int-mult".to_string(),
+        Mode::FloatMult(_) => "float-mult".to_string(),
+        Mode::FloatQuant(k) => format!("float-quant-{k}"),
+        Mode::Dict(_) => "dict".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn delta_name(delta: &DeltaEncoding) -> String {
+    match delta {
+        DeltaEncoding::NoOp => "none".to_string(),
+        DeltaEncoding::Consecutive {
+            order,
+            secondary_uses_delta,
+        } => format!("consecutive-{order}-secondary-{secondary_uses_delta}"),
+        DeltaEncoding::Lookback {
+            config,
+            secondary_uses_delta,
+        } => format!(
+            "lookback-state-{}-window-{}-secondary-{secondary_uses_delta}",
+            config.state_n_log, config.window_n_log
+        ),
+        DeltaEncoding::Conv1(config) => format!("conv1-quantization-{}", config.quantization),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn profile_pco_values<T: Number>(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    ptype: PType,
+    values: &[T],
+) -> VortexResult<()> {
+    let file_compressor = FileCompressor::default();
+    for (chunk_index, chunk) in values.chunks(pco::DEFAULT_MAX_PAGE_N).enumerate() {
+        let compressor = file_compressor
+            .chunk_compressor(chunk, &ChunkConfig::default())
+            .map_err(|error| vortex_err!("cannot profile Pco chunk: {error}"))?;
+        let meta = compressor.meta();
+        let delta = optional_bin_profile(meta.per_latent_var.delta.as_ref());
+        let primary = bin_profile(&meta.per_latent_var.primary);
+        let secondary = optional_bin_profile(meta.per_latent_var.secondary.as_ref());
+        println!(
+            "pco-profile\t{dataset}\t{column}\t{path}\t{ptype}\t{chunk_index}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{:.3}",
+            chunk.len(),
+            mode_name(&meta.mode),
+            delta_name(&meta.delta_encoding),
+            delta.count,
+            delta.max_offset_bits,
+            delta.average_bits,
+            primary.count,
+            primary.ans_size_log,
+            primary.max_offset_bits,
+            primary.average_bits,
+            secondary.count,
+            secondary.ans_size_log,
+            secondary.max_offset_bits,
+            secondary.average_bits,
+        );
+    }
+    Ok(())
+}
+
+fn reference_id_bits(reference_count: usize) -> usize {
+    match reference_count {
+        0 | 1 => 0,
+        2 => 1,
+        _ => 2,
+    }
+}
+
+fn estimate_multi_reference_block(
+    values: &[u64],
+    requested_references: usize,
+    bits: usize,
+) -> usize {
+    const BLOCK_LEN: usize = 1024;
+    const METADATA_BYTES: usize = 12;
+    const HIGH_PADDING_BYTES: usize = 15;
+
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mut references = (0..requested_references)
+        .map(|index| sorted[index * sorted.len() / requested_references])
+        .collect::<Vec<_>>();
+    references.dedup();
+
+    let mut width_counts = [0_usize; 65];
+    let mut maximum_width = 0_usize;
+    for &value in values {
+        let reference_index = references
+            .partition_point(|&reference| reference <= value)
+            .saturating_sub(1);
+        let residual = value - references[reference_index];
+        let width = u64::BITS as usize - residual.leading_zeros() as usize;
+        width_counts[width] += 1;
+        maximum_width = maximum_width.max(width);
+    }
+
+    let mut patch_count = values.len();
+    let mut best_bits = usize::MAX;
+    for residual_width in 0..=maximum_width {
+        patch_count -= width_counts[residual_width];
+        let high_width = if patch_count == 0 {
+            0
+        } else {
+            maximum_width - residual_width
+        };
+        let cost_bits = residual_width * BLOCK_LEN
+            + reference_id_bits(references.len()) * BLOCK_LEN
+            + references.len() * bits
+            + patch_count * (u16::BITS as usize + high_width)
+            + METADATA_BYTES * 8
+            + usize::from(patch_count > 0) * HIGH_PADDING_BYTES * 8;
+        best_bits = best_bits.min(cost_bits);
+    }
+    best_bits.div_ceil(8)
+}
+
+fn estimate_multi_reference(values: &[u64], requested_references: usize, bits: usize) -> usize {
+    values
+        .chunks(1024)
+        .map(|block| estimate_multi_reference_block(block, requested_references, bits))
+        .sum()
+}
+
+fn ordered_f32(value: f32) -> u64 {
+    let bits = value.to_bits();
+    u64::from(if bits & (1_u32 << 31) == 0 {
+        bits ^ (1_u32 << 31)
+    } else {
+        !bits
+    })
+}
+
+fn ordered_f64(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits & (1_u64 << 63) == 0 {
+        bits ^ (1_u64 << 63)
+    } else {
+        !bits
+    }
+}
+
+fn ordered_values(values: &PrimitiveArray) -> Vec<u64> {
+    match values.ptype() {
+        PType::F32 => values
+            .as_slice::<f32>()
+            .iter()
+            .copied()
+            .map(ordered_f32)
+            .collect(),
+        PType::F64 => values
+            .as_slice::<f64>()
+            .iter()
+            .copied()
+            .map(ordered_f64)
+            .collect(),
+        PType::I16 => values
+            .as_slice::<i16>()
+            .iter()
+            .map(|&value| u64::from((value as u16) ^ (1_u16 << 15)))
+            .collect(),
+        PType::I32 => values
+            .as_slice::<i32>()
+            .iter()
+            .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
+            .collect(),
+        PType::I64 => values
+            .as_slice::<i64>()
+            .iter()
+            .map(|&value| (value as u64) ^ (1_u64 << 63))
+            .collect(),
+        PType::U16 => values
+            .as_slice::<u16>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U32 => values
+            .as_slice::<u32>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U64 => values.as_slice::<u64>().to_vec(),
+        ptype => unreachable!("Pco does not support {ptype}"),
+    }
+}
+
+fn profile_pco_array(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    array: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    if array.encoding_id().as_ref() == "vortex.pco" {
+        let mut ctx = session.create_execution_ctx();
+        let primitive = array.clone().execute::<PrimitiveArray>(&mut ctx)?;
+        let primitive_array = primitive.clone().into_array();
+        let mask = primitive_array
+            .validity()?
+            .execute_mask(primitive.len(), &mut ctx)?;
+        let values = primitive_array
+            .filter(mask)?
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let ordered = ordered_values(&values);
+        let validity_bytes = array.children().iter().map(ArrayRef::nbytes).sum::<u64>();
+        let bits = values.ptype().bit_width();
+        let one_reference =
+            u64::try_from(estimate_multi_reference(&ordered, 1, bits))? + validity_bytes;
+        let two_references =
+            u64::try_from(estimate_multi_reference(&ordered, 2, bits))? + validity_bytes;
+        let four_references =
+            u64::try_from(estimate_multi_reference(&ordered, 4, bits))? + validity_bytes;
+        println!(
+            "multi-ref-estimate\t{dataset}\t{column}\t{path}\t{}\t{}\t{}\t{}\t{}\t{}",
+            values.ptype(),
+            array.nbytes(),
+            one_reference,
+            two_references,
+            four_references,
+            one_reference.min(two_references).min(four_references),
+        );
+        match values.ptype() {
+            PType::F32 => {
+                profile_pco_values(dataset, column, path, PType::F32, values.as_slice::<f32>())?
+            }
+            PType::F64 => {
+                profile_pco_values(dataset, column, path, PType::F64, values.as_slice::<f64>())?
+            }
+            PType::I16 => {
+                profile_pco_values(dataset, column, path, PType::I16, values.as_slice::<i16>())?
+            }
+            PType::I32 => {
+                profile_pco_values(dataset, column, path, PType::I32, values.as_slice::<i32>())?
+            }
+            PType::I64 => {
+                profile_pco_values(dataset, column, path, PType::I64, values.as_slice::<i64>())?
+            }
+            PType::U16 => {
+                profile_pco_values(dataset, column, path, PType::U16, values.as_slice::<u16>())?
+            }
+            PType::U32 => {
+                profile_pco_values(dataset, column, path, PType::U32, values.as_slice::<u32>())?
+            }
+            PType::U64 => {
+                profile_pco_values(dataset, column, path, PType::U64, values.as_slice::<u64>())?
+            }
+            ptype => return Err(vortex_err!("cannot profile Pco ptype {ptype}")),
+        }
+    }
+    for (child_index, child) in array.children().iter().enumerate() {
+        profile_pco_array(
+            dataset,
+            column,
+            &format!("{path}/{child_index}"),
+            child,
+            session,
+        )?;
+    }
+    Ok(())
+}
+
 fn measure_dataset(
     dataset: &str,
     columns: &[Column],
@@ -305,11 +673,57 @@ fn measure_dataset(
         for (column, array) in columns.iter().zip(arrays) {
             assert_arrays_eq!(array, column.array, &mut session.create_execution_ctx());
             println!(
-                "structure\t{dataset}\t{}\t{config}\t{}\t{}",
+                "structure\t{dataset}\t{}\t{}\t{config}\t{}\t{}",
                 column.name,
+                column.primitive.ptype(),
                 encoding_tree(array),
                 array.nbytes()
             );
+            if *config == "integer-block-residual-only" {
+                profile_block_residual_array(
+                    dataset,
+                    &column.name,
+                    config,
+                    "root",
+                    array,
+                    session,
+                )?;
+            }
+        }
+    }
+
+    let prior_default = encoded
+        .iter()
+        .find(|(config, _)| *config == "prior-default")
+        .ok_or_else(|| vortex_err!("prior-default configuration is missing"))?;
+    let prior_compact = encoded
+        .iter()
+        .find(|(config, _)| *config == "prior-compact")
+        .ok_or_else(|| vortex_err!("prior-compact configuration is missing"))?;
+    for (column_index, column) in columns.iter().enumerate() {
+        if !column.primitive.ptype().is_float() {
+            continue;
+        }
+        let default_array = &prior_default.1[column_index];
+        let compact_array = &prior_compact.1[column_index];
+        let input_bytes = column.primitive.len() * column.primitive.ptype().byte_width();
+        let default_bytes = default_array.nbytes();
+        let compact_bytes = compact_array.nbytes();
+        let compact_savings = if default_bytes == 0 {
+            0.0
+        } else {
+            100.0 * (1.0 - compact_bytes as f64 / default_bytes as f64)
+        };
+        println!(
+            "float-column\t{dataset}\t{}\t{}\t{}\t{input_bytes}\t{default_bytes}\t{compact_bytes}\t{compact_savings:.3}\t{}\t{}",
+            column.name,
+            column.primitive.ptype(),
+            column.primitive.len(),
+            encoding_tree(default_array),
+            encoding_tree(compact_array),
+        );
+        if compact_bytes * 10 <= default_bytes * 9 {
+            profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
         }
     }
 
@@ -354,7 +768,11 @@ fn measure_dataset(
 }
 
 fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
-    let new_scheme_ids = [FloatQuantScheme.id(), OrderedBlockResidualScheme.id()];
+    let new_scheme_ids = [
+        FloatQuantScheme.id(),
+        OrderedBlockResidualScheme.id(),
+        BlockResidualScheme.id(),
+    ];
     vec![
         (
             "prior-default",
@@ -365,13 +783,19 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
         (
             "float-quant-only",
             BtrBlocksCompressorBuilder::default()
-                .exclude_schemes([OrderedBlockResidualScheme.id()])
+                .exclude_schemes([OrderedBlockResidualScheme.id(), BlockResidualScheme.id()])
                 .build(),
         ),
         (
             "ordered-block-residual-only",
             BtrBlocksCompressorBuilder::default()
-                .exclude_schemes([FloatQuantScheme.id()])
+                .exclude_schemes([FloatQuantScheme.id(), BlockResidualScheme.id()])
+                .build(),
+        ),
+        (
+            "integer-block-residual-only",
+            BtrBlocksCompressorBuilder::default()
+                .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
                 .build(),
         ),
         (
@@ -405,8 +829,20 @@ fn main() -> VortexResult<()> {
     let session = array_session();
     let configs = compressors();
 
-    println!("structure\tdataset\tcolumn\tconfig\tencoding\tbytes");
+    println!("structure\tdataset\tcolumn\tptype\tconfig\tencoding\tbytes");
+    println!(
+        "float-column\tdataset\tcolumn\tptype\trows\tinput-bytes\tdefault-bytes\tcompact-bytes\tcompact-savings-pct\tdefault-encoding\tcompact-encoding"
+    );
+    println!(
+        "pco-profile\tdataset\tcolumn\tpath\tptype\tchunk\trows\tmode\tdelta\tdelta-bins\tdelta-max-offset-bits\tdelta-average-bits\tprimary-bins\tprimary-ans-log\tprimary-max-offset-bits\tprimary-average-bits\tsecondary-bins\tsecondary-ans-log\tsecondary-max-offset-bits\tsecondary-average-bits"
+    );
+    println!(
+        "multi-ref-estimate\tdataset\tcolumn\tpath\tptype\tpco-child-bytes\tone-reference-bytes\ttwo-reference-bytes\tfour-reference-bytes\tbest-bytes"
+    );
     println!("result\tdataset\tconfig\trows\tinput-bytes\tencoded-bytes\tencode-MB/s\tdecode-MB/s");
+    println!(
+        "block-residual-profile\tdataset\tcolumn\tconfig\tpath\tptype\trows\tpatches\tblocks\taverage-residual-width\taverage-high-width\tbytes"
+    );
     if std::env::var_os("VORTEX_BENCH_SKIP_SYNTHETIC").is_none() {
         for (dataset, columns) in synthetic_datasets(row_count) {
             measure_dataset(&dataset, &columns, &configs, &session)?;

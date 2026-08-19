@@ -14,10 +14,12 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProviderExt;
 use vortex_array::validity::Validity;
+use vortex_block_residual::BlockResidual;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
@@ -48,6 +50,52 @@ fn test_for_compressed() -> VortexResult<()> {
     let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<FoR>());
     Ok(())
+}
+
+#[test]
+fn test_block_residual_compressed() -> VortexResult<()> {
+    let values = (0..8_192)
+        .map(|index| {
+            let block = index / 1_024;
+            let residual = (index * 2_654_435_761_usize) % 1_024;
+            (block as i64 - 4) * 1_000_000_000_000 + residual as i64
+        })
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values);
+    let compressed = BtrBlocksCompressor::default()
+        .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        compressed.is::<BlockResidual>(),
+        "expected BlockResidual, got tree:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_block_residual_skips_narrow_integers() -> VortexResult<()> {
+    let values = (0..8_192)
+        .map(|index| {
+            let block = index / 1_024;
+            let residual = (index * 2_654_435_761_usize) % 32;
+            Ok(i16::try_from(block * 1_000 + residual)?)
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let array = PrimitiveArray::from_iter(values);
+    let compressed = BtrBlocksCompressor::default()
+        .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        !contains_block_residual(&compressed),
+        "BlockResidual must not encode narrow integers:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}
+
+fn contains_block_residual(array: &vortex_array::ArrayRef) -> bool {
+    array.is::<BlockResidual>() || array.children().iter().any(contains_block_residual)
 }
 
 #[test]
@@ -110,6 +158,11 @@ fn test_dict_compressed() -> VortexResult<()> {
     let btr = BtrBlocksCompressor::default();
     let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<Dict>());
+    assert!(
+        !contains_block_residual(compressed.as_::<Dict>().codes()),
+        "BlockResidual must not encode dictionary codes:\n{}",
+        compressed.display_tree()
+    );
     Ok(())
 }
 

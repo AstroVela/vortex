@@ -81,9 +81,9 @@ struct Args {
     ingest_output: Option<PathBuf>,
     #[arg(long)]
     tracing: bool,
-    /// Exclude FloatQuant and OrderedBlockResidual from Vortex compression.
+    /// Exclude FloatQuant and block-residual schemes from Vortex compression.
     #[arg(long)]
-    vortex_without_new_float: bool,
+    vortex_without_new_numeric: bool,
     /// Format for the primary stderr log sink. `text` is the default human-readable format;
     /// `json` emits one JSON object per event, suitable for piping into `jq`.
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
         args.display_format,
         args.output_path,
         args.ingest_output,
-        args.vortex_without_new_float,
+        args.vortex_without_new_numeric,
     )
     .await
 }
@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 fn get_compressor(
     format: Format,
     gpu_decompress: bool,
-    vortex_without_new_float: bool,
+    vortex_without_new_numeric: bool,
 ) -> Box<dyn Compressor> {
     if gpu_decompress {
         #[cfg(feature = "cuda")]
@@ -136,7 +136,7 @@ fn get_compressor(
     }
 
     match format {
-        Format::OnDiskVortex => Box::new(VortexCompressor::new(!vortex_without_new_float)),
+        Format::OnDiskVortex => Box::new(VortexCompressor::new(!vortex_without_new_numeric)),
         Format::Parquet => Box::new(ParquetCompressor::new()),
         #[cfg(feature = "lance")]
         Format::Lance => Box::new(LanceCompressor),
@@ -163,7 +163,7 @@ async fn run_compress(
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
     ingest_output: Option<PathBuf>,
-    vortex_without_new_float: bool,
+    vortex_without_new_numeric: bool,
 ) -> anyhow::Result<()> {
     let targets = formats
         .iter()
@@ -242,7 +242,7 @@ async fn run_compress(
             iterations,
             dataset_handle,
             gpu_decompress,
-            vortex_without_new_float,
+            vortex_without_new_numeric,
         )
         .await?;
         measurements.push(m);
@@ -286,7 +286,7 @@ async fn run_benchmark_for_dataset(
     iterations: usize,
     dataset_handle: &dyn Dataset,
     gpu_decompress: bool,
-    vortex_without_new_float: bool,
+    vortex_without_new_numeric: bool,
 ) -> anyhow::Result<(CompressMeasurements, Vec<v3::V3Record>)> {
     let bench_name = dataset_handle.name();
     let (v3_dataset, v3_variant) = dataset_handle.v3_dataset_dims();
@@ -302,7 +302,7 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, gpu_decompress, vortex_without_new_float);
+        let compressor = get_compressor(*format, gpu_decompress, vortex_without_new_numeric);
 
         for op in ops {
             let time = match op {

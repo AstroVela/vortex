@@ -30,24 +30,30 @@ use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
+use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 
 /// Compressor implementation for Vortex format.
 pub struct VortexCompressor {
-    new_float_schemes: bool,
+    new_numeric_schemes: bool,
 }
 
 impl VortexCompressor {
-    pub fn new(new_float_schemes: bool) -> Self {
-        Self { new_float_schemes }
+    pub fn new(new_numeric_schemes: bool) -> Self {
+        Self {
+            new_numeric_schemes,
+        }
     }
 
     fn write_options(&self) -> VortexWriteOptions {
         let options = SESSION.write_options();
-        if self.new_float_schemes {
+        if self.new_numeric_schemes {
             return options;
         }
-        let compressor = BtrBlocksCompressorBuilder::default()
-            .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()]);
+        let compressor = BtrBlocksCompressorBuilder::default().exclude_schemes([
+            FloatQuantScheme.id(),
+            OrderedBlockResidualScheme.id(),
+            BlockResidualScheme.id(),
+        ]);
         options.with_strategy(
             WriteStrategyBuilder::default()
                 .with_btrblocks_builder(compressor)
