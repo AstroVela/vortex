@@ -128,8 +128,14 @@ fn test_rle_compression() -> VortexResult<()> {
     Ok(())
 }
 
-#[test_with::env(CI)]
-#[test_with::no_env(VORTEX_SKIP_SLOW_TESTS)]
+/// Compresses 50M values, so it is ignored by default and run only by the "Rust tests
+/// (linux-arm64)" CI job. To run it locally:
+///
+/// ```text
+/// cargo test --release -p vortex-btrblocks compress_large_int -- --ignored
+/// ```
+#[test]
+#[ignore = "slow: compresses 50M values, run by the \"Rust tests (linux-arm64)\" CI job"]
 fn compress_large_int() -> VortexResult<()> {
     const NUM_LISTS: usize = 10_000;
     const ELEMENTS_PER_LIST: usize = 5_000;
