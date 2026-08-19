@@ -136,7 +136,13 @@ impl BoundExpression {
         scalar_fn: ScalarFnRef,
         children: impl IntoIterator<Item = BoundExpressionRef>,
     ) -> VortexResult<BoundExpressionRef> {
-        let children: Box<[_]> = children.into_iter().collect();
+        Self::try_new_boxed(scalar_fn, children.into_iter().collect())
+    }
+
+    fn try_new_boxed(
+        scalar_fn: ScalarFnRef,
+        children: Box<[BoundExpressionRef]>,
+    ) -> VortexResult<BoundExpressionRef> {
         vortex_ensure!(
             scalar_fn.signature().arity().matches(children.len()),
             "Expression arity mismatch: expected {} children but got {}",
@@ -163,12 +169,7 @@ impl BoundExpression {
         children: impl IntoIterator<Item = BoundExpressionRef>,
     ) -> VortexResult<BoundExpressionRef> {
         let children: Box<[_]> = children.into_iter().collect();
-        let BoundExpression::Scalar {
-            dtype,
-            scalar_fn,
-            children: old_children,
-        } = self.as_ref()
-        else {
+        let BoundExpression::Scalar { scalar_fn, .. } = self.as_ref() else {
             vortex_ensure!(
                 children.is_empty(),
                 "Root expression cannot have {} children",
@@ -177,21 +178,7 @@ impl BoundExpression {
             return Ok(self);
         };
 
-        // cheaply check dtype equality before rebuilding the scalar
-        if children.len() == old_children.len()
-            && children
-                .iter()
-                .zip(old_children.iter())
-                .all(|(new, old)| new.dtype() == old.dtype())
-        {
-            return Ok(Arc::new(Self::Scalar {
-                dtype: dtype.clone(),
-                scalar_fn: scalar_fn.clone(),
-                children,
-            }));
-        }
-
-        Self::try_new(scalar_fn.clone(), children)
+        Self::try_new_boxed(scalar_fn.clone(), children)
     }
 
     /// The dtype this expression evaluates to.
