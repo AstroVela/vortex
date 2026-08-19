@@ -25,6 +25,7 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 use crate::normalize_null_values;
+use crate::schemes::integer::patch_adjusted_nbytes;
 
 const BLOCK_LEN: usize = 1024;
 const ESTIMATE_BLOCKS: usize = 8;
@@ -69,7 +70,7 @@ impl Scheme for OrderedBlockResidualScheme {
                 let ordered = OrderedFloat::from_primitive(sample.as_view())?;
                 let residuals =
                     BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
-                let after_nbytes = residuals.nbytes();
+                let after_nbytes = patch_adjusted_nbytes(&residuals);
                 if after_nbytes == 0 {
                     return Ok(EstimateVerdict::Skip);
                 }

@@ -115,6 +115,17 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
         permuted as f64 - 500_000.0
     }));
 
+    let patch_density_4 = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        if index % 4 == 0 {
+            u32::MAX - u32::try_from(index).unwrap_or(u32::MAX)
+        } else {
+            42
+        }
+    }));
+    let patch_density_1 = PrimitiveArray::from_iter(
+        (0..row_count).map(|index| u32::MAX - u32::try_from(index).unwrap_or(u32::MAX)),
+    );
+
     vec![
         (
             "synthetic-widened-f32".to_string(),
@@ -139,6 +150,14 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
         (
             "synthetic-integer-valued".to_string(),
             vec![column("value", integer_valued)],
+        ),
+        (
+            "synthetic-patch-density-4".to_string(),
+            vec![column("value", patch_density_4)],
+        ),
+        (
+            "synthetic-patch-density-1".to_string(),
+            vec![column("value", patch_density_1)],
         ),
     ]
 }
@@ -307,8 +326,25 @@ fn profile_block_residual_array(
             .map(|&width| f64::from(width))
             .sum::<f64>()
             / blocks as f64;
+        let patch_starts = residuals
+            .patch_starts()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let patch_starts = patch_starts.as_slice::<u32>();
+        let mut maximum_patch_density = 0.0_f64;
+        let mut blocks_above_one_eighth = 0usize;
+        let mut blocks_at_one_quarter = 0usize;
+        for (block_index, starts) in patch_starts.windows(2).enumerate() {
+            let patch_count = usize::try_from(starts[1] - starts[0])?;
+            let block_start = block_index * 1_024;
+            let block_len = (array.len() - block_start).min(1_024);
+            maximum_patch_density =
+                maximum_patch_density.max(patch_count as f64 / block_len as f64);
+            blocks_above_one_eighth += usize::from(patch_count * 8 > block_len);
+            blocks_at_one_quarter += usize::from(patch_count * 4 >= block_len);
+        }
         println!(
-            "block-residual-profile\t{dataset}\t{column}\t{config}\t{path}\t{}\t{}\t{}\t{blocks}\t{average_residual_width:.3}\t{average_high_width:.3}\t{}",
+            "block-residual-profile\t{dataset}\t{column}\t{config}\t{path}\t{}\t{}\t{}\t{blocks}\t{average_residual_width:.3}\t{average_high_width:.3}\t{maximum_patch_density:.3}\t{blocks_above_one_eighth}\t{blocks_at_one_quarter}\t{}",
             array.dtype().as_ptype(),
             array.len(),
             residuals.patch_positions().len(),
@@ -826,7 +862,10 @@ fn measure_dataset(
                 encoding_tree(array),
                 array.nbytes()
             );
-            if *config == "integer-block-residual-only" {
+            if matches!(
+                *config,
+                "integer-block-residual-only" | "ordered-block-residual-only"
+            ) {
                 profile_block_residual_array(
                     dataset,
                     &column.name,
@@ -995,7 +1034,7 @@ fn main() -> VortexResult<()> {
     );
     println!("result\tdataset\tconfig\trows\tinput-bytes\tencoded-bytes\tencode-MB/s\tdecode-MB/s");
     println!(
-        "block-residual-profile\tdataset\tcolumn\tconfig\tpath\tptype\trows\tpatches\tblocks\taverage-residual-width\taverage-high-width\tbytes"
+        "block-residual-profile\tdataset\tcolumn\tconfig\tpath\tptype\trows\tpatches\tblocks\taverage-residual-width\taverage-high-width\tmaximum-patch-density\tblocks-above-one-eighth\tblocks-at-one-quarter\tbytes"
     );
     if std::env::var_os("VORTEX_BENCH_SKIP_SYNTHETIC").is_none() {
         let synthetic_filter = std::env::var("VORTEX_BENCH_SYNTHETIC").ok();
@@ -1015,7 +1054,7 @@ fn main() -> VortexResult<()> {
             .file_stem()
             .and_then(|name| name.to_str())
             .ok_or_else(|| vortex_err!("data path has no valid file name"))?;
-        let columns = if path
+        let mut columns = if path
             .extension()
             .is_some_and(|extension| extension == "parquet")
         {
@@ -1023,6 +1062,13 @@ fn main() -> VortexResult<()> {
         } else {
             read_california(path, row_count)?
         };
+        if let Ok(column_filter) = std::env::var("VORTEX_BENCH_COLUMN") {
+            columns.retain(|column| column.name == column_filter);
+            vortex_ensure!(
+                !columns.is_empty(),
+                "dataset does not contain the requested column"
+            );
+        }
         measure_dataset(dataset, &columns, &configs, &session)?;
     }
     Ok(())

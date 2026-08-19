@@ -13,6 +13,8 @@ use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::match_each_integer_ptype;
 use vortex_block_residual::BlockResidual;
+use vortex_block_residual::BlockResidualArray;
+use vortex_block_residual::BlockResidualArraySlotsExt;
 use vortex_compressor::builtins::BinaryDictScheme;
 use vortex_compressor::builtins::FloatDictScheme;
 use vortex_compressor::builtins::IntDictScheme;
@@ -34,6 +36,9 @@ use crate::normalize_null_values;
 const BLOCK_LEN: usize = 1024;
 const ESTIMATE_BLOCKS: usize = 8;
 const MIN_COMPRESSION_RATIO: f64 = 1.05;
+// The 25-percent patch sweep needs about 80 cost bits per patch to reject its slow tree.
+// This quadratic slope reaches that cost at 25 percent while it keeps sparse patches cheap.
+const PATCH_DENSITY_COST_BITS: u64 = 320;
 
 /// Compress integers with one reference and packed residuals per 1,024-value block.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -88,7 +93,7 @@ impl Scheme for BlockResidualScheme {
                 let sample = normalize_null_values(sample.as_view(), exec_ctx)?;
                 let before_nbytes = sample.nbytes();
                 let residuals = BlockResidual::from_primitive(sample.as_view())?;
-                let after_nbytes = residuals.nbytes();
+                let after_nbytes = patch_adjusted_nbytes(&residuals);
                 if after_nbytes == 0 {
                     return Ok(EstimateVerdict::Skip);
                 }
@@ -123,6 +128,24 @@ impl Scheme for BlockResidualScheme {
     }
 }
 
+pub(crate) fn patch_adjusted_nbytes(residuals: &BlockResidualArray) -> u64 {
+    residuals.nbytes().saturating_add(patch_density_cost_bytes(
+        residuals.len(),
+        residuals.patch_positions().len(),
+    ))
+}
+
+fn patch_density_cost_bytes(len: usize, patch_count: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let patch_count = u64::try_from(patch_count).unwrap_or(u64::MAX);
+    patch_count
+        .saturating_mul(patch_count)
+        .saturating_mul(PATCH_DENSITY_COST_BITS)
+        .div_ceil(u64::try_from(len).unwrap_or(u64::MAX).saturating_mul(8))
+}
+
 fn locality_sample(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     exec_ctx: &mut ExecutionCtx,
@@ -153,4 +176,16 @@ fn locality_sample(
         }
         PrimitiveArray::from_option_iter(sample)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patch_density_cost_bytes;
+
+    #[test]
+    fn patch_density_cost_is_nonlinear() {
+        assert_eq!(patch_density_cost_bytes(1_024, 0), 0);
+        assert_eq!(patch_density_cost_bytes(1_024, 102), 407);
+        assert_eq!(patch_density_cost_bytes(1_024, 256), 2_560);
+    }
 }

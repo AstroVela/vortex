@@ -120,6 +120,21 @@ fn test_block_residual_skips_narrow_integers() -> VortexResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_block_residual_rejects_dense_patches() -> VortexResult<()> {
+    let values = (0..8_192_u32).map(|index| if index % 4 == 0 { u32::MAX - index } else { 42 });
+    let array = PrimitiveArray::from_iter(values);
+    let compressed = BtrBlocksCompressor::default()
+        .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        !contains_block_residual(&compressed),
+        "dense patches must not select BlockResidual:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}
+
 fn contains_block_residual(array: &vortex_array::ArrayRef) -> bool {
     array.is::<BlockResidual>() || array.children().iter().any(contains_block_residual)
 }

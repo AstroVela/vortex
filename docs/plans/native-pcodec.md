@@ -46,7 +46,7 @@ The GloVe result identifies a separate entropy gap inside the ALP integer child.
 
 Generic quotient and remainder trees do not close that gap.
 
-The current selector factors and dense-patch cost remain provisional.
+The current selector factors and nonlinear patch cost remain provisional.
 
 Final calibration requires the complete corpus and selected-tree evidence.
 
@@ -156,11 +156,17 @@ A 1.20 factor requires about 16.7 percent fewer estimated bytes. It does not req
 
 The block planner adds 16 synthetic cost bits per patch.
 
-This cost preserves useful sparse-patch trees. It does not prevent every dense-patch decode regression.
+This cost selects the physical residual width. It preserves useful sparse-patch trees.
 
 A global 96-bit patch cost prevented the synthetic dense-patch regressions. It also removed useful sparse-patch compression on HashTags.
 
-The next planner experiment will add cost only after a block enters the measured slow patch-density region.
+The BtrBlocks estimator adds a separate nonlinear decode cost.
+
+For `p` patches and `n` values, it adds `320 * p * p / n` synthetic bits.
+
+This formula adds 80 bits per patch at 25 percent density. It adds 32 bits per patch at 10 percent density.
+
+The physical encoding remains size-optimal. The adjusted size only affects selection.
 
 The selector excludes BlockResidual from dictionary-code children. A complete BlockResidual tree can still displace a complete dictionary tree.
 
@@ -474,7 +480,37 @@ Decode throughput changed from 22.54 GB/s to 22.77 GB/s. Encode throughput did n
 
 The global 96-bit cost is rejected.
 
-The next planner must preserve low-density patches and penalize the dense patch region.
+The first per-block density gate also rejected the two useful HashTags trees.
+
+The selector-level cost uses total sample density instead. It preserves the physical encoding and compares the complete tree against its incumbent.
+
+The dense synthetic tree now retains BitPacked.
+
+| Synthetic input | Prior tree | Proposed tree | Proposed bytes | Result |
+| --- | --- | --- | ---: | --- |
+| 25 percent patches | BitPacked | BitPacked | 5,508,488 | Reject BlockResidual |
+| Packed residuals | FoR with BitPacked | BlockResidual | 2,543,221 | Select BlockResidual |
+
+The packed-residual prior tree uses 5,252,352 bytes.
+
+BlockResidual reduced its size by 51.6 percent. Encode throughput decreased by 9.4 percent, and decode throughput increased by 8.0 percent.
+
+Two HashTags trees explain the real-data tradeoff:
+
+| Column and candidate | Prior bytes | Candidate bytes | Encode change | Decode change | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `twitter#in_reply_to_user_id` BlockResidual | 701,203 | 399,111 | -23.4 percent | -3.0 percent | Reject |
+| `interaction#received_at` Ordered BlockResidual | 3,263,939 | 3,018,443 | -38.3 percent | -28.5 percent | Reject |
+
+The first tree fails the selected-column encode gate. The second tree fails both throughput gates.
+
+With the nonlinear cost, complete HashTags size is 21,874,126 bytes.
+
+The prior default uses 22,602,522 bytes. The unpenalized new default used 21,306,418 bytes but selected both failing trees.
+
+The gated default reduces size by 3.2 percent against the prior default.
+
+Its measured aggregate encode throughput increased by 0.9 percent. Decode throughput increased by 5.6 percent.
 
 BlockResidual also composes with outer encodings. Sparse and RunEnd children selected BlockResidual in HashTags and the synthetic low-density sweep.
 
@@ -718,6 +754,9 @@ This round completed these steps:
 - Excluded BlockResidual from dictionary-code children.
 - Added fused f32 OrderedFloat with BlockResidual decode and selection.
 - Added u32, i32, f32, and patch-density benchmarks.
+- Added complete-compressor patch-density datasets and a column filter to the profiling benchmark.
+- Added patch-density statistics to the BlockResidual profile.
+- Replaced the global patch cost experiment with a nonlinear selector cost.
 - Removed the full patch scan from scalar access.
 - Made null payload bits neutral for the new default candidates.
 - Excluded integer BlockResidual from the CUDA-compatible preset.
@@ -736,20 +775,19 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these remaining steps:
 
-1. Prototype a density-aware BlockResidual patch cost.
-2. Re-run the patch sweep and the affected real columns after each planner change.
-3. Measure BlockResidual under temporal, FSST, Sparse, RunEnd, and list parents.
-4. Reduce analysis cost on short rejected columns.
-5. Evaluate narrow BlockResidual as a Compact-only candidate.
-6. Prototype bounded scalar checkpoints for fixed-bin range packing.
-7. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
-8. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-9. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-10. Prototype one lightweight scheme for the repeated real-float gap classes.
-11. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-12. Compare the geometric mean against Parquet with Zstd.
-13. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-14. Update this plan after each experiment.
+1. Validate the nonlinear patch cost on the complete corpus.
+2. Measure BlockResidual under temporal, FSST, Sparse, RunEnd, and list parents.
+3. Reduce analysis cost on short rejected columns.
+4. Evaluate narrow BlockResidual as a Compact-only candidate.
+5. Prototype bounded scalar checkpoints for fixed-bin range packing.
+6. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
+7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+8. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+9. Prototype one lightweight scheme for the repeated real-float gap classes.
+10. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+11. Compare the geometric mean against Parquet with Zstd.
+12. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+13. Update this plan after each experiment.
 
 ## Pull request structure
 
