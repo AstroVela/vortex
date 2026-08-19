@@ -241,3 +241,30 @@ fn test_f32_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
     assert!(compressed.children()[0].is::<BlockResidual>());
     Ok(())
 }
+
+#[test]
+fn test_block_residual_composes_with_alp() -> VortexResult<()> {
+    let values = (0..65_536_usize).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+        (block * 1_000_000 + residual) as f64
+    });
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let compressed =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        compressed.is::<ALP>(),
+        "expected ALP, got tree:\n{}",
+        compressed.display_tree()
+    );
+    assert!(
+        compressed
+            .children()
+            .iter()
+            .any(|child| child.is::<BlockResidual>()),
+        "expected a BlockResidual child:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}

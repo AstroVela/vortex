@@ -135,6 +135,52 @@ fn test_block_residual_rejects_dense_patches() -> VortexResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_block_residual_composes_with_sparse() -> VortexResult<()> {
+    let values = (0..65_536_usize).map(|index| {
+        if index % 16 == 0 {
+            let value_index = index / 16;
+            let block = value_index / 1_024;
+            let residual = value_index.wrapping_mul(2_654_435_761) % 1_024;
+            block as u64 * 1_000_000_000_000 + residual as u64
+        } else {
+            42
+        }
+    });
+    let array = PrimitiveArray::from_iter(values);
+    let compressed = BtrBlocksCompressor::default()
+        .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+
+    assert!(compressed.is::<Sparse>());
+    assert!(
+        contains_block_residual(&compressed),
+        "expected a BlockResidual child:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_block_residual_composes_with_runend() -> VortexResult<()> {
+    let values = (0..65_536_usize).map(|index| {
+        let value_index = index / 16;
+        let block = value_index / 1_024;
+        let residual = value_index.wrapping_mul(2_654_435_761) % 1_024;
+        block as u64 * 1_000_000_000_000 + residual as u64
+    });
+    let array = PrimitiveArray::from_iter(values);
+    let compressed = BtrBlocksCompressor::default()
+        .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+
+    assert!(compressed.is::<RunEnd>());
+    assert!(
+        contains_block_residual(&compressed),
+        "expected a BlockResidual child:\n{}",
+        compressed.display_tree()
+    );
+    Ok(())
+}
+
 fn contains_block_residual(array: &vortex_array::ArrayRef) -> bool {
     array.is::<BlockResidual>() || array.children().iter().any(contains_block_residual)
 }

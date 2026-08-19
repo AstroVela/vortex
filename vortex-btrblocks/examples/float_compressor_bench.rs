@@ -27,13 +27,19 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
+use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
+use vortex_array::arrays::ListArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::TemporalArray;
+use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
+use vortex_array::extension::datetime::TimeUnit;
+use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
 use vortex_block_residual::BlockResidual;
 use vortex_block_residual::BlockResidualArraySlotsExt;
@@ -64,20 +70,36 @@ const CALIFORNIA_COLUMNS: [&str; 9] = [
 
 struct Column {
     name: String,
-    primitive: PrimitiveArray,
+    primitive: Option<PrimitiveArray>,
     array: ArrayRef,
+    input_bytes: u64,
+    dtype_label: String,
 }
 
 fn column(name: impl Into<String>, primitive: PrimitiveArray) -> Column {
     let array = primitive.clone().into_array();
+    let input_bytes = array.nbytes();
+    let dtype_label = primitive.ptype().to_string();
     Column {
         name: name.into(),
-        primitive,
+        primitive: Some(primitive),
+        array,
+        input_bytes,
+        dtype_label,
+    }
+}
+
+fn array_column(name: impl Into<String>, array: ArrayRef) -> Column {
+    Column {
+        name: name.into(),
+        primitive: None,
+        input_bytes: array.nbytes(),
+        dtype_label: array.dtype().to_string(),
         array,
     }
 }
 
-fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
+fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>)>> {
     let mut widened_rng = StdRng::seed_from_u64(1);
     let widened_f32 = PrimitiveArray::from_iter((0..row_count).map(|index| {
         let trend = (index % 10_000) as f32 * 0.001;
@@ -114,6 +136,19 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
         let permuted = (index as u64).wrapping_mul(2_654_435_761) % 1_000_000;
         permuted as f64 - 500_000.0
     }));
+    let block_local_integer_valued = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+        (block * 1_000_000 + residual) as f64
+    }));
+    let block_local_ordered_float = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+        let bits = 0x3ff0_0000_0000_0000_u64
+            + u64::try_from(block).unwrap_or(u64::MAX) * 0x1_0000
+            + u64::try_from(residual).unwrap_or(u64::MAX);
+        f64::from_bits(bits)
+    }));
 
     let patch_density_4 = PrimitiveArray::from_iter((0..row_count).map(|index| {
         if index % 4 == 0 {
@@ -125,8 +160,72 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
     let patch_density_1 = PrimitiveArray::from_iter(
         (0..row_count).map(|index| u32::MAX - u32::try_from(index).unwrap_or(u32::MAX)),
     );
+    let sparse_block_local = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        if index % 16 == 0 {
+            let value_index = index / 16;
+            let block = value_index / 1_024;
+            let residual = value_index.wrapping_mul(2_654_435_761) % 1_024;
+            u64::try_from(block).unwrap_or(u64::MAX) * 1_000_000_000_000
+                + u64::try_from(residual).unwrap_or(u64::MAX)
+        } else {
+            42
+        }
+    }));
+    let runend_block_local = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let value_index = index / 16;
+        let block = value_index / 1_024;
+        let residual = value_index.wrapping_mul(2_654_435_761) % 1_024;
+        u64::try_from(block).unwrap_or(u64::MAX) * 1_000_000_000_000
+            + u64::try_from(residual).unwrap_or(u64::MAX)
+    }));
 
-    vec![
+    let mut temporal_rng = StdRng::seed_from_u64(4);
+    let mut timestamp = 1_700_000_000_000_000_i64;
+    let timestamp_values = PrimitiveArray::from_iter((0..row_count).map(|_| {
+        timestamp += temporal_rng.random_range(1_000_i64..1_000_000);
+        timestamp
+    }));
+    let temporal = TemporalArray::new_timestamp(
+        timestamp_values.into_array(),
+        TimeUnit::Microseconds,
+        Some(Arc::from("UTC")),
+    )
+    .into_array();
+
+    let list_elements = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+        u64::try_from(block).unwrap_or(u64::MAX) * 1_000_000_000_000
+            + u64::try_from(residual).unwrap_or(u64::MAX)
+    }));
+    let mut list_offsets = Vec::with_capacity(row_count.div_ceil(8) + 1);
+    list_offsets.push(0_u32);
+    let mut list_offset = 0usize;
+    while list_offset < row_count {
+        list_offset = (list_offset + 8).min(row_count);
+        list_offsets.push(u32::try_from(list_offset).unwrap_or(u32::MAX));
+    }
+    let list = ListArray::try_new(
+        list_elements.into_array(),
+        PrimitiveArray::from_iter(list_offsets).into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+
+    let string_count = row_count.min(500_000);
+    let strings = (0..string_count)
+        .map(|index| {
+            format!(
+                "user{:06}@example{}.com",
+                index.wrapping_mul(2_654_435_761) % 1_000_000,
+                index % 100
+            )
+        })
+        .collect::<Vec<_>>();
+    let fsst_strings =
+        VarBinViewArray::from_iter_str(strings.iter().map(String::as_str)).into_array();
+
+    Ok(vec![
         (
             "synthetic-widened-f32".to_string(),
             vec![column("value", widened_f32)],
@@ -152,6 +251,14 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
             vec![column("value", integer_valued)],
         ),
         (
+            "synthetic-alp-block-local".to_string(),
+            vec![column("value", block_local_integer_valued)],
+        ),
+        (
+            "synthetic-ordered-float-block-local".to_string(),
+            vec![column("value", block_local_ordered_float)],
+        ),
+        (
             "synthetic-patch-density-4".to_string(),
             vec![column("value", patch_density_4)],
         ),
@@ -159,7 +266,27 @@ fn synthetic_datasets(row_count: usize) -> Vec<(String, Vec<Column>)> {
             "synthetic-patch-density-1".to_string(),
             vec![column("value", patch_density_1)],
         ),
-    ]
+        (
+            "synthetic-sparse-block-local".to_string(),
+            vec![column("value", sparse_block_local)],
+        ),
+        (
+            "synthetic-runend-block-local".to_string(),
+            vec![column("value", runend_block_local)],
+        ),
+        (
+            "synthetic-temporal-parent".to_string(),
+            vec![array_column("value", temporal)],
+        ),
+        (
+            "synthetic-list-parent".to_string(),
+            vec![array_column("value", list)],
+        ),
+        (
+            "synthetic-fsst-parent".to_string(),
+            vec![array_column("value", fsst_strings)],
+        ),
+    ])
 }
 
 fn read_california(path: &Path, row_count: usize) -> VortexResult<Vec<Column>> {
@@ -380,7 +507,7 @@ fn decode_all(arrays: &[ArrayRef], session: &VortexSession) -> VortexResult<()> 
         black_box(
             array
                 .clone()
-                .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?,
+                .execute::<RecursiveCanonical>(&mut session.create_execution_ctx())?,
         );
     }
     Ok(())
@@ -843,9 +970,7 @@ fn measure_dataset(
 ) -> VortexResult<()> {
     let mut input_bytes = 0_u64;
     for column in columns {
-        input_bytes += u64::try_from(column.primitive.len())?
-            * u64::try_from(column.primitive.ptype().bit_width())?
-            / 8;
+        input_bytes += column.input_bytes;
     }
     let encoded = configs
         .iter()
@@ -858,7 +983,7 @@ fn measure_dataset(
             println!(
                 "structure\t{dataset}\t{}\t{}\t{config}\t{}\t{}",
                 column.name,
-                column.primitive.ptype(),
+                column.dtype_label,
                 encoding_tree(array),
                 array.nbytes()
             );
@@ -887,12 +1012,15 @@ fn measure_dataset(
         .find(|(config, _)| *config == "prior-compact")
         .ok_or_else(|| vortex_err!("prior-compact configuration is missing"))?;
     for (column_index, column) in columns.iter().enumerate() {
-        if !column.primitive.ptype().is_float() {
+        let Some(primitive) = &column.primitive else {
+            continue;
+        };
+        if !primitive.ptype().is_float() {
             continue;
         }
         let default_array = &prior_default.1[column_index];
         let compact_array = &prior_compact.1[column_index];
-        let input_bytes = column.primitive.len() * column.primitive.ptype().byte_width();
+        let input_bytes = primitive.len() * primitive.ptype().byte_width();
         let default_bytes = default_array.nbytes();
         let compact_bytes = compact_array.nbytes();
         let compact_savings = if default_bytes == 0 {
@@ -903,8 +1031,8 @@ fn measure_dataset(
         println!(
             "float-column\t{dataset}\t{}\t{}\t{}\t{input_bytes}\t{default_bytes}\t{compact_bytes}\t{compact_savings:.3}\t{}\t{}",
             column.name,
-            column.primitive.ptype(),
-            column.primitive.len(),
+            primitive.ptype(),
+            primitive.len(),
             encoding_tree(default_array),
             encoding_tree(compact_array),
         );
@@ -951,7 +1079,7 @@ fn measure_dataset(
         let decode_throughput = input_bytes as f64 / decode_median.as_secs_f64() / 1_000_000.0;
         println!(
             "result\t{dataset}\t{config}\t{}\t{input_bytes}\t{encoded_bytes}\t{encode_throughput:.1}\t{decode_throughput:.1}",
-            columns[0].primitive.len()
+            columns[0].array.len()
         );
     }
     Ok(())
@@ -1038,7 +1166,7 @@ fn main() -> VortexResult<()> {
     );
     if std::env::var_os("VORTEX_BENCH_SKIP_SYNTHETIC").is_none() {
         let synthetic_filter = std::env::var("VORTEX_BENCH_SYNTHETIC").ok();
-        for (dataset, columns) in synthetic_datasets(row_count) {
+        for (dataset, columns) in synthetic_datasets(row_count)? {
             if synthetic_filter
                 .as_deref()
                 .is_some_and(|filter| filter != dataset)

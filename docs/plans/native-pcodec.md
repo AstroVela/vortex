@@ -36,6 +36,10 @@ The default candidate set includes their three BtrBlocks schemes.
 
 `OrderedFloat(BlockResidual)` now supports `f32` and `f64` inputs.
 
+The float scheme applies `OrderedFloat` first, then `BlockResidual` to the unsigned child.
+
+The serialized tree uses `OrderedFloat(BlockResidual(...))` because the outer array restores the float dtype.
+
 The FloatQuant candidate accepts native `f32` and `f64` inputs.
 
 Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
@@ -319,7 +323,9 @@ The incumbent and outer tree estimates remain approximate. Trial compression pre
 
 The outer-sample exclusion removed that error from the measured tree.
 
-### Broad numeric revalidation
+### Broad numeric revalidation before patch-density calibration
+
+This table predates the nonlinear patch cost. The later patch-density section contains the current HashTags result.
 
 The focused run uses two million rows when the source contains that many rows.
 
@@ -514,7 +520,38 @@ Its measured aggregate encode throughput increased by 0.9 percent. Decode throug
 
 BlockResidual also composes with outer encodings. Sparse and RunEnd children selected BlockResidual in HashTags and the synthetic low-density sweep.
 
-This composition reduced size, but it requires parent-specific throughput validation.
+### Complete parent compositions
+
+The finalized benchmark decodes every nested child to recursive canonical form.
+
+Each numeric case contains two million source values. The FSST case contains 500,000 strings.
+
+| Complete tree | Prior bytes | Proposed bytes | Encode change | Decode change |
+| --- | ---: | ---: | ---: | ---: |
+| Timestamp storage with direct BlockResidual | 9,254,235 | 7,293,370 | -5.1 percent | +348.9 percent |
+| `List(BlockResidual)` | 12,755,712 | 2,543,268 | +1.0 percent | +24.8 percent |
+| FSST with two BlockResidual children | 4,675,014 | 4,118,592 | -0.4 percent | +8.1 percent |
+| `ALP(BlockResidual)` | 7,753,472 | 2,543,268 | -0.2 percent | +1.0 percent |
+| `Sparse(BlockResidual, BlockResidual)` | 1,070,594 | 383,297 | +1.9 percent | +6.3 percent |
+| `RunEnd(Sequence, BlockResidual)` | 739,968 | 159,124 | +0.5 percent | +1.6 percent |
+
+Each composition reduced size and passed both throughput gates.
+
+The timestamp candidate displaced `DateTimeParts`. It reduced size by 21.2 percent and decoded 4.5 times faster.
+
+The list, ALP, Sparse, and RunEnd cases reduced size by 64.2 to 80.1 percent.
+
+The FSST case reduced size by 11.9 percent with no material encode cost.
+
+A separate float case selected direct `OrderedFloat(BlockResidual)`.
+
+It reduced size by 69.9 percent, increased encode throughput by 128.7 percent, and increased decode throughput by 56.4 percent.
+
+The attempted ALP-RD case did not select ALP-RD. Evidence for BlockResidual under an ALP-RD child remains missing.
+
+Focused selection tests now cover ALP, Sparse, and RunEnd child composition.
+
+Golden snapshots cover temporal and FSST parent trees.
 
 ### GloVe embeddings
 
@@ -755,6 +792,8 @@ This round completed these steps:
 - Added fused f32 OrderedFloat with BlockResidual decode and selection.
 - Added u32, i32, f32, and patch-density benchmarks.
 - Added complete-compressor patch-density datasets and a column filter to the profiling benchmark.
+- Added complete temporal, FSST, Sparse, RunEnd, list, and ALP composition benchmarks.
+- Added selection tests for BlockResidual under ALP, Sparse, and RunEnd.
 - Added patch-density statistics to the BlockResidual profile.
 - Replaced the global patch cost experiment with a nonlinear selector cost.
 - Removed the full patch scan from scalar access.
@@ -776,7 +815,7 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 Complete these remaining steps:
 
 1. Validate the nonlinear patch cost on the complete corpus.
-2. Measure BlockResidual under temporal, FSST, Sparse, RunEnd, and list parents.
+2. Add a true ALP-RD child composition case if a real selected tree exposes one.
 3. Reduce analysis cost on short rejected columns.
 4. Evaluate narrow BlockResidual as a Compact-only candidate.
 5. Prototype bounded scalar checkpoints for fixed-bin range packing.
