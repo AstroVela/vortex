@@ -54,6 +54,7 @@ vortex-session = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }
 
 [dev-dependencies]
+divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 insta = { workspace = true }
 rstest = { workspace = true }
@@ -65,6 +66,10 @@ vortex-io = { path = "../vortex-io", features = ["tokio"] }
 [features]
 _test-harness = []
 tokio = ["dep:tokio", "vortex-error/tokio"]
+
+[[bench]]
+name = "zone_map_prune"
+harness = false
 
 [lints]
 workspace = true
