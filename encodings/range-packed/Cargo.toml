@@ -20,6 +20,7 @@ vortex-error = { workspace = true }
 vortex-session = { workspace = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 
 [lints]

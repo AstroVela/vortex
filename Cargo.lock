@@ -9557,6 +9557,7 @@ dependencies = [
  "vortex-metrics",
  "vortex-pco",
  "vortex-proto",
+ "vortex-range-packed",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -10190,6 +10191,7 @@ dependencies = [
  "vortex-metrics",
  "vortex-onpair",
  "vortex-pco",
+ "vortex-range-packed",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -10547,6 +10549,7 @@ dependencies = [
 name = "vortex-range-packed"
 version = "0.1.0"
 dependencies = [
+ "rstest",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",

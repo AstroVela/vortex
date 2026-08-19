@@ -280,6 +280,11 @@ pub mod encodings {
         pub use vortex_block_residual::*;
     }
 
+    /// Fixed-bin range-packed integer encoding.
+    pub mod range_packed {
+        pub use vortex_range_packed::*;
+    }
+
     /// Arrow-compatible run-end encoding.
     pub mod runend {
         pub use vortex_runend::*;

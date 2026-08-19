@@ -60,11 +60,10 @@ use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_session::VortexSession;
-use vortex_utils::aliases::hash_map::HashMap;
-
 use vortex_range_packed::RangePacked;
 use vortex_range_packed::RangePackedCodec;
+use vortex_session::VortexSession;
+use vortex_utils::aliases::hash_map::HashMap;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
 const CALIFORNIA_COLUMNS: [&str; 9] = [
