@@ -1,0 +1,193 @@
+# Runs the GPU-enabled compression decompression benchmarks.
+#
+# Two modes:
+#   - `pr`      -- called from pr-bench-dispatch.yml when the `action/bench-gpu-compress` label
+#                  is added. Compares against the recorded baseline and comments on the PR.
+#   - `develop` -- called from develop-bench.yml after every commit to `develop`. Records the
+#                  run to S3 and to the v4 Postgres store that feeds bench.vortex.dev.
+
+name: GPU Compression Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.mode }}-${{ github.head_ref || github.run_id }}-gpu-compress
+  cancel-in-progress: false
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        type: string
+        default: "pr"
+        description: "`pr` compares against the baseline and comments; `develop` records the run."
+  workflow_dispatch:
+    inputs:
+      mode:
+        required: false
+        type: string
+        default: "pr"
+        description: "`pr` compares against the baseline and comments; `develop` records the run."
+
+# No workflow-level `permissions`: the token is inherited from the calling job, as in
+# sql-bench-matrix.yml. A called workflow may only narrow the caller's grant, and the two
+# callers need different scopes -- pr-bench-dispatch.yml grants `pull-requests: write` for the
+# PR comment, develop-bench.yml grants `id-token: write` for the AWS OIDC upload but no
+# pull-request access. Declaring the union here would fail the develop-mode call outright.
+
+jobs:
+  gpu-compress-bench:
+    name: GPU Compression
+    timeout-minutes: 120
+    runs-on: >-
+      runs-on=${{ github.run_id }}/family=g5/cpu=8/image=ubuntu24-gpu-x64/extras=s3-cache/tag=gpu-compress-bench
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ inputs.mode == 'pr' && github.event.pull_request.head.sha || github.sha }}
+          # `compare-benchmark-jsons.py` resolves its baseline by walking `git rev-list HEAD`,
+          # which reaches only the tip of a shallow clone. `post-ingest.py` likewise reads the
+          # benchmarked commit's metadata with `git show`.
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          enable-sccache: "true"
+      - name: Install DuckDB
+        # The Public BI datasets are converted from CSV to Parquet through the DuckDB CLI.
+        # Without it those datasets cannot build their fixture.
+        uses: ./.github/actions/setup-duckdb
+      - name: Install uv
+        uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+        with:
+          # Only `.venv-cudf` below is used, so the repository-wide sync would build the
+          # `vortex-python` extension — and its Rust — for nothing.
+          sync: false
+      - name: Install cuDF
+        # The GPU Parquet number is a cuDF `read_parquet`. cuDF ships prebuilt manylinux wheels
+        # on NVIDIA's index, so it stays a runtime dependency and never enters the Rust build.
+        run: |
+          uv venv --python 3.12 .venv-cudf
+          uv pip install --python .venv-cudf \
+            --extra-index-url https://pypi.nvidia.com \
+            cudf-cu12 pandas pyarrow
+          echo "$PWD/.venv-cudf/bin" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/system-info
+      - name: Display NVIDIA GPU details
+        run: |
+          nvidia-smi
+          nvidia-smi -L
+          nvidia-smi -q -d Memory
+      - name: Build GPU compression benchmark
+        shell: bash
+        run: |
+          cargo build --locked --package compress-bench --profile release_debug --features cuda,unstable_encodings
+      - name: Setup benchmark environment
+        run: sudo bash scripts/setup-benchmark.sh
+      - name: Run GPU compression benchmark
+        shell: bash
+        env:
+          RUST_BACKTRACE: full
+          BENCH_MODE: ${{ inputs.mode }}
+          # Do not enable VORTEX_EXPERIMENTAL_PATCHED_ARRAY here: it rewrites interior
+          # `Patches` into a top-level `vortex.patched` array, which has no CUDA decode
+          # kernel and makes GPU decompression fail with "No CUDA kernel for encoding
+          # vortex.patched". Leaving it unset keeps patches inline in the bitpacked array,
+          # which the CUDA bitpacked kernel decodes. This matches the GPU test workflow
+          # (cuda.yaml), which also sets only FLAT_LAYOUT_INLINE_ARRAY_NODE.
+          FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
+        run: |
+          set -Eeuo pipefail
+
+          # Only a recorded run needs the v4 JSONL; a PR run is compared and discarded.
+          ingest_args=()
+          if [ "$BENCH_MODE" = "develop" ]; then
+            ingest_args+=(--ingest-jsonl results.ingest.jsonl)
+          fi
+
+          bash scripts/bench-taskset.sh target/release_debug/compress-bench \
+            --gpu-decompress "${ingest_args[@]}" -d gh-json -o results.json
+      - name: Publish results
+        if: inputs.mode == 'pr'
+        shell: bash
+        run: |
+          set -Eeu -o pipefail -x
+
+          python3 scripts/s3-download.py s3://vortex-ci-benchmark-results/data.json.gz \
+            data.json.gz --no-sign-request
+          gzip -d -c data.json.gz > base.json
+
+          uv run --no-project scripts/compare-benchmark-jsons.py base.json results.json \
+            "GPU Compression" > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment PR
+        if: inputs.mode == 'pr' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
+        with:
+          file-path: comment.md
+          comment-tag: bench-pr-comment-gpu-compress
+      - name: Comment PR on failure
+        if: failure() && inputs.mode == 'pr' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b  # v3
+        with:
+          message: |
+            # BENCHMARK FAILED
+
+            GPU Compression failed. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+          comment-tag: bench-pr-comment-gpu-compress
+
+      # Recording steps (develop only). The GPU decompression rows carry
+      # `dataset_variant = "gpu"`, which is part of the `compression_times` measurement_id, so
+      # they are stored alongside — not on top of — the host suite's rows for the same dataset.
+      - name: Setup AWS CLI
+        if: inputs.mode == 'develop'
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6
+        with:
+          role-to-assume: arn:aws:iam::245040174862:role/GitHubBenchmarkRole
+          aws-region: us-east-1
+      - name: Upload Benchmark Results
+        if: inputs.mode == 'develop'
+        shell: bash
+        run: |
+          bash scripts/cat-s3.sh vortex-ci-benchmark-results data.json.gz results.json
+
+      # v4 (Postgres) ingest -- the REQUIRED benchmark-results pipeline feeding the live
+      # benchmarks website; a failure here fails the job. Gated on the ingest-role ARN var
+      # (the assume-role input that MUST exist for OIDC to succeed). post-ingest.py mints the
+      # RDS IAM token internally (boto3) from the assumed GitHubBenchmarkIngestRole;
+      # sslmode=verify-full validates the cert.
+      - name: Configure AWS credentials for v4 ingest (OIDC)
+        if: inputs.mode == 'develop' && vars.GH_BENCH_INGEST_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6
+        with:
+          role-to-assume: ${{ vars.GH_BENCH_INGEST_ROLE_ARN }}
+          aws-region: ${{ vars.RDS_BENCH_REGION }}
+      - name: Ingest results to v4 Postgres
+        if: inputs.mode == 'develop' && vars.GH_BENCH_INGEST_ROLE_ARN != ''
+        shell: bash
+        env:
+          RDS_BENCH_INSTANCE_ENDPOINT: ${{ vars.RDS_BENCH_INSTANCE_ENDPOINT }}
+          RDS_BENCH_DB_NAME: ${{ vars.RDS_BENCH_DB_NAME }}
+          AWS_REGION: ${{ vars.RDS_BENCH_REGION }}
+          BENCH_SITE_BASE_URL: ${{ vars.BENCH_SITE_BASE_URL }}
+          BENCH_REVALIDATE_TOKEN: ${{ secrets.BENCH_REVALIDATE_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+            -o "${RUNNER_TEMP}/rds-global-bundle.pem"
+          DSN="postgresql://bench_ingest@${RDS_BENCH_INSTANCE_ENDPOINT}:5432/${RDS_BENCH_DB_NAME}?sslmode=verify-full&sslrootcert=${RUNNER_TEMP}/rds-global-bundle.pem"
+          uv run --no-project --with 'psycopg[binary]' --with boto3 --with xxhash \
+            scripts/post-ingest.py results.ingest.jsonl \
+            --postgres "${DSN}" \
+            --commit-sha "${{ github.sha }}" \
+            --region "${AWS_REGION}"
+
+      - name: Alert incident.io
+        if: failure() && inputs.mode == 'develop'
+        uses: ./.github/actions/alert-incident-io
+        with:
+          api-key: ${{ secrets.INCIDENT_IO_ALERT_TOKEN }}
+          alert-title: "GPU Compression benchmark failed on develop"
+          deduplication-key: ci-bench-gpu-compress-failure

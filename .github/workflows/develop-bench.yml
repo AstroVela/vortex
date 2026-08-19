@@ -186,6 +186,15 @@ jobs:
           alert-title: "${{ matrix.benchmark.name }} benchmark failed on develop"
           deduplication-key: ci-bench-${{ matrix.benchmark.id }}-failure
 
+  # The GPU suite runs on its own (GPU) runner family, so it is a separate call rather than
+  # another entry in the `bench` matrix above. It records to the same S3 blob and v4 Postgres
+  # store, so every commit to `develop` gets a saved GPU decompression run.
+  gpu-compress:
+    uses: ./.github/workflows/bench-gpu-compress.yml
+    secrets: inherit
+    with:
+      mode: "develop"
+
   sql:
     uses: ./.github/workflows/sql-bench-matrix.yml
     secrets: inherit

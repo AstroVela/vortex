@@ -218,13 +218,15 @@ uv run --project bench-orchestrator vx-bench run tpch \
 
 Benchmarks run automatically on all commits to `develop` and can be run on-demand for PRs:
 
-- **Post-commit** -- compression, string encoding, random access, and SQL benchmarks run on every
-  commit to `develop`, with results uploaded for historical tracking.
+- **Post-commit** -- compression, GPU compression, string encoding, random access, and SQL
+  benchmarks run on every commit to `develop`, with results uploaded for historical tracking.
 - **Random access** -- `action/bench-random-access` runs only the random-access benchmark.
 - **Compression** -- `action/bench-compress` runs only the compression benchmark.
 - **String encoding** -- `action/bench-string` runs only the string encoding benchmark.
 - **GPU compression** -- `action/bench-gpu-compress` runs the allow-listed Vortex decompression
-  cases on a GPU runner.
+  cases on a GPU runner. The same suite runs post-commit on `develop`; its rows are recorded
+  under the `gpu` dataset variant, so they chart separately from the host decompression rows
+  for the same dataset.
 - **SQL** -- `action/bench-sql` runs the `pr` preset, which excludes `vortex-compact`.
 - **SQL Compact** -- `action/bench-sql-compact` runs the `pr-compact` preset, which benchmarks
   `vortex-compact` plus Parquet control rows used to distinguish code changes from runner drift.

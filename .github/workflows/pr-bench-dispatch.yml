@@ -113,8 +113,10 @@ jobs:
 
   gpu-compress-bench:
     needs: remove-gpu-compress-label
-    uses: ./.github/workflows/pr-bench-gpu-compress.yml
+    uses: ./.github/workflows/bench-gpu-compress.yml
     secrets: inherit
+    with:
+      mode: "pr"
 
   remove-sql-label:
     runs-on: ubuntu-latest
