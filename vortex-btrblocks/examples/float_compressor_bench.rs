@@ -35,6 +35,7 @@ use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
@@ -515,9 +516,31 @@ fn encode_all(
     columns: &[Column],
     session: &VortexSession,
 ) -> VortexResult<Vec<ArrayRef>> {
+    let chunk_rows = std::env::var("VORTEX_BENCH_CHUNK_ROWS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| vortex_err!("invalid VORTEX_BENCH_CHUNK_ROWS: {error}"))
+        })
+        .transpose()?;
     columns
         .iter()
-        .map(|column| compressor.compress(&column.array, &mut session.create_execution_ctx()))
+        .map(|column| {
+            let Some(chunk_rows) = chunk_rows else {
+                return compressor.compress(&column.array, &mut session.create_execution_ctx());
+            };
+            vortex_ensure!(chunk_rows > 0, "VORTEX_BENCH_CHUNK_ROWS must be positive");
+            let chunks = (0..column.array.len())
+                .step_by(chunk_rows)
+                .map(|start| {
+                    let stop = (start + chunk_rows).min(column.array.len());
+                    let chunk = column.array.slice(start..stop)?;
+                    compressor.compress(&chunk, &mut session.create_execution_ctx())
+                })
+                .collect::<VortexResult<Vec<_>>>()?;
+            Ok(ChunkedArray::try_new(chunks, column.array.dtype().clone())?.into_array())
+        })
         .collect()
 }
 

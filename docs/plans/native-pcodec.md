@@ -24,7 +24,9 @@ Remove `RangeEntropyArray`, `RangeEntropyScheme`, and `BitSplitCodec` from the f
 
 The `wm/pcodec-entropy-experiments` branch preserves the complete entropy and bit-split prototypes.
 
-Keep fixed-bin range packing as an experimental Compact candidate. It is not a default candidate.
+Keep `RangePackedArray` and its manual benchmark as experimental work.
+
+Do not add RangePacked to the default or Compact selector.
 
 Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution Delta.
 
@@ -45,6 +47,10 @@ The FloatQuant candidate accepts native `f32` and `f64` inputs.
 Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
 
 The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
+
+FloatQuant now passes the speed gates for zero-secondary and one-bit-secondary inputs.
+
+BlockResidual now passes the direct speed gates for 32-bit and 64-bit integers.
 
 The GloVe result identifies a separate entropy gap inside the ALP integer child.
 
@@ -238,9 +244,9 @@ The fixed tree was `FloatQuant(FoR(BitPacked), BitPacked)`. The secondary used o
 
 | Configuration | Bytes | Encode MB/s | Decode MB/s | Scalar access ns |
 | --- | ---: | ---: | ---: | ---: |
-| Prior ALP-RD default | 14,057,966 | 564.5 | 12,234.8 | 187 |
-| Default with FloatQuant | 9,004,032 | 633.5 | 13,462.8 | 174 |
-| Compact Pco | 6,171,139 | 268.4 | 3,054.5 | Not measured |
+| Prior ALP-RD default | 14,057,966 | 558.0 | 11,420 | 250 |
+| Default with FloatQuant | 9,004,032 | 603.2 | 13,060 | 209 |
+| Compact Pco | 6,171,139 | 255.5 | 2,914 | Not measured |
 
 FloatQuant reduced size by 36.0 percent. It was 2.9 percent larger than the zero-secondary tree.
 
@@ -250,15 +256,15 @@ The first generic decode path reached 8,375 MB/s.
 
 The fused pair kernel increased decode throughput by 59.4 percent.
 
-The complete default encoded 12.2 percent faster and decoded 10.0 percent faster than the prior default.
+The complete default encoded 8.1 percent faster and decoded 14.4 percent faster than the prior default.
 
-Scalar access latency decreased by 7.0 percent.
+Scalar access latency decreased by 16.4 percent.
 
-The direct two-child scheme compressed at 6,469 MB/s.
+The direct two-child scheme compressed at 6,298 MB/s.
 
 The fused kernel supports aligned, patch-free BitPacked secondary children of any width.
 
-Decode throughput was 12,900 MB/s with a one-bit secondary.
+Decode throughput was 13,010 MB/s with a one-bit secondary.
 
 It was 12,410 MB/s with a 16-bit secondary.
 
@@ -308,8 +314,8 @@ The direct benchmark uses two million block-local values.
 
 | Logical type and tree | Encode GB/s | Decode GB/s | Scalar access ns |
 | --- | ---: | ---: | ---: |
-| `u64` BlockResidual | 5.00 | 36.43 | 125 |
-| `u64` FoR plus BitPacked | 4.25 | 35.37 | 115 |
+| `u64` BlockResidual | 5.11 | 37.39 | 84 |
+| `u64` FoR plus BitPacked | 4.51 | 36.22 | 125 |
 | `i16` BlockResidual | 1.39 | 31.86 | 125 |
 | `i16` FoR plus BitPacked | 1.15 | 42.14 | 125 |
 
@@ -664,7 +670,30 @@ Bitmap patches improve size, but they do not match the Pco child.
 
 The results reject a general quotient and remainder array with ordinary children.
 
-They support a small-alphabet entropy experiment and a fixed-bin Compact experiment.
+They support a small-alphabet entropy experiment and a fixed integer split experiment.
+
+### Exact ALP child comparison
+
+The benchmark replaces a Compact `ALP(Pco)` child with the same latent integers in BlockResidual.
+
+This comparison separates float transform quality from integer child compression.
+
+| Input | Current default bytes | `ALP(BlockResidual)` bytes | Current decode MB/s | Candidate decode MB/s | Candidate encode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CMS Payments | 4,146,124 | 3,918,239 | 14,202 | 20,280 | 2,605 |
+| GloVe | 6,274,834 | 6,298,751 | 16,738 | 19,310 | 1,201 |
+
+The CMS candidate is 5.5 percent smaller and 42.8 percent faster to decode.
+
+The current selector rejects it because the 64-bit BlockResidual score includes a 1.20 factor.
+
+This result makes the CMS miss a final selector calibration issue.
+
+The GloVe candidate is 0.4 percent larger than the current default.
+
+It does not recover the 15.7 percent Pco size advantage.
+
+GloVe still requires a better integer split or small-alphabet backend for the ALP child.
 
 ### Fixed-bin range backend experiments
 
@@ -717,7 +746,7 @@ The first CMS decoder reached 8,057 MB/s. The specialized decoder increased thro
 
 The complete CMS default tree decodes at 14,575 MB/s. The fixed-bin child is 6.1 percent slower.
 
-The benchmark now wraps the codec in an experimental Vortex array.
+The benchmark now wraps the codec in a serialized Vortex array.
 
 This wrapper permits complete ALP decode and scalar measurements without a storage-format commitment.
 
@@ -739,7 +768,7 @@ Fusion increased CMS decode by 4.8 percent and Food decode by 18.7 percent. It d
 
 The fixed-bin tree fails the default decode gate on all three inputs.
 
-CMS and Food support a Compact candidate for classic Pco bins.
+CMS and Food show that fixed bins can trade size for faster access than Pco.
 
 CMS uses 7.8 percent more bytes than Compact. Generic decode is 67.2 percent faster, and scalar access is 37.8 times faster.
 
@@ -749,7 +778,13 @@ The fused Food decode is 2.0 times as fast as Compact. The generic composition a
 
 GloVe uses 16.8 percent more bytes than Compact because Pco also uses `IntMult(10)`.
 
-The evidence does not justify a fused ALP and fixed-bin array. A composable integer child has lower implementation complexity.
+The evidence does not justify a fused ALP and fixed-bin array.
+
+The temporary Compact selector increased GloVe encode time by 7.8 percent when it rejected RangePacked.
+
+The selector also increased aggregate CMS bytes by 1.1 percent after it replaced Pco.
+
+RangePacked therefore remains outside all writer selectors.
 
 ### Nullable and Delta-heavy fixed-bin cases
 
@@ -966,15 +1001,15 @@ Complete these remaining steps:
 1. Validate the nonlinear patch cost on the complete corpus.
 2. Add a true ALP-RD child composition case if a real selected tree exposes one.
 3. Validate the remaining rejected analysis cost in the complete corpus.
-4. Test the complete fixed-bin tree on every available classic-bin Pco win.
-5. Define a Compact size threshold for the fixed-bin candidate.
-6. Promote fixed-bin packing to a production array only if more unrelated classic-bin columns pass.
-7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-8. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-9. Prototype one lightweight scheme for the repeated real-float gap classes.
-10. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-11. Compare the geometric mean against Parquet with Zstd.
-12. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+4. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+5. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+6. Prototype a lightweight integer split for Pco `IntMult` wins under ALP.
+7. Prototype one lightweight scheme for repeated real-float Pco wins.
+8. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+9. Compare the geometric mean against Parquet with Zstd.
+10. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+11. Revisit the 32-bit and 64-bit BlockResidual score factors with selected-tree evidence.
+12. Keep RangePacked outside writer selectors unless a new decode design changes the result.
 13. Update this plan after each experiment.
 
 ## Pull request structure
