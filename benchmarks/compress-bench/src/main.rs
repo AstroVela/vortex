@@ -391,6 +391,15 @@ async fn run_benchmark_for_dataset(
     mode: BenchMode,
 ) -> anyhow::Result<(CompressMeasurements, Vec<v3::V3Record>)> {
     let bench_name = dataset_handle.name();
+    // A GPU decode and a host decode of the same dataset would otherwise publish the same
+    // measurement name, and the PR benchmark report matches rows by name — so a GPU run is
+    // diffed against whatever the host suite last recorded and every dataset reads as a
+    // several-fold regression. The ratio rows already say `gpu`; the timings did not.
+    let decompress_name = if matches!(mode, BenchMode::Gpu(_)) {
+        format!("{bench_name} gpu")
+    } else {
+        bench_name.to_string()
+    };
     let (v3_dataset, v3_variant) = dataset_handle.v3_dataset_dims();
     tracing::info!("Running {bench_name} benchmark");
 
@@ -445,7 +454,7 @@ async fn run_benchmark_for_dataset(
                         compressor.as_ref(),
                         &parquet_path,
                         iterations,
-                        bench_name,
+                        &decompress_name,
                     )
                     .await
                     .with_context(|| format!("decompressing {bench_name} as {format}"))?;
