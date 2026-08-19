@@ -124,6 +124,13 @@ fn setup_widened_f32_array() -> PrimitiveArray {
     }))
 }
 
+fn setup_quantized_f32_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let mantissa = (index.wrapping_mul(7_919) as u32 & 0x7fff) << 8;
+        f32::from_bits(0x3f80_0000 | mantissa)
+    }))
+}
+
 fn setup_nonzero_secondary_array() -> PrimitiveArray {
     let widened = setup_widened_f32_array();
     PrimitiveArray::from_iter(
@@ -158,6 +165,40 @@ fn setup_block_local_u64_array() -> PrimitiveArray {
     }))
 }
 
+fn setup_block_local_u32_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+        (block * 1_000_000 + residual) as u32
+    }))
+}
+
+fn setup_block_local_i32_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+        (block as i32 - 1_000) * 1_000_000 + residual as i32
+    }))
+}
+
+fn setup_patch_density_u32_array(stride: u64) -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        if index % stride == 0 {
+            u32::MAX - index as u32
+        } else {
+            42
+        }
+    }))
+}
+
+fn setup_ordered_f32_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let block = index / 1_024;
+        let residual = index.wrapping_mul(7_919) % 1_024;
+        f32::from_bits(0x3f80_0000 + (block as u32 * 0x1_0000) + residual as u32)
+    }))
+}
+
 fn setup_block_local_i16_array() -> PrimitiveArray {
     PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
         let block = (index / 1_024) % 128;
@@ -187,7 +228,7 @@ fn ordered_values(array: &PrimitiveArray) -> PrimitiveArray {
 fn encode_ordered_block_residual(array: &PrimitiveArray) -> vortex::array::ArrayRef {
     let ordered = OrderedFloat::from_primitive(array.as_view()).unwrap();
     let residuals = BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>()).unwrap();
-    OrderedFloat::try_new(residuals.into_array(), PType::F64)
+    OrderedFloat::try_new(residuals.into_array(), array.ptype())
         .unwrap()
         .into_array()
 }
@@ -200,8 +241,14 @@ fn encode_float_quant_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
             .unwrap();
     // SAFETY: The analysis computes this width from the exact primary range.
     let primary = unsafe { bitpack_encode_unchecked(primary, analysis.primary_bit_width) }.unwrap();
-    let primary = FoR::try_new(primary.into_array(), Scalar::from(analysis.primary_min)).unwrap();
-    FloatQuant::try_new(primary.into_array(), None, PType::F64, analysis.k)
+    let reference = if array.ptype() == PType::F32 {
+        Scalar::from(u32::try_from(analysis.primary_min).unwrap())
+    } else {
+        debug_assert_eq!(array.ptype(), PType::F64);
+        Scalar::from(analysis.primary_min)
+    };
+    let primary = FoR::try_new(primary.into_array(), reference).unwrap();
+    FloatQuant::try_new(primary.into_array(), None, array.ptype(), analysis.k)
         .unwrap()
         .into_array()
 }
@@ -599,6 +646,179 @@ fn bench_block_local_for_bitpacked_scalar_at_u64(bencher: Bencher) {
         .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
 }
 
+#[divan::bench(name = "block_local_block_residual_compress_u32")]
+fn bench_block_local_block_residual_compress_u32(bencher: Bencher) {
+    let array = setup_block_local_u32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &array)
+        .bench_refs(|array| BlockResidual::from_primitive(array.as_view()).unwrap());
+}
+
+#[divan::bench(name = "block_local_block_residual_decompress_u32")]
+fn bench_block_local_block_residual_decompress_u32(bencher: Bencher) {
+    let encoded = BlockResidual::from_primitive(setup_block_local_u32_array().as_view())
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "block_local_block_residual_scalar_at_u32")]
+fn bench_block_local_block_residual_scalar_at_u32(bencher: Bencher) {
+    let encoded = BlockResidual::from_primitive(setup_block_local_u32_array().as_view())
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "block_local_for_bitpacked_compress_u32")]
+fn bench_block_local_for_bitpacked_compress_u32(bencher: Bencher) {
+    let array = setup_block_local_u32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &array)
+        .bench_refs(|array| encode_for_bitpacked_tree(array, 31));
+}
+
+#[divan::bench(name = "block_local_for_bitpacked_decompress_u32")]
+fn bench_block_local_for_bitpacked_decompress_u32(bencher: Bencher) {
+    let encoded = encode_for_bitpacked_tree(&setup_block_local_u32_array(), 31);
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "block_local_for_bitpacked_scalar_at_u32")]
+fn bench_block_local_for_bitpacked_scalar_at_u32(bencher: Bencher) {
+    let encoded = encode_for_bitpacked_tree(&setup_block_local_u32_array(), 31);
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "block_local_block_residual_compress_i32")]
+fn bench_block_local_block_residual_compress_i32(bencher: Bencher) {
+    let array = setup_block_local_i32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &array)
+        .bench_refs(|array| BlockResidual::from_primitive(array.as_view()).unwrap());
+}
+
+#[divan::bench(name = "block_local_block_residual_decompress_i32")]
+fn bench_block_local_block_residual_decompress_i32(bencher: Bencher) {
+    let encoded = BlockResidual::from_primitive(setup_block_local_i32_array().as_view())
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "block_local_block_residual_scalar_at_i32")]
+fn bench_block_local_block_residual_scalar_at_i32(bencher: Bencher) {
+    let encoded = BlockResidual::from_primitive(setup_block_local_i32_array().as_view())
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "block_local_for_bitpacked_compress_i32")]
+fn bench_block_local_for_bitpacked_compress_i32(bencher: Bencher) {
+    let array = setup_block_local_i32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &array)
+        .bench_refs(|array| encode_for_bitpacked_tree(array, 31));
+}
+
+#[divan::bench(name = "block_local_for_bitpacked_decompress_i32")]
+fn bench_block_local_for_bitpacked_decompress_i32(bencher: Bencher) {
+    let encoded = encode_for_bitpacked_tree(&setup_block_local_i32_array(), 31);
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "block_local_for_bitpacked_scalar_at_i32")]
+fn bench_block_local_for_bitpacked_scalar_at_i32(bencher: Bencher) {
+    let encoded = encode_for_bitpacked_tree(&setup_block_local_i32_array(), 31);
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(args = [256, 64, 16, 4, 1])]
+fn patch_density_block_residual_decompress_u32(bencher: Bencher, stride: u64) {
+    let encoded = BlockResidual::from_primitive(setup_patch_density_u32_array(stride).as_view())
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(args = [256, 64, 16, 4, 1])]
+fn patch_density_block_residual_scalar_at_u32(bencher: Bencher, stride: u64) {
+    let encoded = BlockResidual::from_primitive(setup_patch_density_u32_array(stride).as_view())
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
 #[divan::bench(name = "block_local_block_residual_compress_i16")]
 fn bench_block_local_block_residual_compress_i16(bencher: Bencher) {
     let array = setup_block_local_i16_array();
@@ -722,6 +942,40 @@ fn bench_ordered_block_residual_prior_default_scalar_at_f64(bencher: Bencher) {
         .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
 }
 
+#[divan::bench(name = "ordered_block_residual_compress_f32")]
+fn bench_ordered_block_residual_compress_f32(bencher: Bencher) {
+    let float_array = setup_ordered_f32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| encode_ordered_block_residual(array));
+}
+
+#[divan::bench(name = "ordered_block_residual_decompress_f32")]
+fn bench_ordered_block_residual_decompress_f32(bencher: Bencher) {
+    let encoded = encode_ordered_block_residual(&setup_ordered_f32_array());
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "ordered_block_residual_scalar_at_f32")]
+fn bench_ordered_block_residual_scalar_at_f32(bencher: Bencher) {
+    let encoded = encode_ordered_block_residual(&setup_ordered_f32_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
 #[divan::bench(name = "ordered_block_residual_scheme_compress_f64")]
 fn bench_ordered_block_residual_scheme_compress_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
@@ -784,6 +1038,40 @@ fn bench_float_quant_tree_decompress_f64(bencher: Bencher) {
 #[divan::bench(name = "float_quant_tree_scalar_at_f64")]
 fn bench_float_quant_tree_scalar_at_f64(bencher: Bencher) {
     let encoded = encode_float_quant_tree(&setup_widened_f32_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "float_quant_tree_compress_f32")]
+fn bench_float_quant_tree_compress_f32(bencher: Bencher) {
+    let float_array = setup_quantized_f32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| encode_float_quant_tree(array));
+}
+
+#[divan::bench(name = "float_quant_tree_decompress_f32")]
+fn bench_float_quant_tree_decompress_f32(bencher: Bencher) {
+    let encoded = encode_float_quant_tree(&setup_quantized_f32_array());
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_tree_scalar_at_f32")]
+fn bench_float_quant_tree_scalar_at_f32(bencher: Bencher) {
+    let encoded = encode_float_quant_tree(&setup_quantized_f32_array());
     let next_index = AtomicUsize::new(0);
 
     bencher

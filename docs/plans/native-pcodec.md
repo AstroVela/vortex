@@ -26,6 +26,22 @@ The `wm/pcodec-entropy-experiments` branch preserves the complete entropy and bi
 
 Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution Delta.
 
+## Current state
+
+The branch implements `OrderedFloatArray`, `BlockResidualArray`, and `FloatQuantArray`.
+
+The default candidate set includes their three BtrBlocks schemes.
+
+`OrderedFloat(BlockResidual)` now supports `f32` and `f64` inputs.
+
+Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
+
+The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
+
+The GloVe result identifies a separate gap inside the ALP integer child.
+
+The current selector factors and patch cost remain provisional. Final calibration requires the complete corpus and selected-tree evidence.
+
 ## OrderedFloatArray
 
 `OrderedFloatArray` maps IEEE float bits to unsigned integers with the same order.
@@ -219,8 +235,8 @@ The direct benchmark uses two million block-local values.
 | --- | ---: | ---: | ---: |
 | `u64` BlockResidual | 5.00 | 36.43 | 125 |
 | `u64` FoR plus BitPacked | 4.25 | 35.37 | 115 |
-| `i16` BlockResidual | 1.38 | 31.12 | 125 |
-| `i16` FoR plus BitPacked | 1.12 | 41.57 | 104 |
+| `i16` BlockResidual | 1.39 | 31.86 | 125 |
+| `i16` FoR plus BitPacked | 1.15 | 42.14 | 125 |
 
 The first `i16` implementation unpacked through `u64` residuals. It decoded at 11.43 GB/s.
 
@@ -230,7 +246,7 @@ The synthetic `i16` BlockResidual tree uses 1,793,784 bytes. The FoR plus BitPac
 
 BlockResidual is 48.7 percent smaller on that input.
 
-Its `i16` decode throughput is 25.1 percent lower. The default selector therefore excludes direct 8-bit and 16-bit candidates.
+Its `i16` decode throughput is 24.4 percent lower. The default selector therefore excludes direct 8-bit and 16-bit candidates.
 
 The BlockResidual estimator measures its sampled tree exactly, with all child arrays.
 
@@ -270,11 +286,92 @@ CMS reduced size by 5.3 percent and increased decode throughput by 5.5 percent.
 
 HashTags reduced size by 7.0 percent and increased decode throughput by 4.9 percent.
 
-The direct narrow-type exclusion changed no selected tree in this corpus. The earlier 1.40 factor already rejected each direct `i16` candidate.
+The direct narrow-type exclusion changed no selected tree in this corpus.
+
+Before that exclusion, an earlier 1.40 trial factor rejected each direct `i16` candidate.
 
 A FastLanes fused FoR decode trial did not improve `u64` throughput. It reduced `i16` throughput, so the implementation retains native unpack.
 
 The zero-width residual path now writes base values and patches directly. It skips the scratch residual block.
+
+### Native f32 OrderedFloat with BlockResidual
+
+The input contains two million f32 values with narrow ordered-bit ranges inside each 1,024-value block.
+
+| Operation | Result |
+| --- | ---: |
+| Encode | 2.45 GB/s |
+| Decode | 30.30 GB/s |
+| Scalar access | 167 ns |
+
+The fused decode now handles `OrderedFloat(BlockResidual)` trees with u32 latents.
+
+The BtrBlocks candidate now accepts f32 and f64 inputs.
+
+These results remove the prior f32 type exclusion. Corpus comparisons against ALP and ALP-RD remain necessary.
+
+### Direct 32-bit comparison
+
+The direct benchmark compares two million block-local values against a whole-column FoR plus BitPacked tree.
+
+| Type and tree | Encode GB/s | Decode GB/s | Scalar access ns |
+| --- | ---: | ---: | ---: |
+| i32 BlockResidual | 2.69 | 33.66 | 124 |
+| i32 FoR plus BitPacked | 2.59 | 26.93 | 119 |
+| u32 BlockResidual | 2.74 | 33.55 | 98 |
+| u32 FoR plus BitPacked | 2.62 | 39.70 | 87 |
+
+One width factor does not predict both signed and unsigned results.
+
+Retain the current factor until the final corpus calibration uses selected-tree evidence.
+
+### Patch-density sweep
+
+The u32 input uses one large outlier at each configured stride.
+
+| Outlier stride | Approximate patch share | Decode GB/s | Scalar access ns |
+| ---: | ---: | ---: | ---: |
+| 256 | 0.4 percent | 57.88 | 84 |
+| 64 | 1.6 percent | 49.31 | 86 |
+| 16 | 6.3 percent | 26.32 | 104 |
+| 4 | 25.0 percent | 9.57 | 118 |
+| 1 | Packed residuals | 33.02 | 99 |
+
+Scalar access remains bounded across the sweep.
+
+Bulk decode has a severe patch-density cliff before the planner changes to packed residuals.
+
+The final selector calibration must compare alternate patch costs and separate zero-width blocks from packed blocks.
+
+### GloVe embeddings
+
+The corpus now includes the real GloVe dataset with 100,000 rows and 200 f32 values per row.
+
+The complete proposed and previous Vortex defaults both use 68,375,768 bytes.
+
+The Vortex file uses 0.92 times the bytes of Parquet with Zstd.
+
+The first two million embedding values use `ALP(ZigZag(BitPacked))` under both default configurations.
+
+That tree uses 6,274,834 bytes for 8,000,000 raw bytes.
+
+Compact uses `ALP(Pco)` and 5,287,510 bytes. Compact is 15.7 percent smaller than the default tree.
+
+FloatQuant and OrderedFloat with BlockResidual both lose to ALP on this dataset.
+
+Pco receives the `i32` primary child from ALP. Each 262,144-value Pco chunk selects `IntMult(10)` with no Delta encoding.
+
+`IntMult(10)` splits each integer into a quotient and a remainder modulo ten.
+
+The quotient uses 23 to 31 entropy bins. Its average encoded cost is 16.95 to 16.99 bits per value.
+
+The remainder uses ten entropy bins and no offset bits. Its average encoded cost is about 1.08 bits per value.
+
+The complete Pco child uses 4,518,870 bytes for two million values. This result includes model metadata and page overhead.
+
+The size gap comes from a decimal quotient and remainder split plus entropy coding. Pco does not use a Delta or float mode here.
+
+GloVe therefore identifies an ALP-child compression gap. It does not identify a failure in the ALP float transform.
 
 ### Pcodec corpus gap analysis
 
@@ -325,7 +422,7 @@ It reduced default bytes by 7.9 percent across the gap columns.
 
 The extra references did not justify a new array. Generic integer BlockResidual became the next prototype.
 
-Test these secondary candidates after the multi-reference prototype:
+Test these secondary candidates after the quotient and remainder prototype:
 
 - Use ordered-bit XOR suffixes instead of arithmetic residuals.
 - Use sign and exponent prefixes as fixed reference candidates.
@@ -420,16 +517,32 @@ This round completed these steps:
 - Added the patch-count decode cost.
 - Excluded direct 8-bit and 16-bit candidates.
 - Excluded BlockResidual from dictionary-code children.
+- Added fused f32 OrderedFloat with BlockResidual decode and selection.
+- Added u32, i32, f32, and patch-density benchmarks.
+- Removed the full patch scan from scalar access.
+- Made null payload bits neutral for the new default candidates.
+- Excluded integer BlockResidual from the CUDA-compatible preset.
+- Added the real GloVe embeddings dataset to the compression corpus.
 
 Complete these remaining steps:
 
-1. Run the complete `bench-vortex` compression corpus.
-2. Compare the geometric mean against Parquet with Zstd.
-3. Reduce the analysis cost on short rejected columns.
-4. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
-5. Evaluate nonzero-secondary FloatQuant for the default compressor.
-6. Investigate new schemes for real floats that Pco compresses better than ALP and ALP-RD.
-7. Update this plan after each experiment.
+1. Profile the ALP integer child on GloVe and unrelated no-Delta Pco wins.
+2. Record each selected `IntMult` base, quotient distribution, remainder distribution, and Pco bit cost.
+3. Prototype a bounded-access quotient and remainder array with a constant base.
+4. Test existing integer trees for both children before a new entropy backend.
+5. Compare that prototype against `ALP(ZigZag(BitPacked))` and `ALP(Pco)` on the same inputs.
+6. If existing children lose materially, test a small-alphabet entropy child for the remainder.
+7. Test a fused nonzero-secondary FloatQuant decode on selected gap columns.
+8. Evaluate nonzero-secondary FloatQuant for the default compressor.
+9. Compare native f32 FloatQuant against ALP and ALP-RD on the same inputs.
+10. Compare alternate patch costs across the patch-density sweep.
+11. Evaluate narrow BlockResidual as a Compact-only candidate.
+12. Reduce the analysis cost on short rejected columns.
+13. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
+14. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+15. Compare the geometric mean against Parquet with Zstd.
+16. Calibrate all selector thresholds from the complete corpus and selected-tree evidence.
+17. Update this plan after each experiment.
 
 ## Pull request structure
 

@@ -173,6 +173,7 @@ impl BtrBlocksCompressorBuilder {
             allow(unused_mut)
         )]
         let mut excluded: Vec<SchemeId> = vec![
+            integer::BlockResidualScheme.id(),
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
             float::ALPRDScheme.id(),
@@ -301,6 +302,17 @@ mod tests {
                 .schemes
                 .iter()
                 .any(|scheme| scheme.id() == float::FloatQuantScheme.id())
+        );
+    }
+
+    #[test]
+    fn cuda_compatible_excludes_block_residual() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        assert!(
+            !builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == integer::BlockResidualScheme.id())
         );
     }
 

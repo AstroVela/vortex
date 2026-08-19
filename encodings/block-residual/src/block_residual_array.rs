@@ -642,6 +642,20 @@ fn decompress_array(
     }
 }
 
+pub(crate) fn decompress_ordered_f32(
+    array: ArrayView<'_, BlockResidual>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    decode_array_values(array, ctx, |ordered: u32| {
+        let bits = if ordered & (1_u32 << 31) == 0 {
+            !ordered
+        } else {
+            ordered ^ (1_u32 << 31)
+        };
+        f32::from_bits(bits)
+    })
+}
+
 pub(crate) fn decompress_ordered_f64(
     array: ArrayView<'_, BlockResidual>,
     ctx: &mut ExecutionCtx,
@@ -717,8 +731,6 @@ fn scalar_from_array(
         "patch",
     )?;
     let block_positions = &positions[patch_payload];
-    let block_start = block_index * BLOCK_LEN;
-    let block_len = (array.data().unsliced_len - block_start).min(BLOCK_LEN);
     let highs = children.patch_highs.as_slice::<u8>();
     let high_payload = payload_range(
         children.high_starts.as_slice::<u32>(),
@@ -726,11 +738,10 @@ fn scalar_from_array(
         highs.len(),
         "patch high",
     )?;
-    validate_patch_payload(
-        block_len,
+    validate_patch_header(
         residual_width,
         high_width,
-        block_positions,
+        block_positions.len(),
         high_payload.len(),
     )?;
     if let Ok(patch_index) = block_positions.binary_search(&u16::try_from(index_in_block)?) {
@@ -755,27 +766,6 @@ fn unpack_single_residual<T: ResidualWord>(width: u8, packed_words: &[u64], inde
     let packed = packed_words_as_native::<T>(packed_words);
     // SAFETY: The encoder writes one complete FastLanes chunk for each block.
     unsafe { T::unchecked_unpack_single(usize::from(width), packed, index).to_u64() }
-}
-
-fn validate_patch_payload(
-    block_len: usize,
-    residual_width: u8,
-    high_width: u8,
-    positions: &[u16],
-    high_payload_len: usize,
-) -> VortexResult<()> {
-    validate_patch_header(
-        residual_width,
-        high_width,
-        positions.len(),
-        high_payload_len,
-    )?;
-    let mut previous_position = None;
-    for &position in positions {
-        validate_patch_position(block_len, previous_position, position)?;
-        previous_position = Some(position);
-    }
-    Ok(())
 }
 
 fn validate_patch_header(

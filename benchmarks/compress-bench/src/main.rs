@@ -27,6 +27,7 @@ use vortex_bench::compress::benchmark_decompress;
 use vortex_bench::compress::calculate_ratios;
 use vortex_bench::create_output_writer;
 use vortex_bench::datasets::Dataset;
+use vortex_bench::datasets::feature_vectors::GloveEmbeddingsData;
 use vortex_bench::datasets::struct_list_of_ints::StructListOfInts;
 use vortex_bench::datasets::taxi_data::TaxiData;
 use vortex_bench::datasets::tpch_l_comment::TPCHLCommentCanonical;
@@ -197,6 +198,7 @@ async fn run_compress(
 
     let datasets: Vec<&dyn Dataset> = [
         &TaxiData as &dyn Dataset,
+        &GloveEmbeddingsData,
         PBI_DATASETS.get(Arade),
         PBI_DATASETS.get(Bimbo),
         PBI_DATASETS.get(CMSprovider),

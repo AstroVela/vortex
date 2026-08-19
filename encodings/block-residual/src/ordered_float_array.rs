@@ -43,6 +43,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::BlockResidual;
+use crate::block_residual_array::decompress_ordered_f32;
 use crate::block_residual_array::decompress_ordered_f64;
 
 /// IEEE floats mapped to unsigned integers that preserve numeric order.
@@ -169,11 +170,11 @@ impl VTable for OrderedFloat {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let decoded = if let Some(block_residual) = array.encoded().as_typed::<BlockResidual>() {
-            vortex_ensure!(
-                array.dtype().as_ptype() == PType::F64,
-                "fused BlockResidual decode requires f64"
-            );
-            decompress_ordered_f64(block_residual, ctx)?
+            match array.dtype().as_ptype() {
+                PType::F32 => decompress_ordered_f32(block_residual, ctx)?,
+                PType::F64 => decompress_ordered_f64(block_residual, ctx)?,
+                ptype => vortex_bail!("unsupported OrderedFloat ptype {ptype}"),
+            }
         } else {
             decode_primitive(array.as_view(), ctx)?
         };
@@ -372,11 +373,15 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
+    use vortex_array::arrays::Primitive;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::PType;
     use vortex_error::VortexResult;
 
     use super::OrderedFloat;
+    use super::OrderedFloatArraySlotsExt;
+    use crate::BlockResidual;
 
     #[test]
     fn roundtrip_special_values() -> VortexResult<()> {
@@ -394,6 +399,38 @@ mod tests {
         crate::initialize(&session);
         let mut ctx = session.create_execution_ctx();
         assert_arrays_eq!(encoded, primitive.into_array(), &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_f32_block_residual() -> VortexResult<()> {
+        let values = (0..2_050)
+            .scan(1_000.0_f32, |value, index| {
+                *value += ((index * 7_919 % 101) as f32 - 50.0) * 0.0001;
+                Some(*value)
+            })
+            .collect::<Vec<_>>();
+        let primitive = PrimitiveArray::from_iter(values.clone());
+        let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+        let residuals = BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
+        let encoded = OrderedFloat::try_new(residuals.into_array(), PType::F32)?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        assert_arrays_eq!(encoded, primitive, &mut ctx);
+        assert_eq!(
+            encoded
+                .execute_scalar(1_024, &mut ctx)?
+                .as_primitive()
+                .typed_value::<f32>(),
+            Some(values[1_024])
+        );
+        assert_arrays_eq!(
+            encoded.into_array().slice(1_023..1_026)?,
+            primitive.into_array().slice(1_023..1_026)?,
+            &mut ctx
+        );
         Ok(())
     }
 }

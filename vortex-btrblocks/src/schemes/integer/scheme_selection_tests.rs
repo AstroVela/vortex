@@ -74,6 +74,32 @@ fn test_block_residual_compressed() -> VortexResult<()> {
 }
 
 #[test]
+fn test_block_residual_ignores_null_payloads() -> VortexResult<()> {
+    let values = (0usize..8_192)
+        .map(|index| {
+            let block = index / 1_024;
+            let residual = index.wrapping_mul(2_654_435_761) % 1_024;
+            (block as i64 - 4) * 1_000_000_000_000 + residual as i64
+        })
+        .collect::<Vec<_>>();
+    let validity = Validity::from_iter((0..values.len()).map(|index| index % 17 != 0));
+    let mut alternate = values.clone();
+    for index in (0..alternate.len()).step_by(17) {
+        alternate[index] = i64::MAX - index as i64;
+    }
+    let first = PrimitiveArray::new(Buffer::copy_from(&values), validity.clone()).into_array();
+    let second = PrimitiveArray::new(Buffer::copy_from(&alternate), validity).into_array();
+    let compressor = BtrBlocksCompressor::default();
+    let first = compressor.compress(&first, &mut SESSION.create_execution_ctx())?;
+    let second = compressor.compress(&second, &mut SESSION.create_execution_ctx())?;
+
+    assert!(first.is::<BlockResidual>());
+    assert!(second.is::<BlockResidual>());
+    assert_eq!(first.nbytes(), second.nbytes());
+    Ok(())
+}
+
+#[test]
 fn test_block_residual_skips_narrow_integers() -> VortexResult<()> {
     let values = (0..8_192)
         .map(|index| {

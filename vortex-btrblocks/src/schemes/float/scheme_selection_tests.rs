@@ -95,6 +95,31 @@ fn test_widened_f32_uses_float_quant() -> VortexResult<()> {
 }
 
 #[test]
+fn test_float_quant_ignores_null_payloads() -> VortexResult<()> {
+    let values = (0u32..16_384)
+        .map(|index| {
+            let mantissa = index.wrapping_mul(7_919) & 0x007f_ffff;
+            f64::from(f32::from_bits(0x3f80_0000 | mantissa))
+        })
+        .collect::<Vec<_>>();
+    let validity = Validity::from_iter((0..values.len()).map(|index| index % 17 != 0));
+    let mut alternate = values.clone();
+    for index in (0..alternate.len()).step_by(17) {
+        alternate[index] = f64::from_bits(0x3ff0_0000_0000_0001 + index as u64);
+    }
+    let first = PrimitiveArray::new(Buffer::copy_from(&values), validity.clone()).into_array();
+    let second = PrimitiveArray::new(Buffer::copy_from(&alternate), validity).into_array();
+    let compressor = BtrBlocksCompressor::default();
+    let first = compressor.compress(&first, &mut SESSION.create_execution_ctx())?;
+    let second = compressor.compress(&second, &mut SESSION.create_execution_ctx())?;
+
+    assert!(first.is::<FloatQuant>());
+    assert!(second.is::<FloatQuant>());
+    assert_eq!(first.nbytes(), second.nbytes());
+    Ok(())
+}
+
+#[test]
 fn test_f32_does_not_use_float_quant() -> VortexResult<()> {
     let values = (0u32..16_384)
         .map(|index| {
@@ -132,7 +157,7 @@ fn test_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
 
     let mut state = 0x4d59_5df4_d0f3_3173_u64;
     let mut value = 0.0_f64;
-    let values = (0..65_536)
+    let values = (0usize..65_536)
         .map(|_| {
             let radius = (-2.0 * uniform(&mut state).ln()).sqrt();
             let normal = radius * (TAU * uniform(&mut state)).cos();
@@ -144,6 +169,28 @@ fn test_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
     let compressed =
         BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<OrderedFloat>());
+    assert!(compressed.children()[0].is::<BlockResidual>());
+    Ok(())
+}
+
+#[test]
+fn test_f32_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
+    let values = (0_u32..65_536)
+        .map(|index| {
+            let block = index / 1_024;
+            let residual = index.wrapping_mul(7_919) % 1_024;
+            f32::from_bits(0x3f80_0000 + (block * 0x1_0000) + residual)
+        })
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let compressed =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        compressed.is::<OrderedFloat>(),
+        "expected OrderedFloat, got tree:\n{}",
+        compressed.display_tree()
+    );
     assert!(compressed.children()[0].is::<BlockResidual>());
     Ok(())
 }

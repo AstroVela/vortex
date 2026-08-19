@@ -18,13 +18,20 @@ use parquet::arrow::ArrowWriter;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
 
 use crate::CompactionStrategy;
 use crate::Format;
+use crate::conversions::parquet_to_vortex_chunks;
 use crate::conversions::write_parquet_as_vortex;
+use crate::datasets::Dataset;
 use crate::idempotent_async;
 use crate::random_access::BenchDataset;
 use crate::random_access::data_path;
+use crate::vector_dataset::TrainLayout;
+use crate::vector_dataset::VectorDataset;
+use crate::vector_dataset::download;
 
 /// Dataset identifier used for data path generation.
 pub const DATASET: &str = "feature_vectors";
@@ -33,6 +40,31 @@ pub const DATASET: &str = "feature_vectors";
 pub const ROW_COUNT: usize = 1_000_000;
 
 pub struct FeatureVectorsData;
+
+/// A real f32 embedding dataset from the GloVe vector benchmark corpus.
+pub struct GloveEmbeddingsData;
+
+#[async_trait]
+impl Dataset for GloveEmbeddingsData {
+    fn name(&self) -> &str {
+        "glove-embeddings-100k"
+    }
+
+    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> Result<ArrayRef> {
+        Ok(parquet_to_vortex_chunks(self.to_parquet_path().await?)
+            .await?
+            .into())
+    }
+
+    async fn to_parquet_path(&self) -> Result<PathBuf> {
+        let paths = download(VectorDataset::GloveSmall100k, TrainLayout::Single).await?;
+        paths
+            .train_files
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("GloVe embedding train file is missing"))
+    }
+}
 
 #[async_trait]
 impl BenchDataset for FeatureVectorsData {

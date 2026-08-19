@@ -29,6 +29,7 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 use crate::SchemeExt;
+use crate::normalize_null_values;
 
 const BLOCK_LEN: usize = 1024;
 const ESTIMATE_BLOCKS: usize = 8;
@@ -84,6 +85,7 @@ impl Scheme for BlockResidualScheme {
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
             |_compressor, data, _best_so_far, _compress_ctx, exec_ctx| {
                 let sample = locality_sample(data.array_as_primitive(), exec_ctx)?;
+                let sample = normalize_null_values(sample.as_view(), exec_ctx)?;
                 let before_nbytes = sample.nbytes();
                 let residuals = BlockResidual::from_primitive(sample.as_view())?;
                 let after_nbytes = residuals.nbytes();
@@ -114,9 +116,10 @@ impl Scheme for BlockResidualScheme {
         _compressor: &CascadingCompressor,
         data: &ArrayAndStats,
         _compress_ctx: CompressorContext,
-        _exec_ctx: &mut ExecutionCtx,
+        exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        Ok(BlockResidual::from_primitive(data.array_as_primitive())?.into_array())
+        let primitive = normalize_null_values(data.array_as_primitive(), exec_ctx)?;
+        Ok(BlockResidual::from_primitive(primitive.as_view())?.into_array())
     }
 }
 

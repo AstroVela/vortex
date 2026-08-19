@@ -25,6 +25,7 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
+use crate::normalize_null_values;
 
 /// FloatQuant split with a fixed frame-of-reference primary child.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -61,18 +62,22 @@ impl Scheme for FloatQuantScheme {
         _compressor: &CascadingCompressor,
         data: &ArrayAndStats,
         _compress_ctx: CompressorContext,
-        _exec_ctx: &mut ExecutionCtx,
+        exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let primitive = data.array_as_primitive();
-        let Some(analysis) = analyze_float_quant(primitive) else {
-            return Ok(primitive.array().clone());
+        let source = data.array_as_primitive();
+        let primitive = normalize_null_values(source, exec_ctx)?;
+        let Some(analysis) = analyze_float_quant(primitive.as_view()) else {
+            return Ok(source.array().clone());
         };
         if !analysis.secondary_is_constant || analysis.primary_bit_width == 0 {
-            return Ok(primitive.array().clone());
+            return Ok(source.array().clone());
         }
 
-        let biased =
-            FloatQuant::primary_for_primitive(primitive, analysis.k, analysis.primary_min)?;
+        let biased = FloatQuant::primary_for_primitive(
+            primitive.as_view(),
+            analysis.k,
+            analysis.primary_min,
+        )?;
         // SAFETY: The analysis computes this width from the exact primary minimum and maximum.
         let compressed_primary =
             unsafe { bitpack_encode_unchecked(biased, analysis.primary_bit_width)? }.into_array();
