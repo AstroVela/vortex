@@ -21,6 +21,7 @@ use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
 use vortex_arrow::ArrowSessionExt;
+use vortex_bench::CompactionStrategy;
 use vortex_bench::Format;
 use vortex_bench::SESSION;
 use vortex_bench::compress::Compressor;
@@ -34,18 +35,27 @@ use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 
 /// Compressor implementation for Vortex format.
 pub struct VortexCompressor {
+    format: Format,
     new_numeric_schemes: bool,
 }
 
 impl VortexCompressor {
-    pub fn new(new_numeric_schemes: bool) -> Self {
+    pub fn new(format: Format, new_numeric_schemes: bool) -> Self {
+        assert!(matches!(
+            format,
+            Format::OnDiskVortex | Format::VortexCompact
+        ));
         Self {
+            format,
             new_numeric_schemes,
         }
     }
 
     fn write_options(&self) -> VortexWriteOptions {
         let options = SESSION.write_options();
+        if self.format == Format::VortexCompact {
+            return CompactionStrategy::Compact.apply_options(options);
+        }
         if self.new_numeric_schemes {
             return options;
         }
@@ -65,7 +75,7 @@ impl VortexCompressor {
 #[async_trait]
 impl Compressor for VortexCompressor {
     fn format(&self) -> Format {
-        Format::OnDiskVortex
+        self.format
     }
 
     async fn compress(&self, parquet_path: &Path) -> Result<(u64, Duration)> {

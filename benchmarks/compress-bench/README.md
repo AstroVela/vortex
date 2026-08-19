@@ -15,6 +15,13 @@ See [`src/main.rs`](./src/main.rs) for the dataset list and CLI flags (`--format
 cargo run -p compress-bench --profile release_debug
 ```
 
+Compare the default compressor, Compact, and Parquet with Zstd:
+
+```bash
+cargo run -p compress-bench --profile release_debug -- \
+  --formats vortex,vortex-compact,parquet
+```
+
 GPU decompression is opt-in and runs only the existing benchmark names allow-listed in
 `src/main.rs`:
 

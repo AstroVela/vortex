@@ -137,7 +137,11 @@ fn get_compressor(
     }
 
     match format {
-        Format::OnDiskVortex => Box::new(VortexCompressor::new(!vortex_without_new_numeric)),
+        Format::OnDiskVortex => Box::new(VortexCompressor::new(
+            Format::OnDiskVortex,
+            !vortex_without_new_numeric,
+        )),
+        Format::VortexCompact => Box::new(VortexCompressor::new(Format::VortexCompact, true)),
         Format::Parquet => Box::new(ParquetCompressor::new()),
         #[cfg(feature = "lance")]
         Format::Lance => Box::new(LanceCompressor),
