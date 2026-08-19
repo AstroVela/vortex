@@ -3,8 +3,6 @@
 
 //! Lossless float quantization with a fixed frame-of-reference child.
 
-use std::ops::Range;
-
 use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -12,10 +10,8 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VTable;
 use vortex_array::arrays::Primitive;
-use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::PType;
-use vortex_array::match_each_float_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_compressor::scheme::CompressionEstimate;
@@ -35,10 +31,7 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 use crate::normalize_null_values;
-
-const SAMPLE_BLOCK_LEN: usize = 64;
-const MIN_SAMPLE_BLOCKS: usize = 16;
-const SAMPLE_BLOCK_MULTIPLE: usize = 16;
+use crate::schemes::sample_primitive_one_percent;
 
 /// FloatQuant split with a fixed frame-of-reference primary child.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -68,7 +61,7 @@ impl Scheme for FloatQuantScheme {
         }
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
             |_compressor, data, _best_so_far, _compress_ctx, exec_ctx| {
-                let sample = float_quant_sample(data.array_as_primitive(), exec_ctx)?;
+                let sample = sample_primitive_one_percent(data.array_as_primitive(), exec_ctx)?;
                 let Some(analysis) = analyze_float_quant(sample.as_view()) else {
                     return Ok(EstimateVerdict::Skip);
                 };
@@ -224,56 +217,4 @@ fn ordered_u64(bits: u64) -> u64 {
     } else {
         !bits
     }
-}
-
-fn float_quant_sample(
-    primitive: vortex_array::ArrayView<'_, Primitive>,
-    exec_ctx: &mut ExecutionCtx,
-) -> VortexResult<PrimitiveArray> {
-    let sample_blocks = (primitive.len() / 100 / SAMPLE_BLOCK_LEN)
-        .next_multiple_of(SAMPLE_BLOCK_MULTIPLE)
-        .max(MIN_SAMPLE_BLOCKS);
-    let sample_len = sample_blocks * SAMPLE_BLOCK_LEN;
-    if primitive.len() <= sample_len {
-        return normalize_null_values(primitive, exec_ctx);
-    }
-
-    let ranges = float_quant_sample_ranges(primitive.len(), sample_blocks);
-    let validity = primitive.validity()?;
-    if validity.definitely_no_nulls() {
-        return Ok(match_each_float_ptype!(primitive.ptype(), |T| {
-            let values = primitive.as_slice::<T>();
-            let mut sample = Vec::with_capacity(sample_len);
-            for range in ranges {
-                sample.extend_from_slice(&values[range]);
-            }
-            PrimitiveArray::from_iter(sample)
-        }));
-    }
-
-    let validity = validity.execute_mask(primitive.len(), exec_ctx)?;
-    Ok(match_each_float_ptype!(primitive.ptype(), |T| {
-        let values = primitive.as_slice::<T>();
-        PrimitiveArray::from_option_iter(
-            ranges
-                .into_iter()
-                .flatten()
-                .map(|index| validity.value(index).then_some(values[index])),
-        )
-    }))
-}
-
-fn float_quant_sample_ranges(len: usize, sample_blocks: usize) -> Vec<Range<usize>> {
-    let partition_len = len / sample_blocks;
-    let long_partitions = len % sample_blocks;
-    let mut partition_start = 0;
-    (0..sample_blocks)
-        .map(|partition_index| {
-            let current_partition_len =
-                partition_len + usize::from(partition_index < long_partitions);
-            let start = partition_start + (current_partition_len - SAMPLE_BLOCK_LEN) / 2;
-            partition_start += current_partition_len;
-            start..start + SAMPLE_BLOCK_LEN
-        })
-        .collect()
 }

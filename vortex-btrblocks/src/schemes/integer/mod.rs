@@ -8,6 +8,7 @@ mod block_residual;
 #[cfg(feature = "unstable_encodings")]
 mod delta;
 mod for_;
+mod range_packed;
 mod rle;
 mod runend;
 mod sequence;
@@ -25,6 +26,7 @@ pub use delta::DeltaScheme;
 pub use for_::FoRScheme;
 #[cfg(feature = "pco")]
 pub use pco::PcoScheme;
+pub use range_packed::RangePackedScheme;
 pub use rle::IntRLEScheme;
 pub(crate) use rle::rle_compress;
 #[cfg(feature = "unstable_encodings")]

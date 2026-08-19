@@ -133,11 +133,10 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
-    /// Adds compact encoding schemes (Zstd for strings and binary, Pco for numerics).
+    /// Adds compact encoding schemes for strings, binary values, and numeric values.
     ///
     /// This provides better compression ratios than the default, especially for floating-point
-    /// heavy datasets. Requires the `zstd` feature. When the `pco` feature is also enabled,
-    /// Pco schemes for integers and floats are included.
+    /// heavy datasets. This method requires the `zstd` feature. The `pco` feature adds Pco.
     ///
     /// # Panics
     ///
@@ -146,7 +145,9 @@ impl BtrBlocksCompressorBuilder {
     pub fn with_compact(self) -> Self {
         let builder = self
             .with_new_scheme(&string::ZstdScheme)
-            .with_new_scheme(&binary::ZstdScheme);
+            .with_new_scheme(&binary::ZstdScheme)
+            .with_new_scheme(&integer::RangePackedScheme)
+            .with_new_scheme(&float::OrderedRangePackedScheme);
 
         #[cfg(feature = "pco")]
         let builder = builder
@@ -174,11 +175,13 @@ impl BtrBlocksCompressorBuilder {
         )]
         let mut excluded: Vec<SchemeId> = vec![
             integer::BlockResidualScheme.id(),
+            integer::RangePackedScheme.id(),
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
             float::ALPRDScheme.id(),
             float::FloatQuantScheme.id(),
             float::OrderedBlockResidualScheme.id(),
+            float::OrderedRangePackedScheme.id(),
             float::FloatRLEScheme.id(),
             float::NullDominatedSparseScheme.id(),
             string::StringDictScheme.id(),
@@ -228,6 +231,7 @@ impl BtrBlocksCompressorBuilder {
 #[cfg(test)]
 mod tests {
     use vortex_array::VTable;
+    use vortex_error::VortexResult;
     use vortex_fastlanes::FoR;
 
     use super::*;
@@ -314,6 +318,25 @@ mod tests {
                 .iter()
                 .any(|scheme| scheme.id() == integer::BlockResidualScheme.id())
         );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn compact_adds_range_packed_after_default_schemes() -> VortexResult<()> {
+        let builder = BtrBlocksCompressorBuilder::default().with_compact();
+        let integer_index = builder
+            .schemes
+            .iter()
+            .position(|scheme| scheme.id() == integer::RangePackedScheme.id())
+            .ok_or_else(|| vortex_error::vortex_err!("compact lacks integer RangePacked"))?;
+        let float_index = builder
+            .schemes
+            .iter()
+            .position(|scheme| scheme.id() == float::OrderedRangePackedScheme.id())
+            .ok_or_else(|| vortex_error::vortex_err!("compact lacks ordered RangePacked"))?;
+        assert!(integer_index >= ALL_SCHEMES.len());
+        assert!(float_index > integer_index);
+        Ok(())
     }
 
     #[test]

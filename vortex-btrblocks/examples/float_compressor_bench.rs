@@ -56,7 +56,9 @@ use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
+use vortex_btrblocks::schemes::float::OrderedRangePackedScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
+use vortex_btrblocks::schemes::integer::RangePackedScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -1108,6 +1110,106 @@ fn measure_fixed_bin_tree(
     Ok(())
 }
 
+fn measure_block_residual_float_tree(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let Some(encoded) = block_residual_float_tree(compact, session)? else {
+        return Ok(());
+    };
+    measure_existing_tree(
+        dataset,
+        column,
+        "block-residual",
+        expected,
+        &encoded,
+        session,
+    )?;
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(encode_block_residual_float_tree(
+            expected.as_::<Primitive>(),
+            compact,
+            session,
+        )?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "candidate-tree-encode\t{dataset}\t{column}\tblock-residual\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
+}
+
+fn block_residual_float_tree(
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    if compact.encoding_id().as_ref() == "vortex.alp" {
+        let alp = compact.as_::<ALP>();
+        if alp.encoded().encoding_id().as_ref() != "vortex.pco" {
+            return Ok(None);
+        }
+        let primitive = alp
+            .encoded()
+            .clone()
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+        let primitive = primitive
+            .into_array()
+            .cast(alp.encoded().dtype().clone())?
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?.into_array();
+        return Ok(Some(
+            ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+        ));
+    }
+
+    if compact.encoding_id().as_ref() != "vortex.pco" || !compact.dtype().is_float() {
+        return Ok(None);
+    }
+    let primitive = compact
+        .clone()
+        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+    let primitive =
+        fill_float_nulls_with_first_valid(primitive, &mut session.create_execution_ctx())?;
+    let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+    let encoded = BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
+    Ok(Some(
+        OrderedFloat::try_new(encoded.into_array(), primitive.ptype())?.into_array(),
+    ))
+}
+
+fn encode_block_residual_float_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    if compact.encoding_id().as_ref() == "vortex.alp" {
+        let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
+        let encoded = BlockResidual::from_primitive(alp.encoded().as_::<Primitive>())?;
+        return Ok(
+            ALP::try_new(encoded.into_array(), alp.exponents(), alp.patches())?.into_array(),
+        );
+    }
+
+    let primitive = fill_float_nulls_with_first_valid(
+        primitive.into_owned(),
+        &mut session.create_execution_ctx(),
+    )?;
+    let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+    let encoded = BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
+    Ok(OrderedFloat::try_new(encoded.into_array(), primitive.ptype())?.into_array())
+}
+
 fn encode_fixed_bin_float_tree(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     compact: &ArrayRef,
@@ -1483,6 +1585,13 @@ fn measure_dataset(
                 session,
             )?;
             measure_fixed_bin_tree(dataset, &column.name, &column.array, compact_array, session)?;
+            measure_block_residual_float_tree(
+                dataset,
+                &column.name,
+                &column.array,
+                compact_array,
+                session,
+            )?;
         }
     }
 
@@ -1535,6 +1644,8 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
         FloatQuantScheme.id(),
         OrderedBlockResidualScheme.id(),
         BlockResidualScheme.id(),
+        OrderedRangePackedScheme.id(),
+        RangePackedScheme.id(),
     ];
     vec![
         (
@@ -1568,8 +1679,8 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
         (
             "prior-compact",
             BtrBlocksCompressorBuilder::default()
-                .exclude_schemes(new_scheme_ids)
                 .with_compact()
+                .exclude_schemes(new_scheme_ids)
                 .build(),
         ),
         (
@@ -1611,6 +1722,7 @@ fn main() -> VortexResult<()> {
     println!("fixed-bin-tree\tdataset\tcolumn\trows\tbytes\tdecode-MB/s\tscalar-ns\tencoding");
     println!("fixed-bin-tree-fused\tdataset\tcolumn\trows\tbytes\tdecode-MB/s\tencoding");
     println!("fixed-bin-tree-encode\tdataset\tcolumn\trows\tbytes\tencode-MB/s\tencoding");
+    println!("candidate-tree-encode\tdataset\tcolumn\tconfig\trows\tbytes\tencode-MB/s\tencoding");
     println!(
         "tree-throughput\tdataset\tcolumn\tconfig\trows\tbytes\tdecode-MB/s\tscalar-ns\tencoding"
     );
