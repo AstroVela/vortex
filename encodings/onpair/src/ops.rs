@@ -33,7 +33,7 @@ impl OperationsVTable<OnPair> for OnPair {
         let row_end = code_boundary_at(codes_offsets, index + 1, ctx)?;
 
         let codes = collect_widened::<u16>(&array.codes().slice(row_start..row_end)?, ctx)?;
-        let (dict, short) = dict_decode_tables(array, ctx)?;
+        let (dict, short) = dict_decode_tables(array, ctx, codes.len())?;
 
         // The per-row decoded length is recorded in the `uncompressed_lengths`
         // child, so read it directly instead of asking the decoder to compute it.

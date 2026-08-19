@@ -626,3 +626,45 @@ fn test_onpair_slice_canonicalize() -> vortex_error::VortexResult<()> {
     }
     Ok(())
 }
+
+/// Decodes must agree across the lazy low-8 table's lifecycle on an all-short
+/// dictionary: a point read before any bulk decode (no table yet), a small
+/// sliced decode below the build threshold, a full-column decode (which
+/// builds the shared table), and a point read after it exists.
+#[test]
+fn test_onpair_short_table_lazy_paths() -> vortex_error::VortexResult<()> {
+    let words = ["alpha", "beta", "gamma", "delta", "eps", "zeta", "eta"];
+    let strings: Vec<&str> = (0..512).map(|i| words[i % words.len()]).collect();
+    let input = VarBinArray::from_iter(
+        strings.iter().map(|s| Some(s.as_bytes())),
+        DType::Utf8(Nullability::NonNullable),
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let arr = compress_onpair(&input.clone().into_array(), &mut ctx)?;
+    let expected = input.into_array().execute::<VarBinViewArray>(&mut ctx)?;
+
+    // Point read first: the shared dictionary cache exists but no table.
+    let scalar = arr.clone().into_array().execute_scalar(3, &mut ctx)?;
+    assert_eq!(scalar.as_utf8().value().unwrap().as_bytes(), b"delta");
+
+    // A sliced decode smaller than the dictionary stays on the general loop.
+    let small = arr
+        .clone()
+        .into_array()
+        .slice(1..4)?
+        .execute::<VarBinViewArray>(&mut ctx)?;
+    let small_expected = expected.clone().into_array().slice(1..4)?;
+    assert_arrays_eq!(small, small_expected, &mut ctx);
+
+    // The full decode crosses the threshold and builds the table.
+    let full = arr
+        .clone()
+        .into_array()
+        .execute::<VarBinViewArray>(&mut ctx)?;
+    assert_arrays_eq!(full, expected, &mut ctx);
+
+    // Point read again, now served with the table present.
+    let scalar = arr.into_array().execute_scalar(8, &mut ctx)?;
+    assert_eq!(scalar.as_utf8().value().unwrap().as_bytes(), b"beta");
+    Ok(())
+}

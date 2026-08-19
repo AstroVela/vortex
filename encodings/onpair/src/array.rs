@@ -14,6 +14,7 @@ use onpair::CompactDictionary;
 use onpair::CompactDictionaryView;
 use onpair::Dictionary;
 use onpair::DictionaryStorage;
+use onpair::DictionaryView;
 use prost::Message as _;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
@@ -155,10 +156,15 @@ impl DictionaryStorage<u32> for OnPairDictionaryStorage {
 }
 
 /// The memoized dictionary state: the safety-validated storage-backed compact
-/// dictionary, plus the low-8 decode table when every token fits in 8 bytes.
+/// dictionary, plus the lazily-built low-8 decode table.
 struct CachedDictionary {
     compact: CompactDictionary<OnPairDictionaryStorage>,
-    short: Option<ShortTokenDict>,
+    /// `Some` when every token fits in 8 bytes, `None` otherwise — but only
+    /// initialized by the first bulk decode large enough to amortize the
+    /// O(dict) build (29µs at 4K tokens, ~700µs at 64K, measured). Point reads
+    /// (`scalar_at`, small filtered decodes) never trigger the build; they
+    /// consume the table only if a bulk decode already built it.
+    short: OnceLock<Option<ShortTokenDict>>,
 }
 
 /// Non-child data for an OnPair-encoded array.
@@ -180,12 +186,13 @@ pub struct OnPairData {
     /// including its trailing read padding.
     dict_bytes: BufferHandle,
     /// The dictionary state, memoized after successful initialization.
-    /// Initialization decompresses the child, safety-validates the dictionary,
-    /// and builds the low-8 decode table when the dictionary qualifies; once
-    /// cached, later operations do none of that again. The dictionary owns
-    /// clones of the immutable Vortex buffer handles, so this does not copy the
-    /// bytes. A failed validation is not cached, and concurrent first users may
-    /// duplicate initialization work before one value wins the `OnceLock`.
+    /// Initialization decompresses the child and safety-validates the
+    /// dictionary; once cached, later operations do neither again (the low-8
+    /// decode table inside is built lazily on top — see [`CachedDictionary`]).
+    /// The dictionary owns clones of the immutable Vortex buffer handles, so
+    /// this does not copy the bytes. A failed validation is not cached, and
+    /// concurrent first users may duplicate initialization work before one
+    /// value wins the `OnceLock`.
     ///
     /// INVARIANT: once populated, the offsets passed
     /// [`CompactDictionary::validate_safety`] against `dict_bytes`, and the
@@ -232,14 +239,16 @@ impl OnPairData {
     }
 }
 
-/// Safety-validate `(bytes, offsets)`, seal them into a storage-backed
-/// dictionary, and build the low-8 decode table when the dictionary
-/// qualifies.
+/// Safety-validate `(bytes, offsets)` and seal them into a storage-backed
+/// dictionary. The low-8 decode table stays unbuilt until a bulk decode asks
+/// for it — see [`dict_decode_tables`].
 fn build_dictionary(bytes: ByteBuffer, offsets: Buffer<u32>) -> VortexResult<CachedDictionary> {
     let compact = CompactDictionary::validate_safety(OnPairDictionaryStorage { bytes, offsets })
         .map_err(|e| vortex_err!(InvalidArgument: "Unsafe OnPair dictionary: {e}"))?;
-    let short = ShortTokenDict::try_build(compact.as_view());
-    Ok(CachedDictionary { compact, short })
+    Ok(CachedDictionary {
+        compact,
+        short: OnceLock::new(),
+    })
 }
 
 /// The memoized [`CachedDictionary`] for `array`.
@@ -275,12 +284,29 @@ pub fn dict_view<'a>(
 /// The decode inputs for `array`'s dictionary: the compact view plus the
 /// low-8 table when every token fits in 8 bytes. Same memoization as
 /// [`dict_view`].
+///
+/// `decode_codes` is the size of the code stream this decode will consume; a
+/// decode at least as long as the dictionary amortizes the O(dict) table
+/// build (and, once built, the shared cache repays it across every later
+/// decode of the column), while a smaller one — a `scalar_at` row, a heavily
+/// filtered chunk — only consumes a table an earlier bulk decode already
+/// built. Keeps random point reads free of any table-build cost.
 pub(crate) fn dict_decode_tables<'a>(
     array: ArrayView<'a, OnPair>,
     ctx: &mut ExecutionCtx,
+    decode_codes: usize,
 ) -> VortexResult<(CompactDictionaryView<'a>, Option<&'a ShortTokenDict>)> {
     let cached = cached_dictionary(array, ctx)?;
-    Ok((cached.compact.as_view(), cached.short.as_ref()))
+    let view = cached.compact.as_view();
+    let short = if decode_codes >= view.num_tokens() {
+        cached
+            .short
+            .get_or_init(|| ShortTokenDict::try_build(view))
+            .as_ref()
+    } else {
+        cached.short.get().and_then(|short| short.as_ref())
+    };
+    Ok((view, short))
 }
 
 impl Display for OnPairData {

@@ -108,7 +108,7 @@ impl<'a> OnPairDecodePlan<'a> {
         // contiguous decoder walks `codes` in order and never reads the per-row
         // boundaries, so an empty boundary slice is sound.
         let codes = collect_widened::<u16>(&array.codes().slice(code_start..code_end)?, ctx)?;
-        let (dict, short) = dict_decode_tables(array, ctx)?;
+        let (dict, short) = dict_decode_tables(array, ctx, codes.len())?;
 
         Ok(Self {
             codes,
