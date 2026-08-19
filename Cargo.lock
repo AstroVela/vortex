@@ -9770,6 +9770,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "arrow-select 58.4.0",
  "codspeed-divan-compat",
+ "fastlanes",
  "insta",
  "itertools 0.14.0",
  "parquet 58.4.0",

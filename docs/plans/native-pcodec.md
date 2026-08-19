@@ -838,6 +838,47 @@ The results reject a general quotient and remainder array with ordinary children
 
 They support a small-alphabet entropy experiment and a fixed integer split experiment.
 
+### Bounded IntMult prototypes
+
+The direct prototypes use 1,024-value blocks and exact quotient and remainder splits.
+
+Each quotient block stores one reference, FastLanes-packed low bits, and bounded bitmap patches.
+
+The GloVe variants tested three remainder layouts:
+
+- A mode value with bitmap exceptions.
+- Gap positions with a maximum scan of 1,024 values.
+- One exception bit per value pair with one payload byte per exceptional pair.
+
+| GloVe base-ten child | Bytes | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: |
+| Bitmap remainder | 5,197,126 | 10,400 to 11,200 | 14 |
+| Gap positions | 5,348,130 | 10,800 to 12,400 | 78 to 88 |
+| Pair bytes | 5,184,309 | 10,600 to 10,700 | Not measured |
+
+The current Default GloVe tree decodes at 16,700 to 17,500 MB/s.
+
+The bitmap variant encodes at 650 to 666 MB/s. It applies 142,861 quotient patches and 298,831 remainder exceptions.
+
+The gap layout loses size and scalar speed. The pair layout does not improve bulk decode.
+
+The CMS prototype stores every remainder with one dense FastLanes stream. This layout avoids sparse remainder expansion.
+
+| CMS payment child, base ten | Bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: |
+| Pco child | 9,141,872 | Not isolated | Not isolated | Not isolated |
+| Dense remainder prototype | 9,811,885 | 879 | 8,094 | 19 |
+
+The complete Default CMS tree uses 10,494,404 bytes and decodes at 25,226 MB/s.
+
+The dense prototype applies 853,533 quotient patches across two million values.
+
+A diagnostic decode without quotient patches reaches 12,628 MB/s. The split and reconstruction costs still miss the Default decode target.
+
+These results reject the tested IntMult layouts for Default. The layouts retain bounded scalar access, but their bulk decode cost is too high.
+
+The result does not reject an IntMult backend for Compact. Compact accepts a different throughput and random-access tradeoff.
+
 ### Exact ALP child comparison
 
 The benchmark replaces a Compact `ALP(Pco)` child with the same latent integers in BlockResidual.
@@ -1224,6 +1265,8 @@ This round completed these steps:
 - Rejected byte-aligned fixed bins after a direct size and throughput comparison.
 - Rejected grouped fixed bins after Euro2016 and CMS comparisons.
 - Rejected packed multi-reference blocks after patched and patch-free comparisons.
+- Rejected three bounded IntMult remainder layouts on GloVe.
+- Rejected the dense-remainder IntMult layout on CMS Payments.
 
 The Pco mode profile and quotient and remainder experiments are complete.
 
@@ -1231,8 +1274,8 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these remaining steps:
 
-1. Prototype a lightweight integer split for Pco `IntMult` wins under ALP.
-2. Prototype one bounded-access scheme for repeated classic-bin wins without Delta.
+1. Prototype one bounded-access scheme for repeated classic-bin wins without Delta.
+2. Keep IntMult outside Default unless a new design removes the split reconstruction cost.
 3. Add a true ALP-RD child composition case if a real selected tree exposes one.
 4. Validate the remaining rejected analysis cost after the candidate set stabilizes.
 5. Add real embedding datasets beyond GloVe when licenses and loaders permit them.

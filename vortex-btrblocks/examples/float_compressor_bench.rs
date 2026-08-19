@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+#[path = "float_compressor_bench/int_mult_codec.rs"]
+mod int_mult_codec;
+
 use std::fs::File;
 use std::hint::black_box;
 use std::io::BufRead;
@@ -20,6 +23,7 @@ use pco::data_types::Number;
 use pco::metadata::ChunkLatentVarMeta;
 use pco::metadata::DeltaEncoding;
 use pco::metadata::DynBins;
+use pco::metadata::DynLatent;
 use pco::metadata::Mode;
 use pco::wrapped::FileCompressor;
 use rand::RngExt;
@@ -65,6 +69,9 @@ use vortex_range_packed::RangePacked;
 use vortex_range_packed::RangePackedCodec;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
+
+use crate::int_mult_codec::IntMultCodec32;
+use crate::int_mult_codec::IntMultDenseCodec64;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
 const CALIFORNIA_COLUMNS: [&str; 9] = [
@@ -587,11 +594,21 @@ fn optional_bin_profile(meta: Option<&ChunkLatentVarMeta>) -> BinProfile {
 fn mode_name(mode: &Mode) -> String {
     match mode {
         Mode::Classic => "classic".to_string(),
-        Mode::IntMult(_) => "int-mult".to_string(),
+        Mode::IntMult(base) => format!("int-mult-{}", dyn_latent_value(*base)),
         Mode::FloatMult(_) => "float-mult".to_string(),
         Mode::FloatQuant(k) => format!("float-quant-{k}"),
         Mode::Dict(_) => "dict".to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+fn dyn_latent_value(value: DynLatent) -> u64 {
+    match value {
+        DynLatent::U8(value) => u64::from(value),
+        DynLatent::U16(value) => u64::from(value),
+        DynLatent::U32(value) => u64::from(value),
+        DynLatent::U64(value) => value,
+        _ => unreachable!("unsupported Pco latent type"),
     }
 }
 
@@ -899,6 +916,13 @@ fn profile_quotient_remainder(
             encoding_tree(&remainder),
         );
     }
+    if std::env::var_os("VORTEX_BENCH_INT_MULT").is_some() {
+        match ptype.bit_width() {
+            32 => profile_int_mult_codec(dataset, column, path, ptype, pco_bytes, ordered)?,
+            64 => profile_int_mult_dense_codec64(dataset, column, path, ptype, pco_bytes, ordered)?,
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -921,6 +945,223 @@ fn latent_array(values: &[u64], ptype: PType) -> VortexResult<PrimitiveArray> {
             "quotient and remainder profiling does not support {width}-bit values"
         )),
     }
+}
+
+fn profile_int_mult_codec(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    ptype: PType,
+    pco_bytes: u64,
+    ordered: &[u64],
+) -> VortexResult<()> {
+    let values = ordered
+        .iter()
+        .map(|&value| u32::try_from(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    for base in [2, 5, 10, 16, 100, 1_000] {
+        let mut encode_durations = Vec::with_capacity(5);
+        let mut codec = IntMultCodec32::encode(&values, base)?;
+        for _ in 0..5 {
+            let start = Instant::now();
+            codec = IntMultCodec32::encode(black_box(&values), base)?;
+            encode_durations.push(start.elapsed());
+        }
+        let encode_median = percentile(&mut encode_durations, 1, 2);
+
+        vortex_ensure!(codec.decode() == values, "IntMult codec decode differs");
+        let decode_iterations = codec_decode_iterations()?;
+        let mut decode_durations = Vec::with_capacity(decode_iterations);
+        for _ in 0..decode_iterations {
+            let start = Instant::now();
+            black_box(codec.decode());
+            decode_durations.push(start.elapsed());
+        }
+        let decode_median = percentile(&mut decode_durations, 1, 2);
+
+        let scalar_iterations = 200_000;
+        let mut scalar_index = 0usize;
+        let mut scalar_checksum = 0u32;
+        let scalar_start = Instant::now();
+        for _ in 0..scalar_iterations {
+            scalar_index = scalar_index.wrapping_add(2_654_435_761) % values.len();
+            scalar_checksum ^= black_box(codec.scalar_at(scalar_index)?);
+        }
+        black_box(scalar_checksum);
+        let scalar_duration = scalar_start.elapsed();
+
+        let input_bytes = values.len() * ptype.byte_width();
+        let encode_throughput = input_bytes as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+        let decode_throughput = input_bytes as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+        let scalar_nanoseconds =
+            scalar_duration.as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64;
+        println!(
+            "int-mult-checkpoint\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{}\t{pco_bytes}\t{}\t{}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}",
+            values.len(),
+            codec.encoded_size(),
+            codec.quotient_patch_count(),
+            codec.remainder_exception_count(),
+        );
+        let mut gap_decode_durations = Vec::with_capacity(decode_iterations);
+        for _ in 0..decode_iterations {
+            let start = Instant::now();
+            black_box(codec.decode_gaps());
+            gap_decode_durations.push(start.elapsed());
+        }
+        let gap_decode_median = percentile(&mut gap_decode_durations, 1, 2);
+        let gap_decode_throughput =
+            input_bytes as f64 / gap_decode_median.as_secs_f64() / 1_000_000.0;
+        let mut gap_scalar_index = 0usize;
+        let mut gap_scalar_checksum = 0u32;
+        let gap_scalar_start = Instant::now();
+        for _ in 0..scalar_iterations {
+            gap_scalar_index = gap_scalar_index.wrapping_add(2_654_435_761) % values.len();
+            gap_scalar_checksum ^= black_box(codec.scalar_at_gaps(gap_scalar_index)?);
+        }
+        black_box(gap_scalar_checksum);
+        let gap_scalar_nanoseconds =
+            gap_scalar_start.elapsed().as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64;
+        let (quotient_gap_bytes, remainder_gap_bytes) = codec.gap_bytes();
+        let (quotient_bitmap_bytes, remainder_bitmap_bytes) = codec.bitmap_bytes();
+        println!(
+            "int-mult-gaps-checkpoint\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{}\t{pco_bytes}\t{}\t{quotient_gap_bytes}\t{remainder_gap_bytes}\t{quotient_bitmap_bytes}\t{remainder_bitmap_bytes}\t{encode_throughput:.1}\t{gap_decode_throughput:.1}\t{gap_scalar_nanoseconds:.1}",
+            values.len(),
+            codec.encoded_size_gaps(),
+        );
+        if base <= 16 {
+            let mut pair_decode_durations = Vec::with_capacity(decode_iterations);
+            for _ in 0..decode_iterations {
+                let start = Instant::now();
+                black_box(codec.decode_pairs());
+                pair_decode_durations.push(start.elapsed());
+            }
+            let pair_decode_median = percentile(&mut pair_decode_durations, 1, 2);
+            let pair_decode_throughput =
+                input_bytes as f64 / pair_decode_median.as_secs_f64() / 1_000_000.0;
+            println!(
+                "int-mult-pairs-checkpoint\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{}\t{pco_bytes}\t{}\t{encode_throughput:.1}\t{pair_decode_throughput:.1}",
+                values.len(),
+                codec.encoded_size_pairs(),
+            );
+        }
+        if base == 10 {
+            profile_int_mult_decode_breakdown(&codec, input_bytes, decode_iterations);
+        }
+    }
+    Ok(())
+}
+
+fn profile_int_mult_decode_breakdown(
+    codec: &IntMultCodec32,
+    input_bytes: usize,
+    iterations: usize,
+) {
+    type DecodeVariant = fn(&IntMultCodec32) -> Vec<u32>;
+    let variants: [(&str, DecodeVariant); 9] = [
+        ("full", IntMultCodec32::decode),
+        (
+            "no-quotient-patches",
+            IntMultCodec32::decode_without_quotient_patches,
+        ),
+        (
+            "no-remainder-exceptions",
+            IntMultCodec32::decode_without_remainder_exceptions,
+        ),
+        ("no-exceptions", IntMultCodec32::decode_without_exceptions),
+        ("gaps-full", IntMultCodec32::decode_gaps),
+        (
+            "gaps-no-quotient-patches",
+            IntMultCodec32::decode_gaps_without_quotient_patches,
+        ),
+        (
+            "gaps-no-remainder-exceptions",
+            IntMultCodec32::decode_gaps_without_remainder_exceptions,
+        ),
+        (
+            "gaps-no-exceptions",
+            IntMultCodec32::decode_gaps_without_exceptions,
+        ),
+        ("pairs-full", IntMultCodec32::decode_pairs),
+    ];
+    for (variant, decode) in variants {
+        let mut durations = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = Instant::now();
+            black_box(decode(codec));
+            durations.push(start.elapsed());
+        }
+        let median = percentile(&mut durations, 1, 2);
+        let throughput = input_bytes as f64 / median.as_secs_f64() / 1_000_000.0;
+        println!("int-mult-decode-breakdown\t{variant}\t{throughput:.1}");
+    }
+}
+
+fn profile_int_mult_dense_codec64(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    ptype: PType,
+    pco_bytes: u64,
+    values: &[u64],
+) -> VortexResult<()> {
+    for base in [2, 5, 10, 16, 100, 1_000] {
+        let mut encode_durations = Vec::with_capacity(5);
+        let mut codec = IntMultDenseCodec64::encode(values, base)?;
+        for _ in 0..5 {
+            let start = Instant::now();
+            codec = IntMultDenseCodec64::encode(black_box(values), base)?;
+            encode_durations.push(start.elapsed());
+        }
+        let encode_median = percentile(&mut encode_durations, 1, 2);
+
+        vortex_ensure!(codec.decode() == values, "dense IntMult decode differs");
+        let decode_iterations = codec_decode_iterations()?;
+        let mut decode_durations = Vec::with_capacity(decode_iterations);
+        for _ in 0..decode_iterations {
+            let start = Instant::now();
+            black_box(codec.decode());
+            decode_durations.push(start.elapsed());
+        }
+        let decode_median = percentile(&mut decode_durations, 1, 2);
+
+        let scalar_iterations = 200_000;
+        let mut scalar_index = 0usize;
+        let mut scalar_checksum = 0u64;
+        let scalar_start = Instant::now();
+        for _ in 0..scalar_iterations {
+            scalar_index = scalar_index.wrapping_add(2_654_435_761) % values.len();
+            scalar_checksum ^= black_box(codec.scalar_at(scalar_index)?);
+        }
+        black_box(scalar_checksum);
+        let scalar_duration = scalar_start.elapsed();
+
+        let input_bytes = values.len() * ptype.byte_width();
+        let encode_throughput = input_bytes as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+        let decode_throughput = input_bytes as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+        let scalar_nanoseconds =
+            scalar_duration.as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64;
+        println!(
+            "int-mult-dense64-checkpoint\t{dataset}\t{column}\t{path}\t{ptype}\t{base}\t{}\t{pco_bytes}\t{}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}",
+            values.len(),
+            codec.encoded_size(),
+            codec.quotient_patch_count(),
+        );
+        if base == 10 {
+            let mut no_patch_durations = Vec::with_capacity(decode_iterations);
+            for _ in 0..decode_iterations {
+                let start = Instant::now();
+                black_box(codec.decode_without_quotient_patches());
+                no_patch_durations.push(start.elapsed());
+            }
+            let no_patch_median = percentile(&mut no_patch_durations, 1, 2);
+            let no_patch_throughput =
+                input_bytes as f64 / no_patch_median.as_secs_f64() / 1_000_000.0;
+            println!(
+                "int-mult-decode-breakdown\tdense64-no-quotient-patches\t{no_patch_throughput:.1}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn profile_range_packed(
@@ -1746,6 +1987,19 @@ fn main() -> VortexResult<()> {
     );
     println!(
         "quotient-remainder-estimate\tdataset\tcolumn\tpath\tptype\tbase\tpco-child-bytes\tremainder-entropy\tmost-common-remainder-share\tquotient-bytes\tremainder-bytes\ttotal-bytes\tquotient-bitmap-bytes\tremainder-mode-bitmap-bytes\tbitmap-total-bytes\tquotient-encoding\tremainder-encoding"
+    );
+    println!(
+        "int-mult-checkpoint\tdataset\tcolumn\tpath\tptype\tbase\trows\tpco-child-bytes\tint-mult-bytes\tquotient-patches\tremainder-exceptions\tencode-MB/s\tdecode-MB/s\tscalar-ns"
+    );
+    println!(
+        "int-mult-gaps-checkpoint\tdataset\tcolumn\tpath\tptype\tbase\trows\tpco-child-bytes\tint-mult-bytes\tquotient-gap-bytes\tremainder-gap-bytes\tquotient-bitmap-bytes\tremainder-bitmap-bytes\tencode-MB/s\tdecode-MB/s\tscalar-ns"
+    );
+    println!(
+        "int-mult-pairs-checkpoint\tdataset\tcolumn\tpath\tptype\tbase\trows\tpco-child-bytes\tint-mult-bytes\tencode-MB/s\tdecode-MB/s"
+    );
+    println!("int-mult-decode-breakdown\tvariant\tdecode-MB/s");
+    println!(
+        "int-mult-dense64-checkpoint\tdataset\tcolumn\tpath\tptype\tbase\trows\tpco-child-bytes\tint-mult-bytes\tquotient-patches\tencode-MB/s\tdecode-MB/s\tscalar-ns"
     );
     println!(
         "fixed-bin-checkpoint\tdataset\tcolumn\tpath\trows\tpco-bytes\tfixed-bin-bytes\tbins\tmax-offset-bits\toffset-widths\tencode-MB/s\tdecode-MB/s\tscalar-ns"

@@ -46,6 +46,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 divan = { workspace = true }
+fastlanes = { workspace = true }
 insta = { workspace = true }
 parquet = { workspace = true }
 rstest = { workspace = true }
