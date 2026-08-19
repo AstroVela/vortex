@@ -281,7 +281,7 @@ tracing = { version = "0.1.41", default-features = false }
 tracing-perfetto = "0.1.5"
 tracing-subscriber = "0.3"
 url = "2.5.7"
-uuid = { version = "1.23", features = ["js"] }
+uuid = "1.23"
 wasm-bindgen-futures = "0.4.58"
 wkb = "0.9.2"
 xshell = "0.2.6"
