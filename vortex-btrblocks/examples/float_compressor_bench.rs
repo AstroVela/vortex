@@ -55,6 +55,11 @@ use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
+#[path = "support/range_packed.rs"]
+mod range_packed;
+
+use range_packed::RangePackedCodec;
+
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
 const CALIFORNIA_COLUMNS: [&str; 9] = [
     "longitude",
@@ -884,6 +889,61 @@ fn profile_quotient_remainder(
     Ok(())
 }
 
+fn profile_range_packed(
+    dataset: &str,
+    column: &str,
+    path: &str,
+    logical_bytes: usize,
+    pco_bytes: u64,
+    validity_bytes: u64,
+    ordered: &[u64],
+) -> VortexResult<()> {
+    if ordered.is_empty() {
+        return Ok(());
+    }
+
+    let mut encode_durations = Vec::with_capacity(5);
+    let mut codec = RangePackedCodec::encode(ordered, 1_024)?;
+    for _ in 0..5 {
+        let start = Instant::now();
+        codec = RangePackedCodec::encode(black_box(ordered), 1_024)?;
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+
+    vortex_ensure!(codec.decode()? == ordered, "range packed decode differs");
+    let mut decode_durations = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        black_box(codec.decode()?);
+        decode_durations.push(start.elapsed());
+    }
+    let decode_median = percentile(&mut decode_durations, 1, 2);
+
+    let scalar_iterations = 200_000;
+    let mut scalar_index = 0usize;
+    let mut scalar_checksum = 0u64;
+    let scalar_start = Instant::now();
+    for _ in 0..scalar_iterations {
+        scalar_index = scalar_index.wrapping_add(2_654_435_761) % ordered.len();
+        scalar_checksum ^= black_box(codec.scalar_at(scalar_index)?);
+    }
+    black_box(scalar_checksum);
+    let scalar_duration = scalar_start.elapsed();
+    let input_bytes = ordered.len() * logical_bytes;
+    let encode_throughput = input_bytes as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    let decode_throughput = input_bytes as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+    let scalar_nanoseconds =
+        scalar_duration.as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64;
+    let encoded_bytes = u64::try_from(codec.encoded_size())? + validity_bytes;
+    println!(
+        "fixed-bin-checkpoint\t{dataset}\t{column}\t{path}\t{}\t{pco_bytes}\t{encoded_bytes}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}",
+        ordered.len(),
+        codec.bin_count(),
+    );
+    Ok(())
+}
+
 fn profile_pco_array(
     dataset: &str,
     column: &str,
@@ -902,6 +962,18 @@ fn profile_pco_array(
             .filter(mask)?
             .execute::<PrimitiveArray>(&mut ctx)?;
         let ordered = ordered_values(&values);
+        let validity_bytes = array.children().iter().map(ArrayRef::nbytes).sum::<u64>();
+        if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some() {
+            profile_range_packed(
+                dataset,
+                column,
+                path,
+                values.ptype().byte_width(),
+                array.nbytes(),
+                validity_bytes,
+                &ordered,
+            )?;
+        }
         profile_quotient_remainder(
             dataset,
             column,
@@ -911,7 +983,6 @@ fn profile_pco_array(
             &ordered,
             session,
         )?;
-        let validity_bytes = array.children().iter().map(ArrayRef::nbytes).sum::<u64>();
         let bits = values.ptype().bit_width();
         let one_reference =
             u64::try_from(estimate_multi_reference(&ordered, 1, bits))? + validity_bytes;
@@ -1045,7 +1116,9 @@ fn measure_dataset(
             encoding_tree(default_array),
             encoding_tree(compact_array),
         );
-        if compact_bytes * 10 <= default_bytes * 9 {
+        if compact_bytes * 10 <= default_bytes * 9
+            || std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some()
+        {
             profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
         }
     }
@@ -1168,6 +1241,9 @@ fn main() -> VortexResult<()> {
     );
     println!(
         "quotient-remainder-estimate\tdataset\tcolumn\tpath\tptype\tbase\tpco-child-bytes\tremainder-entropy\tmost-common-remainder-share\tquotient-bytes\tremainder-bytes\ttotal-bytes\tquotient-bitmap-bytes\tremainder-mode-bitmap-bytes\tbitmap-total-bytes\tquotient-encoding\tremainder-encoding"
+    );
+    println!(
+        "fixed-bin-checkpoint\tdataset\tcolumn\tpath\trows\tpco-bytes\tfixed-bin-bytes\tbins\tencode-MB/s\tdecode-MB/s\tscalar-ns"
     );
     println!("result\tdataset\tconfig\trows\tinput-bytes\tencoded-bytes\tencode-MB/s\tdecode-MB/s");
     println!(

@@ -695,6 +695,30 @@ A checkpoint interval of 32 values bounds scalar work to 31 offset widths.
 
 This design adds about 0.5 bits per value with 16-bit checkpoints.
 
+### Fixed-bin checkpoint prototype
+
+The checkpoint prototype uses 1,024-value blocks and one 16-bit offset checkpoint per 32 values.
+
+The bin optimizer scores fixed-width identifiers. It restricts bin counts to powers of two.
+
+The bulk decoder uses one narrow-offset specialization for bins with widths of at most 57 bits.
+
+| Input | Default bytes | Pco bytes | Fixed-bin bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Synthetic uniform f64 | 14,104,090 | 13,768,605 | 14,037,682 | 1,194 | 10,534 | 48 |
+| GloVe ALP child | 6,274,834 | 5,287,510 | 6,177,168 | 539 | 6,600 | 25 |
+| CMS ALP child | 4,146,124 | 3,261,563 | 3,515,002 | 1,280 | 13,554 | 23 |
+
+The GloVe fixed-bin tree saves only 1.6 percent against default.
+
+The CMS fixed-bin tree saves 15.2 percent against default. It remains 7.8 percent larger than Compact Pco.
+
+The first CMS decoder reached 8,057 MB/s. The specialized decoder increased throughput by 68.2 percent.
+
+The complete CMS default tree decodes at 14,649 MB/s. The fixed-bin child is 7.5 percent slower.
+
+An integrated Vortex array is required for the complete-tree throughput comparison.
+
 ### Pcodec corpus gap analysis
 
 The focused benchmark reads the first two million numeric rows from each source.
@@ -876,16 +900,14 @@ Complete these remaining steps:
 1. Validate the nonlinear patch cost on the complete corpus.
 2. Add a true ALP-RD child composition case if a real selected tree exposes one.
 3. Validate the remaining rejected analysis cost in the complete corpus.
-4. Optimize narrow BlockResidual decode and recheck the default throughput gate.
-5. Prototype bounded scalar checkpoints for fixed-bin range packing.
-6. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
-7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-8. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-9. Prototype one lightweight scheme for the repeated real-float gap classes.
-10. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-11. Compare the geometric mean against Parquet with Zstd.
-12. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-13. Update this plan after each experiment.
+4. Integrate fixed-bin packing as an experimental array and measure complete CMS and GloVe trees.
+5. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+6. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+7. Prototype one lightweight scheme for the repeated real-float gap classes.
+8. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+9. Compare the geometric mean against Parquet with Zstd.
+10. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+11. Update this plan after each experiment.
 
 ## Pull request structure
 
