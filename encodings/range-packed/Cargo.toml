@@ -1,0 +1,26 @@
+[package]
+name = "vortex-range-packed"
+authors = { workspace = true }
+categories = { workspace = true }
+description = "Vortex fixed-bin range-packed integer array encoding"
+edition = { workspace = true }
+homepage = { workspace = true }
+include = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+vortex-array = { workspace = true }
+vortex-buffer = { workspace = true }
+vortex-error = { workspace = true }
+vortex-session = { workspace = true }
+
+[dev-dependencies]
+vortex-array = { workspace = true, features = ["_test-harness"] }
+
+[lints]
+workspace = true

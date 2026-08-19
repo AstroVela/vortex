@@ -68,7 +68,7 @@ struct Bin {
     offset_bits: u8,
 }
 
-/// Experimental Vortex wrapper for complete-tree benchmark measurements.
+/// Fixed-bin range packing with bounded scalar access.
 pub type RangePackedArray = Array<RangePacked>;
 
 #[derive(Clone, Debug)]

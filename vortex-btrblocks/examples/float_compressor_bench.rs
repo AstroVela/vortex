@@ -63,11 +63,8 @@ use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
-#[path = "support/range_packed.rs"]
-mod range_packed;
-
-use range_packed::RangePacked;
-use range_packed::RangePackedCodec;
+use vortex_range_packed::RangePacked;
+use vortex_range_packed::RangePackedCodec;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
 const CALIFORNIA_COLUMNS: [&str; 9] = [

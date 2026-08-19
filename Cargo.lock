@@ -9793,6 +9793,7 @@ dependencies = [
  "vortex-mask",
  "vortex-onpair",
  "vortex-pco",
+ "vortex-range-packed",
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",
@@ -10540,6 +10541,16 @@ dependencies = [
  "vortex",
  "vortex-cuda",
  "vortex-python-abi",
+]
+
+[[package]]
+name = "vortex-range-packed"
+version = "0.1.0"
+dependencies = [
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-session",
 ]
 
 [[package]]
