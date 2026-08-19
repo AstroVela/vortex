@@ -14,6 +14,7 @@ mod canonical;
 mod compress;
 mod compute;
 mod decode;
+mod decoder;
 mod kernel;
 mod ops;
 mod rules;
@@ -22,6 +23,8 @@ mod tests;
 
 pub use array::*;
 pub use compress::*;
+pub use decoder::ShortTokenDict;
+pub use decoder::try_decode_into;
 pub use onpair::CompactDictionaryView;
 pub use onpair::Config;
 pub use onpair::DEFAULT_CONFIG;

@@ -3,9 +3,12 @@
 //
 //! Decode-path microbenchmarks for the OnPair Vortex array.
 //!
-//! * `decode_into` — the upstream `onpair::decode_into` decoder hot
-//!   loop, fed by pre-materialised [`DecodeInputs`]. Measures the inner loop
-//!   only (no child `execute`, no allocation).
+//! * `decode_into` — the vendored `vortex_onpair::try_decode_into` decoder
+//!   hot loop (the production path, including the low-8 fast path when the
+//!   dictionary qualifies), fed by pre-materialised [`DecodeInputs`].
+//!   Measures the inner loop only (no child `execute`, no allocation).
+//! * `decode_into_upstream` — the upstream `onpair::decode_into` loop on the
+//!   same inputs, as the baseline the vendored decoder is compared against.
 //! * `canonicalize_to_varbinview` — the full Vortex
 //!   `OnPair → VarBinViewArray` path callers actually hit. Includes child
 //!   `execute`, the build_views step, allocation, etc.
@@ -49,13 +52,15 @@ use vortex_onpair::DEFAULT_CONFIG;
 use vortex_onpair::OnPair;
 use vortex_onpair::OnPairArray;
 use vortex_onpair::OnPairArraySlotsExt;
+use vortex_onpair::ShortTokenDict;
 
 /// Host-resident decode inputs, materialised once so the decode-loop benchmark
-/// measures only `onpair::decode_into` (not child `execute`/allocation).
+/// measures only the decode loop (not child `execute`/allocation).
 struct DecodeInputs {
     dict_bytes: BufferHandle,
     dict_offsets: Buffer<u32>,
     codes: Buffer<u16>,
+    short: Option<ShortTokenDict>,
 }
 
 impl DecodeInputs {
@@ -74,7 +79,14 @@ impl DecodeInputs {
         onpair::decoded_len(self.codes.as_slice(), self.dict())
     }
 
+    /// The vendored production decoder, low-8 fast path included.
     fn decode_into(&self, out: &mut [MaybeUninit<u8>]) -> usize {
+        vortex_onpair::try_decode_into(self.codes.as_slice(), self.dict(), self.short.as_ref(), out)
+            .expect("output buffer sized from decoded_len")
+    }
+
+    /// The upstream decoder the vendored loop is benchmarked against.
+    fn decode_into_upstream(&self, out: &mut [MaybeUninit<u8>]) -> usize {
         // SAFETY: callers allocate `decoded_len + DECODE_PADDING` bytes.
         unsafe { onpair::decode_into(self.codes.as_slice(), self.dict(), out) }
     }
@@ -181,15 +193,17 @@ fn materialise(arr: &OnPairArray, ctx: &mut ExecutionCtx) -> (DecodeInputs, usiz
     let view = arr.as_view();
     let dict_offsets = widen::<u32>(view.dict_offsets(), ctx);
     let dict_bytes = view.dict_bytes_handle().clone();
-    CompactDictionaryView::validate_safety(
+    let dict = CompactDictionaryView::validate_safety(
         dict_bytes.as_host().as_slice(),
         dict_offsets.as_slice(),
     )
     .expect("valid OnPair dictionary");
+    let short = ShortTokenDict::try_build(dict);
     let inputs = DecodeInputs {
         dict_bytes,
         dict_offsets,
         codes: widen::<u16>(view.codes(), ctx),
+        short,
     };
     let total = inputs.decoded_len();
     (inputs, total)
@@ -204,7 +218,7 @@ const CASES: &[(Shape, usize)] = &[
 ];
 
 /// Raw decode loop time, excluding child `execute` and the output allocation.
-/// Hits `onpair::decode_into` directly.
+/// Hits the vendored `vortex_onpair::try_decode_into` directly.
 #[divan::bench(args = CASES)]
 fn decode_into_bench(bencher: Bencher, case: (Shape, usize)) {
     let mut ctx = SESSION.create_execution_ctx();
@@ -214,6 +228,22 @@ fn decode_into_bench(bencher: Bencher, case: (Shape, usize)) {
     bencher.bench_local(|| {
         let mut out: Vec<u8> = Vec::with_capacity(total + onpair::DECODE_PADDING);
         let written = inputs.decode_into(out.spare_capacity_mut());
+        unsafe { out.set_len(written) };
+        divan::black_box(out);
+    });
+}
+
+/// The upstream `onpair::decode_into` loop on the same inputs — the baseline
+/// for `decode_into_bench`.
+#[divan::bench(args = CASES)]
+fn decode_into_upstream(bencher: Bencher, case: (Shape, usize)) {
+    let mut ctx = SESSION.create_execution_ctx();
+    let (shape, n) = case;
+    let arr = compress(n, shape, &mut ctx);
+    let (inputs, total) = materialise(&arr, &mut ctx);
+    bencher.bench_local(|| {
+        let mut out: Vec<u8> = Vec::with_capacity(total + onpair::DECODE_PADDING);
+        let written = inputs.decode_into_upstream(out.spare_capacity_mut());
         unsafe { out.set_len(written) };
         divan::black_box(out);
     });

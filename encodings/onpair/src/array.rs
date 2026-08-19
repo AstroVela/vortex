@@ -56,6 +56,7 @@ use crate::canonical::OnPairDecodePlan;
 use crate::canonical::canonicalize_onpair;
 use crate::canonical::onpair_decode_bytes;
 use crate::decode::collect_widened;
+use crate::decoder::ShortTokenDict;
 use crate::rules::RULES;
 
 /// An [`OnPair`]-encoded Vortex array.
@@ -153,6 +154,13 @@ impl DictionaryStorage<u32> for OnPairDictionaryStorage {
     }
 }
 
+/// The memoized dictionary state: the safety-validated storage-backed compact
+/// dictionary, plus the low-8 decode table when every token fits in 8 bytes.
+struct CachedDictionary {
+    compact: CompactDictionary<OnPairDictionaryStorage>,
+    short: Option<ShortTokenDict>,
+}
+
 /// Non-child data for an OnPair-encoded array.
 ///
 /// The serialized dictionary bytes stay in buffer 0, while the dictionary
@@ -171,18 +179,20 @@ pub struct OnPairData {
     /// INVARIANT: this buffer is an OnPair compact dictionary byte buffer,
     /// including its trailing read padding.
     dict_bytes: BufferHandle,
-    /// The storage-backed dictionary, memoized after successful initialization.
-    /// Initialization decompresses the child and safety-validates the dictionary;
-    /// once cached, later operations do neither again. The dictionary owns
+    /// The dictionary state, memoized after successful initialization.
+    /// Initialization decompresses the child, safety-validates the dictionary,
+    /// and builds the low-8 decode table when the dictionary qualifies; once
+    /// cached, later operations do none of that again. The dictionary owns
     /// clones of the immutable Vortex buffer handles, so this does not copy the
     /// bytes. A failed validation is not cached, and concurrent first users may
     /// duplicate initialization work before one value wins the `OnceLock`.
     ///
     /// INVARIANT: once populated, the offsets passed
-    /// [`CompactDictionary::validate_safety`] against `dict_bytes`.
+    /// [`CompactDictionary::validate_safety`] against `dict_bytes`, and the
+    /// low-8 table (when present) was built from that validated dictionary.
     /// The `Arc` cell is shared only between arrays with identical dictionary
     /// bytes and logically identical offsets (slice / filter / cast keep both).
-    dictionary: Arc<OnceLock<CompactDictionary<OnPairDictionaryStorage>>>,
+    dictionary: Arc<OnceLock<CachedDictionary>>,
 }
 
 impl OnPairData {
@@ -222,37 +232,55 @@ impl OnPairData {
     }
 }
 
-/// Safety-validate `(bytes, offsets)` and seal them into a storage-backed
-/// dictionary.
-fn build_dictionary(
-    bytes: ByteBuffer,
-    offsets: Buffer<u32>,
-) -> VortexResult<CompactDictionary<OnPairDictionaryStorage>> {
-    CompactDictionary::validate_safety(OnPairDictionaryStorage { bytes, offsets })
-        .map_err(|e| vortex_err!(InvalidArgument: "Unsafe OnPair dictionary: {e}"))
+/// Safety-validate `(bytes, offsets)`, seal them into a storage-backed
+/// dictionary, and build the low-8 decode table when the dictionary
+/// qualifies.
+fn build_dictionary(bytes: ByteBuffer, offsets: Buffer<u32>) -> VortexResult<CachedDictionary> {
+    let compact = CompactDictionary::validate_safety(OnPairDictionaryStorage { bytes, offsets })
+        .map_err(|e| vortex_err!(InvalidArgument: "Unsafe OnPair dictionary: {e}"))?;
+    let short = ShortTokenDict::try_build(compact.as_view());
+    Ok(CachedDictionary { compact, short })
 }
 
-/// A safety-validated [`CompactDictionaryView`] over `array`'s dictionary.
+/// The memoized [`CachedDictionary`] for `array`.
 ///
 /// The first successful initialization widens the `dict_offsets` child and
-/// safety-validates the dictionary structure; the resulting storage-backed
-/// dictionary is memoized in [`OnPairData`]. Once cached, subsequent calls —
-/// including on arrays derived by slice / filter / cast, which share the cell —
-/// pay neither cost again.
+/// safety-validates the dictionary structure; the result is memoized in
+/// [`OnPairData`]. Once cached, subsequent calls — including on arrays derived
+/// by slice / filter / cast, which share the cell — pay neither cost again.
+fn cached_dictionary<'a>(
+    array: ArrayView<'a, OnPair>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<&'a CachedDictionary> {
+    let data = array.data();
+    match data.dictionary.get() {
+        Some(dictionary) => Ok(dictionary),
+        None => {
+            let widened = collect_widened::<u32>(array.dict_offsets(), ctx)?;
+            let dictionary = build_dictionary(data.dict_bytes().clone(), widened)?;
+            Ok(data.dictionary.get_or_init(|| dictionary))
+        }
+    }
+}
+
+/// A safety-validated [`CompactDictionaryView`] over `array`'s dictionary,
+/// memoized via [`cached_dictionary`].
 pub fn dict_view<'a>(
     array: ArrayView<'a, OnPair>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<CompactDictionaryView<'a>> {
-    let data = array.data();
-    let dictionary = match data.dictionary.get() {
-        Some(dictionary) => dictionary,
-        None => {
-            let widened = collect_widened::<u32>(array.dict_offsets(), ctx)?;
-            let dictionary = build_dictionary(data.dict_bytes().clone(), widened)?;
-            data.dictionary.get_or_init(|| dictionary)
-        }
-    };
-    Ok(dictionary.as_view())
+    Ok(cached_dictionary(array, ctx)?.compact.as_view())
+}
+
+/// The decode inputs for `array`'s dictionary: the compact view plus the
+/// low-8 table when every token fits in 8 bytes. Same memoization as
+/// [`dict_view`].
+pub(crate) fn dict_decode_tables<'a>(
+    array: ArrayView<'a, OnPair>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<(CompactDictionaryView<'a>, Option<&'a ShortTokenDict>)> {
+    let cached = cached_dictionary(array, ctx)?;
+    Ok((cached.compact.as_view(), cached.short.as_ref()))
 }
 
 impl Display for OnPairData {

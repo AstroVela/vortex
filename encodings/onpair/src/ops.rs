@@ -13,7 +13,7 @@ use vortex_error::vortex_panic;
 
 use crate::OnPair;
 use crate::OnPairArraySlotsExt;
-use crate::array::dict_view;
+use crate::array::dict_decode_tables;
 use crate::decode::code_boundary_at;
 use crate::decode::collect_widened;
 
@@ -33,7 +33,7 @@ impl OperationsVTable<OnPair> for OnPair {
         let row_end = code_boundary_at(codes_offsets, index + 1, ctx)?;
 
         let codes = collect_widened::<u16>(&array.codes().slice(row_start..row_end)?, ctx)?;
-        let dict = dict_view(array, ctx)?;
+        let (dict, short) = dict_decode_tables(array, ctx)?;
 
         // The per-row decoded length is recorded in the `uncompressed_lengths`
         // child, so read it directly instead of asking the decoder to compute it.
@@ -45,7 +45,7 @@ impl OperationsVTable<OnPair> for OnPair {
             .ok_or_else(|| vortex_err!("OnPair uncompressed_lengths[{index}] is null"))?;
         let mut buf: Vec<u8> = Vec::with_capacity(len);
         let written =
-            match onpair::try_decode_into(codes.as_slice(), dict, buf.spare_capacity_mut()) {
+            match crate::try_decode_into(codes.as_slice(), dict, short, buf.spare_capacity_mut()) {
                 Ok(written) => written,
                 Err(_) => vortex_panic!(
                     "OnPair row {index} decodes to more bytes than uncompressed_lengths records"

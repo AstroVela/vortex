@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 //
 //! Convert an [`OnPairArray`] to its canonical `VarBinViewArray` by handing
-//! the materialised parts to `onpair::try_decode_into`.
+//! the materialised parts to the vendored decoder
+//! ([`crate::decoder::try_decode_into`]).
 //!
 //! [`OnPairArray`]: crate::OnPairArray
 
@@ -28,7 +29,8 @@ use vortex_error::vortex_ensure;
 
 use crate::OnPair;
 use crate::OnPairArraySlotsExt;
-use crate::array::dict_view;
+use crate::ShortTokenDict;
+use crate::array::dict_decode_tables;
 use crate::decode::code_boundary_at;
 use crate::decode::collect_widened;
 
@@ -55,6 +57,8 @@ pub(super) fn canonicalize_onpair(
 pub(crate) struct OnPairDecodePlan<'a> {
     codes: Buffer<u16>,
     dict: CompactDictionaryView<'a>,
+    /// The low-8 decode table, when every dictionary token fits in 8 bytes.
+    short: Option<&'a ShortTokenDict>,
     /// Per-row uncompressed lengths, zero for null rows.
     pub(crate) lengths: PrimitiveArray,
     /// Total decoded size, i.e. the sum of `lengths`.
@@ -104,11 +108,12 @@ impl<'a> OnPairDecodePlan<'a> {
         // contiguous decoder walks `codes` in order and never reads the per-row
         // boundaries, so an empty boundary slice is sound.
         let codes = collect_widened::<u16>(&array.codes().slice(code_start..code_end)?, ctx)?;
-        let dict = dict_view(array, ctx)?;
+        let (dict, short) = dict_decode_tables(array, ctx)?;
 
         Ok(Self {
             codes,
             dict,
+            short,
             lengths,
             total_size,
         })
@@ -116,19 +121,21 @@ impl<'a> OnPairDecodePlan<'a> {
 
     /// Bulk-decodes the whole code stream into `out`, which must hold at least `total_size` bytes.
     ///
-    /// Do not reach for `#[inline(always)]` here. `try_decode_into` is monomorphized for
-    /// `CompactDictionaryView` whichever way this is annotated, and it is far too large to inline
-    /// either way — it stays an out-of-line call in both. All `always` buys is dropping this
-    /// wrapper's own frame, one `bl`/`ret` per decoded chunk against a whole-column decode, which
-    /// `benches/decode.rs::canonicalize_to_varbinview` cannot tell apart from noise.
+    /// Do not reach for `#[inline(always)]` here. The vendored `try_decode_into` is far too large
+    /// to inline either way — it stays an out-of-line call in both. All `always` buys is dropping
+    /// this wrapper's own frame, one `bl`/`ret` per decoded chunk against a whole-column decode,
+    /// which `benches/decode.rs::canonicalize_to_varbinview` cannot tell apart from noise.
     #[inline]
     pub(crate) fn decode_into(&self, out: &mut [MaybeUninit<u8>]) -> VortexResult<usize> {
-        let written = match onpair::try_decode_into(self.codes.as_slice(), self.dict, out) {
-            Ok(written) => written,
-            Err(_) => {
-                vortex_bail!("OnPair codes decode to more bytes than uncompressed_lengths records")
-            }
-        };
+        let written =
+            match crate::try_decode_into(self.codes.as_slice(), self.dict, self.short, out) {
+                Ok(written) => written,
+                Err(_) => {
+                    vortex_bail!(
+                        "OnPair codes decode to more bytes than uncompressed_lengths records"
+                    )
+                }
+            };
 
         vortex_ensure!(
             written == self.total_size,
