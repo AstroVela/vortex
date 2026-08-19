@@ -25,6 +25,10 @@ use pco::wrapped::FileCompressor;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex_alp::ALP;
+use vortex_alp::ALPArrayExt;
+use vortex_alp::ALPArraySlotsExt;
+use vortex_alp::ALPFloat;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
@@ -58,6 +62,7 @@ use vortex_utils::aliases::hash_map::HashMap;
 #[path = "support/range_packed.rs"]
 mod range_packed;
 
+use range_packed::RangePacked;
 use range_packed::RangePackedCodec;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
@@ -944,6 +949,188 @@ fn profile_range_packed(
     Ok(())
 }
 
+fn fixed_bin_alp_tree(
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    if compact.encoding_id().as_ref() != "vortex.alp" {
+        return Ok(None);
+    }
+    let alp = compact.as_::<ALP>();
+    if alp.encoded().encoding_id().as_ref() != "vortex.pco" {
+        return Ok(None);
+    }
+    let primitive = alp
+        .encoded()
+        .clone()
+        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+    let primitive = primitive
+        .into_array()
+        .cast(alp.encoded().dtype().clone())?
+        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+    let encoded = RangePacked::from_primitive(primitive.as_view())?.into_array();
+    Ok(Some(
+        ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+    ))
+}
+
+fn measure_fixed_bin_tree(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let Some(encoded) = fixed_bin_alp_tree(compact, session)? else {
+        return Ok(());
+    };
+    vortex_ensure!(
+        encoded.dtype() == expected.dtype(),
+        "fixed-bin tree dtype {} differs from expected {}",
+        encoded.dtype(),
+        expected.dtype()
+    );
+    assert_arrays_eq!(encoded, expected, &mut session.create_execution_ctx());
+
+    let mut decode_durations = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        black_box(
+            encoded
+                .clone()
+                .execute::<RecursiveCanonical>(&mut session.create_execution_ctx())?,
+        );
+        decode_durations.push(start.elapsed());
+    }
+    let decode_median = percentile(&mut decode_durations, 1, 2);
+    let decode_throughput = expected.nbytes() as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+
+    let scalar_nanoseconds = measure_scalar_access(&encoded, session)?;
+    println!(
+        "fixed-bin-tree\t{dataset}\t{column}\t{}\t{}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+
+    let mut fused_durations = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        black_box(decode_fixed_bin_alp_tree(&encoded, session)?);
+        fused_durations.push(start.elapsed());
+    }
+    let fused_median = percentile(&mut fused_durations, 1, 2);
+    let fused_throughput = expected.nbytes() as f64 / fused_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "fixed-bin-tree-fused\t{dataset}\t{column}\t{}\t{}\t{fused_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
+}
+
+fn measure_existing_tree(
+    dataset: &str,
+    column: &str,
+    label: &str,
+    expected: &ArrayRef,
+    encoded: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    assert_arrays_eq!(encoded, expected, &mut session.create_execution_ctx());
+    let mut decode_durations = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        black_box(
+            encoded
+                .clone()
+                .execute::<RecursiveCanonical>(&mut session.create_execution_ctx())?,
+        );
+        decode_durations.push(start.elapsed());
+    }
+    let decode_median = percentile(&mut decode_durations, 1, 2);
+    let decode_throughput = expected.nbytes() as f64 / decode_median.as_secs_f64() / 1_000_000.0;
+    let scalar_nanoseconds = measure_scalar_access(encoded, session)?;
+    println!(
+        "tree-throughput\t{dataset}\t{column}\t{label}\t{}\t{}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(encoded),
+    );
+    Ok(())
+}
+
+fn measure_scalar_access(encoded: &ArrayRef, session: &VortexSession) -> VortexResult<f64> {
+    let scalar_iterations = 200_000;
+    let mut scalar_index = 0usize;
+    let mut scalar_checksum = 0u64;
+    let mut scalar_ctx = session.create_execution_ctx();
+    let scalar_start = Instant::now();
+    for _ in 0..scalar_iterations {
+        scalar_index = scalar_index.wrapping_add(2_654_435_761) % encoded.len();
+        let scalar = encoded.execute_scalar(scalar_index, &mut scalar_ctx)?;
+        let bits = match encoded.dtype().as_ptype() {
+            PType::F32 => u64::from(
+                scalar
+                    .as_primitive()
+                    .typed_value::<f32>()
+                    .ok_or_else(|| vortex_err!("tree produced a null scalar"))?
+                    .to_bits(),
+            ),
+            PType::F64 => scalar
+                .as_primitive()
+                .typed_value::<f64>()
+                .ok_or_else(|| vortex_err!("tree produced a null scalar"))?
+                .to_bits(),
+            ptype => {
+                return Err(vortex_err!(
+                    "tree scalar benchmark does not support {ptype}"
+                ));
+            }
+        };
+        scalar_checksum ^= black_box(bits);
+    }
+    black_box(scalar_checksum);
+    Ok(scalar_start.elapsed().as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the range-packed child retains the ALP integer word width"
+)]
+fn decode_fixed_bin_alp_tree(
+    encoded: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<PrimitiveArray> {
+    let alp = encoded.as_::<ALP>();
+    let packed = alp.encoded().as_::<RangePacked>();
+    let validity = alp.encoded().validity()?;
+    let exponents = alp.exponents();
+    let decoded = match encoded.dtype().as_ptype() {
+        PType::F32 => {
+            let values = RangePacked::decode_mapped(packed, |ordered| {
+                let encoded = ((ordered as u32) ^ (1_u32 << 31)) as i32;
+                <f32 as ALPFloat>::decode_single(encoded, exponents)
+            })?;
+            PrimitiveArray::new::<f32>(values, validity)
+        }
+        PType::F64 => {
+            let values = RangePacked::decode_mapped(packed, |ordered| {
+                let encoded = (ordered ^ (1_u64 << 63)) as i64;
+                <f64 as ALPFloat>::decode_single(encoded, exponents)
+            })?;
+            PrimitiveArray::new::<f64>(values, validity)
+        }
+        ptype => return Err(vortex_err!("fixed-bin ALP tree does not support {ptype}")),
+    };
+    if let Some(patches) = alp.patches() {
+        decoded.patch(&patches, &mut session.create_execution_ctx())
+    } else {
+        Ok(decoded)
+    }
+}
+
 fn profile_pco_array(
     dataset: &str,
     column: &str,
@@ -1121,6 +1308,25 @@ fn measure_dataset(
         {
             profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
         }
+        if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some() {
+            measure_existing_tree(
+                dataset,
+                &column.name,
+                "default",
+                &column.array,
+                default_array,
+                session,
+            )?;
+            measure_existing_tree(
+                dataset,
+                &column.name,
+                "compact",
+                &column.array,
+                compact_array,
+                session,
+            )?;
+            measure_fixed_bin_tree(dataset, &column.name, &column.array, compact_array, session)?;
+        }
     }
 
     if std::env::var_os("VORTEX_BENCH_PROFILE_ONLY").is_some() {
@@ -1244,6 +1450,11 @@ fn main() -> VortexResult<()> {
     );
     println!(
         "fixed-bin-checkpoint\tdataset\tcolumn\tpath\trows\tpco-bytes\tfixed-bin-bytes\tbins\tencode-MB/s\tdecode-MB/s\tscalar-ns"
+    );
+    println!("fixed-bin-tree\tdataset\tcolumn\trows\tbytes\tdecode-MB/s\tscalar-ns\tencoding");
+    println!("fixed-bin-tree-fused\tdataset\tcolumn\trows\tbytes\tdecode-MB/s\tencoding");
+    println!(
+        "tree-throughput\tdataset\tcolumn\tconfig\trows\tbytes\tdecode-MB/s\tscalar-ns\tencoding"
     );
     println!("result\tdataset\tconfig\trows\tinput-bytes\tencoded-bytes\tencode-MB/s\tdecode-MB/s");
     println!(

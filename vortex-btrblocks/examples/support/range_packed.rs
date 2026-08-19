@@ -2,11 +2,44 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cmp::Ordering;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 
+use vortex_array::Array;
+use vortex_array::ArrayEq;
+use vortex_array::ArrayHash;
+use vortex_array::ArrayId;
+use vortex_array::ArrayParts;
+use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
+use vortex_array::EqMode;
+use vortex_array::ExecutionCtx;
+use vortex_array::ExecutionResult;
+use vortex_array::IntoArray;
+use vortex_array::arrays::Primitive;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::buffer::BufferHandle;
+use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
+use vortex_array::scalar::Scalar;
+use vortex_array::serde::ArrayChildren;
+use vortex_array::validity::Validity;
+use vortex_array::vtable::OperationsVTable;
+use vortex_array::vtable::VTable;
+use vortex_array::vtable::ValidityVTable;
+use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_panic;
+use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 const MAX_BINS: usize = 64;
 const SPLIT_CANDIDATES: usize = 64;
@@ -18,7 +51,7 @@ const CHECKPOINT_INTERVAL: usize = 32;
 const MAX_BLOCK_LEN: usize = 1_024;
 
 /// Fixed-width range identifiers with variable-width offsets and scalar checkpoints.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RangePackedCodec {
     len: usize,
     block_len: usize,
@@ -28,10 +61,303 @@ pub struct RangePackedCodec {
     payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Bin {
     lower: u64,
     offset_bits: u8,
+}
+
+/// Experimental Vortex wrapper for complete-tree benchmark measurements.
+pub type RangePackedArray = Array<RangePacked>;
+
+#[derive(Clone, Debug)]
+pub struct RangePacked;
+
+#[derive(Clone, Debug)]
+pub struct RangePackedData {
+    codec: RangePackedCodec,
+    physical: ByteBuffer,
+    ptype: PType,
+}
+
+impl Display for RangePackedData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bins: {}", self.codec.bin_count())
+    }
+}
+
+impl ArrayHash for RangePackedData {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
+        self.codec.hash(state);
+        self.ptype.hash(state);
+    }
+}
+
+impl ArrayEq for RangePackedData {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
+        self.codec == other.codec && self.ptype == other.ptype
+    }
+}
+
+impl VTable for RangePacked {
+    type TypedArrayData = RangePackedData;
+    type OperationsVTable = Self;
+    type ValidityVTable = Self;
+
+    fn id(&self) -> ArrayId {
+        static ID: CachedId = CachedId::new("vortex.experimental.range_packed");
+        *ID
+    }
+
+    fn validate(
+        &self,
+        data: &Self::TypedArrayData,
+        dtype: &DType,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()> {
+        vortex_ensure!(slots.is_empty(), "RangePackedArray cannot have children");
+        vortex_ensure!(
+            dtype.is_primitive() && dtype.as_ptype() == data.ptype,
+            "RangePackedArray dtype differs from its physical type"
+        );
+        vortex_ensure!(len == data.codec.len, "RangePackedArray length differs");
+        vortex_ensure!(
+            data.physical.len() == data.codec.encoded_size(),
+            "RangePackedArray physical size differs"
+        );
+        Ok(())
+    }
+
+    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
+        1
+    }
+
+    fn buffer(array: ArrayView<'_, Self>, index: usize) -> BufferHandle {
+        if index == 0 {
+            BufferHandle::new_host(array.data().physical.clone())
+        } else {
+            vortex_panic!("RangePackedArray buffer index {index} is invalid")
+        }
+    }
+
+    fn buffer_name(_array: ArrayView<'_, Self>, index: usize) -> Option<String> {
+        (index == 0).then(|| "encoded".to_string())
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(buffers.len() == 1, "RangePackedArray needs one buffer");
+        let mut data = array.data().clone();
+        data.physical = buffers[0].clone().try_to_host_sync()?;
+        Ok(ArrayParts::new(
+            self.clone(),
+            array.dtype().clone(),
+            array.len(),
+            data,
+        ))
+    }
+
+    fn serialize(
+        _array: ArrayView<'_, Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
+        vortex_bail!("experimental RangePackedArray does not support serialization")
+    }
+
+    fn deserialize(
+        &self,
+        _dtype: &DType,
+        _len: usize,
+        _metadata: &[u8],
+        _buffers: &[BufferHandle],
+        _children: &dyn ArrayChildren,
+        _session: &VortexSession,
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_bail!("experimental RangePackedArray does not support deserialization")
+    }
+
+    fn slot_name(_array: ArrayView<'_, Self>, index: usize) -> String {
+        vortex_panic!("RangePackedArray slot index {index} is invalid")
+    }
+
+    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        let decoded = decode_primitive(array.data())?
+            .into_array()
+            .cast(array.dtype().clone())?;
+        Ok(ExecutionResult::done(decoded))
+    }
+}
+
+impl OperationsVTable<RangePacked> for RangePacked {
+    fn scalar_at(
+        array: ArrayView<'_, RangePacked>,
+        index: usize,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        ordered_scalar(
+            array.data().codec.scalar_at(index)?,
+            array.data().ptype,
+            array.dtype().nullability(),
+        )
+    }
+}
+
+impl ValidityVTable<RangePacked> for RangePacked {
+    fn validity(array: ArrayView<'_, RangePacked>) -> VortexResult<Validity> {
+        if array.dtype().is_nullable() {
+            Ok(Validity::AllValid)
+        } else {
+            Ok(Validity::NonNullable)
+        }
+    }
+}
+
+impl RangePacked {
+    pub fn from_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<RangePackedArray> {
+        vortex_ensure!(
+            array.ptype().is_int(),
+            "RangePackedArray needs integer values"
+        );
+        vortex_ensure!(
+            array.validity()?.definitely_no_nulls(),
+            "experimental RangePackedArray needs values without nulls"
+        );
+        let ordered = ordered_primitive(array)?;
+        let codec = RangePackedCodec::encode(&ordered, MAX_BLOCK_LEN)?;
+        let physical = ByteBuffer::zeroed(codec.encoded_size());
+        let data = RangePackedData {
+            codec,
+            physical,
+            ptype: array.ptype(),
+        };
+        Array::try_from_parts(ArrayParts::new(
+            RangePacked,
+            array.dtype().clone(),
+            array.len(),
+            data,
+        ))
+    }
+
+    pub fn decode_mapped<T, F>(array: ArrayView<'_, RangePacked>, map: F) -> VortexResult<Vec<T>>
+    where
+        F: FnMut(u64) -> T,
+    {
+        array.data().codec.decode_mapped(map)
+    }
+}
+
+fn ordered_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<Vec<u64>> {
+    Ok(match array.ptype() {
+        PType::U8 => array
+            .as_slice::<u8>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U16 => array
+            .as_slice::<u16>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U32 => array
+            .as_slice::<u32>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U64 => array.as_slice::<u64>().to_vec(),
+        PType::I8 => array
+            .as_slice::<i8>()
+            .iter()
+            .map(|&value| u64::from((value as u8) ^ (1_u8 << 7)))
+            .collect(),
+        PType::I16 => array
+            .as_slice::<i16>()
+            .iter()
+            .map(|&value| u64::from((value as u16) ^ (1_u16 << 15)))
+            .collect(),
+        PType::I32 => array
+            .as_slice::<i32>()
+            .iter()
+            .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
+            .collect(),
+        PType::I64 => array
+            .as_slice::<i64>()
+            .iter()
+            .map(|&value| (value as u64) ^ (1_u64 << 63))
+            .collect(),
+        ptype => vortex_bail!("RangePackedArray does not support {ptype}"),
+    })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the encoded values retain the source integer word width"
+)]
+fn decode_primitive(data: &RangePackedData) -> VortexResult<PrimitiveArray> {
+    let ordered = data.codec.decode()?;
+    Ok(match data.ptype {
+        PType::U8 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(u8::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PType::U16 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(u16::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PType::U32 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PType::U64 => PrimitiveArray::from_iter(ordered),
+        PType::I8 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(|value| ((value as u8) ^ (1_u8 << 7)) as i8),
+        ),
+        PType::I16 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(|value| ((value as u16) ^ (1_u16 << 15)) as i16),
+        ),
+        PType::I32 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(|value| ((value as u32) ^ (1_u32 << 31)) as i32),
+        ),
+        PType::I64 => PrimitiveArray::from_iter(
+            ordered
+                .into_iter()
+                .map(|value| (value ^ (1_u64 << 63)) as i64),
+        ),
+        ptype => vortex_bail!("RangePackedArray does not support {ptype}"),
+    })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the encoded value retains the source integer word width"
+)]
+fn ordered_scalar(value: u64, ptype: PType, nullability: Nullability) -> VortexResult<Scalar> {
+    Ok(match ptype {
+        PType::U8 => Scalar::primitive(u8::try_from(value)?, nullability),
+        PType::U16 => Scalar::primitive(u16::try_from(value)?, nullability),
+        PType::U32 => Scalar::primitive(u32::try_from(value)?, nullability),
+        PType::U64 => Scalar::primitive(value, nullability),
+        PType::I8 => Scalar::primitive(((value as u8) ^ (1_u8 << 7)) as i8, nullability),
+        PType::I16 => Scalar::primitive(((value as u16) ^ (1_u16 << 15)) as i16, nullability),
+        PType::I32 => Scalar::primitive(((value as u32) ^ (1_u32 << 31)) as i32, nullability),
+        PType::I64 => Scalar::primitive((value ^ (1_u64 << 63)) as i64, nullability),
+        ptype => vortex_bail!("RangePackedArray does not support {ptype}"),
+    })
 }
 
 impl RangePackedCodec {
@@ -87,26 +413,37 @@ impl RangePackedCodec {
     }
 
     pub fn decode(&self) -> VortexResult<Vec<u64>> {
+        self.decode_mapped(|value| value)
+    }
+
+    pub fn decode_mapped<T, F>(&self, map: F) -> VortexResult<Vec<T>>
+    where
+        F: FnMut(u64) -> T,
+    {
         if self.bins.iter().all(|bin| bin.offset_bits <= 57) {
-            self.decode_with_width::<false>()
+            self.decode_mapped_with_width::<false, T, F>(map)
         } else {
-            self.decode_with_width::<true>()
+            self.decode_mapped_with_width::<true, T, F>(map)
         }
     }
 
-    fn decode_with_width<const WIDE: bool>(&self) -> VortexResult<Vec<u64>> {
+    fn decode_mapped_with_width<const WIDE: bool, T, F>(&self, mut map: F) -> VortexResult<Vec<T>>
+    where
+        F: FnMut(u64) -> T,
+    {
         let mut values = Vec::with_capacity(self.len);
         let table = DecodeTable::new(&self.bins);
         for block_index in 0..self.block_count() {
             let payload = self.block_payload(block_index)?;
             let value_count = self.block_value_count(block_index);
             let output_start = values.len();
-            decode_block::<WIDE>(
+            decode_block::<WIDE, T, F>(
                 payload,
                 value_count,
                 self.symbol_width,
                 &table,
                 &mut values.spare_capacity_mut()[..value_count],
+                &mut map,
             )?;
             // SAFETY: decode_block initialized each output slot.
             unsafe { values.set_len(output_start + value_count) };
@@ -252,13 +589,17 @@ fn encode_block(
     clippy::cast_possible_truncation,
     reason = "the symbol mask never exceeds 63"
 )]
-fn decode_block<const WIDE: bool>(
+fn decode_block<const WIDE: bool, T, F>(
     payload: &[u8],
     value_count: usize,
     symbol_width: u8,
     table: &DecodeTable,
-    values: &mut [MaybeUninit<u64>],
-) -> VortexResult<()> {
+    values: &mut [MaybeUninit<T>],
+    map: &mut F,
+) -> VortexResult<()>
+where
+    F: FnMut(u64) -> T,
+{
     let layout = BlockLayout::new(value_count, symbol_width, payload.len())?;
     let offsets = &payload[layout.offsets_start..];
     let mut offset_position = 0usize;
@@ -280,7 +621,7 @@ fn decode_block<const WIDE: bool>(
             unsafe {
                 values
                     .get_unchecked_mut(base + lane)
-                    .write(lower.wrapping_add(offset))
+                    .write(map(lower.wrapping_add(offset)))
             };
         }
     }
@@ -297,7 +638,7 @@ fn decode_block<const WIDE: bool>(
         unsafe {
             values
                 .get_unchecked_mut(index)
-                .write(lower.wrapping_add(offset))
+                .write(map(lower.wrapping_add(offset)))
         };
     }
     let offset_bytes = offset_position.div_ceil(8);

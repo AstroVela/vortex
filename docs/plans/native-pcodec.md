@@ -715,9 +715,41 @@ The CMS fixed-bin tree saves 15.2 percent against default. It remains 7.8 percen
 
 The first CMS decoder reached 8,057 MB/s. The specialized decoder increased throughput by 68.2 percent.
 
-The complete CMS default tree decodes at 14,649 MB/s. The fixed-bin child is 7.5 percent slower.
+The complete CMS default tree decodes at 14,575 MB/s. The fixed-bin child is 6.1 percent slower.
 
-An integrated Vortex array is required for the complete-tree throughput comparison.
+The benchmark now wraps the codec in an experimental Vortex array.
+
+This wrapper permits complete ALP decode and scalar measurements without a storage-format commitment.
+
+| Input | Default decode MB/s | Compact decode MB/s | Fixed-bin decode MB/s | Fused decode MB/s |
+| --- | ---: | ---: | ---: | ---: |
+| GloVe | 17,523 | 1,853 | 4,991 | 4,984 |
+| CMS Payments | 14,575 | 5,588 | 9,342 | 9,791 |
+| Food | 24,000 | 5,569 | 9,431 | 11,195 |
+
+| Input | Default scalar ns | Compact scalar ns | Fixed-bin scalar ns |
+| --- | ---: | ---: | ---: |
+| GloVe | 824 | 21,374 | 535 |
+| CMS Payments | 903 | 14,473 | 383 |
+| Food | 535 | 13,569 | 140 |
+
+The fused path writes final floats during range decode. It retains the ALP patch step.
+
+Fusion increased CMS decode by 4.8 percent and Food decode by 18.7 percent. It did not improve GloVe decode.
+
+The fixed-bin tree fails the default decode gate on all three inputs.
+
+CMS and Food support a Compact candidate for classic Pco bins.
+
+CMS uses 7.8 percent more bytes than Compact. Generic decode is 67.2 percent faster, and scalar access is 37.8 times faster.
+
+Food uses 5.3 percent more bytes than Compact. Generic decode is 69.4 percent faster, and scalar access is 97.3 times faster.
+
+The fused Food decode is 2.0 times as fast as Compact. The generic composition already gives most of the benefit.
+
+GloVe uses 16.8 percent more bytes than Compact because Pco also uses `IntMult(10)`.
+
+The evidence does not justify a fused ALP and fixed-bin array. A composable integer child has lower implementation complexity.
 
 ### Pcodec corpus gap analysis
 
@@ -900,14 +932,16 @@ Complete these remaining steps:
 1. Validate the nonlinear patch cost on the complete corpus.
 2. Add a true ALP-RD child composition case if a real selected tree exposes one.
 3. Validate the remaining rejected analysis cost in the complete corpus.
-4. Integrate fixed-bin packing as an experimental array and measure complete CMS and GloVe trees.
-5. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-6. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-7. Prototype one lightweight scheme for the repeated real-float gap classes.
-8. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-9. Compare the geometric mean against Parquet with Zstd.
-10. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-11. Update this plan after each experiment.
+4. Test the complete fixed-bin tree on every available classic-bin Pco win.
+5. Define a Compact size threshold for the fixed-bin candidate.
+6. Promote fixed-bin packing to a production array only if more unrelated classic-bin columns pass.
+7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+8. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+9. Prototype one lightweight scheme for the repeated real-float gap classes.
+10. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+11. Compare the geometric mean against Parquet with Zstd.
+12. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+13. Update this plan after each experiment.
 
 ## Pull request structure
 
