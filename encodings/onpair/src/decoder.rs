@@ -201,11 +201,12 @@ fn decode_general(
             // `validate_safety`). The batch bound proves the 16-byte store
             // ends within `out`, by the same argument as `decode_short`.
             unsafe {
+                let len = dict.token_len_unchecked(code);
                 let src = dict.token_ptr(code);
                 dst.add(written)
                     .cast::<[u8; MAX_TOKEN_SIZE]>()
                     .write_unaligned(src.cast::<[u8; MAX_TOKEN_SIZE]>().read_unaligned());
-                written += dict.token_len_unchecked(code);
+                written += len;
             }
         }
         consumed = end;
