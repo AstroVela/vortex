@@ -160,6 +160,11 @@ fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>
     let patch_density_1 = PrimitiveArray::from_iter(
         (0..row_count).map(|index| u32::MAX - u32::try_from(index).unwrap_or(u32::MAX)),
     );
+    let block_local_i16 = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let block = (index / 1_024) % 128;
+        let residual = index.wrapping_mul(2_654_435_761) % 128;
+        i16::try_from(block * 128 + residual).unwrap_or(i16::MAX)
+    }));
     let sparse_block_local = PrimitiveArray::from_iter((0..row_count).map(|index| {
         if index % 16 == 0 {
             let value_index = index / 16;
@@ -265,6 +270,10 @@ fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>
         (
             "synthetic-patch-density-1".to_string(),
             vec![column("value", patch_density_1)],
+        ),
+        (
+            "synthetic-block-local-i16".to_string(),
+            vec![column("value", block_local_i16)],
         ),
         (
             "synthetic-sparse-block-local".to_string(),

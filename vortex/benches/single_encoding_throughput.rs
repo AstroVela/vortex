@@ -966,6 +966,39 @@ fn bench_block_local_for_bitpacked_scalar_at_i16(bencher: Bencher) {
         .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
 }
 
+#[divan::bench(name = "block_local_pcodec_compress_i16")]
+fn bench_block_local_pcodec_compress_i16(bencher: Bencher) {
+    let array = setup_block_local_i16_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+        .with_inputs(|| (&array, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| {
+            Pco::from_primitive(
+                array.as_view(),
+                PCO_COMPRESSION_LEVEL,
+                PCO_VALUES_PER_PAGE,
+                ctx,
+            )
+            .unwrap()
+        });
+}
+
+#[divan::bench(name = "block_local_pcodec_decompress_i16")]
+fn bench_block_local_pcodec_decompress_i16(bencher: Bencher) {
+    let array = setup_block_local_i16_array();
+    let compressed = Pco::from_primitive(
+        array.as_view(),
+        PCO_COMPRESSION_LEVEL,
+        PCO_VALUES_PER_PAGE,
+        &mut SESSION.create_execution_ctx(),
+    )
+    .unwrap();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+        .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
 #[divan::bench(name = "ordered_block_residual_compress_f64")]
 fn bench_ordered_block_residual_compress_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();

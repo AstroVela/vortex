@@ -323,6 +323,24 @@ BlockResidual is 48.7 percent smaller on that input.
 
 Its `i16` decode throughput is 24.4 percent lower. The default selector therefore excludes direct 8-bit and 16-bit candidates.
 
+### Narrow BlockResidual in Compact
+
+The Compact comparison uses the same two million block-local `i16` values.
+
+| Tree | Bytes | Encode MB/s | Decode MB/s |
+| --- | ---: | ---: | ---: |
+| FoR plus BitPacked | 3,501,568 | 1,129 | 40,970 |
+| BlockResidual | 1,793,784 | 1,361 | 31,330 |
+| Compact Pco | 241,832 | 391 | 1,680 |
+
+BlockResidual uses 7.4 times as many bytes as Pco.
+
+It encodes 3.5 times faster and decodes 18.6 times faster than Pco.
+
+Compact gives priority to the Pco size point. Narrow BlockResidual therefore has no Compact-only role.
+
+The 48.8 percent saving against FoR plus BitPacked supports one more narrow decode optimization pass.
+
 The BlockResidual estimator measures its sampled tree exactly, with all child arrays.
 
 The incumbent and outer tree estimates remain approximate. Trial compression previously mis-ranked Dict and ALP on Taxi tips.
@@ -858,7 +876,7 @@ Complete these remaining steps:
 1. Validate the nonlinear patch cost on the complete corpus.
 2. Add a true ALP-RD child composition case if a real selected tree exposes one.
 3. Validate the remaining rejected analysis cost in the complete corpus.
-4. Evaluate narrow BlockResidual as a Compact-only candidate.
+4. Optimize narrow BlockResidual decode and recheck the default throughput gate.
 5. Prototype bounded scalar checkpoints for fixed-bin range packing.
 6. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
 7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
