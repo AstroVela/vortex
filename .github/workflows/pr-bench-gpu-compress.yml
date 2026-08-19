@@ -38,6 +38,10 @@ jobs:
         uses: ./.github/actions/setup-duckdb
       - name: Install uv
         uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+        with:
+          # Only `.venv-cudf` below is used, so the repository-wide sync would build the
+          # `vortex-python` extension — and its Rust — for nothing.
+          sync: false
       - name: Install cuDF
         # The GPU Parquet number is a cuDF `read_parquet`. cuDF ships prebuilt manylinux wheels
         # on NVIDIA's index, so it stays a runtime dependency and never enters the Rust build.
