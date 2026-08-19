@@ -925,8 +925,9 @@ fn profile_range_packed(
     let encode_median = percentile(&mut encode_durations, 1, 2);
 
     vortex_ensure!(codec.decode()? == ordered, "range packed decode differs");
-    let mut decode_durations = Vec::with_capacity(20);
-    for _ in 0..20 {
+    let decode_iterations = codec_decode_iterations()?;
+    let mut decode_durations = Vec::with_capacity(decode_iterations);
+    for _ in 0..decode_iterations {
         let start = Instant::now();
         black_box(codec.decode()?);
         decode_durations.push(start.elapsed());
@@ -957,6 +958,18 @@ fn profile_range_packed(
         codec.offset_widths(),
     );
     Ok(())
+}
+
+fn codec_decode_iterations() -> VortexResult<usize> {
+    std::env::var("VORTEX_BENCH_CODEC_DECODE_ITERATIONS")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| {
+                vortex_err!("invalid VORTEX_BENCH_CODEC_DECODE_ITERATIONS: {error}")
+            })
+        })
+        .transpose()
+        .map(|iterations| iterations.unwrap_or(20))
 }
 
 fn fixed_bin_float_tree(

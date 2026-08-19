@@ -24,6 +24,10 @@ Transfer that model into a native array only when it preserves these Default pro
 
 Compact can use experimental schemes during evaluation. Default selection remains the release decision.
 
+Measure each candidate against both the prior Default tree and the Compact tree.
+
+Use Compact gap recovery as the size metric. Use the displaced Default tree as the speed baseline.
+
 ## Current decision
 
 Focus the production work on these encodings:
@@ -75,6 +79,10 @@ Generic quotient and remainder trees do not close that gap.
 The current selector factors and nonlinear patch cost remain provisional.
 
 Final calibration requires the complete corpus and selected-tree evidence.
+
+The current branch recovers a small share of Compact's aggregate numeric advantage.
+
+The remaining work targets repeated Compact mechanisms with native, bounded-access trees.
 
 ## OrderedFloatArray
 
@@ -547,6 +555,82 @@ This layout recovers most of the Compact-like size gain without a material aggre
 
 The remaining threshold calibration must use selected-column evidence and the complete corpus.
 
+### Compact transfer baseline
+
+The local corpus comparison uses three iterations on all 16 available datasets.
+
+The proposed Default includes FloatQuant and BlockResidual. The prior Default excludes all new numeric schemes.
+
+The numeric scope contains eight numeric datasets. The real scope adds two TPC-H comment variants.
+
+Positive throughput changes indicate faster execution.
+
+| Scope | Size change | Encode throughput change | Decode throughput change | Proposed gap above Compact | Proposed gap above Parquet with Zstd |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Numeric, 8 datasets | -0.84 percent | -0.35 percent | -2.10 percent | +40.84 percent | +1.46 percent |
+| Real, 10 datasets | -1.12 percent | -0.47 percent | -1.85 percent | +37.92 percent | +2.28 percent |
+| All, 16 datasets | -0.70 percent | -1.45 percent | -1.85 percent | +22.26 percent | -0.84 percent |
+
+The proposed Default preserves the aggregate speed and Parquet size constraints.
+
+It recovers little of Compact's numeric advantage. Compact remains 40.84 percent smaller across the numeric scope.
+
+Taxi gains 3.23 percent, CMS gains 1.34 percent, and Euro2016 gains 2.42 percent against the prior Default.
+
+GloVe size does not change. The remaining datasets change by less than one percent.
+
+This result defines the next objective. Recover repeated Compact gains without a large loss in Default throughput or scalar access.
+
+### Column attribution for Compact wins
+
+The profile reads up to two million numeric rows from seven Public BI files and GloVe.
+
+Twenty-nine float columns give Compact a size advantage of at least ten percent.
+
+The prior Default uses 190,686,999 bytes across those columns. Compact uses 143,939,147 bytes.
+
+Compact saves 24.52 percent, or 46,747,852 bytes.
+
+The Pco trees use these main modes:
+
+- Classic bins without Delta cover 20,200,768 profiled values.
+- Classic bins with consecutive Delta cover 9,311,364 values.
+- `IntMult` with consecutive Delta covers 5,048,574 values.
+- `IntMult` without Delta covers 4,469,863 values.
+- `FloatMult` with consecutive Delta covers 3,999,998 values.
+- FloatQuant variants cover about four million values.
+- Classic bins with lookback Delta cover 1,345,593 values.
+
+Classic bins without Delta form the largest transferable target.
+
+`IntMult` forms a separate target for ALP integer children. GloVe demonstrates this target with `IntMult(10)`.
+
+Consecutive Delta explains several Arade wins. It conflicts with the Default random-access and decode goals.
+
+The largest single gap is Euro2016 `subjectivity_confidence`.
+
+The prior Default uses 14,234,326 bytes. Compact uses 6,860,457 bytes with classic bins and no Delta.
+
+CMS standard-deviation columns also use classic bins without Delta.
+
+CMS payment fields use `IntMult`. CMS submitted-charge fields use FloatQuant.
+
+Food `volume_total_bytes` uses classic bins inside an ALP child.
+
+The column attribution separates numeric Compact gains from file-level string compression gains.
+
+### Selector calibration miss on a Compact gap
+
+The CMS ALP integer child exposes a current BlockResidual threshold miss.
+
+The current Default tree uses 11,064,308 bytes and decodes at 24.98 GB/s.
+
+`ALP(BlockResidual)` uses 10,716,519 bytes and decodes at 22.27 GB/s.
+
+The candidate is 3.1 percent smaller and 10.8 percent slower to decode.
+
+The current 1.20 factor rejects it. Final threshold calibration must decide whether this trade belongs in Default.
+
 ### Patch-density sweep
 
 The u32 input uses one large outlier at each configured stride.
@@ -898,6 +982,64 @@ A ten-percent Compact size allowance includes CMS, Food, Euro subjectivity, and 
 
 Arade F8 remains outside that threshold. GloVe also remains outside because `IntMult(10)` gives Pco another size advantage.
 
+### Alternate fixed-bin layouts
+
+The byte-aligned prototype rounds every bin offset width to a byte boundary.
+
+Euro2016 `subjectivity_confidence` provides the comparison.
+
+| Backend | Bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: |
+| Serial bit-packed bins | 7,238,842 | 541.8 | 3,824.4 | 31.1 |
+| Serial byte-aligned bins | 7,835,311 | 474.4 | 3,528.3 | 25.0 |
+
+Byte alignment improves scalar access. It worsens size, encode throughput, and bulk decode throughput.
+
+Cross-byte offset extraction is not the main bulk decode cost.
+
+The grouped-bin prototype stores bit-sliced identifiers and one offset stream per bin.
+
+It uses rank checkpoints every 256 values. Scalar access scans at most four 64-bit words.
+
+| Input and backend | Bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: |
+| Euro serial bins | 7,238,842 | 555.2 | 3,949.5 | 32.1 |
+| Euro grouped bins | 7,257,069 | 461.0 | 5,665.8 | 25.0 |
+| CMS serial bins | 10,650,059 | 1,256.0 | 13,699.0 | 36.8 |
+| CMS grouped bins | 10,670,330 | 929.9 | 6,283.7 | 30.3 |
+
+Grouped bins improve Euro bulk decode by 43 percent. The complete Default tree still decodes about four times faster.
+
+CMS uses similar offset widths across its bins. The grouped scatter path then loses more than half of serial-bin throughput.
+
+Grouped bins do not generalize. The prototype remains outside production code.
+
+### Multi-reference block prototype
+
+The prototype stores up to four quantile references per 1,024-value block.
+
+Two-bit FastLanes identifiers select one reference for each value. FastLanes stores the residuals.
+
+The final experiment uses packed `u8` identifiers and a direct four-entry reference lookup.
+
+| Euro candidate | Bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: |
+| Default ALP | 14,234,326 | Not isolated | 21,759.7 | 523.6 |
+| One-reference BlockResidual | 13,293,263 | 2,171.1 | 24,382.6 | 198.9 |
+| Four references with patches | 11,353,335 | 1,026.5 | 11,215.0 | 19.2 |
+| Four references without patches | 13,117,584 | 1,357.9 | 12,960.4 | 7.4 |
+| Compact Pco | 6,860,457 | Not isolated | 2,467.8 | 18,027.2 |
+
+Packed `u8` identifiers materially improve the multi-reference decoder.
+
+The patched form is 20.2 percent smaller than Default. Its decode throughput is 48.5 percent lower.
+
+The patch-free form is 7.8 percent smaller. Its decode throughput is 40.4 percent lower.
+
+Patch application is not the main cost. Reference-ID expansion and per-value reference lookup dominate.
+
+The one-reference BlockResidual tree is both faster and simpler. The multi-reference prototype is rejected for Default.
+
 ### Pcodec corpus gap analysis
 
 The focused benchmark reads the first two million numeric rows from each source.
@@ -1072,6 +1214,12 @@ This round completed these steps:
 - Added direct paired FastLanes packing for both FloatQuant children.
 - Added fused two-child FloatQuant decode and width-sweep benchmarks.
 - Validated selected and rejected two-child FloatQuant paths.
+- Added Compact as a first-class format in the compression benchmark.
+- Compared the prior Default, proposed Default, Compact, and Parquet across all 16 local datasets.
+- Attributed the largest Compact numeric gaps to Pco modes at the column level.
+- Rejected byte-aligned fixed bins after a direct size and throughput comparison.
+- Rejected grouped fixed bins after Euro2016 and CMS comparisons.
+- Rejected packed multi-reference blocks after patched and patch-free comparisons.
 
 The Pco mode profile and quotient and remainder experiments are complete.
 
@@ -1079,19 +1227,18 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these remaining steps:
 
-1. Validate the nonlinear patch cost on the complete corpus.
-2. Add a true ALP-RD child composition case if a real selected tree exposes one.
-3. Validate the remaining rejected analysis cost in the complete corpus.
-4. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-5. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-6. Prototype a lightweight integer split for Pco `IntMult` wins under ALP.
-7. Prototype one lightweight scheme for repeated real-float Pco wins.
-8. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-9. Compare the geometric mean against Parquet with Zstd.
-10. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-11. Revisit the 32-bit and 64-bit BlockResidual score factors with selected-tree evidence.
-12. Keep RangePacked outside writer selectors unless a new decode design changes the result.
-13. Update this plan after each experiment.
+1. Prototype a lightweight integer split for Pco `IntMult` wins under ALP.
+2. Prototype one bounded-access scheme for repeated classic-bin wins without Delta.
+3. Add a true ALP-RD child composition case if a real selected tree exposes one.
+4. Validate the remaining rejected analysis cost after the candidate set stabilizes.
+5. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+6. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+7. Run the complete compression corpus after the candidate set stabilizes.
+8. Compare the final geometric mean against Compact and Parquet with Zstd.
+9. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+10. Revisit the 32-bit and 64-bit BlockResidual factors with selected-tree evidence.
+11. Keep RangePacked outside writer selectors unless a new decode design changes the result.
+12. Update this plan after each experiment.
 
 ## Pull request structure
 
