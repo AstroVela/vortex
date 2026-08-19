@@ -751,6 +751,40 @@ GloVe uses 16.8 percent more bytes than Compact because Pco also uses `IntMult(1
 
 The evidence does not justify a fused ALP and fixed-bin array. A composable integer child has lower implementation complexity.
 
+### Nullable and Delta-heavy fixed-bin cases
+
+The optimized nullable prototype stores only valid values in the range stream.
+
+It stores canonical validity bits and one 32-bit rank checkpoint per 256 logical values.
+
+Scalar access tests one validity bit. It then scans at most four words to find the dense value index.
+
+The complete Euro subjectivity tree uses `OrderedFloat(RangePacked)`.
+
+| Input | Default bytes | Compact bytes | Fixed-bin bytes | Default decode MB/s | Compact decode MB/s | Fixed-bin decode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Euro subjectivity | 14,234,326 | 6,860,457 | 7,270,094 | 16,822 | 2,475 | 2,487 |
+| Euro polarity | 13,505,943 | 11,638,679 | 12,796,702 | 11,517 | 1,487 | 4,767 |
+| Arade F8 | 6,380,852 | 5,617,973 | 6,257,548 | 17,944 | 4,371 | 8,350 |
+
+Euro subjectivity uses classic Pco bins without Delta. Fixed bins use 6.0 percent more bytes and match Compact decode.
+
+Its scalar access takes 215 ns. Default takes 657 ns, and Compact takes 19,045 ns.
+
+The complete subjectivity candidate encodes at 440 MB/s.
+
+Euro polarity mixes lookback Delta and no-Delta chunks. Fixed bins use 10.0 percent more bytes and decode 3.2 times faster.
+
+Arade F8 uses consecutive Delta in Pco. Fixed bins use 11.4 percent more bytes and decode 1.9 times faster.
+
+These results do not support Delta in the native candidate.
+
+Fixed bins retain much of Pco's size benefit without Delta. They also preserve bounded scalar access.
+
+A ten-percent Compact size allowance includes CMS, Food, Euro subjectivity, and Euro polarity.
+
+Arade F8 remains outside that threshold. GloVe also remains outside because `IntMult(10)` gives Pco another size advantage.
+
 ### Pcodec corpus gap analysis
 
 The focused benchmark reads the first two million numeric rows from each source.

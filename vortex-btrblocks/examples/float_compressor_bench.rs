@@ -29,12 +29,14 @@ use vortex_alp::ALP;
 use vortex_alp::ALPArrayExt;
 use vortex_alp::ALPArraySlotsExt;
 use vortex_alp::ALPFloat;
+use vortex_alp::alp_encode;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::ListArray;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::arrays::VarBinViewArray;
@@ -47,6 +49,8 @@ use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
 use vortex_block_residual::BlockResidual;
 use vortex_block_residual::BlockResidualArraySlotsExt;
+use vortex_block_residual::OrderedFloat;
+use vortex_block_residual::OrderedFloatArraySlotsExt;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
@@ -942,36 +946,95 @@ fn profile_range_packed(
         scalar_duration.as_secs_f64() * 1_000_000_000.0 / scalar_iterations as f64;
     let encoded_bytes = u64::try_from(codec.encoded_size())? + validity_bytes;
     println!(
-        "fixed-bin-checkpoint\t{dataset}\t{column}\t{path}\t{}\t{pco_bytes}\t{encoded_bytes}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}",
+        "fixed-bin-checkpoint\t{dataset}\t{column}\t{path}\t{}\t{pco_bytes}\t{encoded_bytes}\t{}\t{}\t{}\t{encode_throughput:.1}\t{decode_throughput:.1}\t{scalar_nanoseconds:.1}",
         ordered.len(),
         codec.bin_count(),
+        codec.max_offset_bits(),
+        codec.offset_widths(),
     );
     Ok(())
 }
 
-fn fixed_bin_alp_tree(
+fn fixed_bin_float_tree(
     compact: &ArrayRef,
     session: &VortexSession,
 ) -> VortexResult<Option<ArrayRef>> {
-    if compact.encoding_id().as_ref() != "vortex.alp" {
+    if compact.encoding_id().as_ref() == "vortex.alp" {
+        let alp = compact.as_::<ALP>();
+        if alp.encoded().encoding_id().as_ref() != "vortex.pco" {
+            return Ok(None);
+        }
+        let primitive = alp
+            .encoded()
+            .clone()
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+        let primitive = primitive
+            .into_array()
+            .cast(alp.encoded().dtype().clone())?
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+        let encoded =
+            RangePacked::from_primitive(primitive.as_view(), &mut session.create_execution_ctx())?
+                .into_array();
+        return Ok(Some(
+            ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+        ));
+    }
+
+    if compact.encoding_id().as_ref() != "vortex.pco" || !compact.dtype().is_float() {
         return Ok(None);
     }
-    let alp = compact.as_::<ALP>();
-    if alp.encoded().encoding_id().as_ref() != "vortex.pco" {
-        return Ok(None);
-    }
-    let primitive = alp
-        .encoded()
+    let primitive = compact
         .clone()
         .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
-    let primitive = primitive
-        .into_array()
-        .cast(alp.encoded().dtype().clone())?
-        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
-    let encoded = RangePacked::from_primitive(primitive.as_view())?.into_array();
+    let primitive =
+        fill_float_nulls_with_first_valid(primitive, &mut session.create_execution_ctx())?;
+    let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+    let encoded = RangePacked::from_primitive(
+        ordered.encoded().as_::<Primitive>(),
+        &mut session.create_execution_ctx(),
+    )?;
     Ok(Some(
-        ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+        OrderedFloat::try_new(encoded.into_array(), primitive.ptype())?.into_array(),
     ))
+}
+
+fn fill_float_nulls_with_first_valid(
+    primitive: PrimitiveArray,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let validity = primitive.validity()?;
+    let mask = validity.execute_mask(primitive.len(), ctx)?;
+    if mask.all_true() {
+        return Ok(primitive);
+    }
+    let first_valid = mask.first();
+    Ok(match primitive.ptype() {
+        PType::F32 => {
+            let values = primitive.as_slice::<f32>();
+            let fill = first_valid.map_or(0.0, |index| values[index]);
+            PrimitiveArray::new::<f32>(
+                values
+                    .iter()
+                    .zip(mask.iter())
+                    .map(|(&value, valid)| if valid { value } else { fill })
+                    .collect::<Vec<_>>(),
+                validity,
+            )
+        }
+        PType::F64 => {
+            let values = primitive.as_slice::<f64>();
+            let fill = first_valid.map_or(0.0, |index| values[index]);
+            PrimitiveArray::new::<f64>(
+                values
+                    .iter()
+                    .zip(mask.iter())
+                    .map(|(&value, valid)| if valid { value } else { fill })
+                    .collect::<Vec<_>>(),
+                validity,
+            )
+        }
+        ptype => return Err(vortex_err!("null fill does not support {ptype}")),
+    })
 }
 
 fn measure_fixed_bin_tree(
@@ -981,7 +1044,7 @@ fn measure_fixed_bin_tree(
     compact: &ArrayRef,
     session: &VortexSession,
 ) -> VortexResult<()> {
-    let Some(encoded) = fixed_bin_alp_tree(compact, session)? else {
+    let Some(encoded) = fixed_bin_float_tree(compact, session)? else {
         return Ok(());
     };
     vortex_ensure!(
@@ -1016,7 +1079,7 @@ fn measure_fixed_bin_tree(
     let mut fused_durations = Vec::with_capacity(20);
     for _ in 0..20 {
         let start = Instant::now();
-        black_box(decode_fixed_bin_alp_tree(&encoded, session)?);
+        black_box(decode_fixed_bin_float_tree(&encoded, session)?);
         fused_durations.push(start.elapsed());
     }
     let fused_median = percentile(&mut fused_durations, 1, 2);
@@ -1027,7 +1090,52 @@ fn measure_fixed_bin_tree(
         encoded.nbytes(),
         encoding_tree(&encoded),
     );
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(encode_fixed_bin_float_tree(
+            expected.as_::<Primitive>(),
+            compact,
+            session,
+        )?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "fixed-bin-tree-encode\t{dataset}\t{column}\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
     Ok(())
+}
+
+fn encode_fixed_bin_float_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    if compact.encoding_id().as_ref() == "vortex.alp" {
+        let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
+        let packed = RangePacked::from_primitive(
+            alp.encoded().as_::<Primitive>(),
+            &mut session.create_execution_ctx(),
+        )?;
+        return Ok(ALP::try_new(packed.into_array(), alp.exponents(), alp.patches())?.into_array());
+    }
+
+    let primitive = fill_float_nulls_with_first_valid(
+        primitive.into_owned(),
+        &mut session.create_execution_ctx(),
+    )?;
+    let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+    let packed = RangePacked::from_primitive(
+        ordered.encoded().as_::<Primitive>(),
+        &mut session.create_execution_ctx(),
+    )?;
+    Ok(OrderedFloat::try_new(packed.into_array(), primitive.ptype())?.into_array())
 }
 
 fn measure_existing_tree(
@@ -1070,23 +1178,27 @@ fn measure_scalar_access(encoded: &ArrayRef, session: &VortexSession) -> VortexR
     for _ in 0..scalar_iterations {
         scalar_index = scalar_index.wrapping_add(2_654_435_761) % encoded.len();
         let scalar = encoded.execute_scalar(scalar_index, &mut scalar_ctx)?;
-        let bits = match encoded.dtype().as_ptype() {
-            PType::F32 => u64::from(
-                scalar
+        let bits = if scalar.is_null() {
+            u64::MAX
+        } else {
+            match encoded.dtype().as_ptype() {
+                PType::F32 => u64::from(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<f32>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid f32 scalar"))?
+                        .to_bits(),
+                ),
+                PType::F64 => scalar
                     .as_primitive()
-                    .typed_value::<f32>()
-                    .ok_or_else(|| vortex_err!("tree produced a null scalar"))?
+                    .typed_value::<f64>()
+                    .ok_or_else(|| vortex_err!("tree produced an invalid f64 scalar"))?
                     .to_bits(),
-            ),
-            PType::F64 => scalar
-                .as_primitive()
-                .typed_value::<f64>()
-                .ok_or_else(|| vortex_err!("tree produced a null scalar"))?
-                .to_bits(),
-            ptype => {
-                return Err(vortex_err!(
-                    "tree scalar benchmark does not support {ptype}"
-                ));
+                ptype => {
+                    return Err(vortex_err!(
+                        "tree scalar benchmark does not support {ptype}"
+                    ));
+                }
             }
         };
         scalar_checksum ^= black_box(bits);
@@ -1099,27 +1211,60 @@ fn measure_scalar_access(encoded: &ArrayRef, session: &VortexSession) -> VortexR
     clippy::cast_possible_truncation,
     reason = "the range-packed child retains the ALP integer word width"
 )]
-fn decode_fixed_bin_alp_tree(
+fn decode_fixed_bin_float_tree(
     encoded: &ArrayRef,
     session: &VortexSession,
 ) -> VortexResult<PrimitiveArray> {
+    if encoded.encoding_id().as_ref() == "vortex.ordered_float" {
+        let ordered = encoded.as_::<OrderedFloat>();
+        let packed = ordered.encoded().as_::<RangePacked>();
+        let validity = ordered.encoded().validity()?;
+        return Ok(match encoded.dtype().as_ptype() {
+            PType::F32 => {
+                let values = RangePacked::decode_mapped(
+                    packed,
+                    |ordered| f32::from_bits(unordered_u32(ordered as u32)),
+                    0.0,
+                )?;
+                PrimitiveArray::new::<f32>(values, validity)
+            }
+            PType::F64 => {
+                let values = RangePacked::decode_mapped(
+                    packed,
+                    |ordered| f64::from_bits(unordered_u64(ordered)),
+                    0.0,
+                )?;
+                PrimitiveArray::new::<f64>(values, validity)
+            }
+            ptype => return Err(vortex_err!("fixed-bin float tree does not support {ptype}")),
+        });
+    }
+
     let alp = encoded.as_::<ALP>();
     let packed = alp.encoded().as_::<RangePacked>();
     let validity = alp.encoded().validity()?;
     let exponents = alp.exponents();
     let decoded = match encoded.dtype().as_ptype() {
         PType::F32 => {
-            let values = RangePacked::decode_mapped(packed, |ordered| {
-                let encoded = ((ordered as u32) ^ (1_u32 << 31)) as i32;
-                <f32 as ALPFloat>::decode_single(encoded, exponents)
-            })?;
+            let values = RangePacked::decode_mapped(
+                packed,
+                |ordered| {
+                    let encoded = ((ordered as u32) ^ (1_u32 << 31)) as i32;
+                    <f32 as ALPFloat>::decode_single(encoded, exponents)
+                },
+                0.0,
+            )?;
             PrimitiveArray::new::<f32>(values, validity)
         }
         PType::F64 => {
-            let values = RangePacked::decode_mapped(packed, |ordered| {
-                let encoded = (ordered ^ (1_u64 << 63)) as i64;
-                <f64 as ALPFloat>::decode_single(encoded, exponents)
-            })?;
+            let values = RangePacked::decode_mapped(
+                packed,
+                |ordered| {
+                    let encoded = (ordered ^ (1_u64 << 63)) as i64;
+                    <f64 as ALPFloat>::decode_single(encoded, exponents)
+                },
+                0.0,
+            )?;
             PrimitiveArray::new::<f64>(values, validity)
         }
         ptype => return Err(vortex_err!("fixed-bin ALP tree does not support {ptype}")),
@@ -1128,6 +1273,22 @@ fn decode_fixed_bin_alp_tree(
         decoded.patch(&patches, &mut session.create_execution_ctx())
     } else {
         Ok(decoded)
+    }
+}
+
+fn unordered_u32(value: u32) -> u32 {
+    if value & (1_u32 << 31) == 0 {
+        !value
+    } else {
+        value ^ (1_u32 << 31)
+    }
+}
+
+fn unordered_u64(value: u64) -> u64 {
+    if value & (1_u64 << 63) == 0 {
+        !value
+    } else {
+        value ^ (1_u64 << 63)
     }
 }
 
@@ -1449,10 +1610,11 @@ fn main() -> VortexResult<()> {
         "quotient-remainder-estimate\tdataset\tcolumn\tpath\tptype\tbase\tpco-child-bytes\tremainder-entropy\tmost-common-remainder-share\tquotient-bytes\tremainder-bytes\ttotal-bytes\tquotient-bitmap-bytes\tremainder-mode-bitmap-bytes\tbitmap-total-bytes\tquotient-encoding\tremainder-encoding"
     );
     println!(
-        "fixed-bin-checkpoint\tdataset\tcolumn\tpath\trows\tpco-bytes\tfixed-bin-bytes\tbins\tencode-MB/s\tdecode-MB/s\tscalar-ns"
+        "fixed-bin-checkpoint\tdataset\tcolumn\tpath\trows\tpco-bytes\tfixed-bin-bytes\tbins\tmax-offset-bits\toffset-widths\tencode-MB/s\tdecode-MB/s\tscalar-ns"
     );
     println!("fixed-bin-tree\tdataset\tcolumn\trows\tbytes\tdecode-MB/s\tscalar-ns\tencoding");
     println!("fixed-bin-tree-fused\tdataset\tcolumn\trows\tbytes\tdecode-MB/s\tencoding");
+    println!("fixed-bin-tree-encode\tdataset\tcolumn\trows\tbytes\tencode-MB/s\tencoding");
     println!(
         "tree-throughput\tdataset\tcolumn\tconfig\trows\tbytes\tdecode-MB/s\tscalar-ns\tencoding"
     );

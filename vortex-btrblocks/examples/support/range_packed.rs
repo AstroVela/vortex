@@ -48,6 +48,7 @@ const BIN_TABLE_COST_BITS: f64 = 128.0;
 const SYMBOL_PADDING: usize = 8;
 const OFFSET_PADDING: usize = 15;
 const CHECKPOINT_INTERVAL: usize = 32;
+const VALIDITY_CHECKPOINT_INTERVAL: usize = 256;
 const MAX_BLOCK_LEN: usize = 1_024;
 
 /// Fixed-width range identifiers with variable-width offsets and scalar checkpoints.
@@ -78,6 +79,16 @@ pub struct RangePackedData {
     codec: RangePackedCodec,
     physical: ByteBuffer,
     ptype: PType,
+    validity: Validity,
+    dense_validity: DenseValidity,
+    len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DenseValidity {
+    words: Vec<u64>,
+    checkpoints: Vec<u32>,
+    valid_count: usize,
 }
 
 impl Display for RangePackedData {
@@ -90,12 +101,19 @@ impl ArrayHash for RangePackedData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.codec.hash(state);
         self.ptype.hash(state);
+        self.validity.array_hash(state, _accuracy);
+        self.dense_validity.hash(state);
+        self.len.hash(state);
     }
 }
 
 impl ArrayEq for RangePackedData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
-        self.codec == other.codec && self.ptype == other.ptype
+        self.codec == other.codec
+            && self.ptype == other.ptype
+            && self.validity.array_eq(&other.validity, _accuracy)
+            && self.dense_validity == other.dense_validity
+            && self.len == other.len
     }
 }
 
@@ -121,9 +139,17 @@ impl VTable for RangePacked {
             dtype.is_primitive() && dtype.as_ptype() == data.ptype,
             "RangePackedArray dtype differs from its physical type"
         );
-        vortex_ensure!(len == data.codec.len, "RangePackedArray length differs");
         vortex_ensure!(
-            data.physical.len() == data.codec.encoded_size(),
+            dtype.nullability() == data.validity.nullability(),
+            "RangePackedArray dtype differs from its validity"
+        );
+        vortex_ensure!(len == data.len, "RangePackedArray length differs");
+        vortex_ensure!(
+            data.codec.len == data.dense_validity.valid_count,
+            "RangePackedArray dense length differs"
+        );
+        vortex_ensure!(
+            data.physical.len() == data.codec.encoded_size() + data.dense_validity.encoded_size(),
             "RangePackedArray physical size differs"
         );
         Ok(())
@@ -198,41 +224,125 @@ impl OperationsVTable<RangePacked> for RangePacked {
         index: usize,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        if !array.data().dense_validity.is_valid(index) {
+            return Ok(Scalar::null(array.dtype().clone()));
+        }
+        let dense_index = array.data().dense_validity.rank(index);
         ordered_scalar(
-            array.data().codec.scalar_at(index)?,
+            array.data().codec.scalar_at(dense_index)?,
             array.data().ptype,
             array.dtype().nullability(),
         )
     }
 }
 
+impl DenseValidity {
+    fn new(
+        len: usize,
+        valid_count: usize,
+        validity: impl Iterator<Item = bool>,
+    ) -> VortexResult<Self> {
+        if valid_count == len {
+            return Ok(Self {
+                words: Vec::new(),
+                checkpoints: Vec::new(),
+                valid_count,
+            });
+        }
+
+        let mut words = vec![0_u64; len.div_ceil(64)];
+        let mut observed_len = 0usize;
+        for (index, valid) in validity.enumerate() {
+            vortex_ensure!(index < len, "dense validity exceeds its length");
+            if valid {
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+            observed_len += 1;
+        }
+        vortex_ensure!(observed_len == len, "dense validity is too short");
+
+        let words_per_checkpoint = VALIDITY_CHECKPOINT_INTERVAL / 64;
+        let mut checkpoints = Vec::with_capacity(words.len().div_ceil(words_per_checkpoint));
+        let mut rank = 0usize;
+        for block in words.chunks(words_per_checkpoint) {
+            checkpoints.push(u32::try_from(rank)?);
+            rank += block
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>();
+        }
+        vortex_ensure!(rank == valid_count, "dense validity count differs");
+        Ok(Self {
+            words,
+            checkpoints,
+            valid_count,
+        })
+    }
+
+    #[inline]
+    fn is_valid(&self, index: usize) -> bool {
+        self.words.is_empty() || self.words[index / 64] & (1_u64 << (index % 64)) != 0
+    }
+
+    #[inline]
+    fn rank(&self, index: usize) -> usize {
+        if self.words.is_empty() {
+            return index;
+        }
+        let word_index = index / 64;
+        let checkpoint_index = index / VALIDITY_CHECKPOINT_INTERVAL;
+        let words_per_checkpoint = VALIDITY_CHECKPOINT_INTERVAL / 64;
+        let word_start = checkpoint_index * words_per_checkpoint;
+        let mut rank = self.checkpoints[checkpoint_index] as usize;
+        for word in &self.words[word_start..word_index] {
+            rank += word.count_ones() as usize;
+        }
+        let bits_before = index % 64;
+        if bits_before != 0 {
+            let mask = (1_u64 << bits_before) - 1;
+            rank += (self.words[word_index] & mask).count_ones() as usize;
+        }
+        rank
+    }
+
+    fn encoded_size(&self) -> usize {
+        self.words.len() * size_of::<u64>() + self.checkpoints.len() * size_of::<u32>()
+    }
+}
+
 impl ValidityVTable<RangePacked> for RangePacked {
     fn validity(array: ArrayView<'_, RangePacked>) -> VortexResult<Validity> {
-        if array.dtype().is_nullable() {
-            Ok(Validity::AllValid)
-        } else {
-            Ok(Validity::NonNullable)
-        }
+        Ok(array.data().validity.clone())
     }
 }
 
 impl RangePacked {
-    pub fn from_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<RangePackedArray> {
+    pub fn from_primitive(
+        array: ArrayView<'_, Primitive>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<RangePackedArray> {
         vortex_ensure!(
             array.ptype().is_int(),
             "RangePackedArray needs integer values"
         );
-        vortex_ensure!(
-            array.validity()?.definitely_no_nulls(),
-            "experimental RangePackedArray needs values without nulls"
-        );
+        let validity = array.validity()?;
+        let mask = validity.execute_mask(array.len(), ctx)?;
+        let dense_validity = DenseValidity::new(array.len(), mask.true_count(), mask.iter())?;
         let ordered = ordered_primitive(array)?;
-        let codec = RangePackedCodec::encode(&ordered, MAX_BLOCK_LEN)?;
-        let physical = ByteBuffer::zeroed(codec.encoded_size());
+        let dense_ordered = ordered
+            .into_iter()
+            .zip(mask.iter())
+            .filter_map(|(value, valid)| valid.then_some(value))
+            .collect::<Vec<_>>();
+        let codec = RangePackedCodec::encode(&dense_ordered, MAX_BLOCK_LEN)?;
+        let physical = ByteBuffer::zeroed(codec.encoded_size() + dense_validity.encoded_size());
         let data = RangePackedData {
             codec,
             physical,
             ptype: array.ptype(),
+            validity,
+            dense_validity,
+            len: array.len(),
         };
         Array::try_from_parts(ArrayParts::new(
             RangePacked,
@@ -242,11 +352,32 @@ impl RangePacked {
         ))
     }
 
-    pub fn decode_mapped<T, F>(array: ArrayView<'_, RangePacked>, map: F) -> VortexResult<Vec<T>>
+    pub fn decode_mapped<T, F>(
+        array: ArrayView<'_, RangePacked>,
+        map: F,
+        null_value: T,
+    ) -> VortexResult<Vec<T>>
     where
+        T: Copy,
         F: FnMut(u64) -> T,
     {
-        array.data().codec.decode_mapped(map)
+        let dense_values = array.data().codec.decode_mapped(map)?;
+        if array.data().dense_validity.words.is_empty() {
+            return Ok(dense_values);
+        }
+        let mut dense = dense_values.into_iter();
+        let mut values = Vec::with_capacity(array.len());
+        for index in 0..array.len() {
+            values.push(if array.data().dense_validity.is_valid(index) {
+                dense
+                    .next()
+                    .ok_or_else(|| vortex_error::vortex_err!("dense values are too short"))?
+            } else {
+                null_value
+            });
+        }
+        vortex_ensure!(dense.next().is_none(), "dense values are too long");
+        Ok(values)
     }
 }
 
@@ -297,46 +428,75 @@ fn ordered_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<Vec<u64>> 
     reason = "the encoded values retain the source integer word width"
 )]
 fn decode_primitive(data: &RangePackedData) -> VortexResult<PrimitiveArray> {
-    let ordered = data.codec.decode()?;
+    let dense_ordered = data.codec.decode()?;
+    let ordered = if data.dense_validity.words.is_empty() {
+        dense_ordered
+    } else {
+        let mut dense = dense_ordered.into_iter();
+        let mut values = Vec::with_capacity(data.len);
+        for index in 0..data.len {
+            values.push(if data.dense_validity.is_valid(index) {
+                dense
+                    .next()
+                    .ok_or_else(|| vortex_error::vortex_err!("dense values are too short"))?
+            } else {
+                0
+            });
+        }
+        vortex_ensure!(dense.next().is_none(), "dense values are too long");
+        values
+    };
+    let validity = data.validity.clone();
     Ok(match data.ptype {
-        PType::U8 => PrimitiveArray::from_iter(
+        PType::U8 => PrimitiveArray::new::<u8>(
             ordered
                 .into_iter()
                 .map(u8::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            validity,
         ),
-        PType::U16 => PrimitiveArray::from_iter(
+        PType::U16 => PrimitiveArray::new::<u16>(
             ordered
                 .into_iter()
                 .map(u16::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            validity,
         ),
-        PType::U32 => PrimitiveArray::from_iter(
+        PType::U32 => PrimitiveArray::new::<u32>(
             ordered
                 .into_iter()
                 .map(u32::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            validity,
         ),
-        PType::U64 => PrimitiveArray::from_iter(ordered),
-        PType::I8 => PrimitiveArray::from_iter(
+        PType::U64 => PrimitiveArray::new::<u64>(ordered, validity),
+        PType::I8 => PrimitiveArray::new::<i8>(
             ordered
                 .into_iter()
-                .map(|value| ((value as u8) ^ (1_u8 << 7)) as i8),
+                .map(|value| ((value as u8) ^ (1_u8 << 7)) as i8)
+                .collect::<Vec<_>>(),
+            validity,
         ),
-        PType::I16 => PrimitiveArray::from_iter(
+        PType::I16 => PrimitiveArray::new::<i16>(
             ordered
                 .into_iter()
-                .map(|value| ((value as u16) ^ (1_u16 << 15)) as i16),
+                .map(|value| ((value as u16) ^ (1_u16 << 15)) as i16)
+                .collect::<Vec<_>>(),
+            validity,
         ),
-        PType::I32 => PrimitiveArray::from_iter(
+        PType::I32 => PrimitiveArray::new::<i32>(
             ordered
                 .into_iter()
-                .map(|value| ((value as u32) ^ (1_u32 << 31)) as i32),
+                .map(|value| ((value as u32) ^ (1_u32 << 31)) as i32)
+                .collect::<Vec<_>>(),
+            validity,
         ),
-        PType::I64 => PrimitiveArray::from_iter(
+        PType::I64 => PrimitiveArray::new::<i64>(
             ordered
                 .into_iter()
-                .map(|value| (value ^ (1_u64 << 63)) as i64),
+                .map(|value| (value ^ (1_u64 << 63)) as i64)
+                .collect::<Vec<_>>(),
+            validity,
         ),
         ptype => vortex_bail!("RangePackedArray does not support {ptype}"),
     })
@@ -420,14 +580,20 @@ impl RangePackedCodec {
     where
         F: FnMut(u64) -> T,
     {
-        if self.bins.iter().all(|bin| bin.offset_bits <= 57) {
-            self.decode_mapped_with_width::<false, T, F>(map)
+        let max_offset_bits = self.max_offset_bits();
+        if max_offset_bits <= 40 {
+            self.decode_mapped_with_width::<false, false, T, F>(map)
+        } else if max_offset_bits <= 57 {
+            self.decode_mapped_with_width::<false, true, T, F>(map)
         } else {
-            self.decode_mapped_with_width::<true, T, F>(map)
+            self.decode_mapped_with_width::<true, true, T, F>(map)
         }
     }
 
-    fn decode_mapped_with_width<const WIDE: bool, T, F>(&self, mut map: F) -> VortexResult<Vec<T>>
+    fn decode_mapped_with_width<const WIDE: bool, const PARALLEL: bool, T, F>(
+        &self,
+        mut map: F,
+    ) -> VortexResult<Vec<T>>
     where
         F: FnMut(u64) -> T,
     {
@@ -437,7 +603,7 @@ impl RangePackedCodec {
             let payload = self.block_payload(block_index)?;
             let value_count = self.block_value_count(block_index);
             let output_start = values.len();
-            decode_block::<WIDE, T, F>(
+            decode_block::<WIDE, PARALLEL, T, F>(
                 payload,
                 value_count,
                 self.symbol_width,
@@ -496,6 +662,22 @@ impl RangePackedCodec {
 
     pub fn bin_count(&self) -> usize {
         self.bins.len()
+    }
+
+    pub fn max_offset_bits(&self) -> u8 {
+        self.bins
+            .iter()
+            .map(|bin| bin.offset_bits)
+            .max()
+            .unwrap_or_default()
+    }
+
+    pub fn offset_widths(&self) -> String {
+        self.bins
+            .iter()
+            .map(|bin| bin.offset_bits.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn block_count(&self) -> usize {
@@ -589,7 +771,7 @@ fn encode_block(
     clippy::cast_possible_truncation,
     reason = "the symbol mask never exceeds 63"
 )]
-fn decode_block<const WIDE: bool, T, F>(
+fn decode_block<const WIDE: bool, const PARALLEL: bool, T, F>(
     payload: &[u8],
     value_count: usize,
     symbol_width: u8,
@@ -608,21 +790,48 @@ where
     for base in (0..full_len).step_by(8) {
         let symbol_position = base * usize::from(symbol_width);
         let packed = read_bits_padded(payload, symbol_position, symbol_width * 8);
-        for lane in 0..8 {
-            let symbol = ((packed >> (lane * usize::from(symbol_width))) & symbol_mask) as usize;
-            debug_assert!(symbol < table.bin_count);
-            // SAFETY: A power-of-two bin count makes every symbol code valid.
-            let width = unsafe { *table.widths.get_unchecked(symbol) };
-            let offset = read_offset::<WIDE>(offsets, offset_position, width);
-            offset_position += usize::from(width);
-            // SAFETY: A power-of-two bin count makes every symbol code valid.
-            let lower = unsafe { *table.lowers.get_unchecked(symbol) };
-            // SAFETY: This lane is within a complete eight-value output batch.
-            unsafe {
-                values
-                    .get_unchecked_mut(base + lane)
-                    .write(map(lower.wrapping_add(offset)))
-            };
+        if PARALLEL {
+            let mut widths = [0_u8; 8];
+            let mut lowers = [0_u64; 8];
+            let mut positions = [0_usize; 8];
+            for lane in 0..8 {
+                let symbol =
+                    ((packed >> (lane * usize::from(symbol_width))) & symbol_mask) as usize;
+                debug_assert!(symbol < table.bin_count);
+                // SAFETY: A power-of-two bin count makes every symbol code valid.
+                widths[lane] = unsafe { *table.widths.get_unchecked(symbol) };
+                // SAFETY: A power-of-two bin count makes every symbol code valid.
+                lowers[lane] = unsafe { *table.lowers.get_unchecked(symbol) };
+                positions[lane] = offset_position;
+                offset_position += usize::from(widths[lane]);
+            }
+            for lane in 0..8 {
+                let offset = read_offset::<WIDE>(offsets, positions[lane], widths[lane]);
+                // SAFETY: This lane is within a complete eight-value output batch.
+                unsafe {
+                    values
+                        .get_unchecked_mut(base + lane)
+                        .write(map(lowers[lane].wrapping_add(offset)))
+                };
+            }
+        } else {
+            for lane in 0..8 {
+                let symbol =
+                    ((packed >> (lane * usize::from(symbol_width))) & symbol_mask) as usize;
+                debug_assert!(symbol < table.bin_count);
+                // SAFETY: A power-of-two bin count makes every symbol code valid.
+                let width = unsafe { *table.widths.get_unchecked(symbol) };
+                let offset = read_offset::<WIDE>(offsets, offset_position, width);
+                offset_position += usize::from(width);
+                // SAFETY: A power-of-two bin count makes every symbol code valid.
+                let lower = unsafe { *table.lowers.get_unchecked(symbol) };
+                // SAFETY: This lane is within a complete eight-value output batch.
+                unsafe {
+                    values
+                        .get_unchecked_mut(base + lane)
+                        .write(map(lower.wrapping_add(offset)))
+                };
+            }
         }
     }
     for index in full_len..value_count {
@@ -911,8 +1120,14 @@ impl BitWriter {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
     use vortex_error::VortexResult;
 
+    use super::RangePacked;
     use super::RangePackedCodec;
 
     #[test]
@@ -940,6 +1155,26 @@ mod tests {
         assert_eq!(encoded.decode()?, values);
         for (index, value) in values.into_iter().enumerate() {
             assert_eq!(encoded.scalar_at(index)?, value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_dense_roundtrip_and_rank_boundaries() -> VortexResult<()> {
+        let expected = PrimitiveArray::from_option_iter((0_i64..600).map(|value| {
+            (!matches!(value, 0 | 1 | 63 | 64 | 255 | 256 | 257 | 511)).then_some(value - 300)
+        }));
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+        let encoded = RangePacked::from_primitive(expected.as_view(), &mut ctx)?;
+        assert_arrays_eq!(encoded, expected, &mut ctx);
+        for index in [0, 1, 2, 63, 64, 65, 255, 256, 257, 258, 511, 512, 599] {
+            let actual = encoded.execute_scalar(index, &mut ctx)?;
+            let expected_scalar = expected
+                .clone()
+                .into_array()
+                .execute_scalar(index, &mut ctx)?;
+            assert_eq!(actual, expected_scalar);
         }
         Ok(())
     }
