@@ -162,6 +162,21 @@ fn setup_nonzero_secondary_array() -> PrimitiveArray {
     )
 }
 
+fn setup_secondary_width_array(width: u8) -> PrimitiveArray {
+    let widened = setup_widened_f32_array();
+    let low_mask = (1_u64 << width) - 1;
+    PrimitiveArray::from_iter(
+        widened
+            .as_slice::<f64>()
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let low = (index as u64).wrapping_mul(2_654_435_761) & low_mask;
+                f64::from_bits(value.to_bits() | low)
+            }),
+    )
+}
+
 fn setup_random_walk_array() -> PrimitiveArray {
     let mut rng = StdRng::seed_from_u64(2);
     let mut value = 1_000.0_f64;
@@ -249,7 +264,7 @@ fn encode_ordered_block_residual(array: &PrimitiveArray) -> vortex::array::Array
 
 fn encode_float_quant_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
     let analysis = analyze_float_quant(array.as_view()).unwrap();
-    assert!(analysis.secondary_is_constant);
+    assert_eq!(analysis.secondary_bit_width, 0);
     let primary =
         FloatQuant::primary_for_primitive(array.as_view(), analysis.k, analysis.primary_min)
             .unwrap();
@@ -269,7 +284,7 @@ fn encode_float_quant_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
 
 fn encode_float_quant_nonzero_secondary_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
     let analysis = analyze_float_quant(array.as_view()).unwrap();
-    assert!(!analysis.secondary_is_constant);
+    assert_ne!(analysis.secondary_bit_width, 0);
     let split = FloatQuant::from_primitive(array.as_view(), analysis.k).unwrap();
     let primary = split
         .primary()
@@ -295,8 +310,8 @@ fn encode_float_quant_nonzero_secondary_tree(array: &PrimitiveArray) -> vortex::
     let primary = FoR::try_new(primary, Scalar::from(analysis.primary_min))
         .unwrap()
         .into_array();
-    // SAFETY: The input generator changes only the lowest bit.
-    let secondary = unsafe { bitpack_encode_unchecked(secondary, 1) }
+    // SAFETY: The analysis computes the exact secondary width.
+    let secondary = unsafe { bitpack_encode_unchecked(secondary, analysis.secondary_bit_width) }
         .unwrap()
         .into_array();
     FloatQuant::try_new(primary, Some(secondary), PType::F64, analysis.k)
@@ -1220,9 +1235,49 @@ fn bench_float_quant_nonzero_secondary_tree_compress_f64(bencher: Bencher) {
         .bench_refs(|array| encode_float_quant_nonzero_secondary_tree(array));
 }
 
+#[divan::bench(name = "float_quant_nonzero_secondary_scheme_compress_f64")]
+fn bench_float_quant_nonzero_secondary_scheme_compress_f64(bencher: Bencher) {
+    let compressor = BtrBlocksCompressorBuilder::empty()
+        .with_new_scheme(&FloatQuantScheme)
+        .build();
+    bench_compressor(bencher, setup_nonzero_secondary_array(), compressor);
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_default_compress_f64")]
+fn bench_float_quant_nonzero_secondary_default_compress_f64(bencher: Bencher) {
+    bench_compressor(
+        bencher,
+        setup_nonzero_secondary_array(),
+        BtrBlocksCompressorBuilder::default().build(),
+    );
+}
+
 #[divan::bench(name = "float_quant_nonzero_secondary_tree_decompress_f64")]
 fn bench_float_quant_nonzero_secondary_tree_decompress_f64(bencher: Bencher) {
     let encoded = encode_float_quant_nonzero_secondary_tree(&setup_nonzero_secondary_array());
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_default_decompress_f64")]
+fn bench_float_quant_nonzero_secondary_default_decompress_f64(bencher: Bencher) {
+    let input = setup_nonzero_secondary_array().into_array();
+    let encoded = BtrBlocksCompressorBuilder::default()
+        .build()
+        .compress(&input, &mut SESSION.create_execution_ctx())
+        .unwrap();
+    assert!(encoded.is::<FloatQuant>());
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(args = [1, 4, 8, 16])]
+fn float_quant_secondary_width_decompress_f64(bencher: Bencher, width: u8) {
+    let encoded = encode_float_quant_nonzero_secondary_tree(&setup_secondary_width_array(width));
 
     with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))

@@ -417,8 +417,8 @@ pub struct FloatQuantAnalysis {
     pub primary_bit_width: u8,
     /// Minimum primary value before frame-of-reference subtraction.
     pub primary_min: u64,
-    /// True when every secondary value is zero.
-    pub secondary_is_constant: bool,
+    /// Bit width of the secondary values. Zero identifies an implicit-zero child.
+    pub secondary_bit_width: u8,
 }
 
 /// Estimate a useful low-bit split width for a canonical float array.
@@ -435,8 +435,8 @@ pub fn analyze_float_quant(array: ArrayView<'_, Primitive>) -> Option<FloatQuant
     }
 }
 
-fn analyze_histogram(
-    histogram: &mut [usize],
+fn analyze_bits(
+    low_bits_or: u64,
     precision_bits: u8,
     len: usize,
     primary_min: u64,
@@ -445,58 +445,56 @@ fn analyze_histogram(
     if len == 0 {
         return None;
     }
-    let mut cumulative = 0usize;
-    for count in histogram.iter_mut().rev() {
-        cumulative += *count;
-        *count = cumulative;
-    }
 
-    let mut best_k = 0u8;
-    let mut best_savings = 0.0;
+    let mut best = None;
     for k in 1..=precision_bits {
-        let frequency = histogram[usize::from(k)] as f64 / len as f64;
-        if frequency == 0.0 {
+        let low_mask = (1_u64 << k) - 1;
+        let secondary_bit_width =
+            u8::try_from(u64::BITS - (low_bits_or & low_mask).leading_zeros()).unwrap_or(u8::MAX);
+        if k - secondary_bit_width < 2 {
             continue;
         }
-        let category_count = ((1_u64 << k) - 1) as f64;
-        let entropy = category_entropy(frequency)
-            + category_count * category_entropy((1.0 - frequency) / category_count);
-        let savings = f64::from(k) - entropy;
-        if savings > best_savings {
-            best_k = k;
-            best_savings = savings;
+
+        let shifted_min = primary_min >> k;
+        let shifted_max = primary_max >> k;
+        let primary_bit_width =
+            u8::try_from(u64::BITS - (shifted_max - shifted_min).leading_zeros())
+                .unwrap_or(u8::MAX);
+        let total_bit_width = primary_bit_width + secondary_bit_width;
+        let candidate = (
+            total_bit_width,
+            secondary_bit_width,
+            k,
+            primary_bit_width,
+            shifted_min,
+        );
+        if best.is_none_or(|current| candidate < current) {
+            best = Some(candidate);
         }
     }
-    if best_savings <= 1.5 {
-        return None;
-    }
-    let secondary_is_constant = histogram[usize::from(best_k)] == len;
-    let primary_min = primary_min >> best_k;
-    let primary_max = primary_max >> best_k;
-    let primary_bit_width =
-        u8::try_from(u64::BITS - (primary_max - primary_min).leading_zeros()).unwrap_or(u8::MAX);
+
+    let (_, secondary_bit_width, k, primary_bit_width, primary_min) = best?;
     Some(FloatQuantAnalysis {
-        k: best_k,
+        k,
         primary_bit_width,
         primary_min,
-        secondary_is_constant,
+        secondary_bit_width,
     })
 }
 
 fn analyze_f32(values: &[f32]) -> Option<FloatQuantAnalysis> {
     let mut minimum = u32::MAX;
     let mut maximum = u32::MIN;
-    let mut histogram = [0usize; 24];
+    let mut low_bits_or = 0_u32;
     for value in values {
         let bits = value.to_bits();
         let ordered = ordered_u32(bits);
         minimum = minimum.min(ordered);
         maximum = maximum.max(ordered);
-        let zeros = bits.trailing_zeros().min(23);
-        histogram[zeros as usize] += 1;
+        low_bits_or |= bits;
     }
-    analyze_histogram(
-        &mut histogram,
+    analyze_bits(
+        u64::from(low_bits_or),
         23,
         values.len(),
         u64::from(minimum),
@@ -507,24 +505,15 @@ fn analyze_f32(values: &[f32]) -> Option<FloatQuantAnalysis> {
 fn analyze_f64(values: &[f64]) -> Option<FloatQuantAnalysis> {
     let mut minimum = u64::MAX;
     let mut maximum = u64::MIN;
-    let mut histogram = [0usize; 53];
+    let mut low_bits_or = 0_u64;
     for value in values {
         let bits = value.to_bits();
         let ordered = ordered_u64(bits);
         minimum = minimum.min(ordered);
         maximum = maximum.max(ordered);
-        let zeros = bits.trailing_zeros().min(52);
-        histogram[zeros as usize] += 1;
+        low_bits_or |= bits;
     }
-    analyze_histogram(&mut histogram, 52, values.len(), minimum, maximum)
-}
-
-fn category_entropy(probability: f64) -> f64 {
-    if probability == 0.0 || probability == 1.0 {
-        0.0
-    } else {
-        -probability * probability.log2()
-    }
+    analyze_bits(low_bits_or, 52, values.len(), minimum, maximum)
 }
 
 fn latent_ptype(ptype: PType) -> VortexResult<PType> {
@@ -863,16 +852,24 @@ mod tests {
     });
 
     #[test]
-    fn histogram_search_continues_after_local_decline() -> VortexResult<()> {
-        let mut histogram = [0usize; 24];
-        histogram[0] = 10;
-        histogram[1] = 70;
-        histogram[20] = 20;
+    fn fixed_tree_analysis_accounts_for_secondary_width() -> VortexResult<()> {
+        let values = PrimitiveArray::from_iter((0_u32..4096).map(|index| {
+            let value = f64::from(f32::from_bits(0x3f80_0000 | index.wrapping_mul(7_919)));
+            if index % 10 == 0 {
+                f64::from_bits(value.to_bits() | 1)
+            } else {
+                value
+            }
+        }));
+        let analysis = analyze_float_quant(values.as_view()).vortex_expect("FloatQuant input");
+        assert_eq!(analysis.k, 29);
+        assert_eq!(analysis.secondary_bit_width, 1);
 
-        let Some(analysis) = analyze_histogram(&mut histogram, 23, 100, 0, (1 << 23) - 1) else {
-            vortex_bail!("a large trailing-zero group must be useful")
-        };
-        assert_eq!(analysis.k, 20);
+        let general =
+            PrimitiveArray::from_iter((0_u32..4096).map(|index| {
+                f32::from_bits(0x3f80_0000 | (index.wrapping_mul(7_919) & 0x007f_ffff))
+            }));
+        assert_eq!(analyze_float_quant(general.as_view()), None);
         Ok(())
     }
 
@@ -976,7 +973,7 @@ mod tests {
             }
         }));
         let analysis = analyze_float_quant(original.as_view()).vortex_expect("FloatQuant input");
-        assert!(!analysis.secondary_is_constant);
+        assert_eq!(analysis.secondary_bit_width, 1);
         let split = FloatQuant::from_primitive(original.as_view(), analysis.k)?;
         let primary = split
             .primary()
@@ -1001,9 +998,13 @@ mod tests {
             )?
         };
         let primary = FoR::try_new(primary.into_array(), Scalar::from(analysis.primary_min))?;
-        // SAFETY: The test changes only one low bit.
-        let secondary =
-            unsafe { vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked(secondary, 1)? };
+        // SAFETY: The analysis computes the exact secondary width.
+        let secondary = unsafe {
+            vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked(
+                secondary,
+                analysis.secondary_bit_width,
+            )?
+        };
         let encoded = FloatQuant::try_new(
             primary.into_array(),
             Some(secondary.into_array()),

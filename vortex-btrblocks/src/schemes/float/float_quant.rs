@@ -17,6 +17,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_float_ptype;
 use vortex_array::scalar::Scalar;
+use vortex_array::validity::Validity;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
@@ -24,6 +25,7 @@ use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::bitpack_compress::bitpack_primitive_map;
+use vortex_fastlanes::bitpack_compress::bitpack_primitive_map_pair;
 use vortex_float_quant::FloatQuant;
 use vortex_float_quant::FloatQuantAnalysis;
 use vortex_float_quant::analyze_float_quant;
@@ -70,12 +72,8 @@ impl Scheme for FloatQuantScheme {
                 let Some(analysis) = analyze_float_quant(sample.as_view()) else {
                     return Ok(EstimateVerdict::Skip);
                 };
-                if !analysis.secondary_is_constant || analysis.primary_bit_width == 0 {
-                    return Ok(EstimateVerdict::Skip);
-                }
-
                 let before_nbytes = sample.nbytes();
-                let compressed = encode_constant_secondary(sample.as_view(), analysis)?;
+                let compressed = encode_float_quant(sample.as_view(), analysis)?;
                 let after_nbytes = compressed.nbytes();
                 if after_nbytes == 0 || after_nbytes >= before_nbytes {
                     return Ok(EstimateVerdict::Skip);
@@ -100,42 +98,84 @@ impl Scheme for FloatQuantScheme {
         let Some(analysis) = analyze_float_quant(primitive.as_view()) else {
             return Ok(source.array().clone());
         };
-        if !analysis.secondary_is_constant || analysis.primary_bit_width == 0 {
-            return Ok(source.array().clone());
-        }
-
-        encode_constant_secondary(primitive.as_view(), analysis)
+        encode_float_quant(primitive.as_view(), analysis)
     }
 }
 
-fn encode_constant_secondary(
+fn encode_float_quant(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     analysis: FloatQuantAnalysis,
 ) -> VortexResult<ArrayRef> {
-    let (packed, latent_ptype, reference) = match primitive.ptype() {
+    let (primary_packed, secondary_packed, latent_ptype, reference) = match primitive.ptype() {
         PType::F32 => {
             let primary_min = u32::try_from(analysis.primary_min)?;
-            let packed = bitpack_primitive_map(
-                primitive.as_slice::<f32>(),
-                analysis.primary_bit_width,
-                |value| (ordered_u32(value.to_bits()) >> analysis.k) - primary_min,
+            let values = primitive.as_slice::<f32>();
+            let (primary, secondary) = if analysis.secondary_bit_width == 0 {
+                (
+                    bitpack_primitive_map(values, analysis.primary_bit_width, |value| {
+                        (ordered_u32(value.to_bits()) >> analysis.k) - primary_min
+                    }),
+                    None,
+                )
+            } else {
+                let low_mask = (1_u32 << analysis.k) - 1;
+                let (primary, secondary) = bitpack_primitive_map_pair(
+                    values,
+                    analysis.primary_bit_width,
+                    analysis.secondary_bit_width,
+                    |value| {
+                        let bits = value.to_bits();
+                        (
+                            (ordered_u32(bits) >> analysis.k) - primary_min,
+                            bits & low_mask,
+                        )
+                    },
+                );
+                (primary, Some(secondary))
+            };
+            (
+                primary.into_byte_buffer(),
+                secondary.map(|packed| packed.into_byte_buffer()),
+                PType::U32,
+                Scalar::from(primary_min),
             )
-            .into_byte_buffer();
-            (packed, PType::U32, Scalar::from(primary_min))
         }
         PType::F64 => {
-            let packed = bitpack_primitive_map(
-                primitive.as_slice::<f64>(),
-                analysis.primary_bit_width,
-                |value| (ordered_u64(value.to_bits()) >> analysis.k) - analysis.primary_min,
+            let values = primitive.as_slice::<f64>();
+            let (primary, secondary) = if analysis.secondary_bit_width == 0 {
+                (
+                    bitpack_primitive_map(values, analysis.primary_bit_width, |value| {
+                        (ordered_u64(value.to_bits()) >> analysis.k) - analysis.primary_min
+                    }),
+                    None,
+                )
+            } else {
+                let low_mask = (1_u64 << analysis.k) - 1;
+                let (primary, secondary) = bitpack_primitive_map_pair(
+                    values,
+                    analysis.primary_bit_width,
+                    analysis.secondary_bit_width,
+                    |value| {
+                        let bits = value.to_bits();
+                        (
+                            (ordered_u64(bits) >> analysis.k) - analysis.primary_min,
+                            bits & low_mask,
+                        )
+                    },
+                );
+                (primary, Some(secondary))
+            };
+            (
+                primary.into_byte_buffer(),
+                secondary.map(|packed| packed.into_byte_buffer()),
+                PType::U64,
+                Scalar::from(analysis.primary_min),
             )
-            .into_byte_buffer();
-            (packed, PType::U64, Scalar::from(analysis.primary_min))
         }
         _ => unreachable!(),
     };
     let compressed_primary = BitPacked::try_new(
-        BufferHandle::new_host(packed),
+        BufferHandle::new_host(primary_packed),
         latent_ptype,
         primitive.validity()?,
         None,
@@ -145,7 +185,27 @@ fn encode_constant_secondary(
     )?
     .into_array();
     let compressed_primary = FoR::try_new(compressed_primary, reference)?.into_array();
-    Ok(FloatQuant::try_new(compressed_primary, None, primitive.ptype(), analysis.k)?.into_array())
+    let compressed_secondary = secondary_packed
+        .map(|packed| {
+            BitPacked::try_new(
+                BufferHandle::new_host(packed),
+                latent_ptype,
+                Validity::NonNullable,
+                None,
+                analysis.secondary_bit_width,
+                primitive.len(),
+                0,
+            )
+            .map(IntoArray::into_array)
+        })
+        .transpose()?;
+    Ok(FloatQuant::try_new(
+        compressed_primary,
+        compressed_secondary,
+        primitive.ptype(),
+        analysis.k,
+    )?
+    .into_array())
 }
 
 #[inline]

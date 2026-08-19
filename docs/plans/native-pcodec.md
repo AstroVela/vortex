@@ -92,12 +92,12 @@ Metadata stores only the split width. The array dtype stores the source type.
 
 One or two child arrays store the integer latents.
 
-The current BtrBlocks scheme accepts only a constant secondary. It uses a fixed `FoR(BitPacked)` primary tree.
+The BtrBlocks scheme uses a fixed `FoR(BitPacked)` primary tree.
 
 A common path uses `FloatQuant(FoR(BitPacked))` for `f32` values stored in `f64` columns.
 An absent secondary child represents zero low bits.
 
-The array decode kernel also supports `FloatQuant(FoR(BitPacked), BitPacked)`.
+Nonzero low bits use `FloatQuant(FoR(BitPacked), BitPacked)`.
 
 The kernel unpacks both aligned children and reconstructs each float in one pass.
 
@@ -105,25 +105,31 @@ The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar acc
 
 The automatic scheme accepts `f32` and `f64` inputs.
 
-Native `f32` selection now meets the selected-column and rejected-column throughput limits.
+Native `f32` and two-child selection meet the selected-column and rejected-column throughput limits.
 
-Final default inclusion still requires broad corpus validation.
+Final selector factors still require broad corpus validation.
 
 ## Selection policy
 
 `FloatQuantScheme` uses the normal sample comparison against ALP, ALP-RD, dictionary, sparse, and RLE schemes.
 
-The sample builds a direct `FoR(BitPacked)` primary and uses an implicit-zero secondary.
+The sample builds the exact one-child or two-child fixed tree.
 
-The scheme rejects samples with a nonzero secondary. This avoids the recursive integer selector.
+The prefilter tracks the bitwise union of all low float bits.
 
-The scheme uses a cheap bit-pattern prefilter over a stratified one-percent sample.
+For each split, it compares the removed bit count with the required secondary width.
+
+A candidate must save at least two fixed bits through the split.
+
+The prefilter uses a stratified one-percent sample.
 
 If the sample qualifies, the estimator builds the exact fixed tree on that sample.
 
-The final encoder maps float blocks directly into the FastLanes packer.
+The final encoder maps float blocks directly into one or two FastLanes packers.
 
-This fused path does not allocate a full primary integer buffer.
+This fused path does not allocate full primary or secondary integer buffers.
+
+The scheme does not call the recursive integer selector.
 
 `OrderedBlockResidualScheme` uses eight locality-preserving sample blocks.
 
@@ -202,34 +208,47 @@ FloatQuant meets the selected-column throughput limit on this input.
 
 ### FloatQuant with a nonzero secondary
 
-The prototype changed the lowest bit for ten percent of the widened-`f32` values.
+The input changed the lowest bit for ten percent of the widened-`f32` values.
 
 The fixed tree was `FloatQuant(FoR(BitPacked), BitPacked)`. The secondary used one bit per value.
 
-| Configuration | Bytes | Decode MB/s | Scalar access ns |
-| --- | ---: | ---: | ---: |
-| Prior ALP-RD default | 14,057,966 | 11,430 | 208.5 |
-| Two-child FloatQuant prototype | 9,004,032 | 13,350 | 192.2 |
+| Configuration | Bytes | Encode MB/s | Decode MB/s | Scalar access ns |
+| --- | ---: | ---: | ---: | ---: |
+| Prior ALP-RD default | 14,057,966 | 564.5 | 12,234.8 | 187 |
+| Default with FloatQuant | 9,004,032 | 633.5 | 13,462.8 | 174 |
+| Compact Pco | 6,171,139 | 268.4 | 3,054.5 | Not measured |
 
-The prototype reduced size by 36.0 percent. It was 2.9 percent larger than the zero-secondary tree.
+FloatQuant reduced size by 36.0 percent. It was 2.9 percent larger than the zero-secondary tree.
 
-The prototype recovered 64.1 percent of the size gap between ALP-RD and Compact Pco.
+FloatQuant recovered 64.1 percent of the size gap between ALP-RD and Compact Pco.
 
 The first generic decode path reached 8,375 MB/s.
 
 The fused pair kernel increased decode throughput by 59.4 percent.
 
-The fused tree decoded 9.3 percent faster than ALP-RD. It decoded 13.5 percent slower than zero-secondary FloatQuant.
+The complete default encoded 12.2 percent faster and decoded 10.0 percent faster than the prior default.
 
-Scalar access remained competitive. The direct prototype tree compressed at 3,301 MB/s.
+Scalar access latency decreased by 7.0 percent.
+
+The direct two-child scheme compressed at 6,469 MB/s.
 
 The fused kernel supports aligned, patch-free BitPacked secondary children of any width.
 
-The measured input used a one-bit secondary. Real gap columns can require wider secondary values or patches.
+Decode throughput was 12,900 MB/s with a one-bit secondary.
 
-The result clears the isolated decode requirement. The default scheme still rejects this form.
+It was 12,410 MB/s with a 16-bit secondary.
 
-Default selection requires a fixed-tree estimator, a direct final encoder, and full-writer validation on real gap columns.
+The real profile selected this tree only for `HashTags_1.twitter#id`.
+
+It reduced that column by 6.1 percent against ALP-RD.
+
+OrderedFloat with BlockResidual reduced the column by 14.5 percent and won the final comparison.
+
+No other tested Pcodec or Public BI column selected the two-child tree.
+
+Rejected analysis changed encode throughput by less than one percent on most measured datasets.
+
+Retain the two-child form in the default candidate set for final corpus calibration.
 
 ### OrderedFloat with BlockResidual on random walks
 
@@ -645,28 +664,28 @@ This round completed these steps:
 - Added native `f32` FloatQuant selection and scheme benchmarks.
 - Replaced the full primary buffer with fused FloatQuant and FastLanes packing.
 - Replaced the generic FloatQuant sample with a direct fixed-tree estimator.
+- Added fixed-tree analysis for nonzero FloatQuant secondary values.
+- Added direct paired FastLanes packing for both FloatQuant children.
+- Added fused two-child FloatQuant decode and width-sweep benchmarks.
+- Validated selected and rejected two-child FloatQuant paths.
 
 The Pco mode profile and quotient and remainder experiments are complete.
 
-The fused nonzero-secondary FloatQuant decode experiment is complete.
+The nonzero-secondary FloatQuant implementation and focused validation are complete.
 
 Complete these remaining steps:
 
-1. Extend the FloatQuant estimator to small nonzero secondary widths.
-2. Add a direct final encoder for both FloatQuant children.
-3. Measure selected and rejected FloatQuant columns from the real gap corpus.
-4. Decide whether nonzero-secondary FloatQuant enters the default candidate set.
-5. Compare alternate BlockResidual patch costs across the patch-density sweep.
-6. Evaluate narrow BlockResidual as a Compact-only candidate.
-7. Reduce analysis cost on short rejected columns.
-8. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
-9. Prototype bounded scalar checkpoints for fixed-bin range packing.
-10. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
-11. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-12. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
-13. Compare the geometric mean against Parquet with Zstd.
-14. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-15. Update this plan after each experiment.
+1. Compare alternate BlockResidual patch costs across the patch-density sweep.
+2. Evaluate narrow BlockResidual as a Compact-only candidate.
+3. Reduce analysis cost on short rejected columns.
+4. Measure BlockResidual under temporal, FSST, sparse, run-end, and list parents.
+5. Prototype bounded scalar checkpoints for fixed-bin range packing.
+6. Compare fixed-bin packing against default and Pco on unrelated no-Delta wins.
+7. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
+8. Run the complete `bench-vortex` compression corpus after the candidate set stabilizes.
+9. Compare the geometric mean against Parquet with Zstd.
+10. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+11. Update this plan after each experiment.
 
 ## Pull request structure
 

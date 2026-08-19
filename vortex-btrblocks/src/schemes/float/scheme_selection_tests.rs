@@ -21,6 +21,8 @@ use vortex_block_residual::BlockResidual;
 use vortex_block_residual::OrderedFloat;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::BitPackedArrayExt;
 use vortex_float_quant::FloatQuant;
 use vortex_float_quant::FloatQuantArraySlotsExt;
 use vortex_session::VortexSession;
@@ -91,6 +93,34 @@ fn test_widened_f32_uses_float_quant() -> VortexResult<()> {
         BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<FloatQuant>());
     assert!(compressed.as_::<FloatQuant>().secondary().is_none());
+    Ok(())
+}
+
+#[test]
+fn test_nonzero_secondary_uses_float_quant() -> VortexResult<()> {
+    let values = (0u32..65_536)
+        .map(|index| {
+            let mantissa = index.wrapping_mul(7_919) & 0x007f_ffff;
+            let value = f64::from(f32::from_bits(0x3f80_0000 | mantissa));
+            if index % 10 == 0 {
+                f64::from_bits(value.to_bits() | 1)
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressed = BtrBlocksCompressor::default().compress(&array, &mut ctx)?;
+
+    assert!(compressed.is::<FloatQuant>());
+    let float_quant = compressed.as_::<FloatQuant>();
+    let secondary = float_quant
+        .secondary()
+        .ok_or_else(|| vortex_error::vortex_err!("missing nonzero FloatQuant secondary"))?
+        .as_::<BitPacked>();
+    assert_eq!(secondary.bit_width(), 1);
+    assert_arrays_eq!(compressed, array, &mut ctx);
     Ok(())
 }
 
