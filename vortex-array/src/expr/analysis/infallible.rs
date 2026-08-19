@@ -15,6 +15,7 @@ pub fn label_infallible(expr: &Expression) -> BooleanLabels<'_> {
         expr,
         |expr| match expr {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.signature().is_infallible(),
+            Expression::Lambda(_) => false,
             Expression::Root | Expression::Variable(_) => true,
         },
         |acc, &child| acc & child,
