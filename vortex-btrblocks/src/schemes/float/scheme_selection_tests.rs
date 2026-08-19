@@ -28,6 +28,12 @@ use vortex_float_quant::FloatQuantArraySlotsExt;
 use vortex_session::VortexSession;
 
 use crate::BtrBlocksCompressor;
+#[cfg(feature = "unstable_encodings")]
+use crate::BtrBlocksCompressorBuilder;
+#[cfg(feature = "unstable_encodings")]
+use crate::SchemeExt;
+#[cfg(feature = "unstable_encodings")]
+use crate::schemes::integer::DeltaScheme;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
@@ -250,8 +256,13 @@ fn test_block_residual_composes_with_alp() -> VortexResult<()> {
         (block * 1_000_000 + residual) as f64
     });
     let array = PrimitiveArray::from_iter(values).into_array();
-    let compressed =
-        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+    #[cfg(not(feature = "unstable_encodings"))]
+    let compressor = BtrBlocksCompressor::default();
+    #[cfg(feature = "unstable_encodings")]
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([DeltaScheme::default().id()])
+        .build();
+    let compressed = compressor.compress(&array, &mut SESSION.create_execution_ctx())?;
 
     assert!(
         compressed.is::<ALP>(),

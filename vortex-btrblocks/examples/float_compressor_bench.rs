@@ -49,7 +49,7 @@ use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
 use vortex_block_residual::BlockResidual;
-use vortex_block_residual::BlockResidualArraySlotsExt;
+use vortex_block_residual::BlockResidualArrayExt;
 use vortex_block_residual::OrderedFloat;
 use vortex_block_residual::OrderedFloatArraySlotsExt;
 use vortex_btrblocks::BtrBlocksCompressor;
@@ -448,36 +448,22 @@ fn profile_block_residual_array(
     config: &str,
     path: &str,
     array: &ArrayRef,
-    session: &VortexSession,
 ) -> VortexResult<()> {
     if let Some(residuals) = array.as_typed::<BlockResidual>() {
-        let mut ctx = session.create_execution_ctx();
-        let residual_widths = residuals
-            .residual_widths()
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)?;
-        let high_widths = residuals
-            .high_widths()
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)?;
+        let residual_widths = residuals.residual_widths();
+        let high_widths = residuals.high_widths();
         let blocks = residual_widths.len();
         let average_residual_width = residual_widths
-            .as_slice::<u8>()
             .iter()
             .map(|&width| f64::from(width))
             .sum::<f64>()
             / blocks as f64;
         let average_high_width = high_widths
-            .as_slice::<u8>()
             .iter()
             .map(|&width| f64::from(width))
             .sum::<f64>()
             / blocks as f64;
-        let patch_starts = residuals
-            .patch_starts()
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)?;
-        let patch_starts = patch_starts.as_slice::<u32>();
+        let patch_starts = residuals.patch_starts();
         let mut maximum_patch_density = 0.0_f64;
         let mut blocks_above_one_eighth = 0usize;
         let mut blocks_at_one_quarter = 0usize;
@@ -505,7 +491,6 @@ fn profile_block_residual_array(
             config,
             &format!("{path}/{child_index}"),
             child,
-            session,
         )?;
     }
     Ok(())
@@ -1538,14 +1523,7 @@ fn measure_dataset(
                 *config,
                 "integer-block-residual-only" | "ordered-block-residual-only"
             ) {
-                profile_block_residual_array(
-                    dataset,
-                    &column.name,
-                    config,
-                    "root",
-                    array,
-                    session,
-                )?;
+                profile_block_residual_array(dataset, &column.name, config, "root", array)?;
             }
         }
     }

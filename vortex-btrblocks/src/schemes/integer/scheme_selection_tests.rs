@@ -30,6 +30,12 @@ use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
 
 use crate::BtrBlocksCompressor;
+#[cfg(feature = "unstable_encodings")]
+use crate::BtrBlocksCompressorBuilder;
+#[cfg(feature = "unstable_encodings")]
+use crate::SchemeExt;
+#[cfg(feature = "unstable_encodings")]
+use crate::schemes::integer::DeltaScheme;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
 #[test]
@@ -62,8 +68,14 @@ fn test_block_residual_compressed() -> VortexResult<()> {
         })
         .collect::<Vec<_>>();
     let array = PrimitiveArray::from_iter(values);
-    let compressed = BtrBlocksCompressor::default()
-        .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+    #[cfg(not(feature = "unstable_encodings"))]
+    let compressor = BtrBlocksCompressor::default();
+    #[cfg(feature = "unstable_encodings")]
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([DeltaScheme::default().id()])
+        .build();
+    let compressed =
+        compressor.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
 
     assert!(
         compressed.is::<BlockResidual>(),

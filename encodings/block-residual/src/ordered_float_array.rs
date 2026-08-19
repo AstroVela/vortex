@@ -412,7 +412,7 @@ mod tests {
     use super::OrderedFloat;
     use super::OrderedFloatArraySlotsExt;
     use crate::BlockResidual;
-    use crate::BlockResidualArraySlotsExt;
+    use crate::BlockResidualArrayExt;
 
     #[test]
     fn roundtrip_special_values() -> VortexResult<()> {

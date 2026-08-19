@@ -27,7 +27,6 @@ use vortex_array::arrays::slice::SliceReduceAdaptor;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
-use vortex_array::dtype::Nullability::NonNullable;
 use vortex_array::dtype::PType;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar::Scalar;
@@ -38,7 +37,11 @@ use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTable;
 use vortex_array::vtable::child_to_validity;
 use vortex_array::vtable::validity_to_child;
+use vortex_buffer::Alignment;
+use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
+use vortex_buffer::ByteBuffer;
+use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -55,7 +58,7 @@ use crate::codec::packed_words_as_native;
 use crate::codec::read_wide_bits;
 
 const BLOCK_LEN: usize = 1024;
-const METADATA_VERSION: u8 = 1;
+const METADATA_VERSION: u8 = 2;
 const METADATA_LEN: usize = 41;
 
 /// Ordered unsigned integers with one reference and packed residuals per block.
@@ -64,24 +67,6 @@ pub type BlockResidualArray = Array<BlockResidual>;
 #[array_slots(BlockResidual)]
 pub struct BlockResidualSlots {
     #[slot(0)]
-    pub bases: ArrayRef,
-    #[slot(1)]
-    pub residual_widths: ArrayRef,
-    #[slot(2)]
-    pub high_widths: ArrayRef,
-    #[slot(3)]
-    pub residual_starts: ArrayRef,
-    #[slot(4)]
-    pub patch_starts: ArrayRef,
-    #[slot(5)]
-    pub high_starts: ArrayRef,
-    #[slot(6)]
-    pub residual_words: ArrayRef,
-    #[slot(7)]
-    pub patch_positions: ArrayRef,
-    #[slot(8)]
-    pub patch_highs: ArrayRef,
-    #[slot(9)]
     pub validity: Option<ArrayRef>,
 }
 
@@ -90,9 +75,16 @@ pub struct BlockResidualData {
     unsliced_len: usize,
     slice_start: usize,
     slice_stop: usize,
-    residual_word_count: usize,
-    patch_count: usize,
-    patch_high_count: usize,
+    payload: ByteBuffer,
+    bases: Buffer<u64>,
+    residual_widths: Buffer<u8>,
+    high_widths: Buffer<u8>,
+    residual_starts: Buffer<u32>,
+    patch_starts: Buffer<u32>,
+    high_starts: Buffer<u32>,
+    residual_words: Buffer<u64>,
+    patch_positions: Buffer<u16>,
+    patch_highs: Buffer<u8>,
 }
 
 impl Display for BlockResidualData {
@@ -108,24 +100,20 @@ impl Display for BlockResidualData {
 }
 
 impl ArrayHash for BlockResidualData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
         self.unsliced_len.hash(state);
         self.slice_start.hash(state);
         self.slice_stop.hash(state);
-        self.residual_word_count.hash(state);
-        self.patch_count.hash(state);
-        self.patch_high_count.hash(state);
+        self.payload.array_hash(state, accuracy);
     }
 }
 
 impl ArrayEq for BlockResidualData {
-    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
         self.unsliced_len == other.unsliced_len
             && self.slice_start == other.slice_start
             && self.slice_stop == other.slice_stop
-            && self.residual_word_count == other.residual_word_count
-            && self.patch_count == other.patch_count
-            && self.patch_high_count == other.patch_high_count
+            && self.payload.array_eq(&other.payload, accuracy)
     }
 }
 
@@ -188,15 +176,21 @@ impl VTable for BlockResidual {
     }
 
     fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
-        0
+        1
     }
 
-    fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        vortex_panic!("BlockResidualArray buffer index {idx} out of bounds")
+    fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
+        match idx {
+            0 => BufferHandle::new_host(array.payload.clone()),
+            _ => vortex_panic!("BlockResidualArray buffer index {idx} out of bounds"),
+        }
     }
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
-        vortex_panic!("BlockResidualArray buffer_name {idx} out of bounds")
+        match idx {
+            0 => Some("payload".to_string()),
+            _ => vortex_panic!("BlockResidualArray buffer_name {idx} out of bounds"),
+        }
     }
 
     fn with_buffers(
@@ -204,7 +198,13 @@ impl VTable for BlockResidual {
         array: ArrayView<'_, Self>,
         buffers: &[BufferHandle],
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_array::vtable::with_empty_buffers(self, array, buffers)
+        vortex_ensure!(buffers.len() == 1, "BlockResidualArray expects one buffer");
+        let mut data = array.data().clone();
+        data.replace_payload(&buffers[0])?;
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
     }
 
     fn serialize(
@@ -221,7 +221,7 @@ impl VTable for BlockResidual {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-        _buffers: &[BufferHandle],
+        buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
@@ -234,42 +234,25 @@ impl VTable for BlockResidual {
         let residual_word_count = usize::try_from(metadata.residual_word_count)?;
         let patch_count = usize::try_from(metadata.patch_count)?;
         let patch_high_count = usize::try_from(metadata.patch_high_count)?;
-        let block_count = unsliced_len.div_ceil(BLOCK_LEN);
-        let bases = children.get(0, &primitive_dtype(PType::U64), block_count)?;
-        let residual_widths = children.get(1, &primitive_dtype(PType::U8), block_count)?;
-        let high_widths = children.get(2, &primitive_dtype(PType::U8), block_count)?;
-        let residual_starts = children.get(3, &primitive_dtype(PType::U32), block_count + 1)?;
-        let patch_starts = children.get(4, &primitive_dtype(PType::U32), block_count + 1)?;
-        let high_starts = children.get(5, &primitive_dtype(PType::U32), block_count + 1)?;
-        let residual_words = children.get(6, &primitive_dtype(PType::U64), residual_word_count)?;
-        let patch_positions = children.get(7, &primitive_dtype(PType::U16), patch_count)?;
-        let patch_highs = children.get(8, &primitive_dtype(PType::U8), patch_high_count)?;
+        vortex_ensure!(buffers.len() == 1, "BlockResidualArray expects one buffer");
         let validity = match children.len() {
-            9 => Validity::from(dtype.nullability()),
-            10 => Validity::Array(children.get(9, &Validity::DTYPE, unsliced_len)?),
-            count => vortex_bail!("BlockResidualArray expects nine or ten children, got {count}"),
+            0 => Validity::from(dtype.nullability()),
+            1 => Validity::Array(children.get(0, &Validity::DTYPE, unsliced_len)?),
+            count => vortex_bail!("BlockResidualArray expects zero or one child, got {count}"),
         };
         let slots = BlockResidualSlots {
-            bases,
-            residual_widths,
-            high_widths,
-            residual_starts,
-            patch_starts,
-            high_starts,
-            residual_words,
-            patch_positions,
-            patch_highs,
             validity: validity_to_child(&validity, unsliced_len),
         }
         .into_slots();
-        let data = BlockResidualData {
+        let data = BlockResidualData::try_new(
             unsliced_len,
             slice_start,
             slice_stop,
             residual_word_count,
             patch_count,
             patch_high_count,
-        };
+            host_payload(&buffers[0])?,
+        )?;
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
@@ -353,12 +336,57 @@ impl SliceReduce for BlockResidual {
 static RULES: ParentRuleSet<BlockResidual> =
     ParentRuleSet::new(&[ParentRuleSet::lift(&SliceReduceAdaptor(BlockResidual))]);
 
-pub trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> + BlockResidualArraySlotsExt {
+pub trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> {
     fn unsliced_validity(&self) -> Validity {
         child_to_validity(
             self.as_ref().slots()[BlockResidualSlots::VALIDITY].as_ref(),
             self.as_ref().dtype().nullability(),
         )
+    }
+
+    /// Return the reference value for each block.
+    fn bases(&self) -> &[u64] {
+        &self.bases
+    }
+
+    /// Return the packed residual width for each block.
+    fn residual_widths(&self) -> &[u8] {
+        &self.residual_widths
+    }
+
+    /// Return the packed patch width for each block.
+    fn high_widths(&self) -> &[u8] {
+        &self.high_widths
+    }
+
+    /// Return the residual payload offsets.
+    fn residual_starts(&self) -> &[u32] {
+        &self.residual_starts
+    }
+
+    /// Return the patch position offsets.
+    fn patch_starts(&self) -> &[u32] {
+        &self.patch_starts
+    }
+
+    /// Return the patch high-bit offsets.
+    fn high_starts(&self) -> &[u32] {
+        &self.high_starts
+    }
+
+    /// Return the packed residual payload.
+    fn residual_words(&self) -> &[u64] {
+        &self.residual_words
+    }
+
+    /// Return the patch positions.
+    fn patch_positions(&self) -> &[u16] {
+        &self.patch_positions
+    }
+
+    /// Return the packed patch high bits.
+    fn patch_highs(&self) -> &[u8] {
+        &self.patch_highs
     }
 
     /// Decode the logical slice.
@@ -443,24 +471,17 @@ impl BlockResidual {
         validity: Validity,
         ptype: PType,
     ) -> VortexResult<BlockResidualArray> {
-        let data = BlockResidualData {
-            unsliced_len: parts.len,
-            slice_start: 0,
-            slice_stop: parts.len,
-            residual_word_count: parts.residual_words.len(),
-            patch_count: parts.patch_positions.len(),
-            patch_high_count: parts.patch_highs.len(),
-        };
+        let payload = payload_from_parts(&parts)?;
+        let data = BlockResidualData::try_new(
+            parts.len,
+            0,
+            parts.len,
+            parts.residual_words.len(),
+            parts.patch_positions.len(),
+            parts.patch_highs.len(),
+            payload,
+        )?;
         let slots = BlockResidualSlots {
-            bases: PrimitiveArray::from_iter(parts.bases).into_array(),
-            residual_widths: PrimitiveArray::from_iter(parts.residual_widths).into_array(),
-            high_widths: PrimitiveArray::from_iter(parts.high_widths).into_array(),
-            residual_starts: PrimitiveArray::from_iter(parts.residual_starts).into_array(),
-            patch_starts: PrimitiveArray::from_iter(parts.patch_starts).into_array(),
-            high_starts: PrimitiveArray::from_iter(parts.high_starts).into_array(),
-            residual_words: PrimitiveArray::from_iter(parts.residual_words).into_array(),
-            patch_positions: PrimitiveArray::from_iter(parts.patch_positions).into_array(),
-            patch_highs: PrimitiveArray::from_iter(parts.patch_highs).into_array(),
             validity: validity_to_child(&validity, data.unsliced_len),
         }
         .into_slots();
@@ -519,11 +540,54 @@ fn ordered_values(array: ArrayView<'_, Primitive>) -> VortexResult<Vec<u64>> {
 }
 
 impl BlockResidualData {
+    fn try_new(
+        unsliced_len: usize,
+        slice_start: usize,
+        slice_stop: usize,
+        residual_word_count: usize,
+        patch_count: usize,
+        patch_high_count: usize,
+        payload: ByteBuffer,
+    ) -> VortexResult<Self> {
+        let block_count = unsliced_len.div_ceil(BLOCK_LEN);
+        let mut offset = 0;
+        let bases = take_payload(&payload, &mut offset, block_count, "bases")?;
+        let residual_words =
+            take_payload(&payload, &mut offset, residual_word_count, "residual words")?;
+        let residual_starts =
+            take_payload(&payload, &mut offset, block_count + 1, "residual starts")?;
+        let patch_starts = take_payload(&payload, &mut offset, block_count + 1, "patch starts")?;
+        let high_starts = take_payload(&payload, &mut offset, block_count + 1, "high starts")?;
+        let patch_positions = take_payload(&payload, &mut offset, patch_count, "patch positions")?;
+        let residual_widths = take_payload(&payload, &mut offset, block_count, "residual widths")?;
+        let high_widths = take_payload(&payload, &mut offset, block_count, "high widths")?;
+        let patch_highs = take_payload(&payload, &mut offset, patch_high_count, "patch highs")?;
+        vortex_ensure!(
+            offset == payload.len(),
+            "block residual payload contains trailing bytes"
+        );
+        Ok(Self {
+            unsliced_len,
+            slice_start,
+            slice_stop,
+            payload,
+            bases,
+            residual_widths,
+            high_widths,
+            residual_starts,
+            patch_starts,
+            high_starts,
+            residual_words,
+            patch_positions,
+            patch_highs,
+        })
+    }
+
     fn validate(
         &self,
         dtype: &DType,
         len: usize,
-        slots: BlockResidualSlotsView<'_>,
+        _slots: BlockResidualSlotsView<'_>,
         validity: &Validity,
     ) -> VortexResult<()> {
         vortex_ensure!(
@@ -536,22 +600,18 @@ impl BlockResidualData {
         );
         vortex_ensure!(len == self.len(), "block residual slice length is invalid");
         let block_count = self.unsliced_len.div_ceil(BLOCK_LEN);
-        for (child, ptype, child_len) in [
-            (slots.bases, PType::U64, block_count),
-            (slots.residual_widths, PType::U8, block_count),
-            (slots.high_widths, PType::U8, block_count),
-            (slots.residual_starts, PType::U32, block_count + 1),
-            (slots.patch_starts, PType::U32, block_count + 1),
-            (slots.high_starts, PType::U32, block_count + 1),
-            (slots.residual_words, PType::U64, self.residual_word_count),
-            (slots.patch_positions, PType::U16, self.patch_count),
-            (slots.patch_highs, PType::U8, self.patch_high_count),
-        ] {
-            vortex_ensure!(
-                child.dtype() == &primitive_dtype(ptype) && child.len() == child_len,
-                "block residual child has an invalid dtype or length"
-            );
-        }
+        vortex_ensure!(
+            self.bases.len() == block_count
+                && self.residual_widths.len() == block_count
+                && self.high_widths.len() == block_count,
+            "block residual block tables have invalid lengths"
+        );
+        vortex_ensure!(
+            self.residual_starts.len() == block_count + 1
+                && self.patch_starts.len() == block_count + 1
+                && self.high_starts.len() == block_count + 1,
+            "block residual offset tables have invalid lengths"
+        );
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == self.unsliced_len,
@@ -572,56 +632,98 @@ impl BlockResidualData {
             ..self.clone()
         }
     }
-}
 
-struct ExecutedBlockResidual {
-    bases: PrimitiveArray,
-    residual_widths: PrimitiveArray,
-    high_widths: PrimitiveArray,
-    residual_starts: PrimitiveArray,
-    patch_starts: PrimitiveArray,
-    high_starts: PrimitiveArray,
-    residual_words: PrimitiveArray,
-    patch_positions: PrimitiveArray,
-    patch_highs: PrimitiveArray,
-}
-
-impl ExecutedBlockResidual {
-    fn new(array: ArrayView<'_, BlockResidual>, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
-        macro_rules! execute_child {
-            ($accessor:ident) => {
-                array.$accessor().clone().execute::<PrimitiveArray>(ctx)?
-            };
-        }
-        Ok(Self {
-            bases: execute_child!(bases),
-            residual_widths: execute_child!(residual_widths),
-            high_widths: execute_child!(high_widths),
-            residual_starts: execute_child!(residual_starts),
-            patch_starts: execute_child!(patch_starts),
-            high_starts: execute_child!(high_starts),
-            residual_words: execute_child!(residual_words),
-            patch_positions: execute_child!(patch_positions),
-            patch_highs: execute_child!(patch_highs),
-        })
+    fn replace_payload(&mut self, buffer: &BufferHandle) -> VortexResult<()> {
+        *self = Self::try_new(
+            self.unsliced_len,
+            self.slice_start,
+            self.slice_stop,
+            self.residual_words.len(),
+            self.patch_positions.len(),
+            self.patch_highs.len(),
+            host_payload(buffer)?,
+        )?;
+        Ok(())
     }
+}
+
+fn host_payload(buffer: &BufferHandle) -> VortexResult<ByteBuffer> {
+    buffer
+        .clone()
+        .ensure_aligned(Alignment::of::<u64>())?
+        .try_into_host_sync()
+}
+
+fn take_payload<T: NativePType>(
+    payload: &ByteBuffer,
+    offset: &mut usize,
+    len: usize,
+    name: &str,
+) -> VortexResult<Buffer<T>> {
+    let nbytes = len
+        .checked_mul(size_of::<T>())
+        .ok_or_else(|| vortex_error::vortex_err!("block residual {name} size overflows"))?;
+    let stop = offset
+        .checked_add(nbytes)
+        .ok_or_else(|| vortex_error::vortex_err!("block residual {name} offset overflows"))?;
+    vortex_ensure!(
+        stop <= payload.len(),
+        "block residual {name} exceeds the payload"
+    );
+    let bytes = payload.slice_with_alignment(*offset..stop, Alignment::of::<T>());
+    *offset = stop;
+    Ok(Buffer::from_byte_buffer(bytes))
+}
+
+fn payload_from_parts(parts: &BlockResidualParts) -> VortexResult<ByteBuffer> {
+    let total_nbytes = [
+        size_of_val(parts.bases.as_slice()),
+        size_of_val(parts.residual_words.as_slice()),
+        size_of_val(parts.residual_starts.as_slice()),
+        size_of_val(parts.patch_starts.as_slice()),
+        size_of_val(parts.high_starts.as_slice()),
+        size_of_val(parts.patch_positions.as_slice()),
+        size_of_val(parts.residual_widths.as_slice()),
+        size_of_val(parts.high_widths.as_slice()),
+        size_of_val(parts.patch_highs.as_slice()),
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, nbytes| total.checked_add(nbytes))
+    .ok_or_else(|| vortex_error::vortex_err!("block residual payload size overflows"))?;
+    let mut payload = ByteBufferMut::with_capacity_aligned(total_nbytes, Alignment::of::<u64>());
+    append_native(&mut payload, &parts.bases);
+    append_native(&mut payload, &parts.residual_words);
+    append_native(&mut payload, &parts.residual_starts);
+    append_native(&mut payload, &parts.patch_starts);
+    append_native(&mut payload, &parts.high_starts);
+    append_native(&mut payload, &parts.patch_positions);
+    append_native(&mut payload, &parts.residual_widths);
+    append_native(&mut payload, &parts.high_widths);
+    append_native(&mut payload, &parts.patch_highs);
+    Ok(payload.freeze())
+}
+
+fn append_native<T: NativePType>(payload: &mut ByteBufferMut, values: &[T]) {
+    // SAFETY: NativePType values contain no padding and permit every initialized bit pattern.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) };
+    payload.extend_from_slice(bytes);
 }
 
 fn decode_array_values<T: NativePType, U: NativePType + ResidualWord, const DIRECT_OUTPUT: bool>(
     array: ArrayView<'_, BlockResidual>,
-    ctx: &mut ExecutionCtx,
+    _ctx: &mut ExecutionCtx,
     mut transform: impl FnMut(U) -> T,
 ) -> VortexResult<PrimitiveArray> {
-    let children = ExecutedBlockResidual::new(array, ctx)?;
-    let bases = children.bases.as_slice::<u64>();
-    let residual_widths = children.residual_widths.as_slice::<u8>();
-    let high_widths = children.high_widths.as_slice::<u8>();
-    let residual_starts = children.residual_starts.as_slice::<u32>();
-    let patch_starts = children.patch_starts.as_slice::<u32>();
-    let high_starts = children.high_starts.as_slice::<u32>();
-    let residual_words = children.residual_words.as_slice::<u64>();
-    let patch_positions = children.patch_positions.as_slice::<u16>();
-    let patch_highs = children.patch_highs.as_slice::<u8>();
+    let bases = array.bases();
+    let residual_widths = array.residual_widths();
+    let high_widths = array.high_widths();
+    let residual_starts = array.residual_starts();
+    let patch_starts = array.patch_starts();
+    let high_starts = array.high_starts();
+    let residual_words = array.residual_words();
+    let patch_positions = array.patch_positions();
+    let patch_highs = array.patch_highs();
     let logical_range = array.data().slice_start..array.data().slice_stop;
     let mut direct_values =
         DIRECT_OUTPUT.then(|| BufferMut::<U>::with_capacity(logical_range.len()));
@@ -981,14 +1083,13 @@ pub(crate) fn decompress_ordered_f64(
 fn scalar_from_array(
     array: ArrayView<'_, BlockResidual>,
     index: usize,
-    ctx: &mut ExecutionCtx,
+    _ctx: &mut ExecutionCtx,
 ) -> VortexResult<u64> {
     let source_index = array.data().slice_start + index;
     let block_index = source_index / BLOCK_LEN;
     let index_in_block = source_index % BLOCK_LEN;
-    let children = ExecutedBlockResidual::new(array, ctx)?;
-    let residual_width = children.residual_widths.as_slice::<u8>()[block_index];
-    let high_width = children.high_widths.as_slice::<u8>()[block_index];
+    let residual_width = array.residual_widths()[block_index];
+    let high_width = array.high_widths()[block_index];
     let logical_width = array.dtype().as_ptype().bit_width();
     vortex_ensure!(
         usize::from(residual_width) <= logical_width
@@ -996,9 +1097,9 @@ fn scalar_from_array(
             && usize::from(residual_width) + usize::from(high_width) <= logical_width,
         "block residual bit widths are invalid"
     );
-    let residual_words = children.residual_words.as_slice::<u64>();
+    let residual_words = array.residual_words();
     let residual_payload = payload_range(
-        children.residual_starts.as_slice::<u32>(),
+        array.residual_starts(),
         block_index,
         residual_words.len(),
         "residual",
@@ -1031,21 +1132,11 @@ fn scalar_from_array(
         _ => vortex_bail!("block residual logical bit width is invalid"),
     };
 
-    let positions = children.patch_positions.as_slice::<u16>();
-    let patch_payload = payload_range(
-        children.patch_starts.as_slice::<u32>(),
-        block_index,
-        positions.len(),
-        "patch",
-    )?;
+    let positions = array.patch_positions();
+    let patch_payload = payload_range(array.patch_starts(), block_index, positions.len(), "patch")?;
     let block_positions = &positions[patch_payload];
-    let highs = children.patch_highs.as_slice::<u8>();
-    let high_payload = payload_range(
-        children.high_starts.as_slice::<u32>(),
-        block_index,
-        highs.len(),
-        "patch high",
-    )?;
+    let highs = array.patch_highs();
+    let high_payload = payload_range(array.high_starts(), block_index, highs.len(), "patch high")?;
     validate_patch_header(
         residual_width,
         high_width,
@@ -1064,7 +1155,7 @@ fn scalar_from_array(
         };
         residual |= high << residual_width;
     }
-    Ok(children.bases.as_slice::<u64>()[block_index].wrapping_add(residual))
+    Ok(array.bases()[block_index].wrapping_add(residual))
 }
 
 fn unpack_single_residual<T: ResidualWord>(width: u8, packed_words: &[u64], index: usize) -> u64 {
@@ -1148,9 +1239,9 @@ impl BlockResidualMetadata {
         Ok(Self {
             unsliced_len: u64::try_from(data.unsliced_len)?,
             slice_start: u64::try_from(data.slice_start)?,
-            residual_word_count: u64::try_from(data.residual_word_count)?,
-            patch_count: u64::try_from(data.patch_count)?,
-            patch_high_count: u64::try_from(data.patch_high_count)?,
+            residual_word_count: u64::try_from(data.residual_words.len())?,
+            patch_count: u64::try_from(data.patch_positions.len())?,
+            patch_high_count: u64::try_from(data.patch_highs.len())?,
         })
     }
 
@@ -1201,10 +1292,6 @@ impl BlockResidualMetadata {
     }
 }
 
-fn primitive_dtype(ptype: PType) -> DType {
-    DType::Primitive(ptype, NonNullable)
-}
-
 #[cfg(test)]
 mod tests {
     use vortex_array::ArrayContext;
@@ -1222,7 +1309,7 @@ mod tests {
     use vortex_session::registry::ReadContext;
 
     use super::BlockResidual;
-    use super::BlockResidualArraySlotsExt;
+    use super::BlockResidualArrayExt;
 
     #[test]
     fn roundtrip_and_scalar_access() -> VortexResult<()> {
@@ -1343,12 +1430,7 @@ mod tests {
         let session = array_session();
         crate::initialize(&session);
         let mut ctx = session.create_execution_ctx();
-        let widths = encoded
-            .residual_widths()
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)?;
-
-        assert_eq!(widths.as_slice::<u8>()[0], 0);
+        assert_eq!(encoded.residual_widths()[0], 0);
         assert_eq!(
             encoded
                 .execute_scalar(1_023, &mut ctx)?

@@ -8,6 +8,22 @@ Keep native Vortex arrays, bounded metadata, fast canonical decode, and bounded 
 
 Pco remains a compression oracle. The new arrays do not preserve Pco byte compatibility.
 
+The production target is the default compressor, not Compact.
+
+Use Compact to identify numeric columns where the default compressor leaves a material size gap.
+
+For each repeated gap, identify the Pco model that creates the gain.
+
+Transfer that model into a native array only when it preserves these Default properties:
+
+- Full decode remains close to the displaced encoding.
+- Compression throughput remains close to the displaced encoding.
+- Scalar access remains O(1) or bounded O(log N).
+- Rejected candidates add little selector cost.
+- The size gain remains material after native array overhead.
+
+Compact can use experimental schemes during evaluation. Default selection remains the release decision.
+
 ## Current decision
 
 Focus the production work on these encodings:
@@ -82,9 +98,11 @@ Rare wide residuals use sorted positions and packed high bits.
 
 Scalar access uses one packed read and one binary search over the patch positions.
 
-Child arrays store references, widths, offsets, packed words, patch positions, and patch high bits.
+One aligned parent buffer stores references, widths, offsets, packed words, patch positions, and patch high bits.
 
-Fixed metadata stores only lengths and slice bounds. Variable tables remain in child arrays.
+Fixed metadata stores only lengths and slice bounds.
+
+Typed zero-copy views point into the parent buffer after a file read.
 
 The array supports canonical decode, scalar access, slice reduction, serialization, and validation.
 
@@ -92,7 +110,7 @@ The `OrderedFloat(BlockResidual)` execute kernel combines residual decode with t
 
 The residual payload uses the logical integer width. A 16-bit array uses 16-bit FastLanes pack and unpack operations.
 
-The serialized residual payload remains a `u64` child. The logical type defines the packed word interpretation.
+The serialized residual payload remains a `u64` section. The logical type defines the packed word interpretation.
 
 The production codec uses one reference per block. The multi-reference prototype did not justify its encode and decode costs.
 
@@ -347,7 +365,7 @@ Compact gives priority to the Pco size point. Narrow BlockResidual therefore has
 
 The 48.8 percent saving against FoR plus BitPacked supports one more narrow decode optimization pass.
 
-The BlockResidual estimator measures its sampled tree exactly, with all child arrays.
+The BlockResidual estimator measures its sampled tree exactly, with all payload sections.
 
 The incumbent and outer tree estimates remain approximate. Trial compression previously mis-ranked Dict and ALP on Taxi tips.
 
@@ -468,6 +486,66 @@ The narrow integer exclusion remains valid. Native-width unpack does not close t
 One width factor does not predict both signed and unsigned results.
 
 Retain the current factor until the final corpus calibration uses selected-tree evidence.
+
+### Serialized BlockResidual topology
+
+The first serialized layout stored nine primitive child arrays per BlockResidual array.
+
+The codec kernels remained fast, but the file reader executed nine extra array nodes for each chunk.
+
+An intermediate layout replaced those children with nine direct parent buffers.
+
+That layout improved file decode, but each buffer still produced a separate file segment.
+
+The final layout stores every table and payload in one aligned parent buffer.
+
+The section order preserves native alignment without padding:
+
+1. Block references and residual words use 64-bit sections.
+2. Residual and patch offsets use 32-bit sections.
+3. Patch positions use one 16-bit section.
+4. Widths and packed patch high bits use byte sections.
+
+Typed zero-copy views share the same allocation. Scalar access and bulk decode read those views directly.
+
+The single-encoding benchmark uses two million block-local values.
+
+| Logical type | Encode GB/s | Decode GB/s | Scalar access ns |
+| --- | ---: | ---: | ---: |
+| `u64` | 5.23 | 36.87 | 83 |
+| `u32` | 2.79 | 46.69 | 38 |
+| `i32` | 2.78 | 32.23 | 41 |
+| `i16` | 1.42 | 32.18 | 83 |
+
+The direct 8-bit and 16-bit selector exclusion remains valid.
+
+The broad file benchmark uses three iterations across eight datasets.
+
+Positive throughput changes indicate faster execution.
+
+| Dataset | Size change | Encode throughput change | Decode throughput change |
+| --- | ---: | ---: | ---: |
+| Taxi | -3.24 percent | -1.06 percent | +2.51 percent |
+| GloVe | 0.00 percent | +2.45 percent | +0.53 percent |
+| Arade | -0.19 percent | +0.47 percent | +1.72 percent |
+| Bimbo | -1.38 percent | +0.57 percent | +0.05 percent |
+| CMSprovider | -1.41 percent | +0.20 percent | -0.06 percent |
+| Euro2016 | -2.68 percent | +1.68 percent | -5.74 percent |
+| Food | -1.76 percent | +0.50 percent | -3.50 percent |
+| HashTags | -0.63 percent | +1.77 percent | -9.71 percent |
+| Geometric mean | -1.42 percent | +0.82 percent | -1.86 percent |
+
+Five datasets decoded at parity or faster.
+
+The focused five-iteration runs showed smaller HashTags decode losses of 3.7 to 5.6 percent.
+
+The focused Euro2016 decode loss ranged from 3.8 to 5.1 percent.
+
+Focused encode throughput remained within one percent of the prior default.
+
+This layout recovers most of the Compact-like size gain without a material aggregate throughput loss.
+
+The remaining threshold calibration must use selected-column evidence and the complete corpus.
 
 ### Patch-density sweep
 
@@ -976,6 +1054,9 @@ This round completed these steps:
 - Added complete temporal, FSST, Sparse, RunEnd, list, and ALP composition benchmarks.
 - Added selection tests for BlockResidual under ALP, Sparse, and RunEnd.
 - Added exact allocation-free BlockResidual size estimates.
+- Replaced nine BlockResidual child arrays with one aligned parent payload buffer.
+- Removed eight file segments from each serialized BlockResidual array.
+- Revalidated size and throughput across eight file datasets.
 - Added an all-valid fast path for locality sample copies.
 - Rejected a four-block short-column estimate after a real mis-ranking.
 - Added patch-density statistics to the BlockResidual profile.
