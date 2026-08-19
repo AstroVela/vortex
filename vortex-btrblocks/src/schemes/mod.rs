@@ -28,8 +28,6 @@ use vortex_compressor::builtins::StringDictScheme;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
 use vortex_compressor::scheme::DescendantExclusion;
-use vortex_compressor::scheme::EstimateScore;
-use vortex_compressor::scheme::EstimateVerdict;
 use vortex_compressor::scheme::SchemeExt;
 use vortex_error::VortexResult;
 
@@ -39,27 +37,6 @@ use crate::schemes::integer::SparseScheme;
 const SAMPLE_BLOCK_LEN: usize = 64;
 const MIN_SAMPLE_BLOCKS: usize = 16;
 const SAMPLE_BLOCK_MULTIPLE: usize = 16;
-const RANGE_PACKED_NATIVE_SIZE_ADVANTAGE: f64 = 1.10;
-const RANGE_PACKED_PCO_SIZE_ALLOWANCE: f64 = 1.10;
-
-fn range_packed_compact_verdict(
-    before_nbytes: u64,
-    after_nbytes: u64,
-    best_native: Option<EstimateScore>,
-) -> EstimateVerdict {
-    if after_nbytes == 0 || after_nbytes >= before_nbytes {
-        return EstimateVerdict::Skip;
-    }
-    let ratio = before_nbytes as f64 / after_nbytes as f64;
-    if best_native
-        .and_then(EstimateScore::finite_ratio)
-        .is_some_and(|best| ratio < best * RANGE_PACKED_NATIVE_SIZE_ADVANTAGE)
-    {
-        return EstimateVerdict::Skip;
-    }
-    EstimateVerdict::Ratio(ratio * RANGE_PACKED_PCO_SIZE_ALLOWANCE)
-}
-
 fn sample_primitive_one_percent(
     primitive: ArrayView<'_, Primitive>,
     exec_ctx: &mut ExecutionCtx,

@@ -56,9 +56,7 @@ use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
-use vortex_btrblocks::schemes::float::OrderedRangePackedScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
-use vortex_btrblocks::schemes::integer::RangePackedScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -1644,8 +1642,6 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
         FloatQuantScheme.id(),
         OrderedBlockResidualScheme.id(),
         BlockResidualScheme.id(),
-        OrderedRangePackedScheme.id(),
-        RangePackedScheme.id(),
     ];
     vec![
         (
