@@ -25,6 +25,7 @@ use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexResult;
 
+use super::ZigZagScheme;
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
@@ -75,6 +76,10 @@ impl Scheme for BlockResidualScheme {
                 ancestor: BinaryDictScheme.id(),
                 children: ChildSelection::One(1),
             },
+            AncestorExclusion {
+                ancestor: ZigZagScheme.id(),
+                children: ChildSelection::One(0),
+            },
         ]
     }
 
@@ -102,16 +107,7 @@ impl Scheme for BlockResidualScheme {
                 if ratio < MIN_COMPRESSION_RATIO {
                     return Ok(EstimateVerdict::Skip);
                 }
-                let speed_penalty = match sample.ptype().bit_width() {
-                    32 => 1.10,
-                    64 => 1.20,
-                    _ => unreachable!("BlockResidual only matches 32-bit and 64-bit integers"),
-                };
-                let adjusted_ratio = ratio / speed_penalty;
-                if adjusted_ratio < MIN_COMPRESSION_RATIO {
-                    return Ok(EstimateVerdict::Skip);
-                }
-                Ok(EstimateVerdict::Ratio(adjusted_ratio))
+                Ok(EstimateVerdict::Ratio(ratio))
             },
         )))
     }

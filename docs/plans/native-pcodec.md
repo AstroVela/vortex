@@ -179,6 +179,16 @@ It does not create packed payloads, patch payloads, temporary ordered integers, 
 
 All-valid samples use direct block copies. Nullable samples retain the validity mask.
 
+`BlockResidualScheme` requires at least a 1.05 compression ratio before outer comparison.
+
+The nonlinear patch cost represents the measured decode cliff for dense patches.
+
+The selector does not apply another width-specific size factor.
+
+Direct 32-bit and 64-bit BlockResidual decode now matches or exceeds the main FoR paths.
+
+BlockResidual does not occur below ZigZag. That composition lost decode throughput on GloVe for a small size reduction.
+
 The residual scheme requires a 1.05 compression ratio. Its adjusted score includes a 1.02 decode-cost factor.
 
 `BlockResidualScheme` uses the same locality probe for integer arrays.
@@ -554,6 +564,42 @@ Focused encode throughput remained within one percent of the prior default.
 This layout recovers most of the Compact-like size gain without a material aggregate throughput loss.
 
 The remaining threshold calibration must use selected-column evidence and the complete corpus.
+
+### BlockResidual selector calibration
+
+The final numeric trial removes the prior 1.10 and 1.20 width factors.
+
+The 1.05 minimum ratio and nonlinear patch cost remain active.
+
+An initial trial selected `ALP(ZigZag(BlockResidual))` on GloVe.
+
+That tree reduced size by 1.2 percent and reduced decode throughput by 19.9 percent.
+
+No other selected corpus tree placed BlockResidual below ZigZag. An ancestor exclusion removes that composition.
+
+The final run reads two million rows from seven Public BI files and GloVe.
+
+| Dataset | Size change | Encode throughput change | Decode throughput change |
+| --- | ---: | ---: | ---: |
+| Arade | -3.13 percent | -4.44 percent | +8.80 percent |
+| Bimbo | -2.97 percent | -0.36 percent | +1.78 percent |
+| CMSprovider 1 | -1.63 percent | -3.42 percent | -1.29 percent |
+| CMSprovider 2 | -1.56 percent | -3.32 percent | -0.65 percent |
+| Euro2016 | -11.47 percent | -3.61 percent | +6.23 percent |
+| Food | -6.89 percent | -0.85 percent | -4.00 percent |
+| HashTags | -5.83 percent | -0.47 percent | +4.36 percent |
+| GloVe | 0.00 percent | +0.43 percent | +3.63 percent |
+| Geometric mean | -4.25 percent | -2.02 percent | +2.28 percent |
+
+The prior width factors reduced size by 2.28 percent in the same eight-dataset scope.
+
+They changed encode throughput by -0.49 percent and decode throughput by +3.30 percent.
+
+The new policy recovers another 1.97 percent of geometric-mean size.
+
+It keeps every dataset throughput change far inside the 20-percent gate.
+
+The complete file corpus remains necessary before the policy becomes final.
 
 ### Compact transfer baseline
 
