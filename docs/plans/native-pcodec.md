@@ -817,6 +817,10 @@ The Pco advantage comes from a different encoding of the same ALP integer child.
 
 The first prototype splits the exact ALP integer child with a constant base.
 
+The estimator stores each child at the source latent width. GloVe `i32` latents produce `u32` quotient and remainder children.
+
+The native-width correction did not change the GloVe byte totals. Each selected child still uses the same packed bit width.
+
 | Candidate | Bytes |
 | --- | ---: |
 | Pco `IntMult(10)` child | 4,518,870 |

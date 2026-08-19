@@ -877,16 +877,16 @@ fn profile_quotient_remainder(
         let most_common_remainder_share =
             remainder_counts.values().copied().max().unwrap_or_default() as f64
                 / ordered.len() as f64;
-        let quotients = PrimitiveArray::from_iter(ordered.iter().map(|value| value / base));
-        let remainders = PrimitiveArray::from_iter(ordered.iter().map(|value| value % base));
-        let quotient_bitmap_bytes =
-            estimate_bitmap_patches(quotients.as_slice::<u64>(), ptype.bit_width());
-        let remainder_mode_bitmap_bytes =
-            estimate_mode_bitmap(remainders.as_slice::<u64>(), ptype.bit_width());
-        let quotient =
-            compressor.compress(&quotients.into_array(), &mut session.create_execution_ctx())?;
+        let quotients = ordered.iter().map(|value| value / base).collect::<Vec<_>>();
+        let remainders = ordered.iter().map(|value| value % base).collect::<Vec<_>>();
+        let quotient_bitmap_bytes = estimate_bitmap_patches(&quotients, ptype.bit_width());
+        let remainder_mode_bitmap_bytes = estimate_mode_bitmap(&remainders, ptype.bit_width());
+        let quotient = compressor.compress(
+            &latent_array(&quotients, ptype)?.into_array(),
+            &mut session.create_execution_ctx(),
+        )?;
         let remainder = compressor.compress(
-            &remainders.into_array(),
+            &latent_array(&remainders, ptype)?.into_array(),
             &mut session.create_execution_ctx(),
         )?;
         println!(
@@ -900,6 +900,27 @@ fn profile_quotient_remainder(
         );
     }
     Ok(())
+}
+
+fn latent_array(values: &[u64], ptype: PType) -> VortexResult<PrimitiveArray> {
+    match ptype.bit_width() {
+        16 => Ok(PrimitiveArray::from_iter(
+            values
+                .iter()
+                .map(|&value| u16::try_from(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        32 => Ok(PrimitiveArray::from_iter(
+            values
+                .iter()
+                .map(|&value| u32::try_from(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        64 => Ok(PrimitiveArray::from_iter(values.iter().copied())),
+        width => Err(vortex_err!(
+            "quotient and remainder profiling does not support {width}-bit values"
+        )),
+    }
 }
 
 fn profile_range_packed(
