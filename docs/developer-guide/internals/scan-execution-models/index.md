@@ -26,6 +26,10 @@ layout-reader-v1
 plan-v2
 layout27
 self-paced
+morsel-reactor
+scheduler-visible-work
+morsel-reactor-ideas
+self-paced-plan-exec-experiment
 self-paced-implementation-plan
 self-paced-review
 ```
@@ -46,7 +50,7 @@ self-paced-review
 | Coordinate translation | Per-reader arithmetic | Per-operator arithmetic | Per-plan arithmetic | One declared `DomainMap` per edge, shared by demand, coverage, boundaries, and row identity |
 | Runtime state location | `LayoutReader` implementations | Context plus some plan data and futures | Dedicated scan state and prepared handles | Per-scan `ScanState` for reusable facts, per-morsel `ExecGraph` for progress |
 | I/O scheduling | Eager future construction and source-level sharing | Eager future construction and source-level sharing | Explicit reads, phases, lanes, priorities, and byte admission | Per-scan read catalog with morsel views, dynamic gates, lazy demand scoring, deduplication, and byte credits |
-| Mask stability at projection | A shared future resolves the final split mask | A shared `MaskFuture` resolves the final split mask | Selection and demand are explicit in prepared tasks | Open masks stay in a root ledger; projection receives immutable sealed windows |
+| Mask stability at projection | A shared future resolves the final split mask | A shared `MaskFuture` resolves the final split mask | Selection and demand are explicit in prepared tasks | Projection planning sees immutable open snapshots; exact value execution receives sealed demand |
 | Split dependence | Required for pacing and parallelism | Required for pacing and parallelism | Required as morsel boundaries | Required only for outer morsel parallelism, not internal batching |
 | Backpressure boundary | Stream of completed splits | Stream of completed splits | Morsel scheduler | Every parent-child edge inside a morsel plus root rebatching |
 
@@ -218,11 +222,12 @@ V1 `LayoutReader` methods.
 
 The proposed model keeps plan v2's operator IR and adopts `layout27`'s explicit runtime and I/O
 ideas. Static reads are catalogued once, exact mask refinement stays in a root demand ledger, and
-projection is driven only over sealed immutable windows. A drive call registers any mix of
-scheduler-owned I/O and CPU work and runs until it returns a prefix batch, blocks on tickets,
-finishes, or yields for fairness. Parents own cursors that slice and align child batches, while a
-root rebatcher adapts natural internal batches to consumer-facing sizes. Several fixed morsels
-provide outer scan parallelism; self-paced execution happens independently inside each one.
+projection planning may use immutable open snapshots to offer candidate I/O while exact or fallible
+value execution uses sealed windows. A drive call registers any mix of scheduler-owned I/O and CPU
+work and runs until it returns a prefix batch, blocks on tickets, finishes, or yields for fairness.
+Parents own cursors that slice and align child batches, while a root rebatcher adapts natural
+internal batches to consumer-facing sizes. Several fixed morsels provide outer scan parallelism;
+self-paced execution happens independently inside each one.
 
 ## Decision matrix
 

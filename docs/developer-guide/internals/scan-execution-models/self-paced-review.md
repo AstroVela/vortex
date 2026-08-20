@@ -521,8 +521,10 @@ omitted entirely in the first implementation, and record what would justify addi
 
 ### Settled design choices
 
-- Amend 6: open demand is owned by `DemandLedger`; projection receives only sealed demand, and the
-  operator owning an edge's `DomainMap` may **derive** sealed demand across it. *(F1)*
+- Amend 6: open demand is owned by `DemandLedger`; projection planning may consume immutable open
+  snapshots and summaries for candidate I/O and explicitly safe discovery work. Exact or fallible
+  value execution receives sealed demand, and the operator owning an edge's `DomainMap` may
+  **derive** sealed demand across it. *(F1)*
 - Add: the row domain and its transforms are first-class. Every edge declares a `DomainMap`, and one
   map serves demand derivation, catalog coverage, morsel-boundary discovery, and row identity.
   *(F1)*

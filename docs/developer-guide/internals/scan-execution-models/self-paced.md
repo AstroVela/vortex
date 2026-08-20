@@ -376,9 +376,11 @@ This avoids embedding a different, incompatible priority policy in every layout 
 
 ## Demand ledger
 
-Passing a live, repeatedly shrinking mask through projection nodes is the wrong abstraction.
-Projection could be woken for every predicate completion, reconsider the same reads, and
-accidentally execute a fallible expression for rows that a later predicate removes.
+Passing a live, mutable, repeatedly shrinking mask through projection value nodes is the wrong
+abstraction. Projection planning and the read catalog may observe immutable open snapshots and
+summaries to offer candidate I/O, but exact or fallible value execution receives sealed demand.
+This avoids waking the complete projection tree for every predicate completion and prevents a
+fallible expression from running for rows that a later predicate removes.
 
 Instead, each morsel owns a DemandLedger. It divides the morsel into modest fixed windows, for
 example 1,024 rows:
@@ -996,12 +998,15 @@ initial selection
   -> initialize exact candidate masks
 metadata and index evidence
   -> shrink open DemandLedger blocks
+open demand snapshots
+  -> offer predicate work and candidate projection I/O
+  -> run explicitly safe discovery CPU for conditional reads
 predicate stages
   -> evaluate immutable stage masks
   -> intersect exact results
   -> seal completed blocks
 contiguous sealed frontier advances
-  -> drive projection with SealedDemand
+  -> promote exact projection work and drive values with SealedDemand
   -> receive self-paced prefixes
   -> root rebatch and commit
 ~~~
@@ -1097,7 +1102,9 @@ The proposal recommends treating these as architectural constraints:
 5. Static read discovery happens once per scan, with per-morsel views.
 6. Data-dependent reads are exposed by explicit gates, which are exactly the non-static maps.
 7. The central scheduler owns admission, deduplication, and final priority.
-8. Open demand is owned by DemandLedger; projection receives only sealed immutable demand.
+8. Open demand is owned by DemandLedger. Projection planning may consume immutable open snapshots
+   and summaries for candidate I/O and explicitly safe discovery work; exact or fallible value
+   execution receives sealed immutable demand.
 9. Exact masks remain the correctness representation; block summaries are scheduler accelerators
    with one authoritative fact and derived caches.
 10. Drive registers any mix of work and runs to quiescence, and every non-terminal outcome carries

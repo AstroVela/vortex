@@ -36,7 +36,8 @@ The implementation is complete only when:
 - all plan operators used by supported scans have an execution-node implementation;
 - every coordinate translation is a declared DomainMap rather than per-operator arithmetic;
 - exact outputs and observable errors match the compatibility oracle;
-- projection never runs on open demand unless the operation is explicitly safe;
+- projection planning may use immutable open demand for candidate I/O, while projection CPU on open
+  demand requires an explicit speculation-safety classification;
 - read and task registration is idempotent under duplicate wakes;
 - compressed, decoded, task, and output memory are bounded, and no credit class can deadlock;
 - multiple fields can expose independent work in one drive;
@@ -592,8 +593,9 @@ projection computation must observe an immutable final mask for each emitted win
 2. Translate pruning and evidence results into monotone block intersections.
 3. Run parallel or adaptive predicates over immutable stage masks.
 4. Track remaining predicates per block and seal blocks independently.
-5. Wake projection only when the contiguous sealed frontier advances.
-6. Keep catalog read scheduling active for open blocks using conservative summaries.
+5. Wake exact projection value execution only when the contiguous sealed frontier advances.
+6. Keep projection planning and catalog read scheduling active for open blocks using immutable
+   snapshots and conservative summaries.
 7. Promote the exact reads required by each sealed projection prefix.
 8. Preserve current selectivity feedback and make expected block counts scheduling-only.
 9. Classify computation:
@@ -607,7 +609,8 @@ projection computation must observe an immutable final mask for each emitted win
 ### Validation
 
 - Predicate completions in different orders produce identical final output.
-- Many open-mask revisions cause zero projection drives until a prefix seals.
+- Many open-mask revisions cause zero exact projection value drives until a prefix seals; candidate
+  read rescoring remains lazy.
 - A projection read can start before sealing and is promoted without duplication later.
 - A fallible projection is never evaluated on rows removed before sealing.
 - All-false blocks advance the sealed frontier without projection values.
@@ -893,7 +896,7 @@ boundary is not sufficient evidence for the new contract.
 
 | Risk | Consequence | Mitigation and proving phase |
 | --- | --- | --- |
-| Projection sees an open mask | New observable errors or wasted fallible work | Restricted SealedDemand construction and Phase 2/7 tests |
+| Fallible or exact projection value work uses open demand | New observable errors or wasted fallible work | Restricted SealedDemand construction and Phase 2/7 tests; open snapshots authorize only candidate I/O and explicitly safe speculation |
 | Drive becomes an event-processing loop | Poll storms and order-dependent bugs | Durable tickets, run-to-quiescence simulator in Phase 1 |
 | Catalog updates cost more than exact mask work | Filter-heavy regression | Lazy generation scoring and Phase 2/3 microbenchmarks |
 | Leading struct fields decode too far ahead | Unbounded retained state | Capping in Phase 5, byte-based wavefront credits in Phase 5/8 |
