@@ -43,6 +43,7 @@ arrow-array = { workspace = true }
 divan = { workspace = true }
 insta = { workspace = true }
 rstest = { workspace = true }
+test-with = { workspace = true }
 tpchgen = { workspace = true }
 tpchgen-arrow = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }

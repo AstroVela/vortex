@@ -505,14 +505,16 @@ mod tests {
     /// `i32::MAX`, which the buffer-count and buffer-size assertions catch.
     ///
     /// Allocates ~2.25 GiB, so it is ignored by default and run only by the "Rust tests
-    /// (linux-arm64)" CI job. To run it locally (release mode, since debug builds make the
-    /// allocation and fill loop substantially slower):
+    /// (linux-arm64)" CI job. Setting `VORTEX_SKIP_SLOW_TESTS` at build time drops it from the
+    /// binary, which is how the sanitizer jobs avoid compiling it at all. To run it locally
+    /// (release mode, since debug builds make the allocation and fill loop substantially slower):
     ///
     /// ```text
     /// cargo test --release -p vortex-array build_views_offsets_overflow -- --ignored
     /// ```
     ///
     /// [`MAX_BUFFER_LEN`]: super::MAX_BUFFER_LEN
+    #[test_with::no_env(VORTEX_SKIP_SLOW_TESTS)]
     #[test]
     #[ignore = "slow: allocates ~2.25 GiB, run by the \"Rust tests (linux-arm64)\" CI job"]
     fn build_views_offsets_overflow_i32() {
