@@ -142,7 +142,7 @@ impl SqlBenchmarkRunner {
         let mut runs = Vec::with_capacity(iterations);
         let mut row_count = None;
 
-        for _ in 0..iterations {
+        for i in 0..iterations {
             let start = Instant::now();
             let (timing, result) = f();
             let elapsed = timing.unwrap_or_else(|| start.elapsed());
@@ -150,6 +150,10 @@ impl SqlBenchmarkRunner {
 
             if row_count.is_none() {
                 row_count = Some(result.row_count());
+            }
+
+            if i + 1 < iterations {
+                maybe_purge_allocator_cache();
             }
         }
 
@@ -399,7 +403,7 @@ impl SqlBenchmarkRunner {
 
                         tracing::debug!(%format, query_idx, "Running query");
 
-                        for _ in 0..iterations {
+                        for i in 0..iterations {
                             let start = Instant::now();
                             let (timing, result) = execute(query_idx, &ctx, query.as_str())
                                 .await
@@ -411,6 +415,10 @@ impl SqlBenchmarkRunner {
 
                             if row_count.is_none() {
                                 row_count = Some(result.row_count());
+                            }
+
+                            if i + 1 < iterations {
+                                maybe_purge_allocator_cache();
                             }
                         }
 
@@ -446,6 +454,21 @@ impl SqlBenchmarkRunner {
 
 fn is_ci() -> bool {
     matches!(std::env::var("CI").as_deref(), Ok("true"))
+}
+
+/// Replicates PR #9385's between-iteration allocator purge, gated behind
+/// `BENCH_PURGE_ALLOCATOR=1` so one binary can A/B the behavior.
+fn maybe_purge_allocator_cache() {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(
+            std::env::var("BENCH_PURGE_ALLOCATOR").as_deref(),
+            Ok("1")
+        )
+    });
+    if *ENABLED {
+        // SAFETY: mi_collect is safe to call from any thread.
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
 }
 
 fn validate_benchmark_runner_id(benchmark_runner: &str, is_ci: bool) -> anyhow::Result<()> {
