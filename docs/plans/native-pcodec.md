@@ -1824,6 +1824,74 @@ The focused Euro tree still decodes about 30 percent slower than its incumbent.
 
 RangePacked therefore remains an experimental Default option.
 
+### Decomposed fixed-bin bundle
+
+The storage prototype now uses only composable arrays:
+
+`OrderedFloat(IntMult(Dict(BitPacked(codes), starts), BlockResidual(offsets)))`
+
+The scheme permits 1 through 64 bins.
+
+The `IntMult` base is one, so decode uses addition without multiplication.
+
+The exact sample estimator constructs this fixed child tree.
+
+The writer therefore avoids generic integer recursion and its depth limit.
+
+The first decomposed HashTags tree used 1,991,606 bytes.
+
+The incumbent ALP-RD tree used 3,263,939 bytes.
+
+This change reduced the column size by 39.0 percent.
+
+The generic child execution reached 4,476 MB/s.
+
+A nullable dictionary fast path reached 8,383 MB/s after it removed validity work from normal payloads.
+
+An outer in-place decoder now preserves direct BlockResidual unpack.
+
+It combines bin addition and ordered-float restoration in one pass.
+
+The final decomposed tree reached 10,148 to 10,389 MB/s across two focused runs.
+
+The direct fused RangePacked prototype reached 14,658 MB/s.
+
+The ALP-RD incumbent reached 15,578 to 16,060 MB/s.
+
+Scalar access used 312 to 323 ns for the decomposed tree and 150 to 158 ns for ALP-RD.
+
+The decomposed tree retains bounded random access, but the constant factor remains material.
+
+The matched 16-dataset compression pass produced these geometric-mean changes:
+
+| Metric | Change versus Current Default |
+| --- | ---: |
+| File size | -0.056 percent |
+| Write time | +1.172 percent |
+| Read time | -0.268 percent |
+
+HashTags file size fell from 179,382,860 bytes to 178,180,812 bytes.
+
+Its matched write time fell by 0.82 percent, and its matched read time fell by 2.38 percent.
+
+Those complete-file timing changes conflict with the slower selected column.
+
+Treat them as aggregate noise until a larger repeated pass confirms them.
+
+The first two million rows selected the new tree only for HashTags `interaction#received_at`.
+
+Full files also changed size for Bimbo, CMSprovider, Euro2016, and Taxi.
+
+This difference requires a chunk-level selected-tree trace before threshold calibration.
+
+The current broad size gain does not justify Default inclusion by itself.
+
+IntMult now belongs to the August 2026 core edition, so files can serialize the decomposed tree.
+
+Fast rejection remains a cost advantage, not an admission rule.
+
+A scheme without fast rejection can enter Default when corpus evidence justifies its analysis cost.
+
 ### Complete bundle controls
 
 The compression benchmark exposes four numeric bundles:

@@ -9757,10 +9757,12 @@ name = "vortex-block-residual"
 version = "0.1.0"
 dependencies = [
  "fastlanes",
+ "num-traits",
  "rstest",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
+ "vortex-int-mult",
  "vortex-session",
 ]
 

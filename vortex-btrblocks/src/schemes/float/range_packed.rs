@@ -9,11 +9,14 @@ use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VTable;
+use vortex_array::arrays::Dict;
+use vortex_array::arrays::DictArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::half::f16;
 use vortex_array::match_each_float_ptype;
+use vortex_block_residual::BlockResidual;
 use vortex_block_residual::OrderedFloat;
 use vortex_block_residual::OrderedFloatArraySlotsExt;
 use vortex_compressor::scheme::CompressionEstimate;
@@ -21,7 +24,10 @@ use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateScore;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexResult;
-use vortex_range_packed::RangePacked;
+use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked;
+use vortex_int_mult::IntMult;
+use vortex_range_packed::RangeDecomposition;
 
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;
@@ -64,7 +70,13 @@ impl Scheme for OrderedFloatRangePackedScheme {
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
-        vec![RangePacked.id(), OrderedFloat.id()]
+        vec![
+            OrderedFloat.id(),
+            IntMult.id(),
+            Dict.id(),
+            BitPacked.id(),
+            BlockResidual.id(),
+        ]
     }
 
     fn num_children(&self) -> usize {
@@ -283,23 +295,70 @@ fn estimate_ordered_float(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<u64> {
-    let ordered = OrderedFloat::from_primitive(primitive)?;
-    RangePacked::estimate_primitive_with_null_positions(
-        ordered.encoded().as_::<Primitive>(),
-        exec_ctx,
-    )
+    Ok(encode_ordered_float(primitive, exec_ctx)?.nbytes())
 }
 
 fn encode_ordered_float(
     primitive: vortex_array::ArrayView<'_, Primitive>,
-    exec_ctx: &mut ExecutionCtx,
+    _exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let ordered = OrderedFloat::from_primitive(primitive)?;
-    let packed = RangePacked::from_primitive_with_null_positions(
-        ordered.encoded().as_::<Primitive>(),
-        exec_ctx,
-    )?;
-    Ok(OrderedFloat::try_new(packed.into_array(), primitive.ptype())?.into_array())
+    let ordered_values = ordered.encoded().as_::<Primitive>();
+    if ordered_values.is_empty() {
+        return Ok(ordered.into_array());
+    }
+
+    let decomposition = match ordered_values.ptype() {
+        PType::U16 => RangeDecomposition::encode(
+            &ordered_values
+                .as_slice::<u16>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect::<Vec<_>>(),
+        )?,
+        PType::U32 => RangeDecomposition::encode(
+            &ordered_values
+                .as_slice::<u32>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect::<Vec<_>>(),
+        )?,
+        PType::U64 => RangeDecomposition::encode(ordered_values.as_slice::<u64>())?,
+        ptype => vortex_error::vortex_bail!(
+            "range decomposition requires unsigned integers, got {ptype}"
+        ),
+    };
+    let code_width = decomposition.code_width();
+    let codes = PrimitiveArray::new(decomposition.codes().to_vec(), ordered_values.validity()?);
+    // SAFETY: The decomposition computes the exact code width.
+    let codes = unsafe { bitpack_encode_unchecked(codes, code_width) }?.into_array();
+    let starts = narrow_unsigned(decomposition.bin_starts(), ordered_values.ptype())?.into_array();
+    let references = DictArray::try_new(codes, starts)?.into_array();
+    let offsets = narrow_unsigned(decomposition.offsets(), ordered_values.ptype())?;
+    let offsets = BlockResidual::from_primitive(offsets.as_view())?.into_array();
+    let reconstructed = IntMult::try_new(references, offsets, 1)?;
+    Ok(OrderedFloat::try_new(reconstructed.into_array(), primitive.ptype())?.into_array())
+}
+
+fn narrow_unsigned(values: &[u64], ptype: PType) -> VortexResult<PrimitiveArray> {
+    Ok(match ptype {
+        PType::U16 => PrimitiveArray::from_iter(
+            values
+                .iter()
+                .map(|&value| u16::try_from(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PType::U32 => PrimitiveArray::from_iter(
+            values
+                .iter()
+                .map(|&value| u32::try_from(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PType::U64 => PrimitiveArray::from_iter(values.iter().copied()),
+        _ => vortex_error::vortex_bail!(
+            "range decomposition requires unsigned integers, got {ptype}"
+        ),
+    })
 }
 
 fn normalize_float_null_values(
@@ -359,7 +418,6 @@ mod tests {
     })))]
     fn ordered_float_tree_roundtrips(#[case] expected: PrimitiveArray) -> VortexResult<()> {
         let session = array_session();
-        vortex_range_packed::initialize(&session);
         let mut ctx = session.create_execution_ctx();
         let compressed = CascadingCompressor::new(vec![&TEST_SCHEME])
             .compress(&expected.clone().into_array(), &mut ctx)?;
@@ -465,14 +523,19 @@ mod tests {
         }));
         let expected_array = expected.clone().into_array();
         let session = array_session();
-        vortex_range_packed::initialize(&session);
         let mut ctx = session.create_execution_ctx();
         let compressed =
             CascadingCompressor::new(vec![&TEST_SCHEME]).compress(&expected_array, &mut ctx)?;
 
-        let packed = &compressed.children()[0];
-        assert!(packed.is::<vortex_range_packed::RangePacked>());
-        assert_eq!(packed.children().len(), 5);
+        let int_mult = &compressed.children()[0];
+        assert!(int_mult.is::<vortex_int_mult::IntMult>());
+        let references = &int_mult.children()[0];
+        let offsets = &int_mult.children()[1];
+        assert!(references.is::<vortex_array::arrays::Dict>());
+        assert!(references.children()[0].is::<vortex_fastlanes::BitPacked>());
+        assert!(offsets.is::<vortex_block_residual::BlockResidual>());
+        assert_eq!(references.len(), expected.len());
+        assert_eq!(offsets.len(), expected.len());
         assert_arrays_eq!(compressed, expected, &mut ctx);
         Ok(())
     }

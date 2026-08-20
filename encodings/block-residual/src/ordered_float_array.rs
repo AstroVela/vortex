@@ -6,6 +6,7 @@ use std::fmt::Formatter;
 use std::hash::Hasher;
 use std::ops::Range;
 
+use num_traits::AsPrimitive;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
@@ -19,14 +20,18 @@ use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::slice::SliceReduce;
 use vortex_array::arrays::slice::SliceReduceAdaptor;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::half::f16;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::ArrayChildren;
@@ -41,6 +46,9 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
+use vortex_int_mult::IntMult;
+use vortex_int_mult::IntMultArrayExt;
+use vortex_int_mult::IntMultArraySlotsExt;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -174,7 +182,13 @@ impl VTable for OrderedFloat {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        let decoded = if let Some(block_residual) = array.encoded().as_typed::<BlockResidual>() {
+        let decoded = if let Some(int_mult) = array.encoded().as_typed::<IntMult>() {
+            if let Some(decoded) = decompress_ordered_int_mult(array.as_view(), int_mult, ctx)? {
+                decoded
+            } else {
+                decode_primitive(array.as_view(), ctx)?
+            }
+        } else if let Some(block_residual) = array.encoded().as_typed::<BlockResidual>() {
             match array.dtype().as_ptype() {
                 PType::F16 => decode_primitive(array.as_view(), ctx)?,
                 PType::F32 => decompress_ordered_f32(block_residual, ctx)?,
@@ -194,6 +208,137 @@ impl VTable for OrderedFloat {
     ) -> VortexResult<Option<ArrayRef>> {
         RULES.evaluate(array, parent, child_idx)
     }
+}
+
+fn decompress_ordered_int_mult(
+    array: ArrayView<'_, OrderedFloat>,
+    int_mult: ArrayView<'_, IntMult>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<PrimitiveArray>> {
+    if int_mult.base() != 1 {
+        return Ok(None);
+    }
+    let Some(dict) = int_mult.primary().as_typed::<Dict>() else {
+        return Ok(None);
+    };
+    let Some(offsets) = int_mult.secondary().as_typed::<BlockResidual>() else {
+        return Ok(None);
+    };
+    let starts = dict.values().clone().execute::<PrimitiveArray>(ctx)?;
+    if !starts.validity()?.definitely_no_nulls() || starts.ptype() != offsets.dtype().as_ptype() {
+        return Ok(None);
+    }
+    let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
+    let validity = codes.validity()?;
+    let offsets = int_mult
+        .secondary()
+        .clone()
+        .execute::<PrimitiveArray>(ctx)?;
+
+    decode_ordered_int_mult_parts(
+        array.dtype().as_ptype(),
+        starts,
+        offsets,
+        codes,
+        validity,
+        ctx,
+    )
+}
+
+fn decode_ordered_int_mult_parts(
+    float_ptype: PType,
+    starts: PrimitiveArray,
+    offsets: PrimitiveArray,
+    codes: PrimitiveArray,
+    validity: vortex_array::validity::Validity,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<PrimitiveArray>> {
+    match_each_integer_ptype!(codes.ptype(), |C| {
+        decode_ordered_int_mult_codes::<C>(
+            float_ptype,
+            starts,
+            offsets,
+            codes.as_slice::<C>(),
+            validity,
+            ctx,
+        )
+    })
+}
+
+fn decode_ordered_int_mult_codes<C>(
+    float_ptype: PType,
+    starts: PrimitiveArray,
+    offsets: PrimitiveArray,
+    codes: &[C],
+    validity: vortex_array::validity::Validity,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<PrimitiveArray>>
+where
+    C: NativePType + AsPrimitive<usize>,
+{
+    match float_ptype {
+        PType::F16 if starts.ptype() == PType::U16 => {
+            decode_ordered_u16(starts.as_slice::<u16>(), offsets, codes, validity, ctx).map(Some)
+        }
+        PType::F32 if starts.ptype() == PType::U32 => {
+            decode_ordered_u32(starts.as_slice::<u32>(), offsets, codes, validity, ctx).map(Some)
+        }
+        PType::F64 if starts.ptype() == PType::U64 => {
+            decode_ordered_u64(starts.as_slice::<u64>(), offsets, codes, validity, ctx).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+macro_rules! decode_ordered_words {
+    ($name:ident, $word:ty, $float:ty, $unordered:ident) => {
+        fn $name<C>(
+            starts: &[$word],
+            offsets: PrimitiveArray,
+            codes: &[C],
+            validity: vortex_array::validity::Validity,
+            ctx: &mut ExecutionCtx,
+        ) -> VortexResult<PrimitiveArray>
+        where
+            C: NativePType + AsPrimitive<usize>,
+        {
+            let mut offsets = offsets.into_buffer_mut::<$word>();
+            let mut invalid_codes = Vec::new();
+            for (index, (offset, code)) in offsets.iter_mut().zip(codes).enumerate() {
+                let code = <C as AsPrimitive<usize>>::as_(*code);
+                let Some(start) = starts.get(code) else {
+                    invalid_codes.push(index);
+                    continue;
+                };
+                *offset = $unordered(start.wrapping_add(*offset));
+            }
+            validate_invalid_code_payloads(&validity, offsets.len(), &invalid_codes, ctx)?;
+            // SAFETY: Every integer bit pattern represents a valid float value of equal width.
+            let values = unsafe { offsets.transmute::<$float>() }.freeze();
+            Ok(PrimitiveArray::new(values, validity))
+        }
+    };
+}
+
+decode_ordered_words!(decode_ordered_u16, u16, f16, unordered_u16);
+decode_ordered_words!(decode_ordered_u32, u32, f32, unordered_u32);
+decode_ordered_words!(decode_ordered_u64, u64, f64, unordered_u64);
+
+fn validate_invalid_code_payloads(
+    validity: &vortex_array::validity::Validity,
+    len: usize,
+    invalid_codes: &[usize],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    if !invalid_codes.is_empty() {
+        let mask = validity.execute_mask(len, ctx)?;
+        for &index in invalid_codes {
+            if mask.value(index) {
+                vortex_bail!("OrderedFloat IntMult dictionary code is invalid");
+            }
+        }
+    }
+    Ok(())
 }
 
 impl OperationsVTable<OrderedFloat> for OrderedFloat {
@@ -363,36 +508,28 @@ fn decode_primitive(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
     let encoded = array.encoded().clone().execute::<PrimitiveArray>(ctx)?;
+    let validity = encoded.validity()?;
     Ok(match array.dtype().as_ptype() {
         PType::F16 => PrimitiveArray::new(
-            Buffer::from(
-                encoded
-                    .as_slice::<u16>()
-                    .iter()
-                    .map(|&value| f16::from_bits(unordered_u16(value)))
-                    .collect::<Vec<_>>(),
-            ),
-            encoded.validity()?,
+            encoded
+                .into_buffer::<u16>()
+                .map_each_in_place(|value| f16::from_bits(unordered_u16(value)))
+                .freeze(),
+            validity,
         ),
         PType::F32 => PrimitiveArray::new(
-            Buffer::from(
-                encoded
-                    .as_slice::<u32>()
-                    .iter()
-                    .map(|&value| f32::from_bits(unordered_u32(value)))
-                    .collect::<Vec<_>>(),
-            ),
-            encoded.validity()?,
+            encoded
+                .into_buffer::<u32>()
+                .map_each_in_place(|value| f32::from_bits(unordered_u32(value)))
+                .freeze(),
+            validity,
         ),
         PType::F64 => PrimitiveArray::new(
-            Buffer::from(
-                encoded
-                    .as_slice::<u64>()
-                    .iter()
-                    .map(|&value| f64::from_bits(unordered_u64(value)))
-                    .collect::<Vec<_>>(),
-            ),
-            encoded.validity()?,
+            encoded
+                .into_buffer::<u64>()
+                .map_each_in_place(|value| f64::from_bits(unordered_u64(value)))
+                .freeze(),
+            validity,
         ),
         ptype => vortex_panic!("unsupported OrderedFloat ptype {ptype}"),
     })
@@ -461,6 +598,7 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
+    use vortex_array::arrays::DictArray;
     use vortex_array::arrays::Primitive;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
@@ -472,6 +610,7 @@ mod tests {
     use vortex_buffer::Buffer;
     use vortex_buffer::ByteBufferMut;
     use vortex_error::VortexResult;
+    use vortex_int_mult::IntMult;
     use vortex_session::registry::ReadContext;
 
     use super::OrderedFloat;
@@ -609,6 +748,35 @@ mod tests {
             primitive.into_array().slice(1_023..1_026)?,
             &mut ctx
         );
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_nullable_int_mult_dictionary_block_residual() -> VortexResult<()> {
+        let primitive = PrimitiveArray::new(
+            Buffer::from(vec![1.0_f64, 0.0, 2.5, -3.0]),
+            Validity::from_iter([true, false, true, true]),
+        );
+        let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+        let ordered_primitive = ordered.encoded().as_::<Primitive>();
+        let ordered_values = ordered_primitive.as_slice::<u64>();
+        let starts =
+            PrimitiveArray::from_iter([ordered_values[0], ordered_values[2], ordered_values[3]]);
+        let codes = PrimitiveArray::new(
+            Buffer::from(vec![0_u8, 9, 1, 2]),
+            Validity::from_iter([true, false, true, true]),
+        );
+        let references = DictArray::try_new(codes.into_array(), starts.into_array())?;
+        let offsets =
+            BlockResidual::from_primitive(PrimitiveArray::from_iter([0_u64; 4]).as_view())?;
+        let int_mult = IntMult::try_new(references.into_array(), offsets.into_array(), 1)?;
+        let encoded = OrderedFloat::try_new(int_mult.into_array(), PType::F64)?;
+        let session = array_session();
+        crate::initialize(&session);
+        vortex_int_mult::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        assert_arrays_eq!(encoded, primitive, &mut ctx);
         Ok(())
     }
 

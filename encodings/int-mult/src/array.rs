@@ -253,16 +253,14 @@ fn decode_dict_add(
 
     if let Some(codes) = dict.codes().as_typed::<BitPacked>() {
         let validity = BitPackedArrayExt::validity(&codes);
-        if codes.patches().is_none() && validity.definitely_no_nulls() {
-            return decode_bitpacked_dict(starts, secondary, codes, validity).map(Some);
+        if codes.patches().is_none() {
+            return decode_bitpacked_dict(starts, secondary, codes, validity, ctx).map(Some);
         }
     }
 
     let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
-    if !codes.validity()?.definitely_no_nulls() {
-        return Ok(None);
-    }
-    decode_primitive_dict(starts, secondary, codes).map(Some)
+    let validity = codes.validity()?;
+    decode_primitive_dict(starts, secondary, codes, validity, ctx).map(Some)
 }
 
 fn decode_bitpacked_dict(
@@ -270,10 +268,13 @@ fn decode_bitpacked_dict(
     secondary: PrimitiveArray,
     codes: ArrayView<'_, BitPacked>,
     validity: vortex_array::validity::Validity,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
     match_each_integer_ptype!(secondary.ptype(), |T| {
         let starts = starts.as_slice::<T>();
-        let output = add_bitpacked_codes(starts, secondary.into_buffer_mut::<T>(), codes)?;
+        let (output, invalid_codes) =
+            add_bitpacked_codes(starts, secondary.into_buffer_mut::<T>(), codes)?;
+        validate_invalid_codes(&validity, output.len(), &invalid_codes, ctx)?;
         VortexResult::Ok(PrimitiveArray::new(output, validity))
     })
 }
@@ -282,16 +283,18 @@ fn decode_primitive_dict(
     starts: PrimitiveArray,
     secondary: PrimitiveArray,
     codes: PrimitiveArray,
+    validity: vortex_array::validity::Validity,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let validity = codes.validity()?;
     match_each_integer_ptype!(secondary.ptype(), |T| {
         let starts = starts.as_slice::<T>();
         match_each_integer_ptype!(codes.ptype(), |C| {
-            let output = add_primitive_codes(
+            let (output, invalid_codes) = add_primitive_codes(
                 starts,
                 secondary.into_buffer_mut::<T>(),
                 codes.as_slice::<C>(),
             )?;
+            validate_invalid_codes(&validity, output.len(), &invalid_codes, ctx)?;
             VortexResult::Ok(PrimitiveArray::new(output, validity))
         })
     })
@@ -301,53 +304,93 @@ fn add_primitive_codes<T, C>(
     starts: &[T],
     mut output: BufferMut<T>,
     codes: &[C],
-) -> VortexResult<BufferMut<T>>
+) -> VortexResult<(BufferMut<T>, Vec<usize>)>
 where
     T: NativePType + WrappingMulAdd,
     C: NativePType + AsPrimitive<usize>,
 {
-    for (value, code) in output.as_mut_slice().iter_mut().zip(codes) {
-        let code: usize = code.as_();
+    let mut invalid_codes = Vec::new();
+    for (index, (value, code)) in output.as_mut_slice().iter_mut().zip(codes).enumerate() {
+        let code: usize = (*code).as_();
         let Some(start) = starts.get(code) else {
-            vortex_bail!("IntMult dictionary code is invalid");
+            invalid_codes.push(index);
+            continue;
         };
         *value = <T as WrappingMulAdd>::wrapping_add(*start, *value);
     }
-    Ok(output)
+    Ok((output, invalid_codes))
+}
+
+fn validate_invalid_codes(
+    validity: &vortex_array::validity::Validity,
+    len: usize,
+    invalid_codes: &[usize],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    if !invalid_codes.is_empty() {
+        let mask = validity.execute_mask(len, ctx)?;
+        for &index in invalid_codes {
+            if mask.value(index) {
+                vortex_bail!("IntMult dictionary code is invalid");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add_bitpacked_codes<T>(
     starts: &[T],
     mut output: BufferMut<T>,
     codes: ArrayView<'_, BitPacked>,
-) -> VortexResult<BufferMut<T>>
+) -> VortexResult<(BufferMut<T>, Vec<usize>)>
 where
     T: NativePType + WrappingMulAdd,
 {
-    vortex_ensure!(!starts.is_empty(), "IntMult dictionary values are empty");
+    let mut invalid_codes = Vec::new();
     if codes.bit_width() == 0 {
-        for value in output.as_mut_slice() {
-            *value = <T as WrappingMulAdd>::wrapping_add(starts[0], *value);
+        if let Some(start) = starts.first() {
+            for value in output.as_mut_slice() {
+                *value = <T as WrappingMulAdd>::wrapping_add(*start, *value);
+            }
+        } else {
+            invalid_codes.extend(0..output.len());
         }
-        return Ok(output);
+        return Ok((output, invalid_codes));
     }
 
     match_each_integer_ptype!(codes.dtype().as_ptype(), |C| {
-        let mut invalid_code = false;
         let mut chunks = codes.unpacked_chunks::<C>()?;
         chunks.for_each_unpacked_chunk(|codes, range| {
-            for (value, code) in output.as_mut_slice()[range].iter_mut().zip(codes) {
-                let code: usize = code.as_();
-                let Some(start) = starts.get(code) else {
-                    invalid_code = true;
-                    continue;
-                };
-                *value = <T as WrappingMulAdd>::wrapping_add(*start, *value);
-            }
+            add_dictionary_starts(
+                starts,
+                &mut output.as_mut_slice()[range.clone()],
+                codes,
+                range.start,
+                &mut invalid_codes,
+            );
         });
-        vortex_ensure!(!invalid_code, "IntMult dictionary code is invalid");
-        VortexResult::Ok(output)
+        VortexResult::Ok((output, invalid_codes))
     })
+}
+
+fn add_dictionary_starts<T, C>(
+    starts: &[T],
+    output: &mut [T],
+    codes: &[C],
+    offset: usize,
+    invalid_codes: &mut Vec<usize>,
+) where
+    T: NativePType + WrappingMulAdd,
+    C: NativePType + AsPrimitive<usize>,
+{
+    for (index, (value, code)) in output.iter_mut().zip(codes).enumerate() {
+        let code: usize = (*code).as_();
+        let Some(start) = starts.get(code) else {
+            invalid_codes.push(offset + index);
+            continue;
+        };
+        *value = <T as WrappingMulAdd>::wrapping_add(*start, *value);
+    }
 }
 
 impl OperationsVTable<IntMult> for IntMult {
@@ -673,6 +716,32 @@ mod tests {
             encoded,
             PrimitiveArray::from_iter([101_u32, 1_002, 10_003, 1_004, 105]),
             &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_one_adds_nullable_bitpacked_dictionary_references() -> VortexResult<()> {
+        let codes = PrimitiveArray::new(
+            buffer![0_u8, 3, 1, 0, 3],
+            Validity::from_iter([true, false, true, true, false]),
+        );
+        // SAFETY: Two bits represent every code payload, including invalid null payloads.
+        let codes = unsafe { bitpack_encode_unchecked(codes, 2) }?.into_array();
+        let starts = PrimitiveArray::from_iter([100_u32, 1_000]).into_array();
+        let references = DictArray::try_new(codes, starts)?.into_array();
+        let offsets = PrimitiveArray::from_iter([1_u32, 2, 3, 4, 5]).into_array();
+        let encoded = IntMult::try_new(references, offsets, 1)?;
+        let expected =
+            PrimitiveArray::from_option_iter([Some(101_u32), None, Some(1_003), Some(104), None]);
+        let mut ctx = array_session().create_execution_ctx();
+
+        assert!(decode_dict_add(encoded.as_view(), &mut ctx)?.is_some());
+        assert_arrays_eq!(encoded.clone(), expected, &mut ctx);
+        assert_arrays_eq!(
+            encoded.into_array().slice(1..4)?,
+            expected.into_array().slice(1..4)?,
+            &mut ctx
         );
         Ok(())
     }
