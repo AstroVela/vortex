@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Measures Vortex file scans that produce Arrow offset arrays.
+//! Measures end-to-end Vortex file scans that produce Arrow offset arrays.
 //! The file writer uses the default compressor for strings.
 
 #![expect(clippy::unwrap_used)]
@@ -92,7 +92,7 @@ fn enable_all_registered_array_encodings(session: &VortexSession) {
         .read(|map| map.keys().copied().collect::<Vec<_>>());
     for id in ids {
         editions
-            .declare_inclusion(EditionInclusion::new(&id, BENCH_EDITION))
+            .declare_inclusion(EditionInclusion::array(&id, BENCH_EDITION))
             .unwrap();
     }
     session.enable_edition(BENCH_EDITION).unwrap();
