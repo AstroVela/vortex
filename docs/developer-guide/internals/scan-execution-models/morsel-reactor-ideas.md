@@ -5,7 +5,10 @@
 This note is intentionally non-normative. It records design ideas raised while refining the
 [morsel reactor architecture](morsel-reactor.md), along with the evidence needed to choose among
 them. Correctness contracts belong in the architecture document; policies in this note may change
-after simulation and benchmarking.
+after simulation and benchmarking. The
+[plan execution experiment](self-paced-plan-exec-experiment.md) is the first executable vehicle
+for several of these decisions; the [validation vehicles](#validation-vehicles) table records
+which.
 
 ## 1. Fixed versus migratable morsel ownership
 
@@ -305,6 +308,48 @@ For every scenario record:
 - queue starvation and steal success; and
 - time to first and final output.
 
+## 16. Completion summaries
+
+Planning should never scan an array to learn a scalar fact about it. The plan execution experiment
+stores a summary beside each resolved array. A boolean mask's length and true count are mandatory
+because empty sealing depends on them; they are computed by the worker that produced the value.
+Alternatives include:
+
+- per-operation summary types instead of one fixed struct; and
+- richer statistics, such as min/max, for scheduling decisions.
+
+The boolean-mask summary is correctness-bearing metadata inseparable from its `ArrayRef`, not an
+independent resolved value. No task may name it as an input. The task table validates its required
+shape, while the producer is responsible for semantic correctness just as it is for array values.
+
+## 17. Shared-resource wake-up
+
+A shared segment or decode completion must reach every morsel that joined the resource. The
+experiment reuses the joined-user set as the subscriber list and wakes each joined morsel once;
+unresolved morsels discover the value if and when they join. Alternatives include:
+
+- per-fact subscriber lists separate from lifetime tracking;
+- no wake-up at all, with discovery only at join time; and
+- wake-ups batched per scheduler tick.
+
+Measure duplicate wake-ups and join-time discovery latency before separating subscription from
+lifetime state.
+
+## 18. Offer claiming and input snapshots
+
+The plan execution experiment separates a descriptive offer, which names slot identifiers, from a
+runnable task, which owns immutable clones of its resolved inputs. Claiming happens on the owner
+thread immediately before execution: it verifies the offer is still live, clones each resolved
+value, acquires input and output leases, and marks the task running. Alternatives include:
+
+- embedding resolved values in the offer at emission time, which pins results earlier and lets a
+  revoked offer strand its clones;
+- letting workers read the slot store directly under a lock, which reintroduces shared mutable
+  coordination; and
+- claim batching, where the scheduler claims several tasks in one owner interaction.
+
+Measure claim latency, lease hold time, and how often a claim observes a revoked offer.
+
 ## Decisions currently recommended
 
 The following defaults are plausible starting points, not settled architecture:
@@ -317,3 +362,37 @@ The following defaults are plausible starting points, not settled architecture:
 6. Immediate demand notification near commit; lazy rescoring farther ahead.
 7. Fixed transition budgets in the simulator.
 8. No adaptive task fusion until launch cost is measured.
+9. Scalar completion summaries computed by the worker that produced the value.
+10. Descriptive offers claimed into input-owning runnable tasks immediately before execution.
+
+## Validation vehicles
+
+Two executable studies split the evidence:
+
+- the [plan execution experiment](self-paced-plan-exec-experiment.md) tests the control-plane
+  contract on one restricted `Chunked<Struct<Flat>>` shape under a single-threaded external
+  driver with deterministic virtual costs; and
+- the deterministic simulator described in the
+  [implementation plan](self-paced-implementation-plan.md) covers gates, multi-block demand,
+  stealing, and dynamic filters.
+
+| Idea | Vehicle | Notes |
+| --- | --- | --- |
+| 1. Morsel ownership | Simulator | Ownership is fixed and single-threaded in the experiment |
+| 2. Replenishment policy | Both | The experiment measures transition budgets; queue watermarks need the simulator |
+| 3. Frontier transport | Experiment | Stable offers plus the minimal promotion and revocation updates required by an external queue |
+| 4. Predicate scheduling | Experiment | Sequential, concurrent, and hybrid policies under virtual costs |
+| 5. Selectivity uncertainty | Simulator | The experiment uses exact candidate counts only |
+| 6. Speculative projection I/O | Experiment | Prefetch policy sweep over selectivity, latency, and overlap |
+| 7. Speculative discovery CPU | Simulator | The restricted shape has no gated reads |
+| 8. Task fusion | Simulator | Requires measured task-launch cost |
+| 9. Demand update transport | Simulator | One block per morsel makes transport trivial in the experiment |
+| 10. Dynamic-filter sealing | Simulator | No external filter exists in the experiment |
+| 11. Work queues and stealing | Simulator | The experiment driver is single-threaded |
+| 12. Graph representation | Experiment | Slot, node, and edge counts under scaling sweeps |
+| 13. Fact retention | Experiment | Pinned, reusable, and dead classification with retirement and eviction |
+| 14. Planning budget | Experiment | Fixed transition counts, with scheduler admission measured separately |
+| 15. Prototype scenarios | Both | The experiment covers scenarios 1–4, 9, 11, and parts of 12 |
+| 16. Completion summaries | Experiment | Whether summaries keep `advance` free of array scans |
+| 17. Shared-resource wake-up | Experiment | Duplicate wake-ups and join-time discovery latency |
+| 18. Offer claiming | Experiment | Claim latency, lease hold time, and revoked-claim frequency |

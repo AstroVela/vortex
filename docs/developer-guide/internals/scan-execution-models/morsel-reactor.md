@@ -638,4 +638,6 @@ tasks.
   and works through dynamic dictionary reads.
 - [Morsel reactor ideas](morsel-reactor-ideas.md) holds scheduler policies and prototype choices
   that should not yet be treated as architectural requirements.
+- [Plan execution experiment](self-paced-plan-exec-experiment.md) reduces this contract to a
+  restricted executable study driven by an external scheduler.
 - [Implementation plan](self-paced-implementation-plan.md) describes migration phases and gates.

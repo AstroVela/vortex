@@ -1,8 +1,9 @@
 # Self-Paced Plan Execution Experiment
 
 This document proposes a small executable experiment for self-paced plan execution. It is not the
-production implementation plan. Its purpose is to test the control-plane model before integrating
-the complete Vortex expression, array, layout, and scan stacks.
+production implementation plan. Its purpose is to test the control-plane model of the
+[morsel reactor](morsel-reactor.md) before integrating the complete Vortex expression, array,
+layout, and scan stacks.
 
 The experiment belongs in:
 
@@ -14,8 +15,9 @@ It asks whether:
 
 1. a morsel can expose I/O and CPU work without executing either;
 2. independently completed conjuncts can monotonically reduce row demand;
-3. later morsels can join results discovered by earlier morsels; and
-4. morsel retirement can prove when retained I/O and intermediate results are dead.
+3. later morsels can join results discovered by earlier morsels;
+4. morsel retirement can prove when retained I/O and intermediate results are dead; and
+5. a bounded `advance` can expose every currently concrete task without walking the whole graph.
 
 The experiment should favor an inspectable event trace and strong invariants over generality or
 peak performance.
@@ -46,11 +48,38 @@ The first experiment deliberately has these restrictions:
 - projection selects fields rather than evaluating arbitrary expressions;
 - a morsel does not cross a chunk boundary;
 - an in-memory segment evaluator supplies the data plane;
-- the only resolved work values are `BufferHandle` and `ArrayRef`; and
+- the only resolved work values are a segment `BufferHandle` and an `ArrayRef` with its
+  inseparable summary; and
 - the experiment does not replace `PlanVTable::execute`.
 
 These restrictions preserve the scheduling problems under investigation while avoiding an early
 dependency on general expression analysis, arbitrary encodings, and output assembly.
+
+## Relationship to the architecture
+
+The experiment is a reduced, executable form of the [morsel reactor](morsel-reactor.md) contract:
+
+| Experiment | Architecture | Reduction |
+| --- | --- | --- |
+| `AdvanceResult` | `PlanStep` | No gates; only offer, promote, and revoke work updates |
+| `Task` | `WorkItem` | Stable offers with only `Promote` and `Revoke` lifecycle updates |
+| `ResolvedValue` | `FactValue` | Exactly two variants: a segment handle or an array plus inseparable metadata |
+| Demand version | Demand generation | One demand block per morsel instead of 1,024-row blocks |
+| Sealed demand | `BlockState::Sealed` | Sealing is whole-morsel, so out-of-order block sealing is not exercised |
+| Resource node | Read-catalog entry plus fact retention | Whole-segment reads only; no gated or page reads |
+
+The experiment deliberately drops:
+
+- gates, because every read in the restricted shape is statically addressable;
+- rescoring and general elimination, retaining only stable offers, candidate-to-required promotion,
+  and revocation of work that has not been claimed;
+- multi-block demand ledgers, credits, and byte budgets; and
+- worker threads, ownership migration, and stealing, because one external driver runs everything.
+
+The minimal promotion and revocation updates are intentional findings: offer-only transport was
+not sufficient once an external scheduler could retain a candidate after demand changed. If any
+other dropped mechanism turns out to be load-bearing, that is a finding for the
+[ideas note](morsel-reactor-ideas.md), not something to patch silently.
 
 ## Proposed module structure
 
@@ -73,7 +102,7 @@ vortex-layout/benches/
 | Module | Responsibility |
 | --- | --- |
 | `model` | Source plans, query descriptions, identifiers, demand-array metadata, and batches |
-| `slots` | Typed segment and array slots, task ownership, and completion validation |
+| `slots` | Scan- and morsel-scoped typed slots, task ownership, and completion validation |
 | `graph` | Scan-wide resource nodes, possible users, joined users, and retained results |
 | `reactor` | Per-morsel state, bounded `advance`, completion handling, sealing, and retirement |
 | `evaluate` | Reference external evaluator for I/O and CPU task payloads |
@@ -89,12 +118,12 @@ its own.
 
 ### Phase 1: contracts and typed slots
 
-Define identifiers, the two slot arenas, task states, `ResolvedValue`, completion validation,
-demand versions, and row-domain metadata. A worker returns a resolved value to the morsel owner;
-it does not mutate the reactor or slot store directly.
+Define identifiers, the scan- and morsel-scoped slot arenas, task states, `ResolvedValue`, array
+summaries, completion validation, demand versions, and row-domain metadata. A worker returns a
+resolved value to the execution owner; it does not mutate the reactor or slot store directly.
 
-Exit when wrong-type, duplicate, failed, cancelled, and stale completions are rejected or handled
-without leaving a slot permanently running.
+Exit when wrong-type, duplicate, failed, and stale completions plus claims of revoked offers are
+rejected or handled without leaving a slot permanently running.
 
 ### Phase 2: restricted plan compilation
 
@@ -107,16 +136,19 @@ are independently tested.
 ### Phase 3: task protocol and reference evaluator
 
 Implement `Read`, `DecodeFlat`, `EvaluatePredicate`, `CombineDemand`, `SelectFlat`, and
-`PackStruct`. Every task declares only segment or array inputs and exactly one segment or array
-output. Keep operation variants inside the fixed experimental evaluator rather than the central
-completion protocol.
+`PackStruct`. Every offer declares only segment or array inputs and exactly one segment or array
+output. Claiming an offer resolves and clones those inputs into an immutable runnable task while
+acquiring their leases. Keep operation variants inside the fixed experimental evaluator rather
+than the central completion protocol.
 
-Exit when every operation can run outside the reactor and return a validated completion.
+Exit when every operation can be claimed, run outside the reactor without slot-store access, and
+return a validated completion.
 
 ### Phase 4: bounded per-morsel `advance`
 
-Implement a dirty queue, transition budget, task emission, demand-version adoption, sealing, and
-root output. `advance` performs control transitions only and never evaluates or intersects arrays.
+Implement a dirty queue, transition budget, task emission, promotion and revocation updates,
+demand-version adoption, sealing, and root output. `advance` performs control transitions only and
+never evaluates or intersects arrays.
 
 Exit when unrelated clean nodes are not visited, broad demand remains compact, and small and large
 budgets eventually produce identical output.
@@ -156,7 +188,7 @@ values, and Vortex array decoding as the [V1 `LayoutReader`](layout-reader-v1.md
 apples-to-apples benchmark described below only after the control-plane experiment passes.
 
 Exit when V1 and self-paced execution produce the same ordered logical output and their time, I/O,
-reuse, first-batch, and memory measurements use identical fixtures and cache policies.
+reuse, first-batch, and memory measurements use identical fixtures and source-cache policies.
 
 ## Static plan and query
 
@@ -245,11 +277,11 @@ The reactor checks:
 Demand0 ⊇ Demand1 ⊇ Demand2 ⊇ ... ⊇ SealedDemand
 ```
 
-Resolved demand is a non-nullable boolean `ArrayRef`, held in an array slot:
+Resolved demand is a non-nullable boolean `ArrayRef`, held in a morsel-owned array slot:
 
 ```rust
 struct DemandState {
-    rows: ArraySlotId,
+    mask: ArraySlotId,
     version: DemandVersion,
     true_count: usize,
     sealed: bool,
@@ -258,16 +290,20 @@ struct DemandState {
 
 `advance` does not evaluate or intersect these boolean arrays. Predicate evaluation produces a
 boolean `ArrayRef`; `CombineDemand` is a CPU task that intersects the old demand with one or more
-predicate results and produces another boolean `ArrayRef`. The task also returns summary metadata,
-such as `true_count`, so planning need not scan the array.
+predicate results and produces another boolean `ArrayRef`. Every boolean-mask result carries a
+mandatory `BooleanMaskSummary` beside its `ArrayRef`, so planning need not scan the array.
 
 Demand seals when every correctness-relevant conjunct has completed or has been proven
-unnecessary. Empty demand can seal immediately because no projection values are needed.
+unnecessary. Empty demand can seal immediately because no projection values are needed. Sealing
+empty also revokes the morsel's unclaimed offers, marks running morsel-local results unwanted, and
+removes the morsel from every resource's user sets. Task leases may keep a resource live until
+claimed work finishes even when a speculative projection resource has no remaining morsel user.
 
 Each predicate task receives an immutable demand snapshot. Concurrent predicates can run against
 different supersets of the current demand. Their boolean-array results remain valid because a
 `CombineDemand` task intersects them with the current, smaller demand; removed rows never re-enter
-demand.
+demand. Within one morsel the snapshots form a single chain ordered by `⊇`, so a result's
+validity never depends on which snapshot its task happened to read.
 
 ## The global resource graph
 
@@ -280,6 +316,8 @@ Each flat segment has a resource node resembling:
 struct ResourceNode {
     segment: SegmentId,
     root_coverage: Range<u64>,
+    segment_slot: SegmentSlotId,
+    array_slot: ArraySlotId,
     unresolved_users: MorselSet,
     joined_users: MorselSet,
     state: ResourceState,
@@ -301,17 +339,22 @@ This set never grows. A morsel either:
 
 Discovering a use therefore joins an explicit edge without increasing conservative global demand.
 
+`joined_users` doubles as the wake-up list for shared completions: installing a value into one of
+the node's slots marks every joined morsel dirty exactly once. Unresolved morsels are not woken;
+they observe the resolved slot if and when they join.
+
 ## Resource state and lifetime
 
-Result availability progresses independently of demand:
+Result availability progresses independently of demand. The node's scan-owned slots remain the
+only value store; `ResourceState` is a compact view over those slots and their task leases:
 
 ```rust
 enum ResourceState {
     Absent,
     Reading(TaskId),
-    SegmentReady(BufferHandle),
+    SegmentReady,
     Decoding(TaskId),
-    ArrayReady(ArrayRef),
+    ArrayReady,
 }
 ```
 
@@ -319,13 +362,13 @@ The lifetime classification is:
 
 ```text
 Pinned
-    At least one joined morsel uses the result.
+    At least one joined morsel or claimed task lease uses the result.
 
 Reusable
-    No joined morsel uses it, but an unresolved morsel may use it later.
+    No joined morsel or claimed task lease uses it, but an unresolved morsel may use it later.
 
 Dead
-    No joined or unresolved morsel can use it.
+    No joined or unresolved morsel can use it and no claimed task lease holds it.
 ```
 
 Pinned results cannot be discarded. Reusable results are cacheable but evictable under memory
@@ -368,7 +411,7 @@ The complete resolved-value vocabulary is:
 ```rust
 enum ResolvedValue {
     Segment(BufferHandle),
-    Array(ArrayRef),
+    Array(ResolvedArray),
 }
 ```
 
@@ -381,9 +424,14 @@ struct SegmentSlot {
 }
 
 struct ArraySlot {
-    state: SlotState<ArrayRef>,
+    state: SlotState<ResolvedArray>,
 }
 ```
+
+Slots are the only value store. The scan owns the arenas holding shared resource slots; each
+morsel owns the arenas holding its operator-output and demand slots. A slot identifier names its
+scope, so retirement frees exactly the morsel-owned slots and can never reclaim a shared resource
+by accident.
 
 Every per-morsel plan node names an `ArraySlotId` for its output. Coverage and selection belong to
 the node-edge metadata rather than forming another resolved value type:
@@ -460,21 +508,23 @@ whole-request behavior.
 
 ## Scheduler-visible work
 
-The reactor exposes separate I/O and CPU tasks:
+The reactor exposes one ticket type covering both I/O and CPU work, plus the two lifecycle updates
+that an external scheduler must observe:
 
 ```rust
-enum Work {
-    Read(ReadTask),
-    Cpu(CpuTask),
+struct Task {
+    id: TaskId,
+    class: WorkClass,
+    necessity: Necessity,
+    inputs: Vec<InputSlot>,
+    output: OutputSlot,
+    operation: Operation,
 }
 
-enum CpuTask {
-    DecodeFlat(DecodeTask),
-    EvaluatePredicate(PredicateTask),
-    CombineDemand(CombineTask),
-    SelectFlat(SelectTask),
-    PackStruct(PackTask),
-    ConcatChunks(ConcatTask),
+enum TaskUpdate {
+    Offer(Task),
+    Promote(TaskId),
+    Revoke(TaskId),
 }
 
 enum WorkClass {
@@ -482,15 +532,28 @@ enum WorkClass {
     Cpu,
 }
 
-enum Urgency {
+enum Necessity {
     Required,
-    Speculative,
+    Candidate,
+}
+
+enum Operation {
+    Read(ReadOp),
+    DecodeFlat(DecodeOp),
+    EvaluatePredicate(PredicateOp),
+    CombineDemand(CombineOp),
+    SelectFlat(SelectOp),
+    PackStruct(PackOp),
+    ConcatChunks(ConcatOp),
 }
 ```
 
-The operation enum belongs to the experiment's fixed reference evaluator, not the central
-completion protocol. Every task declares only segment or array inputs and exactly one segment or
-array output:
+`Necessity` matches the architecture's candidate/required split. `Promote` changes a retained
+offer from candidate to required without changing its identity. `Revoke` removes an unclaimed
+offer that demand has made unnecessary. `ConcatChunks` is reserved for a later experiment because
+morsels do not cross chunk boundaries here. The operation enum belongs to the experiment's fixed
+reference evaluator, not the central completion protocol. Every task declares only segment or
+array inputs and exactly one segment or array output:
 
 ```rust
 enum InputSlot {
@@ -502,24 +565,41 @@ enum OutputSlot {
     Segment(SegmentSlotId),
     Array(ArraySlotId),
 }
+```
 
-struct Task {
+Operation payloads also contain immutable plan metadata such as row ranges, dtypes, or predicates.
+An offered `Task` is descriptive and contains slot identifiers, not the slot values. Immediately
+before execution, the scheduler claims it:
+
+```rust
+fn claim(&mut self, task: TaskId) -> VortexResult<ClaimResult>;
+
+enum ClaimResult {
+    Runnable(RunnableTask),
+    Revoked,
+}
+
+struct RunnableTask {
     id: TaskId,
-    inputs: Vec<InputSlot>,
+    inputs: Vec<ResolvedValue>,
     output: OutputSlot,
-    operation: TaskOperation,
-    scheduling: SchedulingMetadata,
+    operation: Operation,
 }
 ```
 
-Task payloads also contain immutable plan metadata such as row ranges, dtypes, or predicates. They
-never hold mutable access to a morsel reactor.
+Claiming is a cheap owner-thread transition. It atomically checks that the offer is still live,
+clones each resolved `BufferHandle` or `ArrayRef`, changes the task from offered to running, and
+acquires input and output leases. The runnable task owns those immutable clones and never accesses
+the slot store or morsel reactor. Revoking an offered task releases its output reservation. A
+running morsel-local task cannot be revoked; empty sealing or retirement marks its result unwanted,
+and its eventual completion releases the leases without installing the result. Shared reads and
+decodes continue normally because another morsel may still use their result.
 
 For the worked query's first advance:
 
 ```text
-required I/O:   read a for P0; read b for P1
-speculative I/O: read c for projection
+required I/O:  read a for P0; read b for P1
+candidate I/O: read c for the projection
 ```
 
 Available segments enable `DecodeFlat`. Decoded predicate fields enable independent
@@ -551,21 +631,40 @@ One invocation:
 6. exposes predicates whose inputs are decoded;
 7. exposes `CombineDemand` when predicate arrays are ready;
 8. adopts completed demand-array slots and seals when all conjuncts resolve;
-9. exposes Flat selection and Struct packing work for sealed demand;
-10. propagates completed operator arrays toward the Chunked root;
-11. returns the root batch when it is ready; and
-12. stops at local quiescence or the transition budget.
+9. promotes or revokes retained candidate offers that sealing affected;
+10. exposes Flat selection and Struct packing work for sealed demand;
+11. propagates completed operator arrays toward the Chunked root;
+12. returns the root batch when it is ready; and
+13. stops at local quiescence or the transition budget.
 
 ```rust
 struct AdvanceResult {
-    work: Vec<Work>,
+    work: Vec<TaskUpdate>,
     output: Option<ExecBatch>,
     state: MorselState,
+}
+
+enum MorselState {
+    /// The transition budget expired; call `advance` again without waiting.
+    Budgeted,
+    /// No transition is possible until offered or running work makes external progress.
+    Quiescent,
+    /// The root batch was returned; morsel slots are freed, and any leases still held by
+    /// unwanted running work release as their completions drain.
+    Retired,
 }
 ```
 
 Demand remains compact. A broad range controls a lazy task source; it does not build a task node
-for every row or segment. The transition budget bounds planning effort and the visible frontier.
+for every row or segment. The transition budget bounds planning effort and newly emitted updates
+per call; it does not bound the number of offers the scheduler may retain across calls. `Budgeted`
+and `Quiescent` mirror the architecture's `locally_quiescent` flag: work already returned remains
+schedulable in both states, so exhausting the budget never hides an exposed task.
+
+The external scheduler separately controls admission with a maximum number of claimed/running
+tasks or equivalent I/O and CPU credits. The small-frontier policy uses that admission limit, not
+the reactor's transition budget. Repeated bounded calls may therefore reveal all concrete work
+while the scheduler still admits only as much execution as its queues can support.
 
 ## Completion and external evaluation
 
@@ -576,7 +675,7 @@ fn complete(&mut self, completion: Completion) -> VortexResult<()>;
 ```
 
 Workers do not mutate the reactor or slot store. A completion carries exactly one of the two
-resolved value types back to the morsel owner:
+resolved value types back to the execution owner:
 
 ```rust
 struct Completion {
@@ -591,15 +690,49 @@ completion protocol does not repeat semantic resource, conjunct, or node variant
 validates the output kind, installs the value into its typed write-once slot, and marks dependants
 dirty. Completion does not recursively drive the reactor.
 
+An array result stores its value and inseparable metadata in the array slot:
+
+```rust
+struct ResolvedArray {
+    array: ArrayRef,
+    summary: ArraySummary,
+}
+
+enum ArraySummary {
+    None,
+    BooleanMask(BooleanMaskSummary),
+}
+
+struct BooleanMaskSummary {
+    len: usize,
+    true_count: usize,
+}
+```
+
+`ResolvedValue::Array` contains `ResolvedArray`; it is still the array resolved-value kind, and no
+task can name the summary separately. The task table declares the required summary shape. Every
+predicate and demand-combination result must return a boolean-mask summary whose length agrees
+with the array and whose count is in range. Like the array's values, the producer is responsible
+for the summary's semantic correctness. The summary is correctness-bearing because empty sealing
+uses it; it is not merely scheduling metadata.
+
 Task identifiers and demand versions let the reactor reject duplicate or mismatched completions.
-A predicate array produced for an older demand version remains usable when its input selection is
-a superset of current demand.
+Because demand versions within one morsel only shrink, a predicate array produced from any earlier
+version is a superset of current demand and remains usable. Staleness is therefore confined to
+duplicates, wrong-slot completions, revoked offers, and unwanted results from running
+morsel-local tasks.
+
+Empty sealing and retirement revoke the morsel's offered tasks and emit `Revoke` updates. Running
+morsel-local tasks are marked unwanted; their completions release their leases and install
+nothing. One morsel never revokes shared resource work: a claimed read or decode completes into its
+scan-owned slot, and the value is then classified pinned, reusable, or dead by its remaining users.
+Input leases keep resources live even after their last morsel user disappears.
 
 The experiment includes a reference evaluator, but the reactor never calls it:
 
 ```rust
 fn evaluate(
-    work: Work,
+    task: RunnableTask,
     segments: &InMemorySegments,
 ) -> VortexResult<Completion>;
 ```
@@ -610,8 +743,12 @@ A complete driver remains external:
 loop {
     let progress = execution.advance(morsel, 16)?;
 
-    for work in scheduler.choose(progress.work) {
-        execution.complete(evaluate(work, &segments)?)?;
+    scheduler.apply(progress.work);
+
+    while let Some(task) = scheduler.next_admissible() {
+        if let ClaimResult::Runnable(task) = execution.claim(task)? {
+            execution.complete(evaluate(task, &segments)?)?;
+        }
     }
 
     if let Some(batch) = progress.output {
@@ -631,7 +768,7 @@ For `a > 10 AND b < 5`, projecting `[a, c]`, one possible trace is:
 advance(morsel 0)
   -> Read(a0, required)
   -> Read(b0, required)
-  -> Read(c0, speculative)
+  -> Read(c0, candidate)
 
 complete and decode a0
 advance(morsel 0)
@@ -656,6 +793,7 @@ advance(morsel 0)
 complete combined demand
 advance(morsel 0)
   -> sealed demand=0001
+  -> Promote(Read(c0)), if the candidate read is still queued
   -> SelectFlat(a0, demand=0001)
   -> SelectFlat(c0, demand=0001), once c0 is decoded
 
@@ -682,28 +820,29 @@ The experiment exposes an event trace and metrics snapshot containing:
 advance calls and cheap transitions
 nodes and slots inspected per advance
 initial, current, and per-conjunct demand rows
-I/O and CPU tasks emitted and completed, including demand combinations
+I/O and CPU tasks offered, claimed, promoted, revoked, and completed, including demand combinations
 shared byte and decode reuse hits
 resident bytes and decoded rows
 pinned, reusable, and dead resource counts
 Flat, Struct, and Chunked output tasks and arrays
-maximum outstanding task frontier
+maximum offered and claimed/running task frontiers
 total graph nodes, slots, and explicit edges
 useful and unused speculative I/O bytes
 deterministic virtual critical-path time
 ```
 
-The trace records demand refinement, resource joins, task emission, completion, sealing, output,
-retirement, and eviction.
+The trace records demand refinement, resource joins, task emission, claims, promotion,
+revocation, completion, sealing, output, retirement, and eviction.
 
 ## Evaluation policies
 
 Run the same input through four small external schedulers:
 
 1. **Predicate-first:** prioritize the earliest unfinished conjunct.
-2. **All-ready:** run every returned task before calling `advance` again.
+2. **All-ready:** run every offered task before calling `advance` again.
 3. **Projection-prefetch:** start projection I/O when the required queue is short.
-4. **Small-frontier:** use a very small transition budget.
+4. **Small-frontier:** admit only a small number of claimed/running tasks while continuing bounded
+   planning to quiescence.
 
 All policies must produce identical rows and values. Their task counts, resident state, demand
 reduction timing, and reuse rates may differ.
@@ -735,7 +874,11 @@ receive the same:
 - row ranges and ordered-output requirement;
 - runtime concurrency;
 - segment-source wrapper; and
-- cache and retention policy.
+- source-cache settings.
+
+Executor-native decoded-array retention is recorded but is not forced to be identical. If V1 does
+not provide such a cache, adding one in the harness would change the baseline rather than make it
+fair.
 
 The self-paced evaluator must use real `BufferHandle` values, serialized-array decoding, and
 Vortex `ArrayRef` operations for this stage.
@@ -781,7 +924,7 @@ This produces 54 configurations per executor before cache variants.
 
 ### Cache variants
 
-Run each important configuration in three states:
+Run each important configuration in three comparable source states:
 
 ```text
 cold
@@ -790,13 +933,18 @@ cold
 warm structure
     reader or plan structure reused, resolved segment and array values evicted
 
-warm data
-    BufferHandle and decoded ArrayRef values retained
+warm source data
+    source BufferHandle values retained; executor-native decoded values follow each executor's
+    normal behavior
 ```
 
 Also run both paths over a raw counting source and an equivalently shared/cached source. This
 prevents either engine from winning only because it received a hidden cache unavailable to the
 other.
+
+Run self-paced decoded-`ArrayRef` retention as a separate capability experiment. Report its gain,
+resident memory, and avoided decodes relative to self-paced execution without decoded retention;
+do not present it as a cache-parity V1 ratio unless V1 later gains an equivalent public facility.
 
 ### Common instrumentation
 
@@ -842,7 +990,7 @@ timing. Report the result as ratios rather than isolated numbers:
 | 1% selective | | | | |
 | 50% selective | | | | |
 | 95% selective | | | | |
-| Warm reuse | | | | |
+| Warm source reuse | | | | |
 
 V1 is expected to win the first unfiltered, single-thread comparison. The experiment is promising
 only if its overhead is bounded and any selective, high-latency, or reuse win is explained by
@@ -876,6 +1024,7 @@ root morsel demand
     -> predicate arrays feed CombineDemand tasks
     -> resolved boolean arrays monotonically shrink demand
     -> all conjuncts resolved, so demand seals
+    -> sealing promotes retained candidate offers to required
     -> Flat selects projected values for sealed demand
     -> Struct packs aligned field batches into a StructArray
     -> Chunked translates coverage and forwards the child array
@@ -909,7 +1058,7 @@ than intuition:
 | Whether retirement proves death cheaply | Retire morsels in ordered and randomized sequences | A resource becomes dead exactly after its last possible user disappears, without scanning the whole graph |
 | Whether speculative projection is worthwhile | Sweep predicate selectivity, I/O latency, CPU cost, and projection overlap | Compare output-ready virtual time, unused speculative bytes, avoided reads, and peak memory |
 | Whether operators compose cleanly | Validate Flat arrays, Struct packing, Chunked coordinate translation, and the root result independently | Each node should depend only on child slots and declared row-domain metadata; query policy leakage is a design failure |
-| How the model compares with optimized V1 | Run both over the same serialized layout, source, expressions, row splits, concurrency, and cache policy | Compare output hashes, time, first batch, I/O, reuse, and memory as self-paced/V1 ratios |
+| How the model compares with optimized V1 | Run both over the same serialized layout, source, expressions, row splits, concurrency, and source-cache policy | Compare output hashes, time, first batch, I/O, reuse, and memory as self-paced/V1 ratios |
 
 Use deterministic virtual costs for the first scheduler comparisons. Each I/O and CPU task receives
 a configured cost, so critical-path time can be compared without benchmark noise. Real timings are
@@ -922,7 +1071,7 @@ The input matrix should vary:
 - conjunct count, selectivity, CPU cost, and completion order;
 - projected fields that overlap or do not overlap predicate fields;
 - segment I/O latency and decode cost;
-- scheduler frontier budget; and
+- scheduler admission limit and reactor transition budget; and
 - retained-resource memory budget.
 
 Every run records the event trace, metrics snapshot, root output, and final slot/resource states.
@@ -934,8 +1083,8 @@ The experiment should produce five review artifacts:
 1. a complete worked-query trace showing slots, demand versions, tasks, joins, and retirement;
 2. a policy comparison table containing correctness, virtual time, work, reuse, waste, and memory;
 3. a scaling table showing graph size and `advance` work as rows, morsels, chunks, and conjuncts
-   change; and
-4. the V1 ratio table with cache and fixture parity recorded; and
+   change;
+4. the V1 ratio table with fixture and source-cache parity recorded; and
 5. a short findings record that classifies every proposed invariant as supported, rejected, or
    still untested.
 
@@ -997,7 +1146,9 @@ trade-offs; they cannot establish production throughput or latency. The V1 basel
 real serialized arrays and decoding, so it can establish a fair in-memory relative cost against
 V1. It still does not reproduce object-store or NVMe behavior, general expression workloads,
 allocator pressure at production scale, or a complete asynchronous scan runtime. It also cannot
-validate late row-domain mappings for Dict, List, or ListView plans.
+validate late row-domain mappings for Dict, List, or ListView plans, and it exercises none of the
+gate, multi-block demand, rescoring, or ownership-migration mechanisms recorded in the
+[morsel reactor ideas](morsel-reactor-ideas.md).
 
 Those omissions are deliberate. A successful result means the interfaces and invariants are worth
 testing in a complete scan; it does not mean the resulting implementation is already fast or
@@ -1019,12 +1170,24 @@ The experiment should prove:
 10. Retirement changes a resource from pinned to reusable and eventually dead.
 11. Dead resource state is released.
 12. Chunk-global and segment-local row mappings are correct.
-13. The transition budget bounds each returned frontier.
+13. The transition budget bounds transitions and newly emitted updates per call, while scheduler
+    admission independently bounds claimed/running work.
 14. Graph size does not scale with logical row count when physical plan shape is unchanged.
 15. Every scheduler policy produces the same output as the eager reference evaluator.
-16. Failed, cancelled, duplicate, and stale tasks cannot leave slots or resource leases live.
-17. V1 and self-paced execution produce the same ordered output hash for every shared fixture.
-18. Cold, warm-structure, and warm-data comparisons use equivalent source and cache state.
+16. Failed, duplicate, and stale completions and claims of revoked offers cannot leave slots or
+    resource leases live.
+17. A completed shared read or decode wakes every joined morsel exactly once and wakes no
+    unresolved morsel.
+18. Sealing empty demand revokes unclaimed morsel offers and discards running morsel-local results
+    without cancelling shared in-flight work.
+19. V1 and self-paced execution produce the same ordered output hash for every shared fixture.
+20. Cold, warm-structure, and warm-source-data comparisons use equivalent source state; native
+    decoded-array retention is reported separately.
+21. Claiming a task snapshots every resolved input and holds its leases until completion.
+22. Promotion and revocation updates keep a retained external scheduler queue consistent with
+    demand changes.
+23. Every boolean predicate and demand result carries the mandatory length and true-count summary
+    required for empty sealing.
 
 ## Non-goals
 
@@ -1037,6 +1200,8 @@ The first experiment does not provide:
 - object-store or NVMe performance conclusions;
 - memory admission or a sophisticated eviction policy;
 - cross-file sharing;
+- dependency gates for data-dependent reads;
+- work rescoring: promotion and revocation are the only lifecycle updates;
 - fallible predicate semantics; or
 - the final output-stream and ordering contract.
 
@@ -1049,8 +1214,9 @@ The experiment should precede production integration. It succeeds if:
 - later morsels safely join existing resource nodes;
 - demand and possible-user sets remain monotonic;
 - retirement proves when results are dead;
-- external scheduling policies preserve query results; and
-- `advance` cost and task-frontier size remain bounded and measurable; and
+- external scheduling policies preserve query results;
+- `advance` cost is bounded and measurable, and scheduler admission bounds claimed/running
+  work; and
 - the V1 comparison has identical output and attributes any difference to measured work, I/O,
   reuse, or control-plane overhead.
 
@@ -1061,7 +1227,9 @@ Concretely, the evidence must show:
 - no demand version whose selected row set is larger than its predecessor;
 - no dropped resource with a joined or possible user, and no retained dead resource after cleanup;
 - graph size unchanged when only logical row count grows without changing physical plan shape;
-- no `advance` call emitting more work than its budget or visiting unrelated clean subtrees; and
+- no `advance` call emitting more work than its budget or visiting unrelated clean subtrees;
+- no revoked offer that executes and no promotion that changes a task's identity or duplicates its
+  I/O;
 - an explicit measured frontier where projection prefetch helps and where it wastes enough I/O or
   memory to be rejected; and
 - a V1 ratio table whose unfiltered case exposes the self-paced tax and whose selective or reuse
