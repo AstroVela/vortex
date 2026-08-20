@@ -35,6 +35,7 @@ Focus the production work on these encodings:
 - `OrderedFloatArray`.
 - `BlockResidualArray` for all integer types, with one reference per 1,024-value block.
 - `FloatQuantArray`.
+- `IntMultArray` as a composable integer transform.
 
 Keep `FloatQuantScheme`, `OrderedBlockResidualScheme`, and `BlockResidualScheme` as BtrBlocks candidates.
 
@@ -44,17 +45,29 @@ Remove `RangeEntropyArray`, `RangeEntropyScheme`, and `BitSplitCodec` from the f
 
 The `wm/pcodec-entropy-experiments` branch preserves the complete entropy and bit-split prototypes.
 
-Keep `RangePackedArray` and its manual benchmark as experimental work.
+Keep the fused `RangePackedArray` and its manual benchmark as experimental work.
 
-Do not add RangePacked to the default or Compact selector.
+Prototype fixed bins as a composed tree instead:
+
+- `Dict(BitPacked(bin_codes), bin_starts)` reconstructs one reference per value.
+- `BlockResidual(offsets)` stores each distance from the selected reference.
+- `IntMult(base=1, references, offsets)` adds both components.
+
+The prototype permits any bin count from one through 64.
+
+The BtrBlocks selector and final child choices remain incomplete.
+
+Do not add the fused RangePacked array to the Default or Compact selector.
 
 Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution Delta.
 
 ## Current state
 
-The branch implements `OrderedFloatArray`, `BlockResidualArray`, and `FloatQuantArray`.
+The branch implements `OrderedFloatArray`, `BlockResidualArray`, `FloatQuantArray`, and `IntMultArray`.
 
-The default candidate set includes their three BtrBlocks schemes.
+The default candidate set includes BtrBlocks schemes for the first three arrays.
+
+IntMult does not have a BtrBlocks scheme yet.
 
 `OrderedFloat(BlockResidual)` now supports `f32` and `f64` inputs.
 
@@ -77,6 +90,16 @@ The GloVe result identifies a separate entropy gap inside the ALP integer child.
 Generic quotient and remainder trees do not close that gap.
 
 The current selector factors and nonlinear patch cost remain provisional.
+
+`IntMultArray` owns only the quotient and remainder transform.
+
+Its two children remain generic arrays. Child compression owns patches and other integer models.
+
+The range decomposition prototype uses `IntMult(base=1)` as generic addition.
+
+Its fused decode path skips multiplication and avoids materialization of dictionary references.
+
+Neither IntMult nor decomposed fixed bins participate in the Default selector yet.
 
 Final calibration requires the complete corpus and selected-tree evidence.
 
@@ -146,6 +169,34 @@ The automatic scheme accepts `f32` and `f64` inputs.
 Native `f32` and two-child selection meet the selected-column and rejected-column throughput limits.
 
 Final selector factors still require broad corpus validation.
+
+## IntMultArray
+
+`IntMultArray` reconstructs each integer as `base * primary + secondary`.
+
+The array supports every signed and unsigned integer type.
+
+The primary and secondary children can use any compatible Vortex array encoding.
+
+The primary child owns validity. The secondary child is nonnullable.
+
+The array supports canonical decode, scalar access, slices, serialization, and validation.
+
+`IntMult::from_primitive` creates quotient and remainder children with the source integer width.
+
+A future selector can compress both children through specialized or recursive integer schemes.
+
+IntMult does not own exception positions or exception payloads.
+
+Child encodings can use `PatchArray`, `BlockResidual`, or other integer arrays when those trees win.
+
+When the base equals one, bulk decode and scalar access skip multiplication.
+
+For a dictionary primary, the fused path decodes the secondary into the output buffer.
+
+It then unpacks dictionary codes and adds the selected reference directly.
+
+This path avoids a full materialized array of references.
 
 ## Selection policy
 
@@ -921,7 +972,11 @@ The dense prototype applies 853,533 quotient patches across two million values.
 
 A diagnostic decode without quotient patches reaches 12,628 MB/s. The split and reconstruction costs still miss the Default decode target.
 
-These results reject the tested IntMult layouts for Default. The layouts retain bounded scalar access, but their bulk decode cost is too high.
+These results reject the tested bespoke IntMult layouts for Default.
+
+The layouts retain bounded scalar access, but their bulk decode cost is too high.
+
+They do not reject a pure IntMult transform with independently compressed children.
 
 The result does not reject an IntMult backend for Compact. Compact accepts a different throughput and random-access tradeoff.
 
@@ -1038,6 +1093,56 @@ The temporary Compact selector increased GloVe encode time by 7.8 percent when i
 The selector also increased aggregate CMS bytes by 1.1 percent after it replaced Pco.
 
 RangePacked therefore remains outside all writer selectors.
+
+### Composable fixed-bin prototype
+
+The prior RangePacked prototypes fused bins, offset streams, checkpoints, and reconstruction into one codec.
+
+The current prototype separates the model from storage.
+
+`RangeDecomposition` fits any number of bins through 64.
+
+It produces three logical components:
+
+- A small array of bin starts.
+- One fixed-width bin code per value.
+- One integer offset from the selected start per value.
+
+The manual benchmark builds this exact tree:
+
+`IntMult(base=1, Dict(BitPacked(codes), starts), BlockResidual(offsets))`.
+
+The first IntMult decode materialized every dictionary reference before addition.
+
+A generic dictionary-add path increased decode throughput from 12.06 GB/s to 12.62 GB/s.
+
+A packed-code specialization increased median decode throughput to 14.27 GB/s.
+
+The specialization unpacks codes and adds starts directly into the decoded offset buffer.
+
+It does not multiply because the IntMult base equals one.
+
+The benchmark uses two million `u64` values in ten separated clusters.
+
+| Operation | Result |
+| --- | ---: |
+| Encode | 1.20 GB/s |
+| Decode | 14.27 GB/s |
+| Scalar access | 332 ns |
+
+A separate base-ten IntMult benchmark uses two million `i32` values and primitive children.
+
+| Operation | Result |
+| --- | ---: |
+| Split encode | 2.88 GB/s |
+| Decode | 30.67 GB/s |
+| Scalar access | 125 ns |
+
+These values establish low transform overhead and bounded scalar access.
+
+They do not establish a Default win because the range benchmark lacks incumbent size and throughput comparisons.
+
+The next experiment must compare complete trees on the real Pco gap columns.
 
 ### Nullable and Delta-heavy fixed-bin cases
 
@@ -1344,29 +1449,54 @@ This round completed these steps:
 - Rejected the dense-remainder IntMult layout on CMS Payments.
 - Rejected centered block residuals after a complete Euro subjectivity comparison.
 
-The Pco mode profile and quotient and remainder experiments are complete.
+The Pco mode profile and the first quotient and remainder experiments are complete.
+
+The composable IntMult follow-up remains incomplete.
 
 The nonzero-secondary FloatQuant implementation and focused validation are complete.
 
-Complete these remaining steps:
+Complete these next experiments in order:
 
-1. Keep IntMult outside Default unless a new design removes the split reconstruction cost.
-2. Add a true ALP-RD child composition case if a real selected tree exposes one.
-3. Validate the remaining rejected analysis cost after the candidate set stabilizes.
-4. Add real embedding datasets beyond GloVe when licenses and loaders permit them.
-5. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-6. Run the complete compression corpus after the candidate set stabilizes.
-7. Compare the final geometric mean against Compact and Parquet with Zstd.
-8. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-9. Revisit the 32-bit and 64-bit BlockResidual factors with selected-tree evidence.
-10. Keep RangePacked outside writer selectors unless a new decode design changes the result.
-11. Update this plan after each experiment.
+1. Measure the decomposed fixed-bin tree on CMS, Food, Euro2016, GloVe, and other no-Delta Pco wins.
+2. Compare complete tree size and throughput against the displaced Default tree and Compact Pco.
+3. Compare `BlockResidual` and `FoR(BitPacked)` offset children. Use recursive compression as an oracle for other trees.
+4. Prototype pure IntMult on the exact GloVe and CMS ALP children.
+5. Compress both IntMult children independently through normal integer schemes.
+6. Test BlockResidual as a general compression candidate for patch positions.
+7. Add a specialized range scheme only after a complete tree passes the column gates.
+8. Profile another direct narrow BlockResidual decode optimization for `i16`.
+9. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+10. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+
+Use packed bin codes and primitive bin starts unless evidence supports more complexity.
+
+Let ordinary child arrays own patches and exception payloads.
+
+Add an outer OrderedFloat fused decode only if the generic composition misses the decode gate.
+
+Retain the direct 8-bit and 16-bit selector exclusions until benchmark evidence changes them.
+
+Keep fused RangePacked and RangeEntropy outside Default.
+
+After the candidate set stabilizes, complete these final steps:
+
+1. Run the complete compression corpus.
+2. Compare the final geometric mean against Compact and Parquet with Zstd.
+3. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
+4. Revisit the BlockResidual factors with selected-tree evidence.
+5. Add a true ALP-RD child composition case if a real selected tree exposes one.
+6. Add more real embedding datasets when licenses and loaders permit them.
+7. Update this plan after each experiment.
 
 ## Pull request structure
 
 Prepare one focused stack for `OrderedFloatArray`, `BlockResidualArray`, and `OrderedBlockResidualScheme`.
 
 Prepare a separate stack for `FloatQuantArray` and `FloatQuantScheme`.
+
+Prepare a separate primitive-array change for `IntMultArray`.
+
+Prepare a separate BtrBlocks change for decomposed fixed bins only after real-data validation.
 
 Keep entropy, bit-split, and alternate residual models on `wm/pcodec-entropy-experiments`.
 
