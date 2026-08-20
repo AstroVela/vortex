@@ -233,6 +233,16 @@ fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>
         let residual = index.wrapping_mul(2_654_435_761) % 128;
         i16::try_from(block * 128 + residual).unwrap_or(i16::MAX)
     }));
+    let block_local_i8 = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let block = (index / 1_024) % 16;
+        let residual = index.wrapping_mul(2_654_435_761) % 16;
+        let unsigned = i16::try_from(block * 16 + residual).unwrap_or(i16::MAX);
+        i8::try_from(unsigned - 128).unwrap_or(i8::MAX)
+    }));
+    let uniform_i8 = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let value = u8::try_from(index.wrapping_mul(2_654_435_761) % 256).unwrap_or(u8::MAX);
+        i8::from_le_bytes([value])
+    }));
     let sparse_block_local = PrimitiveArray::from_iter((0..row_count).map(|index| {
         if index % 16 == 0 {
             let value_index = index / 16;
@@ -350,6 +360,14 @@ fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>
         (
             "synthetic-block-local-i16".to_string(),
             vec![column("value", block_local_i16)],
+        ),
+        (
+            "synthetic-block-local-i8".to_string(),
+            vec![column("value", block_local_i8)],
+        ),
+        (
+            "synthetic-uniform-i8".to_string(),
+            vec![column("value", uniform_i8)],
         ),
         (
             "synthetic-sparse-block-local".to_string(),

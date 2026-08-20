@@ -78,7 +78,7 @@ The serialized tree uses `OrderedFloat(BlockResidual(...))` because the outer ar
 
 The FloatQuant candidate accepts native `f16`, `f32`, and `f64` inputs.
 
-Direct integer BlockResidual supports every integer type. The default selector accepts 16-bit, 32-bit, and 64-bit inputs.
+Direct integer BlockResidual supports every integer type. The Default selector accepts every integer width during the current 8-bit trial.
 
 The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
 
@@ -86,7 +86,7 @@ FloatQuant now passes the speed gates for zero-secondary and one-bit-secondary i
 
 The complete file corpus does not yet justify FloatQuant in Default.
 
-BlockResidual now passes the direct speed gates for 32-bit and 64-bit integers.
+BlockResidual now passes the direct speed gates for every integer width.
 
 The GloVe result identifies a separate entropy gap inside the ALP integer child.
 
@@ -121,7 +121,7 @@ The Default selector can exclude a supported type when measured costs do not jus
 | Array | Supported logical types | Default policy |
 | --- | --- | --- |
 | OrderedFloat | `f16`, `f32`, `f64` | All float types remain eligible. |
-| BlockResidual | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | Direct selection uses 32-bit and 64-bit integers. |
+| BlockResidual | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | All widths are eligible during the 8-bit trial. |
 | FloatQuant | `f16`, `f32`, `f64` | All float types remain eligible. |
 | IntMult | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | No Default scheme exists yet. |
 
@@ -296,9 +296,7 @@ Its adjusted score includes a 1.02 decode-cost factor.
 
 `BlockResidualScheme` uses the same locality probe for integer arrays.
 
-The default scheme accepts 16-bit, 32-bit, and 64-bit integers.
-
-The scheme still excludes direct 8-bit candidates.
+The Default scheme accepts every integer width during the current 8-bit trial.
 
 The scheme does not run inside trial compression for an outer scheme. Generic 64-row samples do not preserve 1,024-row locality.
 
@@ -640,6 +638,29 @@ The throughput changes come from adjacent runs and include ordinary benchmark no
 
 The exact size gains and high absolute decode rates support 16-bit Default eligibility.
 
+### 8-bit selector trial
+
+The direct benchmark already showed 30.53 GB/s decode and 44 ns scalar access for `i8`.
+
+The complete synthetic control uses two million block-local `i8` values.
+
+| Configuration | Bytes | Encode MB/s |
+| --- | ---: | ---: |
+| Prior Default with Primitive | 2,000,000 | 820.6 |
+| Default with BlockResidual | 1,043,448 | 316.3 |
+
+BlockResidual reduces size by 47.8 percent and decodes at 29.76 GB/s.
+
+The selected tree has a material encode cost because the prior Default stores the input without compression.
+
+A uniform `i8` control rejects BlockResidual and retains Primitive at 2,000,000 bytes.
+
+The rejected analysis changes encode throughput from 720.5 MB/s to 706.3 MB/s, a 2.0 percent decrease.
+
+The eight real numeric files contain no `i8` columns. Their sizes do not change during this trial.
+
+The current branch enables 8-bit selection for evaluation. Final adoption needs real `i8` coverage and complete threshold calibration.
+
 ### Narrow BlockResidual in Compact
 
 The Compact comparison uses the same two million block-local `i16` values.
@@ -832,10 +853,11 @@ The single-encoding benchmark uses two million block-local values.
 | `u32` | 2.79 | 46.69 | 38 |
 | `i32` | 2.78 | 32.23 | 41 |
 | `i16` | 1.42 | 32.18 | 83 |
+| `i8` | 0.56 | 30.53 | 44 |
 
 The 16-bit path now meets the revised size and absolute-throughput preference.
 
-The direct 8-bit selector exclusion remains active.
+The 8-bit path also clears the decode and scalar-access gates.
 
 The broad file benchmark uses three iterations across eight datasets.
 
@@ -1250,9 +1272,9 @@ This comparison separates float transform quality from integer child compression
 
 The CMS candidate is 5.5 percent smaller and 42.8 percent faster to decode.
 
-The current selector rejects it because the 64-bit BlockResidual score includes a 1.20 factor.
+The selector at the time rejected it because the 64-bit BlockResidual score included a 1.20 factor.
 
-This result makes the CMS miss a final selector calibration issue.
+The current selector removed that factor. The resolved calibration section records the selected 10,716,519-byte tree.
 
 The GloVe candidate is 0.4 percent larger than the current default.
 
@@ -2409,7 +2431,7 @@ This round completed these steps:
 - Added isolated FloatQuant rejection controls for all float widths.
 - Added adjusted-ratio near-miss controls for `f32` and `f64`.
 - Re-enabled 16-bit BlockResidual after absolute-throughput and corpus revalidation.
-- Retained the direct 8-bit selector exclusion.
+- Enabled an 8-bit BlockResidual selector trial with selected and rejected synthetic controls.
 - Removed the Food and HashTags FloatQuant size regressions.
 - Revalidated the BlockResidual and FloatQuant bundles across 16 files.
 - Rejected constant RangePacked samples before exact sample encoding.
@@ -2442,7 +2464,7 @@ Let ordinary child arrays own patches and exception payloads.
 
 Add an outer OrderedFloat fused decode only if the generic composition misses the decode gate.
 
-Retain the direct 8-bit selector exclusion until benchmark evidence changes it.
+Add real `i8` and `u8` columns to the corpus. Use them to decide 8-bit eligibility and threshold calibration.
 
 Keep fused RangePacked and RangeEntropy outside Default.
 
