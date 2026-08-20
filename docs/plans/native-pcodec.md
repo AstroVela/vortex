@@ -2221,6 +2221,31 @@ The complete corpus shows no selected FloatQuant tree and no stable analysis-cos
 
 Retain FloatQuant as an opportunistic option under the calibrated 1.10 factor.
 
+### Wider-integer BlockResidual factor sweep
+
+The final sweep compares wider-integer access cost factors of 1.00, 1.02, and 1.05.
+
+Each compression pass uses six complete Public BI files and three iterations per operation.
+
+The access pass requests about 100 rows through cached file handles. Each pattern runs for five seconds.
+
+| Factor | Size geometric mean | Total bytes | Compression time geometric mean | Decompression time geometric mean | Correlated access | Uniform access |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.02 | -0.25 percent | +0.44 percent | -0.46 percent | +2.17 percent | +3.93 percent | +1.88 percent |
+| 1.05 | +0.92 percent | +1.49 percent | -0.05 percent | +5.04 percent | +1.21 percent | +0.03 percent |
+
+The first candidate access passes contain large Bimbo and CMS correlated outliers.
+
+Reverse-order repeats remove those outliers. The table uses the repeated correlated results.
+
+The 1.02 factor diverts enough Food trees to reduce geometric-mean size by 0.25 percent.
+
+It increases total bytes by 0.44 percent. It also reduces bulk decode and file-access throughput.
+
+The 1.05 factor increases both geometric-mean size and total bytes. It provides no stable access gain.
+
+Retain the 1.00 wider-integer factor. The raw ratio floor and patch cost remain sufficient.
+
 ### Final selector factors
 
 The integer BlockResidual scheme keeps a 1.05 raw-ratio floor. It applies a 1.12 access cost factor to 8-bit estimates.
@@ -2231,7 +2256,7 @@ The Ordered BlockResidual scheme keeps its 1.05 raw floor and 1.02 decode factor
 
 The nonlinear patch cost rejects the known dense-patch and slow HashTags trees.
 
-No selected-tree evidence supports a factor for wider integers.
+The 1.02 and 1.05 trials provide no evidence for a wider-integer factor.
 
 The FloatQuant scheme keeps its 1.10 factor.
 
@@ -2669,6 +2694,7 @@ This round completed these steps:
 - Measured complete-file random access for six Public BI datasets.
 - Added a fused `f16` decoder for `OrderedFloat(BlockResidual)`.
 - Added a fused implicit-zero `f64` decoder for `FloatQuant(FoR(BitPacked))`.
+- Rejected 1.02 and 1.05 wider-integer BlockResidual access cost factors.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
