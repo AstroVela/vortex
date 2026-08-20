@@ -1787,6 +1787,29 @@ The ALP candidate remains experimental until independent columns justify its ana
 
 This split does not reject all selectors with expensive analysis. It reflects the current selection evidence for these two transforms.
 
+### Corrected RangePacked bundle
+
+The first controlled RangePacked pass exposed another constant-sample error.
+
+A constant HashTags sample produced an infinite coarse range ratio.
+
+The exact candidate then lost to the complete incumbent, but it blocked the existing Sparse tree.
+
+The prefilter now rejects non-finite range ratios.
+
+| Dataset | Current bytes | RangePacked bytes | Size change | Write time change | Read time change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Euro2016 | 159,053,012 | 153,090,172 | -3.75 percent | +1.60 percent | -1.30 percent |
+| HashTags | 179,382,828 | 178,141,132 | -0.69 percent | +0.89 percent | +0.69 percent |
+
+The corrected 16-file geometric mean reduces size by 0.28 percent.
+
+The timing differences in this two-file repeat remain within benchmark noise.
+
+The focused Euro tree still decodes about 30 percent slower than its incumbent.
+
+RangePacked therefore remains an experimental Default option.
+
 ### Complete bundle controls
 
 The compression benchmark exposes four numeric bundles:
@@ -1839,6 +1862,36 @@ The write result measures FloatQuant analysis without a size win in this corpus.
 FloatQuant remains a production array and a BtrBlocks candidate.
 
 Default inclusion now requires a real Pco-gap win with the 1.10 factor.
+
+### Real Pco-gap FloatQuant pass
+
+The current benchmark tested 33 real float columns across five inputs:
+
+- CMS Open Payments.
+- California Housing.
+- NYC Taxi.
+- CMS Provider 1.
+- CMS Provider 2.
+
+The pass compared `block-residual-bundle` with `proposed-default`.
+
+FloatQuant selected no column.
+
+Every proposed file size matched the BlockResidual bundle.
+
+The geometric-mean encode throughput changed by +0.12 percent.
+
+The geometric-mean decode throughput changed by -0.06 percent.
+
+Both throughput changes are benchmark noise because the selected trees are identical.
+
+Compact retains material size gains on many float columns in these files.
+
+The Pco mode profile attributes those gaps to classic bins, IntMult, and FloatMult.
+
+This result does not support FloatQuant in Default under the current factor.
+
+Retain the production array while the final candidate review decides the scheme policy.
 
 ### Multi-reference block prototype
 
@@ -2098,6 +2151,9 @@ This round completed these steps:
 - Added a provisional 1.10 FloatQuant selection factor.
 - Removed the Food and HashTags FloatQuant size regressions.
 - Revalidated the BlockResidual and FloatQuant bundles across 16 files.
+- Rejected constant RangePacked samples before exact sample encoding.
+- Revalidated RangePacked against the corrected current bundle.
+- Tested FloatQuant on 33 real float columns from five Pco-gap inputs.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2111,9 +2167,9 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Find real Pco-gap columns that retain FloatQuant with the 1.10 factor.
-2. Revalidate full-position RangePacked after the FloatQuant selector corrections.
-3. Measure rejected-candidate analysis cost after the candidate set stabilizes.
+1. Decide the FloatQuant scheme policy from the no-selection corpus evidence.
+2. Measure rejected-candidate analysis cost after the candidate set stabilizes.
+3. Prepare final Default bundle options with selected-tree evidence.
 4. Prefer cheap rejection tests when they preserve the best candidate model.
 5. Treat fast rejection as a selection advantage, not an admission criterion.
 6. Require stronger corpus evidence when a useful scheme needs costly analysis.

@@ -148,7 +148,8 @@ fn estimate_ordered_float_if_promising(
 }
 
 fn prefilter_passes(model: CoarseModel, best_ratio: f64, decode_cost_factor: f64) -> bool {
-    model.range_ratio >= MIN_PREFILTER_MODEL_RATIO
+    model.range_ratio.is_finite()
+        && model.range_ratio >= MIN_PREFILTER_MODEL_RATIO
         && model.range_ratio / decode_cost_factor * PREFILTER_MODEL_MARGIN > best_ratio
         && !model_prefers_blocks(model)
 }
@@ -404,6 +405,19 @@ mod tests {
 
         let candidate =
             estimate_ordered_float_if_promising(expected.as_view(), 1.13, 1.20, &mut ctx)?;
+
+        assert!(candidate.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prefilter_rejects_constant_sample() -> VortexResult<()> {
+        let expected = PrimitiveArray::from_iter(vec![1.0_f64; 1_024]);
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let candidate =
+            estimate_ordered_float_if_promising(expected.as_view(), 1.0, 1.20, &mut ctx)?;
 
         assert!(candidate.is_none());
         Ok(())
