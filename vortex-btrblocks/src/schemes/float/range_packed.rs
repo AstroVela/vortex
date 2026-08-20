@@ -33,6 +33,7 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
+use crate::SchemeExt;
 use crate::schemes::sample_primitive_one_percent;
 
 /// The default factor accounts for RangePacked decode cost during scheme selection.
@@ -94,8 +95,9 @@ impl Scheme for OrderedFloatRangePackedScheme {
         }
 
         let decode_cost_factor = self.decode_cost_factor;
+        let scheme_id = self.id();
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
-            move |_compressor, data, best_so_far, _compress_ctx, exec_ctx| {
+            move |compressor, data, best_so_far, compress_ctx, exec_ctx| {
                 let bit_width = data.array_as_primitive().ptype().bit_width() as f64;
                 let maximum_adjusted_ratio = bit_width / decode_cost_factor;
                 let best_ratio = best_so_far
@@ -123,7 +125,18 @@ impl Scheme for OrderedFloatRangePackedScheme {
 
                 let adjusted_ratio =
                     before_nbytes as f64 / after_nbytes as f64 / decode_cost_factor;
-                if adjusted_ratio <= 1.0 {
+                if adjusted_ratio <= best_ratio {
+                    return Ok(EstimateVerdict::Skip);
+                }
+
+                let sample = sample.into_array();
+                let incumbent = compressor.compress_sample_without_scheme(
+                    &sample,
+                    scheme_id,
+                    compress_ctx,
+                    exec_ctx,
+                )?;
+                if after_nbytes as f64 * decode_cost_factor >= incumbent.nbytes() as f64 {
                     return Ok(EstimateVerdict::Skip);
                 }
                 Ok(EstimateVerdict::Ratio(adjusted_ratio))
@@ -402,6 +415,7 @@ mod tests {
     use super::encode_ordered_float;
     use super::estimate_ordered_float;
     use super::estimate_ordered_float_if_promising;
+    use crate::BtrBlocksCompressorBuilder;
     use crate::CascadingCompressor;
 
     const TEST_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.0);
@@ -512,6 +526,44 @@ mod tests {
             estimate_ordered_float_if_promising(expected.as_view(), 1.0, 1.20, &mut ctx)?;
 
         assert!(candidate.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn completed_incumbent_tree_beats_range_tree() -> VortexResult<()> {
+        let expected = PrimitiveArray::from_iter((0_u64..65_536).map(|index| {
+            let cluster = index % 8;
+            f64::from_bits(0x3ff0_0000_0000_0000 + cluster * 0x1_0000_0000)
+        }));
+        let expected_array = expected.clone().into_array();
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let retained = estimate_ordered_float_if_promising(
+            expected.as_view(),
+            1.0,
+            TEST_SCHEME.decode_cost_factor,
+            &mut ctx,
+        )?;
+        assert!(retained.is_some());
+
+        let range_only =
+            CascadingCompressor::new(vec![&TEST_SCHEME]).compress(&expected_array, &mut ctx)?;
+        assert!(range_only.is::<vortex_block_residual::OrderedFloat>());
+        assert!(range_only.children()[0].is::<vortex_int_mult::IntMult>());
+
+        let selected = BtrBlocksCompressorBuilder::default()
+            .with_new_scheme(&TEST_SCHEME)
+            .build()
+            .compress(&expected_array, &mut ctx)?;
+        let selected_is_range = selected.is::<vortex_block_residual::OrderedFloat>()
+            && selected
+                .children()
+                .first()
+                .is_some_and(|child| child.is::<vortex_int_mult::IntMult>());
+        assert!(!selected_is_range);
+        assert!(selected.nbytes() < range_only.nbytes());
+        assert_arrays_eq!(selected, expected, &mut ctx);
         Ok(())
     }
 

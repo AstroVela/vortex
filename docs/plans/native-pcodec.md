@@ -1880,9 +1880,9 @@ Treat them as aggregate noise until a larger repeated pass confirms them.
 
 The first two million rows selected the new tree only for HashTags `interaction#received_at`.
 
-Full files also changed size for Bimbo, CMSprovider, Euro2016, and Taxi.
+The initial full files also changed size for Bimbo, CMSprovider, Euro2016, and Taxi.
 
-This difference requires a chunk-level selected-tree trace before threshold calibration.
+A later chunk-level trace identified completed incumbent cascades as the cause.
 
 The current broad size gain does not justify Default inclusion by itself.
 
@@ -1891,6 +1891,50 @@ IntMult now belongs to the August 2026 core edition, so files can serialize the 
 Fast rejection remains a cost advantage, not an admission rule.
 
 A scheme without fast rejection can enter Default when corpus evidence justifies its analysis cost.
+
+### Completed incumbent cascade comparison
+
+The first decomposed selector compared its complete fixed tree against each incumbent root estimate.
+
+Several incumbents compressed their children after root selection.
+
+A full Bimbo chunk trace found eight false fixed-bin selections in `Dev_proxima`.
+
+The fixed-bin trees used 5.3 to 239.7 percent more bytes than the completed incumbent trees.
+
+The selector now compares each retained candidate against the incumbent sample cascade.
+
+The coarse model runs first. Clear losses do not pay for a second sample compression.
+
+This comparison preserves the current cascade depth and excludes only the fixed-bin scheme.
+
+The corrected Bimbo file uses 391,860,906 bytes in both configurations.
+
+Its matched write throughput changes from 515.6 to 509.6 MB/s.
+
+Its matched read throughput changes from 11,143.6 to 11,130.7 MB/s.
+
+The focused HashTags file retains the useful selection:
+
+| Metric | Current | Fixed-bin candidate | Change |
+| --- | ---: | ---: | ---: |
+| File size | 21,252,695 bytes | 20,718,724 bytes | -2.51 percent |
+| Write throughput | 626.6 MB/s | 610.3 MB/s | -2.60 percent |
+| Read throughput | 21,294.0 MB/s | 20,913.0 MB/s | -1.79 percent |
+
+The matched 16-dataset file pass selected the fixed-bin tree only on HashTags.
+
+| Metric | Geometric-mean change |
+| --- | ---: |
+| File size | -0.027 percent |
+| Write time | +0.301 percent |
+| Read time | -0.298 percent |
+
+The read result is benchmark noise because only one file changes its encoded tree.
+
+The corpus size result does not justify Default inclusion with the current decode and scalar costs.
+
+Fast rejection remains an advantage. It does not replace evidence from complete candidate trees.
 
 ### Complete bundle controls
 
@@ -2231,12 +2275,15 @@ This round completed these steps:
 - Updated stale golden trees after the BlockResidual payload and selector changes.
 - Added four numeric bundle controls to the complete compression benchmark.
 - Added explicit winner result events to the compressor trace.
+- Added optional chunk-level encoding trees to the focused compressor benchmark.
 - Rejected constant FloatQuant samples before exact sample encoding.
 - Added a provisional 1.10 FloatQuant selection factor.
 - Removed the Food and HashTags FloatQuant size regressions.
 - Revalidated the BlockResidual and FloatQuant bundles across 16 files.
 - Rejected constant RangePacked samples before exact sample encoding.
 - Revalidated RangePacked against the corrected current bundle.
+- Compared retained fixed-bin candidates against the completed incumbent sample cascade.
+- Removed every known Bimbo, CMSprovider, Euro2016, and Taxi fixed-bin false win.
 - Tested FloatQuant on 33 real float columns from five Pco-gap inputs.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
