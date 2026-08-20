@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
@@ -15,8 +14,6 @@ use compress_bench::vortex::VortexCompressor;
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use regex::Regex;
-use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex_bench::Engine;
 use vortex_bench::Format;
@@ -29,10 +26,10 @@ use vortex_bench::compress::Compressor;
 use vortex_bench::compress::benchmark_compress;
 use vortex_bench::compress::benchmark_decompress;
 use vortex_bench::compress::calculate_ratios;
-use vortex_bench::conversions::parquet_to_vortex_chunks;
 use vortex_bench::create_output_writer;
 use vortex_bench::datasets::Dataset;
 use vortex_bench::datasets::feature_vectors::GloveEmbeddingsData;
+use vortex_bench::datasets::local_parquet::LocalParquetData;
 use vortex_bench::datasets::struct_list_of_ints::StructListOfInts;
 use vortex_bench::datasets::taxi_data::TaxiData;
 use vortex_bench::datasets::tpch_l_comment::TPCHLCommentCanonical;
@@ -128,37 +125,6 @@ async fn main() -> anyhow::Result<()> {
         args.vortex_numeric_bundle,
     )
     .await
-}
-
-struct LocalParquetData {
-    name: String,
-    path: PathBuf,
-}
-
-impl LocalParquetData {
-    fn try_new(path: PathBuf) -> anyhow::Result<Self> {
-        let name = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| anyhow::anyhow!("local Parquet path has no valid file stem"))?
-            .to_string();
-        Ok(Self { name, path })
-    }
-}
-
-#[async_trait]
-impl Dataset for LocalParquetData {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> anyhow::Result<ArrayRef> {
-        Ok(parquet_to_vortex_chunks(self.path.clone()).await?.into())
-    }
-
-    async fn to_parquet_path(&self) -> anyhow::Result<PathBuf> {
-        Ok(self.path.clone())
-    }
 }
 
 /// Get a compressor for the given format.

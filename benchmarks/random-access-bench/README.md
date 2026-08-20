@@ -29,3 +29,12 @@ Compare random access for a numeric scheme bundle with one of these values:
 - `--vortex-numeric-bundle range-packed`
 
 Each bundle uses a separate Vortex file. Existing files remain available for repeated runs.
+
+Add a local Parquet file with `--parquet-path`. A local path replaces the default dataset list.
+
+```bash
+cargo run -p random-access-bench --profile release_debug -- \
+  --formats vortex --parquet-path /tmp/input.parquet
+```
+
+If `--datasets` also selects built-in datasets, the benchmark runs both groups.

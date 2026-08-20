@@ -699,9 +699,27 @@ Residual widths change in whole bits. Therefore, the first patch-free 8-bit win 
 
 The patch-density adjustment protects cases between those discrete widths.
 
-These results support Default eligibility for `i8` and `u8` with the common 1.05 floor.
+The bulk and writer results support Default eligibility for `i8` and `u8`.
 
-No width-specific factor is necessary.
+The file random-access pass adds a material selection trade:
+
+| Input | Size change | Prior correlated | BlockResidual correlated | Prior uniform | BlockResidual uniform |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Global affine `i8` | -16.12 percent | 78.6 us | 156.1 us | 497.7 us | 835.6 us |
+| Symmetric `u8` | -22.16 percent | 79.5 us | 136.4 us | 490.6 us | 708.1 us |
+| Seven-bit boundary | -10.35 percent | 112.7 us | 174.3 us | 785.3 us | 1,014.3 us |
+
+Each pattern requests about 100 rows through a cached file handle.
+
+The candidate increases correlated latency by 55 to 99 percent. It increases uniform latency by 29 to 68 percent.
+
+Every measured lookup remains below 1.1 ms. Sparse patches make the global affine case the slowest relative result.
+
+The current selector keeps the common 1.05 floor and no width factor.
+
+The final file ratios place the seven-bit boundary near a 1.12 factor. They place the global affine case near 1.20.
+
+The final 8-bit factor remains a policy choice because random access has priority over size.
 
 ### Narrow BlockResidual in Compact
 
@@ -2209,7 +2227,9 @@ The 1.10 value adds a small margin and retains every strict synthetic `f32` and 
 
 The 33-column Pco-gap pass exposes no missed real FloatQuant candidate.
 
-The quantized GloVe pass supports the same factor for `i8` and `u8`.
+The 8-bit bulk and writer evidence supports the same factor.
+
+The 8-bit file-access evidence leaves the final width factor open.
 
 ### Default bundle options
 
@@ -2615,6 +2635,8 @@ This round completed these steps:
 - Added `i8` and `u8` support to the focused Parquet and scalar benchmarks.
 - Validated 8-bit selection with quantized real GloVe values.
 - Added local Parquet inputs to the complete compression benchmark.
+- Added local Parquet inputs to the random-access benchmark.
+- Measured 8-bit BlockResidual file access on accepted and boundary cases.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2628,10 +2650,11 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
-2. Prefer cheap rejection tests when they preserve the best candidate model.
-3. Treat fast rejection as a selection advantage, not an admission criterion.
-4. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Choose the final 8-bit width factor from the size and file-access trade.
+2. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
+3. Prefer cheap rejection tests when they preserve the best candidate model.
+4. Treat fast rejection as a selection advantage, not an admission criterion.
+5. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
