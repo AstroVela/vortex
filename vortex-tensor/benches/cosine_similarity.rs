@@ -28,6 +28,8 @@ use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_tensor::encodings::normalized::Normalized;
+use vortex_tensor::scalar_fns::NormMode;
 use vortex_tensor::scalar_fns::cosine_similarity::CosineSimilarity;
 use vortex_tensor::vector::Vector;
 
@@ -80,12 +82,37 @@ fn constant_vector(width: usize) -> ArrayRef {
     ConstantArray::new(ext_scalar, ELEMENTS / width).into_array()
 }
 
-fn bench_cosine(bencher: Bencher, lhs: ArrayRef, rhs: ArrayRef) {
+fn normalized_vectors(width: usize, offset: usize) -> ArrayRef {
+    let row_count = ELEMENTS / width;
+    let elements: Buffer<f64> = (0..ELEMENTS)
+        .map(|i| {
+            if i % width == offset % width {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let storage = FixedSizeListArray::new(
+        elements.into_array(),
+        u32::try_from(width).unwrap(),
+        Validity::NonNullable,
+        row_count,
+    )
+    .into_array();
+    let direction = Vector::try_new_vector_array(storage).unwrap();
+    let norms = PrimitiveArray::from_iter((1..=row_count).map(|norm| norm as f64)).into_array();
+
+    // SAFETY: Every direction row is unit length, and the non-negative norms have matching length.
+    unsafe { Normalized::new_unchecked(direction, norms, Validity::NonNullable) }.into_array()
+}
+
+fn bench_cosine(bencher: Bencher, lhs: ArrayRef, rhs: ArrayRef, mode: NormMode) {
     let session = vortex_array::array_session();
     bencher
         .with_inputs(|| {
             (
-                CosineSimilarity::try_new(lhs.clone(), rhs.clone())
+                CosineSimilarity::try_new(lhs.clone(), rhs.clone(), mode)
                     .unwrap()
                     .into_array(),
                 session.create_execution_ctx(),
@@ -97,13 +124,23 @@ fn bench_cosine(bencher: Bencher, lhs: ArrayRef, rhs: ArrayRef) {
 /// The control: both operands vary by row, so every norm must be computed in the row loop.
 #[divan::bench(args = WIDTHS)]
 fn column_x_column(bencher: Bencher, width: usize) {
-    bench_cosine(bencher, vectors(width, 0), vectors(width, 31));
+    bench_cosine(
+        bencher,
+        vectors(width, 0),
+        vectors(width, 31),
+        NormMode::Exact,
+    );
 }
 
 /// The rhs is a broadcast query vector, whose norm is the same in every row.
 #[divan::bench(args = WIDTHS)]
 fn column_x_constant(bencher: Bencher, width: usize) {
-    bench_cosine(bencher, vectors(width, 0), constant_vector(width));
+    bench_cosine(
+        bencher,
+        vectors(width, 0),
+        constant_vector(width),
+        NormMode::Exact,
+    );
 }
 
 /// One query vector represented as an extension array over constant storage.
@@ -124,5 +161,32 @@ fn extension_constant_vector(width: usize) -> ArrayRef {
 /// The rhs is the same broadcast query represented as extension-wrapped constant storage.
 #[divan::bench(args = WIDTHS)]
 fn column_x_extension_constant(bencher: Bencher, width: usize) {
-    bench_cosine(bencher, vectors(width, 0), extension_constant_vector(width));
+    bench_cosine(
+        bencher,
+        vectors(width, 0),
+        extension_constant_vector(width),
+        NormMode::Exact,
+    );
+}
+
+/// Measures exact cosine similarity over two [`Normalized`] inputs.
+#[divan::bench(args = WIDTHS)]
+fn normalized_exact(bencher: Bencher, width: usize) {
+    bench_cosine(
+        bencher,
+        normalized_vectors(width, 0),
+        normalized_vectors(width, 1),
+        NormMode::Exact,
+    );
+}
+
+/// Measures cosine similarity while trusting both normalized-direction claims.
+#[divan::bench(args = WIDTHS)]
+fn normalized_assume(bencher: Bencher, width: usize) {
+    bench_cosine(
+        bencher,
+        normalized_vectors(width, 0),
+        normalized_vectors(width, 1),
+        NormMode::AssumeNormalized,
+    );
 }

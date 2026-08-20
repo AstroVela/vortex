@@ -18,11 +18,12 @@
 //! use vortex_array::{ArrayRef, VortexSessionExecute};
 //! use vortex_array::arrays::BoolArray;
 //! use vortex_session::VortexSession;
+//! use vortex_tensor::scalar_fns::NormMode;
 //! use vortex_tensor::vector_search::build_similarity_search_tree;
 //!
 //! fn run(session: &VortexSession, data: ArrayRef, query: &[f32]) -> anyhow::Result<()> {
 //!     let mut ctx = session.create_execution_ctx();
-//!     let tree = build_similarity_search_tree(data, query, 0.8)?;
+//!     let tree = build_similarity_search_tree(data, query, 0.8, NormMode::Exact)?;
 //!     let _matches: BoolArray = tree.execute(&mut ctx)?;
 //!     Ok(())
 //! }
@@ -43,6 +44,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_error::VortexResult;
 
+use crate::scalar_fns::NormMode;
 use crate::scalar_fns::cosine_similarity::CosineSimilarity;
 use crate::types::vector::Vector;
 
@@ -63,7 +65,8 @@ use crate::types::vector::Vector;
 /// ```
 ///
 /// The element type is inferred from `T` and must match the element type of `data`'s
-/// [`Vector`] extension dtype.
+/// [`Vector`] extension dtype. `mode` controls whether cosine similarity trusts normalized
+/// encoding evidence.
 ///
 /// This function performs no execution; it is safe to call inside a benchmark setup closure.
 ///
@@ -75,11 +78,12 @@ pub fn build_similarity_search_tree<T: NativePType + Into<PValue>>(
     data: ArrayRef,
     query: &[T],
     threshold: T,
+    mode: NormMode,
 ) -> VortexResult<ArrayRef> {
     let num_rows = data.len();
     let query_vec = Vector::constant_array(query, num_rows)?;
 
-    let cosine = CosineSimilarity::try_new(data, query_vec)?.into_array();
+    let cosine = CosineSimilarity::try_new(data, query_vec, mode)?.into_array();
 
     let threshold_scalar = Scalar::primitive(threshold, Nullability::NonNullable);
     let threshold_array = ConstantArray::new(threshold_scalar, num_rows).into_array();
@@ -95,6 +99,7 @@ mod tests {
     use vortex_error::VortexResult;
 
     use super::build_similarity_search_tree;
+    use crate::scalar_fns::NormMode;
     use crate::tests::SESSION;
     use crate::utils::test_helpers::vector_array;
 
@@ -112,7 +117,7 @@ mod tests {
         )?;
         let query = [1.0f32, 0.0, 0.0];
 
-        let tree = build_similarity_search_tree(data, &query, 0.5)?;
+        let tree = build_similarity_search_tree(data, &query, 0.5, NormMode::Exact)?;
         let mut ctx = SESSION.create_execution_ctx();
         let result: BoolArray = tree.execute(&mut ctx)?;
 

@@ -4,22 +4,25 @@
 //! Cosine similarity expression for tensor-like types.
 
 use num_traits::Zero;
+use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::ScalarFn as ScalarFnArrayEncoding;
 use vortex_array::arrays::ScalarFnArray;
+use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayParts;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
+use vortex_array::dtype::proto::dtype as pb;
 use vortex_array::expr::Expression;
 use vortex_array::expr::union_child_validities;
 use vortex_array::match_each_float_ptype;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
-use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ExecutionArgs;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
@@ -27,14 +30,15 @@ use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::serde::ArrayChildren;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::encodings::normalized::NormalizedOrientation;
 use crate::encodings::normalized::try_build_constant_normalized;
+use crate::scalar_fns::NormMode;
 use crate::scalar_fns::inner_product::InnerProduct;
 use crate::scalar_fns::l2_norm::L2Norm;
-use crate::utils::BinaryTensorOpMetadata;
 use crate::utils::extract_normalized_children;
 use crate::utils::validate_binary_tensor_float_inputs;
 
@@ -47,10 +51,10 @@ use crate::utils::validate_binary_tensor_float_inputs;
 /// Both inputs must be tensor-like extension arrays ([`FixedShapeTensor`] or [`Vector`]) with the
 /// same dtype and a float element type. The output is a float column of the same float type.
 ///
-/// When either input is [`Normalized`]-encoded, this operator treats the stored norms and
-/// normalized children as authoritative. For lossy normalized children, that means the optimized
-/// read-through path may intentionally differ slightly from decoding both sides to dense
-/// coordinates and recomputing cosine from scratch.
+/// [`NormMode::Exact`] measures the physical direction stored by a [`Normalized`] encoding before
+/// applying the cosine formula. [`NormMode::AssumeNormalized`] instead trusts that direction as
+/// unit length and omits its norm computation. The approximate mode does not clamp its output or
+/// provide an error bound for unchecked or lossy encodings.
 ///
 /// [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
 /// [`Vector`]: crate::vector::Vector
@@ -66,17 +70,29 @@ impl CosineSimilarity {
     ///
     /// Returns an error if the [`ScalarFnArray`] cannot be constructed (e.g. due to dtype
     /// mismatches).
-    pub fn try_new(lhs: ArrayRef, rhs: ArrayRef) -> VortexResult<ScalarFnArray> {
-        ScalarFnArray::try_new(CosineSimilarity.bind(EmptyOptions), vec![lhs, rhs])
+    pub fn try_new(lhs: ArrayRef, rhs: ArrayRef, mode: NormMode) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(CosineSimilarity.bind(mode), vec![lhs, rhs])
     }
 }
 
 impl ScalarFnVTable for CosineSimilarity {
-    type Options = EmptyOptions;
+    type Options = NormMode;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.tensor.cosine_similarity");
         *ID
+    }
+
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(options.serialize()))
+    }
+
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        NormMode::deserialize(metadata)
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -103,7 +119,7 @@ impl ScalarFnVTable for CosineSimilarity {
 
     fn execute(
         &self,
-        _options: &Self::Options,
+        options: &Self::Options,
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
@@ -122,13 +138,13 @@ impl ScalarFnVTable for CosineSimilarity {
         // Take any Normalized read-through fast path that applies.
         match NormalizedOrientation::classify(&lhs_ref, &rhs_ref) {
             NormalizedOrientation::Both { lhs, rhs } => {
-                return self.execute_both_normalized(lhs, rhs, len, ctx);
+                return self.execute_both_normalized(lhs, rhs, *options, len, ctx);
             }
             NormalizedOrientation::One {
                 normalized_array,
                 plain,
             } => {
-                return self.execute_one_normalized(normalized_array, plain, len, ctx);
+                return self.execute_one_normalized(normalized_array, plain, *options, len, ctx);
             }
             NormalizedOrientation::Neither => {}
         }
@@ -136,9 +152,9 @@ impl ScalarFnVTable for CosineSimilarity {
         // Compute combined validity.
         let validity = lhs_ref.validity()?.and(rhs_ref.validity()?)?;
 
-        // Compute inner product and norms as columnar operations, and propagate the options.
-        let norm_lhs_arr = L2Norm::try_new(lhs_ref.clone())?;
-        let norm_rhs_arr = L2Norm::try_new(rhs_ref.clone())?;
+        // Ordinary inputs carry no normalized claim, so both modes measure their physical norms.
+        let norm_lhs_arr = L2Norm::try_new(lhs_ref.clone(), NormMode::Exact)?;
+        let norm_rhs_arr = L2Norm::try_new(rhs_ref.clone(), NormMode::Exact)?;
         let dot_arr = InnerProduct::try_new(lhs_ref, rhs_ref)?;
 
         // Execute to get the inner product and norms of the arrays. We only fully decompress
@@ -147,8 +163,8 @@ impl ScalarFnVTable for CosineSimilarity {
         let norm_l: PrimitiveArray = norm_lhs_arr.into_array().execute(ctx)?;
         let norm_r: PrimitiveArray = norm_rhs_arr.into_array().execute(ctx)?;
 
-        // TODO(connor): Ideally we would have a `SafeDiv` binary numeric operation.
-        // TODO(connor): This can be written in a more SIMD-friendly manner.
+        // TODO(connor)[Tensor]: Replace this loop after binary numeric operations support
+        // zero-denominator division. The branch currently prevents a direct binary expression.
         match_each_float_ptype!(dot.ptype(), |T| {
             let dots = dot.as_slice::<T>();
             let norms_l = norm_l.as_slice::<T>();
@@ -188,13 +204,40 @@ impl ScalarFnVTable for CosineSimilarity {
     }
 }
 
+/// Metadata for a serialized [`CosineSimilarity`] array.
+///
+/// `assume_normalized` is optional so metadata written before [`NormMode`] remains readable.
+#[derive(Clone, prost::Message)]
+struct CosineSimilarityMetadata {
+    /// The left input dtype needed to deserialize its child.
+    #[prost(message, optional, tag = "1")]
+    lhs_dtype: Option<pb::DType>,
+
+    /// The right input dtype needed to deserialize its child.
+    #[prost(message, optional, tag = "2")]
+    rhs_dtype: Option<pb::DType>,
+
+    /// Whether execution trusts normalized encoding evidence.
+    ///
+    /// `None` preserves the behavior of metadata written before [`NormMode`] was explicit.
+    #[prost(bool, optional, tag = "3")]
+    assume_normalized: Option<bool>,
+}
+
 impl ScalarFnArrayVTable for CosineSimilarity {
     fn serialize(
         &self,
         view: &ScalarFnArrayView<Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(BinaryTensorOpMetadata::encode_from_view(view)?))
+        let array = view.as_::<ScalarFnArrayEncoding>();
+        let metadata = CosineSimilarityMetadata {
+            lhs_dtype: Some(array.child_at(0).dtype().try_into()?),
+            rhs_dtype: Some(array.child_at(1).dtype().try_into()?),
+            assume_normalized: Some(view.options.assumes_normalized()),
+        };
+
+        Ok(Some(metadata.encode_to_vec()))
     }
 
     fn deserialize(
@@ -205,24 +248,39 @@ impl ScalarFnArrayVTable for CosineSimilarity {
         children: &dyn ArrayChildren,
         session: &VortexSession,
     ) -> VortexResult<ScalarFnArrayParts<Self>> {
-        let reconstructed =
-            BinaryTensorOpMetadata::decode_children(metadata, len, children, session)?;
+        let metadata = CosineSimilarityMetadata::decode(metadata)
+            .map_err(|error| vortex_err!("Failed to decode CosineSimilarity metadata: {error}"))?;
+        let lhs_dtype = metadata
+            .lhs_dtype
+            .as_ref()
+            .ok_or_else(|| vortex_err!("CosineSimilarity metadata missing lhs_dtype"))?;
+        let rhs_dtype = metadata
+            .rhs_dtype
+            .as_ref()
+            .ok_or_else(|| vortex_err!("CosineSimilarity metadata missing rhs_dtype"))?;
+        let lhs_dtype = DType::from_proto(lhs_dtype, session)?;
+        let rhs_dtype = DType::from_proto(rhs_dtype, session)?;
+        validate_binary_tensor_float_inputs(&lhs_dtype, &rhs_dtype)?;
+
+        let lhs = children.get(0, &lhs_dtype, len)?;
+        let rhs = children.get(1, &rhs_dtype, len)?;
+
         Ok(ScalarFnArrayParts {
-            options: EmptyOptions,
-            children: reconstructed,
+            options: NormMode::from_serialized(metadata.assume_normalized),
+            children: vec![lhs, rhs],
         })
     }
 }
 
 impl CosineSimilarity {
-    /// Both sides are [`Normalized`]-encoded: treat the normalized children as authoritative, so
-    /// `cosine_similarity = dot(n_l, n_r)`.
+    /// Computes cosine similarity from two [`Normalized`] direction-and-norm pairs.
     ///
     /// [`Normalized`]: crate::encodings::normalized::Normalized
     fn execute_both_normalized(
         &self,
         lhs_ref: &ArrayRef,
         rhs_ref: &ArrayRef,
+        mode: NormMode,
         len: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
@@ -231,9 +289,17 @@ impl CosineSimilarity {
         let (normalized_l, norms_l) = extract_normalized_children(lhs_ref);
         let (normalized_r, norms_r) = extract_normalized_children(rhs_ref);
 
-        // `Normalized` makes the normalized children authoritative, so their dot product is the
-        // cosine similarity even for lossy storage wrappers, except that a zero stored norm still
-        // represents a zero vector.
+        let direction_norms = if mode.assumes_normalized() {
+            None
+        } else {
+            let lhs: PrimitiveArray = L2Norm::try_new(normalized_l.clone(), NormMode::Exact)?
+                .into_array()
+                .execute(ctx)?;
+            let rhs: PrimitiveArray = L2Norm::try_new(normalized_r.clone(), NormMode::Exact)?
+                .into_array()
+                .execute(ctx)?;
+            Some((lhs, rhs))
+        };
         let dot: PrimitiveArray = InnerProduct::try_new(normalized_l, normalized_r)?
             .into_array()
             .execute(ctx)?;
@@ -244,12 +310,24 @@ impl CosineSimilarity {
             let dots = dot.as_slice::<T>();
             let norms_l = norms_l.as_slice::<T>();
             let norms_r = norms_r.as_slice::<T>();
+            let direction_norms = direction_norms
+                .as_ref()
+                .map(|(lhs, rhs)| (lhs.as_slice::<T>(), rhs.as_slice::<T>()));
             let buffer: Buffer<T> = (0..len)
                 .map(|i| {
                     if norms_l[i] == T::zero() || norms_r[i] == T::zero() {
+                        return T::zero();
+                    }
+
+                    let Some((direction_norms_l, direction_norms_r)) = direction_norms else {
+                        return dots[i];
+                    };
+                    let denominator = direction_norms_l[i] * direction_norms_r[i];
+
+                    if denominator == T::zero() {
                         T::zero()
                     } else {
-                        dots[i]
+                        dots[i] / denominator
                     }
                 })
                 .collect();
@@ -259,16 +337,17 @@ impl CosineSimilarity {
         })
     }
 
-    /// One side is [`Normalized`]-encoded: treat the normalized child as authoritative, so
-    /// `cosine_similarity = dot(n, b) / ||b||`.
+    /// Computes cosine similarity when one side is [`Normalized`]-encoded.
     ///
     /// [`Normalized`]: crate::encodings::normalized::Normalized
     ///
-    /// The caller must pass the [`Normalized`] array as `normalized_ref` and the plain array as `plain_ref`.
+    /// The caller must pass the [`Normalized`] array as `normalized_ref` and the plain array as
+    /// `plain_ref`.
     fn execute_one_normalized(
         &self,
         normalized_ref: &ArrayRef,
         plain_ref: &ArrayRef,
+        mode: NormMode,
         len: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
@@ -276,26 +355,43 @@ impl CosineSimilarity {
 
         let (normalized, normalized_norms) = extract_normalized_children(normalized_ref);
 
+        let direction_norm = if mode.assumes_normalized() {
+            None
+        } else {
+            Some(
+                L2Norm::try_new(normalized.clone(), NormMode::Exact)?
+                    .into_array()
+                    .execute::<PrimitiveArray>(ctx)?,
+            )
+        };
         let dot_arr = InnerProduct::try_new(normalized, plain_ref.clone())?;
         let dot: PrimitiveArray = dot_arr.into_array().execute(ctx)?;
 
         let normalized_norms: PrimitiveArray = normalized_norms.execute(ctx)?;
 
-        let norm_arr = L2Norm::try_new(plain_ref.clone())?;
+        let norm_arr = L2Norm::try_new(plain_ref.clone(), NormMode::Exact)?;
         let plain_norm: PrimitiveArray = norm_arr.into_array().execute(ctx)?;
 
-        // TODO(connor): Ideally we would have a `SafeDiv` binary numeric operation.
-        // TODO(connor): This can be written in a more SIMD-friendly manner.
+        // TODO(connor)[Tensor]: Replace this loop after binary numeric operations support
+        // zero-denominator division. The branch currently prevents a direct binary expression.
         match_each_float_ptype!(dot.ptype(), |T| {
             let dots = dot.as_slice::<T>();
             let normalized_norms = normalized_norms.as_slice::<T>();
             let plain_norms = plain_norm.as_slice::<T>();
+            let direction_norms = direction_norm.as_ref().map(|norm| norm.as_slice::<T>());
             let buffer: Buffer<T> = (0..len)
                 .map(|i| {
                     if normalized_norms[i] == T::zero() || plain_norms[i] == T::zero() {
+                        return T::zero();
+                    }
+
+                    let denominator =
+                        direction_norms.map_or(plain_norms[i], |norms| norms[i] * plain_norms[i]);
+
+                    if denominator == T::zero() {
                         T::zero()
                     } else {
-                        dots[i] / plain_norms[i]
+                        dots[i] / denominator
                     }
                 })
                 .collect();
@@ -309,6 +405,8 @@ impl CosineSimilarity {
 #[cfg(test)]
 mod tests {
 
+    use half::f16;
+    use prost::Message;
     use rstest::rstest;
     use vortex_array::ArrayPlugin;
     use vortex_array::ArrayRef;
@@ -316,11 +414,15 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::MaskedArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::scalar_fn::ExactScalarFn;
     use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
+    use vortex_array::matcher::Matcher;
     use vortex_array::validity::Validity;
     use vortex_error::VortexResult;
 
+    use super::CosineSimilarityMetadata;
     use crate::encodings::normalized::Normalized;
+    use crate::scalar_fns::NormMode;
     use crate::scalar_fns::cosine_similarity::CosineSimilarity;
     use crate::tests::SESSION;
     use crate::types::vector::Vector;
@@ -332,7 +434,15 @@ mod tests {
 
     /// Evaluates cosine similarity between two tensor arrays and returns the result as `Vec<f64>`.
     fn eval_cosine_similarity(lhs: ArrayRef, rhs: ArrayRef) -> VortexResult<Vec<f64>> {
-        let result = CosineSimilarity::try_new(lhs, rhs)?;
+        eval_cosine_similarity_with_mode(lhs, rhs, NormMode::Exact)
+    }
+
+    fn eval_cosine_similarity_with_mode(
+        lhs: ArrayRef,
+        rhs: ArrayRef,
+        mode: NormMode,
+    ) -> VortexResult<Vec<f64>> {
+        let result = CosineSimilarity::try_new(lhs, rhs, mode)?;
         let mut ctx = SESSION.create_execution_ctx();
         let prim: PrimitiveArray = result.into_array().execute(&mut ctx)?;
         Ok(prim.as_slice::<f64>().to_vec())
@@ -496,7 +606,7 @@ mod tests {
         let rhs = tensor_array(&[2], &[3.0, 4.0, 0.0, 1.0])?;
         let rhs = MaskedArray::try_new(rhs, Validity::from_iter([true, false]))?.into_array();
 
-        let result = CosineSimilarity::try_new(lhs, rhs)?;
+        let result = CosineSimilarity::try_new(lhs, rhs, NormMode::Exact)?;
         let mut ctx = SESSION.create_execution_ctx();
         let prim: PrimitiveArray = result.into_array().execute(&mut ctx)?;
 
@@ -545,6 +655,63 @@ mod tests {
     }
 
     #[test]
+    fn mode_controls_near_unit_f16_shortcut() -> VortexResult<()> {
+        let element = f16::from_f32(1.009_765_6);
+        let direction = vector_array(2, &[element, f16::ZERO])?;
+        let norms = PrimitiveArray::from_iter([f16::ONE]).into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+        let vector =
+            Normalized::try_new(direction, norms, Validity::NonNullable, &mut ctx)?.into_array();
+
+        let exact: PrimitiveArray =
+            CosineSimilarity::try_new(vector.clone(), vector.clone(), NormMode::Exact)?
+                .into_array()
+                .execute(&mut ctx)?;
+        let assumed: PrimitiveArray =
+            CosineSimilarity::try_new(vector.clone(), vector, NormMode::AssumeNormalized)?
+                .into_array()
+                .execute(&mut ctx)?;
+
+        assert_eq!(exact.as_slice::<f16>()[0], f16::ONE);
+        assert!(assumed.as_slice::<f16>()[0] > f16::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_mode_measures_lossy_direction() -> VortexResult<()> {
+        let direction = tensor_array(&[2], &[0.8f64, 0.0])?;
+        let stored_norms = PrimitiveArray::from_iter([5.0f64]).into_array();
+        // SAFETY: The children satisfy the structural requirements. This fixture intentionally
+        // supplies a lossy direction whose physical norm is 0.8.
+        let normalized =
+            unsafe { Normalized::new_unchecked(direction, stored_norms, Validity::NonNullable) }
+                .into_array();
+        let plain = tensor_array(&[2], &[1.0f64, 0.0])?;
+
+        assert_close(
+            &eval_cosine_similarity_with_mode(normalized.clone(), plain.clone(), NormMode::Exact)?,
+            &[1.0],
+        );
+        assert_close(
+            &eval_cosine_similarity_with_mode(normalized, plain, NormMode::AssumeNormalized)?,
+            &[0.8],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mode_does_not_change_ordinary_inputs() -> VortexResult<()> {
+        let lhs = tensor_array(&[2], &[3.0f64, 4.0])?;
+        let rhs = tensor_array(&[2], &[4.0f64, 3.0])?;
+
+        let exact = eval_cosine_similarity_with_mode(lhs.clone(), rhs.clone(), NormMode::Exact)?;
+        let assumed = eval_cosine_similarity_with_mode(lhs, rhs, NormMode::AssumeNormalized)?;
+
+        assert_close(&exact, &assumed);
+        Ok(())
+    }
+
+    #[test]
     fn one_side_normalized_lhs() -> VortexResult<()> {
         // LHS is Normalized([0.6, 0.8], 5.0) representing [3.0, 4.0].
         // RHS is plain [3.0, 4.0].
@@ -579,7 +746,7 @@ mod tests {
         let validity = Validity::from_iter([true, false]);
         let rhs = Normalized::try_new(normalized_r, norms_r, validity, &mut ctx)?.into_array();
 
-        let result = CosineSimilarity::try_new(lhs, rhs)?;
+        let result = CosineSimilarity::try_new(lhs, rhs, NormMode::Exact)?;
         let prim: PrimitiveArray = result.into_array().execute(&mut ctx)?;
 
         assert!(prim.is_valid(0, &mut ctx)?);
@@ -752,26 +919,58 @@ mod tests {
     #[case::vector(cosine_vector_lhs(), cosine_vector_rhs())]
     #[case::fixed_shape_tensor(cosine_tensor_lhs(), cosine_tensor_rhs())]
     fn serde_round_trip(#[case] lhs: ArrayRef, #[case] rhs: ArrayRef) -> VortexResult<()> {
-        let original = CosineSimilarity::try_new(lhs.clone(), rhs.clone())?.into_array();
+        let plugin = ScalarFnArrayPlugin::new(CosineSimilarity);
+        for mode in [NormMode::Exact, NormMode::AssumeNormalized] {
+            let original = CosineSimilarity::try_new(lhs.clone(), rhs.clone(), mode)?.into_array();
+            let metadata = plugin
+                .serialize(&original, &SESSION)?
+                .expect("CosineSimilarity serialize must produce metadata");
+            let children = vec![lhs.clone(), rhs.clone()];
+            let recovered = plugin.deserialize(
+                original.dtype(),
+                original.len(),
+                &metadata,
+                &[],
+                &children,
+                &SESSION,
+            )?;
 
+            let recovered_view = ExactScalarFn::<CosineSimilarity>::try_match(&recovered)
+                .expect("deserialized array must retain its scalar function");
+            assert_eq!(*recovered_view.options, mode);
+            assert_eq!(recovered.dtype(), original.dtype());
+            assert_eq!(recovered.len(), original.len());
+            assert_eq!(recovered.encoding_id(), original.encoding_id());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_metadata_uses_assume_normalized_mode() -> VortexResult<()> {
+        let lhs = cosine_vector_lhs();
+        let rhs = cosine_vector_rhs();
+        let original =
+            CosineSimilarity::try_new(lhs.clone(), rhs.clone(), NormMode::Exact)?.into_array();
         let plugin = ScalarFnArrayPlugin::new(CosineSimilarity);
         let metadata = plugin
             .serialize(&original, &SESSION)?
             .expect("CosineSimilarity serialize must produce metadata");
+        let mut metadata = CosineSimilarityMetadata::decode(metadata.as_slice())?;
+        metadata.assume_normalized = None;
 
-        let children = vec![lhs, rhs];
         let recovered = plugin.deserialize(
             original.dtype(),
             original.len(),
-            &metadata,
+            &metadata.encode_to_vec(),
             &[],
-            &children,
+            &[lhs, rhs],
             &SESSION,
         )?;
 
-        assert_eq!(recovered.dtype(), original.dtype());
-        assert_eq!(recovered.len(), original.len());
-        assert_eq!(recovered.encoding_id(), original.encoding_id());
+        let recovered_view = ExactScalarFn::<CosineSimilarity>::try_match(&recovered)
+            .expect("deserialized array must retain its scalar function");
+        assert_eq!(*recovered_view.options, NormMode::AssumeNormalized);
         Ok(())
     }
 

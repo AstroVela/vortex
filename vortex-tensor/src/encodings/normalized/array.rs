@@ -45,6 +45,10 @@ pub type NormalizedArray = Array<Normalized>;
 /// Row `i` decodes to `normalized[i] * norms[i]`. The encoding supports [`Vector`] and
 /// [`FixedShapeTensor`] columns with float elements.
 ///
+/// `Normalized` is a physical representation of those logical tensor types. The direction is
+/// evidence that norm-based scalar functions can use when their [`NormMode`] permits an
+/// approximation; it is not a logical refinement of [`Vector`] or [`FixedShapeTensor`].
+///
 /// # Invariants
 ///
 /// Every [`NormalizedArray`] has three slots.
@@ -56,7 +60,7 @@ pub type NormalizedArray = Array<Normalized>;
 /// Both data children have the array's length and element ptype. A missing validity slot means
 /// either non-nullable or nullable-all-valid data, as determined by the parent dtype.
 ///
-/// [`try_new`](Self::try_new) also enforces the invariants that make the split lossless:
+/// [`try_new`](Self::try_new) also validates the direction-and-norm relationship:
 ///
 /// - Each normalized row has L2 norm `1.0` or `0.0`, within the tolerance for its precision and
 ///   width.
@@ -68,9 +72,10 @@ pub type NormalizedArray = Array<Normalized>;
 /// # Lossy normalized children
 ///
 /// [`new_unchecked`](Self::new_unchecked) permits an approximate normalized child, such as a
-/// quantized direction. The stored norms remain authoritative. [`L2Norm`], [`InnerProduct`], and
-/// [`CosineSimilarity`] therefore operate on the stored children and can differ slightly from
-/// decoding and recomputing.
+/// quantized direction. [`NormMode::Exact`](crate::scalar_fns::NormMode::Exact) measures that
+/// physical direction. Only
+/// [`NormMode::AssumeNormalized`](crate::scalar_fns::NormMode::AssumeNormalized) trusts its norm as
+/// one, which can differ from decoding and recomputing and does not carry an error bound.
 ///
 /// [`Vector`]: crate::vector::Vector
 /// [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
@@ -78,6 +83,7 @@ pub type NormalizedArray = Array<Normalized>;
 /// [`L2Norm`]: crate::scalar_fns::l2_norm::L2Norm
 /// [`InnerProduct`]: crate::scalar_fns::inner_product::InnerProduct
 /// [`CosineSimilarity`]: crate::scalar_fns::cosine_similarity::CosineSimilarity
+/// [`NormMode`]: crate::scalar_fns::NormMode
 #[derive(Clone, Debug)]
 pub struct Normalized;
 

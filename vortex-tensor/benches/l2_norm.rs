@@ -22,6 +22,8 @@ use vortex_array::arrays::MaskedArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_tensor::encodings::normalized::Normalized;
+use vortex_tensor::scalar_fns::NormMode;
 use vortex_tensor::scalar_fns::l2_norm::L2Norm;
 use vortex_tensor::vector::Vector;
 
@@ -54,13 +56,32 @@ fn vectors(width: usize) -> ArrayRef {
     Vector::try_new_vector_array(storage).unwrap()
 }
 
-fn bench_l2_norm(bencher: Bencher, input: ArrayRef) {
+fn normalized_vectors(width: usize) -> ArrayRef {
+    let row_count = ELEMENTS / width;
+    let elements: Buffer<f64> = (0..ELEMENTS)
+        .map(|i| if i % width == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let storage = FixedSizeListArray::new(
+        elements.into_array(),
+        u32::try_from(width).unwrap(),
+        Validity::NonNullable,
+        row_count,
+    )
+    .into_array();
+    let direction = Vector::try_new_vector_array(storage).unwrap();
+    let norms = PrimitiveArray::from_iter((1..=row_count).map(|norm| norm as f64)).into_array();
+
+    // SAFETY: Every direction row is unit length, and the non-negative norms have matching length.
+    unsafe { Normalized::new_unchecked(direction, norms, Validity::NonNullable) }.into_array()
+}
+
+fn bench_l2_norm(bencher: Bencher, input: ArrayRef, mode: NormMode) {
     let session = vortex_array::array_session();
     bencher
         .counter(ItemsCount::new(input.len()))
         .with_inputs(|| {
             (
-                L2Norm::try_new(input.clone()).unwrap().into_array(),
+                L2Norm::try_new(input.clone(), mode).unwrap().into_array(),
                 session.create_execution_ctx(),
             )
         })
@@ -69,7 +90,7 @@ fn bench_l2_norm(bencher: Bencher, input: ArrayRef) {
 
 #[divan::bench(args = WIDTHS)]
 fn non_nullable(bencher: Bencher, width: usize) {
-    bench_l2_norm(bencher, vectors(width));
+    bench_l2_norm(bencher, vectors(width), NormMode::Exact);
 }
 
 #[divan::bench(args = WIDTHS)]
@@ -78,5 +99,21 @@ fn nullable(bencher: Bencher, width: usize) {
     let input = MaskedArray::try_new(vectors(width), validity)
         .unwrap()
         .into_array();
-    bench_l2_norm(bencher, input);
+    bench_l2_norm(bencher, input, NormMode::Exact);
+}
+
+/// Measures the physical norm of a [`Normalized`] input.
+#[divan::bench(args = WIDTHS)]
+fn normalized_exact(bencher: Bencher, width: usize) {
+    bench_l2_norm(bencher, normalized_vectors(width), NormMode::Exact);
+}
+
+/// Reads the stored norm while trusting the normalized-direction claim.
+#[divan::bench(args = WIDTHS)]
+fn normalized_assume(bencher: Bencher, width: usize) {
+    bench_l2_norm(
+        bencher,
+        normalized_vectors(width),
+        NormMode::AssumeNormalized,
+    );
 }

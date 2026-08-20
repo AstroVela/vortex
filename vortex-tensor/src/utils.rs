@@ -65,10 +65,10 @@ pub fn unit_norm_tolerance(element_ptype: PType, dimensions: usize) -> f64 {
 /// # Panics
 ///
 /// Panics if `array` is not [`Normalized`]-encoded. Callers reach this through
-/// [`NormalizedOrientation::classify`], which has already matched on the encoding.
+/// [`NormalizedOrientation`], which has already matched on the encoding.
 ///
 /// [`Normalized`]: crate::encodings::normalized::Normalized
-/// [`NormalizedOrientation::classify`]: crate::encodings::normalized::NormalizedOrientation::classify
+/// [`NormalizedOrientation`]: crate::encodings::normalized::NormalizedOrientation
 pub fn extract_normalized_children(array: &ArrayRef) -> (ArrayRef, ArrayRef) {
     let normalized_array = array
         .as_opt::<Normalized>()
@@ -234,12 +234,10 @@ pub fn extract_constant_flat_row(
     Ok(FlatRow { elems })
 }
 
-/// Metadata for a serialized binary tensor-op array (shared by [`InnerProduct`] and
-/// [`CosineSimilarity`]). Both operands share the same extension dtype up to nullability
-/// (enforced by their `return_dtype` checks), but their individual nullabilities are lost in the
-/// parent's unioned output, so both are persisted.
+/// Metadata for a serialized [`InnerProduct`] array. Both operands share the same extension dtype
+/// up to nullability (enforced by its `return_dtype` checks), but their individual nullabilities
+/// are lost in the parent's unioned output, so both are persisted.
 ///
-/// [`CosineSimilarity`]: crate::scalar_fns::cosine_similarity::CosineSimilarity
 /// [`InnerProduct`]: crate::scalar_fns::inner_product::InnerProduct
 #[derive(Clone, prost::Message)]
 pub(crate) struct BinaryTensorOpMetadata {

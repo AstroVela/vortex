@@ -5,12 +5,14 @@
 //!
 //! [`Normalized`] defines the physical layout and its invariants. Use [`normalize`] to create an
 //! exact split. [`L2Norm`], [`InnerProduct`], and [`CosineSimilarity`] can operate on the split
-//! without decoding it first.
+//! without decoding it first. Norm-based functions use [`NormMode`] to decide whether they measure
+//! the stored direction or trust its normalized-direction claim.
 //!
 //! [`normalize`]: crate::encodings::normalized::normalize
 //! [`L2Norm`]: crate::scalar_fns::l2_norm::L2Norm
 //! [`InnerProduct`]: crate::scalar_fns::inner_product::InnerProduct
 //! [`CosineSimilarity`]: crate::scalar_fns::cosine_similarity::CosineSimilarity
+//! [`NormMode`]: crate::scalar_fns::NormMode
 
 mod array;
 pub use array::Normalized;

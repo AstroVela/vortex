@@ -29,7 +29,6 @@ use vortex_array::match_each_float_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
-use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ExecutionArgs;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
@@ -45,6 +44,7 @@ use vortex_session::registry::CachedId;
 
 use crate::encodings::normalized::Normalized;
 use crate::matcher::AnyTensor;
+use crate::scalar_fns::NormMode;
 use crate::utils::extract_flat_elements;
 use crate::utils::extract_normalized_children;
 use crate::utils::reattach_validity;
@@ -57,10 +57,10 @@ use crate::utils::validate_tensor_float_input;
 /// The input must be a tensor-like extension array with a float element type. The output is a float
 /// column of the same float type.
 ///
-/// When the input is [`Normalized`]-encoded, this operator treats the stored norms as
-/// authoritative. For lossy normalized children, that means `L2Norm` intentionally reads the
-/// stored norms instead of re-deriving them from fully decoded coordinates. That behavior is part
-/// of the storage contract, not a separate lossy-compute mode.
+/// [`NormMode::Exact`] measures the physical direction stored by a [`Normalized`] encoding and
+/// multiplies that result by the stored norm. [`NormMode::AssumeNormalized`] instead trusts that
+/// direction as unit length and returns the stored norm directly. The approximate mode does not
+/// provide an error bound for unchecked or lossy encodings.
 ///
 /// [`Normalized`]: crate::encodings::normalized::Normalized
 #[derive(Clone)]
@@ -71,19 +71,31 @@ impl L2Norm {
     ///
     /// # Errors
     ///
-    /// Returns an error if the [`ScalarFnArray`] cannot be constructed (e.g. due to dtype
-    /// mismatches).
-    pub fn try_new(child: ArrayRef) -> VortexResult<ScalarFnArray> {
-        ScalarFnArray::try_new(L2Norm.bind(EmptyOptions), vec![child])
+    /// Returns an error if the [`ScalarFnArray`] cannot be constructed because its input is not a
+    /// float tensor.
+    pub fn try_new(child: ArrayRef, mode: NormMode) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(L2Norm.bind(mode), vec![child])
     }
 }
 
 impl ScalarFnVTable for L2Norm {
-    type Options = EmptyOptions;
+    type Options = NormMode;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.tensor.l2_norm");
         *ID
+    }
+
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(options.serialize()))
+    }
+
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        NormMode::deserialize(metadata)
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -108,7 +120,7 @@ impl ScalarFnVTable for L2Norm {
 
     fn execute(
         &self,
-        _options: &Self::Options,
+        options: &Self::Options,
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
@@ -118,19 +130,39 @@ impl ScalarFnVTable for L2Norm {
         let ext = input_ref.dtype().as_extension();
         let tensor_match = ext
             .metadata_opt::<AnyTensor>()
-            .vortex_expect("we already validated this in `return_dtype`");
+            .vortex_expect("the input dtype was validated in `return_dtype`");
         let tensor_flat_size = tensor_match.list_size() as usize;
         let element_ptype = tensor_match.element_ptype();
 
         let norm_dtype = DType::Primitive(element_ptype, ext.nullability());
 
-        // Stored norms are authoritative. Reattach the parent validity because the child is
-        // non-nullable.
         if input_ref.is::<Normalized>() {
-            let (_, norms) = extract_normalized_children(&input_ref);
-            let norms = reattach_validity(norms, input_ref.validity()?)?;
-            vortex_ensure_eq!(norms.dtype(), &norm_dtype);
-            return Ok(norms);
+            let (direction, stored_norms) = extract_normalized_children(&input_ref);
+            if options.assumes_normalized() {
+                let norms = reattach_validity(stored_norms, input_ref.validity()?)?;
+                vortex_ensure_eq!(norms.dtype(), &norm_dtype);
+
+                return Ok(norms);
+            }
+
+            let direction_norms: PrimitiveArray = L2Norm::try_new(direction, NormMode::Exact)?
+                .into_array()
+                .execute(ctx)?;
+            let stored_norms: PrimitiveArray = stored_norms.execute(ctx)?;
+            let validity = input_ref.validity()?;
+
+            return match_each_float_ptype!(element_ptype, |T| {
+                let direction_norms = direction_norms.as_slice::<T>();
+                let stored_norms = stored_norms.as_slice::<T>();
+                let norms: Buffer<T> = direction_norms
+                    .iter()
+                    .zip(stored_norms)
+                    .map(|(&direction_norm, &stored_norm)| direction_norm * stored_norm)
+                    .collect();
+
+                // SAFETY: The buffer has one value per input row, matching `validity`.
+                Ok(unsafe { PrimitiveArray::new_unchecked(norms, validity) }.into_array())
+            });
         }
 
         // Optimize for the constant array case.
@@ -144,10 +176,11 @@ impl ScalarFnVTable for L2Norm {
             let norm_scalar = match_each_float_ptype!(element_ptype, |T| {
                 let values: Vec<T> = elements
                     .iter()
-                    .map(|s| {
-                        s.as_primitive()
+                    .map(|scalar| {
+                        scalar
+                            .as_primitive()
                             .as_::<T>()
-                            .vortex_expect("element was somehow not the correct float")
+                            .vortex_expect("the input dtype established float elements")
                     })
                     .collect();
                 let norm = l2_norm_row::<T>(&values);
@@ -194,13 +227,20 @@ impl ScalarFnVTable for L2Norm {
     }
 }
 
-/// Metadata for a serialized [`L2Norm`] array: the single `input` child's [`DType`], which carries
-/// the extension type (`FixedShapeTensor` vs `Vector`), dimension, and nullability that are not
-/// recoverable from the parent's primitive-float output.
+/// Metadata for a serialized [`L2Norm`] array.
+///
+/// `assume_normalized` is optional so metadata written before [`NormMode`] remains readable.
 #[derive(Clone, prost::Message)]
 pub(super) struct L2NormMetadata {
+    /// The input dtype needed to deserialize the child.
     #[prost(message, optional, tag = "1")]
     input_dtype: Option<pb::DType>,
+
+    /// Whether execution trusts normalized encoding evidence.
+    ///
+    /// `None` preserves the behavior of metadata written before [`NormMode`] was explicit.
+    #[prost(bool, optional, tag = "2")]
+    assume_normalized: Option<bool>,
 }
 
 impl ScalarFnArrayVTable for L2Norm {
@@ -211,7 +251,12 @@ impl ScalarFnArrayVTable for L2Norm {
     ) -> VortexResult<Option<Vec<u8>>> {
         let scalar_fn_array = view.as_::<ScalarFnArrayEncoding>();
         let input_dtype = Some(scalar_fn_array.child_at(0).dtype().try_into()?);
-        Ok(Some(L2NormMetadata { input_dtype }.encode_to_vec()))
+        let metadata = L2NormMetadata {
+            input_dtype,
+            assume_normalized: Some(view.options.assumes_normalized()),
+        };
+
+        Ok(Some(metadata.encode_to_vec()))
     }
 
     fn deserialize(
@@ -230,8 +275,9 @@ impl ScalarFnArrayVTable for L2Norm {
             .ok_or_else(|| vortex_err!("L2NormMetadata missing input_dtype"))?;
         let input_dtype = DType::from_proto(input_pb, session)?;
         let child = children.get(0, &input_dtype, len)?;
+
         Ok(ScalarFnArrayParts {
-            options: EmptyOptions,
+            options: NormMode::from_serialized(metadata.assume_normalized),
             children: vec![child],
         })
     }
@@ -251,6 +297,7 @@ fn l2_norm_row<T: Float + NativePType>(v: &[T]) -> T {
 #[cfg(test)]
 mod tests {
 
+    use prost::Message;
     use rstest::rstest;
     use vortex_array::ArrayPlugin;
     use vortex_array::ArrayRef;
@@ -261,16 +308,20 @@ mod tests {
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::MaskedArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::scalar_fn::ExactScalarFn;
     use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::dtype::extension::ExtDType;
+    use vortex_array::matcher::Matcher;
     use vortex_array::scalar::Scalar;
     use vortex_array::validity::Validity;
     use vortex_error::VortexResult;
 
+    use super::L2NormMetadata;
     use crate::encodings::normalized::Normalized;
+    use crate::scalar_fns::NormMode;
     use crate::scalar_fns::l2_norm::L2Norm;
     use crate::tests::SESSION;
     use crate::types::vector::Vector;
@@ -281,7 +332,11 @@ mod tests {
 
     /// Evaluates L2 norm on a tensor/vector array and returns the result as `Vec<f64>`.
     fn eval_l2_norm(input: ArrayRef) -> VortexResult<Vec<f64>> {
-        let result = L2Norm::try_new(input)?;
+        eval_l2_norm_with_mode(input, NormMode::Exact)
+    }
+
+    fn eval_l2_norm_with_mode(input: ArrayRef, mode: NormMode) -> VortexResult<Vec<f64>> {
+        let result = L2Norm::try_new(input, mode)?;
         let mut ctx = SESSION.create_execution_ctx();
         let prim: PrimitiveArray = result.into_array().execute(&mut ctx)?;
         Ok(prim.as_slice::<f64>().to_vec())
@@ -335,7 +390,7 @@ mod tests {
         let arr = tensor_array(&[2], &[3.0, 4.0, 0.0, 0.0])?;
         let arr = MaskedArray::try_new(arr, Validity::from_iter([true, false]))?.into_array();
 
-        let result = L2Norm::try_new(arr)?;
+        let result = L2Norm::try_new(arr, NormMode::Exact)?;
         let mut ctx = SESSION.create_execution_ctx();
         let prim: PrimitiveArray = result.into_array().execute(&mut ctx)?;
 
@@ -354,7 +409,7 @@ mod tests {
     fn constant_non_null_input_yields_constant_output() -> VortexResult<()> {
         let input = literal_vector_array(&[3.0f64, 4.0], 4);
 
-        let result = L2Norm::try_new(input)?.into_array();
+        let result = L2Norm::try_new(input, NormMode::Exact)?.into_array();
         let mut ctx = SESSION.create_execution_ctx();
         let output = result.execute_until::<Constant>(&mut ctx)?;
 
@@ -384,7 +439,7 @@ mod tests {
         let null_scalar = Scalar::null(DType::Extension(ext_dtype));
         let input = ConstantArray::new(null_scalar, 3).into_array();
 
-        let result = L2Norm::try_new(input)?.into_array();
+        let result = L2Norm::try_new(input, NormMode::Exact)?.into_array();
         let mut ctx = SESSION.create_execution_ctx();
         let output = result.execute_until::<Constant>(&mut ctx)?;
 
@@ -409,7 +464,7 @@ mod tests {
         let validity = Validity::from_iter([true, false]);
         let input = Normalized::try_new(normalized, norms, validity, &mut ctx)?.into_array();
 
-        let result = L2Norm::try_new(input)?.into_array();
+        let result = L2Norm::try_new(input, NormMode::Exact)?.into_array();
         let prim: PrimitiveArray = result.execute(&mut ctx)?;
 
         assert_eq!(
@@ -423,30 +478,81 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mode_controls_lossy_direction_norm() -> VortexResult<()> {
+        let direction = vector_array(2, &[0.8f64, 0.0])?;
+        let stored_norms = PrimitiveArray::from_iter([5.0f64]).into_array();
+        // SAFETY: The children satisfy the structural requirements. This fixture intentionally
+        // supplies a lossy direction whose physical norm is 0.8.
+        let input =
+            unsafe { Normalized::new_unchecked(direction, stored_norms, Validity::NonNullable) }
+                .into_array();
+
+        assert_close(
+            &eval_l2_norm_with_mode(input.clone(), NormMode::Exact)?,
+            &[4.0],
+        );
+        assert_close(
+            &eval_l2_norm_with_mode(input, NormMode::AssumeNormalized)?,
+            &[5.0],
+        );
+        Ok(())
+    }
+
     #[rstest]
     #[case::fixed_shape_tensor(l2_norm_tensor_child())]
     #[case::vector(l2_norm_vector_child())]
     fn serde_round_trip(#[case] child: ArrayRef) -> VortexResult<()> {
-        let original = L2Norm::try_new(child.clone())?.into_array();
+        let plugin = ScalarFnArrayPlugin::new(L2Norm);
+        for mode in [NormMode::Exact, NormMode::AssumeNormalized] {
+            let original = L2Norm::try_new(child.clone(), mode)?.into_array();
+            let metadata = plugin
+                .serialize(&original, &SESSION)?
+                .expect("L2Norm serialize must produce metadata");
+            let children = vec![child.clone()];
+            let recovered = plugin.deserialize(
+                original.dtype(),
+                original.len(),
+                &metadata,
+                &[],
+                &children,
+                &SESSION,
+            )?;
 
+            let recovered_view = ExactScalarFn::<L2Norm>::try_match(&recovered)
+                .expect("deserialized array must retain its scalar function");
+            assert_eq!(*recovered_view.options, mode);
+            assert_eq!(recovered.dtype(), original.dtype());
+            assert_eq!(recovered.len(), original.len());
+            assert_eq!(recovered.encoding_id(), original.encoding_id());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_metadata_uses_assume_normalized_mode() -> VortexResult<()> {
+        let child = l2_norm_vector_child();
+        let original = L2Norm::try_new(child.clone(), NormMode::Exact)?.into_array();
         let plugin = ScalarFnArrayPlugin::new(L2Norm);
         let metadata = plugin
             .serialize(&original, &SESSION)?
             .expect("L2Norm serialize must produce metadata");
+        let mut metadata = L2NormMetadata::decode(metadata.as_slice())?;
+        metadata.assume_normalized = None;
 
-        let children = vec![child];
         let recovered = plugin.deserialize(
             original.dtype(),
             original.len(),
-            &metadata,
+            &metadata.encode_to_vec(),
             &[],
-            &children,
+            &[child],
             &SESSION,
         )?;
 
-        assert_eq!(recovered.dtype(), original.dtype());
-        assert_eq!(recovered.len(), original.len());
-        assert_eq!(recovered.encoding_id(), original.encoding_id());
+        let recovered_view = ExactScalarFn::<L2Norm>::try_match(&recovered)
+            .expect("deserialized array must retain its scalar function");
+        assert_eq!(*recovered_view.options, NormMode::AssumeNormalized);
         Ok(())
     }
 

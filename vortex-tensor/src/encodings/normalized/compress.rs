@@ -41,6 +41,7 @@ use crate::encodings::normalized::NormalizedArraySlotsExt;
 use crate::encodings::normalized::NormalizedSlots;
 use crate::encodings::normalized::array::DATA_CHILDREN;
 use crate::matcher::AnyTensor;
+use crate::scalar_fns::NormMode;
 use crate::scalar_fns::l2_norm::L2Norm;
 use crate::utils::extract_constant_flat_row;
 use crate::utils::extract_flat_elements;
@@ -137,7 +138,9 @@ pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Normal
         return Ok(wrapped);
     }
 
-    let norms_array: ArrayRef = L2Norm::try_new(input.clone())?.into_array().execute(ctx)?;
+    let norms_array: ArrayRef = L2Norm::try_new(input.clone(), NormMode::Exact)?
+        .into_array()
+        .execute(ctx)?;
 
     // Execute before reading validity. Reading validity from the lazy array would run `L2Norm`
     // again when the values are requested.
