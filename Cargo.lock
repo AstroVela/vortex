@@ -7292,6 +7292,7 @@ name = "random-access-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "indicatif",
  "lance-bench",
@@ -7299,6 +7300,7 @@ dependencies = [
  "rand_distr 0.6.0",
  "tabled",
  "tokio",
+ "vortex",
  "vortex-bench",
 ]
 
@@ -9738,6 +9740,7 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-arrow",
+ "vortex-btrblocks",
  "vortex-spatial",
  "vortex-tensor",
  "wkb",

@@ -2093,7 +2093,7 @@ Food selected FloatQuant from a 1.94 sample ratio. Its full ratio was 1.73.
 
 ALP had a 1.80 sample ratio and a 2.51 full ratio on the same chunk.
 
-A provisional 1.10 FloatQuant factor retained every focused FloatQuant selection test and rejected this Food choice.
+A 1.10 FloatQuant factor retained every focused FloatQuant selection test and rejected this Food choice.
 
 The corrected FloatQuant bundle produced this change against the BlockResidual bundle:
 
@@ -2141,25 +2141,150 @@ This corpus does not expose a FloatQuant win under the current factor.
 
 The complete synthetic `f32` and `f64` trees produce strict size and throughput wins.
 
-Retain FloatQuant as an opportunistic Default candidate while the final corpus pass measures its analysis cost.
+The complete corpus shows no selected FloatQuant tree and no stable analysis-cost signal.
+
+Retain FloatQuant as an opportunistic option under the calibrated 1.10 factor.
+
+### Final selector factors
+
+The integer BlockResidual scheme keeps a 1.05 raw-ratio floor and no width-specific factor.
+
+This policy resolves the CMS threshold miss and produces a 2.94 percent complete-corpus size gain.
+
+The Ordered BlockResidual scheme keeps its 1.05 raw floor and 1.02 decode factor.
+
+The nonlinear patch cost rejects the known dense-patch and slow HashTags trees.
+
+No selected-tree evidence supports a higher BlockResidual factor.
+
+The FloatQuant scheme keeps its 1.10 factor.
+
+The Food sample mismatch requires a factor above 1.078 to retain its smaller ALP tree.
+
+The 1.10 value adds a small margin and retains every strict synthetic `f32` and `f64` win.
+
+The 33-column Pco-gap pass exposes no missed real FloatQuant candidate.
+
+The 8-bit BlockResidual trial remains outside this conclusion because the corpus lacks real 8-bit columns.
 
 ### Default bundle options
 
+The final numeric pass uses complete files and three iterations per operation.
+
+It covers Taxi, GloVe, Arade, Bimbo, CMSprovider, Euro2016, Food, and HashTags.
+
+The BlockResidual bundle produces these changes against Prior Default:
+
+| Dataset | Size | Write throughput | Read throughput |
+| --- | ---: | ---: | ---: |
+| Taxi | -6.35 percent | -0.81 percent | +7.23 percent |
+| GloVe | 0.00 percent | -11.09 percent | +0.15 percent |
+| Arade | -2.39 percent | -1.71 percent | +5.70 percent |
+| Bimbo | -8.90 percent | -1.56 percent | -5.49 percent |
+| CMSprovider | -7.94 percent | -1.40 percent | -8.51 percent |
+| Euro2016 | -2.71 percent | +8.26 percent | -1.98 percent |
+| Food | -7.79 percent | +1.95 percent | +6.08 percent |
+| HashTags | -3.22 percent | +10.67 percent | -7.45 percent |
+| Geometric mean | -4.96 percent | +0.34 percent | -0.71 percent |
+
+Total bytes decrease by 6.18 percent across the eight files.
+
+Total write time increases by 0.49 percent. Total read time increases by 3.39 percent.
+
+The GloVe write result conflicts with adjacent runs that reverse the difference.
+
+GloVe retains the same tree and size. Treat its write result as benchmark noise.
+
+The remaining eight files contain two TPC-H comment layouts and six nested wide-table cases.
+
+Both TPC-H files become 3.45 percent smaller through BlockResidual descendants.
+
+All six wide-table files retain identical sizes.
+
+Across all 16 files, the BlockResidual bundle produces these changes:
+
+| Metric | Geometric-mean change | Aggregate change |
+| --- | ---: | ---: |
+| Size | -2.94 percent | -5.30 percent |
+| Write throughput | -1.22 percent | -0.60 percent |
+| Read throughput | -1.21 percent | -2.62 percent |
+
 The evidence supports three bundle options:
 
-| Option | Schemes | Comparison | Size | Write throughput | Read throughput |
-| --- | --- | --- | ---: | ---: | ---: |
-| Conservative | BlockResidual | Prior Default | -1.6 percent | -0.9 percent | +1.3 percent |
-| Opportunistic | BlockResidual and FloatQuant | Conservative | 0.0 percent | -0.9 percent | Noise |
-| Size-seeking experiment | Opportunistic plus fixed bins | Opportunistic | -0.027 percent | -0.3 percent | Noise |
+| Option | Schemes | Scope | Comparison | Size | Write throughput | Read throughput |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| Conservative | BlockResidual | 16 files | Prior Default | -2.94 percent | -1.22 percent | -1.21 percent |
+| Opportunistic | BlockResidual and FloatQuant | 16 files | Conservative | 0.00 percent | Noise | Noise |
+| Fixed-bin experiment | Opportunistic plus RangePacked | 8 numeric files | Opportunistic | -0.054 percent | -1.03 percent | Noise |
 
-The conservative option avoids FloatQuant analysis when the workload lacks a matching distribution.
+The conservative option pushes the size frontier without a material geometric-mean throughput loss.
 
-The opportunistic option accepts that analysis cost for large wins on matching `f32` and `f64` data.
+The opportunistic option selects no FloatQuant tree in these eight files.
 
-Its selected synthetic trees improve size, write throughput, and read throughput.
+Focused synthetic `f32` and `f64` inputs still produce strict FloatQuant size and throughput wins.
 
-The fixed-bin option lacks enough corpus benefit for Default.
+The fixed-bin option changes only HashTags `interaction#received_at`.
+
+Its numeric subset is 5.99 percent smaller, but the selected tree has material access costs.
+
+The tree decodes at about 10.1 GB/s instead of 15.6 to 16.1 GB/s.
+
+Scalar access takes 312 to 323 ns instead of 150 to 158 ns.
+
+RangePacked therefore remains outside Default.
+
+### Default bundle random access
+
+The random-access benchmark now writes one Vortex file for each numeric bundle.
+
+The cached-handle pass uses correlated and uniform patterns with about 100 requested rows.
+
+| Dataset and pattern | Prior Default latency | Current Default latency | Change |
+| --- | ---: | ---: | ---: |
+| Taxi correlated | 0.609 ms | 0.624 ms | +2.45 percent |
+| Taxi uniform | 2.760 ms | 2.807 ms | +1.68 percent |
+| Nested lists correlated | 0.154 ms | 0.148 ms | -3.95 percent |
+| Nested lists uniform | 0.922 ms | 0.922 ms | -0.06 percent |
+| Nested structs correlated | 0.216 ms | 0.220 ms | +1.94 percent |
+| Nested structs uniform | 0.532 ms | 0.544 ms | +2.20 percent |
+| Geometric mean | — | — | +0.69 percent |
+
+The six standard patterns remain within four percent of Prior Default.
+
+Taxi file size decreases by 6.35 percent. Nested-list file size decreases by 0.71 percent.
+
+The nested-struct files have identical sizes.
+
+The legacy six-index Taxi case improves from 1.587 ms to 1.325 ms.
+
+This small target is more sensitive to run noise than the 100-row patterns.
+
+BlockResidual, Current Default, and RangePacked remain within 2.5 percent on both Taxi 100-row patterns.
+
+The random-access suite does not include the Public BI files.
+
+Selected-tree scalar benchmarks remain the direct evidence for Bimbo, CMSprovider, Euro2016, Food, and HashTags.
+
+Add Public BI file access only if bundle adoption needs broader late-materialization evidence.
+
+### Compact and Parquet size constraint
+
+The format pass uses three iterations per operation.
+
+| Scope and comparison for Current Default | Size | Write time | Read time |
+| --- | ---: | ---: | ---: |
+| 8 numeric files versus Compact | +38.66 percent | -13.42 percent | -66.63 percent |
+| 8 numeric files versus Parquet with Zstd | -1.11 percent | -65.37 percent | -96.08 percent |
+| Complete 16 files versus Compact | +21.85 percent | -11.69 percent | -55.35 percent |
+| Complete 16 files versus Parquet with Zstd | -1.67 percent | -34.80 percent | -85.82 percent |
+
+Current Default remains 1.67 percent smaller than Parquet with Zstd across the complete corpus.
+
+It writes 1.5 times faster and reads 7.1 times faster than Parquet with Zstd.
+
+Compact remains 17.9 percent smaller than Current Default across the complete corpus.
+
+Current Default writes 13.2 percent faster and reads 2.2 times faster than Compact.
 
 Quick rejection reduces analysis cost and strengthens a candidate.
 
@@ -2426,7 +2551,7 @@ This round completed these steps:
 - Added explicit winner result events to the compressor trace.
 - Added optional chunk-level encoding trees to the focused compressor benchmark.
 - Rejected constant FloatQuant samples before exact sample encoding.
-- Added a provisional 1.10 FloatQuant selection factor.
+- Added and calibrated a 1.10 FloatQuant selection factor.
 - Replaced FloatQuant sample packing with an exact buffer-size estimate.
 - Added isolated FloatQuant rejection controls for all float widths.
 - Added adjusted-ratio near-miss controls for `f32` and `f64`.
@@ -2439,6 +2564,10 @@ This round completed these steps:
 - Compared retained fixed-bin candidates against the completed incumbent sample cascade.
 - Removed every known Bimbo, CMSprovider, Euro2016, and Taxi fixed-bin false win.
 - Tested FloatQuant on 33 real float columns from five Pco-gap inputs.
+- Revalidated the final bundles across eight numeric files and all 16 corpus files.
+- Revalidated Current Default against Compact and Parquet with Zstd across all 16 files.
+- Added numeric bundle controls to the random-access benchmark.
+- Compared cached random access across Taxi and two nested datasets.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2452,11 +2581,12 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Compare the conservative and opportunistic Default bundles on the final corpus.
-2. Calibrate the FloatQuant factor from complete corpus and selected-tree evidence.
-3. Prefer cheap rejection tests when they preserve the best candidate model.
-4. Treat fast rejection as a selection advantage, not an admission criterion.
-5. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Add real `i8` and `u8` columns to the corpus.
+2. Calibrate 8-bit BlockResidual eligibility with those real columns.
+3. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
+4. Prefer cheap rejection tests when they preserve the best candidate model.
+5. Treat fast rejection as a selection advantage, not an admission criterion.
+6. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
@@ -2464,19 +2594,13 @@ Let ordinary child arrays own patches and exception payloads.
 
 Add an outer OrderedFloat fused decode only if the generic composition misses the decode gate.
 
-Add real `i8` and `u8` columns to the corpus. Use them to decide 8-bit eligibility and threshold calibration.
-
 Keep fused RangePacked and RangeEntropy outside Default.
 
 After the candidate set stabilizes, complete these final steps:
 
-1. Run the complete compression corpus.
-2. Compare the final geometric mean against Compact and Parquet with Zstd.
-3. Calibrate all selector thresholds from complete corpus and selected-tree evidence.
-4. Revisit the BlockResidual factors with selected-tree evidence.
-5. Add a true ALP-RD child composition case if a real selected tree exposes one.
-6. Add more real embedding datasets when licenses and loaders permit them.
-7. Update this plan after each experiment.
+1. Add a true ALP-RD child composition case if a real selected tree exposes one.
+2. Add more real embedding datasets when licenses and loaders permit them.
+3. Update this plan after each experiment.
 
 ## Pull request structure
 

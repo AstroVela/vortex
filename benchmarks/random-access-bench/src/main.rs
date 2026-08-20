@@ -4,12 +4,17 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use clap::Parser;
 use clap::ValueEnum;
 use random_access_bench::AccessPattern;
 use random_access_bench::OpenMode;
 use random_access_bench::RunConfig;
+use vortex::file::WriteOptionsSessionExt;
 use vortex_bench::Format;
+use vortex_bench::SESSION;
+use vortex_bench::VortexNumericBundle;
+use vortex_bench::conversions::write_parquet_as_vortex_with_options;
 use vortex_bench::datasets::feature_vectors::FeatureVectorsData;
 use vortex_bench::datasets::nested_lists::NestedListsData;
 use vortex_bench::datasets::nested_structs::NestedStructsData;
@@ -39,6 +44,34 @@ impl DatasetArg {
             Self::NestedLists => Box::new(NestedListsData),
             Self::NestedStructs => Box::new(NestedStructsData),
         }
+    }
+}
+
+struct NumericBundleDataset {
+    dataset: Box<dyn BenchDataset>,
+    bundle: VortexNumericBundle,
+}
+
+#[async_trait]
+impl BenchDataset for NumericBundleDataset {
+    fn name(&self) -> &str {
+        self.dataset.name()
+    }
+
+    fn row_count(&self) -> u64 {
+        self.dataset.row_count()
+    }
+
+    async fn path(&self, format: Format) -> Result<PathBuf> {
+        if format != Format::OnDiskVortex {
+            return self.dataset.path(format).await;
+        }
+
+        let parquet_path = self.dataset.path(Format::Parquet).await?;
+        let name = self.dataset.name();
+        let path = format!("random_access/{name}/{name}-{}.vortex", self.bundle.name());
+        let options = self.bundle.apply_options(SESSION.write_options());
+        write_parquet_as_vortex_with_options(parquet_path, &path, options).await
     }
 }
 
@@ -85,6 +118,9 @@ struct Args {
     /// Whether to reopen the file on each iteration, use a cached handle, or run both.
     #[arg(long, value_enum, default_value_t = OpenMode::Both)]
     open_mode: OpenMode,
+    /// Select the numeric scheme bundle for Vortex files.
+    #[arg(long, value_enum, default_value_t)]
+    vortex_numeric_bundle: VortexNumericBundle,
 }
 
 #[tokio::main]
@@ -97,6 +133,12 @@ async fn main() -> Result<()> {
             .datasets
             .into_iter()
             .map(DatasetArg::into_dataset)
+            .map(|dataset| {
+                Box::new(NumericBundleDataset {
+                    dataset,
+                    bundle: args.vortex_numeric_bundle,
+                }) as Box<dyn BenchDataset>
+            })
             .collect(),
         formats: args.formats,
         patterns: args.patterns,

@@ -34,6 +34,11 @@ use vortex::error::vortex_err;
 use vortex::file::VortexWriteOptions;
 use vortex::file::WriteStrategyBuilder;
 use vortex::utils::aliases::hash_map::HashMap;
+use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::float::FloatQuantScheme;
+use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
+use vortex_btrblocks::schemes::float::OrderedFloatRangePackedScheme;
+use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 
 use crate::spatialbench::SpatialBenchBenchmark;
 use crate::vortex_queries::VortexBenchmark;
@@ -237,6 +242,57 @@ pub enum CompactionStrategy {
     Compact,
     #[default]
     Default,
+}
+
+const RANGE_PACKED_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.20);
+
+/// Numeric scheme bundles for compression benchmarks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum VortexNumericBundle {
+    /// Exclude the new numeric schemes.
+    PriorDefault,
+    /// Add the integer and ordered-float BlockResidual schemes.
+    BlockResidual,
+    /// Use the current Default compressor.
+    #[default]
+    CurrentDefault,
+    /// Add the experimental OrderedFloat with RangePacked scheme.
+    RangePacked,
+}
+
+impl VortexNumericBundle {
+    /// Return the stable CLI and file-name component for this bundle.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PriorDefault => "prior-default",
+            Self::BlockResidual => "block-residual",
+            Self::CurrentDefault => "current-default",
+            Self::RangePacked => "range-packed",
+        }
+    }
+
+    /// Apply this numeric bundle to Vortex write options.
+    pub fn apply_options(self, options: VortexWriteOptions) -> VortexWriteOptions {
+        let compressor = match self {
+            Self::PriorDefault => BtrBlocksCompressorBuilder::default().exclude_schemes([
+                FloatQuantScheme.id(),
+                OrderedBlockResidualScheme.id(),
+                BlockResidualScheme.id(),
+            ]),
+            Self::BlockResidual => {
+                BtrBlocksCompressorBuilder::default().exclude_schemes([FloatQuantScheme.id()])
+            }
+            Self::CurrentDefault => BtrBlocksCompressorBuilder::default(),
+            Self::RangePacked => {
+                BtrBlocksCompressorBuilder::default().with_new_scheme(&RANGE_PACKED_SCHEME)
+            }
+        };
+        options.with_strategy(
+            WriteStrategyBuilder::default()
+                .with_btrblocks_builder(compressor)
+                .build(),
+        )
+    }
 }
 
 impl CompactionStrategy {

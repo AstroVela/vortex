@@ -37,7 +37,7 @@ use crate::Scheme;
 use crate::normalize_null_values;
 use crate::schemes::sample_primitive_one_percent;
 
-// Prefer incumbents on close fits. FloatQuant sample estimates can overstate full-array gains.
+// Food needs a factor above 1.078 to prevent its sample from displacing a smaller ALP tree.
 const SELECTION_COST_FACTOR: f64 = 1.10;
 
 /// FloatQuant split with a fixed frame-of-reference primary child.
