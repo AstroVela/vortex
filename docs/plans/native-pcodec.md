@@ -349,10 +349,12 @@ These cases use canonical primitive children. They isolate each outer array tran
 | IntMult base-ten `u16` | 1.42 GB/s | 30.59 GB/s | 160 ns |
 | IntMult base-ten `u32` | 2.84 GB/s | 30.51 GB/s | 136 ns |
 | IntMult base-ten `u64` | 5.66 GB/s | 24.57 GB/s | 150 ns |
-| FloatQuant zero-secondary `f16` | 6.84 GB/s | 31.24 GB/s | 80 ns |
-| FloatQuant zero-secondary `f32` | 11.66 GB/s | 31.17 GB/s | 83 ns |
-| FloatQuant zero-secondary `f64` | 19.02 GB/s | 25.15 GB/s | 83 ns |
-| FloatQuant one-bit-secondary `f64` | 9.26 GB/s | 8.14 GB/s | 167 ns |
+| FloatQuant zero-secondary `f16` | 7.62 GB/s | 33.02 GB/s | 83 ns |
+| FloatQuant zero-secondary `f32` | 13.63 GB/s | 33.58 GB/s | 75 ns |
+| FloatQuant zero-secondary `f64` | 20.90 GB/s | 26.88 GB/s | 82 ns |
+| FloatQuant one-bit-secondary `f16` | 2.41 GB/s | 2.98 GB/s | 118 ns |
+| FloatQuant one-bit-secondary `f32` | 4.87 GB/s | 4.57 GB/s | 136 ns |
+| FloatQuant one-bit-secondary `f64` | 9.18 GB/s | 8.23 GB/s | 148 ns |
 
 IntMult encode includes quotient and remainder creation. It excludes compression of both children.
 
@@ -383,15 +385,19 @@ These cases include the current compressed children and fused decode paths.
 | OrderedFloat with BlockResidual `f16` | 1.26 GB/s | 20.50 GB/s | 79 ns |
 | OrderedFloat with BlockResidual `f32` | 2.43 GB/s | 29.64 GB/s | 78 ns |
 | OrderedFloat with BlockResidual `f64` | 2.70 GB/s | 20.44 GB/s | 125 ns |
-| FloatQuant with packed primary `f16` | 3.42 GB/s | 19.39 GB/s | 129 ns |
-| FloatQuant with packed primary `f32` | 7.59 GB/s | 18.21 GB/s | 125 ns |
-| FloatQuant with packed primary `f64` | 8.30 GB/s | 14.77 GB/s | 125 ns |
-| FloatQuant with two packed children `f64` | 4.21 GB/s | 13.05 GB/s | 209 ns |
+| FloatQuant with packed primary `f16` | 3.21 GB/s | 20.05 GB/s | 125 ns |
+| FloatQuant with packed primary `f32` | 5.72 GB/s | 19.79 GB/s | 129 ns |
+| FloatQuant with packed primary `f64` | 7.76 GB/s | 15.69 GB/s | 125 ns |
+| FloatQuant with two packed children `f16` | 3.11 GB/s | 16.75 GB/s | 174 ns |
+| FloatQuant with two packed children `f32` | 5.17 GB/s | 16.30 GB/s | 183 ns |
+| FloatQuant with two packed children `f64` | 6.72 GB/s | 13.13 GB/s | 208 ns |
 | Decomposed fixed bins `u64` | 1.20 GB/s | 14.27 GB/s | 332 ns |
 
-The FloatQuant scheme includes analysis and direct tree construction.
+The FloatQuant production encode rows use the single-scheme compressor.
 
-It encodes at 5.19 GB/s for `f32` and 7.07 GB/s for `f64` on selected inputs.
+They include sample analysis and direct packing of the final child tree.
+
+The paired decoder remains within 18 percent of the zero-secondary decoder for every float width.
 
 The packed IntMult tree uses a base of ten and patch-free BitPacked children.
 
@@ -498,6 +504,30 @@ No other tested Pcodec or Public BI column selected the two-child tree.
 Rejected analysis changed encode throughput by less than one percent on most measured datasets.
 
 Retain the two-child form in the default candidate set for final corpus calibration.
+
+### All-width two-child FloatQuant revalidation
+
+The August 20 pass added two-child benchmarks for `f16` and `f32`.
+
+Each case changes the lowest bit for ten percent of two million quantized values.
+
+| Input | Incumbent bytes | Candidate bytes | Size change | Encode change | Decode change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `f16` | 1,751,040 | 1,751,040 | 0.0 percent | -0.3 percent | +0.2 percent |
+| `f32` | 5,752,576 | 4,001,792 | -30.4 percent | +29.6 percent | +43.1 percent |
+| `f64` | 14,057,966 | 9,004,032 | -36.0 percent | +10.0 percent | +14.2 percent |
+
+The `f16` selector retains `Dict(BitPacked, Primitive)`.
+
+The `f32` and `f64` selectors choose `FloatQuant(FoR(BitPacked), BitPacked)`.
+
+The paired decoder stays within 18 percent of the zero-secondary decoder for all three widths.
+
+Paired scalar access uses 174 ns for `f16`, 183 ns for `f32`, and 208 ns for `f64`.
+
+The two selected complete trees improve size, encode throughput, and decode throughput.
+
+This evidence supports the opportunistic FloatQuant bundle despite the zero-selection real corpus pass.
 
 ### OrderedFloat with BlockResidual on random walks
 
@@ -1987,7 +2017,7 @@ The write result measures FloatQuant analysis without a size win in this corpus.
 
 FloatQuant remains a production array and a BtrBlocks candidate.
 
-Default inclusion now requires a real Pco-gap win with the 1.10 factor.
+Default inclusion requires evidence that justifies its analysis cost.
 
 ### Real Pco-gap FloatQuant pass
 
@@ -2015,9 +2045,33 @@ Compact retains material size gains on many float columns in these files.
 
 The Pco mode profile attributes those gaps to classic bins, IntMult, and FloatMult.
 
-This result does not support FloatQuant in Default under the current factor.
+This corpus does not expose a FloatQuant win under the current factor.
 
-Retain the production array while the final candidate review decides the scheme policy.
+The complete synthetic `f32` and `f64` trees produce strict size and throughput wins.
+
+Retain FloatQuant as an opportunistic Default candidate while the final corpus pass measures its analysis cost.
+
+### Default bundle options
+
+The evidence supports three bundle options:
+
+| Option | Schemes | Comparison | Size | Write throughput | Read throughput |
+| --- | --- | --- | ---: | ---: | ---: |
+| Conservative | BlockResidual | Prior Default | -1.6 percent | -0.9 percent | +1.3 percent |
+| Opportunistic | BlockResidual and FloatQuant | Conservative | 0.0 percent | -0.9 percent | Noise |
+| Size-seeking experiment | Opportunistic plus fixed bins | Opportunistic | -0.027 percent | -0.3 percent | Noise |
+
+The conservative option avoids FloatQuant analysis when the workload lacks a matching distribution.
+
+The opportunistic option accepts that analysis cost for large wins on matching `f32` and `f64` data.
+
+Its selected synthetic trees improve size, write throughput, and read throughput.
+
+The fixed-bin option lacks enough corpus benefit for Default.
+
+Quick rejection reduces analysis cost and strengthens a candidate.
+
+It is not an admission rule. A costly candidate requires stronger size and throughput evidence.
 
 ### Multi-reference block prototype
 
@@ -2248,6 +2302,9 @@ This round completed these steps:
 - Added direct paired FastLanes packing for both FloatQuant children.
 - Added fused two-child FloatQuant decode and width-sweep benchmarks.
 - Validated selected and rejected two-child FloatQuant paths.
+- Added two-child FloatQuant benchmarks for `f16`, `f32`, and `f64`.
+- Confirmed strict complete-tree wins for the selected `f32` and `f64` cases.
+- Confirmed that the `f16` selector retains its smaller dictionary tree.
 - Added Compact as a first-class format in the compression benchmark.
 - Compared the prior Default, proposed Default, Compact, and Parquet across all 16 local datasets.
 - Attributed the largest Compact numeric gaps to Pco modes at the column level.
@@ -2298,9 +2355,9 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Decide the FloatQuant scheme policy from the no-selection corpus evidence.
-2. Measure rejected-candidate analysis cost after the candidate set stabilizes.
-3. Prepare final Default bundle options with selected-tree evidence.
+1. Measure rejected-candidate analysis cost after the candidate set stabilizes.
+2. Compare the conservative and opportunistic Default bundles on the final corpus.
+3. Calibrate the FloatQuant factor from complete corpus and selected-tree evidence.
 4. Prefer cheap rejection tests when they preserve the best candidate model.
 5. Treat fast rejection as a selection advantage, not an admission criterion.
 6. Require stronger corpus evidence when a useful scheme needs costly analysis.

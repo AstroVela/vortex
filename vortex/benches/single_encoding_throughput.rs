@@ -181,6 +181,32 @@ fn setup_nonzero_secondary_array() -> PrimitiveArray {
     )
 }
 
+fn setup_nonzero_secondary_f16_array() -> PrimitiveArray {
+    let quantized = setup_quantized_f16_array();
+    PrimitiveArray::from_iter(quantized.as_slice::<f16>().iter().enumerate().map(
+        |(index, value)| {
+            if index % 10 == 0 {
+                f16::from_bits(value.to_bits() | 1)
+            } else {
+                *value
+            }
+        },
+    ))
+}
+
+fn setup_nonzero_secondary_f32_array() -> PrimitiveArray {
+    let quantized = setup_quantized_f32_array();
+    PrimitiveArray::from_iter(quantized.as_slice::<f32>().iter().enumerate().map(
+        |(index, value)| {
+            if index % 10 == 0 {
+                f32::from_bits(value.to_bits() | 1)
+            } else {
+                *value
+            }
+        },
+    ))
+}
+
 fn setup_secondary_width_array(width: u8) -> PrimitiveArray {
     let widened = setup_widened_f32_array();
     let low_mask = (1_u64 << width) - 1;
@@ -494,6 +520,15 @@ fn encode_float_quant_scheme_tree(array: &PrimitiveArray) -> vortex::array::Arra
             &mut SESSION.create_execution_ctx(),
         )
         .unwrap()
+}
+
+fn encode_float_quant_nonzero_secondary_scheme_tree(
+    array: &PrimitiveArray,
+) -> vortex::array::ArrayRef {
+    let encoded = encode_float_quant_scheme_tree(array);
+    let float_quant = encoded.as_::<FloatQuant>();
+    assert!(float_quant.secondary().is_some());
+    encoded
 }
 
 fn encode_prior_default(array: &PrimitiveArray) -> vortex::array::ArrayRef {
@@ -1783,6 +1818,121 @@ fn bench_float_quant_proposed_default_reject_f32(bencher: Bencher) {
     let compressor = BtrBlocksCompressorBuilder::default().build();
     bench_compressor(bencher, setup_general_f32_array(), compressor);
 }
+
+macro_rules! float_quant_nonzero_secondary_benches {
+    (
+        $split_compress:ident,
+        $split_decompress:ident,
+        $split_scalar:ident,
+        $scheme_compress:ident,
+        $tree_decompress:ident,
+        $tree_scalar:ident,
+        $setup:ident,
+        $byte_width:expr
+    ) => {
+        #[divan::bench]
+        fn $split_compress(bencher: Bencher) {
+            let float_array = $setup();
+            let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+
+            with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * $byte_width)
+                .with_inputs(|| &float_array)
+                .bench_refs(|array| FloatQuant::from_primitive(array.as_view(), k).unwrap());
+        }
+
+        #[divan::bench]
+        fn $split_decompress(bencher: Bencher) {
+            let float_array = $setup();
+            let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+            let encoded = FloatQuant::from_primitive(float_array.as_view(), k)
+                .unwrap()
+                .into_array();
+
+            with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * $byte_width)
+                .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+                .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+        }
+
+        #[divan::bench]
+        fn $split_scalar(bencher: Bencher) {
+            let float_array = $setup();
+            let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+            let encoded = FloatQuant::from_primitive(float_array.as_view(), k)
+                .unwrap()
+                .into_array();
+            let next_index = AtomicUsize::new(0);
+
+            bencher
+                .with_inputs(|| {
+                    (
+                        &encoded,
+                        SESSION.create_execution_ctx(),
+                        next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+                    )
+                })
+                .bench_values(|(array, mut ctx, index)| {
+                    array.execute_scalar(index, &mut ctx).unwrap()
+                });
+        }
+
+        #[divan::bench]
+        fn $scheme_compress(bencher: Bencher) {
+            let compressor = BtrBlocksCompressorBuilder::empty()
+                .with_new_scheme(&FloatQuantScheme)
+                .build();
+            bench_compressor(bencher, $setup(), compressor);
+        }
+
+        #[divan::bench]
+        fn $tree_decompress(bencher: Bencher) {
+            let encoded = encode_float_quant_nonzero_secondary_scheme_tree(&$setup());
+
+            with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * $byte_width)
+                .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+                .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+        }
+
+        #[divan::bench]
+        fn $tree_scalar(bencher: Bencher) {
+            let encoded = encode_float_quant_nonzero_secondary_scheme_tree(&$setup());
+            let next_index = AtomicUsize::new(0);
+
+            bencher
+                .with_inputs(|| {
+                    (
+                        &encoded,
+                        SESSION.create_execution_ctx(),
+                        next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+                    )
+                })
+                .bench_values(|(array, mut ctx, index)| {
+                    array.execute_scalar(index, &mut ctx).unwrap()
+                });
+        }
+    };
+}
+
+float_quant_nonzero_secondary_benches!(
+    float_quant_nonzero_secondary_split_compress_f16,
+    float_quant_nonzero_secondary_split_decompress_f16,
+    float_quant_nonzero_secondary_split_scalar_at_f16,
+    float_quant_nonzero_secondary_scheme_compress_f16,
+    float_quant_nonzero_secondary_tree_decompress_f16,
+    float_quant_nonzero_secondary_tree_scalar_at_f16,
+    setup_nonzero_secondary_f16_array,
+    2
+);
+
+float_quant_nonzero_secondary_benches!(
+    float_quant_nonzero_secondary_split_compress_f32,
+    float_quant_nonzero_secondary_split_decompress_f32,
+    float_quant_nonzero_secondary_split_scalar_at_f32,
+    float_quant_nonzero_secondary_scheme_compress_f32,
+    float_quant_nonzero_secondary_tree_decompress_f32,
+    float_quant_nonzero_secondary_tree_scalar_at_f32,
+    setup_nonzero_secondary_f32_array,
+    4
+);
 
 #[divan::bench(name = "float_quant_nonzero_secondary_split_compress_f64")]
 fn bench_float_quant_nonzero_secondary_split_compress_f64(bencher: Bencher) {

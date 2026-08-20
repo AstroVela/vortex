@@ -57,6 +57,7 @@ use vortex_array::assert_arrays_eq;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::half::f16;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
@@ -160,6 +161,32 @@ fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>
         let mantissa = (index.wrapping_mul(7_919) & 0x7fff) << 8;
         f32::from_bits(0x3f80_0000 | mantissa)
     }));
+    let nonzero_secondary_f32 =
+        PrimitiveArray::from_iter(quantized_f32.as_slice::<f32>().iter().enumerate().map(
+            |(index, value)| {
+                if index % 10 == 0 {
+                    f32::from_bits(value.to_bits() | 1)
+                } else {
+                    *value
+                }
+            },
+        ));
+    let quantized_f16 = PrimitiveArray::from_iter((0..row_count).map(|index| {
+        let permuted =
+            u16::try_from(index.wrapping_mul(7_919) & usize::from(u16::MAX)).unwrap_or_default();
+        let mantissa = permuted & 0x03f0;
+        f16::from_bits(0x3c00 | mantissa)
+    }));
+    let nonzero_secondary_f16 =
+        PrimitiveArray::from_iter(quantized_f16.as_slice::<f16>().iter().enumerate().map(
+            |(index, value)| {
+                if index % 10 == 0 {
+                    f16::from_bits(value.to_bits() | 1)
+                } else {
+                    *value
+                }
+            },
+        ));
 
     let mut walk_rng = StdRng::seed_from_u64(2);
     let mut value = 1_000.0_f64;
@@ -279,6 +306,14 @@ fn synthetic_datasets(row_count: usize) -> VortexResult<Vec<(String, Vec<Column>
         (
             "synthetic-nonzero-secondary".to_string(),
             vec![column("value", nonzero_secondary)],
+        ),
+        (
+            "synthetic-nonzero-secondary-f16".to_string(),
+            vec![column("value", nonzero_secondary_f16)],
+        ),
+        (
+            "synthetic-nonzero-secondary-f32".to_string(),
+            vec![column("value", nonzero_secondary_f32)],
         ),
         (
             "synthetic-quantized-f32".to_string(),
