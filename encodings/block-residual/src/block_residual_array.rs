@@ -28,6 +28,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::half::f16;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::ArrayChildren;
@@ -1137,6 +1138,20 @@ pub(crate) fn decompress_ordered_f32(
             ordered ^ (1_u32 << 31)
         };
         f32::from_bits(bits)
+    })
+}
+
+pub(crate) fn decompress_ordered_f16(
+    array: ArrayView<'_, BlockResidual>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    decode_array_values::<f16, u16, false>(array, ctx, |ordered| {
+        let bits = if ordered & (1_u16 << 15) == 0 {
+            !ordered
+        } else {
+            ordered ^ (1_u16 << 15)
+        };
+        f16::from_bits(bits)
     })
 }
 

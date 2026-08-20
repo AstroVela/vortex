@@ -55,6 +55,7 @@ use vortex_session::registry::CachedId;
 use crate::BlockResidual;
 use crate::BlockResidualCodec;
 use crate::BlockResidualEstimate;
+use crate::block_residual_array::decompress_ordered_f16;
 use crate::block_residual_array::decompress_ordered_f32;
 use crate::block_residual_array::decompress_ordered_f64;
 use crate::codec::BlockResidualCodecEstimate;
@@ -190,7 +191,7 @@ impl VTable for OrderedFloat {
             }
         } else if let Some(block_residual) = array.encoded().as_typed::<BlockResidual>() {
             match array.dtype().as_ptype() {
-                PType::F16 => decode_primitive(array.as_view(), ctx)?,
+                PType::F16 => decompress_ordered_f16(block_residual, ctx)?,
                 PType::F32 => decompress_ordered_f32(block_residual, ctx)?,
                 PType::F64 => decompress_ordered_f64(block_residual, ctx)?,
                 ptype => vortex_bail!("unsupported OrderedFloat ptype {ptype}"),

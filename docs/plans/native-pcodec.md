@@ -382,7 +382,7 @@ These cases include the current compressed children and fused decode paths.
 | IntMult with packed children `u16` | 1.38 GB/s | 22.90 GB/s | 125 ns |
 | IntMult with packed children `u32` | 2.64 GB/s | 22.62 GB/s | 140 ns |
 | IntMult with packed children `u64` | 4.34 GB/s | 17.96 GB/s | 125 ns |
-| OrderedFloat with BlockResidual `f16` | 1.26 GB/s | 20.50 GB/s | 79 ns |
+| OrderedFloat with BlockResidual `f16` | 1.26 GB/s | 26.36 GB/s | 79 ns |
 | OrderedFloat with BlockResidual `f32` | 2.43 GB/s | 29.64 GB/s | 78 ns |
 | OrderedFloat with BlockResidual `f64` | 2.70 GB/s | 20.44 GB/s | 125 ns |
 | FloatQuant with packed primary `f16` | 3.21 GB/s | 20.05 GB/s | 125 ns |
@@ -857,7 +857,11 @@ Compression throughput increased by 2.77 times. Decode throughput increased by 2
 
 On general rejected `f16` values, median compression throughput decreased by 1.8 percent.
 
-The `f16` BlockResidual tree decoded at 20.50 GB/s. Its generic inverse transform lacks a fused narrow path.
+The first `f16` BlockResidual tree decoded at 20.50 GB/s.
+
+A later same-benchmark comparison measured 24.31 GB/s before a fused narrow transform and 26.36 GB/s after it.
+
+The fused path improves median decode throughput by 8.4 percent. It reconstructs residuals and float bits in one output pass.
 
 Retain `f16` eligibility. Revisit its selector factors during final corpus calibration.
 
@@ -2325,11 +2329,28 @@ This small target is more sensitive to run noise than the 100-row patterns.
 
 BlockResidual, Current Default, and RangePacked remain within 2.5 percent on both Taxi 100-row patterns.
 
-The random-access suite does not include the Public BI files.
+The Public BI pass uses six complete files and cached handles. Each pattern requests about 100 rows.
 
-Selected-tree scalar benchmarks remain the direct evidence for Bimbo, CMSprovider, Euro2016, Food, and HashTags.
+Two passes use five-second target windows. A ten-second CMS rerun replaces one correlated outlier.
 
-Add Public BI file access only if bundle adoption needs broader late-materialization evidence.
+| Dataset | File size | Correlated latency | Uniform latency |
+| --- | ---: | ---: | ---: |
+| Arade | -2.39 percent | -9.74 to -0.38 percent | -0.72 to +0.86 percent |
+| Bimbo | -7.54 percent | +5.88 to +17.20 percent | +7.07 to +7.85 percent |
+| CMSprovider | -7.86 percent | +14.03 to +18.46 percent | +9.89 to +11.73 percent |
+| Euro2016 | -2.44 percent | -0.06 to +5.27 percent | -0.44 to +0.50 percent |
+| Food | -6.19 percent | -16.78 to -10.54 percent | +12.19 to +13.94 percent |
+| HashTags | -2.56 percent | +7.28 to +13.38 percent | +4.66 to +9.94 percent |
+
+The file-size geometric mean decreases by 4.86 percent. Aggregate bytes decrease by 5.81 percent.
+
+Across both passes, correlated latency increases by 3.06 percent geometrically. Uniform latency increases by 6.33 percent.
+
+The combined latency geometric mean increases by 4.69 percent.
+
+The Public BI pass adds useful evidence beyond scalar benchmarks. It exposes a measurable file-access trade for the conservative bundle.
+
+The final threshold review must include this result. The current factor remains unchanged until that review.
 
 ### Compact and Parquet size constraint
 
@@ -2637,6 +2658,8 @@ This round completed these steps:
 - Added local Parquet inputs to the complete compression benchmark.
 - Added local Parquet inputs to the random-access benchmark.
 - Measured 8-bit BlockResidual file access on accepted and boundary cases.
+- Measured complete-file random access for six Public BI datasets.
+- Added a fused `f16` decoder for `OrderedFloat(BlockResidual)`.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2650,7 +2673,7 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
+1. Use the Public BI file-access evidence during the final threshold review.
 2. Prefer cheap rejection tests when they preserve the best candidate model.
 3. Treat fast rejection as a selection advantage, not an admission criterion.
 4. Require stronger corpus evidence when a useful scheme needs costly analysis.
