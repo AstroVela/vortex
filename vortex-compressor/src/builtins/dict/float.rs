@@ -165,7 +165,13 @@ macro_rules! typed_encode {
         };
         let codes_validity = $source_array.validity()?;
 
-        let values: Buffer<$typ> = distinct.distinct_values().iter().map(|x| x.0).collect();
+        let mut values = distinct
+            .distinct_values()
+            .iter()
+            .map(|(value, &count)| (value.0, count))
+            .collect::<Vec<_>>();
+        values.sort_unstable_by_key(|&(_, count)| std::cmp::Reverse(count));
+        let values: Buffer<$typ> = values.into_iter().map(|(value, _)| value).collect();
 
         let max_code = values.len();
         let codes = if max_code <= u8::MAX as usize {
@@ -271,10 +277,10 @@ mod tests {
     #[test]
     fn test_float_dict_encode() -> VortexResult<()> {
         let mut ctx = vortex_array::array_session().create_execution_ctx();
-        let values = buffer![1f32, 2f32, 2f32, 0f32, 1f32];
+        let values = buffer![1f32, 2f32, 2f32, 0f32, 2f32];
         let validity =
             Validity::Array(BoolArray::from_iter([true, true, true, false, true]).into_array());
-        let array = PrimitiveArray::new(values, validity);
+        let array = PrimitiveArray::new(values, validity.clone());
 
         let stats = FloatStats::generate_opts(
             &array,
@@ -286,9 +292,19 @@ mod tests {
         let dict_array = dictionary_encode(array.as_view(), &stats)?;
         assert_eq!(dict_array.values().len(), 2);
         assert_eq!(dict_array.codes().len(), 5);
+        assert_arrays_eq!(
+            dict_array.values(),
+            PrimitiveArray::new(buffer![2f32, 1f32], Validity::AllValid).into_array(),
+            &mut ctx
+        );
+        assert_arrays_eq!(
+            dict_array.codes(),
+            PrimitiveArray::new(buffer![1u8, 0, 0, 0, 0], validity).into_array(),
+            &mut ctx
+        );
 
         let expected = PrimitiveArray::new(
-            buffer![1f32, 2f32, 2f32, 1f32, 1f32],
+            buffer![1f32, 2f32, 2f32, 2f32, 2f32],
             Validity::Array(BoolArray::from_iter([true, true, true, false, true]).into_array()),
         )
         .into_array();

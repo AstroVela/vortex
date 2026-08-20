@@ -1348,6 +1348,23 @@ Pure IntMult with generic children therefore does not pass the Default evidence 
 
 Pco gains more from its bin and entropy backend than from the multiplication split alone on GloVe.
 
+The CMS standard-deviation payment column provides a no-Delta IntMult target.
+
+Pco uses `IntMult(10)` on seven of eight chunks. The remaining chunk uses classic bins.
+
+| Tree | Bytes | Encode MB/s | Decode MB/s | Scalar ns |
+| --- | ---: | ---: | ---: | ---: |
+| Default | 10,494,404 | Not isolated | 24,593 | 866 |
+| `ALP(BlockResidual)` | 10,220,895 | 2,124 | 21,889 | 551 |
+| Best IntMult, base 1,000 | 10,300,986 | 530 | 10,704 | 727 |
+| Compact Pco | 9,325,132 | Not isolated | 1,977 | 25,987 |
+
+The IntMult tree saves 1.8 percent against Default. It remains larger than the BlockResidual tree.
+
+Its encode throughput is four times lower than BlockResidual. Its decode throughput is more than twice as low.
+
+This result removes Delta as a confounder. Pure IntMult remains outside Default.
+
 ### Equal-width prefix bins
 
 The equal-width prototype uses only `IntMult`, `Dict`, and `BitPacked`.
@@ -1370,6 +1387,53 @@ The fixed suffix grows both columns by 8 to 10 percent against Default.
 The generic decoder is also more than twice as slow as Default.
 
 Equal-width prefix bins do not justify a Default scheme.
+
+### Frequency-ranked dictionary codes
+
+Dictionary codes previously followed hash-table iteration order.
+
+The prototype assigns the lowest codes to the most frequent values. It then compresses both children through normal recursion.
+
+This transform uses existing `Dict`, `BitPacked`, `Sparse`, and BlockResidual arrays. It adds no array format.
+
+Integer statistics already store frequency counts. Float statistics now retain counts during the existing distinct-value pass.
+
+| Column and tree | Bytes | Decode MB/s | Scalar ns | Candidate construction MB/s |
+| --- | ---: | ---: | ---: | ---: |
+| Bimbo `Venta_hoy`, old Default | 3,544,154 | 26,689 | 595 | Not isolated |
+| Bimbo `Venta_hoy`, ranked proposed Default | 3,197,655 | 25,490 | 577 | 1,480 |
+| Bimbo `Dev_proxima`, ranked prior Default | 280,812 | 26,902 | 3,834 | Not isolated |
+| Bimbo `Dev_proxima`, ranked Dict with BlockResidual descendants | 234,832 | 27,134 | 3,823 | 1,367 |
+
+Frequency ranking reduces `Venta_hoy` by 9.8 percent against the old Default.
+
+The complete proposed tree keeps decode and scalar throughput close to the old tree.
+
+The `Dev_proxima` gain depends on BlockResidual below the dictionary code child.
+
+The former ancestor exclusion prevents that useful composition. The corpus trial therefore removes the integer and float Dict exclusions.
+
+The scheme retains exclusions for string and binary dictionaries.
+
+The current eight-dataset numeric trial compares the ranked prior Default with the ranked proposed Default.
+
+| Dataset | Size change | Encode throughput change | Decode throughput change |
+| --- | ---: | ---: | ---: |
+| Arade | -3.19 percent | -5.17 percent | +1.93 percent |
+| Bimbo | -3.57 percent | -0.37 percent | +0.23 percent |
+| CMSprovider 1 | -2.26 percent | -6.51 percent | -6.34 percent |
+| CMSprovider 2 | -3.99 percent | -6.97 percent | -9.06 percent |
+| Euro2016 | -11.47 percent | -3.63 percent | +11.68 percent |
+| Food | -7.14 percent | -3.91 percent | -10.18 percent |
+| HashTags | -5.68 percent | +0.43 percent | +5.46 percent |
+| GloVe | 0.00 percent | +0.11 percent | +1.85 percent |
+| Geometric mean | -4.72 percent | -3.29 percent | -0.80 percent |
+
+Every dataset remains inside the 20-percent throughput gate.
+
+Frequency ranking needs no separate selector. Dictionary analysis already computes the required distinct values.
+
+Cheap rejection remains useful guidance for other schemes. A costly scheme can enter Default only with stronger corpus evidence.
 
 ### BlockResidual patch positions
 
@@ -1741,7 +1805,12 @@ This round completed these steps:
 - Rejected packed multi-reference blocks after patched and patch-free comparisons.
 - Rejected three bounded IntMult remainder layouts on GloVe.
 - Rejected the dense-remainder IntMult layout on CMS Payments.
+- Rejected pure IntMult on a no-Delta CMS standard-deviation column.
 - Rejected centered block residuals after a complete Euro subjectivity comparison.
+- Assigned dictionary codes by descending value frequency.
+- Added float frequency counts to the existing distinct-value statistics.
+- Reopened BlockResidual descendants for integer and float dictionary codes.
+- Validated the ranked Dict policy across eight numeric datasets.
 - Audited constructor and deserialization validation for all four production arrays.
 - Added round-trip tests for every supported integer and float type.
 - Added single-encoding benchmarks for every supported integer and float type.
@@ -1749,20 +1818,21 @@ This round completed these steps:
 - Verified zero-secondary and nonzero-secondary `f16` FloatQuant trees.
 - Updated stale golden trees after the BlockResidual payload and selector changes.
 
-The Pco mode profile and the first quotient and remainder experiments are complete.
+The Pco mode profile and the quotient and remainder experiments are complete.
 
-The composable IntMult follow-up remains incomplete.
+The composable IntMult follow-up is complete. The tested IntMult trees remain outside Default.
 
 The nonzero-secondary FloatQuant implementation and focused validation are complete.
 
 Complete these next experiments in order:
 
-1. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-2. Define a bounded small-alphabet experiment from the remaining no-Delta gaps.
+1. Classify the remaining no-Delta ALP and raw-float gaps.
+2. Define a bounded small-alphabet primitive for the remaining 24-to-49-bin columns.
 3. Add a specialized range scheme only after a complete tree passes the column gates.
-4. Validate rejected-candidate analysis cost after the candidate set stabilizes.
-5. Prefer cheap rejection tests when they preserve the best candidate model.
-6. Require stronger corpus evidence when a useful scheme needs costly analysis.
+4. Validate frequency-ranked Dict across the complete file corpus.
+5. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+6. Prefer cheap rejection tests when they preserve the best candidate model.
+7. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

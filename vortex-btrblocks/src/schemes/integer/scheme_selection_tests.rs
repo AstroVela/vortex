@@ -14,7 +14,6 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProviderExt;
@@ -257,11 +256,6 @@ fn test_dict_compressed() -> VortexResult<()> {
     let btr = BtrBlocksCompressor::default();
     let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<Dict>());
-    assert!(
-        !contains_block_residual(compressed.as_::<Dict>().codes()),
-        "BlockResidual must not encode dictionary codes:\n{}",
-        compressed.display_tree()
-    );
     Ok(())
 }
 

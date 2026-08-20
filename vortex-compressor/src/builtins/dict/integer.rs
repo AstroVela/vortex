@@ -157,7 +157,13 @@ macro_rules! typed_encode {
         };
         let codes_validity = $source_array.validity()?;
 
-        let values: Buffer<$typ> = distinct.distinct_values().keys().map(|x| x.0).collect();
+        let mut values = distinct
+            .distinct_values()
+            .iter()
+            .map(|(value, &count)| (value.0, count))
+            .collect::<Vec<_>>();
+        values.sort_unstable_by_key(|&(_, count)| std::cmp::Reverse(count));
+        let values: Buffer<$typ> = values.into_iter().map(|(value, _)| value).collect();
 
         let max_code = values.len();
         let codes = if max_code <= u8::MAX as usize {
@@ -280,7 +286,7 @@ mod tests {
         let data = buffer![100i32, 200, 100, 0, 100];
         let validity =
             Validity::Array(BoolArray::from_iter([true, true, true, false, true]).into_array());
-        let array = PrimitiveArray::new(data, validity);
+        let array = PrimitiveArray::new(data, validity.clone());
 
         let stats = IntegerStats::generate_opts(
             &array,
@@ -292,6 +298,16 @@ mod tests {
         let dict_array = dictionary_encode(array.as_view(), &stats)?;
         assert_eq!(dict_array.values().len(), 2);
         assert_eq!(dict_array.codes().len(), 5);
+        assert_arrays_eq!(
+            dict_array.values(),
+            PrimitiveArray::new(buffer![100i32, 200], Validity::AllValid).into_array(),
+            &mut ctx
+        );
+        assert_arrays_eq!(
+            dict_array.codes(),
+            PrimitiveArray::new(buffer![0u8, 1, 0, 0, 0], validity).into_array(),
+            &mut ctx
+        );
 
         let expected = PrimitiveArray::new(
             buffer![100i32, 200, 100, 100, 100],

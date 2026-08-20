@@ -15,8 +15,6 @@ use vortex_array::match_each_integer_ptype;
 use vortex_block_residual::BlockResidual;
 use vortex_block_residual::BlockResidualEstimate;
 use vortex_compressor::builtins::BinaryDictScheme;
-use vortex_compressor::builtins::FloatDictScheme;
-use vortex_compressor::builtins::IntDictScheme;
 use vortex_compressor::builtins::StringDictScheme;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
@@ -60,14 +58,6 @@ impl Scheme for BlockResidualScheme {
 
     fn ancestor_exclusions(&self) -> Vec<AncestorExclusion> {
         vec![
-            AncestorExclusion {
-                ancestor: IntDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
-            AncestorExclusion {
-                ancestor: FloatDictScheme.id(),
-                children: ChildSelection::One(1),
-            },
             AncestorExclusion {
                 ancestor: StringDictScheme.id(),
                 children: ChildSelection::One(1),

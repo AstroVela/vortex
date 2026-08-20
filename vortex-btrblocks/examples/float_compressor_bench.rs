@@ -43,18 +43,21 @@ use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::ChunkedArray;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::DictArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::match_each_integer_ptype;
+use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::patches::Patches;
 use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
@@ -75,7 +78,10 @@ use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::FoRArrayExt;
 use vortex_fastlanes::FoRArraySlotsExt;
+use vortex_fastlanes::bitpack_compress::bit_width_histogram;
+use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked;
+use vortex_fastlanes::bitpack_compress::find_best_bit_width;
 use vortex_int_mult::IntMult;
 use vortex_range_packed::RangeDecomposition;
 use vortex_range_packed::RangePacked;
@@ -1307,6 +1313,21 @@ impl FixedBinOffsetTree {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FrequencyRankedCodeTree {
+    BitPacked,
+    Default,
+}
+
+impl FrequencyRankedCodeTree {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BitPacked => "bitpacked",
+            Self::Default => "default",
+        }
+    }
+}
+
 fn decomposed_fixed_bin_integer_tree(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     offset_tree: FixedBinOffsetTree,
@@ -1520,6 +1541,86 @@ fn encode_prefix_int_mult_float_tree(
     Ok(Some(
         ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
     ))
+}
+
+#[expect(
+    clippy::useless_conversion,
+    reason = "the generic unsigned-code path must reject values that exceed usize"
+)]
+fn frequency_ranked_dict_tree(
+    encoded: &ArrayRef,
+    code_tree: FrequencyRankedCodeTree,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    let Some(dict) = encoded.as_typed::<Dict>() else {
+        return Ok(None);
+    };
+    let mut ctx = session.create_execution_ctx();
+    let codes = dict.codes().clone().execute::<PrimitiveArray>(&mut ctx)?;
+    let old_codes = match_each_unsigned_integer_ptype!(codes.ptype(), |T| {
+        codes
+            .as_slice::<T>()
+            .iter()
+            .map(|&code| usize::try_from(u64::from(code)))
+            .collect::<Result<Vec<_>, _>>()?
+    });
+    let validity = codes.validity()?;
+    let mask = validity.execute_mask(codes.len(), &mut ctx)?;
+    let mut counts = vec![0_usize; dict.values().len()];
+    for (&code, valid) in old_codes.iter().zip(mask.iter()) {
+        if valid {
+            vortex_ensure!(
+                code < counts.len(),
+                "dictionary code {code} exceeds {} values",
+                counts.len()
+            );
+            counts[code] += 1;
+        }
+    }
+
+    let mut order = (0..counts.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&code| (std::cmp::Reverse(counts[code]), code));
+    let mut new_code_by_old = vec![0_usize; order.len()];
+    for (new_code, &old_code) in order.iter().enumerate() {
+        new_code_by_old[old_code] = new_code;
+    }
+    let remapped = match_each_unsigned_integer_ptype!(codes.ptype(), |T| {
+        PrimitiveArray::new(
+            old_codes
+                .iter()
+                .zip(mask.iter())
+                .map(|(&old_code, valid)| {
+                    if valid {
+                        T::try_from(new_code_by_old[old_code])
+                    } else {
+                        T::try_from(0)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            validity.clone(),
+        )
+    });
+    let codes = match code_tree {
+        FrequencyRankedCodeTree::BitPacked => {
+            let bit_width_freq = bit_width_histogram(remapped.as_view(), &mut ctx)?;
+            let bit_width = find_best_bit_width(remapped.ptype(), &bit_width_freq)?;
+            bitpack_encode(&remapped, bit_width, Some(&bit_width_freq), &mut ctx)?.into_array()
+        }
+        FrequencyRankedCodeTree::Default => {
+            BtrBlocksCompressor::default().compress(&remapped.into_array(), &mut ctx)?
+        }
+    };
+
+    let order = order
+        .into_iter()
+        .map(u64::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = dict
+        .values()
+        .take(PrimitiveArray::from_iter(order).into_array())?
+        .execute::<PrimitiveArray>(&mut ctx)?;
+    let values = BtrBlocksCompressor::default().compress(&values.into_array(), &mut ctx)?;
+    Ok(Some(DictArray::try_new(codes, values)?.into_array()))
 }
 
 fn fill_integer_nulls_with_first_valid(
@@ -2317,6 +2418,57 @@ fn measure_prefix_int_mult_float_tree(
     Ok(())
 }
 
+fn measure_frequency_ranked_dict_tree(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    default: &ArrayRef,
+    code_tree: FrequencyRankedCodeTree,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let Some(encoded) = frequency_ranked_dict_tree(default, code_tree, session)? else {
+        return Ok(());
+    };
+    let label = format!("frequency-ranked-dict-{}", code_tree.label());
+    measure_existing_tree(dataset, column, &label, expected, &encoded, session)?;
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(frequency_ranked_dict_tree(default, code_tree, session)?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "candidate-tree-encode\t{dataset}\t{column}\t{label}\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
+}
+
+fn measure_frequency_ranked_dict_trees(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    default: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    if std::env::var_os("VORTEX_BENCH_FREQ_DICT").is_none() {
+        return Ok(());
+    }
+    measure_existing_tree(dataset, column, "default", expected, default, session)?;
+    for code_tree in [
+        FrequencyRankedCodeTree::BitPacked,
+        FrequencyRankedCodeTree::Default,
+    ] {
+        measure_frequency_ranked_dict_tree(dataset, column, expected, default, code_tree, session)?;
+    }
+    Ok(())
+}
+
 fn measure_existing_tree(
     dataset: &str,
     column: &str,
@@ -2636,6 +2788,13 @@ fn measure_dataset(
             encoding_tree(default_array),
             encoding_tree(compact_array),
         );
+        measure_frequency_ranked_dict_trees(
+            dataset,
+            &column.name,
+            &column.array,
+            default_array,
+            session,
+        )?;
         if compact_bytes * 10 <= default_bytes * 9
             || std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some()
         {
