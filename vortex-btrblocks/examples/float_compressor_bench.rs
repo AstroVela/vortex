@@ -42,6 +42,7 @@ use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
+use vortex_array::arrays::Chunked;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::DictArray;
@@ -50,6 +51,7 @@ use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::builtins::ArrayBuiltins;
@@ -2775,6 +2777,20 @@ fn measure_dataset(
                 encoding_tree(array),
                 array.nbytes()
             );
+            if std::env::var_os("VORTEX_BENCH_CHUNK_TREES").is_some()
+                && let Some(chunked) = array.as_typed::<Chunked>()
+            {
+                for (chunk_index, chunk) in chunked.iter_chunks().enumerate() {
+                    println!(
+                        "chunk-structure\t{dataset}\t{}\t{}\t{config}\t{chunk_index}\t{}\t{}\t{}",
+                        column.name,
+                        column.dtype_label,
+                        chunk.len(),
+                        encoding_tree(chunk),
+                        chunk.nbytes(),
+                    );
+                }
+            }
             if matches!(
                 *config,
                 "integer-block-residual-only" | "ordered-block-residual-only"
