@@ -69,8 +69,8 @@ use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
-use vortex_btrblocks::schemes::float::FloatRangePackedScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
+use vortex_btrblocks::schemes::float::OrderedFloatRangePackedScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -94,7 +94,7 @@ use crate::int_mult_codec::IntMultCodec32;
 use crate::int_mult_codec::IntMultDenseCodec64;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
-const RANGE_PACKED_SCHEME: FloatRangePackedScheme = FloatRangePackedScheme::new(1.20);
+const RANGE_PACKED_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.20);
 const CALIFORNIA_COLUMNS: [&str; 9] = [
     "longitude",
     "latitude",

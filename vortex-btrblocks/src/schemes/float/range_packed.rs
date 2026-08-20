@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Fixed-bin range packing for floating-point values.
+//! Fixed-bin range packing for ordered floating-point values.
 
-use vortex_alp::ALP;
-use vortex_alp::ALPArrayExt;
-use vortex_alp::ALPArraySlotsExt;
-use vortex_alp::alp_encode;
 use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -31,7 +27,6 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
-use crate::compress_patches;
 use crate::schemes::sample_primitive_one_percent;
 
 /// The default factor accounts for RangePacked decode cost during scheme selection.
@@ -40,28 +35,28 @@ const PREFILTER_MODEL_MARGIN: f64 = 1.50;
 const MIN_PREFILTER_MODEL_RATIO: f64 = 1.15;
 const MAX_BLOCK_TO_RANGE_RATIO: f64 = 1.10;
 
-/// Compress floats through ALP or ordered IEEE bits, then use fixed-bin range packing.
+/// Compress floats through ordered IEEE bits, then use fixed-bin range packing.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub struct FloatRangePackedScheme {
+pub struct OrderedFloatRangePackedScheme {
     decode_cost_factor: f64,
 }
 
-impl FloatRangePackedScheme {
+impl OrderedFloatRangePackedScheme {
     /// Creates a scheme with the specified decode cost factor.
     pub const fn new(decode_cost_factor: f64) -> Self {
         Self { decode_cost_factor }
     }
 }
 
-impl Default for FloatRangePackedScheme {
+impl Default for OrderedFloatRangePackedScheme {
     fn default() -> Self {
         Self::new(DEFAULT_DECODE_COST_FACTOR)
     }
 }
 
-impl Scheme for FloatRangePackedScheme {
+impl Scheme for OrderedFloatRangePackedScheme {
     fn scheme_name(&self) -> &'static str {
-        "vortex.float.range_packed"
+        "vortex.ordered_float.range_packed"
     }
 
     fn matches(&self, canonical: &Canonical) -> bool {
@@ -69,7 +64,7 @@ impl Scheme for FloatRangePackedScheme {
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
-        vec![RangePacked.id(), OrderedFloat.id(), ALP.id()]
+        vec![RangePacked.id(), OrderedFloat.id()]
     }
 
     fn num_children(&self) -> usize {
@@ -101,7 +96,7 @@ impl Scheme for FloatRangePackedScheme {
                 let sample = sample_primitive_one_percent(data.array_as_primitive(), exec_ctx)?;
                 let sample = normalize_float_null_values(sample.as_view(), exec_ctx)?;
                 let before_nbytes = sample.nbytes();
-                let Some((_, after_nbytes)) = choose_transform_for_estimate(
+                let Some(after_nbytes) = estimate_ordered_float_if_promising(
                     sample.as_view(),
                     best_ratio,
                     decode_cost_factor,
@@ -131,52 +126,25 @@ impl Scheme for FloatRangePackedScheme {
         _compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let sample = sample_primitive_one_percent(data.array_as_primitive(), exec_ctx)?;
-        let sample = normalize_float_null_values(sample.as_view(), exec_ctx)?;
-        let (transform, _) = choose_transform(sample.as_view(), exec_ctx)?;
-
         let primitive = normalize_float_null_values(data.array_as_primitive(), exec_ctx)?;
-        encode_transform(primitive.as_view(), transform, exec_ctx)
+        encode_ordered_float(primitive.as_view(), exec_ctx)
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum FloatTransform {
-    OrderedFloat,
-    Alp,
-}
-
-fn choose_transform_for_estimate(
+fn estimate_ordered_float_if_promising(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     best_ratio: f64,
     decode_cost_factor: f64,
     exec_ctx: &mut ExecutionCtx,
-) -> VortexResult<Option<(FloatTransform, u64)>> {
+) -> VortexResult<Option<u64>> {
     let ordered_model = coarse_ordered_float_model(primitive);
     if model_prefers_blocks(ordered_model) {
         return Ok(None);
     }
-    let mut best = if prefilter_passes(ordered_model, best_ratio, decode_cost_factor) {
-        Some((
-            FloatTransform::OrderedFloat,
-            estimate_transform(primitive, FloatTransform::OrderedFloat, exec_ctx)?,
-        ))
-    } else {
-        None
-    };
-
-    if primitive.ptype().bit_width() > 16 {
-        let alp = alp_encode(primitive, None, exec_ctx)?;
-        let model = coarse_integer_model(alp.encoded().as_::<Primitive>());
-        if prefilter_passes(model, best_ratio, decode_cost_factor) {
-            let nbytes = estimate_transform(primitive, FloatTransform::Alp, exec_ctx)?;
-            if best.is_none_or(|(_, best_nbytes)| nbytes < best_nbytes) {
-                best = Some((FloatTransform::Alp, nbytes));
-            }
-        }
+    if !prefilter_passes(ordered_model, best_ratio, decode_cost_factor) {
+        return Ok(None);
     }
-
-    Ok(best)
+    Ok(Some(estimate_ordered_float(primitive, exec_ctx)?))
 }
 
 fn prefilter_passes(model: CoarseModel, best_ratio: f64, decode_cost_factor: f64) -> bool {
@@ -211,28 +179,6 @@ fn coarse_ordered_float_model(primitive: vortex_array::ArrayView<'_, Primitive>)
             .as_slice::<f64>()
             .iter()
             .map(|value| ordered_u64(value.to_bits()))
-            .collect(),
-        _ => {
-            return CoarseModel {
-                range_ratio: 0.0,
-                block_ratio: 0.0,
-            };
-        }
-    };
-    coarse_model(&values, primitive.ptype().bit_width())
-}
-
-fn coarse_integer_model(primitive: vortex_array::ArrayView<'_, Primitive>) -> CoarseModel {
-    let values: Vec<u64> = match primitive.ptype() {
-        PType::I32 => primitive
-            .as_slice::<i32>()
-            .iter()
-            .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
-            .collect(),
-        PType::I64 => primitive
-            .as_slice::<i64>()
-            .iter()
-            .map(|&value| (value as u64) ^ (1_u64 << 63))
             .collect(),
         _ => {
             return CoarseModel {
@@ -332,83 +278,27 @@ fn ordered_u64(bits: u64) -> u64 {
     }
 }
 
-fn choose_transform(
+fn estimate_ordered_float(
     primitive: vortex_array::ArrayView<'_, Primitive>,
-    exec_ctx: &mut ExecutionCtx,
-) -> VortexResult<(FloatTransform, u64)> {
-    let ordered_nbytes = estimate_transform(primitive, FloatTransform::OrderedFloat, exec_ctx)?;
-    let mut best = (FloatTransform::OrderedFloat, ordered_nbytes);
-
-    if primitive.ptype().is_float() && primitive.ptype().bit_width() > 16 {
-        let alp_nbytes = estimate_transform(primitive, FloatTransform::Alp, exec_ctx)?;
-        if alp_nbytes < best.1 {
-            best = (FloatTransform::Alp, alp_nbytes);
-        }
-    }
-
-    Ok(best)
-}
-
-fn estimate_transform(
-    primitive: vortex_array::ArrayView<'_, Primitive>,
-    transform: FloatTransform,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<u64> {
-    match transform {
-        FloatTransform::OrderedFloat => {
-            let ordered = OrderedFloat::from_primitive(primitive)?;
-            RangePacked::estimate_primitive_with_null_positions(
-                ordered.encoded().as_::<Primitive>(),
-                exec_ctx,
-            )
-        }
-        FloatTransform::Alp => {
-            let alp = alp_encode(primitive, None, exec_ctx)?;
-            let packed_nbytes = RangePacked::estimate_primitive_with_null_positions(
-                alp.encoded().as_::<Primitive>(),
-                exec_ctx,
-            )?;
-            let patches = alp
-                .patches()
-                .map(|patches| compress_patches(patches, exec_ctx))
-                .transpose()?;
-            let patch_nbytes = patches.as_ref().map_or(0, |patches| {
-                patches.indices().nbytes()
-                    + patches.values().nbytes()
-                    + patches.chunk_offsets().as_ref().map_or(0, ArrayRef::nbytes)
-            });
-            Ok(packed_nbytes + patch_nbytes)
-        }
-    }
+    let ordered = OrderedFloat::from_primitive(primitive)?;
+    RangePacked::estimate_primitive_with_null_positions(
+        ordered.encoded().as_::<Primitive>(),
+        exec_ctx,
+    )
 }
 
-fn encode_transform(
+fn encode_ordered_float(
     primitive: vortex_array::ArrayView<'_, Primitive>,
-    transform: FloatTransform,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    match transform {
-        FloatTransform::OrderedFloat => {
-            let ordered = OrderedFloat::from_primitive(primitive)?;
-            let packed = RangePacked::from_primitive_with_null_positions(
-                ordered.encoded().as_::<Primitive>(),
-                exec_ctx,
-            )?;
-            Ok(OrderedFloat::try_new(packed.into_array(), primitive.ptype())?.into_array())
-        }
-        FloatTransform::Alp => {
-            let alp = alp_encode(primitive, None, exec_ctx)?;
-            let packed = RangePacked::from_primitive_with_null_positions(
-                alp.encoded().as_::<Primitive>(),
-                exec_ctx,
-            )?;
-            let patches = alp
-                .patches()
-                .map(|patches| compress_patches(patches, exec_ctx))
-                .transpose()?;
-            Ok(ALP::try_new(packed.into_array(), alp.exponents(), patches)?.into_array())
-        }
-    }
+    let ordered = OrderedFloat::from_primitive(primitive)?;
+    let packed = RangePacked::from_primitive_with_null_positions(
+        ordered.encoded().as_::<Primitive>(),
+        exec_ctx,
+    )?;
+    Ok(OrderedFloat::try_new(packed.into_array(), primitive.ptype())?.into_array())
 }
 
 fn normalize_float_null_values(
@@ -448,15 +338,13 @@ mod tests {
     use vortex_array::dtype::half::f16;
     use vortex_error::VortexResult;
 
-    use super::FloatRangePackedScheme;
-    use super::FloatTransform;
-    use super::choose_transform;
-    use super::choose_transform_for_estimate;
-    use super::encode_transform;
-    use super::estimate_transform;
+    use super::OrderedFloatRangePackedScheme;
+    use super::encode_ordered_float;
+    use super::estimate_ordered_float;
+    use super::estimate_ordered_float_if_promising;
     use crate::CascadingCompressor;
 
-    const TEST_SCHEME: FloatRangePackedScheme = FloatRangePackedScheme::new(1.0);
+    const TEST_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.0);
 
     #[rstest]
     #[case::f16(PrimitiveArray::from_iter((0_u16..4_096).map(|index| {
@@ -480,39 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_float_wins_for_close_bit_patterns() -> VortexResult<()> {
-        let expected = PrimitiveArray::from_iter((0_u64..65_536).map(|index| {
-            f64::from_bits(0x3ff0_0000_0000_0000 + index.wrapping_mul(7_919) % 1_024)
-        }));
-        let session = array_session();
-        let mut ctx = session.create_execution_ctx();
-
-        let (transform, _) = choose_transform(expected.as_view(), &mut ctx)?;
-
-        assert_eq!(transform, FloatTransform::OrderedFloat);
-        Ok(())
-    }
-
-    #[test]
-    fn alp_wins_for_decimal_values() -> VortexResult<()> {
-        let expected = PrimitiveArray::from_iter(
-            (0_u64..65_536).map(|index| (index.wrapping_mul(7_919) % 100_000) as f64 / 100.0),
-        );
-        let session = array_session();
-        let mut ctx = session.create_execution_ctx();
-
-        let (transform, _) = choose_transform(expected.as_view(), &mut ctx)?;
-
-        assert_eq!(transform, FloatTransform::Alp);
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::ordered(FloatTransform::OrderedFloat)]
-    #[case::alp(FloatTransform::Alp)]
-    fn transform_estimate_matches_encoded_size(
-        #[case] transform: FloatTransform,
-    ) -> VortexResult<()> {
+    fn transform_estimate_matches_encoded_size() -> VortexResult<()> {
         let expected = PrimitiveArray::from_option_iter((0_u64..65_536).map(|index| {
             (index % 19 != 0).then(|| {
                 let value = (index.wrapping_mul(7_919) % 100_000) as f64 / 100.0;
@@ -526,8 +382,8 @@ mod tests {
         let session = array_session();
         let mut ctx = session.create_execution_ctx();
 
-        let estimate = estimate_transform(expected.as_view(), transform, &mut ctx)?;
-        let encoded = encode_transform(expected.as_view(), transform, &mut ctx)?;
+        let estimate = estimate_ordered_float(expected.as_view(), &mut ctx)?;
+        let encoded = encode_ordered_float(expected.as_view(), &mut ctx)?;
 
         assert_eq!(estimate, encoded.nbytes());
         Ok(())
@@ -546,7 +402,8 @@ mod tests {
         let session = array_session();
         let mut ctx = session.create_execution_ctx();
 
-        let candidate = choose_transform_for_estimate(expected.as_view(), 1.13, 1.20, &mut ctx)?;
+        let candidate =
+            estimate_ordered_float_if_promising(expected.as_view(), 1.13, 1.20, &mut ctx)?;
 
         assert!(candidate.is_none());
         Ok(())
@@ -562,7 +419,8 @@ mod tests {
         let session = array_session();
         let mut ctx = session.create_execution_ctx();
 
-        let candidate = choose_transform_for_estimate(expected.as_view(), 1.36, 1.20, &mut ctx)?;
+        let candidate =
+            estimate_ordered_float_if_promising(expected.as_view(), 1.36, 1.20, &mut ctx)?;
 
         assert!(candidate.is_some());
         Ok(())
@@ -578,7 +436,8 @@ mod tests {
         let session = array_session();
         let mut ctx = session.create_execution_ctx();
 
-        let candidate = choose_transform_for_estimate(expected.as_view(), 1.0, 1.20, &mut ctx)?;
+        let candidate =
+            estimate_ordered_float_if_promising(expected.as_view(), 1.0, 1.20, &mut ctx)?;
 
         assert!(candidate.is_none());
         Ok(())

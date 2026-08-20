@@ -1658,7 +1658,7 @@ The manual fused benchmark reaches 15,492 MB/s on the same run.
 
 The registered kernel is within 3.5 percent of the manual helper.
 
-An experimental `FloatRangePackedScheme` remains outside `ALL_SCHEMES`.
+An experimental `OrderedFloatRangePackedScheme` remains outside `ALL_SCHEMES`.
 
 The scheme tests two complete trees on the existing stratified one-percent sample:
 

@@ -20,7 +20,7 @@ pub use float_quant::FloatQuantScheme;
 pub use ordered_block_residual::OrderedBlockResidualScheme;
 #[cfg(feature = "pco")]
 pub use pco::PcoScheme;
-pub use range_packed::FloatRangePackedScheme;
+pub use range_packed::OrderedFloatRangePackedScheme;
 pub use rle::FloatRLEScheme;
 pub use sparse::NullDominatedSparseScheme;
 // Re-export builtin schemes from vortex-compressor.
