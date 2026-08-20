@@ -45,6 +45,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::BitPackedArrayExt;
+use vortex_fastlanes::bitpack_decompress::unpack_pair_map;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -187,6 +188,9 @@ impl VTable for IntMult {
         {
             return Ok(ExecutionResult::done(decoded.into_array()));
         }
+        if let Some(decoded) = decode_fastlanes_pair(array.as_view())? {
+            return Ok(ExecutionResult::done(decoded.into_array()));
+        }
         let primary = array.primary().clone().execute::<PrimitiveArray>(ctx)?;
         let secondary = array.secondary().clone().execute::<PrimitiveArray>(ctx)?;
         Ok(ExecutionResult::done(
@@ -201,6 +205,37 @@ impl VTable for IntMult {
     ) -> VortexResult<Option<ArrayRef>> {
         RULES.evaluate(array, parent, child_idx)
     }
+}
+
+fn decode_fastlanes_pair(array: ArrayView<'_, IntMult>) -> VortexResult<Option<PrimitiveArray>> {
+    let Some(primary) = array.primary().as_opt::<BitPacked>() else {
+        return Ok(None);
+    };
+    let Some(secondary) = array.secondary().as_opt::<BitPacked>() else {
+        return Ok(None);
+    };
+    if primary.patches().is_some()
+        || secondary.patches().is_some()
+        || primary.offset() != secondary.offset()
+        || !array.dtype().as_ptype().is_unsigned_int()
+    {
+        return Ok(None);
+    }
+
+    let validity = primary.validity()?;
+    let base = array.base();
+    Ok(Some(vortex_array::match_each_unsigned_integer_ptype!(
+        array.dtype().as_ptype(),
+        |T| {
+            let base = T::try_from(base).vortex_expect("validated IntMult base");
+            PrimitiveArray::new(
+                unpack_pair_map::<T, T, _>(primary, secondary, |primary, secondary| {
+                    T::wrapping_mul_add(base, primary, secondary)
+                })?,
+                validity,
+            )
+        }
+    )))
 }
 
 fn decode_dict_add(
@@ -656,6 +691,38 @@ mod tests {
             encoded,
             PrimitiveArray::from_iter([101_u32, 102, 103]),
             &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multiplies_bitpacked_pair_with_validity_and_slice() -> VortexResult<()> {
+        let input = PrimitiveArray::from_option_iter(
+            (0..2_050_u32)
+                .map(|index| (index != 1_024).then_some((index % 1_000) * 10 + index % 10)),
+        );
+        let split = IntMult::from_primitive(input.as_view(), 10)?;
+        let mut ctx = array_session().create_execution_ctx();
+        let primary = split
+            .primary()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let secondary = split
+            .secondary()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        // SAFETY: Ten bits represent every quotient in the test input.
+        let primary = unsafe { bitpack_encode_unchecked(primary, 10) }?.into_array();
+        // SAFETY: Four bits represent every remainder in the test input.
+        let secondary = unsafe { bitpack_encode_unchecked(secondary, 4) }?.into_array();
+        let encoded = IntMult::try_new(primary, secondary, 10)?;
+
+        assert!(decode_fastlanes_pair(encoded.as_view())?.is_some());
+        assert_arrays_eq!(encoded, input, &mut ctx);
+        assert_arrays_eq!(
+            encoded.into_array().slice(1_000..1_050)?,
+            input.into_array().slice(1_000..1_050)?,
+            &mut ctx
         );
         Ok(())
     }

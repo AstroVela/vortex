@@ -376,6 +376,10 @@ These cases include the current compressed children and fused decode paths.
 | BlockResidual `u16` | 1.31 GB/s | 32.55 GB/s | 61 ns |
 | BlockResidual `u32` | 2.67 GB/s | 46.61 GB/s | 48 ns |
 | BlockResidual `u64` | 4.97 GB/s | 35.56 GB/s | 40 ns |
+| IntMult with packed children `u8` | 0.70 GB/s | 24.81 GB/s | 125 ns |
+| IntMult with packed children `u16` | 1.38 GB/s | 22.90 GB/s | 125 ns |
+| IntMult with packed children `u32` | 2.64 GB/s | 22.62 GB/s | 140 ns |
+| IntMult with packed children `u64` | 4.34 GB/s | 17.96 GB/s | 125 ns |
 | OrderedFloat with BlockResidual `f16` | 1.26 GB/s | 20.50 GB/s | 79 ns |
 | OrderedFloat with BlockResidual `f32` | 2.43 GB/s | 29.64 GB/s | 78 ns |
 | OrderedFloat with BlockResidual `f64` | 2.70 GB/s | 20.44 GB/s | 125 ns |
@@ -388,6 +392,16 @@ These cases include the current compressed children and fused decode paths.
 The FloatQuant scheme includes analysis and direct tree construction.
 
 It encodes at 5.19 GB/s for `f32` and 7.07 GB/s for `f64` on selected inputs.
+
+The packed IntMult tree uses a base of ten and patch-free BitPacked children.
+
+The fused pair decoder unpacks both children directly into the reconstructed output.
+
+It removes the full secondary buffer and the separate multiplication pass.
+
+The paired `u64` benchmark improved decode throughput from 13.10 GB/s to 17.73 GB/s.
+
+This change increased decode throughput by 35.3 percent.
 
 The decomposed fixed-bin row uses ten separated clusters and a BlockResidual offset child.
 
@@ -2139,6 +2153,8 @@ This round completed these steps:
 - Audited constructor and deserialization validation for all four production arrays.
 - Added round-trip tests for every supported integer and float type.
 - Added single-encoding benchmarks for every supported integer and float type.
+- Added packed-child IntMult benchmarks for every unsigned integer type.
+- Added fused IntMult decode for aligned, patch-free BitPacked children.
 - Added `f16` support to OrderedFloat, FloatQuant, and both Default schemes.
 - Verified zero-secondary and nonzero-secondary `f16` FloatQuant trees.
 - Added exact RangePacked size estimates without packed payload construction.

@@ -51,6 +51,7 @@ use vortex::encodings::float_quant::analyze_float_quant;
 use vortex::encodings::fsst::fsst_compress;
 use vortex::encodings::fsst::fsst_train_compressor;
 use vortex::encodings::int_mult::IntMult;
+use vortex::encodings::int_mult::IntMultArraySlotsExt;
 use vortex::encodings::pco::Pco;
 use vortex::encodings::range_packed::RangeDecomposition;
 use vortex::encodings::runend::RunEnd;
@@ -348,6 +349,38 @@ fn setup_ranged_u64_array() -> PrimitiveArray {
         let cluster = index % 10;
         cluster * 1_000_000_000 + index.wrapping_mul(7_919) % 1_024
     }))
+}
+
+fn encode_int_mult_packed_tree<T: NativePType>(array: &PrimitiveArray) -> vortex::array::ArrayRef {
+    let split = IntMult::from_primitive(array.as_view(), 10).unwrap();
+    let primary = split
+        .primary()
+        .clone()
+        .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())
+        .unwrap();
+    let secondary = split
+        .secondary()
+        .clone()
+        .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())
+        .unwrap();
+    let primary_width = match T::PTYPE {
+        PType::U8 => 5,
+        PType::U16 => 13,
+        PType::U32 => 27,
+        PType::U64 => 30,
+        ptype => unreachable!("unsupported packed IntMult benchmark type {ptype}"),
+    };
+    // SAFETY: The benchmark generator bounds the quotient to the selected width.
+    let primary = unsafe { bitpack_encode_unchecked(primary, primary_width) }
+        .unwrap()
+        .into_array();
+    // SAFETY: The benchmark generator bounds the remainder below ten.
+    let secondary = unsafe { bitpack_encode_unchecked(secondary, 4) }
+        .unwrap()
+        .into_array();
+    IntMult::try_new(primary, secondary, 10)
+        .unwrap()
+        .into_array()
 }
 
 fn encode_decomposed_range_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
@@ -855,6 +888,42 @@ fn int_mult_split_scalar_at<T: NativePType>(bencher: Bencher) {
     let encoded = IntMult::from_primitive(setup_int_mult_integer_array::<T>().as_view(), 10)
         .unwrap()
         .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(types = [u8, u16, u32, u64])]
+fn int_mult_packed_tree_compress<T: NativePType>(bencher: Bencher) {
+    let array = setup_int_mult_integer_array::<T>();
+    let byte_width = u64::try_from(T::PTYPE.byte_width()).unwrap();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * byte_width)
+        .with_inputs(|| &array)
+        .bench_refs(|array| encode_int_mult_packed_tree::<T>(array));
+}
+
+#[divan::bench(types = [u8, u16, u32, u64])]
+fn int_mult_packed_tree_decompress<T: NativePType>(bencher: Bencher) {
+    let encoded = encode_int_mult_packed_tree::<T>(&setup_int_mult_integer_array::<T>());
+    let byte_width = u64::try_from(T::PTYPE.byte_width()).unwrap();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * byte_width)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(types = [u8, u16, u32, u64])]
+fn int_mult_packed_tree_scalar_at<T: NativePType>(bencher: Bencher) {
+    let encoded = encode_int_mult_packed_tree::<T>(&setup_int_mult_integer_array::<T>());
     let next_index = AtomicUsize::new(0);
 
     bencher
