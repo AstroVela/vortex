@@ -589,65 +589,53 @@ fn split_f64(values: &[f64], k: u8) -> VortexResult<(Vec<u64>, Vec<u64>)> {
 fn split_primary_f32(values: &[f32], k: u8) -> VortexResult<Vec<u32>> {
     vortex_ensure!(k > 0 && k <= 23, "FloatQuant f32 k must be in 1..=23");
     let low_mask = (1_u32 << k) - 1;
-    values
+    vortex_ensure!(
+        values.iter().all(|value| value.to_bits() & low_mask == 0),
+        "FloatQuant constant secondary requires zero low bits"
+    );
+    Ok(values
         .iter()
-        .map(|value| {
-            let bits = value.to_bits();
-            vortex_ensure!(
-                bits & low_mask == 0,
-                "FloatQuant constant secondary requires zero low bits"
-            );
-            Ok(ordered_u32(bits) >> k)
-        })
-        .collect()
+        .map(|value| ordered_u32(value.to_bits()) >> k)
+        .collect())
 }
 
 fn split_primary_f64(values: &[f64], k: u8) -> VortexResult<Vec<u64>> {
     vortex_ensure!(k > 0 && k <= 52, "FloatQuant f64 k must be in 1..=52");
     let low_mask = (1_u64 << k) - 1;
-    values
+    vortex_ensure!(
+        values.iter().all(|value| value.to_bits() & low_mask == 0),
+        "FloatQuant constant secondary requires zero low bits"
+    );
+    Ok(values
         .iter()
-        .map(|value| {
-            let bits = value.to_bits();
-            vortex_ensure!(
-                bits & low_mask == 0,
-                "FloatQuant constant secondary requires zero low bits"
-            );
-            Ok(ordered_u64(bits) >> k)
-        })
-        .collect()
+        .map(|value| ordered_u64(value.to_bits()) >> k)
+        .collect())
 }
 
 fn split_primary_for_f32(values: &[f32], k: u8, primary_min: u32) -> VortexResult<Vec<u32>> {
     vortex_ensure!(k > 0 && k <= 23, "FloatQuant f32 k must be in 1..=23");
     let low_mask = (1_u32 << k) - 1;
-    values
+    vortex_ensure!(
+        values.iter().all(|value| value.to_bits() & low_mask == 0),
+        "FloatQuant constant secondary requires zero low bits"
+    );
+    Ok(values
         .iter()
-        .map(|value| {
-            let bits = value.to_bits();
-            vortex_ensure!(
-                bits & low_mask == 0,
-                "FloatQuant constant secondary requires zero low bits"
-            );
-            Ok((ordered_u32(bits) >> k) - primary_min)
-        })
-        .collect()
+        .map(|value| (ordered_u32(value.to_bits()) >> k) - primary_min)
+        .collect())
 }
 
 fn split_primary_for_f64(values: &[f64], k: u8, primary_min: u64) -> VortexResult<Vec<u64>> {
     vortex_ensure!(k > 0 && k <= 52, "FloatQuant f64 k must be in 1..=52");
     let low_mask = (1_u64 << k) - 1;
-    values
+    vortex_ensure!(
+        values.iter().all(|value| value.to_bits() & low_mask == 0),
+        "FloatQuant constant secondary requires zero low bits"
+    );
+    Ok(values
         .iter()
-        .map(|value| {
-            let bits = value.to_bits();
-            vortex_ensure!(
-                bits & low_mask == 0,
-                "FloatQuant constant secondary requires zero low bits"
-            );
-            Ok((ordered_u64(bits) >> k) - primary_min)
-        })
-        .collect()
+        .map(|value| (ordered_u64(value.to_bits()) >> k) - primary_min)
+        .collect())
 }
 
 fn join_f32(primary: u32, secondary: u32, k: u8) -> f32 {
@@ -959,6 +947,17 @@ mod tests {
         assert!(decoded.as_::<FloatQuant>().secondary().is_none());
         assert_arrays_eq!(decoded, expected, &mut ctx);
         Ok(())
+    }
+
+    #[test]
+    fn implicit_zero_secondary_rejects_nonzero_low_bits() {
+        let f32_values = PrimitiveArray::from_iter([f32::from_bits(1.0_f32.to_bits() | 1)]);
+        assert!(FloatQuant::from_primitive_constant_secondary(f32_values.as_view(), 8).is_err());
+        assert!(FloatQuant::primary_for_primitive(f32_values.as_view(), 8, 0).is_err());
+
+        let f64_values = PrimitiveArray::from_iter([f64::from_bits(1.0_f64.to_bits() | 1)]);
+        assert!(FloatQuant::from_primitive_constant_secondary(f64_values.as_view(), 29).is_err());
+        assert!(FloatQuant::primary_for_primitive(f64_values.as_view(), 29, 0).is_err());
     }
 
     #[test]

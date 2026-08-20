@@ -400,6 +400,7 @@ fn unordered_u64(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
@@ -407,7 +408,13 @@ mod tests {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::PType;
+    use vortex_array::serde::SerializeOptions;
+    use vortex_array::serde::SerializedArray;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+    use vortex_buffer::ByteBufferMut;
     use vortex_error::VortexResult;
+    use vortex_session::registry::ReadContext;
 
     use super::OrderedFloat;
     use super::OrderedFloatArraySlotsExt;
@@ -469,6 +476,41 @@ mod tests {
             primitive.into_array().slice(1_023..1_026)?,
             &mut ctx
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_serialized_slice_roundtrip() -> VortexResult<()> {
+        let primitive = PrimitiveArray::new(
+            Buffer::from(vec![f64::NEG_INFINITY, -0.0, 0.0, 42.25, f64::INFINITY]),
+            Validity::from_iter([true, false, true, true, true]),
+        );
+        let encoded = OrderedFloat::from_primitive(primitive.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+        assert!(encoded.execute_scalar(1, &mut ctx)?.is_null());
+
+        let sliced = encoded.into_array().slice(1..5)?;
+        let expected = primitive.into_array().slice(1..5)?;
+        let dtype = sliced.dtype().clone();
+        let len = sliced.len();
+        let array_context = ArrayContext::empty();
+        let serialized =
+            sliced.serialize(&array_context, &session, &SerializeOptions::default())?;
+        let mut bytes = ByteBufferMut::empty();
+        for buffer in serialized {
+            bytes.extend_from_slice(buffer.as_ref());
+        }
+        let decoded = SerializedArray::try_from(bytes.freeze())?.decode(
+            &dtype,
+            len,
+            &ReadContext::new(array_context.to_ids()),
+            &session,
+        )?;
+
+        assert!(decoded.is::<OrderedFloat>());
+        assert_arrays_eq!(decoded, expected, &mut ctx);
         Ok(())
     }
 }

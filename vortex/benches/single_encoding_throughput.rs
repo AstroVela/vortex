@@ -247,6 +247,14 @@ fn setup_int_mult_i32_array() -> PrimitiveArray {
     }))
 }
 
+fn setup_int_mult_u64_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let primary = index.wrapping_mul(7_919) % 1_000_000_000;
+        let secondary = index % 10;
+        primary.wrapping_mul(10).wrapping_add(secondary)
+    }))
+}
+
 fn setup_ranged_u64_array() -> PrimitiveArray {
     PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
         let cluster = index % 10;
@@ -627,6 +635,62 @@ fn bench_ordered_float_decompress_f64(bencher: Bencher) {
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
 
+#[divan::bench(name = "ordered_float_scalar_at_f64")]
+fn bench_ordered_float_scalar_at_f64(bencher: Bencher) {
+    let encoded = OrderedFloat::from_primitive(setup_random_walk_array().as_view())
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "ordered_float_compress_f32")]
+fn bench_ordered_float_compress_f32(bencher: Bencher) {
+    let float_array = setup_ordered_f32_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| OrderedFloat::from_primitive(array.as_view()).unwrap());
+}
+
+#[divan::bench(name = "ordered_float_decompress_f32")]
+fn bench_ordered_float_decompress_f32(bencher: Bencher) {
+    let encoded = OrderedFloat::from_primitive(setup_ordered_f32_array().as_view())
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "ordered_float_scalar_at_f32")]
+fn bench_ordered_float_scalar_at_f32(bencher: Bencher) {
+    let encoded = OrderedFloat::from_primitive(setup_ordered_f32_array().as_view())
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
 #[divan::bench(name = "int_mult_split_compress_i32")]
 fn bench_int_mult_split_compress_i32(bencher: Bencher) {
     let array = setup_int_mult_i32_array();
@@ -650,6 +714,44 @@ fn bench_int_mult_split_decompress_i32(bencher: Bencher) {
 #[divan::bench(name = "int_mult_split_scalar_at_i32")]
 fn bench_int_mult_split_scalar_at_i32(bencher: Bencher) {
     let encoded = IntMult::from_primitive(setup_int_mult_i32_array().as_view(), 10)
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "int_mult_split_compress_u64")]
+fn bench_int_mult_split_compress_u64(bencher: Bencher) {
+    let array = setup_int_mult_u64_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| &array)
+        .bench_refs(|array| IntMult::from_primitive(array.as_view(), 10).unwrap());
+}
+
+#[divan::bench(name = "int_mult_split_decompress_u64")]
+fn bench_int_mult_split_decompress_u64(bencher: Bencher) {
+    let encoded = IntMult::from_primitive(setup_int_mult_u64_array().as_view(), 10)
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "int_mult_split_scalar_at_u64")]
+fn bench_int_mult_split_scalar_at_u64(bencher: Bencher) {
+    let encoded = IntMult::from_primitive(setup_int_mult_u64_array().as_view(), 10)
         .unwrap()
         .into_array();
     let next_index = AtomicUsize::new(0);
@@ -1233,6 +1335,25 @@ fn bench_float_quant_split_decompress_f64(bencher: Bencher) {
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
 
+#[divan::bench(name = "float_quant_split_scalar_at_f64")]
+fn bench_float_quant_split_scalar_at_f64(bencher: Bencher) {
+    let encoded =
+        FloatQuant::from_primitive_constant_secondary(setup_widened_f32_array().as_view(), 29)
+            .unwrap()
+            .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
 #[divan::bench(name = "float_quant_materialized_tree_compress_f64")]
 fn bench_float_quant_tree_compress_f64(bencher: Bencher) {
     let float_array = setup_widened_f32_array();
@@ -1263,6 +1384,51 @@ fn bench_float_quant_tree_decompress_f64(bencher: Bencher) {
 #[divan::bench(name = "float_quant_tree_scalar_at_f64")]
 fn bench_float_quant_tree_scalar_at_f64(bencher: Bencher) {
     let encoded = encode_float_quant_tree(&setup_widened_f32_array());
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
+}
+
+#[divan::bench(name = "float_quant_split_compress_f32")]
+fn bench_float_quant_split_compress_f32(bencher: Bencher) {
+    let float_array = setup_quantized_f32_array();
+    let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| &float_array)
+        .bench_refs(|array| {
+            FloatQuant::from_primitive_constant_secondary(array.as_view(), k).unwrap()
+        });
+}
+
+#[divan::bench(name = "float_quant_split_decompress_f32")]
+fn bench_float_quant_split_decompress_f32(bencher: Bencher) {
+    let float_array = setup_quantized_f32_array();
+    let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+    let encoded = FloatQuant::from_primitive_constant_secondary(float_array.as_view(), k)
+        .unwrap()
+        .into_array();
+
+    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_split_scalar_at_f32")]
+fn bench_float_quant_split_scalar_at_f32(bencher: Bencher) {
+    let float_array = setup_quantized_f32_array();
+    let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+    let encoded = FloatQuant::from_primitive_constant_secondary(float_array.as_view(), k)
+        .unwrap()
+        .into_array();
     let next_index = AtomicUsize::new(0);
 
     bencher
@@ -1412,6 +1578,26 @@ fn bench_float_quant_nonzero_secondary_split_decompress_f64(bencher: Bencher) {
     with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
+}
+
+#[divan::bench(name = "float_quant_nonzero_secondary_split_scalar_at_f64")]
+fn bench_float_quant_nonzero_secondary_split_scalar_at_f64(bencher: Bencher) {
+    let float_array = setup_nonzero_secondary_array();
+    let k = analyze_float_quant(float_array.as_view()).unwrap().k;
+    let encoded = FloatQuant::from_primitive(float_array.as_view(), k)
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            (
+                &encoded,
+                SESSION.create_execution_ctx(),
+                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
+            )
+        })
+        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
 }
 
 #[divan::bench(name = "float_quant_nonzero_secondary_tree_compress_f64")]

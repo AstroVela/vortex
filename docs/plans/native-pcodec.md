@@ -87,7 +87,7 @@ BlockResidual now passes the direct speed gates for 32-bit and 64-bit integers.
 
 The GloVe result identifies a separate entropy gap inside the ALP integer child.
 
-Generic quotient and remainder trees do not close that gap.
+The previously tested quotient and remainder trees do not close that gap.
 
 The current selector factors and nonlinear patch cost remain provisional.
 
@@ -240,7 +240,9 @@ Direct 32-bit and 64-bit BlockResidual decode now matches or exceeds the main Fo
 
 BlockResidual does not occur below ZigZag. That composition lost decode throughput on GloVe for a small size reduction.
 
-The residual scheme requires a 1.05 compression ratio. Its adjusted score includes a 1.02 decode-cost factor.
+The ordered-float residual scheme requires a 1.05 compression ratio.
+
+Its adjusted score includes a 1.02 decode-cost factor.
 
 `BlockResidualScheme` uses the same locality probe for integer arrays.
 
@@ -250,12 +252,7 @@ The scheme does not run inside trial compression for an outer scheme. Generic 64
 
 The selected outer scheme can still choose BlockResidual for its full child.
 
-The integer selector divides the measured compression ratio by these decode-cost factors:
-
-- 1.10 for 32-bit integers.
-- 1.20 for 64-bit integers.
-
-A 1.20 factor requires about 16.7 percent fewer estimated bytes. It does not require 20 percent fewer bytes.
+The integer BlockResidual scheme does not use a width-specific decode-cost factor.
 
 The block planner adds 16 synthetic cost bits per patch.
 
@@ -274,6 +271,63 @@ The physical encoding remains size-optimal. The adjusted size only affects selec
 The selector excludes BlockResidual from dictionary-code children. A complete BlockResidual tree can still displace a complete dictionary tree.
 
 Both schemes remain eligible to displace ALP or ALP-RD when their sample size scores win.
+
+## Single-encoding performance ledger
+
+This snapshot dates from 2026-08-20.
+
+Each benchmark uses two million logical values and 100 Divan samples.
+
+Encode and decode results report median logical input throughput.
+
+Scalar results report median random-access latency.
+
+### Primitive transforms
+
+These cases use canonical primitive children. They isolate each outer array transform.
+
+| Array and input | Encode | Decode | Scalar access |
+| --- | ---: | ---: | ---: |
+| OrderedFloat `f32` | 52.38 GB/s | 60.47 GB/s | 82 ns |
+| OrderedFloat `f64` | 58.78 GB/s | 42.78 GB/s | 90 ns |
+| IntMult base-ten `i32` | 2.83 GB/s | 30.43 GB/s | 125 ns |
+| IntMult base-ten `u64` | 5.67 GB/s | 25.24 GB/s | 140 ns |
+| FloatQuant zero-secondary `f32` | 11.66 GB/s | 31.17 GB/s | 83 ns |
+| FloatQuant zero-secondary `f64` | 19.02 GB/s | 25.15 GB/s | 83 ns |
+| FloatQuant one-bit-secondary `f64` | 9.26 GB/s | 8.14 GB/s | 167 ns |
+
+IntMult encode includes quotient and remainder creation. It excludes compression of both children.
+
+FloatQuant zero-secondary encode uses separate validation and transform passes.
+
+The prior fallible per-value loop reached 1.99 GB/s for `f32` and 3.72 GB/s for `f64`.
+
+The two-pass implementation improved those results by 5.9 times and 5.1 times.
+
+### Production child trees
+
+These cases include the current compressed children and fused decode paths.
+
+| Array tree and input | Encode | Decode | Scalar access |
+| --- | ---: | ---: | ---: |
+| BlockResidual `i16` | 1.41 GB/s | 32.03 GB/s | 83 ns |
+| BlockResidual `i32` | 2.80 GB/s | 33.07 GB/s | 57 ns |
+| BlockResidual `u32` | 2.79 GB/s | 45.99 GB/s | 60 ns |
+| BlockResidual `u64` | 5.18 GB/s | 37.72 GB/s | 83 ns |
+| OrderedFloat with BlockResidual `f32` | 2.43 GB/s | 29.64 GB/s | 78 ns |
+| OrderedFloat with BlockResidual `f64` | 2.70 GB/s | 20.44 GB/s | 125 ns |
+| FloatQuant with packed primary `f32` | 7.59 GB/s | 18.21 GB/s | 125 ns |
+| FloatQuant with packed primary `f64` | 8.30 GB/s | 14.77 GB/s | 125 ns |
+| FloatQuant with two packed children `f64` | 4.21 GB/s | 13.05 GB/s | 209 ns |
+| Decomposed fixed bins `u64` | 1.20 GB/s | 14.27 GB/s | 332 ns |
+
+The FloatQuant scheme includes analysis and direct tree construction.
+
+It encodes at 5.19 GB/s for `f32` and 7.07 GB/s for `f64` on selected inputs.
+
+The decomposed fixed-bin row uses ten separated clusters and a BlockResidual offset child.
+
+The fixed-bin result still lacks complete Default and Compact comparisons on real columns.
 
 ## Performance requirements
 
