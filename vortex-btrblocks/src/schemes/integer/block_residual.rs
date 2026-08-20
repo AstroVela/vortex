@@ -49,7 +49,7 @@ impl Scheme for BlockResidualScheme {
     }
 
     fn matches(&self, canonical: &Canonical) -> bool {
-        canonical.dtype().is_int() && canonical.dtype().as_ptype().bit_width() >= 32
+        canonical.dtype().is_int() && canonical.dtype().as_ptype().bit_width() >= 16
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {

@@ -78,7 +78,7 @@ The serialized tree uses `OrderedFloat(BlockResidual(...))` because the outer ar
 
 The FloatQuant candidate accepts native `f16`, `f32`, and `f64` inputs.
 
-Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
+Direct integer BlockResidual supports every integer type. The default selector accepts 16-bit, 32-bit, and 64-bit inputs.
 
 The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
 
@@ -296,7 +296,9 @@ Its adjusted score includes a 1.02 decode-cost factor.
 
 `BlockResidualScheme` uses the same locality probe for integer arrays.
 
-The default scheme accepts only 32-bit and 64-bit integers. Direct 8-bit and 16-bit candidates cannot save enough absolute space.
+The default scheme accepts 16-bit, 32-bit, and 64-bit integers.
+
+The scheme still excludes direct 8-bit candidates.
 
 The scheme does not run inside trial compression for an outer scheme. Generic 64-row samples do not preserve 1,024-row locality.
 
@@ -608,7 +610,35 @@ The synthetic `i16` BlockResidual tree uses 1,793,784 bytes. The FoR plus BitPac
 
 BlockResidual is 48.7 percent smaller on that input.
 
-Its `i16` decode throughput is 24.4 percent lower. The default selector therefore excludes direct 8-bit and 16-bit candidates.
+Its `i16` decode throughput is 24.4 percent lower, but it still exceeds 31 GB/s.
+
+The absolute decode rate makes this a useful Default trade. The selector now includes 16-bit integers.
+
+### 16-bit selector revalidation
+
+The complete synthetic control uses the production compressor without experimental Delta.
+
+| Configuration | Bytes | Encode MB/s | Decode MB/s |
+| --- | ---: | ---: | ---: |
+| Prior Default | 3,501,568 | 599.4 | 38,415 |
+| Default with 16-bit BlockResidual | 1,793,269 | 653.8 | 31,600 |
+
+The selected tree reduces size by 48.8 percent and increases encode throughput by 9.1 percent.
+
+Decode throughput decreases by 17.7 percent, but it remains 31.6 GB/s.
+
+Three real files selected direct or nested 16-bit BlockResidual trees.
+
+| Dataset | 32-bit and 64-bit bundle | Bundle with 16-bit | Size change | Encode change | Decode change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Bimbo | 10,573,121 | 9,671,397 | -8.53 percent | -1.01 percent | -2.20 percent |
+| Food | 12,297,725 | 11,443,009 | -6.95 percent | -1.28 percent | -5.66 percent |
+| HashTags | 21,283,222 | 21,254,341 | -0.14 percent | +1.78 percent | +8.81 percent |
+| Geometric mean | — | — | -5.27 percent | -0.18 percent | +0.13 percent |
+
+The throughput changes come from adjacent runs and include ordinary benchmark noise.
+
+The exact size gains and high absolute decode rates support 16-bit Default eligibility.
 
 ### Narrow BlockResidual in Compact
 
@@ -769,11 +799,9 @@ Signed integers and ordered floats still require a transform after residual deco
 
 The specialization removes the prior `u32` decode disadvantage.
 
-The narrow integer exclusion remains valid. Native-width unpack does not close the `i16` gap.
+Native-width unpack leaves a percentage gap for `i16`, but its absolute decode rate remains high.
 
-One width factor does not predict both signed and unsigned results.
-
-Retain the current factor until the final corpus calibration uses selected-tree evidence.
+One width factor does not predict both signed and unsigned results. The integer selector uses no width-specific factor.
 
 ### Serialized BlockResidual topology
 
@@ -805,7 +833,9 @@ The single-encoding benchmark uses two million block-local values.
 | `i32` | 2.78 | 32.23 | 41 |
 | `i16` | 1.42 | 32.18 | 83 |
 
-The direct 8-bit and 16-bit selector exclusion remains valid.
+The 16-bit path now meets the revised size and absolute-throughput preference.
+
+The direct 8-bit selector exclusion remains active.
 
 The broad file benchmark uses three iterations across eight datasets.
 
@@ -935,9 +965,9 @@ Food `volume_total_bytes` uses classic bins inside an ALP child.
 
 The column attribution separates numeric Compact gains from file-level string compression gains.
 
-### Selector calibration miss on a Compact gap
+### Resolved selector calibration miss on a Compact gap
 
-The CMS ALP integer child exposes a current BlockResidual threshold miss.
+The CMS ALP integer child exposed a historical BlockResidual threshold miss.
 
 The current Default tree uses 11,064,308 bytes and decodes at 24.98 GB/s.
 
@@ -945,7 +975,15 @@ The current Default tree uses 11,064,308 bytes and decodes at 24.98 GB/s.
 
 The candidate is 3.1 percent smaller and 10.8 percent slower to decode.
 
-The current 1.20 factor rejects it. Final threshold calibration must decide whether this trade belongs in Default.
+The historical 1.20 factor rejected it.
+
+Later calibration removed the width factors.
+
+The current integer scheme uses a 1.05 raw-ratio floor and no decode-cost factor.
+
+The current compressor selects `ALP(BlockResidual)` at 10,716,519 bytes.
+
+This result resolves the threshold miss. The nonlinear patch cost still protects dense-patch decode.
 
 ### Patch-density sweep
 
@@ -2308,7 +2346,7 @@ This round completed these steps:
 - Rejected the multi-reference residual design.
 - Added the outer-sample exclusion and width-specific factors.
 - Added the patch-count decode cost.
-- Excluded direct 8-bit and 16-bit candidates.
+- Initially excluded direct 8-bit and 16-bit candidates.
 - Excluded BlockResidual from dictionary-code children.
 - Added fused f32 OrderedFloat with BlockResidual decode and selection.
 - Added u32, i32, f32, and patch-density benchmarks.
@@ -2370,6 +2408,8 @@ This round completed these steps:
 - Replaced FloatQuant sample packing with an exact buffer-size estimate.
 - Added isolated FloatQuant rejection controls for all float widths.
 - Added adjusted-ratio near-miss controls for `f32` and `f64`.
+- Re-enabled 16-bit BlockResidual after absolute-throughput and corpus revalidation.
+- Retained the direct 8-bit selector exclusion.
 - Removed the Food and HashTags FloatQuant size regressions.
 - Revalidated the BlockResidual and FloatQuant bundles across 16 files.
 - Rejected constant RangePacked samples before exact sample encoding.
@@ -2402,7 +2442,7 @@ Let ordinary child arrays own patches and exception payloads.
 
 Add an outer OrderedFloat fused decode only if the generic composition misses the decode gate.
 
-Retain the direct 8-bit and 16-bit selector exclusions until benchmark evidence changes them.
+Retain the direct 8-bit selector exclusion until benchmark evidence changes it.
 
 Keep fused RangePacked and RangeEntropy outside Default.
 

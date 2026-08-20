@@ -111,21 +111,57 @@ fn test_block_residual_ignores_null_payloads() -> VortexResult<()> {
 }
 
 #[test]
-fn test_block_residual_skips_narrow_integers() -> VortexResult<()> {
-    let values = (0..8_192)
+fn test_block_residual_compresses_16_bit_integers() -> VortexResult<()> {
+    let signed_values = (0..8_192)
         .map(|index| {
             let block = index / 1_024;
             let residual = (index * 2_654_435_761_usize) % 32;
             Ok(i16::try_from(block * 1_000 + residual)?)
         })
         .collect::<VortexResult<Vec<_>>>()?;
+    let unsigned_values = signed_values
+        .iter()
+        .copied()
+        .map(u16::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(not(feature = "unstable_encodings"))]
+    let compressor = BtrBlocksCompressor::default();
+    #[cfg(feature = "unstable_encodings")]
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([DeltaScheme::default().id()])
+        .build();
+
+    for array in [
+        PrimitiveArray::from_iter(signed_values),
+        PrimitiveArray::from_iter(unsigned_values),
+    ] {
+        let compressed =
+            compressor.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+        assert!(
+            contains_block_residual(&compressed),
+            "BlockResidual must encode this 16-bit input:\n{}",
+            compressed.display_tree()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_block_residual_skips_8_bit_integers() -> VortexResult<()> {
+    let values = (0..8_192)
+        .map(|index| {
+            let block = index / 1_024;
+            let residual = (index * 2_654_435_761_usize) % 8;
+            i8::try_from(block * 16 + residual)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let array = PrimitiveArray::from_iter(values);
     let compressed = BtrBlocksCompressor::default()
         .compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
 
     assert!(
         !contains_block_residual(&compressed),
-        "BlockResidual must not encode narrow integers:\n{}",
+        "BlockResidual must not encode 8-bit integers:\n{}",
         compressed.display_tree()
     );
     Ok(())
