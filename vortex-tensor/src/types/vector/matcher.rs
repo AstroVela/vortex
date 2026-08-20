@@ -13,7 +13,7 @@ use vortex_error::vortex_panic;
 use crate::types::unit_vector::UnitVector;
 use crate::types::vector::Vector;
 
-/// Matches [`Vector`] and [`UnitVector`](crate::unit_vector::UnitVector) dtypes.
+/// Matches [`Vector`] and [`UnitVector`] dtypes.
 pub struct AnyVector;
 
 /// Shape metadata derived from a vector dtype's fixed-size-list storage.
@@ -56,7 +56,10 @@ impl VectorMatcherMetadata {
     ///
     /// Returns an error if the element type is not a float.
     pub fn try_new(element_ptype: PType, dimensions: u32) -> VortexResult<Self> {
-        vortex_ensure!(element_ptype.is_float());
+        vortex_ensure!(
+            element_ptype.is_float(),
+            "Vector element ptype must be a float, got {element_ptype}",
+        );
 
         Ok(Self {
             element_ptype,
@@ -86,10 +89,11 @@ mod tests {
     use vortex_array::dtype::extension::ExtDType;
     use vortex_error::VortexResult;
 
-    use super::*;
+    use super::AnyVector;
     use crate::types::fixed_shape_tensor::FixedShapeTensor;
     use crate::types::fixed_shape_tensor::FixedShapeTensorMetadata;
     use crate::types::unit_vector::UnitVector;
+    use crate::types::vector::Vector;
 
     fn vector_storage_dtype(element_ptype: PType, dimensions: u32) -> DType {
         DType::FixedSizeList(

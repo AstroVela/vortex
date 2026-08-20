@@ -63,7 +63,9 @@ impl ExtVTable for UnitVector {
             |(sum_squares, is_zero), element| -> VortexResult<_> {
                 let value = element
                     .as_ref()
-                    .ok_or_else(|| vortex_err!("UnitVector scalar elements must be non-null"))?
+                    .ok_or_else(|| {
+                        vortex_err!("UnitVector scalar elements must be non-null, got null")
+                    })?
                     .as_primitive();
                 let value = match value {
                     PValue::F16(value) => value.to_f64(),

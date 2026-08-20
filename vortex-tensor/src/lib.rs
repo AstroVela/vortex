@@ -4,6 +4,14 @@
 //! Types and functionality for working with tensors, vectors, and related mathematical constructs
 //! including unit vectors, spherical coordinates, and similarity measures such as cosine
 //! similarity.
+//!
+//! [`Vector`], [`UnitVector`], and [`FixedShapeTensor`] define logical tensor dtypes. The
+//! [`scalar_fns`] module provides tensor operations, while [`encodings`] contains their physical
+//! representations.
+//!
+//! [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
+//! [`UnitVector`]: crate::unit_vector::UnitVector
+//! [`Vector`]: crate::vector::Vector
 
 #![cfg_attr(
     test,
@@ -79,7 +87,7 @@ pub fn initialize(session: &VortexSession) {
     // encodings inside Vortex files. Gate this on an env var so applications that do not intend
     // to persist these encodings do not pay the registry cost or widen their stable-encoding
     // surface unintentionally.
-    if std::env::var_os(SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV).is_some_and(|v| !v.is_empty()) {
+    if std::env::var_os(SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV).is_some_and(|value| !value.is_empty()) {
         let session_arrays = session.arrays();
 
         session_arrays.register(ScalarFnArrayPlugin::new(CosineSimilarity));

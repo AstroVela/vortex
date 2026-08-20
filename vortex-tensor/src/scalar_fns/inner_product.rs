@@ -94,7 +94,8 @@ impl ScalarFnVTable for InnerProduct {
         let lhs = &arg_dtypes[0];
         let rhs = &arg_dtypes[1];
 
-        // TODO(connor): relax the float-only gate once integer tensors are supported.
+        // TODO(connor)[Tensor]: Add integer products after their result dtype and overflow
+        // semantics are defined. The current kernels and return dtype support only floats.
         let tensor_match = validate_binary_tensor_float_inputs(lhs, rhs)?;
         let ptype = tensor_match.element_ptype();
         let nullability = Nullability::from(lhs.is_nullable() || rhs.is_nullable());
@@ -240,7 +241,8 @@ impl InnerProduct {
     ///
     /// [`Normalized`]: crate::encodings::normalized::Normalized
     ///
-    /// The caller must pass the [`Normalized`] array as `normalized_ref` and the plain array as `plain_ref`.
+    /// The caller must pass the [`Normalized`] array as `normalized_ref` and the plain array as
+    /// `plain_ref`.
     fn execute_one_normalized(
         &self,
         normalized_ref: &ArrayRef,

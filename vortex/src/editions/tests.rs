@@ -6,16 +6,24 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+#[cfg(feature = "unstable_encodings")]
+use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::ChunkedArray;
+#[cfg(feature = "unstable_encodings")]
+use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
+#[cfg(feature = "unstable_encodings")]
+use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::field_path;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::stream::ArrayStreamExt;
+#[cfg(feature = "unstable_encodings")]
+use vortex_array::validity::Validity;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
 use vortex_edition::ComponentKind;
@@ -41,6 +49,12 @@ use vortex_layout::session::LayoutSession;
 use vortex_sequence::Sequence;
 use vortex_session::VortexSession;
 use vortex_session::registry::Id;
+#[cfg(feature = "unstable_encodings")]
+use vortex_tensor::scalar_fns::l2_normalize::L2Normalize;
+#[cfg(feature = "unstable_encodings")]
+use vortex_tensor::unit_vector::UnitVector;
+#[cfg(feature = "unstable_encodings")]
+use vortex_tensor::vector::Vector;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use super::CORE_2025_05_0;
@@ -52,6 +66,8 @@ use super::DEFAULT_CORE_EDITION;
 use super::DEFAULT_PREVIEW_EDITION;
 use super::EDITION_DECLARATIONS;
 use super::PREVIEW_2026_06_0;
+#[cfg(feature = "unstable_encodings")]
+use crate::VortexSessionDefault;
 
 fn session() -> Result<EditionSession, EditionError> {
     let session = EditionSession::empty();
@@ -502,17 +518,6 @@ async fn write_with(session: &VortexSession, array: ArrayRef) -> VortexResult<By
 #[cfg(feature = "unstable_encodings")]
 #[tokio::test]
 async fn preview_writer_accepts_unit_vector_dtype_and_normalizer() -> VortexResult<()> {
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::arrays::FixedSizeListArray;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
-    use vortex_array::validity::Validity;
-    use vortex_tensor::scalar_fns::l2_normalize::L2Normalize;
-    use vortex_tensor::unit_vector::UnitVector;
-    use vortex_tensor::vector::Vector;
-
-    use crate::VortexSessionDefault;
-
     let session = VortexSession::default();
     session
         .arrays()

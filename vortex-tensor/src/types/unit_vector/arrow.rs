@@ -169,12 +169,23 @@ impl ArrowImportVTable for UnitVector {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::ArrayRef as ArrowArrayRef;
     use arrow_array::FixedSizeListArray as ArrowFixedSizeListArray;
     use arrow_array::Float32Array;
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use vortex_array::EmptyMetadata;
+    use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::dtype::extension::ExtDType;
+    use vortex_arrow::ArrowSession;
+    use vortex_error::VortexResult;
 
-    use super::*;
+    use super::ARROW_UNIT_VECTOR_EXTENSION_NAME;
+    use crate::types::unit_vector::UnitVector;
 
     const DIMENSIONS: u32 = 2;
 

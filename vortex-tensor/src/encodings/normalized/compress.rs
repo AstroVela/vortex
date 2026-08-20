@@ -49,7 +49,7 @@ use crate::utils::extract_constant_flat_row;
 use crate::utils::extract_flat_elements;
 use crate::utils::validate_tensor_float_input;
 
-/// The compression scheme that rewrites a tensor-like column into the [`Normalized`] encoding.
+/// The compression scheme that rewrites an ordinary tensor column into [`Normalized`] storage.
 #[derive(Debug)]
 pub struct NormalizedScheme;
 
@@ -124,14 +124,19 @@ impl Scheme for NormalizedScheme {
     }
 }
 
-/// Splits a tensor-like column into its exact [`Normalized`] representation.
+/// Splits a [`Vector`] or [`FixedShapeTensor`] column into its exact [`Normalized`] representation.
 ///
 /// The children are non-nullable, and the input validity moves to the parent. Both children are
 /// zero at null rows so masked physical values cannot reach downstream encodings.
 ///
 /// # Errors
 ///
-/// Returns an error if `input` is not a float tensor column or if execution fails.
+/// Returns an error if `input` is a [`UnitVector`], is not a float tensor column, or cannot be
+/// executed.
+///
+/// [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
+/// [`UnitVector`]: crate::unit_vector::UnitVector
+/// [`Vector`]: crate::vector::Vector
 pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<NormalizedArray> {
     vortex_ensure!(
         !input
@@ -213,7 +218,10 @@ pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Normal
 /// Normalizes a single constant row without expanding it to the column length.
 ///
 /// Returns `Ok(None)` unless `input` has a non-null constant fixed-size-list storage scalar. A
-/// matching input produces constant normalized and norms children.
+/// [`UnitVector`] input also returns `Ok(None)`. Any other matching input produces constant
+/// normalized and norms children.
+///
+/// [`UnitVector`]: crate::unit_vector::UnitVector
 pub(crate) fn try_build_constant_normalized(
     input: &ArrayRef,
     len: usize,

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Matcher for tensor-like extension types.
+//! Matchers for tensor-like extension types.
+//!
+//! [`AnyTensor`] recognizes fixed-shape tensors and both vector refinements. [`TensorMatch`]
+//! exposes their shared float element type and flattened row width without erasing the distinction
+//! between fixed-shape tensors and vectors.
 
 use vortex_array::dtype::PType;
 use vortex_array::dtype::extension::ExtDTypeRef;

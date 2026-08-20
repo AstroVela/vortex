@@ -4,7 +4,7 @@
 //! Scalar function expressions defined on tensor and tensor-like extension types.
 //!
 //! Each child module owns one expression. [`NormMode`] defines whether norm-based expressions
-//! measure physical coordinates or trust normalized encoding evidence.
+//! measure physical coordinates or trust normalized dtype and encoding claims.
 
 use std::fmt::Display;
 use std::fmt::Formatter;

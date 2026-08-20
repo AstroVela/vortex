@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Vector extension type for fixed-length float vectors (e.g., embeddings).
+//! Vector extension type for fixed-length float vectors, such as embeddings.
+//!
+//! [`Vector`] establishes the fixed-size, non-nullable-float element layout. [`AnyVector`] matches
+//! both ordinary vectors and the [`UnitVector`](crate::unit_vector::UnitVector) refinement.
 
 use vortex_array::ArrayRef;
 use vortex_array::EmptyMetadata;
@@ -16,6 +19,16 @@ use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+
+mod arrow;
+pub use arrow::ARROW_VECTOR_EXTENSION_NAME;
+
+mod matcher;
+pub use matcher::AnyVector;
+pub use matcher::VectorMatcherMetadata;
+pub(crate) use matcher::match_vector_storage;
+
+mod vtable;
 
 /// Validates that `storage` is a valid storage dtype for a [`Vector`].
 ///
@@ -32,18 +45,18 @@ pub(crate) fn validate_vector_storage_dtype(storage: &DType) -> VortexResult<()>
     );
     vortex_ensure!(
         !element_dtype.is_nullable(),
-        "Vector element dtype must be non-nullable"
+        "Vector element dtype must be non-nullable, got {element_dtype}",
     );
 
     Ok(())
 }
 
-/// The Vector extension type.
+/// A fixed-length vector with non-nullable floating-point elements.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Vector;
 
 impl Vector {
-    /// Helper function for creating a new [`Vector`] [`ExtensionArray`].
+    /// Constructs a [`Vector`] [`ExtensionArray`] from its storage array.
     ///
     /// # Errors
     ///
@@ -53,8 +66,8 @@ impl Vector {
             .map(|ext| ext.into_array())
     }
 
-    /// Helper function to build a [`Vector`] [`ExtensionArray`] whose storage is a
-    /// [`ConstantArray`], broadcasting a single vector `elements` across `len` rows.
+    /// Constructs a [`Vector`] [`ExtensionArray`] whose [`ConstantArray`] storage broadcasts
+    /// `elements` across `len` rows.
     ///
     /// # Errors
     ///
@@ -66,20 +79,10 @@ impl Vector {
         let element_dtype = DType::Primitive(T::PTYPE, Nullability::NonNullable);
         let children: Vec<Scalar> = elements
             .iter()
-            .map(|&v| Scalar::primitive(v, Nullability::NonNullable))
+            .map(|&value| Scalar::primitive(value, Nullability::NonNullable))
             .collect();
         let storage_scalar =
             Scalar::fixed_size_list(element_dtype, children, Nullability::NonNullable);
         Self::try_new_vector_array(ConstantArray::new(storage_scalar, len).into_array())
     }
 }
-
-mod arrow;
-mod matcher;
-
-pub use arrow::ARROW_VECTOR_EXTENSION_NAME;
-pub use matcher::AnyVector;
-pub use matcher::VectorMatcherMetadata;
-pub(crate) use matcher::match_vector_storage;
-
-mod vtable;

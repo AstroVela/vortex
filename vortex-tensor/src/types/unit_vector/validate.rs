@@ -8,6 +8,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::match_each_float_ptype;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
@@ -47,7 +48,8 @@ pub(super) fn validate_unit_vector_rows(
             let (sum_squares, is_zero) = flat.row::<T>(row_idx).iter().fold(
                 (0.0f64, true),
                 |(sum_squares, is_zero), value| {
-                    let value_f64 = ToPrimitive::to_f64(value).unwrap_or(f64::NAN);
+                    let value_f64 = ToPrimitive::to_f64(value)
+                        .vortex_expect("UnitVector dtype validation established float elements");
                     (
                         sum_squares + value_f64 * value_f64,
                         is_zero && value.is_zero(),
@@ -59,7 +61,7 @@ pub(super) fn validate_unit_vector_rows(
             vortex_ensure!(
                 !is_zero && norm.is_finite() && (norm - 1.0).abs() <= tolerance,
                 "UnitVector row must be finite, nonzero, and have L2 norm within {tolerance:.6} \
-                 of 1.0, but row {row_idx} has norm {norm:.6}",
+                 of 1.0, got row {row_idx} with norm {norm:.6}",
             );
         }
     });

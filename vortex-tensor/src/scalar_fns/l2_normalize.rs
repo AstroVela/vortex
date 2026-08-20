@@ -5,7 +5,8 @@
 //!
 //! [`L2Normalize`] converts each finite, nonzero [`Vector`] row into a [`UnitVector`]. Exact-zero
 //! rows become null because they have no direction, and input nulls remain null. An existing
-//! [`UnitVector`] is returned unchanged.
+//! [`UnitVector`] is returned unchanged. Execution returns an error if a valid input row contains
+//! a non-finite coordinate.
 //!
 //! [`Vector`]: crate::vector::Vector
 //! [`UnitVector`]: crate::unit_vector::UnitVector
@@ -57,7 +58,12 @@ use crate::types::vector::AnyVector;
 use crate::types::vector::Vector;
 use crate::utils::extract_flat_elements;
 
-/// Converts ordinary vector rows into nullable unit vectors.
+/// Normalizes vector rows into [`UnitVector`] values.
+///
+/// Ordinary [`Vector`] inputs produce a nullable result because exact-zero rows have no direction.
+/// Existing [`UnitVector`] inputs retain their dtype and nullability.
+///
+/// [`Vector`]: crate::vector::Vector
 #[derive(Clone)]
 pub struct L2Normalize;
 
@@ -176,12 +182,12 @@ impl ScalarFnArrayVTable for L2Normalize {
 }
 
 fn normalized_dtype(input_dtype: &DType) -> VortexResult<DType> {
-    let ext_dtype = input_dtype
-        .as_extension_opt()
-        .ok_or_else(|| vortex_err!("L2Normalize input must be a vector, got {input_dtype}"))?;
-    let metadata = ext_dtype
-        .metadata_opt::<AnyVector>()
-        .ok_or_else(|| vortex_err!("L2Normalize input must be a vector, got {input_dtype}"))?;
+    let ext_dtype = input_dtype.as_extension_opt().ok_or_else(|| {
+        vortex_err!("L2Normalize input must be a Vector or UnitVector, got {input_dtype}")
+    })?;
+    let metadata = ext_dtype.metadata_opt::<AnyVector>().ok_or_else(|| {
+        vortex_err!("L2Normalize input must be a Vector or UnitVector, got {input_dtype}")
+    })?;
 
     if ext_dtype.is::<UnitVector>() {
         return Ok(input_dtype.clone());
@@ -224,15 +230,12 @@ fn normalize_vector(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Arr
                 .as_ref()
                 .is_some_and(|valid_rows| !valid_rows.value(row_idx))
             {
-                // SAFETY: `elements` reserves `dimensions` values for each input row.
-                unsafe { elements.push_n_unchecked(T::zero(), dimensions) };
+                elements.push_n(T::zero(), dimensions);
                 output_validity.push(false);
                 continue;
             }
 
-            // SAFETY: `elements` reserves `dimensions` values for each input row.
-            let is_nonzero =
-                unsafe { normalize_row_into(flat.row::<T>(row_idx), &mut elements, row_idx)? };
+            let is_nonzero = normalize_row_into(flat.row::<T>(row_idx), &mut elements, row_idx)?;
             output_validity.push(is_nonzero);
         }
 
@@ -254,11 +257,7 @@ fn normalize_vector(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Arr
 }
 
 /// Writes one normalized row and returns whether its direction is defined.
-///
-/// # Safety
-///
-/// `output` must have spare capacity for every value in `row`.
-unsafe fn normalize_row_into<T: NativePType>(
+fn normalize_row_into<T: NativePType>(
     row: &[T],
     output: &mut BufferMut<T>,
     row_idx: usize,
@@ -275,8 +274,7 @@ unsafe fn normalize_row_into<T: NativePType>(
     }
 
     if scale == 0.0 {
-        // SAFETY: The caller reserves space for the entire row.
-        unsafe { output.push_n_unchecked(T::zero(), row.len()) };
+        output.push_n(T::zero(), row.len());
         return Ok(false);
     }
 
@@ -296,8 +294,7 @@ unsafe fn normalize_row_into<T: NativePType>(
         let normalized = T::from_f64((value / scale) / scaled_norm)
             .vortex_expect("normalized float coordinates must fit their input ptype");
 
-        // SAFETY: The caller reserves space for the entire row.
-        unsafe { output.push_unchecked(normalized) };
+        output.push(normalized);
     }
 
     Ok(true)
@@ -384,6 +381,15 @@ mod tests {
         let output = evaluate(input)?;
 
         assert_close(&values::<f64>(&output)?, &[0.6, 0.8, 0.6, 0.8, 0.6, 0.8]);
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_empty_input() -> VortexResult<()> {
+        let output = evaluate(vector_array::<f32>(2, &[])?)?;
+
+        assert_eq!(output.len(), 0);
+        assert!(output.dtype().as_extension().is::<UnitVector>());
         Ok(())
     }
 
