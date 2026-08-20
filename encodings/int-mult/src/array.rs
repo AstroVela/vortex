@@ -6,6 +6,7 @@ use std::fmt::Formatter;
 use std::hash::Hash;
 use std::hash::Hasher;
 
+use num_traits::AsPrimitive;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
@@ -19,8 +20,10 @@ use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
@@ -40,6 +43,8 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
+use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::BitPackedArrayExt;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -177,6 +182,11 @@ impl VTable for IntMult {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        if array.base() == 1
+            && let Some(decoded) = decode_dict_add(array.as_view(), ctx)?
+        {
+            return Ok(ExecutionResult::done(decoded.into_array()));
+        }
         let primary = array.primary().clone().execute::<PrimitiveArray>(ctx)?;
         let secondary = array.secondary().clone().execute::<PrimitiveArray>(ctx)?;
         Ok(ExecutionResult::done(
@@ -191,6 +201,118 @@ impl VTable for IntMult {
     ) -> VortexResult<Option<ArrayRef>> {
         RULES.evaluate(array, parent, child_idx)
     }
+}
+
+fn decode_dict_add(
+    array: ArrayView<'_, IntMult>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<PrimitiveArray>> {
+    let Some(dict) = array.primary().as_typed::<Dict>() else {
+        return Ok(None);
+    };
+    let starts = dict.values().clone().execute::<PrimitiveArray>(ctx)?;
+    if !starts.validity()?.definitely_no_nulls() {
+        return Ok(None);
+    }
+    let secondary = array.secondary().clone().execute::<PrimitiveArray>(ctx)?;
+
+    if let Some(codes) = dict.codes().as_typed::<BitPacked>() {
+        let validity = BitPackedArrayExt::validity(&codes);
+        if codes.patches().is_none() && validity.definitely_no_nulls() {
+            return decode_bitpacked_dict(starts, secondary, codes, validity).map(Some);
+        }
+    }
+
+    let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
+    if !codes.validity()?.definitely_no_nulls() {
+        return Ok(None);
+    }
+    decode_primitive_dict(starts, secondary, codes).map(Some)
+}
+
+fn decode_bitpacked_dict(
+    starts: PrimitiveArray,
+    secondary: PrimitiveArray,
+    codes: ArrayView<'_, BitPacked>,
+    validity: vortex_array::validity::Validity,
+) -> VortexResult<PrimitiveArray> {
+    match_each_integer_ptype!(secondary.ptype(), |T| {
+        let starts = starts.as_slice::<T>();
+        let output = add_bitpacked_codes(starts, secondary.into_buffer_mut::<T>(), codes)?;
+        VortexResult::Ok(PrimitiveArray::new(output, validity))
+    })
+}
+
+fn decode_primitive_dict(
+    starts: PrimitiveArray,
+    secondary: PrimitiveArray,
+    codes: PrimitiveArray,
+) -> VortexResult<PrimitiveArray> {
+    let validity = codes.validity()?;
+    match_each_integer_ptype!(secondary.ptype(), |T| {
+        let starts = starts.as_slice::<T>();
+        match_each_integer_ptype!(codes.ptype(), |C| {
+            let output = add_primitive_codes(
+                starts,
+                secondary.into_buffer_mut::<T>(),
+                codes.as_slice::<C>(),
+            )?;
+            VortexResult::Ok(PrimitiveArray::new(output, validity))
+        })
+    })
+}
+
+fn add_primitive_codes<T, C>(
+    starts: &[T],
+    mut output: BufferMut<T>,
+    codes: &[C],
+) -> VortexResult<BufferMut<T>>
+where
+    T: NativePType + WrappingMulAdd,
+    C: NativePType + AsPrimitive<usize>,
+{
+    for (value, code) in output.as_mut_slice().iter_mut().zip(codes) {
+        let code: usize = code.as_();
+        let Some(start) = starts.get(code) else {
+            vortex_bail!("IntMult dictionary code is invalid");
+        };
+        *value = <T as WrappingMulAdd>::wrapping_add(*start, *value);
+    }
+    Ok(output)
+}
+
+fn add_bitpacked_codes<T>(
+    starts: &[T],
+    mut output: BufferMut<T>,
+    codes: ArrayView<'_, BitPacked>,
+) -> VortexResult<BufferMut<T>>
+where
+    T: NativePType + WrappingMulAdd,
+{
+    vortex_ensure!(!starts.is_empty(), "IntMult dictionary values are empty");
+    if codes.bit_width() == 0 {
+        for value in output.as_mut_slice() {
+            *value = <T as WrappingMulAdd>::wrapping_add(starts[0], *value);
+        }
+        return Ok(output);
+    }
+
+    match_each_integer_ptype!(codes.dtype().as_ptype(), |C| {
+        let mut invalid_code = false;
+        let mut chunks = codes.unpacked_chunks::<C>()?;
+        chunks.for_each_unpacked_chunk(|codes, range| {
+            for (value, code) in output.as_mut_slice()[range].iter_mut().zip(codes) {
+                let code: usize = code.as_();
+                let Some(start) = starts.get(code) else {
+                    invalid_code = true;
+                    continue;
+                };
+                *value = <T as WrappingMulAdd>::wrapping_add(*start, *value);
+            }
+        });
+        vortex_ensure!(!invalid_code, "IntMult dictionary code is invalid");
+        VortexResult::Ok(output)
+    })
 }
 
 impl OperationsVTable<IntMult> for IntMult {
@@ -416,6 +538,7 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
+    use vortex_array::arrays::DictArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::NativePType;
@@ -424,6 +547,7 @@ mod tests {
     use vortex_array::validity::Validity;
     use vortex_buffer::ByteBufferMut;
     use vortex_buffer::buffer;
+    use vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked;
     use vortex_session::registry::ReadContext;
 
     use super::*;
@@ -482,6 +606,42 @@ mod tests {
         assert_arrays_eq!(
             encoded,
             PrimitiveArray::from_iter([101_u32, 202, 303]),
+            &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_one_adds_bitpacked_dictionary_references() -> VortexResult<()> {
+        let codes = PrimitiveArray::from_iter([0_u8, 1, 2, 1, 0]);
+        // SAFETY: Two bits represent every code.
+        let codes = unsafe { bitpack_encode_unchecked(codes, 2) }?.into_array();
+        let starts = PrimitiveArray::from_iter([100_u32, 1_000, 10_000]).into_array();
+        let references = DictArray::try_new(codes, starts)?.into_array();
+        let offsets = PrimitiveArray::from_iter([1_u32, 2, 3, 4, 5]).into_array();
+        let encoded = IntMult::try_new(references, offsets, 1)?;
+
+        assert_arrays_eq!(
+            encoded,
+            PrimitiveArray::from_iter([101_u32, 1_002, 10_003, 1_004, 105]),
+            &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_one_adds_zero_width_dictionary_references() -> VortexResult<()> {
+        let codes = PrimitiveArray::from_iter([0_u8; 3]);
+        // SAFETY: Zero bits represent the only code.
+        let codes = unsafe { bitpack_encode_unchecked(codes, 0) }?.into_array();
+        let starts = PrimitiveArray::from_iter([100_u32]).into_array();
+        let references = DictArray::try_new(codes, starts)?.into_array();
+        let offsets = PrimitiveArray::from_iter([1_u32, 2, 3]).into_array();
+        let encoded = IntMult::try_new(references, offsets, 1)?;
+
+        assert_arrays_eq!(
+            encoded,
+            PrimitiveArray::from_iter([101_u32, 102, 103]),
             &mut array_session().create_execution_ctx()
         );
         Ok(())

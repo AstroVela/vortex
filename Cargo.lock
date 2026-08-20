@@ -10276,10 +10276,12 @@ dependencies = [
 name = "vortex-int-mult"
 version = "0.1.0"
 dependencies = [
+ "num-traits",
  "rstest",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
+ "vortex-fastlanes",
  "vortex-session",
 ]
 
