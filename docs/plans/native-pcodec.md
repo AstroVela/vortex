@@ -78,7 +78,7 @@ The serialized tree uses `OrderedFloat(BlockResidual(...))` because the outer ar
 
 The FloatQuant candidate accepts native `f16`, `f32`, and `f64` inputs.
 
-Direct integer BlockResidual supports every integer type. The Default selector accepts every integer width during the current 8-bit trial.
+Direct integer BlockResidual supports every integer type. The Default selector accepts every integer width.
 
 The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
 
@@ -121,7 +121,7 @@ The Default selector can exclude a supported type when measured costs do not jus
 | Array | Supported logical types | Default policy |
 | --- | --- | --- |
 | OrderedFloat | `f16`, `f32`, `f64` | All float types remain eligible. |
-| BlockResidual | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | All widths are eligible during the 8-bit trial. |
+| BlockResidual | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | All widths are eligible. |
 | FloatQuant | `f16`, `f32`, `f64` | All float types remain eligible. |
 | IntMult | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | No Default scheme exists yet. |
 
@@ -296,7 +296,7 @@ Its adjusted score includes a 1.02 decode-cost factor.
 
 `BlockResidualScheme` uses the same locality probe for integer arrays.
 
-The Default scheme accepts every integer width during the current 8-bit trial.
+The Default scheme accepts every integer width.
 
 The scheme does not run inside trial compression for an outer scheme. Generic 64-row samples do not preserve 1,024-row locality.
 
@@ -638,7 +638,7 @@ The throughput changes come from adjacent runs and include ordinary benchmark no
 
 The exact size gains and high absolute decode rates support 16-bit Default eligibility.
 
-### 8-bit selector trial
+### 8-bit selector validation
 
 The direct benchmark already showed 30.53 GB/s decode and 44 ns scalar access for `i8`.
 
@@ -657,9 +657,51 @@ A uniform `i8` control rejects BlockResidual and retains Primitive at 2,000,000 
 
 The rejected analysis changes encode throughput from 720.5 MB/s to 706.3 MB/s, a 2.0 percent decrease.
 
-The eight real numeric files contain no `i8` columns. Their sizes do not change during this trial.
+The original eight numeric files contain no 8-bit columns.
 
-The current branch enables 8-bit selection for evaluation. Final adoption needs real `i8` coverage and complete threshold calibration.
+A second pass quantizes 20 million real GloVe values into six `i8` and `u8` variants.
+
+It contains these quantizers:
+
+- Symmetric quantization uses the maximum absolute corpus value. The unsigned form adds 128.
+- Global affine quantization maps the corpus minimum and maximum to 0 and 255. The signed form subtracts 128.
+- Per-vector affine quantization uses each 200-value vector minimum and maximum. The signed form subtracts 128.
+
+The global affine `i8` and `u8` variants select BlockResidual. The unsigned symmetric variant also selects BlockResidual.
+
+The signed symmetric variant retains ZigZag with BitPacked. Both per-vector affine variants retain Primitive.
+
+| Selected variant | Prior bytes | BlockResidual bytes | Size change | Encode MB/s | Decode MB/s | Scalar access ns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Global affine `i8` | 20,000,000 | 16,775,243 | -16.12 percent | 277.8 | 21,791 | 80 |
+| Global affine `u8` | 20,000,000 | 16,775,243 | -16.12 percent | 278.3 | 20,745 | 82 |
+| Symmetric `u8` | 20,000,000 | 15,558,250 | -22.21 percent | 294.4 | 32,870 | 78 |
+
+The isolated Primitive encoders reach 754 to 777 MB/s on these selected columns.
+
+The complete writer reduces that isolated encode gap:
+
+| File | Size change | Write time change | Read throughput |
+| --- | ---: | ---: | ---: |
+| Global affine `i8` only | -16.12 percent | +10.06 percent | 17.3 GB/s |
+| Two `i8` variants | -8.06 percent | +0.21 percent | 30.7 GB/s |
+| Four `u8` variants | -10.19 percent | +1.62 to +2.25 percent | 35.4 GB/s |
+
+The single-column result isolates the maximum measured writer cost. The multi-column results represent mixed accepted and rejected candidates.
+
+A patch-free boundary control uses one seven-bit local range per block.
+
+It reduces complete file size by 10.35 percent and increases write time by 1.43 percent.
+
+Its complete read throughput is 31.7 GB/s. Scalar access takes 81 ns for `u8` and 110 ns for `i8`.
+
+Residual widths change in whole bits. Therefore, the first patch-free 8-bit win already saves about ten percent after file overhead.
+
+The patch-density adjustment protects cases between those discrete widths.
+
+These results support Default eligibility for `i8` and `u8` with the common 1.05 floor.
+
+No width-specific factor is necessary.
 
 ### Narrow BlockResidual in Compact
 
@@ -1633,9 +1675,11 @@ The implementation retains the prior signed path.
 
 Current i16 BlockResidual decode reaches 31.4 GB/s. The comparable `FoR(BitPacked)` tree reaches 42.0 GB/s.
 
-This result retains the direct i8 and i16 selector exclusions.
+At that stage, this result retained the direct i8 and i16 selector exclusions.
 
-The u16 result is faster than the prior narrow path, but no real selected-tree evidence supports policy removal yet.
+At that stage, the u16 result lacked real selected-tree evidence.
+
+Later absolute-throughput and complete-file results re-enabled all narrow integer widths.
 
 The faster unsigned path also improves the BlockResidual patch-position bulk decoder.
 
@@ -2165,7 +2209,7 @@ The 1.10 value adds a small margin and retains every strict synthetic `f32` and 
 
 The 33-column Pco-gap pass exposes no missed real FloatQuant candidate.
 
-The 8-bit BlockResidual trial remains outside this conclusion because the corpus lacks real 8-bit columns.
+The quantized GloVe pass supports the same factor for `i8` and `u8`.
 
 ### Default bundle options
 
@@ -2568,6 +2612,9 @@ This round completed these steps:
 - Revalidated Current Default against Compact and Parquet with Zstd across all 16 files.
 - Added numeric bundle controls to the random-access benchmark.
 - Compared cached random access across Taxi and two nested datasets.
+- Added `i8` and `u8` support to the focused Parquet and scalar benchmarks.
+- Validated 8-bit selection with quantized real GloVe values.
+- Added local Parquet inputs to the complete compression benchmark.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2581,12 +2628,10 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Add real `i8` and `u8` columns to the corpus.
-2. Calibrate 8-bit BlockResidual eligibility with those real columns.
-3. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
-4. Prefer cheap rejection tests when they preserve the best candidate model.
-5. Treat fast rejection as a selection advantage, not an admission criterion.
-6. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
+2. Prefer cheap rejection tests when they preserve the best candidate model.
+3. Treat fast rejection as a selection advantage, not an admission criterion.
+4. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

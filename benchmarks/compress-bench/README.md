@@ -29,6 +29,13 @@ Compare a numeric scheme bundle with the same command and one of these values:
 - `--vortex-numeric-bundle current-default`
 - `--vortex-numeric-bundle range-packed`
 
+Add a local Parquet file with `--parquet-path`. Use `--datasets` to select its file stem.
+
+```bash
+cargo run -p compress-bench --profile release_debug -- \
+  --parquet-path /tmp/input.parquet --datasets '^input$'
+```
+
 GPU decompression is opt-in and runs only the existing benchmark names allow-listed in
 `src/main.rs`:
 

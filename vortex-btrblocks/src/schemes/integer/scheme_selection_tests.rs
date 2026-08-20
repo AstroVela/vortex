@@ -148,18 +148,18 @@ fn test_block_residual_compresses_16_bit_integers() -> VortexResult<()> {
 
 #[test]
 fn test_block_residual_compresses_8_bit_integers() -> VortexResult<()> {
-    let signed_values = (0..8_192)
+    let unsigned_values = (0..16_384)
         .map(|index| {
-            let block = index / 1_024;
-            let residual = (index * 2_654_435_761_usize) % 8;
-            i8::try_from(block * 16 + residual)
+            let block = (index / 1_024) % 2;
+            let residual = (index * 2_654_435_761_usize) % 128;
+            u8::try_from(block * 128 + residual)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let unsigned_values = signed_values
+    let signed_values = unsigned_values
         .iter()
         .copied()
-        .map(u8::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|value| i8::from_le_bytes([value]))
+        .collect::<Vec<_>>();
     #[cfg(not(feature = "unstable_encodings"))]
     let compressor = BtrBlocksCompressor::default();
     #[cfg(feature = "unstable_encodings")]
@@ -176,6 +176,38 @@ fn test_block_residual_compresses_8_bit_integers() -> VortexResult<()> {
         assert!(
             contains_block_residual(&compressed),
             "BlockResidual must encode this 8-bit input:\n{}",
+            compressed.display_tree()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_block_residual_rejects_uniform_8_bit_integers() -> VortexResult<()> {
+    let unsigned_values = (0..16_384)
+        .map(|index| u8::try_from((index * 2_654_435_761_usize) % 256))
+        .collect::<Result<Vec<_>, _>>()?;
+    let signed_values = unsigned_values
+        .iter()
+        .copied()
+        .map(|value| i8::from_le_bytes([value]))
+        .collect::<Vec<_>>();
+    #[cfg(not(feature = "unstable_encodings"))]
+    let compressor = BtrBlocksCompressor::default();
+    #[cfg(feature = "unstable_encodings")]
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([DeltaScheme::default().id()])
+        .build();
+
+    for array in [
+        PrimitiveArray::from_iter(signed_values),
+        PrimitiveArray::from_iter(unsigned_values),
+    ] {
+        let compressed =
+            compressor.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+        assert!(
+            !contains_block_residual(&compressed),
+            "BlockResidual must reject this uniform 8-bit input:\n{}",
             compressed.display_tree()
         );
     }

@@ -359,6 +359,11 @@ fn trace_scan_like_on_compressed_comment() -> VortexResult<()> {
     insta::assert_snapshot!(executed.trace.to_string(), @"
     execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
       iter 0 current=vortex.like(bool, len=4096) builder_active=false
+    execute_until target=AnyCanonical root=vortex.block_residual(u16, len=4097)
+      iter 0 current=vortex.block_residual(u16, len=4097) builder_active=false
+        Done array=vortex.primitive(u16, len=4097)
+      iter 1 current=vortex.primitive(u16, len=4097) builder_active=false
+      return output=vortex.primitive(u16, len=4097)
         child_execute_parent session[0]:execute_parent_fn slot=0 parent=vortex.like(bool, len=4096) child=vortex.fsst(utf8, len=4096) -> vortex.bool(bool, len=4096)
       iter 1 current=vortex.bool(bool, len=4096) builder_active=false
       return output=vortex.bool(bool, len=4096)

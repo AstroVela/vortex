@@ -455,9 +455,11 @@ fn read_parquet_numeric(
             };
             matches!(
                 data_type,
-                DataType::Int16
+                DataType::Int8
+                    | DataType::Int16
                     | DataType::Int32
                     | DataType::Int64
+                    | DataType::UInt8
                     | DataType::UInt16
                     | DataType::UInt32
                     | DataType::UInt64
@@ -2593,6 +2595,63 @@ fn measure_scalar_access(encoded: &ArrayRef, session: &VortexSession) -> VortexR
             u64::MAX
         } else {
             match encoded.dtype().as_ptype() {
+                PType::U8 => u64::from(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<u8>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid u8 scalar"))?,
+                ),
+                PType::U16 => u64::from(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<u16>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid u16 scalar"))?,
+                ),
+                PType::U32 => u64::from(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<u32>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid u32 scalar"))?,
+                ),
+                PType::U64 => scalar
+                    .as_primitive()
+                    .typed_value::<u64>()
+                    .ok_or_else(|| vortex_err!("tree produced an invalid u64 scalar"))?,
+                PType::I8 => u64::from(u8::from_le_bytes(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<i8>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid i8 scalar"))?
+                        .to_le_bytes(),
+                )),
+                PType::I16 => u64::from(u16::from_le_bytes(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<i16>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid i16 scalar"))?
+                        .to_le_bytes(),
+                )),
+                PType::I32 => u64::from(u32::from_le_bytes(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<i32>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid i32 scalar"))?
+                        .to_le_bytes(),
+                )),
+                PType::I64 => u64::from_le_bytes(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<i64>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid i64 scalar"))?
+                        .to_le_bytes(),
+                ),
+                PType::F16 => u64::from(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<f16>()
+                        .ok_or_else(|| vortex_err!("tree produced an invalid f16 scalar"))?
+                        .to_bits(),
+                ),
                 PType::F32 => u64::from(
                     scalar
                         .as_primitive()
@@ -2605,11 +2664,6 @@ fn measure_scalar_access(encoded: &ArrayRef, session: &VortexSession) -> VortexR
                     .typed_value::<f64>()
                     .ok_or_else(|| vortex_err!("tree produced an invalid f64 scalar"))?
                     .to_bits(),
-                ptype => {
-                    return Err(vortex_err!(
-                        "tree scalar benchmark does not support {ptype}"
-                    ));
-                }
             }
         };
         scalar_checksum ^= black_box(bits);
@@ -2856,11 +2910,7 @@ fn measure_dataset(
     if std::env::var_os("VORTEX_BENCH_CONFIG_TREES").is_some() {
         for (config, arrays) in &encoded {
             for (column, array) in columns.iter().zip(arrays) {
-                if column
-                    .primitive
-                    .as_ref()
-                    .is_some_and(|primitive| primitive.ptype().is_float())
-                {
+                if column.primitive.is_some() {
                     measure_existing_tree(
                         dataset,
                         &column.name,

@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use clap::Parser;
 #[cfg(feature = "lance")]
 use compress_bench::LanceCompressor;
@@ -14,6 +15,8 @@ use compress_bench::vortex::VortexCompressor;
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use regex::Regex;
+use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex_bench::Engine;
 use vortex_bench::Format;
@@ -26,6 +29,7 @@ use vortex_bench::compress::Compressor;
 use vortex_bench::compress::benchmark_compress;
 use vortex_bench::compress::benchmark_decompress;
 use vortex_bench::compress::calculate_ratios;
+use vortex_bench::conversions::parquet_to_vortex_chunks;
 use vortex_bench::create_output_writer;
 use vortex_bench::datasets::Dataset;
 use vortex_bench::datasets::feature_vectors::GloveEmbeddingsData;
@@ -69,6 +73,9 @@ struct Args {
     ops: Vec<CompressOp>,
     #[arg(long)]
     datasets: Option<String>,
+    /// Add a local Parquet file to the benchmark suite.
+    #[arg(long)]
+    parquet_path: Vec<PathBuf>,
     /// Run GPU decompression for the allow-listed benchmarks.
     ///
     /// This filters the suite to GPU-supported dataset names and runs only Vortex decompression.
@@ -111,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     run_compress(
         args.iterations,
         args.datasets.map(|d| Regex::new(&d)).transpose()?,
+        args.parquet_path,
         formats,
         ops,
         args.gpu_decompress,
@@ -120,6 +128,37 @@ async fn main() -> anyhow::Result<()> {
         args.vortex_numeric_bundle,
     )
     .await
+}
+
+struct LocalParquetData {
+    name: String,
+    path: PathBuf,
+}
+
+impl LocalParquetData {
+    fn try_new(path: PathBuf) -> anyhow::Result<Self> {
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("local Parquet path has no valid file stem"))?
+            .to_string();
+        Ok(Self { name, path })
+    }
+}
+
+#[async_trait]
+impl Dataset for LocalParquetData {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> anyhow::Result<ArrayRef> {
+        Ok(parquet_to_vortex_chunks(self.path.clone()).await?.into())
+    }
+
+    async fn to_parquet_path(&self) -> anyhow::Result<PathBuf> {
+        Ok(self.path.clone())
+    }
 }
 
 /// Get a compressor for the given format.
@@ -166,6 +205,7 @@ const DOC_PATH: &str = "benchmarks/compress-bench/README.md";
 async fn run_compress(
     iterations: usize,
     datasets_filter: Option<Regex>,
+    parquet_paths: Vec<PathBuf>,
     formats: Vec<Format>,
     ops: Vec<CompressOp>,
     gpu_decompress: bool,
@@ -195,6 +235,10 @@ async fn run_compress(
         //     Some(READ_PROJECTION_COLUMNS),
         // ),
     ];
+    let local_parquet = parquet_paths
+        .into_iter()
+        .map(LocalParquetData::try_new)
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Add an existing benchmark name here only after its CUDA-compatible compression and
     // decompression kernels have been verified end to end.
@@ -204,28 +248,36 @@ async fn run_compress(
     )]
     let gpu_decompress_benchmarks = vec!["TPC-H l_comment canonical"];
 
-    let datasets: Vec<&dyn Dataset> = [
-        &TaxiData as &dyn Dataset,
-        &GloveEmbeddingsData,
-        PBI_DATASETS.get(Arade),
-        PBI_DATASETS.get(Bimbo),
-        PBI_DATASETS.get(CMSprovider),
+    let mut datasets: Vec<&dyn Dataset> = vec![&TaxiData, &GloveEmbeddingsData];
+    for (name, dataset) in [
+        ("Arade", Arade),
+        ("Bimbo", Bimbo),
+        ("CMSprovider", CMSprovider),
         // Corporations, // duckdb thinks ' is a quote character but its used as an apostrophe
         // CityMaxCapita, // 11th column has F, M, and U but is inferred as boolean
-        PBI_DATASETS.get(Euro2016),
-        PBI_DATASETS.get(Food),
-        PBI_DATASETS.get(HashTags),
+        ("Euro2016", Euro2016),
+        ("Food", Food),
+        ("HashTags", HashTags),
         // Hatred, // panic in fsst_compress_iter
         // TableroSistemaPenal, // Unexpected type error
         // YaleLanguages, // 4th column looks like integer but also contains Y
-        &TPCHLCommentChunked,
+    ] {
+        if datasets_filter
+            .as_ref()
+            .is_none_or(|filter| filter.is_match(name))
+        {
+            datasets.push(PBI_DATASETS.get(dataset));
+        }
+    }
+    datasets.extend([
+        &TPCHLCommentChunked as &dyn Dataset,
         &TPCHLCommentCanonical,
         &DownloadableDataset::RPlace,
         &DownloadableDataset::AirQuality,
-    ]
-    .into_iter()
-    .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
-    .filter(|d| {
+    ]);
+    datasets.extend(structlistofints.iter().map(|d| d as &dyn Dataset));
+    datasets.extend(local_parquet.iter().map(|d| d as &dyn Dataset));
+    datasets.retain(|d| {
         if gpu_decompress && !gpu_decompress_benchmarks.contains(&d.name()) {
             return false;
         }
@@ -236,8 +288,7 @@ async fn run_compress(
             // for pcodec. As such, we do not run in CI.
             d.name() != "airquality" && d.name() != "rplace"
         }
-    })
-    .collect();
+    });
 
     let progress = ProgressBar::new((datasets.len() * formats.len() * ops.len()) as u64);
 
