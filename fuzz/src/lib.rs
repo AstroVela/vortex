@@ -44,6 +44,10 @@ mod native_runtime {
     use std::sync::LazyLock;
 
     use vortex::VortexSessionDefault;
+    use vortex::editions::CORE_2026_08_3;
+    use vortex::editions::EditionSessionExt;
+    use vortex_error::VortexExpect;
+    use vortex_error::vortex_err;
     use vortex_io::runtime::BlockingRuntime;
     use vortex_io::runtime::current::CurrentThreadRuntime;
     use vortex_io::session::RuntimeSessionExt;
@@ -53,6 +57,12 @@ mod native_runtime {
     pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         #[allow(unused_mut)]
         let mut session = VortexSession::default().with_handle(RUNTIME.handle());
+        // The arbitrary array generator produces every component Vortex can write, including
+        // those still staged in a draft `core` edition, so the fuzz writer must permit them.
+        session
+            .enable_edition(CORE_2026_08_3)
+            .map_err(|error| vortex_err!("{error}"))
+            .vortex_expect("latest draft core edition is registered");
         #[cfg(all(feature = "cuda", target_os = "linux"))]
         // Even if the CUDA feature is enabled we need to check at
         // runtime whether CUDA is available in the current environment.
