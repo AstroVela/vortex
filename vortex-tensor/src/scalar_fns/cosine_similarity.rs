@@ -48,16 +48,18 @@ use crate::utils::validate_binary_tensor_float_inputs;
 /// The shape and permutation do not affect the result because cosine similarity only depends on the
 /// element values, not their logical arrangement.
 ///
-/// Both inputs must be tensor-like extension arrays ([`FixedShapeTensor`] or [`Vector`]) with the
-/// same dtype and a float element type. The output is a float column of the same float type.
+/// Fixed-shape tensor inputs must have the same dtype, ignoring top-level nullability. Vector
+/// inputs may mix [`Vector`] and [`UnitVector`] when their element ptype and dimensions match. The
+/// output is a float column of that element ptype.
 ///
-/// [`NormMode::Exact`] measures the physical direction stored by a [`Normalized`] encoding before
-/// applying the cosine formula. [`NormMode::AssumeNormalized`] instead trusts that direction as
-/// unit length and omits its norm computation. The approximate mode does not clamp its output or
-/// provide an error bound for unchecked or lossy encodings.
+/// [`NormMode::Exact`] measures all physical coordinates before applying the cosine formula.
+/// [`NormMode::AssumeNormalized`] omits norms claimed by a [`UnitVector`] dtype or [`Normalized`]
+/// encoding. The approximate mode does not clamp its output or provide an error bound for unchecked
+/// or lossy claims.
 ///
 /// [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
 /// [`Vector`]: crate::vector::Vector
+/// [`UnitVector`]: crate::unit_vector::UnitVector
 /// [`Normalized`]: crate::encodings::normalized::Normalized
 #[derive(Clone)]
 pub struct CosineSimilarity;
@@ -152,9 +154,10 @@ impl ScalarFnVTable for CosineSimilarity {
         // Compute combined validity.
         let validity = lhs_ref.validity()?.and(rhs_ref.validity()?)?;
 
-        // Ordinary inputs carry no normalized claim, so both modes measure their physical norms.
-        let norm_lhs_arr = L2Norm::try_new(lhs_ref.clone(), NormMode::Exact)?;
-        let norm_rhs_arr = L2Norm::try_new(rhs_ref.clone(), NormMode::Exact)?;
+        // UnitVector inputs can carry a normalized claim. Ordinary tensors measure physical norms
+        // in both modes.
+        let norm_lhs_arr = L2Norm::try_new(lhs_ref.clone(), *options)?;
+        let norm_rhs_arr = L2Norm::try_new(rhs_ref.clone(), *options)?;
         let dot_arr = InnerProduct::try_new(lhs_ref, rhs_ref)?;
 
         // Execute to get the inner product and norms of the arrays. We only fully decompress
@@ -369,7 +372,7 @@ impl CosineSimilarity {
 
         let normalized_norms: PrimitiveArray = normalized_norms.execute(ctx)?;
 
-        let norm_arr = L2Norm::try_new(plain_ref.clone(), NormMode::Exact)?;
+        let norm_arr = L2Norm::try_new(plain_ref.clone(), mode)?;
         let plain_norm: PrimitiveArray = norm_arr.into_array().execute(ctx)?;
 
         // TODO(connor)[Tensor]: Replace this loop after binary numeric operations support
@@ -430,6 +433,7 @@ mod tests {
     use crate::utils::test_helpers::constant_tensor_array;
     use crate::utils::test_helpers::normalized_array;
     use crate::utils::test_helpers::tensor_array;
+    use crate::utils::test_helpers::unit_vector_array;
     use crate::utils::test_helpers::vector_array;
 
     /// Evaluates cosine similarity between two tensor arrays and returns the result as `Vec<f64>`.
@@ -579,6 +583,35 @@ mod tests {
 
         // Row 0: identical -> 1.0, row 1: orthogonal -> 0.0.
         assert_close(&eval_cosine_similarity(lhs, rhs)?, &[1.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn mode_controls_unit_vector_norms() -> VortexResult<()> {
+        let value = 1.0 + 8.0 * f64::EPSILON;
+        let mut ctx = SESSION.create_execution_ctx();
+        let input = unit_vector_array(2, &[value, 0.0], &mut ctx)?;
+
+        assert_eq!(
+            eval_cosine_similarity_with_mode(input.clone(), input.clone(), NormMode::Exact)?,
+            vec![1.0],
+        );
+        let assumed =
+            eval_cosine_similarity_with_mode(input.clone(), input, NormMode::AssumeNormalized)?;
+        assert!(assumed[0] > 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn mixes_unit_and_ordinary_vectors() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let unit = unit_vector_array(2, &[0.6f64, 0.8], &mut ctx)?;
+        let ordinary = vector_array(2, &[3.0f64, 4.0])?;
+
+        assert_close(
+            &eval_cosine_similarity_with_mode(unit, ordinary, NormMode::AssumeNormalized)?,
+            &[1.0],
+        );
         Ok(())
     }
 

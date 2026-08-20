@@ -118,11 +118,21 @@ pub fn validate_binary_tensor_float_inputs<'a>(
     lhs: &'a DType,
     rhs: &DType,
 ) -> VortexResult<TensorMatch<'a>> {
+    let lhs_match = validate_tensor_float_input(lhs)?;
+    if lhs.eq_ignore_nullability(rhs) {
+        return Ok(lhs_match);
+    }
+
+    let rhs_match = validate_tensor_float_input(rhs)?;
     vortex_ensure!(
-        lhs.eq_ignore_nullability(rhs),
-        "binary tensor expression expects inputs to have the same dtype, got {lhs} and {rhs}"
+        matches!(
+            (lhs_match, rhs_match),
+            (TensorMatch::Vector(lhs), TensorMatch::Vector(rhs)) if lhs == rhs
+        ),
+        "binary tensor expression expects compatible inputs, got {lhs} and {rhs}",
     );
-    validate_tensor_float_input(lhs)
+
+    Ok(lhs_match)
 }
 
 /// The flat primitive elements of a tensor storage array, with typed row access.
@@ -305,6 +315,7 @@ pub mod test_helpers {
     use vortex_array::arrays::ExtensionArray;
     use vortex_array::arrays::FixedSizeListArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::extension::ExtensionArrayExt;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::NativePType;
     use vortex_array::dtype::Nullability;
@@ -318,6 +329,7 @@ pub mod test_helpers {
     use crate::encodings::normalized::Normalized;
     use crate::types::fixed_shape_tensor::FixedShapeTensor;
     use crate::types::fixed_shape_tensor::FixedShapeTensorMetadata;
+    use crate::types::unit_vector::UnitVector;
     use crate::types::vector::Vector;
 
     /// Builds a `FixedSizeList<T, list_size>` storage array from flat `elements`. The row count is
@@ -354,6 +366,18 @@ pub mod test_helpers {
     /// Builds a [`Vector`] extension array from flat `elements` and a vector dimension size.
     pub fn vector_array<T: NativePType>(dim: u32, elements: &[T]) -> VortexResult<ArrayRef> {
         Vector::try_new_vector_array(flat_fsl(elements, dim))
+    }
+
+    /// Builds and validates a [`UnitVector`] extension array from flat `elements`.
+    pub fn unit_vector_array<T: NativePType>(
+        dim: u32,
+        elements: &[T],
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let vector = vector_array(dim, elements)?;
+        let vector: ExtensionArray = vector.execute(ctx)?;
+
+        UnitVector::try_new_unit_vector_array(vector.storage_array().clone(), ctx)
     }
 
     /// Builds a [`FixedShapeTensor`] extension array whose storage is a [`ConstantArray`],

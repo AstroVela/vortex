@@ -43,6 +43,7 @@ use crate::types::vector::Vector;
 use crate::utils::test_helpers::assert_close;
 use crate::utils::test_helpers::constant_tensor_array;
 use crate::utils::test_helpers::tensor_array;
+use crate::utils::test_helpers::unit_vector_array;
 use crate::utils::test_helpers::vector_array;
 
 fn eval_normalized(
@@ -803,6 +804,17 @@ fn scheme_does_not_match_non_float_tensors(#[case] input: ArrayRef) -> VortexRes
 
     assert_ne!(compressed.encoding_id(), ArrayVTable::id(&Normalized));
 
+    Ok(())
+}
+
+#[test]
+fn scheme_does_not_match_unit_vectors() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let input = unit_vector_array(2, &[0.6f64, 0.8], &mut ctx)?;
+    let canonical: Canonical = input.clone().execute(&mut ctx)?;
+
+    assert!(!NormalizedScheme.matches(&canonical));
+    assert!(normalize(input, &mut ctx).is_err());
     Ok(())
 }
 

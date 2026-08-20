@@ -4,6 +4,7 @@
 //! L2 norm expression for tensor-like types.
 
 use num_traits::Float;
+use num_traits::One;
 use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
@@ -45,6 +46,7 @@ use vortex_session::registry::CachedId;
 use crate::encodings::normalized::Normalized;
 use crate::matcher::AnyTensor;
 use crate::scalar_fns::NormMode;
+use crate::types::unit_vector::UnitVector;
 use crate::utils::extract_flat_elements;
 use crate::utils::extract_normalized_children;
 use crate::utils::reattach_validity;
@@ -57,12 +59,13 @@ use crate::utils::validate_tensor_float_input;
 /// The input must be a tensor-like extension array with a float element type. The output is a float
 /// column of the same float type.
 ///
-/// [`NormMode::Exact`] measures the physical direction stored by a [`Normalized`] encoding and
-/// multiplies that result by the stored norm. [`NormMode::AssumeNormalized`] instead trusts that
-/// direction as unit length and returns the stored norm directly. The approximate mode does not
-/// provide an error bound for unchecked or lossy encodings.
+/// [`NormMode::Exact`] measures physical coordinates, including a [`UnitVector`] value or the
+/// direction stored by a [`Normalized`] encoding. [`NormMode::AssumeNormalized`] returns one for a
+/// [`UnitVector`] and returns a [`Normalized`] value's stored norm directly. The approximate mode
+/// does not provide an error bound for unchecked or lossy claims.
 ///
 /// [`Normalized`]: crate::encodings::normalized::Normalized
+/// [`UnitVector`]: crate::unit_vector::UnitVector
 #[derive(Clone)]
 pub struct L2Norm;
 
@@ -135,6 +138,15 @@ impl ScalarFnVTable for L2Norm {
         let element_ptype = tensor_match.element_ptype();
 
         let norm_dtype = DType::Primitive(element_ptype, ext.nullability());
+
+        if options.assumes_normalized() && ext.is::<UnitVector>() {
+            let one = match_each_float_ptype!(element_ptype, |T| {
+                Scalar::primitive(T::one(), Nullability::NonNullable)
+            });
+            let ones = ConstantArray::new(one, row_count).into_array();
+
+            return reattach_validity(ones, input_ref.validity()?);
+        }
 
         if input_ref.is::<Normalized>() {
             let (direction, stored_norms) = extract_normalized_children(&input_ref);
@@ -328,6 +340,7 @@ mod tests {
     use crate::utils::test_helpers::assert_close;
     use crate::utils::test_helpers::literal_vector_array;
     use crate::utils::test_helpers::tensor_array;
+    use crate::utils::test_helpers::unit_vector_array;
     use crate::utils::test_helpers::vector_array;
 
     /// Evaluates L2 norm on a tensor/vector array and returns the result as `Vec<f64>`.
@@ -381,6 +394,23 @@ mod tests {
             ],
         )?;
         assert_close(&eval_l2_norm(arr)?, &[1.0, 5.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn mode_controls_unit_vector_claim() -> VortexResult<()> {
+        let value = 1.0 + 8.0 * f64::EPSILON;
+        let mut ctx = SESSION.create_execution_ctx();
+        let input = unit_vector_array(2, &[value, 0.0], &mut ctx)?;
+
+        assert_eq!(
+            eval_l2_norm_with_mode(input.clone(), NormMode::Exact)?,
+            vec![value],
+        );
+        assert_eq!(
+            eval_l2_norm_with_mode(input, NormMode::AssumeNormalized)?,
+            vec![1.0],
+        );
         Ok(())
     }
 

@@ -34,6 +34,7 @@ use vortex_compressor::scheme::SchemeExt;
 use vortex_compressor::stats::ArrayAndStats;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 
 use crate::encodings::normalized::Normalized;
 use crate::encodings::normalized::NormalizedArray;
@@ -43,6 +44,7 @@ use crate::encodings::normalized::array::DATA_CHILDREN;
 use crate::matcher::AnyTensor;
 use crate::scalar_fns::NormMode;
 use crate::scalar_fns::l2_norm::L2Norm;
+use crate::types::unit_vector::UnitVector;
 use crate::utils::extract_constant_flat_row;
 use crate::utils::extract_flat_elements;
 use crate::utils::validate_tensor_float_input;
@@ -63,9 +65,11 @@ impl Scheme for NormalizedScheme {
 
         // `AlwaysUse` prevents later schemes from seeing a claimed array, so match only the float
         // tensor dtypes accepted by `compress`.
-        ext.ext_dtype()
-            .metadata_opt::<AnyTensor>()
-            .is_some_and(|tensor| tensor.element_ptype().is_float())
+        !ext.ext_dtype().is::<UnitVector>()
+            && ext
+                .ext_dtype()
+                .metadata_opt::<AnyTensor>()
+                .is_some_and(|tensor| tensor.element_ptype().is_float())
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
@@ -129,6 +133,15 @@ impl Scheme for NormalizedScheme {
 ///
 /// Returns an error if `input` is not a float tensor column or if execution fails.
 pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<NormalizedArray> {
+    vortex_ensure!(
+        !input
+            .dtype()
+            .as_extension_opt()
+            .is_some_and(|dtype| dtype.is::<UnitVector>()),
+        InvalidArgument: "Normalized input must not already be a UnitVector, got {}",
+        input.dtype(),
+    );
+
     let row_count = input.len();
     let tensor_match = validate_tensor_float_input(input.dtype())?;
     let tensor_flat_size = tensor_match.list_size() as usize;
@@ -206,6 +219,14 @@ pub(crate) fn try_build_constant_normalized(
     len: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<NormalizedArray>> {
+    if input
+        .dtype()
+        .as_extension_opt()
+        .is_some_and(|dtype| dtype.is::<UnitVector>())
+    {
+        return Ok(None);
+    }
+
     let Some(ext) = input.as_opt::<Extension>() else {
         return Ok(None);
     };

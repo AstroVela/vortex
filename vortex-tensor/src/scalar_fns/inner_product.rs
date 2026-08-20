@@ -47,11 +47,13 @@ use crate::utils::validate_binary_tensor_float_inputs;
 /// this is the standard dot product; for higher-rank ([`FixedShapeTensor`]) arrays this is the
 /// Frobenius inner product.
 ///
-/// Both inputs must be tensor-like extension arrays ([`FixedShapeTensor`] or [`Vector`]) with the
-/// same dtype and a float element type. The output is a float column of the same float type.
+/// Fixed-shape tensor inputs must have the same dtype, ignoring top-level nullability. Vector
+/// inputs may mix [`Vector`] and [`UnitVector`] when their element ptype and dimensions match. The
+/// output is a float column of that element ptype.
 ///
 /// [`FixedShapeTensor`]: crate::fixed_shape_tensor::FixedShapeTensor
 /// [`Vector`]: crate::vector::Vector
+/// [`UnitVector`]: crate::unit_vector::UnitVector
 #[derive(Clone)]
 pub struct InnerProduct;
 
@@ -296,6 +298,7 @@ mod tests {
     use crate::utils::test_helpers::assert_close;
     use crate::utils::test_helpers::normalized_array;
     use crate::utils::test_helpers::tensor_array;
+    use crate::utils::test_helpers::unit_vector_array;
     use crate::utils::test_helpers::vector_array;
 
     /// Evaluates inner product between two tensor arrays and returns the result as `Vec<f64>`.
@@ -367,6 +370,16 @@ mod tests {
             ],
         )?;
         assert_close(&eval_inner_product(lhs, rhs)?, &[25.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn mixes_unit_and_ordinary_vectors() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let unit = unit_vector_array(2, &[0.6f64, 0.8], &mut ctx)?;
+        let ordinary = vector_array(2, &[3.0f64, 4.0])?;
+
+        assert_close(&eval_inner_product(unit, ordinary)?, &[5.0]);
         Ok(())
     }
 

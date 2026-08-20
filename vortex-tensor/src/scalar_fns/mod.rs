@@ -17,19 +17,20 @@ pub mod cosine_similarity;
 pub mod inner_product;
 pub mod l2_norm;
 
-/// Controls whether norm-based functions may trust [`Normalized`] encoding evidence.
+/// Controls whether norm-based functions may trust normalized-value claims.
 ///
-/// This policy belongs to the scalar function rather than the logical tensor dtype. It only
-/// changes execution for [`Normalized`]-encoded inputs; ordinary tensors use their physical
-/// coordinates in both modes.
+/// [`Normalized`] encodings claim that their direction child is normalized, while [`UnitVector`]
+/// dtypes claim that each non-null value is unit length. Ordinary tensors carry neither claim and
+/// use their physical coordinates in both modes.
 ///
 /// [`Normalized`]: crate::encodings::normalized::Normalized
+/// [`UnitVector`]: crate::unit_vector::UnitVector
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NormMode {
     /// Compute physical direction norms instead of assuming that they are exactly one.
     Exact,
 
-    /// Trust each `Normalized` direction as unit length and omit its norm computation.
+    /// Trust normalized encoding and dtype claims and omit their norm computation.
     ///
     /// Checked arrays satisfy the encoding's documented tolerance. Unchecked or lossy arrays do
     /// not carry an error bound, so this mode can produce values outside the mathematical range.
