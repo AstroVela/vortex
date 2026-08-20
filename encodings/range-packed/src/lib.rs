@@ -228,6 +228,49 @@ impl RangePackedCodec {
     }
 }
 
+pub(crate) fn estimate_codec_nbytes(values: &[u64], block_len: usize) -> VortexResult<usize> {
+    vortex_ensure!(
+        block_len > 0 && block_len <= MAX_BLOCK_LEN,
+        "range packed block length must be in 1..={MAX_BLOCK_LEN}"
+    );
+    if values.is_empty() {
+        return Ok(size_of::<u32>());
+    }
+
+    let (sample, minimum, maximum) = training_sample(values);
+    let bins = cover_domain(optimize_bins(&sample), minimum, maximum);
+    let symbol_width = bit_width(u64::try_from(bins.len() - 1)?);
+    let block_count = values.len().div_ceil(block_len);
+    let mut payload_len = 0usize;
+    for block_index in 0..block_count {
+        let start = block_index * block_len;
+        let stop = (start + block_len).min(values.len());
+        let values = &values[start..stop];
+        let symbol_bytes = (values.len() * usize::from(symbol_width)).div_ceil(8);
+        let checkpoint_bytes = values.len().div_ceil(CHECKPOINT_INTERVAL) * size_of::<u16>();
+        let offset_bits = values.iter().try_fold(0usize, |total, &value| {
+            let symbol = bins
+                .partition_point(|bin| bin.lower <= value)
+                .saturating_sub(1);
+            let bin = bins[symbol];
+            vortex_ensure!(
+                value - bin.lower <= low_mask(bin.offset_bits),
+                "range packed value exceeds its bin"
+            );
+            Ok::<usize, vortex_error::VortexError>(total + usize::from(bin.offset_bits))
+        })?;
+        payload_len += symbol_bytes
+            + SYMBOL_PADDING
+            + checkpoint_bytes
+            + offset_bits.div_ceil(8)
+            + OFFSET_PADDING;
+    }
+
+    Ok(bins.len() * (size_of::<u64>() + size_of::<u8>())
+        + (block_count + 1) * size_of::<u32>()
+        + payload_len)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BinTableView<'a> {
     Interleaved(&'a [Bin]),
@@ -1081,6 +1124,27 @@ mod tests {
                 .execute_scalar(index, &mut ctx)?;
             assert_eq!(actual, expected_scalar);
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::nonnullable(PrimitiveArray::from_iter((0_u64..4_096).map(|value| {
+        (value % 8) * 1_000_000 + value.wrapping_mul(7_919) % 1_024
+    })))]
+    #[case::nullable(PrimitiveArray::from_option_iter((0_i64..4_096).map(|value| {
+        (value % 17 != 0).then_some((value % 8) * 1_000_000 + value * 7_919 % 1_024)
+    })))]
+    fn full_position_estimate_matches_encoded_size(
+        #[case] expected: PrimitiveArray,
+    ) -> VortexResult<()> {
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+        let estimate =
+            RangePacked::estimate_primitive_with_null_positions(expected.as_view(), &mut ctx)?;
+        let encoded =
+            RangePacked::from_primitive_with_null_positions(expected.as_view(), &mut ctx)?;
+
+        assert_eq!(estimate, encoded.nbytes());
         Ok(())
     }
 

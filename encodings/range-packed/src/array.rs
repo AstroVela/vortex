@@ -52,6 +52,7 @@ use crate::MAX_BLOCK_LEN;
 use crate::RangePackedCodec;
 use crate::RangePackedDecoder;
 use crate::VALIDITY_CHECKPOINT_INTERVAL;
+use crate::estimate_codec_nbytes;
 use crate::low_mask;
 
 const METADATA_VERSION: u8 = 1;
@@ -315,6 +316,26 @@ impl RangePacked {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<RangePackedArray> {
         Self::from_primitive_mode(array, ctx, true)
+    }
+
+    /// Estimates storage when every physical value remains at its logical position.
+    pub fn estimate_primitive_with_null_positions(
+        array: ArrayView<'_, Primitive>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<u64> {
+        vortex_ensure!(
+            array.ptype().is_int(),
+            "RangePackedArray needs integer values"
+        );
+        let validity = array.validity()?;
+        let mask = validity.execute_mask(array.len(), ctx)?;
+        let actual_nulls = mask.true_count() != array.len();
+        let ordered = ordered_primitive(array)?;
+        let mut nbytes = estimate_codec_nbytes(&ordered, MAX_BLOCK_LEN)?;
+        if actual_nulls {
+            nbytes += array.len().div_ceil(8);
+        }
+        Ok(u64::try_from(nbytes)?)
     }
 
     fn from_primitive_mode(

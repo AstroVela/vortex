@@ -1695,6 +1695,39 @@ Fast rejection remains an advantage, not an admission rule.
 
 A candidate with costly analysis needs stronger corpus evidence.
 
+### RangePacked estimate and rejection cost
+
+A focused Samply profile attributed 11.79 percent of CPU time to the rejected RangePacked callback.
+
+Bin construction consumed almost all of that time. Exact size estimation alone did not reduce the cost.
+
+The estimator now fits the bins and counts exact child-buffer bytes. It does not construct the packed payload.
+
+A coarse model uses the existing one-percent sample. It compares fixed prefix bins with a single global range.
+
+The model also compares 64-value local ranges with the global range model.
+
+A large local advantage identifies inputs that favor BlockResidual. The selector then skips RangePacked before ALP analysis.
+
+The locality test retains Euro and rejects the random walk, Food, and CMS candidates.
+
+| Input | Default encode MB/s | Candidate encode MB/s | Write change | Selected RangePacked |
+| --- | ---: | ---: | ---: | --- |
+| Uniform floats | 639.5 | 629.7 | -1.5 percent | No |
+| Widened `f32` values | 680.3 | 662.9 | -2.6 percent | No |
+| Random walk | 581.0 | 576.2 | -0.8 percent | No |
+| Nonzero-secondary FloatQuant | 677.8 | 659.8 | -2.7 percent | No |
+| Quantized `f32` | 1,410.8 | 1,338.7 | -5.1 percent | No |
+| Euro subjectivity | 357.8 | 359.9 | +0.6 percent | Yes |
+
+These focused paired results contain benchmark noise. The complete corpus will determine the final policy.
+
+On Euro, RangePacked uses 8,180,506 bytes instead of 14,234,326 bytes.
+
+Its decode throughput is 15,179 MB/s instead of 19,716 MB/s.
+
+Food and CMS now retain their existing BlockResidual trees. Their prior RangePacked choices lost too much decode throughput.
+
 ### Multi-reference block prototype
 
 The prototype stores up to four quantile references per 1,024-value block.
@@ -1943,6 +1976,9 @@ This round completed these steps:
 - Added single-encoding benchmarks for every supported integer and float type.
 - Added `f16` support to OrderedFloat, FloatQuant, and both Default schemes.
 - Verified zero-secondary and nonzero-secondary `f16` FloatQuant trees.
+- Added exact RangePacked size estimates without packed payload construction.
+- Added a coarse RangePacked rejection model over the existing one-percent sample.
+- Added a locality rejection test that retains Euro and rejects clear BlockResidual fits.
 - Updated stale golden trees after the BlockResidual payload and selector changes.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
@@ -1957,12 +1993,11 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Add a cheap sample rejection test if it preserves the Euro range model.
-2. Validate frequency-ranked Dict and full-position RangePacked across the complete file corpus.
-3. Measure rejected-candidate analysis cost after the candidate set stabilizes.
-4. Prefer cheap rejection tests when they preserve the best candidate model.
-5. Treat fast rejection as a selection advantage, not an admission criterion.
-6. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Validate frequency-ranked Dict and full-position RangePacked across the complete file corpus.
+2. Measure rejected-candidate analysis cost after the candidate set stabilizes.
+3. Prefer cheap rejection tests when they preserve the best candidate model.
+4. Treat fast rejection as a selection advantage, not an admission criterion.
+5. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

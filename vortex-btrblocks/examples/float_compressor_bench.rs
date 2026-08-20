@@ -2746,6 +2746,10 @@ fn profile_pco_array(
     Ok(())
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "benchmark options share the same encoded arrays"
+)]
 fn measure_dataset(
     dataset: &str,
     columns: &[Column],
@@ -2780,95 +2784,53 @@ fn measure_dataset(
         }
     }
 
-    let prior_default = encoded
-        .iter()
-        .find(|(config, _)| *config == "prior-default")
-        .ok_or_else(|| vortex_err!("prior-default configuration is missing"))?;
-    let prior_compact = encoded
-        .iter()
-        .find(|(config, _)| *config == "prior-compact")
-        .ok_or_else(|| vortex_err!("prior-compact configuration is missing"))?;
-    for (column_index, column) in columns.iter().enumerate() {
-        let Some(primitive) = &column.primitive else {
-            continue;
-        };
-        if !primitive.ptype().is_float() {
-            continue;
-        }
-        let default_array = &prior_default.1[column_index];
-        let compact_array = &prior_compact.1[column_index];
-        let input_bytes = primitive.len() * primitive.ptype().byte_width();
-        let default_bytes = default_array.nbytes();
-        let compact_bytes = compact_array.nbytes();
-        let compact_savings = if default_bytes == 0 {
-            0.0
-        } else {
-            100.0 * (1.0 - compact_bytes as f64 / default_bytes as f64)
-        };
-        println!(
-            "float-column\t{dataset}\t{}\t{}\t{}\t{input_bytes}\t{default_bytes}\t{compact_bytes}\t{compact_savings:.3}\t{}\t{}",
-            column.name,
-            primitive.ptype(),
-            primitive.len(),
-            encoding_tree(default_array),
-            encoding_tree(compact_array),
-        );
-        measure_frequency_ranked_dict_trees(
-            dataset,
-            &column.name,
-            &column.array,
-            default_array,
-            session,
-        )?;
-        if compact_bytes * 10 <= default_bytes * 9
-            || std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some()
-        {
-            profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
-        }
-        if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some() {
-            measure_existing_tree(
+    if std::env::var_os("VORTEX_BENCH_SKIP_AUXILIARY_ANALYSIS").is_none() {
+        let prior_default = encoded
+            .iter()
+            .find(|(config, _)| *config == "prior-default")
+            .ok_or_else(|| vortex_err!("prior-default configuration is missing"))?;
+        let prior_compact = encoded
+            .iter()
+            .find(|(config, _)| *config == "prior-compact")
+            .ok_or_else(|| vortex_err!("prior-compact configuration is missing"))?;
+        for (column_index, column) in columns.iter().enumerate() {
+            let Some(primitive) = &column.primitive else {
+                continue;
+            };
+            if !primitive.ptype().is_float() {
+                continue;
+            }
+            let default_array = &prior_default.1[column_index];
+            let compact_array = &prior_compact.1[column_index];
+            let input_bytes = primitive.len() * primitive.ptype().byte_width();
+            let default_bytes = default_array.nbytes();
+            let compact_bytes = compact_array.nbytes();
+            let compact_savings = if default_bytes == 0 {
+                0.0
+            } else {
+                100.0 * (1.0 - compact_bytes as f64 / default_bytes as f64)
+            };
+            println!(
+                "float-column\t{dataset}\t{}\t{}\t{}\t{input_bytes}\t{default_bytes}\t{compact_bytes}\t{compact_savings:.3}\t{}\t{}",
+                column.name,
+                primitive.ptype(),
+                primitive.len(),
+                encoding_tree(default_array),
+                encoding_tree(compact_array),
+            );
+            measure_frequency_ranked_dict_trees(
                 dataset,
                 &column.name,
-                "default",
                 &column.array,
                 default_array,
                 session,
             )?;
-            measure_existing_tree(
-                dataset,
-                &column.name,
-                "compact",
-                &column.array,
-                compact_array,
-                session,
-            )?;
-            measure_fixed_bin_tree(dataset, &column.name, &column.array, compact_array, session)?;
-            measure_decomposed_fixed_bin_tree(
-                dataset,
-                &column.name,
-                &column.array,
-                compact_array,
-                FixedBinOffsetTree::BlockResidual,
-                session,
-            )?;
-            measure_decomposed_fixed_bin_tree(
-                dataset,
-                &column.name,
-                &column.array,
-                compact_array,
-                FixedBinOffsetTree::FoRBitPacked,
-                session,
-            )?;
-            measure_block_residual_float_tree(
-                dataset,
-                &column.name,
-                &column.array,
-                compact_array,
-                session,
-            )?;
-        }
-        if std::env::var_os("VORTEX_BENCH_INT_MULT_TREE").is_some() {
-            if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_none() {
+            if compact_bytes * 10 <= default_bytes * 9
+                || std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some()
+            {
+                profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
+            }
+            if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some() {
                 measure_existing_tree(
                     dataset,
                     &column.name,
@@ -2883,6 +2845,29 @@ fn measure_dataset(
                     "compact",
                     &column.array,
                     compact_array,
+                    session,
+                )?;
+                measure_fixed_bin_tree(
+                    dataset,
+                    &column.name,
+                    &column.array,
+                    compact_array,
+                    session,
+                )?;
+                measure_decomposed_fixed_bin_tree(
+                    dataset,
+                    &column.name,
+                    &column.array,
+                    compact_array,
+                    FixedBinOffsetTree::BlockResidual,
+                    session,
+                )?;
+                measure_decomposed_fixed_bin_tree(
+                    dataset,
+                    &column.name,
+                    &column.array,
+                    compact_array,
+                    FixedBinOffsetTree::FoRBitPacked,
                     session,
                 )?;
                 measure_block_residual_float_tree(
@@ -2893,61 +2878,88 @@ fn measure_dataset(
                     session,
                 )?;
             }
-            for base in [5, 10, 100, 1_000] {
-                measure_int_mult_float_tree(
-                    dataset,
-                    &column.name,
-                    &column.array,
-                    compact_array,
-                    base,
-                    session,
-                )?;
+            if std::env::var_os("VORTEX_BENCH_INT_MULT_TREE").is_some() {
+                if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_none() {
+                    measure_existing_tree(
+                        dataset,
+                        &column.name,
+                        "default",
+                        &column.array,
+                        default_array,
+                        session,
+                    )?;
+                    measure_existing_tree(
+                        dataset,
+                        &column.name,
+                        "compact",
+                        &column.array,
+                        compact_array,
+                        session,
+                    )?;
+                    measure_block_residual_float_tree(
+                        dataset,
+                        &column.name,
+                        &column.array,
+                        compact_array,
+                        session,
+                    )?;
+                }
+                for base in [5, 10, 100, 1_000] {
+                    measure_int_mult_float_tree(
+                        dataset,
+                        &column.name,
+                        &column.array,
+                        compact_array,
+                        base,
+                        session,
+                    )?;
+                }
+                let suffix_widths: &[u8] = match primitive.ptype() {
+                    PType::F32 => &[12, 14, 16, 18, 20, 22, 24, 26, 28],
+                    PType::F64 => &[24, 28, 32, 36, 40, 44, 48, 52, 56],
+                    _ => &[],
+                };
+                for &suffix_bits in suffix_widths {
+                    measure_prefix_int_mult_float_tree(
+                        dataset,
+                        &column.name,
+                        &column.array,
+                        compact_array,
+                        suffix_bits,
+                        session,
+                    )?;
+                }
             }
-            let suffix_widths: &[u8] = match primitive.ptype() {
-                PType::F32 => &[12, 14, 16, 18, 20, 22, 24, 26, 28],
-                PType::F64 => &[24, 28, 32, 36, 40, 44, 48, 52, 56],
-                _ => &[],
-            };
-            for &suffix_bits in suffix_widths {
-                measure_prefix_int_mult_float_tree(
+            if std::env::var_os("VORTEX_BENCH_PATCH_POSITIONS").is_some() {
+                if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_none()
+                    && std::env::var_os("VORTEX_BENCH_INT_MULT_TREE").is_none()
+                {
+                    measure_existing_tree(
+                        dataset,
+                        &column.name,
+                        "default",
+                        &column.array,
+                        default_array,
+                        session,
+                    )?;
+                    measure_existing_tree(
+                        dataset,
+                        &column.name,
+                        "compact",
+                        &column.array,
+                        compact_array,
+                        session,
+                    )?;
+                }
+                measure_block_residual_patch_positions(
                     dataset,
                     &column.name,
-                    &column.array,
-                    compact_array,
-                    suffix_bits,
-                    session,
-                )?;
-            }
-        }
-        if std::env::var_os("VORTEX_BENCH_PATCH_POSITIONS").is_some() {
-            if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_none()
-                && std::env::var_os("VORTEX_BENCH_INT_MULT_TREE").is_none()
-            {
-                measure_existing_tree(
-                    dataset,
-                    &column.name,
-                    "default",
                     &column.array,
                     default_array,
-                    session,
-                )?;
-                measure_existing_tree(
-                    dataset,
-                    &column.name,
-                    "compact",
-                    &column.array,
                     compact_array,
                     session,
                 )?;
             }
-            measure_block_residual_patch_positions(
-                dataset,
-                &column.name,
-                &column.array,
-                default_array,
-                compact_array,
-                session,
-            )?;
         }
     }
 
@@ -3069,7 +3081,11 @@ fn main() -> VortexResult<()> {
         .unwrap_or(DEFAULT_ROW_COUNT);
     let session = array_session();
     vortex_range_packed::initialize(&session);
-    let configs = compressors();
+    let mut configs = compressors();
+    if let Ok(filter) = std::env::var("VORTEX_BENCH_CONFIGS") {
+        configs.retain(|(name, _)| filter.split(',').any(|requested| requested == *name));
+        vortex_ensure!(!configs.is_empty(), "no benchmark configuration matched");
+    }
 
     println!("structure\tdataset\tcolumn\tptype\tconfig\tencoding\tbytes");
     println!(
