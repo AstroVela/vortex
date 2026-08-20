@@ -1763,7 +1763,26 @@ This HashTags trade needs the final threshold review. It does not yet justify de
 
 The ALP RangePacked branch selected no column in this pass. Its rejected analysis contributes to the GloVe and synthetic costs.
 
-The next experiment will measure an OrderedFloat-only selector before removal or retention of the ALP branch.
+An OrderedFloat-only estimator reduced rejected write costs on every affected control.
+
+| Input | General selector loss | OrderedFloat-only loss |
+| --- | ---: | ---: |
+| Widened `f32` | 2.6 percent | 0.5 percent |
+| Nonzero-secondary FloatQuant | 2.7 percent | 1.3 percent |
+| Quantized `f32` | 5.1 percent | 2.4 percent |
+| GloVe | 5.6 percent | 1.3 percent |
+
+The same estimator increased HashTags write throughput from 231 to 294 MB/s.
+
+A direct OrderedFloat encoder increased it again to 379 MB/s. The Default baseline reached 1,316 MB/s.
+
+The direct form kept the Euro write result neutral. It also retained both selected sizes.
+
+The Default candidate can therefore use a specialized OrderedFloat selector.
+
+The ALP candidate remains experimental until independent columns justify its analysis cost.
+
+This split does not reject all selectors with expensive analysis. It reflects the current selection evidence for these two transforms.
 
 ### Multi-reference block prototype
 
