@@ -13,13 +13,12 @@ use vortex_compute::lane_kernels::IndexedSourceExt;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
-use super::RowExecution;
+use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::unstable::row::FailureEvidence;
 use crate::scalar_fn::unstable::row::IndexedElementTuple;
 use crate::scalar_fn::unstable::row::OutputElement;
-use crate::scalar_fn::unstable::row::ViewLen;
 use crate::scalar_fn::unstable::row::visitor::assert_owned_output_needs_no_drop;
 
 /// Zero-sized failure accumulator for infallible owned visits.
@@ -36,7 +35,7 @@ pub(crate) fn execute_owned_infallible<Args, Out, Prepared>(
     ctx: &mut ExecutionCtx,
     prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
     apply: impl Fn(&Prepared, Args::Elems<'_>) -> Out,
-) -> VortexResult<RowExecution>
+) -> VortexResult<ArrayRef>
 where
     Args: IndexedElementTuple,
     Out: OutputElement,
@@ -57,7 +56,7 @@ pub(crate) fn execute_owned<Args, Out, Prepared, Fail>(
     prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
     apply: impl Fn(&Prepared, Args::Elems<'_>) -> (Out, Fail),
     finish_failure: impl FnOnce(Fail) -> VortexResult<()>,
-) -> VortexResult<RowExecution>
+) -> VortexResult<ArrayRef>
 where
     Args: IndexedElementTuple,
     Out: OutputElement,
@@ -78,12 +77,12 @@ where
     let failure = if let Some(views) = Args::views_if_no_consts(&columns) {
         // Keep this validation beside the views so LLVM sees their common length here.
         vortex_ensure!(
-            Args::ARITY == 0 || views.len() == row_count,
+            Args::view_lens_match(&views, row_count),
             "a decoded row input does not address exactly {row_count} rows",
         );
 
-        // SAFETY: the tuple length check proved every non-nullary view addresses exactly
-        // `row_count` rows immediately above. Nullary tuples do not access an input view.
+        // SAFETY: `view_lens_match` checked that these exact retained views address `row_count`
+        // rows.
         let source = unsafe { Args::indexed_source(views, row_count) };
 
         source.map_checked_into(output, |elements| apply(&prepared, elements))
@@ -115,9 +114,8 @@ where
     // once, and `values` was allocated with at least `row_count` capacity.
     unsafe { values.set_len(row_count) };
 
-    // Defer failures so batch execution can retry with only valid rows.
-    match finish_failure(failure) {
-        Ok(()) => Ok(RowExecution::Output(Out::build(values))),
-        Err(error) => Ok(RowExecution::DeferredError(error)),
-    }
+    // Defer rich error construction until after the row loop.
+    finish_failure(failure)?;
+
+    Ok(Out::build(values))
 }
