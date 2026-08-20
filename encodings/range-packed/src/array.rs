@@ -79,7 +79,7 @@ pub struct RangePackedSlots {
 #[derive(Clone, Debug)]
 pub struct RangePackedData {
     unsliced_len: usize,
-    dense_len: usize,
+    stored_len: usize,
     slice_start: usize,
     slice_stop: usize,
     payload_len: usize,
@@ -101,7 +101,7 @@ impl Display for RangePackedData {
 impl ArrayHash for RangePackedData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.unsliced_len.hash(state);
-        self.dense_len.hash(state);
+        self.stored_len.hash(state);
         self.slice_start.hash(state);
         self.slice_stop.hash(state);
         self.payload_len.hash(state);
@@ -112,7 +112,7 @@ impl ArrayHash for RangePackedData {
 impl ArrayEq for RangePackedData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.unsliced_len == other.unsliced_len
-            && self.dense_len == other.dense_len
+            && self.stored_len == other.stored_len
             && self.slice_start == other.slice_start
             && self.slice_stop == other.slice_stop
             && self.payload_len == other.payload_len
@@ -181,37 +181,37 @@ impl VTable for RangePacked {
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = RangePackedMetadata::decode(metadata)?;
         let unsliced_len = usize::try_from(metadata.unsliced_len)?;
-        let dense_len = usize::try_from(metadata.dense_len)?;
+        let stored_len = usize::try_from(metadata.stored_len)?;
         let slice_start = usize::try_from(metadata.slice_start)?;
         let slice_stop = slice_start
             .checked_add(len)
             .ok_or_else(|| vortex_error::vortex_err!("RangePacked slice length overflows"))?;
         let payload_len = usize::try_from(metadata.payload_len)?;
-        let bin_count = bin_count(dense_len, metadata.symbol_width)?;
-        let block_count = dense_len.div_ceil(MAX_BLOCK_LEN);
+        let bin_count = bin_count(stored_len, metadata.symbol_width)?;
+        let block_count = stored_len.div_ceil(MAX_BLOCK_LEN);
         vortex_ensure!(
-            matches!(children.len(), 4 | 6),
-            "RangePackedArray expects four or six children"
+            matches!(children.len(), 4..=6),
+            "RangePackedArray expects four, five, or six children"
         );
         let bin_lowers = children.get(0, &primitive_dtype(PType::U64), bin_count)?;
         let offset_widths = children.get(1, &primitive_dtype(PType::U8), bin_count)?;
         let block_offsets = children.get(2, &primitive_dtype(PType::U32), block_count + 1)?;
         let payload = children.get(3, &primitive_dtype(PType::U8), payload_len)?;
-        let (validity_bits, rank_checkpoints) = if children.len() == 6 {
-            (
-                Some(children.get(4, &DType::Bool(NonNullable), unsliced_len)?),
-                Some(children.get(
+        let validity_bits = (children.len() >= 5)
+            .then(|| children.get(4, &DType::Bool(NonNullable), unsliced_len))
+            .transpose()?;
+        let rank_checkpoints = (children.len() == 6)
+            .then(|| {
+                children.get(
                     5,
                     &primitive_dtype(PType::U32),
                     unsliced_len.div_ceil(VALIDITY_CHECKPOINT_INTERVAL),
-                )?),
-            )
-        } else {
-            (None, None)
-        };
+                )
+            })
+            .transpose()?;
         let data = RangePackedData {
             unsliced_len,
-            dense_len,
+            stored_len,
             slice_start,
             slice_stop,
             payload_len,
@@ -306,28 +306,50 @@ impl RangePacked {
         array: ArrayView<'_, Primitive>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<RangePackedArray> {
+        Self::from_primitive_mode(array, ctx, false)
+    }
+
+    /// Encodes every physical value, including values at null positions.
+    pub fn from_primitive_with_null_positions(
+        array: ArrayView<'_, Primitive>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<RangePackedArray> {
+        Self::from_primitive_mode(array, ctx, true)
+    }
+
+    fn from_primitive_mode(
+        array: ArrayView<'_, Primitive>,
+        ctx: &mut ExecutionCtx,
+        preserve_null_positions: bool,
+    ) -> VortexResult<RangePackedArray> {
         vortex_ensure!(
             array.ptype().is_int(),
             "RangePackedArray needs integer values"
         );
         let validity = array.validity()?;
         let mask = validity.execute_mask(array.len(), ctx)?;
-        let dense_len = mask.true_count();
-        let dense_ordered = ordered_primitive(array)?
-            .into_iter()
-            .zip(mask.iter())
-            .filter_map(|(value, valid)| valid.then_some(value))
-            .collect::<Vec<_>>();
-        let codec = RangePackedCodec::encode(&dense_ordered, MAX_BLOCK_LEN)?;
-        let actual_nulls = dense_len != array.len();
+        let valid_count = mask.true_count();
+        let actual_nulls = valid_count != array.len();
+        let ordered = ordered_primitive(array)?;
+        let stored_ordered = if preserve_null_positions {
+            ordered
+        } else {
+            ordered
+                .into_iter()
+                .zip(mask.iter())
+                .filter_map(|(value, valid)| valid.then_some(value))
+                .collect::<Vec<_>>()
+        };
+        let stored_len = stored_ordered.len();
+        let codec = RangePackedCodec::encode(&stored_ordered, MAX_BLOCK_LEN)?;
         let validity_bits = actual_nulls.then(|| BoolArray::from_iter(mask.iter()).into_array());
-        let rank_checkpoints = actual_nulls
-            .then(|| rank_checkpoints(mask.iter(), dense_len))
+        let rank_checkpoints = (actual_nulls && !preserve_null_positions)
+            .then(|| rank_checkpoints(mask.iter(), stored_len))
             .transpose()?
             .map(|ranks| PrimitiveArray::from_iter(ranks).into_array());
         let data = RangePackedData {
             unsliced_len: array.len(),
-            dense_len,
+            stored_len,
             slice_start: 0,
             slice_stop: array.len(),
             payload_len: codec.payload.len(),
@@ -368,6 +390,9 @@ impl RangePacked {
         let dense_values = with_decoder(array, |decoder| {
             decoder.decode_mapped_range(dense_start..dense_stop, map)
         })?;
+        if array.data().stored_len == array.data().unsliced_len {
+            return Ok(dense_values);
+        }
         let Some(validity_bits) = array.validity_bits() else {
             return Ok(dense_values);
         };
@@ -406,8 +431,8 @@ impl RangePackedData {
         );
         vortex_ensure!(len == self.len(), "RangePacked slice length is invalid");
         vortex_ensure!(
-            self.dense_len <= self.unsliced_len,
-            "RangePacked dense length exceeds its source length"
+            self.stored_len <= self.unsliced_len,
+            "RangePacked stored length exceeds its source length"
         );
         let bin_count = self.bin_count();
         validate_primitive_child(slots.bin_lowers, PType::U64, bin_count, "bin lowers")?;
@@ -415,15 +440,15 @@ impl RangePackedData {
         validate_primitive_child(
             slots.block_offsets,
             PType::U32,
-            self.dense_len.div_ceil(MAX_BLOCK_LEN) + 1,
+            self.stored_len.div_ceil(MAX_BLOCK_LEN) + 1,
             "block offsets",
         )?;
         validate_primitive_child(slots.payload, PType::U8, self.payload_len, "payload")?;
         vortex_ensure!(
-            slots.validity_bits.is_some() == slots.rank_checkpoints.is_some(),
-            "RangePacked validity and rank children must occur together"
+            slots.validity_bits.is_some() || slots.rank_checkpoints.is_none(),
+            "RangePacked rank checkpoints require validity"
         );
-        if let (Some(validity_bits), Some(ranks)) = (slots.validity_bits, slots.rank_checkpoints) {
+        if let Some(validity_bits) = slots.validity_bits {
             vortex_ensure!(
                 dtype.is_nullable(),
                 "RangePacked validity requires a nullable dtype"
@@ -434,20 +459,27 @@ impl RangePackedData {
                     && validity_bits.len() == self.unsliced_len,
                 "RangePacked validity child is invalid"
             );
-            validate_primitive_child(
-                ranks,
-                PType::U32,
-                self.unsliced_len.div_ceil(VALIDITY_CHECKPOINT_INTERVAL),
-                "rank checkpoints",
-            )?;
-            validate_ranks(
-                validity_bits.as_::<Bool>(),
-                ranks.as_::<Primitive>().as_slice::<u32>(),
-                self.dense_len,
-            )?;
+            if let Some(ranks) = slots.rank_checkpoints {
+                validate_primitive_child(
+                    ranks,
+                    PType::U32,
+                    self.unsliced_len.div_ceil(VALIDITY_CHECKPOINT_INTERVAL),
+                    "rank checkpoints",
+                )?;
+                validate_ranks(
+                    validity_bits.as_::<Bool>(),
+                    ranks.as_::<Primitive>().as_slice::<u32>(),
+                    self.stored_len,
+                )?;
+            } else {
+                vortex_ensure!(
+                    self.stored_len == self.unsliced_len,
+                    "RangePacked without rank checkpoints must store every value"
+                );
+            }
         } else {
             vortex_ensure!(
-                self.dense_len == self.unsliced_len,
+                self.stored_len == self.unsliced_len,
                 "RangePacked without validity must store every value"
             );
         }
@@ -464,7 +496,7 @@ impl RangePackedData {
     }
 
     fn bin_count(&self) -> usize {
-        if self.dense_len == 0 {
+        if self.stored_len == 0 {
             0
         } else {
             1_usize << self.symbol_width
@@ -534,7 +566,7 @@ fn validate_block_offsets(offsets: &[u32], payload_len: usize) -> VortexResult<(
     Ok(())
 }
 
-fn validate_ranks(bits: ArrayView<'_, Bool>, ranks: &[u32], dense_len: usize) -> VortexResult<()> {
+fn validate_ranks(bits: ArrayView<'_, Bool>, ranks: &[u32], stored_len: usize) -> VortexResult<()> {
     let bits = bits.bit_buffer_view();
     let mut rank = 0usize;
     for (checkpoint, &stored) in ranks.iter().enumerate() {
@@ -546,7 +578,7 @@ fn validate_ranks(bits: ArrayView<'_, Bool>, ranks: &[u32], dense_len: usize) ->
         let stop = (start + VALIDITY_CHECKPOINT_INTERVAL).min(bits.len());
         rank += bits.slice(start..stop).true_count();
     }
-    vortex_ensure!(rank == dense_len, "RangePacked dense length is invalid");
+    vortex_ensure!(rank == stored_len, "RangePacked stored length is invalid");
     Ok(())
 }
 
@@ -574,11 +606,14 @@ fn is_valid(array: ArrayView<'_, RangePacked>, global_index: usize) -> bool {
 }
 
 fn dense_rank(array: ArrayView<'_, RangePacked>, global_index: usize) -> VortexResult<usize> {
+    if array.data().stored_len == array.data().unsliced_len {
+        return Ok(global_index);
+    }
     let Some(validity) = array.validity_bits() else {
         return Ok(global_index);
     };
     if global_index == array.data().unsliced_len {
-        return Ok(array.data().dense_len);
+        return Ok(array.data().stored_len);
     }
     let checkpoint = global_index / VALIDITY_CHECKPOINT_INTERVAL;
     let checkpoint_start = checkpoint * VALIDITY_CHECKPOINT_INTERVAL;
@@ -606,7 +641,7 @@ fn with_decoder<T>(
     let block_offsets = array.block_offsets().as_::<Primitive>();
     let payload = array.payload().as_::<Primitive>();
     let decoder = RangePackedDecoder::try_new(
-        array.data().dense_len,
+        array.data().stored_len,
         MAX_BLOCK_LEN,
         array.data().symbol_width,
         BinTableView::Split {
@@ -757,12 +792,12 @@ fn primitive_dtype(ptype: PType) -> DType {
     DType::Primitive(ptype, NonNullable)
 }
 
-fn bin_count(dense_len: usize, symbol_width: u8) -> VortexResult<usize> {
+fn bin_count(stored_len: usize, symbol_width: u8) -> VortexResult<usize> {
     vortex_ensure!(
         symbol_width <= 6,
         "RangePacked symbol width exceeds six bits"
     );
-    Ok(if dense_len == 0 {
+    Ok(if stored_len == 0 {
         0
     } else {
         1_usize << symbol_width
@@ -772,7 +807,7 @@ fn bin_count(dense_len: usize, symbol_width: u8) -> VortexResult<usize> {
 #[derive(Clone, Copy)]
 struct RangePackedMetadata {
     unsliced_len: u64,
-    dense_len: u64,
+    stored_len: u64,
     slice_start: u64,
     payload_len: u64,
     symbol_width: u8,
@@ -782,7 +817,7 @@ impl RangePackedMetadata {
     fn from_data(data: &RangePackedData) -> VortexResult<Self> {
         Ok(Self {
             unsliced_len: u64::try_from(data.unsliced_len)?,
-            dense_len: u64::try_from(data.dense_len)?,
+            stored_len: u64::try_from(data.stored_len)?,
             slice_start: u64::try_from(data.slice_start)?,
             payload_len: u64::try_from(data.payload_len)?,
             symbol_width: data.symbol_width,
@@ -793,7 +828,7 @@ impl RangePackedMetadata {
         let mut bytes = Vec::with_capacity(METADATA_LEN);
         bytes.push(METADATA_VERSION);
         bytes.extend_from_slice(&self.unsliced_len.to_le_bytes());
-        bytes.extend_from_slice(&self.dense_len.to_le_bytes());
+        bytes.extend_from_slice(&self.stored_len.to_le_bytes());
         bytes.extend_from_slice(&self.slice_start.to_le_bytes());
         bytes.extend_from_slice(&self.payload_len.to_le_bytes());
         bytes.push(self.symbol_width);
@@ -812,7 +847,7 @@ impl RangePackedMetadata {
         );
         Ok(Self {
             unsliced_len: read_u64(bytes, 1),
-            dense_len: read_u64(bytes, 9),
+            stored_len: read_u64(bytes, 9),
             slice_start: read_u64(bytes, 17),
             payload_len: read_u64(bytes, 25),
             symbol_width: bytes[33],

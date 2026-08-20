@@ -465,6 +465,7 @@ impl<'a> RangePackedDecoder<'a> {
 struct DecodeTable {
     lowers: [u64; MAX_BINS],
     widths: [u8; MAX_BINS],
+    masks: [u64; MAX_BINS],
     bin_count: usize,
 }
 
@@ -472,6 +473,7 @@ impl DecodeTable {
     fn new(bins: BinTableView<'_>) -> Self {
         let mut lowers = [0_u64; MAX_BINS];
         let mut widths = [0_u8; MAX_BINS];
+        let mut masks = [0_u64; MAX_BINS];
         for index in 0..bins.len() {
             lowers[index] = bins
                 .lower(index)
@@ -479,10 +481,12 @@ impl DecodeTable {
             widths[index] = bins
                 .width(index)
                 .unwrap_or_else(|| unreachable!("validated range packed bin table"));
+            masks[index] = low_mask(widths[index]);
         }
         Self {
             lowers,
             widths,
+            masks,
             bin_count: bins.len(),
         }
     }
@@ -564,6 +568,7 @@ where
         if PARALLEL {
             let mut widths = [0_u8; 8];
             let mut lowers = [0_u64; 8];
+            let mut masks = [0_u64; 8];
             let mut positions = [0_usize; 8];
             for lane in 0..8 {
                 let symbol =
@@ -573,11 +578,17 @@ where
                 widths[lane] = unsafe { *table.widths.get_unchecked(symbol) };
                 // SAFETY: A power-of-two bin count makes every symbol code valid.
                 lowers[lane] = unsafe { *table.lowers.get_unchecked(symbol) };
+                // SAFETY: A power-of-two bin count makes every symbol code valid.
+                masks[lane] = unsafe { *table.masks.get_unchecked(symbol) };
                 positions[lane] = offset_position;
                 offset_position += usize::from(widths[lane]);
             }
             for lane in 0..8 {
-                let offset = read_offset::<WIDE>(offsets, positions[lane], widths[lane]);
+                let offset = if WIDE {
+                    read_offset::<true>(offsets, positions[lane], widths[lane])
+                } else {
+                    read_offset_masked(offsets, positions[lane], masks[lane])
+                };
                 // SAFETY: This lane is within a complete eight-value output batch.
                 unsafe {
                     values
@@ -636,6 +647,15 @@ fn read_symbol(payload: &[u8], index: usize, symbol_width: u8) -> VortexResult<u
         symbol_width,
     ))
     .map_err(Into::into)
+}
+
+#[inline(always)]
+fn read_offset_masked(offsets: &[u8], bit_position: usize, mask: u64) -> u64 {
+    let byte_position = bit_position / 8;
+    let bits_past_byte = bit_position % 8;
+    // SAFETY: Offset streams include fifteen readable padding bytes.
+    let packed = unsafe { read_u64_unaligned(offsets.as_ptr().add(byte_position)) };
+    (packed >> bits_past_byte) & mask
 }
 
 #[inline(always)]
@@ -967,14 +987,22 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn nullable_dense_roundtrip_and_rank_boundaries() -> VortexResult<()> {
+    #[rstest]
+    #[case::dense(false)]
+    #[case::full(true)]
+    fn nullable_roundtrip_and_rank_boundaries(
+        #[case] preserve_null_positions: bool,
+    ) -> VortexResult<()> {
         let expected = PrimitiveArray::from_option_iter((0_i64..600).map(|value| {
             (!matches!(value, 0 | 1 | 63 | 64 | 255 | 256 | 257 | 511)).then_some(value - 300)
         }));
         let session = array_session();
         let mut ctx = session.create_execution_ctx();
-        let encoded = RangePacked::from_primitive(expected.as_view(), &mut ctx)?;
+        let encoded = if preserve_null_positions {
+            RangePacked::from_primitive_with_null_positions(expected.as_view(), &mut ctx)?
+        } else {
+            RangePacked::from_primitive(expected.as_view(), &mut ctx)?
+        };
         assert_arrays_eq!(encoded, expected, &mut ctx);
         for index in [0, 1, 2, 63, 64, 65, 255, 256, 257, 258, 511, 512, 599] {
             let actual = encoded.execute_scalar(index, &mut ctx)?;
@@ -1019,17 +1047,25 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn serialized_nullable_slice_roundtrip() -> VortexResult<()> {
+    #[rstest]
+    #[case::dense(false)]
+    #[case::full(true)]
+    fn serialized_nullable_slice_roundtrip(
+        #[case] preserve_null_positions: bool,
+    ) -> VortexResult<()> {
         let expected = PrimitiveArray::from_option_iter(
             (0_i64..1_500).map(|value| (value % 17 != 0).then_some(value - 750)),
         );
         let session = array_session();
         initialize(&session);
         let mut ctx = session.create_execution_ctx();
-        let encoded = RangePacked::from_primitive(expected.as_view(), &mut ctx)?
-            .into_array()
-            .slice(251..1_101)?;
+        let encoded = if preserve_null_positions {
+            RangePacked::from_primitive_with_null_positions(expected.as_view(), &mut ctx)?
+        } else {
+            RangePacked::from_primitive(expected.as_view(), &mut ctx)?
+        }
+        .into_array()
+        .slice(251..1_101)?;
         let expected = expected.into_array().slice(251..1_101)?;
         let dtype = encoded.dtype().clone();
         let len = encoded.len();

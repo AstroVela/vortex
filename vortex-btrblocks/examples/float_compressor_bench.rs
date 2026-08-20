@@ -1298,6 +1298,18 @@ fn codec_decode_iterations() -> VortexResult<usize> {
         .map(|iterations| iterations.unwrap_or(20))
 }
 
+fn tree_decode_iterations() -> VortexResult<usize> {
+    std::env::var("VORTEX_BENCH_TREE_DECODE_ITERATIONS")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| {
+                vortex_err!("invalid VORTEX_BENCH_TREE_DECODE_ITERATIONS: {error}")
+            })
+        })
+        .transpose()
+        .map(|iterations| iterations.unwrap_or(20))
+}
+
 #[derive(Clone, Copy)]
 enum FixedBinOffsetTree {
     BlockResidual,
@@ -1863,8 +1875,7 @@ fn fixed_bin_float_tree(
             .cast(alp.encoded().dtype().clone())?
             .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
         let encoded =
-            RangePacked::from_primitive(primitive.as_view(), &mut session.create_execution_ctx())?
-                .into_array();
+            range_packed_from_primitive(primitive.as_view(), &mut session.create_execution_ctx())?;
         return Ok(Some(
             ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
         ));
@@ -1879,13 +1890,24 @@ fn fixed_bin_float_tree(
     let primitive =
         fill_float_nulls_with_first_valid(primitive, &mut session.create_execution_ctx())?;
     let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
-    let encoded = RangePacked::from_primitive(
+    let encoded = range_packed_from_primitive(
         ordered.encoded().as_::<Primitive>(),
         &mut session.create_execution_ctx(),
     )?;
     Ok(Some(
-        OrderedFloat::try_new(encoded.into_array(), primitive.ptype())?.into_array(),
+        OrderedFloat::try_new(encoded, primitive.ptype())?.into_array(),
     ))
+}
+
+fn range_packed_from_primitive(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    if std::env::var_os("VORTEX_BENCH_FIXED_BIN_FULL_POSITIONS").is_some() {
+        Ok(RangePacked::from_primitive_with_null_positions(primitive, ctx)?.into_array())
+    } else {
+        Ok(RangePacked::from_primitive(primitive, ctx)?.into_array())
+    }
 }
 
 fn fill_float_nulls_with_first_valid(
@@ -1945,8 +1967,9 @@ fn measure_fixed_bin_tree(
     );
     assert_arrays_eq!(encoded, expected, &mut session.create_execution_ctx());
 
-    let mut decode_durations = Vec::with_capacity(20);
-    for _ in 0..20 {
+    let decode_iterations = tree_decode_iterations()?;
+    let mut decode_durations = Vec::with_capacity(decode_iterations);
+    for _ in 0..decode_iterations {
         let start = Instant::now();
         black_box(
             encoded
@@ -1966,8 +1989,8 @@ fn measure_fixed_bin_tree(
         encoding_tree(&encoded),
     );
 
-    let mut fused_durations = Vec::with_capacity(20);
-    for _ in 0..20 {
+    let mut fused_durations = Vec::with_capacity(decode_iterations);
+    for _ in 0..decode_iterations {
         let start = Instant::now();
         black_box(decode_fixed_bin_float_tree(&encoded, session)?);
         fused_durations.push(start.elapsed());
@@ -2231,11 +2254,11 @@ fn encode_fixed_bin_float_tree(
 ) -> VortexResult<ArrayRef> {
     if compact.encoding_id().as_ref() == "vortex.alp" {
         let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
-        let packed = RangePacked::from_primitive(
+        let packed = range_packed_from_primitive(
             alp.encoded().as_::<Primitive>(),
             &mut session.create_execution_ctx(),
         )?;
-        return Ok(ALP::try_new(packed.into_array(), alp.exponents(), alp.patches())?.into_array());
+        return Ok(ALP::try_new(packed, alp.exponents(), alp.patches())?.into_array());
     }
 
     let primitive = fill_float_nulls_with_first_valid(
@@ -2243,11 +2266,11 @@ fn encode_fixed_bin_float_tree(
         &mut session.create_execution_ctx(),
     )?;
     let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
-    let packed = RangePacked::from_primitive(
+    let packed = range_packed_from_primitive(
         ordered.encoded().as_::<Primitive>(),
         &mut session.create_execution_ctx(),
     )?;
-    Ok(OrderedFloat::try_new(packed.into_array(), primitive.ptype())?.into_array())
+    Ok(OrderedFloat::try_new(packed, primitive.ptype())?.into_array())
 }
 
 fn encode_decomposed_fixed_bin_float_tree(

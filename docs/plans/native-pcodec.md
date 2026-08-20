@@ -231,7 +231,7 @@ This path avoids a full materialized array of references.
 
 ## Selection policy
 
-Fast rejection is a strong preference for schemes in normal Default recursion.
+Fast rejection is a selection advantage for schemes in normal Default recursion.
 
 A cheap rejection path reads a bounded sample and avoids child compression when the model does not fit.
 
@@ -239,7 +239,9 @@ This path lets Default test more encodings with little throughput loss on reject
 
 Fast rejection is not a hard gate.
 
-A scheme with costly analysis can enter Default when corpus evidence shows larger size or decode gains.
+Do not use fast rejection as an admission criterion.
+
+A scheme with costly analysis can enter Default when stronger corpus evidence justifies its analysis cost.
 
 Specialized schemes remain useful when they bypass depth limits, recursive search, or an unfused common tree.
 
@@ -1564,6 +1566,80 @@ It uses rank checkpoints every 256 values. Scalar access scans at most four 64-b
 
 Grouped bins improve Euro bulk decode by 43 percent. The complete Default tree still decodes about four times faster.
 
+### Precomputed offset masks
+
+The serial decoder previously constructed one low-bit mask for each nonzero offset.
+
+The 8-lane decoder now stores one mask per bin in its 1 KiB decode table.
+
+For offset widths from 41 through 57 bits, each lane performs one load, one shift, and one mask operation.
+
+This path removes the unpredictable zero-width branch and the per-lane mask construction.
+
+The narrow path retains its zero-width branch because an unconditional load reduced Euro throughput.
+
+| Input | Fixed-bin bytes | Direct decode MB/s | Complete decode MB/s | Fused decode MB/s | Default decode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Euro subjectivity | 7,270,094 | 15,932 | 5,121 | 5,965 | 17,829 to 20,600 |
+| Food volume | 5,653,643 | 14,244 | 9,025 | 12,114 | 24,903 |
+| CMS `LINE_SRVC_CNT` | 2,463,791 | 14,031 | 5,731 | 4,071 | 26,249 |
+| CMS average payment | 10,845,743 | 15,390 | 3,545 | 3,746 | 23,861 |
+
+Euro direct decode previously reached 3,721 to 3,979 MB/s.
+
+The precomputed mask increases its direct throughput by about four times.
+
+The 500-iteration rerun produced 15,932 MB/s.
+
+Food and CMS `LINE_SRVC_CNT` use offset widths of at most 40 bits, so they do not use the new path.
+
+CMS average payment uses the new path, but BlockResidual gives a smaller complete tree.
+
+The optimized codec establishes a much higher fixed-bin decode ceiling.
+
+The complete dense candidate still fails the Default decode gate because validity checks and float reconstruction dominate its final path.
+
+An in-place reverse validity expansion reduced complete Euro decode to 3,116 MB/s.
+
+Its reverse bit iteration cost exceeded the allocation and copy cost that it removed.
+
+The implementation retains the forward expansion with a separate logical output vector.
+
+### Full-position null storage
+
+The full-position mode stores physical values at null positions instead of a dense valid-value stream.
+
+The validity child remains present, but the rank child is absent.
+
+The missing rank child identifies full-position storage without a metadata flag.
+
+Bulk decode then writes one value per logical position and skips validity expansion.
+
+Scalar access uses the logical index directly.
+
+| Input | Mode | Bytes | Encode MB/s | Fused decode MB/s | Scalar ns |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Euro subjectivity | Dense | 7,270,094 | 461 | 5,965 | 232 |
+| Euro subjectivity | Full-position | 8,180,506 | 654 | 15,180 | 206 |
+| CMS `LINE_SRVC_CNT` | Dense | 2,463,791 | 875 | 4,071 | 465 |
+| CMS `LINE_SRVC_CNT` | Full-position | 2,470,956 | 942 | 10,623 | 445 |
+
+The Euro result uses 200 complete-tree decode iterations.
+
+Default uses 14,234,326 bytes and decodes at 20,924 MB/s on the same run.
+
+Full-position RangePacked reduces Euro size by 42.5 percent and reduces decode throughput by 27.5 percent.
+
+Compact uses 6,860,457 bytes and decodes at 2,574 MB/s.
+
+The full-position candidate retains 82.1 percent of the Compact size gain and decodes 5.9 times faster than Compact.
+
+CMS `LINE_SRVC_CNT` still favors `ALP(BlockResidual)` for Default.
+
+That tree uses 2,725,541 bytes and decodes at 23,493 MB/s.
+
+The Euro candidate now warrants a complete corpus and selector-cost evaluation.
+
 CMS uses similar offset widths across its bins. The grouped scatter path then loses more than half of serial-bin throughput.
 
 Grouped bins do not generalize. The prototype remains outside production code.
@@ -1826,13 +1902,14 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these next experiments in order:
 
-1. Classify the remaining no-Delta ALP and raw-float gaps.
-2. Define a bounded small-alphabet primitive for the remaining 24-to-49-bin columns.
-3. Add a specialized range scheme only after a complete tree passes the column gates.
-4. Validate frequency-ranked Dict across the complete file corpus.
-5. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+1. Add full-position RangePacked to the focused Default bundle as an experimental candidate.
+2. Compare specialized OrderedFloat and ALP trees with their fused decoders.
+3. Add a cheap sample rejection test if it preserves the best range model.
+4. Validate frequency-ranked Dict and full-position RangePacked across the complete file corpus.
+5. Measure rejected-candidate analysis cost after the candidate set stabilizes.
 6. Prefer cheap rejection tests when they preserve the best candidate model.
-7. Require stronger corpus evidence when a useful scheme needs costly analysis.
+7. Treat fast rejection as a selection advantage, not an admission criterion.
+8. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
