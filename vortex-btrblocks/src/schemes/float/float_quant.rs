@@ -16,11 +16,13 @@ use vortex_array::dtype::PType;
 use vortex_array::dtype::half::f16;
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
+use vortex_array::vtable::validity_to_child;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::FL_CHUNK_SIZE;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::bitpack_compress::bitpack_primitive_map;
 use vortex_fastlanes::bitpack_compress::bitpack_primitive_map_pair;
@@ -98,8 +100,7 @@ fn estimate_float_quant_sample(sample: &PrimitiveArray) -> VortexResult<Estimate
     }
 
     let before_nbytes = sample.nbytes();
-    let compressed = encode_float_quant(sample.as_view(), analysis)?;
-    let after_nbytes = compressed.nbytes();
+    let after_nbytes = estimate_float_quant_nbytes(sample, analysis)?;
     if after_nbytes == 0 || after_nbytes >= before_nbytes {
         return Ok(EstimateVerdict::Skip);
     }
@@ -110,6 +111,21 @@ fn estimate_float_quant_sample(sample: &PrimitiveArray) -> VortexResult<Estimate
     }
 
     Ok(EstimateVerdict::Ratio(adjusted_ratio))
+}
+
+fn estimate_float_quant_nbytes(
+    sample: &PrimitiveArray,
+    analysis: FloatQuantAnalysis,
+) -> VortexResult<u64> {
+    let packed_chunks = u64::try_from(sample.len().div_ceil(FL_CHUNK_SIZE))?;
+    let bytes_per_bit = u64::try_from(FL_CHUNK_SIZE / 8)?;
+    let packed_bit_width =
+        u64::from(analysis.primary_bit_width) + u64::from(analysis.secondary_bit_width);
+    let packed_nbytes = packed_chunks * bytes_per_bit * packed_bit_width;
+    let validity_nbytes = validity_to_child(&sample.validity()?, sample.len())
+        .map(|validity| validity.nbytes())
+        .unwrap_or(0);
+    Ok(packed_nbytes + validity_nbytes)
 }
 
 fn encode_float_quant(
@@ -281,9 +297,14 @@ fn ordered_u64(bits: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::half::f16;
     use vortex_compressor::scheme::EstimateVerdict;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
 
+    use super::analyze_float_quant;
+    use super::encode_float_quant;
+    use super::estimate_float_quant_nbytes;
     use super::estimate_float_quant_sample;
 
     #[test]
@@ -294,6 +315,60 @@ mod tests {
             estimate_float_quant_sample(&sample)?,
             EstimateVerdict::Skip
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn estimated_nbytes_matches_encoded_tree() -> VortexResult<()> {
+        let f16_values = PrimitiveArray::from_iter((0..2_050).map(|index| {
+            let high_bits = u16::try_from(index).unwrap_or_default().wrapping_mul(17) & 0x03f0;
+            let low_bit = u16::from(index % 10 == 0);
+            f16::from_bits(0x3c00 | high_bits | low_bit)
+        }));
+        let f32_values = PrimitiveArray::from_option_iter((0..2_050).map(|index| {
+            let high_bits = (index as u32).wrapping_mul(7_919) & 0x007f_ff00;
+            let low_bit = u32::from(index % 10 == 0);
+            (index % 17 != 0).then_some(f32::from_bits(0x3f80_0000 | high_bits | low_bit))
+        }));
+        let f64_values = PrimitiveArray::from_iter((0..2_050).map(|index| {
+            let high_bits = ((index as u64).wrapping_mul(7_919) << 29) & 0x000f_ffff_ffff_ff00;
+            let low_bit = u64::from(index % 10 == 0);
+            f64::from_bits(0x3ff0_0000_0000_0000 | high_bits | low_bit)
+        }));
+
+        for values in [f16_values, f32_values, f64_values] {
+            let analysis = analyze_float_quant(values.as_view())
+                .ok_or_else(|| vortex_err!("FloatQuant test input did not produce an analysis"))?;
+            let expected = encode_float_quant(values.as_view(), analysis)?.nbytes();
+            assert_eq!(estimate_float_quant_nbytes(&values, analysis)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn near_miss_sample_is_rejected() -> VortexResult<()> {
+        let f32_values = PrimitiveArray::from_iter((0..2_048).map(|index| {
+            let scrambled = (index as u32).wrapping_mul(2_654_435_761);
+            let sign = (scrambled & 1) << 31;
+            let exponent = ((scrambled >> 1) % 254 + 1) << 23;
+            let mantissa = scrambled & 0x007f_fffc;
+            f32::from_bits(sign | exponent | mantissa)
+        }));
+        let f64_values = PrimitiveArray::from_iter((0..2_048).map(|index| {
+            let scrambled = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let sign = (scrambled & 1) << 63;
+            let exponent = ((scrambled >> 1) % 2_046 + 1) << 52;
+            let mantissa = scrambled & 0x000f_ffff_ffff_fffc;
+            f64::from_bits(sign | exponent | mantissa)
+        }));
+
+        for values in [f32_values, f64_values] {
+            assert!(analyze_float_quant(values.as_view()).is_some());
+            assert!(matches!(
+                estimate_float_quant_sample(&values)?,
+                EstimateVerdict::Skip
+            ));
+        }
         Ok(())
     }
 }

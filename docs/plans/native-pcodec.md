@@ -529,6 +529,38 @@ The two selected complete trees improve size, encode throughput, and decode thro
 
 This evidence supports the opportunistic FloatQuant bundle despite the zero-selection real corpus pass.
 
+### FloatQuant rejection cost
+
+The August 20 pass added isolated Default controls that differ only by FloatQuant.
+
+Each benchmark compresses two million values with 100 samples.
+
+| Input | Default without FloatQuant | Default with FloatQuant | Time change |
+| --- | ---: | ---: | ---: |
+| General `f16` | 4.383 ms | 4.348 ms | Noise |
+| General `f32` | 17.84 ms | 18.03 ms | +1.1 percent |
+| General `f64` | 23.62 ms | 23.43 ms | Noise |
+| Near-miss `f32` | 23.77 ms | 23.78 ms | Noise |
+| Near-miss `f64` | 20.67 ms | 20.58 ms | Noise |
+
+The near-miss inputs pass FloatQuant transform analysis but fail the adjusted ratio test.
+
+The estimator now computes the exact padded FastLanes buffer size and validity size from the analysis.
+
+It no longer packs the sample payload only to count its bytes.
+
+A focused test verifies the estimate against complete `f16`, `f32`, and `f64` trees.
+
+The test includes a nullable two-child case.
+
+The optimization did not produce a measurable complete-compressor change on the near-miss controls.
+
+Sample construction, statistics, and the other schemes dominate those complete times.
+
+The isolated controls place the marginal rejected cost between noise and 1.1 percent.
+
+The 16-file pass remains the broader result. It measured a 0.9 percent write-throughput cost.
+
 ### OrderedFloat with BlockResidual on random walks
 
 | Configuration | Bytes | Encode MB/s | Decode MB/s | Scalar access ns |
@@ -2335,6 +2367,9 @@ This round completed these steps:
 - Added optional chunk-level encoding trees to the focused compressor benchmark.
 - Rejected constant FloatQuant samples before exact sample encoding.
 - Added a provisional 1.10 FloatQuant selection factor.
+- Replaced FloatQuant sample packing with an exact buffer-size estimate.
+- Added isolated FloatQuant rejection controls for all float widths.
+- Added adjusted-ratio near-miss controls for `f32` and `f64`.
 - Removed the Food and HashTags FloatQuant size regressions.
 - Revalidated the BlockResidual and FloatQuant bundles across 16 files.
 - Rejected constant RangePacked samples before exact sample encoding.
@@ -2355,12 +2390,11 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Measure rejected-candidate analysis cost after the candidate set stabilizes.
-2. Compare the conservative and opportunistic Default bundles on the final corpus.
-3. Calibrate the FloatQuant factor from complete corpus and selected-tree evidence.
-4. Prefer cheap rejection tests when they preserve the best candidate model.
-5. Treat fast rejection as a selection advantage, not an admission criterion.
-6. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Compare the conservative and opportunistic Default bundles on the final corpus.
+2. Calibrate the FloatQuant factor from complete corpus and selected-tree evidence.
+3. Prefer cheap rejection tests when they preserve the best candidate model.
+4. Treat fast rejection as a selection advantage, not an admission criterion.
+5. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

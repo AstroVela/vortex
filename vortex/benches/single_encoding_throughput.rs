@@ -164,6 +164,33 @@ fn setup_general_f32_array() -> PrimitiveArray {
     }))
 }
 
+fn setup_general_f64_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let mantissa = index.wrapping_mul(0x9e37_79b9_7f4a_7c15) & 0x000f_ffff_ffff_ffff;
+        f64::from_bits(0x3ff0_0000_0000_0000 | mantissa)
+    }))
+}
+
+fn setup_float_quant_near_miss_f32_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let scrambled = (index as u32).wrapping_mul(2_654_435_761);
+        let sign = (scrambled & 1) << 31;
+        let exponent = ((scrambled >> 1) % 254 + 1) << 23;
+        let mantissa = scrambled & 0x007f_fffc;
+        f32::from_bits(sign | exponent | mantissa)
+    }))
+}
+
+fn setup_float_quant_near_miss_f64_array() -> PrimitiveArray {
+    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        let scrambled = index.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let sign = (scrambled & 1) << 63;
+        let exponent = ((scrambled >> 1) % 2_046 + 1) << 52;
+        let mantissa = scrambled & 0x000f_ffff_ffff_fffc;
+        f64::from_bits(sign | exponent | mantissa)
+    }))
+}
+
 fn setup_nonzero_secondary_array() -> PrimitiveArray {
     let widened = setup_widened_f32_array();
     PrimitiveArray::from_iter(
@@ -1574,6 +1601,70 @@ fn bench_float_quant_proposed_default_reject_f16(bencher: Bencher) {
     );
 }
 
+macro_rules! float_quant_rejection_benches {
+    ($scheme_only:ident, $without_scheme:ident, $with_scheme:ident, $setup:ident) => {
+        #[divan::bench]
+        fn $scheme_only(bencher: Bencher) {
+            let compressor = BtrBlocksCompressorBuilder::empty()
+                .with_new_scheme(&FloatQuantScheme)
+                .build();
+            bench_compressor(bencher, $setup(), compressor);
+        }
+
+        #[divan::bench]
+        fn $without_scheme(bencher: Bencher) {
+            let compressor = BtrBlocksCompressorBuilder::default()
+                .exclude_schemes([FloatQuantScheme.id()])
+                .build();
+            bench_compressor(bencher, $setup(), compressor);
+        }
+
+        #[divan::bench]
+        fn $with_scheme(bencher: Bencher) {
+            bench_compressor(
+                bencher,
+                $setup(),
+                BtrBlocksCompressorBuilder::default().build(),
+            );
+        }
+    };
+}
+
+float_quant_rejection_benches!(
+    float_quant_scheme_reject_f16,
+    float_quant_default_without_scheme_reject_f16,
+    float_quant_default_with_scheme_reject_f16,
+    setup_general_f16_array
+);
+
+float_quant_rejection_benches!(
+    float_quant_scheme_reject_f32,
+    float_quant_default_without_scheme_reject_f32,
+    float_quant_default_with_scheme_reject_f32,
+    setup_general_f32_array
+);
+
+float_quant_rejection_benches!(
+    float_quant_scheme_reject_f64,
+    float_quant_default_without_scheme_reject_f64,
+    float_quant_default_with_scheme_reject_f64,
+    setup_general_f64_array
+);
+
+float_quant_rejection_benches!(
+    float_quant_scheme_near_miss_f32,
+    float_quant_default_without_scheme_near_miss_f32,
+    float_quant_default_with_scheme_near_miss_f32,
+    setup_float_quant_near_miss_f32_array
+);
+
+float_quant_rejection_benches!(
+    float_quant_scheme_near_miss_f64,
+    float_quant_default_without_scheme_near_miss_f64,
+    float_quant_default_with_scheme_near_miss_f64,
+    setup_float_quant_near_miss_f64_array
+);
+
 #[divan::bench(name = "float_quant_split_compress_f64")]
 fn bench_float_quant_split_compress_f64(bencher: Bencher) {
     let float_array = setup_widened_f32_array();
@@ -1791,14 +1882,6 @@ fn bench_float_quant_default_compress_f32(bencher: Bencher) {
 fn bench_float_quant_proposed_default_compress_f32(bencher: Bencher) {
     let compressor = BtrBlocksCompressorBuilder::default().build();
     bench_compressor(bencher, setup_quantized_f32_array(), compressor);
-}
-
-#[divan::bench(name = "float_quant_scheme_reject_f32")]
-fn bench_float_quant_scheme_reject_f32(bencher: Bencher) {
-    let compressor = BtrBlocksCompressorBuilder::empty()
-        .with_new_scheme(&FloatQuantScheme)
-        .build();
-    bench_compressor(bencher, setup_general_f32_array(), compressor);
 }
 
 #[divan::bench(name = "float_quant_prior_default_reject_f32")]
