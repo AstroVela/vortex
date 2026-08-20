@@ -69,6 +69,7 @@ use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
+use vortex_btrblocks::schemes::float::FloatRangePackedScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 use vortex_error::VortexResult;
@@ -93,6 +94,7 @@ use crate::int_mult_codec::IntMultCodec32;
 use crate::int_mult_codec::IntMultDenseCodec64;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
+const RANGE_PACKED_SCHEME: FloatRangePackedScheme = FloatRangePackedScheme::new(1.20);
 const CALIFORNIA_COLUMNS: [&str; 9] = [
     "longitude",
     "latitude",
@@ -3029,6 +3031,19 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
             BtrBlocksCompressorBuilder::default().build(),
         ),
         (
+            "range-packed-only",
+            BtrBlocksCompressorBuilder::default()
+                .exclude_schemes(new_scheme_ids)
+                .with_new_scheme(&RANGE_PACKED_SCHEME)
+                .build(),
+        ),
+        (
+            "proposed-default-range-packed",
+            BtrBlocksCompressorBuilder::default()
+                .with_new_scheme(&RANGE_PACKED_SCHEME)
+                .build(),
+        ),
+        (
             "prior-compact",
             BtrBlocksCompressorBuilder::default()
                 .with_compact()
@@ -3053,6 +3068,7 @@ fn main() -> VortexResult<()> {
         .transpose()?
         .unwrap_or(DEFAULT_ROW_COUNT);
     let session = array_session();
+    vortex_range_packed::initialize(&session);
     let configs = compressors();
 
     println!("structure\tdataset\tcolumn\tptype\tconfig\tencoding\tbytes");

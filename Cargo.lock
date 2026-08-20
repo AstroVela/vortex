@@ -10568,7 +10568,9 @@ name = "vortex-range-packed"
 version = "0.1.0"
 dependencies = [
  "rstest",
+ "vortex-alp",
  "vortex-array",
+ "vortex-block-residual",
  "vortex-buffer",
  "vortex-error",
  "vortex-int-mult",

@@ -7,6 +7,7 @@ mod alp;
 mod alprd;
 mod float_quant;
 mod ordered_block_residual;
+mod range_packed;
 mod rle;
 mod sparse;
 
@@ -19,6 +20,7 @@ pub use float_quant::FloatQuantScheme;
 pub use ordered_block_residual::OrderedBlockResidualScheme;
 #[cfg(feature = "pco")]
 pub use pco::PcoScheme;
+pub use range_packed::FloatRangePackedScheme;
 pub use rle::FloatRLEScheme;
 pub use sparse::NullDominatedSparseScheme;
 // Re-export builtin schemes from vortex-compressor.

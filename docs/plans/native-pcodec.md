@@ -1644,6 +1644,57 @@ CMS uses similar offset widths across its bins. The grouped scatter path then lo
 
 Grouped bins do not generalize. The prototype remains outside production code.
 
+### Fused parent kernels and the experimental selector
+
+RangePacked now provides parent kernels for `OrderedFloat(RangePacked)` and `ALP(RangePacked)`.
+
+The session registry selects these kernels from the child encoding and the parent encoding.
+
+The outer arrays remain generic composable arrays.
+
+On Euro subjectivity, normal recursive execution reaches 14,956 MB/s.
+
+The manual fused benchmark reaches 15,492 MB/s on the same run.
+
+The registered kernel is within 3.5 percent of the manual helper.
+
+An experimental `FloatRangePackedScheme` remains outside `ALL_SCHEMES`.
+
+The scheme tests two complete trees on the existing stratified one-percent sample:
+
+- `OrderedFloat(RangePacked)`
+- `ALP(RangePacked)`
+
+The full encoder builds only the smaller sampled tree.
+
+The selector divides the sample ratio by a provisional 1.20 decode cost factor.
+
+This factor does not produce the intended complete-tree choices on CMS or Food.
+
+The one-percent sample overstates the RangePacked advantage against BlockResidual on those columns.
+
+| Input | Default bytes | Candidate bytes | Default encode MB/s | Candidate encode MB/s | Default decode MB/s | Candidate decode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Euro subjectivity | 14,234,326 | 8,180,506 | 362.4 | 376.4 | 21,795 | 14,849 |
+| CMS `LINE_SRVC_CNT` | 2,725,541 | 2,436,604 | 1,054.8 | 630.5 | 24,227 | 10,354 |
+| Food volume | 6,599,221 | 5,653,643 | 491.3 | 538.2 | 19,747 | 11,920 |
+
+Euro is the target win.
+
+CMS and Food do not justify their decode losses at the current size gains.
+
+The rejected-candidate cost is also material.
+
+On uniform random floats, the candidate reduces total encode throughput by 6.8 percent.
+
+On widened `f32` values, FloatQuant still wins, but the candidate reduces encode throughput by 18.8 percent.
+
+These results justify a cheap rejection test, if that test retains the Euro model.
+
+Fast rejection remains an advantage, not an admission rule.
+
+A candidate with costly analysis needs stronger corpus evidence.
+
 ### Multi-reference block prototype
 
 The prototype stores up to four quantile references per 1,024-value block.
@@ -1900,16 +1951,18 @@ The composable IntMult follow-up is complete. The tested IntMult trees remain ou
 
 The nonzero-secondary FloatQuant implementation and focused validation are complete.
 
+The focused Default bundle now includes full-position RangePacked as an experimental candidate.
+
+The specialized OrderedFloat and ALP trees now use registered fused parent kernels.
+
 Complete these next experiments in order:
 
-1. Add full-position RangePacked to the focused Default bundle as an experimental candidate.
-2. Compare specialized OrderedFloat and ALP trees with their fused decoders.
-3. Add a cheap sample rejection test if it preserves the best range model.
-4. Validate frequency-ranked Dict and full-position RangePacked across the complete file corpus.
-5. Measure rejected-candidate analysis cost after the candidate set stabilizes.
-6. Prefer cheap rejection tests when they preserve the best candidate model.
-7. Treat fast rejection as a selection advantage, not an admission criterion.
-8. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Add a cheap sample rejection test if it preserves the Euro range model.
+2. Validate frequency-ranked Dict and full-position RangePacked across the complete file corpus.
+3. Measure rejected-candidate analysis cost after the candidate set stabilizes.
+4. Prefer cheap rejection tests when they preserve the best candidate model.
+5. Treat fast rejection as a selection advantage, not an admission criterion.
+6. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

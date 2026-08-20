@@ -4,6 +4,7 @@
 //! Fixed-bin range packing with bounded random access.
 
 mod array;
+mod kernel;
 
 use std::cmp::Ordering;
 use std::hash::Hash;
@@ -119,6 +120,7 @@ impl RangeDecomposition {
 /// Register the RangePacked encoding in one session.
 pub fn initialize(session: &VortexSession) {
     session.arrays().register(RangePacked);
+    kernel::initialize(session);
 }
 
 impl RangePackedCodec {
@@ -923,6 +925,10 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vortex_alp::ALP;
+    use vortex_alp::ALPArrayExt;
+    use vortex_alp::ALPArraySlotsExt;
+    use vortex_alp::alp_encode;
     use vortex_array::ArrayContext;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
@@ -931,8 +937,11 @@ mod tests {
     use vortex_array::arrays::Primitive;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::half::f16;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
+    use vortex_block_residual::OrderedFloat;
+    use vortex_block_residual::OrderedFloatArraySlotsExt;
     use vortex_buffer::ByteBufferMut;
     use vortex_error::VortexResult;
     use vortex_session::registry::ReadContext;
@@ -973,6 +982,66 @@ mod tests {
         for index in [0, 1, 31, 32, 33, 1_023, 1_024, 19_999] {
             assert_eq!(encoded.scalar_at(index)?, values[index]);
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::f16(PrimitiveArray::from_option_iter([
+        Some(f16::from_f32(-7.5)),
+        None,
+        Some(f16::from_f32(0.25)),
+        Some(f16::INFINITY),
+    ]))]
+    #[case::f32(PrimitiveArray::from_option_iter([
+        Some(-7.5_f32),
+        None,
+        Some(0.25),
+        Some(f32::INFINITY),
+    ]))]
+    #[case::f64(PrimitiveArray::from_option_iter([
+        Some(-7.5_f64),
+        None,
+        Some(0.25),
+        Some(f64::INFINITY),
+    ]))]
+    fn ordered_float_parent_kernel(#[case] expected: PrimitiveArray) -> VortexResult<()> {
+        let session = array_session();
+        initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+        let ordered = OrderedFloat::from_primitive(expected.as_view())?;
+        let packed = RangePacked::from_primitive_with_null_positions(
+            ordered.encoded().as_::<Primitive>(),
+            &mut ctx,
+        )?;
+        let encoded = OrderedFloat::try_new(packed.into_array(), expected.ptype())?;
+        assert_arrays_eq!(encoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::f32(PrimitiveArray::from_option_iter([
+        Some(1.25_f32),
+        None,
+        Some(17.5),
+        Some(f32::MAX),
+    ]))]
+    #[case::f64(PrimitiveArray::from_option_iter([
+        Some(1.25_f64),
+        None,
+        Some(17.5),
+        Some(f64::MAX),
+    ]))]
+    fn alp_parent_kernel(#[case] expected: PrimitiveArray) -> VortexResult<()> {
+        let session = array_session();
+        initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+        let alp = alp_encode(expected.as_view(), None, &mut ctx)?;
+        let packed = RangePacked::from_primitive_with_null_positions(
+            alp.encoded().as_::<Primitive>(),
+            &mut ctx,
+        )?;
+        let encoded = ALP::try_new(packed.into_array(), alp.exponents(), alp.patches())?;
+        assert_arrays_eq!(encoded, expected, &mut ctx);
         Ok(())
     }
 
