@@ -48,6 +48,22 @@ pub fn unpack_primitive_array<T: BitPackedUnpack>(
     Ok(builder.finish_into_primitive())
 }
 
+/// Unpacks one bit-packed array and maps each value into the output primitive array.
+pub fn unpack_map<F, T, M>(
+    array: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+    map: M,
+) -> VortexResult<PrimitiveArray>
+where
+    F: BitPackedUnpack,
+    T: NativePType,
+    M: Fn(F) -> T,
+{
+    let mut builder = PrimitiveBuilder::with_capacity(array.dtype().nullability(), array.len());
+    unpack_map_into_builder::<F, T, M>(array, &mut builder, ctx, map)?;
+    Ok(builder.finish_into_primitive())
+}
+
 /// Unpacks two aligned bit-packed arrays and maps each value pair into one output buffer.
 ///
 /// This path requires equal lengths and offsets. Neither input can contain patches.
@@ -323,6 +339,30 @@ mod tests {
     use crate::BitPackedArray;
     use crate::BitPackedData;
     use crate::bitpack_compress::bitpack_encode;
+
+    #[test]
+    fn unpack_map_preserves_slice_and_validity() -> VortexResult<()> {
+        let values = (0_u32..3073)
+            .map(|value| (value % 17 != 0).then_some(value & 0x3ff))
+            .collect::<Vec<_>>();
+        let input = PrimitiveArray::from_option_iter(values.iter().copied());
+        let mut ctx = SESSION.create_execution_ctx();
+        let packed = bitpack_encode(&input, 10, None, &mut ctx)?.into_array();
+
+        for range in [0..3073, 3..2051, 1023..2050] {
+            let packed = packed.slice(range.clone())?;
+            let actual = unpack_map::<u32, u64, _>(packed.as_::<BitPacked>(), &mut ctx, |value| {
+                u64::from(value) * 17
+            })?;
+            let expected = PrimitiveArray::from_option_iter(
+                values[range]
+                    .iter()
+                    .map(|value| value.map(|value| u64::from(value) * 17)),
+            );
+            assert_arrays_eq!(actual, expected, &mut ctx);
+        }
+        Ok(())
+    }
 
     #[test]
     fn unpack_pair_map_matches_sliced_inputs() -> VortexResult<()> {

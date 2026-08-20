@@ -43,6 +43,7 @@ use vortex_fastlanes::BitPackedArrayExt;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::FoRArrayExt;
 use vortex_fastlanes::FoRArraySlotsExt;
+use vortex_fastlanes::bitpack_decompress::unpack_map;
 use vortex_fastlanes::bitpack_decompress::unpack_pair_map;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -858,6 +859,11 @@ fn decode(
     array: ArrayView<'_, FloatQuant>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
+    if array.dtype().as_ptype() == PType::F64
+        && let Some(decoded) = decode_fastlanes_zero(array, ctx)?
+    {
+        return Ok(decoded);
+    }
     if let Some(decoded) = decode_fastlanes_pair(array)? {
         return Ok(decoded);
     }
@@ -934,6 +940,31 @@ fn decode(
         }
         ptype => vortex_panic!("unsupported FloatQuant ptype {ptype}"),
     })
+}
+
+fn decode_fastlanes_zero(
+    array: ArrayView<'_, FloatQuant>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<PrimitiveArray>> {
+    if array.secondary().is_some() {
+        return Ok(None);
+    }
+    let Some(primary_for) = array.primary().as_opt::<FoR>() else {
+        return Ok(None);
+    };
+    let Some(primary) = primary_for.encoded().as_opt::<BitPacked>() else {
+        return Ok(None);
+    };
+
+    let k = array.data().k;
+    let reference = primary_for
+        .reference_scalar()
+        .as_primitive()
+        .typed_value::<u64>()
+        .vortex_expect("validated f64 primary reference");
+    Ok(Some(unpack_map::<u64, f64, _>(primary, ctx, |primary| {
+        join_zero_f64(primary.wrapping_add(reference), k)
+    })?))
 }
 
 fn decode_fastlanes_pair(array: ArrayView<'_, FloatQuant>) -> VortexResult<Option<PrimitiveArray>> {
@@ -1216,6 +1247,42 @@ mod tests {
         let f64_values = PrimitiveArray::from_iter([f64::from_bits(1.0_f64.to_bits() | 1)]);
         assert!(FloatQuant::from_primitive_constant_secondary(f64_values.as_view(), 29).is_err());
         assert!(FloatQuant::primary_for_primitive(f64_values.as_view(), 29, 0).is_err());
+    }
+
+    #[test]
+    fn fastlanes_zero_decode_roundtrip_and_slice() -> VortexResult<()> {
+        let original = PrimitiveArray::from_option_iter((0_u32..4097).map(|index| {
+            (index % 17 != 0).then(|| {
+                let mantissa = index.wrapping_mul(7_919) & 0x007f_ffff;
+                f64::from(f32::from_bits(0x3f80_0000 | mantissa))
+            })
+        }));
+        let analysis = analyze_float_quant(original.as_view()).vortex_expect("FloatQuant input");
+        assert_eq!(analysis.secondary_bit_width, 0);
+        let primary = FloatQuant::primary_for_primitive(
+            original.as_view(),
+            analysis.k,
+            analysis.primary_min,
+        )?;
+        // SAFETY: The analysis computes the exact primary width.
+        let primary = unsafe {
+            vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked(
+                primary,
+                analysis.primary_bit_width,
+            )?
+        };
+        let primary = FoR::try_new(primary.into_array(), Scalar::from(analysis.primary_min))?;
+        let encoded =
+            FloatQuant::try_new(primary.into_array(), None, PType::F64, analysis.k)?.into_array();
+
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(encoded, original, &mut ctx);
+        assert_arrays_eq!(
+            encoded.slice(3..2051)?,
+            original.into_array().slice(3..2051)?,
+            &mut ctx
+        );
+        Ok(())
     }
 
     #[test]

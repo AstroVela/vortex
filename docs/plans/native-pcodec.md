@@ -387,7 +387,7 @@ These cases include the current compressed children and fused decode paths.
 | OrderedFloat with BlockResidual `f64` | 2.70 GB/s | 20.44 GB/s | 125 ns |
 | FloatQuant with packed primary `f16` | 3.21 GB/s | 20.05 GB/s | 125 ns |
 | FloatQuant with packed primary `f32` | 5.72 GB/s | 19.79 GB/s | 129 ns |
-| FloatQuant with packed primary `f64` | 7.76 GB/s | 15.69 GB/s | 125 ns |
+| FloatQuant with packed primary `f64` | 7.76 GB/s | 16.19 GB/s | 125 ns |
 | FloatQuant with two packed children `f16` | 3.11 GB/s | 16.75 GB/s | 174 ns |
 | FloatQuant with two packed children `f32` | 5.17 GB/s | 16.30 GB/s | 183 ns |
 | FloatQuant with two packed children `f64` | 6.72 GB/s | 13.13 GB/s | 208 ns |
@@ -396,6 +396,14 @@ These cases include the current compressed children and fused decode paths.
 The FloatQuant production encode rows use the single-scheme compressor.
 
 They include sample analysis and direct packing of the final child tree.
+
+The implicit-zero `f64` decoder maps FastLanes output directly to reconstructed floats.
+
+A controlled five-second comparison measured 14.08 GB/s before fusion and 16.19 GB/s after it.
+
+The fused path improves median decode throughput by 15.0 percent.
+
+The same trial reduced `f16` and `f32` throughput by 2 to 3 percent. Those types retain the generic path.
 
 The paired decoder remains within 18 percent of the zero-secondary decoder for every float width.
 
@@ -2660,6 +2668,7 @@ This round completed these steps:
 - Measured 8-bit BlockResidual file access on accepted and boundary cases.
 - Measured complete-file random access for six Public BI datasets.
 - Added a fused `f16` decoder for `OrderedFloat(BlockResidual)`.
+- Added a fused implicit-zero `f64` decoder for `FloatQuant(FoR(BitPacked))`.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
