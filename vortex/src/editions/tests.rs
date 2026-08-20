@@ -499,6 +499,45 @@ async fn write_with(session: &VortexSession, array: ArrayRef) -> VortexResult<By
     Ok(buffer)
 }
 
+#[cfg(feature = "unstable_encodings")]
+#[tokio::test]
+async fn preview_writer_accepts_unit_vector_dtype_and_normalizer() -> VortexResult<()> {
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::FixedSizeListArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
+    use vortex_array::validity::Validity;
+    use vortex_tensor::scalar_fns::l2_normalize::L2Normalize;
+    use vortex_tensor::unit_vector::UnitVector;
+    use vortex_tensor::vector::Vector;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    session
+        .arrays()
+        .register(ScalarFnArrayPlugin::new(L2Normalize));
+
+    let elements = PrimitiveArray::from_iter([0.6f64, 0.8]).into_array();
+    let storage = FixedSizeListArray::try_new(elements, 2, Validity::NonNullable, 1)?.into_array();
+    let mut ctx = session.create_execution_ctx();
+    let unit = UnitVector::try_new_unit_vector_array(storage, &mut ctx)?;
+    write_with(&session, unit).await?;
+
+    let elements = PrimitiveArray::from_iter([3.0f64, 4.0]).into_array();
+    let storage = FixedSizeListArray::try_new(elements, 2, Validity::NonNullable, 1)?.into_array();
+    let vector = Vector::try_new_vector_array(storage)?;
+    let lazy_normalized = L2Normalize::try_new(vector)?.into_array();
+    let mut buffer = ByteBufferMut::empty();
+    session
+        .write_options()
+        .with_strategy(Arc::new(FlatLayoutStrategy::default()))
+        .write(&mut buffer, lazy_normalized.to_array_stream())
+        .await?;
+
+    Ok(())
+}
+
 /// The layout encodings a written file actually contains, depth first.
 fn written_layout_ids(session: &VortexSession, buffer: ByteBufferMut) -> VortexResult<Vec<Id>> {
     let file = session.open_options().open_buffer(buffer)?;

@@ -23,6 +23,7 @@ use crate::encodings::normalized::Normalized;
 use crate::scalar_fns::cosine_similarity::CosineSimilarity;
 use crate::scalar_fns::inner_product::InnerProduct;
 use crate::scalar_fns::l2_norm::L2Norm;
+use crate::scalar_fns::l2_normalize::L2Normalize;
 use crate::types::fixed_shape_tensor::FixedShapeTensor;
 use crate::types::unit_vector::UnitVector;
 use crate::types::vector::Vector;
@@ -44,10 +45,10 @@ pub mod vector_search;
 mod utils;
 
 /// Environment variable that gates registration of the tensor scalar-fn array plugins (the array
-/// encodings that let [`CosineSimilarity`], [`InnerProduct`], and [`L2Norm`] persist in a Vortex
-/// file). When unset, only the scalar functions themselves are registered; readers of files
-/// containing serialized tensor scalar-fn arrays will fail to deserialize. Opt-in by setting the
-/// variable to any non-empty value.
+/// encodings that let [`CosineSimilarity`], [`InnerProduct`], [`L2Norm`], and [`L2Normalize`]
+/// persist in a Vortex file). When unset, only the scalar functions themselves are registered;
+/// readers of files containing serialized tensor scalar-fn arrays will fail to deserialize.
+/// Opt-in by setting the variable to any non-empty value.
 ///
 /// This does **not** gate [`Normalized`]. That is a real array encoding rather than a persisted
 /// scalar function, and the compressor can emit it, so it always registers.
@@ -72,6 +73,7 @@ pub fn initialize(session: &VortexSession) {
     session_fns.register(CosineSimilarity);
     session_fns.register(InnerProduct);
     session_fns.register(L2Norm);
+    session_fns.register(L2Normalize);
 
     // Registering the scalar-fn array plugins lets the tensor scalar fns be serialized as array
     // encodings inside Vortex files. Gate this on an env var so applications that do not intend
@@ -83,6 +85,7 @@ pub fn initialize(session: &VortexSession) {
         session_arrays.register(ScalarFnArrayPlugin::new(CosineSimilarity));
         session_arrays.register(ScalarFnArrayPlugin::new(InnerProduct));
         session_arrays.register(ScalarFnArrayPlugin::new(L2Norm));
+        session_arrays.register(ScalarFnArrayPlugin::new(L2Normalize));
     }
 }
 

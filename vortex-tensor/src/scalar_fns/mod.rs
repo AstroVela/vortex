@@ -16,6 +16,7 @@ use vortex_error::vortex_err;
 pub mod cosine_similarity;
 pub mod inner_product;
 pub mod l2_norm;
+pub mod l2_normalize;
 
 /// Controls whether norm-based functions may trust normalized-value claims.
 ///
