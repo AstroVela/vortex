@@ -1,8 +1,8 @@
 [package]
-name = "vortex-range-packed"
+name = "vortex-int-mult"
 authors = { workspace = true }
 categories = { workspace = true }
-description = "Vortex fixed-bin range-packed integer array encoding"
+description = "Vortex integer multiplier transform array encoding"
 edition = { workspace = true }
 homepage = { workspace = true }
 include = { workspace = true }
@@ -17,7 +17,6 @@ version = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
-vortex-int-mult = { workspace = true }
 vortex-session = { workspace = true }
 
 [dev-dependencies]

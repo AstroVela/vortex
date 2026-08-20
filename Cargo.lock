@@ -9550,6 +9550,7 @@ dependencies = [
  "vortex-flatbuffers",
  "vortex-float-quant",
  "vortex-fsst",
+ "vortex-int-mult",
  "vortex-io",
  "vortex-ipc",
  "vortex-layout",
@@ -10186,6 +10187,7 @@ dependencies = [
  "vortex-flatbuffers",
  "vortex-float-quant",
  "vortex-fsst",
+ "vortex-int-mult",
  "vortex-io",
  "vortex-layout",
  "vortex-mask",
@@ -10268,6 +10270,17 @@ dependencies = [
  "vortex-runend",
  "vortex-session",
  "vortex-utils",
+]
+
+[[package]]
+name = "vortex-int-mult"
+version = "0.1.0"
+dependencies = [
+ "rstest",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-session",
 ]
 
 [[package]]
@@ -10554,6 +10567,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
+ "vortex-int-mult",
  "vortex-session",
 ]
 

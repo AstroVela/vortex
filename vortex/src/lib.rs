@@ -265,6 +265,11 @@ pub mod encodings {
         pub use vortex_float_quant::*;
     }
 
+    /// Integer multiplication transform with generic multiplied and additive children.
+    pub mod int_mult {
+        pub use vortex_int_mult::*;
+    }
+
     /// Fast Static Symbol Table string encoding.
     pub mod fsst {
         pub use vortex_fsst::*;

@@ -11,9 +11,15 @@ use std::mem::MaybeUninit;
 use std::ops::Range;
 
 pub use array::*;
+use vortex_array::IntoArray;
+use vortex_array::arrays::DictArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::session::ArraySessionExt;
+use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_int_mult::IntMult;
+use vortex_int_mult::IntMultArray;
 use vortex_session::VortexSession;
 
 const MAX_BINS: usize = 64;
@@ -41,6 +47,73 @@ pub struct RangePackedCodec {
 pub(crate) struct Bin {
     pub(crate) lower: u64,
     pub(crate) offset_bits: u8,
+}
+
+/// A fixed-bin split before compression of its component arrays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeDecomposition {
+    bin_starts: Vec<u64>,
+    codes: Vec<u8>,
+    offsets: Vec<u64>,
+}
+
+impl RangeDecomposition {
+    /// Fit at most 64 bins and split values into bin codes and offsets.
+    pub fn encode(values: &[u64]) -> VortexResult<Self> {
+        if values.is_empty() {
+            return Ok(Self {
+                bin_starts: Vec::new(),
+                codes: Vec::new(),
+                offsets: Vec::new(),
+            });
+        }
+
+        let (sample, minimum, maximum) = training_sample(values);
+        let bins = cover_domain(optimize_bins_arbitrary(&sample), minimum, maximum);
+        let codes = assign_bins(values, &bins)?;
+        let offsets = values
+            .iter()
+            .zip(&codes)
+            .map(|(&value, &code)| value - bins[usize::from(code)].lower)
+            .collect();
+        Ok(Self {
+            bin_starts: bins.iter().map(|bin| bin.lower).collect(),
+            codes,
+            offsets,
+        })
+    }
+
+    /// Return the selected bin starts.
+    pub fn bin_starts(&self) -> &[u64] {
+        &self.bin_starts
+    }
+
+    /// Return the per-value bin codes.
+    pub fn codes(&self) -> &[u8] {
+        &self.codes
+    }
+
+    /// Return each value's offset from its selected bin start.
+    pub fn offsets(&self) -> &[u64] {
+        &self.offsets
+    }
+
+    /// Return the number of bits required for each fixed-width code.
+    pub fn code_width(&self) -> u8 {
+        self.bin_starts
+            .len()
+            .checked_sub(1)
+            .map_or(0, |maximum| bit_width(maximum as u64))
+    }
+
+    /// Compose the raw components from a dictionary and an IntMult array.
+    pub fn into_array(self, validity: Validity) -> VortexResult<IntMultArray> {
+        let codes = PrimitiveArray::new(self.codes, validity).into_array();
+        let starts = PrimitiveArray::from_iter(self.bin_starts).into_array();
+        let references = DictArray::try_new(codes, starts)?.into_array();
+        let offsets = PrimitiveArray::from_iter(self.offsets).into_array();
+        IntMult::try_new(references, offsets, 1)
+    }
 }
 
 /// Register the RangePacked encoding in one session.
@@ -621,6 +694,17 @@ fn assign_bins(values: &[u64], bins: &[Bin]) -> VortexResult<Vec<u8>> {
 }
 
 fn optimize_bins(sorted: &[u64]) -> Vec<Bin> {
+    optimize_bins_with_count_policy(sorted, usize::is_power_of_two)
+}
+
+fn optimize_bins_arbitrary(sorted: &[u64]) -> Vec<Bin> {
+    optimize_bins_with_count_policy(sorted, |_| true)
+}
+
+fn optimize_bins_with_count_policy(
+    sorted: &[u64],
+    allowed_count: impl Fn(usize) -> bool,
+) -> Vec<Bin> {
     let mut segments = Vec::with_capacity(MAX_BINS);
     segments.push(0..sorted.len());
     let mut best_segments = segments.clone();
@@ -649,7 +733,7 @@ fn optimize_bins(sorted: &[u64]) -> Vec<Bin> {
         segments.push(split.at..segment.end);
         segments.sort_unstable_by_key(|segment| segment.start);
         let cost = partition_cost(sorted, &segments);
-        if segments.len().is_power_of_two() && cost < best_cost {
+        if allowed_count(segments.len()) && cost < best_cost {
             best_cost = cost;
             best_segments.clone_from(&segments);
         }
@@ -833,9 +917,26 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_session::registry::ReadContext;
 
+    use super::RangeDecomposition;
     use super::RangePacked;
     use super::RangePackedCodec;
     use super::initialize;
+
+    #[test]
+    fn decomposition_uses_arbitrary_bin_count() -> VortexResult<()> {
+        let values = (0_u64..10)
+            .flat_map(|cluster| (0_u64..1_000).map(move |_| cluster * 1_000_000_000))
+            .collect::<Vec<_>>();
+        let decomposition = RangeDecomposition::encode(&values)?;
+        assert_eq!(decomposition.bin_starts().len(), 10);
+        assert_eq!(decomposition.code_width(), 4);
+        assert_arrays_eq!(
+            decomposition.into_array(vortex_array::validity::Validity::NonNullable)?,
+            PrimitiveArray::from_iter(values),
+            &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
 
     #[test]
     fn clustered_roundtrip_and_scalar_access() -> VortexResult<()> {

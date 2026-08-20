@@ -47,6 +47,7 @@ vortex-fastlanes = { workspace = true }
 vortex-flatbuffers = { workspace = true, features = ["file"] }
 vortex-float-quant = { workspace = true }
 vortex-fsst = { workspace = true }
+vortex-int-mult = { workspace = true }
 vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
 vortex-mask = { workspace = true }
