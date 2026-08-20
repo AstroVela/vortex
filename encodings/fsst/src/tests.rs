@@ -140,7 +140,7 @@ fn test_fsst_array_ops() {
 /// preserved.
 ///
 /// Allocates ~1.1 GiB for the input and ~2.1 GiB for the FSST output (~3.2 GiB total), so it is
-/// ignored by default and run only by the "Rust tests (linux-arm64)" CI job. Setting
+/// ignored by default and run only by the "Rust tests (linux-musl)" CI job. Setting
 /// `VORTEX_SKIP_SLOW_TESTS` at build time drops it from the binary, which is how the sanitizer
 /// jobs avoid compiling it at all. To run it locally (release mode, since debug builds make the
 /// allocation and compression loop substantially slower):
@@ -152,7 +152,7 @@ fn test_fsst_array_ops() {
 /// [`fsst_compress`]: crate::compress::fsst_compress
 #[test_with::no_env(VORTEX_SKIP_SLOW_TESTS)]
 #[test]
-#[ignore = "slow: allocates ~3.2 GiB, run by the \"Rust tests (linux-arm64)\" CI job"]
+#[ignore = "slow: allocates ~3.2 GiB, run by the \"Rust tests (linux-musl)\" CI job"]
 fn fsst_compress_offsets_overflow_i32() {
     const STRING_LEN: usize = 64 * 1024;
     // Escape coding doubles every byte, so ~1.06 GiB of input compresses to ~2.13 GiB,

@@ -131,7 +131,7 @@ fn test_rle_compression() -> VortexResult<()> {
 }
 
 /// Compresses 50M values, so it is ignored by default and run only by the "Rust tests
-/// (linux-arm64)" CI job. Setting `VORTEX_SKIP_SLOW_TESTS` at build time drops it from the
+/// (linux-musl)" CI job. Setting `VORTEX_SKIP_SLOW_TESTS` at build time drops it from the
 /// binary, which is how the sanitizer jobs avoid compiling it at all. To run it locally:
 ///
 /// ```text
@@ -139,7 +139,7 @@ fn test_rle_compression() -> VortexResult<()> {
 /// ```
 #[test_with::no_env(VORTEX_SKIP_SLOW_TESTS)]
 #[test]
-#[ignore = "slow: compresses 50M values, run by the \"Rust tests (linux-arm64)\" CI job"]
+#[ignore = "slow: compresses 50M values, run by the \"Rust tests (linux-musl)\" CI job"]
 fn compress_large_int() -> VortexResult<()> {
     const NUM_LISTS: usize = 10_000;
     const ELEMENTS_PER_LIST: usize = 5_000;
