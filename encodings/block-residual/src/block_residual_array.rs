@@ -324,12 +324,11 @@ impl ValidityVTable<BlockResidual> for BlockResidual {
 impl SliceReduce for BlockResidual {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         let data = array.data().slice(range);
+        let parts = ArrayParts::new(BlockResidual, array.dtype().clone(), data.len(), data)
+            .with_slots(array.slots().iter().cloned().collect());
+        // SAFETY: The source array is valid. The slice only narrows its logical bounds.
         Ok(Some(
-            Array::try_from_parts(
-                ArrayParts::new(BlockResidual, array.dtype().clone(), data.len(), data)
-                    .with_slots(array.slots().iter().cloned().collect()),
-            )?
-            .into_array(),
+            unsafe { Array::from_parts_unchecked(parts) }.into_array(),
         ))
     }
 }
@@ -1278,17 +1277,25 @@ fn validate_patch_header(
     Ok(())
 }
 
+#[inline(always)]
 fn validate_patch_position(
     block_len: usize,
     previous_position: Option<u16>,
     position: u16,
 ) -> VortexResult<()> {
-    vortex_ensure!(
-        usize::from(position) < block_len
-            && previous_position.is_none_or(|previous| previous < position),
-        "block residual patch positions are invalid"
-    );
-    Ok(())
+    if usize::from(position) < block_len
+        && previous_position.is_none_or(|previous| previous < position)
+    {
+        Ok(())
+    } else {
+        invalid_patch_position()
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn invalid_patch_position() -> VortexResult<()> {
+    vortex_bail!("block residual patch positions are invalid")
 }
 
 fn validate_offset_table(

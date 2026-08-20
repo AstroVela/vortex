@@ -2364,26 +2364,40 @@ BlockResidual, Current Default, and RangePacked remain within 2.5 percent on bot
 
 The Public BI pass uses six complete files and cached handles. Each pattern requests about 100 rows.
 
-Two passes use five-second target windows. A ten-second CMS rerun replaces one correlated outlier.
+The first pass exposed repeated BlockResidual payload validation during each slice operation.
+
+The source array already passed validation. The slice only changes its logical bounds.
+
+The slice path now constructs the narrowed array without repeated payload validation.
+
+The valid patch-position branch now avoids a non-inlined fallible call for each patch.
+
+A focused CMS correlated pass decreased from 1.127 ms to 0.964 ms after both changes.
+
+The Prior Default control changed from 0.991 ms to 0.954 ms across the same runs.
+
+The CMS gap therefore decreased from 13.7 percent to 1.1 percent.
+
+Two new passes use five-second target windows. The second pass uses reverse dataset order.
 
 | Dataset | File size | Correlated latency | Uniform latency |
 | --- | ---: | ---: | ---: |
-| Arade | -2.39 percent | -9.74 to -0.38 percent | -0.72 to +0.86 percent |
-| Bimbo | -7.54 percent | +5.88 to +17.20 percent | +7.07 to +7.85 percent |
-| CMSprovider | -7.86 percent | +14.03 to +18.46 percent | +9.89 to +11.73 percent |
-| Euro2016 | -2.44 percent | -0.06 to +5.27 percent | -0.44 to +0.50 percent |
-| Food | -6.19 percent | -16.78 to -10.54 percent | +12.19 to +13.94 percent |
-| HashTags | -2.56 percent | +7.28 to +13.38 percent | +4.66 to +9.94 percent |
+| Arade | -2.39 percent | -15.75 to -6.11 percent | -5.11 to +2.75 percent |
+| Bimbo | -7.54 percent | -8.28 to +1.96 percent | -1.09 to +7.99 percent |
+| CMSprovider | -7.86 percent | -2.22 to +9.22 percent | -6.64 to +11.82 percent |
+| Euro2016 | -2.44 percent | +1.55 to +2.64 percent | -1.76 to +3.54 percent |
+| Food | -6.19 percent | -29.89 to -15.70 percent | -2.83 to +6.97 percent |
+| HashTags | -2.56 percent | +3.23 to +6.85 percent | +8.34 to +13.26 percent |
 
-The file-size geometric mean decreases by 4.86 percent. Aggregate bytes decrease by 5.81 percent.
+The file-size geometric mean still decreases by 4.86 percent. Aggregate bytes still decrease by 5.81 percent.
 
-Across both passes, correlated latency increases by 3.06 percent geometrically. Uniform latency increases by 6.33 percent.
+Across both passes, correlated latency decreases by 5.05 percent geometrically. Uniform latency increases by 2.91 percent.
 
-The combined latency geometric mean increases by 4.69 percent.
+The combined latency geometric mean decreases by 1.15 percent.
 
-The Public BI pass adds useful evidence beyond scalar benchmarks. It exposes a measurable file-access trade for the conservative bundle.
+The individual file values remain noisy. The aggregate result removes the earlier random-access trade for the conservative bundle.
 
-The final threshold review must include this result. The current factor remains unchanged until that review.
+The selector factors remain unchanged.
 
 ### Compact and Parquet size constraint
 

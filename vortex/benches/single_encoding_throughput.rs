@@ -1096,6 +1096,24 @@ fn block_local_block_residual_scalar_at<T: NativePType>(bencher: Bencher) {
         .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
 }
 
+#[divan::bench(name = "block_residual_slice_patched_u32")]
+fn bench_block_residual_slice_patched_u32(bencher: Bencher) {
+    const SLICE_LEN: usize = 100;
+
+    let encoded = BlockResidual::from_primitive(setup_patch_density_u32_array(16).as_view())
+        .unwrap()
+        .into_array();
+    let next_index = AtomicUsize::new(0);
+
+    bencher
+        .with_inputs(|| {
+            let start = next_index.fetch_add(2_654_435_761, Ordering::Relaxed)
+                % (encoded.len() - SLICE_LEN);
+            (&encoded, start)
+        })
+        .bench_values(|(array, start)| array.slice(start..start + SLICE_LEN).unwrap());
+}
+
 #[divan::bench(name = "block_local_for_bitpacked_compress_u64")]
 fn bench_block_local_for_bitpacked_compress_u64(bencher: Bencher) {
     let array = setup_block_local_u64_array();
