@@ -1728,6 +1728,43 @@ Its decode throughput is 15,179 MB/s instead of 19,716 MB/s.
 
 Food and CMS now retain their existing BlockResidual trees. Their prior RangePacked choices lost too much decode throughput.
 
+### Broad RangePacked selector pass
+
+The next pass covered seven Public BI files and the GloVe file.
+
+Only Euro and HashTags selected RangePacked. The other six files retained every existing tree.
+
+| Dataset | Default bytes | Candidate bytes | Default encode MB/s | Candidate encode MB/s | Default decode MB/s | Candidate decode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Arade | 26,078,866 | 26,078,866 | 549.8 | 539.6 | 21,853 | 23,772 |
+| Bimbo | 10,573,121 | 10,573,121 | 767.8 | 764.8 | 11,181 | 11,342 |
+| CMS provider 1 | 70,490,567 | 70,490,567 | 492.0 | 480.3 | 16,387 | 16,394 |
+| CMS provider 2 | 70,640,453 | 70,640,453 | 483.9 | 475.0 | 15,641 | 15,623 |
+| Euro2016 | 39,571,884 | 33,518,064 | 506.8 | 493.7 | 20,356 | 18,969 |
+| Food | 12,297,725 | 12,297,725 | 542.7 | 541.8 | 19,633 | 19,650 |
+| HashTags | 21,283,222 | 20,147,808 | 709.8 | 631.6 | 22,303 | 22,207 |
+| GloVe | 6,274,834 | 6,274,834 | 363.0 | 342.8 | 19,341 | 19,440 |
+
+The geometric mean gives 2.7 percent less size and 3.3 percent less write throughput.
+
+The geometric-mean read throughput increases by 0.4 percent. This small change is within benchmark noise.
+
+HashTags `interaction#received_at` is the second selected column.
+
+RangePacked uses 2,128,525 bytes instead of 3,263,939 bytes. It reduces size by 34.8 percent.
+
+Its focused decode throughput is 14,658 MB/s instead of 15,678 MB/s.
+
+Its focused write throughput is 231 MB/s instead of 1,254 MB/s.
+
+The direct RangePacked tree encoder reaches 660 MB/s. Repeated scheme analysis accounts for part of the complete write cost.
+
+This HashTags trade needs the final threshold review. It does not yet justify default inclusion.
+
+The ALP RangePacked branch selected no column in this pass. Its rejected analysis contributes to the GloVe and synthetic costs.
+
+The next experiment will measure an OrderedFloat-only selector before removal or retention of the ALP branch.
+
 ### Multi-reference block prototype
 
 The prototype stores up to four quantile references per 1,024-value block.
