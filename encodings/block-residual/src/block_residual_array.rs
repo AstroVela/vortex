@@ -1106,10 +1106,10 @@ fn decompress_array(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
     match array.dtype().as_ptype() {
-        PType::U8 => decode_array_values::<u8, u8, false>(array, ctx, |value| value),
-        PType::U16 => decode_array_values::<u16, u16, false>(array, ctx, |value| value),
+        PType::U8 => decode_array_values::<u8, u8, true>(array, ctx, |value| value),
+        PType::U16 => decode_array_values::<u16, u16, true>(array, ctx, |value| value),
         PType::U32 => decode_array_values::<u32, u32, true>(array, ctx, |value| value),
-        PType::U64 => decode_array_values::<u64, u64, false>(array, ctx, |value| value),
+        PType::U64 => decode_array_values::<u64, u64, true>(array, ctx, |value| value),
         PType::I8 => {
             decode_array_values::<i8, u8, false>(array, ctx, |value| (value ^ (1_u8 << 7)) as i8)
         }

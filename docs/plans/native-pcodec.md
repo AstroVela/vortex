@@ -1403,6 +1403,41 @@ A future general patch backend can retain this size opportunity through a fast s
 
 Do not add a BlockResidual special case to ALP or IntMult patch handling.
 
+### Direct unsigned BlockResidual decode
+
+The array decoder now writes unpacked unsigned values directly into the final output buffer.
+
+The prior path used a temporary 1,024-value block for u8, u16, and u64 values.
+
+| Type | Prior decode GB/s | Direct decode GB/s | Change |
+| --- | ---: | ---: | ---: |
+| u8 | 30.14 | 40.37 | +34.0 percent |
+| u16 | 32.55 | 45.86 | +40.9 percent |
+| u32 | 46.61 | 47.23 | +1.3 percent |
+| u64 | 35.56 | 39.37 | +10.7 percent |
+
+u32 already used the direct path.
+
+The signed prototype unpacked into the final unsigned buffer and flipped the sign bit in place.
+
+That extra pass reduced i16 throughput from about 31.4 GB/s to 27.4 GB/s.
+
+It also reduced throughput for i8, i32, and i64.
+
+The implementation retains the prior signed path.
+
+Current i16 BlockResidual decode reaches 31.4 GB/s. The comparable `FoR(BitPacked)` tree reaches 42.0 GB/s.
+
+This result retains the direct i8 and i16 selector exclusions.
+
+The u16 result is faster than the prior narrow path, but no real selected-tree evidence supports policy removal yet.
+
+The faster unsigned path also improves the BlockResidual patch-position bulk decoder.
+
+GloVe patch decode now stays within 2 percent of Default. Euro patch decode remains 12 percent slower than Default.
+
+Scalar patch lookup remains the blocking cost.
+
 ### Nullable and Delta-heavy fixed-bin cases
 
 The optimized nullable prototype stores only valid values in the range stream.
@@ -1722,13 +1757,12 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these next experiments in order:
 
-1. Profile another direct narrow BlockResidual decode optimization for `i16`.
-2. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-3. Define a bounded small-alphabet experiment from the remaining no-Delta gaps.
-4. Add a specialized range scheme only after a complete tree passes the column gates.
-5. Validate rejected-candidate analysis cost after the candidate set stabilizes.
-6. Prefer cheap rejection tests when they preserve the best candidate model.
-7. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+2. Define a bounded small-alphabet experiment from the remaining no-Delta gaps.
+3. Add a specialized range scheme only after a complete tree passes the column gates.
+4. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+5. Prefer cheap rejection tests when they preserve the best candidate model.
+6. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
