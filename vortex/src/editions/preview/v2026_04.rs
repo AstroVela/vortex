@@ -24,6 +24,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         EditionMember::array(&"vortex.tensor.normalized"),
         EditionMember::array(&"vortex.tensor.l2_norm"),
         EditionMember::dtype(&"vortex.tensor.fixed_shape_tensor"),
+        EditionMember::dtype(&"vortex.tensor.unit_vector"),
         EditionMember::dtype(&"vortex.tensor.vector"),
     ],
 };

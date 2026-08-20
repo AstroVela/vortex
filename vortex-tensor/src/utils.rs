@@ -35,14 +35,14 @@ use crate::matcher::TensorMatch;
 
 /// Safety factor for unit-norm tolerance. Applied as a constant multiplier on the probabilistic
 /// `√d · ε` bound so that legitimate round-off noise clears the check with headroom.
-pub(crate) const SAFETY_FACTOR: usize = 10;
+const UNIT_NORM_SAFETY_FACTOR: f64 = 10.0;
+
+const F16_MAX_UNIT_NORM_DRIFT: f64 = 1e-2;
 
 /// Returns the acceptable unit-norm drift for the given element precision and dimension count.
 ///
-/// Uses the `c · √d · ε` bound where ε is machine epsilon and d is the vector dimension. Under
-/// IEEE 754 round-to-nearest the probabilistic (RMS-case) forward error for computing ‖x‖₂ grows
-/// as `O(√d · ε)` rather than the worst-case `O(d · ε)` from the classical Wilkinson bound,
-/// assuming near-independent rounding errors across the d-term summation.
+/// Uses `10 · √d · ε`, where `ε` is machine epsilon and `d` is the dimension count. The f16
+/// tolerance is capped at one percent so the refinement remains useful for large vectors.
 ///
 /// Reference: Croci, Fasi, Higham, Mary, Mikaitis (2022). "Stochastic rounding: implementation,
 /// error analysis and applications." Royal Society Open Science, 9: 211631, §6.1 "Probabilistic
@@ -57,7 +57,12 @@ pub fn unit_norm_tolerance(element_ptype: PType, dimensions: usize) -> f64 {
 
     let dimensions_root = (dimensions as f64).sqrt();
 
-    SAFETY_FACTOR as f64 * machine_epsilon * dimensions_root
+    let tolerance = UNIT_NORM_SAFETY_FACTOR * machine_epsilon * dimensions_root;
+    if element_ptype == PType::F16 {
+        tolerance.min(F16_MAX_UNIT_NORM_DRIFT)
+    } else {
+        tolerance
+    }
 }
 
 /// Extracts the `(normalized, norms)` children of a [`Normalized`]-encoded array.

@@ -24,6 +24,7 @@ use crate::scalar_fns::cosine_similarity::CosineSimilarity;
 use crate::scalar_fns::inner_product::InnerProduct;
 use crate::scalar_fns::l2_norm::L2Norm;
 use crate::types::fixed_shape_tensor::FixedShapeTensor;
+use crate::types::unit_vector::UnitVector;
 use crate::types::vector::Vector;
 
 pub mod matcher;
@@ -32,7 +33,9 @@ pub mod scalar_fns;
 mod types;
 
 pub use types::fixed_shape_tensor;
+pub use types::unit_vector;
 pub use types::vector;
+pub use utils::unit_norm_tolerance;
 
 pub mod encodings;
 
@@ -53,11 +56,14 @@ pub const SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV: &str = "VX_SCALAR_FN_ARRAY_TENSOR_P
 /// Initialize the Vortex tensor library with a Vortex session.
 pub fn initialize(session: &VortexSession) {
     session.dtypes().register(Vector);
+    session.dtypes().register(UnitVector);
     session.dtypes().register(FixedShapeTensor);
 
     let arrow_session = session.arrow();
     arrow_session.register_exporter(Arc::new(Vector));
     arrow_session.register_importer(Arc::new(Vector));
+    arrow_session.register_exporter(Arc::new(UnitVector));
+    arrow_session.register_importer(Arc::new(UnitVector));
 
     session.arrays().register(Normalized);
 
