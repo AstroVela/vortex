@@ -18,26 +18,20 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
-use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::DictArray;
-use vortex_array::arrays::FilterArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::SliceArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::builders::VarBinBuilder;
 use vortex_array::builders::VarBinViewBuilder;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::StructFields;
-use vortex_array::scalar::Scalar;
 use vortex_array::session::ArraySessionExt;
 #[expect(
     deprecated,
@@ -49,7 +43,6 @@ use vortex_arrow::ArrowSessionExt;
 use vortex_arrow::dtype::ToArrowType as _;
 use vortex_fsst::fsst_compress;
 use vortex_fsst::fsst_train_compressor;
-use vortex_mask::Mask;
 use vortex_onpair::DEFAULT_CONFIG;
 use vortex_onpair::onpair_compress;
 use vortex_session::VortexSession;
@@ -168,29 +161,6 @@ impl Display for StringStructure {
 }
 
 #[derive(Clone, Copy)]
-enum StringOperator {
-    Identity,
-    Filter,
-    Take,
-    Slice,
-    Mask,
-    Zip,
-}
-
-impl Display for StringOperator {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Identity => "identity",
-            Self::Filter => "filter",
-            Self::Take => "take",
-            Self::Slice => "slice",
-            Self::Mask => "mask",
-            Self::Zip => "zip",
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
 enum StringValidity {
     NonNullable,
     Nullable,
@@ -218,17 +188,12 @@ impl Display for StringValidity {
 struct StringCase {
     encoding: StringEncoding,
     structure: StringStructure,
-    operator: StringOperator,
     validity: StringValidity,
 }
 
 impl Display for StringCase {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}/{}/{}/{}",
-            self.encoding, self.structure, self.operator, self.validity
-        )
+        write!(f, "{}/{}/{}", self.encoding, self.structure, self.validity)
     }
 }
 
@@ -280,14 +245,6 @@ const STRING_STRUCTURES: &[StringStructure] = &[
     StringStructure::Dict,
     StringStructure::Chunked,
 ];
-const STRING_OPERATORS: &[StringOperator] = &[
-    StringOperator::Identity,
-    StringOperator::Filter,
-    StringOperator::Take,
-    StringOperator::Slice,
-    StringOperator::Mask,
-    StringOperator::Zip,
-];
 const STRING_VALIDITIES: &[StringValidity] =
     &[StringValidity::NonNullable, StringValidity::Nullable];
 const ARROW_STRING_LAYOUTS: &[ArrowStringLayout] =
@@ -301,13 +258,11 @@ fn string_cases() -> Vec<StringCase> {
     iproduct!(
         STRING_ENCODINGS.iter().copied(),
         STRING_STRUCTURES.iter().copied(),
-        STRING_OPERATORS.iter().copied(),
         STRING_VALIDITIES.iter().copied()
     )
-    .map(|(encoding, structure, operator, validity)| StringCase {
+    .map(|(encoding, structure, validity)| StringCase {
         encoding,
         structure,
-        operator,
         validity,
     })
     .collect()
@@ -348,12 +303,6 @@ fn dictionary_codes() -> ArrayRef {
         (0..STRING_ROWS).map(|index| u16::try_from(index % DICTIONARY_SIZE).unwrap()),
     )
     .into_array()
-}
-
-fn filtered(array: ArrayRef) -> ArrayRef {
-    let mask = Mask::from_iter((0..array.len()).map(|index| index.is_multiple_of(2)));
-    // Create a lazy FilterArray. The benchmark executes Filter during export.
-    FilterArray::new(array, mask).into_array()
 }
 
 fn offset(source: VarBinViewArray, ctx: &mut ExecutionCtx) -> ArrayRef {
@@ -419,57 +368,9 @@ fn chunked_strings(
         .into_array()
 }
 
-fn take(array: ArrayRef) -> ArrayRef {
-    let indices = PrimitiveArray::from_iter(
-        (0..array.len())
-            .step_by(2)
-            .map(|index| u64::try_from(index).unwrap()),
-    );
-    // Create a lazy DictArray. The benchmark executes Take during export.
-    DictArray::try_new(indices.into_array(), array)
-        .unwrap()
-        .into_array()
-}
-
-fn sliced(array: ArrayRef) -> ArrayRef {
-    let start = array.len() / 4;
-    let end = array.len() * 3 / 4;
-    // Create a lazy SliceArray. The benchmark executes Slice during export.
-    SliceArray::new(array, start..end).into_array()
-}
-
-fn mask_array(len: usize) -> ArrayRef {
-    BoolArray::from_iter((0..len).map(|index| !index.is_multiple_of(3))).into_array()
-}
-
-fn masked(array: ArrayRef) -> ArrayRef {
-    let mask = mask_array(array.len());
-    array.mask(mask).unwrap()
-}
-
-fn zipped(array: ArrayRef) -> ArrayRef {
-    let replacement = ConstantArray::new(
-        Scalar::utf8("replacement", array.dtype().nullability()),
-        array.len(),
-    )
-    .into_array();
-    mask_array(array.len()).zip(array, replacement).unwrap()
-}
-
-fn apply_operator(array: ArrayRef, operator: StringOperator) -> ArrayRef {
-    match operator {
-        StringOperator::Identity => array,
-        StringOperator::Filter => filtered(array),
-        StringOperator::Take => take(array),
-        StringOperator::Slice => sliced(array),
-        StringOperator::Mask => masked(array),
-        StringOperator::Zip => zipped(array),
-    }
-}
-
 fn string_array(case: StringCase) -> ArrayRef {
     let mut ctx = SESSION.create_execution_ctx();
-    let array = match case.structure {
+    match case.structure {
         StringStructure::Flat => encode_strings(
             structured_strings(STRING_ROWS, case.validity),
             case.encoding,
@@ -477,8 +378,7 @@ fn string_array(case: StringCase) -> ArrayRef {
         ),
         StringStructure::Dict => dictionary_strings(case.encoding, case.validity, &mut ctx),
         StringStructure::Chunked => chunked_strings(case.encoding, case.validity, &mut ctx),
-    };
-    apply_operator(array, case.operator)
+    }
 }
 
 /// Measures export to Arrow offset arrays and Arrow view arrays.
