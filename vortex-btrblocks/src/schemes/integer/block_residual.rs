@@ -35,6 +35,9 @@ use crate::schemes::sample_primitive_blocks;
 const BLOCK_LEN: usize = 1024;
 const ESTIMATE_BLOCKS: usize = 8;
 const MIN_COMPRESSION_RATIO: f64 = 1.05;
+// The weakest measured 8-bit gain increased file-access latency by 29 to 55 percent.
+// Require about 12 percent estimated savings for 8-bit values.
+const EIGHT_BIT_ACCESS_COST_FACTOR: f64 = 1.12;
 // The 25-percent patch sweep needs about 80 cost bits per patch to reject its slow tree.
 // This quadratic slope reaches that cost at 25 percent while it keeps sparse patches cheap.
 const PATCH_DENSITY_COST_BITS: u64 = 320;
@@ -97,7 +100,12 @@ impl Scheme for BlockResidualScheme {
                 if ratio < MIN_COMPRESSION_RATIO {
                     return Ok(EstimateVerdict::Skip);
                 }
-                Ok(EstimateVerdict::Ratio(ratio))
+                let adjusted_ratio = if sample.ptype().byte_width() == 1 {
+                    ratio / EIGHT_BIT_ACCESS_COST_FACTOR
+                } else {
+                    ratio
+                };
+                Ok(EstimateVerdict::Ratio(adjusted_ratio))
             },
         )))
     }

@@ -715,11 +715,13 @@ The candidate increases correlated latency by 55 to 99 percent. It increases uni
 
 Every measured lookup remains below 1.1 ms. Sparse patches make the global affine case the slowest relative result.
 
-The current selector keeps the common 1.05 floor and no width factor.
+The selector keeps the common 1.05 raw-ratio floor. It applies a 1.12 access cost factor to 8-bit estimates.
 
-The final file ratios place the seven-bit boundary near a 1.12 factor. They place the global affine case near 1.20.
+The factor rejects the seven-bit boundary case. That case saved 10.35 percent and increased random-access latency by 29 to 55 percent.
 
-The final 8-bit factor remains a policy choice because random access has priority over size.
+The factor retains the global affine `i8` and `u8` variants. It also retains the unsigned symmetric variant.
+
+These retained variants save 16.12 to 22.21 percent. The measured file-access latency remains below one millisecond for about 100 requested rows.
 
 ### Narrow BlockResidual in Compact
 
@@ -2209,7 +2211,7 @@ Retain FloatQuant as an opportunistic option under the calibrated 1.10 factor.
 
 ### Final selector factors
 
-The integer BlockResidual scheme keeps a 1.05 raw-ratio floor and no width-specific factor.
+The integer BlockResidual scheme keeps a 1.05 raw-ratio floor. It applies a 1.12 access cost factor to 8-bit estimates.
 
 This policy resolves the CMS threshold miss and produces a 2.94 percent complete-corpus size gain.
 
@@ -2217,7 +2219,7 @@ The Ordered BlockResidual scheme keeps its 1.05 raw floor and 1.02 decode factor
 
 The nonlinear patch cost rejects the known dense-patch and slow HashTags trees.
 
-No selected-tree evidence supports a higher BlockResidual factor.
+No selected-tree evidence supports a factor for wider integers.
 
 The FloatQuant scheme keeps its 1.10 factor.
 
@@ -2227,9 +2229,7 @@ The 1.10 value adds a small margin and retains every strict synthetic `f32` and 
 
 The 33-column Pco-gap pass exposes no missed real FloatQuant candidate.
 
-The 8-bit bulk and writer evidence supports the same factor.
-
-The 8-bit file-access evidence leaves the final width factor open.
+The 8-bit factor rejects the weakest measured gain. It retains three real quantized GloVe variants with 16 to 22 percent savings.
 
 ### Default bundle options
 
@@ -2650,11 +2650,10 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Choose the final 8-bit width factor from the size and file-access trade.
-2. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
-3. Prefer cheap rejection tests when they preserve the best candidate model.
-4. Treat fast rejection as a selection advantage, not an admission criterion.
-5. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Decide whether Public BI file random access adds useful evidence beyond scalar benchmarks.
+2. Prefer cheap rejection tests when they preserve the best candidate model.
+3. Treat fast rejection as a selection advantage, not an admission criterion.
+4. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
