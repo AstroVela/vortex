@@ -1346,6 +1346,181 @@ fn decomposed_fixed_bin_integer_tree(
     Ok(Some(IntMult::try_new(references, offsets, 1)?.into_array()))
 }
 
+fn int_mult_integer_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    base: u64,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    let validity = primitive.validity()?;
+    let (primary, secondary) = match primitive.ptype() {
+        PType::I32 => {
+            let base = i32::try_from(base)?;
+            let values = primitive.as_slice::<i32>();
+            (
+                PrimitiveArray::new(
+                    values
+                        .iter()
+                        .map(|value| value.div_euclid(base))
+                        .collect::<Vec<_>>(),
+                    validity,
+                ),
+                PrimitiveArray::from_iter(
+                    values
+                        .iter()
+                        .map(|value| value.rem_euclid(base))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        }
+        PType::I64 => {
+            let base = i64::try_from(base)?;
+            let values = primitive.as_slice::<i64>();
+            (
+                PrimitiveArray::new(
+                    values
+                        .iter()
+                        .map(|value| value.div_euclid(base))
+                        .collect::<Vec<_>>(),
+                    validity,
+                ),
+                PrimitiveArray::from_iter(
+                    values
+                        .iter()
+                        .map(|value| value.rem_euclid(base))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        }
+        ptype => return Err(vortex_err!("ALP IntMult does not support {ptype}")),
+    };
+    let compressor = BtrBlocksCompressor::default();
+    let primary =
+        compressor.compress(&primary.into_array(), &mut session.create_execution_ctx())?;
+    let secondary =
+        compressor.compress(&secondary.into_array(), &mut session.create_execution_ctx())?;
+    Ok(IntMult::try_new(primary, secondary, base)?.into_array())
+}
+
+fn prefix_int_mult_integer_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    suffix_bits: u8,
+) -> VortexResult<Option<ArrayRef>> {
+    let validity = primitive.validity()?;
+    let base = 1_u64 << suffix_bits;
+    let (codes, dictionary, secondary) = match primitive.ptype() {
+        PType::I32 if suffix_bits < 31 => {
+            let base = i32::try_from(base)?;
+            let mut dictionary = Vec::<i32>::new();
+            let mut code_by_value = HashMap::<i32, u8>::new();
+            let mut codes = Vec::with_capacity(primitive.len());
+            let mut secondary = Vec::with_capacity(primitive.len());
+            for &value in primitive.as_slice::<i32>() {
+                let quotient = value.div_euclid(base);
+                let code = match code_by_value.get(&quotient) {
+                    Some(&code) => code,
+                    None if dictionary.len() < 64 => {
+                        let code = u8::try_from(dictionary.len())?;
+                        dictionary.push(quotient);
+                        code_by_value.insert(quotient, code);
+                        code
+                    }
+                    None => return Ok(None),
+                };
+                codes.push(code);
+                secondary.push(value.rem_euclid(base));
+            }
+            (
+                codes,
+                PrimitiveArray::from_iter(dictionary).into_array(),
+                PrimitiveArray::from_iter(secondary),
+            )
+        }
+        PType::I64 if suffix_bits < 63 => {
+            let base = i64::try_from(base)?;
+            let mut dictionary = Vec::<i64>::new();
+            let mut code_by_value = HashMap::<i64, u8>::new();
+            let mut codes = Vec::with_capacity(primitive.len());
+            let mut secondary = Vec::with_capacity(primitive.len());
+            for &value in primitive.as_slice::<i64>() {
+                let quotient = value.div_euclid(base);
+                let code = match code_by_value.get(&quotient) {
+                    Some(&code) => code,
+                    None if dictionary.len() < 64 => {
+                        let code = u8::try_from(dictionary.len())?;
+                        dictionary.push(quotient);
+                        code_by_value.insert(quotient, code);
+                        code
+                    }
+                    None => return Ok(None),
+                };
+                codes.push(code);
+                secondary.push(value.rem_euclid(base));
+            }
+            (
+                codes,
+                PrimitiveArray::from_iter(dictionary).into_array(),
+                PrimitiveArray::from_iter(secondary),
+            )
+        }
+        _ => return Ok(None),
+    };
+    let code_width =
+        u8::try_from(u8::BITS - u8::try_from(dictionary.len().saturating_sub(1))?.leading_zeros())?;
+    let codes = PrimitiveArray::new(codes, validity);
+    // SAFETY: Every code fits the width computed from the dictionary length.
+    let codes = unsafe { bitpack_encode_unchecked(codes, code_width) }?.into_array();
+    let primary = DictArray::try_new(codes, dictionary)?.into_array();
+    // SAFETY: Euclidean remainders for a power-of-two base fit in `suffix_bits` bits.
+    let secondary = unsafe { bitpack_encode_unchecked(secondary, suffix_bits) }?.into_array();
+    Ok(Some(
+        IntMult::try_new(primary, secondary, base)?.into_array(),
+    ))
+}
+
+fn encode_int_mult_float_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    compact: &ArrayRef,
+    base: u64,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    if compact.encoding_id().as_ref() != "vortex.alp" {
+        return Ok(None);
+    }
+    let compact_alp = compact.as_::<ALP>();
+    if compact_alp.encoded().encoding_id().as_ref() != "vortex.pco" {
+        return Ok(None);
+    }
+    let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
+    let encoded = int_mult_integer_tree(alp.encoded().as_::<Primitive>(), base, session)?;
+    Ok(Some(
+        ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+    ))
+}
+
+fn encode_prefix_int_mult_float_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    compact: &ArrayRef,
+    suffix_bits: u8,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    if compact.encoding_id().as_ref() != "vortex.alp" {
+        return Ok(None);
+    }
+    let compact_alp = compact.as_::<ALP>();
+    if compact_alp.encoded().encoding_id().as_ref() != "vortex.pco" {
+        return Ok(None);
+    }
+    let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
+    let Some(encoded) =
+        prefix_int_mult_integer_tree(alp.encoded().as_::<Primitive>(), suffix_bits)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+    ))
+}
+
 fn fill_integer_nulls_with_first_valid(
     primitive: PrimitiveArray,
     ctx: &mut vortex_array::ExecutionCtx,
@@ -1939,6 +2114,86 @@ fn measure_decomposed_fixed_bin_tree(
     Ok(())
 }
 
+fn measure_int_mult_float_tree(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    compact: &ArrayRef,
+    base: u64,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let Some(encoded) =
+        encode_int_mult_float_tree(expected.as_::<Primitive>(), compact, base, session)?
+    else {
+        return Ok(());
+    };
+    let label = format!("int-mult-{base}");
+    measure_existing_tree(dataset, column, &label, expected, &encoded, session)?;
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(encode_int_mult_float_tree(
+            expected.as_::<Primitive>(),
+            compact,
+            base,
+            session,
+        )?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "candidate-tree-encode\t{dataset}\t{column}\t{label}\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
+}
+
+fn measure_prefix_int_mult_float_tree(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    compact: &ArrayRef,
+    suffix_bits: u8,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let Some(encoded) = encode_prefix_int_mult_float_tree(
+        expected.as_::<Primitive>(),
+        compact,
+        suffix_bits,
+        session,
+    )?
+    else {
+        return Ok(());
+    };
+    let label = format!("prefix-int-mult-{suffix_bits}");
+    measure_existing_tree(dataset, column, &label, expected, &encoded, session)?;
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(encode_prefix_int_mult_float_tree(
+            expected.as_::<Primitive>(),
+            compact,
+            suffix_bits,
+            session,
+        )?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "candidate-tree-encode\t{dataset}\t{column}\t{label}\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
+}
+
 fn measure_existing_tree(
     dataset: &str,
     column: &str,
@@ -2304,6 +2559,58 @@ fn measure_dataset(
                 compact_array,
                 session,
             )?;
+        }
+        if std::env::var_os("VORTEX_BENCH_INT_MULT_TREE").is_some() {
+            if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_none() {
+                measure_existing_tree(
+                    dataset,
+                    &column.name,
+                    "default",
+                    &column.array,
+                    default_array,
+                    session,
+                )?;
+                measure_existing_tree(
+                    dataset,
+                    &column.name,
+                    "compact",
+                    &column.array,
+                    compact_array,
+                    session,
+                )?;
+                measure_block_residual_float_tree(
+                    dataset,
+                    &column.name,
+                    &column.array,
+                    compact_array,
+                    session,
+                )?;
+            }
+            for base in [5, 10, 100, 1_000] {
+                measure_int_mult_float_tree(
+                    dataset,
+                    &column.name,
+                    &column.array,
+                    compact_array,
+                    base,
+                    session,
+                )?;
+            }
+            let suffix_widths: &[u8] = match primitive.ptype() {
+                PType::F32 => &[12, 14, 16, 18, 20, 22, 24, 26, 28],
+                PType::F64 => &[24, 28, 32, 36, 40, 44, 48, 52, 56],
+                _ => &[],
+            };
+            for &suffix_bits in suffix_widths {
+                measure_prefix_int_mult_float_tree(
+                    dataset,
+                    &column.name,
+                    &column.array,
+                    compact_array,
+                    suffix_bits,
+                    session,
+                )?;
+            }
         }
     }
 

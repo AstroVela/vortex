@@ -1319,7 +1319,57 @@ A competitive fixed-bin design requires a reusable primitive for code-dependent 
 
 Earlier grouped and checkpoint prototypes did not pass the Default decode gate.
 
-Fixed bins remain paused while the pure IntMult experiment proceeds.
+The generic fixed-bin composition remains paused for Default.
+
+### Pure IntMult real-data results
+
+The next prototype applies ALP first and splits its integer child with one global IntMult base.
+
+Default compresses the quotient and remainder independently through normal integer recursion.
+
+The benchmark tests bases 5, 10, 100, and 1,000.
+
+| Input | Default bytes | BlockResidual bytes | Best IntMult bytes | Default decode MB/s | Best IntMult decode MB/s | Best IntMult encode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GloVe embeddings | 6,274,834 | 6,298,751 | 6,665,400 at base 1,000 | 17,504 | 10,188 | 445 |
+| CMS payment | 11,064,308 | 10,716,519 | 10,442,347 at base 10 | 22,715 | 10,212 | 412 |
+
+GloVe grows by 6.2 percent against Default.
+
+CMS shrinks by 5.6 percent against Default and 2.6 percent against `ALP(BlockResidual)`.
+
+The CMS IntMult tree decodes 55 percent slower than Default and 51 percent slower than `ALP(BlockResidual)`.
+
+Its encode throughput falls 77 percent against the direct `ALP(BlockResidual)` candidate.
+
+CMS scalar access remains close to Default, but it remains slower than the BlockResidual candidate.
+
+Pure IntMult with generic children therefore does not pass the Default evidence bar.
+
+Pco gains more from its bin and entropy backend than from the multiplication split alone on GloVe.
+
+### Equal-width prefix bins
+
+The equal-width prototype uses only `IntMult`, `Dict`, and `BitPacked`.
+
+The base is a power of two. A dictionary stores at most 64 observed quotients.
+
+The remainder uses one fixed suffix width for every value.
+
+This tree provides fast rejection when more than 64 quotients appear in the sample.
+
+| Input | Best suffix width | Candidate bytes | Default bytes | Encode MB/s | Decode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GloVe embeddings | 20 | 6,909,476 | 6,274,834 | 1,348 | 7,538 |
+| CMS payment | 44 | 11,984,848 | 11,064,308 | 2,487 | 8,709 |
+
+The encoder is fast because it builds one dictionary and two packed streams.
+
+The fixed suffix grows both columns by 8 to 10 percent against Default.
+
+The generic decoder is also more than twice as slow as Default.
+
+Equal-width prefix bins do not justify a Default scheme.
 
 ### Nullable and Delta-heavy fixed-bin cases
 
@@ -1640,15 +1690,14 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these next experiments in order:
 
-1. Prototype pure IntMult on the exact GloVe and CMS ALP children.
-2. Compress both IntMult children independently through normal integer schemes.
-3. Test BlockResidual as a general compression candidate for patch positions.
-4. Add a specialized range scheme only after a complete tree passes the column gates.
-5. Profile another direct narrow BlockResidual decode optimization for `i16`.
-6. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-7. Validate rejected-candidate analysis cost after the candidate set stabilizes.
-8. Prefer cheap rejection tests when they preserve the best candidate model.
-9. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Test BlockResidual as a general compression candidate for patch positions.
+2. Profile another direct narrow BlockResidual decode optimization for `i16`.
+3. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+4. Define a bounded small-alphabet experiment from the remaining no-Delta gaps.
+5. Add a specialized range scheme only after a complete tree passes the column gates.
+6. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+7. Prefer cheap rejection tests when they preserve the best candidate model.
+8. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
