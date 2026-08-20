@@ -1282,6 +1282,45 @@ They do not establish a Default win because the range benchmark lacks incumbent 
 
 The next experiment must compare complete trees on the real Pco gap columns.
 
+### Decomposed fixed-bin real-data results
+
+The benchmark now builds `IntMult(base=1, Dict(BitPacked(codes), starts), offsets)` on four real float columns.
+
+It tests `BlockResidual` and `FoR(BitPacked)` as the offset child.
+
+The GloVe benchmark reader flattens numeric `List`, `LargeList`, and `FixedSizeList` columns.
+
+| Input | Default bytes | Compact bytes | Decomposed BR bytes | Decomposed FoR bytes | Default decode MB/s | Decomposed BR decode MB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Euro subjectivity | 14,234,326 | 6,860,457 | 13,000,391 | 14,006,288 | 16,915 | 4,217 |
+| Food volume | 7,529,728 | 5,368,140 | 7,223,283 | 10,504,832 | 24,104 | 10,060 |
+| GloVe embeddings | 6,274,834 | 5,287,510 | 7,105,298 | 8,160,260 | 17,388 | 7,125 |
+| CMS payment | 11,064,308 | 9,288,800 | 11,073,385 | 12,735,216 | 22,542 | 6,570 |
+
+The `BlockResidual` form saves 8.7 percent on Euro and 4.1 percent on Food against Default.
+
+It grows GloVe by 13.2 percent and matches Default size on CMS payment.
+
+Its decode throughput falls by 58 to 75 percent against Default on all four columns.
+
+The `FoR(BitPacked)` form encodes and decodes faster than the `BlockResidual` form.
+
+Its global offset range loses more size on every input.
+
+The offset stream interleaves values from bins with different widths.
+
+A generic offset child then pays for the widest offsets in each local block.
+
+The fused prototype avoids this cost because each value uses the width for its selected bin.
+
+The tested composition therefore does not pass the Default evidence bar.
+
+A competitive fixed-bin design requires a reusable primitive for code-dependent widths or grouped offsets with rank data.
+
+Earlier grouped and checkpoint prototypes did not pass the Default decode gate.
+
+Fixed bins remain paused while the pure IntMult experiment proceeds.
+
 ### Nullable and Delta-heavy fixed-bin cases
 
 The optimized nullable prototype stores only valid values in the range stream.
@@ -1601,18 +1640,15 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these next experiments in order:
 
-1. Measure the decomposed fixed-bin tree on CMS, Food, Euro2016, GloVe, and other no-Delta Pco wins.
-2. Compare complete tree size and throughput against the displaced Default tree and Compact Pco.
-3. Compare `BlockResidual` and `FoR(BitPacked)` offset children. Use recursive compression as an oracle for other trees.
-4. Prototype pure IntMult on the exact GloVe and CMS ALP children.
-5. Compress both IntMult children independently through normal integer schemes.
-6. Test BlockResidual as a general compression candidate for patch positions.
-7. Add a specialized range scheme only after a complete tree passes the column gates.
-8. Profile another direct narrow BlockResidual decode optimization for `i16`.
-9. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-10. Validate rejected-candidate analysis cost after the candidate set stabilizes.
-11. Prefer cheap rejection tests when they preserve the best candidate model.
-12. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Prototype pure IntMult on the exact GloVe and CMS ALP children.
+2. Compress both IntMult children independently through normal integer schemes.
+3. Test BlockResidual as a general compression candidate for patch positions.
+4. Add a specialized range scheme only after a complete tree passes the column gates.
+5. Profile another direct narrow BlockResidual decode optimization for `i16`.
+6. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+7. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+8. Prefer cheap rejection tests when they preserve the best candidate model.
+9. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

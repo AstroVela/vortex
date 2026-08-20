@@ -14,6 +14,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use arrow_array::ArrayRef as ArrowArrayRef;
+use arrow_array::FixedSizeListArray;
+use arrow_array::LargeListArray;
+use arrow_array::ListArray as ArrowListArray;
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
 use parquet::arrow::ProjectionMask;
@@ -40,6 +43,7 @@ use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::ChunkedArray;
+use vortex_array::arrays::DictArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
@@ -50,6 +54,7 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_array::extension::datetime::TimeUnit;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
 use vortex_block_residual::BlockResidual;
@@ -65,6 +70,13 @@ use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::FoR;
+use vortex_fastlanes::FoRArrayExt;
+use vortex_fastlanes::FoRArraySlotsExt;
+use vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked;
+use vortex_int_mult::IntMult;
+use vortex_range_packed::RangeDecomposition;
 use vortex_range_packed::RangePacked;
 use vortex_range_packed::RangePackedCodec;
 use vortex_session::VortexSession;
@@ -371,8 +383,14 @@ fn read_parquet_numeric(
         .iter()
         .enumerate()
         .filter_map(|(index, field)| {
+            let data_type = match field.data_type() {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::FixedSizeList(field, _) => field.data_type(),
+                data_type => data_type,
+            };
             matches!(
-                field.data_type(),
+                data_type,
                 DataType::Int16
                     | DataType::Int32
                     | DataType::Int64
@@ -424,6 +442,45 @@ fn read_parquet_numeric(
                 .collect::<Vec<_>>();
             let combined = concat(&chunk_refs)
                 .map_err(|error| vortex_err!("cannot concatenate {}: {error}", field.name()))?;
+            let (combined, field, name) = match field.data_type() {
+                DataType::FixedSizeList(value_field, _) => {
+                    let list = combined
+                        .as_any()
+                        .downcast_ref::<FixedSizeListArray>()
+                        .ok_or_else(|| vortex_err!("{} is not a fixed-size list", field.name()))?;
+                    let values = list.values();
+                    (
+                        values.slice(0, values.len().min(row_count)),
+                        Arc::clone(value_field),
+                        format!("{}.values", field.name()),
+                    )
+                }
+                DataType::List(value_field) => {
+                    let list = combined
+                        .as_any()
+                        .downcast_ref::<ArrowListArray>()
+                        .ok_or_else(|| vortex_err!("{} is not a list", field.name()))?;
+                    let values = list.values();
+                    (
+                        values.slice(0, values.len().min(row_count)),
+                        Arc::clone(value_field),
+                        format!("{}.values", field.name()),
+                    )
+                }
+                DataType::LargeList(value_field) => {
+                    let list = combined
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .ok_or_else(|| vortex_err!("{} is not a large list", field.name()))?;
+                    let values = list.values();
+                    (
+                        values.slice(0, values.len().min(row_count)),
+                        Arc::clone(value_field),
+                        format!("{}.values", field.name()),
+                    )
+                }
+                _ => (combined, Arc::clone(field), field.name().to_string()),
+            };
             let array = session.arrow().from_arrow_array(combined, field.as_ref())?;
             let array = if matches!(field.data_type(), DataType::Timestamp(_, _)) {
                 array.cast(DType::Primitive(PType::I64, array.dtype().nullability()))?
@@ -431,7 +488,7 @@ fn read_parquet_numeric(
                 array
             };
             let primitive = array.execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
-            Ok(column(field.name(), primitive))
+            Ok(column(name, primitive))
         })
         .collect()
 }
@@ -1234,6 +1291,283 @@ fn codec_decode_iterations() -> VortexResult<usize> {
         .map(|iterations| iterations.unwrap_or(20))
 }
 
+#[derive(Clone, Copy)]
+enum FixedBinOffsetTree {
+    BlockResidual,
+    FoRBitPacked,
+}
+
+impl FixedBinOffsetTree {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BlockResidual => "block-residual",
+            Self::FoRBitPacked => "for-bitpacked",
+        }
+    }
+}
+
+fn decomposed_fixed_bin_integer_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    offset_tree: FixedBinOffsetTree,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    vortex_ensure!(primitive.ptype().is_int(), "fixed bins require integers");
+    let primitive = fill_integer_nulls_with_first_valid(
+        primitive.into_owned(),
+        &mut session.create_execution_ctx(),
+    )?;
+    let decomposition = RangeDecomposition::encode(&ordered_integer_values(&primitive)?)?;
+    if decomposition.bin_starts().is_empty()
+        || !offsets_fit_ptype(decomposition.offsets(), primitive.ptype())
+    {
+        return Ok(None);
+    }
+
+    let codes = PrimitiveArray::new(decomposition.codes().to_vec(), primitive.validity()?);
+    // SAFETY: The decomposition computes the exact code width.
+    let codes =
+        unsafe { bitpack_encode_unchecked(codes, decomposition.code_width()) }?.into_array();
+    let (starts, offsets) = range_components(&decomposition, primitive.ptype())?;
+    let references = DictArray::try_new(codes, starts)?.into_array();
+    let offsets = match offset_tree {
+        FixedBinOffsetTree::BlockResidual => {
+            BlockResidual::from_primitive(offsets.as_view())?.into_array()
+        }
+        FixedBinOffsetTree::FoRBitPacked => {
+            let minimum = decomposition.offsets().iter().copied().min().unwrap_or(0);
+            let maximum = decomposition.offsets().iter().copied().max().unwrap_or(0);
+            let bit_width = u8::try_from(u64::BITS - (maximum - minimum).leading_zeros())?;
+            let mut ctx = session.create_execution_ctx();
+            let encoded = FoR::encode(offsets, &mut ctx)?;
+            let packed = BitPacked::encode(encoded.encoded(), bit_width, &mut ctx)?;
+            FoR::try_new(packed.into_array(), encoded.reference_scalar().clone())?.into_array()
+        }
+    };
+    Ok(Some(IntMult::try_new(references, offsets, 1)?.into_array()))
+}
+
+fn fill_integer_nulls_with_first_valid(
+    primitive: PrimitiveArray,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let validity = primitive.validity()?;
+    let mask = validity.execute_mask(primitive.len(), ctx)?;
+    if mask.all_true() {
+        return Ok(primitive);
+    }
+    let first_valid = mask.first();
+    Ok(match_each_integer_ptype!(primitive.ptype(), |T| {
+        let values = primitive.as_slice::<T>();
+        let fill = first_valid.map_or_else(T::default, |index| values[index]);
+        PrimitiveArray::new::<T>(
+            values
+                .iter()
+                .zip(mask.iter())
+                .map(|(&value, valid)| if valid { value } else { fill })
+                .collect::<Vec<_>>(),
+            validity,
+        )
+    }))
+}
+
+fn ordered_integer_values(primitive: &PrimitiveArray) -> VortexResult<Vec<u64>> {
+    Ok(match primitive.ptype() {
+        PType::U8 => primitive
+            .as_slice::<u8>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U16 => primitive
+            .as_slice::<u16>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U32 => primitive
+            .as_slice::<u32>()
+            .iter()
+            .map(|&value| u64::from(value))
+            .collect(),
+        PType::U64 => primitive.as_slice::<u64>().to_vec(),
+        PType::I8 => primitive
+            .as_slice::<i8>()
+            .iter()
+            .map(|&value| u64::from((value as u8) ^ (1_u8 << 7)))
+            .collect(),
+        PType::I16 => primitive
+            .as_slice::<i16>()
+            .iter()
+            .map(|&value| u64::from((value as u16) ^ (1_u16 << 15)))
+            .collect(),
+        PType::I32 => primitive
+            .as_slice::<i32>()
+            .iter()
+            .map(|&value| u64::from((value as u32) ^ (1_u32 << 31)))
+            .collect(),
+        PType::I64 => primitive
+            .as_slice::<i64>()
+            .iter()
+            .map(|&value| (value as u64) ^ (1_u64 << 63))
+            .collect(),
+        ptype => return Err(vortex_err!("fixed bins do not support {ptype}")),
+    })
+}
+
+fn offsets_fit_ptype(offsets: &[u64], ptype: PType) -> bool {
+    let maximum = match ptype {
+        PType::U8 => u64::from(u8::MAX),
+        PType::U16 => u64::from(u16::MAX),
+        PType::U32 => u64::from(u32::MAX),
+        PType::U64 => u64::MAX,
+        PType::I8 => i8::MAX as u64,
+        PType::I16 => i16::MAX as u64,
+        PType::I32 => i32::MAX as u64,
+        PType::I64 => i64::MAX as u64,
+        _ => return false,
+    };
+    offsets.iter().all(|&offset| offset <= maximum)
+}
+
+fn range_components(
+    decomposition: &RangeDecomposition,
+    ptype: PType,
+) -> VortexResult<(ArrayRef, PrimitiveArray)> {
+    let starts = decomposition.bin_starts();
+    let offsets = decomposition.offsets();
+    Ok(match ptype {
+        PType::U8 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(u8::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(u8::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        PType::U16 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(u16::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(u16::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        PType::U32 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(u32::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(u32::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        PType::U64 => (
+            PrimitiveArray::from_iter(starts.iter().copied()).into_array(),
+            PrimitiveArray::from_iter(offsets.iter().copied()),
+        ),
+        PType::I8 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(|value| {
+                        u8::try_from(value).map(|value| i8::from_le_bytes([value ^ (1_u8 << 7)]))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(i8::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        PType::I16 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(|value| {
+                        u16::try_from(value)
+                            .map(|value| i16::from_le_bytes((value ^ (1_u16 << 15)).to_le_bytes()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(i16::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        PType::I32 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map(|value| i32::from_le_bytes((value ^ (1_u32 << 31)).to_le_bytes()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(i32::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        PType::I64 => (
+            PrimitiveArray::from_iter(
+                starts
+                    .iter()
+                    .copied()
+                    .map(|value| i64::from_le_bytes((value ^ (1_u64 << 63)).to_le_bytes())),
+            )
+            .into_array(),
+            PrimitiveArray::from_iter(
+                offsets
+                    .iter()
+                    .copied()
+                    .map(i64::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        ptype => return Err(vortex_err!("fixed bins do not support {ptype}")),
+    })
+}
+
 fn fixed_bin_float_tree(
     compact: &ArrayRef,
     session: &VortexSession,
@@ -1515,6 +1849,94 @@ fn encode_fixed_bin_float_tree(
         &mut session.create_execution_ctx(),
     )?;
     Ok(OrderedFloat::try_new(packed.into_array(), primitive.ptype())?.into_array())
+}
+
+fn encode_decomposed_fixed_bin_float_tree(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    compact: &ArrayRef,
+    offset_tree: FixedBinOffsetTree,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    if compact.encoding_id().as_ref() == "vortex.alp" {
+        let compact_alp = compact.as_::<ALP>();
+        if compact_alp.encoded().encoding_id().as_ref() != "vortex.pco" {
+            return Ok(None);
+        }
+        let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
+        let Some(encoded) = decomposed_fixed_bin_integer_tree(
+            alp.encoded().as_::<Primitive>(),
+            offset_tree,
+            session,
+        )?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            ALP::try_new(encoded, alp.exponents(), alp.patches())?.into_array(),
+        ));
+    }
+
+    if compact.encoding_id().as_ref() != "vortex.pco" || !compact.dtype().is_float() {
+        return Ok(None);
+    }
+    let primitive = fill_float_nulls_with_first_valid(
+        primitive.into_owned(),
+        &mut session.create_execution_ctx(),
+    )?;
+    let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+    let Some(encoded) = decomposed_fixed_bin_integer_tree(
+        ordered.encoded().as_::<Primitive>(),
+        offset_tree,
+        session,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        OrderedFloat::try_new(encoded, primitive.ptype())?.into_array(),
+    ))
+}
+
+fn measure_decomposed_fixed_bin_tree(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    compact: &ArrayRef,
+    offset_tree: FixedBinOffsetTree,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    let Some(encoded) = encode_decomposed_fixed_bin_float_tree(
+        expected.as_::<Primitive>(),
+        compact,
+        offset_tree,
+        session,
+    )?
+    else {
+        return Ok(());
+    };
+    let label = format!("decomposed-fixed-bin-{}", offset_tree.label());
+    measure_existing_tree(dataset, column, &label, expected, &encoded, session)?;
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(encode_decomposed_fixed_bin_float_tree(
+            expected.as_::<Primitive>(),
+            compact,
+            offset_tree,
+            session,
+        )?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "candidate-tree-encode\t{dataset}\t{column}\t{label}\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
 }
 
 fn measure_existing_tree(
@@ -1859,6 +2281,22 @@ fn measure_dataset(
                 session,
             )?;
             measure_fixed_bin_tree(dataset, &column.name, &column.array, compact_array, session)?;
+            measure_decomposed_fixed_bin_tree(
+                dataset,
+                &column.name,
+                &column.array,
+                compact_array,
+                FixedBinOffsetTree::BlockResidual,
+                session,
+            )?;
+            measure_decomposed_fixed_bin_tree(
+                dataset,
+                &column.name,
+                &column.array,
+                compact_array,
+                FixedBinOffsetTree::FoRBitPacked,
+                session,
+            )?;
             measure_block_residual_float_tree(
                 dataset,
                 &column.name,
