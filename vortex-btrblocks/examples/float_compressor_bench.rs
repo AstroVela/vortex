@@ -55,6 +55,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::match_each_integer_ptype;
+use vortex_array::patches::Patches;
 use vortex_array::validity::Validity;
 use vortex_arrow::ArrowSessionExt;
 use vortex_block_residual::BlockResidual;
@@ -1940,6 +1941,60 @@ fn measure_block_residual_float_tree(
     Ok(())
 }
 
+fn measure_block_residual_patch_positions(
+    dataset: &str,
+    column: &str,
+    expected: &ArrayRef,
+    default: &ArrayRef,
+    compact: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<()> {
+    if let Some(encoded) = rewrite_alp_patch_positions(default, session)? {
+        measure_existing_tree(
+            dataset,
+            column,
+            "default-block-residual-patch-positions",
+            expected,
+            &encoded,
+            session,
+        )?;
+    }
+
+    let Some(block_residual) = block_residual_float_tree(compact, session)? else {
+        return Ok(());
+    };
+    let Some(encoded) = rewrite_alp_patch_positions(&block_residual, session)? else {
+        return Ok(());
+    };
+    measure_existing_tree(
+        dataset,
+        column,
+        "block-residual-patch-positions",
+        expected,
+        &encoded,
+        session,
+    )?;
+
+    let mut encode_durations = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        black_box(encode_block_residual_float_tree_with_patch_positions(
+            expected.as_::<Primitive>(),
+            session,
+        )?);
+        encode_durations.push(start.elapsed());
+    }
+    let encode_median = percentile(&mut encode_durations, 1, 2);
+    let encode_throughput = expected.nbytes() as f64 / encode_median.as_secs_f64() / 1_000_000.0;
+    println!(
+        "candidate-tree-encode\t{dataset}\t{column}\tblock-residual-patch-positions\t{}\t{}\t{encode_throughput:.1}\t{}",
+        encoded.len(),
+        encoded.nbytes(),
+        encoding_tree(&encoded),
+    );
+    Ok(())
+}
+
 fn block_residual_float_tree(
     compact: &ArrayRef,
     session: &VortexSession,
@@ -1976,6 +2031,74 @@ fn block_residual_float_tree(
     Ok(Some(
         OrderedFloat::try_new(encoded.into_array(), primitive.ptype())?.into_array(),
     ))
+}
+
+fn block_residual_patch_positions(
+    patches: Patches,
+    session: &VortexSession,
+) -> VortexResult<Patches> {
+    let indices = patches
+        .indices()
+        .clone()
+        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+    let encoded_indices = BlockResidual::from_primitive(indices.as_view())?.into_array();
+    let indices = if encoded_indices.nbytes() < indices.nbytes() {
+        encoded_indices
+    } else {
+        indices.into_array()
+    };
+    let chunk_offsets = patches
+        .chunk_offsets()
+        .as_ref()
+        .map(|offsets| {
+            let offsets = offsets
+                .clone()
+                .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+            let encoded = BlockResidual::from_primitive(offsets.as_view())?.into_array();
+            Ok::<ArrayRef, vortex_error::VortexError>(if encoded.nbytes() < offsets.nbytes() {
+                encoded
+            } else {
+                offsets.into_array()
+            })
+        })
+        .transpose()?;
+    Patches::new(
+        patches.array_len(),
+        patches.offset(),
+        indices,
+        patches.values().clone(),
+        chunk_offsets,
+    )
+}
+
+fn rewrite_alp_patch_positions(
+    encoded: &ArrayRef,
+    session: &VortexSession,
+) -> VortexResult<Option<ArrayRef>> {
+    if encoded.encoding_id().as_ref() != "vortex.alp" {
+        return Ok(None);
+    }
+    let alp = encoded.as_::<ALP>();
+    let Some(patches) = alp.patches() else {
+        return Ok(None);
+    };
+    let patches = block_residual_patch_positions(patches, session)?;
+    Ok(Some(
+        ALP::try_new(alp.encoded().clone(), alp.exponents(), Some(patches))?.into_array(),
+    ))
+}
+
+fn encode_block_residual_float_tree_with_patch_positions(
+    primitive: vortex_array::ArrayView<'_, Primitive>,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    let alp = alp_encode(primitive, None, &mut session.create_execution_ctx())?;
+    let encoded = BlockResidual::from_primitive(alp.encoded().as_::<Primitive>())?;
+    let patches = alp
+        .patches()
+        .map(|patches| block_residual_patch_positions(patches, session))
+        .transpose()?;
+    Ok(ALP::try_new(encoded.into_array(), alp.exponents(), patches)?.into_array())
 }
 
 fn encode_block_residual_float_tree(
@@ -2611,6 +2734,36 @@ fn measure_dataset(
                     session,
                 )?;
             }
+        }
+        if std::env::var_os("VORTEX_BENCH_PATCH_POSITIONS").is_some() {
+            if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_none()
+                && std::env::var_os("VORTEX_BENCH_INT_MULT_TREE").is_none()
+            {
+                measure_existing_tree(
+                    dataset,
+                    &column.name,
+                    "default",
+                    &column.array,
+                    default_array,
+                    session,
+                )?;
+                measure_existing_tree(
+                    dataset,
+                    &column.name,
+                    "compact",
+                    &column.array,
+                    compact_array,
+                    session,
+                )?;
+            }
+            measure_block_residual_patch_positions(
+                dataset,
+                &column.name,
+                &column.array,
+                default_array,
+                compact_array,
+                session,
+            )?;
         }
     }
 

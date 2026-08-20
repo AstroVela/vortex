@@ -1371,6 +1371,38 @@ The generic decoder is also more than twice as slow as Default.
 
 Equal-width prefix bins do not justify a Default scheme.
 
+### BlockResidual patch positions
+
+The patch prototype replaces sorted ALP patch indices and chunk offsets with BlockResidual when it reduces their byte size.
+
+It leaves patch values unchanged.
+
+| Input and tree | Original bytes | Candidate bytes | Original decode MB/s | Candidate decode MB/s | Original scalar ns | Candidate scalar ns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GloVe Default | 6,274,834 | 6,071,376 | 18,077 | 17,178 | 812 | 2,076 |
+| GloVe `ALP(BlockResidual)` | 6,298,751 | 6,095,293 | 19,233 | 18,735 | 503 | 1,766 |
+| CMS Default | 11,064,308 | 11,040,803 | 24,168 | 23,111 | 934 | 1,551 |
+| CMS `ALP(BlockResidual)` | 10,716,519 | 10,693,014 | 20,678 | 19,982 | 656 | 1,241 |
+| Euro subjectivity Default | 14,234,326 | 11,211,722 | 21,055 | 16,583 | 631 | 9,801 |
+
+Food volume has no ALP patches on this input.
+
+BlockResidual saves 3.2 percent on GloVe patch trees and 21.2 percent on Euro Default.
+
+CMS saves only 0.2 percent.
+
+Patch lookup uses binary search over the index array.
+
+Compressed indices require one generic scalar read for each comparison.
+
+This path increases scalar latency by 1.7 to 15.5 times across the measured trees.
+
+Direct BlockResidual patch positions therefore do not pass the random-access gate.
+
+A future general patch backend can retain this size opportunity through a fast sorted-search kernel or a bitmap with bounded rank data.
+
+Do not add a BlockResidual special case to ALP or IntMult patch handling.
+
 ### Nullable and Delta-heavy fixed-bin cases
 
 The optimized nullable prototype stores only valid values in the range stream.
@@ -1690,14 +1722,13 @@ The nonzero-secondary FloatQuant implementation and focused validation are compl
 
 Complete these next experiments in order:
 
-1. Test BlockResidual as a general compression candidate for patch positions.
-2. Profile another direct narrow BlockResidual decode optimization for `i16`.
-3. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
-4. Define a bounded small-alphabet experiment from the remaining no-Delta gaps.
-5. Add a specialized range scheme only after a complete tree passes the column gates.
-6. Validate rejected-candidate analysis cost after the candidate set stabilizes.
-7. Prefer cheap rejection tests when they preserve the best candidate model.
-8. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Profile another direct narrow BlockResidual decode optimization for `i16`.
+2. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
+3. Define a bounded small-alphabet experiment from the remaining no-Delta gaps.
+4. Add a specialized range scheme only after a complete tree passes the column gates.
+5. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+6. Prefer cheap rejection tests when they preserve the best candidate model.
+7. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
