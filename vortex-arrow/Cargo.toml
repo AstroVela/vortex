@@ -39,22 +39,12 @@ vortex-session = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-futures = { workspace = true }
 rstest = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
-vortex-edition = { workspace = true }
-vortex-file = { workspace = true }
 vortex-fsst = { workspace = true }
-vortex-io = { workspace = true, features = ["tokio"] }
-vortex-layout = { workspace = true }
 vortex-onpair = { workspace = true }
 vortex-zstd = { workspace = true }
 
 [[bench]]
 name = "to_arrow"
-harness = false
-
-[[bench]]
-name = "string_to_arrow"
 harness = false
