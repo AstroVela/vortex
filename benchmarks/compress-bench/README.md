@@ -22,6 +22,13 @@ cargo run -p compress-bench --profile release_debug -- \
   --formats vortex,vortex-compact,parquet
 ```
 
+Compare a numeric scheme bundle with the same command and one of these values:
+
+- `--vortex-numeric-bundle prior-default`
+- `--vortex-numeric-bundle block-residual`
+- `--vortex-numeric-bundle current-default`
+- `--vortex-numeric-bundle range-packed`
+
 GPU decompression is opt-in and runs only the existing benchmark names allow-listed in
 `src/main.rs`:
 

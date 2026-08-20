@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use clap::ValueEnum;
 use futures::StreamExt;
 use futures::pin_mut;
 use vortex::array::IntoArray;
@@ -31,23 +32,40 @@ use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
+use vortex_btrblocks::schemes::float::OrderedFloatRangePackedScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
+
+const RANGE_PACKED_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.20);
+
+/// Numeric scheme bundle for the Vortex compressor benchmark.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum VortexNumericBundle {
+    /// Exclude the new numeric schemes.
+    PriorDefault,
+    /// Add the integer and ordered-float BlockResidual schemes.
+    BlockResidual,
+    /// Use the current Default compressor.
+    #[default]
+    CurrentDefault,
+    /// Add the experimental OrderedFloat with RangePacked scheme.
+    RangePacked,
+}
 
 /// Compressor implementation for Vortex format.
 pub struct VortexCompressor {
     format: Format,
-    new_numeric_schemes: bool,
+    numeric_bundle: VortexNumericBundle,
 }
 
 impl VortexCompressor {
-    pub fn new(format: Format, new_numeric_schemes: bool) -> Self {
+    pub fn new(format: Format, numeric_bundle: VortexNumericBundle) -> Self {
         assert!(matches!(
             format,
             Format::OnDiskVortex | Format::VortexCompact
         ));
         Self {
             format,
-            new_numeric_schemes,
+            numeric_bundle,
         }
     }
 
@@ -56,14 +74,21 @@ impl VortexCompressor {
         if self.format == Format::VortexCompact {
             return CompactionStrategy::Compact.apply_options(options);
         }
-        if self.new_numeric_schemes {
-            return options;
-        }
-        let compressor = BtrBlocksCompressorBuilder::default().exclude_schemes([
-            FloatQuantScheme.id(),
-            OrderedBlockResidualScheme.id(),
-            BlockResidualScheme.id(),
-        ]);
+        let compressor = match self.numeric_bundle {
+            VortexNumericBundle::PriorDefault => BtrBlocksCompressorBuilder::default()
+                .exclude_schemes([
+                    FloatQuantScheme.id(),
+                    OrderedBlockResidualScheme.id(),
+                    BlockResidualScheme.id(),
+                ]),
+            VortexNumericBundle::BlockResidual => {
+                BtrBlocksCompressorBuilder::default().exclude_schemes([FloatQuantScheme.id()])
+            }
+            VortexNumericBundle::CurrentDefault => BtrBlocksCompressorBuilder::default(),
+            VortexNumericBundle::RangePacked => {
+                BtrBlocksCompressorBuilder::default().with_new_scheme(&RANGE_PACKED_SCHEME)
+            }
+        };
         options.with_strategy(
             WriteStrategyBuilder::default()
                 .with_btrblocks_builder(compressor)

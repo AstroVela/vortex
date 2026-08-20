@@ -19,7 +19,8 @@ Transfer that model into a native array only when it preserves these Default pro
 - Full decode remains close to the displaced encoding.
 - Compression throughput remains close to the displaced encoding.
 - Scalar access remains O(1) or bounded O(log N).
-- Rejected candidates add little selector cost.
+- Selector cost remains proportionate to measured gains.
+- Cheap rejection lowers the evidence bar, but it is not required.
 - The size gain remains material after native array overhead.
 
 Compact can use experimental schemes during evaluation. Default selection remains the release decision.
@@ -65,7 +66,7 @@ Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution D
 
 The branch implements `OrderedFloatArray`, `BlockResidualArray`, `FloatQuantArray`, and `IntMultArray`.
 
-The default candidate set includes BtrBlocks schemes for the first three arrays.
+The evaluation set includes BtrBlocks schemes for the first three arrays.
 
 IntMult does not have a BtrBlocks scheme yet.
 
@@ -82,6 +83,8 @@ Direct integer BlockResidual supports every integer type. The default selector a
 The retained schemes win on specific structures. They do not replace ALP or ALP-RD across general float data.
 
 FloatQuant now passes the speed gates for zero-secondary and one-bit-secondary inputs.
+
+The complete file corpus does not yet justify FloatQuant in Default.
 
 BlockResidual now passes the direct speed gates for 32-bit and 64-bit integers.
 
@@ -1784,6 +1787,59 @@ The ALP candidate remains experimental until independent columns justify its ana
 
 This split does not reject all selectors with expensive analysis. It reflects the current selection evidence for these two transforms.
 
+### Complete bundle controls
+
+The compression benchmark exposes four numeric bundles:
+
+- `prior-default`
+- `block-residual`
+- `current-default`
+- `range-packed`
+
+All bundles use the same file strategy construction.
+
+The complete pass covered 16 datasets with three iterations per operation.
+
+The BlockResidual bundle produced this geometric-mean change against Prior Default:
+
+| Scope | Size change | Write throughput change | Read throughput change |
+| --- | ---: | ---: | ---: |
+| Numeric files | -2.6 percent | +0.0 percent | +2.0 percent |
+| Real files | -2.5 percent | +0.0 percent | +0.9 percent |
+| All files | -1.6 percent | -0.9 percent | +1.3 percent |
+
+This result supports BlockResidual as the primary Default bundle.
+
+The first FloatQuant pass exposed two selector errors.
+
+HashTags produced a constant FloatQuant sample and an estimated ratio of 8,193.
+
+Full analysis rejected the transform. The failed winner then blocked a compact Sparse tree.
+
+FloatQuant now rejects a constant sample. The main compressor already handles true constant arrays.
+
+Food selected FloatQuant from a 1.94 sample ratio. Its full ratio was 1.73.
+
+ALP had a 1.80 sample ratio and a 2.51 full ratio on the same chunk.
+
+A provisional 1.10 FloatQuant factor retained every focused FloatQuant selection test and rejected this Food choice.
+
+The corrected FloatQuant bundle produced this change against the BlockResidual bundle:
+
+| Scope | Size change | Write throughput change | Read throughput change |
+| --- | ---: | ---: | ---: |
+| 16-file corpus | 0.0 percent | -0.9 percent | -0.8 percent |
+
+Every file size matched exactly.
+
+No selected-tree evidence supports a read difference. Treat the measured read change as noise.
+
+The write result measures FloatQuant analysis without a size win in this corpus.
+
+FloatQuant remains a production array and a BtrBlocks candidate.
+
+Default inclusion now requires a real Pco-gap win with the 1.10 factor.
+
 ### Multi-reference block prototype
 
 The prototype stores up to four quantile references per 1,024-value block.
@@ -2036,6 +2092,12 @@ This round completed these steps:
 - Added a coarse RangePacked rejection model over the existing one-percent sample.
 - Added a locality rejection test that retains Euro and rejects clear BlockResidual fits.
 - Updated stale golden trees after the BlockResidual payload and selector changes.
+- Added four numeric bundle controls to the complete compression benchmark.
+- Added explicit winner result events to the compressor trace.
+- Rejected constant FloatQuant samples before exact sample encoding.
+- Added a provisional 1.10 FloatQuant selection factor.
+- Removed the Food and HashTags FloatQuant size regressions.
+- Revalidated the BlockResidual and FloatQuant bundles across 16 files.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2049,11 +2111,12 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Complete these next experiments in order:
 
-1. Validate frequency-ranked Dict and full-position RangePacked across the complete file corpus.
-2. Measure rejected-candidate analysis cost after the candidate set stabilizes.
-3. Prefer cheap rejection tests when they preserve the best candidate model.
-4. Treat fast rejection as a selection advantage, not an admission criterion.
-5. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Find real Pco-gap columns that retain FloatQuant with the 1.10 factor.
+2. Revalidate full-position RangePacked after the FloatQuant selector corrections.
+3. Measure rejected-candidate analysis cost after the candidate set stabilizes.
+4. Prefer cheap rejection tests when they preserve the best candidate model.
+5. Treat fast rejection as a selection advantage, not an admission criterion.
+6. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

@@ -10,6 +10,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VTable;
 use vortex_array::arrays::Primitive;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::half::f16;
@@ -33,6 +34,9 @@ use crate::CompressorContext;
 use crate::Scheme;
 use crate::normalize_null_values;
 use crate::schemes::sample_primitive_one_percent;
+
+// Prefer incumbents on close fits. FloatQuant sample estimates can overstate full-array gains.
+const SELECTION_COST_FACTOR: f64 = 1.10;
 
 /// FloatQuant split with a fixed frame-of-reference primary child.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -63,19 +67,7 @@ impl Scheme for FloatQuantScheme {
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
             |_compressor, data, _best_so_far, _compress_ctx, exec_ctx| {
                 let sample = sample_primitive_one_percent(data.array_as_primitive(), exec_ctx)?;
-                let Some(analysis) = analyze_float_quant(sample.as_view()) else {
-                    return Ok(EstimateVerdict::Skip);
-                };
-                let before_nbytes = sample.nbytes();
-                let compressed = encode_float_quant(sample.as_view(), analysis)?;
-                let after_nbytes = compressed.nbytes();
-                if after_nbytes == 0 || after_nbytes >= before_nbytes {
-                    return Ok(EstimateVerdict::Skip);
-                }
-
-                Ok(EstimateVerdict::Ratio(
-                    before_nbytes as f64 / after_nbytes as f64,
-                ))
+                estimate_float_quant_sample(&sample)
             },
         )))
     }
@@ -94,6 +86,30 @@ impl Scheme for FloatQuantScheme {
         };
         encode_float_quant(primitive.as_view(), analysis)
     }
+}
+
+fn estimate_float_quant_sample(sample: &PrimitiveArray) -> VortexResult<EstimateVerdict> {
+    let Some(analysis) = analyze_float_quant(sample.as_view()) else {
+        return Ok(EstimateVerdict::Skip);
+    };
+    // A constant sample does not prove that the full array is constant.
+    if analysis.primary_bit_width == 0 && analysis.secondary_bit_width == 0 {
+        return Ok(EstimateVerdict::Skip);
+    }
+
+    let before_nbytes = sample.nbytes();
+    let compressed = encode_float_quant(sample.as_view(), analysis)?;
+    let after_nbytes = compressed.nbytes();
+    if after_nbytes == 0 || after_nbytes >= before_nbytes {
+        return Ok(EstimateVerdict::Skip);
+    }
+
+    let adjusted_ratio = before_nbytes as f64 / after_nbytes as f64 / SELECTION_COST_FACTOR;
+    if adjusted_ratio <= 1.0 {
+        return Ok(EstimateVerdict::Skip);
+    }
+
+    Ok(EstimateVerdict::Ratio(adjusted_ratio))
 }
 
 fn encode_float_quant(
@@ -259,5 +275,25 @@ fn ordered_u64(bits: u64) -> u64 {
         bits ^ (1_u64 << 63)
     } else {
         !bits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_compressor::scheme::EstimateVerdict;
+    use vortex_error::VortexResult;
+
+    use super::estimate_float_quant_sample;
+
+    #[test]
+    fn constant_sample_is_not_evidence_for_float_quant() -> VortexResult<()> {
+        let sample = PrimitiveArray::from_iter(vec![1.0_f64; 1_024]);
+
+        assert!(matches!(
+            estimate_float_quant_sample(&sample)?,
+            EstimateVerdict::Skip
+        ));
+        Ok(())
     }
 }

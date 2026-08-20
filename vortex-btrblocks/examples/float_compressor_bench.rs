@@ -2784,6 +2784,27 @@ fn measure_dataset(
         }
     }
 
+    if std::env::var_os("VORTEX_BENCH_CONFIG_TREES").is_some() {
+        for (config, arrays) in &encoded {
+            for (column, array) in columns.iter().zip(arrays) {
+                if column
+                    .primitive
+                    .as_ref()
+                    .is_some_and(|primitive| primitive.ptype().is_float())
+                {
+                    measure_existing_tree(
+                        dataset,
+                        &column.name,
+                        config,
+                        &column.array,
+                        array,
+                        session,
+                    )?;
+                }
+            }
+        }
+    }
+
     if std::env::var_os("VORTEX_BENCH_SKIP_AUXILIARY_ANALYSIS").is_none() {
         let prior_default = encoded
             .iter()
@@ -3036,6 +3057,12 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
             "integer-block-residual-only",
             BtrBlocksCompressorBuilder::default()
                 .exclude_schemes([FloatQuantScheme.id(), OrderedBlockResidualScheme.id()])
+                .build(),
+        ),
+        (
+            "block-residual-bundle",
+            BtrBlocksCompressorBuilder::default()
+                .exclude_schemes([FloatQuantScheme.id()])
                 .build(),
         ),
         (

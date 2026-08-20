@@ -11,6 +11,7 @@ use compress_bench::LanceCompressor;
 use compress_bench::gpu_vortex::GpuVortexCompressor;
 use compress_bench::parquet::ParquetCompressor;
 use compress_bench::vortex::VortexCompressor;
+use compress_bench::vortex::VortexNumericBundle;
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use regex::Regex;
@@ -82,9 +83,9 @@ struct Args {
     ingest_output: Option<PathBuf>,
     #[arg(long)]
     tracing: bool,
-    /// Exclude FloatQuant and block-residual schemes from Vortex compression.
-    #[arg(long)]
-    vortex_without_new_numeric: bool,
+    /// Select the numeric scheme bundle for Vortex compression.
+    #[arg(long, value_enum, default_value_t)]
+    vortex_numeric_bundle: VortexNumericBundle,
     /// Format for the primary stderr log sink. `text` is the default human-readable format;
     /// `json` emits one JSON object per event, suitable for piping into `jq`.
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
@@ -116,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         args.display_format,
         args.output_path,
         args.ingest_output,
-        args.vortex_without_new_numeric,
+        args.vortex_numeric_bundle,
     )
     .await
 }
@@ -125,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
 fn get_compressor(
     format: Format,
     gpu_decompress: bool,
-    vortex_without_new_numeric: bool,
+    vortex_numeric_bundle: VortexNumericBundle,
 ) -> Box<dyn Compressor> {
     if gpu_decompress {
         #[cfg(feature = "cuda")]
@@ -139,9 +140,12 @@ fn get_compressor(
     match format {
         Format::OnDiskVortex => Box::new(VortexCompressor::new(
             Format::OnDiskVortex,
-            !vortex_without_new_numeric,
+            vortex_numeric_bundle,
         )),
-        Format::VortexCompact => Box::new(VortexCompressor::new(Format::VortexCompact, true)),
+        Format::VortexCompact => Box::new(VortexCompressor::new(
+            Format::VortexCompact,
+            VortexNumericBundle::CurrentDefault,
+        )),
         Format::Parquet => Box::new(ParquetCompressor::new()),
         #[cfg(feature = "lance")]
         Format::Lance => Box::new(LanceCompressor),
@@ -168,7 +172,7 @@ async fn run_compress(
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
     ingest_output: Option<PathBuf>,
-    vortex_without_new_numeric: bool,
+    vortex_numeric_bundle: VortexNumericBundle,
 ) -> anyhow::Result<()> {
     let targets = formats
         .iter()
@@ -248,7 +252,7 @@ async fn run_compress(
             iterations,
             dataset_handle,
             gpu_decompress,
-            vortex_without_new_numeric,
+            vortex_numeric_bundle,
         )
         .await?;
         measurements.push(m);
@@ -292,7 +296,7 @@ async fn run_benchmark_for_dataset(
     iterations: usize,
     dataset_handle: &dyn Dataset,
     gpu_decompress: bool,
-    vortex_without_new_numeric: bool,
+    vortex_numeric_bundle: VortexNumericBundle,
 ) -> anyhow::Result<(CompressMeasurements, Vec<v3::V3Record>)> {
     let bench_name = dataset_handle.name();
     let (v3_dataset, v3_variant) = dataset_handle.v3_dataset_dims();
@@ -308,7 +312,7 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, gpu_decompress, vortex_without_new_numeric);
+        let compressor = get_compressor(*format, gpu_decompress, vortex_numeric_bundle);
 
         for op in ops {
             let time = match op {
