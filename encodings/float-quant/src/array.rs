@@ -25,6 +25,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability::NonNullable;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::half::f16;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::vtable::OperationsVTable;
@@ -243,6 +244,29 @@ impl OperationsVTable<FloatQuant> for FloatQuant {
         }
         let k = array.data().k;
         Ok(match PType::try_from(array.dtype())? {
+            PType::F16 => Scalar::primitive(
+                join_f16(
+                    primary
+                        .as_primitive()
+                        .typed_value::<u16>()
+                        .vortex_expect("validated primary scalar"),
+                    array
+                        .secondary()
+                        .map(|secondary| {
+                            secondary
+                                .execute_scalar(index, ctx)?
+                                .as_primitive()
+                                .typed_value::<u16>()
+                                .ok_or_else(|| {
+                                    vortex_error::vortex_err!("validated secondary scalar is null")
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(0),
+                    k,
+                ),
+                array.dtype().nullability(),
+            ),
             PType::F32 => Scalar::primitive(
                 join_f32(
                     primary
@@ -329,6 +353,18 @@ impl FloatQuant {
     pub fn from_primitive(array: ArrayView<'_, Primitive>, k: u8) -> VortexResult<FloatQuantArray> {
         let validity = array.validity()?;
         match array.ptype() {
+            PType::F16 => {
+                let (primary, secondary) = split_f16(array.as_slice::<f16>(), k)?;
+                Self::try_new(
+                    PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
+                    Some(
+                        PrimitiveArray::new(Buffer::from(secondary), NonNullable.into())
+                            .into_array(),
+                    ),
+                    PType::F16,
+                    k,
+                )
+            }
             PType::F32 => {
                 let (primary, secondary) = split_f32(array.as_slice::<f32>(), k)?;
                 Self::try_new(
@@ -353,7 +389,7 @@ impl FloatQuant {
                     k,
                 )
             }
-            ptype => vortex_bail!("FloatQuant requires f32 or f64, got {ptype}"),
+            ptype => vortex_bail!("FloatQuant requires f16, f32, or f64, got {ptype}"),
         }
     }
 
@@ -364,6 +400,15 @@ impl FloatQuant {
     ) -> VortexResult<FloatQuantArray> {
         let validity = array.validity()?;
         match array.ptype() {
+            PType::F16 => {
+                let primary = split_primary_f16(array.as_slice::<f16>(), k)?;
+                Self::try_new(
+                    PrimitiveArray::new(Buffer::from(primary), validity).into_array(),
+                    None,
+                    PType::F16,
+                    k,
+                )
+            }
             PType::F32 => {
                 let primary = split_primary_f32(array.as_slice::<f32>(), k)?;
                 Self::try_new(
@@ -382,7 +427,7 @@ impl FloatQuant {
                     k,
                 )
             }
-            ptype => vortex_bail!("FloatQuant requires f32 or f64, got {ptype}"),
+            ptype => vortex_bail!("FloatQuant requires f16, f32, or f64, got {ptype}"),
         }
     }
 
@@ -394,6 +439,11 @@ impl FloatQuant {
     ) -> VortexResult<PrimitiveArray> {
         let validity = array.validity()?;
         match array.ptype() {
+            PType::F16 => {
+                let primary_min = u16::try_from(primary_min)?;
+                let primary = split_primary_for_f16(array.as_slice::<f16>(), k, primary_min)?;
+                Ok(PrimitiveArray::new(Buffer::from(primary), validity))
+            }
             PType::F32 => {
                 let primary_min = u32::try_from(primary_min)?;
                 let primary = split_primary_for_f32(array.as_slice::<f32>(), k, primary_min)?;
@@ -403,7 +453,7 @@ impl FloatQuant {
                 let primary = split_primary_for_f64(array.as_slice::<f64>(), k, primary_min)?;
                 Ok(PrimitiveArray::new(Buffer::from(primary), validity))
             }
-            ptype => vortex_bail!("FloatQuant requires f32 or f64, got {ptype}"),
+            ptype => vortex_bail!("FloatQuant requires f16, f32, or f64, got {ptype}"),
         }
     }
 }
@@ -429,6 +479,7 @@ pub fn estimate_k(array: ArrayView<'_, Primitive>) -> Option<u8> {
 /// Analyze a canonical float array for a FloatQuant split.
 pub fn analyze_float_quant(array: ArrayView<'_, Primitive>) -> Option<FloatQuantAnalysis> {
     match array.ptype() {
+        PType::F16 => analyze_f16(array.as_slice::<f16>()),
         PType::F32 => analyze_f32(array.as_slice::<f32>()),
         PType::F64 => analyze_f64(array.as_slice::<f64>()),
         _ => None,
@@ -482,6 +533,26 @@ fn analyze_bits(
     })
 }
 
+fn analyze_f16(values: &[f16]) -> Option<FloatQuantAnalysis> {
+    let mut minimum = u16::MAX;
+    let mut maximum = u16::MIN;
+    let mut low_bits_or = 0_u16;
+    for value in values {
+        let bits = value.to_bits();
+        let ordered = ordered_u16(bits);
+        minimum = minimum.min(ordered);
+        maximum = maximum.max(ordered);
+        low_bits_or |= bits;
+    }
+    analyze_bits(
+        u64::from(low_bits_or),
+        10,
+        values.len(),
+        u64::from(minimum),
+        u64::from(maximum),
+    )
+}
+
 fn analyze_f32(values: &[f32]) -> Option<FloatQuantAnalysis> {
     let mut minimum = u32::MAX;
     let mut maximum = u32::MIN;
@@ -518,17 +589,27 @@ fn analyze_f64(values: &[f64]) -> Option<FloatQuantAnalysis> {
 
 fn latent_ptype(ptype: PType) -> VortexResult<PType> {
     match ptype {
+        PType::F16 => Ok(PType::U16),
         PType::F32 => Ok(PType::U32),
         PType::F64 => Ok(PType::U64),
-        _ => vortex_bail!("FloatQuant requires f32 or f64, got {ptype}"),
+        _ => vortex_bail!("FloatQuant requires f16, f32, or f64, got {ptype}"),
     }
 }
 
 fn precision_bits(ptype: PType) -> VortexResult<u8> {
     match ptype {
+        PType::F16 => Ok(10),
         PType::F32 => Ok(23),
         PType::F64 => Ok(52),
-        _ => vortex_bail!("FloatQuant requires f32 or f64, got {ptype}"),
+        _ => vortex_bail!("FloatQuant requires f16, f32, or f64, got {ptype}"),
+    }
+}
+
+fn ordered_u16(bits: u16) -> u16 {
+    if bits & (1_u16 << 15) == 0 {
+        bits ^ (1_u16 << 15)
+    } else {
+        !bits
     }
 }
 
@@ -546,6 +627,25 @@ fn ordered_u64(bits: u64) -> u64 {
     } else {
         !bits
     }
+}
+
+fn split_f16(values: &[f16], k: u8) -> VortexResult<(Vec<u16>, Vec<u16>)> {
+    vortex_ensure!(k > 0 && k <= 10, "FloatQuant f16 k must be in 1..=10");
+    let low_mask = (1_u16 << k) - 1;
+    let mut primary = Vec::with_capacity(values.len());
+    let mut secondary = Vec::with_capacity(values.len());
+    for &value in values {
+        let bits = value.to_bits();
+        let ordered = ordered_u16(bits);
+        primary.push(ordered >> k);
+        let low = ordered & low_mask;
+        secondary.push(if bits & (1_u16 << 15) == 0 {
+            low
+        } else {
+            low_mask - low
+        });
+    }
+    Ok((primary, secondary))
 }
 
 fn split_f32(values: &[f32], k: u8) -> VortexResult<(Vec<u32>, Vec<u32>)> {
@@ -599,6 +699,19 @@ fn split_primary_f32(values: &[f32], k: u8) -> VortexResult<Vec<u32>> {
         .collect())
 }
 
+fn split_primary_f16(values: &[f16], k: u8) -> VortexResult<Vec<u16>> {
+    vortex_ensure!(k > 0 && k <= 10, "FloatQuant f16 k must be in 1..=10");
+    let low_mask = (1_u16 << k) - 1;
+    vortex_ensure!(
+        values.iter().all(|value| value.to_bits() & low_mask == 0),
+        "FloatQuant constant secondary requires zero low bits"
+    );
+    Ok(values
+        .iter()
+        .map(|value| ordered_u16(value.to_bits()) >> k)
+        .collect())
+}
+
 fn split_primary_f64(values: &[f64], k: u8) -> VortexResult<Vec<u64>> {
     vortex_ensure!(k > 0 && k <= 52, "FloatQuant f64 k must be in 1..=52");
     let low_mask = (1_u64 << k) - 1;
@@ -625,6 +738,19 @@ fn split_primary_for_f32(values: &[f32], k: u8, primary_min: u32) -> VortexResul
         .collect())
 }
 
+fn split_primary_for_f16(values: &[f16], k: u8, primary_min: u16) -> VortexResult<Vec<u16>> {
+    vortex_ensure!(k > 0 && k <= 10, "FloatQuant f16 k must be in 1..=10");
+    let low_mask = (1_u16 << k) - 1;
+    vortex_ensure!(
+        values.iter().all(|value| value.to_bits() & low_mask == 0),
+        "FloatQuant constant secondary requires zero low bits"
+    );
+    Ok(values
+        .iter()
+        .map(|value| (ordered_u16(value.to_bits()) >> k) - primary_min)
+        .collect())
+}
+
 fn split_primary_for_f64(values: &[f64], k: u8, primary_min: u64) -> VortexResult<Vec<u64>> {
     vortex_ensure!(k > 0 && k <= 52, "FloatQuant f64 k must be in 1..=52");
     let low_mask = (1_u64 << k) - 1;
@@ -636,6 +762,23 @@ fn split_primary_for_f64(values: &[f64], k: u8, primary_min: u64) -> VortexResul
         .iter()
         .map(|value| (ordered_u64(value.to_bits()) >> k) - primary_min)
         .collect())
+}
+
+fn join_f16(primary: u16, secondary: u16, k: u8) -> f16 {
+    let low_mask = (1_u16 << k) - 1;
+    let sign_cutoff = (1_u16 << 15) >> k;
+    let low = if primary >= sign_cutoff {
+        secondary
+    } else {
+        low_mask.wrapping_sub(secondary)
+    };
+    let ordered = (primary << k).wrapping_add(low);
+    let bits = if ordered & (1_u16 << 15) == 0 {
+        !ordered
+    } else {
+        ordered ^ (1_u16 << 15)
+    };
+    f16::from_bits(bits)
 }
 
 fn join_f32(primary: u32, secondary: u32, k: u8) -> f32 {
@@ -685,6 +828,19 @@ fn join_zero_f32(primary: u32, k: u8) -> f32 {
     f32::from_bits(bits)
 }
 
+fn join_zero_f16(primary: u16, k: u8) -> f16 {
+    let low_mask = (1_u16 << k) - 1;
+    let sign_cutoff = (1_u16 << 15) >> k;
+    let low = if primary >= sign_cutoff { 0 } else { low_mask };
+    let ordered = (primary << k).wrapping_add(low);
+    let bits = if ordered & (1_u16 << 15) == 0 {
+        !ordered
+    } else {
+        ordered ^ (1_u16 << 15)
+    };
+    f16::from_bits(bits)
+}
+
 fn join_zero_f64(primary: u64, k: u8) -> f64 {
     let low_mask = (1_u64 << k) - 1;
     let sign_cutoff = (1_u64 << 63) >> k;
@@ -711,6 +867,13 @@ fn decode(
     let k = array.data().k;
     let Some(secondary) = array.secondary() else {
         return Ok(match PType::try_from(array.dtype())? {
+            PType::F16 => PrimitiveArray::new(
+                primary
+                    .into_buffer::<u16>()
+                    .map_each_in_place(|primary| join_zero_f16(primary, k))
+                    .freeze(),
+                validity,
+            ),
             PType::F32 => PrimitiveArray::new(
                 primary
                     .into_buffer::<u32>()
@@ -730,6 +893,19 @@ fn decode(
     };
     let secondary = secondary.clone().execute::<PrimitiveArray>(ctx)?;
     Ok(match PType::try_from(array.dtype())? {
+        PType::F16 => {
+            let secondary_values = secondary.as_slice::<u16>();
+            let mut index = 0;
+            let values = primary
+                .into_buffer::<u16>()
+                .map_each_in_place(|primary| {
+                    let value = join_f16(primary, secondary_values[index], k);
+                    index += 1;
+                    value
+                })
+                .freeze();
+            PrimitiveArray::new(values, validity)
+        }
         PType::F32 => {
             let secondary_values = secondary.as_slice::<u32>();
             let mut index = 0;
@@ -783,6 +959,19 @@ fn decode_fastlanes_pair(array: ArrayView<'_, FloatQuant>) -> VortexResult<Optio
     let validity = primary.validity()?;
     let k = array.data().k;
     Ok(Some(match PType::try_from(array.dtype())? {
+        PType::F16 => {
+            let reference = primary_for
+                .reference_scalar()
+                .as_primitive()
+                .typed_value::<u16>()
+                .vortex_expect("validated f16 primary reference");
+            PrimitiveArray::new(
+                unpack_pair_map::<u16, f16, _>(primary, secondary, |primary, secondary| {
+                    join_f16(primary.wrapping_add(reference), secondary, k)
+                })?,
+                validity,
+            )
+        }
         PType::F32 => {
             let reference = primary_for
                 .reference_scalar()
@@ -840,6 +1029,34 @@ mod tests {
     });
 
     #[test]
+    fn f16_bit_patterns_roundtrip() -> VortexResult<()> {
+        let values = [
+            f16::from_bits(0xfc00),
+            f16::from_f32(-1.5),
+            f16::NEG_ZERO,
+            f16::ZERO,
+            f16::from_f32(1.5),
+            f16::INFINITY,
+            f16::from_bits(0x7e34),
+            f16::from_bits(0xfe56),
+        ];
+        let array = PrimitiveArray::from_iter(values);
+        let encoded = FloatQuant::from_primitive(array.as_view(), 5)?;
+        let decoded = encoded
+            .into_array()
+            .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
+        assert_eq!(
+            decoded
+                .as_slice::<f16>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f16::to_bits)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fixed_tree_analysis_accounts_for_secondary_width() -> VortexResult<()> {
         let values = PrimitiveArray::from_iter((0_u32..4096).map(|index| {
             let value = f64::from(f32::from_bits(0x3f80_0000 | index.wrapping_mul(7_919)));
@@ -890,6 +1107,47 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         Ok(())
+    }
+
+    #[test]
+    fn f32_bit_patterns_roundtrip() -> VortexResult<()> {
+        let values = [
+            f32::NEG_INFINITY,
+            -1.5,
+            -0.0,
+            0.0,
+            1.5,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0xffc0_5678),
+        ];
+        let array = PrimitiveArray::from_iter(values);
+        let encoded = FloatQuant::from_primitive(array.as_view(), 8)?;
+        let decoded = encoded
+            .into_array()
+            .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
+        assert_eq!(
+            decoded
+                .as_slice::<f32>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f32::to_bits)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_split_shapes() {
+        let primary = PrimitiveArray::from_iter([0_u32, 1, 2]).into_array();
+        assert!(FloatQuant::try_new(primary.clone(), None, PType::F32, 0).is_err());
+        assert!(FloatQuant::try_new(primary.clone(), None, PType::F32, 24).is_err());
+        assert!(FloatQuant::try_new(primary.clone(), None, PType::U32, 8).is_err());
+
+        let wrong_ptype = PrimitiveArray::from_iter([0_u64, 1, 2]).into_array();
+        assert!(FloatQuant::try_new(primary.clone(), Some(wrong_ptype), PType::F32, 8).is_err());
+        let nullable = PrimitiveArray::from_option_iter([Some(0_u32), None, Some(2)]).into_array();
+        assert!(FloatQuant::try_new(primary, Some(nullable), PType::F32, 8).is_err());
     }
 
     #[test]

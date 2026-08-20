@@ -69,13 +69,13 @@ The default candidate set includes BtrBlocks schemes for the first three arrays.
 
 IntMult does not have a BtrBlocks scheme yet.
 
-`OrderedFloat(BlockResidual)` now supports `f32` and `f64` inputs.
+`OrderedFloat(BlockResidual)` now supports `f16`, `f32`, and `f64` inputs.
 
 The float scheme applies `OrderedFloat` first, then `BlockResidual` to the unsigned child.
 
 The serialized tree uses `OrderedFloat(BlockResidual(...))` because the outer array restores the float dtype.
 
-The FloatQuant candidate accepts native `f32` and `f64` inputs.
+The FloatQuant candidate accepts native `f16`, `f32`, and `f64` inputs.
 
 Direct integer BlockResidual supports every integer type. The default selector accepts only 32-bit and 64-bit inputs.
 
@@ -107,6 +107,35 @@ The current branch recovers a small share of Compact's aggregate numeric advanta
 
 The remaining work targets repeated Compact mechanisms with native, bounded-access trees.
 
+## Array support and validation
+
+The array API and the Default selector use separate type policies.
+
+An array supports each natural logical type unless the transform has a structural restriction.
+
+The Default selector can exclude a supported type when measured costs do not justify selection.
+
+| Array | Supported logical types | Default policy |
+| --- | --- | --- |
+| OrderedFloat | `f16`, `f32`, `f64` | All float types remain eligible. |
+| BlockResidual | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | Direct selection uses 32-bit and 64-bit integers. |
+| FloatQuant | `f16`, `f32`, `f64` | All float types remain eligible. |
+| IntMult | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | No Default scheme exists yet. |
+
+OrderedFloat validates the logical float type, unsigned child width, child nullability, child length, and empty metadata.
+
+FloatQuant validates the metadata version, split width, latent child types, child nullability, and child lengths.
+
+IntMult validates the metadata version, positive base, base range, matching child types, child nullability, and child lengths.
+
+BlockResidual validates every payload offset table before decode or scalar access.
+
+It also validates bases, bit widths, packed word counts, patch counts, patch order, patch bounds, and validity length.
+
+Bit-exact tests cover signed zero values, infinities, and NaN payloads for every float width.
+
+Round-trip tests cover every signed and unsigned integer width.
+
 ## OrderedFloatArray
 
 `OrderedFloatArray` maps IEEE float bits to unsigned integers with the same order.
@@ -115,7 +144,9 @@ The transform preserves every bit pattern. It also preserves nulls and signed ze
 
 The array stores one unsigned child. Empty metadata identifies the transform.
 
-The array supports canonical decode, scalar access, slice reduction, serialization, and validation.
+The array supports `f16`, `f32`, and `f64` values.
+
+It supports canonical decode, scalar access, slice reduction, serialization, and validation.
 
 ## BlockResidualArray
 
@@ -164,7 +195,7 @@ The kernel unpacks both aligned children and reconstructs each float in one pass
 
 The array supports exact IEEE bit-pattern round trips, nulls, slices, scalar access, and serialization.
 
-The automatic scheme accepts `f32` and `f64` inputs.
+The automatic scheme accepts `f16`, `f32`, and `f64` inputs.
 
 Native `f32` and two-child selection meet the selected-column and rejected-column throughput limits.
 
@@ -199,6 +230,20 @@ It then unpacks dictionary codes and adds the selected reference directly.
 This path avoids a full materialized array of references.
 
 ## Selection policy
+
+Fast rejection is a strong preference for schemes in normal Default recursion.
+
+A cheap rejection path reads a bounded sample and avoids child compression when the model does not fit.
+
+This path lets Default test more encodings with little throughput loss on rejected columns.
+
+Fast rejection is not a hard gate.
+
+A scheme with costly analysis can enter Default when corpus evidence shows larger size or decode gains.
+
+Specialized schemes remain useful when they bypass depth limits, recursive search, or an unfused common tree.
+
+Measure rejected-column cost separately from selected-column encode cost.
 
 `FloatQuantScheme` uses the normal sample comparison against ALP, ALP-RD, dictionary, sparse, and RLE schemes.
 
@@ -288,10 +333,18 @@ These cases use canonical primitive children. They isolate each outer array tran
 
 | Array and input | Encode | Decode | Scalar access |
 | --- | ---: | ---: | ---: |
+| OrderedFloat `f16` | 59.11 GB/s | 59.09 GB/s | 77 ns |
 | OrderedFloat `f32` | 52.38 GB/s | 60.47 GB/s | 82 ns |
 | OrderedFloat `f64` | 58.78 GB/s | 42.78 GB/s | 90 ns |
-| IntMult base-ten `i32` | 2.83 GB/s | 30.43 GB/s | 125 ns |
-| IntMult base-ten `u64` | 5.67 GB/s | 25.24 GB/s | 140 ns |
+| IntMult base-ten `i8` | 0.72 GB/s | 29.98 GB/s | 125 ns |
+| IntMult base-ten `i16` | 1.41 GB/s | 29.68 GB/s | 105 ns |
+| IntMult base-ten `i32` | 2.82 GB/s | 29.84 GB/s | 100 ns |
+| IntMult base-ten `i64` | 5.57 GB/s | 24.80 GB/s | 169 ns |
+| IntMult base-ten `u8` | 0.70 GB/s | 29.63 GB/s | 125 ns |
+| IntMult base-ten `u16` | 1.42 GB/s | 30.59 GB/s | 160 ns |
+| IntMult base-ten `u32` | 2.84 GB/s | 30.51 GB/s | 136 ns |
+| IntMult base-ten `u64` | 5.66 GB/s | 24.57 GB/s | 150 ns |
+| FloatQuant zero-secondary `f16` | 6.84 GB/s | 31.24 GB/s | 80 ns |
 | FloatQuant zero-secondary `f32` | 11.66 GB/s | 31.17 GB/s | 83 ns |
 | FloatQuant zero-secondary `f64` | 19.02 GB/s | 25.15 GB/s | 83 ns |
 | FloatQuant one-bit-secondary `f64` | 9.26 GB/s | 8.14 GB/s | 167 ns |
@@ -310,12 +363,18 @@ These cases include the current compressed children and fused decode paths.
 
 | Array tree and input | Encode | Decode | Scalar access |
 | --- | ---: | ---: | ---: |
-| BlockResidual `i16` | 1.41 GB/s | 32.03 GB/s | 83 ns |
-| BlockResidual `i32` | 2.80 GB/s | 33.07 GB/s | 57 ns |
-| BlockResidual `u32` | 2.79 GB/s | 45.99 GB/s | 60 ns |
-| BlockResidual `u64` | 5.18 GB/s | 37.72 GB/s | 83 ns |
+| BlockResidual `i8` | 0.56 GB/s | 30.53 GB/s | 44 ns |
+| BlockResidual `i16` | 1.40 GB/s | 31.31 GB/s | 39 ns |
+| BlockResidual `i32` | 2.72 GB/s | 33.89 GB/s | 40 ns |
+| BlockResidual `i64` | 4.93 GB/s | 35.88 GB/s | 42 ns |
+| BlockResidual `u8` | 0.55 GB/s | 30.14 GB/s | 35 ns |
+| BlockResidual `u16` | 1.31 GB/s | 32.55 GB/s | 61 ns |
+| BlockResidual `u32` | 2.67 GB/s | 46.61 GB/s | 48 ns |
+| BlockResidual `u64` | 4.97 GB/s | 35.56 GB/s | 40 ns |
+| OrderedFloat with BlockResidual `f16` | 1.26 GB/s | 20.50 GB/s | 79 ns |
 | OrderedFloat with BlockResidual `f32` | 2.43 GB/s | 29.64 GB/s | 78 ns |
 | OrderedFloat with BlockResidual `f64` | 2.70 GB/s | 20.44 GB/s | 125 ns |
+| FloatQuant with packed primary `f16` | 3.42 GB/s | 19.39 GB/s | 129 ns |
 | FloatQuant with packed primary `f32` | 7.59 GB/s | 18.21 GB/s | 125 ns |
 | FloatQuant with packed primary `f64` | 8.30 GB/s | 14.77 GB/s | 125 ns |
 | FloatQuant with two packed children `f64` | 4.21 GB/s | 13.05 GB/s | 209 ns |
@@ -582,6 +641,31 @@ On rejected general `f32` data, the proposed default compressed at 390 MB/s.
 The prior default compressed at 394 MB/s. The difference is 1.2 percent.
 
 The Compact size is specific to this synthetic pattern. It does not establish a general real-float result.
+
+### Native f16 coverage
+
+The audit added `f16` support to OrderedFloat, OrderedFloat with BlockResidual, FloatQuant, and FloatQuantScheme.
+
+The test corpus covers zero low bits, nonzero secondary bits, signed zero values, infinities, and NaN payloads.
+
+The quantized input contains two million `f16` values with four zero low mantissa bits.
+
+| Configuration | Bytes | Encode MB/s | Decode MB/s |
+| --- | ---: | ---: | ---: |
+| Prior default | 1,500,800 | 368.1 | 7,268 |
+| Default with FloatQuant | 1,500,672 | 1,018 | 19,450 |
+
+The selected Default tree is `FloatQuant(FoR(BitPacked))`.
+
+It uses nearly the same space as the prior dictionary-like tree.
+
+Compression throughput increased by 2.77 times. Decode throughput increased by 2.68 times.
+
+On general rejected `f16` values, median compression throughput decreased by 1.8 percent.
+
+The `f16` BlockResidual tree decoded at 20.50 GB/s. Its generic inverse transform lacks a fused narrow path.
+
+Retain `f16` eligibility. Revisit its selector factors during final corpus calibration.
 
 ### Direct integer comparison after decode specialization
 
@@ -1502,6 +1586,12 @@ This round completed these steps:
 - Rejected three bounded IntMult remainder layouts on GloVe.
 - Rejected the dense-remainder IntMult layout on CMS Payments.
 - Rejected centered block residuals after a complete Euro subjectivity comparison.
+- Audited constructor and deserialization validation for all four production arrays.
+- Added round-trip tests for every supported integer and float type.
+- Added single-encoding benchmarks for every supported integer and float type.
+- Added `f16` support to OrderedFloat, FloatQuant, and both Default schemes.
+- Verified zero-secondary and nonzero-secondary `f16` FloatQuant trees.
+- Updated stale golden trees after the BlockResidual payload and selector changes.
 
 The Pco mode profile and the first quotient and remainder experiments are complete.
 
@@ -1521,6 +1611,8 @@ Complete these next experiments in order:
 8. Profile another direct narrow BlockResidual decode optimization for `i16`.
 9. Classify more float columns where Pco beats ALP, ALP-RD, and the new schemes.
 10. Validate rejected-candidate analysis cost after the candidate set stabilizes.
+11. Prefer cheap rejection tests when they preserve the best candidate model.
+12. Require stronger corpus evidence when a useful scheme needs costly analysis.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 

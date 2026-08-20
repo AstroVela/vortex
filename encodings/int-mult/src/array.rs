@@ -574,7 +574,7 @@ mod tests {
     #[case(vec![i16::MIN, -8, -7, -1, 0, 1, 7, 8, i16::MAX], 7)]
     #[case(vec![i32::MIN, -8, -7, -1, 0, 1, 7, 8, i32::MAX], 7)]
     #[case(vec![i64::MIN, -8, -7, -1, 0, 1, 7, 8, i64::MAX], 7)]
-    fn round_trip_unsigned<T>(#[case] values: Vec<T>, #[case] base: u64) -> VortexResult<()>
+    fn round_trip_integer_ptype<T>(#[case] values: Vec<T>, #[case] base: u64) -> VortexResult<()>
     where
         T: NativePType + Copy,
     {
@@ -596,6 +596,19 @@ mod tests {
             &mut array_session().create_execution_ctx()
         );
         Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_child_shapes() {
+        let primary = PrimitiveArray::from_iter([1_u32, 2, 3]).into_array();
+        let wrong_ptype = PrimitiveArray::from_iter([1_u16, 2, 3]).into_array();
+        assert!(IntMult::try_new(primary.clone(), wrong_ptype, 10).is_err());
+
+        let wrong_length = PrimitiveArray::from_iter([1_u32, 2]).into_array();
+        assert!(IntMult::try_new(primary.clone(), wrong_length, 10).is_err());
+
+        let nullable = PrimitiveArray::from_option_iter([Some(1_u32), None, Some(3)]).into_array();
+        assert!(IntMult::try_new(primary, nullable, 10).is_err());
     }
 
     #[test]

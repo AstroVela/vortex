@@ -612,6 +612,80 @@ impl BlockResidualData {
                 && self.high_starts.len() == block_count + 1,
             "block residual offset tables have invalid lengths"
         );
+        validate_offset_table(
+            &self.residual_starts,
+            block_count,
+            self.residual_words.len(),
+            "residual",
+        )?;
+        validate_offset_table(
+            &self.patch_starts,
+            block_count,
+            self.patch_positions.len(),
+            "patch",
+        )?;
+        validate_offset_table(
+            &self.high_starts,
+            block_count,
+            self.patch_highs.len(),
+            "patch high",
+        )?;
+        let logical_width = dtype.as_ptype().bit_width();
+        let maximum = if logical_width == 64 {
+            u64::MAX
+        } else {
+            (1_u64 << logical_width) - 1
+        };
+        for block_index in 0..block_count {
+            vortex_ensure!(
+                self.bases[block_index] <= maximum,
+                "block residual base exceeds its logical type"
+            );
+            let residual_width = self.residual_widths[block_index];
+            let high_width = self.high_widths[block_index];
+            vortex_ensure!(
+                usize::from(residual_width) <= logical_width
+                    && usize::from(high_width) <= logical_width
+                    && usize::from(residual_width) + usize::from(high_width) <= logical_width,
+                "block residual bit widths are invalid"
+            );
+            let residual_range = payload_range(
+                &self.residual_starts,
+                block_index,
+                self.residual_words.len(),
+                "residual",
+            )?;
+            vortex_ensure!(
+                residual_range.len() == BLOCK_LEN * usize::from(residual_width) / 64,
+                "block residual word count is invalid"
+            );
+            let patch_range = payload_range(
+                &self.patch_starts,
+                block_index,
+                self.patch_positions.len(),
+                "patch",
+            )?;
+            let high_range = payload_range(
+                &self.high_starts,
+                block_index,
+                self.patch_highs.len(),
+                "patch high",
+            )?;
+            let positions = &self.patch_positions[patch_range];
+            validate_patch_header(
+                residual_width,
+                high_width,
+                positions.len(),
+                high_range.len(),
+            )?;
+            let block_start = block_index * BLOCK_LEN;
+            let block_len = (self.unsliced_len - block_start).min(BLOCK_LEN);
+            let mut previous = None;
+            for &position in positions {
+                validate_patch_position(block_len, previous, position)?;
+                previous = Some(position);
+            }
+        }
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == self.unsliced_len,
@@ -1202,6 +1276,28 @@ fn validate_patch_position(
     Ok(())
 }
 
+fn validate_offset_table(
+    starts: &[u32],
+    block_count: usize,
+    payload_len: usize,
+    name: &str,
+) -> VortexResult<()> {
+    vortex_ensure!(
+        starts.len() == block_count + 1,
+        "block residual {name} offsets have an invalid length"
+    );
+    vortex_ensure!(
+        starts.first() == Some(&0)
+            && starts.last().copied().map(usize::try_from).transpose()? == Some(payload_len),
+        "block residual {name} offsets do not cover the payload"
+    );
+    vortex_ensure!(
+        starts.windows(2).all(|window| window[0] <= window[1]),
+        "block residual {name} offsets are not ordered"
+    );
+    Ok(())
+}
+
 fn payload_range(
     starts: &[u32],
     block_index: usize,
@@ -1294,12 +1390,15 @@ impl BlockResidualMetadata {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::NativePType;
+    use vortex_array::dtype::PType;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
     use vortex_array::validity::Validity;
@@ -1310,6 +1409,7 @@ mod tests {
 
     use super::BlockResidual;
     use super::BlockResidualArrayExt;
+    use crate::BlockResidualCodec;
 
     #[test]
     fn roundtrip_and_scalar_access() -> VortexResult<()> {
@@ -1360,25 +1460,49 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn narrow_integer_roundtrip() -> VortexResult<()> {
-        let signed = PrimitiveArray::from_iter((0..2_050).map(|index| {
-            let value = (index * 7919) % 65_521;
-            value - 32_760
-        }));
-        let unsigned = PrimitiveArray::from_iter((0..2_050).map(|index| {
-            let value = (index * 7907) % 65_521;
-            value as u16
-        }));
-        let signed_encoded = BlockResidual::from_primitive(signed.as_view())?;
-        let unsigned_encoded = BlockResidual::from_primitive(unsigned.as_view())?;
+    #[rstest]
+    #[case(vec![0_u8, 1, u8::MAX])]
+    #[case(vec![0_u16, 1, u16::MAX])]
+    #[case(vec![0_u32, 1, u32::MAX])]
+    #[case(vec![0_u64, 1, u64::MAX])]
+    #[case(vec![i8::MIN, -1, 0, 1, i8::MAX])]
+    #[case(vec![i16::MIN, -1, 0, 1, i16::MAX])]
+    #[case(vec![i32::MIN, -1, 0, 1, i32::MAX])]
+    #[case(vec![i64::MIN, -1, 0, 1, i64::MAX])]
+    fn integer_ptype_roundtrip<T>(#[case] values: Vec<T>) -> VortexResult<()>
+    where
+        T: NativePType + Copy,
+    {
+        let primitive = PrimitiveArray::from_iter(values);
+        let encoded = BlockResidual::from_primitive(primitive.as_view())?;
         let session = array_session();
         crate::initialize(&session);
         let mut ctx = session.create_execution_ctx();
 
-        assert_arrays_eq!(signed_encoded, signed.into_array(), &mut ctx);
-        assert_arrays_eq!(unsigned_encoded, unsigned.into_array(), &mut ctx);
+        assert_arrays_eq!(encoded, primitive, &mut ctx);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_components_outside_logical_width() -> VortexResult<()> {
+        let mut parts = BlockResidualCodec::encode(&[0_u64, 1, 2])?.into_parts()?;
+        parts.bases[0] = u64::from(u8::MAX) + 1;
+        assert!(BlockResidual::try_new(parts, Validity::NonNullable, PType::U8).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_component_offsets() -> VortexResult<()> {
+        let mut parts = BlockResidualCodec::encode(&[0_u64, 1, 2])?.into_parts()?;
+        parts.residual_starts[0] = 1;
+        assert!(BlockResidual::try_new(parts, Validity::NonNullable, PType::U64).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_integer_input() {
+        let primitive = PrimitiveArray::from_iter([0.0_f32, 1.0, 2.0]);
+        assert!(BlockResidual::from_primitive(primitive.as_view()).is_err());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use vortex_array::VTable;
 use vortex_array::arrays::Primitive;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::half::f16;
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_compressor::scheme::CompressionEstimate;
@@ -100,6 +101,39 @@ fn encode_float_quant(
     analysis: FloatQuantAnalysis,
 ) -> VortexResult<ArrayRef> {
     let (primary_packed, secondary_packed, latent_ptype, reference) = match primitive.ptype() {
+        PType::F16 => {
+            let primary_min = u16::try_from(analysis.primary_min)?;
+            let values = primitive.as_slice::<f16>();
+            let (primary, secondary) = if analysis.secondary_bit_width == 0 {
+                (
+                    bitpack_primitive_map(values, analysis.primary_bit_width, |value| {
+                        (ordered_u16(value.to_bits()) >> analysis.k) - primary_min
+                    }),
+                    None,
+                )
+            } else {
+                let low_mask = (1_u16 << analysis.k) - 1;
+                let (primary, secondary) = bitpack_primitive_map_pair(
+                    values,
+                    analysis.primary_bit_width,
+                    analysis.secondary_bit_width,
+                    |value| {
+                        let bits = value.to_bits();
+                        (
+                            (ordered_u16(bits) >> analysis.k) - primary_min,
+                            bits & low_mask,
+                        )
+                    },
+                );
+                (primary, Some(secondary))
+            };
+            (
+                primary.into_byte_buffer(),
+                secondary.map(|packed| packed.into_byte_buffer()),
+                PType::U16,
+                Scalar::from(primary_min),
+            )
+        }
         PType::F32 => {
             let primary_min = u32::try_from(analysis.primary_min)?;
             let values = primitive.as_slice::<f32>();
@@ -199,6 +233,15 @@ fn encode_float_quant(
         analysis.k,
     )?
     .into_array())
+}
+
+#[inline]
+fn ordered_u16(bits: u16) -> u16 {
+    if bits & (1_u16 << 15) == 0 {
+        bits ^ (1_u16 << 15)
+    } else {
+        !bits
+    }
 }
 
 #[inline]

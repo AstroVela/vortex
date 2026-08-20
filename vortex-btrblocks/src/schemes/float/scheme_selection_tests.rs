@@ -16,6 +16,7 @@ use vortex_array::assert_arrays_eq;
 use vortex_array::builders::ArrayBuilder;
 use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::dtype::Nullability;
+use vortex_array::dtype::half::f16;
 use vortex_array::validity::Validity;
 use vortex_block_residual::BlockResidual;
 use vortex_block_residual::OrderedFloat;
@@ -30,12 +31,47 @@ use vortex_session::VortexSession;
 use crate::BtrBlocksCompressor;
 #[cfg(feature = "unstable_encodings")]
 use crate::BtrBlocksCompressorBuilder;
+use crate::CascadingCompressor;
 #[cfg(feature = "unstable_encodings")]
 use crate::SchemeExt;
+use crate::schemes::float::FloatQuantScheme;
 #[cfg(feature = "unstable_encodings")]
 use crate::schemes::integer::DeltaScheme;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+
+#[test]
+fn test_quantized_f16_uses_float_quant() -> VortexResult<()> {
+    let values = (0_u16..16_384)
+        .map(|index| f16::from_bits(0x3c00 | (index.wrapping_mul(7_919) & 0x03f0)))
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressed = BtrBlocksCompressor::default().compress(&array, &mut ctx)?;
+
+    assert!(compressed.is::<FloatQuant>());
+    assert_arrays_eq!(compressed, array, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn test_f16_secondary_uses_float_quant() -> VortexResult<()> {
+    let values = (0_u16..16_384)
+        .map(|index| {
+            let high_mantissa = index.wrapping_mul(7_919) & 0x03f0;
+            f16::from_bits(0x3c00 | high_mantissa | (index & 1))
+        })
+        .collect::<Vec<_>>();
+    let array = PrimitiveArray::from_iter(values).into_array();
+    let compressor = CascadingCompressor::new(vec![&FloatQuantScheme]);
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressed = compressor.compress(&array, &mut ctx)?;
+
+    assert!(compressed.is::<FloatQuant>());
+    assert!(compressed.as_::<FloatQuant>().secondary().is_some());
+    assert_arrays_eq!(compressed, array, &mut ctx);
+    Ok(())
+}
 
 #[test]
 fn test_constant_compressed() -> VortexResult<()> {

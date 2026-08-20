@@ -9757,6 +9757,7 @@ name = "vortex-block-residual"
 version = "0.1.0"
 dependencies = [
  "fastlanes",
+ "rstest",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",

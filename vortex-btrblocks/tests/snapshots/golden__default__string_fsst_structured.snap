@@ -13,21 +13,3 @@ root: vortex.fsst(utf8, len=16384) nbytes=141400
       metadata: scalar: 23u8
   codes_offsets: vortex.block_residual(u32, len=16385) nbytes=27010
     metadata: blocks: 17, slice: 0..16385
-    bases: vortex.primitive(u64, len=17) nbytes=136
-      metadata: ptype: u64
-    residual_widths: vortex.primitive(u8, len=17) nbytes=17
-      metadata: ptype: u8
-    high_widths: vortex.primitive(u8, len=17) nbytes=17
-      metadata: ptype: u8
-    residual_starts: vortex.primitive(u32, len=18) nbytes=72
-      metadata: ptype: u32
-    patch_starts: vortex.primitive(u32, len=18) nbytes=72
-      metadata: ptype: u32
-    high_starts: vortex.primitive(u32, len=18) nbytes=72
-      metadata: ptype: u32
-    residual_words: vortex.primitive(u64, len=3328) nbytes=26624
-      metadata: ptype: u64
-    patch_positions: vortex.primitive(u16, len=0) nbytes=0
-      metadata: ptype: u16
-    patch_highs: vortex.primitive(u8, len=0) nbytes=0
-      metadata: ptype: u8

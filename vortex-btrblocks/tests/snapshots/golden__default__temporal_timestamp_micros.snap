@@ -3,37 +3,7 @@ source: vortex-btrblocks/tests/golden.rs
 expression: rendered
 ---
 input: vortex.timestamp[µs, tz=UTC](i64), len=16384, nbytes=131072
-root: vortex.datetimeparts(vortex.timestamp[µs, tz=UTC](i64), len=16384) nbytes=60983
+root: vortex.ext(vortex.timestamp[µs, tz=UTC](i64), len=16384) nbytes=59756
   metadata: 
-  days: vortex.dict(u16, len=16384) nbytes=10
-    metadata: all_values_referenced: true
-    codes: vortex.runend(u8, len=16384) nbytes=6
-      metadata: offset: 0
-      ends: vortex.primitive(u16, len=2) nbytes=4
-        metadata: ptype: u16
-      values: vortex.primitive(u8, len=2) nbytes=2
-        metadata: ptype: u8
-    values: vortex.primitive(u16, len=2) nbytes=4
-      metadata: ptype: u16
-  seconds: vortex.block_residual(u32, len=16384) nbytes=20013
+  storage: vortex.block_residual(i64, len=16384) nbytes=59756
     metadata: blocks: 16, slice: 0..16384
-    bases: vortex.primitive(u64, len=16) nbytes=128
-      metadata: ptype: u64
-    residual_widths: vortex.primitive(u8, len=16) nbytes=16
-      metadata: ptype: u8
-    high_widths: vortex.primitive(u8, len=16) nbytes=16
-      metadata: ptype: u8
-    residual_starts: vortex.primitive(u32, len=17) nbytes=68
-      metadata: ptype: u32
-    patch_starts: vortex.primitive(u32, len=17) nbytes=68
-      metadata: ptype: u32
-    high_starts: vortex.primitive(u32, len=17) nbytes=68
-      metadata: ptype: u32
-    residual_words: vortex.primitive(u64, len=2432) nbytes=19456
-      metadata: ptype: u64
-    patch_positions: vortex.primitive(u16, len=47) nbytes=94
-      metadata: ptype: u16
-    patch_highs: vortex.primitive(u8, len=99) nbytes=99
-      metadata: ptype: u8
-  subseconds: fastlanes.bitpacked(u32, len=16384) nbytes=40960
-    metadata: bit_width: 20, offset: 0

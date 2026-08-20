@@ -26,6 +26,7 @@ use vortex_array::arrays::slice::SliceReduceAdaptor;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::half::f16;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::ArrayChildren;
@@ -101,8 +102,8 @@ impl VTable for OrderedFloat {
     ) -> VortexResult<()> {
         let ptype = PType::try_from(dtype)?;
         vortex_ensure!(
-            matches!(ptype, PType::F32 | PType::F64),
-            "OrderedFloatArray requires f32 or f64"
+            matches!(ptype, PType::F16 | PType::F32 | PType::F64),
+            "OrderedFloatArray requires f16, f32, or f64"
         );
         let encoded = OrderedFloatSlotsView::from_slots(slots).encoded;
         let expected = DType::Primitive(ordered_ptype(ptype)?, dtype.nullability());
@@ -175,6 +176,7 @@ impl VTable for OrderedFloat {
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let decoded = if let Some(block_residual) = array.encoded().as_typed::<BlockResidual>() {
             match array.dtype().as_ptype() {
+                PType::F16 => decode_primitive(array.as_view(), ctx)?,
                 PType::F32 => decompress_ordered_f32(block_residual, ctx)?,
                 PType::F64 => decompress_ordered_f64(block_residual, ctx)?,
                 ptype => vortex_bail!("unsupported OrderedFloat ptype {ptype}"),
@@ -205,6 +207,15 @@ impl OperationsVTable<OrderedFloat> for OrderedFloat {
             return Ok(Scalar::null(array.dtype().clone()));
         }
         Ok(match array.dtype().as_ptype() {
+            PType::F16 => Scalar::primitive(
+                f16::from_bits(unordered_u16(
+                    scalar
+                        .as_primitive()
+                        .typed_value::<u16>()
+                        .vortex_expect("validated ordered float scalar"),
+                )),
+                array.dtype().nullability(),
+            ),
             PType::F32 => Scalar::primitive(
                 f32::from_bits(unordered_u32(
                     scalar
@@ -259,6 +270,11 @@ impl OrderedFloat {
             encoded_nbytes,
             patch_count,
         } = match array.ptype() {
+            PType::F16 => {
+                BlockResidualCodec::estimate_transformed(array.as_slice::<f16>(), |value| {
+                    u64::from(ordered_u16(value.to_bits()))
+                })
+            }
             PType::F32 => {
                 BlockResidualCodec::estimate_transformed(array.as_slice::<f32>(), |value| {
                     u64::from(ordered_u32(value.to_bits()))
@@ -269,7 +285,7 @@ impl OrderedFloat {
                     ordered_u64(value.to_bits())
                 })
             }
-            ptype => vortex_bail!("OrderedFloat requires f32 or f64, got {ptype}"),
+            ptype => vortex_bail!("OrderedFloat requires f16, f32, or f64, got {ptype}"),
         };
         let validity_nbytes = validity_to_child(&array.validity()?, array.len())
             .map(|validity| validity.nbytes())
@@ -280,8 +296,8 @@ impl OrderedFloat {
     /// Construct an ordered float array from an unsigned child.
     pub fn try_new(encoded: ArrayRef, float_ptype: PType) -> VortexResult<OrderedFloatArray> {
         vortex_ensure!(
-            matches!(float_ptype, PType::F32 | PType::F64),
-            "OrderedFloat requires f32 or f64"
+            matches!(float_ptype, PType::F16 | PType::F32 | PType::F64),
+            "OrderedFloat requires f16, f32, or f64"
         );
         let dtype = DType::Primitive(float_ptype, encoded.dtype().nullability());
         let len = encoded.len();
@@ -295,6 +311,20 @@ impl OrderedFloat {
     pub fn from_primitive(array: ArrayView<'_, Primitive>) -> VortexResult<OrderedFloatArray> {
         let validity = array.validity()?;
         match array.ptype() {
+            PType::F16 => Self::try_new(
+                PrimitiveArray::new(
+                    Buffer::from(
+                        array
+                            .as_slice::<f16>()
+                            .iter()
+                            .map(|value| ordered_u16(value.to_bits()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    validity,
+                )
+                .into_array(),
+                PType::F16,
+            ),
             PType::F32 => Self::try_new(
                 PrimitiveArray::new(
                     Buffer::from(
@@ -323,7 +353,7 @@ impl OrderedFloat {
                 .into_array(),
                 PType::F64,
             ),
-            ptype => vortex_bail!("OrderedFloat requires f32 or f64, got {ptype}"),
+            ptype => vortex_bail!("OrderedFloat requires f16, f32, or f64, got {ptype}"),
         }
     }
 }
@@ -334,6 +364,16 @@ fn decode_primitive(
 ) -> VortexResult<PrimitiveArray> {
     let encoded = array.encoded().clone().execute::<PrimitiveArray>(ctx)?;
     Ok(match array.dtype().as_ptype() {
+        PType::F16 => PrimitiveArray::new(
+            Buffer::from(
+                encoded
+                    .as_slice::<u16>()
+                    .iter()
+                    .map(|&value| f16::from_bits(unordered_u16(value)))
+                    .collect::<Vec<_>>(),
+            ),
+            encoded.validity()?,
+        ),
         PType::F32 => PrimitiveArray::new(
             Buffer::from(
                 encoded
@@ -360,9 +400,26 @@ fn decode_primitive(
 
 fn ordered_ptype(ptype: PType) -> VortexResult<PType> {
     match ptype {
+        PType::F16 => Ok(PType::U16),
         PType::F32 => Ok(PType::U32),
         PType::F64 => Ok(PType::U64),
-        _ => vortex_bail!("OrderedFloat requires f32 or f64, got {ptype}"),
+        _ => vortex_bail!("OrderedFloat requires f16, f32, or f64, got {ptype}"),
+    }
+}
+
+fn ordered_u16(bits: u16) -> u16 {
+    if bits & (1_u16 << 15) == 0 {
+        bits ^ (1_u16 << 15)
+    } else {
+        !bits
+    }
+}
+
+fn unordered_u16(value: u16) -> u16 {
+    if value & (1_u16 << 15) == 0 {
+        !value
+    } else {
+        value ^ (1_u16 << 15)
     }
 }
 
@@ -408,6 +465,7 @@ mod tests {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::PType;
+    use vortex_array::dtype::half::f16;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
     use vortex_array::validity::Validity;
@@ -420,6 +478,41 @@ mod tests {
     use super::OrderedFloatArraySlotsExt;
     use crate::BlockResidual;
     use crate::BlockResidualArrayExt;
+
+    #[test]
+    fn roundtrip_f16_special_values() -> VortexResult<()> {
+        let values = [
+            f16::from_bits(0xfc00),
+            f16::from_f32(-1.0),
+            f16::NEG_ZERO,
+            f16::ZERO,
+            f16::from_f32(1.0),
+            f16::INFINITY,
+            f16::from_bits(0x7e42),
+        ];
+        let primitive = PrimitiveArray::from_iter(values);
+        let estimate = OrderedFloat::estimate_block_residual(primitive.as_view())?;
+        let ordered = OrderedFloat::from_primitive(primitive.as_view())?;
+        let residuals = BlockResidual::from_primitive(ordered.encoded().as_::<Primitive>())?;
+        assert_eq!(estimate.nbytes(), residuals.nbytes());
+        assert_eq!(estimate.patch_count(), residuals.patch_positions().len());
+        let encoded = OrderedFloat::try_new(residuals.into_array(), PType::F16)?;
+        let session = array_session();
+        crate::initialize(&session);
+        let decoded = encoded
+            .into_array()
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+
+        assert_eq!(
+            decoded
+                .as_slice::<f16>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f16::to_bits)
+        );
+        Ok(())
+    }
 
     #[test]
     fn roundtrip_special_values() -> VortexResult<()> {
@@ -442,6 +535,46 @@ mod tests {
         let mut ctx = session.create_execution_ctx();
         assert_arrays_eq!(encoded, primitive.into_array(), &mut ctx);
         Ok(())
+    }
+
+    #[test]
+    fn roundtrip_f32_special_values() -> VortexResult<()> {
+        let values = [
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_0042),
+        ];
+        let primitive = PrimitiveArray::from_iter(values);
+        let encoded = OrderedFloat::from_primitive(primitive.as_view())?;
+        let session = array_session();
+        crate::initialize(&session);
+        let decoded = encoded
+            .into_array()
+            .execute::<PrimitiveArray>(&mut session.create_execution_ctx())?;
+
+        assert_eq!(
+            decoded
+                .as_slice::<f32>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f32::to_bits)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_logical_and_child_types() {
+        let u32_child = PrimitiveArray::from_iter([0_u32, 1, 2]).into_array();
+        assert!(OrderedFloat::try_new(u32_child.clone(), PType::F64).is_err());
+        assert!(OrderedFloat::try_new(u32_child, PType::U32).is_err());
+
+        let u64_child = PrimitiveArray::from_iter([0_u64, 1, 2]).into_array();
+        assert!(OrderedFloat::try_new(u64_child, PType::F32).is_err());
     }
 
     #[test]
