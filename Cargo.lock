@@ -10789,6 +10789,7 @@ dependencies = [
 name = "vortex-zstd-v2"
 version = "0.1.0"
 dependencies = [
+ "num-traits",
  "prost 0.14.4",
  "rstest",
  "vortex-array",

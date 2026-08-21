@@ -10,10 +10,13 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::compute::conformance::consistency::test_array_consistency;
 use vortex_array::session::ArraySessionExt as _;
+use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
@@ -228,5 +231,61 @@ fn test_mostly_empty_values() -> VortexResult<()> {
     }));
     let array = ZstdV2::from_var_bin_view(&sparse, 3, 64, &mut ctx)?.into_array();
     assert_arrays_eq!(array, sparse.into_array(), &mut ctx);
+    Ok(())
+}
+
+fn assert_take_matches_canonical(array: &ArrayRef, indices: Vec<u64>) -> VortexResult<()> {
+    let mut ctx = ctx();
+    let indices =
+        PrimitiveArray::new(Buffer::copy_from(&indices), Validity::NonNullable).into_array();
+    let expected = array
+        .clone()
+        .execute::<Canonical>(&mut ctx)?
+        .into_array()
+        .take(indices.clone())?;
+    assert_arrays_eq!(array.clone().take(indices)?, expected, &mut ctx);
+    Ok(())
+}
+
+#[rstest]
+#[case::single_frame(false, 0)]
+#[case::many_frames(false, VALUES_PER_FRAME)]
+#[case::many_frames_nullable(true, VALUES_PER_FRAME)]
+fn test_take_matches_canonical(
+    #[case] nullable: bool,
+    #[case] values_per_frame: usize,
+) -> VortexResult<()> {
+    let array = encoded(nullable, values_per_frame)?;
+    // One row, rows out of order, repeats, and every row.
+    assert_take_matches_canonical(&array, vec![300])?;
+    assert_take_matches_canonical(&array, vec![511, 0, 200, 7, 200])?;
+    assert_take_matches_canonical(&array, (0..N as u64).rev().collect())?;
+    Ok(())
+}
+
+#[test]
+fn test_take_from_a_slice_matches_canonical() -> VortexResult<()> {
+    let sliced = encoded(true, VALUES_PER_FRAME)?.slice(100..300)?;
+    assert_take_matches_canonical(&sliced, vec![199, 0, 100])?;
+    Ok(())
+}
+
+#[test]
+fn test_take_reads_only_the_frames_holding_the_rows() -> VortexResult<()> {
+    let mut ctx = ctx();
+    // Frame 1 holds values 64..128, and is the only unreadable frame.
+    let array = with_truncated_frame(encoded(false, VALUES_PER_FRAME)?, 1)?;
+
+    let indices = PrimitiveArray::new(Buffer::copy_from([5u64, 200, 511]), Validity::NonNullable)
+        .into_array();
+    let taken = array.take(indices)?.execute::<Canonical>(&mut ctx)?;
+    assert_eq!(taken.into_array().len(), 3);
+
+    let inside =
+        PrimitiveArray::new(Buffer::copy_from([100u64]), Validity::NonNullable).into_array();
+    assert!(
+        array.take(inside)?.execute::<Canonical>(&mut ctx).is_err(),
+        "a take reading the truncated frame should fail"
+    );
     Ok(())
 }

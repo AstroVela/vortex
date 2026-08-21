@@ -41,6 +41,7 @@ use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexError;
+use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -865,49 +866,19 @@ impl ZstdV2Data {
         };
 
         let spans = self.frame_spans()?;
-        // Only the frames a selected value falls in are decompressed. They stay contiguous in the
-        // output buffer list, so a view's buffer index is its frame's position among them.
-        let mut needed = Vec::new();
-        let mut next = 0usize;
-        for (index, span) in spans.iter().enumerate() {
-            while next < slots.len() && slots[next].is_none_or(|value| value < span.value_start) {
-                next += 1;
-            }
-            if next < slots.len() && slots[next].is_some_and(|value| value < span.value_stop()) {
-                needed.push(index);
-            }
-        }
-        if needed.len() == spans.len() && needed.len() > 1 {
-            // Nothing to skip. Decoding the whole array and filtering that is no more work, and
-            // it keeps one code path warm rather than two.
+        // Nothing to skip means decoding the whole array and filtering that is no more work.
+        if self.frames_needed(&spans, &slots) == spans.len() && spans.len() > 1 {
             return Ok(None);
         }
 
-        let lengths = self.decompress_lengths()?;
-        let mut decompressor = new_decompressor()?;
-        let mut buffers = Vec::with_capacity(needed.len());
-        let mut kept_spans = Vec::with_capacity(needed.len());
-        for index in &needed {
-            buffers.push(self.decompress_frame_at(&mut decompressor, *index, &spans[*index])?);
-            kept_spans.push(spans[*index]);
-        }
-
-        // Offsets are per frame, so a gap between kept frames does not disturb them.
-        let mut offsets = BufferMut::<u32>::empty();
-        for span in &kept_spans {
-            let frame_offsets = value_offsets(&lengths, std::slice::from_ref(span))?;
-            offsets.extend_from_slice(frame_offsets.as_slice());
-        }
-
-        let offsets = offsets.freeze();
-        let views = build_views_gathered(&lengths, &offsets, &kept_spans, &buffers, &slots)?;
+        let (views, buffers) = self.gather(&slots, &spans)?;
         let validity = align_validity_to_dtype(
             unsliced_validity
                 .slice(self.slice_start..self.slice_stop)?
                 .filter(mask)?,
             dtype,
         )?;
-        // SAFETY: `build_views_gathered` only emits views inside the buffers it was handed.
+        // SAFETY: `gather` only emits views inside the buffers it returns.
         Ok(Some(
             unsafe {
                 VarBinViewArray::new_unchecked(views, Arc::from(buffers), dtype.clone(), validity)
@@ -915,58 +886,205 @@ impl ZstdV2Data {
             .into_array(),
         ))
     }
+
+    /// Reads the values at `rows`, decompressing only the frames that hold them.
+    ///
+    /// Random access is what the separate lengths stream is for: a row's value index comes from
+    /// the validity rank, its frame from the frame spans, and its bytes from a prefix sum over
+    /// that frame's lengths. Nothing before it in the frame has to be walked, and no other frame
+    /// is read at all.
+    pub(crate) fn take(
+        &self,
+        dtype: &DType,
+        unsliced_validity: &Validity,
+        rows: &[usize],
+        row_validity: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let unsliced_mask = unsliced_validity.execute_mask(self.unsliced_n_rows, ctx)?;
+        let absolute: Vec<usize> = rows.iter().map(|row| self.slice_start + row).collect();
+        for (row, absolute) in rows.iter().zip(&absolute) {
+            vortex_ensure!(
+                *absolute < self.slice_stop,
+                "Take index {row} is out of bounds for the {} rows of the array",
+                self.len()
+            );
+        }
+        // Ranking requires ascending rows, while a take asks for them in whatever order it likes,
+        // so the ranks are computed over a sorted view and scattered back.
+        let mut by_row: Vec<usize> = (0..absolute.len()).collect();
+        by_row.sort_unstable_by_key(|position| absolute[*position]);
+        let ascending: Vec<usize> = by_row.iter().map(|position| absolute[*position]).collect();
+        let ascending_ranks = unsliced_mask.valid_counts_for_indices(&ascending);
+        let mut ranks = vec![0usize; absolute.len()];
+        for (position, rank) in by_row.iter().zip(ascending_ranks) {
+            ranks[*position] = rank;
+        }
+        let value_valid = unsliced_mask.bit_buffer();
+        let slots: Vec<Option<usize>> = absolute
+            .iter()
+            .zip(&ranks)
+            .enumerate()
+            .map(|(position, (row, rank))| {
+                let taken = match row_validity.bit_buffer() {
+                    AllOr::All => true,
+                    AllOr::None => false,
+                    AllOr::Some(bits) => bits.value(position),
+                };
+                let holds_value = match value_valid {
+                    AllOr::All => true,
+                    AllOr::None => false,
+                    AllOr::Some(bits) => bits.value(*row),
+                };
+                (taken && holds_value).then_some(*rank)
+            })
+            .collect();
+
+        let spans = self.frame_spans()?;
+        let (views, buffers) = self.gather(&slots, &spans)?;
+        // A take of valid rows through non-null indices stays non-nullable, so the output dtype
+        // follows both rather than being nullable on principle.
+        let taken_dtype = dtype.union_nullability(row_validity_nullability(row_validity));
+        let validity = align_validity_to_dtype(
+            Validity::from_iter(slots.iter().map(Option::is_some)),
+            &taken_dtype,
+        )?;
+        // SAFETY: `gather` only emits views inside the buffers it returns.
+        Ok(unsafe {
+            VarBinViewArray::new_unchecked(views, Arc::from(buffers), taken_dtype, validity)
+        }
+        .into_array())
+    }
+
+    /// How many frames hold at least one of the values in `slots`.
+    fn frames_needed(&self, spans: &[FrameSpan], slots: &[Option<usize>]) -> usize {
+        let mut needed = 0;
+        for span in spans {
+            if slots
+                .iter()
+                .flatten()
+                .any(|value| *value >= span.value_start && *value < span.value_stop())
+            {
+                needed += 1;
+            }
+        }
+        needed
+    }
+
+    /// Reads the values `slots` names, decompressing each frame that holds one exactly once.
+    ///
+    /// `slots` carries one entry per output row: the index of the value it holds, or `None` for a
+    /// row with no value. Entries need not be ordered, so this serves both a filter, whose rows
+    /// ascend, and a take, whose rows are wherever the caller asked for.
+    fn gather(
+        &self,
+        slots: &[Option<usize>],
+        spans: &[FrameSpan],
+    ) -> VortexResult<(Buffer<BinaryView>, Vec<ByteBuffer>)> {
+        let mut views = BufferMut::<BinaryView>::zeroed(slots.len());
+        let mut buffers: Vec<ByteBuffer> = Vec::new();
+
+        // Visiting values in ascending order lets each frame be decompressed once and dropped.
+        let mut order: Vec<usize> = (0..slots.len()).filter(|i| slots[*i].is_some()).collect();
+        if !order
+            .windows(2)
+            .all(|pair| slots[pair[0]] <= slots[pair[1]])
+        {
+            order.sort_unstable_by_key(|position| slots[*position]);
+        }
+        if order.is_empty() {
+            return Ok((views.freeze(), buffers));
+        }
+
+        let lengths = self.decompress_lengths()?;
+        let mut decompressor = new_decompressor()?;
+        let mut frame = 0usize;
+        let mut loaded: Option<LoadedFrame> = None;
+
+        for position in order {
+            let value = slots[position].vortex_expect("filtered to Some above");
+            while frame < spans.len() && value >= spans[frame].value_stop() {
+                frame += 1;
+            }
+            vortex_ensure!(
+                frame < spans.len() && value >= spans[frame].value_start,
+                "Corrupt zstd.v2 metadata: value {value} is not covered by any frame"
+            );
+
+            if loaded.as_ref().is_none_or(|held| held.frame != frame) {
+                let bytes = self.decompress_frame_at(&mut decompressor, frame, &spans[frame])?;
+                buffers.push(bytes.clone());
+                loaded = Some(LoadedFrame {
+                    frame,
+                    offsets: frame_offsets(&lengths, &spans[frame])?,
+                    bytes,
+                    buffer: u32::try_from(buffers.len() - 1)?,
+                });
+            }
+            let held = loaded.as_ref().vortex_expect("just loaded");
+
+            let local = value - spans[frame].value_start;
+            let offset = *held.offsets.get(local).ok_or_else(|| {
+                vortex_err!("Corrupt zstd.v2 metadata: value {value} has no offset")
+            })?;
+            let length = *lengths.get(value).ok_or_else(|| {
+                vortex_err!("Corrupt zstd.v2 metadata: value {value} has no length")
+            })?;
+            let bytes = held
+                .bytes
+                .as_slice()
+                .get(offset as usize..offset as usize + length as usize)
+                .ok_or_else(|| {
+                    vortex_err!(
+                        "Corrupt zstd.v2 metadata: value {value} of {length} bytes at offset \
+                         {offset} runs past the end of its {} byte frame",
+                        held.bytes.len()
+                    )
+                })?;
+            views[position] = BinaryView::make_view(bytes, held.buffer, offset);
+        }
+        Ok((views.freeze(), buffers))
+    }
 }
 
-/// Builds views over a set of frames that need not be adjacent.
-///
-/// [`build_views`] can index its offsets by a single value range because the frames it is given
-/// are contiguous. A filter keeps only the frames it needs, so offsets are numbered per kept
-/// frame instead.
-fn build_views_gathered(
-    lengths: &Buffer<ValueLen>,
-    offsets: &Buffer<u32>,
-    spans: &[FrameSpan],
-    buffers: &[ByteBuffer],
-    slots: &[Option<usize>],
-) -> VortexResult<Buffer<BinaryView>> {
-    let mut views = BufferMut::<BinaryView>::zeroed(slots.len());
-    let mut frame = 0usize;
-    // Where each kept frame's offsets begin.
-    let mut frame_offset_starts = Vec::with_capacity(spans.len());
-    let mut running = 0usize;
-    for span in spans {
-        frame_offset_starts.push(running);
-        running += span.n_values;
+/// Whether a take through `row_validity` can produce a null.
+fn row_validity_nullability(row_validity: &Mask) -> vortex_array::dtype::Nullability {
+    if row_validity.all_true() {
+        vortex_array::dtype::Nullability::NonNullable
+    } else {
+        vortex_array::dtype::Nullability::Nullable
     }
+}
 
-    for (slot, view) in slots.iter().zip(views.iter_mut()) {
-        let Some(value) = *slot else { continue };
-        while frame < spans.len() && value >= spans[frame].value_stop() {
-            frame += 1;
-        }
-        vortex_ensure!(
-            frame < spans.len() && value >= spans[frame].value_start,
-            "Corrupt zstd.v2 metadata: value {value} is not covered by the decompressed frames"
-        );
+/// The frame `gather` currently holds decompressed.
+struct LoadedFrame {
+    frame: usize,
+    bytes: ByteBuffer,
+    offsets: Buffer<u32>,
+    buffer: u32,
+}
 
-        let offset_idx = frame_offset_starts[frame] + (value - spans[frame].value_start);
-        let offset = *offsets
-            .get(offset_idx)
-            .ok_or_else(|| vortex_err!("Corrupt zstd.v2 metadata: value {value} has no offset"))?;
-        let length = *lengths
-            .get(value)
-            .ok_or_else(|| vortex_err!("Corrupt zstd.v2 metadata: value {value} has no length"))?;
-        let bytes = buffers[frame]
-            .as_slice()
-            .get(offset as usize..offset as usize + length as usize)
-            .ok_or_else(|| {
-                vortex_err!(
-                    "Corrupt zstd.v2 metadata: value {value} of {length} bytes at offset {offset} \
-                     runs past the end of its {} byte frame",
-                    buffers[frame].len()
-                )
-            })?;
-        *view = BinaryView::make_view(bytes, u32::try_from(frame)?, offset);
+/// The offset of every value within one frame.
+fn frame_offsets(lengths: &Buffer<ValueLen>, span: &FrameSpan) -> VortexResult<Buffer<u32>> {
+    let mut offsets = BufferMut::<u32>::with_capacity(span.n_values);
+    let mut offset = 0u32;
+    for value in span.value_start..span.value_stop() {
+        let length = *lengths.get(value).ok_or_else(|| {
+            vortex_err!(
+                "Corrupt zstd.v2 metadata: value {value} is past the {} stored lengths",
+                lengths.len()
+            )
+        })?;
+        offsets.push(offset);
+        offset = offset
+            .checked_add(length)
+            .ok_or_else(|| vortex_err!("Corrupt zstd.v2 lengths: frame offsets overflow a u32"))?;
     }
-    Ok(views.freeze())
+    vortex_ensure!(
+        offset as usize == span.uncompressed_size,
+        "Corrupt zstd.v2 metadata: {} values measure {offset} bytes, but their frame holds {}",
+        span.n_values,
+        span.uncompressed_size
+    );
+    Ok(offsets.freeze())
 }

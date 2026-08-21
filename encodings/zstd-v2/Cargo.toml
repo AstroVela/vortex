@@ -20,6 +20,7 @@ all-features = true
 workspace = true
 
 [dependencies]
+num-traits = { workspace = true }
 prost = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
