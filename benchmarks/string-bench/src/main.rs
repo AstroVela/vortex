@@ -34,6 +34,7 @@ use vortex_bench::LogFormat;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
 use vortex_bench::display::print_measurements_json;
+use vortex_bench::log_data_dir_storage;
 use vortex_bench::measurements::CustomUnitMeasurement;
 use vortex_bench::setup_logging_and_tracing_with_format;
 
@@ -140,6 +141,7 @@ fn contains_duplicates<T: PartialEq>(values: &[T]) -> bool {
 fn main() -> Result<()> {
     let args = Args::parse();
     setup_logging_and_tracing_with_format(args.verbose, args.tracing, args.log_format)?;
+    log_data_dir_storage();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

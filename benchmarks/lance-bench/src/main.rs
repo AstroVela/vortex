@@ -24,6 +24,7 @@ use vortex_bench::Opts;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::log_data_dir_storage;
 use vortex_bench::runner::BenchmarkMode;
 use vortex_bench::runner::BenchmarkQueryResult;
 use vortex_bench::runner::SqlBenchmarkRunner;
@@ -90,6 +91,8 @@ async fn main() -> anyhow::Result<()> {
     let opts = Opts::from(args.options);
 
     setup_logging_and_tracing(args.verbose, args.tracing)?;
+
+    log_data_dir_storage();
 
     let benchmark = create_benchmark(args.benchmark, &opts)?;
 

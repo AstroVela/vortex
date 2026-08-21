@@ -1,6 +1,13 @@
 name: "System Info"
 description: "Print CPU, memory, and disk information for benchmark runners"
 
+outputs:
+  workspace-storage:
+    description: >-
+      Storage backing the runner workspace: "local-nvme" (EC2 instance store), "ebs", or
+      "unknown".
+    value: ${{ steps.workspace-storage.outputs.workspace-storage }}
+
 runs:
   using: "composite"
   steps:
@@ -32,3 +39,68 @@ runs:
         echo "=== NVMe Devices ==="
         ls -la /dev/nvme* 2>/dev/null || echo "No NVMe"
         sudo nvme list 2>/dev/null || true
+
+    # Benchmarks labelled "nvme" read from the checkout, so they only hit local NVMe if the
+    # runner work directory is mounted on the instance store. Nothing in this repository pins
+    # that, so resolve and record it per run rather than assuming it.
+    - name: Workspace Storage
+      id: workspace-storage
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+
+        target="${GITHUB_WORKSPACE:-$PWD}"
+        echo "=== Workspace Storage ==="
+        echo "workspace: $target"
+
+        findmnt -no SOURCE,TARGET,FSTYPE,OPTIONS --target "$target" || true
+
+        source_dev="$(findmnt -no SOURCE --target "$target" 2>/dev/null || true)"
+        fstype="$(findmnt -no FSTYPE --target "$target" 2>/dev/null || true)"
+
+        # An overlay's writes land in its upper directory, which lives on another filesystem.
+        if [ "$fstype" = "overlay" ]; then
+          upper="$(findmnt -no OPTIONS --target "$target" | tr ',' '\n' \
+            | sed -n 's/^upperdir=//p' | head -1)"
+          if [ -n "$upper" ]; then
+            echo "overlay upperdir: $upper"
+            source_dev="$(findmnt -no SOURCE --target "$upper" 2>/dev/null || true)"
+          fi
+        fi
+        echo "backing source: ${source_dev:-unknown}"
+
+        # Expand MD arrays to their members, then read the model each device reports. On EC2
+        # this is "Amazon EC2 NVMe Instance Storage" for the instance store and "Amazon Elastic
+        # Block Store" for EBS.
+        name="${source_dev#/dev/}"
+        devices="$name"
+        if [ -d "/sys/block/$name/slaves" ]; then
+          members="$(ls "/sys/block/$name/slaves" 2>/dev/null | tr '\n' ' ')"
+          if [ -n "$members" ]; then
+            devices="$members"
+          fi
+        fi
+
+        kind="unknown"
+        for dev in $devices; do
+          model="$(cat "/sys/block/$dev/device/model" 2>/dev/null || echo unknown)"
+          echo "device $dev: model=$model"
+          case "$model" in
+            *"Instance Storage"*) kind="local-nvme" ;;
+            *"Elastic Block Store"*) kind="ebs" ;;
+          esac
+        done
+        echo "workspace storage: $kind"
+        echo "workspace-storage=$kind" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Workspace storage: \`$kind\`"
+          echo ""
+          echo "- workspace: \`$target\`"
+          echo "- backing source: \`${source_dev:-unknown}\`"
+          echo "- devices: \`$devices\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$kind" != "local-nvme" ]; then
+          echo "::warning title=Benchmark storage::Workspace is on ${kind}, not local NVMe;" \
+            "NVMe benchmark timings from this run are not comparable to instance-store runs."
+        fi

@@ -15,6 +15,7 @@ use vortex_bench::datasets::nested_lists::NestedListsData;
 use vortex_bench::datasets::nested_structs::NestedStructsData;
 use vortex_bench::datasets::taxi_data::TaxiData;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::log_data_dir_storage;
 use vortex_bench::random_access::BenchDataset;
 use vortex_bench::setup_logging_and_tracing;
 
@@ -91,6 +92,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     setup_logging_and_tracing(args.verbose, args.tracing)?;
+    log_data_dir_storage();
 
     let run_config = RunConfig {
         datasets: args

@@ -28,6 +28,8 @@ use tpcds::TpcDsBenchmark;
 use tpch::benchmark::TpcHBenchmark;
 pub use utils::file::*;
 pub use utils::logging::*;
+pub use utils::storage::describe_path;
+pub use utils::storage::log_data_dir_storage;
 use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::error::VortexExpect;
 use vortex::error::vortex_err;

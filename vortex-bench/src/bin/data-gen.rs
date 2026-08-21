@@ -23,6 +23,7 @@ use vortex_bench::Opts;
 use vortex_bench::conversions::convert_parquet_directory_to_vortex;
 use vortex_bench::create_benchmark;
 use vortex_bench::generate_duckdb_registration_sql;
+use vortex_bench::log_data_dir_storage;
 use vortex_bench::setup_logging_and_tracing_with_format;
 
 #[derive(Parser)]
@@ -56,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
     let opts = Opts::from(args.options);
 
     setup_logging_and_tracing_with_format(args.verbose, args.tracing, args.log_format)?;
+
+    log_data_dir_storage();
 
     let benchmark = create_benchmark(args.benchmark, &opts)?;
 

@@ -4,6 +4,7 @@
 pub mod constants;
 pub mod file;
 pub mod logging;
+pub mod storage;
 
 use std::process::Command;
 use std::sync::LazyLock;

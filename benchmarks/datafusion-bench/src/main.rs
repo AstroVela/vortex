@@ -42,6 +42,7 @@ use vortex_bench::SESSION;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::log_data_dir_storage;
 use vortex_bench::require_prepared_data;
 use vortex_bench::runner::BenchmarkMode;
 use vortex_bench::runner::BenchmarkQueryResult;
@@ -130,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     set_join_set_tracer(get_static_tracer())?;
     setup_logging_and_tracing(args.verbose, args.tracing)?;
+    log_data_dir_storage();
 
     let benchmark = create_benchmark(args.benchmark, &opts)?;
 
