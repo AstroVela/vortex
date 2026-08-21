@@ -10727,7 +10727,9 @@ name = "vortex-utils"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "half",
  "hashbrown 0.17.1",
+ "rstest",
 ]
 
 [[package]]

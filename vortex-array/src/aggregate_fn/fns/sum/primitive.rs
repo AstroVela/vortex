@@ -13,6 +13,7 @@ use super::checked_add_i64;
 use super::checked_add_u64;
 use crate::ExecutionCtx;
 use crate::arrays::PrimitiveArray;
+use crate::dtype::AlgebraicFloat;
 use crate::dtype::NativePType;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
@@ -66,18 +67,29 @@ fn accumulate_primitive_all(
 /// Sum the values of a float slice into an `f64` accumulator. When `skip_nans` is set, NaN values
 /// are skipped to match the scalar `sum` semantics; otherwise any NaN poisons the accumulator to
 /// NaN. Floats cannot overflow the accumulator, so this never reports saturation.
+///
+/// The accumulation uses [`AlgebraicFloat::alg_add`] so the compiler may split the reduction
+/// across several vector accumulators instead of serializing on one add per element. That makes
+/// the summation order unspecified, so the low bits of the result can differ from a strict
+/// left-to-right sum, and can vary with the vector width the compiler chose. NaN and infinity
+/// still propagate, because the algebraic operations are not `nnan`/`ninf`.
 pub(super) fn sum_float_all<T: NativePType>(acc: &mut f64, slice: &[T], skip_nans: bool) {
+    // Accumulate in a local so the compiler does not have to reload through `acc` each lane.
+    let mut sum = *acc;
     if skip_nans {
         for &v in slice {
-            if !v.is_nan() {
-                *acc += ToPrimitive::to_f64(&v).vortex_expect("float to f64");
-            }
+            let v = ToPrimitive::to_f64(&v).vortex_expect("float to f64");
+            // Branchless skip: `-0.0` is the additive identity for every f64, including both
+            // signed zeroes, so a skipped NaN leaves `sum` bit-identical while keeping the loop
+            // free of the data-dependent branch that blocked vectorization.
+            sum = sum.alg_add(if v.is_nan() { -0.0 } else { v });
         }
     } else {
         for &v in slice {
-            *acc += ToPrimitive::to_f64(&v).vortex_expect("float to f64");
+            sum = sum.alg_add(ToPrimitive::to_f64(&v).vortex_expect("float to f64"));
         }
     }
+    *acc = sum;
 }
 
 /// Sum all values into a `u64` accumulator. For types narrower than 64 bits, values are summed in

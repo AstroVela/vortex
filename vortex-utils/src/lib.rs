@@ -5,6 +5,7 @@
 
 #![deny(missing_docs)]
 
+pub mod algebraic;
 pub mod aliases;
 pub mod debug_with;
 #[cfg(feature = "dyn-traits")]

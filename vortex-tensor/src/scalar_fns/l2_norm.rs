@@ -19,6 +19,7 @@ use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayParts;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
+use vortex_array::dtype::AlgebraicFloat;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
@@ -240,10 +241,17 @@ impl ScalarFnArrayVTable for L2Norm {
 /// Computes the L2 norm (Euclidean norm) of a float slice.
 ///
 /// Returns `sqrt(sum(v_i^2))`. A zero-length or all-zero input produces `0.0`.
-fn l2_norm_row<T: Float + NativePType>(v: &[T]) -> T {
+///
+/// The sum of squares accumulates through [`AlgebraicFloat`], so it may vectorize and contract
+/// into FMAs at the cost of an unspecified summation order. Callers already treat the norm as
+/// approximate — see [`unit_norm_tolerance`], which budgets `O(√d · ε)` of round-off for exactly
+/// this reduction.
+///
+/// [`unit_norm_tolerance`]: crate::utils::unit_norm_tolerance
+fn l2_norm_row<T: Float + NativePType + AlgebraicFloat>(v: &[T]) -> T {
     let mut sum_sq = T::zero();
     for &x in v {
-        sum_sq = sum_sq + x * x;
+        sum_sq = sum_sq.alg_add(x.alg_mul(x));
     }
     sum_sq.sqrt()
 }

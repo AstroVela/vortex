@@ -15,7 +15,11 @@ version = { workspace = true }
 
 [dependencies]
 dashmap = { workspace = true, optional = true }
+half = { workspace = true }
 hashbrown = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
 
 [lints]
 workspace = true

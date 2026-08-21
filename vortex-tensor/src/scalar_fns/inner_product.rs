@@ -14,6 +14,7 @@ use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayParts;
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayVTable;
+use vortex_array::dtype::AlgebraicFloat;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
@@ -269,11 +270,15 @@ impl InnerProduct {
 /// Computes the inner product (dot product) of two equal-length float slices.
 ///
 /// Returns `sum(a_i * b_i)`.
-fn inner_product_row<T: Float + NativePType>(a: &[T], b: &[T]) -> T {
+///
+/// Uses [`AlgebraicFloat`] so the reduction may be split across vector accumulators and the
+/// multiply-add contracted into an FMA. The summation order is therefore unspecified and the low
+/// bits can differ from a strict left-to-right dot product, which is acceptable for a similarity
+/// score. NaN and infinity still propagate.
+fn inner_product_row<T: Float + NativePType + AlgebraicFloat>(a: &[T], b: &[T]) -> T {
     a.iter()
         .zip(b.iter())
-        .map(|(&x, &y)| x * y)
-        .fold(T::zero(), |acc, v| acc + v)
+        .fold(T::zero(), |acc, (&x, &y)| acc.alg_add(x.alg_mul(y)))
 }
 
 #[cfg(test)]

@@ -192,6 +192,7 @@ pub use nullability::*;
 pub use ptype::*;
 pub use struct_::*;
 pub use union::*;
+pub use vortex_utils::algebraic::AlgebraicFloat;
 
 use crate::dtype::extension::ExtDTypeRef;
 
