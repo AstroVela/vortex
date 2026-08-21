@@ -12,9 +12,11 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
+use vortex_array::compute::conformance::consistency::test_array_consistency;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
+use vortex_array::session::ArraySessionExt as _;
 use vortex_session::VortexSession;
 
 use crate::ZstdV2;
@@ -174,5 +176,53 @@ fn test_empty_and_all_null() -> VortexResult<()> {
     let all_null = VarBinViewArray::from_iter_nullable_str((0..16).map(|_| None::<String>));
     let array = ZstdV2::from_var_bin_view(&all_null, 3, 4, &mut ctx)?.into_array();
     assert_arrays_eq!(array, all_null.into_array(), &mut ctx);
+    Ok(())
+}
+
+/// The file writer serializes arrays and reads them back, which unit tests that keep an array in
+/// memory never exercise.
+#[test]
+fn test_serde_roundtrip() -> VortexResult<()> {
+    let mut ctx = ctx();
+    let array = encoded(true, VALUES_PER_FRAME)?;
+    let serialized = SESSION.array_serialize(&array)?;
+    assert!(serialized.is_some(), "ZstdV2 must be serializable");
+    assert_arrays_eq!(array, values(true).into_array(), &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn test_consistency() {
+    let mut ctx = ctx();
+    let array = encoded(true, VALUES_PER_FRAME).unwrap_or_else(|e| panic!("encoding: {e}"));
+    test_array_consistency(&array, &mut ctx);
+}
+
+/// Columns of empty strings are common in the wild, and make every frame zero bytes long.
+#[rstest]
+#[case::single_frame(0)]
+#[case::many_frames(64)]
+fn test_all_empty_values(#[case] values_per_frame: usize) -> VortexResult<()> {
+    let mut ctx = ctx();
+    let empty = VarBinViewArray::from_iter_str((0..N).map(|_| String::new()));
+    let array = ZstdV2::from_var_bin_view(&empty, 3, values_per_frame, &mut ctx)?.into_array();
+    assert_arrays_eq!(array.clone(), empty.into_array(), &mut ctx);
+    assert_arrays_eq!(
+        array.slice(10..20)?,
+        VarBinViewArray::from_iter_str((0..10).map(|_| String::new())).into_array(),
+        &mut ctx
+    );
+    Ok(())
+}
+
+/// A column that is mostly empty strings puts many values in a frame of very few bytes.
+#[test]
+fn test_mostly_empty_values() -> VortexResult<()> {
+    let mut ctx = ctx();
+    let sparse = VarBinViewArray::from_iter_str(
+        (0..N).map(|i| if i % 97 == 0 { format!("value-{i}") } else { String::new() }),
+    );
+    let array = ZstdV2::from_var_bin_view(&sparse, 3, 64, &mut ctx)?.into_array();
+    assert_arrays_eq!(array, sparse.into_array(), &mut ctx);
     Ok(())
 }

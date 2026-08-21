@@ -2451,7 +2451,7 @@ async fn test_string_chunks_stay_fine_grained_under_split_cap() -> VortexResult<
     let mut buf = ByteBufferMut::empty();
     SESSION
         .write_options()
-        .write(&mut buf, st.to_array_stream())
+        .write(&mut buf, st.clone().to_array_stream())
         .await?;
 
     let file = SESSION.open_options().open_buffer(buf)?;
@@ -2798,5 +2798,45 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
         .execute::<StructArray>(&mut ctx)?;
 
     assert_eq!(result.len(), 1);
+    Ok(())
+}
+
+/// Writing through the file writer serializes arrays, slices them into row blocks and reads them
+/// back, none of which an encoding's own tests exercise.
+#[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_zstd_v2_file_roundtrip() -> VortexResult<()> {
+    use vortex_btrblocks::BtrBlocksCompressorBuilder;
+
+    use crate::strategy::WriteStrategyBuilder;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    const N_ROWS: usize = 40_000;
+    let strings = VarBinViewArray::from_iter_nullable_str(
+        (0..N_ROWS).map(|i| (i % 7 != 0).then(|| format!("value-{i:0>100}"))),
+    )
+    .into_array();
+    let st = StructArray::from_fields(&[("s", strings)])?.into_array();
+
+    let strategy = WriteStrategyBuilder::default()
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact().with_zstd_v2())
+        .build();
+
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut buf, st.clone().to_array_stream())
+        .await?;
+
+    let read = SESSION
+        .open_options()
+        .open_buffer(buf.freeze())?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    assert_arrays_eq!(read, st, &mut ctx);
     Ok(())
 }

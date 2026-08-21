@@ -4,7 +4,11 @@ use std::time::Instant;
 
 use anyhow::Result;
 use futures::StreamExt;
+use vortex::array::Canonical;
 use vortex::array::IntoArray;
+use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::Struct;
+use vortex::array::arrays::struct_::StructArrayExt as _;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex_bench::SESSION;
@@ -62,6 +66,43 @@ async fn main() -> Result<()> {
         Config { name: "v2 L6 one frame", encoding: Encoding::V2 { level: 6, values_per_frame: 0 } },
         Config { name: "v2 L9 vpf=8192", encoding: Encoding::V2 { level: 9, values_per_frame: 8192 } },
     ];
+
+    // Set ZSTD_SWEEP_PER_COLUMN to write each field on its own, naming the ones that fail rather
+    // than stopping the whole sweep at the first error.
+    if std::env::var("ZSTD_SWEEP_PER_COLUMN").is_ok() {
+        for path in &paths {
+            let chunks = parquet_to_vortex_chunks(path.clone()).await?;
+            let mut ctx = SESSION.create_execution_ctx();
+            let array = chunks.into_array().execute::<Canonical>(&mut ctx)?.into_array();
+            let fields = array.dtype().as_struct_fields().names().clone();
+            println!("\n### per-column {} ({} fields)", path.display(), fields.len());
+            for name in fields.iter() {
+                let column = array
+                    .as_::<Struct>()
+                    .unmasked_field_by_name(name.as_ref())?
+                    .clone();
+                let scheme: &'static string::ZstdV2Scheme =
+                    Box::leak(Box::new(string::ZstdV2Scheme::DEFAULT));
+                let builder = BtrBlocksCompressorBuilder::default()
+                    .with_compact()
+                    .exclude_schemes([string::ZstdScheme::DEFAULT.id()])
+                    .with_new_scheme(scheme);
+                let strategy = WriteStrategyBuilder::default()
+                    .with_btrblocks_builder(builder)
+                    .build();
+                let mut buf = Vec::new();
+                let result = SESSION
+                    .write_options()
+                    .with_strategy(strategy)
+                    .write(&mut std::io::Cursor::new(&mut buf), column.to_array_stream())
+                    .await;
+                if let Err(error) = result {
+                    println!("  {name}: FAILED: {error}");
+                }
+            }
+        }
+        return Ok(());
+    }
 
     for path in &paths {
         let chunks = parquet_to_vortex_chunks(path.clone()).await?;
