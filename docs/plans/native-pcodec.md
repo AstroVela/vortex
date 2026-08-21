@@ -56,7 +56,9 @@ Prototype fixed bins as a composed tree instead:
 
 The prototype permits any bin count from one through 64.
 
-The BtrBlocks selector and final child choices remain incomplete.
+The branch includes an experimental `IntegerFixedBinsScheme` for the composed tree.
+
+The scheme runs only below ALP. It remains outside `ALL_SCHEMES`.
 
 Do not add the fused RangePacked array to the Default or Compact selector.
 
@@ -68,7 +70,7 @@ The branch implements `OrderedFloatArray`, `BlockResidualArray`, `FloatQuantArra
 
 The evaluation set includes BtrBlocks schemes for the first three arrays.
 
-IntMult does not have a BtrBlocks scheme yet.
+The experimental BtrBlocks scheme for IntMult applies only to ALP integer children.
 
 `OrderedFloat(BlockResidual)` now supports `f16`, `f32`, and `f64` inputs.
 
@@ -102,7 +104,9 @@ The range decomposition prototype uses `IntMult(base=1)` as generic addition.
 
 Its fused decode path skips multiplication and avoids materialization of dictionary references.
 
-Neither IntMult nor decomposed fixed bins participate in the Default selector yet.
+IntMult participates only through explicit experimental schemes.
+
+Decomposed fixed bins do not participate in the Default selector.
 
 Final calibration requires the complete corpus and selected-tree evidence.
 
@@ -2459,15 +2463,59 @@ The selected tree passes the absolute decode and bounded-access bar.
 
 The current direct scheme remains niche. Its full-suite size gain does not justify Default inclusion alone.
 
-The nested Pco evidence defines the next fixed-bin prototype.
+The nested Pco evidence motivated the pure integer fixed-bin prototype.
 
-Add a pure integer scheme that constructs this tree:
+The experiment added a pure integer scheme that constructs this tree:
 
 `IntMult(base=1, Dict(BitPacked(codes), starts), BlockResidual(offsets))`
 
-Let ALP and other outer schemes select it through normal child recursion.
+ALP selects it through normal child recursion.
 
 Keep the black-box RangePacked array outside Default.
+
+### Pure integer fixed-bin result
+
+The prototype constructs this complete integer tree:
+
+`IntMult(base=1, Dict(BitPacked(codes), starts), BlockResidual(offsets))`
+
+It supports every signed and unsigned integer type.
+
+Signed inputs flip the sign bit before the bin fit. The tree restores starts and offsets with modular addition.
+
+Tests cover every integer width, nullable values, signed-domain boundaries, and composition below ALP.
+
+The bin trainer previously used one fixed stride. Periodic inputs could alias that stride and hide complete clusters.
+
+A deterministic offset within each sample stratum now covers periodic phases. One regression test covers four interleaved clusters.
+
+The first selector version examined every integer recursion site.
+
+Across nine available datasets, this version reduced write throughput by 6.85 percent geometric mean.
+
+An ALP-child gate reduced the write loss to 2.78 percent geometric mean.
+
+The focused pass used 524,288 rows per dataset.
+
+It covered Arade, Bimbo, both CMS Provider files, Euro2016, Food, HashTags, CMS Payments, and GloVe embeddings.
+
+The fixed-bin scheme selected no tree. Every encoded size matched the Opportunistic bundle exactly.
+
+This result agrees with the earlier forced-tree measurements.
+
+One generic offset child mixes residuals from bins with different local widths.
+
+BlockResidual then pays for local width variation and occasional cross-bin outliers.
+
+The Pco bin model retains one offset width per bin. The generic tree loses that advantage.
+
+The pure integer fixed-bin scheme therefore does not enter Default.
+
+Keep the implementation as an experimental reference. Do not spend more selector time on this tree without new evidence.
+
+The direct OrderedFloat fixed-bin scheme remains a separate experiment.
+
+It still reduces HashTags `interaction#received_at` by 39.0 percent. Its complete file gain remains 0.429 percent.
 
 ### Compact and Parquet size constraint
 
@@ -2783,6 +2831,9 @@ This round completed these steps:
 - Profiled Pco modes across 53 float columns from 12 real datasets.
 - Compared opportunistic and fixed-bin bundles across 18 complete files.
 - Measured the selected HashTags fixed-bin tree and fresh cached file access.
+- Added the pure integer fixed-bin scheme for ALP child recursion.
+- Fixed alias errors in the deterministic fixed-bin sample.
+- Rejected the integer fixed-bin tree after a focused nine-dataset pass.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2796,14 +2847,18 @@ The specialized OrderedFloat and ALP trees now use registered fused parent kerne
 
 Use the opportunistic bundle as the leading Default candidate.
 
-Complete these next experiments in order:
+The pure integer fixed-bin experiment is complete.
 
-1. Prototype a pure integer fixed-bin scheme for normal child recursion.
-2. Add a fast model that rejects poor integer fixed-bin fits.
-3. Test the scheme on the 12 nested Pco targets with at most 64 bins.
-4. Compare each selected tree against the complete incumbent child cascade.
-5. Repeat the 18-file bundle and access passes.
-6. Decide fixed-bin admission from coverage, total cost, and bounded random access.
+It selected no real tree and reduced write throughput. Keep it outside Default.
+
+Use these next steps:
+
+1. Keep the Opportunistic bundle as the leading Default candidate.
+2. Retain the direct OrderedFloat fixed-bin bundle as an optional experiment.
+3. Revisit direct fixed bins when the corpus gains more applicable distributions.
+4. Complete the final threshold review for the retained schemes.
+5. Compare the retained bundle across the complete file corpus.
+6. Add more real embedding datasets when licenses and loaders permit them.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
@@ -2813,7 +2868,7 @@ Add an outer OrderedFloat fused decode only if the generic composition misses th
 
 Keep the black-box RangePacked array and RangeEntropy outside Default.
 
-Retain decomposed fixed bins as an active Default candidate.
+Retain decomposed fixed bins only as an experimental reference.
 
 After the candidate set stabilizes, complete these final steps:
 

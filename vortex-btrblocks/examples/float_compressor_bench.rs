@@ -75,6 +75,7 @@ use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
 use vortex_btrblocks::schemes::float::OrderedFloatRangePackedScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
+use vortex_btrblocks::schemes::integer::IntegerFixedBinsScheme;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -98,6 +99,7 @@ use crate::int_mult_codec::IntMultDenseCodec64;
 
 const DEFAULT_ROW_COUNT: usize = 2_000_000;
 const RANGE_PACKED_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.20);
+const INTEGER_FIXED_BINS_SCHEME: IntegerFixedBinsScheme = IntegerFixedBinsScheme::new(1.20);
 const CALIFORNIA_COLUMNS: [&str; 9] = [
     "longitude",
     "latitude",
@@ -3203,6 +3205,12 @@ fn compressors() -> Vec<(&'static str, BtrBlocksCompressor)> {
             "proposed-default-range-packed",
             BtrBlocksCompressorBuilder::default()
                 .with_new_scheme(&RANGE_PACKED_SCHEME)
+                .build(),
+        ),
+        (
+            "proposed-default-integer-fixed-bins",
+            BtrBlocksCompressorBuilder::default()
+                .with_new_scheme(&INTEGER_FIXED_BINS_SCHEME)
                 .build(),
         ),
         (

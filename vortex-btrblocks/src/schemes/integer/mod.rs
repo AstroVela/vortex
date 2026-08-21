@@ -7,6 +7,7 @@ mod bitpacking;
 mod block_residual;
 #[cfg(feature = "unstable_encodings")]
 mod delta;
+mod fixed_bins;
 mod for_;
 mod rle;
 mod runend;
@@ -22,6 +23,7 @@ pub use block_residual::BlockResidualScheme;
 pub(crate) use block_residual::patch_adjusted_estimate_nbytes;
 #[cfg(feature = "unstable_encodings")]
 pub use delta::DeltaScheme;
+pub use fixed_bins::IntegerFixedBinsScheme;
 pub use for_::FoRScheme;
 #[cfg(feature = "pco")]
 pub use pco::PcoScheme;

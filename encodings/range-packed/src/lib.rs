@@ -833,7 +833,12 @@ fn training_sample(values: &[u64]) -> (Vec<u64>, u64, u64) {
         values.to_vec()
     } else {
         (0..TRAINING_SAMPLE_SIZE)
-            .map(|index| values[index * values.len() / TRAINING_SAMPLE_SIZE])
+            .map(|index| {
+                let start = index * values.len() / TRAINING_SAMPLE_SIZE;
+                let stop = (index + 1) * values.len() / TRAINING_SAMPLE_SIZE;
+                let offset = index.wrapping_mul(2_654_435_761) % (stop - start);
+                values[start + offset]
+            })
             .collect()
     };
     sample.push(minimum);
@@ -1006,6 +1011,26 @@ mod tests {
             decomposition.into_array(vortex_array::validity::Validity::NonNullable)?,
             PrimitiveArray::from_iter(values),
             &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decomposition_sample_covers_periodic_clusters() -> VortexResult<()> {
+        let values = (0_u64..65_536)
+            .map(|index| (index % 4) * 4_000_000_000_000_000_000 + index % 1_024)
+            .collect::<Vec<_>>();
+        let decomposition = RangeDecomposition::encode(&values)?;
+        let distant_offsets = decomposition
+            .offsets()
+            .iter()
+            .filter(|&&offset| offset >= 1_000_000)
+            .count();
+
+        assert!(decomposition.bin_starts().len() >= 4);
+        assert!(
+            distant_offsets < values.len() / 50,
+            "distant offsets: {distant_offsets}"
         );
         Ok(())
     }
