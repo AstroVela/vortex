@@ -82,7 +82,7 @@ impl RowFnExecutionArgs {
     }
 
     /// Try execution against the original inputs, then mask a returned full-length result.
-    fn try_execute_valid_rows(
+    pub(super) fn try_execute_valid_rows(
         &self,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,

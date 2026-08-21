@@ -15,6 +15,7 @@ use super::args::BorrowedRowFnArgs;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::arrays::Constant;
+use crate::scalar_fn::unstable::row::execute::DenseAttempt;
 use crate::scalar_fn::unstable::row::types::batch_const;
 use crate::validity::Validity;
 
@@ -33,6 +34,10 @@ impl RowFnExecutionArgs {
     pub(crate) fn execute(
         &self,
         kernel: impl Fn(BorrowedRowFnArgs<'_>, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
+        execute_dense_attempt: impl FnOnce(
+            BorrowedRowFnArgs<'_>,
+            &mut ExecutionCtx,
+        ) -> VortexResult<DenseAttempt>,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
             &Mask,
@@ -70,6 +75,9 @@ impl RowFnExecutionArgs {
 
         match self.policy {
             RowPolicy::Dense => self.execute_dense(kernel, ctx),
+            RowPolicy::DenseWithRetry => {
+                self.execute_dense_with_retry(execute_dense_attempt, try_valid_rows, ctx)
+            }
             RowPolicy::ValidOnly => self.execute_valid_only(kernel, try_valid_rows, ctx),
         }
     }

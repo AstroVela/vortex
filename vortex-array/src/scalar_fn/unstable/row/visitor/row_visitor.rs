@@ -73,8 +73,8 @@ pub trait RowVisitor<Options>: private::Sealed + Sized {
     /// # Examples
     ///
     /// Test whether each string occurs in its allowed-values list. The prepare closure builds one
-    /// lookup table for a batch-constant list. The row closure scans the current list from the input
-    /// column directly.
+    /// lookup table for a batch-constant list. The row closure scans the current list from the
+    /// input column directly.
     ///
     /// ```ignore
     /// visitor.visit_prepared::<
@@ -199,9 +199,14 @@ pub trait RowVisitor<Options>: private::Sealed + Sized {
     /// The executor OR-reduces [`FailureEvidence`] across rows and passes the result to
     /// `finish_failure`.
     ///
-    /// [`RowFn::INFALLIBLE`](crate::scalar_fn::unstable::row::RowFn::INFALLIBLE) **must** be `false`.
-    /// `Out` must not require drop glue. `Fail` must be no wider than `Out`, or failure tracking
-    /// reduces the vector width. The framework checks these requirements.
+    /// If `finish_failure` rejects dense evidence, reduction has lost which row failed. Batch
+    /// execution therefore resolves input validity: it preserves the error for all-valid input,
+    /// suppresses it for all-null input, and retries `apply` over valid rows for partially valid
+    /// input. A prepared retry also runs `prepare` again.
+    ///
+    /// [`RowFn::INFALLIBLE`](crate::scalar_fn::unstable::row::RowFn::INFALLIBLE) **must** be
+    /// `false`. `Out` must not require drop glue. `Fail` must be no wider than `Out`, or failure
+    /// tracking reduces the vector width. The framework checks these requirements.
     ///
     /// # Examples
     ///

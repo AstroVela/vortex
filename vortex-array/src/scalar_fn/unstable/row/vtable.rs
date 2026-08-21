@@ -18,6 +18,7 @@ use super::batch::RowFnExecutionArgs;
 use super::batch::finalize_kernel_output;
 use super::row_fn::RowFn;
 use super::visitor::BatchPlanner;
+use super::visitor::ExecuteDenseWithRetry;
 use super::visitor::ExecuteRows;
 use super::visitor::ExecuteValidRows;
 use crate::ArrayRef;
@@ -30,6 +31,7 @@ use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::unstable::row::execute::DenseAttempt;
 
 impl<F: RowFn> ScalarFnVTable for F {
     type Options = F::Options;
@@ -122,6 +124,7 @@ pub fn execute_rows<F: RowFn>(
     let batch = prepare_batch(function, options, args)?;
     batch.execute(
         |args, ctx| execute_row_kernel(function, options, args, ctx),
+        |args, ctx| execute_dense_attempt(function, options, args, ctx),
         |args, valid, ctx| try_execute_valid_rows(function, options, args, valid, ctx),
         ctx,
     )
@@ -172,6 +175,19 @@ fn execute_row_kernel<F: RowFn>(
             args.policy(),
             ctx,
         ),
+    )
+}
+
+fn execute_dense_attempt<F: RowFn>(
+    function: &F,
+    options: &F::Options,
+    args: BorrowedRowFnArgs<'_>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<DenseAttempt> {
+    function.dispatch(
+        options,
+        args.dtypes(),
+        ExecuteDenseWithRetry::<F>::new(&args, options, ctx),
     )
 }
 
@@ -382,7 +398,7 @@ mod tests {
             "unexpected error: {error}",
         );
         assert!(
-            message.contains("planned Dense, got ValidOnly"),
+            message.contains("planned Dense, got DenseWithRetry"),
             "unexpected error: {error}",
         );
         Ok(())
