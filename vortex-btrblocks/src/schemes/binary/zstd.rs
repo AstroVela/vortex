@@ -17,10 +17,26 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
+use crate::schemes::DEFAULT_ZSTD_LEVEL;
 
 /// Zstd compression without dictionaries for binary arrays.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct ZstdScheme;
+pub struct ZstdScheme {
+    level: i32,
+}
+
+impl ZstdScheme {
+    /// Creates a scheme that compresses with the given zstd level.
+    pub const fn new(level: i32) -> Self {
+        Self { level }
+    }
+}
+
+impl Default for ZstdScheme {
+    fn default() -> Self {
+        Self::new(DEFAULT_ZSTD_LEVEL)
+    }
+}
 
 impl Scheme for ZstdScheme {
     fn scheme_name(&self) -> &'static str {
@@ -55,9 +71,9 @@ impl Scheme for ZstdScheme {
             .array_as_varbinview()
             .into_owned()
             .compact_buffers(exec_ctx)?;
-        Ok(
-            vortex_zstd::Zstd::from_var_bin_view_without_dict(&compacted, 3, 8192, exec_ctx)?
-                .into_array(),
-        )
+        Ok(vortex_zstd::Zstd::from_var_bin_view_without_dict(
+            &compacted, self.level, 8192, exec_ctx,
+        )?
+        .into_array())
     }
 }

@@ -10,6 +10,11 @@
 //! With the `unstable_encodings` feature, `ZstdBuffers` stores the buffers of another encoding as
 //! independently compressed zstd buffers while preserving the inner encoding metadata.
 //!
+//! Both encodings accept a caller-chosen zstd compression level. The level used at write time is
+//! recorded in the array metadata (see [`ZstdMetadata::compression_level`] and
+//! [`ZstdBuffersMetadata::compression_level`]) so it survives serialization; arrays written before
+//! the field existed decode it as `None`.
+//!
 //! This crate exposes array encodings only. Compression scheme selection is wired through
 //! `vortex-btrblocks` and file writing. To deserialize arrays manually, register the encoding in the
 //! array session:
@@ -76,6 +81,11 @@ pub struct ZstdMetadata {
     /// Metadata for each compressed frame.
     #[prost(message, repeated, tag = "2")]
     pub frames: Vec<ZstdFrameMetadata>,
+    /// Zstd compression level used to write the frames.
+    ///
+    /// `None` for arrays written before this field existed.
+    #[prost(int32, optional, tag = "3")]
+    pub compression_level: Option<i32>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -101,4 +111,9 @@ pub struct ZstdBuffersMetadata {
     /// Length of each child array, ordered as "child_dtypes"
     #[prost(uint64, repeated, tag = "6")]
     pub child_lens: Vec<u64>,
+    /// Zstd compression level used to write the buffers.
+    ///
+    /// `None` for arrays written before this field existed.
+    #[prost(int32, optional, tag = "7")]
+    pub compression_level: Option<i32>,
 }

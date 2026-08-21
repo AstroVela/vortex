@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 #![expect(clippy::cast_possible_truncation)]
 
+use prost::Message;
 use rstest::rstest;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -407,6 +408,7 @@ fn test_zstd_rejects_a_frame_ending_in_a_dangling_length_prefix() -> VortexResul
                     uncompressed_size: values.len() as u64,
                     n_values: 2,
                 }],
+                compression_level: Some(3),
             },
             2,
         ),
@@ -488,4 +490,46 @@ fn test_zstd_rejects_mismatched_frame_content_size() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("metadata declares"));
+}
+
+/// The level a writer chose is part of the array's metadata, so it has to survive a round trip
+/// through the serialized form and show up in the data's summary.
+#[rstest]
+#[case::fast(-3)]
+#[case::default_level(3)]
+#[case::high(19)]
+fn test_zstd_records_compression_level(#[case] level: i32) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = VarBinViewArray::from_iter(
+        (0..64).map(|i| Some(format!("value number {i}"))),
+        DType::Utf8(Nullability::NonNullable),
+    );
+
+    let data = ZstdData::from_var_bin_view(&array, level, 8, &mut ctx)?;
+    assert_eq!(data.compression_level(), Some(level));
+    assert!(format!("{data}").contains(&format!("level: {level}")));
+
+    let roundtripped = ZstdMetadata::decode(data.metadata.encode_to_vec().as_slice())?;
+    assert_eq!(roundtripped.compression_level, Some(level));
+    Ok(())
+}
+
+/// Metadata written before the level was recorded has no such field, and must still decode.
+#[test]
+fn test_zstd_reads_metadata_without_a_compression_level() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = VarBinViewArray::from_iter(
+        (0..64).map(|i| Some(format!("value number {i}"))),
+        DType::Utf8(Nullability::NonNullable),
+    );
+
+    let mut data = ZstdData::from_var_bin_view(&array, 3, 8, &mut ctx)?;
+    data.metadata.compression_level = None;
+    let legacy = ZstdMetadata::decode(data.metadata.encode_to_vec().as_slice())?;
+    assert_eq!(legacy.compression_level, None);
+
+    let compressed = Zstd::try_new(array.dtype().clone(), data, array.validity()?)?;
+    assert!(format!("{}", compressed.data()).contains("level: unknown"));
+    assert_arrays_eq!(compressed, array, &mut ctx);
+    Ok(())
 }

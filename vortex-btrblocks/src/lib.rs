@@ -79,6 +79,8 @@ mod trace_tests;
 pub use builder::ALL_SCHEMES;
 pub use builder::BtrBlocksCompressorBuilder;
 pub use canonical_compressor::BtrBlocksCompressor;
+#[cfg(feature = "zstd")]
+pub use schemes::DEFAULT_ZSTD_LEVEL;
 pub use schemes::patches::compress_patches;
 pub use vortex_compressor::CascadingCompressor;
 pub use vortex_compressor::scheme::CompressorContext;

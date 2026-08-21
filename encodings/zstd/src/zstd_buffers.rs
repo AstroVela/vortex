@@ -95,6 +95,7 @@ impl ZstdBuffers {
             compressed_buffers,
             uncompressed_sizes,
             buffer_alignments,
+            compression_level: Some(level),
         };
         let slots: ArraySlots = children.into_iter().map(Some).collect();
         let compressed = Array::try_from_parts(
@@ -151,11 +152,16 @@ pub struct ZstdBuffersData {
     compressed_buffers: Vec<BufferHandle>,
     uncompressed_sizes: Vec<u64>,
     buffer_alignments: Vec<u32>,
+    compression_level: Option<i32>,
 }
 
 impl Display for ZstdBuffersData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "inner_encoding: {}", self.inner_encoding_id)
+        write!(f, "inner_encoding: {}", self.inner_encoding_id)?;
+        match self.compression_level {
+            Some(level) => write!(f, ", level: {level}"),
+            None => write!(f, ", level: unknown"),
+        }
     }
 }
 
@@ -227,6 +233,13 @@ impl ZstdBuffersDecodePlan {
 }
 
 impl ZstdBuffersData {
+    /// Zstd compression level the buffers were written with.
+    ///
+    /// Returns `None` for arrays written before the level was recorded in metadata.
+    pub fn compression_level(&self) -> Option<i32> {
+        self.compression_level
+    }
+
     fn validate(&self) -> VortexResult<()> {
         vortex_ensure_eq!(
             self.compressed_buffers.len(),
@@ -465,6 +478,7 @@ impl VTable for ZstdBuffers {
                 buffer_alignments: array.buffer_alignments.clone(),
                 child_dtypes,
                 child_lens,
+                compression_level: array.compression_level,
             }
             .encode_to_vec(),
         ))
@@ -503,6 +517,7 @@ impl VTable for ZstdBuffers {
             compressed_buffers,
             uncompressed_sizes: metadata.uncompressed_sizes.clone(),
             buffer_alignments: metadata.buffer_alignments.clone(),
+            compression_level: metadata.compression_level,
         };
 
         data.validate()?;
@@ -568,6 +583,7 @@ mod tests {
     use vortex_array::serde::SerializedArray;
     use vortex_array::session::ArraySessionExt;
     use vortex_buffer::ByteBufferMut;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_session::registry::ReadContext;
 
@@ -654,6 +670,55 @@ mod tests {
         let mut ctx = session.create_execution_ctx();
         let decoded = decoded.execute::<ArrayRef>(&mut ctx)?;
         assert_arrays_eq!(input, decoded, &mut ctx);
+        Ok(())
+    }
+
+    /// The level a writer chose is recorded in metadata, so it survives serialization; buffers
+    /// written before the field existed decode as an unknown level.
+    #[test]
+    fn test_serde_roundtrip_preserves_compression_level() -> VortexResult<()> {
+        let session = array_session();
+        session.arrays().register(ZstdBuffers);
+
+        let input = make_varbinview_array();
+        let compressed = ZstdBuffers::compress(&input, 9, &session)?;
+        assert_eq!(compressed.data().compression_level(), Some(9));
+        assert!(format!("{}", compressed.data()).contains("level: 9"));
+
+        let compressed = compressed.into_array();
+        let dtype = compressed.dtype().clone();
+        let len = compressed.len();
+
+        let array_ctx = ArrayContext::empty();
+        let serialized =
+            compressed.serialize(&array_ctx, &session, &SerializeOptions::default())?;
+        let mut concat = ByteBufferMut::empty();
+        for buf in serialized {
+            concat.extend_from_slice(buf.as_ref());
+        }
+        let parts = SerializedArray::try_from(concat.freeze())?;
+        let decoded = parts.decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &session)?;
+
+        let decoded = decoded
+            .as_opt::<ZstdBuffers>()
+            .vortex_expect("decoded a ZstdBuffers array");
+        assert_eq!(decoded.data().compression_level(), Some(9));
+        Ok(())
+    }
+
+    /// Metadata written before the level was recorded has no such field, and must still decode.
+    #[test]
+    fn test_metadata_without_a_compression_level() -> VortexResult<()> {
+        let legacy =
+            ZstdBuffersMetadata::decode(ZstdBuffersMetadata::default().encode_to_vec().as_slice())?;
+        assert_eq!(legacy.compression_level, None);
+
+        let mut compressed = ZstdBuffers::compress(&make_varbinview_array(), 3, &array_session())?;
+        compressed
+            .data_mut()
+            .vortex_expect("owned array has mutable data")
+            .compression_level = None;
+        assert!(format!("{}", compressed.data()).contains("level: unknown"));
         Ok(())
     }
 

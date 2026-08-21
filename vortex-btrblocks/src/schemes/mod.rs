@@ -13,6 +13,10 @@ pub mod temporal;
 
 pub(crate) mod patches;
 
+/// Default zstd compression level used by the zstd schemes.
+#[cfg(feature = "zstd")]
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 use vortex_compressor::builtins::BinaryDictScheme;
 use vortex_compressor::builtins::FloatDictScheme;
 use vortex_compressor::builtins::IntDictScheme;

@@ -3,7 +3,20 @@
 
 //! Builder for configuring `BtrBlocksCompressor` instances.
 
+#[cfg(feature = "zstd")]
+use std::any::Any;
+#[cfg(feature = "zstd")]
+use std::any::TypeId;
+#[cfg(feature = "zstd")]
+use std::sync::LazyLock;
+
+#[cfg(feature = "zstd")]
+use parking_lot::Mutex;
 use vortex_array::ArrayId;
+#[cfg(feature = "zstd")]
+use vortex_error::VortexExpect;
+#[cfg(feature = "zstd")]
+use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::BtrBlocksCompressor;
@@ -11,6 +24,8 @@ use crate::CascadingCompressor;
 use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
+#[cfg(feature = "zstd")]
+use crate::schemes::DEFAULT_ZSTD_LEVEL;
 use crate::schemes::binary;
 use crate::schemes::decimal;
 use crate::schemes::float;
@@ -91,12 +106,20 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 #[derive(Debug, Clone)]
 pub struct BtrBlocksCompressorBuilder {
     schemes: Vec<&'static dyn Scheme>,
+
+    /// Zstd compression level handed to the zstd schemes registered by
+    /// [`with_compact`](BtrBlocksCompressorBuilder::with_compact) and
+    /// [`only_cuda_compatible`](BtrBlocksCompressorBuilder::only_cuda_compatible).
+    #[cfg(feature = "zstd")]
+    zstd_level: i32,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
     fn default() -> Self {
         Self {
             schemes: ALL_SCHEMES.to_vec(),
+            #[cfg(feature = "zstd")]
+            zstd_level: DEFAULT_ZSTD_LEVEL,
         }
     }
 }
@@ -108,7 +131,33 @@ impl BtrBlocksCompressorBuilder {
     pub fn empty() -> Self {
         Self {
             schemes: Vec::new(),
+            #[cfg(feature = "zstd")]
+            zstd_level: DEFAULT_ZSTD_LEVEL,
         }
+    }
+
+    /// Sets the zstd compression level used by the zstd schemes, defaulting to
+    /// [`DEFAULT_ZSTD_LEVEL`].
+    ///
+    /// Higher levels compress harder and more slowly; negative levels are zstd's fast modes. Only
+    /// zstd schemes registered after this call observe the new level, so set it before
+    /// [`with_compact`](Self::with_compact) or [`only_cuda_compatible`](Self::only_cuda_compatible).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    ///
+    /// // Compress zstd-eligible columns harder than the default level.
+    /// let compressor = BtrBlocksCompressorBuilder::default()
+    ///     .with_zstd_level(9)
+    ///     .with_compact()
+    ///     .build();
+    /// ```
+    #[cfg(feature = "zstd")]
+    pub fn with_zstd_level(mut self, level: i32) -> Self {
+        self.zstd_level = level;
+        self
     }
 
     /// Adds an external compression scheme not in [`ALL_SCHEMES`].
@@ -141,9 +190,16 @@ impl BtrBlocksCompressorBuilder {
     /// Panics if any of the compact schemes are already present.
     #[cfg(feature = "zstd")]
     pub fn with_compact(self) -> Self {
+        let level = self.zstd_level;
         let builder = self
-            .with_new_scheme(&string::ZstdScheme)
-            .with_new_scheme(&binary::ZstdScheme);
+            .with_new_scheme(interned_scheme::<string::ZstdScheme>(
+                level,
+                string::ZstdScheme::new,
+            ))
+            .with_new_scheme(interned_scheme::<binary::ZstdScheme>(
+                level,
+                binary::ZstdScheme::new,
+            ));
 
         #[cfg(feature = "pco")]
         let builder = builder
@@ -187,9 +243,21 @@ impl BtrBlocksCompressorBuilder {
         let builder = self.exclude_schemes(excluded);
 
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
-        let builder = builder.with_new_scheme(&binary::ZstdBuffersScheme);
+        let builder = {
+            let level = builder.zstd_level;
+            builder.with_new_scheme(interned_scheme::<binary::ZstdBuffersScheme>(
+                level,
+                binary::ZstdBuffersScheme::new,
+            ))
+        };
         #[cfg(all(feature = "zstd", not(feature = "unstable_encodings")))]
-        let builder = builder.with_new_scheme(&binary::ZstdScheme);
+        let builder = {
+            let level = builder.zstd_level;
+            builder.with_new_scheme(interned_scheme::<binary::ZstdScheme>(
+                level,
+                binary::ZstdScheme::new,
+            ))
+        };
 
         builder
     }
@@ -215,6 +283,26 @@ impl BtrBlocksCompressorBuilder {
     pub fn build(self) -> BtrBlocksCompressor {
         BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
     }
+}
+
+/// Returns a `'static` scheme value for a runtime-chosen zstd level.
+///
+/// Schemes are registered as `&'static dyn Scheme`, so a level picked at runtime cannot be held in
+/// a scheme value on the stack. Each distinct (scheme type, level) pair is leaked once and reused
+/// afterwards, so repeatedly building compressors does not leak repeatedly.
+#[cfg(feature = "zstd")]
+fn interned_scheme<S: Scheme + Any>(level: i32, make: fn(i32) -> S) -> &'static S {
+    /// Leaked schemes, keyed by the scheme type they were built from and their zstd level.
+    type SchemeCache = Mutex<HashMap<(TypeId, i32), &'static (dyn Any + Send + Sync)>>;
+    static CACHE: LazyLock<SchemeCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut cache = CACHE.lock();
+    let scheme = *cache
+        .entry((TypeId::of::<S>(), level))
+        .or_insert_with(|| Box::leak(Box::new(make(level))) as &'static (dyn Any + Send + Sync));
+    scheme
+        .downcast_ref::<S>()
+        .vortex_expect("interned scheme has the type it was cached under")
 }
 
 #[cfg(test)]
@@ -282,7 +370,7 @@ mod tests {
             !builder
                 .schemes
                 .iter()
-                .any(|scheme| scheme.id() == string::ZstdScheme.id())
+                .any(|scheme| scheme.id() == string::ZstdScheme::default().id())
         );
     }
 

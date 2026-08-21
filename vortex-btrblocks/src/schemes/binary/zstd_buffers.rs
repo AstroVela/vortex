@@ -17,10 +17,26 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
+use crate::schemes::DEFAULT_ZSTD_LEVEL;
 
 /// Zstd buffer-level compression preserving array layout for GPU decompression.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct ZstdBuffersScheme;
+pub struct ZstdBuffersScheme {
+    level: i32,
+}
+
+impl ZstdBuffersScheme {
+    /// Creates a scheme that compresses with the given zstd level.
+    pub const fn new(level: i32) -> Self {
+        Self { level }
+    }
+}
+
+impl Default for ZstdBuffersScheme {
+    fn default() -> Self {
+        Self::new(DEFAULT_ZSTD_LEVEL)
+    }
+}
 
 impl Scheme for ZstdBuffersScheme {
     fn scheme_name(&self) -> &'static str {
@@ -51,6 +67,9 @@ impl Scheme for ZstdBuffersScheme {
         _compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        Ok(vortex_zstd::ZstdBuffers::compress(data.array(), 3, exec_ctx.session())?.into_array())
+        Ok(
+            vortex_zstd::ZstdBuffers::compress(data.array(), self.level, exec_ctx.session())?
+                .into_array(),
+        )
     }
 }

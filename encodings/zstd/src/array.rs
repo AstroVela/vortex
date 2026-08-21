@@ -509,7 +509,11 @@ impl Display for ZstdData {
             f,
             "nrows: {}, slice: {}..{}",
             self.unsliced_n_rows, self.slice_start, self.slice_stop
-        )
+        )?;
+        match self.compression_level() {
+            Some(level) => write!(f, ", level: {level}"),
+            None => write!(f, ", level: unknown"),
+        }
     }
 }
 
@@ -922,6 +926,13 @@ impl<'a> ZstdValues<'a> {
 }
 
 impl ZstdData {
+    /// Zstd compression level the frames were written with.
+    ///
+    /// Returns `None` for arrays written before the level was recorded in metadata.
+    pub fn compression_level(&self) -> Option<i32> {
+        self.metadata.compression_level
+    }
+
     /// Construct unsliced zstd data from raw frames and metadata.
     pub fn new(
         dictionary: Option<ByteBuffer>,
@@ -1169,6 +1180,7 @@ impl ZstdData {
                 .map_or(0, |dict| dict.len())
                 .try_into()?,
             frames: frame_metas,
+            compression_level: Some(level),
         };
 
         Ok(ZstdData::new(dictionary, frames, metadata, parray.len()))
@@ -1255,6 +1267,7 @@ impl ZstdData {
                 .map_or(0, |dict| dict.len())
                 .try_into()?,
             frames: frame_metas,
+            compression_level: Some(level),
         };
         Ok(ZstdData::new(dictionary, frames, metadata, vbv.len()))
     }

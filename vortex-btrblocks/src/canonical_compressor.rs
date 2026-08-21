@@ -79,6 +79,8 @@ mod tests {
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    #[cfg(feature = "zstd")]
+    use vortex_error::vortex_err;
     use vortex_session::VortexSession;
 
     use crate::BtrBlocksCompressor;
@@ -260,6 +262,38 @@ mod tests {
             "expected Zstd, got {}",
             compressed.encoding_id()
         );
+        assert_arrays_eq!(compressed, array, &mut ctx);
+        Ok(())
+    }
+
+    /// The builder's zstd level reaches the schemes it registers, and the encoding records it.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_compact_binary_zstd_uses_configured_level() -> VortexResult<()> {
+        let values = (0..1024)
+            .map(|idx| {
+                let mut value = Vec::from(&b"common binary payload prefix "[..]);
+                value.extend_from_slice(&(idx as u32).to_le_bytes());
+                value.extend_from_slice(&[b'x'; 96]);
+                value
+            })
+            .collect::<Vec<_>>();
+        let array = VarBinViewArray::from_iter(
+            values.iter().map(|value| Some(value.as_slice())),
+            DType::Binary(Nullability::NonNullable),
+        );
+
+        let compressor = BtrBlocksCompressorBuilder::default()
+            .with_zstd_level(9)
+            .with_compact()
+            .build();
+        let mut ctx = SESSION.create_execution_ctx();
+        let compressed = compressor.compress(&array.clone().into_array(), &mut ctx)?;
+
+        let zstd = compressed
+            .as_opt::<vortex_zstd::Zstd>()
+            .ok_or_else(|| vortex_err!("expected Zstd, got {}", compressed.encoding_id()))?;
+        assert_eq!(zstd.data().compression_level(), Some(9));
         assert_arrays_eq!(compressed, array, &mut ctx);
         Ok(())
     }

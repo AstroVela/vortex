@@ -9751,6 +9751,7 @@ dependencies = [
  "codspeed-divan-compat",
  "insta",
  "itertools 0.14.0",
+ "parking_lot",
  "pco",
  "rand 0.10.2",
  "rstest",
