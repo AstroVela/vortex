@@ -68,6 +68,12 @@ pub trait AlgebraicFloat: Copy + sealed::Sealed {
 macro_rules! impl_algebraic_native {
     ($($T:ty),*) => {
         $(
+            // Clippy reads the crate's declared 1.95 MSRV and cannot see that `build.rs` only
+            // enables this arm on 1.98 and later, where the operations are stable.
+            #[expect(
+                clippy::incompatible_msrv,
+                reason = "gated on cfg(vortex_float_algebraic), set only for rustc >= 1.98"
+            )]
             impl AlgebraicFloat for $T {
                 #[inline(always)]
                 fn alg_add(self, rhs: Self) -> Self { self.algebraic_add(rhs) }
