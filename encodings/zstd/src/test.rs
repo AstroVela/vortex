@@ -209,8 +209,8 @@ fn test_zstd_keeps_a_dictionary_that_pays_for_itself() -> VortexResult<()> {
 #[test]
 fn test_zstd_drops_a_dictionary_that_does_not_pay() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
-    // One frame holding every value: a dictionary trained on this array can only repeat what the
-    // frame already contains, so it is pure overhead.
+    // One frame holding every value: a dictionary trained on this array could only repeat what
+    // the frame already contains, so training never runs.
     let array = dictionary_friendly_strings();
     let compressed =
         Zstd::from_var_bin_view_with_options(&array, crate::ZstdOptions::new(3), &mut ctx)?;

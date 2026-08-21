@@ -68,7 +68,8 @@ use crate::ZstdFrameMetadata;
 use crate::ZstdMetadata;
 use crate::validate_frame_content_size;
 
-// Zstd doesn't support training dictionaries on very few samples.
+// Zstd doesn't support training dictionaries on very few samples, and an array with this few
+// frames cannot amortize one either.
 const MIN_SAMPLES_FOR_DICTIONARY: usize = 8;
 // Zstd recommends training on around 100x the dictionary size. Training cost grows with the
 // sample size, so feeding it a whole column buys nothing and costs an order of magnitude in
@@ -1168,8 +1169,14 @@ impl ZstdData {
             value_bytes.slice(start..end)
         };
 
+        // A dictionary can only pay for itself by priming frames that do not contain its contents
+        // yet, so an array with a handful of frames cannot earn back the bytes it stores. Gating
+        // on the frame count keeps training off the write path entirely for the single-frame
+        // arrays the file writer produces.
         let dictionary = match options.dictionary {
-            DictionaryMode::Auto if n_frames > 0 => train_dictionary(value_bytes),
+            DictionaryMode::Auto if n_frames >= MIN_SAMPLES_FOR_DICTIONARY => {
+                train_dictionary(value_bytes)
+            }
             _ => None,
         };
 
@@ -1200,14 +1207,16 @@ impl ZstdData {
         for i in 0..n_frames {
             let uncompressed = frame_bytes(i);
             if i >= frames.len() {
-                frames.push(ByteBuffer::from(compress_frame(&mut compressor, &uncompressed)?));
+                frames.push(ByteBuffer::from(compress_frame(
+                    &mut compressor,
+                    &uncompressed,
+                )?));
             }
             frame_metas.push(ZstdFrameMetadata {
                 uncompressed_size: uncompressed.len() as u64,
                 n_values: options
                     .values_per_frame
-                    .min(n_values - i * options.values_per_frame)
-                    as u64,
+                    .min(n_values - i * options.values_per_frame) as u64,
             });
         }
 

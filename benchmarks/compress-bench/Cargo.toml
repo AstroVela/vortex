@@ -35,6 +35,9 @@ tracing = { workspace = true }
 vortex = { workspace = true }
 vortex-arrow = { workspace = true }
 vortex-bench = { workspace = true }
+vortex-btrblocks = { workspace = true, features = ["zstd"] }
+vortex-zstd = { workspace = true }
+vortex-file = { workspace = true }
 vortex-cuda = { workspace = true, optional = true }
 
 [features]
