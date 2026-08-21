@@ -54,6 +54,7 @@ vortex-tensor = { workspace = true, optional = true }
 vortex-utils = { workspace = true }
 vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
+vortex-zstd-v2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -87,7 +88,7 @@ tokio = [
     "vortex-io/tokio",
     "vortex-layout/tokio",
 ]
-zstd = ["dep:vortex-zstd", "vortex-file?/zstd"]
+zstd = ["dep:vortex-zstd", "dep:vortex-zstd-v2", "vortex-file?/zstd"]
 wasm-bindgen = [
     "vortex-file?/wasm-bindgen",
     "vortex-io/wasm-bindgen",

@@ -59,6 +59,7 @@ vortex-tensor = { workspace = true, optional = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }
 vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
+vortex-zstd-v2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan = { workspace = true }
@@ -86,7 +87,12 @@ tokio = [
     "vortex-layout/tokio",
 ]
 wasm-bindgen = ["vortex-layout/wasm-bindgen"]
-zstd = ["dep:vortex-zstd", "vortex-btrblocks/zstd", "vortex-btrblocks/pco"]
+zstd = [
+    "dep:vortex-zstd",
+    "dep:vortex-zstd-v2",
+    "vortex-btrblocks/zstd",
+    "vortex-btrblocks/pco",
+]
 # This feature enables unstable encodings for which we don't guarantee stability.
 unstable_encodings = [
     "dep:vortex-tensor",

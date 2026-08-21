@@ -37,6 +37,7 @@ vortex-sparse = { workspace = true }
 vortex-utils = { workspace = true }
 vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
+vortex-zstd-v2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 arrow-array = { workspace = true }
@@ -53,7 +54,11 @@ vortex-session = { workspace = true }
 
 [features]
 # This feature enabled unstable encodings for which we don't guarantee stability.
-unstable_encodings = ["dep:vortex-onpair", "vortex-zstd?/unstable_encodings"]
+unstable_encodings = [
+    "dep:vortex-onpair",
+    "dep:vortex-zstd-v2",
+    "vortex-zstd?/unstable_encodings",
+]
 pco = ["dep:pco", "dep:vortex-pco"]
 zstd = ["dep:vortex-zstd"]
 

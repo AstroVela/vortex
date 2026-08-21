@@ -295,6 +295,12 @@ pub mod encodings {
     pub mod zstd {
         pub use vortex_zstd::*;
     }
+
+    #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+    /// Zstd compression storing value lengths apart from value bytes.
+    pub mod zstd_v2 {
+        pub use vortex_zstd_v2::*;
+    }
 }
 
 /// Extension trait to create a default Vortex session.

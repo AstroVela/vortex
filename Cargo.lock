@@ -9562,6 +9562,7 @@ dependencies = [
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
+ "vortex-zstd-v2",
 ]
 
 [[package]]
@@ -9780,6 +9781,7 @@ dependencies = [
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
+ "vortex-zstd-v2",
 ]
 
 [[package]]
@@ -10176,6 +10178,7 @@ dependencies = [
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
+ "vortex-zstd-v2",
 ]
 
 [[package]]
@@ -10771,6 +10774,20 @@ version = "0.1.0"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
+ "prost 0.14.4",
+ "rstest",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-mask",
+ "vortex-session",
+ "zstd",
+]
+
+[[package]]
+name = "vortex-zstd-v2"
+version = "0.1.0"
+dependencies = [
  "prost 0.14.4",
  "rstest",
  "vortex-array",

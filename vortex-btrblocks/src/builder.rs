@@ -153,6 +153,24 @@ impl BtrBlocksCompressorBuilder {
         builder
     }
 
+    /// Replaces the string zstd scheme with `vortex.zstd.v2`, which keeps value lengths in a
+    /// stream of their own.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the compact schemes are not already present.
+    #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+    pub fn with_zstd_v2(self) -> Self {
+        assert!(
+            self.schemes
+                .iter()
+                .any(|scheme| scheme.id() == string::ZstdScheme::DEFAULT.id()),
+            "with_zstd_v2 replaces the string zstd scheme, which is not present"
+        );
+        self.exclude_schemes([string::ZstdScheme::DEFAULT.id()])
+            .with_new_scheme(&string::ZstdV2Scheme::DEFAULT)
+    }
+
     /// Excludes schemes without CUDA kernel support, keeps FSST for string compression,
     /// and adds Zstd for binary compression.
     ///

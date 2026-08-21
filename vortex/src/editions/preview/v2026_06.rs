@@ -17,5 +17,8 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         id: PREVIEW_2026_06_0,
         min_vortex_version: None,
     },
-    added: &[EditionMember::layout(&"vortex.list")],
+    added: &[
+        EditionMember::layout(&"vortex.list"),
+        EditionMember::array(&"vortex.zstd.v2"),
+    ],
 };

@@ -186,6 +186,8 @@ pub fn register_default_encodings(session: &VortexSession) {
     }
     #[cfg(feature = "zstd")]
     vortex_zstd::register_kernels(session);
+    #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+    vortex_zstd_v2::initialize(session);
 
     vortex_alp::initialize(session);
     vortex_datetime_parts::initialize(session);

@@ -10,6 +10,8 @@ mod sparse;
 mod zstd;
 #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
 mod zstd_buffers;
+#[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+mod zstd_v2;
 
 #[cfg(feature = "unstable_encodings")]
 mod onpair;
@@ -25,6 +27,8 @@ pub use vortex_compressor::stats::StringStats;
 pub use zstd::ZstdScheme;
 #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
 pub use zstd_buffers::ZstdBuffersScheme;
+#[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+pub use zstd_v2::ZstdV2Scheme;
 
 #[cfg(test)]
 mod scheme_selection_tests;
