@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     for arg in std::env::args().skip(1) {
         if let Some(scale_factor) = arg.strip_prefix("tpch:") {
             let output_dir = PathBuf::from("/tmp/zstd-sweep-tpch").join(scale_factor);
-            let lineitem = output_dir.join("lineitem.parquet");
+            let lineitem = output_dir.join("parquet").join("lineitem.parquet");
             if !lineitem.exists() {
                 generate_tpch_tables(TpchGenOptions {
                     scale_factor: scale_factor.to_string(),
