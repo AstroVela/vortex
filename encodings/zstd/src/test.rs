@@ -142,7 +142,8 @@ fn test_zstd_with_dict() {
     );
 
     let compressed = Zstd::from_primitive(&array, 0, 16, &mut ctx).unwrap();
-    assert!(compressed.dictionary.is_some());
+    // 800 bytes of values are far too few for a dictionary to earn back the bytes it costs.
+    assert!(compressed.dictionary.is_none());
     assert_nth_scalar!(compressed, 0, 0, &mut ctx);
     assert_nth_scalar!(compressed, 199, 199, &mut ctx);
 
@@ -160,6 +161,71 @@ fn test_zstd_with_dict() {
         PrimitiveArray::from_iter([176, 177, 178]),
         &mut ctx
     );
+}
+
+/// Values drawn from a vocabulary too large to repeat often inside one frame, but shared across
+/// every frame: the case a dictionary is for.
+fn dictionary_friendly_strings() -> VarBinViewArray {
+    const PHRASES: usize = 512;
+    VarBinViewArray::from_iter_str((0..60_000).map(|i| {
+        format!(
+            "https://vortex.dev/docs/encodings/zstd/reference/section-{:04}/anchor-{:04}#{}",
+            (i * 37) % PHRASES,
+            (i * 53) % PHRASES,
+            i
+        )
+    }))
+}
+
+#[test]
+fn test_zstd_keeps_a_dictionary_that_pays_for_itself() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let array = dictionary_friendly_strings();
+    let options = crate::ZstdOptions::new(3).with_values_per_frame(64);
+
+    let with_dict = Zstd::from_var_bin_view_with_options(&array, options, &mut ctx)?;
+    let without_dict = Zstd::from_var_bin_view_with_options(
+        &array,
+        options.with_dictionary(crate::DictionaryMode::Never),
+        &mut ctx,
+    )?;
+
+    assert!(with_dict.dictionary.is_some());
+    assert!(without_dict.dictionary.is_none());
+    assert!(
+        compressed_bytes(&with_dict) < compressed_bytes(&without_dict),
+        "dictionary was kept without making the array smaller: {} vs {}",
+        compressed_bytes(&with_dict),
+        compressed_bytes(&without_dict)
+    );
+    assert_arrays_eq!(
+        Zstd::decompress(&with_dict, &mut ctx)?,
+        array.clone().into_array(),
+        &mut ctx
+    );
+    Ok(())
+}
+
+#[test]
+fn test_zstd_drops_a_dictionary_that_does_not_pay() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    // One frame holding every value: a dictionary trained on this array can only repeat what the
+    // frame already contains, so it is pure overhead.
+    let array = dictionary_friendly_strings();
+    let compressed =
+        Zstd::from_var_bin_view_with_options(&array, crate::ZstdOptions::new(3), &mut ctx)?;
+    assert!(compressed.dictionary.is_none());
+    assert_arrays_eq!(
+        Zstd::decompress(&compressed, &mut ctx)?,
+        array.into_array(),
+        &mut ctx
+    );
+    Ok(())
+}
+
+fn compressed_bytes(array: &ZstdArray) -> usize {
+    array.dictionary.as_ref().map_or(0, |dict| dict.len())
+        + array.frames.iter().map(|frame| frame.len()).sum::<usize>()
 }
 
 #[test]

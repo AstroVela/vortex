@@ -1586,7 +1586,10 @@ dependencies = [
  "vortex",
  "vortex-arrow",
  "vortex-bench",
+ "vortex-btrblocks",
  "vortex-cuda",
+ "vortex-file",
+ "vortex-zstd",
 ]
 
 [[package]]

@@ -142,8 +142,8 @@ impl BtrBlocksCompressorBuilder {
     #[cfg(feature = "zstd")]
     pub fn with_compact(self) -> Self {
         let builder = self
-            .with_new_scheme(&string::ZstdScheme)
-            .with_new_scheme(&binary::ZstdScheme);
+            .with_new_scheme(&string::ZstdScheme::DEFAULT)
+            .with_new_scheme(&binary::ZstdScheme::DEFAULT);
 
         #[cfg(feature = "pco")]
         let builder = builder
@@ -189,7 +189,7 @@ impl BtrBlocksCompressorBuilder {
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
         let builder = builder.with_new_scheme(&binary::ZstdBuffersScheme);
         #[cfg(all(feature = "zstd", not(feature = "unstable_encodings")))]
-        let builder = builder.with_new_scheme(&binary::ZstdScheme);
+        let builder = builder.with_new_scheme(&binary::ZstdScheme::DEFAULT);
 
         builder
     }
@@ -282,7 +282,7 @@ mod tests {
             !builder
                 .schemes
                 .iter()
-                .any(|scheme| scheme.id() == string::ZstdScheme.id())
+                .any(|scheme| scheme.id() == string::ZstdScheme::DEFAULT.id())
         );
     }
 
