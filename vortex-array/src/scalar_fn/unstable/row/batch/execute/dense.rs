@@ -5,6 +5,7 @@ use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
+use vortex_mask::MaskValuesRef;
 
 use super::super::RowFnExecutionArgs;
 use super::super::args::BorrowedRowFnArgs;
@@ -39,7 +40,7 @@ impl RowFnExecutionArgs {
         ) -> VortexResult<DenseAttempt>,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
-            &Mask,
+            MaskValuesRef,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<ArrayRef>>,
         ctx: &mut ExecutionCtx,
@@ -60,30 +61,26 @@ impl RowFnExecutionArgs {
         deferred_error: VortexError,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
-            &Mask,
+            MaskValuesRef,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<ArrayRef>>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let valid_rows = self.validity.execute_mask(self.row_count, ctx)?;
-
-        // An array-backed validity can materialize to all valid even though the cheap checks in
-        // `RowFnExecutionArgs::execute` could not prove that. The deferred error therefore came
-        // from an observable row and remains terminal. Check all-true before all-false because an
-        // empty mask is both.
-        if valid_rows.all_true() {
-            return Err(deferred_error);
-        }
-
-        if valid_rows.all_false() {
-            return Ok(self.all_null());
-        }
+        let valid_rows = match self.validity.execute_mask(self.row_count, ctx)? {
+            // An array-backed validity can materialize to all valid even though the cheap checks
+            // in `RowFnExecutionArgs::execute` could not prove that. The deferred error therefore
+            // came from an observable row and remains terminal. An empty mask is both all-valid
+            // and all-null, so preserve the all-valid behavior.
+            Mask::AllTrue(_) | Mask::AllFalse(0) => return Err(deferred_error),
+            Mask::AllFalse(_) => return Ok(self.all_null()),
+            Mask::Values(valid_rows) => valid_rows,
+        };
 
         // Reduced evidence does not identify which rows failed. Discard the dense error before
         // retrying only observable rows.
         drop(deferred_error);
 
-        if let Some(result) = self.try_execute_valid_rows(try_valid_rows, &valid_rows, ctx)? {
+        if let Some(result) = self.try_execute_valid_rows(try_valid_rows, valid_rows, ctx)? {
             return Ok(result);
         }
 
@@ -105,8 +102,9 @@ impl RowFnExecutionArgs {
                 self.finalize_output(values, self.row_count)
             }
             Validity::Array(valid) => self.finalize_output(values.mask(valid)?, self.row_count),
-            // Handled by the guard in `RowFnExecutionArgs::execute`, before the kernel ran.
-            Validity::AllInvalid => Ok(self.all_null()),
+            Validity::AllInvalid => {
+                unreachable!("all-invalid validity is handled before dense row execution")
+            }
         }
     }
 }

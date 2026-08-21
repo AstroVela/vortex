@@ -8,7 +8,7 @@
 //! signature cannot execute over the original inputs.
 
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
+use vortex_mask::MaskValuesRef;
 
 use super::RowPolicy;
 use super::RowVisitor;
@@ -180,7 +180,7 @@ pub(crate) struct ExecuteValidRows<'args, 'ctx, F: RowFn> {
     policy: RowPolicy,
 
     /// The conjoined validity, containing both valid and invalid rows.
-    valid: &'args Mask,
+    valid: MaskValuesRef,
 
     /// The execution context used to decode the input columns.
     ctx: &'ctx mut ExecutionCtx,
@@ -193,7 +193,7 @@ impl<'args, 'ctx, F: RowFn> ExecuteValidRows<'args, 'ctx, F> {
         options: &'args F::Options,
         output_dtype: &'args DType,
         policy: RowPolicy,
-        valid: &'args Mask,
+        valid: MaskValuesRef,
         ctx: &'ctx mut ExecutionCtx,
     ) -> Self {
         Self {
@@ -231,7 +231,11 @@ impl<F: RowFn> RowVisitor<F::Options> for ExecuteValidRows<'_, '_, F> {
         )?;
 
         execute_owned_infallible_valid_rows::<Args, Out, Prepared>(
-            self.args, self.valid, self.ctx, prepare, apply,
+            self.args,
+            &self.valid,
+            self.ctx,
+            prepare,
+            apply,
         )
     }
 
@@ -258,7 +262,11 @@ impl<F: RowFn> RowVisitor<F::Options> for ExecuteValidRows<'_, '_, F> {
         )?;
 
         execute_sink_valid_rows::<Args, Prepared, Sink, ApplyResult, F::Options>(
-            self.args, self.valid, self.ctx, prepare, apply,
+            self.args,
+            &self.valid,
+            self.ctx,
+            prepare,
+            apply,
         )
     }
 
@@ -283,7 +291,7 @@ impl<F: RowFn> RowVisitor<F::Options> for ExecuteValidRows<'_, '_, F> {
 
         execute_owned_valid_rows::<Args, Out, Prepared, Fail>(
             self.args,
-            self.valid,
+            &self.valid,
             self.ctx,
             prepare,
             apply,

@@ -7,7 +7,7 @@
 //! valid-only execution.
 
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
+use vortex_mask::MaskValuesRef;
 
 use super::RowFnExecutionArgs;
 use super::RowPolicy;
@@ -40,7 +40,7 @@ impl RowFnExecutionArgs {
         ) -> VortexResult<DenseAttempt>,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
-            &Mask,
+            MaskValuesRef,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<ArrayRef>>,
         ctx: &mut ExecutionCtx,
@@ -67,8 +67,8 @@ impl RowFnExecutionArgs {
             return self.execute_all_constant(kernel, ctx);
         }
 
-        // A known all-valid batch does not need to materialize validity, even when its row policy
-        // only permits valid rows.
+        // Do not resolve array-backed validity for the uncommon all-valid or all-null cases here.
+        // That can execute and scan the full mask; each policy resolves it only when necessary.
         if self.validity.definitely_no_nulls() {
             return self.execute_dense(kernel, ctx);
         }
