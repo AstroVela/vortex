@@ -18,9 +18,6 @@ impl FilterKernel for Zstd {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let validity = unsliced_validity(array);
-        array
-            .data()
-            .filter(array.dtype(), &validity, mask, ctx)
-            .map(Some)
+        array.data().filter(array.dtype(), &validity, mask, ctx)
     }
 }

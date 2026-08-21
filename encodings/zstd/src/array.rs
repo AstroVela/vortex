@@ -1651,7 +1651,7 @@ impl ZstdData {
         unsliced_validity: &Validity,
         mask: &Mask,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    ) -> VortexResult<Option<ArrayRef>> {
         vortex_ensure!(
             mask.len() == self.slice_stop - self.slice_start,
             "Filter mask of length {} does not match the {} rows of the array",
@@ -1678,6 +1678,14 @@ impl ZstdData {
             AllOr::Some(bits) => selected_rows.iter().map(|&row| bits.value(row)).collect(),
         };
 
+        // This kernel earns its keep by not decompressing frames, and pays for it by copying each
+        // selected value out of the frame that holds it. Decompressing everything instead builds
+        // views straight over the decompressed bytes without copying values at all, so when a mask
+        // reaches every frame there is nothing left to win: hand those back to the generic path.
+        if self.touched_frames(&spans, &value_indices, &selected_valid) == spans.len() {
+            return Ok(None);
+        }
+
         let out_validity = align_validity_to_dtype(
             unsliced_validity
                 .slice(self.slice_start..self.slice_stop)?
@@ -1703,14 +1711,16 @@ impl ZstdData {
                         Ok(())
                     },
                 )?;
-                Ok(PrimitiveArray::from_values_byte_buffer(
-                    values.freeze(),
-                    dtype.as_ptype(),
-                    out_validity,
-                    mask.true_count(),
-                    ctx,
-                )
-                .into_array())
+                Ok(Some(
+                    PrimitiveArray::from_values_byte_buffer(
+                        values.freeze(),
+                        dtype.as_ptype(),
+                        out_validity,
+                        mask.true_count(),
+                        ctx,
+                    )
+                    .into_array(),
+                ))
             }
             DType::Binary(_) | DType::Utf8(_) => {
                 let mut builder =
@@ -1736,10 +1746,32 @@ impl ZstdData {
                 for _ in next_row..selected_valid.len() {
                     builder.append_null();
                 }
-                Ok(builder.finish_into_varbinview().into_array())
+                Ok(Some(builder.finish_into_varbinview().into_array()))
             }
             _ => vortex_bail!("Unsupported dtype for Zstd filter: {dtype}"),
         }
+    }
+
+    /// How many frames hold at least one selected value.
+    fn touched_frames(
+        &self,
+        spans: &[FrameSpan],
+        value_indices: &[usize],
+        selected_valid: &[bool],
+    ) -> usize {
+        let mut touched = 0;
+        let mut next = 0usize;
+        for span in spans {
+            while next < value_indices.len()
+                && (!selected_valid[next] || value_indices[next] < span.value_start)
+            {
+                next += 1;
+            }
+            if next < value_indices.len() && value_indices[next] < span.value_stop() {
+                touched += 1;
+            }
+        }
+        touched
     }
 
     /// Calls `handle_value` with each selected value, in row order.
