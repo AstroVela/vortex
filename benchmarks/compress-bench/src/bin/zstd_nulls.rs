@@ -1,3 +1,5 @@
+#![expect(clippy::cast_possible_truncation)]
+
 //! How the zstd encodings handle null-heavy string columns.
 //!
 //! Both store only the valid values, so nulls cost validity bits rather than value bytes. This
@@ -33,7 +35,7 @@ fn values(null_fraction: f64, value_len: usize) -> VarBinViewArray {
 
 fn main() -> Result<()> {
     println!(
-        "{:>6} {:>8} {:>11} {:>11} {:>11} {:>7} {:>11} {:>11} {:>7} {:>9} {:>9}  {}",
+        "{:>6} {:>8} {:>11} {:>11} {:>11} {:>7} {:>11} {:>11} {:>7} {:>9} {:>9}  cascade picks",
         "nulls",
         "str len",
         "raw",
@@ -45,7 +47,6 @@ fn main() -> Result<()> {
         "v2/v1",
         "v1 decode",
         "v2 decode",
-        "cascade picks"
     );
     for value_len in [32usize, 256] {
         for null_fraction in [0.0f64, 0.25, 0.5, 0.75, 0.9, 0.99] {

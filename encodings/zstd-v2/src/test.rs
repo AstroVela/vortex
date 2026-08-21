@@ -13,10 +13,10 @@ use vortex_array::array_session;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::compute::conformance::consistency::test_array_consistency;
+use vortex_array::session::ArraySessionExt as _;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
-use vortex_array::session::ArraySessionExt as _;
 use vortex_session::VortexSession;
 
 use crate::ZstdV2;
@@ -206,7 +206,7 @@ fn test_all_empty_values(#[case] values_per_frame: usize) -> VortexResult<()> {
     let mut ctx = ctx();
     let empty = VarBinViewArray::from_iter_str((0..N).map(|_| String::new()));
     let array = ZstdV2::from_var_bin_view(&empty, 3, values_per_frame, &mut ctx)?.into_array();
-    assert_arrays_eq!(array.clone(), empty.into_array(), &mut ctx);
+    assert_arrays_eq!(array, empty.into_array(), &mut ctx);
     assert_arrays_eq!(
         array.slice(10..20)?,
         VarBinViewArray::from_iter_str((0..10).map(|_| String::new())).into_array(),
@@ -219,9 +219,13 @@ fn test_all_empty_values(#[case] values_per_frame: usize) -> VortexResult<()> {
 #[test]
 fn test_mostly_empty_values() -> VortexResult<()> {
     let mut ctx = ctx();
-    let sparse = VarBinViewArray::from_iter_str(
-        (0..N).map(|i| if i % 97 == 0 { format!("value-{i}") } else { String::new() }),
-    );
+    let sparse = VarBinViewArray::from_iter_str((0..N).map(|i| {
+        if i % 97 == 0 {
+            format!("value-{i}")
+        } else {
+            String::new()
+        }
+    }));
     let array = ZstdV2::from_var_bin_view(&sparse, 3, 64, &mut ctx)?.into_array();
     assert_arrays_eq!(array, sparse.into_array(), &mut ctx);
     Ok(())

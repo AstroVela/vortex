@@ -1,3 +1,5 @@
+#![expect(clippy::cast_possible_truncation)]
+
 //! Measures filtering a zstd array against decompressing it and filtering the result, across
 //! framings and selectivities. Frames are compressed independently, so a mask that touches few of
 //! them only pays for those.
@@ -8,7 +10,6 @@ use vortex::array::Canonical;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::VarBinViewArray;
-use vortex::array::builtins::ArrayBuiltins as _;
 use vortex::mask::Mask;
 use vortex_bench::SESSION;
 use vortex_zstd::Zstd;

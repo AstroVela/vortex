@@ -569,7 +569,6 @@ mod filter {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_array::builtins::ArrayBuiltins as _;
     use vortex_array::session::ArraySessionExt as _;
     use vortex_buffer::ByteBuffer;
     use vortex_error::VortexResult;
@@ -661,7 +660,7 @@ mod filter {
     /// Truncating a frame's compressed bytes leaves its header, and so its metadata, intact: the
     /// frame only fails when something decompresses it. A filter that reads around it must not.
     fn with_truncated_frame(array: ArrayRef, frame: usize) -> VortexResult<ArrayRef> {
-        let zstd = array.as_::<Zstd>().clone();
+        let zstd = array.as_::<Zstd>();
         let dtype = zstd.dtype().clone();
         let validity = zstd.validity()?;
         let mut data: ZstdData = zstd.data().clone();
@@ -682,7 +681,6 @@ mod filter {
 
         // Selecting around the broken frame succeeds only if it was never decompressed.
         let kept = array
-            .clone()
             .filter(Mask::from_indices(N, [5, 200, 511]))?
             .execute::<Canonical>(&mut ctx)?;
         assert_eq!(kept.into_array().len(), 3);
@@ -690,7 +688,6 @@ mod filter {
         // Selecting from it must still report the corruption rather than inventing values.
         assert!(
             array
-                .clone()
                 .filter(Mask::from_indices(N, [100]))?
                 .execute::<Canonical>(&mut ctx)
                 .is_err(),
