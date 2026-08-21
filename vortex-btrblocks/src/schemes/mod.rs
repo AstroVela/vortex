@@ -13,6 +13,13 @@ pub mod temporal;
 
 pub(crate) mod patches;
 
+/// Zstd compression level used by the Zstd schemes unless another level is selected.
+///
+/// Level 3 is the zstd library default: it is the point where the ratio curve is still steep but
+/// encode throughput has not yet collapsed.
+#[cfg(feature = "zstd")]
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 use vortex_compressor::builtins::BinaryDictScheme;
 use vortex_compressor::builtins::FloatDictScheme;
 use vortex_compressor::builtins::IntDictScheme;

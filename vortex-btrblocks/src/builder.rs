@@ -11,6 +11,8 @@ use crate::CascadingCompressor;
 use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
+#[cfg(feature = "zstd")]
+use crate::schemes::DEFAULT_ZSTD_LEVEL;
 use crate::schemes::binary;
 use crate::schemes::decimal;
 use crate::schemes::float;
@@ -141,9 +143,23 @@ impl BtrBlocksCompressorBuilder {
     /// Panics if any of the compact schemes are already present.
     #[cfg(feature = "zstd")]
     pub fn with_compact(self) -> Self {
+        self.with_compact_at_zstd_level::<DEFAULT_ZSTD_LEVEL>()
+    }
+
+    /// Adds the compact encoding schemes, writing Zstd frames at `LEVEL`.
+    ///
+    /// [`with_compact`](Self::with_compact) is this at [`DEFAULT_ZSTD_LEVEL`]. Higher levels trade
+    /// encode throughput for ratio; decode is unaffected, since a Zstd frame carries the
+    /// parameters it was written with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the compact schemes are already present.
+    #[cfg(feature = "zstd")]
+    pub fn with_compact_at_zstd_level<const LEVEL: i32>(self) -> Self {
         let builder = self
-            .with_new_scheme(&string::ZstdScheme)
-            .with_new_scheme(&binary::ZstdScheme);
+            .with_new_scheme(string::ZstdScheme::<LEVEL>::INSTANCE)
+            .with_new_scheme(binary::ZstdScheme::<LEVEL>::INSTANCE);
 
         #[cfg(feature = "pco")]
         let builder = builder
@@ -189,7 +205,7 @@ impl BtrBlocksCompressorBuilder {
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
         let builder = builder.with_new_scheme(&binary::ZstdBuffersScheme);
         #[cfg(all(feature = "zstd", not(feature = "unstable_encodings")))]
-        let builder = builder.with_new_scheme(&binary::ZstdScheme);
+        let builder = builder.with_new_scheme(binary::ZstdScheme::<DEFAULT_ZSTD_LEVEL>::INSTANCE);
 
         builder
     }
@@ -282,8 +298,31 @@ mod tests {
             !builder
                 .schemes
                 .iter()
-                .any(|scheme| scheme.id() == string::ZstdScheme.id())
+                .any(|scheme| scheme.id() == string::ZstdScheme::<DEFAULT_ZSTD_LEVEL>.id())
         );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn compact_at_zstd_level_registers_the_zstd_schemes() {
+        let builder = BtrBlocksCompressorBuilder::default().with_compact_at_zstd_level::<9>();
+
+        for id in [string::ZstdScheme::<9>.id(), binary::ZstdScheme::<9>.id()] {
+            assert!(builder.schemes.iter().any(|scheme| scheme.id() == id));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn compact_is_compact_at_the_default_zstd_level() {
+        let default_level = BtrBlocksCompressorBuilder::default().with_compact();
+        let explicit = BtrBlocksCompressorBuilder::default()
+            .with_compact_at_zstd_level::<DEFAULT_ZSTD_LEVEL>();
+
+        let ids = |builder: &BtrBlocksCompressorBuilder| {
+            builder.schemes.iter().map(|s| s.id()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&default_level), ids(&explicit));
     }
 
     #[test]

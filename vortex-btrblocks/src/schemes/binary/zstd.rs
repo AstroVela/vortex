@@ -17,12 +17,24 @@ use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
+use crate::schemes::DEFAULT_ZSTD_LEVEL;
 
 /// Zstd compression without dictionaries for binary arrays.
+///
+/// `LEVEL` is the zstd compression level the frames are written at. See
+/// [`string::ZstdScheme`](crate::schemes::string::ZstdScheme) for why the level is a type
+/// parameter rather than a field.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct ZstdScheme;
+pub struct ZstdScheme<const LEVEL: i32 = DEFAULT_ZSTD_LEVEL>;
 
-impl Scheme for ZstdScheme {
+impl<const LEVEL: i32> ZstdScheme<LEVEL> {
+    /// A `'static` handle to this scheme, for [`with_new_scheme`].
+    ///
+    /// [`with_new_scheme`]: crate::BtrBlocksCompressorBuilder::with_new_scheme
+    pub const INSTANCE: &'static Self = &Self;
+}
+
+impl<const LEVEL: i32> Scheme for ZstdScheme<LEVEL> {
     fn scheme_name(&self) -> &'static str {
         "vortex.binary.zstd"
     }
@@ -56,7 +68,7 @@ impl Scheme for ZstdScheme {
             .into_owned()
             .compact_buffers(exec_ctx)?;
         Ok(
-            vortex_zstd::Zstd::from_var_bin_view_without_dict(&compacted, 3, 8192, exec_ctx)?
+            vortex_zstd::Zstd::from_var_bin_view_without_dict(&compacted, LEVEL, 8192, exec_ctx)?
                 .into_array(),
         )
     }

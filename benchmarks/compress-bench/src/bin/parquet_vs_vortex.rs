@@ -81,6 +81,10 @@ struct Args {
     #[arg(long)]
     compact: bool,
 
+    /// Zstd level the compact schemes write at. Only used with `--compact`.
+    #[arg(long, default_value_t = 3)]
+    compact_zstd_level: i32,
+
     /// Also time a separate single-column scan for every top-level column.
     #[arg(long)]
     per_column: bool,
@@ -308,8 +312,16 @@ async fn convert(args: &Args) -> anyhow::Result<Duration> {
 
     let mut strategy = WriteStrategyBuilder::default();
     if args.compact {
-        strategy =
-            strategy.with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
+        // The level is a const generic on the scheme, so the runtime flag dispatches here.
+        let compressor = BtrBlocksCompressorBuilder::default();
+        let compressor = match args.compact_zstd_level {
+            3 => compressor.with_compact_at_zstd_level::<3>(),
+            6 => compressor.with_compact_at_zstd_level::<6>(),
+            9 => compressor.with_compact_at_zstd_level::<9>(),
+            12 => compressor.with_compact_at_zstd_level::<12>(),
+            other => bail!("--compact-zstd-level {other} is not one of 3, 6, 9, 12"),
+        };
+        strategy = strategy.with_btrblocks_builder(compressor);
     }
 
     let start = Instant::now();
