@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+include ../setup.slt.no
+
+statement ok
+COPY (SELECT range AS id FROM range(1000000))
+TO '${WORK_DIR}/chunk-offset.vortex';
+
+query I
+SELECT id FROM '${WORK_DIR}/chunk-offset.vortex' LIMIT 1;
+----
+0
+
+query I
+SELECT id FROM '${WORK_DIR}/chunk-offset.vortex'
+LIMIT 1 OFFSET 100000;
+----
+100000
+
+query I
+SELECT id FROM (
+    SELECT id, row_number() OVER () - 1 p
+    FROM '${WORK_DIR}/chunk-offset.vortex')
+WHERE p = 100000;
+----
+100000

@@ -221,11 +221,12 @@ pub unsafe extern "C-unwind" fn duckdb_reader_get_statistics(
 pub unsafe extern "C-unwind" fn duckdb_reader_initialize(
     global: *const c_void,
     file: *mut c_void,
+    ordered: bool,
     error: *mut cpp::duckdb_vx_error,
 ) -> bool {
     let global = unsafe { global.cast::<GlobalState>().as_ref() }.vortex_expect("null pointer");
     let file = unsafe { file.cast::<OpenFileReader>().as_mut() }.vortex_expect("null pointer");
-    try_or(error, || reader_initialize(file, global))
+    try_or(error, || reader_initialize(file, global, ordered))
 }
 
 #[unsafe(no_mangle)]

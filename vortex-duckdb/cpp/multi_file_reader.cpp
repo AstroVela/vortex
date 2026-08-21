@@ -84,10 +84,19 @@ VortexMultiFileReader::InitializeReader(MultiFileReaderData &reader_data,
 
     const VortexGlobalState &global = gstate.global_state->Cast<VortexGlobalState>();
 
+    // Unlike ANSI SQL, Duckdb provides ordering by default
+    // https://duckdb.org/docs/current/sql/dialect/order_preservation
+    Value ordered_value;
+    if (!context.TryGetCurrentSetting("preserve_insertion_order", ordered_value)) {
+        throw BinderException("preserve_insertion_order not set");
+    }
+    D_ASSERT(ordered_value.type() == LogicalType::BOOLEAN);
+    const bool ordered = ordered_value.GetValueUnsafe<bool>();
+
     duckdb_vx_error error = nullptr;
     const void *const ffi_global = global.ffi_global_state->DataPtr();
     void *const ffi_file = reader.ffi_file->DataPtr();
-    const bool skip = duckdb_reader_initialize(ffi_global, ffi_file, &error);
+    const bool skip = duckdb_reader_initialize(ffi_global, ffi_file, ordered, &error);
     if (error) {
         throw InvalidInputException(IntoErrString(error));
     }

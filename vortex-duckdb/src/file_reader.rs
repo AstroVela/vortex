@@ -159,16 +159,21 @@ pub fn reader_bind(file: &OpenFileReader, result: &mut BindResultRef) -> VortexR
 /// Called once per file by one thread under file-local lock. Determines
 /// whether the opened file should be skipped. If this function returns false,
 /// duckdb closes the file and doesn't call reader_try_initialize_scan on it.
-pub fn reader_initialize(file: &mut OpenFileReader, global: &GlobalState) -> VortexResult<bool> {
+pub fn reader_initialize(
+    file: &mut OpenFileReader,
+    global: &GlobalState,
+    mut ordered: bool,
+) -> VortexResult<bool> {
     if file.can_skip(&global.filter)? {
         return Ok(true);
     }
 
-    // Getting splits is non-trivial work so we prefer doing it here under file
-    // lock and not in reader_try_initialize_scan under global lock.
-    let ordered = global.file_row_number_column_pos.is_some();
+    ordered |= global.file_row_number_column_pos.is_some();
+
     let reader = Arc::clone(&file.reader);
     let filter = &global.filter;
+    // Getting splits is non-trivial work so we prefer doing it here under file
+    // lock and not in reader_try_initialize_scan under global lock.
     let mut builder = ScanBuilder::new(SESSION.clone(), reader)
         .with_projection(global.projection.clone())
         .with_ordered(ordered)
