@@ -11,7 +11,6 @@ pub mod string;
 pub mod decimal;
 pub mod temporal;
 
-pub(crate) mod fixed_bins;
 pub(crate) mod patches;
 
 use std::ops::Range;

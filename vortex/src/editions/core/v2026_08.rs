@@ -31,7 +31,6 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         EditionMember::array(&"vortex.int_mult"),
         EditionMember::array(&"vortex.map"),
         EditionMember::array(&"vortex.ordered_float"),
-        EditionMember::array(&"vortex.range_packed"),
         EditionMember::aggregate(&"vortex.bounded_max"),
         EditionMember::aggregate(&"vortex.bounded_min"),
         EditionMember::aggregate(&"vortex.max"),

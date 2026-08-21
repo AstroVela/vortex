@@ -20,7 +20,6 @@ use vortex::VortexSessionDefault;
 use vortex::array::Canonical;
 use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
-use vortex::array::arrays::DictArray;
 use vortex::array::arrays::Primitive;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::VarBinViewArray;
@@ -53,7 +52,6 @@ use vortex::encodings::fsst::fsst_train_compressor;
 use vortex::encodings::int_mult::IntMult;
 use vortex::encodings::int_mult::IntMultArraySlotsExt;
 use vortex::encodings::pco::Pco;
-use vortex::encodings::range_packed::RangeDecomposition;
 use vortex::encodings::runend::RunEnd;
 use vortex::encodings::sequence::sequence_encode;
 use vortex::encodings::zigzag::zigzag_encode;
@@ -397,13 +395,6 @@ fn setup_int_mult_integer_array<T: NativePType>() -> PrimitiveArray {
     }
 }
 
-fn setup_ranged_u64_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
-        let cluster = index % 10;
-        cluster * 1_000_000_000 + index.wrapping_mul(7_919) % 1_024
-    }))
-}
-
 fn encode_int_mult_packed_tree<T: NativePType>(array: &PrimitiveArray) -> vortex::array::ArrayRef {
     let split = IntMult::from_primitive(array.as_view(), 10).unwrap();
     let primary = split
@@ -432,25 +423,6 @@ fn encode_int_mult_packed_tree<T: NativePType>(array: &PrimitiveArray) -> vortex
         .unwrap()
         .into_array();
     IntMult::try_new(primary, secondary, 10)
-        .unwrap()
-        .into_array()
-}
-
-fn encode_decomposed_range_tree(array: &PrimitiveArray) -> vortex::array::ArrayRef {
-    let decomposition = RangeDecomposition::encode(array.as_slice::<u64>()).unwrap();
-    let code_width = decomposition.code_width();
-    let codes = PrimitiveArray::from_iter(decomposition.codes().iter().copied());
-    // SAFETY: The decomposition computes the exact code width.
-    let codes = unsafe { bitpack_encode_unchecked(codes, code_width) }
-        .unwrap()
-        .into_array();
-    let starts = PrimitiveArray::from_iter(decomposition.bin_starts().iter().copied()).into_array();
-    let references = DictArray::try_new(codes, starts).unwrap().into_array();
-    let offsets = PrimitiveArray::from_iter(decomposition.offsets().iter().copied());
-    let offsets = BlockResidual::from_primitive(offsets.as_view())
-        .unwrap()
-        .into_array();
-    IntMult::try_new(references, offsets, 1)
         .unwrap()
         .into_array()
 }
@@ -986,40 +958,6 @@ fn int_mult_packed_tree_decompress<T: NativePType>(bencher: Bencher) {
 #[divan::bench(types = [u8, u16, u32, u64])]
 fn int_mult_packed_tree_scalar_at<T: NativePType>(bencher: Bencher) {
     let encoded = encode_int_mult_packed_tree::<T>(&setup_int_mult_integer_array::<T>());
-    let next_index = AtomicUsize::new(0);
-
-    bencher
-        .with_inputs(|| {
-            (
-                &encoded,
-                SESSION.create_execution_ctx(),
-                next_index.fetch_add(2_654_435_761, Ordering::Relaxed) % encoded.len(),
-            )
-        })
-        .bench_values(|(array, mut ctx, index)| array.execute_scalar(index, &mut ctx).unwrap());
-}
-
-#[divan::bench(name = "decomposed_range_compress_u64")]
-fn bench_decomposed_range_compress_u64(bencher: Bencher) {
-    let array = setup_ranged_u64_array();
-
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
-        .with_inputs(|| &array)
-        .bench_refs(|array| encode_decomposed_range_tree(array));
-}
-
-#[divan::bench(name = "decomposed_range_decompress_u64")]
-fn bench_decomposed_range_decompress_u64(bencher: Bencher) {
-    let encoded = encode_decomposed_range_tree(&setup_ranged_u64_array());
-
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
-        .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
-        .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
-}
-
-#[divan::bench(name = "decomposed_range_scalar_at_u64")]
-fn bench_decomposed_range_scalar_at_u64(bencher: Bencher) {
-    let encoded = encode_decomposed_range_tree(&setup_ranged_u64_array());
     let next_index = AtomicUsize::new(0);
 
     bencher

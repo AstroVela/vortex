@@ -193,7 +193,6 @@ pub fn register_default_encodings(session: &VortexSession) {
     vortex_float_quant::initialize(session);
     vortex_int_mult::initialize(session);
     vortex_block_residual::initialize(session);
-    vortex_range_packed::initialize(session);
     vortex_runend::initialize(session);
     vortex_sequence::initialize(session);
     vortex_sparse::initialize(session);

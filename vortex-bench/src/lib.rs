@@ -37,7 +37,6 @@ use vortex::utils::aliases::hash_map::HashMap;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::float::FloatQuantScheme;
 use vortex_btrblocks::schemes::float::OrderedBlockResidualScheme;
-use vortex_btrblocks::schemes::float::OrderedFloatRangePackedScheme;
 use vortex_btrblocks::schemes::integer::BlockResidualScheme;
 
 use crate::spatialbench::SpatialBenchBenchmark;
@@ -244,8 +243,6 @@ pub enum CompactionStrategy {
     Default,
 }
 
-const RANGE_PACKED_SCHEME: OrderedFloatRangePackedScheme = OrderedFloatRangePackedScheme::new(1.20);
-
 /// Numeric scheme bundles for compression benchmarks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum VortexNumericBundle {
@@ -256,8 +253,6 @@ pub enum VortexNumericBundle {
     /// Use the current Default compressor.
     #[default]
     CurrentDefault,
-    /// Add the experimental OrderedFloat with RangePacked scheme.
-    RangePacked,
 }
 
 impl VortexNumericBundle {
@@ -267,7 +262,6 @@ impl VortexNumericBundle {
             Self::PriorDefault => "prior-default",
             Self::BlockResidual => "block-residual",
             Self::CurrentDefault => "current-default",
-            Self::RangePacked => "range-packed",
         }
     }
 
@@ -283,9 +277,6 @@ impl VortexNumericBundle {
                 BtrBlocksCompressorBuilder::default().exclude_schemes([FloatQuantScheme.id()])
             }
             Self::CurrentDefault => BtrBlocksCompressorBuilder::default(),
-            Self::RangePacked => {
-                BtrBlocksCompressorBuilder::default().with_new_scheme(&RANGE_PACKED_SCHEME)
-            }
         };
         options.with_strategy(
             WriteStrategyBuilder::default()

@@ -29,6 +29,7 @@ use vortex_bench::compress::calculate_ratios;
 use vortex_bench::create_output_writer;
 use vortex_bench::datasets::Dataset;
 use vortex_bench::datasets::feature_vectors::GloveEmbeddingsData;
+use vortex_bench::datasets::feature_vectors::OpenAiEmbeddingsData;
 use vortex_bench::datasets::local_parquet::LocalParquetData;
 use vortex_bench::datasets::struct_list_of_ints::StructListOfInts;
 use vortex_bench::datasets::taxi_data::TaxiData;
@@ -214,7 +215,8 @@ async fn run_compress(
     )]
     let gpu_decompress_benchmarks = vec!["TPC-H l_comment canonical"];
 
-    let mut datasets: Vec<&dyn Dataset> = vec![&TaxiData, &GloveEmbeddingsData];
+    let mut datasets: Vec<&dyn Dataset> =
+        vec![&TaxiData, &GloveEmbeddingsData, &OpenAiEmbeddingsData];
     for (name, dataset) in [
         ("Arade", Arade),
         ("Bimbo", Bimbo),

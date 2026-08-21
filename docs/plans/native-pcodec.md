@@ -46,19 +46,21 @@ Remove `RangeEntropyArray`, `RangeEntropyScheme`, and `BitSplitCodec` from the f
 
 The `wm/pcodec-entropy-experiments` branch preserves the complete entropy and bit-split prototypes.
 
-Keep the fused `RangePackedArray` and its manual benchmark as experimental work.
+Remove `RangePackedArray` and its manual benchmark from the focused branch.
 
-Prototype fixed bins as a composed tree instead:
+The Git history and this plan preserve the fixed-bin experiment.
+
+The fixed-bin experiment used this composed tree:
 
 - `Dict(BitPacked(bin_codes), bin_starts)` reconstructs one reference per value.
 - `BlockResidual(offsets)` stores each distance from the selected reference.
 - `IntMult(base=1, references, offsets)` adds both components.
 
-The prototype permits any bin count from one through 64.
+The prototype accepted any bin count from one through 64.
 
-The branch includes an experimental `IntegerFixedBinsScheme` for the composed tree.
+The experiment also tested an `IntegerFixedBinsScheme` below ALP.
 
-The scheme runs only below ALP. It remains outside `ALL_SCHEMES`.
+The complete corpus did not justify either scheme. The focused branch no longer contains either scheme.
 
 Do not add the fused RangePacked array to the Default or Compact selector.
 
@@ -69,8 +71,6 @@ Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution D
 The branch implements `OrderedFloatArray`, `BlockResidualArray`, `FloatQuantArray`, and `IntMultArray`.
 
 The evaluation set includes BtrBlocks schemes for the first three arrays.
-
-The experimental BtrBlocks scheme for IntMult applies only to ALP integer children.
 
 `OrderedFloat(BlockResidual)` now supports `f16`, `f32`, and `f64` inputs.
 
@@ -86,7 +86,9 @@ The retained schemes win on specific structures. They do not replace ALP or ALP-
 
 FloatQuant now passes the speed gates for zero-secondary and one-bit-secondary inputs.
 
-The complete file corpus does not yet justify FloatQuant in Default.
+The complete file corpus justifies FloatQuant in Default.
+
+OpenAI-on-C4 f64 embeddings select zero-secondary FloatQuant and shrink by 40.5 percent.
 
 BlockResidual now passes the direct speed gates for every integer width.
 
@@ -94,25 +96,27 @@ The GloVe result identifies a separate entropy gap inside the ALP integer child.
 
 The previously tested quotient and remainder trees do not close that gap.
 
-The current selector factors and nonlinear patch cost remain provisional.
+The final calibration retains the 1.05 BlockResidual ratio floor.
+
+It retains the 1.02 ordered-float factor, 1.10 FloatQuant factor, 1.12 8-bit factor, and nonlinear patch cost.
 
 `IntMultArray` owns only the quotient and remainder transform.
 
 Its two children remain generic arrays. Child compression owns patches and other integer models.
 
-The range decomposition prototype uses `IntMult(base=1)` as generic addition.
+The range decomposition prototype used `IntMult(base=1)` as generic addition.
 
-Its fused decode path skips multiplication and avoids materialization of dictionary references.
+Its fused decode path skipped multiplication and avoided dictionary reference materialization.
 
-IntMult participates only through explicit experimental schemes.
+IntMult has no Default scheme.
 
 Decomposed fixed bins do not participate in the Default selector.
 
-Final calibration requires the complete corpus and selected-tree evidence.
+The final calibration includes the complete corpus and selected-tree evidence.
 
-The current branch recovers a small share of Compact's aggregate numeric advantage.
+The Opportunistic bundle cuts aggregate size by 11.7 percent against Prior Default.
 
-The remaining work targets repeated Compact mechanisms with native, bounded-access trees.
+Future work targets repeated Compact mechanisms with native, bounded-access trees.
 
 ## Array support and validation
 
@@ -2841,40 +2845,84 @@ The composable IntMult follow-up is complete. The tested IntMult trees remain ou
 
 The nonzero-secondary FloatQuant implementation and focused validation are complete.
 
-The focused Default bundle now includes full-position RangePacked as an experimental candidate.
-
 The specialized OrderedFloat and ALP trees now use registered fused parent kernels.
-
-Use the opportunistic bundle as the leading Default candidate.
 
 The pure integer fixed-bin experiment is complete.
 
-It selected no real tree and reduced write throughput. Keep it outside Default.
+It selected no integer tree and reduced write throughput. The focused branch no longer contains either fixed-bin scheme.
 
-Use these next steps:
+## Final calibration
 
-1. Keep the Opportunistic bundle as the leading Default candidate.
-2. Retain the direct OrderedFloat fixed-bin bundle as an optional experiment.
-3. Revisit direct fixed bins when the corpus gains more applicable distributions.
-4. Complete the final threshold review for the retained schemes.
-5. Compare the retained bundle across the complete file corpus.
-6. Add more real embedding datasets when licenses and loaders permit them.
+The final pass compared 17 datasets with five timed iterations per operation.
 
-Use packed bin codes and primitive bin starts unless evidence supports more complexity.
+The corpus included GloVe `f32` embeddings and OpenAI-on-C4 `f64` embeddings.
 
-Let ordinary child arrays own patches and exception payloads.
+| Bundle or format | Aggregate bytes | Encode time | Decode time |
+| --- | ---: | ---: | ---: |
+| Prior Default | 3,025,406,960 | 10.928 seconds | 0.424 seconds |
+| Opportunistic | 2,672,321,904 | 10.487 seconds | 0.422 seconds |
+| Compact | 2,027,179,944 | 11.655 seconds | 1.082 seconds |
+| Parquet with Zstd | 2,718,861,135 | 24.830 seconds | 5.635 seconds |
 
-Add an outer OrderedFloat fused decode only if the generic composition misses the decode gate.
+Against Prior Default, Opportunistic reduced aggregate size by 11.67 percent.
 
-Keep the black-box RangePacked array and RangeEntropy outside Default.
+It reduced aggregate encode time by 4.04 percent and aggregate decode time by 0.56 percent.
 
-Retain decomposed fixed bins only as an experimental reference.
+The geometric means improved by 5.69 percent for size, 10.49 percent for encode time, and 4.99 percent for decode time.
 
-After the candidate set stabilizes, complete these final steps:
+Opportunistic produced 1.71 percent fewer aggregate bytes than Parquet with Zstd.
 
-1. Add a true ALP-RD child composition case if a real selected tree exposes one.
-2. Add more real embedding datasets when licenses and loaders permit them.
-3. Update this plan after each experiment.
+Its geometric-mean size ratio against Parquet with Zstd was 0.980.
+
+The focused cached-access corpus included five tabular datasets and the OpenAI vector dataset.
+
+Opportunistic reduced geometric-mean scalar latency by 10.97 percent and aggregate scalar latency by 10.20 percent.
+
+OpenAI-on-C4 selected `FloatQuant(FoR(BitPacked))`.
+
+That tree reduced size by 40.5 percent and improved bulk decode time against Prior Default.
+
+GloVe retained its prior tree. Its result still identifies an entropy gap inside the ALP integer child.
+
+The fixed-bin bundle reduced aggregate size by only 0.025 percent against Opportunistic.
+
+It changed only the HashTags file in the complete corpus, where it reduced file size by 0.43 percent.
+
+The selected HashTags column was 35.0 percent smaller, but that narrow win did not justify the scheme cost.
+
+## Final production decision
+
+Use the Opportunistic bundle in Default.
+
+The bundle contains these schemes:
+
+- `BlockResidualScheme` for integers.
+- `OrderedBlockResidualScheme` for floating-point values.
+- `FloatQuantScheme` for floating-point values.
+
+Keep `IntMultArray` as a composable primitive without a Default scheme.
+
+Retain these selector controls:
+
+- A 1.05 minimum ratio for integer BlockResidual.
+- A 1.05 minimum ratio and 1.02 decode factor for ordered BlockResidual.
+- A 1.10 FloatQuant factor.
+- A 1.12 factor for 8-bit BlockResidual.
+- The nonlinear BlockResidual patch cost.
+- The one-block rejection for integer BlockResidual.
+
+Remove RangePacked and both fixed-bin schemes from the focused branch.
+
+Keep RangeEntropy, BitSplit, and alternate residual models on the experimental branch.
+
+Use ordinary child arrays for patches and exception payloads.
+
+Test these items in future research:
+
+1. Test nonzero-secondary FloatQuant on more real distributions.
+2. Add more real float datasets where Pco beats ALP and ALP-RD.
+3. Test a true ALP-RD child composition when a real selected tree exposes one.
+4. Revisit fixed bins only when the corpus includes more applicable distributions.
 
 ## Pull request structure
 
@@ -2883,8 +2931,6 @@ Prepare one focused stack for `OrderedFloatArray`, `BlockResidualArray`, and `Or
 Prepare a separate stack for `FloatQuantArray` and `FloatQuantScheme`.
 
 Prepare a separate primitive-array change for `IntMultArray`.
-
-Prepare a separate BtrBlocks change for decomposed fixed bins only after real-data validation.
 
 Keep entropy, bit-split, and alternate residual models on `wm/pcodec-entropy-experiments`.
 

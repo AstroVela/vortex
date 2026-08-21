@@ -44,6 +44,9 @@ pub struct FeatureVectorsData;
 /// A real f32 embedding dataset from the GloVe vector benchmark corpus.
 pub struct GloveEmbeddingsData;
 
+/// A real f64 embedding dataset from the OpenAI-on-C4 vector benchmark corpus.
+pub struct OpenAiEmbeddingsData;
+
 #[async_trait]
 impl Dataset for GloveEmbeddingsData {
     fn name(&self) -> &str {
@@ -63,6 +66,28 @@ impl Dataset for GloveEmbeddingsData {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("GloVe embedding train file is missing"))
+    }
+}
+
+#[async_trait]
+impl Dataset for OpenAiEmbeddingsData {
+    fn name(&self) -> &str {
+        "openai-c4-embeddings-50k"
+    }
+
+    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> Result<ArrayRef> {
+        Ok(parquet_to_vortex_chunks(self.to_parquet_path().await?)
+            .await?
+            .into())
+    }
+
+    async fn to_parquet_path(&self) -> Result<PathBuf> {
+        let paths = download(VectorDataset::OpenaiSmall50k, TrainLayout::Single).await?;
+        paths
+            .train_files
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI embedding train file is missing"))
     }
 }
 

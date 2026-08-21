@@ -9560,7 +9560,6 @@ dependencies = [
  "vortex-metrics",
  "vortex-pco",
  "vortex-proto",
- "vortex-range-packed",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -9777,7 +9776,6 @@ dependencies = [
  "arrow-schema 58.4.0",
  "arrow-select 58.4.0",
  "codspeed-divan-compat",
- "fastlanes",
  "insta",
  "itertools 0.14.0",
  "parquet 58.4.0",
@@ -9799,11 +9797,9 @@ dependencies = [
  "vortex-fastlanes",
  "vortex-float-quant",
  "vortex-fsst",
- "vortex-int-mult",
  "vortex-mask",
  "vortex-onpair",
  "vortex-pco",
- "vortex-range-packed",
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",
@@ -10201,7 +10197,6 @@ dependencies = [
  "vortex-metrics",
  "vortex-onpair",
  "vortex-pco",
- "vortex-range-packed",
  "vortex-runend",
  "vortex-scan",
  "vortex-sequence",
@@ -10566,20 +10561,6 @@ dependencies = [
  "vortex",
  "vortex-cuda",
  "vortex-python-abi",
-]
-
-[[package]]
-name = "vortex-range-packed"
-version = "0.1.0"
-dependencies = [
- "rstest",
- "vortex-alp",
- "vortex-array",
- "vortex-block-residual",
- "vortex-buffer",
- "vortex-error",
- "vortex-int-mult",
- "vortex-session",
 ]
 
 [[package]]

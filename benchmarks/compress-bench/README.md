@@ -27,7 +27,6 @@ Compare a numeric scheme bundle with the same command and one of these values:
 - `--vortex-numeric-bundle prior-default`
 - `--vortex-numeric-bundle block-residual`
 - `--vortex-numeric-bundle current-default`
-- `--vortex-numeric-bundle range-packed`
 
 Add a local Parquet file with `--parquet-path`. Use `--datasets` to select its file stem.
 

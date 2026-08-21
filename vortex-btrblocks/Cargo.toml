@@ -30,9 +30,7 @@ vortex-decimal-byte-parts = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
 vortex-float-quant = { workspace = true }
-vortex-range-packed = { workspace = true }
 vortex-fsst = { workspace = true }
-vortex-int-mult = { workspace = true }
 vortex-onpair = { workspace = true, optional = true }
 vortex-pco = { workspace = true, optional = true }
 vortex-runend = { workspace = true }
@@ -47,7 +45,6 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 divan = { workspace = true }
-fastlanes = { workspace = true }
 insta = { workspace = true }
 parquet = { workspace = true }
 rstest = { workspace = true }
@@ -81,7 +78,3 @@ test = false
 [[example]]
 name = "pco_probe"
 required-features = ["pco"]
-
-[[example]]
-name = "float_compressor_bench"
-required-features = ["pco", "zstd"]

@@ -78,11 +78,15 @@ impl Scheme for BlockResidualScheme {
 
     fn expected_compression_ratio(
         &self,
-        _data: &ArrayAndStats,
+        data: &ArrayAndStats,
         compress_ctx: CompressorContext,
         _exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
-        if compress_ctx.finished_cascading() || compress_ctx.is_sample() {
+        // A single block cannot amortize a block-local reference against FoR.
+        if data.array().len() <= BLOCK_LEN
+            || compress_ctx.finished_cascading()
+            || compress_ctx.is_sample()
+        {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(

@@ -65,7 +65,6 @@ members = [
     "encodings/block-residual",
     "encodings/float-quant",
     "encodings/int-mult",
-    "encodings/range-packed",
     # Benchmarks
     "benchmarks/bench-support",
     "benchmarks/lance-bench",
@@ -328,7 +327,6 @@ vortex-pco = { version = "0.1.0", path = "./encodings/pco", default-features = f
 vortex-block-residual = { version = "0.1.0", path = "./encodings/block-residual", default-features = false }
 vortex-float-quant = { version = "0.1.0", path = "./encodings/float-quant", default-features = false }
 vortex-int-mult = { version = "0.1.0", path = "./encodings/int-mult", default-features = false }
-vortex-range-packed = { version = "0.1.0", path = "./encodings/range-packed", default-features = false }
 vortex-proto = { version = "0.1.0", path = "./vortex-proto", default-features = false }
 vortex-row = { version = "0.1.0", path = "./vortex-row", default-features = false }
 vortex-runend = { version = "0.1.0", path = "./encodings/runend", default-features = false }

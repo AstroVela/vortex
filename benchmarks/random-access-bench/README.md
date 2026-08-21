@@ -26,7 +26,6 @@ Compare random access for a numeric scheme bundle with one of these values:
 - `--vortex-numeric-bundle prior-default`
 - `--vortex-numeric-bundle block-residual`
 - `--vortex-numeric-bundle current-default`
-- `--vortex-numeric-bundle range-packed`
 
 Each bundle uses a separate Vortex file. Existing files remain available for repeated runs.
 
