@@ -46,6 +46,11 @@ unstable_encodings = ["vortex/unstable_encodings", "vortex-cuda?/unstable_encodi
 name = "compress-bench"
 test = false
 
+[[bin]]
+name = "parquet-vs-vortex"
+path = "src/bin/parquet_vs_vortex.rs"
+test = false
+
 [lib]
 
 [lints]
