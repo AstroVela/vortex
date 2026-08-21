@@ -20,7 +20,15 @@ use vortex_zstd::ZstdOptions;
 
 struct Config {
     name: &'static str,
-    options: ZstdOptions,
+    encoding: Encoding,
+}
+
+/// Which zstd encoding a configuration writes strings with.
+enum Encoding {
+    /// `vortex.zstd`: a length prefix ahead of every value, inside the frame holding it.
+    V1(ZstdOptions),
+    /// `vortex.zstd.v2`: value lengths in a stream of their own.
+    V2 { level: i32, values_per_frame: usize },
 }
 
 #[tokio::main]
@@ -46,13 +54,13 @@ async fn main() -> Result<()> {
     }
 
     let configs = vec![
-        Config { name: "L3 vpf=8192 nodict (today)", options: ZstdOptions::new(3).with_values_per_frame(8192).with_dictionary(DictionaryMode::Never) },
-        Config { name: "L3 vpf=8192 auto-dict", options: ZstdOptions::new(3).with_values_per_frame(8192) },
-        Config { name: "L3 one frame nodict", options: ZstdOptions::new(3).with_dictionary(DictionaryMode::Never) },
-        Config { name: "L6 one frame nodict", options: ZstdOptions::new(6).with_dictionary(DictionaryMode::Never) },
-        Config { name: "L6 one frame auto-dict", options: ZstdOptions::new(6) },
-        Config { name: "L9 one frame nodict", options: ZstdOptions::new(9).with_dictionary(DictionaryMode::Never) },
-        Config { name: "L9 one frame auto-dict", options: ZstdOptions::new(9) },
+        Config { name: "v1 L3 vpf=8192 (before)", encoding: Encoding::V1(ZstdOptions::new(3).with_values_per_frame(8192).with_dictionary(DictionaryMode::Never)) },
+        Config { name: "v1 L6 one frame (now)", encoding: Encoding::V1(ZstdOptions::new(6).with_dictionary(DictionaryMode::Never)) },
+        Config { name: "v1 L9 one frame", encoding: Encoding::V1(ZstdOptions::new(9).with_dictionary(DictionaryMode::Never)) },
+        Config { name: "v1 L6 vpf=8192", encoding: Encoding::V1(ZstdOptions::new(6).with_values_per_frame(8192).with_dictionary(DictionaryMode::Never)) },
+        Config { name: "v2 L6 vpf=8192", encoding: Encoding::V2 { level: 6, values_per_frame: 8192 } },
+        Config { name: "v2 L6 one frame", encoding: Encoding::V2 { level: 6, values_per_frame: 0 } },
+        Config { name: "v2 L9 vpf=8192", encoding: Encoding::V2 { level: 9, values_per_frame: 8192 } },
     ];
 
     for path in &paths {
@@ -62,12 +70,27 @@ async fn main() -> Result<()> {
         println!("{:<30} {:>14} {:>8} {:>10} {:>10}", "config", "vortex bytes", "vs today", "write s", "scan s");
         let mut baseline = 0u64;
         for config in &configs {
-            let scheme: &'static string::ZstdScheme =
-                Box::leak(Box::new(string::ZstdScheme::new(config.options)));
-            let builder = BtrBlocksCompressorBuilder::default()
-                .with_compact()
-                .exclude_schemes([string::ZstdScheme::DEFAULT.id()])
-                .with_new_scheme(scheme);
+            let builder = BtrBlocksCompressorBuilder::default().with_compact();
+            let builder = match &config.encoding {
+                Encoding::V1(options) => {
+                    let scheme: &'static string::ZstdScheme =
+                        Box::leak(Box::new(string::ZstdScheme::new(*options)));
+                    builder
+                        .exclude_schemes([string::ZstdScheme::DEFAULT.id()])
+                        .with_new_scheme(scheme)
+                }
+                Encoding::V2 {
+                    level,
+                    values_per_frame,
+                } => {
+                    let scheme: &'static string::ZstdV2Scheme = Box::leak(Box::new(
+                        string::ZstdV2Scheme::new(*level, *values_per_frame),
+                    ));
+                    builder
+                        .exclude_schemes([string::ZstdScheme::DEFAULT.id()])
+                        .with_new_scheme(scheme)
+                }
+            };
             let strategy = WriteStrategyBuilder::default()
                 .with_btrblocks_builder(builder)
                 .build();
