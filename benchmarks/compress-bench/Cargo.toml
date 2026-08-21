@@ -37,6 +37,7 @@ vortex-arrow = { workspace = true }
 vortex-bench = { workspace = true }
 vortex-btrblocks = { workspace = true, features = ["zstd", "unstable_encodings"] }
 vortex-zstd = { workspace = true }
+vortex-zstd-v2 = { workspace = true }
 vortex-file = { workspace = true }
 vortex-cuda = { workspace = true, optional = true }
 

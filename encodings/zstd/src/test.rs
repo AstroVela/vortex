@@ -699,3 +699,20 @@ mod filter {
         Ok(())
     }
 }
+
+/// Every row null means no stored values at all, which the frame stride has to survive.
+#[rstest]
+#[case::one_frame(0)]
+#[case::many_frames(16)]
+fn test_zstd_all_null(#[case] values_per_frame: usize) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let strings = VarBinViewArray::from_iter_nullable_str((0..64).map(|_| None::<String>));
+    let compressed = Zstd::from_var_bin_view(&strings, 3, values_per_frame, &mut ctx)?;
+    assert_arrays_eq!(compressed, strings.into_array(), &mut ctx);
+
+    let primitives = PrimitiveArray::from_option_iter((0..64).map(|_| None::<i32>));
+    let compressed = Zstd::from_primitive(&primitives, 3, values_per_frame, &mut ctx)?;
+    assert_arrays_eq!(compressed, primitives.into_array(), &mut ctx);
+    Ok(())
+}

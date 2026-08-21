@@ -1317,10 +1317,12 @@ impl ZstdData {
         // We compress only the valid elements.
         let values = collect_valid_primitive(parray, ctx)?;
         let n_values = values.len();
+        // An array whose rows are all null stores no values, and a frame stride of zero would
+        // panic rather than produce the empty frame list that case wants.
         let options = options.with_values_per_frame(if options.values_per_frame > 0 {
             options.values_per_frame
         } else {
-            n_values
+            n_values.max(1)
         });
         let values_per_frame = options.values_per_frame;
 
@@ -1410,10 +1412,12 @@ impl ZstdData {
         // We compress only the valid elements.
         let (value_bytes, value_byte_indices) = collect_valid_vbv(vbv, ctx)?;
         let n_values = value_byte_indices.len();
+        // An array whose rows are all null stores no values, and a frame stride of zero would
+        // panic rather than produce the empty frame list that case wants.
         let options = options.with_values_per_frame(if options.values_per_frame > 0 {
             options.values_per_frame
         } else {
-            n_values
+            n_values.max(1)
         });
         let values_per_frame = options.values_per_frame;
 
