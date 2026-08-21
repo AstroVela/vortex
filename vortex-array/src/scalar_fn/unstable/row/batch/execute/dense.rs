@@ -105,8 +105,9 @@ impl RowFnExecutionArgs {
                 self.finalize_output(values, self.row_count)
             }
             Validity::Array(valid) => self.finalize_output(values.mask(valid)?, self.row_count),
-            // Handled by the guard in `RowFnExecutionArgs::execute`, before the kernel ran.
-            Validity::AllInvalid => Ok(self.all_null()),
+            Validity::AllInvalid => {
+                unreachable!("all-invalid validity is handled before dense row execution")
+            }
         }
     }
 }
