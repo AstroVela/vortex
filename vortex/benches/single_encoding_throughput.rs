@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #![expect(clippy::unwrap_used)]
-#![expect(clippy::cast_possible_truncation)]
 
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicUsize;
@@ -76,10 +75,21 @@ fn main() {
     divan::main();
 }
 
-const NUM_VALUES: u64 = 100_000;
-const FLOAT_CODEC_NUM_VALUES: u64 = 2_000_000;
+// Sizes are chosen to keep each CodSpeed run well under 1ms; zstd and pco get
+// smaller inputs because they are much slower per element.
+const NUM_VALUES: u64 = 4096;
+const PCO_NUM_VALUES: u64 = 1024;
 const PCO_COMPRESSION_LEVEL: usize = 8;
 const PCO_VALUES_PER_PAGE: usize = 8192;
+#[cfg(feature = "zstd")]
+const ZSTD_NUM_VALUES: u64 = 128;
+const STRING_NUM_VALUES: usize = 2048;
+#[cfg(feature = "zstd")]
+const ZSTD_STRING_NUM_VALUES: usize = 200;
+// Uniqueness fractions keep ~5 unique strings, as in the original 100k * 0.00005 workload.
+const STRING_UNIQUENESS: f64 = 0.0025;
+#[cfg(feature = "zstd")]
+const ZSTD_STRING_UNIQUENESS: f64 = 0.025;
 
 // Helper function to conditionally add counter based on codspeed cfg
 fn with_byte_counter<'a, 'b>(bencher: Bencher<'a, 'b>, bytes: u64) -> Bencher<'a, 'b> {
@@ -103,11 +113,10 @@ fn bench_compressor(bencher: Bencher, array: PrimitiveArray, compressor: BtrBloc
 }
 
 // Setup functions
-fn setup_primitive_arrays() -> (PrimitiveArray, PrimitiveArray, PrimitiveArray) {
+fn setup_primitive_arrays(len: u64) -> (PrimitiveArray, PrimitiveArray, PrimitiveArray) {
     let mut ctx = SESSION.create_execution_ctx();
     let mut rng = StdRng::seed_from_u64(0);
-    let uint_array =
-        PrimitiveArray::from_iter((0..NUM_VALUES).map(|_| rng.random_range(42u32..256)));
+    let uint_array = PrimitiveArray::from_iter((0..len).map(|_| rng.random_range(42u32..256)));
     let int_array = uint_array
         .clone()
         .into_array()
@@ -127,21 +136,21 @@ fn setup_primitive_arrays() -> (PrimitiveArray, PrimitiveArray, PrimitiveArray) 
 
 fn setup_widened_f32_array() -> PrimitiveArray {
     let mut rng = StdRng::seed_from_u64(1);
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let trend = (index % 10_000) as f32 * 0.001;
         f64::from(trend + rng.random_range(-1.0_f32..1.0))
     }))
 }
 
 fn setup_quantized_f32_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let mantissa = (index.wrapping_mul(7_919) as u32 & 0x7fff) << 8;
         f32::from_bits(0x3f80_0000 | mantissa)
     }))
 }
 
 fn setup_quantized_f16_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let mantissa = (index.wrapping_mul(7_919) as u16) & 0x03f0;
         f16::from_bits(0x3c00 | mantissa)
     }))
@@ -149,26 +158,26 @@ fn setup_quantized_f16_array() -> PrimitiveArray {
 
 fn setup_general_f16_array() -> PrimitiveArray {
     PrimitiveArray::from_iter(
-        (0..FLOAT_CODEC_NUM_VALUES).map(|index| f16::from_bits(index.wrapping_mul(7_919) as u16)),
+        (0..NUM_VALUES).map(|index| f16::from_bits(index.wrapping_mul(7_919) as u16)),
     )
 }
 
 fn setup_general_f32_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let mantissa = index.wrapping_mul(7_919) as u32 & 0x007f_ffff;
         f32::from_bits(0x3f80_0000 | mantissa)
     }))
 }
 
 fn setup_general_f64_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let mantissa = index.wrapping_mul(0x9e37_79b9_7f4a_7c15) & 0x000f_ffff_ffff_ffff;
         f64::from_bits(0x3ff0_0000_0000_0000 | mantissa)
     }))
 }
 
 fn setup_float_quant_near_miss_f32_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let scrambled = (index as u32).wrapping_mul(2_654_435_761);
         let sign = (scrambled & 1) << 31;
         let exponent = ((scrambled >> 1) % 254 + 1) << 23;
@@ -178,7 +187,7 @@ fn setup_float_quant_near_miss_f32_array() -> PrimitiveArray {
 }
 
 fn setup_float_quant_near_miss_f64_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let scrambled = index.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let sign = (scrambled & 1) << 63;
         let exponent = ((scrambled >> 1) % 2_046 + 1) << 52;
@@ -248,14 +257,14 @@ fn setup_secondary_width_array(width: u8) -> PrimitiveArray {
 fn setup_random_walk_array() -> PrimitiveArray {
     let mut rng = StdRng::seed_from_u64(2);
     let mut value = 1_000.0_f64;
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|_| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|_| {
         value += rng.random_range(-0.01_f64..0.01);
         value
     }))
 }
 
 fn setup_block_local_u64_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let block = index / 1_024;
         let residual = index.wrapping_mul(2_654_435_761) % 1_024;
         block * 1_000_000 + residual
@@ -263,7 +272,7 @@ fn setup_block_local_u64_array() -> PrimitiveArray {
 }
 
 fn setup_block_local_u32_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let block = index / 1_024;
         let residual = index.wrapping_mul(2_654_435_761) % 1_024;
         (block * 1_000_000 + residual) as u32
@@ -271,7 +280,7 @@ fn setup_block_local_u32_array() -> PrimitiveArray {
 }
 
 fn setup_block_local_i32_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let block = index / 1_024;
         let residual = index.wrapping_mul(2_654_435_761) % 1_024;
         (block as i32 - 1_000) * 1_000_000 + residual as i32
@@ -279,7 +288,7 @@ fn setup_block_local_i32_array() -> PrimitiveArray {
 }
 
 fn setup_patch_density_u32_array(stride: u64) -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         if index % stride == 0 {
             u32::MAX - index as u32
         } else {
@@ -289,7 +298,7 @@ fn setup_patch_density_u32_array(stride: u64) -> PrimitiveArray {
 }
 
 fn setup_ordered_f32_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let block = index / 1_024;
         let residual = index.wrapping_mul(7_919) % 1_024;
         f32::from_bits(0x3f80_0000 + (block as u32 * 0x1_0000) + residual as u32)
@@ -297,7 +306,7 @@ fn setup_ordered_f32_array() -> PrimitiveArray {
 }
 
 fn setup_ordered_f16_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let block = (index / 1_024) % 8;
         let residual = index.wrapping_mul(7_919) % 64;
         f16::from_bits(0x3c00 + (block * 64 + residual) as u16)
@@ -305,7 +314,7 @@ fn setup_ordered_f16_array() -> PrimitiveArray {
 }
 
 fn setup_block_local_i16_array() -> PrimitiveArray {
-    PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+    PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
         let block = (index / 1_024) % 128;
         let residual = index.wrapping_mul(2_654_435_761) % 128;
         (block * 128 + residual) as i16
@@ -314,26 +323,26 @@ fn setup_block_local_i16_array() -> PrimitiveArray {
 
 fn setup_block_local_integer_array<T: NativePType>() -> PrimitiveArray {
     match T::PTYPE {
-        PType::U8 => PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        PType::U8 => PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
             let block = (index / 1_024) % 16;
             let residual = index.wrapping_mul(2_654_435_761) % 16;
             (block * 16 + residual) as u8
         })),
-        PType::U16 => PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        PType::U16 => PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
             let block = (index / 1_024) % 256;
             let residual = index.wrapping_mul(2_654_435_761) % 256;
             (block * 256 + residual) as u16
         })),
         PType::U32 => setup_block_local_u32_array(),
         PType::U64 => setup_block_local_u64_array(),
-        PType::I8 => PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        PType::I8 => PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
             let block = (index / 1_024) % 16;
             let residual = index.wrapping_mul(2_654_435_761) % 16;
             ((block * 16 + residual) as i16 - 128) as i8
         })),
         PType::I16 => setup_block_local_i16_array(),
         PType::I32 => setup_block_local_i32_array(),
-        PType::I64 => PrimitiveArray::from_iter((0..FLOAT_CODEC_NUM_VALUES).map(|index| {
+        PType::I64 => PrimitiveArray::from_iter((0..NUM_VALUES).map(|index| {
             let block = index / 1_024;
             let residual = index.wrapping_mul(2_654_435_761) % 1_024;
             (block as i64 - 1_000) * 1_000_000_000_000 + residual as i64
@@ -491,7 +500,7 @@ fn gen_varbin_words(len: usize, uniqueness: f64) -> Vec<String> {
 fn bench_bitpacked_compress_u32(bencher: Bencher) {
     use vortex::encodings::fastlanes::bitpack_compress::bitpack_encode_unchecked;
 
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
     let bit_width = 8;
 
     with_byte_counter(bencher, NUM_VALUES * 4)
@@ -503,7 +512,7 @@ fn bench_bitpacked_compress_u32(bencher: Bencher) {
 fn bench_bitpacked_decompress_u32(bencher: Bencher) {
     use vortex::encodings::fastlanes::bitpack_compress::bitpack_encode;
 
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
     let bit_width = 8;
     let compressed = bitpack_encode(
         &uint_array,
@@ -521,7 +530,7 @@ fn bench_bitpacked_decompress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "runend_compress_u32")]
 fn bench_runend_compress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
 
     with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (uint_array.clone(), SESSION.create_execution_ctx()))
@@ -530,7 +539,7 @@ fn bench_runend_compress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "runend_decompress_u32")]
 fn bench_runend_decompress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
     let compressed =
         RunEnd::encode(uint_array.into_array(), &mut SESSION.create_execution_ctx()).unwrap();
 
@@ -541,7 +550,7 @@ fn bench_runend_decompress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "delta_compress_u32")]
 fn bench_delta_compress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
 
     with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&uint_array, SESSION.create_execution_ctx()))
@@ -553,7 +562,7 @@ fn bench_delta_compress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "delta_decompress_u32")]
 fn bench_delta_decompress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
     let (bases, deltas) = delta_compress(&uint_array, &mut SESSION.create_execution_ctx()).unwrap();
     let compressed = Delta::try_new(bases.into_array(), deltas.into_array(), 0, uint_array.len())
         .unwrap()
@@ -566,7 +575,7 @@ fn bench_delta_decompress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "for_compress_i32")]
 fn bench_for_compress_i32(bencher: Bencher) {
-    let (_, int_array, _) = setup_primitive_arrays();
+    let (_, int_array, _) = setup_primitive_arrays(NUM_VALUES);
 
     with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (int_array.clone(), SESSION.create_execution_ctx()))
@@ -575,7 +584,7 @@ fn bench_for_compress_i32(bencher: Bencher) {
 
 #[divan::bench(name = "for_decompress_i32")]
 fn bench_for_decompress_i32(bencher: Bencher) {
-    let (_, int_array, _) = setup_primitive_arrays();
+    let (_, int_array, _) = setup_primitive_arrays(NUM_VALUES);
     let compressed = FoR::encode(int_array, &mut SESSION.create_execution_ctx()).unwrap();
 
     with_byte_counter(bencher, NUM_VALUES * 4)
@@ -585,7 +594,7 @@ fn bench_for_decompress_i32(bencher: Bencher) {
 
 #[divan::bench(name = "dict_compress_u32")]
 fn bench_dict_compress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
     let array = uint_array.into_array();
 
     with_byte_counter(bencher, NUM_VALUES * 4)
@@ -595,7 +604,7 @@ fn bench_dict_compress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "dict_decompress_u32")]
 fn bench_dict_decompress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(NUM_VALUES);
     let compressed = dict_encode(
         &uint_array.into_array(),
         &mut SESSION.create_execution_ctx(),
@@ -609,7 +618,7 @@ fn bench_dict_decompress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "zigzag_compress_i32")]
 fn bench_zigzag_compress_i32(bencher: Bencher) {
-    let (_, int_array, _) = setup_primitive_arrays();
+    let (_, int_array, _) = setup_primitive_arrays(NUM_VALUES);
 
     with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| int_array.clone())
@@ -618,7 +627,7 @@ fn bench_zigzag_compress_i32(bencher: Bencher) {
 
 #[divan::bench(name = "zigzag_decompress_i32")]
 fn bench_zigzag_decompress_i32(bencher: Bencher) {
-    let (_, int_array, _) = setup_primitive_arrays();
+    let (_, int_array, _) = setup_primitive_arrays(NUM_VALUES);
     let compressed = zigzag_encode(int_array.as_view()).unwrap().into_array();
 
     with_byte_counter(bencher, NUM_VALUES * 4)
@@ -650,7 +659,7 @@ fn bench_sequence_decompress_u32(bencher: Bencher) {
 
 #[divan::bench(name = "alp_compress_f64")]
 fn bench_alp_compress_f64(bencher: Bencher) {
-    let (_, _, float_array) = setup_primitive_arrays();
+    let (_, _, float_array) = setup_primitive_arrays(NUM_VALUES);
 
     with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&float_array, SESSION.create_execution_ctx()))
@@ -659,7 +668,7 @@ fn bench_alp_compress_f64(bencher: Bencher) {
 
 #[divan::bench(name = "alp_decompress_f64")]
 fn bench_alp_decompress_f64(bencher: Bencher) {
-    let (_, _, float_array) = setup_primitive_arrays();
+    let (_, _, float_array) = setup_primitive_arrays(NUM_VALUES);
     let compressed = alp_encode(
         float_array.as_view(),
         None,
@@ -674,7 +683,7 @@ fn bench_alp_decompress_f64(bencher: Bencher) {
 
 #[divan::bench(name = "alp_rd_compress_f64")]
 fn bench_alp_rd_compress_f64(bencher: Bencher) {
-    let (_, _, float_array) = setup_primitive_arrays();
+    let (_, _, float_array) = setup_primitive_arrays(NUM_VALUES);
 
     with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
@@ -686,7 +695,7 @@ fn bench_alp_rd_compress_f64(bencher: Bencher) {
 
 #[divan::bench(name = "alp_rd_decompress_f64")]
 fn bench_alp_rd_decompress_f64(bencher: Bencher) {
-    let (_, _, float_array) = setup_primitive_arrays();
+    let (_, _, float_array) = setup_primitive_arrays(NUM_VALUES);
     let encoder = RDEncoder::new(float_array.as_slice::<f64>());
     let compressed = encoder.encode(float_array.as_view());
 
@@ -699,7 +708,7 @@ fn bench_alp_rd_decompress_f64(bencher: Bencher) {
 fn bench_ordered_float_compress_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| OrderedFloat::from_primitive(array.as_view()).unwrap());
 }
@@ -711,7 +720,7 @@ fn bench_ordered_float_decompress_f64(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -738,7 +747,7 @@ fn bench_ordered_float_scalar_at_f64(bencher: Bencher) {
 fn bench_ordered_float_compress_f16(bencher: Bencher) {
     let float_array = setup_ordered_f16_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| &float_array)
         .bench_refs(|array| OrderedFloat::from_primitive(array.as_view()).unwrap());
 }
@@ -749,7 +758,7 @@ fn bench_ordered_float_decompress_f16(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -776,7 +785,7 @@ fn bench_ordered_float_scalar_at_f16(bencher: Bencher) {
 fn bench_ordered_float_compress_f32(bencher: Bencher) {
     let float_array = setup_ordered_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &float_array)
         .bench_refs(|array| OrderedFloat::from_primitive(array.as_view()).unwrap());
 }
@@ -787,7 +796,7 @@ fn bench_ordered_float_decompress_f32(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -815,7 +824,7 @@ fn bench_block_residual_compress_u64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
     let ordered = ordered_values(&float_array);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &ordered)
         .bench_refs(|array| BlockResidual::from_primitive(array.as_view()).unwrap());
 }
@@ -828,7 +837,7 @@ fn bench_block_residual_decompress_u64(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -838,7 +847,7 @@ fn block_local_block_residual_compress<T: NativePType>(bencher: Bencher) {
     let array = setup_block_local_integer_array::<T>();
     let byte_width = u64::try_from(T::PTYPE.byte_width()).unwrap();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * byte_width)
+    with_byte_counter(bencher, NUM_VALUES * byte_width)
         .with_inputs(|| &array)
         .bench_refs(|array| BlockResidual::from_primitive(array.as_view()).unwrap());
 }
@@ -850,7 +859,7 @@ fn block_local_block_residual_decompress<T: NativePType>(bencher: Bencher) {
         .into_array();
     let byte_width = u64::try_from(T::PTYPE.byte_width()).unwrap();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * byte_width)
+    with_byte_counter(bencher, NUM_VALUES * byte_width)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -895,7 +904,7 @@ fn bench_block_residual_slice_patched_u32(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_compress_u64(bencher: Bencher) {
     let array = setup_block_local_u64_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &array)
         .bench_refs(|array| encode_for_bitpacked_tree(array, 31));
 }
@@ -904,7 +913,7 @@ fn bench_block_local_for_bitpacked_compress_u64(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_decompress_u64(bencher: Bencher) {
     let encoded = encode_for_bitpacked_tree(&setup_block_local_u64_array(), 31);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -929,7 +938,7 @@ fn bench_block_local_for_bitpacked_scalar_at_u64(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_compress_u32(bencher: Bencher) {
     let array = setup_block_local_u32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &array)
         .bench_refs(|array| encode_for_bitpacked_tree(array, 31));
 }
@@ -938,7 +947,7 @@ fn bench_block_local_for_bitpacked_compress_u32(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_decompress_u32(bencher: Bencher) {
     let encoded = encode_for_bitpacked_tree(&setup_block_local_u32_array(), 31);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -963,7 +972,7 @@ fn bench_block_local_for_bitpacked_scalar_at_u32(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_compress_i32(bencher: Bencher) {
     let array = setup_block_local_i32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &array)
         .bench_refs(|array| encode_for_bitpacked_tree(array, 31));
 }
@@ -972,7 +981,7 @@ fn bench_block_local_for_bitpacked_compress_i32(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_decompress_i32(bencher: Bencher) {
     let encoded = encode_for_bitpacked_tree(&setup_block_local_i32_array(), 31);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -999,7 +1008,7 @@ fn patch_density_block_residual_decompress_u32(bencher: Bencher, stride: u64) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1044,7 +1053,7 @@ fn patch_density_default_compress_u32(bencher: Bencher, stride: u64) {
 fn patch_density_prior_default_decompress_u32(bencher: Bencher, stride: u64) {
     let encoded = encode_prior_default(&setup_patch_density_u32_array(stride));
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1053,7 +1062,7 @@ fn patch_density_prior_default_decompress_u32(bencher: Bencher, stride: u64) {
 fn patch_density_default_decompress_u32(bencher: Bencher, stride: u64) {
     let encoded = encode_proposed_default(&setup_patch_density_u32_array(stride));
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1062,7 +1071,7 @@ fn patch_density_default_decompress_u32(bencher: Bencher, stride: u64) {
 fn bench_block_local_for_bitpacked_compress_i16(bencher: Bencher) {
     let array = setup_block_local_i16_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| &array)
         .bench_refs(|array| encode_for_bitpacked_tree(array, 14));
 }
@@ -1071,7 +1080,7 @@ fn bench_block_local_for_bitpacked_compress_i16(bencher: Bencher) {
 fn bench_block_local_for_bitpacked_decompress_i16(bencher: Bencher) {
     let encoded = encode_for_bitpacked_tree(&setup_block_local_i16_array(), 14);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1096,7 +1105,7 @@ fn bench_block_local_for_bitpacked_scalar_at_i16(bencher: Bencher) {
 fn bench_block_local_pcodec_compress_i16(bencher: Bencher) {
     let array = setup_block_local_i16_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&array, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| {
             Pco::from_primitive(
@@ -1120,7 +1129,7 @@ fn bench_block_local_pcodec_decompress_i16(bencher: Bencher) {
     )
     .unwrap();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1129,7 +1138,7 @@ fn bench_block_local_pcodec_decompress_i16(bencher: Bencher) {
 fn bench_ordered_block_residual_compress_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_ordered_block_residual(array));
 }
@@ -1139,7 +1148,7 @@ fn bench_ordered_block_residual_decompress_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
     let encoded = encode_ordered_block_residual(&float_array);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1180,7 +1189,7 @@ fn bench_ordered_block_residual_prior_default_scalar_at_f64(bencher: Bencher) {
 fn bench_ordered_block_residual_compress_f16(bencher: Bencher) {
     let float_array = setup_ordered_f16_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_ordered_block_residual(array));
 }
@@ -1189,7 +1198,7 @@ fn bench_ordered_block_residual_compress_f16(bencher: Bencher) {
 fn bench_ordered_block_residual_decompress_f16(bencher: Bencher) {
     let encoded = encode_ordered_block_residual(&setup_ordered_f16_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1214,7 +1223,7 @@ fn bench_ordered_block_residual_scalar_at_f16(bencher: Bencher) {
 fn bench_ordered_block_residual_compress_f32(bencher: Bencher) {
     let float_array = setup_ordered_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_ordered_block_residual(array));
 }
@@ -1223,7 +1232,7 @@ fn bench_ordered_block_residual_compress_f32(bencher: Bencher) {
 fn bench_ordered_block_residual_decompress_f32(bencher: Bencher) {
     let encoded = encode_ordered_block_residual(&setup_ordered_f32_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1251,7 +1260,7 @@ fn bench_ordered_block_residual_scheme_compress_f64(bencher: Bencher) {
         .with_new_scheme(&OrderedBlockResidualScheme)
         .build();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| {
             (
                 float_array.clone().into_array(),
@@ -1265,7 +1274,7 @@ fn bench_ordered_block_residual_scheme_compress_f64(bencher: Bencher) {
 fn bench_float_quant_split_compress_f16(bencher: Bencher) {
     let float_array = setup_quantized_f16_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| &float_array)
         .bench_refs(|array| {
             FloatQuant::from_primitive_constant_secondary(array.as_view(), 4).unwrap()
@@ -1279,7 +1288,7 @@ fn bench_float_quant_split_decompress_f16(bencher: Bencher) {
             .unwrap()
             .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1315,7 +1324,7 @@ fn bench_float_quant_scheme_compress_f16(bencher: Bencher) {
 fn bench_float_quant_tree_decompress_f16(bencher: Bencher) {
     let encoded = encode_float_quant_scheme_tree(&setup_quantized_f16_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1361,7 +1370,7 @@ fn bench_float_quant_proposed_default_compress_f16(bencher: Bencher) {
 fn bench_float_quant_prior_default_decompress_f16(bencher: Bencher) {
     let encoded = encode_prior_default(&setup_quantized_f16_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1370,7 +1379,7 @@ fn bench_float_quant_prior_default_decompress_f16(bencher: Bencher) {
 fn bench_float_quant_proposed_default_decompress_f16(bencher: Bencher) {
     let encoded = encode_proposed_default(&setup_quantized_f16_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 2)
+    with_byte_counter(bencher, NUM_VALUES * 2)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1464,7 +1473,7 @@ float_quant_rejection_benches!(
 fn bench_float_quant_split_compress_f64(bencher: Bencher) {
     let float_array = setup_widened_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| {
             FloatQuant::from_primitive_constant_secondary(array.as_view(), 29).unwrap()
@@ -1478,7 +1487,7 @@ fn bench_float_quant_split_decompress_f64(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1506,7 +1515,7 @@ fn bench_float_quant_split_scalar_at_f64(bencher: Bencher) {
 fn bench_float_quant_tree_compress_f64(bencher: Bencher) {
     let float_array = setup_widened_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_float_quant_tree(array));
 }
@@ -1524,7 +1533,7 @@ fn bench_float_quant_tree_decompress_f64(bencher: Bencher) {
     let float_array = setup_widened_f32_array();
     let encoded = encode_float_quant_tree(&float_array);
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1550,7 +1559,7 @@ fn bench_float_quant_split_compress_f32(bencher: Bencher) {
     let float_array = setup_quantized_f32_array();
     let k = analyze_float_quant(float_array.as_view()).unwrap().k;
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &float_array)
         .bench_refs(|array| {
             FloatQuant::from_primitive_constant_secondary(array.as_view(), k).unwrap()
@@ -1565,7 +1574,7 @@ fn bench_float_quant_split_decompress_f32(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1594,7 +1603,7 @@ fn bench_float_quant_split_scalar_at_f32(bencher: Bencher) {
 fn bench_float_quant_tree_compress_f32(bencher: Bencher) {
     let float_array = setup_quantized_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_float_quant_tree(array));
 }
@@ -1603,7 +1612,7 @@ fn bench_float_quant_tree_compress_f32(bencher: Bencher) {
 fn bench_float_quant_alp_rd_compress_f32(bencher: Bencher) {
     let float_array = setup_quantized_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &float_array)
         .bench_refs(|array| {
             let encoder = RDEncoder::new(array.as_slice::<f32>());
@@ -1615,7 +1624,7 @@ fn bench_float_quant_alp_rd_compress_f32(bencher: Bencher) {
 fn bench_float_quant_tree_decompress_f32(bencher: Bencher) {
     let encoded = encode_float_quant_tree(&setup_quantized_f32_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1640,7 +1649,7 @@ fn bench_float_quant_tree_scalar_at_f32(bencher: Bencher) {
 fn bench_float_quant_analyze_f32(bencher: Bencher) {
     let float_array = setup_quantized_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 4)
+    with_byte_counter(bencher, NUM_VALUES * 4)
         .with_inputs(|| &float_array)
         .bench_refs(|array| analyze_float_quant(array.as_view()).unwrap());
 }
@@ -1713,7 +1722,7 @@ macro_rules! float_quant_nonzero_secondary_benches {
             let float_array = $setup();
             let k = analyze_float_quant(float_array.as_view()).unwrap().k;
 
-            with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * $byte_width)
+            with_byte_counter(bencher, NUM_VALUES * $byte_width)
                 .with_inputs(|| &float_array)
                 .bench_refs(|array| FloatQuant::from_primitive(array.as_view(), k).unwrap());
         }
@@ -1726,7 +1735,7 @@ macro_rules! float_quant_nonzero_secondary_benches {
                 .unwrap()
                 .into_array();
 
-            with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * $byte_width)
+            with_byte_counter(bencher, NUM_VALUES * $byte_width)
                 .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
                 .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
         }
@@ -1765,7 +1774,7 @@ macro_rules! float_quant_nonzero_secondary_benches {
         fn $tree_decompress(bencher: Bencher) {
             let encoded = encode_float_quant_nonzero_secondary_scheme_tree(&$setup());
 
-            with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * $byte_width)
+            with_byte_counter(bencher, NUM_VALUES * $byte_width)
                 .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
                 .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
         }
@@ -1817,7 +1826,7 @@ fn bench_float_quant_nonzero_secondary_split_compress_f64(bencher: Bencher) {
     let float_array = setup_nonzero_secondary_array();
     let k = analyze_float_quant(float_array.as_view()).unwrap().k;
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| FloatQuant::from_primitive(array.as_view(), k).unwrap());
 }
@@ -1830,7 +1839,7 @@ fn bench_float_quant_nonzero_secondary_split_decompress_f64(bencher: Bencher) {
         .unwrap()
         .into_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1859,7 +1868,7 @@ fn bench_float_quant_nonzero_secondary_split_scalar_at_f64(bencher: Bencher) {
 fn bench_float_quant_nonzero_secondary_tree_compress_f64(bencher: Bencher) {
     let float_array = setup_nonzero_secondary_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_float_quant_nonzero_secondary_tree(array));
 }
@@ -1885,7 +1894,7 @@ fn bench_float_quant_nonzero_secondary_default_compress_f64(bencher: Bencher) {
 fn bench_float_quant_nonzero_secondary_tree_decompress_f64(bencher: Bencher) {
     let encoded = encode_float_quant_nonzero_secondary_tree(&setup_nonzero_secondary_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1899,7 +1908,7 @@ fn bench_float_quant_nonzero_secondary_default_decompress_f64(bencher: Bencher) 
         .unwrap();
     assert!(encoded.is::<FloatQuant>());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1908,7 +1917,7 @@ fn bench_float_quant_nonzero_secondary_default_decompress_f64(bencher: Bencher) 
 fn float_quant_secondary_width_decompress_f64(bencher: Bencher, width: u8) {
     let encoded = encode_float_quant_nonzero_secondary_tree(&setup_secondary_width_array(width));
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1933,7 +1942,7 @@ fn bench_float_quant_nonzero_secondary_tree_scalar_at_f64(bencher: Bencher) {
 fn bench_float_quant_nonzero_secondary_prior_default_compress_f64(bencher: Bencher) {
     let float_array = setup_nonzero_secondary_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| &float_array)
         .bench_refs(|array| encode_prior_default(array));
 }
@@ -1942,7 +1951,7 @@ fn bench_float_quant_nonzero_secondary_prior_default_compress_f64(bencher: Bench
 fn bench_float_quant_nonzero_secondary_prior_default_decompress_f64(bencher: Bencher) {
     let encoded = encode_prior_default(&setup_nonzero_secondary_array());
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&encoded, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -1981,16 +1990,16 @@ fn bench_float_quant_prior_default_scalar_at_f64(bencher: Bencher) {
 
 #[divan::bench(name = "pcodec_compress_f64")]
 fn bench_pcodec_compress_f64(bencher: Bencher) {
-    let (_, _, float_array) = setup_primitive_arrays();
+    let (_, _, float_array) = setup_primitive_arrays(PCO_NUM_VALUES);
 
-    with_byte_counter(bencher, NUM_VALUES * 8)
+    with_byte_counter(bencher, PCO_NUM_VALUES * 8)
         .with_inputs(|| (&float_array, SESSION.create_execution_ctx()))
         .bench_refs(|(a, ctx)| Pco::from_primitive(a.as_view(), 3, 0, ctx).unwrap());
 }
 
 #[divan::bench(name = "pcodec_decompress_f64")]
 fn bench_pcodec_decompress_f64(bencher: Bencher) {
-    let (_, _, float_array) = setup_primitive_arrays();
+    let (_, _, float_array) = setup_primitive_arrays(PCO_NUM_VALUES);
     let compressed = Pco::from_primitive(
         float_array.as_view(),
         3,
@@ -1999,7 +2008,7 @@ fn bench_pcodec_decompress_f64(bencher: Bencher) {
     )
     .unwrap();
 
-    with_byte_counter(bencher, NUM_VALUES * 8)
+    with_byte_counter(bencher, PCO_NUM_VALUES * 8)
         .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
         .bench_refs(|(a, ctx)| canonicalize((**a).clone(), ctx));
 }
@@ -2008,7 +2017,7 @@ fn bench_pcodec_decompress_f64(bencher: Bencher) {
 fn bench_pcodec_compress_widened_f32_f64(bencher: Bencher) {
     let float_array = setup_widened_f32_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&float_array, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| {
             Pco::from_primitive(
@@ -2032,7 +2041,7 @@ fn bench_pcodec_decompress_widened_f32_f64(bencher: Bencher) {
     )
     .unwrap();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -2041,7 +2050,7 @@ fn bench_pcodec_decompress_widened_f32_f64(bencher: Bencher) {
 fn bench_pcodec_compress_random_walk_f64(bencher: Bencher) {
     let float_array = setup_random_walk_array();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&float_array, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| {
             Pco::from_primitive(
@@ -2065,7 +2074,7 @@ fn bench_pcodec_decompress_random_walk_f64(bencher: Bencher) {
     )
     .unwrap();
 
-    with_byte_counter(bencher, FLOAT_CODEC_NUM_VALUES * 8)
+    with_byte_counter(bencher, NUM_VALUES * 8)
         .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| canonicalize((**array).clone(), ctx));
 }
@@ -2073,10 +2082,10 @@ fn bench_pcodec_decompress_random_walk_f64(bencher: Bencher) {
 #[cfg(feature = "zstd")]
 #[divan::bench(name = "zstd_compress_u32")]
 fn bench_zstd_compress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(ZSTD_NUM_VALUES);
     let array = uint_array.into_array();
 
-    with_byte_counter(bencher, NUM_VALUES * 4)
+    with_byte_counter(bencher, ZSTD_NUM_VALUES * 4)
         .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
         .bench_values(|(a, mut ctx)| ZstdData::from_array(a, 3, 8192, &mut ctx).unwrap());
 }
@@ -2084,7 +2093,7 @@ fn bench_zstd_compress_u32(bencher: Bencher) {
 #[cfg(feature = "zstd")]
 #[divan::bench(name = "zstd_decompress_u32")]
 fn bench_zstd_decompress_u32(bencher: Bencher) {
-    let (uint_array, ..) = setup_primitive_arrays();
+    let (uint_array, ..) = setup_primitive_arrays(ZSTD_NUM_VALUES);
     let dtype = uint_array.dtype().clone();
     let validity = uint_array.validity().unwrap();
     let compressed = Zstd::try_new(
@@ -2101,7 +2110,7 @@ fn bench_zstd_decompress_u32(bencher: Bencher) {
     .unwrap()
     .into_array();
 
-    with_byte_counter(bencher, NUM_VALUES * 4)
+    with_byte_counter(bencher, ZSTD_NUM_VALUES * 4)
         .with_inputs(|| (&compressed, SESSION.create_execution_ctx()))
         .bench_refs(|(a, ctx)| canonicalize((**a).clone(), ctx));
 }
@@ -2110,7 +2119,7 @@ fn bench_zstd_decompress_u32(bencher: Bencher) {
 #[divan::bench(name = "dict_compress_string")]
 fn bench_dict_compress_string(bencher: Bencher) {
     let varbinview_arr =
-        VarBinViewArray::from_iter_str(gen_varbin_words(NUM_VALUES as usize, 0.00005));
+        VarBinViewArray::from_iter_str(gen_varbin_words(STRING_NUM_VALUES, STRING_UNIQUENESS));
     let nbytes = varbinview_arr.nbytes();
     let array = varbinview_arr.into_array();
 
@@ -2122,7 +2131,7 @@ fn bench_dict_compress_string(bencher: Bencher) {
 #[divan::bench(name = "dict_decompress_string")]
 fn bench_dict_decompress_string(bencher: Bencher) {
     let varbinview_arr =
-        VarBinViewArray::from_iter_str(gen_varbin_words(NUM_VALUES as usize, 0.00005));
+        VarBinViewArray::from_iter_str(gen_varbin_words(STRING_NUM_VALUES, STRING_UNIQUENESS));
     let dict = dict_encode(
         &varbinview_arr.clone().into_array(),
         &mut SESSION.create_execution_ctx(),
@@ -2138,7 +2147,8 @@ fn bench_dict_decompress_string(bencher: Bencher) {
 #[divan::bench(name = "fsst_compress_string")]
 fn bench_fsst_compress_string(bencher: Bencher) {
     let varbinview_arr =
-        VarBinViewArray::from_iter_str(gen_varbin_words(NUM_VALUES as usize, 0.00005)).into_array();
+        VarBinViewArray::from_iter_str(gen_varbin_words(STRING_NUM_VALUES, STRING_UNIQUENESS))
+            .into_array();
     let fsst_compressor =
         fsst_train_compressor(&varbinview_arr, &mut SESSION.create_execution_ctx()).unwrap();
     let nbytes = varbinview_arr.nbytes();
@@ -2151,7 +2161,8 @@ fn bench_fsst_compress_string(bencher: Bencher) {
 #[divan::bench(name = "fsst_decompress_string")]
 fn bench_fsst_decompress_string(bencher: Bencher) {
     let varbinview_arr =
-        VarBinViewArray::from_iter_str(gen_varbin_words(NUM_VALUES as usize, 0.00005)).into_array();
+        VarBinViewArray::from_iter_str(gen_varbin_words(STRING_NUM_VALUES, STRING_UNIQUENESS))
+            .into_array();
     let mut ctx = SESSION.create_execution_ctx();
     let fsst_compressor = fsst_train_compressor(&varbinview_arr, &mut ctx).unwrap();
     let fsst_array = fsst_compress(&varbinview_arr, &fsst_compressor, &mut ctx)
@@ -2167,8 +2178,11 @@ fn bench_fsst_decompress_string(bencher: Bencher) {
 #[cfg(feature = "zstd")]
 #[divan::bench(name = "zstd_compress_string")]
 fn bench_zstd_compress_string(bencher: Bencher) {
-    let varbinview_arr =
-        VarBinViewArray::from_iter_str(gen_varbin_words(NUM_VALUES as usize, 0.00005)).into_array();
+    let varbinview_arr = VarBinViewArray::from_iter_str(gen_varbin_words(
+        ZSTD_STRING_NUM_VALUES,
+        ZSTD_STRING_UNIQUENESS,
+    ))
+    .into_array();
     let nbytes = varbinview_arr.nbytes();
 
     with_byte_counter(bencher, nbytes)
@@ -2179,8 +2193,11 @@ fn bench_zstd_compress_string(bencher: Bencher) {
 #[cfg(feature = "zstd")]
 #[divan::bench(name = "zstd_decompress_string")]
 fn bench_zstd_decompress_string(bencher: Bencher) {
-    let varbinview_arr =
-        VarBinViewArray::from_iter_str(gen_varbin_words(NUM_VALUES as usize, 0.00005)).into_array();
+    let varbinview_arr = VarBinViewArray::from_iter_str(gen_varbin_words(
+        ZSTD_STRING_NUM_VALUES,
+        ZSTD_STRING_UNIQUENESS,
+    ))
+    .into_array();
     let dtype = varbinview_arr.dtype().clone();
     let validity = varbinview_arr.validity().unwrap();
     let compressed = Zstd::try_new(
