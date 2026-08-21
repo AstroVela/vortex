@@ -374,7 +374,7 @@ impl VTable for Zstd {
     }
 }
 
-fn unsliced_validity(array: ArrayView<'_, Zstd>) -> Validity {
+pub(crate) fn unsliced_validity(array: ArrayView<'_, Zstd>) -> Validity {
     child_to_validity(
         array.slots()[ZstdSlots::VALIDITY].as_ref(),
         array.dtype().nullability(),
@@ -610,6 +610,20 @@ pub struct ZstdDataParts {
     pub slice_stop: usize,
 }
 
+/// The stored values one frame holds, and the bytes it decompresses to.
+#[derive(Clone, Copy, Debug)]
+struct FrameSpan {
+    value_start: usize,
+    n_values: usize,
+    uncompressed_size: usize,
+}
+
+impl FrameSpan {
+    fn value_stop(&self) -> usize {
+        self.value_start + self.n_values
+    }
+}
+
 /// Compressed ZStd frames and their metadata
 #[derive(Debug)]
 struct Frames {
@@ -672,6 +686,24 @@ fn train_dictionary(value_bytes: &ByteBuffer) -> Option<Vec<u8>> {
     }
 
     zstd::dict::from_continuous(&samples, &sample_sizes, max_dict_size).ok()
+}
+
+/// Reconciles a validity taken from the array with the one its dtype implies.
+///
+/// Zstd stores no bytes for null values, so an array keeps its full validity bitmap even when
+/// sliced down to only valid rows. Decoded output must still carry the validity its dtype implies.
+fn align_validity_to_dtype(validity: Validity, dtype: &DType) -> VortexResult<Validity> {
+    if !dtype.is_nullable() && !matches!(validity, Validity::NonNullable) {
+        vortex_ensure!(
+            matches!(validity, Validity::AllValid),
+            "ZSTD array expects to be non-nullable but there are nulls after decompression"
+        );
+        return Ok(Validity::NonNullable);
+    }
+    if dtype.is_nullable() && matches!(validity, Validity::NonNullable) {
+        return Ok(Validity::AllValid);
+    }
+    Ok(validity)
 }
 
 fn collect_valid_primitive(
@@ -1462,6 +1494,58 @@ impl ZstdData {
         }
     }
 
+    /// The value range each frame covers, in the order the frames are stored.
+    ///
+    /// Frames hold only the valid values, so a frame's span is a range of stored values rather
+    /// than of rows. `unsliced_mask` is only consulted for the legacy metadata fallback.
+    fn frame_spans(&self, dtype: &DType, unsliced_mask: &Mask) -> VortexResult<Vec<FrameSpan>> {
+        let byte_width = Self::byte_width(dtype);
+        let mut spans = Vec::with_capacity(self.frames.len());
+        let mut value_start = 0usize;
+        for frame_meta in &self.metadata.frames {
+            let uncompressed_size =
+                usize::try_from(frame_meta.uncompressed_size).map_err(|_| {
+                    vortex_err!(
+                        "Zstd frame uncompressed size {} does not fit in a usize",
+                        frame_meta.uncompressed_size
+                    )
+                })?;
+            let n_values = if frame_meta.n_values != 0 {
+                usize::try_from(frame_meta.n_values).map_err(|_| {
+                    vortex_err!(
+                        "Zstd frame value count {} does not fit in a usize",
+                        frame_meta.n_values
+                    )
+                })?
+            } else if dtype.is_primitive() {
+                // Possibly older primitive-only metadata that just didn't store this. Fixed-width
+                // values make the byte count an exact value count.
+                uncompressed_size / byte_width
+            } else {
+                // The same fallback would read a byte count as a value count for variable-width
+                // values, which misattributes values to frames. A single frame holds every stored
+                // value, so that case is still recoverable; anything else is not.
+                vortex_ensure!(
+                    self.frames.len() == 1,
+                    "Zstd frame metadata for a variable-width array is missing its value count"
+                );
+                unsliced_mask.true_count()
+            };
+
+            // Bounding the running total also bounds every span derived from it.
+            let value_stop = value_start.checked_add(n_values).ok_or_else(|| {
+                vortex_err!("Corrupt zstd metadata: frame value counts overflow a usize")
+            })?;
+            spans.push(FrameSpan {
+                value_start,
+                n_values,
+                uncompressed_size,
+            });
+            value_start = value_stop;
+        }
+        Ok(spans)
+    }
+
     fn decompress_slice(
         &self,
         dtype: &DType,
@@ -1480,62 +1564,30 @@ impl ZstdData {
         let slice_value_idx_stop = slice_value_indices[1];
 
         let mut frames_to_decompress = vec![];
-        let mut value_idx_start = 0;
         let mut uncompressed_size_to_decompress = 0usize;
         let mut n_skipped_values = 0;
         let mut n_buffered_values = 0;
-        for (frame, frame_meta) in self.frames.iter().zip(&self.metadata.frames) {
-            if value_idx_start >= slice_value_idx_stop {
+        for (frame, span) in self
+            .frames
+            .iter()
+            .zip(self.frame_spans(dtype, &unsliced_mask)?)
+        {
+            if span.value_start >= slice_value_idx_stop {
                 break;
             }
 
-            let frame_uncompressed_size =
-                usize::try_from(frame_meta.uncompressed_size).map_err(|_| {
-                    vortex_err!(
-                        "Zstd frame uncompressed size {} does not fit in a usize",
-                        frame_meta.uncompressed_size
-                    )
-                })?;
-            let frame_n_values = if frame_meta.n_values != 0 {
-                usize::try_from(frame_meta.n_values).map_err(|_| {
-                    vortex_err!(
-                        "Zstd frame value count {} does not fit in a usize",
-                        frame_meta.n_values
-                    )
-                })?
-            } else if dtype.is_primitive() {
-                // Possibly older primitive-only metadata that just didn't store this. Fixed-width
-                // values make the byte count an exact value count.
-                frame_uncompressed_size / byte_width
-            } else {
-                // The same fallback would read a byte count as a value count for variable-width
-                // values, which misattributes values to frames. A single frame holds every stored
-                // value, so that case is still recoverable; anything else is not.
-                vortex_ensure!(
-                    self.frames.len() == 1,
-                    "Zstd frame metadata for a variable-width array is missing its value count"
-                );
-                unsliced_mask.true_count()
-            };
-
-            // Bounding the running total also bounds the two accumulators below, which partition
-            // it between the frames we keep and the ones we skip.
-            let value_idx_stop = value_idx_start.checked_add(frame_n_values).ok_or_else(|| {
-                vortex_err!("Corrupt zstd metadata: frame value counts overflow a usize")
-            })?;
-            if value_idx_stop > slice_value_idx_start {
+            if span.value_stop() > slice_value_idx_start {
                 // we need this frame
                 frames_to_decompress.push(frame);
                 uncompressed_size_to_decompress = uncompressed_size_to_decompress
-                    .checked_add(frame_uncompressed_size)
+                    .checked_add(span.uncompressed_size)
                     .ok_or_else(|| {
                         vortex_err!("Corrupt zstd metadata: frame sizes overflow a usize")
                     })?;
-                n_buffered_values += frame_n_values;
+                n_buffered_values += span.n_values;
             } else {
-                n_skipped_values += frame_n_values;
+                n_skipped_values += span.n_values;
             }
-            value_idx_start = value_idx_stop;
         }
 
         // then we actually decompress those frames
@@ -1573,28 +1625,9 @@ impl ZstdData {
 
         let decompressed = decompressed.freeze();
         // Last, we slice the exact values requested out of the decompressed data.
-        let mut slice_validity = unsliced_validity.slice(self.slice_start..self.slice_stop)?;
+        let slice_validity = unsliced_validity.slice(self.slice_start..self.slice_stop)?;
 
-        // NOTE: this block handles setting the output type when the validity and DType disagree.
-        //
-        // ZSTD is a compact block compressor, meaning that null values are not stored inline in
-        // the data frames. A ZSTD Array that was initialized must always hold onto its full
-        // validity bitmap, even if sliced to only include non-null values.
-        //
-        // We ensure that the validity of the decompressed array ALWAYS matches the validity
-        // implied by the DType.
-        if !dtype.is_nullable() && !matches!(slice_validity, Validity::NonNullable) {
-            vortex_ensure!(
-                matches!(slice_validity, Validity::AllValid),
-                "ZSTD array expects to be non-nullable but there are nulls after decompression"
-            );
-
-            slice_validity = Validity::NonNullable;
-        } else if dtype.is_nullable() && matches!(slice_validity, Validity::NonNullable) {
-            slice_validity = Validity::AllValid;
-        }
-        // END OF IMPORTANT BLOCK
-        //
+        let slice_validity = align_validity_to_dtype(slice_validity, dtype)?;
 
         Ok(DecompressedSlice {
             bytes: decompressed,
@@ -1606,6 +1639,235 @@ impl ZstdData {
             n_skipped_values,
             n_buffered_values,
         })
+    }
+
+    /// Filters the array, decompressing only the frames that hold a selected value.
+    ///
+    /// Canonicalizing first would decompress every frame and then throw most of it away. Frames
+    /// are independently compressed, so a mask that touches few of them only has to pay for those.
+    pub(crate) fn filter(
+        &self,
+        dtype: &DType,
+        unsliced_validity: &Validity,
+        mask: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        vortex_ensure!(
+            mask.len() == self.slice_stop - self.slice_start,
+            "Filter mask of length {} does not match the {} rows of the array",
+            mask.len(),
+            self.slice_stop - self.slice_start
+        );
+        let unsliced_mask = unsliced_validity.execute_mask(self.unsliced_n_rows, ctx)?;
+        let spans = self.frame_spans(dtype, &unsliced_mask)?;
+
+        // Rows the mask selects, in this array's own (unsliced) row space.
+        let selected_rows: Vec<usize> = match mask.indices() {
+            AllOr::All => (self.slice_start..self.slice_stop).collect(),
+            AllOr::None => Vec::new(),
+            AllOr::Some(indices) => indices.iter().map(|i| self.slice_start + i).collect(),
+        };
+        // Valid rows before each selected row, which is a selected row's own value index. The
+        // batch form materializes the ranks once instead of ranking per row.
+        let value_indices = unsliced_mask.valid_counts_for_indices(&selected_rows);
+        // Which selected rows hold a value at all. The bits are read once here rather than
+        // through a per-row validity lookup inside the frame loop.
+        let selected_valid: Vec<bool> = match unsliced_mask.bit_buffer() {
+            AllOr::All => vec![true; selected_rows.len()],
+            AllOr::None => vec![false; selected_rows.len()],
+            AllOr::Some(bits) => selected_rows.iter().map(|&row| bits.value(row)).collect(),
+        };
+
+        let out_validity = align_validity_to_dtype(
+            unsliced_validity
+                .slice(self.slice_start..self.slice_stop)?
+                .filter(mask)?,
+            dtype,
+        )?;
+
+        match dtype {
+            DType::Primitive(..) => {
+                let byte_width = Self::byte_width(dtype);
+                let n_valid = selected_valid.iter().filter(|valid| **valid).count();
+                let mut values = ByteBufferMut::with_capacity_aligned(
+                    n_valid * byte_width,
+                    Alignment::new(byte_width),
+                );
+                self.for_each_selected_value(
+                    dtype,
+                    &spans,
+                    &value_indices,
+                    &selected_valid,
+                    |value| {
+                        values.extend_from_slice(value);
+                        Ok(())
+                    },
+                )?;
+                Ok(PrimitiveArray::from_values_byte_buffer(
+                    values.freeze(),
+                    dtype.as_ptype(),
+                    out_validity,
+                    mask.true_count(),
+                    ctx,
+                )
+                .into_array())
+            }
+            DType::Binary(_) | DType::Utf8(_) => {
+                let mut builder =
+                    VarBinViewBuilder::with_capacity(dtype.clone(), mask.true_count());
+                // Selected rows and stored values are both in row order, so nulls are filled in as
+                // the walk passes them rather than needing a second pass.
+                let mut next_row = 0usize;
+                self.for_each_selected_value(
+                    dtype,
+                    &spans,
+                    &value_indices,
+                    &selected_valid,
+                    |value| {
+                        while !selected_valid[next_row] {
+                            builder.append_null();
+                            next_row += 1;
+                        }
+                        builder.append_value(value);
+                        next_row += 1;
+                        Ok(())
+                    },
+                )?;
+                for _ in next_row..selected_valid.len() {
+                    builder.append_null();
+                }
+                Ok(builder.finish_into_varbinview().into_array())
+            }
+            _ => vortex_bail!("Unsupported dtype for Zstd filter: {dtype}"),
+        }
+    }
+
+    /// Calls `handle_value` with each selected value, in row order.
+    ///
+    /// Frames without a selected value are never decompressed, and the ones that are decompress
+    /// into a single reused buffer.
+    fn for_each_selected_value(
+        &self,
+        dtype: &DType,
+        spans: &[FrameSpan],
+        value_indices: &[usize],
+        selected_valid: &[bool],
+        mut handle_value: impl FnMut(&[u8]) -> VortexResult<()>,
+    ) -> VortexResult<()> {
+        let byte_width = Self::byte_width(dtype);
+        let is_primitive = dtype.is_primitive();
+        // The value indices of the selected rows that hold one, ascending.
+        let wanted: Vec<usize> = value_indices
+            .iter()
+            .zip(selected_valid)
+            .filter_map(|(value_idx, valid)| valid.then_some(*value_idx))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+
+        let mut decompressor = self.decompressor()?;
+        // One frame's worth of scratch, sized for the largest frame so no decompression regrows it.
+        let largest_frame = spans
+            .iter()
+            .map(|span| span.uncompressed_size)
+            .max()
+            .unwrap_or(0);
+        let mut scratch =
+            ByteBufferMut::with_capacity_aligned(largest_frame, Alignment::new(byte_width));
+
+        let mut next = 0usize;
+        for (frame, span) in self.frames.iter().zip(spans) {
+            if next == wanted.len() {
+                break;
+            }
+            if wanted[next] >= span.value_stop() {
+                // No selected value lives in this frame, so it is never decompressed.
+                continue;
+            }
+
+            let frame_bytes =
+                self.decompress_frame(&mut decompressor, frame, span, &mut scratch)?;
+            if is_primitive {
+                while next < wanted.len() && wanted[next] < span.value_stop() {
+                    let offset = (wanted[next] - span.value_start) * byte_width;
+                    let value = frame_bytes
+                        .get(offset..offset + byte_width)
+                        .ok_or_else(|| {
+                            vortex_err!(
+                                "Corrupt zstd metadata: value {} is out of bounds of the {} byte \
+                                 frame buffer",
+                                wanted[next],
+                                frame_bytes.len()
+                            )
+                        })?;
+                    handle_value(value)?;
+                    next += 1;
+                }
+            } else {
+                // Variable-width values can only be located by walking the length prefixes, so the
+                // frame is walked once, forwards, skipping the values the mask did not select.
+                let mut offset = 0usize;
+                let mut value_idx = span.value_start;
+                while next < wanted.len() && wanted[next] < span.value_stop() {
+                    while value_idx < wanted[next] {
+                        offset += size_of::<ViewLen>() + zstd_value_len(frame_bytes, offset)?;
+                        value_idx += 1;
+                    }
+                    let len = zstd_value_len(frame_bytes, offset)?;
+                    let start = offset + size_of::<ViewLen>();
+                    let value = frame_bytes.get(start..start + len).ok_or_else(|| {
+                        vortex_err!(
+                            "Corrupt zstd value: {len} bytes at offset {start} run past the end \
+                             of the {} byte frame buffer",
+                            frame_bytes.len()
+                        )
+                    })?;
+                    handle_value(value)?;
+                    offset = start + len;
+                    value_idx += 1;
+                    next += 1;
+                }
+            }
+        }
+
+        vortex_ensure!(
+            next == wanted.len(),
+            "Corrupt zstd metadata: {} selected values are past the {} values the frames hold",
+            wanted.len() - next,
+            spans.last().map_or(0, FrameSpan::value_stop)
+        );
+        Ok(())
+    }
+
+    fn decompressor(&self) -> VortexResult<zstd::bulk::Decompressor<'static>> {
+        Ok(match &self.dictionary {
+            Some(dictionary) => zstd::bulk::Decompressor::with_dictionary(dictionary)?,
+            None => zstd::bulk::Decompressor::new()?,
+        })
+    }
+
+    /// Decompresses one frame into `scratch`, reusing its allocation across frames.
+    fn decompress_frame<'a>(
+        &self,
+        decompressor: &mut zstd::bulk::Decompressor<'_>,
+        frame: &ByteBuffer,
+        span: &FrameSpan,
+        scratch: &'a mut ByteBufferMut,
+    ) -> VortexResult<&'a [u8]> {
+        scratch.clear();
+        scratch.reserve(span.uncompressed_size);
+        let mut destination =
+            UninitDestination::new(&mut scratch.spare_capacity_mut()[..span.uncompressed_size]);
+        let n = decompressor.decompress_to_buffer(frame.as_slice(), &mut destination)?;
+        vortex_ensure!(
+            n == span.uncompressed_size,
+            "Zstd metadata or frames were corrupt; expected {} bytes but decompressed {n}",
+            span.uncompressed_size
+        );
+        // SAFETY: zstd reported writing exactly `n` bytes into the front of the spare capacity.
+        unsafe { scratch.set_len(n) };
+        Ok(&scratch[..n])
     }
 
     fn decompress(

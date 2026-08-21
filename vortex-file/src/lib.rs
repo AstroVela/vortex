@@ -184,6 +184,8 @@ pub fn register_default_encodings(session: &VortexSession) {
             arrays.register(Patched);
         }
     }
+    #[cfg(feature = "zstd")]
+    vortex_zstd::register_kernels(session);
 
     vortex_alp::initialize(session);
     vortex_datetime_parts::initialize(session);

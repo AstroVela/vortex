@@ -22,6 +22,7 @@
 //! ```
 
 pub use array::*;
+pub use kernel::register_kernels;
 use vortex_array::dtype::proto::dtype as pb;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -31,6 +32,7 @@ pub use zstd_buffers::*;
 
 mod array;
 mod compute;
+mod kernel;
 mod rules;
 mod slice;
 #[cfg(feature = "unstable_encodings")]

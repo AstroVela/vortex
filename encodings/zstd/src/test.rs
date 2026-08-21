@@ -555,3 +555,147 @@ fn test_zstd_rejects_mismatched_frame_content_size() {
     .unwrap_err();
     assert!(error.to_string().contains("metadata declares"));
 }
+
+mod filter {
+    use std::sync::LazyLock;
+
+    use rstest::rstest;
+    use vortex_array::ArrayRef;
+    use vortex_array::Canonical;
+    use vortex_array::ExecutionCtx;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::VarBinViewArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::builtins::ArrayBuiltins as _;
+    use vortex_array::session::ArraySessionExt as _;
+    use vortex_buffer::ByteBuffer;
+    use vortex_error::VortexResult;
+    use vortex_mask::Mask;
+    use vortex_session::VortexSession;
+
+    use crate::Zstd;
+    use crate::ZstdData;
+
+    const N: usize = 512;
+    const VALUES_PER_FRAME: usize = 64;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = array_session();
+        session.arrays().register(Zstd);
+        crate::register_kernels(&session);
+        session
+    });
+
+    fn ctx() -> ExecutionCtx {
+        SESSION.create_execution_ctx()
+    }
+
+    fn primitive(nullable: bool) -> VortexResult<ArrayRef> {
+        let values = if nullable {
+            PrimitiveArray::from_option_iter(
+                (0..N).map(|i| (i % 7 != 0).then_some((i * 31) as i64)),
+            )
+        } else {
+            PrimitiveArray::from_iter((0..N).map(|i| (i * 31) as i64))
+        };
+        Ok(Zstd::from_primitive(&values, 3, VALUES_PER_FRAME, &mut ctx())?.into_array())
+    }
+
+    fn strings(nullable: bool) -> VortexResult<ArrayRef> {
+        let values = if nullable {
+            VarBinViewArray::from_iter_nullable_str(
+                (0..N).map(|i| (i % 5 != 0).then(|| format!("value-{i:05}"))),
+            )
+        } else {
+            VarBinViewArray::from_iter_str((0..N).map(|i| format!("value-{i:05}")))
+        };
+        Ok(Zstd::from_var_bin_view(&values, 3, VALUES_PER_FRAME, &mut ctx())?.into_array())
+    }
+
+    /// The filter kernel must agree with decompressing everything and filtering that.
+    fn assert_matches_canonical(array: &ArrayRef, mask: Mask) -> VortexResult<()> {
+        let mut ctx = ctx();
+        let expected = array
+            .clone()
+            .execute::<Canonical>(&mut ctx)?
+            .into_array()
+            .filter(mask.clone())?;
+        let actual = array.clone().filter(mask)?;
+        assert_arrays_eq!(actual, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::primitive(primitive(false))]
+    #[case::primitive_nullable(primitive(true))]
+    #[case::strings(strings(false))]
+    #[case::strings_nullable(strings(true))]
+    fn test_filter_matches_canonical(#[case] array: VortexResult<ArrayRef>) -> VortexResult<()> {
+        let array = array?;
+        // One value in the last frame only, so every earlier frame is skipped.
+        assert_matches_canonical(&array, Mask::from_indices(N, [N - 1]))?;
+        // One value in the first frame only.
+        assert_matches_canonical(&array, Mask::from_indices(N, [3]))?;
+        // Scattered across frames, including rows that are null in the nullable cases.
+        assert_matches_canonical(&array, Mask::from_indices(N, [0, 7, 70, 200, 201, 511]))?;
+        // Dense enough to touch every frame.
+        assert_matches_canonical(&array, Mask::from_iter((0..N).map(|i| i % 3 == 0)))?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::primitive(primitive(false))]
+    #[case::strings(strings(false))]
+    fn test_filter_of_a_slice_matches_canonical(
+        #[case] array: VortexResult<ArrayRef>,
+    ) -> VortexResult<()> {
+        let sliced = array?.slice(100..300)?;
+        assert_matches_canonical(&sliced, Mask::from_indices(200, [0, 1, 150, 199]))?;
+        assert_matches_canonical(&sliced, Mask::from_iter((0..200).map(|i| i % 5 == 0)))?;
+        Ok(())
+    }
+
+    /// Truncating a frame's compressed bytes leaves its header, and so its metadata, intact: the
+    /// frame only fails when something decompresses it. A filter that reads around it must not.
+    fn with_truncated_frame(array: ArrayRef, frame: usize) -> VortexResult<ArrayRef> {
+        let zstd = array.as_::<Zstd>().clone();
+        let dtype = zstd.dtype().clone();
+        let validity = zstd.validity()?;
+        let mut data: ZstdData = zstd.data().clone();
+        let truncated = data.frames[frame].slice(0..data.frames[frame].len() - 8);
+        data.frames[frame] = ByteBuffer::from(truncated.as_slice().to_vec());
+        Ok(Zstd::try_new(dtype, data, validity)?.into_array())
+    }
+
+    #[rstest]
+    #[case::primitive(primitive(false))]
+    #[case::strings(strings(false))]
+    fn test_filter_skips_frames_holding_no_selected_value(
+        #[case] array: VortexResult<ArrayRef>,
+    ) -> VortexResult<()> {
+        // Frame 1 holds values 64..128, and is the only unreadable frame.
+        let array = with_truncated_frame(array?, 1)?;
+        let mut ctx = ctx();
+
+        // Selecting around the broken frame succeeds only if it was never decompressed.
+        let kept = array
+            .clone()
+            .filter(Mask::from_indices(N, [5, 200, 511]))?
+            .execute::<Canonical>(&mut ctx)?;
+        assert_eq!(kept.into_array().len(), 3);
+
+        // Selecting from it must still report the corruption rather than inventing values.
+        assert!(
+            array
+                .clone()
+                .filter(Mask::from_indices(N, [100]))?
+                .execute::<Canonical>(&mut ctx)
+                .is_err(),
+            "a filter reading the truncated frame should fail"
+        );
+        Ok(())
+    }
+}
