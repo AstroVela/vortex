@@ -59,3 +59,35 @@ You likely do not have the required packages installed. On macOS, try this:
 ```
 brew install duckdb cmake ninja pkg-config vcpkg
 ```
+
+## Hugging Face mirror (`scripts/hf_mirror.py`)
+
+`scripts/hf_mirror.py` mirrors Hugging Face datasets and compares the mirrored Parquet against
+Vortex. Every public dataset on the Hub is auto-converted to Parquet under the
+`refs/convert/parquet` branch, so this works for CSV-, JSON-, and Arrow-backed datasets too, not
+just the ones published as Parquet.
+
+Browse the Hub rankings, then mirror whatever looks interesting:
+
+```bash
+# Hub rankings: trending / likes / downloads, optionally restricted to tabular Parquet.
+./vortex-bench/scripts/hf_mirror.py list --sort trending --tabular
+
+# The curated shortlist, chosen to cover distinct corners of the encoding space.
+./vortex-bench/scripts/hf_mirror.py list --sort curated
+
+# Mirror one shard each and report Parquet vs Vortex sizes, for both strategies.
+./vortex-bench/scripts/hf_mirror.py mirror --max-shards 1 HuggingFaceFW/fineweb-edu mteb/results
+
+# Mirror the whole curated set, then re-print the report without re-downloading.
+./vortex-bench/scripts/hf_mirror.py mirror --max-shards 1 --max-bytes 400MiB
+./vortex-bench/scripts/hf_mirror.py report
+```
+
+Datasets are named `dataset[:config[:split]]`. Pin the config where the alphabetically-first one
+is unrepresentative — `wikimedia/wikipedia` would otherwise resolve to Abkhazian and `allenai/c4`
+to Afrikaans. Downloads are idempotent and land in `vortex-bench/data/hf/`, so re-running only
+converts. Set `HF_TOKEN` for gated datasets.
+
+The script builds `vx` via `cargo run --release` unless `vx` is on `PATH` or `--vx` points at a
+binary. Prefer passing a pre-built binary when mirroring more than a couple of datasets.
