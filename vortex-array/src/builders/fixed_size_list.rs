@@ -59,7 +59,9 @@ impl FixedSizeListBuilder {
         nullability: Nullability,
         capacity: usize,
     ) -> Self {
-        let elements_builder = ChildBuilder::new(&element_dtype);
+        // The element count is exactly known here, unlike for a list of varying sizes.
+        let elements_builder =
+            ChildBuilder::with_capacity(&element_dtype, capacity * list_size as usize);
         let fsl_dtype = DType::FixedSizeList(element_dtype, list_size, nullability);
         let nulls = ValidityBuilder::new(capacity);
 

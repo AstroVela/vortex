@@ -42,23 +42,23 @@ pub struct ChildBuilder {
     pending: Option<Box<dyn ArrayBuilder>>,
 
     /// The capacity the scalar builder is materialized with, grown by
-    /// [`reserve_exact`](Self::reserve_exact).
+    /// [`reserve_exact`](Self::reserve_exact) until it is.
     pending_capacity: usize,
 }
 
 impl ChildBuilder {
-    /// Creates a new `ChildBuilder`.
+    /// Creates a new `ChildBuilder` whose scalar builder has room for `capacity` values.
     ///
-    /// Nothing is allocated for the scalars: a child that only ever receives whole arrays never
-    /// materializes a scalar builder at all, and a caller that knows how many scalars are coming
-    /// says so with [`reserve_exact`](Self::reserve_exact).
-    pub fn new(dtype: &DType) -> Self {
+    /// Nothing is allocated for them here: `capacity` is only the size the scalar builder is
+    /// materialized with, and a child that only ever receives whole arrays never materializes one
+    /// at all. Callers are free to pass a capacity they may not need.
+    pub fn with_capacity(dtype: &DType, capacity: usize) -> Self {
         Self {
             dtype: dtype.clone(),
             chunks: Vec::new(),
             chunks_len: 0,
             pending: None,
-            pending_capacity: 0,
+            pending_capacity: capacity,
         }
     }
 
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn test_appended_arrays_are_kept_as_chunks() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         builder.append_array(&constant(1, CHUNK_LEN), &mut ctx)?;
         builder.append_array(&constant(2, CHUNK_LEN), &mut ctx)?;
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn test_short_arrays_are_kept_as_chunks_too() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         builder.append_array(&constant(1, 1), &mut ctx)?;
         builder.append_array(&constant(2, 1), &mut ctx)?;
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn test_scalars_interleaved_with_chunks_keep_their_order() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         builder.append_scalar(&1i32.into())?;
         builder.append_array(&constant(2, CHUNK_LEN), &mut ctx)?;
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn test_single_chunk_is_not_wrapped() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         builder.append_array(&constant(7, CHUNK_LEN), &mut ctx)?;
 
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_empty_arrays_never_become_chunks() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
         let empty = constant(1, CHUNK_LEN).slice(0..0)?;
 
         builder.append_array(&empty, &mut ctx)?;
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn test_empty_child_finishes_without_chunks() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         builder.append_array(&constant(1, CHUNK_LEN).slice(0..0)?, &mut ctx)?;
 
@@ -338,7 +338,7 @@ mod tests {
     #[case::non_empty(CHUNK_LEN)]
     fn test_appending_a_mismatched_dtype_is_rejected(#[case] len: usize) {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         let wrong_dtype = ConstantArray::new(1i64, len).into_array();
         assert!(builder.append_array(&wrong_dtype, &mut ctx).is_err());
@@ -349,7 +349,7 @@ mod tests {
     fn test_zeros_and_nulls_around_chunks_keep_their_order() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
         let dtype = DType::Primitive(I32, Nullable);
-        let mut builder = ChildBuilder::new(&dtype);
+        let mut builder = ChildBuilder::with_capacity(&dtype, 0);
 
         builder.append_array(&nullable_constant(1, CHUNK_LEN), &mut ctx)?;
         builder.append_nulls(2);
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_finish_resets_the_builder() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = ChildBuilder::new(&DType::from(I32));
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
 
         builder.append_array(&constant(1, CHUNK_LEN), &mut ctx)?;
         builder.append_scalar(&2i32.into())?;
@@ -386,6 +386,40 @@ mod tests {
 
         let expected = PrimitiveArray::new(buffer![3i32], NonNullable.into()).into_array();
         assert_arrays_eq!(&builder.finish(), &expected, &mut ctx);
+
+        Ok(())
+    }
+
+    /// Reserving is recorded while the scalar builder is unmaterialized and forwarded once it
+    /// exists; either way the scalars appended after it are the ones that come back.
+    #[test]
+    fn test_reserving_before_and_after_the_first_scalar() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
+
+        builder.reserve_exact(2);
+        builder.append_scalar(&1i32.into())?;
+        builder.reserve_exact(2);
+        builder.append_scalar(&2i32.into())?;
+
+        let expected = PrimitiveArray::new(buffer![1i32, 2], NonNullable.into()).into_array();
+        assert_arrays_eq!(&builder.finish(), &expected, &mut ctx);
+
+        Ok(())
+    }
+
+    /// A child that is only ever reserved never materializes a scalar builder, and still finishes
+    /// as an empty array of its own dtype.
+    #[test]
+    fn test_reserving_alone_finishes_empty() -> VortexResult<()> {
+        let mut builder = ChildBuilder::with_capacity(&DType::from(I32), 0);
+
+        builder.reserve_exact(CHUNK_LEN);
+
+        assert_eq!(builder.len(), 0);
+        let child = builder.finish();
+        assert!(child.is_empty());
+        assert!(child.is::<Primitive>());
 
         Ok(())
     }

@@ -86,10 +86,6 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ListViewBuilder<O, S> {
 
     /// Create a new [`ListViewArray`] builder with the given `capacity`.
     ///
-    /// The `elements` builder is left to size itself: how many elements the lists hold is not
-    /// something the outer `capacity` says, and an appended array becomes a chunk of the elements
-    /// rather than a copy into them.
-    ///
     /// # Panics
     ///
     /// Panics if the size type `S` cannot fit within the offset type `O`.
@@ -98,7 +94,8 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ListViewBuilder<O, S> {
         nullability: Nullability,
         capacity: usize,
     ) -> Self {
-        let elements_builder = ChildBuilder::new(&element_dtype);
+        // The element count is unknown, so guess at two per list.
+        let elements_builder = ChildBuilder::with_capacity(&element_dtype, 2 * capacity);
 
         let offsets_builder =
             PrimitiveBuilder::<O>::with_capacity(Nullability::NonNullable, capacity);
@@ -655,7 +652,7 @@ mod tests {
     #[test]
     fn test_empty() {
         let mut builder =
-            ListViewBuilder::<u32, u32>::with_capacity(Arc::new(I32.into()), NonNullable, 0, 0);
+            ListViewBuilder::<u32, u32>::with_capacity(Arc::new(I32.into()), NonNullable, 0);
 
         let listview = builder.finish();
         assert_eq!(listview.len(), 0);
@@ -973,8 +970,7 @@ mod tests {
         );
         let constant = ConstantArray::new(fill, ROWS).into_array();
 
-        let mut builder =
-            ListViewBuilder::<u64, u64>::with_capacity(element_dtype, NonNullable, 0);
+        let mut builder = ListViewBuilder::<u64, u64>::with_capacity(element_dtype, NonNullable, 0);
         constant.append_to_builder(&mut builder, &mut ctx)?;
         let listview = builder.finish_into_listview();
 

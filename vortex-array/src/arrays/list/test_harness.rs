@@ -29,7 +29,8 @@ impl ListArray {
         let mut builder = ListBuilder::<O>::with_capacity(
             Arc::clone(&dtype),
             crate::dtype::Nullability::NonNullable,
-            iter.size_hint().0,);
+            iter.size_hint().0,
+        );
 
         for v in iter {
             let elem = Scalar::list(
@@ -54,7 +55,8 @@ impl ListArray {
         let mut builder = ListBuilder::<O>::with_capacity(
             Arc::clone(&dtype),
             crate::dtype::Nullability::Nullable,
-            iter.size_hint().0,);
+            iter.size_hint().0,
+        );
 
         for v in iter {
             if let Some(v) = v {
