@@ -11,11 +11,9 @@ use std::ops::BitOrAssign;
 
 use vortex_compute::lane_kernels::IndexedSourceExt;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
-use vortex_mask::AllOr;
-use vortex_mask::Mask;
+use vortex_mask::MaskValues;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -56,7 +54,7 @@ where
 /// Decode nullable inputs, then store one output for each valid row from an infallible kernel.
 pub(crate) fn execute_owned_infallible_valid_rows<Args, Out, Prepared>(
     args: &dyn ExecutionArgs,
-    valid: &Mask,
+    valid: &MaskValues,
     ctx: &mut ExecutionCtx,
     prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
     apply: impl Fn(&Prepared, Args::Elems<'_>) -> Out,
@@ -78,7 +76,7 @@ where
 /// Decode nullable inputs, then store outputs and combine failure evidence for valid rows.
 pub(crate) fn execute_owned_valid_rows<Args, Out, Prepared, Fail>(
     args: &dyn ExecutionArgs,
-    valid: &Mask,
+    valid: &MaskValues,
     ctx: &mut ExecutionCtx,
     prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
     apply: impl Fn(&Prepared, Args::Elems<'_>) -> (Out, Fail),
@@ -96,11 +94,7 @@ where
     };
 
     let row_count = args.row_count();
-    let AllOr::Some(valid_rows) = valid.bit_buffer() else {
-        vortex_bail!(
-            "execute_owned_valid_rows requires valid and invalid rows, got an all-valid or all-invalid mask"
-        );
-    };
+    let valid_rows = valid.bit_buffer();
     vortex_ensure_eq!(
         valid_rows.len(),
         row_count,

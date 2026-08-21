@@ -263,6 +263,11 @@ impl Validity {
         }
     }
 
+    /// Execute this validity into a [`Mask`] of the given length.
+    ///
+    /// Resolving [`Validity::Array`] can execute and scan up to `length` values. Optimistic fast
+    /// paths that do not need the exact mask should use [`Self::definitely_no_nulls`] or
+    /// [`Self::definitely_all_null`] and delay this work until necessary.
     #[inline]
     pub fn execute_mask(&self, length: usize, ctx: &mut ExecutionCtx) -> VortexResult<Mask> {
         match self {

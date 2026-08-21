@@ -8,7 +8,7 @@
 //! signature cannot execute over the original inputs.
 
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
+use vortex_mask::MaskValues;
 
 use super::RowPolicy;
 use super::RowVisitor;
@@ -180,7 +180,7 @@ pub(crate) struct ExecuteValidRows<'args, 'ctx, F: RowFn> {
     policy: RowPolicy,
 
     /// The conjoined validity, containing both valid and invalid rows.
-    valid: &'args Mask,
+    valid: &'args MaskValues,
 
     /// The execution context used to decode the input columns.
     ctx: &'ctx mut ExecutionCtx,
@@ -193,7 +193,7 @@ impl<'args, 'ctx, F: RowFn> ExecuteValidRows<'args, 'ctx, F> {
         options: &'args F::Options,
         output_dtype: &'args DType,
         policy: RowPolicy,
-        valid: &'args Mask,
+        valid: &'args MaskValues,
         ctx: &'ctx mut ExecutionCtx,
     ) -> Self {
         Self {
