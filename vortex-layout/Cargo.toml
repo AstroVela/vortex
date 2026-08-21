@@ -24,7 +24,7 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 bit-vec = { workspace = true }
 flatbuffers = { workspace = true }
-futures = { workspace = true, features = ["alloc", "async-await", "executor"] }
+futures = { workspace = true, features = ["alloc", "async-await", "executor", "thread-pool"] }
 itertools = { workspace = true }
 kanal = { workspace = true }
 moka = { workspace = true, features = ["future"] }
@@ -36,6 +36,7 @@ pin-project-lite = { workspace = true }
 prost = { workspace = true }
 rustc-hash = { workspace = true }
 sketches-ddsketch = { workspace = true }
+smallvec = { workspace = true }
 termtree = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }
 tracing = { workspace = true }
@@ -55,8 +56,11 @@ vortex-session = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }
 
 [dev-dependencies]
+arrow-cast = { workspace = true }
+divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 insta = { workspace = true }
+parquet = { workspace = true }
 rstest = { workspace = true }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
@@ -69,6 +73,14 @@ tokio = ["dep:tokio", "vortex-error/tokio"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "self_paced_plan_exec"
+harness = false
+
+[[bench]]
+name = "self_paced_vs_v1"
+harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["uuid"]

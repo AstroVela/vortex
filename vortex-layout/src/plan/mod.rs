@@ -9,6 +9,8 @@
 
 mod children;
 mod display;
+/// Experimental self-paced execution model.
+pub mod exec;
 mod execution;
 mod lower;
 mod optimize;

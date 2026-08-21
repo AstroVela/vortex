@@ -46,7 +46,7 @@ The first experiment deliberately has these restrictions:
 - flat columns contain `i64` values;
 - each conjunct reads one field and applies a simple comparison;
 - projection selects fields rather than evaluating arbitrary expressions;
-- a morsel does not cross a chunk boundary;
+- a morsel may cross field-chunk boundaries and carries an ordered Flat slice list per field;
 - an in-memory segment evaluator supplies the data plane;
 - the only resolved work values are a segment `BufferHandle` and an `ArrayRef` with its
   inseparable summary; and
@@ -127,8 +127,8 @@ rejected or handled without leaving a slot permanently running.
 
 ### Phase 2: restricted plan compilation
 
-Compile the experimental `Chunked<Struct<Flat>>` model into canonical Flat resources, chunk row
-offsets, chunk-contained morsels, possible-user sets, and per-morsel reverse resource lists.
+Compile the experimental `Struct<Chunked<Flat>>` model into canonical Flat resources, field-chunk
+row offsets, cross-chunk morsels, possible-user sets, and per-morsel reverse resource lists.
 
 Exit when global/local row mapping, resource interning, possible users, and graph-size accounting
 are independently tested.
@@ -998,7 +998,7 @@ measured avoided work rather than unequal caching or inputs.
 
 ## Experiment summary
 
-The experiment compiles one restricted `Chunked<Struct<Flat>>` source and a conjunctive query into
+The experiment compiles one restricted `Struct<Chunked<Flat>>` source and a conjunctive query into
 two kinds of runtime state:
 
 ```text
@@ -1016,9 +1016,9 @@ The complete control and data flow is:
 
 ```text
 root morsel demand
-    -> Chunked maps root rows to a chunk-local domain
     -> Struct routes open demand to predicate and projection fields
-    -> Flat joins canonical segment resources
+    -> each field's Chunked layout maps root rows to one or more Flat slices
+    -> Flat slices join canonical segment resources
     -> advance exposes Read and DecodeFlat tasks
     -> decoded arrays enable independent predicate tasks
     -> predicate arrays feed CombineDemand tasks
@@ -1027,7 +1027,6 @@ root morsel demand
     -> sealing promotes retained candidate offers to required
     -> Flat selects projected values for sealed demand
     -> Struct packs aligned field batches into a StructArray
-    -> Chunked translates coverage and forwards the child array
     -> root wraps its ArrayRef and row metadata in ExecBatch
     -> morsel retires and releases resource joins
 ```
