@@ -445,7 +445,7 @@ where
 /// Check if a mask is sparse.
 ///
 /// BitBuffer traversal uses u64, hence we conclude that one or fewer values per u64 is sparse
-fn mask_is_sparse(values: &Arc<MaskValues>) -> bool {
+fn mask_is_sparse(values: &MaskValues) -> bool {
     values.true_count().saturating_mul(64) < values.len()
 }
 
@@ -453,7 +453,7 @@ fn mask_is_sparse(values: &Arc<MaskValues>) -> bool {
 ///
 /// The mask-driven path becomes worthwhile around ~3% mask density: each set
 /// bit costs a select and push, but we save a per-self-chunk popcount + deposit.
-fn rank_mask_is_sparse(values: &Arc<MaskValues>) -> bool {
+fn rank_mask_is_sparse(values: &MaskValues) -> bool {
     values.true_count().saturating_mul(32) < values.len()
 }
 

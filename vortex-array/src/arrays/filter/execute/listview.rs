@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use vortex_error::VortexExpect;
 use vortex_mask::Mask;
-use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use crate::arrays::ListViewArray;
 use crate::arrays::filter::execute::filter_validity;
@@ -23,7 +21,7 @@ use crate::arrays::listview::ListViewArraySlotsExt;
 ///
 /// The trade-off is that we may keep unreferenced elements in memory, but this is acceptable since
 /// we're optimizing for read performance and the data isn't being copied.
-pub fn filter_listview(array: &ListViewArray, selection_mask: &Arc<MaskValues>) -> ListViewArray {
+pub fn filter_listview(array: &ListViewArray, selection_mask: &MaskValuesRef) -> ListViewArray {
     let elements = array.elements();
     let offsets = array.offsets();
     let sizes = array.sizes();
@@ -41,7 +39,7 @@ pub fn filter_listview(array: &ListViewArray, selection_mask: &Arc<MaskValues>) 
     );
 
     // Simply filter the offsets and sizes arrays.
-    let mask_for_filter = Mask::Values(Arc::clone(selection_mask));
+    let mask_for_filter = Mask::Values(MaskValuesRef::clone(selection_mask));
     let new_offsets = offsets
         .filter(mask_for_filter.clone())
         .vortex_expect("ListViewArray offsets are guaranteed to support filter");

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use vortex_error::VortexExpect;
 use vortex_mask::Mask;
 use vortex_mask::MaskIter;
 use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::filter::execute::filter_validity;
@@ -24,7 +23,7 @@ const MASK_EXPANSION_DENSITY_THRESHOLD: f64 = 0.05;
 /// mask down to the child elements array.
 pub fn filter_fixed_size_list(
     array: &FixedSizeListArray,
-    selection_mask: &Arc<MaskValues>,
+    selection_mask: &MaskValuesRef,
 ) -> FixedSizeListArray {
     let filtered_validity = filter_validity(
         array

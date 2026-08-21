@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use vortex_error::VortexExpect;
-use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use crate::arrays::BoolArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::filter::execute::bitbuffer;
 use crate::arrays::filter::execute::filter_validity;
 
-pub fn filter_bool(array: &BoolArray, mask: &Arc<MaskValues>) -> BoolArray {
+pub fn filter_bool(array: &BoolArray, mask: &MaskValuesRef) -> BoolArray {
     let validity = array
         .validity()
         .vortex_expect("bool validity should be derivable");
