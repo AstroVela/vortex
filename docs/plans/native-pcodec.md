@@ -36,7 +36,6 @@ Focus the production work on these encodings:
 - `OrderedFloatArray`.
 - `BlockResidualArray` for all integer types, with one reference per 1,024-value block.
 - `FloatQuantArray`.
-- `IntMultArray` as a composable integer transform.
 
 Keep `FloatQuantScheme`, `OrderedBlockResidualScheme`, and `BlockResidualScheme` as BtrBlocks candidates.
 
@@ -68,9 +67,9 @@ Do not add adjacent Delta, Delta-of-delta, Delta with lookback, or convolution D
 
 ## Current state
 
-The branch implements `OrderedFloatArray`, `BlockResidualArray`, `FloatQuantArray`, and `IntMultArray`.
+The branch implements `OrderedFloatArray`, `BlockResidualArray`, and `FloatQuantArray`.
 
-The evaluation set includes BtrBlocks schemes for the first three arrays.
+The evaluation set includes BtrBlocks schemes for all three arrays.
 
 `OrderedFloat(BlockResidual)` now supports `f16`, `f32`, and `f64` inputs.
 
@@ -100,15 +99,11 @@ The final calibration retains the 1.05 BlockResidual ratio floor.
 
 It retains the 1.02 ordered-float factor, 1.10 FloatQuant factor, 1.12 8-bit factor, and nonlinear patch cost.
 
-`IntMultArray` owns only the quotient and remainder transform.
-
-Its two children remain generic arrays. Child compression owns patches and other integer models.
-
 The range decomposition prototype used `IntMult(base=1)` as generic addition.
 
 Its fused decode path skipped multiplication and avoided dictionary reference materialization.
 
-IntMult has no Default scheme.
+No tested IntMult tree passed the Default evidence bar. The focused branch no longer contains `IntMultArray`.
 
 Decomposed fixed bins do not participate in the Default selector.
 
@@ -131,13 +126,10 @@ The Default selector can exclude a supported type when measured costs do not jus
 | OrderedFloat | `f16`, `f32`, `f64` | All float types remain eligible. |
 | BlockResidual | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | All widths are eligible. |
 | FloatQuant | `f16`, `f32`, `f64` | All float types remain eligible. |
-| IntMult | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` | No Default scheme exists yet. |
 
 OrderedFloat validates the logical float type, unsigned child width, child nullability, child length, and empty metadata.
 
 FloatQuant validates the metadata version, split width, latent child types, child nullability, and child lengths.
-
-IntMult validates the metadata version, positive base, base range, matching child types, child nullability, and child lengths.
 
 BlockResidual validates every payload offset table before decode or scalar access.
 
@@ -210,35 +202,35 @@ The automatic scheme accepts `f16`, `f32`, and `f64` inputs.
 
 Native `f32` and two-child selection meet the selected-column and rejected-column throughput limits.
 
-Final selector factors still require broad corpus validation.
+The final corpus pass validates the retained selector factors.
 
-## IntMultArray
+## IntMult prototype
 
-`IntMultArray` reconstructs each integer as `base * primary + secondary`.
+The prototype reconstructed each integer as `base * primary + secondary`.
 
-The array supports every signed and unsigned integer type.
+It supported every signed and unsigned integer type.
 
-The primary and secondary children can use any compatible Vortex array encoding.
+The primary and secondary children used compatible Vortex array encodings.
 
-The primary child owns validity. The secondary child is nonnullable.
+The primary child owned validity. The secondary child was nonnullable.
 
-The array supports canonical decode, scalar access, slices, serialization, and validation.
+The prototype supported canonical decode, scalar access, slices, serialization, and validation.
 
-`IntMult::from_primitive` creates quotient and remainder children with the source integer width.
+`IntMult::from_primitive` created quotient and remainder children with the source integer width.
 
-A future selector can compress both children through specialized or recursive integer schemes.
+The tested selectors compressed both children through specialized or recursive integer schemes.
 
-IntMult does not own exception positions or exception payloads.
+IntMult did not own exception positions or exception payloads.
 
-Child encodings can use `PatchArray`, `BlockResidual`, or other integer arrays when those trees win.
+Child encodings used `PatchArray`, `BlockResidual`, or other integer arrays when those trees won.
 
-When the base equals one, bulk decode and scalar access skip multiplication.
+When the base equaled one, bulk decode and scalar access skipped multiplication.
 
-For a dictionary primary, the fused path decodes the secondary into the output buffer.
+For a dictionary primary, the fused path decoded the secondary into the output buffer.
 
-It then unpacks dictionary codes and adds the selected reference directly.
+It then unpacked dictionary codes and added the selected reference directly.
 
-This path avoids a full materialized array of references.
+This path avoided a full materialized array of references.
 
 ## Selection policy
 
@@ -2900,8 +2892,6 @@ The bundle contains these schemes:
 - `OrderedBlockResidualScheme` for floating-point values.
 - `FloatQuantScheme` for floating-point values.
 
-Keep `IntMultArray` as a composable primitive without a Default scheme.
-
 Retain these selector controls:
 
 - A 1.05 minimum ratio for integer BlockResidual.
@@ -2929,8 +2919,6 @@ Test these items in future research:
 Prepare one focused stack for `OrderedFloatArray`, `BlockResidualArray`, and `OrderedBlockResidualScheme`.
 
 Prepare a separate stack for `FloatQuantArray` and `FloatQuantScheme`.
-
-Prepare a separate primitive-array change for `IntMultArray`.
 
 Keep entropy, bit-split, and alternate residual models on `wm/pcodec-entropy-experiments`.
 
