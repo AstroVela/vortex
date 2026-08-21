@@ -17,6 +17,7 @@ use vortex_error::vortex_panic;
 
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
+use crate::runtime::platform;
 
 /// A handle to an active Vortex runtime.
 ///
@@ -44,7 +45,9 @@ impl Handle {
     /// Returns a handle to the current runtime, if such a reasonable choice exists.
     ///
     /// For example, if called from within a Tokio context this will return a
-    /// `TokioRuntime` handle.
+    /// `TokioRuntime` handle. On browser WebAssembly with the `wasm-bindgen` feature this returns
+    /// the global `WasmRuntime` handle; without it there is no event loop to schedule onto, and
+    /// callers must drive a `SingleThreadRuntime` and install its handle themselves.
     pub fn find() -> Option<Self> {
         #[cfg(feature = "tokio")]
         {
@@ -56,7 +59,7 @@ impl Handle {
             }
         }
 
-        None
+        platform::default_handle()
     }
 
     /// Spawn a new future onto the runtime.
