@@ -2318,7 +2318,9 @@ The evidence supports three bundle options:
 | Opportunistic | BlockResidual and FloatQuant | 16 files | Conservative | 0.00 percent | Noise | Noise |
 | Fixed-bin experiment | Opportunistic plus RangePacked | 8 numeric files | Opportunistic | -0.054 percent | -1.03 percent | Noise |
 
-The conservative option pushes the size frontier without a material geometric-mean throughput loss.
+The opportunistic option is the leading Default bundle.
+
+It adds strict synthetic FloatQuant wins without a measured corpus size regression.
 
 The opportunistic option selects no FloatQuant tree in these eight files.
 
@@ -2332,7 +2334,9 @@ The tree decodes at about 10.1 GB/s instead of 15.6 to 16.1 GB/s.
 
 Scalar access takes 312 to 323 ns instead of 150 to 158 ns.
 
-RangePacked therefore remains outside Default.
+The absolute decode rate remains valid for Default consideration.
+
+RangePacked remains an active experiment until the broad corpus establishes its coverage and total cost.
 
 ### Default bundle random access
 
@@ -2398,6 +2402,72 @@ The combined latency geometric mean decreases by 1.15 percent.
 The individual file values remain noisy. The aggregate result removes the earlier random-access trade for the conservative bundle.
 
 The selector factors remain unchanged.
+
+### Broad fixed-bin coverage pass
+
+The Pco mode scan covers 53 float columns across 12 real datasets.
+
+It uses 524,288 rows per large column. This limit includes two complete Pco chunks.
+
+Pco selects classic bins without Delta on 41 chunks. It selects classic bins with consecutive Delta on another 17 chunks.
+
+Four columns use direct classic bins without Delta:
+
+| Dataset and column | Compact gap | Maximum Pco bins |
+| --- | ---: | ---: |
+| HashTags `interaction#received_at` | 65.2 percent | 36 |
+| Taxi `airport_fee` | 53.6 percent | 4 |
+| Euro2016 `subjectivity_confidence` | 51.1 percent | 39 |
+| Taxi `tips` | 45.4 percent | 17 |
+
+The current corpus therefore contains the direct fixed-bin distribution.
+
+Another 21 columns use classic bins only below an outer transform such as ALP.
+
+Fifteen of these columns have a Compact gap of at least ten percent.
+
+Twelve also use at most 64 Pco bins. Six have a Compact gap of at least 20 percent.
+
+The complete bundle pass uses 18 files and three iterations per operation.
+
+It adds the CMS Payments and Twitter Pco inputs to the standard 16-file corpus.
+
+| Fixed-bin change against opportunistic | Geometric mean | Aggregate |
+| --- | ---: | ---: |
+| Size | -0.024 percent | -0.034 percent |
+| Write throughput | -0.45 percent | Noise |
+| Read throughput | -0.65 percent | Noise |
+
+Only HashTags changes its file size. The other 17 files retain identical sizes.
+
+The HashTags file becomes 0.429 percent smaller.
+
+Its selected `interaction#received_at` tree changes from 3,263,939 bytes to 1,991,606 bytes.
+
+The column becomes 39.0 percent smaller. Decode throughput changes from 15.79 GB/s to 11.44 GB/s.
+
+Scalar access changes from 165 ns to 322 ns.
+
+Fresh files from the same run produce this cached file-access result:
+
+| Pattern | Opportunistic | Fixed-bin | Change |
+| --- | ---: | ---: | ---: |
+| Correlated | 1.978 ms | 2.009 ms | +1.58 percent |
+| Uniform | 12.142 ms | 12.018 ms | -1.02 percent |
+
+The selected tree passes the absolute decode and bounded-access bar.
+
+The current direct scheme remains niche. Its full-suite size gain does not justify Default inclusion alone.
+
+The nested Pco evidence defines the next fixed-bin prototype.
+
+Add a pure integer scheme that constructs this tree:
+
+`IntMult(base=1, Dict(BitPacked(codes), starts), BlockResidual(offsets))`
+
+Let ALP and other outer schemes select it through normal child recursion.
+
+Keep the black-box RangePacked array outside Default.
 
 ### Compact and Parquet size constraint
 
@@ -2709,6 +2779,10 @@ This round completed these steps:
 - Added a fused `f16` decoder for `OrderedFloat(BlockResidual)`.
 - Added a fused implicit-zero `f64` decoder for `FloatQuant(FoR(BitPacked))`.
 - Rejected 1.02 and 1.05 wider-integer BlockResidual access cost factors.
+- Added a fast Pco mode-only profile path.
+- Profiled Pco modes across 53 float columns from 12 real datasets.
+- Compared opportunistic and fixed-bin bundles across 18 complete files.
+- Measured the selected HashTags fixed-bin tree and fresh cached file access.
 
 The Pco mode profile and the quotient and remainder experiments are complete.
 
@@ -2720,12 +2794,16 @@ The focused Default bundle now includes full-position RangePacked as an experime
 
 The specialized OrderedFloat and ALP trees now use registered fused parent kernels.
 
+Use the opportunistic bundle as the leading Default candidate.
+
 Complete these next experiments in order:
 
-1. Use the Public BI file-access evidence during the final threshold review.
-2. Prefer cheap rejection tests when they preserve the best candidate model.
-3. Treat fast rejection as a selection advantage, not an admission criterion.
-4. Require stronger corpus evidence when a useful scheme needs costly analysis.
+1. Prototype a pure integer fixed-bin scheme for normal child recursion.
+2. Add a fast model that rejects poor integer fixed-bin fits.
+3. Test the scheme on the 12 nested Pco targets with at most 64 bins.
+4. Compare each selected tree against the complete incumbent child cascade.
+5. Repeat the 18-file bundle and access passes.
+6. Decide fixed-bin admission from coverage, total cost, and bounded random access.
 
 Use packed bin codes and primitive bin starts unless evidence supports more complexity.
 
@@ -2733,7 +2811,9 @@ Let ordinary child arrays own patches and exception payloads.
 
 Add an outer OrderedFloat fused decode only if the generic composition misses the decode gate.
 
-Keep fused RangePacked and RangeEntropy outside Default.
+Keep the black-box RangePacked array and RangeEntropy outside Default.
+
+Retain decomposed fixed bins as an active Default candidate.
 
 After the candidate set stabilizes, complete these final steps:
 

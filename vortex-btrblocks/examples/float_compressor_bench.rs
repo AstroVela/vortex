@@ -2776,6 +2776,36 @@ fn profile_pco_array(
             .execute::<PrimitiveArray>(&mut ctx)?;
         let ordered = ordered_values(&values);
         let validity_bytes = array.children().iter().map(ArrayRef::nbytes).sum::<u64>();
+        match values.ptype() {
+            PType::F32 => {
+                profile_pco_values(dataset, column, path, PType::F32, values.as_slice::<f32>())?
+            }
+            PType::F64 => {
+                profile_pco_values(dataset, column, path, PType::F64, values.as_slice::<f64>())?
+            }
+            PType::I16 => {
+                profile_pco_values(dataset, column, path, PType::I16, values.as_slice::<i16>())?
+            }
+            PType::I32 => {
+                profile_pco_values(dataset, column, path, PType::I32, values.as_slice::<i32>())?
+            }
+            PType::I64 => {
+                profile_pco_values(dataset, column, path, PType::I64, values.as_slice::<i64>())?
+            }
+            PType::U16 => {
+                profile_pco_values(dataset, column, path, PType::U16, values.as_slice::<u16>())?
+            }
+            PType::U32 => {
+                profile_pco_values(dataset, column, path, PType::U32, values.as_slice::<u32>())?
+            }
+            PType::U64 => {
+                profile_pco_values(dataset, column, path, PType::U64, values.as_slice::<u64>())?
+            }
+            ptype => return Err(vortex_err!("cannot profile Pco ptype {ptype}")),
+        }
+        if std::env::var_os("VORTEX_BENCH_PCO_MODES_ONLY").is_some() {
+            return Ok(());
+        }
         if std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some() {
             profile_range_packed(
                 dataset,
@@ -2815,33 +2845,6 @@ fn profile_pco_array(
             one_reference.min(two_references).min(four_references),
             bitmap_patches,
         );
-        match values.ptype() {
-            PType::F32 => {
-                profile_pco_values(dataset, column, path, PType::F32, values.as_slice::<f32>())?
-            }
-            PType::F64 => {
-                profile_pco_values(dataset, column, path, PType::F64, values.as_slice::<f64>())?
-            }
-            PType::I16 => {
-                profile_pco_values(dataset, column, path, PType::I16, values.as_slice::<i16>())?
-            }
-            PType::I32 => {
-                profile_pco_values(dataset, column, path, PType::I32, values.as_slice::<i32>())?
-            }
-            PType::I64 => {
-                profile_pco_values(dataset, column, path, PType::I64, values.as_slice::<i64>())?
-            }
-            PType::U16 => {
-                profile_pco_values(dataset, column, path, PType::U16, values.as_slice::<u16>())?
-            }
-            PType::U32 => {
-                profile_pco_values(dataset, column, path, PType::U32, values.as_slice::<u32>())?
-            }
-            PType::U64 => {
-                profile_pco_values(dataset, column, path, PType::U64, values.as_slice::<u64>())?
-            }
-            ptype => return Err(vortex_err!("cannot profile Pco ptype {ptype}")),
-        }
     }
     for (child_index, child) in array.children().iter().enumerate() {
         profile_pco_array(
@@ -2967,6 +2970,7 @@ fn measure_dataset(
             )?;
             if compact_bytes * 10 <= default_bytes * 9
                 || std::env::var_os("VORTEX_BENCH_FIXED_BIN").is_some()
+                || std::env::var_os("VORTEX_BENCH_PCO_MODES_ONLY").is_some()
             {
                 profile_pco_array(dataset, &column.name, "root", compact_array, session)?;
             }
