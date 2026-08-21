@@ -231,7 +231,26 @@ def read_jsonl_rows_for_commit(path: str, commit_id: str) -> pd.DataFrame:
 
 
 def git_tree_commit_ids() -> set[str]:
-    """Return every commit reachable from the checked-out branch head."""
+    """Return every commit reachable from the checked-out branch head.
+
+    A shallow checkout reaches only its own tip, so every recorded baseline
+    commit looks unreachable and the report silently degrades into "no
+    baseline is available for this benchmark yet" — indistinguishable from a
+    genuinely new benchmark, and wrong. Refuse the guess and say what to fix.
+    """
+
+    is_shallow = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if is_shallow == "true":
+        raise SystemExit(
+            "Cannot resolve a baseline from a shallow checkout: the baseline is the newest "
+            "recorded commit reachable from HEAD, and a shallow clone reaches only its own "
+            "tip. Check the repository out with `fetch-depth: 0`."
+        )
 
     commits = subprocess.run(
         ["git", "rev-list", "HEAD"],
@@ -662,25 +681,32 @@ def format_performance(
     return f"{ratio:.3f}x {emoji}"
 
 
-def format_cold_summary(
-    groups: list[tuple[str, pd.DataFrame]],
+def format_target_summary(
+    group: pd.DataFrame,
+    hot_ratio: float,
     improvement_threshold: float,
     regression_threshold: float,
-) -> str | None:
-    """Render the cold-run geomeans, or nothing when no row recorded its runs."""
+    target_name: str,
+) -> str:
+    """Render one target's hot geomean with its cold geomean beside it.
 
-    parts = []
-    for label, group in groups:
-        if group.empty:
-            continue
-        ratio = calculate_geometric_mean(group, "cold_ratio")
-        if pd.isna(ratio):
-            continue
-        parts.append(f"{label} {format_performance(ratio, improvement_threshold, regression_threshold, label)}")
+    The detail tables put a row's hot and cold runs side by side, so the summary
+    reads the same way: a cold-start-only change is visible on the target's own
+    line instead of on a separate one the reader has to cross-reference. Rows that
+    recorded no per-run timings have no cold geomean, and the target then reports
+    its hot geomean alone.
+    """
 
-    if not parts:
-        return None
-    return " · ".join(parts)
+    hot = format_performance(hot_ratio, improvement_threshold, regression_threshold, target_name)
+    if pd.isna(hot_ratio):
+        return hot
+
+    cold_ratio = calculate_geometric_mean(group, "cold_ratio")
+    if pd.isna(cold_ratio):
+        return f"hot {hot}"
+
+    cold = format_performance(cold_ratio, improvement_threshold, regression_threshold, target_name)
+    return f"hot {hot} · cold {cold}"
 
 
 def format_measurement_value(value: float) -> str:
@@ -1071,8 +1097,10 @@ def format_report_help() -> str:
             "the noise floor, and control-run noise.",
             "- **Hot vs cold**: Every measurement is run several times. The first run is "
             "reported as the cold run, and the median of the runs after it is reported as "
-            "the hot run. The verdict, geomeans, and significance all use hot runs; the "
-            "cold column shows first-run cost separately, and `hot/cold` is how much of "
+            "the hot run. The verdict and significance use hot runs; each target's "
+            "geomean reports hot and cold beside each other where the individual runs "
+            "were recorded and hot alone where they were not, the cold column shows "
+            "first-run cost per row, and `hot/cold` is how much of "
             "each run the warm path saves. Rows whose results predate per-run reporting "
             "show only one value, taken from the value the runner reported.",
             "- **Table cells**: Each cell reads `PR / base / %diff`. The hot and cold "
@@ -1186,29 +1214,23 @@ def main() -> None:
         summary_fields.append(f"**Engines**: {engine_summary}")
 
     if len(vortex_df) > 0:
-        vortex_performance = format_performance(
+        vortex_performance = format_target_summary(
+            vortex_df,
             vortex_geometric_mean_ratio,
             improvement_threshold,
             regression_threshold,
             "vortex",
         )
-        summary_fields.append(f"**Vortex (hot geomean)**: {vortex_performance}")
+        summary_fields.append(f"**Vortex (geomean)**: {vortex_performance}")
     if len(parquet_df) > 0:
-        parquet_performance = format_performance(
+        parquet_performance = format_target_summary(
+            parquet_df,
             parquet_geometric_mean_ratio,
             improvement_threshold,
             regression_threshold,
             "parquet",
         )
-        summary_fields.append(f"**Parquet (hot geomean)**: {parquet_performance}")
-
-    cold_summary = format_cold_summary(
-        [("Vortex", vortex_df), ("Parquet", parquet_df)],
-        improvement_threshold,
-        regression_threshold,
-    )
-    if cold_summary is not None:
-        summary_fields.append(f"**Cold run (geomean)**: {cold_summary}")
+        summary_fields.append(f"**Parquet (geomean)**: {parquet_performance}")
 
     if verdict is not None:
         shifts = f"Parquet (control) {verdict['environment_shift']}"
