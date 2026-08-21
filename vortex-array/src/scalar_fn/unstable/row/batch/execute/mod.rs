@@ -7,7 +7,7 @@
 //! valid-only execution.
 
 use vortex_error::VortexResult;
-use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use super::RowFnExecutionArgs;
 use super::RowPolicy;
@@ -40,7 +40,7 @@ impl RowFnExecutionArgs {
         ) -> VortexResult<DenseAttempt>,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
-            &MaskValues,
+            MaskValuesRef,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<ArrayRef>>,
         ctx: &mut ExecutionCtx,

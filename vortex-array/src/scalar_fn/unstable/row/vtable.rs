@@ -10,7 +10,7 @@
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
-use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 use vortex_session::VortexSession;
 
 use super::batch::BorrowedRowFnArgs;
@@ -195,7 +195,7 @@ fn try_execute_valid_rows<F: RowFn>(
     function: &F,
     options: &F::Options,
     args: BorrowedRowFnArgs<'_>,
-    valid: &MaskValues,
+    valid: MaskValuesRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
     function.dispatch(

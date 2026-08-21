@@ -11,7 +11,7 @@ use vortex_buffer::BitBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure_eq;
-use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -101,7 +101,7 @@ where
 /// how to handle the decline.
 pub(crate) fn execute_sink_valid_rows<Args, Prepared, Sink, ApplyResult, Options>(
     args: &dyn ExecutionArgs,
-    valid: &MaskValues,
+    valid: &MaskValuesRef,
     ctx: &mut ExecutionCtx,
     prepare: impl FnOnce(Args::ConstElems<'_>) -> Prepared,
     apply: impl Fn(&Prepared, Args::Elems<'_>, <Sink as OutputSink<Options>>::Row<'_>) -> ApplyResult,
@@ -208,7 +208,7 @@ where
 /// Resolve the capabilities, inputs, sink, and validity mask for skip-invalid execution.
 fn setup_sink_valid_rows<'valid, Args, Sink, Options>(
     args: &dyn ExecutionArgs,
-    valid: &'valid MaskValues,
+    valid: &'valid MaskValuesRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ValidRowsSetup<'valid, Args, Sink, Options>>>
 where
@@ -341,15 +341,14 @@ mod tests {
     fn test_non_skipping_sink_declines_before_allocation() -> VortexResult<()> {
         let input = PrimitiveArray::new(vec![1_i64, 2], Validity::NonNullable).into_array();
         let args = VecExecutionArgs::new(vec![input], 2);
-        let valid_mask = Mask::from_iter([true, false]);
-        let Some(valid) = valid_mask.values() else {
+        let Mask::Values(valid) = Mask::from_iter([true, false]) else {
             vortex_bail!("the test validity must be partially valid");
         };
         let mut ctx = array_session().create_execution_ctx();
 
         let execution = execute_sink_valid_rows::<(i64,), (), NonSkippingSink, (), EmptyOptions>(
             &args,
-            valid,
+            &valid,
             &mut ctx,
             |_| (),
             |_, _, _| (),
@@ -364,15 +363,14 @@ mod tests {
     fn test_skip_invalid_sink_rechecks_rows_after_initialization() -> VortexResult<()> {
         let input = PrimitiveArray::from_iter([10_i64, 20]).into_array();
         let args = VecExecutionArgs::new(vec![input], 2);
-        let valid_mask = Mask::from_iter([false, true]);
-        let Some(valid) = valid_mask.values() else {
+        let Mask::Values(valid) = Mask::from_iter([false, true]) else {
             vortex_bail!("the test validity must be partially valid");
         };
         let mut ctx = array_session().create_execution_ctx();
 
         let result = execute_sink_valid_rows::<(i64,), (), ShrinkingSink, (), EmptyOptions>(
             &args,
-            valid,
+            &valid,
             &mut ctx,
             |_| (),
             |_, (value,), output| {

@@ -4,7 +4,7 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
-use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use super::super::RowFnExecutionArgs;
 use super::super::args::BorrowedRowFnArgs;
@@ -25,7 +25,7 @@ impl RowFnExecutionArgs {
         kernel: impl Fn(BorrowedRowFnArgs<'_>, &mut ExecutionCtx) -> VortexResult<ArrayRef>,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
-            &MaskValues,
+            MaskValuesRef,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<ArrayRef>>,
         ctx: &mut ExecutionCtx,
@@ -44,9 +44,7 @@ impl RowFnExecutionArgs {
             Mask::Values(valid_rows) => valid_rows,
         };
 
-        if let Some(result) =
-            self.try_execute_valid_rows(try_valid_rows, valid_rows.as_ref(), ctx)?
-        {
+        if let Some(result) = self.try_execute_valid_rows(try_valid_rows, valid_rows, ctx)? {
             return Ok(result);
         }
 
@@ -61,15 +59,15 @@ impl RowFnExecutionArgs {
         &self,
         try_valid_rows: impl FnOnce(
             BorrowedRowFnArgs<'_>,
-            &MaskValues,
+            MaskValuesRef,
             &mut ExecutionCtx,
         ) -> VortexResult<Option<ArrayRef>>,
-        valid: &MaskValues,
+        valid: MaskValuesRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let Some(values) = try_valid_rows(
             self.execution_args(&self.inputs, self.row_count),
-            valid,
+            MaskValuesRef::clone(&valid),
             ctx,
         )?
         else {
@@ -77,7 +75,7 @@ impl RowFnExecutionArgs {
         };
         let values = self.validate_kernel_output(values, valid.len(), ctx)?;
 
-        let mask = valid.into_array();
+        let mask = valid.as_ref().into_array();
         self.finalize_output(values.mask(mask)?, valid.len())
             .map(Some)
     }
