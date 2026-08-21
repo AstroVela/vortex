@@ -4,6 +4,7 @@
 use vortex::array::ExecutionCtx;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
+use vortex::mask::MaskValuesRef;
 
 use crate::duckdb::ValidityData;
 use crate::duckdb::VectorBuffer;
@@ -21,26 +22,33 @@ struct ValidityExporter {
     exporter: Box<dyn ColumnExporter>,
 }
 
-/// Returns true if the bit buffer can be zero-copied as a DuckDB validity mask.
+/// Returns the zero-copy validity data for `values`, if DuckDB can read its bit buffer directly.
 ///
 /// Requirements:
 /// - No sub-byte bit offset (offset == 0)
 /// - The underlying byte buffer is u64-aligned
 /// - The underlying byte buffer length is a multiple of 8 (so u64 reads are in-bounds)
-fn can_zero_copy_validity(mask: &Mask) -> bool {
-    let Mask::Values(values) = mask else {
-        return false;
-    };
+fn zero_copy_validity(values: &MaskValuesRef) -> Option<ValidityData> {
     let bit_buf = values.bit_buffer();
     if bit_buf.offset() != 0 {
-        return false;
+        return None;
     }
-    let inner = bit_buf.inner();
-    let slice = inner.as_slice();
-    // DuckDB reads validity as u64 words, so the buffer must be u64-aligned and
-    // its length must be a multiple of 8 bytes to avoid out-of-bounds reads.
-    (slice.as_ptr() as usize).is_multiple_of(size_of::<u64>())
-        && slice.len().is_multiple_of(size_of::<u64>())
+
+    let buffer = bit_buf.inner().clone();
+    let data_ptr = buffer.as_slice().as_ptr();
+
+    // DuckDB reads validity as u64 words, so the buffer must be u64-aligned and its length must be
+    // a multiple of 8 bytes to avoid out-of-bounds reads.
+    if !(data_ptr as usize).is_multiple_of(size_of::<u64>())
+        || !buffer.as_slice().len().is_multiple_of(size_of::<u64>())
+    {
+        return None;
+    }
+
+    Some(ValidityData {
+        shared_buffer: VectorBuffer::new(buffer),
+        data_ptr,
+    })
 }
 
 pub(crate) fn new_exporter(
@@ -50,17 +58,11 @@ pub(crate) fn new_exporter(
     if mask.all_true() {
         exporter
     } else {
-        let zero_copy = can_zero_copy_validity(&mask).then(|| {
-            let Mask::Values(values) = &mask else {
-                unreachable!()
-            };
-            let buffer = values.bit_buffer().inner().clone();
-            let data_ptr = buffer.as_slice().as_ptr();
-            ValidityData {
-                shared_buffer: VectorBuffer::new(buffer),
-                data_ptr,
-            }
-        });
+        // Only a partially valid mask carries a bit buffer to hand to DuckDB.
+        let zero_copy = match &mask {
+            Mask::AllTrue(_) | Mask::AllFalse(_) => None,
+            Mask::Values(values) => zero_copy_validity(values),
+        };
         Box::new(ValidityExporter {
             mask,
             zero_copy,
