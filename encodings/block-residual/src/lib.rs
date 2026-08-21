@@ -8,8 +8,8 @@ mod codec;
 mod ordered_float_array;
 
 pub use block_residual_array::*;
-pub use codec::BlockResidualCodec;
-pub use codec::BlockResidualParts;
+pub(crate) use codec::BlockResidualCodec;
+pub(crate) use codec::BlockResidualParts;
 pub use ordered_float_array::*;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;

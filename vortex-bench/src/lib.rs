@@ -74,6 +74,8 @@ pub use datasets::BenchmarkDataset;
 pub use output::BenchmarkOutput;
 pub use output::create_output_writer;
 use vortex::VortexSessionDefault;
+use vortex::editions::CORE_2026_08_4;
+use vortex::editions::EditionSessionExt;
 pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -84,6 +86,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_tokio();
+    session
+        .enable_edition(CORE_2026_08_4)
+        .unwrap_or_else(|error| {
+            vortex_panic!("numeric benchmark edition is not registered: {error}")
+        });
     vortex_spatial::initialize(&session);
     session
 });

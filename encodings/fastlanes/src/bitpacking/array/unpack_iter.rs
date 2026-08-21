@@ -221,8 +221,8 @@ impl<T: PhysicalPType, S: UnpackStrategy<T>> UnpackedChunks<T, S> {
         });
     }
 
-    /// Walk every unpacked chunk in logical order and reuse one scratch buffer.
-    pub fn for_each_unpacked_chunk<F>(&mut self, mut f: F)
+    /// Walk every unpacked chunk in array order, reusing the internal scratch buffer.
+    pub(crate) fn for_each_unpacked_chunk<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut [T], Range<usize>),
     {

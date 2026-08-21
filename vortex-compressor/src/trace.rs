@@ -120,7 +120,6 @@ pub(super) fn record_winner_compress_result(
         span.record("achieved_ratio", r);
     }
     span.record("accepted", accepted);
-    tracing::debug!(target: TARGET_TRACE, "winner.result");
 }
 
 /// Records the final output size and, when finite, the top-level compression ratio.

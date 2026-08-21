@@ -9766,12 +9766,9 @@ name = "vortex-btrblocks"
 version = "0.1.0"
 dependencies = [
  "arrow-array 58.4.0",
- "arrow-schema 58.4.0",
- "arrow-select 58.4.0",
  "codspeed-divan-compat",
  "insta",
  "itertools 0.14.0",
- "parquet 58.4.0",
  "pco",
  "rand 0.10.2",
  "rstest",

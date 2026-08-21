@@ -111,6 +111,12 @@ The final calibration includes the complete corpus and selected-tree evidence.
 
 The Opportunistic bundle cuts aggregate size by 11.7 percent against Prior Default.
 
+The three array encodings belong to the draft `core:2026.08.4` edition.
+
+The default session still writes the frozen `core:2026.08.1` edition.
+
+Focused file tests and benchmarks enable the draft numeric edition explicitly.
+
 Future work targets repeated Compact mechanisms with native, bounded-access trees.
 
 ## Array support and validation
@@ -2084,7 +2090,9 @@ A later chunk-level trace identified completed incumbent cascades as the cause.
 
 The current broad size gain does not justify Default inclusion by itself.
 
-IntMult now belongs to the August 2026 core edition, so files can serialize the decomposed tree.
+The prototype temporarily added IntMult to a draft edition for file tests.
+
+The focused branch removed IntMult and that edition membership.
 
 Fast rejection remains a cost advantage, not an admission rule.
 
@@ -2778,11 +2786,11 @@ This round completed these steps:
 - Rejected the dense-remainder IntMult layout on CMS Payments.
 - Rejected pure IntMult on a no-Delta CMS standard-deviation column.
 - Rejected centered block residuals after a complete Euro subjectivity comparison.
-- Assigned dictionary codes by descending value frequency.
-- Added float frequency counts to the existing distinct-value statistics.
+- Tested dictionary codes in descending value frequency, then removed the policy with IntMult.
+- Tested float frequency counts, then restored the existing distinct-value statistics.
 - Reopened BlockResidual descendants for integer and float dictionary codes.
 - Validated the ranked Dict policy across eight numeric datasets.
-- Audited constructor and deserialization validation for all four production arrays.
+- Audited constructor and deserialization validation for all three production arrays.
 - Added round-trip tests for every supported integer and float type.
 - Added single-encoding benchmarks for every supported integer and float type.
 - Added packed-child IntMult benchmarks for every unsigned integer type.
@@ -2794,7 +2802,7 @@ This round completed these steps:
 - Added a locality rejection test that retains Euro and rejects clear BlockResidual fits.
 - Updated stale golden trees after the BlockResidual payload and selector changes.
 - Added four numeric bundle controls to the complete compression benchmark.
-- Added explicit winner result events to the compressor trace.
+- Tested explicit winner result events, then removed the unused trace event.
 - Added optional chunk-level encoding trees to the focused compressor benchmark.
 - Rejected constant FloatQuant samples before exact sample encoding.
 - Added and calibrated a 1.10 FloatQuant selection factor.
@@ -2916,11 +2924,31 @@ Test these items in future research:
 
 ## Pull request structure
 
-Prepare one focused stack for `OrderedFloatArray`, `BlockResidualArray`, and `OrderedBlockResidualScheme`.
+Prepare one pull request for the three arrays, their schemes, fused FastLanes paths, and benchmark support.
 
-Prepare a separate stack for `FloatQuantArray` and `FloatQuantScheme`.
+Split the pull request only when review reveals a clear independent boundary.
 
 Keep entropy, bit-split, and alternate residual models on `wm/pcodec-entropy-experiments`.
+
+## Adversarial review checkpoint
+
+The review followed the merge from `origin/develop`.
+
+It preserved the frozen August editions and added `core:2026.08.4` as a draft.
+
+It added the array conformance suite to BlockResidual, OrderedFloat, and FloatQuant.
+
+It added empty-buffer validation to OrderedFloat and FloatQuant deserialization.
+
+It added signed coverage for the fused nonzero-secondary FloatQuant encoder.
+
+It changed invalid FloatQuant references from a debug panic to an error.
+
+It removed the Pco probe, the custom Pco API, abandoned compressor hooks, and public BlockResidual codec internals.
+
+It removed unrelated dictionary frequency ranking and float frequency statistics.
+
+It retained the three production candidates, their selectors, and their focused benchmarks.
 
 ## References
 

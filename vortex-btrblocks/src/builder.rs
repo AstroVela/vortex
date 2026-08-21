@@ -225,6 +225,7 @@ impl BtrBlocksCompressorBuilder {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use vortex_array::VTable;
     use vortex_fastlanes::FoR;
 
@@ -239,12 +240,16 @@ mod tests {
     #[test]
     fn default_includes_all_schemes() {
         let builder = BtrBlocksCompressorBuilder::default();
-        assert_eq!(builder.schemes.len(), ALL_SCHEMES.len());
-        assert!(
+        assert_eq!(
             builder
                 .schemes
                 .iter()
-                .any(|scheme| scheme.id() == float::FloatQuantScheme.id())
+                .map(|scheme| scheme.id())
+                .collect::<Vec<_>>(),
+            ALL_SCHEMES
+                .iter()
+                .map(|scheme| scheme.id())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -281,36 +286,18 @@ mod tests {
         assert_eq!(builder.schemes.len(), ALL_SCHEMES.len());
     }
 
-    #[test]
-    fn cuda_compatible_excludes_alprd() {
+    #[rstest]
+    #[case(float::ALPRDScheme.id())]
+    #[case(float::FloatQuantScheme.id())]
+    #[case(float::OrderedBlockResidualScheme.id())]
+    #[case(integer::BlockResidualScheme.id())]
+    fn cuda_compatible_excludes_non_cuda_schemes(#[case] scheme_id: SchemeId) {
         let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
         assert!(
             !builder
                 .schemes
                 .iter()
-                .any(|s| s.id() == float::ALPRDScheme.id())
-        );
-    }
-
-    #[test]
-    fn cuda_compatible_excludes_float_quant() {
-        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
-        assert!(
-            !builder
-                .schemes
-                .iter()
-                .any(|scheme| scheme.id() == float::FloatQuantScheme.id())
-        );
-    }
-
-    #[test]
-    fn cuda_compatible_excludes_block_residual() {
-        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
-        assert!(
-            !builder
-                .schemes
-                .iter()
-                .any(|scheme| scheme.id() == integer::BlockResidualScheme.id())
+                .any(|scheme| scheme.id() == scheme_id)
         );
     }
 

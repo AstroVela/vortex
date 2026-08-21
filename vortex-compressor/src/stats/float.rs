@@ -19,22 +19,22 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::AllOr;
-use vortex_utils::aliases::hash_map::HashMap;
+use vortex_utils::aliases::hash_set::HashSet;
 
 use super::GenerateStatsOptions;
 
 /// Information about the distinct values in a float array.
 #[derive(Debug, Clone)]
 pub struct DistinctInfo<T> {
-    /// The distinct float values and their occurrence counts.
-    distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher>,
+    /// The set of distinct float values.
+    distinct_values: HashSet<NativeValue<T>, FxBuildHasher>,
     /// The count of unique values. This _must_ be non-zero.
     distinct_count: u32,
 }
 
 impl<T> DistinctInfo<T> {
-    /// Returns a reference to the distinct values map.
-    pub fn distinct_values(&self) -> &HashMap<NativeValue<T>, u32, FxBuildHasher> {
+    /// Returns a reference to the distinct values set.
+    pub fn distinct_values(&self) -> &HashSet<NativeValue<T>, FxBuildHasher> {
         &self.distinct_values
     }
 }
@@ -188,7 +188,7 @@ where
             average_run_length: 0,
             erased: TypedStats {
                 distinct: Some(DistinctInfo {
-                    distinct_values: HashMap::with_capacity_and_hasher(0, FxBuildHasher),
+                    distinct_values: HashSet::with_capacity_and_hasher(0, FxBuildHasher),
                     distinct_count: 0,
                 }),
             }
@@ -202,10 +202,12 @@ where
         .ok_or_else(|| vortex_err!("Failed to compute null_count"))?;
     let value_count = array.len() - null_count;
 
+    // Keep a HashMap of T, then convert the keys into PValue afterward since value is
+    // so much more efficient to hash and search for.
     let mut distinct_values = if count_distinct_values {
-        HashMap::with_capacity_and_hasher(array.len() / 2, FxBuildHasher)
+        HashSet::with_capacity_and_hasher(array.len() / 2, FxBuildHasher)
     } else {
-        HashMap::with_hasher(FxBuildHasher)
+        HashSet::with_hasher(FxBuildHasher)
     };
 
     let validity = array
@@ -225,7 +227,7 @@ where
         AllOr::All => {
             for value in first_valid_buff {
                 if count_distinct_values {
-                    *distinct_values.entry(NativeValue(value)).or_insert(0) += 1;
+                    distinct_values.insert(NativeValue(value));
                 }
 
                 if value != prev {
@@ -242,7 +244,7 @@ where
             {
                 if valid {
                     if count_distinct_values {
-                        *distinct_values.entry(NativeValue(value)).or_insert(0) += 1;
+                        distinct_values.insert(NativeValue(value));
                     }
 
                     if value != prev {

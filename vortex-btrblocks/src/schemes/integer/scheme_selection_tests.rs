@@ -9,6 +9,8 @@ use std::sync::LazyLock;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex_array::ArrayEq;
+use vortex_array::EqMode;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
@@ -106,7 +108,7 @@ fn test_block_residual_ignores_null_payloads() -> VortexResult<()> {
 
     assert!(first.is::<BlockResidual>());
     assert!(second.is::<BlockResidual>());
-    assert_eq!(first.nbytes(), second.nbytes());
+    assert!(first.array_eq(&second, EqMode::Value));
     Ok(())
 }
 

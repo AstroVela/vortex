@@ -336,7 +336,7 @@ impl SliceReduce for BlockResidual {
 static RULES: ParentRuleSet<BlockResidual> =
     ParentRuleSet::new(&[ParentRuleSet::lift(&SliceReduceAdaptor(BlockResidual))]);
 
-pub trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> {
+pub(crate) trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> {
     fn unsliced_validity(&self) -> Validity {
         child_to_validity(
             self.as_ref().slots()[BlockResidualSlots::VALIDITY].as_ref(),
@@ -387,11 +387,6 @@ pub trait BlockResidualArrayExt: TypedArrayRef<BlockResidual> {
     /// Return the packed patch high bits.
     fn patch_highs(&self) -> &[u8] {
         &self.patch_highs
-    }
-
-    /// Decode the logical slice.
-    fn decompress(&self, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
-        decompress_array(self.to_owned().as_view(), ctx)
     }
 }
 
@@ -1419,6 +1414,7 @@ mod tests {
     use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::compute::conformance::consistency::test_array_consistency;
     use vortex_array::dtype::NativePType;
     use vortex_array::dtype::PType;
     use vortex_array::serde::SerializeOptions;
@@ -1507,7 +1503,8 @@ mod tests {
 
     #[test]
     fn rejects_components_outside_logical_width() -> VortexResult<()> {
-        let mut parts = BlockResidualCodec::encode(&[0_u64, 1, 2])?.into_parts()?;
+        let mut parts =
+            BlockResidualCodec::encode_with_word_width(&[0_u64, 1, 2], 64)?.into_parts()?;
         parts.bases[0] = u64::from(u8::MAX) + 1;
         assert!(BlockResidual::try_new(parts, Validity::NonNullable, PType::U8).is_err());
         Ok(())
@@ -1515,7 +1512,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_component_offsets() -> VortexResult<()> {
-        let mut parts = BlockResidualCodec::encode(&[0_u64, 1, 2])?.into_parts()?;
+        let mut parts =
+            BlockResidualCodec::encode_with_word_width(&[0_u64, 1, 2], 64)?.into_parts()?;
         parts.residual_starts[0] = 1;
         assert!(BlockResidual::try_new(parts, Validity::NonNullable, PType::U64).is_err());
         Ok(())
@@ -1638,6 +1636,21 @@ mod tests {
         )?;
         assert!(decoded.is::<BlockResidual>());
         assert_arrays_eq!(decoded, expected, &mut session.create_execution_ctx());
+        Ok(())
+    }
+
+    #[test]
+    fn conformance() -> VortexResult<()> {
+        let mut values = vec![42_i16; 2_050];
+        values[1_023] = i16::MAX;
+        let primitive = PrimitiveArray::new(
+            Buffer::from(values),
+            Validity::from_iter((0..2_050).map(|index| index != 1_024)),
+        );
+        let array = BlockResidual::from_primitive(primitive.as_view())?.into_array();
+        let session = array_session();
+        crate::initialize(&session);
+        test_array_consistency(&array, &mut session.create_execution_ctx());
         Ok(())
     }
 }

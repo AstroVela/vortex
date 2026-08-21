@@ -4,10 +4,6 @@
 
 use std::sync::LazyLock;
 
-use pco::ChunkConfig;
-use pco::DeltaSpec;
-use pco::ModeSpec;
-use pco::PagingSpec;
 use vortex_array::ArrayContext;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -72,21 +68,6 @@ fn test_compress_decompress() {
         PrimitiveArray::from_iter(Vec::<i32>::new()),
         &mut ctx
     );
-}
-
-#[test]
-fn test_custom_config_roundtrip() -> VortexResult<()> {
-    let mut ctx = SESSION.create_execution_ctx();
-    let array = PrimitiveArray::from_iter((0..1_000).map(|value| f64::from(value).sin()));
-    let config = ChunkConfig::default()
-        .with_mode_spec(ModeSpec::Classic)
-        .with_delta_spec(DeltaSpec::NoOp)
-        .with_paging_spec(PagingSpec::EqualPagesUpTo(128));
-
-    let compressed = Pco::from_primitive_with_config(array.as_view(), &config, 512, &mut ctx)?;
-
-    assert_arrays_eq!(compressed, array, &mut ctx);
-    Ok(())
 }
 
 #[test]

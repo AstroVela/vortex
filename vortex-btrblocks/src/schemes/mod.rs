@@ -37,6 +37,7 @@ use crate::schemes::integer::SparseScheme;
 const SAMPLE_BLOCK_LEN: usize = 64;
 const MIN_SAMPLE_BLOCKS: usize = 16;
 const SAMPLE_BLOCK_MULTIPLE: usize = 16;
+
 fn sample_primitive_one_percent(
     primitive: ArrayView<'_, Primitive>,
     exec_ctx: &mut ExecutionCtx,

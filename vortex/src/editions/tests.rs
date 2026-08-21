@@ -53,6 +53,7 @@ use super::CORE_2026_08_0;
 use super::CORE_2026_08_1;
 use super::CORE_2026_08_2;
 use super::CORE_2026_08_3;
+use super::CORE_2026_08_4;
 use super::DEFAULT_CORE_EDITION;
 use super::DEFAULT_PREVIEW_EDITION;
 use super::EDITION_DECLARATIONS;
@@ -191,6 +192,29 @@ fn core_2026_08_3_adds_variants() {
             .iter()
             .any(|inclusion| inclusion.component_id.as_str() == "vortex.uuid")
     );
+}
+
+#[test]
+fn core_2026_08_4_adds_numeric_arrays() {
+    let session = session().unwrap_or_else(|e| panic!("registering editions: {e}"));
+    assert!(
+        session
+            .find(&CORE_2026_08_4)
+            .unwrap_or_else(|| panic!("{CORE_2026_08_4} is not registered"))
+            .is_draft()
+    );
+    let arrays = session.components_in(&CORE_2026_08_4, ComponentKind::Array);
+    for id in [
+        "vortex.block_residual",
+        "vortex.float_quant",
+        "vortex.ordered_float",
+    ] {
+        assert!(
+            arrays
+                .iter()
+                .any(|inclusion| inclusion.component_id.as_str() == id)
+        );
+    }
 }
 
 #[test]
@@ -696,10 +720,13 @@ async fn default_strategy_round_trip_uses_only_enabled_encodings() -> VortexResu
 }
 
 #[tokio::test]
-async fn default_writer_round_trips_float_quant() -> VortexResult<()> {
+async fn numeric_draft_writer_round_trips_float_quant() -> VortexResult<()> {
     use crate::VortexSessionDefault;
 
     let session = VortexSession::default();
+    session
+        .enable_edition(CORE_2026_08_4)
+        .map_err(|error| vortex_err!("{error}"))?;
     let values = (0u32..65_536)
         .map(|index| {
             let mantissa = index.wrapping_mul(7_919) & 0x007f_ffff;
@@ -726,7 +753,7 @@ async fn default_writer_round_trips_float_quant() -> VortexResult<()> {
 }
 
 #[tokio::test]
-async fn default_writer_round_trips_ordered_block_residual() -> VortexResult<()> {
+async fn numeric_draft_writer_round_trips_ordered_block_residual() -> VortexResult<()> {
     use crate::VortexSessionDefault;
 
     fn uniform(state: &mut u64) -> f64 {
@@ -737,6 +764,9 @@ async fn default_writer_round_trips_ordered_block_residual() -> VortexResult<()>
     }
 
     let session = VortexSession::default();
+    session
+        .enable_edition(CORE_2026_08_4)
+        .map_err(|error| vortex_err!("{error}"))?;
     let mut state = 0x4d59_5df4_d0f3_3173_u64;
     let mut value = 0.0_f64;
     let values = (0..65_536)

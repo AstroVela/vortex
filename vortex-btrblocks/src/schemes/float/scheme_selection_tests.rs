@@ -7,6 +7,8 @@ use std::f64::consts::TAU;
 use std::sync::LazyLock;
 
 use vortex_alp::ALP;
+use vortex_array::ArrayEq;
+use vortex_array::EqMode;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
@@ -187,7 +189,7 @@ fn test_float_quant_ignores_null_payloads() -> VortexResult<()> {
 
     assert!(first.is::<FloatQuant>());
     assert!(second.is::<FloatQuant>());
-    assert_eq!(first.nbytes(), second.nbytes());
+    assert!(first.array_eq(&second, EqMode::Value));
     Ok(())
 }
 

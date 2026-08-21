@@ -12,24 +12,24 @@ const SERIALIZED_BLOCK_METADATA_BYTES: usize = 12;
 
 /// Block-local residual codec for ordered unsigned latents.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockResidualCodec {
+pub(crate) struct BlockResidualCodec {
     len: usize,
     blocks: Vec<BlockResidualBlock>,
 }
 
 /// Serialized children for the one-reference block residual codec.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockResidualParts {
-    pub len: usize,
-    pub bases: Vec<u64>,
-    pub residual_widths: Vec<u8>,
-    pub high_widths: Vec<u8>,
-    pub residual_starts: Vec<u32>,
-    pub patch_starts: Vec<u32>,
-    pub high_starts: Vec<u32>,
-    pub residual_words: Vec<u64>,
-    pub patch_positions: Vec<u16>,
-    pub patch_highs: Vec<u8>,
+pub(crate) struct BlockResidualParts {
+    pub(crate) len: usize,
+    pub(crate) bases: Vec<u64>,
+    pub(crate) residual_widths: Vec<u8>,
+    pub(crate) high_widths: Vec<u8>,
+    pub(crate) residual_starts: Vec<u32>,
+    pub(crate) patch_starts: Vec<u32>,
+    pub(crate) high_starts: Vec<u32>,
+    pub(crate) residual_words: Vec<u64>,
+    pub(crate) patch_positions: Vec<u16>,
+    pub(crate) patch_highs: Vec<u8>,
 }
 
 pub(crate) struct BlockResidualCodecEstimate {
@@ -39,7 +39,6 @@ pub(crate) struct BlockResidualCodecEstimate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockResidualBlock {
-    len: u16,
     base: u64,
     residual_width: u8,
     high_width: u8,
@@ -49,11 +48,6 @@ struct BlockResidualBlock {
 }
 
 impl BlockResidualCodec {
-    /// Encode ordered unsigned latents in independent 1024-value blocks.
-    pub fn encode(values: &[u64]) -> VortexResult<Self> {
-        Self::encode_with_word_width(values, 64)
-    }
-
     pub(crate) fn encode_with_word_width(values: &[u64], word_width: u8) -> VortexResult<Self> {
         vortex_error::vortex_ensure!(
             matches!(word_width, 8 | 16 | 32 | 64),
@@ -97,8 +91,7 @@ impl BlockResidualCodec {
         }
     }
 
-    /// Convert the codec into serialized array children.
-    pub fn into_parts(self) -> VortexResult<BlockResidualParts> {
+    pub(crate) fn into_parts(self) -> VortexResult<BlockResidualParts> {
         let mut parts = BlockResidualParts {
             len: self.len,
             bases: Vec::with_capacity(self.blocks.len()),
@@ -133,258 +126,7 @@ impl BlockResidualCodec {
         }
         Ok(parts)
     }
-
-    /// Reconstruct the codec from serialized array children.
-    pub fn try_from_parts(parts: BlockResidualParts) -> VortexResult<Self> {
-        let block_count = parts.len.div_ceil(CHUNK_LEN);
-        vortex_error::vortex_ensure!(
-            parts.bases.len() == block_count
-                && parts.residual_widths.len() == block_count
-                && parts.high_widths.len() == block_count,
-            "block residual metadata child lengths are invalid"
-        );
-        validate_starts(
-            &parts.residual_starts,
-            block_count,
-            parts.residual_words.len(),
-            "residual",
-        )?;
-        validate_starts(
-            &parts.patch_starts,
-            block_count,
-            parts.patch_positions.len(),
-            "patch",
-        )?;
-        validate_starts(
-            &parts.high_starts,
-            block_count,
-            parts.patch_highs.len(),
-            "patch high",
-        )?;
-
-        let mut blocks = Vec::with_capacity(block_count);
-        for block_index in 0..block_count {
-            let residual_start = usize::try_from(parts.residual_starts[block_index])?;
-            let residual_stop = usize::try_from(parts.residual_starts[block_index + 1])?;
-            let patch_start = usize::try_from(parts.patch_starts[block_index])?;
-            let patch_stop = usize::try_from(parts.patch_starts[block_index + 1])?;
-            let high_start = usize::try_from(parts.high_starts[block_index])?;
-            let high_stop = usize::try_from(parts.high_starts[block_index + 1])?;
-            let block_start = block_index * CHUNK_LEN;
-            let block_len = (parts.len - block_start).min(CHUNK_LEN);
-            let residual_width = parts.residual_widths[block_index];
-            let high_width = parts.high_widths[block_index];
-            vortex_error::vortex_ensure!(
-                residual_width <= 64
-                    && high_width <= 64
-                    && u16::from(residual_width) + u16::from(high_width) <= 64,
-                "block residual bit widths are invalid"
-            );
-            vortex_error::vortex_ensure!(
-                residual_stop - residual_start
-                    == CHUNK_LEN * usize::from(residual_width) / u64::BITS as usize,
-                "block residual packed word count is invalid"
-            );
-            let patch_positions = &parts.patch_positions[patch_start..patch_stop];
-            vortex_error::vortex_ensure!(
-                patch_positions.is_empty() || (high_width > 0 && residual_width < 64),
-                "block residual patches require nonzero high bits"
-            );
-            vortex_error::vortex_ensure!(
-                patch_positions
-                    .iter()
-                    .all(|&position| usize::from(position) < block_len)
-                    && patch_positions
-                        .windows(2)
-                        .all(|window| window[0] < window[1]),
-                "block residual patch positions are invalid"
-            );
-            let expected_high_len = if patch_positions.is_empty() {
-                0
-            } else {
-                (patch_positions.len() * usize::from(high_width)).div_ceil(8) + HIGH_PADDING
-            };
-            vortex_error::vortex_ensure!(
-                high_stop - high_start == expected_high_len,
-                "block residual patch high payload length is invalid"
-            );
-            blocks.push(BlockResidualBlock {
-                len: u16::try_from(block_len)?,
-                base: parts.bases[block_index],
-                residual_width,
-                high_width,
-                residuals: parts.residual_words[residual_start..residual_stop].to_vec(),
-                patch_positions: parts.patch_positions[patch_start..patch_stop].to_vec(),
-                patch_highs: parts.patch_highs[high_start..high_stop].to_vec(),
-            });
-        }
-        Ok(Self {
-            len: parts.len,
-            blocks,
-        })
-    }
-
-    /// Decode all values.
-    pub fn decode(&self) -> VortexResult<Vec<u64>> {
-        let mut values = Vec::with_capacity(self.len);
-        let mut residuals = [0u64; CHUNK_LEN];
-        for block in &self.blocks {
-            residuals.fill(0);
-            if block.residual_width > 0 {
-                // SAFETY: The encoder creates one complete FastLanes chunk.
-                unsafe {
-                    u64::unchecked_unpack(
-                        usize::from(block.residual_width),
-                        &block.residuals,
-                        &mut residuals,
-                    );
-                }
-            }
-
-            let mut high_bit_position = 0usize;
-            for &position in &block.patch_positions {
-                // SAFETY: The encoder appends fifteen readable padding bytes.
-                let high = unsafe {
-                    read_wide_bits(&block.patch_highs, high_bit_position, block.high_width)
-                };
-                residuals[usize::from(position)] |= high << block.residual_width;
-                high_bit_position += usize::from(block.high_width);
-            }
-
-            let block_len = usize::from(block.len);
-            for residual in &mut residuals[..block_len] {
-                *residual = residual.wrapping_add(block.base);
-            }
-            values.extend_from_slice(&residuals[..block_len]);
-        }
-        Ok(values)
-    }
-
-    /// Decode ordered `f64` latents with a fused inverse transform.
-    pub fn decode_ordered_f64(&self) -> VortexResult<Vec<f64>> {
-        let mut values = Vec::with_capacity(self.len);
-        let mut residuals = [0_u64; CHUNK_LEN];
-        for block in &self.blocks {
-            residuals.fill(0);
-            if block.residual_width > 0 {
-                // SAFETY: The encoder creates one complete FastLanes chunk.
-                unsafe {
-                    u64::unchecked_unpack(
-                        usize::from(block.residual_width),
-                        &block.residuals,
-                        &mut residuals,
-                    );
-                }
-            }
-            let mut high_bit_position = 0_usize;
-            for &position in &block.patch_positions {
-                // SAFETY: The encoder appends fifteen readable padding bytes.
-                let high = unsafe {
-                    read_wide_bits(&block.patch_highs, high_bit_position, block.high_width)
-                };
-                residuals[usize::from(position)] |= high << block.residual_width;
-                high_bit_position += usize::from(block.high_width);
-            }
-            let block_len = usize::from(block.len);
-            for residual in &mut residuals[..block_len] {
-                *residual = residual.wrapping_add(block.base);
-            }
-            values.extend(residuals[..block_len].iter().map(|&ordered| {
-                let bits = if ordered & (1_u64 << 63) == 0 {
-                    !ordered
-                } else {
-                    ordered ^ (1_u64 << 63)
-                };
-                f64::from_bits(bits)
-            }));
-        }
-        Ok(values)
-    }
-
-    /// Decode one value with direct packed access and a binary patch search.
-    pub fn scalar_at(&self, index: usize) -> VortexResult<u64> {
-        vortex_error::vortex_ensure!(
-            index < self.len,
-            "index {index} is out of bounds for length {}",
-            self.len
-        );
-        let block = &self.blocks[index / CHUNK_LEN];
-        let index_in_block = index % CHUNK_LEN;
-        let mut residual = if block.residual_width == 0 {
-            0
-        } else {
-            // SAFETY: The encoder creates one complete FastLanes chunk.
-            unsafe {
-                u64::unchecked_unpack_single(
-                    usize::from(block.residual_width),
-                    &block.residuals,
-                    index_in_block,
-                )
-            }
-        };
-        if let Ok(patch_index) = block
-            .patch_positions
-            .binary_search(&u16::try_from(index_in_block)?)
-        {
-            // SAFETY: The encoder appends fifteen readable padding bytes.
-            let high = unsafe {
-                read_wide_bits(
-                    &block.patch_highs,
-                    patch_index * usize::from(block.high_width),
-                    block.high_width,
-                )
-            };
-            residual |= high << block.residual_width;
-        }
-        Ok(block.base.wrapping_add(residual))
-    }
-
-    /// Return the logical value count.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Return true when the codec contains no values.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Return the encoded bytes, including estimated serialized block metadata.
-    pub fn encoded_size(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(|block| {
-                SERIALIZED_BLOCK_METADATA_BYTES
-                    + size_of::<u64>()
-                    + block.residuals.len() * size_of::<u64>()
-                    + block.patch_positions.len() * size_of::<u16>()
-                    + block.patch_highs.len()
-            })
-            .sum()
-    }
-
-    /// Return the logical block count.
-    pub fn block_count(&self) -> usize {
-        self.blocks.len()
-    }
-
-    /// Return the total patch count.
-    pub fn patch_count(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(|block| block.patch_positions.len())
-            .sum()
-    }
-
-    /// Return the sum of main residual widths across all blocks.
-    pub fn total_residual_width(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(|block| usize::from(block.residual_width))
-            .sum()
-    }
 }
-
 fn encode_block(values: &[u64], word_width: u8) -> VortexResult<BlockResidualBlock> {
     let base = values.iter().copied().min().unwrap_or(0);
     let mut residuals = Vec::with_capacity(CHUNK_LEN);
@@ -463,27 +205,6 @@ fn choose_width(
     }
 }
 
-fn validate_starts(
-    starts: &[u32],
-    block_count: usize,
-    payload_len: usize,
-    name: &str,
-) -> VortexResult<()> {
-    vortex_error::vortex_ensure!(
-        starts.len() == block_count + 1,
-        "block residual {name} offsets have an invalid length"
-    );
-    vortex_error::vortex_ensure!(
-        starts.first() == Some(&0) && usize::try_from(*starts.last().unwrap_or(&0))? == payload_len,
-        "block residual {name} offsets do not cover the payload"
-    );
-    vortex_error::vortex_ensure!(
-        starts.windows(2).all(|window| window[0] <= window[1]),
-        "block residual {name} offsets are not ordered"
-    );
-    Ok(())
-}
-
 struct BlockPlan {
     base: u64,
     residual_width: u8,
@@ -524,7 +245,6 @@ fn materialize_block(
     };
 
     Ok(BlockResidualBlock {
-        len: u16::try_from(values.len())?,
         base: plan.base,
         residual_width: plan.residual_width,
         high_width: plan.high_width,
@@ -711,78 +431,10 @@ mod tests {
     use super::BlockResidualCodec;
 
     #[test]
-    fn roundtrip_lengths_and_domains() -> VortexResult<()> {
-        for len in [0, 1, 1_023, 1_024, 1_025, 20_000] {
-            let values = (0..len)
-                .map(|index| match index % 4 {
-                    0 => index as u64,
-                    1 => 1_000_000 + index as u64 % 31,
-                    2 => u64::MAX - index as u64 % 13,
-                    _ => 42,
-                })
-                .collect::<Vec<_>>();
-            let codec = BlockResidualCodec::encode(&values)?;
-            assert_eq!(codec.decode()?, values);
-            for (index, &value) in values.iter().enumerate() {
-                assert_eq!(codec.scalar_at(index)?, value);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn constant_roundtrip() -> VortexResult<()> {
-        let values = vec![42; 10_000];
-        let codec = BlockResidualCodec::encode(&values)?;
-        assert_eq!(codec.decode()?, values);
-        assert_eq!(codec.scalar_at(4_321)?, 42);
-        Ok(())
-    }
-
-    #[test]
-    fn parts_roundtrip() -> VortexResult<()> {
-        let values = (0..4_099)
-            .map(|index| {
-                let value = u64::try_from(index)?;
-                Ok(1_000_000_u64.wrapping_add(value * value))
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-        let parts = BlockResidualCodec::encode(&values)?.into_parts()?;
-        let codec = BlockResidualCodec::try_from_parts(parts)?;
-        assert_eq!(codec.decode()?, values);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_incompatible_patch_widths() -> VortexResult<()> {
-        let mut values = vec![0_u64; 1_024];
-        values[1_023] = u64::MAX;
-        let mut parts = BlockResidualCodec::encode(&values)?.into_parts()?;
-        assert!(!parts.patch_positions.is_empty());
-
-        parts.residual_widths[0] = 64;
-        parts.high_widths[0] = 1;
-        assert!(BlockResidualCodec::try_from_parts(parts).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_patches_without_high_bits() -> VortexResult<()> {
-        let mut values = vec![0_u64; 1_024];
-        values[1_023] = u64::MAX;
-        let mut parts = BlockResidualCodec::encode(&values)?.into_parts()?;
-        assert!(!parts.patch_positions.is_empty());
-
-        parts.high_widths[0] = 0;
-        assert!(BlockResidualCodec::try_from_parts(parts).is_err());
-        Ok(())
-    }
-
-    #[test]
     fn patch_penalty_prefers_dense_residuals() -> VortexResult<()> {
         let mut values = vec![0_u64; 1_024];
         values[..307].fill(4_095);
-        let parts = BlockResidualCodec::encode(&values)?.into_parts()?;
+        let parts = BlockResidualCodec::encode_with_word_width(&values, 64)?.into_parts()?;
 
         assert_eq!(parts.residual_widths, [12]);
         assert!(parts.patch_positions.is_empty());

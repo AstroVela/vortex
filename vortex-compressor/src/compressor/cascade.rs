@@ -66,35 +66,6 @@ impl CascadingCompressor {
         Ok(compressed)
     }
 
-    /// Compresses an estimator sample after it removes one scheme from the current cascade.
-    ///
-    /// Fused schemes use this method to compare their output with the completed incumbent tree.
-    /// The method preserves the current cascade depth and marks the input as a sample.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if canonicalization or compression fails.
-    pub fn compress_sample_without_scheme(
-        &self,
-        array: &ArrayRef,
-        excluded: SchemeId,
-        compress_ctx: CompressorContext,
-        exec_ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let compressor = Self {
-            schemes: self
-                .schemes
-                .iter()
-                .copied()
-                .filter(|scheme| scheme.id() != excluded)
-                .collect(),
-            root_exclusions: self.root_exclusions.clone(),
-        };
-        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
-        let compact = canonical.compact(exec_ctx)?;
-        compressor.compress_canonical(compact, compress_ctx.with_sampling(), exec_ctx)
-    }
-
     /// Compresses a child array produced by a cascading scheme.
     ///
     /// If the cascade budget is exhausted, the canonical array is returned as-is. Otherwise, the

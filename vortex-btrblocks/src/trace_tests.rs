@@ -263,6 +263,11 @@ fn trace_scan_compare_on_compressed_quantity() -> VortexResult<()> {
       iter 4 current=vortex.dict(bool, len=4096) builder_active=false
         ExecuteSlot slot=1 parent=vortex.dict(bool, len=4096) child=vortex.binary(bool, len=50)
       iter 5 current=vortex.binary(bool, len=50) stack_parent=vortex.dict(bool, len=4096) slot=1 builder_active=false
+    execute_until target=AnyCanonical root=vortex.sequence(i16, len=50)
+      iter 0 current=vortex.sequence(i16, len=50) builder_active=false
+        Done array=vortex.primitive(i16, len=50)
+      iter 1 current=vortex.primitive(i16, len=50) builder_active=false
+      return output=vortex.primitive(i16, len=50)
         Done array=vortex.bool(bool, len=50)
       iter 6 current=vortex.bool(bool, len=50) stack_parent=vortex.dict(bool, len=4096) slot=1 builder_active=false
         pop_frame slot=1 output=vortex.dict(bool, len=4096)

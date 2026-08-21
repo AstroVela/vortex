@@ -152,10 +152,11 @@ impl VTable for OrderedFloat {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-        _buffers: &[BufferHandle],
+        buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(buffers.is_empty(), "OrderedFloatArray expects no buffers");
         vortex_ensure!(
             metadata.is_empty(),
             "OrderedFloatArray metadata must be empty"
@@ -457,6 +458,7 @@ mod tests {
     use vortex_array::arrays::Primitive;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::compute::conformance::consistency::test_array_consistency;
     use vortex_array::dtype::PType;
     use vortex_array::dtype::half::f16;
     use vortex_array::serde::SerializeOptions;
@@ -637,6 +639,25 @@ mod tests {
 
         assert!(decoded.is::<OrderedFloat>());
         assert_arrays_eq!(decoded, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn conformance() -> VortexResult<()> {
+        let primitive = PrimitiveArray::new(
+            Buffer::from(vec![f32::NEG_INFINITY, -0.0, 0.0, 42.25, f32::INFINITY]),
+            Validity::from_iter([true, false, true, true, true]),
+        );
+        let direct = OrderedFloat::from_primitive(primitive.as_view())?;
+        let residuals = BlockResidual::from_primitive(direct.encoded().as_::<Primitive>())?;
+        let fused = OrderedFloat::try_new(residuals.into_array(), PType::F32)?;
+        let session = array_session();
+        crate::initialize(&session);
+        let mut ctx = session.create_execution_ctx();
+
+        for array in [direct.into_array(), fused.into_array()] {
+            test_array_consistency(&array, &mut ctx);
+        }
         Ok(())
     }
 }

@@ -176,10 +176,11 @@ impl VTable for FloatQuant {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-        _buffers: &[BufferHandle],
+        buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(buffers.is_empty(), "FloatQuant expects no buffers");
         vortex_ensure!(
             metadata.len() == METADATA_LEN,
             "FloatQuant metadata requires {METADATA_LEN} bytes"
@@ -472,11 +473,6 @@ pub struct FloatQuantAnalysis {
     pub secondary_bit_width: u8,
 }
 
-/// Estimate a useful low-bit split width for a canonical float array.
-pub fn estimate_k(array: ArrayView<'_, Primitive>) -> Option<u8> {
-    analyze_float_quant(array).map(|analysis| analysis.k)
-}
-
 /// Analyze a canonical float array for a FloatQuant split.
 pub fn analyze_float_quant(array: ArrayView<'_, Primitive>) -> Option<FloatQuantAnalysis> {
     match array.ptype() {
@@ -733,10 +729,14 @@ fn split_primary_for_f32(values: &[f32], k: u8, primary_min: u32) -> VortexResul
         values.iter().all(|value| value.to_bits() & low_mask == 0),
         "FloatQuant constant secondary requires zero low bits"
     );
-    Ok(values
+    values
         .iter()
-        .map(|value| (ordered_u32(value.to_bits()) >> k) - primary_min)
-        .collect())
+        .map(|value| {
+            (ordered_u32(value.to_bits()) >> k)
+                .checked_sub(primary_min)
+                .ok_or_else(|| vortex_error::vortex_err!("FloatQuant primary minimum is invalid"))
+        })
+        .collect::<VortexResult<Vec<_>>>()
 }
 
 fn split_primary_for_f16(values: &[f16], k: u8, primary_min: u16) -> VortexResult<Vec<u16>> {
@@ -746,10 +746,14 @@ fn split_primary_for_f16(values: &[f16], k: u8, primary_min: u16) -> VortexResul
         values.iter().all(|value| value.to_bits() & low_mask == 0),
         "FloatQuant constant secondary requires zero low bits"
     );
-    Ok(values
+    values
         .iter()
-        .map(|value| (ordered_u16(value.to_bits()) >> k) - primary_min)
-        .collect())
+        .map(|value| {
+            (ordered_u16(value.to_bits()) >> k)
+                .checked_sub(primary_min)
+                .ok_or_else(|| vortex_error::vortex_err!("FloatQuant primary minimum is invalid"))
+        })
+        .collect::<VortexResult<Vec<_>>>()
 }
 
 fn split_primary_for_f64(values: &[f64], k: u8, primary_min: u64) -> VortexResult<Vec<u64>> {
@@ -759,10 +763,14 @@ fn split_primary_for_f64(values: &[f64], k: u8, primary_min: u64) -> VortexResul
         values.iter().all(|value| value.to_bits() & low_mask == 0),
         "FloatQuant constant secondary requires zero low bits"
     );
-    Ok(values
+    values
         .iter()
-        .map(|value| (ordered_u64(value.to_bits()) >> k) - primary_min)
-        .collect())
+        .map(|value| {
+            (ordered_u64(value.to_bits()) >> k)
+                .checked_sub(primary_min)
+                .ok_or_else(|| vortex_error::vortex_err!("FloatQuant primary minimum is invalid"))
+        })
+        .collect::<VortexResult<Vec<_>>>()
 }
 
 fn join_f16(primary: u16, secondary: u16, k: u8) -> f16 {
@@ -1043,6 +1051,7 @@ mod tests {
     use vortex_array::array_session;
     use vortex_array::assert_arrays_eq;
     use vortex_array::assert_nth_scalar;
+    use vortex_array::compute::conformance::consistency::test_array_consistency;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
     use vortex_array::validity::Validity;
@@ -1250,6 +1259,14 @@ mod tests {
     }
 
     #[test]
+    fn primary_for_primitive_rejects_invalid_reference() {
+        let values = PrimitiveArray::from_iter([1.0_f32, 2.0]);
+        assert!(
+            FloatQuant::primary_for_primitive(values.as_view(), 1, u64::from(u32::MAX)).is_err()
+        );
+    }
+
+    #[test]
     fn fastlanes_zero_decode_roundtrip_and_slice() -> VortexResult<()> {
         let original = PrimitiveArray::from_option_iter((0_u32..4097).map(|index| {
             (index % 17 != 0).then(|| {
@@ -1380,6 +1397,33 @@ mod tests {
             original.into_array().slice(1..5)?,
             &mut SESSION.create_execution_ctx()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conformance() -> VortexResult<()> {
+        let explicit = PrimitiveArray::from_option_iter([
+            Some(f32::NEG_INFINITY),
+            None,
+            Some(-0.0),
+            Some(0.0),
+            Some(42.25),
+            Some(f32::INFINITY),
+        ]);
+        let explicit = FloatQuant::from_primitive(explicit.as_view(), 8)?.into_array();
+        let implicit = PrimitiveArray::from_option_iter([
+            Some(f64::from(-10.5_f32)),
+            None,
+            Some(f64::from(-0.0_f32)),
+            Some(f64::from(42.25_f32)),
+        ]);
+        let implicit =
+            FloatQuant::from_primitive_constant_secondary(implicit.as_view(), 29)?.into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+
+        for array in [explicit, implicit] {
+            test_array_consistency(&array, &mut ctx);
+        }
         Ok(())
     }
 }

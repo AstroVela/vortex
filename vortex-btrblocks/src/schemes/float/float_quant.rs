@@ -132,6 +132,8 @@ fn encode_float_quant(
     primitive: vortex_array::ArrayView<'_, Primitive>,
     analysis: FloatQuantAnalysis,
 ) -> VortexResult<ArrayRef> {
+    // The ordered transform complements the low bits of negative values. Decode complements the
+    // secondary bits again, so both signs store the original low bits.
     let (primary_packed, secondary_packed, latent_ptype, reference) = match primitive.ptype() {
         PType::F16 => {
             let primary_min = u16::try_from(analysis.primary_min)?;
@@ -296,7 +298,11 @@ fn ordered_u64(bits: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::half::f16;
     use vortex_compressor::scheme::EstimateVerdict;
     use vortex_error::VortexResult;
@@ -369,6 +375,26 @@ mod tests {
                 EstimateVerdict::Skip
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn nonzero_secondary_round_trips_negative_values() -> VortexResult<()> {
+        let values = PrimitiveArray::from_iter((0_u32..2_050).flat_map(|index| {
+            let high_bits = index.wrapping_mul(7_919) & 0x007f_ff00;
+            let low_bits = index % 7;
+            let positive = f32::from_bits(0x3f80_0000 | high_bits | low_bits);
+            [positive, -positive]
+        }));
+        let analysis = analyze_float_quant(values.as_view())
+            .ok_or_else(|| vortex_err!("FloatQuant test input did not produce an analysis"))?;
+        assert!(analysis.secondary_bit_width > 0);
+        let encoded = encode_float_quant(values.as_view(), analysis)?;
+        assert_arrays_eq!(
+            encoded,
+            values.into_array(),
+            &mut array_session().create_execution_ctx()
+        );
         Ok(())
     }
 }
