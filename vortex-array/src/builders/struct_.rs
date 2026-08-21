@@ -47,7 +47,7 @@ impl StructBuilder {
     ) -> Self {
         let builders = struct_dtype
             .fields()
-            .map(|dt| ChildBuilder::with_capacity(&dt, capacity))
+            .map(|dt| ChildBuilder::new(&dt))
             .collect();
 
         Self {

@@ -48,7 +48,6 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> MapBuilder<O, S> {
         let entries_builder = ListViewBuilder::with_capacity(
             Arc::new(map_dtype.entries_dtype()),
             nullability,
-            capacity.saturating_mul(2),
             capacity,
         );
         let dtype = DType::Map(map_dtype.clone(), nullability);

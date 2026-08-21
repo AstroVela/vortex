@@ -13,7 +13,6 @@ use crate::arrays::ExtensionArray;
 use crate::arrays::extension::ExtensionArrayExt;
 use crate::builders::ArrayBuilder;
 use crate::builders::ChildBuilder;
-use crate::builders::DEFAULT_BUILDER_CAPACITY;
 use crate::canonical::Canonical;
 use crate::dtype::DType;
 use crate::dtype::extension::ExtDTypeRef;
@@ -27,15 +26,10 @@ pub struct ExtensionBuilder {
 }
 
 impl ExtensionBuilder {
-    /// Creates a new `ExtensionBuilder` with a capacity of [`DEFAULT_BUILDER_CAPACITY`].
+    /// Creates a new `ExtensionBuilder`.
     pub fn new(ext_dtype: ExtDTypeRef) -> Self {
-        Self::with_capacity(ext_dtype, DEFAULT_BUILDER_CAPACITY)
-    }
-
-    /// Creates a new `ExtensionBuilder` with the given `capacity`.
-    pub fn with_capacity(ext_dtype: ExtDTypeRef, capacity: usize) -> Self {
         Self {
-            storage: ChildBuilder::with_capacity(ext_dtype.storage_dtype(), capacity),
+            storage: ChildBuilder::new(ext_dtype.storage_dtype()),
             dtype: DType::Extension(ext_dtype),
         }
     }

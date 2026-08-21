@@ -424,9 +424,7 @@ fn execute_sparse_lists_inner<I: IntegerPType, O: OffsetBuilderPType>(
     let mut builder = ListViewBuilder::<O, O>::with_capacity(
         values_dtype,
         nullability,
-        total_canonical_values,
-        len,
-    );
+        len,);
     // The fill's elements become an array once, up front. Every gap then appends that same array,
     // so the fill's elements are stored once for the whole result however many gaps reference them.
     let fill_elements = list_scalar_elements_array(fill_value.as_list());
