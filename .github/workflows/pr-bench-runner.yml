@@ -30,9 +30,11 @@ permissions:
 jobs:
   build:
     timeout-minutes: 60
+    # Builds only need capacity, not a stable machine: accept c6id.8xlarge or larger so a
+    # scarce 8xlarge does not stall the benchmark. Measurement jobs stay pinned to c6id.metal.
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=bench-dedicated/family=c6id.8xlarge/tag=build-{1}{2}', github.run_id, inputs.benchmark_id, github.event.pull_request.head.repo.fork == false && '/extras=s3-cache' || '')
+          && format('runs-on={0}/runner=bench-dedicated/family=c6id.8xlarge+c6id.12xlarge+c6id.16xlarge+c6id.24xlarge+c6id.32xlarge+c6id.metal/tag=build-{1}{2}', github.run_id, inputs.benchmark_id, github.event.pull_request.head.repo.fork == false && '/extras=s3-cache' || '')
           || 'ubuntu-latest' }}
     steps:
       - uses: runs-on/action@v2
