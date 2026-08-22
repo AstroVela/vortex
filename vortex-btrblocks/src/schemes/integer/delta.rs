@@ -86,9 +86,12 @@ const DELTA_PENALTY: f64 = 0.98;
 /// Bits per value that Delta's bases cost.
 ///
 /// FastLanes stores `1024 / T` bases of `T` bits for every 1024 values, which is exactly one bit
-/// per value, whatever the type. The bases are themselves compressed by the cascade, so this is
-/// an upper bound.
-const BASE_BITS_PER_VALUE: f64 = 1.0;
+/// per value before compression, whatever the type. The bases are themselves cascaded, though, and
+/// they are a monotone sample of the column, so FoR + BitPacking usually takes them to a quarter of
+/// that. Sweeping this constant over the corpus in `scripts/delta-analysis` puts the optimum at
+/// `0.25`: charging the full bit leaves 1.2% on the table, and charging nothing over-selects Delta
+/// on columns whose bases do not compress.
+const BASE_BITS_PER_VALUE: f64 = 0.25;
 
 /// Minimum length before Delta is worth considering (one FastLanes chunk).
 const MIN_DELTA_LEN: usize = 1024;

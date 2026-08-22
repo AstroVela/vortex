@@ -150,9 +150,46 @@ delta-of-delta is a **~1 % win on two of seven columns**, and a loss on the rest
 inside the noise of the estimate itself (the sampled width is within one bit 93 % of the time), and
 it buys a second sequential decode dependency. Hence: statistic yes, scheme no.
 
+### Checked against the real compressor, not just the model
+
+The analysis above is a cost model, so it was checked by building a compressor that actually allows
+delta-of-delta - `DescendantExclusion` on child 0 only, so a second `Delta` may sit under the
+residual child - and compressing all nine datasets with it:
+
+| configuration | total | vs. Delta only |
+| --- | --- | --- |
+| btrblocks, no Delta | 74.50 MB | — |
+| btrblocks + Delta | 61.47 MB | — |
+| btrblocks + Delta, nesting allowed (bases charged 1 bit/value) | 61.47 MB | **byte-identical** |
+| btrblocks + Delta, nesting allowed (bases charged nothing) | 60.80 MB | 1.09 % smaller |
+
+The third row is the answer: with nesting allowed, the nested Delta *is* evaluated on the residual
+child and loses to FoR every time, on all 1115 blocks, output byte-for-byte identical. The fourth
+row looked at first like delta-of-delta paying off, but isolating the two changes shows it is not:
+running the same zero base charge with nesting *disabled* gives exactly 60.80 MB too, so the whole
+1.09 % came from charging Delta's bases less, and delta-of-delta contributed 0.00 %.
+
 `DeltaStats::delta_of_delta_bits_per_value` keeps the measurement available so the claim stays
 falsifiable on a new corpus, and `delta_of_delta_never_beats_delta_by_more_than_its_bases` in
 `vortex-btrblocks/src/schemes/integer/delta_stats.rs` pins it as a test.
+
+### What that experiment did change: the base charge
+
+Sweeping `BASE_BITS_PER_VALUE`, the bits per value the estimate charges for Delta's bases, over the
+whole corpus:
+
+| charge | total | vs. btrblocks |
+| --- | --- | --- |
+| 1.00 (uncompressed bases) | 61.47 MB | −17.5 % |
+| 0.75 | 61.12 MB | −18.0 % |
+| 0.50 | 60.97 MB | −18.2 % |
+| **0.25** | **60.72 MB** | **−18.5 %** |
+| 0.00 (bases free) | 60.80 MB | −18.4 % |
+
+A full bit per value is the *uncompressed* cost; the bases are cascaded like any other child, and
+being a monotone sample of the column they usually pack to about a quarter of that. Charging 0.25
+is worth 1.2 % over charging 1.0 - `btc_1s` gains 2.9 points, `airquality` 2.8 - while charging
+nothing over-selects Delta on `ais` and `hits`, whose bases do not compress as well.
 
 ## Finding 4: what this is worth end-to-end
 
@@ -162,17 +199,21 @@ estimate (`nbytes` of the compressed tree, 8 blocks per dataset):
 
 | dataset | no Delta | previous estimate | sampled stats | vs. no Delta | vs. previous |
 | --- | --- | --- | --- | --- | --- |
-| airquality | 9.80 MB | 5.73 MB | 5.55 MB | −43.3 % | −3.1 % |
+| airquality | 9.80 MB | 5.73 MB | 5.28 MB | −46.1 % | −7.8 % |
 | taxi | 6.32 MB | 6.17 MB | 3.94 MB | −37.6 % | −36.1 % |
+| ais | 5.35 MB | — | 3.45 MB | −35.5 % | — |
 | rplace | 4.25 MB | 4.25 MB | 3.19 MB | −25.0 % | −25.0 % |
 | btc_1m | 1.93 MB | 1.93 MB | 1.58 MB | −18.2 % | −18.2 % |
 | btc_trades | 6.40 MB | 5.63 MB | 5.63 MB | −12.0 % | 0.0 % |
-| hits | 20.54 MB | 20.46 MB | 18.87 MB | −8.2 % | −7.8 % |
-| btc_1s | 16.56 MB | 16.34 MB | 15.93 MB | −3.8 % | −2.5 % |
-| power | 3.35 MB | 3.35 MB | 3.34 MB | −0.2 % | −0.1 % |
-| **total** | **69.15 MB** | **63.87 MB** | **58.04 MB** | **−16.1 %** | **−9.1 %** |
+| hits | 20.54 MB | 20.46 MB | 18.88 MB | −8.1 % | −7.8 % |
+| btc_1s | 16.56 MB | 16.34 MB | 15.45 MB | −6.7 % | −5.5 % |
+| power | 3.35 MB | 3.35 MB | 3.32 MB | −0.9 % | −0.8 % |
+| **total** | **74.50 MB** | — | **60.72 MB** | **−18.5 %** | **−10.3 %** (8 datasets) |
 
-Delta changes the output on 366 of 1059 blocks: smaller on 355, larger on 11. Compression
+The "previous estimate" column is the full-encode estimator this replaces; it predates the AIS
+dataset, so the total against it is over the original eight (69.15 → 63.87 → 57.27 MB).
+
+Delta changes the output on 461 of 1115 blocks: smaller on 436, larger on 25. Compression
 throughput is unchanged (the estimate got cheaper, and Delta gets selected more often, which
 roughly cancel), while the estimate is now O(sample) rather than O(array).
 
@@ -184,10 +225,10 @@ the shape the previous estimate was blindest to:
 
 ## Known limitations
 
-* **Run-heavy columns can still be over-selected.** 11 blocks regress, all in columns dominated by
-  repeats (`power.timestamp`, `power.Sub_metering_3`), where RunEnd-shaped encodings beat Delta by
-  a little and the residual estimate is slightly optimistic. Total cost 26 KB against 5.8 MB
-  gained. The zero-count statistic is a candidate guard, but on its own it is a poor predictor
+* **Run-heavy columns can still be over-selected.** 25 blocks regress, mostly in columns dominated
+  by repeats (`power.timestamp`, `power.Sub_metering_3`), where RunEnd-shaped encodings beat Delta
+  by a little and the residual estimate is slightly optimistic. The losses are a small fraction of
+  the 13.8 MB gained. The zero-count statistic is a candidate guard, but on its own it is a poor predictor
   (precision 0.43) — `rplace.red` has 98.5 % zero residuals and Delta wins there by 1.9×.
 * **Unsigned columns cannot use ZigZag.** Vortex subtracts in the unsigned domain, so a decrease
   wraps to a near-maximal value that only BitPacking exceptions can absorb. A signed column with
