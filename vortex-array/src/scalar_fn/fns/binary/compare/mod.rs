@@ -4,12 +4,12 @@
 //! Native comparison kernels.
 //!
 //! [`execute_compare`] dispatches on the logical [`DType`] of its operands and evaluates every
-//! comparison directly over Vortex canonical arrays — bit buffers for booleans, lane kernels from
-//! `vortex-compute` for primitives and decimals, binary views for strings/bytes, and a row-wise
-//! comparator for nested types. There is no Arrow fallback.
+//! comparison directly over Vortex canonical arrays: bit buffers for booleans, row or fused lane
+//! kernels for primitives, lane kernels for decimals, binary views for strings and bytes, and a
+//! row-wise comparator for nested types. There is no Arrow fallback.
 //!
-//! Floating point values compare with Vortex's total ordering (`NaN` is the largest value,
-//! `-0.0 < +0.0`, and equality is bitwise), matching [`Scalar`] comparison semantics.
+//! Floating point values compare with Vortex's total ordering, including signed zero and ordered
+//! NaN bit patterns. Equality is bitwise, matching [`Scalar`] comparison semantics.
 
 use std::cmp::Ordering;
 
@@ -48,6 +48,10 @@ mod bytes;
 mod decimal;
 mod nested;
 mod primitive;
+#[cfg(any(test, feature = "_test-harness"))]
+pub(crate) use primitive::compare_primitive_columnar;
+#[cfg(any(test, feature = "_test-harness"))]
+pub(crate) use primitive::compare_primitive_rows;
 #[cfg(test)]
 mod tests;
 
@@ -211,7 +215,7 @@ fn compare_arrays(
         )
         .into_array()),
         DType::Bool(_) => boolean::compare_bool(lhs, rhs, op, nullability, ctx),
-        DType::Primitive(..) => primitive::compare_primitive(lhs, rhs, op, nullability, ctx),
+        DType::Primitive(..) => primitive::compare_primitive(lhs, rhs, op, ctx),
         DType::Decimal(..) => decimal::compare_decimal(lhs, rhs, op, nullability, ctx),
         DType::Utf8(_) | DType::Binary(_) => bytes::compare_bytes(lhs, rhs, op, nullability, ctx),
         DType::Struct(..) | DType::List(..) | DType::FixedSizeList(..) | DType::Map(..) => {
@@ -282,8 +286,13 @@ pub(super) fn ordering_predicate(op: CompareOperator) -> fn(Ordering) -> bool {
 }
 
 /// Freeze `len` bits packed into `words` (LSB-first, 64 lanes per word) into a [`BitBuffer`].
-pub(super) fn bit_buffer_from_words(words: BufferMut<u64>, len: usize) -> BitBuffer {
+pub(super) fn bit_buffer_from_words(mut words: BufferMut<u64>, len: usize) -> BitBuffer {
     debug_assert!(words.len() * 64 >= len);
+
+    for word in words.iter_mut() {
+        *word = word.to_le();
+    }
+
     let mut bytes = words.into_byte_buffer();
     bytes.truncate(len.div_ceil(8));
     BitBuffer::new(bytes.freeze(), len)

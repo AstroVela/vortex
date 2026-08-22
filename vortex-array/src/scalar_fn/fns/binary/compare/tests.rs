@@ -10,6 +10,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
 use crate::array_session;
@@ -20,6 +21,7 @@ use crate::arrays::ExtensionArray;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListArray;
 use crate::arrays::ListViewArray;
+use crate::arrays::MaskedArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
 use crate::arrays::VarBinArray;
@@ -32,13 +34,17 @@ use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
+use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::extension::datetime::TimeUnit;
 use crate::extension::datetime::Timestamp;
 use crate::extension::datetime::TimestampOptions;
+use crate::match_each_native_ptype;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
+use crate::scalar_fn::fns::binary::compare::primitive::compare_primitive_columnar;
+use crate::scalar_fn::fns::binary::compare::primitive::compare_primitive_rows;
 use crate::scalar_fn::fns::binary::scalar_cmp;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
@@ -406,8 +412,9 @@ fn int_constant_lhs_and_rhs(#[case] op: Operator, #[case] expected: [bool; 4]) {
     assert_arrays_eq!(swapped, BoolArray::from_iter(expected_swapped), &mut ctx);
 }
 
-/// Floats compare with Vortex's total ordering: NaN is the largest value, equality is bitwise,
-/// and -0.0 < +0.0. This matches `Scalar` comparison semantics.
+/// Floats compare with Vortex's total ordering: negative NaNs sort below negative infinity,
+/// positive NaNs sort above positive infinity, equality is bitwise, and -0.0 < +0.0. This matches
+/// `Scalar` comparison semantics.
 #[test]
 fn float_total_order() {
     let mut ctx = array_session().create_execution_ctx();
@@ -427,6 +434,257 @@ fn float_total_order() {
         BoolArray::from_iter([false, false, true, true]),
         &mut ctx
     );
+}
+
+#[rstest]
+#[case::row_eq(compare_primitive_rows, CompareOperator::Eq)]
+#[case::row_not_eq(compare_primitive_rows, CompareOperator::NotEq)]
+#[case::row_lt(compare_primitive_rows, CompareOperator::Lt)]
+#[case::columnar_eq(compare_primitive_columnar, CompareOperator::Eq)]
+#[case::columnar_not_eq(compare_primitive_columnar, CompareOperator::NotEq)]
+#[case::columnar_lt(compare_primitive_columnar, CompareOperator::Lt)]
+fn test_primitive_comparison_paths_preserve_semantics(
+    #[case] compare: fn(
+        &ArrayRef,
+        &ArrayRef,
+        CompareOperator,
+        &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef>,
+    #[case] op: CompareOperator,
+) -> VortexResult<()> {
+    let lhs = PrimitiveArray::new(
+        vec![
+            f64::NAN, // Equal NaNs.
+            f64::NAN, // Null on the left.
+            -0.0,     // Signed zero ordering.
+            1.0,      // A finite value below NaN.
+            f64::NAN, // Null on the right.
+        ],
+        Validity::from_iter([
+            true,  //
+            false, //
+            true,  //
+            true,  //
+            true,  //
+        ]),
+    )
+    .into_array();
+    let rhs = PrimitiveArray::new(
+        vec![
+            f64::NAN,      // Equal NaNs.
+            f64::INFINITY, // Null on the left.
+            0.0,           // Signed zero ordering.
+            f64::NAN,      // A finite value below NaN.
+            1.0,           // Null on the right.
+        ],
+        Validity::from_iter([
+            true,  //
+            true,  //
+            true,  //
+            true,  //
+            false, //
+        ]),
+    )
+    .into_array();
+    let mut ctx = array_session().create_execution_ctx();
+
+    let actual = compare(&lhs, &rhs, op, &mut ctx)?;
+    let expected = match op {
+        CompareOperator::Eq => [
+            Some(true),  // Equal NaNs.
+            None,        // Null on the left.
+            Some(false), // Distinct signed zeroes.
+            Some(false), // A finite value and NaN.
+            None,        // Null on the right.
+        ],
+        CompareOperator::NotEq | CompareOperator::Lt => [
+            Some(false), // Equal NaNs.
+            None,        // Null on the left.
+            Some(true),  // Distinct signed zeroes.
+            Some(true),  // A finite value and NaN.
+            None,        // Null on the right.
+        ],
+        _ => unreachable!(),
+    };
+    let expected = BoolArray::from_iter(expected);
+
+    assert_arrays_eq!(&actual, &expected, &mut ctx);
+    assert_eq!(actual.dtype(), &DType::Bool(Nullability::Nullable));
+
+    Ok(())
+}
+
+#[test]
+fn row_primitive_comparison_packs_bit_boundaries() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    for len in [0, 1, 63, 64, 65, 127, 128, 129] {
+        let lhs_values = (0..len).map(|index| index as u64).collect::<Vec<_>>();
+        let rhs_values = (0..len).map(|index| (index ^ 1) as u64).collect::<Vec<_>>();
+        let lhs = PrimitiveArray::from_iter(lhs_values.iter().copied()).into_array();
+        let rhs = PrimitiveArray::from_iter(rhs_values.iter().copied()).into_array();
+
+        let actual = compare_primitive_rows(&lhs, &rhs, CompareOperator::Eq, &mut ctx)?;
+        let expected = BoolArray::from_iter(
+            lhs_values
+                .iter()
+                .zip(&rhs_values)
+                .map(|(lhs, rhs)| lhs == rhs),
+        );
+        assert_arrays_eq!(&actual, &expected, &mut ctx);
+
+        let lhs_i64 =
+            PrimitiveArray::from_iter(lhs_values.iter().map(|value| *value as i64)).into_array();
+        let rhs_i64 =
+            PrimitiveArray::from_iter(rhs_values.iter().map(|value| *value as i64)).into_array();
+        let actual = compare_primitive_rows(&lhs_i64, &rhs_i64, CompareOperator::Gte, &mut ctx)?;
+        let expected = BoolArray::from_iter(
+            lhs_values
+                .iter()
+                .zip(&rhs_values)
+                .map(|(lhs, rhs)| lhs >= rhs),
+        );
+        assert_arrays_eq!(&actual, &expected, &mut ctx);
+
+        let constant = ConstantArray::new(31_u64, len).into_array();
+        let actual = compare_primitive_rows(&lhs, &constant, CompareOperator::Gt, &mut ctx)?;
+        let expected = BoolArray::from_iter(lhs_values.iter().map(|value| *value > 31));
+        assert_arrays_eq!(&actual, &expected, &mut ctx);
+
+        let actual = compare_primitive_rows(&constant, &lhs, CompareOperator::Lt, &mut ctx)?;
+        let expected = BoolArray::from_iter(lhs_values.iter().map(|value| 31 < *value));
+        assert_arrays_eq!(&actual, &expected, &mut ctx);
+    }
+
+    let len = 65;
+    let lhs_validity = Validity::from_iter((0..len).map(|index| index % 3 != 0));
+    let rhs_validity = Validity::from_iter((0..len).map(|index| index % 5 != 0));
+    let lhs = MaskedArray::try_new(
+        ConstantArray::new(30_u64, len).into_array(),
+        lhs_validity.clone(),
+    )?
+    .into_array();
+    let rhs = MaskedArray::try_new(
+        ConstantArray::new(31_u64, len).into_array(),
+        rhs_validity.clone(),
+    )?
+    .into_array();
+
+    let actual = compare_primitive_rows(&lhs, &rhs, CompareOperator::Lt, &mut ctx)?;
+    let expected = BoolArray::new(BitBuffer::new_set(len), lhs_validity.and(rhs_validity)?);
+    assert_arrays_eq!(&actual, &expected, &mut ctx);
+
+    Ok(())
+}
+
+#[test]
+fn row_primitive_comparison_supports_every_native_type() -> VortexResult<()> {
+    for ptype in [
+        PType::U8,
+        PType::U16,
+        PType::U32,
+        PType::U64,
+        PType::I8,
+        PType::I16,
+        PType::I32,
+        PType::I64,
+        PType::F16,
+        PType::F32,
+        PType::F64,
+    ] {
+        match_each_native_ptype!(ptype, |T| { assert_row_primitive_comparison_type::<T>()? });
+    }
+
+    Ok(())
+}
+
+fn assert_row_primitive_comparison_type<T: NativePType>() -> VortexResult<()> {
+    let lhs_values = (0..129)
+        .map(|index| T::from_i64((index * 31 % 127) as i64).vortex_expect("value must fit"))
+        .collect::<Vec<_>>();
+    let rhs_values = (0..129)
+        .map(|index| T::from_i64((index * 17 % 127) as i64).vortex_expect("value must fit"))
+        .collect::<Vec<_>>();
+    let lhs = PrimitiveArray::from_iter(lhs_values.iter().copied()).into_array();
+    let rhs = PrimitiveArray::from_iter(rhs_values.iter().copied()).into_array();
+    let mut ctx = array_session().create_execution_ctx();
+
+    for op in [
+        CompareOperator::Eq,
+        CompareOperator::NotEq,
+        CompareOperator::Gt,
+        CompareOperator::Gte,
+        CompareOperator::Lt,
+        CompareOperator::Lte,
+    ] {
+        let actual = compare_primitive_rows(&lhs, &rhs, op, &mut ctx)?;
+        let expected = BoolArray::from_iter(lhs_values.iter().zip(&rhs_values).map(
+            |(lhs, rhs)| match op {
+                CompareOperator::Eq => lhs.is_eq(*rhs),
+                CompareOperator::NotEq => !lhs.is_eq(*rhs),
+                CompareOperator::Gt => lhs.is_gt(*rhs),
+                CompareOperator::Gte => lhs.is_ge(*rhs),
+                CompareOperator::Lt => lhs.is_lt(*rhs),
+                CompareOperator::Lte => lhs.is_le(*rhs),
+            },
+        ));
+        assert_arrays_eq!(&actual, &expected, &mut ctx);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[rstest]
+#[case::i64_eq(
+    buffer![1_i64, 2, 3].into_array(),
+    buffer![1_i64, 4, 3].into_array(),
+    CompareOperator::Eq,
+    [true, false, true]
+)]
+#[case::i64_not_eq(
+    buffer![1_i64, 2, 3].into_array(),
+    buffer![1_i64, 4, 3].into_array(),
+    CompareOperator::NotEq,
+    [false, true, false]
+)]
+#[case::u64_eq(
+    buffer![1_u64, 2, 3].into_array(),
+    buffer![1_u64, 4, 3].into_array(),
+    CompareOperator::Eq,
+    [true, false, true]
+)]
+#[case::u64_not_eq(
+    buffer![1_u64, 2, 3].into_array(),
+    buffer![1_u64, 4, 3].into_array(),
+    CompareOperator::NotEq,
+    [false, true, false]
+)]
+#[case::f64_eq(
+    buffer![1_f64, 2.0, 3.0].into_array(),
+    buffer![1_f64, 4.0, 3.0].into_array(),
+    CompareOperator::Eq,
+    [true, false, true]
+)]
+#[case::f64_not_eq(
+    buffer![1_f64, 2.0, 3.0].into_array(),
+    buffer![1_f64, 4.0, 3.0].into_array(),
+    CompareOperator::NotEq,
+    [false, true, false]
+)]
+fn test_primitive_equality_uses_row_fn_for_supported_ptype(
+    #[case] lhs: ArrayRef,
+    #[case] rhs: ArrayRef,
+    #[case] op: CompareOperator,
+    #[case] expected: [bool; 3],
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let actual = compare_primitive_rows(&lhs, &rhs, op, &mut ctx)?;
+
+    assert_arrays_eq!(actual, BoolArray::from_iter(expected), &mut ctx);
+
+    Ok(())
 }
 
 #[rstest]

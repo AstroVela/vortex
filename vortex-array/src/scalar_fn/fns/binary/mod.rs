@@ -42,10 +42,15 @@ pub(crate) use boolean::execute_boolean;
 pub use boolean::kleene_boolean_buffer_scalar;
 pub use boolean::kleene_boolean_buffers;
 mod compare;
+#[cfg(any(test, feature = "_test-harness"))]
+pub(crate) use compare::compare_primitive_columnar;
+#[cfg(any(test, feature = "_test-harness"))]
+pub(crate) use compare::compare_primitive_rows;
 pub use compare::*;
 mod numeric;
 pub(crate) use numeric::*;
-mod primitive_operand;
+#[cfg(any(not(target_arch = "x86_64"), test, feature = "_test-harness"))]
+pub(crate) mod primitive_operand;
 
 use crate::scalar::NumericOperator;
 use crate::scalar::Scalar;

@@ -97,6 +97,7 @@ vortex-array = { path = ".", features = [
     "table-display",
     "unstable_row_fns",
 ] }
+vortex-bench-support = { workspace = true }
 
 [[bench]]
 name = "aggregate_max"
@@ -128,6 +129,10 @@ harness = false
 
 [[bench]]
 name = "compare"
+harness = false
+
+[[bench]]
+name = "compare_primitive"
 harness = false
 
 [[bench]]

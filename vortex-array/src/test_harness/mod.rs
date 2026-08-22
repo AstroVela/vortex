@@ -8,9 +8,13 @@ use goldenfile::differs::binary_diff;
 use itertools::Itertools;
 use vortex_error::VortexResult;
 
+use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::arrays::BoolArray;
 use crate::arrays::bool::BoolArrayExt;
+use crate::scalar_fn::fns::binary::compare_primitive_columnar as compare_columnar;
+use crate::scalar_fn::fns::binary::compare_primitive_rows as compare_rows;
+use crate::scalar_fn::fns::operators::CompareOperator;
 
 #[cfg(not(codspeed))]
 pub mod trace;
@@ -39,4 +43,24 @@ pub fn to_int_indices(indices_bits: BoolArray, ctx: &mut ExecutionCtx) -> Vortex
         .enumerate()
         .filter_map(|(idx, v)| (v && mask.value(idx)).then_some(idx as u64))
         .collect_vec())
+}
+
+/// Compare primitive arrays through the row-function implementation.
+pub fn compare_primitive_rows(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    op: CompareOperator,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    compare_rows(lhs, rhs, op, ctx)
+}
+
+/// Compare primitive arrays through the fused columnar implementation.
+pub fn compare_primitive_columnar(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    op: CompareOperator,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    compare_columnar(lhs, rhs, op, ctx)
 }
