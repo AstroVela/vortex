@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The August 2026 draft core edition with numeric array encodings.
+//! The August 2026 `preview` encoding cohort.
 
 use vortex_edition::Edition;
 use vortex_edition::EditionDeclaration;
 use vortex_edition::EditionId;
 use vortex_edition::EditionMember;
 
-/// The fifth August 2026 edition of the `core` family.
-pub const CORE_2026_08_4: EditionId = EditionId::new("core", 2026, 8, 4);
+/// The August 2026 draft edition of the `preview` family.
+pub const PREVIEW_2026_08_0: EditionId = EditionId::new("preview", 2026, 8, 0);
 
-/// The declaration of [`CORE_2026_08_4`] and its new components.
+/// The declaration of [`PREVIEW_2026_08_0`] and the encodings that join the family at it.
 pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
-        id: CORE_2026_08_4,
+        id: PREVIEW_2026_08_0,
         min_vortex_version: None,
     },
     added: &[
