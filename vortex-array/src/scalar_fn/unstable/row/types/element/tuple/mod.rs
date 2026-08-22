@@ -7,6 +7,8 @@
 //! [`IndexedElementTuple`] adds the validated indexed source used by vectorizable dense loops.
 
 mod element_tuple;
+pub use element_tuple::ArgColumn;
+pub use element_tuple::ArgView;
 pub use element_tuple::ElementTuple;
 pub use element_tuple::batch_const;
 

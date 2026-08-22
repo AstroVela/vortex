@@ -9,7 +9,10 @@
 //! A [`RowFn`] describes the typed operation while the framework owns columnar concerns such as
 //! decoding, constant handling, null propagation, allocation, and validity. Its
 //! [`RowFn::dispatch`] implementation uses a [`RowVisitor`] to select an [`ElementTuple`] and
-//! either an [`OutputElement`] or [`OutputSink`] for each supported dtype combination.
+//! output contract for each supported dtype combination. An [`OutputElement`] returns one owned
+//! value per row, an [`OutputSink`] writes through a shared builder, and a [`RowKernel`] can attach
+//! an associated dense output representation while retaining scalar semantics for other execution
+//! policies.
 //!
 //! Unlike a general strict function, a [`RowFn`] cannot produce null from valid inputs.
 //!
@@ -29,6 +32,9 @@ mod row_fn;
 pub use row_fn::RowFn;
 
 mod types;
+pub use types::ArgColumn;
+pub use types::ArgView;
+pub use types::DenseRows;
 pub use types::ElementTuple;
 pub use types::FailureEvidence;
 pub use types::IndexedElementTuple;
@@ -36,8 +42,12 @@ pub use types::InitializedElement;
 pub use types::InputElement;
 pub use types::OutputElement;
 pub use types::OutputSink;
+pub use types::PackedBoolOutput;
+pub use types::RowKernel;
+pub use types::RowKernelOutput;
 pub use types::SinkResult;
 pub use types::UninitElementSink;
+pub use types::VecOutput;
 pub use types::ViewLen;
 
 mod visitor;

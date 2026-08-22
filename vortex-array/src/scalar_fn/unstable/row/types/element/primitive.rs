@@ -9,6 +9,7 @@ use vortex_error::vortex_ensure_eq;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::Constant;
 use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
@@ -42,6 +43,19 @@ unsafe impl<T: NativePType> InputElement for T {
 
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
         Ok(array.execute::<PrimitiveArray>(ctx)?.into_buffer::<T>())
+    }
+
+    fn decode_batch_constant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self::Column> {
+        if let Some(constant) = array.as_opt::<Constant>()
+            && let Some(value) = constant.scalar().as_primitive().try_typed_value::<T>()?
+        {
+            return Ok(Buffer::full(value, 1));
+        }
+
+        Self::decode(array.slice(0..1)?, ctx)
     }
 
     fn can_decode_null_tolerant(_array: &ArrayRef) -> VortexResult<bool> {

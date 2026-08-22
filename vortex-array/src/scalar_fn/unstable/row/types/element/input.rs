@@ -59,6 +59,18 @@ pub unsafe trait InputElement: 'static {
     /// and other invocation-invariant work into this method.
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column>;
 
+    /// Decode one representative row from an input that is constant for the batch.
+    ///
+    /// The default preserves the ordinary decode contract by slicing the input to one row first.
+    /// Implementations can override this when their constant representation supports cheaper
+    /// scalar extraction. The returned column **must** contain exactly one row.
+    fn decode_batch_constant(
+        array: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self::Column> {
+        Self::decode(array.slice(0..1)?, ctx)
+    }
+
     /// Whether [`decode_null_tolerant`](Self::decode_null_tolerant) can decode this array.
     ///
     /// The conservative default declines. An implementation whose ordinary decode is safe and

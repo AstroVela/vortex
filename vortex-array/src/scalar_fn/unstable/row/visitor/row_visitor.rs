@@ -15,6 +15,7 @@ use crate::scalar_fn::unstable::row::FailureEvidence;
 use crate::scalar_fn::unstable::row::IndexedElementTuple;
 use crate::scalar_fn::unstable::row::OutputElement;
 use crate::scalar_fn::unstable::row::OutputSink;
+use crate::scalar_fn::unstable::row::RowKernel;
 use crate::scalar_fn::unstable::row::SinkResult;
 
 /// A planning or execution visit at concrete input and output types.
@@ -66,6 +67,19 @@ pub trait RowVisitor<Options>: private::Sealed + Sized {
         Out: OutputElement,
     {
         self.visit_prepared::<Args, Out, ()>(|_| (), move |&(), args| apply(args))
+    }
+
+    /// Visit an infallible kernel with an associated output representation.
+    ///
+    /// Planning uses [`RowKernel::Element`] to derive the dtype. Validity-aware execution evaluates
+    /// rows through [`RowKernel::eval`] before constructing [`RowKernel::Output`]. Dense execution
+    /// can use [`RowKernel::collect_dense`] instead.
+    fn visit_kernel<Args, Kernel>(self, kernel: Kernel) -> VortexResult<Self::VisitResult>
+    where
+        Args: IndexedElementTuple,
+        Kernel: RowKernel<Args>,
+    {
+        self.visit::<Args, Kernel::Element>(move |args| kernel.eval(args))
     }
 
     /// The prepared form of [`visit`](Self::visit), with the same prerequisites.

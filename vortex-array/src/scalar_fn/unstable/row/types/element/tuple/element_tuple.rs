@@ -35,6 +35,17 @@ enum ArgColumnKind<T: InputElement> {
     Const(T::Column),
 }
 
+/// A typed decoded input classified by how the dense collector addresses it.
+///
+/// This classification does not prove that the view covers a particular batch length.
+pub enum ArgView<'a, T: InputElement> {
+    /// A view with one value for every row in the batch.
+    Column(T::View<'a>),
+
+    /// A one-row view whose value is broadcast across the batch.
+    Constant(T::View<'a>),
+}
+
 impl<T: InputElement> ArgColumn<T> {
     fn try_from_const(column: T::Column) -> VortexResult<Self> {
         let decoded_len = T::view(&column).len();
@@ -52,7 +63,7 @@ impl<T: InputElement> ArgColumn<T> {
         if let Some(const_array) = batch_const(&array)
             && !array.is_empty()
         {
-            return Self::try_from_const(T::decode(const_array.slice(0..1)?, ctx)?);
+            return Self::try_from_const(T::decode_batch_constant(const_array, ctx)?);
         }
 
         Ok(Self(ArgColumnKind::Column(T::decode(array, ctx)?)))
@@ -64,7 +75,7 @@ impl<T: InputElement> ArgColumn<T> {
         if let Some(const_array) = batch_const(&array)
             && !array.is_empty()
         {
-            return Self::try_from_const(T::decode(const_array.slice(0..1)?, ctx)?).map(Some);
+            return Self::try_from_const(T::decode_batch_constant(const_array, ctx)?).map(Some);
         }
 
         Ok(T::decode_null_tolerant(array, ctx)?
@@ -93,6 +104,14 @@ impl<T: InputElement> ArgColumn<T> {
         match &self.0 {
             ArgColumnKind::Column(column) => Some(column),
             ArgColumnKind::Const(_) => None,
+        }
+    }
+
+    /// Borrow the decoded input with its batch-constant classification.
+    pub fn view(&self) -> ArgView<'_, T> {
+        match &self.0 {
+            ArgColumnKind::Column(column) => ArgView::Column(T::view(column)),
+            ArgColumnKind::Const(column) => ArgView::Constant(T::view(column)),
         }
     }
 

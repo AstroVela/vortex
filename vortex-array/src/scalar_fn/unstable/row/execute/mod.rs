@@ -6,6 +6,10 @@
 //! [`owned`] stores one independent value per row and reduces compact failure evidence. [`sink`]
 //! drives output builders whose row handles may share batch state.
 
+mod kernel;
+pub(super) use kernel::execute_kernel;
+pub(super) use kernel::execute_kernel_valid_rows;
+
 mod owned;
 pub(super) use owned::execute_owned;
 pub(super) use owned::execute_owned_infallible;

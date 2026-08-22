@@ -18,6 +18,8 @@ pub use output::OutputElement;
 mod primitive;
 
 mod tuple;
+pub use tuple::ArgColumn;
+pub use tuple::ArgView;
 pub use tuple::ElementTuple;
 pub use tuple::IndexedElementTuple;
 pub use tuple::batch_const;

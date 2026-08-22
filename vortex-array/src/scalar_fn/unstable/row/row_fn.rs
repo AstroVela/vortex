@@ -26,10 +26,12 @@ use crate::scalar_fn::ScalarFnId;
 /// propagation but permits valid inputs to produce null. The framework derives output validity
 /// only from input validity.
 ///
-/// A dispatched [`OutputElement`] or [`OutputSink`] describes the non-nullable values produced for
-/// valid rows. The framework widens that dtype when an input dtype is nullable, attaches the
-/// input-derived validity, and casts the finished array to the widened dtype. Implementations do
-/// not construct nullable placeholders for invalid rows.
+/// A dispatched [`OutputElement`], [`OutputSink`], or [`RowKernel`] describes the non-nullable
+/// values produced for valid rows. A `RowKernel` also selects an associated output representation
+/// and can override dense collection without changing its scalar semantics. The framework widens
+/// the output dtype when an input dtype is nullable, attaches the input-derived validity, and casts
+/// the finished array to the widened dtype. Implementations do not construct nullable placeholders
+/// for invalid rows.
 ///
 /// Declare argument names and use [`dispatch`](Self::dispatch) to select element and output types.
 /// Every implementation receives the standard [`ScalarFnVTable`]. A public type that needs custom
@@ -37,6 +39,7 @@ use crate::scalar_fn::ScalarFnId;
 ///
 /// [`OutputElement`]: crate::scalar_fn::unstable::row::OutputElement
 /// [`OutputSink`]: crate::scalar_fn::unstable::row::OutputSink
+/// [`RowKernel`]: crate::scalar_fn::unstable::row::RowKernel
 /// [`ScalarFnVTable`]: crate::scalar_fn::ScalarFnVTable
 /// [`execute_rows`]: crate::scalar_fn::unstable::row::execute_rows
 /// [`row_fn_return_dtype`]: crate::scalar_fn::unstable::row::row_fn_return_dtype
@@ -73,7 +76,8 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
         vortex_bail!("Expression {} is not deserializable", self.id())
     }
 
-    /// Choose element types for these input dtypes and visit the framework with them.
+    /// Choose element types and an output contract for these input dtypes, then visit the
+    /// framework with them.
     ///
     /// Planning and execution both call this method, so its result **must** depend only on
     /// `options` and `args`. Cross-argument dtype validation belongs here.

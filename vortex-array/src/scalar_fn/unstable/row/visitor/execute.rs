@@ -29,7 +29,10 @@ use crate::scalar_fn::unstable::row::IndexedElementTuple;
 use crate::scalar_fn::unstable::row::OutputElement;
 use crate::scalar_fn::unstable::row::OutputSink;
 use crate::scalar_fn::unstable::row::RowFn;
+use crate::scalar_fn::unstable::row::RowKernel;
 use crate::scalar_fn::unstable::row::SinkResult;
+use crate::scalar_fn::unstable::row::execute::execute_kernel;
+use crate::scalar_fn::unstable::row::execute::execute_kernel_valid_rows;
 use crate::scalar_fn::unstable::row::execute::execute_owned;
 use crate::scalar_fn::unstable::row::execute::execute_owned_infallible;
 use crate::scalar_fn::unstable::row::execute::execute_owned_infallible_valid_rows;
@@ -82,6 +85,22 @@ impl<F: RowFn> private::Sealed for ExecuteRows<'_, '_, F> {}
 
 impl<F: RowFn> RowVisitor<F::Options> for ExecuteRows<'_, '_, F> {
     type VisitResult = ArrayRef;
+
+    fn visit_kernel<Args, Kernel>(self, kernel: Kernel) -> VortexResult<Self::VisitResult>
+    where
+        Args: IndexedElementTuple,
+        Kernel: RowKernel<Args>,
+    {
+        const { assert_owned_visit_contract::<F, Args, Kernel::Element>() };
+        ensure_plan(
+            self.output_dtype,
+            self.policy,
+            validate_owned_visit::<Args, Kernel::Element>(self.dtypes)?,
+            RowPolicy::for_owned_output::<Args>(),
+        )?;
+
+        execute_kernel::<Args, Kernel>(self.args, self.ctx, kernel)
+    }
 
     fn visit_prepared<Args, Out, Prepared>(
         self,
@@ -212,6 +231,22 @@ impl<F: RowFn> private::Sealed for ExecuteValidRows<'_, '_, F> {}
 
 impl<F: RowFn> RowVisitor<F::Options> for ExecuteValidRows<'_, '_, F> {
     type VisitResult = Option<ArrayRef>;
+
+    fn visit_kernel<Args, Kernel>(self, kernel: Kernel) -> VortexResult<Self::VisitResult>
+    where
+        Args: IndexedElementTuple,
+        Kernel: RowKernel<Args>,
+    {
+        const { assert_owned_visit_contract::<F, Args, Kernel::Element>() };
+        ensure_plan(
+            self.output_dtype,
+            self.policy,
+            validate_owned_visit::<Args, Kernel::Element>(self.dtypes)?,
+            RowPolicy::for_owned_output::<Args>(),
+        )?;
+
+        execute_kernel_valid_rows::<Args, Kernel>(self.args, &self.valid, self.ctx, kernel)
+    }
 
     fn visit_prepared<Args, Out, Prepared>(
         self,

@@ -9,11 +9,22 @@
 //! outcomes.
 
 mod element;
+pub use element::ArgColumn;
+pub use element::ArgView;
 pub use element::ElementTuple;
 pub use element::IndexedElementTuple;
 pub use element::InputElement;
 pub use element::OutputElement;
 pub(super) use element::batch_const;
+
+mod kernel;
+pub use kernel::DenseRows;
+pub use kernel::RowKernel;
+
+mod kernel_output;
+pub use kernel_output::PackedBoolOutput;
+pub use kernel_output::RowKernelOutput;
+pub use kernel_output::VecOutput;
 
 mod result;
 pub use result::FailureEvidence;
