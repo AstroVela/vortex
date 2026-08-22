@@ -43,9 +43,15 @@ use crate::schemes::integer::delta_stats::delta_stats;
 /// [`DeltaScheme::new`]; [`DeltaScheme::default`] uses a ratio of `1.05`.
 ///
 /// There is deliberately no delta-of-delta scheme: the layer below Delta is FoR (or ZigZag) plus
-/// BitPacking, which already subtracts the mean rate, so a second Delta layer only doubles the
-/// span of what is left while adding another bit per value of bases. Across 1966 real
-/// (column, block) pairs it never once came out ahead - see `scripts/delta-analysis/README.md`.
+/// BitPacking, which already subtracts the mean rate, so a second Delta layer mostly doubles the
+/// span of the jitter that is left while adding another layer of bases. Across 1966 real
+/// (column, block) pairs of analytics, telemetry and market data it never came out ahead, and on
+/// the one shape that suits it - GPS-style trajectories, where the rate drifts smoothly - it wins
+/// by about 1% on two columns in seven, in exchange for a second sequential decode dependency.
+/// [`DeltaStats::delta_of_delta_bits_per_value`] keeps the measurement available; see
+/// `scripts/delta-analysis/README.md`.
+///
+/// [`DeltaStats::delta_of_delta_bits_per_value`]: super::DeltaStats::delta_of_delta_bits_per_value
 ///
 /// [`DeltaStats`]: super::DeltaStats
 #[derive(Debug, Copy, Clone, PartialEq)]

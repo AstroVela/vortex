@@ -391,10 +391,12 @@ mod tests {
         Ok(())
     }
 
-    /// Second differencing doubles the residual span, so delta-of-delta never comes out ahead of
-    /// delta on smooth data - the measurement that keeps it a statistic rather than a scheme.
+    /// Second differencing doubles the span of jittery residuals, so delta-of-delta cannot pay for
+    /// the extra layer of bases it costs - the measurement that keeps it a statistic rather than a
+    /// scheme. On smoothly drifting data it can narrow the residuals by about a bit, which is why
+    /// the bound here is the cost of that extra layer rather than zero.
     #[test]
-    fn delta_of_delta_is_never_narrower_than_delta() -> VortexResult<()> {
+    fn delta_of_delta_never_beats_delta_by_more_than_its_bases() -> VortexResult<()> {
         let mut rng = StdRng::seed_from_u64(11);
         let mut value = 0i64;
         let values: Vec<i64> = (0..1 << 16)

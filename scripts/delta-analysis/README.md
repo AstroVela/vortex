@@ -15,6 +15,7 @@ scripts/delta-analysis/fetch.sh                       # ~1.5 GB of public parque
 cd scripts/delta-analysis
 uv run --with pyarrow --with pandas --with numpy python study.py    # writes results.csv
 uv run --with pandas --with numpy python analyze.py                 # prints the tables below
+uv run --with pyarrow --with pandas --with numpy python ais_check.py  # the trajectory probe
 ```
 
 `study.py` models the compressor; the end-to-end numbers in the last section come from running the
@@ -31,8 +32,11 @@ real `BtrBlocksCompressor` over the same corpus.
 | `btc_1s` / `btc_1m` | 2.7 M / 45 K | exchange klines: **exactly periodic** timestamps, fixed-point prices | 11 each |
 | `btc_trades` | 2 M | raw trades: sequential ids, irregular ms timestamps | 5 |
 | `power` | 2.1 M | UCI household power, one-minute meter readings | 8 |
+| `ais` | 6 M | NOAA AIS vessel tracks, sorted per vessel: smooth trajectories | 7 |
 
-That is 142 integer columns, analysed in 64 Ki-value blocks: 1966 (column, block) units.
+That is 142 integer columns in the main study, analysed in 64 Ki-value blocks: 1966 (column,
+block) units. AIS is analysed separately by `ais_check.py`, because it exists to probe the one
+shape the others lack (see Finding 3).
 
 ## What the compressor actually does
 
@@ -96,13 +100,16 @@ Cheaper rules were tried and are worse: widths alone without the exception model
 "more than half the residuals are zero" (0.43), "the sample is sorted" (0.34). The histogram is
 worth its 65 counters.
 
-## Finding 3: delta-of-delta never pays — not once in 1966 real blocks
+## Finding 3: delta-of-delta is at best marginal, and never enough to justify a scheme
+
+On the eight datasets above it loses outright, and not because of how the bases are priced - its
+*residuals* are never narrower than delta's:
 
 | | |
 | --- | --- |
 | blocks where delta-of-delta beats delta | **0 / 1966** |
-| best width the second delta layer ever saved | **0 bits** |
-| median cost of the second layer | +0.20 bytes/value |
+| blocks where its residuals alone are narrower, bases charged at zero | **0 / 1966** |
+| best width the second delta layer ever saved | **0 bits** (331 exact ties) |
 
 The reason is structural, and it is worth stating because it is not what the Gorilla-style
 literature suggests:
@@ -113,15 +120,38 @@ literature suggests:
   timestamps do not need a second delta layer; they come out at width 0 (`btc_1s.open_time`:
   3.25 B/value → 0.125 B/value, a 26× win from one Delta layer, and `SequenceScheme` catches the
   perfectly regular case even more cheaply).
-* What remains after the first layer is jitter. Differencing jitter *doubles* its span, costing
-  about a bit, and the second layer of bases costs another bit per value. So delta-of-delta needs
-  the delta *rate to drift* by more than the local jitter across a whole block to break even — and
-  no real column in this corpus does that. Measured over the corpus, the second layer is one bit
-  *wider* than the first in 554 blocks, exactly as wide in 1254, and never narrower.
+* What remains after the first layer is jitter, and differencing jitter *doubles* its span.
+  Measured over the corpus, the second layer is one bit *wider* than the first in 554 blocks,
+  exactly as wide in 1254, and never narrower.
 
-The conclusion drawn in the code: expose delta-of-delta as a *statistic*
-(`DeltaStats::delta_of_delta_bits_per_value`) so the claim stays falsifiable on new corpora, but do
-not add a scheme that would never fire. `delta_of_delta_is_never_narrower_than_delta` in
+### The case where it does something: smooth trajectories
+
+That corpus has no column whose delta *rate drifts smoothly*, which is the shape delta-of-delta is
+actually for. `ais_check.py` adds one: 6 M AIS vessel positions (15 374 vessels, sorted per vessel,
+lat/lon as fixed-point microdegrees), where position is sampled from something with continuous
+velocity so the second difference is acceleration. There, second differencing really does help:
+
+| column | delta width | delta-of-delta width | residual saving |
+| --- | --- | --- | --- |
+| `lat_e6` | 13.67 bits | 12.58 bits | +0.034 B/value |
+| `lon_e6` | 13.92 bits | 12.83 bits | +0.034 B/value |
+| `sog_e1`, `cog_e1`, `heading`, `time` | — | wider | negative |
+
+So on trajectories the answer turns entirely on what the second layer's bases cost, and that is a
+modelling choice worth being explicit about:
+
+| second-layer bases priced at | delta-of-delta wins |
+| --- | --- |
+| 1 bit/value (a full-width value per lane head, as for the first layer) | 0 / 168 blocks |
+| their compressed width (they hold *residuals*, ~13 bits, not values) | 32 / 168 blocks, by 1.2 % of the column |
+
+The second pricing is the honest one - the cascade compresses the bases child - so on GPS-like data
+delta-of-delta is a **~1 % win on two of seven columns**, and a loss on the rest. That is well
+inside the noise of the estimate itself (the sampled width is within one bit 93 % of the time), and
+it buys a second sequential decode dependency. Hence: statistic yes, scheme no.
+
+`DeltaStats::delta_of_delta_bits_per_value` keeps the measurement available so the claim stays
+falsifiable on a new corpus, and `delta_of_delta_never_beats_delta_by_more_than_its_bases` in
 `vortex-btrblocks/src/schemes/integer/delta_stats.rs` pins it as a test.
 
 ## Finding 4: what this is worth end-to-end

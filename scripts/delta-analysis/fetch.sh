@@ -39,10 +39,13 @@ fetch https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1s/BTCUSDT-1s
 fetch https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2024-01.zip btc1m.zip
 fetch https://data.binance.vision/data/spot/monthly/trades/BTCUSDT/BTCUSDT-trades-2024-01.zip btctrades.zip
 
+# AIS vessel tracks: the smooth-trajectory case delta-of-delta is supposed to want.
+fetch https://coast.noaa.gov/htdata/CMSP/AISDataHandler/2023/AIS_2023_01_01.zip ais.zip
+
 # UCI household power consumption: one-minute smart-meter readings over four years.
 fetch https://archive.ics.uci.edu/static/public/235/individual+household+electric+power+consumption.zip power.zip
 
-for z in btc1s btc1m btctrades power; do
+for z in btc1s btc1m btctrades power ais; do
   unzip -o -q "$z.zip"
 done
 
