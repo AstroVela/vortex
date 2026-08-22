@@ -358,9 +358,36 @@ fn trace_scan_like_on_compressed_comment() -> VortexResult<()> {
     // No reduce rule rewrites a like over FSST; the FSST like kernel compiles the pattern and
     // matches in compressed space at execution time.
     insta::assert_snapshot!(optimized.trace.to_string(), @"");
+    #[cfg(not(feature = "unstable_encodings"))]
     insta::assert_snapshot!(executed.trace.to_string(), @"
     execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
       iter 0 current=vortex.like(bool, len=4096) builder_active=false
+        child_execute_parent session[0]:execute_parent_fn slot=0 parent=vortex.like(bool, len=4096) child=vortex.fsst(utf8, len=4096) -> vortex.bool(bool, len=4096)
+      iter 1 current=vortex.bool(bool, len=4096) builder_active=false
+      return output=vortex.bool(bool, len=4096)
+    ");
+    // With `unstable_encodings`, Delta wins on the FSST offsets, and decoding it adds its own
+    // frames to the trace.
+    #[cfg(feature = "unstable_encodings")]
+    insta::assert_snapshot!(executed.trace.to_string(), @"
+    execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
+      iter 0 current=vortex.like(bool, len=4096) builder_active=false
+    execute_until target=AnyCanonical root=fastlanes.delta(u16, len=4097)
+      iter 0 current=fastlanes.delta(u16, len=4097) builder_active=false
+    execute_until target=AnyCanonical root=fastlanes.bitpacked(u16, len=5120)
+      iter 0 current=fastlanes.bitpacked(u16, len=5120) builder_active=false
+        ExecuteSlot slot=1 parent=fastlanes.bitpacked(u16, len=5120) child=vortex.constant(u16, len=1)
+      iter 1 current=vortex.constant(u16, len=1) stack_parent=fastlanes.bitpacked(u16, len=5120) slot=1 builder_active=false
+        Done array=vortex.primitive(u16, len=1)
+      iter 2 current=vortex.primitive(u16, len=1) stack_parent=fastlanes.bitpacked(u16, len=5120) slot=1 builder_active=false
+        pop_frame slot=1 output=fastlanes.bitpacked(u16, len=5120)
+      iter 3 current=fastlanes.bitpacked(u16, len=5120) builder_active=false
+        Done array=vortex.primitive(u16, len=5120)
+      iter 4 current=vortex.primitive(u16, len=5120) builder_active=false
+      return output=vortex.primitive(u16, len=5120)
+        Done array=vortex.primitive(u16, len=4097)
+      iter 1 current=vortex.primitive(u16, len=4097) builder_active=false
+      return output=vortex.primitive(u16, len=4097)
         child_execute_parent session[0]:execute_parent_fn slot=0 parent=vortex.like(bool, len=4096) child=vortex.fsst(utf8, len=4096) -> vortex.bool(bool, len=4096)
       iter 1 current=vortex.bool(bool, len=4096) builder_active=false
       return output=vortex.bool(bool, len=4096)

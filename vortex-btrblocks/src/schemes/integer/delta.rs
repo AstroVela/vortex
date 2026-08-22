@@ -17,9 +17,7 @@ use vortex_compressor::builtins::StringDictScheme;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
 use vortex_compressor::scheme::CompressionEstimate;
-use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::DescendantExclusion;
-use vortex_compressor::scheme::EstimateScore;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexResult;
 use vortex_fastlanes::Delta;
@@ -27,18 +25,29 @@ use vortex_fastlanes::Delta;
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
-use crate::GenerateStatsOptions;
 use crate::Scheme;
 use crate::SchemeExt;
+use crate::schemes::integer::delta_stats::delta_stats;
 
 /// FastLanes Delta encoding for smooth / near-monotone integers.
 ///
-/// Delta replaces each value with its difference from an earlier value (at the FastLanes lane
-/// stride), so a later cascade layer (FoR / BitPacking) packs the smaller residuals. It only
-/// pays off when those residuals span meaningfully fewer bits than the values themselves.
+/// Delta replaces each value with its difference from the preceding value, so a later cascade
+/// layer (FoR / ZigZag / BitPacking) packs the smaller residuals. It only pays off when those
+/// residuals span meaningfully fewer bits than the values themselves.
+///
+/// Selection is driven by [`DeltaStats`], a sampled statistic: the residual widths are a local
+/// property of the data, so a few short contiguous runs describe them as accurately as the whole
+/// array does, at a cost that does not grow with array length.
 ///
 /// The minimum penalized compression ratio required for Delta to be selected is configurable via
-/// [`DeltaScheme::new`]; [`DeltaScheme::default`] uses a ratio of `1.25`.
+/// [`DeltaScheme::new`]; [`DeltaScheme::default`] uses a ratio of `1.05`.
+///
+/// There is deliberately no delta-of-delta scheme: the layer below Delta is FoR (or ZigZag) plus
+/// BitPacking, which already subtracts the mean rate, so a second Delta layer only doubles the
+/// span of what is left while adding another bit per value of bases. Across 1966 real
+/// (column, block) pairs it never once came out ahead - see `scripts/delta-analysis/README.md`.
+///
+/// [`DeltaStats`]: super::DeltaStats
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct DeltaScheme {
     min_ratio: f64,
@@ -48,7 +57,7 @@ impl DeltaScheme {
     /// Creates a Delta scheme requiring `min_ratio` after the delta penalty before it wins.
     ///
     /// Pass a higher ratio to make Delta more conservative, or a lower one to select it more
-    /// eagerly. [`DeltaScheme::default`] uses a ratio of `1.25`.
+    /// eagerly. [`DeltaScheme::default`] uses a ratio of `1.05`.
     pub const fn new(min_ratio: f64) -> Self {
         Self { min_ratio }
     }
@@ -56,17 +65,24 @@ impl DeltaScheme {
 
 impl Default for DeltaScheme {
     fn default() -> Self {
-        Self::new(1.25)
+        Self::new(1.05)
     }
 }
 
 /// Multiplicative penalty applied to Delta's estimated compression ratio.
 ///
-/// Unlike FoR/BitPacking, Delta breaks random access and adds a prefix-sum decode pass, and it
-/// carries a structural sign bit on its residuals. We therefore require Delta to be meaningfully
-/// (~5%) smaller than the best alternative before it wins, rather than picking it for a
-/// single-bit gain. This factor encodes that "delta tax".
-const DELTA_PENALTY: f64 = 0.95;
+/// Unlike FoR/BitPacking, Delta breaks random access and adds a prefix-sum decode pass, so we
+/// require it to be slightly smaller than the best alternative rather than picking it for a
+/// single-bit gain. The structural costs Delta pays - the bases and the residual sign bit - are
+/// charged directly to the estimate instead, so this factor is only the "random access tax".
+const DELTA_PENALTY: f64 = 0.98;
+
+/// Bits per value that Delta's bases cost.
+///
+/// FastLanes stores `1024 / T` bases of `T` bits for every 1024 values, which is exactly one bit
+/// per value, whatever the type. The bases are themselves compressed by the cascade, so this is
+/// an upper bound.
+const BASE_BITS_PER_VALUE: f64 = 1.0;
 
 /// Minimum length before Delta is worth considering (one FastLanes chunk).
 const MIN_DELTA_LEN: usize = 1024;
@@ -124,7 +140,7 @@ impl Scheme for DeltaScheme {
         &self,
         data: &ArrayAndStats,
         compress_ctx: CompressorContext,
-        _exec_ctx: &mut ExecutionCtx,
+        exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
         // Delta only pays off if a later cascade layer (FoR/BitPacking) packs the residuals.
         if compress_ctx.finished_cascading() {
@@ -135,43 +151,23 @@ impl Scheme for DeltaScheme {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
-        // Estimating Delta needs the real transposed-delta span, so defer to a callback that
-        // delta-encodes the array and measures the residual range.
-        let min_ratio = self.min_ratio;
-        CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
-            move |_compressor, data, best_so_far, _ctx, exec_ctx| {
-                let primitive = data.array().clone().execute::<PrimitiveArray>(exec_ctx)?;
-                let full_width = primitive.ptype().bit_width() as f64;
+        let primitive = data.array_as_primitive();
+        let full_width = primitive.ptype().bit_width() as f64;
 
-                // Delta's best case is residuals collapsing to a single bit. If even that, after
-                // the penalty, can't beat the incumbent, skip before doing the encode work.
-                let threshold = best_so_far.and_then(EstimateScore::finite_ratio);
-                if threshold.is_some_and(|t| full_width * DELTA_PENALTY <= t) {
-                    return Ok(EstimateVerdict::Skip);
-                }
+        let stats = delta_stats(data, exec_ctx);
 
-                // Measure the actual FastLanes transposed-delta span. This is the lane-stride
-                // difference that gets bit-packed, not the lag-1 difference (which the transpose
-                // makes optimistic), so it is what truly drives the compressed size.
-                let (_bases, deltas) = vortex_fastlanes::delta_compress(&primitive, exec_ctx)?;
-                let delta_stats =
-                    ArrayAndStats::new(deltas.into_array(), GenerateStatsOptions::default());
-                let span = delta_stats.integer_stats(exec_ctx).erased().max_minus_min();
+        // Constant deltas are an arithmetic sequence, which SequenceScheme stores in O(1).
+        if stats.is_constant_delta() {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
 
-                // Bits needed to FoR-pack the residuals. A zero span means constant deltas, which
-                // SequenceScheme already captures more cheaply, so defer to it.
-                let delta_bits = match span.checked_ilog2() {
-                    Some(l) => (l + 1) as f64,
-                    None => return Ok(EstimateVerdict::Skip),
-                };
-
-                let ratio = full_width / delta_bits * DELTA_PENALTY;
-                if ratio <= min_ratio {
-                    return Ok(EstimateVerdict::Skip);
-                }
-                Ok(EstimateVerdict::Ratio(ratio))
-            },
-        )))
+        // The residuals are packed by the layer below, and the bases cost one bit per value.
+        let cost = stats.delta_bits_per_value() + BASE_BITS_PER_VALUE;
+        let ratio = full_width / cost * DELTA_PENALTY;
+        if ratio <= self.min_ratio {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+        CompressionEstimate::Verdict(EstimateVerdict::Ratio(ratio))
     }
 
     fn compress(
