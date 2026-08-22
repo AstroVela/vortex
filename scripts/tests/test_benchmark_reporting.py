@@ -7,6 +7,7 @@ import math
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pandas as pd
 
@@ -15,7 +16,7 @@ COMPARE_SCRIPT = REPO_ROOT / "scripts" / "compare-benchmark-jsons.py"
 CAPTURE_SCRIPT = REPO_ROOT / "scripts" / "capture-file-sizes.py"
 
 
-def load_compare_module():
+def load_compare_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("compare_benchmark_jsons", COMPARE_SCRIPT)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
