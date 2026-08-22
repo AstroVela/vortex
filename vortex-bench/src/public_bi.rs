@@ -184,6 +184,12 @@ pub struct Table {
     data_url: Url,
 }
 
+impl Table {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 impl PBIBenchmark {
     /// Parse the sql files under the queries folder and return their contents with the query idx.
     pub fn queries(&self) -> anyhow::Result<Vec<(usize, String)>> {
@@ -210,7 +216,7 @@ impl PBIBenchmark {
     }
 
     /// Return table name and Url pairs. Each Url is pointing to a csv.bz2 file for the table.
-    fn tables(&self) -> anyhow::Result<Vec<Table>> {
+    pub fn tables(&self) -> anyhow::Result<Vec<Table>> {
         fs::read_to_string(self.base_path.join("data-urls.txt"))?
             .lines()
             .map(|url_str| {
@@ -325,6 +331,40 @@ impl PBIData {
             .iter()
             .map(|table| self.get_file_path(&table.name, file_type))
             .collect()
+    }
+
+    /// Materialise a single table as Parquet, fetching only that table's data.
+    ///
+    /// [`Self::write_as_parquet`] downloads, decompresses and converts every table in the
+    /// dataset at once. That is fine for the query benchmarks, which need the whole schema
+    /// resident, but the compression suite measures one table at a time and cannot afford to
+    /// hold 68 decompressed CSVs (MLB) on disk to benchmark one of them. This fetches exactly
+    /// the requested table and leaves the rest alone.
+    pub async fn write_table_as_parquet(&self, table: &Table) -> anyhow::Result<PathBuf> {
+        let bzipped = self.get_file_path(&table.name, FileType::CsvBzip2);
+        let csv = self.get_file_path(&table.name, FileType::Csv);
+        let parquet = self.get_file_path(&table.name, FileType::Parquet);
+
+        if !parquet.exists() {
+            download_many([(bzipped.clone(), table.data_url.as_str().to_owned())]).await?;
+            let csv_for_task = csv.clone();
+            tokio::task::spawn_blocking(move || decompress_bz2(bzipped, csv_for_task))
+                .await
+                .map_err(|e| anyhow!("Failed to spawn decompression task: {e}"))??;
+        }
+
+        let parquet_file = idempotent_async(&parquet, async |output_path| {
+            info!("Compressing {} to parquet", csv.display());
+            public_bi_csv_to_parquet_file(table, csv.clone(), &output_path).await
+        })
+        .await?;
+        let pq_size = parquet_file.metadata()?.len();
+        info!(
+            "Parquet size: {}, {}B",
+            format_size(pq_size, DECIMAL),
+            pq_size
+        );
+        Ok(parquet_file)
     }
 
     pub async fn write_as_parquet(&self) -> anyhow::Result<()> {
@@ -491,6 +531,132 @@ impl Dataset for PBIBenchmark {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("must have at least one parquet file"))
+    }
+}
+
+/// One table of one Public BI dataset, benchmarked on its own.
+///
+/// [`PBIBenchmark`]'s own [`Dataset`] impl converts every table in the dataset and then
+/// benchmarks only the first one, so a multi-table dataset silently reports numbers for
+/// `<name>_1` alone — 2 of CMSprovider's tables become 1, and 68 of MLB's become 1. Each
+/// table has its own schema, so they cannot be concatenated into one array; the fix is to
+/// treat each table as its own benchmark entry.
+#[derive(Clone, Debug)]
+pub struct PBITable {
+    dataset: PBIDataset,
+    /// The table's own name, as it appears in `data-urls.txt` (e.g. `CMSprovider_2`).
+    table_name: String,
+    /// The benchmark name reported for this entry.
+    ///
+    /// Single-table datasets keep the bare dataset name so their recorded history carries
+    /// over; multi-table datasets are qualified as `<Dataset>/<table>`.
+    name: String,
+}
+
+impl PBITable {
+    pub fn dataset(&self) -> PBIDataset {
+        self.dataset
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Resolve this entry back to its [`Table`] definition.
+    fn table(&self) -> anyhow::Result<(PBIData, Table)> {
+        let data = PBI_DATASETS.get(self.dataset).dataset()?;
+        let index = data
+            .tables
+            .iter()
+            .position(|t| t.name == self.table_name)
+            .ok_or_else(|| anyhow!("table {} vanished from {:?}", self.table_name, self.dataset))?;
+        let mut data = data;
+        let table = data.tables.swap_remove(index);
+        Ok((data, table))
+    }
+}
+
+#[async_trait]
+impl Dataset for PBITable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn v3_dataset_dims(&self) -> (&str, Option<&str>) {
+        (&self.name, None)
+    }
+
+    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> anyhow::Result<ArrayRef> {
+        let (data, table) = self.table()?;
+        data.write_table_as_parquet(&table).await?;
+        let parquet = data.get_file_path(&table.name, FileType::Parquet);
+        let vortex = data.get_file_path(&table.name, FileType::Vortex);
+        let chunks = parquet_to_vortex_chunks(parquet).await?;
+        let vortex_file = idempotent_async(&vortex, async |output_path| -> anyhow::Result<()> {
+            SESSION
+                .write_options()
+                .write(
+                    &mut File::create(output_path).await?,
+                    chunks.into_array().to_array_stream(),
+                )
+                .await?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(SESSION
+            .open_options()
+            .open_path(vortex_file.as_path())
+            .await?
+            .scan()?
+            .into_array_stream()?
+            .read_all()
+            .await?)
+    }
+
+    async fn to_parquet_path(&self) -> anyhow::Result<PathBuf> {
+        let (data, table) = self.table()?;
+        data.write_table_as_parquet(&table).await
+    }
+}
+
+impl PBIDatasets {
+    /// Every table of every Public BI dataset, as its own benchmark entry.
+    ///
+    /// Ordered by dataset then by the order tables appear in `data-urls.txt`, so a run is
+    /// reproducible and resumable (`PBIDatasets` is backed by a `HashMap`, whose iteration
+    /// order is not).
+    pub fn all_tables(&self) -> anyhow::Result<Vec<PBITable>> {
+        let mut names: Vec<&PBIBenchmark> = self.benchmarks.values().collect();
+        names.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut tables = Vec::new();
+        for benchmark in names {
+            tables.extend(benchmark.own_tables()?);
+        }
+        Ok(tables)
+    }
+}
+
+impl PBIBenchmark {
+    /// This dataset's tables, as individual benchmark entries.
+    pub fn own_tables(&self) -> anyhow::Result<Vec<PBITable>> {
+        let dataset = <PBIDataset as ValueEnum>::from_str(self.name.trim(), true)
+            .map_err(|e| anyhow!("unsupported dataset {}: {e}", self.name))?;
+        let tables = self.tables()?;
+        let qualify = tables.len() > 1;
+        Ok(tables
+            .into_iter()
+            .map(|table| PBITable {
+                dataset,
+                name: if qualify {
+                    format!("{}/{}", self.name, table.name)
+                } else {
+                    self.name.clone()
+                },
+                table_name: table.name,
+            })
+            .collect())
     }
 }
 

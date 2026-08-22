@@ -42,12 +42,14 @@ use vortex_bench::display::render_table;
 use vortex_bench::downloadable_dataset::DownloadableDataset;
 use vortex_bench::measurements::CustomUnitMeasurement;
 use vortex_bench::public_bi::PBI_DATASETS;
+use vortex_bench::public_bi::PBIDataset;
 use vortex_bench::public_bi::PBIDataset::Arade;
 use vortex_bench::public_bi::PBIDataset::Bimbo;
 use vortex_bench::public_bi::PBIDataset::CMSprovider;
 use vortex_bench::public_bi::PBIDataset::Euro2016;
 use vortex_bench::public_bi::PBIDataset::Food;
 use vortex_bench::public_bi::PBIDataset::HashTags;
+use vortex_bench::public_bi::PBITable;
 use vortex_bench::setup_logging_and_tracing_with_format;
 use vortex_bench::v3;
 
@@ -73,6 +75,13 @@ struct Args {
     ops: Vec<CompressOp>,
     #[arg(long)]
     datasets: Option<String>,
+    /// Benchmark every table of every Public BI dataset instead of the curated subset.
+    ///
+    /// 206 tables across 46 datasets, several of which are far larger than anything in the
+    /// default suite. Both compressors buffer the whole table in memory, so pair this with
+    /// `--datasets` and a driver that reclaims `vortex-bench/data` between tables.
+    #[arg(long, default_value_t = false)]
+    pbi_all_tables: bool,
     /// Print the dataset names that would run, one per line, and exit.
     /// Knowledge of datasets lies only in this binary so we need
     /// orchestrator to know whan queries to run one by one.
@@ -152,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
         formats,
         ops,
         mode,
+        args.pbi_all_tables,
         args.print_datasets,
         args.display_format,
         args.output_path,
@@ -212,6 +222,7 @@ async fn run_compress(
     formats: Vec<Format>,
     ops: Vec<CompressOp>,
     mode: BenchMode,
+    pbi_all_tables: bool,
     print_datasets: bool,
     display_format: DisplayFormat,
     output_path: Option<PathBuf>,
@@ -253,37 +264,54 @@ async fn run_compress(
     // - `CMSprovider`: `expected host buffer` — a CPU fallback is reached with device-resident
     //   buffers, which `CudaArrayExt::execute_cuda` refuses.
     // - `StructListOfInts`: its list layouts have no verified CUDA decode path.
-    let gpu_datasets: [&dyn Dataset; 4] = [
-        &TPCHLCommentCanonical as &dyn Dataset,
-        &TPCHLCommentChunked,
-        PBI_DATASETS.get(Bimbo),
-        PBI_DATASETS.get(Food),
-    ];
-
-    let all_datasets: Vec<&dyn Dataset> = [
-        &TaxiData as &dyn Dataset,
-        PBI_DATASETS.get(Arade),
-        PBI_DATASETS.get(Bimbo),
-        PBI_DATASETS.get(CMSprovider),
+    // Public BI entries are per *table*, not per dataset: each table in a dataset has its own
+    // schema, and the dataset-level `Dataset` impl converted them all and then benchmarked only
+    // the first — so CMSprovider reported for `CMSprovider_1` alone.
+    let pbi_tables: Vec<PBITable> = if pbi_all_tables {
+        PBI_DATASETS.all_tables()?
+    } else {
         // Corporations, // duckdb thinks ' is a quote character but its used as an apostrophe
         // CityMaxCapita, // 11th column has F, M, and U but is inferred as boolean
-        PBI_DATASETS.get(Euro2016),
-        PBI_DATASETS.get(Food),
-        PBI_DATASETS.get(HashTags),
         // Hatred, // panic in fsst_compress_iter
         // TableroSistemaPenal, // Unexpected type error
         // YaleLanguages, // 4th column looks like integer but also contains Y
-        &TPCHLCommentChunked,
-        &TPCHLCommentCanonical,
-        &DownloadableDataset::RPlace,
-        &DownloadableDataset::AirQuality,
-    ]
-    .into_iter()
-    .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
-    .collect();
+        [Arade, Bimbo, CMSprovider, Euro2016, Food, HashTags]
+            .into_iter()
+            .map(|d| PBI_DATASETS.get(d).own_tables())
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    let pbi_table = |dataset: PBIDataset| -> Vec<&dyn Dataset> {
+        pbi_tables
+            .iter()
+            .filter(|t| t.dataset() == dataset)
+            .map(|t| t as &dyn Dataset)
+            .collect()
+    };
+
+    let gpu_datasets: Vec<&dyn Dataset> = [&TPCHLCommentCanonical as &dyn Dataset]
+        .into_iter()
+        .chain([&TPCHLCommentChunked as &dyn Dataset])
+        .chain(pbi_table(Bimbo))
+        .chain(pbi_table(Food))
+        .collect();
+
+    let all_datasets: Vec<&dyn Dataset> = [&TaxiData as &dyn Dataset]
+        .into_iter()
+        .chain(pbi_tables.iter().map(|t| t as &dyn Dataset))
+        .chain([
+            &TPCHLCommentChunked as &dyn Dataset,
+            &TPCHLCommentCanonical,
+            &DownloadableDataset::RPlace,
+            &DownloadableDataset::AirQuality,
+        ])
+        .chain(structlistofints.iter().map(|d| d as &dyn Dataset))
+        .collect();
 
     let datasets: Vec<&dyn Dataset> = if mode.is_gpu() {
-        gpu_datasets.to_vec()
+        gpu_datasets
     } else {
         all_datasets
     }

@@ -6,6 +6,22 @@ versus Parquet (and optionally Lance) across a range of datasets: NYC taxi data,
 CMSprovider, Euro2016, Food, HashTags), TPC-H `l_comment` variants, and synthetic nested
 data. This is the workload behind the `Compression` PR comment.
 
+## Public BI granularity
+
+Public BI entries are per **table**, not per dataset. Every table in a Public BI dataset has
+its own schema, so they cannot be concatenated into one array; the dataset-level `Dataset`
+impl converted all of them and then benchmarked only the first, which silently reported
+`CMSprovider_1` alone as `CMSprovider`. Single-table datasets keep their bare name (`Arade`,
+`Bimbo`, ...) so their recorded history carries over; multi-table datasets are reported as
+`<Dataset>/<table>`, so `CMSprovider` is now `CMSprovider/CMSprovider_1` and
+`CMSprovider/CMSprovider_2`.
+
+`--pbi-all-tables` swaps the curated subset for all 206 tables across all 46 Public BI
+datasets. It is not for CI: both compressors buffer the whole table in memory, and every
+intermediate (`.csv.bz2`, `.csv`, `.parquet`, `.vortex`) lands under `vortex-bench/data`.
+Drive it one table at a time with `--datasets` and reclaim `vortex-bench/data` between
+tables.
+
 See [`src/main.rs`](./src/main.rs) for the dataset list and CLI flags (`--formats`,
 `--datasets`, `--ops compress,decompress`).
 
