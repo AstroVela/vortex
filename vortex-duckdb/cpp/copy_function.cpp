@@ -80,9 +80,6 @@ void copy_to_sink(ExecutionContext &,
     }
 }
 
-// Called before the write (right after global init) when the plan requests
-// WRITTEN_FILE_STATISTICS. We stash the target struct and fill it at finalize, once the
-// footer statistics exist - mirroring the parquet writer's store-pointer-then-fill pattern.
 void copy_to_get_written_statistics(ClientContext &,
                                     FunctionData &,
                                     GlobalFunctionData &gstate,
@@ -102,8 +99,6 @@ void copy_to_finalize(ClientContext &, FunctionData &bind_data, GlobalFunctionDa
     if (!global.written_stats) {
         return;
     }
-    // Fill the statistics captured in copy_to_get_written_statistics from the finished write's
-    // footer. min/max come back as owned duckdb values; DuckLake expects their string form.
     auto &names = bind_data.Cast<VortexCopyBindData>().column_names;
     duckdb_vx_written_file_statistics file_stats;
     if (!duckdb_copy_function_get_written_file_statistics(ffi_global, &file_stats)) {
@@ -111,21 +106,26 @@ void copy_to_finalize(ClientContext &, FunctionData &bind_data, GlobalFunctionDa
         // that is an internal inconsistency, not a silently empty result.
         throw InternalException("vortex COPY: written statistics were requested but not produced");
     }
+    if (file_stats.num_columns != names.size()) {
+        throw InternalException("vortex COPY: %llu statistics columns for %llu written columns",
+                                file_stats.num_columns,
+                                names.size());
+    }
+    D_ASSERT(global.written_stats != nullptr);
     global.written_stats->row_count = file_stats.row_count;
     global.written_stats->file_size_bytes = file_stats.file_size_bytes;
     global.written_stats->footer_size_bytes = Value::UBIGINT(file_stats.footer_size_bytes);
     // Keyed by top-level column name only. The vortex footer reports one statistics set per
     // top-level field, so nested struct/list leaf columns get no statistics here (unlike parquet,
     // which recurses to leaf paths). Flat tables are fully covered.
-    for (idx_t i = 0; i < file_stats.num_columns && i < names.size(); i++) {
+    for (idx_t i = 0; i < file_stats.num_columns; i++) {
         duckdb_vx_written_column_statistics col_stats {};
         duckdb_vx_error col_error = nullptr;
         if (!duckdb_copy_function_get_written_column_statistics(ffi_global, i, &col_stats, &col_error)) {
             if (col_error) {
                 throw ExecutorException(IntoErrString(col_error));
             }
-            // No statistics for this column (e.g. a type without min/max); skip it.
-            continue;
+            throw InternalException("vortex COPY: no statistics for column %llu after finalize", i);
         }
         case_insensitive_map_t<Value> column;
         column["num_values"] = Value::UBIGINT(col_stats.num_values);

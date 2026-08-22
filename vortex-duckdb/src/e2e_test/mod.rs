@@ -2,8 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #[cfg(test)]
-mod copy_statistics_test;
-#[cfg(test)]
 mod spatial_pushdown_test;
 #[cfg(test)]
 mod vortex_scan_test;

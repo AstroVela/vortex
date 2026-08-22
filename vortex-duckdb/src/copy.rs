@@ -54,9 +54,8 @@ pub struct CopyFunctionBind {
 }
 assert_impl_all!(CopyFunctionBind: Send, Clone);
 
-/// Captured in `copy_to_finalize` and read back by the WRITTEN_FILE_STATISTICS path. The per-column
-/// compressed sizes are computed once here rather than per column, since DuckDB queries statistics
-/// one column at a time.
+/// The per-column compressed sizes are computed once here rather than per column, since DuckDB
+/// queries statistics one column at a time.
 struct FinishedWrite {
     summary: WriteSummary,
     column_sizes: Vec<u64>,
@@ -197,7 +196,7 @@ pub(crate) fn written_file_stats(global: &CopyFunctionGlobal) -> Option<WrittenF
 }
 
 /// Read per-column statistics for `column_index` from the finished write. `Ok(None)` if the file is
-/// not finalized or the column has no statistics; `Err` if a scalar could not be converted.
+/// not finalized.
 pub(crate) fn written_column_stats(
     global: &CopyFunctionGlobal,
     column_index: usize,
@@ -206,7 +205,7 @@ pub(crate) fn written_column_stats(
     let Some(finished) = guard.as_ref() else {
         return Ok(None);
     };
-    column_stats_from_summary(&finished.summary, column_index, &finished.column_sizes)
+    column_stats_from_summary(&finished.summary, column_index, &finished.column_sizes).map(Some)
 }
 
 fn file_stats_from_summary(summary: &WriteSummary) -> WrittenFileStats {
@@ -233,18 +232,22 @@ fn column_stats_from_summary(
     summary: &WriteSummary,
     column_index: usize,
     column_sizes: &[u64],
-) -> VortexResult<Option<WrittenColumnStats>> {
-    let Some(file_stats) = summary.footer().statistics() else {
-        return Ok(None);
-    };
+) -> VortexResult<WrittenColumnStats> {
+    let file_stats = summary
+        .footer()
+        .statistics()
+        .ok_or_else(|| vortex_err!("written file has no statistics"))?;
     let stats_sets = file_stats.stats_sets();
     if column_index >= stats_sets.len() {
-        return Ok(None);
+        vortex_bail!(
+            "column index {column_index} out of range for {} statistics sets",
+            stats_sets.len()
+        );
     }
     let stats = &stats_sets[column_index];
     let dtype = &file_stats.dtypes()[column_index];
 
-    Ok(Some(WrittenColumnStats {
+    Ok(WrittenColumnStats {
         min: exact_scalar_to_duckdb(stats.get(Stat::Min), dtype)?,
         max: exact_scalar_to_duckdb(stats.get(Stat::Max), dtype)?,
         null_count: exact_u64(stats.get(Stat::NullCount)),
@@ -253,7 +256,7 @@ fn column_stats_from_summary(
         num_values: summary.row_count(),
         // On-disk compressed size; excludes bytes not attributable to a column (e.g. struct validity).
         column_size_bytes: column_sizes.get(column_index).copied(),
-    }))
+    })
 }
 
 /// Convert an exact scalar statistic to a DuckDB value, propagating a conversion failure rather than
@@ -323,4 +326,45 @@ pub fn copy_to_initialize_global(
         finished: Mutex::new(None),
         sink: Some(sink),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex::array::IntoArray;
+    use vortex::array::arrays::StructArray;
+    use vortex::array::stats::PRUNING_STATS;
+    use vortex::buffer::ByteBufferMut;
+    use vortex::buffer::buffer;
+
+    use super::*;
+
+    /// Writes a one-column file and returns its summary, with `file_statistics` controlling which
+    /// statistics the footer carries (empty means none at all).
+    fn write_summary(file_statistics: Vec<Stat>) -> WriteSummary {
+        RUNTIME.block_on(async {
+            let array = StructArray::from_fields(&[("i", buffer![1u32, 2, 3].into_array())])
+                .unwrap()
+                .into_array();
+            let mut buf = ByteBufferMut::empty();
+            let mut writer = SESSION
+                .write_options()
+                .with_file_statistics(file_statistics)
+                .writer(&mut buf, array.dtype().clone());
+            writer.push(array).await.unwrap();
+            writer.finish().await.unwrap()
+        })
+    }
+
+    #[test]
+    fn column_stats_out_of_range_is_an_error() {
+        let summary = write_summary(PRUNING_STATS.to_vec());
+        assert!(column_stats_from_summary(&summary, 0, &[]).is_ok());
+        assert!(column_stats_from_summary(&summary, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn column_stats_without_file_statistics_is_an_error() {
+        let summary = write_summary(vec![]);
+        assert!(column_stats_from_summary(&summary, 0, &[]).is_err());
+    }
 }

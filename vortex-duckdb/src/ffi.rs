@@ -410,8 +410,6 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_flush_batch(
     try_or(error, || flush_batch(global, batch))
 }
 
-/// Fill file-level statistics of the just-written Vortex file. Returns `false` if the
-/// file has not been finalized (no statistics available), leaving `out` untouched.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_file_statistics(
     global_data: *const c_void,
@@ -430,9 +428,6 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_file_statistics
     true
 }
 
-/// Fill per-column statistics for `column_index` of the just-written Vortex file.
-/// `min`/`max` are owned duckdb values the caller must destroy. Returns `false` if
-/// no statistics are available for that column.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_column_statistics(
     global_data: *const c_void,
@@ -442,8 +437,6 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_column_statisti
 ) -> bool {
     let global_data = unsafe { global_data.cast::<CopyFunctionGlobal>().as_ref() }
         .vortex_expect("global_data null pointer");
-    // Converting a Vortex scalar to a DuckDB value can fail; surface it through error_out like the
-    // rest of ffi.rs rather than swallowing it as "no statistics".
     try_or(error_out, || {
         let Some(stats) = written_column_stats(global_data, column_index)? else {
             return Ok(false);

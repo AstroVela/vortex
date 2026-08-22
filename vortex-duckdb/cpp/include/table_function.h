@@ -60,9 +60,9 @@ typedef struct {
     uint64_t num_columns;
 } duckdb_vx_written_file_statistics;
 
-// Per-column statistics of a written Vortex file. `min`/`max` are owned
-// duckdb_value handles (null if absent) that the caller must destroy.
+// Per-column statistics of a written Vortex file.
 typedef struct {
+    // Owned values, null if absent; the caller must destroy them.
     duckdb_value min;
     duckdb_value max;
     bool has_null_count;
