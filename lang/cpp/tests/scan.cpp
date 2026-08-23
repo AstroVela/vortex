@@ -66,16 +66,16 @@ void verify_age_field(const Session &session,
 void verify_sample_array(const Session &session, const Array &array) {
     REQUIRE(array.size() == SAMPLE_ROWS);
     REQUIRE(array.has_dtype(DataTypeVariant::Struct));
-    verify_age_field(session, array.field(0));
+    verify_age_field(session, array.field(session, 0));
 
-    Array height = array.field(1);
+    Array height = array.field(session, 1);
     REQUIRE(height.is_primitive(U16));
     auto view = height.values<uint16_t>(session);
     for (size_t i = 0; i < SAMPLE_ROWS; ++i) {
         REQUIRE(view.values()[i] == (i + 1) % 200);
     }
 
-    REQUIRE_THROWS_AS(array.field(2), VortexException);
+    REQUIRE_THROWS_AS(array.field(session, 2), VortexException);
 }
 
 TEST_CASE("Basic scan", "[scan]") {
@@ -225,7 +225,7 @@ TEST_CASE("Project multiple fields", "[projection]") {
     REQUIRE(partition.has_value());
     auto array = partition->next();
     REQUIRE(array.has_value());
-    verify_age_field(session, array->field("age"));
+    verify_age_field(session, array->field(session, "age"));
 }
 
 TEST_CASE("Filter age", "[filter]") {
@@ -243,7 +243,7 @@ TEST_CASE("Filter age", "[filter]") {
     REQUIRE(array.has_value());
 
     REQUIRE(array->size() == SAMPLE_ROWS - threshold);
-    verify_age_field(session, array->field(0), threshold, SAMPLE_ROWS - threshold);
+    verify_age_field(session, array->field(session, 0), threshold, SAMPLE_ROWS - threshold);
 }
 
 TEST_CASE("Filter invalid values", "[filter]") {
@@ -310,7 +310,7 @@ TEST_CASE("Row range and limit", "[scan]") {
     REQUIRE(array.has_value());
 
     REQUIRE(array->size() == 5);
-    verify_age_field(session, array->field(0), 10, 5);
+    verify_age_field(session, array->field(session, 0), 10, 5);
 }
 
 TEST_CASE("Selection", "[scan]") {
@@ -328,7 +328,7 @@ TEST_CASE("Selection", "[scan]") {
     REQUIRE(array.has_value());
     REQUIRE(array->size() == 3);
 
-    auto ages = array->field(0).values<uint8_t>(session);
+    auto ages = array->field(session, 0).values<uint8_t>(session);
     REQUIRE(ages.values()[0] == 3);
     REQUIRE(ages.values()[1] == 5);
     REQUIRE(ages.values()[2] == 8);
@@ -342,7 +342,7 @@ TEST_CASE("Selection", "[scan]") {
     REQUIRE(array.has_value());
     REQUIRE(array->size() == 97);
 
-    ages = array->field(0).values<uint8_t>(session);
+    ages = array->field(session, 0).values<uint8_t>(session);
     REQUIRE(ages.values()[0] == 3);
 }
 } // namespace
