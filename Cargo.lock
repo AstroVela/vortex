@@ -10517,6 +10517,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "codspeed-divan-compat",
  "mimalloc",
+ "num-traits",
  "rand 0.10.2",
  "rstest",
  "smallvec",
