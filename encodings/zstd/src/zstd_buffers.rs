@@ -542,6 +542,7 @@ impl ValidityVTable<ZstdBuffers> for ZstdBuffers {
             return Ok(Validity::NonNullable);
         }
 
+        // TODO(ctx): trait fixes - ValidityVTable::validity has a fixed signature.
         let inner_array = ZstdBuffers::decompress_and_build_inner(
             &array.into_owned(),
             vortex_array::legacy_session(),

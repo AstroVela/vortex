@@ -3,6 +3,7 @@
 
 mod primitive;
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::cmp::Ordering::Equal;
 use std::cmp::Ordering::Greater;
@@ -16,8 +17,7 @@ pub use primitive::*;
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
-use crate::VortexSessionExecute;
-use crate::legacy_session;
+use crate::ExecutionCtx;
 use crate::scalar::Scalar;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -272,15 +272,25 @@ fn search_sorted_side_idx<F: FnMut(usize) -> VortexResult<Ordering>>(
     }
 }
 
-impl IndexOrd<Scalar> for ArrayRef {
-    #[allow(clippy::disallowed_methods)]
+/// A [`SearchSorted`] adapter over a sorted array, comparing elements as [`Scalar`]s using an
+/// explicit [`ExecutionCtx`].
+pub struct SearchSortedArray<'a>(&'a ArrayRef, RefCell<&'a mut ExecutionCtx>);
+
+impl<'a> SearchSortedArray<'a> {
+    /// Wraps `array` for searching with the given execution context.
+    pub fn new(array: &'a ArrayRef, ctx: &'a mut ExecutionCtx) -> Self {
+        Self(array, RefCell::new(ctx))
+    }
+}
+
+impl IndexOrd<Scalar> for SearchSortedArray<'_> {
     fn index_cmp(&self, idx: usize, elem: &Scalar) -> VortexResult<Option<Ordering>> {
-        let scalar_a = self.execute_scalar(idx, &mut legacy_session().create_execution_ctx())?;
+        let scalar_a = self.0.execute_scalar(idx, &mut self.1.borrow_mut())?;
         Ok(scalar_a.partial_cmp(elem))
     }
 
     fn index_len(&self) -> usize {
-        Self::len(self)
+        self.0.len()
     }
 }
 
