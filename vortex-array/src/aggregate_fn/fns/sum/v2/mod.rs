@@ -26,6 +26,8 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AggregateFnId;
+use crate::aggregate_fn::AggregateFnRef;
+use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
@@ -70,10 +72,10 @@ pub fn sum_v2(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> 
 #[derive(Clone, Debug)]
 pub struct SumV2;
 
-/// Field name of the accumulated sum in the partial struct.
-const SUM_FIELD: &str = "sum";
+/// Field name of the accumulated sum value in the partial struct.
+pub const SUM_V2_SUM: &str = "sum";
 /// Field name of the empty flag in the partial struct.
-const IS_EMPTY_FIELD: &str = "is_empty";
+pub const SUM_V2_IS_EMPTY: &str = "is_empty";
 
 impl AggregateFnVTable for SumV2 {
     type Options = NumericalAggregateOpts;
@@ -101,13 +103,40 @@ impl AggregateFnVTable for SumV2 {
         Sum.return_dtype(options, input_dtype)
     }
 
+    fn can_satisfy(
+        &self,
+        options: &Self::Options,
+        requested: &AggregateFnRef,
+    ) -> AggregateFnSatisfaction {
+        if requested
+            .as_opt::<Self>()
+            .is_some_and(|other| other == options)
+        {
+            return AggregateFnSatisfaction::Exact;
+        }
+
+        // The `sum` field of the stored partial carries exact `Sum` semantics: it is zero when
+        // no valid values were observed, and overflow surfaces as a null partial (and thus a
+        // null projected field). NaN handling must match for the two sums to agree. The
+        // converse does not hold: a stored `Sum` of zero cannot distinguish an all-null input
+        // from a genuine zero, so `Sum` keeps its default `No` for a requested `SumV2`.
+        if requested
+            .as_opt::<Sum>()
+            .is_some_and(|other| other == options)
+        {
+            return AggregateFnSatisfaction::Exact;
+        }
+
+        AggregateFnSatisfaction::No
+    }
+
     fn partial_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
         let sum_dtype = self.return_dtype(options, input_dtype)?;
         Some(DType::Struct(
             StructFields::new(
                 FieldNames::from_iter([
-                    FieldName::from(SUM_FIELD),
-                    FieldName::from(IS_EMPTY_FIELD),
+                    FieldName::from(SUM_V2_SUM),
+                    FieldName::from(SUM_V2_IS_EMPTY),
                 ]),
                 vec![
                     sum_dtype.as_nonnullable(),
@@ -151,8 +180,8 @@ impl AggregateFnVTable for SumV2 {
         }
         let other = other.as_struct();
         let is_empty = other
-            .field(IS_EMPTY_FIELD)
-            .ok_or_else(|| vortex_err!("SumV2 partial missing `{}` field", IS_EMPTY_FIELD))?
+            .field(SUM_V2_IS_EMPTY)
+            .ok_or_else(|| vortex_err!("SumV2 partial missing `{}` field", SUM_V2_IS_EMPTY))?
             .as_bool()
             .value()
             .vortex_expect("non-null partial has a non-null is_empty field");
@@ -161,8 +190,8 @@ impl AggregateFnVTable for SumV2 {
             return Ok(());
         }
         let value = other
-            .field(SUM_FIELD)
-            .ok_or_else(|| vortex_err!("SumV2 partial missing `{}` field", SUM_FIELD))?;
+            .field(SUM_V2_SUM)
+            .ok_or_else(|| vortex_err!("SumV2 partial missing `{}` field", SUM_V2_SUM))?;
         partial.is_empty = false;
         add_value(partial, &value);
         Ok(())
@@ -285,8 +314,8 @@ impl AggregateFnVTable for SumV2 {
     fn finalize(&self, states: ArrayRef) -> VortexResult<ArrayRef> {
         // A null partial (overflow or an invalid group) projects to a null sum directly; an
         // empty partial is masked out to null.
-        let sums = states.get_item(SUM_FIELD)?;
-        let non_empty = states.get_item(IS_EMPTY_FIELD)?.fill_null(true)?.not()?;
+        let sums = states.get_item(SUM_V2_SUM)?;
+        let non_empty = states.get_item(SUM_V2_IS_EMPTY)?.fill_null(true)?.not()?;
         sums.mask(non_empty)
     }
 

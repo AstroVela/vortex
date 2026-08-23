@@ -16,6 +16,10 @@ use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
 use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
+use vortex_array::aggregate_fn::fns::sum::SUM_V2_IS_EMPTY;
+use vortex_array::aggregate_fn::fns::sum::SUM_V2_SUM;
+use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::aggregate_fn::fns::sum::SumV2;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
@@ -24,8 +28,11 @@ use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
+use vortex_array::expr::fill_null;
 use vortex_array::expr::get_item;
 use vortex_array::expr::lit;
+use vortex_array::expr::mask;
+use vortex_array::expr::not;
 use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
 use vortex_array::scalar_fn::EmptyOptions;
@@ -246,6 +253,7 @@ impl ZoneMap {
         if self.array.unmasked_field_by_name_opt(&field_name).is_some() {
             return Some(aggregate_result_expr(
                 requested,
+                requested,
                 get_item(field_name, root()),
             ));
         }
@@ -259,10 +267,18 @@ impl ZoneMap {
 
             match stored.can_satisfy(requested) {
                 AggregateFnSatisfaction::Exact => {
-                    return Some(aggregate_result_expr(stored, get_item(field_name, root())));
+                    return Some(aggregate_result_expr(
+                        stored,
+                        requested,
+                        get_item(field_name, root()),
+                    ));
                 }
                 AggregateFnSatisfaction::Approximate => {
-                    approximate = Some(aggregate_result_expr(stored, get_item(field_name, root())));
+                    approximate = Some(aggregate_result_expr(
+                        stored,
+                        requested,
+                        get_item(field_name, root()),
+                    ));
                 }
                 AggregateFnSatisfaction::No => {}
             }
@@ -290,12 +306,32 @@ impl ZoneMap {
     }
 }
 
-fn aggregate_result_expr(stored: &AggregateFnRef, state_expr: Expression) -> Expression {
+/// Project a stored aggregate's state field into the result of the `requested` aggregate.
+///
+/// The `requested` aggregate is either `stored` itself or one that `stored` reported it can
+/// satisfy, and the projection may differ per request (e.g. a stored [`SumV2`] state answers
+/// both [`SumV2`] and [`Sum`] requests).
+fn aggregate_result_expr(
+    stored: &AggregateFnRef,
+    requested: &AggregateFnRef,
+    state_expr: Expression,
+) -> Expression {
     if stored.is::<BoundedMax>() {
-        get_item(BOUNDED_MAX_BOUND, state_expr)
-    } else {
-        state_expr
+        return get_item(BOUNDED_MAX_BOUND, state_expr);
     }
+    if stored.is::<SumV2>() {
+        let sum = get_item(SUM_V2_SUM, state_expr.clone());
+        if requested.is::<Sum>() {
+            // The `sum` field carries exact `Sum` semantics: it is zero when the zone has no
+            // valid values, and null (through the outer struct validity) on overflow.
+            return sum;
+        }
+        // Null out the sums of empty states; a null (overflowed) state projects to a null sum
+        // field as-is.
+        let is_empty = fill_null(get_item(SUM_V2_IS_EMPTY, state_expr), lit(true));
+        return mask(sum, not(is_empty));
+    }
+    state_expr
 }
 
 fn row_count_expr() -> Expression {
@@ -356,6 +392,10 @@ mod tests {
     use vortex_array::aggregate_fn::fns::min::Min;
     use vortex_array::aggregate_fn::fns::nan_count::NanCount;
     use vortex_array::aggregate_fn::fns::null_count::NullCount;
+    use vortex_array::aggregate_fn::fns::sum::SUM_V2_IS_EMPTY;
+    use vortex_array::aggregate_fn::fns::sum::SUM_V2_SUM;
+    use vortex_array::aggregate_fn::fns::sum::Sum;
+    use vortex_array::aggregate_fn::fns::sum::SumV2;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::StructArray;
@@ -531,6 +571,95 @@ mod tests {
             BoolArray::from_iter([false, true, true]),
             ctx
         );
+    }
+
+    #[test]
+    fn stored_sum_v2_satisfies_sum_requests() -> VortexResult<()> {
+        let sum_v2 = SumV2.bind(NumericalAggregateOpts::skip_nans());
+        let column_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+
+        // Zone 0 has values, zone 1 is all-null (an empty sum), zone 2 overflowed.
+        let states = StructArray::try_new(
+            [SUM_V2_SUM, SUM_V2_IS_EMPTY].into(),
+            vec![
+                PrimitiveArray::new(buffer![10i64, 0, 0], Validity::NonNullable).into_array(),
+                BoolArray::from_iter([false, true, false]).into_array(),
+            ],
+            3,
+            Validity::from_iter([true, true, false]),
+        )?;
+        let zone_map = ZoneMap::try_new(
+            column_dtype,
+            StructArray::from_fields(&[(sum_v2.to_string(), states.into_array())])?,
+            Arc::new([sum_v2.clone()]),
+            4,
+            10,
+        )?;
+        let ctx = &mut SESSION.create_execution_ctx();
+
+        // A requested `SumV2` projects the empty zone to null.
+        let expr = zone_map
+            .aggregate_field_expr(&sum_v2)
+            .expect("stored field answers its own request");
+        let result = zone_map
+            .array
+            .clone()
+            .into_array()
+            .apply_bound(&expr.bind(zone_map.array.dtype())?)?;
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(10i64), None, None]),
+            ctx
+        );
+
+        // A requested `Sum` with matching options is satisfied exactly by the stored `sum`
+        // field: zero for the empty zone, null only on overflow.
+        let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+        let expr = zone_map
+            .aggregate_field_expr(&sum)
+            .expect("satisfied by the stored SumV2 state");
+        let result = zone_map
+            .array
+            .clone()
+            .into_array()
+            .apply_bound(&expr.bind(zone_map.array.dtype())?)?;
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(10i64), Some(0i64), None]),
+            ctx
+        );
+
+        // NaN handling must match, and a stored `Sum` never answers a `SumV2` request.
+        assert!(
+            zone_map
+                .aggregate_field_expr(&Sum.bind(NumericalAggregateOpts::include_nans()))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stored_sum_does_not_satisfy_sum_v2_requests() -> VortexResult<()> {
+        let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+        let column_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+        let zone_map = ZoneMap::try_new(
+            column_dtype,
+            StructArray::from_fields(&[(
+                sum.to_string(),
+                PrimitiveArray::from_option_iter([Some(10i64), Some(0), None]).into_array(),
+            )])?,
+            Arc::new([sum]),
+            4,
+            10,
+        )?;
+
+        // A stored `Sum` of zero cannot distinguish an all-null zone from a genuine zero.
+        assert!(
+            zone_map
+                .aggregate_field_expr(&SumV2.bind(NumericalAggregateOpts::skip_nans()))
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

@@ -395,6 +395,47 @@ fn grouped_sum_v2_overflow_group_is_null() -> VortexResult<()> {
     Ok(())
 }
 
+// Satisfaction
+
+#[test]
+fn sum_v2_satisfies_sum_exactly() {
+    use crate::aggregate_fn::AggregateFnSatisfaction;
+    use crate::aggregate_fn::AggregateFnVTableExt;
+    use crate::aggregate_fn::fns::sum::Sum;
+
+    let stored = SumV2.bind(NumericalAggregateOpts::skip_nans());
+    assert_eq!(
+        stored.can_satisfy(&SumV2.bind(NumericalAggregateOpts::skip_nans())),
+        AggregateFnSatisfaction::Exact
+    );
+    // The stored partial's `sum` field carries exact `Sum` semantics.
+    assert_eq!(
+        stored.can_satisfy(&Sum.bind(NumericalAggregateOpts::skip_nans())),
+        AggregateFnSatisfaction::Exact
+    );
+    // NaN handling must match.
+    assert_eq!(
+        stored.can_satisfy(&Sum.bind(NumericalAggregateOpts::include_nans())),
+        AggregateFnSatisfaction::No
+    );
+    assert_eq!(
+        stored.can_satisfy(&SumV2.bind(NumericalAggregateOpts::include_nans())),
+        AggregateFnSatisfaction::No
+    );
+    // The converse never holds: a stored `Sum` of zero cannot distinguish an all-null input
+    // from a genuine zero.
+    assert_eq!(
+        Sum.bind(NumericalAggregateOpts::skip_nans())
+            .can_satisfy(&stored),
+        AggregateFnSatisfaction::No
+    );
+    assert_eq!(
+        Sum.bind(NumericalAggregateOpts::include_nans())
+            .can_satisfy(&stored),
+        AggregateFnSatisfaction::No
+    );
+}
+
 // Return dtypes
 
 #[test]

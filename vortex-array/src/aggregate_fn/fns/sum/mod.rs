@@ -8,6 +8,8 @@ mod grouped;
 mod primitive;
 mod v2;
 pub(crate) use grouped::PrimitiveGroupedSumEncodingKernel;
+pub use v2::SUM_V2_IS_EMPTY;
+pub use v2::SUM_V2_SUM;
 pub use v2::SumV2;
 pub use v2::sum_v2;
 use vortex_error::VortexExpect;
