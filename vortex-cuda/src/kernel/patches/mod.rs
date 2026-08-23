@@ -282,7 +282,7 @@ mod tests {
         .into_array()
         .execute::<vortex::array::Canonical>(&mut ctx)
         .unwrap()
-        .into_host()
+        .into_host(cuda_ctx.session())
         .await
         .unwrap()
         .into_primitive();

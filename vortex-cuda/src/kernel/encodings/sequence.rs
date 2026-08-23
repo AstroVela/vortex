@@ -139,7 +139,7 @@ mod tests {
             .execute(array.clone(), &mut cuda_ctx)
             .await
             .unwrap()
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await
             .unwrap()
             .into_array();

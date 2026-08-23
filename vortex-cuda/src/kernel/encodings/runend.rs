@@ -217,7 +217,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -246,7 +246,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -267,7 +267,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -293,7 +293,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -325,7 +325,7 @@ mod tests {
             .execute_cuda(&mut cuda_ctx)
             .await
             .vortex_expect("GPU/CPU fallback should succeed")
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 

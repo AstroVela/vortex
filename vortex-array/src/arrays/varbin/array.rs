@@ -14,6 +14,7 @@ use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::ArraySlots;
+use crate::ExecutionCtx;
 use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
@@ -333,8 +334,7 @@ pub trait VarBinArrayExt: VarBinArraySlotsExt {
         )
     }
 
-    #[allow(clippy::disallowed_methods)]
-    fn offset_at(&self, index: usize) -> usize {
+    fn offset_at(&self, index: usize, ctx: &mut ExecutionCtx) -> usize {
         assert!(
             index <= self.as_ref().len(),
             "Index {index} out of bounds 0..={}",
@@ -343,21 +343,21 @@ pub trait VarBinArrayExt: VarBinArraySlotsExt {
 
         (&self
             .offsets()
-            .execute_scalar(index, &mut legacy_session().create_execution_ctx())
+            .execute_scalar(index, ctx)
             .vortex_expect("offsets must support execute_scalar"))
             .try_into()
             .vortex_expect("Failed to convert offset to usize")
     }
 
-    fn bytes_at(&self, index: usize) -> ByteBuffer {
-        let start = self.offset_at(index);
-        let end = self.offset_at(index + 1);
+    fn bytes_at(&self, index: usize, ctx: &mut ExecutionCtx) -> ByteBuffer {
+        let start = self.offset_at(index, ctx);
+        let end = self.offset_at(index + 1, ctx);
         self.bytes().slice(start..end)
     }
 
-    fn sliced_bytes(&self) -> ByteBuffer {
-        let first_offset: usize = self.offset_at(0);
-        let last_offset = self.offset_at(self.as_ref().len());
+    fn sliced_bytes(&self, ctx: &mut ExecutionCtx) -> ByteBuffer {
+        let first_offset: usize = self.offset_at(0, ctx);
+        let last_offset = self.offset_at(self.as_ref().len(), ctx);
         self.bytes().slice(first_offset..last_offset)
     }
 }

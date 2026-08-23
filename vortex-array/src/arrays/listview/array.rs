@@ -368,8 +368,7 @@ pub trait ListViewArrayExt: ListViewArraySlotsExt {
         )
     }
 
-    #[allow(clippy::disallowed_methods)]
-    fn offset_at(&self, index: usize) -> usize {
+    fn offset_at(&self, index: usize, ctx: &mut ExecutionCtx) -> usize {
         assert!(
             index < self.as_ref().len(),
             "Index {index} out of bounds 0..{}",
@@ -380,7 +379,7 @@ pub trait ListViewArrayExt: ListViewArraySlotsExt {
             .map(|p| match_each_integer_ptype!(p.ptype(), |P| { p.as_slice::<P>()[index].as_() }))
             .unwrap_or_else(|| {
                 self.offsets()
-                    .execute_scalar(index, &mut legacy_session().create_execution_ctx())
+                    .execute_scalar(index, ctx)
                     .vortex_expect("offsets must support execute_scalar")
                     .as_primitive()
                     .as_::<usize>()
@@ -388,8 +387,7 @@ pub trait ListViewArrayExt: ListViewArraySlotsExt {
             })
     }
 
-    #[allow(clippy::disallowed_methods)]
-    fn size_at(&self, index: usize) -> usize {
+    fn size_at(&self, index: usize, ctx: &mut ExecutionCtx) -> usize {
         assert!(
             index < self.as_ref().len(),
             "Index {} out of bounds 0..{}",
@@ -401,7 +399,7 @@ pub trait ListViewArrayExt: ListViewArraySlotsExt {
             .map(|p| match_each_integer_ptype!(p.ptype(), |P| { p.as_slice::<P>()[index].as_() }))
             .unwrap_or_else(|| {
                 self.sizes()
-                    .execute_scalar(index, &mut legacy_session().create_execution_ctx())
+                    .execute_scalar(index, ctx)
                     .vortex_expect("sizes must support execute_scalar")
                     .as_primitive()
                     .as_::<usize>()
@@ -409,9 +407,9 @@ pub trait ListViewArrayExt: ListViewArraySlotsExt {
             })
     }
 
-    fn list_elements_at(&self, index: usize) -> VortexResult<ArrayRef> {
-        let offset = self.offset_at(index);
-        let size = self.size_at(index);
+    fn list_elements_at(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        let offset = self.offset_at(index, ctx);
+        let size = self.size_at(index, ctx);
         self.elements().slice(offset..offset + size)
     }
 
@@ -528,8 +526,8 @@ pub trait ListViewArrayExt: ListViewArraySlotsExt {
         );
 
         if self.is_zero_copy_to_list() {
-            let start = self.offset_at(0);
-            let end = self.offset_at(n_lists - 1) + self.size_at(n_lists - 1);
+            let start = self.offset_at(0, ctx);
+            let end = self.offset_at(n_lists - 1, ctx) + self.size_at(n_lists - 1, ctx);
             return Ok((start, end));
         }
 

@@ -429,7 +429,7 @@ mod tests {
         let actual = DictExecutor
             .execute(dict, &mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_bool();
 
@@ -897,9 +897,12 @@ mod tests {
     }
 
     /// Helper to copy a CUDA VarBinViewArray result to host memory.
-    async fn cuda_varbinview_to_host(vbv: VarBinViewArray) -> VortexResult<VarBinViewArray> {
+    async fn cuda_varbinview_to_host(
+        vbv: VarBinViewArray,
+        session: &vortex::session::VortexSession,
+    ) -> VortexResult<VarBinViewArray> {
         Ok(Canonical::VarBinView(vbv)
-            .into_host()
+            .into_host(session)
             .await?
             .into_varbinview())
     }
@@ -922,7 +925,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())
@@ -946,7 +949,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())
@@ -972,7 +975,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())
@@ -1001,7 +1004,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())
@@ -1025,7 +1028,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())
@@ -1050,7 +1053,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())
@@ -1082,7 +1085,7 @@ mod tests {
             .await
             .vortex_expect("GPU decompression failed")
             .into_varbinview();
-        let cuda_result = cuda_varbinview_to_host(cuda_result).await?;
+        let cuda_result = cuda_varbinview_to_host(cuda_result, cuda_ctx.session()).await?;
 
         assert_arrays_eq!(cuda_result.into_array(), dict_array, &mut ctx);
         Ok(())

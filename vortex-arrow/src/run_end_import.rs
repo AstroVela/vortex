@@ -23,6 +23,7 @@ impl<R: RunEndIndexType> FromArrowArray<&RunArray<R>> for RunEndData
 where
     R::Native: NativePType,
 {
+    // TODO(ctx): trait fixes - FromArrowArray::from_arrow has a fixed signature.
     #[allow(clippy::disallowed_methods)]
     fn from_arrow(array: &RunArray<R>, nullable: bool) -> VortexResult<Self> {
         let offset = array.run_ends().offset();

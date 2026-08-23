@@ -282,6 +282,7 @@ mod tests {
 
     #[test]
     fn arrow_map_import_sets_zero_copy_to_list() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
         let vortex_session = array_session();
         let session = vortex_session.arrow();
         let field = i32_utf8_map_field(false, false);
@@ -310,8 +311,8 @@ mod tests {
         let map = vortex.as_::<VortexMap>();
         let entries = map.entries().as_::<ListView>();
         assert!(entries.is_zero_copy_to_list());
-        assert_eq!(entries.offset_at(0), 1);
-        assert_eq!(entries.offset_at(1), 3);
+        assert_eq!(entries.offset_at(0, &mut ctx), 1);
+        assert_eq!(entries.offset_at(1, &mut ctx), 3);
 
         Ok(())
     }
@@ -334,10 +335,10 @@ mod tests {
         let vortex = session.from_arrow_array(sliced, &field)?;
         let map = vortex.as_::<VortexMap>();
         let entries = map.entries().as_::<ListView>();
-        assert_eq!(entries.offset_at(0), 1);
-        assert_eq!(entries.offset_at(1), 3);
-        assert_eq!(entries.size_at(0), 2);
-        assert_eq!(entries.size_at(1), 1);
+        assert_eq!(entries.offset_at(0, &mut ctx), 1);
+        assert_eq!(entries.offset_at(1, &mut ctx), 3);
+        assert_eq!(entries.size_at(0, &mut ctx), 2);
+        assert_eq!(entries.size_at(1, &mut ctx), 1);
 
         let exported = session.execute_arrow(vortex, Some(&field), &mut ctx)?;
         let map = exported.as_map();
