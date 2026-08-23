@@ -250,6 +250,7 @@ impl VarBinData {
             Ok(())
         };
 
+        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
         let mut ctx = legacy_session().create_execution_ctx();
         // TODO(joe): update the created VarBin with this decompressed Array.
         let primitive_offsets = offsets.clone().execute::<PrimitiveArray>(&mut ctx)?;

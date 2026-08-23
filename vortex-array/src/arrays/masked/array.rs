@@ -77,6 +77,7 @@ impl MaskedData {
 
 impl Array<Masked> {
     /// Constructs a new `MaskedArray`.
+    // TODO(ctx): trait fixes - constructors are called from metadata-only contexts without a ctx.
     #[allow(clippy::disallowed_methods)]
     pub fn try_new(child: ArrayRef, validity: Validity) -> VortexResult<Self> {
         let dtype = child.dtype().as_nullable();

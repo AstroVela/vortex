@@ -7,6 +7,7 @@ use std::hash::Hash;
 use std::ops::Range;
 
 use num_traits::NumCast;
+use num_traits::ToPrimitive;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexError;
@@ -237,7 +238,6 @@ pub struct Patches {
 }
 
 impl Patches {
-    #[allow(clippy::disallowed_methods)]
     pub fn new(
         array_len: usize,
         offset: usize,
@@ -261,28 +261,27 @@ impl Patches {
         );
         vortex_ensure!(!indices.is_empty(), "Patch indices must not be empty");
 
-        // Perform validation of components when they are host-resident.
-        // This is not possible to do eagerly when the data is on GPU memory.
-        if indices.is_host() && values.is_host() {
-            let max = usize::try_from(&indices.execute_scalar(
-                indices.len() - 1,
-                &mut legacy_session().create_execution_ctx(),
-            )?)
-            .map_err(|_| vortex_err!("indices must be a number"))?;
-            vortex_ensure!(
-                max - offset < array_len,
-                "Patch indices {max:?}, offset {offset} are longer than the array length {array_len}"
-            );
-
-            #[cfg(debug_assertions)]
-            {
-                use crate::aggregate_fn::fns::is_sorted::is_sorted;
-                let mut ctx = legacy_session().create_execution_ctx();
-                assert!(
-                    is_sorted(&indices, &mut ctx).unwrap_or(false),
-                    "Patch indices must be sorted"
+        // Perform validation of components when the indices are host-resident and already
+        // decoded. Eager validation is not possible for GPU-resident data, and decoding
+        // encoded indices here would require an execution context the constructor does not
+        // have.
+        if indices.is_host()
+            && values.is_host()
+            && let Some(primitive_indices) = indices.as_opt::<Primitive>()
+        {
+            match_each_unsigned_integer_ptype!(primitive_indices.ptype(), |T| {
+                let indices_slice = primitive_indices.as_slice::<T>();
+                let max = indices_slice[indices_slice.len() - 1]
+                    .to_usize()
+                    .ok_or_else(|| vortex_err!("indices must fit in usize"))?;
+                vortex_ensure!(
+                    max - offset < array_len,
+                    "Patch indices {max:?}, offset {offset} are longer than the array length {array_len}"
                 );
-            }
+
+                #[cfg(debug_assertions)]
+                assert!(indices_slice.is_sorted(), "Patch indices must be sorted");
+            });
         }
 
         Ok(Self {

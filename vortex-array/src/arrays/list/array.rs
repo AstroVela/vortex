@@ -209,6 +209,7 @@ impl ListData {
 
         // We can safely unwrap the DType as primitive now
         let offsets_ptype = offsets.dtype().as_ptype();
+        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
         let mut ctx = legacy_session().create_execution_ctx();
 
         // Offsets must be sorted (but not strictly sorted, zero-length lists are allowed)
