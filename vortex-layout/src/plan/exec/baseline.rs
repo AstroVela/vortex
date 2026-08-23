@@ -604,20 +604,22 @@ fn complete_concurrent_task(
 }
 
 fn execute_inline(operation: &Operation, policy: SchedulePolicy) -> bool {
-    matches!(operation, Operation::CombineDemand { .. })
-        || (!matches!(policy, SchedulePolicy::LegacyAdaptivePredicates { .. })
-            && matches!(
-                operation,
-                Operation::PackStruct { .. }
-                    | Operation::SelectFlat {
-                        selection_all_true: true,
-                        ..
-                    }
-                    | Operation::SelectStruct {
-                        selection_all_true: true,
-                        ..
-                    }
-            ))
+    matches!(
+        operation,
+        Operation::CombineDemand { .. } | Operation::MergeDemandFragments
+    ) || (!matches!(policy, SchedulePolicy::LegacyAdaptivePredicates { .. })
+        && matches!(
+            operation,
+            Operation::PackStruct { .. }
+                | Operation::SelectFlat {
+                    selection_all_true: true,
+                    ..
+                }
+                | Operation::SelectStruct {
+                    selection_all_true: true,
+                    ..
+                }
+        ))
 }
 
 fn enqueue_woken_morsels(
@@ -715,6 +717,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::DecodeFlat { .. } => "decode_flat",
         Operation::EvaluatePredicate { .. } => "evaluate_predicate",
         Operation::CombineDemand { .. } => "combine_demand",
+        Operation::MergeDemandFragments => "merge_demand_fragments",
         Operation::SelectFlat { .. } => "select_flat",
         Operation::SelectStruct { .. } => "select_struct",
         Operation::PackStruct { .. } => "pack_struct",

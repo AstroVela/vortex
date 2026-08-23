@@ -13,6 +13,7 @@ use vortex_array::arrays::BoolArray;
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
@@ -84,6 +85,30 @@ pub struct Metrics {
     pub segment_reuse_hits: usize,
     pub decode_reuse_hits: usize,
     pub resource_nodes: usize,
+    pub predicate_only_resources: usize,
+    pub projection_only_resources: usize,
+    pub shared_predicate_projection_resources: usize,
+    pub predicate_only_read_bytes: usize,
+    pub projection_only_read_bytes: usize,
+    pub shared_predicate_projection_read_bytes: usize,
+    pub shared_decode_reuse_hits: usize,
+    pub shared_decode_reuse_bytes: usize,
+    pub projection_from_predicate_decode_hits: usize,
+    pub projection_from_predicate_decode_bytes: usize,
+    pub demand_fragments: usize,
+    pub fragment_predicates_completed: usize,
+    pub fragment_demand_updates: usize,
+    pub fragment_merge_tasks: usize,
+    pub fragment_projection_reads_unblocked: usize,
+    pub segment_predicates_fused: usize,
+    pub fragment_cached_predicate_hits: usize,
+    pub segment_predicate_eval_ns: u64,
+    pub fragment_demand_adoption_ns: u64,
+    pub fragment_merge_elapsed_ns: u64,
+    pub fragment_reduced_demand_predicates: usize,
+    pub fragment_reduced_demand_input_rows: usize,
+    pub fragment_reduced_demand_skipped_rows: usize,
+    pub fragment_reduced_demand_eval_ns: u64,
     pub morsel_slots: usize,
     pub max_updates_per_advance: usize,
     pub scheduler_passes: usize,
@@ -199,12 +224,29 @@ struct PendingCombine {
 }
 
 #[derive(Clone, Debug)]
+struct FragmentConjunctState {
+    slice: ResourceSlice,
+    result_slot: ArraySlotId,
+    predicate_task: Option<TaskId>,
+    combined: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DemandFragment {
+    morsel_range: std::ops::Range<usize>,
+    demand_slot: ArraySlotId,
+    demand_version: DemandVersion,
+    conjuncts: Vec<FragmentConjunctState>,
+    sealed: bool,
+}
+
+#[derive(Clone, Debug)]
 struct Morsel {
     id: MorselId,
     root_range: std::ops::Range<u64>,
     uses: Vec<ResourceUse>,
     activation_cursor: usize,
-    waiting_on: Option<ResourceId>,
+    waiting_on: SmallVec<[ResourceId; 4]>,
     arrays: Vec<Slot<ResolvedArray>>,
     demand_slot: ArraySlotId,
     demand_version: DemandVersion,
@@ -212,6 +254,9 @@ struct Morsel {
     conjuncts: Vec<ConjunctState>,
     predicate_offer_cursor: usize,
     combine: Option<PendingCombine>,
+    demand_fragments: Vec<DemandFragment>,
+    fragment_merge_task: Option<TaskId>,
+    fragment_merge_slot: Option<ArraySlotId>,
     cancelling: bool,
     sealed: bool,
     projections: Vec<ProjectionState>,
@@ -369,11 +414,19 @@ impl Execution {
                     leases: 0,
                     read_task: None,
                     decode_task: None,
+                    completed_bytes: None,
+                    predicate_consumed: false,
+                    projection_consumed: false,
+                    shared_reuse_recorded: false,
+                    fused_predicate_waiters: SmallVec::new(),
+                    fused_predicate_task_waiters: SmallVec::new(),
                 });
                 resource_by_segment.insert(flat.segment, id);
             }
         }
 
+        let stream_predicate_fragments =
+            matches!(policy, SchedulePolicy::AdaptivePredicates { .. });
         let mut morsels = Vec::with_capacity(morsel_capacity);
         let mut initial_demand_by_len = BTreeMap::new();
         for range in morsel_ranges {
@@ -465,12 +518,89 @@ impl Execution {
             }
             let pack_slot = ArraySlotId::Morsel(id, arrays.len());
             arrays.push(Slot::default());
+            let mut demand_fragments = Vec::new();
+            if stream_predicate_fragments && !query.conjuncts.is_empty() {
+                for chunk in plan.chunks.iter().filter(|chunk| {
+                    chunk.root_coverage.start < end && chunk.root_coverage.end > start
+                }) {
+                    let fragment_start = start.max(chunk.root_coverage.start);
+                    let fragment_end = end.min(chunk.root_coverage.end);
+                    let fragment_len = usize::try_from(fragment_end - fragment_start)?;
+                    let fragment_demand_slot = ArraySlotId::Morsel(id, arrays.len());
+                    let fragment_demand = initial_demand_by_len
+                        .entry(fragment_len)
+                        .or_insert_with(|| {
+                            let values = BitBuffer::new_set(fragment_len);
+                            ResolvedArray::boolean(
+                                BoolArray::new(values.clone(), Validity::NonNullable).into_array(),
+                                values,
+                            )
+                        })
+                        .clone();
+                    arrays.push(Slot {
+                        state: SlotState::Ready(fragment_demand),
+                    });
+                    let mut fragment_conjuncts = Vec::with_capacity(query.conjuncts.len());
+                    for conjunct in &query.conjuncts {
+                        let flat = chunk
+                            .fields
+                            .iter()
+                            .find(|flat| flat.field == conjunct.field)
+                            .ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "chunk omitted predicate field {}",
+                                    conjunct.field.0
+                                )
+                            })?;
+                        let resource =
+                            *resource_by_segment.get(&flat.segment).ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "predicate segment {} has no resource",
+                                    flat.segment
+                                )
+                            })?;
+                        let use_idx = uses
+                            .iter()
+                            .position(|use_| use_.resource == resource)
+                            .ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "predicate resource does not overlap its morsel"
+                                )
+                            })?;
+                        let result_slot = ArraySlotId::Morsel(id, arrays.len());
+                        arrays.push(Slot::default());
+                        fragment_conjuncts.push(FragmentConjunctState {
+                            slice: ResourceSlice {
+                                resource,
+                                use_idx,
+                                local_range: usize::try_from(
+                                    fragment_start - flat.root_coverage.start,
+                                )?
+                                    ..usize::try_from(fragment_end - flat.root_coverage.start)?,
+                                morsel_range: usize::try_from(fragment_start - start)?
+                                    ..usize::try_from(fragment_end - start)?,
+                            },
+                            result_slot,
+                            predicate_task: None,
+                            combined: false,
+                        });
+                    }
+                    demand_fragments.push(DemandFragment {
+                        morsel_range: usize::try_from(fragment_start - start)?
+                            ..usize::try_from(fragment_end - start)?,
+                        demand_slot: fragment_demand_slot,
+                        demand_version: DemandVersion(0),
+                        conjuncts: fragment_conjuncts,
+                        sealed: false,
+                    });
+                }
+            }
             morsels.push(Morsel {
                 id,
                 root_range: start..end,
                 uses,
                 activation_cursor: 0,
-                waiting_on: None,
+                waiting_on: SmallVec::new(),
                 arrays,
                 demand_slot,
                 demand_version: DemandVersion(0),
@@ -478,6 +608,9 @@ impl Execution {
                 conjuncts,
                 predicate_offer_cursor: 0,
                 combine: None,
+                demand_fragments,
+                fragment_merge_task: None,
+                fragment_merge_slot: None,
                 cancelling: false,
                 sealed: query.conjuncts.is_empty(),
                 projections,
@@ -489,6 +622,10 @@ impl Execution {
             });
         }
 
+        let demand_fragments = morsels
+            .iter()
+            .map(|morsel| morsel.demand_fragments.len())
+            .sum();
         let initial_rows = morsels.iter().try_fold(0usize, |total, morsel| {
             Ok::<_, std::num::TryFromIntError>(
                 total + usize::try_from(morsel.root_range.end - morsel.root_range.start)?,
@@ -498,6 +635,18 @@ impl Execution {
             + morsels.len() * (query.conjuncts.len() * 2 + query.projection.len() + 1);
         let predicate_stats = vec![PredicateStats::default(); query.conjuncts.len()];
         let resource_waiters = vec![SmallVec::new(); resources.len()];
+        let predicate_only_resources = resources
+            .iter()
+            .filter(|resource| resource.read_phase == ReadPhase::Predicate)
+            .count();
+        let projection_only_resources = resources
+            .iter()
+            .filter(|resource| resource.read_phase == ReadPhase::Projection)
+            .count();
+        let shared_predicate_projection_resources = resources
+            .iter()
+            .filter(|resource| resource.read_phase == ReadPhase::PredicateAndProjection)
+            .count();
         Ok(Self {
             query,
             projection_names,
@@ -505,6 +654,10 @@ impl Execution {
                 demand_rows_initial: initial_rows,
                 demand_rows_current: initial_rows,
                 resource_nodes: resources.len(),
+                predicate_only_resources,
+                projection_only_resources,
+                shared_predicate_projection_resources,
+                demand_fragments,
                 morsel_slots: morsels.iter().map(|morsel| morsel.arrays.len()).sum(),
                 ..Metrics::default()
             },
@@ -690,22 +843,29 @@ impl Execution {
             TaskOwner::Resource(resource) => {
                 let waiters = std::mem::take(&mut self.resource_waiters[resource.0]);
                 self.metrics.completion_wake_candidates_inspected += waiters.len();
-                waiters
-                    .into_iter()
-                    .filter(|morsel| {
-                        !self.morsels[morsel.0].retired
-                            && self.morsels[morsel.0].waiting_on == Some(resource)
-                    })
-                    .collect()
+                let mut wake = SmallVec::new();
+                for morsel in waiters {
+                    if self.morsels[morsel.0].retired {
+                        continue;
+                    }
+                    let waiting = &mut self.morsels[morsel.0].waiting_on;
+                    let Some(index) = waiting.iter().position(|waiting| *waiting == resource)
+                    else {
+                        continue;
+                    };
+                    waiting.swap_remove(index);
+                    wake.push(morsel);
+                }
+                wake
             }
         })
     }
 
     fn wait_on_resource(&mut self, morsel: MorselId, resource: ResourceId) {
-        if self.morsels[morsel.0].waiting_on == Some(resource) {
+        if self.morsels[morsel.0].waiting_on.contains(&resource) {
             return;
         }
-        self.morsels[morsel.0].waiting_on = Some(resource);
+        self.morsels[morsel.0].waiting_on.push(resource);
         let waiters = &mut self.resource_waiters[resource.0];
         if !waiters.contains(&morsel) {
             waiters.push(morsel);
@@ -731,8 +891,6 @@ impl Execution {
                 state: MorselState::Retired,
             });
         }
-        self.morsels[morsel.0].waiting_on = None;
-
         let mut work = Vec::new();
         let mut output = None;
         let mut transitions = 0usize;
@@ -803,6 +961,9 @@ impl Execution {
         }
 
         let sealed = self.morsels[morsel_id.0].sealed;
+        if !sealed && !self.morsels[morsel_id.0].demand_fragments.is_empty() {
+            return self.transition_fragment_predicates(morsel_id, updates);
+        }
         let demand_nonempty = self
             .current_demand(morsel_id)?
             .boolean_summary()?
@@ -1302,6 +1463,396 @@ impl Execution {
             .map(|(index, _)| index)
     }
 
+    fn transition_fragment_predicates(
+        &mut self,
+        morsel: MorselId,
+        updates: &mut Vec<TaskUpdate>,
+    ) -> VortexResult<bool> {
+        if let (Some(task), Some(slot)) = (
+            self.morsels[morsel.0].fragment_merge_task,
+            self.morsels[morsel.0].fragment_merge_slot,
+        ) && self.array_slot(slot).ready().is_some()
+        {
+            self.morsels[morsel.0].demand_slot = slot;
+            self.morsels[morsel.0].sealed = true;
+            if self.trace_enabled {
+                self.push_trace(
+                    morsel,
+                    format!("event=demand_fragments_merged task={}", task.0),
+                );
+            }
+            return Ok(true);
+        }
+
+        for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
+            for conjunct_idx in 0..self.query.conjuncts.len() {
+                let state =
+                    &self.morsels[morsel.0].demand_fragments[fragment_idx].conjuncts[conjunct_idx];
+                let task = state.predicate_task;
+                if state.combined
+                    || task.is_none()
+                    || self.array_slot(state.result_slot).ready().is_none()
+                {
+                    continue;
+                }
+                let output_slot = state.result_slot;
+                let previous_slot =
+                    self.morsels[morsel.0].demand_fragments[fragment_idx].demand_slot;
+                let previous = self
+                    .array_slot(previous_slot)
+                    .ready()
+                    .ok_or_else(|| vortex_error::vortex_err!("fragment demand is not resolved"))?
+                    .boolean_summary()?
+                    .true_count;
+                let current = self
+                    .array_slot(output_slot)
+                    .ready()
+                    .ok_or_else(|| vortex_error::vortex_err!("fragment result is not resolved"))?
+                    .boolean_summary()?
+                    .true_count;
+                if current > previous {
+                    vortex_bail!("fragment demand grew from {previous} to {current} rows");
+                }
+                let fragment = &mut self.morsels[morsel.0].demand_fragments[fragment_idx];
+                fragment.conjuncts[conjunct_idx].combined = true;
+                self.metrics.fragment_predicates_completed += 1;
+                if current == previous {
+                    self.metrics.demand_noop_adoptions += 1;
+                } else {
+                    fragment.demand_slot = output_slot;
+                    fragment.demand_version.0 += 1;
+                    self.metrics.demand_rows_current -= previous - current;
+                    self.metrics.demand_direct_adoptions += 1;
+                    self.metrics.fragment_demand_updates += 1;
+                }
+                if current == 0 {
+                    for conjunct in &mut fragment.conjuncts {
+                        conjunct.combined = true;
+                    }
+                }
+                fragment.sealed = fragment.conjuncts.iter().all(|state| state.combined);
+                if self.trace_enabled {
+                    let range = fragment.morsel_range.clone();
+                    self.push_trace(
+                        morsel,
+                        format!(
+                            "event=demand_adopt method=fragment fragment={} range={}..{} conjunct={} previous_rows={} rows={} task={}",
+                            fragment_idx,
+                            range.start,
+                            range.end,
+                            conjunct_idx,
+                            previous,
+                            current,
+                            task.map_or_else(|| "fused".to_string(), |task| task.0.to_string()),
+                        ),
+                    );
+                }
+                return Ok(true);
+            }
+        }
+
+        if self.morsels[morsel.0]
+            .demand_fragments
+            .iter()
+            .all(|fragment| fragment.sealed)
+        {
+            if self.morsels[morsel.0].fragment_merge_task.is_some() {
+                return Ok(false);
+            }
+            let inputs = self.morsels[morsel.0]
+                .demand_fragments
+                .iter()
+                .map(|fragment| InputSlot::Array(fragment.demand_slot))
+                .collect::<SmallVec<_>>();
+            let output_slot = self.alloc_morsel_array(morsel);
+            let task = self.offer_task(
+                TaskOwner::Morsel(morsel),
+                WorkClass::Cpu,
+                Necessity::Required,
+                inputs,
+                OutputSlot::Array(output_slot),
+                Operation::MergeDemandFragments,
+            )?;
+            self.morsels[morsel.0].fragment_merge_task = Some(task.id);
+            self.morsels[morsel.0].fragment_merge_slot = Some(output_slot);
+            self.metrics.fragment_merge_tasks += 1;
+            updates.push(TaskUpdate::Offer(task));
+            return Ok(true);
+        }
+
+        // A ready fragment predicate is more valuable than launching another read: it can shrink
+        // demand before this fragment advances to the next conjunct.
+        for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
+            let Some(conjunct_idx) = self.next_fragment_predicate(morsel, fragment_idx) else {
+                continue;
+            };
+            let state =
+                &self.morsels[morsel.0].demand_fragments[fragment_idx].conjuncts[conjunct_idx];
+            let resource_array = self.resources[state.slice.resource.0].array_slot;
+            if self.array_slot(resource_array).ready().is_none() {
+                continue;
+            }
+            let demand = self.morsels[morsel.0].demand_fragments[fragment_idx].demand_slot;
+            let output_slot = state.result_slot;
+            let local_range = state.slice.local_range.clone();
+            let fragment_rows = local_range.len();
+            let resource = state.slice.resource;
+            let version = self.morsels[morsel.0].demand_fragments[fragment_idx].demand_version;
+            let input_true_count = self
+                .array_slot(demand)
+                .ready()
+                .ok_or_else(|| vortex_error::vortex_err!("fragment demand is not resolved"))?
+                .boolean_summary()?
+                .true_count;
+            if self.apply_cached_fragment_predicate(morsel, fragment_idx, conjunct_idx, false)? {
+                return Ok(true);
+            }
+            let task = self.offer_task(
+                TaskOwner::Morsel(morsel),
+                WorkClass::Cpu,
+                Necessity::Required,
+                smallvec![
+                    InputSlot::Array(self.resources[resource.0].array_slot),
+                    InputSlot::Array(demand),
+                ],
+                OutputSlot::Array(output_slot),
+                Operation::EvaluatePredicate {
+                    conjunct: conjunct_idx,
+                    local_ranges: vec![local_range],
+                    predicate: self.query.conjuncts[conjunct_idx].predicate,
+                    demand_version: version,
+                    input_true_count,
+                },
+            )?;
+            self.morsels[morsel.0].demand_fragments[fragment_idx].conjuncts[conjunct_idx]
+                .predicate_task = Some(task.id);
+            if input_true_count < fragment_rows {
+                self.metrics.fragment_reduced_demand_predicates += 1;
+                self.metrics.fragment_reduced_demand_input_rows += input_true_count;
+                self.metrics.fragment_reduced_demand_skipped_rows +=
+                    fragment_rows - input_true_count;
+            }
+            let task_id = task.id;
+            updates.push(TaskUpdate::Offer(task));
+            if self.trace_enabled {
+                self.push_trace(
+                    morsel,
+                    format!(
+                        "event=predicate_offer fragment={} conjunct={} task={}",
+                        fragment_idx, conjunct_idx, task_id.0,
+                    ),
+                );
+            }
+            return Ok(true);
+        }
+
+        let mut waiting = SmallVec::<[ResourceId; 8]>::new();
+        for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
+            let Some(conjunct_idx) = self.next_fragment_predicate(morsel, fragment_idx) else {
+                continue;
+            };
+            let resource = self.morsels[morsel.0].demand_fragments[fragment_idx].conjuncts
+                [conjunct_idx]
+                .slice
+                .resource;
+            if self
+                .array_slot(self.resources[resource.0].array_slot)
+                .ready()
+                .is_some()
+            {
+                continue;
+            }
+            let waiter = (morsel, fragment_idx, conjunct_idx);
+            if !self.resources[resource.0]
+                .fused_predicate_waiters
+                .contains(&waiter)
+            {
+                self.resources[resource.0]
+                    .fused_predicate_waiters
+                    .push(waiter);
+                if self.trace_enabled {
+                    self.push_trace(
+                        morsel,
+                        format!(
+                            "event=predicate_stream fragment={} conjunct={} resource={}",
+                            fragment_idx, conjunct_idx, resource.0,
+                        ),
+                    );
+                }
+            }
+            self.wait_on_resource(morsel, resource);
+            if let Some(update) = self.ensure_resource(resource, Necessity::Required)? {
+                updates.push(update);
+                return Ok(true);
+            }
+            if !waiting.contains(&resource) {
+                waiting.push(resource);
+            }
+        }
+        for resource in waiting {
+            self.wait_on_resource(morsel, resource);
+        }
+        for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
+            let fragment = &self.morsels[morsel.0].demand_fragments[fragment_idx];
+            if !fragment.sealed {
+                continue;
+            }
+            let selected = self
+                .array_slot(fragment.demand_slot)
+                .ready()
+                .ok_or_else(|| vortex_error::vortex_err!("fragment demand is not resolved"))?
+                .boolean_summary()?
+                .true_count;
+            if selected == 0 {
+                continue;
+            }
+            let range = fragment.morsel_range.clone();
+            let projection_resources = self.morsels[morsel.0]
+                .projections
+                .iter()
+                .flat_map(|projection| &projection.slices)
+                .filter(|slice| slice.morsel_range == range)
+                .map(|slice| slice.resource)
+                .collect::<SmallVec<[ResourceId; 8]>>();
+            for resource in projection_resources {
+                if let Some(update) = self.ensure_resource(resource, Necessity::Required)? {
+                    updates.push(update);
+                    self.metrics.fragment_projection_reads_unblocked += 1;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn next_fragment_predicate(&self, morsel: MorselId, fragment: usize) -> Option<usize> {
+        let fragment = &self.morsels[morsel.0].demand_fragments[fragment];
+        if fragment.sealed
+            || fragment
+                .conjuncts
+                .iter()
+                .any(|state| state.predicate_task.is_some() && !state.combined)
+        {
+            return None;
+        }
+        let first = fragment
+            .conjuncts
+            .iter()
+            .position(|state| !state.combined && state.predicate_task.is_none())?;
+        if fragment.demand_version == DemandVersion(0) {
+            return Some(first);
+        }
+        fragment
+            .conjuncts
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| !state.combined && state.predicate_task.is_none())
+            .max_by(|(lhs, _), (rhs, _)| {
+                self.predicate_score(*lhs)
+                    .total_cmp(&self.predicate_score(*rhs))
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn apply_cached_fragment_predicate(
+        &mut self,
+        morsel: MorselId,
+        fragment_idx: usize,
+        conjunct_idx: usize,
+        trust_coverage: bool,
+    ) -> VortexResult<bool> {
+        if self.morsels[morsel.0].retired
+            || self.morsels[morsel.0].demand_fragments[fragment_idx].conjuncts[conjunct_idx]
+                .combined
+        {
+            return Ok(false);
+        }
+        let state = &self.morsels[morsel.0].demand_fragments[fragment_idx].conjuncts[conjunct_idx];
+        let resource = state.slice.resource;
+        let local_range = state.slice.local_range.clone();
+        let output_slot = state.result_slot;
+        let Some(cached) = self
+            .array_slot(self.resources[resource.0].array_slot)
+            .ready()
+            .and_then(|array| {
+                array
+                    .cached_predicates
+                    .iter()
+                    .find(|cached| cached.conjunct == conjunct_idx)
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let adoption_started = Instant::now();
+        let previous_slot = self.morsels[morsel.0].demand_fragments[fragment_idx].demand_slot;
+        let previous_summary = self
+            .array_slot(previous_slot)
+            .ready()
+            .ok_or_else(|| vortex_error::vortex_err!("fragment demand is not resolved"))?
+            .boolean_summary()?;
+        let previous = previous_summary.true_count;
+        let demand = previous_summary.values.clone();
+        if !trust_coverage {
+            let evaluated = cached.evaluated.slice(local_range.clone());
+            if (&demand & &evaluated).true_count() != previous {
+                return Ok(false);
+            }
+        }
+        let predicate = cached.values.slice(local_range);
+        if predicate.len() != demand.len() {
+            vortex_bail!("cached predicate length does not match fragment demand");
+        }
+        let values = if previous == demand.len() {
+            predicate
+        } else {
+            &demand & &predicate
+        };
+        let current = values.true_count();
+        self.predicate_stats[conjunct_idx].observe(previous, current, cached.elapsed_ns);
+        self.metrics.fragment_cached_predicate_hits += 1;
+        self.metrics.fragment_predicates_completed += 1;
+        if current != previous {
+            self.array_slot_mut(output_slot).state = SlotState::Ready(ResolvedArray::boolean(
+                BoolArray::new(values.clone(), Validity::NonNullable).into_array(),
+                values,
+            ));
+        }
+
+        let fragment = &mut self.morsels[morsel.0].demand_fragments[fragment_idx];
+        fragment.conjuncts[conjunct_idx].combined = true;
+        if current == previous {
+            self.metrics.demand_noop_adoptions += 1;
+        } else {
+            fragment.demand_slot = output_slot;
+            fragment.demand_version.0 += 1;
+            self.metrics.demand_rows_current -= previous - current;
+            self.metrics.demand_direct_adoptions += 1;
+            self.metrics.fragment_demand_updates += 1;
+        }
+        if current == 0 {
+            for conjunct in &mut fragment.conjuncts {
+                conjunct.combined = true;
+            }
+        }
+        fragment.sealed = fragment.conjuncts.iter().all(|state| state.combined);
+        self.metrics.fragment_demand_adoption_ns =
+            self.metrics.fragment_demand_adoption_ns.saturating_add(
+                u64::try_from(adoption_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+        if self.trace_enabled {
+            let range = fragment.morsel_range.clone();
+            self.push_trace(
+                morsel,
+                format!(
+                    "event=demand_adopt method=fragment_fused fragment={} range={}..{} conjunct={} previous_rows={} rows={}",
+                    fragment_idx, range.start, range.end, conjunct_idx, previous, current,
+                ),
+            );
+        }
+        Ok(true)
+    }
+
     fn predicate_window(&self, morsel: MorselId, next: usize) -> usize {
         let concurrency = match self.policy {
             SchedulePolicy::AdaptivePredicates { concurrency }
@@ -1526,6 +2077,90 @@ impl Execution {
             let estimated_bytes = node.estimated_bytes;
             let encoding = node.encoding.clone();
             let row_count = node.row_count;
+            let field = node.field;
+            let fuse_predicates = matches!(self.policy, SchedulePolicy::AdaptivePredicates { .. })
+                && phase.includes_predicate();
+            let captured_waiters = if fuse_predicates {
+                self.resources[resource.0].fused_predicate_waiters.clone()
+            } else {
+                SmallVec::new()
+            };
+            let predicates = if fuse_predicates {
+                let mut gathered =
+                    SmallVec::<[(usize, StdRange<usize>, BitBuffer, usize); 2]>::new();
+                for (morsel, fragment_idx, conjunct) in captured_waiters.iter().copied() {
+                    if self.query.conjuncts[conjunct].field != field {
+                        continue;
+                    }
+                    let fragment = &self.morsels[morsel.0].demand_fragments[fragment_idx];
+                    let local_range = fragment.conjuncts[conjunct].slice.local_range.clone();
+                    let (demand, input_rows, demand_len) = {
+                        let summary = self
+                            .array_slot(fragment.demand_slot)
+                            .ready()
+                            .ok_or_else(|| {
+                                vortex_error::vortex_err!("fragment demand is not resolved")
+                            })?
+                            .boolean_summary()?;
+                        (summary.values.clone(), summary.true_count, summary.len)
+                    };
+                    if input_rows < demand_len {
+                        self.metrics.fragment_reduced_demand_predicates += 1;
+                        self.metrics.fragment_reduced_demand_input_rows += input_rows;
+                        self.metrics.fragment_reduced_demand_skipped_rows +=
+                            demand_len - input_rows;
+                    }
+                    gathered.push((conjunct, local_range, demand, input_rows));
+                }
+                if let [(conjunct, range, demand, input_rows)] = gathered.as_slice()
+                    && range.start == 0
+                    && range.end == row_count
+                {
+                    vec![(
+                        *conjunct,
+                        self.query.conjuncts[*conjunct].predicate,
+                        demand.clone(),
+                        *input_rows,
+                    )]
+                } else {
+                    let mut demands =
+                        BTreeMap::<usize, Vec<(StdRange<usize>, BitBuffer, usize)>>::new();
+                    for (conjunct, range, demand, input_rows) in gathered {
+                        demands
+                            .entry(conjunct)
+                            .or_default()
+                            .push((range, demand, input_rows));
+                    }
+                    demands
+                        .into_iter()
+                        .map(|(conjunct, mut slices)| {
+                            slices.sort_unstable_by_key(|(range, ..)| range.start);
+                            let input_rows = slices.iter().map(|(_, _, rows)| *rows).sum();
+                            let mut combined = BitBufferMut::with_capacity(row_count);
+                            let mut cursor = 0;
+                            for (range, demand, _) in slices {
+                                if range.start < cursor || range.len() != demand.len() {
+                                    vortex_bail!(
+                                        "predicate demand slices overlap or have mismatched lengths"
+                                    );
+                                }
+                                combined.append_buffer(&BitBuffer::new_unset(range.start - cursor));
+                                combined.append_buffer(&demand);
+                                cursor = range.end;
+                            }
+                            combined.append_buffer(&BitBuffer::new_unset(row_count - cursor));
+                            Ok((
+                                conjunct,
+                                self.query.conjuncts[conjunct].predicate,
+                                combined.freeze(),
+                                input_rows,
+                            ))
+                        })
+                        .collect::<VortexResult<Vec<_>>>()?
+                }
+            } else {
+                Vec::new()
+            };
             let task = self.offer_task(
                 TaskOwner::Resource(resource),
                 WorkClass::Io,
@@ -1538,9 +2173,11 @@ impl Execution {
                     estimated_bytes,
                     encoding,
                     row_count,
+                    predicates,
                 },
             )?;
             self.resources[resource.0].read_task = Some(task.id);
+            self.resources[resource.0].fused_predicate_task_waiters = captured_waiters;
             return Ok(Some(TaskUpdate::Offer(task)));
         }
         Ok(None)
@@ -1655,6 +2292,17 @@ impl Execution {
         for resource in &leases {
             self.resources[resource.0].leases += 1;
         }
+        for resource in &leases {
+            match &operation {
+                Operation::EvaluatePredicate { .. } => {
+                    self.record_resource_consumption(*resource, true);
+                }
+                Operation::SelectFlat { .. } | Operation::SelectStruct { .. } => {
+                    self.record_resource_consumption(*resource, false);
+                }
+                _ => {}
+            }
+        }
         let stored = &mut self.tasks[task.0];
         stored.status = TaskStatus::Running;
         stored.leases = leases;
@@ -1706,10 +2354,64 @@ impl Execution {
             }),
             _ => None,
         };
+        let reduced_fragment_predicate_elapsed_ns =
+            match &self.tasks[completion.task.0].task.operation {
+                Operation::EvaluatePredicate {
+                    local_ranges,
+                    input_true_count,
+                    ..
+                } if local_ranges.len() == 1 && *input_true_count < local_ranges[0].len() => {
+                    completion.elapsed_ns
+                }
+                _ => 0,
+            };
         let completed_read_bytes = self.tasks[completion.task.0]
             .claimed_as_candidate
             .then_some(completion.read_bytes)
             .flatten();
+        let completed_phase = read_operation(&self.tasks[completion.task.0].task.operation)
+            .and_then(|(phase, _)| completion.read_bytes.map(|bytes| (phase, bytes)));
+        let fused_predicates = match &self.tasks[completion.task.0].task.operation {
+            Operation::ReadDecodeFlat { predicates, .. } => predicates.len(),
+            _ => 0,
+        };
+        let fused_predicate_eval_ns = completion
+            .result
+            .as_ref()
+            .ok()
+            .and_then(|value| match value {
+                ResolvedValue::Array(array) => Some(
+                    array
+                        .cached_predicates
+                        .iter()
+                        .map(|predicate| predicate.elapsed_ns)
+                        .sum::<u64>(),
+                ),
+                ResolvedValue::Segment(_) => None,
+            })
+            .unwrap_or(0);
+        let fused_reduced_demand_eval_ns = completion
+            .result
+            .as_ref()
+            .ok()
+            .and_then(|value| match value {
+                ResolvedValue::Array(array) => Some(
+                    array
+                        .cached_predicates
+                        .iter()
+                        .filter(|predicate| predicate.input_true_count < predicate.values.len())
+                        .map(|predicate| predicate.elapsed_ns)
+                        .sum::<u64>(),
+                ),
+                ResolvedValue::Segment(_) => None,
+            })
+            .unwrap_or(0);
+        let fragment_merge_elapsed_ns = matches!(
+            self.tasks[completion.task.0].task.operation,
+            Operation::MergeDemandFragments
+        )
+        .then_some(completion.elapsed_ns)
+        .unwrap_or(0);
         let value = match completion.result {
             Ok(value) => value,
             Err(error) => {
@@ -1743,13 +2445,62 @@ impl Execution {
                 );
             }
         }
+        let completed_resource = matches!(
+            self.tasks[completion.task.0].task.operation,
+            Operation::ReadDecodeFlat { .. }
+        )
+        .then(|| match self.tasks[completion.task.0].owner {
+            TaskOwner::Resource(resource) => resource,
+            TaskOwner::Morsel(_) => unreachable!("read/decode tasks belong to resources"),
+        });
         if self.tasks[completion.task.0].unwanted {
             self.discard_output(expected);
         } else {
             self.install_output(expected, completion.task, value)?;
         }
+        if let Some(resource) = completed_resource {
+            let waiters = std::mem::take(&mut self.resources[resource.0].fused_predicate_waiters);
+            let captured =
+                std::mem::take(&mut self.resources[resource.0].fused_predicate_task_waiters);
+            for waiter @ (morsel, fragment, conjunct) in waiters {
+                if self.apply_cached_fragment_predicate(
+                    morsel,
+                    fragment,
+                    conjunct,
+                    captured.contains(&waiter),
+                )? {
+                    self.record_resource_consumption(resource, true);
+                }
+            }
+        }
         self.finish_task(completion.task);
+        self.metrics.segment_predicates_fused += fused_predicates;
+        self.metrics.segment_predicate_eval_ns = self
+            .metrics
+            .segment_predicate_eval_ns
+            .saturating_add(fused_predicate_eval_ns);
+        self.metrics.fragment_merge_elapsed_ns = self
+            .metrics
+            .fragment_merge_elapsed_ns
+            .saturating_add(fragment_merge_elapsed_ns);
+        self.metrics.fragment_reduced_demand_eval_ns = self
+            .metrics
+            .fragment_reduced_demand_eval_ns
+            .saturating_add(reduced_fragment_predicate_elapsed_ns)
+            .saturating_add(fused_reduced_demand_eval_ns);
         self.tasks[completion.task.0].completed_read_bytes = completed_read_bytes;
+        if let Some((phase, bytes)) = completed_phase {
+            match phase {
+                ReadPhase::Predicate => self.metrics.predicate_only_read_bytes += bytes,
+                ReadPhase::Projection => self.metrics.projection_only_read_bytes += bytes,
+                ReadPhase::PredicateAndProjection => {
+                    self.metrics.shared_predicate_projection_read_bytes += bytes;
+                }
+            }
+            if let TaskOwner::Resource(resource) = self.tasks[completion.task.0].owner {
+                self.resources[resource.0].completed_bytes = Some(bytes);
+            }
+        }
         if let Some((conjunct, input_rows, output_rows, elapsed_ns)) = predicate_observation {
             self.predicate_stats[conjunct].observe(input_rows, output_rows, elapsed_ns);
         }
@@ -2012,6 +2763,30 @@ impl Execution {
             InputSlot::Array(slot) => resource.array_slot == slot,
         };
         belongs_to_resource.then_some(resource.id)
+    }
+
+    fn record_resource_consumption(&mut self, resource: ResourceId, predicate: bool) {
+        let node = &mut self.resources[resource.0];
+        if predicate {
+            node.predicate_consumed = true;
+        } else {
+            node.projection_consumed = true;
+        }
+        if node.read_phase != ReadPhase::PredicateAndProjection
+            || node.shared_reuse_recorded
+            || !node.predicate_consumed
+            || !node.projection_consumed
+        {
+            return;
+        }
+        node.shared_reuse_recorded = true;
+        let bytes = node.completed_bytes.or(node.estimated_bytes).unwrap_or(0);
+        self.metrics.shared_decode_reuse_hits += 1;
+        self.metrics.shared_decode_reuse_bytes += bytes;
+        if !predicate {
+            self.metrics.projection_from_predicate_decode_hits += 1;
+            self.metrics.projection_from_predicate_decode_bytes += bytes;
+        }
     }
 
     fn segment_slot(&self, slot: SegmentSlotId) -> &Slot<vortex_array::buffer::BufferHandle> {

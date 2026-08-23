@@ -98,6 +98,16 @@ pub enum ArraySummary {
 pub struct ResolvedArray {
     pub array: ArrayRef,
     pub summary: ArraySummary,
+    pub cached_predicates: Vec<CachedPredicate>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedPredicate {
+    pub conjunct: usize,
+    pub values: BitBuffer,
+    pub evaluated: BitBuffer,
+    pub input_true_count: usize,
+    pub elapsed_ns: u64,
 }
 
 impl ResolvedArray {
@@ -105,6 +115,15 @@ impl ResolvedArray {
         Self {
             array,
             summary: ArraySummary::None,
+            cached_predicates: Vec::new(),
+        }
+    }
+
+    pub fn plain_with_predicates(array: ArrayRef, cached_predicates: Vec<CachedPredicate>) -> Self {
+        Self {
+            array,
+            summary: ArraySummary::None,
+            cached_predicates,
         }
     }
 
@@ -117,6 +136,7 @@ impl ResolvedArray {
                 values,
             }),
             array,
+            cached_predicates: Vec::new(),
         }
     }
 
@@ -560,6 +580,7 @@ pub enum Operation {
         estimated_bytes: Option<usize>,
         encoding: FlatEncoding,
         row_count: usize,
+        predicates: Vec<(usize, Predicate, BitBuffer, usize)>,
     },
     DecodeFlat {
         encoding: FlatEncoding,
@@ -575,6 +596,7 @@ pub enum Operation {
     CombineDemand {
         demand_version: DemandVersion,
     },
+    MergeDemandFragments,
     SelectFlat {
         local_ranges: Vec<Range<usize>>,
         selection_ranges: Vec<Range<usize>>,

@@ -215,6 +215,118 @@ async fn multi_field_projection_uses_one_struct_selection_per_morsel() -> Vortex
     Ok(())
 }
 
+#[tokio::test]
+async fn reports_filter_projection_resource_and_decode_sharing() -> VortexResult<()> {
+    let session = new_session().with_tokio();
+    let (plan, source, query) = fixture()?;
+    let result = run_self_paced(
+        &plan,
+        query,
+        8,
+        source,
+        &session,
+        RunOptions {
+            policy: SchedulePolicy::PredicateFirst,
+            transition_budget: 4,
+            retention: RetentionPolicy::RetainUntilDead,
+            concurrency: 2,
+            collect_trace: false,
+            speculative_io: super::SpeculativeIoConfig::disabled(),
+        },
+    )
+    .await?;
+
+    assert_eq!(result.metrics.predicate_only_resources, 2);
+    assert_eq!(result.metrics.projection_only_resources, 2);
+    assert_eq!(result.metrics.shared_predicate_projection_resources, 2);
+    assert_eq!(result.metrics.predicate_only_read_bytes, 128);
+    assert_eq!(result.metrics.projection_only_read_bytes, 128);
+    assert_eq!(result.metrics.shared_predicate_projection_read_bytes, 128);
+    assert_eq!(result.metrics.shared_decode_reuse_hits, 2);
+    assert_eq!(result.metrics.shared_decode_reuse_bytes, 128);
+    assert_eq!(result.metrics.projection_from_predicate_decode_hits, 2);
+    assert_eq!(result.metrics.projection_from_predicate_decode_bytes, 128);
+    Ok(())
+}
+
+#[tokio::test]
+async fn adaptive_morsel_streams_predicates_by_segment_fragment() -> VortexResult<()> {
+    let session = new_session().with_tokio();
+    let (plan, source, query) = fixture()?;
+    let expected = run_eager(
+        &plan,
+        &query,
+        16,
+        Arc::<super::MemorySegments>::clone(&source),
+        &session,
+    )
+    .await?;
+    let actual = run_self_paced(
+        &plan,
+        query,
+        16,
+        source,
+        &session,
+        RunOptions {
+            policy: SchedulePolicy::AdaptivePredicates { concurrency: 4 },
+            transition_budget: 4,
+            retention: RetentionPolicy::RetainUntilDead,
+            concurrency: 4,
+            collect_trace: true,
+            speculative_io: super::SpeculativeIoConfig::disabled(),
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        stable_output_hash(&actual.batches, &session)?,
+        stable_output_hash(&expected, &session)?
+    );
+    assert_eq!(actual.metrics.demand_fragments, 2);
+    assert_eq!(actual.metrics.fragment_merge_tasks, 1);
+    assert!(actual.metrics.fragment_reduced_demand_predicates > 0);
+    assert!(actual.metrics.fragment_reduced_demand_input_rows > 0);
+    assert!(actual.metrics.fragment_reduced_demand_skipped_rows > 0);
+    for fragment in 0..2 {
+        let first_adopt = actual
+            .trace
+            .iter()
+            .position(|event| {
+                event.message.contains("event=demand_adopt method=fragment")
+                    && event.message.contains(&format!("fragment={fragment} "))
+                    && event.message.contains("conjunct=0 ")
+            })
+            .ok_or_else(|| vortex_error::vortex_err!("fragment omitted first demand adoption"))?;
+        let second_offer = actual
+            .trace
+            .iter()
+            .position(|event| {
+                (event.message.contains("event=predicate_offer")
+                    || event.message.contains("event=predicate_stream"))
+                    && event.message.contains(&format!("fragment={fragment} "))
+                    && event.message.contains("conjunct=1 ")
+            })
+            .ok_or_else(|| vortex_error::vortex_err!("fragment omitted second predicate"))?;
+        assert!(first_adopt < second_offer);
+    }
+    let reduced_predicate = actual
+        .trace
+        .iter()
+        .position(|event| {
+            event
+                .message
+                .contains("event=predicate_stream fragment=0 conjunct=1")
+        })
+        .ok_or_else(|| vortex_error::vortex_err!("reduced predicate was not scheduled"))?;
+    let outer_merge = actual
+        .trace
+        .iter()
+        .position(|event| event.message.contains("operation=merge_demand_fragments"))
+        .ok_or_else(|| vortex_error::vortex_err!("outer demand was not merged"))?;
+    assert!(reduced_predicate < outer_merge);
+    Ok(())
+}
+
 #[rstest]
 #[case(SchedulePolicy::PredicateFirst)]
 #[case(SchedulePolicy::AdaptivePredicates { concurrency: 4 })]
@@ -603,7 +715,17 @@ async fn adaptive_empty_demand_does_not_offer_remaining_predicates() -> VortexRe
                 && event.message.contains("operation=evaluate_predicate")
         })
         .count();
-    assert_eq!(predicate_claims, morsel_count);
+    assert_eq!(predicate_claims, morsel_count - plan.chunks.len());
+    assert!(!result.trace.iter().any(|event| {
+        event.message.contains("event=predicate_offer")
+            && (event.message.contains("conjunct=1") || event.message.contains("conjunct=2"))
+    }));
+    assert_eq!(result.metrics.fragment_predicates_completed, morsel_count);
+    assert_eq!(
+        result.metrics.fragment_cached_predicate_hits,
+        plan.chunks.len()
+    );
+    assert_eq!(result.metrics.segment_predicates_fused, plan.chunks.len());
     Ok(())
 }
 
@@ -628,10 +750,10 @@ async fn adaptive_equal_scores_preserve_query_order() -> VortexResult<()> {
     )
     .await?;
 
-    let first_predicate = result
-        .trace
-        .iter()
-        .find(|event| event.message.contains("event=predicate_offer"));
+    let first_predicate = result.trace.iter().find(|event| {
+        event.message.contains("event=predicate_offer")
+            || event.message.contains("event=predicate_stream")
+    });
     assert!(
         first_predicate.is_some_and(|event| event.message.contains("conjunct=0")),
         "first predicate was {first_predicate:?}"

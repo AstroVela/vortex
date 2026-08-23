@@ -24,6 +24,7 @@ use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use super::ArraySummary;
+use super::CachedPredicate;
 use super::Completion;
 use super::FlatEncoding;
 use super::Operation;
@@ -37,7 +38,11 @@ pub async fn evaluate(
     source: &dyn SegmentSource,
     session: &VortexSession,
 ) -> Completion {
-    let started = matches!(task.operation, Operation::EvaluatePredicate { .. }).then(Instant::now);
+    let started = matches!(
+        task.operation,
+        Operation::EvaluatePredicate { .. } | Operation::MergeDemandFragments
+    )
+    .then(Instant::now);
     let mut read_bytes = None;
     let result = evaluate_inner(&task, source, session, &mut read_bytes).await;
     Completion {
@@ -67,13 +72,37 @@ async fn evaluate_inner(
             segment,
             encoding,
             row_count,
+            predicates,
             ..
         } => {
             let segment = source.request(*segment).await?;
             *read_bytes = Some(segment.len());
-            Ok(ResolvedValue::Array(ResolvedArray::plain(decode_flat(
-                &segment, encoding, *row_count, session,
-            )?)))
+            let resolved =
+                ResolvedArray::plain(decode_flat(&segment, encoding, *row_count, session)?);
+            let mut cached = Vec::with_capacity(predicates.len());
+            if !predicates.is_empty() {
+                let array = primitive_array(&resolved, session)?;
+                for (conjunct, predicate, demand, input_true_count) in predicates {
+                    let started = Instant::now();
+                    let values = evaluate_predicate_slice(
+                        array.as_slice::<i64>(),
+                        demand,
+                        *input_true_count,
+                        *predicate,
+                    );
+                    cached.push(CachedPredicate {
+                        conjunct: *conjunct,
+                        values,
+                        evaluated: demand.clone(),
+                        input_true_count: *input_true_count,
+                        elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    });
+                }
+            }
+            Ok(ResolvedValue::Array(ResolvedArray::plain_with_predicates(
+                resolved.array,
+                cached,
+            )))
         }
         Operation::DecodeFlat {
             encoding,
@@ -138,6 +167,24 @@ async fn evaluate_inner(
                 vortex_bail!("cannot combine demand masks with different lengths");
             }
             let result = &lhs & &rhs;
+            Ok(ResolvedValue::Array(ResolvedArray::boolean(
+                BoolArray::new(result.clone(), Validity::NonNullable).into_array(),
+                result,
+            )))
+        }
+        Operation::MergeDemandFragments => {
+            let mut len = 0;
+            let mut fragments = Vec::with_capacity(task.inputs.len());
+            for input in 0..task.inputs.len() {
+                let fragment = boolean_bits(array_input(task, input)?, session)?;
+                len += fragment.len();
+                fragments.push(fragment);
+            }
+            let mut result = BitBufferMut::with_capacity(len);
+            for fragment in fragments {
+                result.append_buffer(&fragment);
+            }
+            let result = result.freeze();
             Ok(ResolvedValue::Array(ResolvedArray::boolean(
                 BoolArray::new(result.clone(), Validity::NonNullable).into_array(),
                 result,

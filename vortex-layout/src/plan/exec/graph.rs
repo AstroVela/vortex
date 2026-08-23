@@ -3,9 +3,12 @@
 
 use std::ops::Range;
 
+use smallvec::SmallVec;
+
 use super::ArraySlotId;
 use super::FieldId;
 use super::FlatEncoding;
+use super::MorselId;
 use super::ReadPhase;
 use super::ResourceId;
 use super::SegmentSlotId;
@@ -42,6 +45,12 @@ pub(crate) struct ResourceNode {
     pub leases: usize,
     pub read_task: Option<TaskId>,
     pub decode_task: Option<TaskId>,
+    pub completed_bytes: Option<usize>,
+    pub predicate_consumed: bool,
+    pub projection_consumed: bool,
+    pub shared_reuse_recorded: bool,
+    pub fused_predicate_waiters: SmallVec<[(MorselId, usize, usize); 2]>,
+    pub fused_predicate_task_waiters: SmallVec<[(MorselId, usize, usize); 2]>,
 }
 
 impl ResourceNode {

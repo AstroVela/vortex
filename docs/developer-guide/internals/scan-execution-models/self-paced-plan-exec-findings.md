@@ -690,6 +690,67 @@ increase the number of physical resource slices assembled by each task and reduc
 schedule independent morsels. Natural-split rollup therefore needs a byte/work-aware target; a
 fixed count of 32 is not a generally better aggregation policy.
 
+## Segment-streamed predicate demand
+
+Adaptive execution now subdivides each outer morsel into demand fragments at the serialized
+`Struct(Chunked(Flat))` chunk boundaries. The outer morsel remains the scheduling and output unit;
+fragments are internal mask state and do not change the fair merge-16 contract. Each fragment
+starts with an all-true demand mask and advances through its predicates independently, while
+different fragments can run concurrently.
+
+The read/decode task fuses only the predicate currently requested by a fragment and captures that
+fragment's current demand. After I/O, predicate evaluation visits only demanded rows and completion
+adopts the result immediately. A selective result therefore exposes the next predicate or
+projection read for that segment without waiting for sibling fragments or a complete outer-morsel
+mask. A partial cached predicate records exactly which rows it evaluated; later resource reuse is
+allowed only when that coverage contains every newly demanded row. Otherwise the decoded array is
+reused by a normal predicate task. After every fragment seals, one `MergeDemandFragments`
+operation concatenates their masks in row order; normal projection selection then consumes this
+single outer-morsel mask.
+
+Resources remain keyed and deduplicated by `SegmentId`. A resource used by both filter and
+projection has one read/decode slot, and the projection consumes that same decoded array. Metrics
+now report predicate-only, projection-only, and shared resources and bytes, shared decode reuse,
+projection reuse of predicate decodes, fragment counts and updates, early projection unblocks,
+fused predicates and cache hits, and nanoseconds spent evaluating fused predicates, adopting
+fragment masks, and merging the final masks.
+
+On full 15-file FineWeb Q06, pinned to CPUs 0-15, the streamed completion path read 714,536,112
+bytes in 10,918 unique segment requests, versus V1's 714,601,752 bytes in 10,931 requests. It
+executed 5,461 fused segment predicates across 1,823 fragments and 116 outer morsels. Moving mask
+adoption into resource completion reduced reactor transitions from about 33,242 in the first
+fragment implementation to 22,320, slightly below the earlier morsel-wide executor's roughly
+22,903 transitions. The first three-iteration full-data check nevertheless measured V1 at 21.708
+ms and self-paced at 47.708 ms (`2.198x`). Its trace attributed 18.83 ms of aggregate worker CPU to
+fused predicate evaluation, 5.23 ms to fragment-demand adoption, and only 0.57 ms to the outside
+mask merge. Of 5,461 adoptions, 2,796 did not reduce demand; avoiding `BoolArray` materialization
+for those no-ops improved a five-iteration rerun to 22.472 ms for V1 and 46.127 ms for self-paced
+(`2.053x`). The remaining Q06 gap is therefore not explained by extra physical I/O, additional
+fragment-notification transitions, or the final merge. Segment-granular predicate and mask CPU is
+the next optimization target.
+
+A subsequent demand-aware experiment passed the reduced fragment mask into each fused predicate.
+On Q06, 3,638 later predicate applications received only 24,957 demanded rows and skipped
+29,689,351 row applications. Aggregate predicate CPU fell from about 18.8 ms to 10.9 ms. Despite
+that useful work reduction, the final five-iteration comparison measured V1 at 22.240 ms and
+self-paced at 48.695 ms (`2.190x`), slower than the all-row fused version. The saved worker CPU did
+not shorten the critical path enough to offset mask publication and serialized orchestration.
+
+This is primarily a plan-execution ownership issue, not predicate semantics that belong in the
+global scheduler. `Execution` represents fragment demand, resource dependencies, cache coverage,
+and readiness. The scheduler should admit any ready task subject to CPU, I/O, and byte budgets.
+Today `run_self_paced_concurrent` keeps the complete mutable `Execution` on one async coordinator:
+that one loop drains completions, advances every morsel, chooses tasks, claims work, adopts masks,
+and queues outputs. The worker pool only evaluates claimed tasks. This made resource deduplication,
+leases, cancellation, and tracing deterministic without locks, but it also serializes thousands of
+small state transitions. A production design should shard plan execution by morsel (or a small
+group of morsels), publish resource completions to the owning shards, and retain only admission and
+global byte accounting in the shared scheduler.
+
+The [implementation handover](self-paced-plan-exec-handover.md) records the exact current state and
+next work. The [experimental learning ledger](self-paced-plan-exec-learnings.md) preserves less
+certain observations and hypotheses separately from the measured findings in this report.
+
 ## What remains unknown
 
 The current results do not establish performance for compressed production encodings, unaligned
