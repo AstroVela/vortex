@@ -375,6 +375,7 @@ impl VarBinViewData {
             // into a mask once and zip it with the views, validating only the valid (non-null)
             // entries.
             Validity::Array(_) => {
+                // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
                 let mut ctx = legacy_session().create_execution_ctx();
                 let mask = validity.execute_mask(views.len(), &mut ctx)?;
                 for ((idx, view), valid) in views.iter().enumerate().zip(mask.iter()) {

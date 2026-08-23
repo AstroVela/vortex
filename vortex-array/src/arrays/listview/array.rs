@@ -9,7 +9,6 @@ use num_traits::AsPrimitive;
 use vortex_buffer::BitBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
@@ -263,6 +262,7 @@ impl ListViewData {
 
         // Skip host-only validation when offsets/sizes are not host-resident.
         if offsets.is_host() && sizes.is_host() {
+            // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
             #[allow(clippy::disallowed_methods)]
             let mut ctx = legacy_session().create_execution_ctx();
             let offsets_primitive = offsets.clone().execute::<PrimitiveArray>(&mut ctx)?;
@@ -625,21 +625,19 @@ impl Array<ListView> {
     ///
     /// See [`ListViewData::with_zero_copy_to_list`].
     pub unsafe fn with_zero_copy_to_list(self, is_zctl: bool) -> Self {
-        if cfg!(debug_assertions) && is_zctl {
-            #[allow(clippy::disallowed_methods)]
-            let mut ctx = legacy_session().create_execution_ctx();
-            let offsets_primitive = self
-                .offsets()
-                .clone()
-                .execute::<PrimitiveArray>(&mut ctx)
-                .vortex_expect("offsets must canonicalize to primitive");
-            let sizes_primitive = self
-                .sizes()
-                .clone()
-                .execute::<PrimitiveArray>(&mut ctx)
-                .vortex_expect("sizes must canonicalize to primitive");
-            validate_zctl(self.elements(), offsets_primitive, sizes_primitive)
-                .vortex_expect("Failed to validate zero-copy to list flag");
+        if cfg!(debug_assertions)
+            && is_zctl
+            // Best-effort: decoding encoded offsets/sizes would require an execution context
+            // the caller does not provide, so only already-decoded components are checked.
+            && let Some(offsets_primitive) = self.offsets().as_opt::<Primitive>()
+            && let Some(sizes_primitive) = self.sizes().as_opt::<Primitive>()
+        {
+            validate_zctl(
+                self.elements(),
+                offsets_primitive.into_owned(),
+                sizes_primitive.into_owned(),
+            )
+            .vortex_expect("Failed to validate zero-copy to list flag");
         }
         let dtype = self.dtype().clone();
         let len = self.len();
@@ -726,20 +724,20 @@ where
 
 /// Helper function to validate if the `ListViewArray` components are actually zero-copyable to
 /// [`ListArray`](crate::arrays::ListArray).
-#[allow(clippy::disallowed_methods)]
 fn validate_zctl(
     elements: &ArrayRef,
     offsets_primitive: PrimitiveArray,
     sizes_primitive: PrimitiveArray,
 ) -> VortexResult<()> {
     // Offsets must be sorted (but not strictly sorted, zero-length lists are allowed), even
-    // if there are null views.
-    let mut ctx = legacy_session().create_execution_ctx();
-    if let Some(is_sorted) = offsets_primitive.statistics().compute_is_sorted(&mut ctx) {
-        vortex_ensure!(is_sorted, "offsets must be sorted");
-    } else {
-        vortex_bail!("offsets must report is_sorted statistic");
-    }
+    // if there are null views. Offsets are non-nullable by invariant, so sortedness can be
+    // checked directly on the decoded values.
+    match_each_integer_ptype!(offsets_primitive.ptype(), |P| {
+        vortex_ensure!(
+            offsets_primitive.as_slice::<P>().is_sorted(),
+            "offsets must be sorted"
+        );
+    });
 
     // Validate that offset[i] + size[i] <= offset[i+1] for all items
     // This ensures views are non-overlapping and properly ordered for zero-copy-to-list
