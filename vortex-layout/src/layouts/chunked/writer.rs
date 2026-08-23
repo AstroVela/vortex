@@ -28,13 +28,21 @@ use crate::sequence::SequentialStreamExt as _;
 pub struct ChunkedLayoutStrategy {
     /// The layout strategy for each chunk.
     pub chunk_strategy: Arc<dyn LayoutStrategy>,
+    preserve_single_child: bool,
 }
 
 impl ChunkedLayoutStrategy {
     pub fn new<S: LayoutStrategy>(chunk_strategy: S) -> Self {
         Self {
             chunk_strategy: Arc::new(chunk_strategy),
+            preserve_single_child: false,
         }
+    }
+
+    /// Preserve the chunked wrapper when the input contains exactly one chunk.
+    pub fn with_preserve_single_child(mut self) -> Self {
+        self.preserve_single_child = true;
+        self
     }
 }
 
@@ -87,7 +95,7 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
         // Poll all of our children concurrently to accumulate their layouts.
         let mut child_layouts: Vec<LayoutRef> = stream.buffered(usize::MAX).try_collect().await?;
 
-        if child_layouts.len() == 1 {
+        if child_layouts.len() == 1 && !self.preserve_single_child {
             Ok(child_layouts.pop().vortex_expect("must have one child"))
         } else {
             let row_count = child_layouts.iter().map(|layout| layout.row_count()).sum();

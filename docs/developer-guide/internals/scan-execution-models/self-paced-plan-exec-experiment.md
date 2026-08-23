@@ -22,16 +22,38 @@ It asks whether:
 The experiment should favor an inspectable event trace and strong invariants over generality or
 peak performance.
 
+The implemented experiment and its benchmark conclusions are recorded in the
+[findings report](self-paced-plan-exec-findings.md).
+
+## V1 comparison invariant
+
+V1 must run with the layout's natural chunk boundaries. The self-paced morsel size is a candidate
+scheduler parameter and must never be passed to V1 or used to subdivide V1 work. The comparison
+harness therefore supplies `ScanBuilder::with_natural_splits` with boundaries derived directly
+from `SourcePlan::chunks`; relying on the default `SplitBy::Layout` is incorrect for this
+experiment because it may subdivide wide chunk spans at `IDEAL_SPLIT_SIZE`.
+
+Both engines must scan the same input rows and may use the same worker-thread pool. Their work-unit
+counts are intentionally different: V1 owns one split per natural layout chunk, while self-paced
+owns the configured morsels (currently the primary comparison is 128K rows). Never report a run as
+V1 versus self-paced if V1 was row-split using the self-paced morsel size or the layout
+subdivision fallback.
+
 ## Scope
 
 The only supported source shape is:
 
 ```text
-Chunked
-└── Struct
-    ├── Flat(a)
-    ├── Flat(b)
-    └── Flat(c)
+Struct
+├── Chunked(a)
+│   ├── Flat(a0)
+│   └── Flat(a1)
+├── Chunked(b)
+│   ├── Flat(b0)
+│   └── Flat(b1)
+└── Chunked(c)
+    ├── Flat(c0)
+    └── Flat(c1)
 ```
 
 The supported query shape is a conjunction of field predicates followed by a field projection:
@@ -46,6 +68,7 @@ The first experiment deliberately has these restrictions:
 - flat columns contain `i64` values;
 - each conjunct reads one field and applies a simple comparison;
 - projection selects fields rather than evaluating arbitrary expressions;
+- field chunk boundaries are aligned across the Struct;
 - a morsel may cross field-chunk boundaries and carries an ordered Flat slice list per field;
 - an in-memory segment evaluator supplies the data plane;
 - the only resolved work values are a segment `BufferHandle` and an `ArrayRef` with its
@@ -95,7 +118,9 @@ vortex-layout/src/plan/exec/
 └── tests.rs
 
 vortex-layout/benches/
-├── self_paced_plan_exec.rs
+└── self_paced_plan_exec.rs
+
+vortex-file/benches/
 └── self_paced_vs_v1.rs
 ```
 
@@ -153,13 +178,12 @@ never evaluates or intersects arrays.
 Exit when unrelated clean nodes are not visited, broad demand remains compact, and small and large
 budgets eventually produce identical output.
 
-### Phase 5: Flat, Struct, and Chunked output
+### Phase 5: Flat, Struct, and Chunked input
 
 Flat selects a morsel-specific array from a shared decode. Struct packs aligned field arrays.
-Chunked translates child coverage and forwards the result because morsels cannot cross chunk
-boundaries in this experiment.
-
-Do not implement `ConcatChunks` in this phase: the restricted experiment cannot exercise it.
+Each field's Chunked layout maps the morsel range to an ordered list of Flat slices. A morsel may
+therefore cross one or more aligned field-chunk boundaries; the evaluator concatenates selected
+values from those slices before Struct packs the fields.
 
 Exit when every node output and the root result match the eager reference evaluator.
 
@@ -251,16 +275,15 @@ and identifies which unfinished morsels might reuse a result.
 
 ## Morsels and shrinking demand
 
-Morsels are created inside chunk boundaries. For two eight-row chunks and a four-row target:
+Morsels partition the root row domain independently of aligned field-chunk boundaries. For two
+eight-row chunks and a ten-row target:
 
 ```text
 chunk 0: root rows [0, 8)
-    morsel 0: [0, 4)
-    morsel 1: [4, 8)
-
 chunk 1: root rows [8, 16)
-    morsel 2: [8, 12)
-    morsel 3: [12, 16)
+
+morsel 0: [0, 10)   # slices chunk 0 [0, 8) and chunk 1 [0, 2)
+morsel 1: [10, 16)  # slices chunk 1 [2, 8)
 ```
 
 Every morsel starts with an over-approximation containing all its rows:
@@ -391,8 +414,9 @@ resource node.
 
 ## Operator outputs and transformed arrays
 
-Resource facts are not plan outputs. A decoded flat segment is reusable input; Flat, Struct, and
-Chunked still need to produce the arrays described by their plan nodes.
+Resource facts are not plan outputs. A decoded flat segment is reusable input; Flat selection and
+Struct packing still need to produce morsel-local arrays. Chunked is compiled into the ordered Flat
+slices consumed by those operations.
 
 The experiment therefore contains two connected graphs:
 
@@ -402,7 +426,7 @@ scan-wide resource graph
     retained and reused across morsels
 
 per-morsel operator graph
-    Flat output -> Struct output -> Chunked output
+    Flat selections -> Struct output
     retired with the morsel
 ```
 
@@ -495,16 +519,11 @@ Flat(c) batch ─┘
 Struct does not read or decode data itself. It routes field demand, waits for aligned field
 outputs, and describes the array assembly work.
 
-### Chunked output
+### Chunked input
 
-Because the first experiment keeps morsels inside one chunk, Chunked usually forwards the child
-Struct batch after translating chunk-local coverage into root coordinates. Forwarding an
-`ArrayRef` and changing coordinate metadata is a cheap planning transition.
-
-If a future experiment permits one output batch to span chunks, Chunked can either return each
-ready child batch separately or expose a `ConcatChunks` CPU task that constructs a `ChunkedArray`.
-The former better demonstrates self-paced output; the latter tests equivalence with the current
-whole-request behavior.
+Chunked translates a root morsel range into ordered Flat slices. The fields of the Struct must have
+aligned chunk boundaries, but a morsel need not align with them. Predicate evaluation and Flat
+selection consume all overlapping slices and preserve root row order.
 
 ## Scheduler-visible work
 
@@ -550,10 +569,11 @@ enum Operation {
 
 `Necessity` matches the architecture's candidate/required split. `Promote` changes a retained
 offer from candidate to required without changing its identity. `Revoke` removes an unclaimed
-offer that demand has made unnecessary. `ConcatChunks` is reserved for a later experiment because
-morsels do not cross chunk boundaries here. The operation enum belongs to the experiment's fixed
-reference evaluator, not the central completion protocol. Every task declares only segment or
-array inputs and exactly one segment or array output:
+offer that demand has made unnecessary. `ConcatChunks` remains reserved: cross-chunk morsels are
+handled by the multi-slice predicate and Flat-selection operations, so the experiment does not
+produce a per-chunk output that needs concatenation. The operation enum belongs to the
+experiment's fixed reference evaluator, not the central completion protocol. Every task declares
+only segment or array inputs and exactly one segment or array output:
 
 ```rust
 enum InputSlot {
@@ -803,7 +823,6 @@ advance(morsel 0)
 
 complete Struct output
 advance(morsel 0)
-  -> Chunked translates coverage and forwards the Struct batch
   -> output one row
   -> retire morsel 0
 ```
@@ -824,7 +843,7 @@ I/O and CPU tasks offered, claimed, promoted, revoked, and completed, including 
 shared byte and decode reuse hits
 resident bytes and decoded rows
 pinned, reusable, and dead resource counts
-Flat, Struct, and Chunked output tasks and arrays
+Flat and Struct output tasks and arrays
 maximum offered and claimed/running task frontiers
 total graph nodes, slots, and explicit edges
 useful and unused speculative I/O bytes
@@ -885,14 +904,15 @@ Vortex `ArrayRef` operations for this stage.
 
 ### V1 execution
 
-Run V1 through `ScanBuilder` with row-count splitting so its worker ranges match the experiment's
-morsels:
+Run V1 through `ScanBuilder` with natural layout-chunk boundaries computed once from
+`SourcePlan::chunks`. Pass them explicitly so `SplitBy::Layout` cannot silently subdivide wide
+chunks. Morsels are an implementation choice of self-paced execution and are never imposed on V1:
 
 ```rust
 ScanBuilder::new(session, layout_reader)
     .with_filter(filter)
     .with_projection(projection)
-    .with_split_by(SplitBy::RowCount(morsel_rows))
+    .with_natural_splits(Arc::clone(&fixture.natural_splits))
     .with_concurrency(concurrency)
     .into_array_stream()
 ```
@@ -916,7 +936,7 @@ Run each case through V1 and self-paced execution:
 For every case, use:
 
 ```text
-morsel rows: 4,096; 16,384; 65,536
+morsel rows: 4,096; 16,384; 65,536; 131,072
 concurrency: 1; 4; 16
 ```
 
@@ -975,10 +995,10 @@ headline measurements but are not themselves a direct V1 comparison.
 
 ### Baseline benchmark command
 
-Add `vortex-layout/benches/self_paced_vs_v1.rs` and run:
+Add `vortex-file/benches/self_paced_vs_v1.rs` and run:
 
 ```bash
-cargo bench -p vortex-layout --bench self_paced_vs_v1
+cargo bench -p vortex-file --bench self_paced_vs_v1
 ```
 
 The benchmark must consume every output and compare its stable ordered hash before accepting its
@@ -1101,9 +1121,8 @@ superset validation are sufficient or whether additional dependency state is nee
 ### Is the resource/operator split correct?
 
 Shared segment handles and decoded arrays should survive when later morsels may reuse them.
-Morsel-specific Flat selections, Struct arrays, and Chunked outputs should retire with their
-morsel. This reveals whether the proposed keys and ownership boundaries retain too much or prevent
-useful reuse.
+Morsel-specific Flat selections and Struct arrays should retire with their morsel. This reveals
+whether the proposed keys and ownership boundaries retain too much or prevent useful reuse.
 
 ### Can possible future users drive useful lifetime decisions?
 
@@ -1111,11 +1130,11 @@ After one morsel retires, a resource should be pinned, reusable, or dead without
 experiment should quantify how long conservative possible-user sets retain data and whether late
 joins achieve enough reuse to justify that retention.
 
-### Are Chunked and Struct compositional?
+### Are Chunked input and Struct output compositional?
 
-Chunked should only translate row domains and order output. Struct should only route field demand
-and pack aligned outputs. Flat should own the physical resource boundary. If query-specific state
-leaks deeply into these nodes, the plan/executor boundary needs revision.
+Chunked should only translate root ranges into ordered Flat slices. Struct should only route field
+demand and pack aligned outputs. Flat should own the physical resource boundary. If query-specific
+state leaks deeply into these nodes, the plan/executor boundary needs revision.
 
 ### Does scheduler freedom improve the trade-off?
 

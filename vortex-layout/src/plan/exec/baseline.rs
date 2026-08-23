@@ -4,12 +4,14 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
-use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use smallvec::SmallVec;
 use smallvec::smallvec;
 use vortex_array::IntoArray;
@@ -32,6 +34,7 @@ use super::Completion;
 use super::ExecBatch;
 use super::Execution;
 use super::Metrics;
+use super::MorselId;
 use super::MorselState;
 use super::Necessity;
 use super::Operation;
@@ -42,6 +45,8 @@ use super::RunnableTask;
 use super::ScanQuery;
 use super::SchedulePolicy;
 use super::SourcePlan;
+use super::SpeculativeIoConfig;
+use super::SpeculativeReadPolicy;
 use super::TaskId;
 use super::TaskUpdate;
 use super::TraceEvent;
@@ -49,9 +54,10 @@ use super::evaluate;
 use super::evaluate::primitive_values;
 use crate::segments::SegmentSource;
 
-static EXECUTOR_POOL: OnceCell<futures::executor::ThreadPool> = OnceCell::new();
+static EXECUTOR_POOLS: LazyLock<Mutex<BTreeMap<usize, futures::executor::ThreadPool>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 type OfferedTasks = SmallVec<[TaskId; 16]>;
-type TaskStarts = BTreeMap<TaskId, (Instant, &'static str, Option<super::MorselId>)>;
+type TaskStarts = BTreeMap<TaskId, (Instant, &'static str, Option<MorselId>)>;
 
 #[derive(Clone, Debug)]
 pub struct RunResult {
@@ -67,12 +73,32 @@ pub struct RunOptions {
     pub retention: RetentionPolicy,
     pub concurrency: usize,
     pub collect_trace: bool,
+    pub speculative_io: SpeculativeIoConfig,
 }
 
 pub async fn run_self_paced(
-    plan: SourcePlan,
+    plan: &SourcePlan,
     query: ScanQuery,
     morsel_rows: usize,
+    source: Arc<dyn SegmentSource>,
+    session: &VortexSession,
+    options: RunOptions,
+) -> VortexResult<RunResult> {
+    if morsel_rows == 0 {
+        vortex_bail!("morsel_rows must be non-zero");
+    }
+    let morsel_rows = u64::try_from(morsel_rows)?;
+    let morsel_ranges = (0..plan.row_count)
+        .step_by(usize::try_from(morsel_rows)?)
+        .map(|start| start..(start + morsel_rows).min(plan.row_count))
+        .collect::<Vec<_>>();
+    run_self_paced_ranges(plan, query, &morsel_ranges, source, session, options).await
+}
+
+pub async fn run_self_paced_ranges(
+    plan: &SourcePlan,
+    query: ScanQuery,
+    morsel_ranges: &[Range<u64>],
     source: Arc<dyn SegmentSource>,
     session: &VortexSession,
     options: RunOptions,
@@ -82,17 +108,19 @@ pub async fn run_self_paced(
         vortex_bail!("execution concurrency must be non-zero");
     }
     if options.concurrency > 1 {
-        return run_self_paced_concurrent(plan, query, morsel_rows, source, session, options).await;
+        return run_self_paced_concurrent(plan, query, morsel_ranges, source, session, options)
+            .await;
     }
 
     let init_started = collect_trace.then(Instant::now);
-    let mut execution = Execution::try_new_with_policy(
+    let mut execution = Execution::try_new_with_policy_and_ranges(
         plan,
         query,
-        morsel_rows,
+        morsel_ranges,
         options.retention,
         options.policy,
     )?;
+    execution.populate_segment_sizes(source.as_ref());
     execution.set_trace_enabled(collect_trace);
     if let Some(init_started) = init_started {
         let init_latency_ns = init_started.elapsed().as_nanos();
@@ -109,7 +137,7 @@ pub async fn run_self_paced(
         loop {
             let transitions_before = collect_trace.then(|| execution.metrics().transitions);
             let result = execution.advance(morsel, options.transition_budget)?;
-            apply_updates(&result, &mut offered);
+            apply_updates(&result, &mut offered, options.speculative_io);
             if let Some(transitions_before) = transitions_before {
                 record_updates(&mut execution, &result, offered.len(), 0);
                 let transitions = execution.metrics().transitions - transitions_before;
@@ -146,7 +174,15 @@ pub async fn run_self_paced(
                 continue;
             }
 
-            let admitted = choose_tasks(&execution, &offered, options.policy);
+            let (admitted, considered) = choose_tasks(
+                &execution,
+                &offered,
+                options.policy,
+                options.speculative_io,
+                options.speculative_io.max_in_flight_bytes,
+                usize::MAX,
+            )?;
+            execution.record_scheduler_pass(considered, admitted.len());
             if collect_trace {
                 execution.record_trace(
                     Some(morsel),
@@ -162,6 +198,15 @@ pub async fn run_self_paced(
                 vortex_bail!("self-paced execution reached quiescence without runnable work");
             }
             for task_id in admitted {
+                let speculative_charge =
+                    speculative_read_charge(&execution, task_id, options.speculative_io)?;
+                record_speculative_io_admission(
+                    &mut execution,
+                    task_id,
+                    speculative_charge,
+                    Some(morsel),
+                    collect_trace,
+                )?;
                 remove_offered(&mut offered, task_id);
                 match execution.claim(task_id)? {
                     ClaimResult::Runnable(task) => {
@@ -218,6 +263,7 @@ pub async fn run_self_paced(
         }
     }
 
+    execution.finalize_speculative_io_metrics();
     Ok(RunResult {
         batches,
         metrics: execution.metrics().clone(),
@@ -226,22 +272,23 @@ pub async fn run_self_paced(
 }
 
 async fn run_self_paced_concurrent(
-    plan: SourcePlan,
+    plan: &SourcePlan,
     query: ScanQuery,
-    morsel_rows: usize,
+    morsel_ranges: &[Range<u64>],
     source: Arc<dyn SegmentSource>,
     session: &VortexSession,
     options: RunOptions,
 ) -> VortexResult<RunResult> {
     let collect_trace = options.collect_trace;
     let init_started = collect_trace.then(Instant::now);
-    let mut execution = Execution::try_new_with_policy(
+    let mut execution = Execution::try_new_with_policy_and_ranges(
         plan,
         query,
-        morsel_rows,
+        morsel_ranges,
         options.retention,
         options.policy,
     )?;
+    execution.populate_segment_sizes(source.as_ref());
     execution.set_trace_enabled(collect_trace);
     if let Some(init_started) = init_started {
         let init_latency_ns = init_started.elapsed().as_nanos();
@@ -259,18 +306,43 @@ async fn run_self_paced_concurrent(
     if collect_trace {
         execution.record_trace(None, format_args!("event=executor_pool_start"));
     }
-    let pool = EXECUTOR_POOL.get_or_try_init(|| {
-        futures::executor::ThreadPool::new()
-            .map_err(|error| vortex_error::vortex_err!("cannot create executor pool: {error}"))
-    })?;
+    let pool = {
+        let mut pools = EXECUTOR_POOLS.lock();
+        if let Some(pool) = pools.get(&options.concurrency) {
+            pool.clone()
+        } else {
+            let pool = futures::executor::ThreadPoolBuilder::new()
+                .pool_size(options.concurrency)
+                .name_prefix(format!("self-paced-{}-", options.concurrency))
+                .create()
+                .map_err(|error| {
+                    vortex_error::vortex_err!("cannot create executor pool: {error}")
+                })?;
+            pools.insert(options.concurrency, pool.clone());
+            pool
+        }
+    };
     if collect_trace {
         execution.record_trace(None, format_args!("event=executor_pool_ready"));
     }
     let (completion_tx, mut completion_rx) = mpsc::unbounded();
     let mut running = 0usize;
     let mut task_starts = BTreeMap::new();
+    let mut speculative_in_flight = BTreeMap::<TaskId, usize>::new();
 
     while unfinished != 0 || running != 0 {
+        let drained = drain_ready_completions(
+            &mut completion_rx,
+            &mut execution,
+            &mut running,
+            &mut speculative_in_flight,
+            &mut task_starts,
+            offered.len(),
+            &batches,
+            &mut ready,
+            &mut queued,
+        )?;
+        execution.record_completion_batch(drained);
         while let Some(morsel) = ready.pop_front() {
             queued[morsel.0] = false;
             if batches[morsel.0].is_some() {
@@ -278,7 +350,7 @@ async fn run_self_paced_concurrent(
             }
             let transitions_before = collect_trace.then(|| execution.metrics().transitions);
             let result = execution.advance(morsel, options.transition_budget)?;
-            apply_updates(&result, &mut offered);
+            apply_updates(&result, &mut offered, options.speculative_io);
             if let Some(transitions_before) = transitions_before {
                 record_updates(&mut execution, &result, offered.len(), running);
                 let transitions = execution.metrics().transitions - transitions_before;
@@ -319,10 +391,30 @@ async fn run_self_paced_concurrent(
 
         if unfinished != 0 {
             let capacity = options.concurrency.saturating_sub(running);
-            for task_id in choose_tasks(&execution, &offered, options.policy)
-                .into_iter()
-                .take(capacity)
-            {
+            let speculative_bytes = speculative_in_flight.values().sum::<usize>();
+            let available_speculative_bytes = options
+                .speculative_io
+                .max_in_flight_bytes
+                .saturating_sub(speculative_bytes);
+            let (admitted, considered) = choose_tasks(
+                &execution,
+                &offered,
+                options.policy,
+                options.speculative_io,
+                available_speculative_bytes,
+                capacity,
+            )?;
+            execution.record_scheduler_pass(considered, admitted.len());
+            for task_id in admitted {
+                let speculative_charge =
+                    speculative_read_charge(&execution, task_id, options.speculative_io)?;
+                record_speculative_io_admission(
+                    &mut execution,
+                    task_id,
+                    speculative_charge,
+                    None,
+                    collect_trace,
+                )?;
                 remove_offered(&mut offered, task_id);
                 if let ClaimResult::Runnable(task) = execution.claim(task_id)? {
                     let inline = execute_inline(&task.operation, options.policy);
@@ -361,6 +453,9 @@ async fn run_self_paced_concurrent(
                         let completion = evaluate(task, source.as_ref(), &session).await;
                         drop(completion_tx.unbounded_send(completion));
                     });
+                    if let Some(charge) = speculative_charge {
+                        speculative_in_flight.insert(task_id, charge);
+                    }
                     running += 1;
                 }
             }
@@ -390,24 +485,30 @@ async fn run_self_paced_concurrent(
             Some(Instant::now())
         };
         if let Some(completion) = completion_rx.next().await {
-            running -= 1;
-            let task_id = completion.task;
-            let wake_morsels = execution.completion_morsels(task_id)?;
-            if let Some((started, operation, morsel)) = task_starts.remove(&task_id) {
-                execution.record_trace(
-                    morsel,
-                    format_args!(
-                        "event=wait_end task={} operation={operation} task_latency_ns={} success={} offered={} running={}",
-                        task_id.0,
-                        started.elapsed().as_nanos(),
-                        completion.result.is_ok(),
-                        offered.len(),
-                        running,
-                    ),
-                );
-            }
-            execution.complete(completion)?;
-            enqueue_woken_morsels(wake_morsels, &batches, &mut ready, &mut queued);
+            let mut drained = 1;
+            complete_concurrent_task(
+                completion,
+                &mut execution,
+                &mut running,
+                &mut speculative_in_flight,
+                &mut task_starts,
+                offered.len(),
+                &batches,
+                &mut ready,
+                &mut queued,
+            )?;
+            drained += drain_ready_completions(
+                &mut completion_rx,
+                &mut execution,
+                &mut running,
+                &mut speculative_in_flight,
+                &mut task_starts,
+                offered.len(),
+                &batches,
+                &mut ready,
+                &mut queued,
+            )?;
+            execution.record_completion_batch(drained);
             if let Some(wait_started) = wait_started {
                 execution.record_trace(
                     None,
@@ -422,11 +523,82 @@ async fn run_self_paced_concurrent(
         }
     }
 
+    execution.finalize_speculative_io_metrics();
     Ok(RunResult {
         batches: batches.into_iter().flatten().collect(),
         metrics: execution.metrics().clone(),
         trace: execution.trace().to_vec(),
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "completion bookkeeping belongs together at the executor boundary"
+)]
+fn drain_ready_completions(
+    completion_rx: &mut mpsc::UnboundedReceiver<Completion>,
+    execution: &mut Execution,
+    running: &mut usize,
+    speculative_in_flight: &mut BTreeMap<TaskId, usize>,
+    task_starts: &mut TaskStarts,
+    offered: usize,
+    batches: &[Option<ExecBatch>],
+    ready: &mut VecDeque<MorselId>,
+    queued: &mut [bool],
+) -> VortexResult<usize> {
+    let mut drained = 0;
+    while let Ok(completion) = completion_rx.try_recv() {
+        complete_concurrent_task(
+            completion,
+            execution,
+            running,
+            speculative_in_flight,
+            task_starts,
+            offered,
+            batches,
+            ready,
+            queued,
+        )?;
+        drained += 1;
+    }
+    Ok(drained)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "completion bookkeeping belongs together at the executor boundary"
+)]
+fn complete_concurrent_task(
+    completion: Completion,
+    execution: &mut Execution,
+    running: &mut usize,
+    speculative_in_flight: &mut BTreeMap<TaskId, usize>,
+    task_starts: &mut TaskStarts,
+    offered: usize,
+    batches: &[Option<ExecBatch>],
+    ready: &mut VecDeque<MorselId>,
+    queued: &mut [bool],
+) -> VortexResult<()> {
+    *running -= 1;
+    let task_id = completion.task;
+    speculative_in_flight.remove(&task_id);
+    let wake_morsels = execution.completion_morsels(task_id)?;
+    if let Some((started, operation, morsel)) = task_starts.remove(&task_id) {
+        execution.record_trace(
+            morsel,
+            format_args!(
+                "event=wait_end task={} operation={operation} task_latency_ns={} success={} offered={} running={}",
+                task_id.0,
+                started.elapsed().as_nanos(),
+                completion.result.is_ok(),
+                offered,
+                running,
+            ),
+        );
+    }
+    execution.complete(completion)?;
+    enqueue_woken_morsels(wake_morsels, batches, ready, queued);
+    Ok(())
 }
 
 fn execute_inline(operation: &Operation, policy: SchedulePolicy) -> bool {
@@ -436,9 +608,9 @@ fn execute_inline(operation: &Operation, policy: SchedulePolicy) -> bool {
 }
 
 fn enqueue_woken_morsels(
-    morsels: impl IntoIterator<Item = super::MorselId>,
+    morsels: impl IntoIterator<Item = MorselId>,
     batches: &[Option<ExecBatch>],
-    ready: &mut VecDeque<super::MorselId>,
+    ready: &mut VecDeque<MorselId>,
     queued: &mut [bool],
 ) {
     for morsel in morsels {
@@ -456,7 +628,7 @@ async fn complete_inline_task(
     task_starts: &mut TaskStarts,
     offered: usize,
     running: usize,
-) -> VortexResult<SmallVec<[super::MorselId; 8]>> {
+) -> VortexResult<SmallVec<[MorselId; 8]>> {
     let record_demand_combination = matches!(task.operation, Operation::CombineDemand { .. });
     let completion = evaluate(task, source, session).await;
     let wake_morsels = execution.completion_morsels(completion.task)?;
@@ -480,11 +652,7 @@ async fn complete_inline_task(
     Ok(wake_morsels)
 }
 
-fn enqueue_morsel(
-    ready: &mut VecDeque<super::MorselId>,
-    queued: &mut [bool],
-    morsel: super::MorselId,
-) {
+fn enqueue_morsel(ready: &mut VecDeque<MorselId>, queued: &mut [bool], morsel: MorselId) {
     if !queued[morsel.0] {
         queued[morsel.0] = true;
         ready.push_back(morsel);
@@ -530,15 +698,17 @@ fn record_updates(
 fn operation_name(operation: &Operation) -> &'static str {
     match operation {
         Operation::Read { .. } => "read",
+        Operation::ReadDecodeFlat { .. } => "read_decode_flat",
         Operation::DecodeFlat { .. } => "decode_flat",
         Operation::EvaluatePredicate { .. } => "evaluate_predicate",
         Operation::CombineDemand { .. } => "combine_demand",
         Operation::SelectFlat { .. } => "select_flat",
+        Operation::SelectStruct { .. } => "select_struct",
         Operation::PackStruct { .. } => "pack_struct",
     }
 }
 
-fn output_morsel(output: OutputSlot) -> Option<super::MorselId> {
+fn output_morsel(output: OutputSlot) -> Option<MorselId> {
     match output {
         OutputSlot::Array(ArraySlotId::Morsel(morsel, _)) => Some(morsel),
         OutputSlot::Array(ArraySlotId::Scan(_)) | OutputSlot::Segment(_) => None,
@@ -560,19 +730,41 @@ pub fn write_execution_trace(mut writer: impl Write, events: &[TraceEvent]) -> s
     Ok(())
 }
 
-fn apply_updates(result: &AdvanceResult, offered: &mut OfferedTasks) {
+fn apply_updates(
+    result: &AdvanceResult,
+    offered: &mut OfferedTasks,
+    speculative_io: SpeculativeIoConfig,
+) {
     for update in &result.work {
         match update {
             TaskUpdate::Offer(task) => {
-                if let Err(index) = offered.binary_search(&task.id) {
-                    offered.insert(index, task.id);
+                let schedulable = task.necessity == Necessity::Required
+                    || match task.operation {
+                        Operation::Read { phase, .. } | Operation::ReadDecodeFlat { phase, .. } => {
+                            speculative_io.max_in_flight_bytes != 0
+                                && ((phase.includes_predicate()
+                                    && speculative_io.predicate != SpeculativeReadPolicy::Disabled)
+                                    || (phase.includes_projection()
+                                        && speculative_io.projection
+                                            != SpeculativeReadPolicy::Disabled))
+                        }
+                        _ => false,
+                    };
+                if schedulable {
+                    add_offered(offered, task.id);
                 }
             }
-            TaskUpdate::Promote(_) => {}
+            TaskUpdate::Promote(task) => add_offered(offered, *task),
             TaskUpdate::Revoke(task) => {
                 remove_offered(offered, *task);
             }
         }
+    }
+}
+
+fn add_offered(offered: &mut OfferedTasks, task: TaskId) {
+    if let Err(index) = offered.binary_search(&task) {
+        offered.insert(index, task);
     }
 }
 
@@ -582,48 +774,151 @@ fn remove_offered(offered: &mut OfferedTasks, task: TaskId) {
     }
 }
 
+fn record_speculative_io_admission(
+    execution: &mut Execution,
+    task: TaskId,
+    charge: Option<usize>,
+    morsel: Option<MorselId>,
+    collect_trace: bool,
+) -> VortexResult<()> {
+    if !collect_trace {
+        return Ok(());
+    }
+    let Some(charge) = charge else {
+        return Ok(());
+    };
+    let Some(estimate) = execution.read_estimate(task)? else {
+        return Ok(());
+    };
+    execution.record_trace(
+        morsel,
+        format_args!(
+            "event=speculative_io_admit task={} phase={:?} estimated_bytes={:?} charge={} current_rows={} expected_rows={:.3}",
+            task.0,
+            estimate.phase,
+            estimate.estimated_bytes,
+            charge,
+            estimate.current_rows,
+            estimate.expected_rows,
+        ),
+    );
+    Ok(())
+}
+
 fn choose_tasks(
     execution: &Execution,
     offered: &OfferedTasks,
     policy: SchedulePolicy,
-) -> SmallVec<[TaskId; 16]> {
-    if offered.is_empty() {
-        return SmallVec::new();
+    speculative_io: SpeculativeIoConfig,
+    available_speculative_bytes: usize,
+    max_tasks: usize,
+) -> VortexResult<(SmallVec<[TaskId; 16]>, usize)> {
+    if offered.is_empty() || max_tasks == 0 {
+        return Ok((SmallVec::new(), 0));
     }
-    match policy {
-        SchedulePolicy::AllReady | SchedulePolicy::ProjectionPrefetch => {
-            offered.iter().copied().collect()
+    let (start, reverse) = match policy {
+        SchedulePolicy::Reverse | SchedulePolicy::AdaptivePredicates { .. } => {
+            (offered.len() - 1, true)
         }
-        SchedulePolicy::SmallFrontier(limit) => {
-            offered.iter().copied().take(limit.max(1)).collect()
-        }
-        SchedulePolicy::Reverse => offered.iter().rev().copied().collect(),
         SchedulePolicy::Random(seed) => {
             let len = offered.len();
             let index = usize::try_from(seed.wrapping_mul(6364136223846793005).wrapping_add(1))
                 .unwrap_or(0)
                 % len;
-            offered.get(index).copied().into_iter().collect()
+            (index, false)
         }
-        SchedulePolicy::PredicateFirst
-        | SchedulePolicy::AdaptivePredicates { .. }
-        | SchedulePolicy::LegacyAdaptivePredicates { .. } => {
-            let required = offered
-                .iter()
-                .copied()
-                .filter(|task| {
-                    execution
-                        .task(*task)
-                        .is_some_and(|task| task.necessity == Necessity::Required)
-                })
-                .collect::<SmallVec<_>>();
-            if required.is_empty() {
-                offered.iter().next().copied().into_iter().collect()
+        SchedulePolicy::AllReady
+        | SchedulePolicy::ProjectionPrefetch
+        | SchedulePolicy::SmallFrontier(_)
+        | SchedulePolicy::PredicateFirst
+        | SchedulePolicy::LegacyAdaptivePredicates { .. } => (0, false),
+    };
+
+    let mut admitted = SmallVec::new();
+    let mut remaining_bytes = available_speculative_bytes;
+    let limit = match policy {
+        SchedulePolicy::SmallFrontier(limit) => max_tasks.min(limit.max(1)),
+        _ => max_tasks,
+    };
+    let mut considered = 0;
+    'necessities: for necessity in [Necessity::Required, Necessity::Candidate] {
+        for offset in 0..offered.len() {
+            let index = if reverse {
+                start - offset
             } else {
-                required
+                (start + offset) % offered.len()
+            };
+            let task = offered[index];
+            considered += 1;
+            let stored = execution
+                .task(task)
+                .ok_or_else(|| vortex_error::vortex_err!("unknown offered task {}", task.0))?;
+            if stored.necessity != necessity {
+                continue;
+            }
+            if necessity == Necessity::Required {
+                admitted.push(task);
+                if admitted.len() == limit {
+                    break 'necessities;
+                }
+                continue;
+            }
+            let Some(charge) = speculative_read_charge(execution, task, speculative_io)? else {
+                continue;
+            };
+            if charge > remaining_bytes {
+                continue;
+            }
+            remaining_bytes -= charge;
+            admitted.push(task);
+            if admitted.len() == limit {
+                break 'necessities;
             }
         }
     }
+    Ok((admitted, considered))
+}
+
+fn speculative_read_charge(
+    execution: &Execution,
+    task: TaskId,
+    config: SpeculativeIoConfig,
+) -> VortexResult<Option<usize>> {
+    if !execution
+        .task(task)
+        .is_some_and(|task| task.necessity == Necessity::Candidate)
+    {
+        return Ok(None);
+    }
+    let Some(estimate) = execution.read_estimate(task)? else {
+        return Ok(None);
+    };
+    let predicate = estimate
+        .phase
+        .includes_predicate()
+        .then_some(config.predicate);
+    let projection = estimate
+        .phase
+        .includes_projection()
+        .then_some(config.projection);
+    let mut policies = [predicate, projection].into_iter().flatten();
+    let admitted = policies.any(|policy| match policy {
+        SpeculativeReadPolicy::Disabled => false,
+        SpeculativeReadPolicy::Eager => true,
+        SpeculativeReadPolicy::Adaptive {
+            minimum_expected_rows,
+        } => estimate.expected_rows >= minimum_expected_rows as f64,
+    });
+    if !admitted {
+        return Ok(None);
+    }
+    let charge = estimate
+        .estimated_bytes
+        .unwrap_or(config.unknown_read_bytes);
+    if charge == 0 {
+        return Ok(None);
+    }
+    Ok(Some(charge))
 }
 
 pub async fn run_eager(
@@ -649,6 +944,8 @@ pub async fn run_eager(
                     output: OutputSlot::Segment(super::SegmentSlotId::Scan(usize::MAX)),
                     operation: Operation::Read {
                         segment: flat.segment,
+                        phase: super::ReadPhase::PredicateAndProjection,
+                        estimated_bytes: flat.estimated_bytes,
                     },
                 };
                 let Completion { result, .. } = evaluate(read, source.as_ref(), session).await;

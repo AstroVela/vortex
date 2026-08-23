@@ -18,6 +18,7 @@ use vortex_layout::plan::exec::RunOptions;
 use vortex_layout::plan::exec::ScanQuery;
 use vortex_layout::plan::exec::SchedulePolicy;
 use vortex_layout::plan::exec::SourcePlan;
+use vortex_layout::plan::exec::SpeculativeIoConfig;
 use vortex_layout::plan::exec::run_self_paced;
 use vortex_layout::plan::exec::stable_output_hash;
 use vortex_layout::session::LayoutSession;
@@ -79,7 +80,7 @@ fn transition_budget(bencher: Bencher, budget: usize) {
     bencher.bench(|| {
         let result = RUNTIME
             .block_on(run_self_paced(
-                plan.clone(),
+                &plan,
                 query.clone(),
                 4096,
                 Arc::<MemorySegments>::clone(&source),
@@ -90,6 +91,7 @@ fn transition_budget(bencher: Bencher, budget: usize) {
                     retention: RetentionPolicy::RetainUntilDead,
                     concurrency: 1,
                     collect_trace: false,
+                    speculative_io: SpeculativeIoConfig::disabled(),
                 },
             ))
             .unwrap();

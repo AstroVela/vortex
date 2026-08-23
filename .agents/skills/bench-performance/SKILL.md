@@ -27,6 +27,22 @@ Emit evidence as soon as it exists:
 
 Do not wait for a deep code read before showing benchmark comparisons or first stack summaries.
 
+## Self-Paced Versus V1 Split Contract
+
+For `self_paced_vs_v1`, V1 always uses the file's natural layout chunk boundaries. Never pass the
+self-paced morsel size to V1, and never rely on the default `SplitBy::Layout`: it can subdivide a
+wide natural chunk at `IDEAL_SPLIT_SIZE`. Supply the natural boundaries explicitly with
+`ScanBuilder::with_natural_splits`.
+
+The primary comparison uses 128K-row morsels only for self-paced. Keep input rows and runtime
+worker threads equal, but do not force equal work-unit counts. Discard any V1 result collected with
+row-count morsels or automatic layout subdivision and rerun it with natural chunks.
+
+Pin every comparison, trace, and profile run to exactly 16 allowed CPUs with
+`taskset -c 0-15`. A configured concurrency or worker-thread count is not a substitute for process
+affinity: runtimes and helper pools may otherwise execute across additional CPUs. Results collected
+without this prefix are diagnostic only and must not be used in the reported comparison.
+
 ## Standard Loop
 
 1. Capture branch and dirty state:
@@ -241,6 +257,21 @@ When investigating stream scheduling, enable the relevant flow trace and summari
 python3 .agents/skills/bench-performance/scripts/summarize_flow_tracing.py \
   /private/tmp/<label>.log
 ```
+
+For the experimental self-paced executor, capture a `VORTEX_SELF_PACED_TRACE` log and summarize
+its task graph, scheduling churn, completion batching, and wait time:
+
+```bash
+VORTEX_SELF_PACED_TRACE=fineweb-q01-128k \
+  target/release/deps/self_paced_vs_v1-<hash> > /tmp/self-paced-q01.log
+python3 .agents/skills/bench-performance/scripts/summarize_self_paced_trace.py \
+  /tmp/self-paced-q01.log
+```
+
+Use the cheap `trace_end` counters for routine comparisons. Use the event timeline when those
+counters identify excess scheduler passes, one-at-a-time completions, repeated reactor advances,
+or long task waits. Record a Samply profile only after this report points to CPU work inside a
+specific operation rather than executor orchestration.
 
 Read the summary as a scheduling picture:
 

@@ -10118,6 +10118,9 @@ dependencies = [
 name = "vortex-file"
 version = "0.1.0"
 dependencies = [
+ "arrow-array 58.4.0",
+ "arrow-cast 58.4.0",
+ "arrow-schema 58.4.0",
  "async-trait",
  "bytes",
  "codspeed-divan-compat",
@@ -10129,8 +10132,11 @@ dependencies = [
  "object_store",
  "oneshot",
  "parking_lot",
+ "parquet 58.4.0",
  "pin-project-lite",
  "rstest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "url",
@@ -10332,6 +10338,8 @@ dependencies = [
  "prost 0.14.4",
  "rstest",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "sketches-ddsketch",
  "smallvec",
  "temp-env",

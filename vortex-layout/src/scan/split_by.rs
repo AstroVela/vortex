@@ -35,6 +35,23 @@ pub enum SplitBy {
 }
 
 impl SplitBy {
+    /// Collect the natural boundaries registered by the layout without inserting scheduler
+    /// subdivisions into wide spans.
+    pub fn natural_splits(
+        layout_reader: &dyn LayoutReader,
+        row_range: &Range<u64>,
+        field_mask: &[FieldMask],
+    ) -> VortexResult<Vec<u64>> {
+        let mut row_splits = RowSplits::new_capacity(128);
+        row_splits.push(row_range.start);
+        layout_reader.register_splits(
+            field_mask,
+            &SplitRange::root(row_range.clone())?,
+            &mut row_splits,
+        )?;
+        Ok(row_splits.into_sorted_deduped())
+    }
+
     /// Compute the splits for the given layout.
     // TODO(ngates): remove this once layout readers are stream based.
     pub fn splits(
@@ -44,18 +61,10 @@ impl SplitBy {
         field_mask: &[FieldMask],
     ) -> VortexResult<Vec<u64>> {
         Ok(match *self {
-            SplitBy::Layout => {
-                // We usually have under 100 splits so reserving upfront saves
-                // us some allocations
-                let mut row_splits = RowSplits::new_capacity(128);
-                row_splits.push(row_range.start);
-                layout_reader.register_splits(
-                    field_mask,
-                    &SplitRange::root(row_range.clone())?,
-                    &mut row_splits,
-                )?;
-                subdivide_large_spans(row_splits.into_sorted_deduped(), MAX_SPLIT_ROWS)
-            }
+            SplitBy::Layout => subdivide_large_spans(
+                Self::natural_splits(layout_reader, row_range, field_mask)?,
+                MAX_SPLIT_ROWS,
+            ),
             SplitBy::RowCount(n) => row_range
                 .clone()
                 .step_by(n)
@@ -149,7 +158,7 @@ mod test {
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
 
-    fn reader() -> LayoutReaderRef {
+    fn reader(rows: usize) -> LayoutReaderRef {
         let ctx = ArrayContext::empty();
         let segments = Arc::new(TestSegments::default());
         let (ptr, eof) = SequenceId::root().split();
@@ -159,7 +168,7 @@ mod test {
                 .write_stream(
                     ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
-                    buffer![1_i32; 10]
+                    buffer![1_i32; rows]
                         .into_array()
                         .to_array_stream()
                         .sequenced(ptr),
@@ -177,7 +186,7 @@ mod test {
 
     #[test]
     fn test_layout_splits_flat() {
-        let reader = reader();
+        let reader = reader(10);
 
         let splits = SplitBy::Layout
             .splits(
@@ -191,7 +200,7 @@ mod test {
 
     #[test]
     fn test_row_count_splits() {
-        let reader = reader();
+        let reader = reader(10);
 
         let splits = SplitBy::RowCount(3)
             .splits(
@@ -201,6 +210,28 @@ mod test {
             )
             .unwrap();
         assert_eq!(splits, vec![0u64, 3, 6, 9, 10]);
+    }
+
+    #[test]
+    fn natural_splits_do_not_subdivide_a_wide_layout_span() {
+        let rows = usize::try_from(MAX_SPLIT_ROWS).unwrap() * 2 + 1;
+        let reader = reader(rows);
+        let row_range = 0..u64::try_from(rows).unwrap();
+        let natural = SplitBy::natural_splits(
+            reader.as_ref(),
+            &row_range,
+            &[FieldMask::Exact(FieldPath::root())],
+        )
+        .unwrap();
+        let scheduled = SplitBy::Layout
+            .splits(
+                reader.as_ref(),
+                &row_range,
+                &[FieldMask::Exact(FieldPath::root())],
+            )
+            .unwrap();
+        assert_eq!(natural, vec![0, u64::try_from(rows).unwrap()]);
+        assert!(scheduled.len() > natural.len());
     }
 
     #[test]

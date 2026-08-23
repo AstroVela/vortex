@@ -6,8 +6,8 @@ use std::time::Instant;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::Bool;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
@@ -18,9 +18,9 @@ use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
 use vortex_buffer::Buffer;
-use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use super::ArraySummary;
@@ -38,13 +38,15 @@ pub async fn evaluate(
     session: &VortexSession,
 ) -> Completion {
     let started = matches!(task.operation, Operation::EvaluatePredicate { .. }).then(Instant::now);
-    let result = evaluate_inner(&task, source, session).await;
+    let mut read_bytes = None;
+    let result = evaluate_inner(&task, source, session, &mut read_bytes).await;
     Completion {
         task: task.id,
         output: task.output,
         elapsed_ns: started.map_or(0, |started| {
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
         }),
+        read_bytes,
         result,
     }
 }
@@ -53,41 +55,32 @@ async fn evaluate_inner(
     task: &RunnableTask,
     source: &dyn SegmentSource,
     session: &VortexSession,
+    read_bytes: &mut Option<usize>,
 ) -> VortexResult<ResolvedValue> {
     match &task.operation {
-        Operation::Read { segment } => Ok(ResolvedValue::Segment(source.request(*segment).await?)),
+        Operation::Read { segment, .. } => {
+            let segment = source.request(*segment).await?;
+            *read_bytes = Some(segment.len());
+            Ok(ResolvedValue::Segment(segment))
+        }
+        Operation::ReadDecodeFlat {
+            segment,
+            encoding,
+            row_count,
+            ..
+        } => {
+            let segment = source.request(*segment).await?;
+            *read_bytes = Some(segment.len());
+            Ok(ResolvedValue::Array(ResolvedArray::plain(decode_flat(
+                &segment, encoding, *row_count, session,
+            )?)))
+        }
         Operation::DecodeFlat {
             encoding,
             row_count,
         } => {
             let segment = segment_input(task, 0)?;
-            let array = match encoding {
-                FlatEncoding::RawI64 => {
-                    let values = Buffer::<i64>::from_byte_buffer(segment.as_host().clone());
-                    if values.len() != *row_count {
-                        vortex_bail!(
-                            "raw segment has {} rows, expected {row_count}",
-                            values.len()
-                        );
-                    }
-                    PrimitiveArray::new(values, Validity::NonNullable).into_array()
-                }
-                FlatEncoding::Serialized {
-                    dtype,
-                    read_ctx,
-                    array_tree,
-                } => {
-                    let serialized = if let Some(array_tree) = array_tree {
-                        SerializedArray::from_flatbuffer_and_segment(
-                            array_tree.clone(),
-                            segment.clone(),
-                        )?
-                    } else {
-                        SerializedArray::try_from(segment.clone())?
-                    };
-                    serialized.decode(dtype, *row_count, read_ctx, session)?
-                }
-            };
+            let array = decode_flat(segment, encoding, *row_count, session)?;
             Ok(ResolvedValue::Array(ResolvedArray::plain(array)))
         }
         Operation::EvaluatePredicate {
@@ -133,10 +126,9 @@ async fn evaluate_inner(
                 }
                 result.freeze()
             };
-            let true_count = result.true_count();
             Ok(ResolvedValue::Array(ResolvedArray::boolean(
-                BoolArray::new(result, Validity::NonNullable).into_array(),
-                true_count,
+                BoolArray::new(result.clone(), Validity::NonNullable).into_array(),
+                result,
             )))
         }
         Operation::CombineDemand { .. } => {
@@ -146,51 +138,128 @@ async fn evaluate_inner(
                 vortex_bail!("cannot combine demand masks with different lengths");
             }
             let result = &lhs & &rhs;
-            let true_count = result.true_count();
             Ok(ResolvedValue::Array(ResolvedArray::boolean(
-                BoolArray::new(result, Validity::NonNullable).into_array(),
-                true_count,
+                BoolArray::new(result.clone(), Validity::NonNullable).into_array(),
+                result,
             )))
         }
-        Operation::SelectFlat { local_ranges } => {
+        Operation::SelectFlat {
+            local_ranges,
+            selection_ranges,
+            pack_names,
+        } => {
+            if local_ranges.len() != selection_ranges.len() {
+                vortex_bail!("selection input and row-range counts differ");
+            }
             let selection_array = array_input(task, local_ranges.len())?;
             let selection_summary = selection_array.boolean_summary()?;
-            let input_len = local_ranges.iter().map(|range| range.len()).sum::<usize>();
-            if selection_summary.len != input_len {
-                vortex_bail!("selection length does not match its row range");
+            if selection_ranges.iter().any(|range| {
+                range.start > range.end || range.end > selection_summary.len || range.is_empty()
+            }) {
+                vortex_bail!("selection range is empty or outside its demand mask");
             }
             if selection_summary.true_count == 0 {
-                return Ok(ResolvedValue::Array(ResolvedArray::plain(
+                return selected_output(
                     PrimitiveArray::from_iter(std::iter::empty::<i64>()).into_array(),
-                )));
+                    pack_names.as_ref(),
+                );
             }
-            if selection_summary.true_count == selection_summary.len
-                && let [local_range] = local_ranges.as_slice()
+            if selection_summary.true_count == selection_summary.len {
+                let covers_selection = selection_ranges
+                    .first()
+                    .is_some_and(|range| range.start == 0)
+                    && selection_ranges
+                        .last()
+                        .is_some_and(|range| range.end == selection_summary.len)
+                    && selection_ranges
+                        .windows(2)
+                        .all(|ranges| ranges[0].end == ranges[1].start);
+                if covers_selection {
+                    let chunks = local_ranges
+                        .iter()
+                        .enumerate()
+                        .map(|(input, range)| array_input(task, input)?.array.slice(range.clone()))
+                        .collect::<VortexResult<Vec<_>>>()?;
+                    let array = if let [chunk] = chunks.as_slice() {
+                        chunk.clone()
+                    } else {
+                        let dtype = chunks[0].dtype().clone();
+                        ChunkedArray::try_new(chunks, dtype)?.into_array()
+                    };
+                    return selected_output(array, pack_names.as_ref());
+                }
+            }
+            let chunks = local_ranges
+                .iter()
+                .enumerate()
+                .map(|(input, range)| array_input(task, input)?.array.slice(range.clone()))
+                .collect::<VortexResult<Vec<_>>>()?;
+            let array = if let [chunk] = chunks.as_slice() {
+                chunk.clone()
+            } else {
+                let dtype = chunks[0].dtype().clone();
+                ChunkedArray::try_new(chunks, dtype)?.into_array()
+            };
+            let mut included_selection = BitBufferMut::with_capacity(array.len());
+            for range in selection_ranges {
+                included_selection.append_buffer(&selection_summary.values.slice(range.clone()));
+            }
+            let included_selection = included_selection.freeze();
+            if included_selection.len() != array.len()
+                || included_selection.true_count() != selection_summary.true_count
             {
-                let array = &array_input(task, 0)?.array;
-                return Ok(ResolvedValue::Array(ResolvedArray::plain(
-                    array.slice(local_range.clone())?,
-                )));
+                vortex_bail!("selection ranges do not cover every selected row");
             }
-            let selection = boolean_bits(selection_array, session)?;
-            let mut selected = BufferMut::with_capacity(selection_summary.true_count);
-            let mut offset = 0;
-            for (input, local_range) in local_ranges.iter().enumerate() {
-                let array = primitive_array(array_input(task, input)?, session)?;
-                let values = array
-                    .as_slice::<i64>()
-                    .get(local_range.clone())
-                    .ok_or_else(|| {
-                        vortex_error::vortex_err!("local range is outside its Flat array")
-                    })?;
-                selection
-                    .slice(offset..offset + values.len())
-                    .for_each_set_index(|index| selected.push(values[index]));
-                offset += values.len();
+            selected_output(
+                array.filter(Mask::from_buffer(included_selection))?,
+                pack_names.as_ref(),
+            )
+        }
+        Operation::SelectStruct {
+            field_local_ranges,
+            selection_ranges,
+            names,
+        } => {
+            let value_input_count = field_local_ranges.iter().map(Vec::len).sum::<usize>();
+            let selection_array = array_input(task, value_input_count)?;
+            let selection_summary = selection_array.boolean_summary()?;
+            let mut input = 0;
+            let mut fields = Vec::with_capacity(field_local_ranges.len());
+            for local_ranges in field_local_ranges {
+                let chunks = local_ranges
+                    .iter()
+                    .map(|range| {
+                        let array = array_input(task, input)?;
+                        input += 1;
+                        array.array.slice(range.clone())
+                    })
+                    .collect::<VortexResult<Vec<_>>>()?;
+                let array = if let [chunk] = chunks.as_slice() {
+                    chunk.clone()
+                } else {
+                    let dtype = chunks[0].dtype().clone();
+                    ChunkedArray::try_new(chunks, dtype)?.into_array()
+                };
+                fields.push(array);
             }
-            Ok(ResolvedValue::Array(ResolvedArray::plain(
-                PrimitiveArray::new(selected.freeze(), Validity::NonNullable).into_array(),
-            )))
+            let unfiltered_len = fields.first().map_or(0, |field| field.len());
+            let array = pack_struct_array(names.clone(), fields, unfiltered_len)?;
+            let mut included_selection = BitBufferMut::with_capacity(unfiltered_len);
+            for range in selection_ranges {
+                included_selection.append_buffer(&selection_summary.values.slice(range.clone()));
+            }
+            let included_selection = included_selection.freeze();
+            if included_selection.len() != unfiltered_len
+                || included_selection.true_count() != selection_summary.true_count
+            {
+                vortex_bail!("struct selection ranges do not cover every selected row");
+            }
+            let array = if included_selection.true_count() == included_selection.len() {
+                array
+            } else {
+                array.filter(Mask::from_buffer(included_selection))?
+            };
+            Ok(ResolvedValue::Array(ResolvedArray::plain(array)))
         }
         Operation::PackStruct { names, len } => {
             let arrays = if task.inputs.is_empty() {
@@ -210,6 +279,51 @@ async fn evaluate_inner(
             Ok(ResolvedValue::Array(ResolvedArray::plain(array)))
         }
     }
+}
+
+fn decode_flat(
+    segment: &vortex_array::buffer::BufferHandle,
+    encoding: &FlatEncoding,
+    row_count: usize,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    match encoding {
+        FlatEncoding::RawI64 => {
+            let values = Buffer::<i64>::from_byte_buffer(segment.as_host().clone());
+            if values.len() != row_count {
+                vortex_bail!(
+                    "raw segment has {} rows, expected {row_count}",
+                    values.len()
+                );
+            }
+            Ok(PrimitiveArray::new(values, Validity::NonNullable).into_array())
+        }
+        FlatEncoding::Serialized {
+            dtype,
+            read_ctx,
+            array_tree,
+        } => {
+            let serialized = if let Some(array_tree) = array_tree {
+                SerializedArray::from_flatbuffer_and_segment(array_tree.clone(), segment.clone())?
+            } else {
+                SerializedArray::try_from(segment.clone())?
+            };
+            serialized.decode(dtype, row_count, read_ctx, session)
+        }
+    }
+}
+
+fn selected_output(
+    array: ArrayRef,
+    pack_names: Option<&FieldNames>,
+) -> VortexResult<ResolvedValue> {
+    let array = if let Some(names) = pack_names {
+        let len = array.len();
+        pack_struct_array(names.clone(), vec![array], len)?
+    } else {
+        array
+    };
+    Ok(ResolvedValue::Array(ResolvedArray::plain(array)))
 }
 
 fn evaluate_predicate_slice(
@@ -301,20 +415,12 @@ fn primitive_array(array: &ResolvedArray, session: &VortexSession) -> VortexResu
     array.array.clone().execute::<PrimitiveArray>(&mut ctx)
 }
 
-fn boolean_bits(array: &ResolvedArray, session: &VortexSession) -> VortexResult<BitBuffer> {
+fn boolean_bits(array: &ResolvedArray, _session: &VortexSession) -> VortexResult<BitBuffer> {
     let summary = array.boolean_summary()?;
     if summary.len != array.array.len() || summary.true_count > summary.len {
         vortex_bail!("invalid boolean-mask summary");
     }
-    if array.array.is::<Bool>() {
-        return Ok(array.array.as_::<Bool>().to_bit_buffer());
-    }
-    let mut ctx = session.create_execution_ctx();
-    Ok(array
-        .array
-        .clone()
-        .execute::<BoolArray>(&mut ctx)?
-        .to_bit_buffer())
+    Ok(summary.values.clone())
 }
 
 pub fn boolean_values(array: &ResolvedArray, session: &VortexSession) -> VortexResult<Vec<bool>> {

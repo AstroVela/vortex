@@ -20,6 +20,7 @@ pub mod list;
 pub(crate) mod partitioned;
 pub mod repartition;
 pub mod row_idx;
+pub mod self_paced;
 pub mod struct_;
 pub mod table;
 pub mod zoned;

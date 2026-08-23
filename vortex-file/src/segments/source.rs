@@ -196,6 +196,12 @@ impl FileSegmentSource {
 }
 
 impl SegmentSource for FileSegmentSource {
+    fn estimated_size(&self, id: SegmentId) -> Option<usize> {
+        self.segments
+            .get(*id as usize)
+            .map(|segment| segment.length as usize)
+    }
+
     fn request(&self, id: SegmentId) -> SegmentFuture {
         // We eagerly register the read request here assuming the behaviour of [`FileSegmentSource`], where
         // coalescing becomes effective prior to the future being polled.
@@ -352,6 +358,12 @@ impl BufferSegmentSource {
 }
 
 impl SegmentSource for BufferSegmentSource {
+    fn estimated_size(&self, id: SegmentId) -> Option<usize> {
+        self.segments
+            .get(*id as usize)
+            .map(|segment| segment.length as usize)
+    }
+
     fn request(&self, id: SegmentId) -> SegmentFuture {
         let spec = match self.segments.get(*id as usize) {
             Some(spec) => spec,

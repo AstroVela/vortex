@@ -6,6 +6,7 @@ use std::ops::Range;
 use super::ArraySlotId;
 use super::FieldId;
 use super::FlatEncoding;
+use super::ReadPhase;
 use super::ResourceId;
 use super::SegmentSlotId;
 use super::TaskId;
@@ -31,6 +32,8 @@ pub(crate) struct ResourceNode {
     pub segment: SegmentId,
     pub root_coverage: Range<u64>,
     pub row_count: usize,
+    pub estimated_bytes: Option<usize>,
+    pub read_phase: ReadPhase,
     pub encoding: FlatEncoding,
     pub segment_slot: SegmentSlotId,
     pub array_slot: ArraySlotId,

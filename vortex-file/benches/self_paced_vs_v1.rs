@@ -4,7 +4,9 @@
 #![expect(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::File;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -14,6 +16,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use arrow_array::Array as ArrowArray;
+use arrow_array::Date32Array;
+use arrow_array::Decimal128Array;
 use arrow_array::Float32Array;
 use arrow_array::Float64Array;
 use arrow_array::Int64Array;
@@ -26,7 +30,7 @@ use futures::FutureExt;
 use futures::TryStreamExt;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use vortex_array::ArrayContext;
+use serde::Deserialize;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -47,47 +51,68 @@ use vortex_array::expr::root;
 use vortex_array::expr::select;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_buffer::ByteBufferMut;
+use vortex_edition::Edition;
+use vortex_edition::EditionId;
+use vortex_edition::EditionInclusion;
+use vortex_edition::EditionSessionExt;
 use vortex_error::VortexResult;
+use vortex_file::OpenOptionsSessionExt;
+use vortex_file::WriteOptionsSessionExt;
 use vortex_io::session::RuntimeSession;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::LayoutReaderContext;
 use vortex_layout::LayoutRef;
-use vortex_layout::LayoutStrategy;
-use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
-use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
-use vortex_layout::layouts::struct_::StructStrategy;
+use vortex_layout::layouts::self_paced::SelfPacedLayoutStrategy;
 use vortex_layout::plan::exec::Conjunct;
 use vortex_layout::plan::exec::FieldId;
-use vortex_layout::plan::exec::MemorySegments;
 use vortex_layout::plan::exec::Predicate;
 use vortex_layout::plan::exec::RetentionPolicy;
 use vortex_layout::plan::exec::RunOptions;
 use vortex_layout::plan::exec::ScanQuery;
 use vortex_layout::plan::exec::SchedulePolicy;
 use vortex_layout::plan::exec::SourcePlan;
+use vortex_layout::plan::exec::SpeculativeIoConfig;
+use vortex_layout::plan::exec::SpeculativeReadPolicy;
 use vortex_layout::plan::exec::run_self_paced;
+use vortex_layout::plan::exec::run_self_paced_ranges;
 use vortex_layout::plan::exec::stable_output_hash;
 use vortex_layout::plan::exec::write_execution_trace;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentSource;
-use vortex_layout::sequence::SequenceId;
-use vortex_layout::sequence::SequentialArrayStreamExt;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
 fn main() {
-    LazyLock::force(&FIXTURE);
-    LazyLock::force(&CLICKBENCH_FIXTURE);
-    LazyLock::force(&TPCH_FIXTURE);
-    LazyLock::force(&FINEWEB_FIXTURE);
     if let Ok(iterations) = std::env::var("VORTEX_SELF_PACED_COMPARE_ITERATIONS") {
+        match std::env::var("VORTEX_SELF_PACED_COMPARE_WORKLOAD") {
+            Ok(workload) if workload.starts_with("fineweb_") => {
+                LazyLock::force(&FINEWEB_FIXTURE);
+            }
+            Ok(workload) if workload.starts_with("clickbench_") => {
+                LazyLock::force(&CLICKBENCH_FIXTURE);
+            }
+            Ok(workload) if workload.starts_with("tpch_") => {
+                LazyLock::force(&TPCH_FIXTURE);
+            }
+            Ok(_) | Err(_) => force_all_fixtures(),
+        }
         RUNTIME
             .block_on(compare_cases(iterations.parse::<usize>().unwrap()))
             .unwrap();
         return;
     }
     if let Ok(requested) = std::env::var("VORTEX_SELF_PACED_PROFILE") {
+        if requested.starts_with("fineweb-") {
+            LazyLock::force(&FINEWEB_FIXTURE);
+        } else if requested.starts_with("tpch-") {
+            LazyLock::force(&TPCH_FIXTURE);
+        } else if requested.starts_with("q40-") || requested.starts_with("q42-") {
+            LazyLock::force(&CLICKBENCH_FIXTURE);
+        } else {
+            LazyLock::force(&FIXTURE);
+        }
         let iterations = std::env::var("VORTEX_SELF_PACED_PROFILE_ITERATIONS")
             .map_or(Ok(500), |value| value.parse::<usize>())
             .unwrap();
@@ -97,11 +122,31 @@ fn main() {
         return;
     }
     if let Ok(trace_case) = std::env::var("VORTEX_SELF_PACED_TRACE") {
+        if trace_case.starts_with("fineweb-") {
+            LazyLock::force(&FINEWEB_FIXTURE);
+        } else if trace_case.starts_with("clickbench-") {
+            LazyLock::force(&CLICKBENCH_FIXTURE);
+        } else if trace_case.starts_with("q6-")
+            || trace_case.starts_with("q1-")
+            || trace_case.starts_with("v1-friendly-")
+        {
+            LazyLock::force(&TPCH_FIXTURE);
+        } else {
+            LazyLock::force(&FIXTURE);
+        }
         RUNTIME.block_on(trace_cases(&trace_case)).unwrap();
         return;
     }
+    force_all_fixtures();
     RUNTIME.block_on(validate_outputs()).unwrap();
     divan::main();
+}
+
+fn force_all_fixtures() {
+    LazyLock::force(&FIXTURE);
+    LazyLock::force(&CLICKBENCH_FIXTURE);
+    LazyLock::force(&TPCH_FIXTURE);
+    LazyLock::force(&FINEWEB_FIXTURE);
 }
 
 const CHUNKS: usize = 4;
@@ -123,26 +168,64 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let _guard = RUNTIME.enter();
-    vortex_array::array_session()
+    let session = vortex_array::array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>()
-        .with_tokio()
+        .with_tokio();
+    vortex_file::register_default_encodings(&session);
+    enable_self_paced_file_encoding(&session);
+    session
 });
+
+const SELF_PACED_FILE_EDITION: EditionId = EditionId::new("self-paced-file", 2026, 8, 0);
+
+fn enable_self_paced_file_encoding(session: &VortexSession) {
+    let editions = session.editions();
+    editions
+        .declare_edition(Edition {
+            id: SELF_PACED_FILE_EDITION,
+            min_vortex_version: None,
+        })
+        .unwrap();
+    editions
+        .declare_inclusion(EditionInclusion::new(
+            "vortex.primitive",
+            SELF_PACED_FILE_EDITION,
+        ))
+        .unwrap();
+    session.enable_edition(SELF_PACED_FILE_EDITION).unwrap();
+}
+static SPECULATIVE_IO_CONFIG: LazyLock<SpeculativeIoConfig> =
+    LazyLock::new(benchmark_speculative_io_config);
 
 struct Fixture {
     layout: LayoutRef,
     plan: SourcePlan,
-    source: Arc<MemorySegments>,
+    natural_splits: Arc<[u64]>,
+    source: Arc<dyn SegmentSource>,
+    serialized_bytes: usize,
+    serialized_hash: u64,
+    logical_array: ArrayRef,
+    physical_splits: Option<PhysicalSplitCatalog>,
+    physical_field_sources: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct PhysicalSplitCatalog {
+    files: Vec<PhysicalSplitFile>,
+}
+
+#[derive(Deserialize)]
+struct PhysicalSplitFile {
+    row_count: u64,
+    fields: BTreeMap<String, Vec<u64>>,
 }
 
 static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| RUNTIME.block_on(build_fixture()).unwrap());
 static CLICKBENCH_FIXTURE: LazyLock<Fixture> =
     LazyLock::new(|| RUNTIME.block_on(build_clickbench_fixture()).unwrap());
-static TPCH_FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
-    RUNTIME
-        .block_on(build_tpch_fixture(TPCH_ROWS_PER_CHUNK))
-        .unwrap()
-});
+static TPCH_FIXTURE: LazyLock<Fixture> =
+    LazyLock::new(|| RUNTIME.block_on(build_tpch_fixture()).unwrap());
 static FINEWEB_FIXTURE: LazyLock<Fixture> =
     LazyLock::new(|| RUNTIME.block_on(build_fineweb_fixture()).unwrap());
 
@@ -212,6 +295,10 @@ impl CountingSource {
 }
 
 impl SegmentSource for CountingSource {
+    fn estimated_size(&self, id: vortex_layout::segments::SegmentId) -> Option<usize> {
+        self.inner.estimated_size(id)
+    }
+
     fn request(&self, id: vortex_layout::segments::SegmentId) -> SegmentFuture {
         self.counts.requests.fetch_add(1, Ordering::Relaxed);
         if self.track_segments {
@@ -264,29 +351,89 @@ async fn build_fixture() -> VortexResult<Fixture> {
 }
 
 async fn build_serialized_fixture(chunks: Vec<ArrayRef>) -> VortexResult<Fixture> {
+    build_serialized_fixture_with_physical_splits(chunks, None, Vec::new()).await
+}
+
+async fn build_serialized_fixture_with_physical_splits(
+    chunks: Vec<ArrayRef>,
+    catalog_env: Option<&str>,
+    physical_field_sources: Vec<Vec<String>>,
+) -> VortexResult<Fixture> {
     let dtype = chunks[0].dtype().clone();
     let chunked_array = ChunkedArray::try_new(chunks, dtype)?.into_array();
-    let source = Arc::new(MemorySegments::default());
-    let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
-    let chunked_flat: Arc<dyn LayoutStrategy> =
-        Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()));
-    let strategy = StructStrategy::new(flat, chunked_flat);
-    let (pointer, eof) = SequenceId::root().split();
-    let layout = strategy
-        .write_stream(
-            ArrayContext::empty().into(),
-            Arc::<MemorySegments>::clone(&source),
-            chunked_array.to_array_stream().sequenced(pointer),
-            eof,
-            &SESSION,
-        )
+    let logical_array = chunked_array.clone();
+    let mut serialized = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_strategy(Arc::new(SelfPacedLayoutStrategy::default()))
+        .with_file_statistics(Vec::new())
+        .write(&mut serialized, chunked_array.to_array_stream())
         .await?;
+    let serialized = serialized.freeze();
+    let serialized_bytes = serialized.len();
+    let serialized_hash = serialized
+        .as_ref()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        });
+    let file = SESSION.open_options().open_buffer(serialized)?;
+    let layout = Arc::clone(file.footer().layout());
+    let source = file.segment_source();
     let plan = SourcePlan::try_from_layout(&layout)?;
+    let natural_splits = std::iter::once(0)
+        .chain(plan.chunks.iter().map(|chunk| chunk.root_coverage.end))
+        .collect::<Vec<_>>()
+        .into();
     Ok(Fixture {
         layout,
         plan,
+        natural_splits,
         source,
+        serialized_bytes,
+        serialized_hash,
+        logical_array,
+        physical_splits: catalog_env
+            .and_then(std::env::var_os)
+            .map(|path| {
+                let path = PathBuf::from(path);
+                let file = File::open(&path).map_err(|error| {
+                    vortex_error::vortex_err!(
+                        "failed to open physical split catalog {}: {error}",
+                        path.display()
+                    )
+                })?;
+                serde_json::from_reader(file).map_err(|error| {
+                    vortex_error::vortex_err!(
+                        "failed to parse physical split catalog {}: {error}",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?,
+        physical_field_sources,
     })
+}
+
+async fn rechunk_fixture_at_natural_splits(
+    fixture: &Fixture,
+    natural_splits: Arc<[u64]>,
+) -> VortexResult<Fixture> {
+    let chunks = natural_splits
+        .windows(2)
+        .map(|bounds| {
+            fixture
+                .logical_array
+                .slice(usize::try_from(bounds[0])?..usize::try_from(bounds[1])?)
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let rechunked = build_serialized_fixture(chunks).await?;
+    if rechunked.natural_splits.as_ref() != natural_splits.as_ref() {
+        vortex_error::vortex_bail!(
+            "rechunked fixture boundaries do not match the real natural splits"
+        );
+    }
+    Ok(rechunked)
 }
 
 const CLICKBENCH_PARQUET_COLUMNS: [&str; 24] = [
@@ -320,8 +467,13 @@ async fn build_clickbench_fixture() -> VortexResult<Fixture> {
     let parquet_dir = std::env::var_os("VORTEX_CLICKBENCH_PARQUET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/mnt/vortex-ssd/data/clickbench_partitioned/parquet"));
-    let mut chunks = Vec::with_capacity(10);
-    for shard in 0..10 {
+    let file_count = std::env::var("VORTEX_CLICKBENCH_MAX_FILES")
+        .map_or(Ok(10), |value| value.parse::<usize>())
+        .map_err(|error| {
+            vortex_error::vortex_err!("invalid VORTEX_CLICKBENCH_MAX_FILES: {error}")
+        })?;
+    let mut chunks = Vec::with_capacity(file_count);
+    for shard in 0..file_count {
         let path = parquet_dir.join(format!("hits_{shard}.parquet"));
         let file = File::open(&path).map_err(|error| {
             vortex_error::vortex_err!("failed to open {}: {error}", path.display())
@@ -392,7 +544,20 @@ async fn build_clickbench_fixture() -> VortexResult<Fixture> {
             .into_array(),
         );
     }
-    build_serialized_fixture(chunks).await
+    eprintln!(
+        "clickbench_fixture files={file_count} chunks={} rows={}",
+        chunks.len(),
+        chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+    );
+    build_serialized_fixture_with_physical_splits(
+        chunks,
+        Some("VORTEX_CLICKBENCH_SPLIT_CATALOG"),
+        CLICKBENCH_PARQUET_COLUMNS
+            .iter()
+            .map(|name| vec![(*name).to_string()])
+            .collect(),
+    )
+    .await
 }
 
 const FINEWEB_SOURCE_COLUMNS: [&str; 7] = [
@@ -422,87 +587,161 @@ const FINEWEB_FIELD_NAMES: [&str; 14] = [
     "text_len",
 ];
 
-async fn build_fineweb_fixture() -> VortexResult<Fixture> {
-    let path = std::env::var_os("VORTEX_FINEWEB_PARQUET")
+fn fineweb_parquet_paths() -> VortexResult<Vec<PathBuf>> {
+    let input = std::env::var_os("VORTEX_FINEWEB_PARQUET")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/mnt/vortex-ssd/data/fineweb/parquet/sample.parquet"));
-    let file = File::open(&path)
-        .map_err(|error| vortex_error::vortex_err!("failed to open {}: {error}", path.display()))?;
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
-        vortex_error::vortex_err!("failed to inspect {}: {error}", path.display())
-    })?;
-    let projection = FINEWEB_SOURCE_COLUMNS
-        .iter()
-        .map(|name| {
-            builder
-                .schema()
-                .index_of(name)
-                .map_err(|error| vortex_error::vortex_err!("{name} in {}: {error}", path.display()))
-        })
-        .collect::<VortexResult<Vec<_>>>()?;
-    let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
-    builder = builder.with_projection(projection).with_batch_size(100_000);
-
-    let mut chunks = Vec::new();
-    for batch in builder
-        .build()
-        .map_err(|error| vortex_error::vortex_err!("failed to read {}: {error}", path.display()))?
+    let mut paths = if input.is_dir() {
+        std::fs::read_dir(&input)
+            .map_err(|error| {
+                vortex_error::vortex_err!("failed to list {}: {error}", input.display())
+            })?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|error| vortex_error::vortex_err!("failed to list FineWeb: {error}"))
+            })
+            .filter_map(|path| match path {
+                Ok(path)
+                    if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet")) =>
+                {
+                    Some(Ok(path))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<VortexResult<Vec<_>>>()?
+    } else {
+        vec![input]
+    };
+    paths.sort_unstable();
+    if let Some(max_files) = std::env::var("VORTEX_FINEWEB_MAX_FILES")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| vortex_error::vortex_err!("invalid VORTEX_FINEWEB_MAX_FILES: {error}"))?
     {
-        let batch = batch.map_err(|error| {
-            vortex_error::vortex_err!("failed to decode {}: {error}", path.display())
-        })?;
-        let dump = batch.column_by_name("dump").unwrap();
-        let date = batch.column_by_name("date").unwrap();
-        let url = batch.column_by_name("url").unwrap();
-        let text = batch.column_by_name("text").unwrap();
-        let language = batch.column_by_name("language").unwrap();
-        let language_score = batch.column_by_name("language_score").unwrap();
-        let file_path = batch.column_by_name("file_path").unwrap();
-        let mut fields = (0..FINEWEB_FIELD_NAMES.len())
-            .map(|_| Vec::with_capacity(batch.num_rows()))
-            .collect::<Vec<Vec<i64>>>();
-
-        for row in 0..batch.num_rows() {
-            let dump = arrow_string_value(dump.as_ref(), row).unwrap_or_default();
-            let date = arrow_string_value(date.as_ref(), row).unwrap_or_default();
-            let url = arrow_string_value(url.as_ref(), row).unwrap_or_default();
-            let text = arrow_string_value(text.as_ref(), row).unwrap_or_default();
-            let language = arrow_string_value(language.as_ref(), row).unwrap_or_default();
-            let file_path = arrow_string_value(file_path.as_ref(), row).unwrap_or_default();
-            let url_google = url.contains("google");
-            let text_google = text.contains("Google");
-            fields[0].push(stable_string_hash(dump));
-            fields[1].push(date_year_month(date));
-            fields[2].push(stable_string_hash(url));
-            fields[3].push(stable_string_hash(text));
-            fields[4].push(stable_string_hash(language));
-            fields[5].push(language_score_ppm(language_score.as_ref(), row));
-            fields[6].push(stable_string_hash(file_path));
-            fields[7].push(i64::from(url_google));
-            fields[8].push(i64::from(text_google));
-            fields[9].push(i64::from(
-                url.contains(".google.") || text.contains(" Google "),
-            ));
-            fields[10].push(i64::from(text.contains(" vortex ")));
-            fields[11].push(i64::from(url.contains("espn")));
-            fields[12].push(i64::from(file_path.contains("/CC-MAIN-2014-")));
-            fields[13].push(i64::try_from(text.len()).unwrap_or(i64::MAX));
-        }
-        let arrays = fields
-            .into_iter()
-            .map(|values| Buffer::from_iter(values).into_array())
-            .collect::<Vec<_>>();
-        chunks.push(
-            StructArray::try_new(
-                FieldNames::from(FINEWEB_FIELD_NAMES),
-                arrays,
-                batch.num_rows(),
-                Validity::NonNullable,
-            )?
-            .into_array(),
-        );
+        paths.truncate(max_files);
     }
-    build_serialized_fixture(chunks).await
+    if paths.is_empty() {
+        vortex_error::vortex_bail!("FineWeb input contains no Parquet files");
+    }
+    Ok(paths)
+}
+
+async fn build_fineweb_fixture() -> VortexResult<Fixture> {
+    let paths = fineweb_parquet_paths()?;
+    let file_count = paths.len();
+    let mut chunks = Vec::new();
+    for path in paths {
+        let file = File::open(&path).map_err(|error| {
+            vortex_error::vortex_err!("failed to open {}: {error}", path.display())
+        })?;
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+            vortex_error::vortex_err!("failed to inspect {}: {error}", path.display())
+        })?;
+        let projection = FINEWEB_SOURCE_COLUMNS
+            .iter()
+            .map(|name| {
+                builder.schema().index_of(name).map_err(|error| {
+                    vortex_error::vortex_err!("{name} in {}: {error}", path.display())
+                })
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+        let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
+        builder = builder.with_projection(projection).with_batch_size(100_000);
+
+        for batch in builder.build().map_err(|error| {
+            vortex_error::vortex_err!("failed to read {}: {error}", path.display())
+        })? {
+            let batch = batch.map_err(|error| {
+                vortex_error::vortex_err!("failed to decode {}: {error}", path.display())
+            })?;
+            let dump = batch.column_by_name("dump").unwrap();
+            let date = batch.column_by_name("date").unwrap();
+            let url = batch.column_by_name("url").unwrap();
+            let text = batch.column_by_name("text").unwrap();
+            let language = batch.column_by_name("language").unwrap();
+            let language_score = batch.column_by_name("language_score").unwrap();
+            let file_path = batch.column_by_name("file_path").unwrap();
+            let mut fields = (0..FINEWEB_FIELD_NAMES.len())
+                .map(|_| Vec::with_capacity(batch.num_rows()))
+                .collect::<Vec<Vec<i64>>>();
+
+            for row in 0..batch.num_rows() {
+                let dump = arrow_string_value(dump.as_ref(), row).unwrap_or_default();
+                let date = arrow_string_value(date.as_ref(), row).unwrap_or_default();
+                let url = arrow_string_value(url.as_ref(), row).unwrap_or_default();
+                let text = arrow_string_value(text.as_ref(), row).unwrap_or_default();
+                let language = arrow_string_value(language.as_ref(), row).unwrap_or_default();
+                let file_path = arrow_string_value(file_path.as_ref(), row).unwrap_or_default();
+                let url_google = url.contains("google");
+                let text_google = text.contains("Google");
+                fields[0].push(stable_string_hash(dump));
+                fields[1].push(date_year_month(date));
+                fields[2].push(stable_string_hash(url));
+                fields[3].push(stable_string_hash(text));
+                fields[4].push(stable_string_hash(language));
+                fields[5].push(language_score_ppm(language_score.as_ref(), row));
+                fields[6].push(stable_string_hash(file_path));
+                fields[7].push(i64::from(url_google));
+                fields[8].push(i64::from(text_google));
+                fields[9].push(i64::from(
+                    url.contains(".google.") || text.contains(" Google "),
+                ));
+                fields[10].push(i64::from(text.contains(" vortex ")));
+                fields[11].push(i64::from(url.contains("espn")));
+                fields[12].push(i64::from(file_path.contains("/CC-MAIN-2014-")));
+                fields[13].push(i64::try_from(text.len()).unwrap_or(i64::MAX));
+            }
+            let arrays = fields
+                .into_iter()
+                .map(|values| Buffer::from_iter(values).into_array())
+                .collect::<Vec<_>>();
+            chunks.push(
+                StructArray::try_new(
+                    FieldNames::from(FINEWEB_FIELD_NAMES),
+                    arrays,
+                    batch.num_rows(),
+                    Validity::NonNullable,
+                )?
+                .into_array(),
+            );
+        }
+    }
+    eprintln!(
+        "fineweb_fixture files={file_count} chunks={} rows={}",
+        chunks.len(),
+        chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+    );
+    let physical_field_sources = [
+        &["dump"][..],
+        &["date"],
+        &["url"],
+        &["text"],
+        &["language"],
+        &["language_score"],
+        &["file_path"],
+        &["url"],
+        &["text"],
+        &["url", "text"],
+        &["text"],
+        &["url"],
+        &["file_path"],
+        &["text"],
+    ]
+    .into_iter()
+    .map(|names| names.iter().map(|name| (*name).to_string()).collect())
+    .collect();
+    build_serialized_fixture_with_physical_splits(
+        chunks,
+        Some("VORTEX_FINEWEB_SPLIT_CATALOG"),
+        physical_field_sources,
+    )
+    .await
 }
 
 fn arrow_string_value(array: &dyn ArrowArray, index: usize) -> Option<&str> {
@@ -561,7 +800,128 @@ fn date_year_month(value: &str) -> i64 {
         .fold(0i64, |number, digit| number * 10 + i64::from(digit - b'0'))
 }
 
-async fn build_tpch_fixture(rows_per_chunk: usize) -> VortexResult<Fixture> {
+async fn build_tpch_fixture() -> VortexResult<Fixture> {
+    let Some(path) = std::env::var_os("VORTEX_TPCH_LINEITEM_PARQUET").map(PathBuf::from) else {
+        return build_synthetic_tpch_fixture(TPCH_ROWS_PER_CHUNK).await;
+    };
+    let file = File::open(&path)
+        .map_err(|error| vortex_error::vortex_err!("failed to open {}: {error}", path.display()))?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+        vortex_error::vortex_err!("failed to inspect {}: {error}", path.display())
+    })?;
+    const COLUMNS: [(&str, i128); 8] = [
+        ("l_orderkey", 1),
+        ("l_partkey", 1),
+        ("l_suppkey", 1),
+        ("l_quantity", 100),
+        ("l_extendedprice", 1),
+        ("l_discount", 1),
+        ("l_tax", 1),
+        ("l_shipdate", 1),
+    ];
+    let projection = COLUMNS
+        .iter()
+        .map(|(name, _)| {
+            builder
+                .schema()
+                .index_of(name)
+                .map_err(|error| vortex_error::vortex_err!("{name} in {}: {error}", path.display()))
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
+    builder = builder
+        .with_projection(projection)
+        .with_batch_size(TPCH_ROWS_PER_CHUNK);
+    let names = FieldNames::from([
+        "orderkey",
+        "partkey",
+        "suppkey",
+        "quantity",
+        "extendedprice",
+        "discount",
+        "tax",
+        "shipdate",
+    ]);
+    let mut chunks = Vec::new();
+    for batch in builder
+        .build()
+        .map_err(|error| vortex_error::vortex_err!("failed to read {}: {error}", path.display()))?
+    {
+        let batch = batch.map_err(|error| {
+            vortex_error::vortex_err!("failed to decode {}: {error}", path.display())
+        })?;
+        let arrays = COLUMNS
+            .iter()
+            .map(|(name, divisor)| {
+                tpch_i64_values(
+                    batch.column_by_name(name).ok_or_else(|| {
+                        vortex_error::vortex_err!("missing {name} in {}", path.display())
+                    })?,
+                    *divisor,
+                )
+                .map(|values| Buffer::from_iter(values).into_array())
+            })
+            .collect::<VortexResult<Vec<_>>>()?;
+        chunks.push(
+            StructArray::try_new(
+                names.clone(),
+                arrays,
+                batch.num_rows(),
+                Validity::NonNullable,
+            )?
+            .into_array(),
+        );
+    }
+    eprintln!(
+        "tpch_fixture source={} chunks={} rows={}",
+        path.display(),
+        chunks.len(),
+        chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+    );
+    build_serialized_fixture_with_physical_splits(
+        chunks,
+        Some("VORTEX_TPCH_SPLIT_CATALOG"),
+        COLUMNS
+            .iter()
+            .map(|(name, _)| vec![(*name).to_string()])
+            .collect(),
+    )
+    .await
+}
+
+fn tpch_i64_values(array: &dyn ArrowArray, divisor: i128) -> VortexResult<Vec<i64>> {
+    if array.null_count() != 0 {
+        vortex_error::vortex_bail!("TPC-H input contains nulls");
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Decimal128Array>() {
+        return array
+            .values()
+            .iter()
+            .map(|value| Ok(i64::try_from(*value / divisor)?))
+            .collect();
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Date32Array>() {
+        return Ok(array
+            .values()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect());
+    }
+    let casted = cast(array, &DataType::Int64).map_err(|error| {
+        vortex_error::vortex_err!("cannot cast {:?} to i64: {error}", array.data_type())
+    })?;
+    let casted = casted
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| vortex_error::vortex_err!("TPC-H cast did not produce i64"))?;
+    casted
+        .values()
+        .iter()
+        .map(|value| Ok(i64::try_from(i128::from(*value) / divisor)?))
+        .collect()
+}
+
+async fn build_synthetic_tpch_fixture(rows_per_chunk: usize) -> VortexResult<Fixture> {
     let names = FieldNames::from([
         "orderkey",
         "partkey",
@@ -891,6 +1251,9 @@ fn clickbench_suite_query(
                 Predicate::Equal(value) => eq(field, lit(value)),
                 Predicate::LessThan(value) => lt(field, lit(value)),
                 Predicate::GreaterThan(value) => gt(field, lit(value)),
+                Predicate::RangeExclusive { lower, upper } => {
+                    and(gt(field.clone(), lit(lower)), lt(field, lit(upper)))
+                }
             }
         })
         .reduce(and)
@@ -1057,6 +1420,9 @@ fn fineweb_suite_query(
                 Predicate::Equal(value) => eq(field, lit(value)),
                 Predicate::LessThan(value) => lt(field, lit(value)),
                 Predicate::GreaterThan(value) => gt(field, lit(value)),
+                Predicate::RangeExclusive { lower, upper } => {
+                    and(gt(field.clone(), lit(lower)), lt(field, lit(upper)))
+                }
             }
         })
         .reduce(and)
@@ -1113,20 +1479,35 @@ fn fineweb_query_factory(query_id: usize) -> QueryFactory {
     }
 }
 
+fn fineweb_query_id(value: &str, prefix: &str, suffix: &str) -> Option<usize> {
+    let query_id = value
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse::<usize>()
+        .ok()?;
+    FINEWEB_QUERY_IDS.contains(&query_id).then_some(query_id)
+}
+
 fn tpch_q6_scan_query() -> (
     ScanQuery,
     vortex_array::expr::Expression,
     vortex_array::expr::Expression,
 ) {
+    let (shipdate_start, shipdate_end) =
+        if std::env::var_os("VORTEX_TPCH_LINEITEM_PARQUET").is_some() {
+            (8_765, 9_131)
+        } else {
+            (1_000, 1_365)
+        };
     let query = ScanQuery {
         conjuncts: vec![
             Conjunct {
                 field: FieldId(7),
-                predicate: Predicate::GreaterThan(1_000),
+                predicate: Predicate::GreaterThan(shipdate_start),
             },
             Conjunct {
                 field: FieldId(7),
-                predicate: Predicate::LessThan(1_365),
+                predicate: Predicate::LessThan(shipdate_end),
             },
             Conjunct {
                 field: FieldId(5),
@@ -1145,8 +1526,8 @@ fn tpch_q6_scan_query() -> (
     };
     let filter = and(
         and(
-            gt(get_item("shipdate", root()), lit(1_000i64)),
-            lt(get_item("shipdate", root()), lit(1_365i64)),
+            gt(get_item("shipdate", root()), lit(shipdate_start)),
+            lt(get_item("shipdate", root()), lit(shipdate_end)),
         ),
         and(
             and(
@@ -1165,14 +1546,19 @@ fn tpch_q1_scan_query() -> (
     vortex_array::expr::Expression,
     vortex_array::expr::Expression,
 ) {
+    let shipdate_end = if std::env::var_os("VORTEX_TPCH_LINEITEM_PARQUET").is_some() {
+        10_472
+    } else {
+        2_300
+    };
     let query = ScanQuery {
         conjuncts: vec![Conjunct {
             field: FieldId(7),
-            predicate: Predicate::LessThan(2_300),
+            predicate: Predicate::LessThan(shipdate_end),
         }],
         projection: vec![FieldId(3), FieldId(4), FieldId(5), FieldId(6)],
     };
-    let filter = lt(get_item("shipdate", root()), lit(2_300i64));
+    let filter = lt(get_item("shipdate", root()), lit(shipdate_end));
     let projection = select(["quantity", "extendedprice", "discount", "tax"], root());
     (query, filter, projection)
 }
@@ -1197,9 +1583,9 @@ fn tpch_v1_friendly_query() -> (
 async fn run_v1(
     selectivity: usize,
     concurrency: usize,
-    track_segments: bool,
+    diagnostics: bool,
 ) -> VortexResult<((usize, u64), SourceSummary)> {
-    run_v1_fixture(&FIXTURE, query(selectivity), concurrency, track_segments).await
+    run_v1_fixture(&FIXTURE, query(selectivity), concurrency, diagnostics).await
 }
 
 async fn run_v1_fixture(
@@ -1210,10 +1596,10 @@ async fn run_v1_fixture(
         vortex_array::expr::Expression,
     ),
     concurrency: usize,
-    track_segments: bool,
+    diagnostics: bool,
 ) -> VortexResult<((usize, u64), SourceSummary)> {
-    let source_inner: Arc<dyn SegmentSource> = Arc::<MemorySegments>::clone(&fixture.source);
-    let (source, counts) = CountingSource::new(source_inner, track_segments);
+    let source_inner = Arc::clone(&fixture.source);
+    let (source, counts) = CountingSource::new(source_inner, diagnostics);
     let reader = fixture.layout.new_reader(
         "self-paced-v1".into(),
         source,
@@ -1226,11 +1612,58 @@ async fn run_v1_fixture(
     let arrays = ScanBuilder::new(SESSION.clone(), reader)
         .with_filter(filter)
         .with_projection(projection)
+        // V1 is the unmodified scan model: preserve its natural layout chunks. In particular,
+        // never feed the self-paced experiment's morsel size into this path.
+        .with_natural_splits(Arc::clone(&fixture.natural_splits))
         .with_concurrency(concurrency)
         .into_array_stream()?
         .try_collect::<Vec<_>>()
         .await?;
-    let hash = stable_array_hash(&arrays)?;
+    let hash = if diagnostics {
+        stable_array_hash(&arrays)?
+    } else {
+        let rows = arrays.iter().map(|array| array.len()).sum();
+        std::hint::black_box(&arrays);
+        (rows, 0)
+    };
+    Ok((hash, counts.summary()))
+}
+
+async fn run_v1_fixture_with_splits(
+    fixture: &Fixture,
+    query: (
+        ScanQuery,
+        vortex_array::expr::Expression,
+        vortex_array::expr::Expression,
+    ),
+    natural_splits: Arc<[u64]>,
+    concurrency: usize,
+    diagnostics: bool,
+) -> VortexResult<((usize, u64), SourceSummary)> {
+    let source_inner = Arc::clone(&fixture.source);
+    let (source, counts) = CountingSource::new(source_inner, diagnostics);
+    let reader = fixture.layout.new_reader(
+        "self-paced-v1-real-splits".into(),
+        source,
+        &SESSION,
+        &LayoutReaderContext::default(),
+    )?;
+    let (_, filter, projection) = query;
+    let arrays = ScanBuilder::new(SESSION.clone(), Arc::clone(&reader))
+        .with_filter(filter.bind(reader.dtype())?)
+        .with_projection(projection.bind(reader.dtype())?)
+        .with_natural_splits(natural_splits)
+        .with_concurrency(concurrency)
+        .into_array_stream()?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let hash = if diagnostics {
+        stable_array_hash(&arrays)?
+    } else {
+        let rows = arrays.iter().map(|array| array.len()).sum();
+        std::hint::black_box(&arrays);
+        (rows, 0)
+    };
     Ok((hash, counts.summary()))
 }
 
@@ -1238,14 +1671,14 @@ async fn run_candidate(
     selectivity: usize,
     morsel_rows: usize,
     concurrency: usize,
-    track_segments: bool,
+    diagnostics: bool,
 ) -> VortexResult<((usize, u64), SourceSummary)> {
     run_candidate_fixture(
         &FIXTURE,
         query(selectivity),
         morsel_rows,
         concurrency,
-        track_segments,
+        diagnostics,
     )
     .await
 }
@@ -1259,14 +1692,14 @@ async fn run_candidate_fixture(
     ),
     morsel_rows: usize,
     concurrency: usize,
-    track_segments: bool,
+    diagnostics: bool,
 ) -> VortexResult<((usize, u64), SourceSummary)> {
-    let source_inner: Arc<dyn SegmentSource> = Arc::<MemorySegments>::clone(&fixture.source);
-    let (source, counts) = CountingSource::new(source_inner, track_segments);
+    let source_inner = Arc::clone(&fixture.source);
+    let (source, counts) = CountingSource::new(source_inner, diagnostics);
     let (query, ..) = query;
     let policy = benchmark_schedule_policy(concurrency);
     let result = run_self_paced(
-        fixture.plan.clone(),
+        &fixture.plan,
         query,
         morsel_rows,
         source,
@@ -1277,10 +1710,57 @@ async fn run_candidate_fixture(
             retention: RetentionPolicy::RetainUntilDead,
             concurrency,
             collect_trace: false,
+            speculative_io: *SPECULATIVE_IO_CONFIG,
         },
     )
     .await?;
-    let hash = stable_output_hash(&result.batches, &SESSION)?;
+    let hash = if diagnostics {
+        stable_output_hash(&result.batches, &SESSION)?
+    } else {
+        let rows = result.batches.iter().map(|batch| batch.array.len()).sum();
+        std::hint::black_box(&result.batches);
+        (rows, 0)
+    };
+    Ok((hash, counts.summary()))
+}
+
+async fn run_candidate_fixture_with_ranges(
+    fixture: &Fixture,
+    query: (
+        ScanQuery,
+        vortex_array::expr::Expression,
+        vortex_array::expr::Expression,
+    ),
+    morsel_ranges: &[Range<u64>],
+    concurrency: usize,
+    diagnostics: bool,
+) -> VortexResult<((usize, u64), SourceSummary)> {
+    let source_inner = Arc::clone(&fixture.source);
+    let (source, counts) = CountingSource::new(source_inner, diagnostics);
+    let (query, ..) = query;
+    let result = run_self_paced_ranges(
+        &fixture.plan,
+        query,
+        morsel_ranges,
+        source,
+        &SESSION,
+        RunOptions {
+            policy: benchmark_schedule_policy(concurrency),
+            transition_budget: 32,
+            retention: RetentionPolicy::RetainUntilDead,
+            concurrency,
+            collect_trace: false,
+            speculative_io: *SPECULATIVE_IO_CONFIG,
+        },
+    )
+    .await?;
+    let hash = if diagnostics {
+        stable_output_hash(&result.batches, &SESSION)?
+    } else {
+        let rows = result.batches.iter().map(|batch| batch.array.len()).sum();
+        std::hint::black_box(&result.batches);
+        (rows, 0)
+    };
     Ok((hash, counts.summary()))
 }
 
@@ -1294,14 +1774,65 @@ fn benchmark_schedule_policy(concurrency: usize) -> SchedulePolicy {
     }
 }
 
+fn benchmark_speculative_io_config() -> SpeculativeIoConfig {
+    let mode =
+        std::env::var("VORTEX_SELF_PACED_SPECULATIVE_IO").unwrap_or_else(|_| "off".to_owned());
+    if mode == "off" {
+        return SpeculativeIoConfig::disabled();
+    }
+    let max_in_flight_bytes = std::env::var("VORTEX_SELF_PACED_SPECULATIVE_IO_MAX_BYTES")
+        .map_or(64 << 20, |value| value.parse().unwrap());
+    let unknown_read_bytes = std::env::var("VORTEX_SELF_PACED_SPECULATIVE_IO_UNKNOWN_BYTES")
+        .map_or(8 << 20, |value| value.parse().unwrap());
+    let minimum_expected_rows = std::env::var("VORTEX_SELF_PACED_SPECULATIVE_IO_MIN_ROWS")
+        .map_or(1, |value| value.parse().unwrap());
+    let adaptive = SpeculativeReadPolicy::Adaptive {
+        minimum_expected_rows,
+    };
+    let eager = mode.ends_with("-eager") || mode == "eager";
+    let selected = |enabled: bool| {
+        if !enabled {
+            SpeculativeReadPolicy::Disabled
+        } else if eager {
+            SpeculativeReadPolicy::Eager
+        } else {
+            adaptive
+        }
+    };
+    let predicate = selected(matches!(
+        mode.as_str(),
+        "predicate" | "predicate-eager" | "adaptive" | "eager"
+    ));
+    let projection = selected(matches!(
+        mode.as_str(),
+        "projection" | "projection-eager" | "adaptive" | "eager"
+    ));
+    assert!(
+        predicate != SpeculativeReadPolicy::Disabled
+            || projection != SpeculativeReadPolicy::Disabled,
+        "unsupported VORTEX_SELF_PACED_SPECULATIVE_IO mode {mode}"
+    );
+    SpeculativeIoConfig {
+        predicate,
+        projection,
+        max_in_flight_bytes,
+        unknown_read_bytes,
+    }
+}
+
 async fn trace_cases(requested: &str) -> VortexResult<()> {
-    if matches!(requested, "fineweb-q03-128k" | "fineweb-q06-128k") {
-        let query_id = if requested.contains("q03") { 3 } else { 6 };
+    if let Some((query_id, morsel_rows)) = [
+        (fineweb_query_id(requested, "fineweb-q", "-65k"), 65_536),
+        (fineweb_query_id(requested, "fineweb-q", "-128k"), 131_072),
+    ]
+    .into_iter()
+    .find_map(|(query_id, morsel_rows)| query_id.map(|query_id| (query_id, morsel_rows)))
+    {
         return trace_workload(
             &format!("fineweb_q{query_id:02}_scan_analogue"),
             fineweb_fixture(),
             fineweb_query_factory(query_id),
-            131_072,
+            morsel_rows,
         )
         .await;
     }
@@ -1348,6 +1879,9 @@ async fn trace_cases(requested: &str) -> VortexResult<()> {
         )
         .await;
     }
+    if requested == "q1-128k" {
+        return trace_workload("tpch_q1_scan", tpch_fixture(), tpch_q1_scan_query, 131_072).await;
+    }
     if matches!(requested, "v1-friendly-65k" | "v1-friendly-128k") {
         let morsel_rows = if requested == "v1-friendly-65k" {
             65_536
@@ -1368,11 +1902,11 @@ async fn trace_cases(requested: &str) -> VortexResult<()> {
             continue;
         }
         matched = true;
-        let source_inner: Arc<dyn SegmentSource> = Arc::<MemorySegments>::clone(&FIXTURE.source);
+        let source_inner = Arc::clone(&FIXTURE.source);
         let (source, counts) = CountingSource::new(source_inner, true);
         let (query, ..) = query(selectivity);
         let result = run_self_paced(
-            FIXTURE.plan.clone(),
+            &FIXTURE.plan,
             query,
             morsel_rows,
             source,
@@ -1383,6 +1917,7 @@ async fn trace_cases(requested: &str) -> VortexResult<()> {
                 retention: RetentionPolicy::RetainUntilDead,
                 concurrency,
                 collect_trace: true,
+                speculative_io: *SPECULATIVE_IO_CONFIG,
             },
         )
         .await?;
@@ -1395,7 +1930,7 @@ async fn trace_cases(requested: &str) -> VortexResult<()> {
         })?;
         let source = counts.summary();
         println!(
-            "trace_end requests={} unique_segments={} segment_requests_min={} segment_requests_max={} bytes={} advance_calls={} transitions={} tasks_offered={} tasks_claimed={} tasks_completed={} demand_combinations={} inline_demand_combinations={} demand_direct_adoptions={} demand_noop_adoptions={} adaptive_launches={} adaptive_waits={} predicate_reorders={} demand_initial={} demand_final={} trace_events={}",
+            "trace_end requests={} unique_segments={} segment_requests_min={} segment_requests_max={} bytes={} advance_calls={} transitions={} tasks_offered={} tasks_claimed={} tasks_completed={} scheduler_passes={} scheduler_tasks_considered={} scheduler_tasks_admitted={} completion_batches={} completions_drained={} max_completion_batch={} speculative_io_offered={} speculative_io_admitted={} speculative_io_unknown_size={} speculative_io_estimated_bytes_offered={} speculative_io_estimated_bytes_admitted={} speculative_io_completed_bytes={} speculative_io_useful_bytes={} speculative_io_wasted_bytes={} speculative_predicate_io_offered={} speculative_projection_io_offered={} demand_combinations={} inline_demand_combinations={} demand_direct_adoptions={} demand_noop_adoptions={} adaptive_launches={} adaptive_waits={} predicate_reorders={} demand_initial={} demand_final={} trace_events={}",
             source.requests,
             source.unique_segments,
             source.segment_requests_min,
@@ -1406,6 +1941,22 @@ async fn trace_cases(requested: &str) -> VortexResult<()> {
             result.metrics.tasks_offered,
             result.metrics.tasks_claimed,
             result.metrics.tasks_completed,
+            result.metrics.scheduler_passes,
+            result.metrics.scheduler_tasks_considered,
+            result.metrics.scheduler_tasks_admitted,
+            result.metrics.completion_batches,
+            result.metrics.completions_drained,
+            result.metrics.max_completion_batch,
+            result.metrics.speculative_io_offered,
+            result.metrics.speculative_io_admitted,
+            result.metrics.speculative_io_unknown_size,
+            result.metrics.speculative_io_estimated_bytes_offered,
+            result.metrics.speculative_io_estimated_bytes_admitted,
+            result.metrics.speculative_io_completed_bytes,
+            result.metrics.speculative_io_useful_bytes,
+            result.metrics.speculative_io_wasted_bytes,
+            result.metrics.speculative_predicate_io_offered,
+            result.metrics.speculative_projection_io_offered,
             result.metrics.demand_combinations,
             result.metrics.inline_demand_combinations,
             result.metrics.demand_direct_adoptions,
@@ -1432,12 +1983,12 @@ async fn trace_workload(
 ) -> VortexResult<()> {
     std::hint::black_box(run_candidate_fixture(fixture, query(), morsel_rows, 16, false).await?);
     let (v1_output, v1_source) = run_v1_fixture(fixture, query(), 16, true).await?;
-    let source_inner: Arc<dyn SegmentSource> = Arc::<MemorySegments>::clone(&fixture.source);
+    let source_inner = Arc::clone(&fixture.source);
     let (source, counts) = CountingSource::new(source_inner, true);
     let (query, ..) = query();
     let policy = benchmark_schedule_policy(16);
     let result = run_self_paced(
-        fixture.plan.clone(),
+        &fixture.plan,
         query,
         morsel_rows,
         source,
@@ -1448,6 +1999,7 @@ async fn trace_workload(
             retention: RetentionPolicy::RetainUntilDead,
             concurrency: 16,
             collect_trace: true,
+            speculative_io: *SPECULATIVE_IO_CONFIG,
         },
     )
     .await?;
@@ -1469,7 +2021,7 @@ async fn trace_workload(
         .map_err(|error| vortex_error::vortex_err!("failed to write self-paced trace: {error}"))?;
     let source = counts.summary();
     println!(
-        "trace_end requests={} unique_segments={} segment_requests_min={} segment_requests_max={} bytes={} advance_calls={} transitions={} nodes_inspected={} tasks_offered={} tasks_claimed={} tasks_completed={} demand_combinations={} inline_demand_combinations={} demand_direct_adoptions={} demand_noop_adoptions={} adaptive_launches={} adaptive_waits={} predicate_reorders={} demand_initial={} demand_final={} resource_nodes={} morsel_slots={} trace_events={}",
+        "trace_end requests={} unique_segments={} segment_requests_min={} segment_requests_max={} bytes={} advance_calls={} transitions={} nodes_inspected={} completion_wake_candidates_inspected={} tasks_offered={} tasks_claimed={} tasks_completed={} scheduler_passes={} scheduler_tasks_considered={} scheduler_tasks_admitted={} completion_batches={} completions_drained={} max_completion_batch={} speculative_io_offered={} speculative_io_admitted={} speculative_io_unknown_size={} speculative_io_estimated_bytes_offered={} speculative_io_estimated_bytes_admitted={} speculative_io_completed_bytes={} speculative_io_useful_bytes={} speculative_io_wasted_bytes={} speculative_predicate_io_offered={} speculative_projection_io_offered={} demand_combinations={} inline_demand_combinations={} demand_direct_adoptions={} demand_noop_adoptions={} adaptive_launches={} adaptive_waits={} predicate_reorders={} demand_initial={} demand_final={} resource_nodes={} morsel_slots={} trace_events={}",
         source.requests,
         source.unique_segments,
         source.segment_requests_min,
@@ -1478,9 +2030,26 @@ async fn trace_workload(
         result.metrics.advance_calls,
         result.metrics.transitions,
         result.metrics.nodes_inspected,
+        result.metrics.completion_wake_candidates_inspected,
         result.metrics.tasks_offered,
         result.metrics.tasks_claimed,
         result.metrics.tasks_completed,
+        result.metrics.scheduler_passes,
+        result.metrics.scheduler_tasks_considered,
+        result.metrics.scheduler_tasks_admitted,
+        result.metrics.completion_batches,
+        result.metrics.completions_drained,
+        result.metrics.max_completion_batch,
+        result.metrics.speculative_io_offered,
+        result.metrics.speculative_io_admitted,
+        result.metrics.speculative_io_unknown_size,
+        result.metrics.speculative_io_estimated_bytes_offered,
+        result.metrics.speculative_io_estimated_bytes_admitted,
+        result.metrics.speculative_io_completed_bytes,
+        result.metrics.speculative_io_useful_bytes,
+        result.metrics.speculative_io_wasted_bytes,
+        result.metrics.speculative_predicate_io_offered,
+        result.metrics.speculative_projection_io_offered,
         result.metrics.demand_combinations,
         result.metrics.inline_demand_combinations,
         result.metrics.demand_direct_adoptions,
@@ -1498,6 +2067,57 @@ async fn trace_workload(
 }
 
 async fn profile_case(requested: &str, iterations: usize) -> VortexResult<()> {
+    if matches!(
+        requested,
+        "tpch-q6-v1-128k" | "tpch-q6-self-128k" | "tpch-q1-v1-128k" | "tpch-q1-self-128k"
+    ) {
+        let fixture = tpch_fixture();
+        let query = if requested.starts_with("tpch-q1-") {
+            tpch_q1_scan_query
+        } else {
+            tpch_q6_scan_query
+        };
+        println!("profile_begin workload={requested} iterations={iterations}");
+        for _ in 0..iterations {
+            if requested.contains("-v1-") {
+                std::hint::black_box(run_v1_fixture(fixture, query(), 16, false).await?);
+            } else {
+                std::hint::black_box(
+                    run_candidate_fixture(fixture, query(), 131_072, 16, false).await?,
+                );
+            }
+        }
+        println!("profile_end workload={requested} iterations={iterations}");
+        return Ok(());
+    }
+    if let Some((query_id, engine, morsel_rows)) = ["65k", "128k"]
+        .into_iter()
+        .flat_map(|size| ["v1", "self"].map(|engine| (size, engine)))
+        .find_map(|(size, engine)| {
+            fineweb_query_id(requested, "fineweb-q", &format!("-{engine}-{size}")).map(|query_id| {
+                (
+                    query_id,
+                    engine,
+                    if size == "65k" { 65_536 } else { 131_072 },
+                )
+            })
+        })
+    {
+        let fixture = fineweb_fixture();
+        let query = fineweb_query_factory(query_id);
+        println!("profile_begin workload={requested} iterations={iterations}");
+        for _ in 0..iterations {
+            if engine == "v1" {
+                std::hint::black_box(run_v1_fixture(fixture, query(), 16, false).await?);
+            } else {
+                std::hint::black_box(
+                    run_candidate_fixture(fixture, query(), morsel_rows, 16, false).await?,
+                );
+            }
+        }
+        println!("profile_end workload={requested} iterations={iterations}");
+        return Ok(());
+    }
     if matches!(
         requested,
         "q40-v1-65k" | "q40-self-65k" | "q42-v1-128k" | "q42-self-128k"
@@ -1547,6 +2167,33 @@ async fn compare_cases(iterations: usize) -> VortexResult<()> {
         vortex_error::vortex_bail!("comparison iterations must be non-zero");
     }
     if let Ok(workload) = std::env::var("VORTEX_SELF_PACED_COMPARE_WORKLOAD") {
+        if workload == "fineweb_all" {
+            return compare_fineweb_workloads(iterations).await;
+        }
+        if let Some(query_id) = fineweb_query_id(&workload, "fineweb_q", "") {
+            return compare_workload(
+                &workload,
+                fineweb_fixture,
+                fineweb_query_factory(query_id),
+                iterations,
+            )
+            .await;
+        }
+        if workload == "clickbench_all" {
+            return compare_clickbench_workloads(iterations).await;
+        }
+        if workload == "tpch_all" {
+            return compare_tpch_workloads(iterations).await;
+        }
+        if workload.starts_with("tpch_") {
+            let query = match workload.as_str() {
+                "tpch_q6" => tpch_q6_scan_query,
+                "tpch_q1" => tpch_q1_scan_query,
+                "tpch_v1_friendly" => tpch_v1_friendly_query,
+                _ => vortex_error::vortex_bail!("unsupported comparison workload {workload}"),
+            };
+            return compare_workload(&workload, tpch_fixture, query, iterations).await;
+        }
         let query_id = match workload.as_str() {
             "clickbench_q40" => 40,
             "clickbench_q41" => 41,
@@ -1566,6 +2213,13 @@ async fn compare_cases(iterations: usize) -> VortexResult<()> {
             compare_synthetic_case(selectivity, morsel_rows, iterations).await?;
         }
     }
+    compare_clickbench_workloads(iterations).await?;
+    compare_tpch_workloads(iterations).await?;
+    compare_fineweb_workloads(iterations).await?;
+    Ok(())
+}
+
+async fn compare_clickbench_workloads(iterations: usize) -> VortexResult<()> {
     compare_workload(
         "clickbench_selective",
         clickbench_fixture,
@@ -1589,6 +2243,10 @@ async fn compare_cases(iterations: usize) -> VortexResult<()> {
         )
         .await?;
     }
+    Ok(())
+}
+
+async fn compare_tpch_workloads(iterations: usize) -> VortexResult<()> {
     compare_workload("tpch_q6_scan", tpch_fixture, tpch_q6_scan_query, iterations).await?;
     compare_workload("tpch_q1_scan", tpch_fixture, tpch_q1_scan_query, iterations).await?;
     compare_workload(
@@ -1598,6 +2256,10 @@ async fn compare_cases(iterations: usize) -> VortexResult<()> {
         iterations,
     )
     .await?;
+    Ok(())
+}
+
+async fn compare_fineweb_workloads(iterations: usize) -> VortexResult<()> {
     for query_id in FINEWEB_QUERY_IDS {
         compare_workload(
             &format!("fineweb_q{query_id:02}_scan_analogue"),
@@ -1615,8 +2277,8 @@ async fn compare_synthetic_case(
     morsel_rows: usize,
     iterations: usize,
 ) -> VortexResult<()> {
-    let v1_warmup = run_v1(selectivity, 16, false).await?;
-    let candidate_warmup = run_candidate(selectivity, morsel_rows, 16, false).await?;
+    let v1_warmup = run_v1(selectivity, 16, true).await?;
+    let candidate_warmup = run_candidate(selectivity, morsel_rows, 16, true).await?;
     if v1_warmup.0 != candidate_warmup.0 {
         vortex_error::vortex_bail!(
             "synthetic output mismatch at selectivity={selectivity} morsel_rows={morsel_rows}"
@@ -1650,12 +2312,96 @@ async fn compare_synthetic_case(
     Ok(())
 }
 
-type QueryFactory = fn() -> (
+type QueryBundle = (
     ScanQuery,
     vortex_array::expr::Expression,
     vortex_array::expr::Expression,
 );
+type QueryFactory = fn() -> QueryBundle;
 type FixtureFactory = fn() -> &'static Fixture;
+
+struct SplitMergePlan {
+    natural_splits: Arc<[u64]>,
+    morsel_ranges: Vec<Range<u64>>,
+    natural_split_count: usize,
+    concurrency: usize,
+}
+
+fn split_merge_plan(
+    fixture: &Fixture,
+    query: &ScanQuery,
+    merge_factor: usize,
+) -> VortexResult<SplitMergePlan> {
+    if merge_factor == 0 {
+        vortex_error::vortex_bail!("split merge factor must be non-zero");
+    }
+    let catalog = fixture.physical_splits.as_ref().ok_or_else(|| {
+        vortex_error::vortex_err!("physical split catalog is required for real-split comparison")
+    })?;
+    let used_fields = query
+        .conjuncts
+        .iter()
+        .map(|conjunct| conjunct.field)
+        .chain(query.projection.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let source_fields = used_fields
+        .iter()
+        .flat_map(|field| {
+            fixture
+                .physical_field_sources
+                .get(field.0)
+                .into_iter()
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    if source_fields.is_empty() {
+        vortex_error::vortex_bail!("query maps to no physical source fields");
+    }
+
+    let mut natural_splits = vec![0];
+    let mut morsel_ranges = Vec::new();
+    let mut natural_split_count = 0;
+    let mut file_offset = 0u64;
+    for file in &catalog.files {
+        let mut boundaries = BTreeSet::from([0, file.row_count]);
+        for field in &source_fields {
+            let field_boundaries = file.fields.get(field.as_str()).ok_or_else(|| {
+                vortex_error::vortex_err!("physical split catalog is missing field {field}")
+            })?;
+            boundaries.extend(field_boundaries.iter().copied());
+        }
+        let boundaries = boundaries.into_iter().collect::<Vec<_>>();
+        if boundaries.first() != Some(&0) || boundaries.last() != Some(&file.row_count) {
+            vortex_error::vortex_bail!("physical split boundaries do not cover a catalog file");
+        }
+        natural_split_count += boundaries.len() - 1;
+        natural_splits.extend(
+            boundaries
+                .iter()
+                .skip(1)
+                .map(|boundary| file_offset + boundary),
+        );
+        for split_start in (0..boundaries.len() - 1).step_by(merge_factor) {
+            let split_end = (split_start + merge_factor).min(boundaries.len() - 1);
+            morsel_ranges
+                .push(file_offset + boundaries[split_start]..file_offset + boundaries[split_end]);
+        }
+        file_offset += file.row_count;
+    }
+    if file_offset != fixture.plan.row_count {
+        vortex_error::vortex_bail!(
+            "physical split catalog has {file_offset} rows but fixture has {}",
+            fixture.plan.row_count
+        );
+    }
+    let concurrency = 16.min(morsel_ranges.len()).max(1);
+    Ok(SplitMergePlan {
+        natural_splits: natural_splits.into(),
+        morsel_ranges,
+        natural_split_count,
+        concurrency,
+    })
+}
 
 async fn compare_workload(
     name: &str,
@@ -1663,14 +2409,46 @@ async fn compare_workload(
     query: QueryFactory,
     iterations: usize,
 ) -> VortexResult<()> {
-    for morsel_rows in [65_536, 131_072] {
-        let fixture = fixture();
-        let v1_warmup = run_v1_fixture(fixture, query(), 16, false).await?;
-        let candidate_warmup =
-            run_candidate_fixture(fixture, query(), morsel_rows, 16, false).await?;
+    let source_fixture = fixture();
+    // Materialize one canonical query bundle for the whole comparison. Both execution paths
+    // receive clones of this exact object rather than independently rebuilding the query.
+    let query = query();
+    let scan_query = &query.0;
+    let first_plan = split_merge_plan(source_fixture, scan_query, 16)?;
+    let fixture =
+        rechunk_fixture_at_natural_splits(source_fixture, Arc::clone(&first_plan.natural_splits))
+            .await?;
+    eprintln!(
+        "comparison_fixture workload={name} rows={} natural_splits={} serialized_bytes={} serialized_hash={:#x}",
+        fixture.plan.row_count,
+        first_plan.natural_split_count,
+        fixture.serialized_bytes,
+        fixture.serialized_hash,
+    );
+    if std::env::var_os("VORTEX_SELF_PACED_COMPARE_TRACE").is_some() {
+        return trace_split_workload(name, &fixture, query, &first_plan).await;
+    }
+    for merge_factor in [16, 32] {
+        let split_plan = split_merge_plan(source_fixture, scan_query, merge_factor)?;
+        let v1_warmup = run_v1_fixture_with_splits(
+            &fixture,
+            query.clone(),
+            Arc::clone(&split_plan.natural_splits),
+            split_plan.concurrency,
+            true,
+        )
+        .await?;
+        let candidate_warmup = run_candidate_fixture_with_ranges(
+            &fixture,
+            query.clone(),
+            &split_plan.morsel_ranges,
+            split_plan.concurrency,
+            true,
+        )
+        .await?;
         if !logical_outputs_match(v1_warmup.0, candidate_warmup.0) {
             vortex_error::vortex_bail!(
-                "{name} output mismatch at morsel_rows={morsel_rows}: v1={:?} self_paced={:?}",
+                "{name} output mismatch at split_merge={merge_factor}: v1={:?} self_paced={:?}",
                 v1_warmup.0,
                 candidate_warmup.0,
             );
@@ -1680,32 +2458,182 @@ async fn compare_workload(
         for iteration in 0..iterations {
             let started = Instant::now();
             if iteration % 2 == 0 {
-                std::hint::black_box(run_v1_fixture(fixture, query(), 16, false).await?);
+                std::hint::black_box(
+                    run_v1_fixture_with_splits(
+                        &fixture,
+                        query.clone(),
+                        Arc::clone(&split_plan.natural_splits),
+                        split_plan.concurrency,
+                        false,
+                    )
+                    .await?,
+                );
                 v1_times.push(started.elapsed());
                 let started = Instant::now();
                 std::hint::black_box(
-                    run_candidate_fixture(fixture, query(), morsel_rows, 16, false).await?,
+                    run_candidate_fixture_with_ranges(
+                        &fixture,
+                        query.clone(),
+                        &split_plan.morsel_ranges,
+                        split_plan.concurrency,
+                        false,
+                    )
+                    .await?,
                 );
                 candidate_times.push(started.elapsed());
             } else {
                 std::hint::black_box(
-                    run_candidate_fixture(fixture, query(), morsel_rows, 16, false).await?,
+                    run_candidate_fixture_with_ranges(
+                        &fixture,
+                        query.clone(),
+                        &split_plan.morsel_ranges,
+                        split_plan.concurrency,
+                        false,
+                    )
+                    .await?,
                 );
                 candidate_times.push(started.elapsed());
                 let started = Instant::now();
-                std::hint::black_box(run_v1_fixture(fixture, query(), 16, false).await?);
+                std::hint::black_box(
+                    run_v1_fixture_with_splits(
+                        &fixture,
+                        query.clone(),
+                        Arc::clone(&split_plan.natural_splits),
+                        split_plan.concurrency,
+                        false,
+                    )
+                    .await?,
+                );
                 v1_times.push(started.elapsed());
             }
         }
-        print_comparison(
+        print_split_comparison(
             name,
-            morsel_rows,
+            merge_factor,
+            &split_plan,
             iterations,
             &mut v1_times,
             &mut candidate_times,
         );
     }
     Ok(())
+}
+
+async fn trace_split_workload(
+    name: &str,
+    fixture: &Fixture,
+    query: QueryBundle,
+    split_plan: &SplitMergePlan,
+) -> VortexResult<()> {
+    let (v1_output, v1_source) = run_v1_fixture_with_splits(
+        fixture,
+        query.clone(),
+        Arc::clone(&split_plan.natural_splits),
+        split_plan.concurrency,
+        true,
+    )
+    .await?;
+    let source_inner = Arc::clone(&fixture.source);
+    let (source, counts) = CountingSource::new(source_inner, true);
+    let (scan_query, ..) = query;
+    let result = run_self_paced_ranges(
+        &fixture.plan,
+        scan_query,
+        &split_plan.morsel_ranges,
+        source,
+        &SESSION,
+        RunOptions {
+            policy: benchmark_schedule_policy(split_plan.concurrency),
+            transition_budget: 32,
+            retention: RetentionPolicy::RetainUntilDead,
+            concurrency: split_plan.concurrency,
+            collect_trace: true,
+            speculative_io: *SPECULATIVE_IO_CONFIG,
+        },
+    )
+    .await?;
+    let output = stable_output_hash(&result.batches, &SESSION)?;
+    if !logical_outputs_match(v1_output, output) {
+        vortex_error::vortex_bail!(
+            "{name} traced output mismatch: v1={v1_output:?} self_paced={output:?}"
+        );
+    }
+    println!(
+        "trace_begin workload={name} split_merge=16 natural_splits={} morsels={} concurrency={} rows={} hash={:#x}",
+        split_plan.natural_split_count,
+        split_plan.morsel_ranges.len(),
+        split_plan.concurrency,
+        output.0,
+        output.1,
+    );
+    println!(
+        "v1_summary rows={} hash={:#x} requests={} unique_segments={} segment_requests_min={} segment_requests_max={} bytes={}",
+        v1_output.0,
+        v1_output.1,
+        v1_source.requests,
+        v1_source.unique_segments,
+        v1_source.segment_requests_min,
+        v1_source.segment_requests_max,
+        v1_source.bytes,
+    );
+    write_execution_trace(std::io::stdout().lock(), &result.trace)
+        .map_err(|error| vortex_error::vortex_err!("failed to write self-paced trace: {error}"))?;
+    let source = counts.summary();
+    println!(
+        "trace_end requests={} unique_segments={} segment_requests_min={} segment_requests_max={} bytes={} advance_calls={} transitions={} nodes_inspected={} completion_wake_candidates_inspected={} tasks_offered={} tasks_claimed={} tasks_completed={} scheduler_passes={} scheduler_tasks_considered={} scheduler_tasks_admitted={} completion_batches={} completions_drained={} max_completion_batch={} demand_combinations={} inline_demand_combinations={} demand_direct_adoptions={} demand_noop_adoptions={} adaptive_launches={} adaptive_waits={} predicate_reorders={} demand_initial={} demand_final={} resource_nodes={} morsel_slots={} trace_events={}",
+        source.requests,
+        source.unique_segments,
+        source.segment_requests_min,
+        source.segment_requests_max,
+        source.bytes,
+        result.metrics.advance_calls,
+        result.metrics.transitions,
+        result.metrics.nodes_inspected,
+        result.metrics.completion_wake_candidates_inspected,
+        result.metrics.tasks_offered,
+        result.metrics.tasks_claimed,
+        result.metrics.tasks_completed,
+        result.metrics.scheduler_passes,
+        result.metrics.scheduler_tasks_considered,
+        result.metrics.scheduler_tasks_admitted,
+        result.metrics.completion_batches,
+        result.metrics.completions_drained,
+        result.metrics.max_completion_batch,
+        result.metrics.demand_combinations,
+        result.metrics.inline_demand_combinations,
+        result.metrics.demand_direct_adoptions,
+        result.metrics.demand_noop_adoptions,
+        result.metrics.adaptive_predicate_launches,
+        result.metrics.adaptive_predicate_waits,
+        result.metrics.predicate_reorders,
+        result.metrics.demand_rows_initial,
+        result.metrics.demand_rows_current,
+        result.metrics.resource_nodes,
+        result.metrics.morsel_slots,
+        result.trace.len(),
+    );
+    Ok(())
+}
+
+fn print_split_comparison(
+    workload: &str,
+    merge_factor: usize,
+    split_plan: &SplitMergePlan,
+    iterations: usize,
+    v1_times: &mut [Duration],
+    candidate_times: &mut [Duration],
+) {
+    let v1 = median(v1_times);
+    let candidate = median(candidate_times);
+    println!(
+        "compare workload={workload} split_merge={merge_factor} natural_splits={} morsels={} concurrency={} iterations={iterations} v1_ms={:.3} self_paced_ms={:.3} ratio={:.3}",
+        split_plan.natural_split_count,
+        split_plan.morsel_ranges.len(),
+        split_plan.concurrency,
+        v1.as_secs_f64() * 1_000.0,
+        candidate.as_secs_f64() * 1_000.0,
+        candidate.as_secs_f64() / v1.as_secs_f64(),
+    );
 }
 
 fn print_comparison(

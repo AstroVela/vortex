@@ -9,6 +9,7 @@ use vortex_array::ArrayRef;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldNames;
+use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
@@ -67,6 +68,24 @@ pub enum OutputSlot {
 pub struct BooleanMaskSummary {
     pub len: usize,
     pub true_count: usize,
+    pub(crate) values: BitBuffer,
+}
+
+impl BooleanMaskSummary {
+    pub fn true_count_in(&self, range: Range<usize>) -> VortexResult<usize> {
+        if range.start > range.end || range.end > self.len {
+            vortex_bail!("mask range {range:?} is outside {} rows", self.len);
+        }
+        Ok(if self.true_count == 0 {
+            0
+        } else if self.true_count == self.len {
+            range.len()
+        } else if range.len() == self.len {
+            self.true_count
+        } else {
+            self.values.slice(range).true_count()
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,11 +108,13 @@ impl ResolvedArray {
         }
     }
 
-    pub fn boolean(array: ArrayRef, true_count: usize) -> Self {
+    pub fn boolean(array: ArrayRef, values: BitBuffer) -> Self {
+        debug_assert_eq!(array.len(), values.len());
         Self {
             summary: ArraySummary::BooleanMask(BooleanMaskSummary {
                 len: array.len(),
-                true_count,
+                true_count: values.true_count(),
+                values,
             }),
             array,
         }
@@ -118,6 +139,7 @@ pub enum Predicate {
     Equal(i64),
     LessThan(i64),
     GreaterThan(i64),
+    RangeExclusive { lower: i64, upper: i64 },
 }
 
 impl Predicate {
@@ -126,6 +148,49 @@ impl Predicate {
             Self::Equal(rhs) => value == rhs,
             Self::LessThan(rhs) => value < rhs,
             Self::GreaterThan(rhs) => value > rhs,
+            Self::RangeExclusive { lower, upper } => value > lower && value < upper,
+        }
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::GreaterThan(left), Self::GreaterThan(right)) => {
+                Some(Self::GreaterThan(left.max(right)))
+            }
+            (Self::LessThan(left), Self::LessThan(right)) => Some(Self::LessThan(left.min(right))),
+            (Self::GreaterThan(lower), Self::LessThan(upper))
+            | (Self::LessThan(upper), Self::GreaterThan(lower)) => {
+                Some(Self::RangeExclusive { lower, upper })
+            }
+            (Self::RangeExclusive { lower, upper }, Self::GreaterThan(next_lower))
+            | (Self::GreaterThan(next_lower), Self::RangeExclusive { lower, upper }) => {
+                Some(Self::RangeExclusive {
+                    lower: lower.max(next_lower),
+                    upper,
+                })
+            }
+            (Self::RangeExclusive { lower, upper }, Self::LessThan(next_upper))
+            | (Self::LessThan(next_upper), Self::RangeExclusive { lower, upper }) => {
+                Some(Self::RangeExclusive {
+                    lower,
+                    upper: upper.min(next_upper),
+                })
+            }
+            (
+                Self::RangeExclusive {
+                    lower: left_lower,
+                    upper: left_upper,
+                },
+                Self::RangeExclusive {
+                    lower: right_lower,
+                    upper: right_upper,
+                },
+            ) => Some(Self::RangeExclusive {
+                lower: left_lower.max(right_lower),
+                upper: left_upper.min(right_upper),
+            }),
+            (Self::Equal(left), Self::Equal(right)) if left == right => Some(Self::Equal(left)),
+            _ => None,
         }
     }
 }
@@ -140,6 +205,28 @@ pub struct Conjunct {
 pub struct ScanQuery {
     pub conjuncts: Vec<Conjunct>,
     pub projection: Vec<FieldId>,
+}
+
+impl ScanQuery {
+    pub(crate) fn coalesce_same_field_predicates(&mut self) {
+        let mut current = 0;
+        while current < self.conjuncts.len() {
+            let mut candidate = current + 1;
+            while candidate < self.conjuncts.len() {
+                if self.conjuncts[current].field == self.conjuncts[candidate].field
+                    && let Some(predicate) = self.conjuncts[current]
+                        .predicate
+                        .intersection(self.conjuncts[candidate].predicate)
+                {
+                    self.conjuncts[current].predicate = predicate;
+                    self.conjuncts.remove(candidate);
+                } else {
+                    candidate += 1;
+                }
+            }
+            current += 1;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +245,7 @@ pub struct FlatPlan {
     pub segment: SegmentId,
     pub root_coverage: Range<u64>,
     pub row_count: usize,
+    pub estimated_bytes: Option<usize>,
     pub encoding: FlatEncoding,
 }
 
@@ -175,6 +263,16 @@ pub struct SourcePlan {
 }
 
 impl SourcePlan {
+    pub fn populate_segment_sizes(&mut self, source: &dyn SegmentSource) {
+        for flat in self
+            .chunks
+            .iter_mut()
+            .flat_map(|chunk| chunk.fields.iter_mut())
+        {
+            flat.estimated_bytes = source.estimated_size(flat.segment);
+        }
+    }
+
     pub fn try_from_layout(layout: &LayoutRef) -> VortexResult<Self> {
         let root = layout
             .as_opt::<Struct>()
@@ -234,6 +332,7 @@ impl SourcePlan {
                     segment: flat.segment_id(),
                     root_coverage: root_start..root_end,
                     row_count: usize::try_from(flat.row_count())?,
+                    estimated_bytes: None,
                     encoding: FlatEncoding::Serialized {
                         dtype: flat.dtype().clone(),
                         read_ctx: flat.array_ctx().clone(),
@@ -282,6 +381,7 @@ impl SourcePlan {
                     segment,
                     root_coverage: root_start..root_end,
                     row_count,
+                    estimated_bytes: source.estimated_size(segment),
                     encoding: FlatEncoding::RawI64,
                 });
             }
@@ -317,6 +417,10 @@ impl MemorySegments {
 }
 
 impl SegmentSource for MemorySegments {
+    fn estimated_size(&self, id: SegmentId) -> Option<usize> {
+        self.buffers.lock().get(*id as usize).map(ByteBuffer::len)
+    }
+
     fn request(&self, id: SegmentId) -> SegmentFuture {
         use futures::FutureExt;
 
@@ -366,6 +470,72 @@ pub enum WorkClass {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadPhase {
+    Predicate,
+    Projection,
+    PredicateAndProjection,
+}
+
+impl ReadPhase {
+    pub fn includes_predicate(self) -> bool {
+        matches!(self, Self::Predicate | Self::PredicateAndProjection)
+    }
+
+    pub fn includes_projection(self) -> bool {
+        matches!(self, Self::Projection | Self::PredicateAndProjection)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpeculativeReadPolicy {
+    Disabled,
+    Eager,
+    Adaptive { minimum_expected_rows: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpeculativeIoConfig {
+    pub predicate: SpeculativeReadPolicy,
+    pub projection: SpeculativeReadPolicy,
+    pub max_in_flight_bytes: usize,
+    pub unknown_read_bytes: usize,
+}
+
+impl SpeculativeIoConfig {
+    pub const fn disabled() -> Self {
+        Self {
+            predicate: SpeculativeReadPolicy::Disabled,
+            projection: SpeculativeReadPolicy::Disabled,
+            max_in_flight_bytes: 0,
+            unknown_read_bytes: 0,
+        }
+    }
+
+    pub const fn eager(max_in_flight_bytes: usize, unknown_read_bytes: usize) -> Self {
+        Self {
+            predicate: SpeculativeReadPolicy::Eager,
+            projection: SpeculativeReadPolicy::Eager,
+            max_in_flight_bytes,
+            unknown_read_bytes,
+        }
+    }
+}
+
+impl Default for SpeculativeIoConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReadEstimate {
+    pub phase: ReadPhase,
+    pub estimated_bytes: Option<usize>,
+    pub current_rows: usize,
+    pub expected_rows: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulePolicy {
     PredicateFirst,
     AdaptivePredicates { concurrency: usize },
@@ -381,6 +551,15 @@ pub enum SchedulePolicy {
 pub enum Operation {
     Read {
         segment: SegmentId,
+        phase: ReadPhase,
+        estimated_bytes: Option<usize>,
+    },
+    ReadDecodeFlat {
+        segment: SegmentId,
+        phase: ReadPhase,
+        estimated_bytes: Option<usize>,
+        encoding: FlatEncoding,
+        row_count: usize,
     },
     DecodeFlat {
         encoding: FlatEncoding,
@@ -398,6 +577,13 @@ pub enum Operation {
     },
     SelectFlat {
         local_ranges: Vec<Range<usize>>,
+        selection_ranges: Vec<Range<usize>>,
+        pack_names: Option<FieldNames>,
+    },
+    SelectStruct {
+        field_local_ranges: Vec<Vec<Range<usize>>>,
+        selection_ranges: Vec<Range<usize>>,
+        names: FieldNames,
     },
     PackStruct {
         names: FieldNames,
@@ -416,6 +602,10 @@ pub struct Task {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeping offered tasks inline avoids the measured allocation/indirection regression"
+)]
 pub enum TaskUpdate {
     Offer(Task),
     Promote(TaskId),
@@ -445,6 +635,7 @@ pub struct Completion {
     pub task: TaskId,
     pub output: OutputSlot,
     pub elapsed_ns: u64,
+    pub read_bytes: Option<usize>,
     pub result: VortexResult<ResolvedValue>,
 }
 

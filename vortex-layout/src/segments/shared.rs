@@ -38,6 +38,10 @@ impl<S: SegmentSource> SharedSegmentSource<S> {
 }
 
 impl<S: SegmentSource> SegmentSource for SharedSegmentSource<S> {
+    fn estimated_size(&self, id: SegmentId) -> Option<usize> {
+        self.inner.estimated_size(id)
+    }
+
     fn request(&self, id: SegmentId) -> SegmentFuture {
         loop {
             match self.in_flight.entry(id) {

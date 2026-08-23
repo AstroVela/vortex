@@ -146,6 +146,10 @@ impl SegmentCacheSourceAdapter {
 }
 
 impl SegmentSource for SegmentCacheSourceAdapter {
+    fn estimated_size(&self, id: SegmentId) -> Option<usize> {
+        self.source.estimated_size(id)
+    }
+
     fn request(&self, id: SegmentId) -> SegmentFuture {
         let cache = Arc::clone(&self.cache);
         let delegate = self.source.request(id);

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ops::Range as StdRange;
 use std::time::Instant;
 
 use smallvec::SmallVec;
@@ -27,6 +28,8 @@ use super::MorselState;
 use super::Necessity;
 use super::Operation;
 use super::OutputSlot;
+use super::ReadEstimate;
+use super::ReadPhase;
 use super::ResolvedArray;
 use super::ResolvedValue;
 use super::ResourceId;
@@ -57,6 +60,16 @@ pub struct Metrics {
     pub tasks_completed: usize,
     pub io_offered: usize,
     pub cpu_offered: usize,
+    pub speculative_io_offered: usize,
+    pub speculative_io_admitted: usize,
+    pub speculative_io_unknown_size: usize,
+    pub speculative_io_estimated_bytes_offered: usize,
+    pub speculative_io_estimated_bytes_admitted: usize,
+    pub speculative_io_completed_bytes: usize,
+    pub speculative_io_useful_bytes: usize,
+    pub speculative_io_wasted_bytes: usize,
+    pub speculative_predicate_io_offered: usize,
+    pub speculative_projection_io_offered: usize,
     pub demand_rows_initial: usize,
     pub demand_rows_current: usize,
     pub demand_combinations: usize,
@@ -71,6 +84,13 @@ pub struct Metrics {
     pub resource_nodes: usize,
     pub morsel_slots: usize,
     pub max_updates_per_advance: usize,
+    pub scheduler_passes: usize,
+    pub scheduler_tasks_considered: usize,
+    pub scheduler_tasks_admitted: usize,
+    pub completion_batches: usize,
+    pub completions_drained: usize,
+    pub max_completion_batch: usize,
+    pub completion_wake_candidates_inspected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -101,19 +121,23 @@ struct StoredTask {
     owner: TaskOwner,
     leases: SmallVec<[ResourceId; 2]>,
     unwanted: bool,
+    claimed_as_candidate: bool,
+    completed_read_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
 struct ResourceUse {
     resource: ResourceId,
-    necessity: Necessity,
     joined: bool,
+    selected_rows: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
 struct ResourceSlice {
     resource: ResourceId,
+    use_idx: usize,
     local_range: std::ops::Range<usize>,
+    morsel_range: std::ops::Range<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +206,7 @@ struct Morsel {
     arrays: Vec<Slot<ResolvedArray>>,
     demand_slot: ArraySlotId,
     demand_version: DemandVersion,
+    selected_rows_by_range: SmallVec<[((usize, usize), usize); 4]>,
     conjuncts: Vec<ConjunctState>,
     predicate_offer_cursor: usize,
     combine: Option<PendingCombine>,
@@ -199,6 +224,7 @@ pub struct Execution {
     query: ScanQuery,
     projection_names: FieldNames,
     resources: Vec<ResourceNode>,
+    resource_waiters: Vec<SmallVec<[MorselId; 8]>>,
     segment_slots: Vec<Slot<vortex_array::buffer::BufferHandle>>,
     scan_array_slots: Vec<Slot<ResolvedArray>>,
     morsels: Vec<Morsel>,
@@ -214,7 +240,7 @@ pub struct Execution {
 
 impl Execution {
     pub fn try_new(
-        plan: SourcePlan,
+        plan: &SourcePlan,
         query: ScanQuery,
         morsel_rows: usize,
         retention: RetentionPolicy,
@@ -229,7 +255,7 @@ impl Execution {
     }
 
     pub(crate) fn try_new_with_policy(
-        plan: SourcePlan,
+        plan: &SourcePlan,
         query: ScanQuery,
         morsel_rows: usize,
         retention: RetentionPolicy,
@@ -238,6 +264,32 @@ impl Execution {
         if morsel_rows == 0 {
             vortex_bail!("morsel_rows must be non-zero");
         }
+        let morsel_rows = u64::try_from(morsel_rows)?;
+        let morsel_ranges = (0..plan.row_count)
+            .step_by(usize::try_from(morsel_rows)?)
+            .map(|start| start..(start + morsel_rows).min(plan.row_count))
+            .collect::<Vec<_>>();
+        Self::try_new_with_policy_and_ranges(plan, query, &morsel_ranges, retention, policy)
+    }
+
+    pub(crate) fn try_new_with_policy_and_ranges(
+        plan: &SourcePlan,
+        mut query: ScanQuery,
+        morsel_ranges: &[StdRange<u64>],
+        retention: RetentionPolicy,
+        policy: SchedulePolicy,
+    ) -> VortexResult<Self> {
+        let mut expected_start = 0;
+        for range in morsel_ranges {
+            if range.start != expected_start || range.start >= range.end {
+                vortex_bail!("morsel ranges must be nonempty, contiguous, and ordered");
+            }
+            expected_start = range.end;
+        }
+        if expected_start != plan.row_count {
+            vortex_bail!("morsel ranges must cover all {} plan rows", plan.row_count);
+        }
+        query.coalesce_same_field_predicates();
         for conjunct in &query.conjuncts {
             if conjunct.field.0 >= plan.field_names.len() {
                 vortex_bail!("predicate field {} is out of range", conjunct.field.0);
@@ -259,6 +311,7 @@ impl Execution {
             .iter()
             .map(|conjunct| conjunct.field)
             .collect::<BTreeSet<_>>();
+        let projection_fields = query.projection.iter().copied().collect::<BTreeSet<_>>();
         let used_fields = required_fields
             .iter()
             .copied()
@@ -270,7 +323,7 @@ impl Execution {
             .flat_map(|chunk| &chunk.fields)
             .filter(|flat| used_fields.contains(&flat.field))
             .count();
-        let morsel_capacity = usize::try_from(plan.row_count)?.div_ceil(morsel_rows);
+        let morsel_capacity = morsel_ranges.len();
         let mut resources = Vec::with_capacity(resource_capacity);
         let mut resource_by_segment = BTreeMap::new();
         let mut segment_slots = Vec::with_capacity(resource_capacity);
@@ -295,6 +348,16 @@ impl Execution {
                     segment: flat.segment,
                     root_coverage: flat.root_coverage.clone(),
                     row_count: flat.row_count,
+                    estimated_bytes: flat.estimated_bytes,
+                    read_phase: match (
+                        required_fields.contains(&flat.field),
+                        projection_fields.contains(&flat.field),
+                    ) {
+                        (true, true) => ReadPhase::PredicateAndProjection,
+                        (true, false) => ReadPhase::Predicate,
+                        (false, true) => ReadPhase::Projection,
+                        (false, false) => unreachable!("unused fields do not have resources"),
+                    },
                     encoding: flat.encoding.clone(),
                     segment_slot,
                     array_slot,
@@ -310,9 +373,9 @@ impl Execution {
 
         let mut morsels = Vec::with_capacity(morsel_capacity);
         let mut initial_demand_by_len = BTreeMap::new();
-        let mut start = 0u64;
-        while start < plan.row_count {
-            let end = (start + u64::try_from(morsel_rows)?).min(plan.row_count);
+        for range in morsel_ranges {
+            let start = range.start;
+            let end = range.end;
             let id = MorselId(morsels.len());
             let mut uses = Vec::new();
             let overlapping = resources
@@ -323,15 +386,10 @@ impl Execution {
                 .map(|resource| resource.id)
                 .collect::<Vec<_>>();
             for resource in overlapping {
-                let necessity = if required_fields.contains(&resources[resource.0].field) {
-                    Necessity::Required
-                } else {
-                    Necessity::Candidate
-                };
                 uses.push(ResourceUse {
                     resource,
-                    necessity,
                     joined: false,
+                    selected_rows: None,
                 });
                 resources[resource.0].unresolved_users += 1;
             }
@@ -343,9 +401,10 @@ impl Execution {
             let initial_demand = initial_demand_by_len
                 .entry(len)
                 .or_insert_with(|| {
+                    let values = BitBuffer::new_set(len);
                     ResolvedArray::boolean(
-                        BoolArray::new(BitBuffer::new_set(len), Validity::NonNullable).into_array(),
-                        len,
+                        BoolArray::new(values.clone(), Validity::NonNullable).into_array(),
+                        values,
                     )
                 })
                 .clone();
@@ -355,15 +414,19 @@ impl Execution {
             let slices = |field: super::FieldId| -> VortexResult<Vec<ResourceSlice>> {
                 let slices = uses
                     .iter()
-                    .filter(|use_| resources[use_.resource.0].field == field)
-                    .map(|use_| {
+                    .enumerate()
+                    .filter(|(_, use_)| resources[use_.resource.0].field == field)
+                    .map(|(use_idx, use_)| {
                         let coverage = &resources[use_.resource.0].root_coverage;
                         let slice_start = start.max(coverage.start);
                         let slice_end = end.min(coverage.end);
                         Ok(ResourceSlice {
                             resource: use_.resource,
+                            use_idx,
                             local_range: usize::try_from(slice_start - coverage.start)?
                                 ..usize::try_from(slice_end - coverage.start)?,
+                            morsel_range: usize::try_from(slice_start - start)?
+                                ..usize::try_from(slice_end - start)?,
                         })
                     })
                     .collect::<VortexResult<Vec<_>>>()?;
@@ -408,6 +471,7 @@ impl Execution {
                 arrays,
                 demand_slot,
                 demand_version: DemandVersion(0),
+                selected_rows_by_range: SmallVec::new(),
                 conjuncts,
                 predicate_offer_cursor: 0,
                 combine: None,
@@ -420,7 +484,6 @@ impl Execution {
                 tasks: SmallVec::new(),
                 retired: false,
             });
-            start = end;
         }
 
         let initial_rows = morsels.iter().try_fold(0usize, |total, morsel| {
@@ -431,6 +494,7 @@ impl Execution {
         let task_capacity = resources.len() * 2
             + morsels.len() * (query.conjuncts.len() * 2 + query.projection.len() + 1);
         let predicate_stats = vec![PredicateStats::default(); query.conjuncts.len()];
+        let resource_waiters = vec![SmallVec::new(); resources.len()];
         Ok(Self {
             query,
             projection_names,
@@ -442,6 +506,7 @@ impl Execution {
                 ..Metrics::default()
             },
             resources,
+            resource_waiters,
             segment_slots,
             scan_array_slots,
             morsels,
@@ -463,8 +528,29 @@ impl Execution {
         &self.metrics
     }
 
+    pub(crate) fn populate_segment_sizes(&mut self, source: &dyn crate::segments::SegmentSource) {
+        for resource in &mut self.resources {
+            resource.estimated_bytes = source.estimated_size(resource.segment);
+        }
+    }
+
     pub(crate) fn record_inline_demand_combination(&mut self) {
         self.metrics.inline_demand_combinations += 1;
+    }
+
+    pub(crate) fn record_scheduler_pass(&mut self, considered: usize, admitted: usize) {
+        self.metrics.scheduler_passes += 1;
+        self.metrics.scheduler_tasks_considered += considered;
+        self.metrics.scheduler_tasks_admitted += admitted;
+    }
+
+    pub(crate) fn record_completion_batch(&mut self, completions: usize) {
+        if completions == 0 {
+            return;
+        }
+        self.metrics.completion_batches += 1;
+        self.metrics.completions_drained += completions;
+        self.metrics.max_completion_batch = self.metrics.max_completion_batch.max(completions);
     }
 
     pub fn trace(&self) -> &[TraceEvent] {
@@ -498,31 +584,124 @@ impl Execution {
         self.tasks.get(id.0).map(|stored| &stored.task)
     }
 
-    pub fn completion_morsels(&self, task: TaskId) -> VortexResult<SmallVec<[MorselId; 8]>> {
-        let stored = self
+    pub fn read_estimate(&self, task: TaskId) -> VortexResult<Option<ReadEstimate>> {
+        let Some(stored) = self.tasks.get(task.0) else {
+            vortex_bail!("unknown task {}", task.0);
+        };
+        let (phase, estimated_bytes) = match &stored.task.operation {
+            Operation::Read {
+                phase,
+                estimated_bytes,
+                ..
+            }
+            | Operation::ReadDecodeFlat {
+                phase,
+                estimated_bytes,
+                ..
+            } => (phase, estimated_bytes),
+            _ => return Ok(None),
+        };
+        let TaskOwner::Resource(resource) = stored.owner else {
+            return Ok(None);
+        };
+        let mut current_rows = 0usize;
+        let mut expected_rows = 0.0;
+        for morsel in &self.morsels {
+            if morsel.retired
+                || !morsel
+                    .uses
+                    .iter()
+                    .any(|use_| use_.joined && use_.resource == resource)
+            {
+                continue;
+            }
+            let rows = self
+                .current_demand(morsel.id)?
+                .boolean_summary()?
+                .true_count;
+            current_rows += rows;
+            let survival = morsel
+                .conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(_, conjunct)| !conjunct.combined)
+                .fold(1.0, |survival, (conjunct, _)| {
+                    survival * self.expected_survival(conjunct)
+                });
+            expected_rows += rows as f64 * survival;
+        }
+        Ok(Some(ReadEstimate {
+            phase: *phase,
+            estimated_bytes: *estimated_bytes,
+            current_rows,
+            expected_rows,
+        }))
+    }
+
+    pub fn finalize_speculative_io_metrics(&mut self) {
+        for stored in &self.tasks {
+            let Some(bytes) = stored.completed_read_bytes else {
+                continue;
+            };
+            self.metrics.speculative_io_completed_bytes += bytes;
+            if stored.task.necessity == Necessity::Required {
+                self.metrics.speculative_io_useful_bytes += bytes;
+            } else {
+                self.metrics.speculative_io_wasted_bytes += bytes;
+            }
+        }
+    }
+
+    pub fn completion_morsels(&mut self, task: TaskId) -> VortexResult<SmallVec<[MorselId; 8]>> {
+        let owner = self
             .tasks
             .get(task.0)
-            .ok_or_else(|| vortex_error::vortex_err!("unknown task {}", task.0))?;
-        Ok(match stored.owner {
-            TaskOwner::Morsel(morsel) => smallvec![morsel],
-            TaskOwner::Resource(resource) => self
-                .morsels
-                .iter()
-                .filter(|morsel| {
-                    !morsel.retired
-                        && if matches!(self.policy, SchedulePolicy::LegacyAdaptivePredicates { .. })
-                        {
-                            morsel
+            .ok_or_else(|| vortex_error::vortex_err!("unknown task {}", task.0))?
+            .owner;
+        Ok(match owner {
+            TaskOwner::Morsel(morsel) => {
+                self.metrics.completion_wake_candidates_inspected += 1;
+                smallvec![morsel]
+            }
+            TaskOwner::Resource(resource)
+                if matches!(self.policy, SchedulePolicy::LegacyAdaptivePredicates { .. }) =>
+            {
+                self.metrics.completion_wake_candidates_inspected += self.morsels.len();
+                self.morsels
+                    .iter()
+                    .filter(|morsel| {
+                        !morsel.retired
+                            && morsel
                                 .uses
                                 .iter()
                                 .any(|use_| use_.joined && use_.resource == resource)
-                        } else {
-                            morsel.waiting_on == Some(resource)
-                        }
-                })
-                .map(|morsel| morsel.id)
-                .collect(),
+                    })
+                    .map(|morsel| morsel.id)
+                    .collect()
+            }
+            TaskOwner::Resource(resource) => {
+                let waiters = std::mem::take(&mut self.resource_waiters[resource.0]);
+                self.metrics.completion_wake_candidates_inspected += waiters.len();
+                waiters
+                    .into_iter()
+                    .filter(|morsel| {
+                        !self.morsels[morsel.0].retired
+                            && self.morsels[morsel.0].waiting_on == Some(resource)
+                    })
+                    .collect()
+            }
         })
+    }
+
+    fn wait_on_resource(&mut self, morsel: MorselId, resource: ResourceId) {
+        if self.morsels[morsel.0].waiting_on == Some(resource) {
+            return;
+        }
+        self.morsels[morsel.0].waiting_on = Some(resource);
+        let waiters = &mut self.resource_waiters[resource.0];
+        if !waiters.contains(&morsel) {
+            waiters.push(morsel);
+        }
     }
 
     pub fn advance(
@@ -621,15 +800,48 @@ impl Execution {
             .boolean_summary()?
             .true_count
             != 0;
+        let next_predicate = (!sealed).then(|| self.next_predicate(morsel_id)).flatten();
+        let predicates_in_flight = self.morsels[morsel_id.0]
+            .conjuncts
+            .iter()
+            .filter(|conjunct| conjunct.predicate_task.is_some() && !conjunct.combined)
+            .count();
+        let next_predicate_required = next_predicate
+            .is_some_and(|next| predicates_in_flight < self.predicate_window(morsel_id, next));
         for use_idx in 0..self.morsels[morsel_id.0].uses.len() {
             let use_ = self.morsels[morsel_id.0].uses[use_idx].clone();
-            let should_prepare = use_.necessity == Necessity::Required
-                || (!sealed && self.policy == SchedulePolicy::ProjectionPrefetch)
-                || (sealed && demand_nonempty);
+            let predicate_pending = self.morsels[morsel_id.0].conjuncts.iter().any(|conjunct| {
+                !conjunct.combined
+                    && conjunct
+                        .slices
+                        .iter()
+                        .any(|slice| slice.resource == use_.resource)
+            });
+            let required_by_next_predicate = next_predicate_required
+                && next_predicate.is_some_and(|next| {
+                    self.morsels[morsel_id.0].conjuncts[next]
+                        .slices
+                        .iter()
+                        .any(|slice| slice.resource == use_.resource)
+                });
+            let projection_candidate = self.resources[use_.resource.0]
+                .read_phase
+                .includes_projection();
+            let selected_rows = self.projection_resource_selected_rows(
+                morsel_id,
+                use_idx,
+                sealed,
+                projection_candidate,
+            )?;
+            let should_prepare = if sealed {
+                demand_nonempty && projection_candidate && selected_rows != 0
+            } else {
+                predicate_pending || projection_candidate
+            };
             if !should_prepare {
                 continue;
             }
-            let necessity = if use_.necessity == Necessity::Required || sealed {
+            let necessity = if required_by_next_predicate || sealed {
                 Necessity::Required
             } else {
                 Necessity::Candidate
@@ -667,7 +879,7 @@ impl Execution {
                             .is_none()
                             .then_some(slice.resource)
                     }) {
-                        self.morsels[morsel_id.0].waiting_on = Some(resource);
+                        self.wait_on_resource(morsel_id, resource);
                         return Ok(false);
                     }
                     let first_unoffered = self.morsels[morsel_id.0]
@@ -851,40 +1063,59 @@ impl Execution {
             .boolean_summary()?
             .true_count;
         if true_count != 0 {
+            if let Some(transitioned) = self.offer_select_struct(morsel_id, updates)? {
+                return Ok(transitioned);
+            }
             let projection_idx = self.morsels[morsel_id.0].projection_offer_cursor;
             if projection_idx < self.morsels[morsel_id.0].projections.len() {
                 let projection = self.morsels[morsel_id.0].projections[projection_idx].clone();
-                if let Some(resource) = projection.slices.iter().find_map(|slice| {
+                let active_slices = self.active_projection_slices(morsel_id, &projection)?;
+                if let Some(resource) = active_slices.iter().find_map(|slice| {
                     let resource_array = self.resources[slice.resource.0].array_slot;
                     self.array_slot(resource_array)
                         .ready()
                         .is_none()
                         .then_some(slice.resource)
                 }) {
-                    self.morsels[morsel_id.0].waiting_on = Some(resource);
+                    self.wait_on_resource(morsel_id, resource);
                     return Ok(false);
                 }
                 let demand = self.morsels[morsel_id.0].demand_slot;
-                let local_ranges = projection
-                    .slices
+                let local_ranges = active_slices
                     .iter()
                     .map(|slice| slice.local_range.clone())
                     .collect();
-                let mut inputs = projection
-                    .slices
+                let selection_ranges = active_slices
+                    .iter()
+                    .map(|slice| slice.morsel_range.clone())
+                    .collect();
+                let mut inputs = active_slices
                     .iter()
                     .map(|slice| InputSlot::Array(self.resources[slice.resource.0].array_slot))
                     .collect::<SmallVec<_>>();
                 inputs.push(InputSlot::Array(demand));
+                let pack_names = (self.morsels[morsel_id.0].projections.len() == 1)
+                    .then(|| self.projection_names.clone());
+                let packs_output = pack_names.is_some();
+                let output_slot = select_output_slot(
+                    pack_names.as_ref(),
+                    self.morsels[morsel_id.0].pack_slot,
+                    projection.output_slot,
+                );
                 let task = self.offer_task(
                     TaskOwner::Morsel(morsel_id),
                     WorkClass::Cpu,
                     Necessity::Required,
                     inputs,
-                    OutputSlot::Array(projection.output_slot),
-                    Operation::SelectFlat { local_ranges },
+                    OutputSlot::Array(output_slot),
+                    Operation::SelectFlat {
+                        local_ranges,
+                        selection_ranges,
+                        pack_names,
+                    },
                 )?;
                 self.morsels[morsel_id.0].projections[projection_idx].task = Some(task.id);
+                self.morsels[morsel_id.0].pack_task = packs_output.then_some(task.id);
                 self.morsels[morsel_id.0].projection_offer_cursor += 1;
                 updates.push(TaskUpdate::Offer(task));
                 return Ok(true);
@@ -941,6 +1172,80 @@ impl Execution {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn offer_select_struct(
+        &mut self,
+        morsel: MorselId,
+        updates: &mut Vec<TaskUpdate>,
+    ) -> VortexResult<Option<bool>> {
+        if self.morsels[morsel.0].projections.len() <= 1
+            || self.morsels[morsel.0].pack_task.is_some()
+        {
+            return Ok(None);
+        }
+        let active_by_field = self.morsels[morsel.0]
+            .projections
+            .iter()
+            .map(|projection| self.active_projection_slices(morsel, projection))
+            .collect::<VortexResult<Vec<_>>>()?;
+        if let Some(resource) = active_by_field.iter().flatten().find_map(|slice| {
+            let resource_array = self.resources[slice.resource.0].array_slot;
+            self.array_slot(resource_array)
+                .ready()
+                .is_none()
+                .then_some(slice.resource)
+        }) {
+            self.wait_on_resource(morsel, resource);
+            return Ok(Some(false));
+        }
+        let selection_ranges = active_by_field[0]
+            .iter()
+            .map(|slice| slice.morsel_range.clone())
+            .collect::<Vec<_>>();
+        if active_by_field.iter().skip(1).any(|slices| {
+            slices
+                .iter()
+                .map(|slice| slice.morsel_range.clone())
+                .ne(selection_ranges.iter().cloned())
+        }) {
+            vortex_bail!("projected fields have unaligned active selection ranges");
+        }
+        let field_local_ranges = active_by_field
+            .iter()
+            .map(|slices| {
+                slices
+                    .iter()
+                    .map(|slice| slice.local_range.clone())
+                    .collect()
+            })
+            .collect();
+        let mut inputs = active_by_field
+            .iter()
+            .flatten()
+            .map(|slice| InputSlot::Array(self.resources[slice.resource.0].array_slot))
+            .collect::<SmallVec<_>>();
+        inputs.push(InputSlot::Array(self.morsels[morsel.0].demand_slot));
+        let output_slot = self.morsels[morsel.0].pack_slot;
+        let task = self.offer_task(
+            TaskOwner::Morsel(morsel),
+            WorkClass::Cpu,
+            Necessity::Required,
+            inputs,
+            OutputSlot::Array(output_slot),
+            Operation::SelectStruct {
+                field_local_ranges,
+                selection_ranges,
+                names: self.projection_names.clone(),
+            },
+        )?;
+        for projection in &mut self.morsels[morsel.0].projections {
+            projection.task = Some(task.id);
+        }
+        self.morsels[morsel.0].projection_offer_cursor = self.morsels[morsel.0].projections.len();
+        self.morsels[morsel.0].pack_task = Some(task.id);
+        updates.push(TaskUpdate::Offer(task));
+        Ok(Some(true))
     }
 
     fn next_predicate(&self, morsel: MorselId) -> Option<usize> {
@@ -1042,6 +1347,7 @@ impl Execution {
         let prior = match self.query.conjuncts[conjunct].predicate {
             super::Predicate::Equal(_) => 0.1,
             super::Predicate::LessThan(_) | super::Predicate::GreaterThan(_) => 0.5,
+            super::Predicate::RangeExclusive { .. } => 0.25,
         };
         self.predicate_stats[conjunct].survival(prior)
     }
@@ -1146,44 +1452,45 @@ impl Execution {
         resource: ResourceId,
         necessity: Necessity,
     ) -> VortexResult<Option<TaskUpdate>> {
-        let (segment_slot, array_slot) = {
+        let array_slot = {
             let node = &self.resources[resource.0];
-            (node.segment_slot, node.array_slot)
+            node.array_slot
         };
-        if self.segment_slot(segment_slot).ready().is_none() {
+        if let Some(task) = self.resources[resource.0].read_task
+            && let Some(update) = self.promote_if_needed(task, necessity)?
+        {
+            return Ok(Some(update));
+        }
+        if let Some(task) = self.resources[resource.0].decode_task
+            && let Some(update) = self.promote_if_needed(task, necessity)?
+        {
+            return Ok(Some(update));
+        }
+        if self.array_slot(array_slot).ready().is_none() {
             if let Some(task_id) = self.resources[resource.0].read_task {
                 return self.promote_if_needed(task_id, necessity);
             }
-            let segment = self.resources[resource.0].segment;
+            let node = &self.resources[resource.0];
+            let segment = node.segment;
+            let phase = node.read_phase;
+            let estimated_bytes = node.estimated_bytes;
+            let encoding = node.encoding.clone();
+            let row_count = node.row_count;
             let task = self.offer_task(
                 TaskOwner::Resource(resource),
                 WorkClass::Io,
                 necessity,
                 SmallVec::new(),
-                OutputSlot::Segment(segment_slot),
-                Operation::Read { segment },
-            )?;
-            self.resources[resource.0].read_task = Some(task.id);
-            return Ok(Some(TaskUpdate::Offer(task)));
-        }
-        if self.array_slot(array_slot).ready().is_none() {
-            if let Some(task_id) = self.resources[resource.0].decode_task {
-                return self.promote_if_needed(task_id, necessity);
-            }
-            let row_count = self.resources[resource.0].row_count;
-            let encoding = self.resources[resource.0].encoding.clone();
-            let task = self.offer_task(
-                TaskOwner::Resource(resource),
-                WorkClass::Cpu,
-                necessity,
-                smallvec![InputSlot::Segment(segment_slot)],
                 OutputSlot::Array(array_slot),
-                Operation::DecodeFlat {
+                Operation::ReadDecodeFlat {
+                    segment,
+                    phase,
+                    estimated_bytes,
                     encoding,
                     row_count,
                 },
             )?;
-            self.resources[resource.0].decode_task = Some(task.id);
+            self.resources[resource.0].read_task = Some(task.id);
             return Ok(Some(TaskUpdate::Offer(task)));
         }
         Ok(None)
@@ -1195,13 +1502,12 @@ impl Execution {
         necessity: Necessity,
     ) -> VortexResult<Option<TaskUpdate>> {
         let stored = &mut self.tasks[task.0];
-        if necessity == Necessity::Required
-            && stored.task.necessity == Necessity::Candidate
-            && stored.status == TaskStatus::Offered
-        {
+        if necessity == Necessity::Required && stored.task.necessity == Necessity::Candidate {
             stored.task.necessity = Necessity::Required;
             self.metrics.tasks_promoted += 1;
-            return Ok(Some(TaskUpdate::Promote(task)));
+            if stored.status == TaskStatus::Offered {
+                return Ok(Some(TaskUpdate::Promote(task)));
+            }
         }
         Ok(None)
     }
@@ -1231,6 +1537,8 @@ impl Execution {
             owner,
             leases: SmallVec::new(),
             unwanted: false,
+            claimed_as_candidate: false,
+            completed_read_bytes: None,
         });
         if let TaskOwner::Morsel(morsel) = owner {
             self.morsels[morsel.0].tasks.push(id);
@@ -1239,6 +1547,22 @@ impl Execution {
         match class {
             WorkClass::Io => self.metrics.io_offered += 1,
             WorkClass::Cpu => self.metrics.cpu_offered += 1,
+        }
+        if necessity == Necessity::Candidate
+            && let Some((phase, estimated_bytes)) = read_operation(&task.operation)
+        {
+            self.metrics.speculative_io_offered += 1;
+            if let Some(bytes) = estimated_bytes {
+                self.metrics.speculative_io_estimated_bytes_offered += bytes;
+            } else {
+                self.metrics.speculative_io_unknown_size += 1;
+            }
+            if phase.includes_predicate() {
+                self.metrics.speculative_predicate_io_offered += 1;
+            }
+            if phase.includes_projection() {
+                self.metrics.speculative_projection_io_offered += 1;
+            }
         }
         Ok(task)
     }
@@ -1261,6 +1585,11 @@ impl Execution {
             .collect::<VortexResult<SmallVec<_>>>()?;
         let output = stored.task.output;
         let operation = stored.task.operation.clone();
+        let claimed_as_candidate = stored.task.necessity == Necessity::Candidate
+            && read_operation(&stored.task.operation).is_some();
+        let estimated_candidate_bytes = read_operation(&stored.task.operation)
+            .filter(|_| claimed_as_candidate)
+            .and_then(|(_, estimated_bytes)| estimated_bytes);
         let mut leases = SmallVec::<[ResourceId; 2]>::new();
         for resource in stored
             .task
@@ -1279,7 +1608,13 @@ impl Execution {
         let stored = &mut self.tasks[task.0];
         stored.status = TaskStatus::Running;
         stored.leases = leases;
+        stored.claimed_as_candidate = claimed_as_candidate;
         self.metrics.tasks_claimed += 1;
+        if claimed_as_candidate {
+            self.metrics.speculative_io_admitted += 1;
+            self.metrics.speculative_io_estimated_bytes_admitted +=
+                estimated_candidate_bytes.unwrap_or(0);
+        }
         Ok(ClaimResult::Runnable(RunnableTask {
             id: task,
             inputs,
@@ -1321,6 +1656,10 @@ impl Execution {
             }),
             _ => None,
         };
+        let completed_read_bytes = self.tasks[completion.task.0]
+            .claimed_as_candidate
+            .then_some(completion.read_bytes)
+            .flatten();
         let value = match completion.result {
             Ok(value) => value,
             Err(error) => {
@@ -1360,6 +1699,7 @@ impl Execution {
             self.install_output(expected, completion.task, value)?;
         }
         self.finish_task(completion.task);
+        self.tasks[completion.task.0].completed_read_bytes = completed_read_bytes;
         if let Some((conjunct, input_rows, output_rows, elapsed_ns)) = predicate_observation {
             self.predicate_stats[conjunct].observe(input_rows, output_rows, elapsed_ns);
         }
@@ -1459,6 +1799,80 @@ impl Execution {
         self.array_slot(self.morsels[morsel.0].demand_slot)
             .ready()
             .ok_or_else(|| vortex_error::vortex_err!("current demand is not resolved"))
+    }
+
+    fn resource_morsel_range(
+        &self,
+        morsel: MorselId,
+        resource: ResourceId,
+    ) -> VortexResult<std::ops::Range<usize>> {
+        let morsel_range = &self.morsels[morsel.0].root_range;
+        let resource_range = &self.resources[resource.0].root_coverage;
+        let start = morsel_range.start.max(resource_range.start);
+        let end = morsel_range.end.min(resource_range.end);
+        Ok(
+            usize::try_from(start - morsel_range.start)?
+                ..usize::try_from(end - morsel_range.start)?,
+        )
+    }
+
+    fn projection_resource_selected_rows(
+        &mut self,
+        morsel: MorselId,
+        use_idx: usize,
+        sealed: bool,
+        projection_candidate: bool,
+    ) -> VortexResult<usize> {
+        if !sealed || !projection_candidate {
+            return Ok(0);
+        }
+        if let Some(rows) = self.morsels[morsel.0].uses[use_idx].selected_rows {
+            return Ok(rows);
+        }
+        let resource = self.morsels[morsel.0].uses[use_idx].resource;
+        let range = self.resource_morsel_range(morsel, resource)?;
+        let key = (range.start, range.end);
+        let rows = match self.morsels[morsel.0]
+            .selected_rows_by_range
+            .iter()
+            .find_map(|(range, rows)| (*range == key).then_some(*rows))
+        {
+            Some(rows) => rows,
+            None => {
+                let rows = self
+                    .current_demand(morsel)?
+                    .boolean_summary()?
+                    .true_count_in(range)?;
+                self.morsels[morsel.0]
+                    .selected_rows_by_range
+                    .push((key, rows));
+                rows
+            }
+        };
+        self.morsels[morsel.0].uses[use_idx].selected_rows = Some(rows);
+        Ok(rows)
+    }
+
+    fn active_projection_slices(
+        &self,
+        morsel: MorselId,
+        projection: &ProjectionState,
+    ) -> VortexResult<Vec<ResourceSlice>> {
+        let mut active = Vec::with_capacity(projection.slices.len());
+        for slice in &projection.slices {
+            let selected_rows = self.morsels[morsel.0].uses[slice.use_idx]
+                .selected_rows
+                .ok_or_else(|| {
+                    vortex_error::vortex_err!("projection resource demand is not summarized")
+                })?;
+            if selected_rows != 0 {
+                active.push(slice.clone());
+            }
+        }
+        if active.is_empty() {
+            vortex_bail!("nonempty projection demand has no resource slices");
+        }
+        Ok(active)
     }
 
     fn alloc_morsel_array(&mut self, morsel: MorselId) -> ArraySlotId {
@@ -1590,4 +2004,32 @@ fn resolved_kind_matches(output: OutputSlot, value: &ResolvedValue) -> bool {
         (OutputSlot::Segment(_), ResolvedValue::Segment(_))
             | (OutputSlot::Array(_), ResolvedValue::Array(_))
     )
+}
+
+fn read_operation(operation: &Operation) -> Option<(ReadPhase, Option<usize>)> {
+    match operation {
+        Operation::Read {
+            phase,
+            estimated_bytes,
+            ..
+        }
+        | Operation::ReadDecodeFlat {
+            phase,
+            estimated_bytes,
+            ..
+        } => Some((*phase, *estimated_bytes)),
+        _ => None,
+    }
+}
+
+fn select_output_slot(
+    pack_names: Option<&FieldNames>,
+    pack_slot: ArraySlotId,
+    projection_slot: ArraySlotId,
+) -> ArraySlotId {
+    if pack_names.is_some() {
+        pack_slot
+    } else {
+        projection_slot
+    }
 }

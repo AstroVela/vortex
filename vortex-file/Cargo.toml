@@ -61,8 +61,14 @@ vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
 divan = { workspace = true }
+parquet = { workspace = true }
 rstest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-io = { workspace = true, features = ["tokio"] }
@@ -74,6 +80,10 @@ workspace = true
 
 [[bench]]
 name = "split_collection"
+harness = false
+
+[[bench]]
+name = "self_paced_vs_v1"
 harness = false
 
 [features]
