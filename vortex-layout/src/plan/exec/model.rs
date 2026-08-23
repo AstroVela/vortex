@@ -578,11 +578,13 @@ pub enum Operation {
     SelectFlat {
         local_ranges: Vec<Range<usize>>,
         selection_ranges: Vec<Range<usize>>,
+        selection_all_true: bool,
         pack_names: Option<FieldNames>,
     },
     SelectStruct {
         field_local_ranges: Vec<Vec<Range<usize>>>,
         selection_ranges: Vec<Range<usize>>,
+        selection_all_true: bool,
         names: FieldNames,
     },
     PackStruct {

@@ -498,8 +498,8 @@ async fn empty_demand_does_not_read_projection_resources() -> VortexResult<()> {
             .sum::<usize>(),
         0
     );
-    assert_eq!(result.metrics.io_offered, 4);
-    assert_eq!(result.metrics.speculative_io_offered, 2);
+    assert_eq!(result.metrics.io_offered, 2);
+    assert_eq!(result.metrics.speculative_io_offered, 0);
     assert_eq!(result.metrics.speculative_io_admitted, 0);
     assert_eq!(result.metrics.speculative_io_completed_bytes, 0);
     Ok(())

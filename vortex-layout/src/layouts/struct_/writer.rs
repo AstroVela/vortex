@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use futures::future::try_join;
+use futures::future::join;
 use futures::future::try_join_all;
 use futures::pin_mut;
 use itertools::Itertools;
@@ -251,7 +251,11 @@ impl LayoutStrategy for StructStrategy {
             })
             .collect();
 
-        let (_success, column_layouts) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
+        let (fanout_result, column_layouts) = join(fanout_fut, try_join_all(layout_futures)).await;
+        // A child failure closes its channel, which also makes fanout fail. Prefer the child error:
+        // it describes the actual serialization failure instead of the secondary closed channel.
+        let column_layouts = column_layouts?;
+        fanout_result?;
         // TODO(os): transposed stream could count row counts as well,
         // This must hold though, all columns must have the same row count of the struct layout
         let row_count = column_layouts.first().map(|l| l.row_count()).unwrap_or(0);

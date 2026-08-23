@@ -187,12 +187,11 @@ fn enable_self_paced_file_encoding(session: &VortexSession) {
             min_vortex_version: None,
         })
         .unwrap();
-    editions
-        .declare_inclusion(EditionInclusion::new(
-            "vortex.primitive",
-            SELF_PACED_FILE_EDITION,
-        ))
-        .unwrap();
+    for encoding in ["vortex.primitive", "vortex.chunked"] {
+        editions
+            .declare_inclusion(EditionInclusion::new(encoding, SELF_PACED_FILE_EDITION))
+            .unwrap();
+    }
     session.enable_edition(SELF_PACED_FILE_EDITION).unwrap();
 }
 static SPECULATIVE_IO_CONFIG: LazyLock<SpeculativeIoConfig> =
@@ -2194,12 +2193,13 @@ async fn compare_cases(iterations: usize) -> VortexResult<()> {
             };
             return compare_workload(&workload, tpch_fixture, query, iterations).await;
         }
-        let query_id = match workload.as_str() {
-            "clickbench_q40" => 40,
-            "clickbench_q41" => 41,
-            "clickbench_q42" => 42,
-            _ => vortex_error::vortex_bail!("unsupported comparison workload {workload}"),
-        };
+        let query_id = workload
+            .strip_prefix("clickbench_q")
+            .and_then(|query_id| query_id.parse::<usize>().ok())
+            .filter(|query_id| CLICKBENCH_SUITE_QUERY_IDS.contains(query_id))
+            .ok_or_else(|| {
+                vortex_error::vortex_err!("unsupported comparison workload {workload}")
+            })?;
         return compare_workload(
             &workload,
             clickbench_fixture,
@@ -2428,7 +2428,7 @@ async fn compare_workload(
     if std::env::var_os("VORTEX_SELF_PACED_COMPARE_TRACE").is_some() {
         return trace_split_workload(name, &fixture, query, &first_plan).await;
     }
-    for merge_factor in [16, 32] {
+    for merge_factor in [16] {
         let split_plan = split_merge_plan(source_fixture, scan_query, merge_factor)?;
         let v1_warmup = run_v1_fixture_with_splits(
             &fixture,

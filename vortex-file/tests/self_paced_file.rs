@@ -41,12 +41,11 @@ fn session() -> VortexResult<VortexSession> {
             min_vortex_version: None,
         })
         .map_err(|error| vortex_err!("{error}"))?;
-    editions
-        .declare_inclusion(EditionInclusion::new(
-            "vortex.primitive",
-            SELF_PACED_TEST_EDITION,
-        ))
-        .map_err(|error| vortex_err!("{error}"))?;
+    for encoding in ["vortex.primitive", "vortex.chunked"] {
+        editions
+            .declare_inclusion(EditionInclusion::new(encoding, SELF_PACED_TEST_EDITION))
+            .map_err(|error| vortex_err!("{error}"))?;
+    }
     session
         .enable_edition(SELF_PACED_TEST_EDITION)
         .map_err(|error| vortex_err!("{error}"))?;

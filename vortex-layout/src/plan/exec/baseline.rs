@@ -120,6 +120,7 @@ pub async fn run_self_paced_ranges(
         options.retention,
         options.policy,
     )?;
+    execution.set_speculative_io(options.speculative_io);
     execution.populate_segment_sizes(source.as_ref());
     execution.set_trace_enabled(collect_trace);
     if let Some(init_started) = init_started {
@@ -288,6 +289,7 @@ async fn run_self_paced_concurrent(
         options.retention,
         options.policy,
     )?;
+    execution.set_speculative_io(options.speculative_io);
     execution.populate_segment_sizes(source.as_ref());
     execution.set_trace_enabled(collect_trace);
     if let Some(init_started) = init_started {
@@ -604,7 +606,18 @@ fn complete_concurrent_task(
 fn execute_inline(operation: &Operation, policy: SchedulePolicy) -> bool {
     matches!(operation, Operation::CombineDemand { .. })
         || (!matches!(policy, SchedulePolicy::LegacyAdaptivePredicates { .. })
-            && matches!(operation, Operation::PackStruct { .. }))
+            && matches!(
+                operation,
+                Operation::PackStruct { .. }
+                    | Operation::SelectFlat {
+                        selection_all_true: true,
+                        ..
+                    }
+                    | Operation::SelectStruct {
+                        selection_all_true: true,
+                        ..
+                    }
+            ))
 }
 
 fn enqueue_woken_morsels(

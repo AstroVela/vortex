@@ -146,6 +146,7 @@ async fn evaluate_inner(
         Operation::SelectFlat {
             local_ranges,
             selection_ranges,
+            selection_all_true: _,
             pack_names,
         } => {
             if local_ranges.len() != selection_ranges.len() {
@@ -218,6 +219,7 @@ async fn evaluate_inner(
         Operation::SelectStruct {
             field_local_ranges,
             selection_ranges,
+            selection_all_true: _,
             names,
         } => {
             let value_input_count = field_local_ranges.iter().map(Vec::len).sum::<usize>();

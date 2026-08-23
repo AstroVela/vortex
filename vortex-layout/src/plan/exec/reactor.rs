@@ -41,6 +41,8 @@ use super::ScanQuery;
 use super::SchedulePolicy;
 use super::SegmentSlotId;
 use super::SourcePlan;
+use super::SpeculativeIoConfig;
+use super::SpeculativeReadPolicy;
 use super::Task;
 use super::TaskId;
 use super::TaskUpdate;
@@ -232,6 +234,7 @@ pub struct Execution {
     tasks: Vec<StoredTask>,
     retention: RetentionPolicy,
     policy: SchedulePolicy,
+    speculative_io: SpeculativeIoConfig,
     metrics: Metrics,
     trace: Vec<TraceEvent>,
     trace_enabled: bool,
@@ -514,6 +517,7 @@ impl Execution {
             tasks: Vec::with_capacity(task_capacity),
             retention,
             policy,
+            speculative_io: SpeculativeIoConfig::default(),
             trace: Vec::new(),
             trace_enabled: true,
             trace_start: Instant::now(),
@@ -532,6 +536,10 @@ impl Execution {
         for resource in &mut self.resources {
             resource.estimated_bytes = source.estimated_size(resource.segment);
         }
+    }
+
+    pub(crate) fn set_speculative_io(&mut self, speculative_io: SpeculativeIoConfig) {
+        self.speculative_io = speculative_io;
     }
 
     pub(crate) fn record_inline_demand_combination(&mut self) {
@@ -1111,6 +1119,11 @@ impl Execution {
                     Operation::SelectFlat {
                         local_ranges,
                         selection_ranges,
+                        selection_all_true: true_count
+                            == usize::try_from(
+                                self.morsels[morsel_id.0].root_range.end
+                                    - self.morsels[morsel_id.0].root_range.start,
+                            )?,
                         pack_names,
                     },
                 )?;
@@ -1236,6 +1249,11 @@ impl Execution {
             Operation::SelectStruct {
                 field_local_ranges,
                 selection_ranges,
+                selection_all_true: self.current_demand(morsel)?.boolean_summary()?.true_count
+                    == usize::try_from(
+                        self.morsels[morsel.0].root_range.end
+                            - self.morsels[morsel.0].root_range.start,
+                    )?,
                 names: self.projection_names.clone(),
             },
         )?;
@@ -1261,6 +1279,12 @@ impl Execution {
             SchedulePolicy::AdaptivePredicates { .. }
                 | SchedulePolicy::LegacyAdaptivePredicates { .. }
         ) {
+            return Some(first_unoffered);
+        }
+        // Query order carries useful clustering information that row-level global statistics do
+        // not capture. Keep the first predicate stable, then adapt once this morsel has observed
+        // an actual demand reduction.
+        if self.morsels[morsel.0].demand_version == DemandVersion(0) {
             return Some(first_unoffered);
         }
         self.morsels[morsel.0]
@@ -1391,6 +1415,21 @@ impl Execution {
         if current > previous {
             vortex_bail!("demand grew from {previous} to {current} rows");
         }
+        if current == previous {
+            self.morsels[morsel.0].conjuncts[conjunct].combined = true;
+            self.metrics.demand_noop_adoptions += 1;
+            if self.trace_enabled {
+                self.push_trace(
+                    morsel,
+                    format!(
+                        "event=demand_adopt method=noop version={} previous_rows={previous} rows={current} task={}",
+                        self.morsels[morsel.0].demand_version.0,
+                        task.0,
+                    ),
+                );
+            }
+            return Ok(());
+        }
         self.morsels[morsel.0].demand_slot = output_slot;
         self.morsels[morsel.0].demand_version.0 += 1;
         self.morsels[morsel.0].conjuncts[conjunct].combined = true;
@@ -1452,6 +1491,17 @@ impl Execution {
         resource: ResourceId,
         necessity: Necessity,
     ) -> VortexResult<Option<TaskUpdate>> {
+        if necessity == Necessity::Candidate {
+            let phase = self.resources[resource.0].read_phase;
+            let enabled = self.speculative_io.max_in_flight_bytes != 0
+                && ((phase.includes_predicate()
+                    && self.speculative_io.predicate != SpeculativeReadPolicy::Disabled)
+                    || (phase.includes_projection()
+                        && self.speculative_io.projection != SpeculativeReadPolicy::Disabled));
+            if !enabled {
+                return Ok(None);
+            }
+        }
         let array_slot = {
             let node = &self.resources[resource.0];
             node.array_slot

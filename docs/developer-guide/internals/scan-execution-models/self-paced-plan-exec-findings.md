@@ -21,60 +21,73 @@ ratios was `0.891`, or 10.9% faster overall.
 The ratio is the geometric mean of per-workload median ratios. Summing all wall times gives a
 different and less useful answer because long broad scans dominate that calculation.
 
-### Complete-data follow-up
+### Fair complete-data merge-16 follow-up
 
-The original headline used ten of 100 ClickBench shards, a synthetic TPC-H fixture, and one of 15
-FineWeb 10BT shards. Those inputs were useful while iterating but were not acceptable as final
-benchmark evidence. A 20-iteration follow-up used every locally available benchmark row:
+The final comparison replaces fixed 128K self-paced morsels with ranges formed by merging 16 real
+natural splits. V1 receives those natural boundaries directly and never receives morsels. Both
+paths reopen the same query-specific serialized file, whose edition permits only
+`Struct<Chunked<Flat<i64>>>`, and receive clones of the same materialized query object. The process
+is pinned to CPUs 0-15 and both paths use concurrency 16 (or the morsel count when smaller).
 
-| Suite | Input | Rows | Self-paced wins | Ratio range |
-| --- | --- | ---: | ---: | ---: |
-| ClickBench | all 100 Parquet shards | 99,997,497 | 0/16 | 1.192-1.818 |
-| TPC-H | full SF10 lineitem table | 59,986,052 | 0/3 | 1.154-1.501 |
-| FineWeb | all 15 official 10BT sample shards | 14,868,862 | 0/9 | 1.140-3.135 |
-
-This reverses the original headline: self-paced loses every complete-data scan shape. The result
-is still about the restricted scan analogues, not full SQL query runtimes.
-
-The final FineWeb measurements were:
+These are medians of ten alternating iterations over every locally available benchmark row. The
+unweighted geometric mean of the 28 self-paced/V1 ratios is `1.176`; self-paced wins 6 of 28.
 
 | Workload | V1 ms | Self-paced ms | Ratio |
 | --- | ---: | ---: | ---: |
-| FineWeb Q00 analogue | 1.206 | 2.808 | 2.328 |
-| FineWeb Q01 analogue | 5.312 | 6.058 | 1.140 |
-| FineWeb Q02 analogue | 1.675 | 2.821 | 1.684 |
-| FineWeb Q03 analogue | 2.607 | 7.220 | 2.770 |
-| FineWeb Q04 analogue | 2.155 | 5.837 | 2.709 |
-| FineWeb Q05 analogue | 2.147 | 5.846 | 2.723 |
-| FineWeb Q06 analogue | 2.748 | 8.615 | 3.135 |
-| FineWeb Q07 analogue | 2.151 | 5.849 | 2.720 |
-| FineWeb Q08 analogue | 1.955 | 4.761 | 2.436 |
+| ClickBench selective | 6.717 | 7.253 | 1.080 |
+| ClickBench dashboard | 13.568 | 19.858 | 1.464 |
+| ClickBench Q00 | 5.618 | 5.407 | 0.963 |
+| ClickBench Q01 | 3.946 | 4.939 | 1.252 |
+| ClickBench Q02 | 7.452 | 11.285 | 1.514 |
+| ClickBench Q03 | 6.304 | 8.134 | 1.290 |
+| ClickBench Q04 | 6.228 | 8.312 | 1.334 |
+| ClickBench Q05 | 5.847 | 7.656 | 1.309 |
+| ClickBench Q06 | 5.924 | 7.794 | 1.316 |
+| ClickBench Q07 | 3.949 | 4.985 | 1.263 |
+| ClickBench Q08 | 8.079 | 13.299 | 1.646 |
+| ClickBench Q09 | 11.955 | 18.982 | 1.588 |
+| ClickBench Q39 | 16.349 | 12.434 | 0.761 |
+| ClickBench Q40 | 9.889 | 11.271 | 1.140 |
+| ClickBench Q41 | 8.643 | 9.719 | 1.124 |
+| ClickBench Q42 | 6.144 | 8.085 | 1.316 |
+| TPC-H Q6 | 15.312 | 12.558 | 0.820 |
+| TPC-H Q1 | 6.796 | 8.570 | 1.261 |
+| TPC-H V1-friendly | 3.356 | 3.128 | 0.932 |
+| FineWeb Q00 | 8.562 | 10.949 | 1.279 |
+| FineWeb Q01 | 82.335 | 42.325 | 0.514 |
+| FineWeb Q02 | 15.364 | 11.273 | 0.734 |
+| FineWeb Q03 | 20.081 | 30.828 | 1.535 |
+| FineWeb Q04 | 18.542 | 22.920 | 1.236 |
+| FineWeb Q05 | 18.503 | 22.523 | 1.217 |
+| FineWeb Q06 | 21.508 | 39.935 | 1.857 |
+| FineWeb Q07 | 19.068 | 22.741 | 1.193 |
+| FineWeb Q08 | 23.736 | 25.585 | 1.078 |
 
-These are scan-only medians over 20 alternating iterations with speculative I/O disabled. Q06
-gives both executors exactly 942 unique segments and 713,799,576 logical bytes and produces the
-same 11,898 rows. Self-paced additionally executes 2,682 tasks, 1,632 reactor advances, 5,738
-transitions, and 7,256 node inspections. Its scheduler considers only 1.03 entries per admission,
-so scheduler rescanning and unequal I/O do not explain the `3.135x` result.
+The complete inputs are all 100 ClickBench shards (99,997,497 rows), TPC-H SF10 lineitem
+(59,986,052 rows), and all 15 local FineWeb shards (14,868,862 rows). This remains a comparison of
+restricted scan analogues rather than full SQL query runtimes.
 
-The full SF10 measurements were Q6 `16.366/23.580 ms` (`1.441x`), Q1 `8.460/12.698 ms`
-(`1.501x`), and the V1-friendly case `3.863/4.459 ms` (`1.154x`). An earlier eager-copying Q1 path
-took 173.7 ms. Returning lazy filtered projection views reduced it to 12.7 ms without changing
-output, demonstrating that executor comparisons must align output materialization semantics.
+FineWeb Q06 explains the largest remaining regression. V1 and self-paced issue about 10.9k reads
+and return about 714.7 MB each, but self-paced performs 11,386 scheduled operations, 22,903 state
+transitions, and 23,827 node inspections. Polling fused `ReadDecodeFlat` work on the coordinator
+made the ratio worse (`2.082`): a ready request also performs synchronous decode, so the attempted
+fast path serialized work that needs to remain parallel. The next useful optimization boundary is
+coarser multi-segment read/decode submission, not inline polling of the fused task.
 
 ## Comparison contract
 
-The comparison was constructed as a scan comparison, not a like-for-like execution-model
-comparison:
+The comparison is a scan comparison, not a like-for-like execution-model comparison:
 
-- V1 runs through `ScanBuilder` with its native splitting and no experiment morsels.
-- Self-paced execution uses 131,072-row morsels, a transition budget of 32, and the adaptive
-  predicate policy.
-- Both paths use concurrency 16, the same serialized Vortex layout, in-memory `SegmentSource`,
+- V1 runs through `ScanBuilder::with_natural_splits` using the file's real natural layout
+  boundaries. It never receives a morsel size and never falls back to automatic layout splitting.
+- Self-paced ranges merge 16 consecutive natural splits. A morsel can cross chunk boundaries and
+  is never smaller than a constituent natural split.
+- Both paths use at most 16 workers, the same serialized Vortex layout, in-memory `SegmentSource`,
   filter, projection, input rows, and warm fixture state.
 - They do not use identical worker executors: V1 is driven by the 16-worker Tokio runtime, while
   self-paced non-inline tasks use a shared futures thread pool behind the same concurrency cap.
-- Each path gets a warm-up. The 100 measured iterations alternate which executor runs first, and
-  the reported time is the median.
+- Each path gets a warm-up. Ten measured iterations alternate which executor runs first, and the
+  reported time is the median.
 - Every warm-up compares output row count and a stable ordered hash before timings are accepted.
 - Timed runs consume every output. Fixture construction and Parquet ingestion are outside timing.
 
@@ -106,10 +119,10 @@ The ClickBench and FineWeb cases are scan-input analogues. They preserve useful 
 projection shapes, but exclude aggregation, grouping, ordering, strings, and disjunction because
 those are outside the restricted evaluator. They must not be reported as full query runtimes.
 
-## Final 128K results
+## Historical fixed-128K results
 
-Values below are median milliseconds over 100 alternating iterations. Ratios below one favor
-self-paced execution.
+These values predate the fair natural-split contract and are retained only as optimization history.
+They are median milliseconds over 100 alternating iterations. Ratios below one favor self-paced.
 
 | Workload | V1 ms | Self-paced ms | Ratio |
 | --- | ---: | ---: | ---: |
@@ -239,18 +252,20 @@ event traces, and operation counters rather than unresolved sampled stacks.
 
 ## Morsel size
 
-The 131,072-row setting improved the self-paced/V1 ratio over 65,536 rows on 27 of 28 workloads;
-FineWeb Q00 was the exception. Larger morsels reduce the number of per-morsel graphs, masks, tasks,
-queue operations, and output batches. They also give each predicate task enough rows to amortize
-dispatch and array setup.
+The earlier 128K/65K sweep showed that larger morsels usually amortize per-morsel graphs, masks,
+tasks, queue operations, and output batches. Fixed row counts were still the wrong final contract:
+they ignored the storage layout and made it too easy to accidentally subdivide V1 work in the same
+way.
 
-The complete-data fixtures expose ample parallel work: ClickBench has about 763 morsels, SF10
-lineitem about 458, and FineWeb 10BT about 114. Their regressions therefore cannot be attributed to
-having fewer outer morsels than the 16-worker concurrency setting.
+The final contract merges 16 consecutive natural splits for self-paced and leaves V1 at the
+unmodified natural boundaries. ClickBench produces 100-110 morsels, TPC-H 29, and FineWeb 116-168,
+so every final workload has enough morsels to use all 16 allowed cores. A smaller table may produce
+fewer than 16 morsels; in that case the executor caps concurrency to the morsel count rather than
+manufacturing smaller work units.
 
-Larger morsels are not intrinsically faster. They may reduce early output, increase mask and
-temporary-array size, or leave fewer independent morsels when row counts are small. The experiment
-therefore chose 128K as the final comparison point, not as a production constant.
+Merge-16 is an experimental roll-up factor, not a production constant. Larger roll-ups reduce
+control overhead but may reduce early output, increase masks and temporary arrays, or leave too few
+independent morsels.
 
 Morsels partition the root row domain independently of storage chunks. The implemented layout is
 `Struct<Chunked<Flat>>`; a morsel carries ordered Flat slices and may cross aligned field-chunk
@@ -291,6 +306,9 @@ The implementation converged on several small fast paths rather than one broad s
 - reuse the materialized all-true initial demand by morsel length instead of allocating one per
   morsel;
 - use direct and no-op demand adoption to remove redundant mask intersections;
+- leave candidate resource tasks dormant when their speculative I/O class is disabled;
+- preserve query order for the first predicate, then adapt after a morsel observes real demand;
+- execute all-true Struct and Flat selections inline while keeping sparse selection parallel;
 - run dependency-critical mask combination and final Struct packing inline;
 - wake only morsels recorded as waiting on a completed shared resource;
 - retain and look up scan-wide resources directly by `SegmentId`;
@@ -385,7 +403,9 @@ add work to the multi-field filtered queries. Q02's trace completed only 56 task
 scheduler considered 1.34 tasks per admission; the remaining regression is task/reactor overhead,
 not serialized completion handling or scheduler rescanning.
 
-## Corrected natural-split baseline and projection fusion
+## Historical natural-split baseline and projection fusion
+
+This section records intermediate results before the serialized merge-16 comparison above.
 
 The final comparison contract gives V1 only the 115 natural SF10 lineitem chunks and gives 128K
 morsels only to self-paced. `SplitBy::Layout` is not a valid substitute because it silently
@@ -481,7 +501,10 @@ Consequently, 128K is a target rather than an invariant when morsels preserve ph
 natural span wider than the target must remain one larger morsel. The previous fixed-row benchmark
 still measures executor overhead, but it is not a real-layout end-to-end comparison.
 
-### Split-count rollup comparison
+### Historical in-memory split-count rollup
+
+These results were later rejected because physical-file boundaries were applied to an unrelated
+coarse in-memory layout. They remain here to document how the benchmark artifact was discovered.
 
 The follow-up replaced the row target with file-local split-count rollups. A self-paced morsel is
 the complete row range covered by 16 or 32 adjacent query-visible natural splits; the final morsel
@@ -602,7 +625,11 @@ threshold, adaptive read-ahead improved a few latency-hiding cases but regressed
 sub-millisecond suite. This is evidence for a cost/benefit admission score, not for enabling the
 current adaptive default broadly.
 
-## Real natural-split rollup comparison
+## Earlier serialized natural-split rollup comparison
+
+These measurements established the correct serialized-file contract but predate the final
+executor optimizations. The fair complete-data merge-16 table near the top supersedes their
+performance numbers. Merge-32 is retained here only as historical evidence for choosing 16.
 
 A later comparison replaced fixed 128K morsels with morsels formed by merging 16 or 32 consecutive
 natural splits from the real benchmark Vortex files. The source catalogs contain 99,997,497
@@ -617,10 +644,12 @@ artifact produced implausible 7-14x FineWeb gains. Those measurements are reject
 
 The corrected harness writes one complete Vortex byte buffer with a restricted
 `Struct<Chunked<Flat<i64>>>` strategy, freezes it, and reopens it through `vortex-file`. The writer
-edition permits only `vortex.primitive`; the strategy rejects nullable roots and every field type
-other than non-nullable `i64`, so unsupported encodings and layout strategies cannot silently enter
-the fixture. `SourcePlan::try_from_layout` independently validates the reopened footer, including
-aligned field-chunk boundaries. A single-chunk field retains its `Chunked` wrapper.
+edition permits only `vortex.primitive` and `vortex.chunked`, the two physical array encodings a
+Flat segment can contain after slicing these inputs. The strategy rejects nullable roots and every
+field type other than non-nullable `i64`, so unsupported encodings and layout strategies cannot
+silently enter the fixture. `SourcePlan::try_from_layout` independently validates the reopened
+footer, including aligned field-chunk boundaries. A single-chunk field retains its `Chunked`
+wrapper.
 
 Both executors scan the same reopened layout and `SegmentSource`, and the harness prints the exact
 serialized byte length and a stable byte hash. Each comparison also materializes its query bundle
