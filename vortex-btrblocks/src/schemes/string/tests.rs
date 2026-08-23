@@ -35,7 +35,7 @@ fn test_strings() -> VortexResult<()> {
     assert_eq!(compressed.len(), 2048);
 
     let display = compressed
-        .display_as(DisplayOptions::MetadataOnly)
+        .display_as(DisplayOptions::MetadataOnly, &SESSION)
         .to_string()
         .to_lowercase();
     assert_eq!(display, "vortex.dict(utf8, len=2048)");
@@ -58,7 +58,7 @@ fn test_sparse_nulls() -> VortexResult<()> {
     assert_eq!(compressed.len(), 100);
 
     let display = compressed
-        .display_as(DisplayOptions::MetadataOnly)
+        .display_as(DisplayOptions::MetadataOnly, &SESSION)
         .to_string()
         .to_lowercase();
     assert_eq!(display, "vortex.sparse(utf8?, len=100)");

@@ -107,8 +107,8 @@ impl Display for VortexFuzzError {
             ) => {
                 let expected_tree = expected_array.display_tree();
                 let current_tree = current_array.display_tree();
-                let expected_values = expected_array.display_values();
-                let current_values = current_array.display_values();
+                let expected_values = expected_array.display_values(&crate::SESSION);
+                let current_values = current_array.display_values(&crate::SESSION);
                 write!(
                     f,
                     "Mismatch at step {step} at index {idx}\n\

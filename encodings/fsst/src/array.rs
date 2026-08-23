@@ -13,6 +13,7 @@ use fsst::Compressor;
 use fsst::Decompressor;
 use fsst::Symbol;
 use num_traits::AsPrimitive;
+use num_traits::ToPrimitive;
 use prost::Message as _;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
@@ -28,6 +29,7 @@ use vortex_array::ExecutionResult;
 use vortex_array::TypedArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_slots;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::VarBin;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::varbin::VarBinArraySlotsExt;
@@ -39,7 +41,6 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::OffsetBuilderPType;
 use vortex_array::dtype::PType;
-use vortex_array::legacy_session;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_varbin_builder;
 use vortex_array::serde::ArrayChildren;
@@ -124,17 +125,15 @@ impl VTable for FSST {
         *ID
     }
 
-    #[allow(clippy::disallowed_methods)]
     fn validate(
         &self,
         data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
-        let mut ctx = legacy_session().create_execution_ctx();
-        data.validate(dtype, len, slots, &mut ctx)
+        data.validate(dtype, len, slots, ctx)
     }
 
     fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
@@ -842,17 +841,20 @@ impl FSSTData {
 
         // Validate that last offset doesn't exceed bytes length (when host-resident).
         if codes_bytes.is_on_host() && codes_offsets.is_host() && !codes_offsets.is_empty() {
-            let last_offset: usize = (&codes_offsets
-                .execute_scalar(codes_offsets.len() - 1, ctx)
-                .vortex_expect("offsets must support scalar_at"))
-                .try_into()
-                .vortex_expect("Failed to convert offset to usize");
-            vortex_ensure!(
-                last_offset <= codes_bytes.len(),
-                InvalidArgument: "Last codes offset {} exceeds codes bytes length {}",
-                last_offset,
-                codes_bytes.len()
-            );
+            let last_offset = usize::try_from(
+                &codes_offsets
+                    .execute_scalar(codes_offsets.len() - 1, ctx)
+                    .vortex_expect("offsets must support scalar_at"),
+            )
+            .vortex_expect("Failed to convert offset to usize");
+            {
+                vortex_ensure!(
+                    last_offset <= codes_bytes.len(),
+                    InvalidArgument: "Last codes offset {} exceeds codes bytes length {}",
+                    last_offset,
+                    codes_bytes.len()
+                );
+            }
         }
 
         Ok(())

@@ -215,7 +215,7 @@ fn collect_row_bytes(array: &ListViewArray, ctx: &mut ExecutionCtx) -> Vec<Vec<u
     (0..array.len())
         .map(|i| {
             let slice = array
-                .list_elements_at(i)
+                .list_elements_at(i, ctx)
                 .vortex_expect("row key bytes must be addressable");
             let p = slice
                 .execute::<PrimitiveArray>(ctx)

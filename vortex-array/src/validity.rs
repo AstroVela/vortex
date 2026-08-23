@@ -60,7 +60,9 @@ impl Debug for Validity {
             Self::NonNullable => write!(f, "NonNullable"),
             Self::AllValid => write!(f, "AllValid"),
             Self::AllInvalid => write!(f, "AllInvalid"),
-            Self::Array(arr) => write!(f, "SomeValid({})", arr.display_values()),
+            // Display the array's summary rather than its values: decoding values requires an
+            // execution context, which the fixed Debug signature cannot provide.
+            Self::Array(arr) => write!(f, "SomeValid({arr})"),
         }
     }
 }

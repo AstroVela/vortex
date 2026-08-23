@@ -37,7 +37,7 @@ fn test_dict_display() {
     .into_array();
 
     assert_eq!(
-        x.display_values().to_string(),
+        x.display_values(&array_session()).to_string(),
         "[\"Hello\", \"Hello\", \"Hello\", \"你好\", \"Hello\", \"Hola\"]"
     )
 }
@@ -59,7 +59,7 @@ fn test_dict_list_dict_display() {
     .into_array();
 
     assert_eq!(
-        elements.display_values().to_string(),
+        elements.display_values(&array_session()).to_string(),
         "[\"Hello\", \"Hello\", \"Hello\", \"你好\", \"Hello\", \"Bonjour\", \"Bonjour\", null]"
     );
 
@@ -74,7 +74,7 @@ fn test_dict_list_dict_display() {
     .into_array();
 
     assert_eq!(
-        lists.display_values().to_string(),
+        lists.display_values(&array_session()).to_string(),
         "[[\"Hello\"], [], null, [\"Hello\", \"Hello\"], null, [\"你好\", \"Hello\"], [\"Bonjour\", \"Bonjour\", null]]"
     );
 
@@ -83,7 +83,7 @@ fn test_dict_list_dict_display() {
         .into_array();
 
     assert_eq!(
-        x.display_values().to_string(),
+        x.display_values(&array_session()).to_string(),
         "[[\"Bonjour\", \"Bonjour\", null], [\"你好\", \"Hello\"], null, [\"Hello\", \"Hello\"], null, []]"
     )
 }

@@ -10,6 +10,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
@@ -81,6 +82,7 @@ pub struct ListSlots {
 /// ```
 /// use vortex_array::arrays::{ListArray, PrimitiveArray};
 /// use vortex_array::arrays::list::ListArrayExt;
+/// use vortex_array::{VortexSessionExecute, array_session};
 /// use vortex_array::validity::Validity;
 /// use vortex_array::IntoArray;
 /// use vortex_buffer::buffer;
@@ -99,10 +101,11 @@ pub struct ListSlots {
 /// assert_eq!(list_array.len(), 3);
 ///
 /// // Access individual lists
-/// let first_list = list_array.list_elements_at(0).unwrap();
+/// let mut ctx = array_session().create_execution_ctx();
+/// let first_list = list_array.list_elements_at(0, &mut ctx).unwrap();
 /// assert_eq!(first_list.len(), 2); // [1, 2]
 ///
-/// let third_list = list_array.list_elements_at(2).unwrap();
+/// let third_list = list_array.list_elements_at(2, &mut ctx).unwrap();
 /// assert!(third_list.is_empty()); // []
 /// ```
 #[derive(Clone, Debug, Default)]
@@ -143,7 +146,10 @@ impl ListData {
     /// Panics if the provided components do not satisfy the invariants documented
     /// in `ListArray::new_unchecked`.
     pub fn build(elements: ArrayRef, offsets: ArrayRef, validity: Validity) -> Self {
-        Self::try_build(elements, offsets, validity).vortex_expect("ListArray new")
+        // TODO(ctx): constructor - build is a ctx-free public constructor.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        Self::try_build(elements, offsets, validity, &mut ctx).vortex_expect("ListArray new")
     }
 
     /// Constructs a new `ListArray`.
@@ -158,8 +164,9 @@ impl ListData {
         elements: ArrayRef,
         offsets: ArrayRef,
         validity: Validity,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
-        Self::validate(&elements, &offsets, &validity)?;
+        Self::validate(&elements, &offsets, &validity, ctx)?;
 
         // SAFETY: validate ensures all invariants are met.
         Ok(unsafe { Self::new_unchecked() })
@@ -188,11 +195,11 @@ impl ListData {
     /// Validates the components that would be used to create a `ListArray`.
     ///
     /// This function checks all the invariants required by `ListArray::new_unchecked`.
-    #[allow(clippy::disallowed_methods)]
     pub fn validate(
         elements: &ArrayRef,
         offsets: &ArrayRef,
         validity: &Validity,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         // Offsets must have at least one element
         vortex_ensure!(
@@ -209,11 +216,9 @@ impl ListData {
 
         // We can safely unwrap the DType as primitive now
         let offsets_ptype = offsets.dtype().as_ptype();
-        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
-        let mut ctx = legacy_session().create_execution_ctx();
 
         // Offsets must be sorted (but not strictly sorted, zero-length lists are allowed)
-        if let Some(is_sorted) = offsets.statistics().compute_is_sorted(&mut ctx) {
+        if let Some(is_sorted) = offsets.statistics().compute_is_sorted(ctx) {
             vortex_ensure!(is_sorted, InvalidArgument: "offsets must be sorted");
         } else {
             vortex_bail!(InvalidArgument: "offsets must report is_sorted statistic");
@@ -221,17 +226,22 @@ impl ListData {
 
         // Validate that offsets min is non-negative, and max does not exceed the length of
         // the elements array.
-        if let Some(min_max) = min_max(offsets, &mut ctx, NumericalAggregateOpts::default())? {
+        let mm = min_max(offsets, ctx, NumericalAggregateOpts::default())?.ok_or_else(|| {
+            vortex_err!(
+                InvalidArgument: "offsets array with encoding {} must support min_max compute function",
+                offsets.encoding_id()
+            )
+        })?;
+        {
+            let (min_scalar, max_scalar) = (mm.min, mm.max);
             match_each_integer_ptype!(offsets_ptype, |P| {
                 #[allow(clippy::absurd_extreme_comparisons, unused_comparisons)]
                 {
-                    let max = min_max
-                        .max
+                    let max = max_scalar
                         .as_primitive()
                         .as_::<P>()
                         .vortex_expect("offsets type must fit offsets values");
-                    let min = min_max
-                        .min
+                    let min = min_scalar
                         .as_primitive()
                         .as_::<P>()
                         .vortex_expect("offsets type must fit offsets values");
@@ -252,13 +262,7 @@ impl ListData {
                     );
                 }
             })
-        } else {
-            // TODO(aduffy): fallback to slower validation pathway?
-            vortex_bail!(
-                InvalidArgument: "offsets array with encoding {} must support min_max compute function",
-                offsets.encoding_id()
-            );
-        };
+        }
 
         // If a validity array is present, it must be the same length as the ListArray
         if let Some(validity_len) = validity.maybe_len() {
@@ -377,7 +381,10 @@ impl Array<List> {
         let dtype = DType::List(Arc::new(elements.dtype().clone()), validity.nullability());
         let len = offsets.len().saturating_sub(1);
         let slots = ListData::make_slots(&elements, &offsets, &validity, len);
-        let data = ListData::try_build(elements, offsets, validity)?;
+        // TODO(ctx): constructor - try_new is a ctx-free public constructor.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        let data = ListData::try_build(elements, offsets, validity, &mut ctx)?;
         Ok(unsafe {
             Array::from_parts_unchecked(ArrayParts::new(List, dtype, len, data).with_slots(slots))
         })

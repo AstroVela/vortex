@@ -78,6 +78,7 @@ impl VTable for Masked {
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         vortex_ensure!(
             slots[MaskedSlots::CHILD].is_some(),
@@ -272,8 +273,8 @@ mod tests {
 
         assert!(decoded.is::<Masked>());
         assert_eq!(
-            array.as_ref().display_values().to_string(),
-            decoded.display_values().to_string()
+            array.as_ref().display_values(&array_session()).to_string(),
+            decoded.display_values(&array_session()).to_string()
         );
     }
 

@@ -6,6 +6,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use vortex_buffer::Buffer;
+use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -19,6 +20,7 @@ use crate::ArrayRef;
 use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -91,6 +93,7 @@ impl VTable for VarBinView {
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         vortex_ensure!(
             slots.len() == VarBinViewSlots::COUNT,
@@ -168,7 +171,7 @@ impl VTable for VarBinView {
 
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         if !metadata.is_empty() {
             vortex_bail!(
@@ -219,12 +222,13 @@ impl VTable for VarBinView {
             .collect::<Vec<_>>();
         let views = Buffer::<BinaryView>::from_byte_buffer(views_handle.clone().as_host().clone());
 
-        let data = VarBinViewData::try_new(
-            views,
-            Arc::from(data_buffers),
-            dtype.clone(),
-            validity.clone(),
-        )?;
+        let data_buffers: Arc<[ByteBuffer]> = Arc::from(data_buffers);
+        let mut ctx = session.create_execution_ctx();
+        VarBinViewData::validate(&views, &data_buffers, dtype, &validity, &mut ctx)?;
+        // SAFETY: validate above ensures all invariants are met.
+        let data = unsafe {
+            VarBinViewData::new_unchecked(views, data_buffers, dtype.clone(), validity.clone())
+        };
         let slots = VarBinViewData::make_slots(&validity, len);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }

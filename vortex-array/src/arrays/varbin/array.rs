@@ -68,7 +68,10 @@ impl VarBinData {
     /// Panics if the provided components do not satisfy the invariants documented
     /// in `VarBinArray::new_unchecked`.
     pub fn build(offsets: ArrayRef, bytes: ByteBuffer, dtype: DType, validity: Validity) -> Self {
-        Self::try_build(offsets, bytes, dtype, validity).vortex_expect("VarBinArray new")
+        // TODO(ctx): constructor - build is a ctx-free public constructor.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        Self::try_build(offsets, bytes, dtype, validity, &mut ctx).vortex_expect("VarBinArray new")
     }
 
     /// Creates a new `VarBinArray`.
@@ -107,9 +110,10 @@ impl VarBinData {
         bytes: ByteBuffer,
         dtype: DType,
         validity: Validity,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
         let bytes = BufferHandle::new_host(bytes);
-        Self::validate(&offsets, &bytes, &dtype, &validity)?;
+        Self::validate(&offsets, &bytes, &dtype, &validity, ctx)?;
 
         // SAFETY: validate ensures all invariants are met.
         Ok(unsafe { Self::new_unchecked_from_handle(bytes) })
@@ -130,7 +134,10 @@ impl VarBinData {
         dtype: DType,
         validity: Validity,
     ) -> VortexResult<Self> {
-        Self::validate(&offsets, &bytes, &dtype, &validity)?;
+        // TODO(ctx): constructor - try_build_from_handle is a ctx-free public constructor.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        Self::validate(&offsets, &bytes, &dtype, &validity, &mut ctx)?;
 
         // SAFETY: validate ensures all invariants are met.
         Ok(unsafe { Self::new_unchecked_from_handle(bytes) })
@@ -188,6 +195,7 @@ impl VarBinData {
         bytes: &BufferHandle,
         dtype: &DType,
         validity: &Validity,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         // Check offsets are non-nullable integer
         vortex_ensure!(
@@ -231,15 +239,19 @@ impl VarBinData {
             && matches!(dtype, DType::Utf8(_))
             && let Some(bytes) = bytes.as_host_opt()
         {
-            Self::validate_utf8(offsets, bytes.as_ref(), validity)?;
+            Self::validate_utf8(offsets, bytes.as_ref(), validity, ctx)?;
         }
 
         Ok(())
     }
 
     /// Validates that every non-null value is valid UTF-8.
-    #[allow(clippy::disallowed_methods)]
-    fn validate_utf8(offsets: &ArrayRef, bytes: &[u8], validity: &Validity) -> VortexResult<()> {
+    fn validate_utf8(
+        offsets: &ArrayRef,
+        bytes: &[u8],
+        validity: &Validity,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
         let validate_at = |i: usize, start: usize, end: usize| -> VortexResult<()> {
             let string_bytes = &bytes[start..end];
             simdutf8::basic::from_utf8(string_bytes).map_err(|_| {
@@ -251,17 +263,15 @@ impl VarBinData {
             Ok(())
         };
 
-        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
-        let mut ctx = legacy_session().create_execution_ctx();
         // TODO(joe): update the created VarBin with this decompressed Array.
-        let primitive_offsets = offsets.clone().execute::<PrimitiveArray>(&mut ctx)?;
+        let primitive_offsets = offsets.clone().execute::<PrimitiveArray>(ctx)?;
 
         // Array-backed validity is the only variant that needs an execution context: execute it into
         // a mask once. The constant variants resolve null-ness without one. Resolving this before
         // the per-type dispatch keeps the dtype loop simple.
         let mask = match validity {
             Validity::Array(_) => {
-                Some(validity.execute_mask(primitive_offsets.len().saturating_sub(1), &mut ctx)?)
+                Some(validity.execute_mask(primitive_offsets.len().saturating_sub(1), ctx)?)
             }
             _ => None,
         };
@@ -515,7 +525,10 @@ impl Array<VarBin> {
     ) -> VortexResult<Self> {
         let len = offsets.len() - 1;
         let bytes = BufferHandle::new_host(bytes);
-        VarBinData::validate(&offsets, &bytes, &dtype, &validity)?;
+        // TODO(ctx): constructor - try_new is a ctx-free public constructor.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        VarBinData::validate(&offsets, &bytes, &dtype, &validity, &mut ctx)?;
         let slots = VarBinData::make_slots(offsets, &validity, len);
         // SAFETY: validate ensures all invariants are met.
         let data = unsafe { VarBinData::new_unchecked_from_handle(bytes) };

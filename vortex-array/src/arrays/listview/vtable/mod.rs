@@ -21,6 +21,7 @@ use crate::ArrayRef;
 use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -123,6 +124,7 @@ impl VTable for ListView {
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         vortex_ensure!(
             slots.len() == ListViewSlots::COUNT,
@@ -165,7 +167,7 @@ impl VTable for ListView {
 
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = ListViewMetadata::decode(metadata)?;
         vortex_ensure!(
@@ -210,7 +212,8 @@ impl VTable for ListView {
             len,
         )?;
 
-        ListViewData::validate(&elements, &offsets, &sizes, &validity)?;
+        let mut ctx = session.create_execution_ctx();
+        ListViewData::validate(&elements, &offsets, &sizes, &validity, &mut ctx)?;
         let data = ListViewData::try_new()?;
         let slots = ListViewData::make_slots(&elements, &offsets, &sizes, &validity, len);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))

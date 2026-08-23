@@ -16,6 +16,7 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -93,6 +94,7 @@ impl VTable for VarBin {
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         vortex_ensure!(
             slots.len() == VarBinSlots::COUNT,
@@ -168,7 +170,7 @@ impl VTable for VarBin {
         metadata: &[u8],
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = VarBinMetadata::decode(metadata)?;
         let validity = if children.len() == 1 {
@@ -191,7 +193,14 @@ impl VTable for VarBin {
         }
         let bytes = buffers[0].clone().try_to_host_sync()?;
 
-        let data = VarBinData::try_build(offsets.clone(), bytes, dtype.clone(), validity.clone())?;
+        let mut ctx = session.create_execution_ctx();
+        let data = VarBinData::try_build(
+            offsets.clone(),
+            bytes,
+            dtype.clone(),
+            validity.clone(),
+            &mut ctx,
+        )?;
         let slots = VarBinData::make_slots(offsets, &validity, len);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }

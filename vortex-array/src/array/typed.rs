@@ -116,10 +116,12 @@ pub(crate) struct ArrayData<V: VTable> {
 
 impl<V: VTable> ArrayInner<ArrayData<V>> {
     /// Create a new validated [`ArrayInner`] from construction parameters.
+    ///
+    /// See [`VTable::validate`] for the meaning of `ctx`.
     #[doc(hidden)]
-    pub fn try_new(new: ArrayParts<V>) -> VortexResult<Self> {
+    pub fn try_new(new: ArrayParts<V>, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
         new.vtable
-            .validate(&new.data, &new.dtype, new.len, &new.slots)?;
+            .validate(&new.data, &new.dtype, new.len, &new.slots, ctx)?;
         Ok(ArrayInner {
             len: new.len,
             encoding_id: new.vtable.id(),
@@ -215,7 +217,25 @@ impl<V: VTable> Array<V> {
     /// This is the safe construction path for encoding implementors. It calls
     /// [`VTable::validate`] before publishing the array as an [`ArrayRef`].
     pub fn try_from_parts(new: ArrayParts<V>) -> VortexResult<Self> {
-        let store = ArrayInner::<ArrayData<V>>::try_new(new)?;
+        // TODO(ctx): constructor - try_from_parts is the ubiquitous ctx-free construction path.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        let store = ArrayInner::<ArrayData<V>>::try_new(new, &mut ctx)?;
+        let inner = ArrayRef::from_inner(Arc::new(store));
+        Ok(Self {
+            inner,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Like [`Self::try_from_parts`], but with an execution context so that
+    /// [`VTable::validate`] can fully validate encoded components. Used on the
+    /// deserialization path, where the parts are untrusted.
+    pub fn try_from_parts_with_ctx(
+        new: ArrayParts<V>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self> {
+        let store = ArrayInner::<ArrayData<V>>::try_new(new, ctx)?;
         let inner = ArrayRef::from_inner(Arc::new(store));
         Ok(Self {
             inner,

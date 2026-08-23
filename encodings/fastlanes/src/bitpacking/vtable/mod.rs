@@ -107,6 +107,7 @@ impl VTable for BitPacked {
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         let bp_slots = BitPackedSlotsView::from_slots(slots);
 

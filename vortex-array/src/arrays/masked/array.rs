@@ -9,15 +9,15 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::ArrayRef;
-use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
 use crate::array::child_to_validity;
 use crate::array::validity_to_child;
 use crate::array_slots;
+use crate::arrays::Bool;
 use crate::arrays::Masked;
-use crate::legacy_session;
+use crate::arrays::bool::BoolArrayExt;
 use crate::validity::Validity;
 
 #[array_slots(Masked)]
@@ -77,17 +77,26 @@ impl MaskedData {
 
 impl Array<Masked> {
     /// Constructs a new `MaskedArray`.
-    // TODO(ctx): trait fixes - constructors are called from metadata-only contexts without a ctx.
-    #[allow(clippy::disallowed_methods)]
     pub fn try_new(child: ArrayRef, validity: Validity) -> VortexResult<Self> {
         let dtype = child.dtype().as_nullable();
         let len = child.len();
         let validity_slot = validity_to_child(&validity, len);
-        let data = MaskedData::try_new(
-            len,
-            child.all_valid(&mut legacy_session().create_execution_ctx())?,
-            validity,
-        )?;
+        // Best-effort no-nulls check without an execution context: the constant validity
+        // variants and decoded bool validity children are checked directly; encoded validity
+        // would require execution to inspect, and the deserialization path re-validates it with
+        // a session-derived context.
+        let child_all_valid = match child.validity()? {
+            Validity::NonNullable | Validity::AllValid => true,
+            Validity::AllInvalid => false,
+            Validity::Array(child_validity) => match child_validity.as_opt::<Bool>() {
+                Some(bool_array) => {
+                    let bits = bool_array.to_bit_buffer();
+                    bits.true_count() == bits.len()
+                }
+                None => true,
+            },
+        };
+        let data = MaskedData::try_new(len, child_all_valid, validity)?;
         Ok(unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(Masked, dtype, len, data)

@@ -47,7 +47,7 @@ fn test_compress() -> VortexResult<()> {
     assert_eq!(compressed.len(), 1024);
 
     let display = compressed
-        .display_as(DisplayOptions::MetadataOnly)
+        .display_as(DisplayOptions::MetadataOnly, &SESSION)
         .to_string()
         .to_lowercase();
     assert_eq!(display, "vortex.dict(f32, len=1024)");
@@ -92,7 +92,7 @@ fn test_sparse_compression() -> VortexResult<()> {
     assert_eq!(compressed.len(), 96);
 
     let display = compressed
-        .display_as(DisplayOptions::MetadataOnly)
+        .display_as(DisplayOptions::MetadataOnly, &SESSION)
         .to_string()
         .to_lowercase();
     assert_eq!(display, "vortex.sparse(f32?, len=96)");

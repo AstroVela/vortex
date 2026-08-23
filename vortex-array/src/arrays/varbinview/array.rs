@@ -19,6 +19,7 @@ use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
 use crate::ArraySlots;
+use crate::ExecutionCtx;
 use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
@@ -181,7 +182,10 @@ impl VarBinViewData {
         dtype: DType,
         validity: Validity,
     ) -> VortexResult<Self> {
-        Self::validate(&views, &buffers, &dtype, &validity)?;
+        // TODO(ctx): constructor - try_new is a ctx-free public constructor.
+        #[allow(clippy::disallowed_methods)]
+        let mut ctx = legacy_session().create_execution_ctx();
+        Self::validate(&views, &buffers, &dtype, &validity, &mut ctx)?;
 
         // SAFETY: validate ensures all invariants are met.
         Ok(unsafe { Self::new_unchecked(views, buffers, dtype, validity) })
@@ -256,8 +260,13 @@ impl VarBinViewData {
         validity: Validity,
     ) -> Self {
         #[cfg(debug_assertions)]
-        Self::validate(&views, &buffers, &dtype, &validity)
-            .vortex_expect("[Debug Assertion]: Invalid `VarBinViewArray` parameters");
+        {
+            // TODO(ctx): constructor - new_unchecked debug validation has no ctx source.
+            #[allow(clippy::disallowed_methods)]
+            let mut ctx = legacy_session().create_execution_ctx();
+            Self::validate(&views, &buffers, &dtype, &validity, &mut ctx)
+                .vortex_expect("[Debug Assertion]: Invalid `VarBinViewArray` parameters");
+        }
 
         let handles: Vec<BufferHandle> = buffers
             .iter()
@@ -294,6 +303,7 @@ impl VarBinViewData {
         buffers: &Arc<[ByteBuffer]>,
         dtype: &DType,
         validity: &Validity,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         vortex_ensure!(
             validity.nullability() == dtype.nullability(),
@@ -303,21 +313,21 @@ impl VarBinViewData {
         );
 
         match dtype {
-            DType::Utf8(_) => Self::validate_views(views, buffers, validity, |string| {
+            DType::Utf8(_) => Self::validate_views(views, buffers, validity, ctx, |string| {
                 simdutf8::basic::from_utf8(string).is_ok()
             })?,
-            DType::Binary(_) => Self::validate_views(views, buffers, validity, |_| true)?,
+            DType::Binary(_) => Self::validate_views(views, buffers, validity, ctx, |_| true)?,
             _ => vortex_bail!(InvalidArgument: "invalid DType {dtype} for `VarBinViewArray`"),
         }
 
         Ok(())
     }
 
-    #[allow(clippy::disallowed_methods)]
     fn validate_views<F>(
         views: &Buffer<BinaryView>,
         buffers: &Arc<[ByteBuffer]>,
         validity: &Validity,
+        ctx: &mut ExecutionCtx,
         validator: F,
     ) -> VortexResult<()>
     where
@@ -375,9 +385,7 @@ impl VarBinViewData {
             // into a mask once and zip it with the views, validating only the valid (non-null)
             // entries.
             Validity::Array(_) => {
-                // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
-                let mut ctx = legacy_session().create_execution_ctx();
-                let mask = validity.execute_mask(views.len(), &mut ctx)?;
+                let mask = validity.execute_mask(views.len(), ctx)?;
                 for ((idx, view), valid) in views.iter().enumerate().zip(mask.iter()) {
                     if valid {
                         validate_view(idx, view)?;

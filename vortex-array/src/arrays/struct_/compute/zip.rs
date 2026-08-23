@@ -101,7 +101,7 @@ mod tests {
 
         let result = mask.into_array().zip(if_true, if_false).unwrap();
 
-        insta::assert_snapshot!(result.display_table(), @r"
+        insta::assert_snapshot!(result.display_table(&crate::array_session()), @r"
         ┌───────┐
         │ field │
         ├───────┤
@@ -138,7 +138,7 @@ mod tests {
 
         let result = mask.into_array().zip(if_true, if_false).unwrap();
 
-        insta::assert_snapshot!(result.display_table(), @r"
+        insta::assert_snapshot!(result.display_table(&crate::array_session()), @r"
         ┌───────┐
         │   a   │
         ├───────┤

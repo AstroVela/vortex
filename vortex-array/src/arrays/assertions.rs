@@ -85,13 +85,14 @@ macro_rules! assert_arrays_eq {
     ($left:expr, $right:expr, $ctx:expr) => {{
         let left: $crate::ArrayRef = $crate::IntoArray::into_array($left.clone());
         let right: $crate::ArrayRef = $crate::IntoArray::into_array($right.clone());
+        let ctx_ref = &mut *$ctx;
         if left.dtype() != right.dtype() {
             panic!(
                 "assertion left == right failed: arrays differ in type: {} != {}.\n  left: {}\n right: {}",
                 left.dtype(),
                 right.dtype(),
-                left.display_values(),
-                right.display_values()
+                left.display_values(ctx_ref.session()),
+                right.display_values(ctx_ref.session())
             )
         }
 
@@ -101,13 +102,13 @@ macro_rules! assert_arrays_eq {
             "assertion left == right failed: arrays differ in length: {} != {}.\n  left: {}\n right: {}",
             left.len(),
             right.len(),
-            left.display_values(),
-            right.display_values()
+            left.display_values(ctx_ref.session()),
+            right.display_values(ctx_ref.session())
         );
 
         let left = left.clone();
         let right = right.clone();
-        $crate::arrays::assert_arrays_eq_impl(&left, &right, $ctx);
+        $crate::arrays::assert_arrays_eq_impl(&left, &right, ctx_ref);
     }};
 }
 
@@ -144,9 +145,9 @@ pub fn assert_arrays_eq_impl(left: &ArrayRef, right: &ArrayRef, ctx: &mut Execut
         panic!(
             "assertion failed: arrays do not match:{}\n     left: {}\n    right: {}\n executed: {}",
             msg,
-            left.display_values(),
-            right.display_values(),
-            executed.display_values()
+            left.display_values(ctx.session()),
+            right.display_values(ctx.session()),
+            executed.display_values(ctx.session())
         )
     }
 }

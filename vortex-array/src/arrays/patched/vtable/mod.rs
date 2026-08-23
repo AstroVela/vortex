@@ -114,6 +114,7 @@ impl VTable for Patched {
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         data.validate(dtype, len, &PatchedSlotsView::from_slots(slots))
     }
@@ -612,8 +613,8 @@ mod tests {
 
         assert!(decoded.is::<Patched>());
         assert_eq!(
-            array.display_values().to_string(),
-            decoded.display_values().to_string()
+            array.display_values(&session).to_string(),
+            decoded.display_values(&session).to_string()
         );
     }
 
