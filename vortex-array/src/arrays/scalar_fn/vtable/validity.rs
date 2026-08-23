@@ -73,6 +73,7 @@ impl ValidityVTable<ScalarFn> for ScalarFn {
         let expr = Expression::try_new(array.scalar_fn().clone(), inputs)?;
         let validity_expr = array.scalar_fn().validity(&expr)?;
 
+        // TODO(ctx): trait fixes - ValidityVTable::validity has a fixed signature.
         #[allow(clippy::disallowed_methods)]
         let ctx = &mut legacy_session().create_execution_ctx();
         // Execute the validity expression. All leaves are ArrayExpr nodes.
