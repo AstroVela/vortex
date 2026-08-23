@@ -68,7 +68,7 @@ impl FsstDecodePlan {
         fsst_array: ArrayView<'_, FSST>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
-        let codes = fsst_array.codes().sliced_bytes();
+        let codes = fsst_array.codes().sliced_bytes(ctx);
         let lengths = fsst_array
             .uncompressed_lengths()
             .clone()
@@ -267,7 +267,7 @@ mod tests {
             let arr = builder.finish_into_varbin();
             let mask = arr.validity()?.execute_mask(arr.len(), &mut ctx)?;
             let actual = (0..arr.len())
-                .map(|i| mask.value(i).then(|| arr.bytes_at(i).to_vec()))
+                .map(|i| mask.value(i).then(|| arr.bytes_at(i, &mut ctx).to_vec()))
                 .collect::<Vec<_>>();
             assert_eq!(data, actual);
         }

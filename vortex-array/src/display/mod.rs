@@ -522,6 +522,7 @@ impl ArrayRef {
         DisplayArrayAs(self, DisplayOptions::TableDisplay)
     }
 
+    // TODO(ctx): trait fixes - std::fmt::Display cannot thread an ExecutionCtx.
     #[allow(clippy::disallowed_methods)]
     fn fmt_as(&self, f: &mut std::fmt::Formatter, options: &DisplayOptions) -> std::fmt::Result {
         match options {

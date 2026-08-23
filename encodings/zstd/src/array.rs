@@ -1609,6 +1609,7 @@ impl OperationsVTable<Zstd> for Zstd {
 #[expect(clippy::cast_possible_truncation)]
 mod tests {
     use rstest::rstest;
+    use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::varbin::VarBinArrayExt as _;
     use vortex_array::builders::VarBinBuilder;
     use vortex_array::dtype::DType;
@@ -1770,13 +1771,14 @@ mod tests {
 
     #[test]
     fn test_append_to_varbin_copies_the_stored_values() -> VortexResult<()> {
+        let mut ctx = vortex_array::array_session().create_execution_ctx();
         let slice = decompressed_slice(make_interleaved(&[b"hello", b"world"]), 0, 2, 0, 2);
         let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(NonNullable));
         append_slice_to_varbin(&slice, &Mask::new_true(2), &mut builder)?;
 
         let appended = builder.finish_into_varbin();
-        assert_eq!(appended.bytes_at(0).as_slice(), b"hello");
-        assert_eq!(appended.bytes_at(1).as_slice(), b"world");
+        assert_eq!(appended.bytes_at(0, &mut ctx).as_slice(), b"hello");
+        assert_eq!(appended.bytes_at(1, &mut ctx).as_slice(), b"world");
         Ok(())
     }
 

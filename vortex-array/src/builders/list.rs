@@ -461,8 +461,8 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let list_array = list.execute::<ListViewArray>(&mut ctx).unwrap();
 
-        assert_eq!(list_array.list_elements_at(0).unwrap().len(), 3);
-        assert_eq!(list_array.list_elements_at(1).unwrap().len(), 3);
+        assert_eq!(list_array.list_elements_at(0, &mut ctx).unwrap().len(), 3);
+        assert_eq!(list_array.list_elements_at(1, &mut ctx).unwrap().len(), 3);
     }
 
     #[test]
@@ -514,9 +514,9 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let list_array = list.execute::<ListViewArray>(&mut ctx).unwrap();
 
-        assert_eq!(list_array.list_elements_at(0).unwrap().len(), 3);
-        assert_eq!(list_array.list_elements_at(1).unwrap().len(), 0);
-        assert_eq!(list_array.list_elements_at(2).unwrap().len(), 3);
+        assert_eq!(list_array.list_elements_at(0, &mut ctx).unwrap().len(), 3);
+        assert_eq!(list_array.list_elements_at(1, &mut ctx).unwrap().len(), 0);
+        assert_eq!(list_array.list_elements_at(2, &mut ctx).unwrap().len(), 3);
     }
 
     fn test_extend_builder_gen<O: OffsetBuilderPType>() {

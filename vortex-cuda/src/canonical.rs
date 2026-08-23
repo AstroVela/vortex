@@ -22,24 +22,23 @@ use vortex::array::arrays::struct_::StructDataParts;
 use vortex::array::arrays::varbinview::BinaryView;
 use vortex::array::arrays::varbinview::VarBinViewDataParts;
 use vortex::array::buffer::BufferHandle;
-use vortex::array::legacy_session;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
+use vortex::session::VortexSession;
 
 /// Move all canonical data from to_host from device.
 #[async_trait]
 pub trait CanonicalCudaExt {
-    async fn into_host(self) -> VortexResult<Self>
+    async fn into_host(self, session: &VortexSession) -> VortexResult<Self>
     where
         Self: Sized;
 }
 
 #[async_trait]
 impl CanonicalCudaExt for Canonical {
-    #[allow(clippy::disallowed_methods)]
-    async fn into_host(self) -> VortexResult<Self> {
+    async fn into_host(self, session: &VortexSession) -> VortexResult<Self> {
         match self {
             Canonical::Struct(struct_array) => {
                 // Children should all be canonical now
@@ -56,8 +55,8 @@ impl CanonicalCudaExt for Canonical {
                     host_fields.push(
                         field
                             .clone()
-                            .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
-                            .into_host()
+                            .execute::<Canonical>(&mut session.create_execution_ctx())?
+                            .into_host(session)
                             .await?
                             .into_array(),
                     );
@@ -145,8 +144,8 @@ impl CanonicalCudaExt for Canonical {
                 let host_storage = ext
                     .storage_array()
                     .clone()
-                    .execute::<Canonical>(&mut legacy_session().create_execution_ctx())?
-                    .into_host()
+                    .execute::<Canonical>(&mut session.create_execution_ctx())?
+                    .into_host(session)
                     .await?
                     .into_array();
                 Ok(Canonical::Extension(ExtensionArray::new(

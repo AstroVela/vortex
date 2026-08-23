@@ -291,8 +291,7 @@ pub trait ListArrayExt: ListArraySlotsExt {
         )
     }
 
-    #[allow(clippy::disallowed_methods)]
-    fn offset_at(&self, index: usize) -> VortexResult<usize> {
+    fn offset_at(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<usize> {
         vortex_ensure!(
             index <= self.as_ref().len(),
             "Index {index} out of bounds 0..={}",
@@ -305,22 +304,22 @@ pub trait ListArrayExt: ListArraySlotsExt {
             }))
         } else {
             self.offsets()
-                .execute_scalar(index, &mut legacy_session().create_execution_ctx())?
+                .execute_scalar(index, ctx)?
                 .as_primitive()
                 .as_::<usize>()
                 .ok_or_else(|| vortex_error::vortex_err!("offset value does not fit in usize"))
         }
     }
 
-    fn list_elements_at(&self, index: usize) -> VortexResult<ArrayRef> {
-        let start = self.offset_at(index)?;
-        let end = self.offset_at(index + 1)?;
+    fn list_elements_at(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        let start = self.offset_at(index, ctx)?;
+        let end = self.offset_at(index + 1, ctx)?;
         self.elements().slice(start..end)
     }
 
-    fn sliced_elements(&self) -> VortexResult<ArrayRef> {
-        let start = self.offset_at(0)?;
-        let end = self.offset_at(self.as_ref().len())?;
+    fn sliced_elements(&self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        let start = self.offset_at(0, ctx)?;
+        let end = self.offset_at(self.as_ref().len(), ctx)?;
         self.elements().slice(start..end)
     }
 
@@ -329,7 +328,7 @@ pub trait ListArrayExt: ListArraySlotsExt {
     }
 
     fn reset_offsets(&self, recurse: bool, ctx: &mut ExecutionCtx) -> VortexResult<Array<List>> {
-        let mut elements = self.sliced_elements()?;
+        let mut elements = self.sliced_elements(ctx)?;
         if recurse && elements.is_canonical() {
             let compacted = elements
                 .execute::<Canonical>(ctx)?

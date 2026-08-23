@@ -126,7 +126,7 @@ impl CudaExecute for FSSTExecutor {
             .clone()
             .execute_cuda(ctx)
             .await?
-            .into_host()
+            .into_host(ctx.session())
             .await?
             .into_primitive();
         let codes_offsets = fsst
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(gpu_result.dtype(), &dtype);
         assert_device_resident(&gpu_result);
 
-        let host_result = gpu_result.into_host().await?.into_array();
+        let host_result = gpu_result.into_host(ctx.session()).await?.into_array();
         assert_arrays_eq!(fsst_array, host_result, &mut ctx);
         Ok(())
     }
@@ -521,7 +521,7 @@ mod tests {
 
         let gpu_result = FSSTExecutor.execute(sliced.clone(), &mut cuda_ctx).await?;
         assert_device_resident(&gpu_result);
-        let host_result = gpu_result.into_host().await?.into_array();
+        let host_result = gpu_result.into_host(ctx.session()).await?.into_array();
         assert_arrays_eq!(sliced, host_result, &mut ctx);
         Ok(())
     }
@@ -633,7 +633,7 @@ mod tests {
             .vortex_expect("GPU decompression failed");
         assert_device_resident(&gpu_result);
 
-        let host_result = gpu_result.into_host().await?.into_array();
+        let host_result = gpu_result.into_host(ctx.session()).await?.into_array();
         assert_arrays_eq!(fsst_array, host_result, &mut ctx);
         Ok(())
     }

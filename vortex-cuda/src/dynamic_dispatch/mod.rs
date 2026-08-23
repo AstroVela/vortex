@@ -1153,7 +1153,9 @@ mod tests {
         // Execute through the hybrid dispatch path (handles widening).
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<u32> = codes.iter().map(|&c| dict_values[c as usize]).collect();
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
@@ -1186,7 +1188,9 @@ mod tests {
         // Execute through the hybrid dispatch path (handles widening).
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<u32> = codes.iter().map(|&c| dict_values[c as usize]).collect();
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
@@ -1218,7 +1222,9 @@ mod tests {
 
         // Execute through the non-fused dispatch path.
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<u32> = (0..len as u64)
             .map(|i| {
@@ -1626,7 +1632,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut cpu_ctx);
@@ -1659,7 +1667,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut cpu_ctx);
@@ -1690,7 +1700,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut cpu_ctx);
@@ -1703,7 +1715,9 @@ mod tests {
         let primitive = PrimitiveArray::new(Buffer::from(values), NonNullable);
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&primitive.into_array(), &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
         assert_eq!(result.len(), 0);
         Ok(())
     }
@@ -1723,7 +1737,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected = PrimitiveArray::new(Buffer::from(values), NonNullable).into_array();
         assert_arrays_eq!(expected, result, &mut cpu_ctx);
@@ -1754,7 +1770,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut ctx);
@@ -1919,7 +1937,9 @@ mod tests {
         // GPU decode.
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let gpu = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let gpu = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         assert_arrays_eq!(cpu, gpu, &mut ctx);
 
@@ -1962,7 +1982,7 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?;
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session()).await?;
         let result_prim = result.as_primitive();
         let actual: Vec<f64> = result_prim.as_slice::<f64>().to_vec();
         for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -2027,7 +2047,9 @@ mod tests {
         let sliced = alp.slice(100..3000)?;
 
         let canonical = try_gpu_dispatch(&sliced, &mut cuda_ctx).await?;
-        let gpu = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let gpu = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let mut expected = vec![0.0f64; sliced.len()];
         expected[500 - 100] = std::f64::consts::PI;
@@ -2064,7 +2086,9 @@ mod tests {
         );
 
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<u16> = (0..len as u64)
             .map(|i| {
@@ -2111,7 +2135,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<u32> = codes.iter().map(|&c| dict_values[c as usize]).collect();
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
@@ -2152,7 +2178,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<V> = codes.iter().map(|&c| dict_values[c as usize]).collect();
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
@@ -2193,7 +2221,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<V> = codes.iter().map(|&c| dict_values[c as usize]).collect();
         let expected_arr = PrimitiveArray::new(Buffer::from(expected), NonNullable).into_array();
@@ -2243,7 +2273,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let mut expected: Vec<V> = Vec::with_capacity(len);
         let mut prev: u64 = 0;
@@ -2285,7 +2317,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&array, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let mut expected: Vec<u32> = Vec::with_capacity(len);
         let mut prev = 0u16;
@@ -2318,7 +2352,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&sliced, &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected: Vec<u32> = codes[1000..3000]
             .iter()
@@ -2421,7 +2457,7 @@ mod tests {
 
         let gpu = try_gpu_dispatch(&array.clone().into_array(), &mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -2474,7 +2510,7 @@ mod tests {
 
         let gpu = try_gpu_dispatch(&for_arr.into_array(), &mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -2491,7 +2527,7 @@ mod tests {
 
         let result = try_gpu_dispatch(&array.into_array(), &mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?;
 
         let prim = result.into_primitive();
@@ -2511,7 +2547,7 @@ mod tests {
 
         let gpu = try_gpu_dispatch(&array.clone().into_array(), &mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -2551,7 +2587,7 @@ mod tests {
             .into_array()
             .execute_cuda(&mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -2587,7 +2623,7 @@ mod tests {
             .into_array()
             .execute_cuda(&mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
@@ -2849,7 +2885,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&bp.into_array(), &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(values), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut ctx);
@@ -2879,7 +2917,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&bp.into_array(), &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(values), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut cpu_ctx);
@@ -2909,7 +2949,9 @@ mod tests {
 
         let mut cuda_ctx = CudaSession::create_execution_ctx(&cuda_session())?;
         let canonical = try_gpu_dispatch(&bp.into_array(), &mut cuda_ctx).await?;
-        let result = CanonicalCudaExt::into_host(canonical).await?.into_array();
+        let result = CanonicalCudaExt::into_host(canonical, cuda_ctx.session())
+            .await?
+            .into_array();
 
         let expected_arr = PrimitiveArray::new(Buffer::from(values), NonNullable).into_array();
         assert_arrays_eq!(expected_arr, result, &mut cpu_ctx);
@@ -3037,7 +3079,7 @@ mod tests {
 
         let gpu = try_gpu_dispatch(&bp.into_array(), &mut cuda_ctx)
             .await?
-            .into_host()
+            .into_host(cuda_ctx.session())
             .await?
             .into_array();
 
