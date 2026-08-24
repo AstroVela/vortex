@@ -39,7 +39,15 @@ pub struct FlatReader {
     name: Arc<str>,
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
+    /// The in-flight (or still-referenced) read+decode of this layout's segment. Filter and
+    /// projection evaluations — and concurrent splits over the same chunk — share one physical
+    /// read and one decode through this handle. The weak reference means nothing is retained
+    /// once every consumer has dropped its clone: a later evaluation re-reads instead of holding
+    /// the decoded chunk for the scan's lifetime.
+    array: parking_lot::Mutex<Option<futures::future::WeakShared<ArrayFutureInner>>>,
 }
+
+type ArrayFutureInner = BoxFuture<'static, Result<ArrayRef, Arc<vortex_error::VortexError>>>;
 
 impl FlatReader {
     pub(crate) fn new(
@@ -53,24 +61,26 @@ impl FlatReader {
             name,
             segment_source,
             session,
+            array: parking_lot::Mutex::new(None),
         }
     }
 
-    /// Register the segment request and return a future that would resolve into the deserialised array.
+    /// Return the shared future that resolves into the deserialised array, deduplicating the
+    /// segment read and decode across every live consumer.
     fn array_future(&self) -> SharedArrayFuture {
+        let mut slot = self.array.lock();
+        if let Some(shared) = slot.as_ref().and_then(futures::future::WeakShared::upgrade) {
+            return shared;
+        }
+
         let row_count =
             usize::try_from(self.layout.row_count()).vortex_expect("row count must fit in usize");
-
-        // We create the segment_fut here to ensure we give the segment reader visibility into
-        // how to prioritize this segment, even if the `array` future has already been initialized.
-        // This is gross... see the function's TODO for a maybe better solution?
         let segment_fut = self.segment_source.request(self.layout.segment_id());
-
         let ctx = self.layout.array_ctx().clone();
         let session = self.session.clone();
         let dtype = self.layout.dtype().clone();
         let array_tree = self.layout.array_tree().cloned();
-        async move {
+        let shared = async move {
             let segment = segment_fut.await?;
             let parts = if let Some(array_tree) = array_tree {
                 // Use the pre-stored flatbuffer from layout metadata combined with segment buffers.
@@ -84,7 +94,9 @@ impl FlatReader {
                 .map_err(Arc::new)
         }
         .boxed()
-        .shared()
+        .shared();
+        *slot = shared.downgrade();
+        shared
     }
 }
 
@@ -368,6 +380,82 @@ mod test {
 
             let expected = PrimitiveArray::new(buffer![3i32, 4], Validity::AllValid).into_array();
             assert_arrays_eq!(result, expected, &mut ctx);
+        })
+    }
+
+    #[test]
+    fn concurrent_evaluations_share_one_segment_read() -> VortexResult<()> {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use crate::segments::SegmentFuture;
+        use crate::segments::SegmentId;
+        use crate::segments::SegmentSource;
+
+        struct CountingSegments {
+            inner: Arc<TestSegments>,
+            requests: AtomicUsize,
+        }
+
+        impl SegmentSource for CountingSegments {
+            fn request(&self, id: SegmentId) -> SegmentFuture {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                self.inner.request(id)
+            }
+        }
+
+        block_on(|handle| async {
+            let session = new_session().with_handle(handle);
+            let array_ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
+            let (ptr, eof) = SequenceId::root().split();
+            let array =
+                PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
+            let layout = FlatLayoutStrategy::default()
+                .write_stream(
+                    array_ctx.into(),
+                    Arc::<TestSegments>::clone(&segments),
+                    array.to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await?;
+            let source = Arc::new(CountingSegments {
+                inner: segments,
+                requests: AtomicUsize::new(0),
+            });
+            let reader = layout.new_reader(
+                "".into(),
+                Arc::<CountingSegments>::clone(&source),
+                &session,
+                &Default::default(),
+            )?;
+            let expr = root().bind(reader.dtype())?;
+
+            // Filter and projection evaluations created together must share one read.
+            let filter = reader.filter_evaluation(
+                &(0..layout.row_count()),
+                &gt(root(), lit(2)).bind(reader.dtype())?,
+                MaskFuture::new_true(layout.row_count().try_into()?),
+            )?;
+            let projection =
+                reader.projection_evaluation(&(0..layout.row_count()), &expr, filter.clone())?;
+            drop(filter);
+            let result = projection.await?;
+            assert_eq!(result.len(), 3);
+            assert_eq!(source.requests.load(Ordering::Relaxed), 1);
+
+            // With every consumer dropped, nothing is retained: a fresh evaluation re-reads.
+            let again = reader
+                .projection_evaluation(
+                    &(0..layout.row_count()),
+                    &expr,
+                    MaskFuture::new_true(layout.row_count().try_into()?),
+                )?
+                .await?;
+            assert_eq!(again.len(), 5);
+            assert_eq!(source.requests.load(Ordering::Relaxed), 2);
+            Ok(())
         })
     }
 }
