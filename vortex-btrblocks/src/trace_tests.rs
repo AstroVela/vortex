@@ -358,6 +358,15 @@ fn trace_scan_like_on_compressed_comment() -> VortexResult<()> {
     // No reduce rule rewrites a like over FSST; the FSST like kernel compiles the pattern and
     // matches in compressed space at execution time.
     insta::assert_snapshot!(optimized.trace.to_string(), @"");
+    #[cfg(not(feature = "unstable_encodings"))]
+    insta::assert_snapshot!(executed.trace.to_string(), @"
+    execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
+      iter 0 current=vortex.like(bool, len=4096) builder_active=false
+        child_execute_parent session[0]:execute_parent_fn slot=0 parent=vortex.like(bool, len=4096) child=vortex.fsst(utf8, len=4096) -> vortex.bool(bool, len=4096)
+      iter 1 current=vortex.bool(bool, len=4096) builder_active=false
+      return output=vortex.bool(bool, len=4096)
+    ");
+    #[cfg(feature = "unstable_encodings")]
     insta::assert_snapshot!(executed.trace.to_string(), @"
     execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
       iter 0 current=vortex.like(bool, len=4096) builder_active=false

@@ -9,7 +9,9 @@ use std::sync::LazyLock;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::ArrayEq;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::EqMode;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -20,6 +22,7 @@ use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProviderExt;
 use vortex_array::validity::Validity;
+#[cfg(feature = "unstable_encodings")]
 use vortex_block_residual::BlockResidual;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
@@ -59,6 +62,7 @@ fn test_for_compressed() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_compressed() -> VortexResult<()> {
     let values = (0..8_192)
@@ -86,6 +90,7 @@ fn test_block_residual_compressed() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_ignores_null_payloads() -> VortexResult<()> {
     let values = (0usize..8_192)
@@ -112,6 +117,7 @@ fn test_block_residual_ignores_null_payloads() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_compresses_16_bit_integers() -> VortexResult<()> {
     let signed_values = (0..8_192)
@@ -148,6 +154,7 @@ fn test_block_residual_compresses_16_bit_integers() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_compresses_8_bit_integers() -> VortexResult<()> {
     let unsigned_values = (0..16_384)
@@ -184,6 +191,7 @@ fn test_block_residual_compresses_8_bit_integers() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_rejects_weak_8_bit_gain() -> VortexResult<()> {
     let unsigned_values = (0..16_384)
@@ -220,6 +228,7 @@ fn test_block_residual_rejects_weak_8_bit_gain() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_rejects_uniform_8_bit_integers() -> VortexResult<()> {
     let unsigned_values = (0..16_384)
@@ -252,6 +261,7 @@ fn test_block_residual_rejects_uniform_8_bit_integers() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_rejects_dense_patches() -> VortexResult<()> {
     let values = (0..8_192_u32).map(|index| if index % 4 == 0 { u32::MAX - index } else { 42 });
@@ -267,6 +277,7 @@ fn test_block_residual_rejects_dense_patches() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_composes_with_sparse() -> VortexResult<()> {
     let values = (0..65_536_usize).map(|index| {
@@ -292,6 +303,7 @@ fn test_block_residual_composes_with_sparse() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_composes_with_runend() -> VortexResult<()> {
     let values = (0..65_536_usize).map(|index| {
@@ -313,6 +325,7 @@ fn test_block_residual_composes_with_runend() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 fn contains_block_residual(array: &vortex_array::ArrayRef) -> bool {
     array.is::<BlockResidual>() || array.children().iter().any(contains_block_residual)
 }

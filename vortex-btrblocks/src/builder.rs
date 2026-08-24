@@ -31,6 +31,7 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
     &integer::BitPackingScheme,
+    #[cfg(feature = "unstable_encodings")]
     &integer::BlockResidualScheme,
     &integer::SparseScheme,
     &integer::IntDictScheme,
@@ -45,7 +46,9 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     &float::ALPScheme,
     &float::ALPRDScheme,
+    #[cfg(feature = "unstable_encodings")]
     &float::FloatQuantScheme,
+    #[cfg(feature = "unstable_encodings")]
     &float::OrderedBlockResidualScheme,
     &float::FloatDictScheme,
     &float::NullDominatedSparseScheme,
@@ -254,6 +257,23 @@ mod tests {
     }
 
     #[test]
+    fn preview_numeric_schemes_follow_unstable_feature() {
+        let builder = BtrBlocksCompressorBuilder::default();
+        for scheme_id in [
+            integer::BlockResidualScheme.id(),
+            float::FloatQuantScheme.id(),
+            float::OrderedBlockResidualScheme.id(),
+        ] {
+            let present = builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == scheme_id);
+            assert_eq!(present, cfg!(feature = "unstable_encodings"));
+        }
+    }
+
+    #[cfg(feature = "unstable_encodings")]
+    #[test]
     fn float_quant_can_be_excluded() {
         let builder =
             BtrBlocksCompressorBuilder::default().exclude_schemes([float::FloatQuantScheme.id()]);
@@ -288,9 +308,18 @@ mod tests {
 
     #[rstest]
     #[case(float::ALPRDScheme.id())]
-    #[case(float::FloatQuantScheme.id())]
-    #[case(float::OrderedBlockResidualScheme.id())]
-    #[case(integer::BlockResidualScheme.id())]
+    #[cfg_attr(
+        feature = "unstable_encodings",
+        case(float::FloatQuantScheme.id())
+    )]
+    #[cfg_attr(
+        feature = "unstable_encodings",
+        case(float::OrderedBlockResidualScheme.id())
+    )]
+    #[cfg_attr(
+        feature = "unstable_encodings",
+        case(integer::BlockResidualScheme.id())
+    )]
     fn cuda_compatible_excludes_non_cuda_schemes(#[case] scheme_id: SchemeId) {
         let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
         assert!(

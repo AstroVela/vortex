@@ -3,11 +3,14 @@
 
 //! Tests to verify that each float compression scheme produces the expected encoding.
 
+#[cfg(feature = "unstable_encodings")]
 use std::f64::consts::TAU;
 use std::sync::LazyLock;
 
 use vortex_alp::ALP;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::ArrayEq;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::EqMode;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -20,11 +23,15 @@ use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::half::f16;
 use vortex_array::validity::Validity;
+#[cfg(feature = "unstable_encodings")]
 use vortex_block_residual::BlockResidual;
+#[cfg(feature = "unstable_encodings")]
 use vortex_block_residual::OrderedFloat;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+#[cfg(feature = "unstable_encodings")]
 use vortex_fastlanes::BitPacked;
+#[cfg(feature = "unstable_encodings")]
 use vortex_fastlanes::BitPackedArrayExt;
 use vortex_float_quant::FloatQuant;
 use vortex_float_quant::FloatQuantArraySlotsExt;
@@ -42,6 +49,7 @@ use crate::schemes::integer::DeltaScheme;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_quantized_f16_uses_float_quant() -> VortexResult<()> {
     let values = (0_u16..16_384)
@@ -124,6 +132,7 @@ fn test_null_dominated_compressed() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_widened_f32_uses_float_quant() -> VortexResult<()> {
     let values = (0u32..16_384)
@@ -140,6 +149,7 @@ fn test_widened_f32_uses_float_quant() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_nonzero_secondary_uses_float_quant() -> VortexResult<()> {
     let values = (0u32..65_536)
@@ -168,6 +178,7 @@ fn test_nonzero_secondary_uses_float_quant() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_float_quant_ignores_null_payloads() -> VortexResult<()> {
     let values = (0u32..16_384)
@@ -193,6 +204,7 @@ fn test_float_quant_ignores_null_payloads() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_f32_does_not_use_float_quant() -> VortexResult<()> {
     let values = (0u32..16_384)
@@ -208,6 +220,7 @@ fn test_f32_does_not_use_float_quant() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_quantized_f32_uses_float_quant() -> VortexResult<()> {
     let values = (0_u32..65_536)
@@ -225,6 +238,7 @@ fn test_quantized_f32_uses_float_quant() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_repeated_f64_prefers_existing_scheme() -> VortexResult<()> {
     let values = (0u32..16_384)
@@ -237,6 +251,7 @@ fn test_repeated_f64_prefers_existing_scheme() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
     fn uniform(state: &mut u64) -> f64 {
@@ -264,6 +279,7 @@ fn test_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_f32_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
     let values = (0_u32..65_536)
@@ -286,6 +302,7 @@ fn test_f32_random_walk_uses_ordered_block_residual() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_block_residual_composes_with_alp() -> VortexResult<()> {
     let values = (0..65_536_usize).map(|index| {

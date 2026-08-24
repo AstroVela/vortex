@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+#[cfg(feature = "unstable_encodings")]
 use std::f64::consts::TAU;
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::ChunkedArray;
@@ -18,7 +20,9 @@ use vortex_array::dtype::PType;
 use vortex_array::field_path;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::stream::ArrayStreamExt;
+#[cfg(feature = "unstable_encodings")]
 use vortex_block_residual::BlockResidual;
+#[cfg(feature = "unstable_encodings")]
 use vortex_block_residual::OrderedFloat;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
@@ -37,6 +41,7 @@ use vortex_error::vortex_err;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_file::WriteStrategyBuilder;
+#[cfg(feature = "unstable_encodings")]
 use vortex_float_quant::FloatQuant;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::LayoutStrategy;
@@ -719,6 +724,7 @@ async fn default_strategy_round_trip_uses_only_enabled_encodings() -> VortexResu
         .await
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[tokio::test]
 async fn numeric_draft_writer_round_trips_float_quant() -> VortexResult<()> {
     use crate::VortexSessionDefault;
@@ -752,6 +758,7 @@ async fn numeric_draft_writer_round_trips_float_quant() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[tokio::test]
 async fn numeric_draft_writer_round_trips_ordered_block_residual() -> VortexResult<()> {
     use crate::VortexSessionDefault;
