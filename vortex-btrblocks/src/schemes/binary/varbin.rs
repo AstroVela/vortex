@@ -20,6 +20,7 @@ use vortex_array::arrays::VarBin;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::arrays::varbin::VarBinArraySlotsExt;
+use vortex_array::builders::VarBinBuilder;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::SchemeExt;
@@ -67,16 +68,13 @@ impl Scheme for VarBinScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let view = data.array_as_varbinview().into_owned();
-        let len = view.len();
-        // Materialize validity once; a per-element accessor here would be quadratic-ish in a
-        // loop this hot.
-        let mask = view.validity()?.execute_mask(len, exec_ctx)?;
-
-        let varbin = VarBinArray::from_iter(
-            (0..len).map(|i| mask.value(i).then(|| view.bytes_at(i).as_slice().to_vec())),
-            view.dtype().clone(),
-        );
+        // `append_to_builder` resolves the views slice and data buffers once and appends
+        // borrowed slices into a single pre-sized allocation. Iterating the array per element
+        // instead would clone a buffer handle and allocate for every value.
+        let array = data.array();
+        let mut builder = VarBinBuilder::<u64>::with_capacity(array.dtype().clone(), array.len());
+        array.append_to_builder(&mut builder, exec_ctx)?;
+        let varbin = builder.finish_into_varbin();
 
         let offsets = varbin
             .offsets()
