@@ -53,6 +53,12 @@ impl Scheme for OnPairScheme {
         vec![OnPair.id()]
     }
 
+    /// Decoding OnPair costs real work per value, unlike a raw varbin/varbinview handoff, so a
+    /// marginal size win is a net loss on every subsequent read. Require a meaningful gain.
+    fn min_gain(&self) -> f64 {
+        0.1
+    }
+
     /// 4 primitive slot children flow through the cascading compressor:
     /// `dict_offsets` (u32 → typically `FoR`/`BitPacked`), `codes` (u16 →
     /// usually `FastLanes::BitPacked` after scheme selection),

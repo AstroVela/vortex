@@ -54,6 +54,12 @@ impl Scheme for FSSTScheme {
         vec![FSST.id(), VarBin.id()]
     }
 
+    /// Decoding FSST costs real work per value, unlike a raw varbin/varbinview handoff, so a
+    /// marginal size win is a net loss on every subsequent read. Require a meaningful gain.
+    fn min_gain(&self) -> f64 {
+        0.1
+    }
+
     /// Children: lengths=0, code_offsets=1.
     fn num_children(&self) -> usize {
         2

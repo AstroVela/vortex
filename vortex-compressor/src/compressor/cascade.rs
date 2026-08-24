@@ -317,7 +317,11 @@ impl CascadingCompressor {
         let after_nbytes = compressed.nbytes();
         let actual_ratio = (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);
 
-        let accepted = after_nbytes < before_nbytes;
+        // Accept only when the winner clears its own gain floor. A scheme that barely shrinks the
+        // array still charges full decode price on every read, so `min_gain` lets expensive schemes
+        // (FSST, zstd) decline work that is not worth materializing later, while cheap ones keep
+        // the default floor of zero.
+        let accepted = (after_nbytes as f64) <= (before_nbytes as f64) * (1.0 - winner.min_gain());
 
         trace::record_winner_compress_result(
             after_nbytes,

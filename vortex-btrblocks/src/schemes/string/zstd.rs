@@ -35,6 +35,12 @@ impl Scheme for ZstdScheme {
         vec![vortex_zstd::Zstd.id()]
     }
 
+    /// Decoding zstd costs real work per value, unlike a raw varbin/varbinview handoff, so a
+    /// marginal size win is a net loss on every subsequent read. Require a meaningful gain.
+    fn min_gain(&self) -> f64 {
+        0.1
+    }
+
     fn expected_compression_ratio(
         &self,
         _data: &ArrayAndStats,

@@ -144,6 +144,19 @@ pub trait Scheme: Debug + Send + Sync {
         0
     }
 
+    /// The minimum fraction of bytes this scheme must save for its output to be accepted.
+    ///
+    /// Acceptance is a cost/benefit decision, not a pure size comparison: a scheme that shaves a
+    /// few percent off an array it cannot really compress still charges full decode price on every
+    /// read. Materializing raw `varbin` to Arrow is a pointer handoff, while FSST-decoding the same
+    /// data costs tens of milliseconds per 200k values, so a 2-3% saving is paid back only when
+    /// storage delivers under ~15 MB/s. Schemes whose output decodes essentially for free (and
+    /// those that unlock pruning or pushdown) keep the default floor of zero; schemes that add real
+    /// per-value decode work should demand a gain large enough to be worth it.
+    fn min_gain(&self) -> f64 {
+        0.0
+    }
+
     /// Schemes to exclude from specific children's subtrees (push direction).
     ///
     /// Each rule says: "when I cascade through child Y, do not use scheme X anywhere in that
