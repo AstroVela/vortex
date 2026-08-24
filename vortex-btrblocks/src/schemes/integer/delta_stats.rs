@@ -111,14 +111,14 @@ impl DeltaStats {
 
     /// Estimated bits per value to store the lag-1 residuals, exceptions included.
     ///
-    /// This excludes the one bit per value that Delta's bases cost.
+    /// This excludes Delta's bases; the scheme charges those separately.
     pub fn delta_bits_per_value(&self) -> f64 {
         self.bits_per_value(&self.delta_widths, self.delta_span, self.delta_count)
     }
 
     /// Estimated bits per value to store the lag-2 residuals, exceptions included.
     ///
-    /// This excludes the two bits per value that two layers of Delta bases cost.
+    /// This excludes the bases of both Delta layers.
     pub fn delta_of_delta_bits_per_value(&self) -> f64 {
         self.bits_per_value(&self.dod_widths, self.dod_span, self.dod_count)
     }
