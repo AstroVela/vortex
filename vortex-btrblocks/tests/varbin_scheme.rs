@@ -105,3 +105,42 @@ fn varbin_scheme_shrinks_binary() -> VortexResult<()> {
     }
     Ok(())
 }
+
+/// Same bytes, two dtypes: Binary takes the `VarBinScheme` path, Utf8 takes FSST.
+#[test]
+fn fsst_versus_varbin_on_identical_bytes() -> VortexResult<()> {
+    let compressor = BtrBlocksCompressorBuilder::default().build();
+    let mut seed = 99u64;
+
+    let shared_prefix: Vec<String> = (0..N).map(|i| format!("PREFIX_{i:09}")).collect();
+    let hex_random: Vec<String> = (0..N)
+        .map(|_| {
+            (0..16)
+                .map(|_| format!("{:02x}", (lcg(&mut seed) >> 33) as u8))
+                .collect()
+        })
+        .collect();
+
+    println!(
+        "{:<20}{:>14}{:>14}{:>9}",
+        "case", "binary", "utf8(fsst)", "fsst/bin"
+    );
+    for (name, vals) in [
+        ("shared prefix", &shared_prefix),
+        ("hex random", &hex_random),
+    ] {
+        let as_bin = VarBinViewArray::from_iter_bin(vals.iter().map(|v| v.as_bytes())).into_array();
+        let as_str = VarBinViewArray::from_iter_str(vals.iter().map(|v| v.as_str())).into_array();
+
+        let bin_bytes = {
+            let mut ctx = SESSION.create_execution_ctx();
+            compressor.compress(&as_bin, &mut ctx)?.nbytes()
+        };
+        let utf8_bytes = {
+            let mut ctx = SESSION.create_execution_ctx();
+            compressor.compress(&as_str, &mut ctx)?.nbytes()
+        };
+        println!("{:<20}{:>14}{:>14}{:>9.2}", name, bin_bytes, utf8_bytes, utf8_bytes as f64 / bin_bytes as f64);
+    }
+    Ok(())
+}
