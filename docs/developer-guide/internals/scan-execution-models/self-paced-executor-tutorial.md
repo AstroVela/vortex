@@ -1,201 +1,287 @@
-# From 2.5x Slower to 2.5x Faster: The Self-Paced Executor, Step by Step
+# The Self-Paced Execution Model, From First Principles
 
-This is a tutorial-style walkthrough of one day of experiments on the restricted self-paced scan
-executor, written to be read top to bottom. Each section introduces one idea, the measurement
-that motivated it, and how the result changed the design. The
-[findings report](self-paced-plan-exec-findings.md) holds the full tables; the
-[handover](self-paced-plan-exec-handover.md) holds the current code map.
+This tutorial teaches the experimental self-paced execution model to a reader who knows Layout
+V1 and nothing else. It introduces one concept at a time, in the order the experiments
+introduced them, and ties each back to its V1 counterpart. The
+[findings report](self-paced-plan-exec-findings.md) has every benchmark table; the
+[handover](self-paced-plan-exec-handover.md) has the code map. Here the goal is understanding.
 
-All numbers are `self-paced / V1` wall-time ratios on a 16-core, 30 GB host, pinned with
-`taskset -c 0-15`, under the fair natural-split contract (same serialized bytes, same query
-object, validated row counts and ordered output hashes, alternating iterations, medians).
-Headline workload: FineWeb Q06, a three-conjunct selective scan over 14.9M rows.
+## 1. What you already know: V1 in three sentences
 
-## 0. Starting point: reproduce before touching anything
+In V1, a scan asks the layout tree for its **splits** (`register_splits` unions the chunk
+boundaries of every field the query touches), then turns each split into an independent task on
+the Tokio runtime. Each task calls `filter_evaluation(row_range, expr, mask)` to get a survivor
+mask and `projection_evaluation(row_range, expr, mask)` to get the output rows, and each layout
+node (struct, chunked, flat) implements those vtable methods by translating the row range into
+its children's coordinates. A 15M-row file with ~1,800 splits therefore becomes ~1,800 futures,
+each a black box that reads, decodes, filters, and projects its own little row range.
 
-The handover left the executor at **2.19x slower** than V1 on Q06 (2.53x on this host). Before
-changing code we reproduced the whole environment: the 15 FineWeb parquet shards, and — because
-the required "physical split catalog" generator was never committed — a new audit tool
-(`vortex-file/examples/fineweb_split_audit.rs`) that writes each dataset with the default Vortex
-writer and records every field's natural chunk boundaries. The regenerated catalogs matched the
-documented counts exactly (FineWeb 1,823/2,527 splits, TPC-H 458), which told us the environment
-was faithful and the old numbers were real.
+Hold on to two properties of this design, because the whole experiment is a reaction to them:
 
-**Idea introduced:** never optimize against an unreproduced baseline.
+- **The unit of work is the split**, and there are thousands of them. Every split pays the
+  future/scheduling machinery, and two splits that need the same segment don't know about each
+  other.
+- **Filtering and projecting are one opaque call per split.** The engine cannot see "predicate
+  A eliminated 99% of rows, so don't bother reading column B for this region" across the
+  boundary of a split, and it cannot share partially-computed filter state.
 
-## 1. Measure the coordinator before believing in it
+## 2. The experiment's question, and its restricted world
 
-The docs *claimed* the single coordinator thread was the bottleneck. We added phase timing
-(`VORTEX_SELF_PACED_PHASE_TIMING=1`) attributing coordinator wall time to drain / advance /
-schedule / dispatch / inline / wait, plus a queue-dwell timestamp on every worker completion.
+The self-paced experiment asks: if execution could see *inside* the scan — which rows are still
+alive, which segments serve which predicates — could it do less work and go faster?
 
-Result: the coordinator was **89% busy** (advance 34%, completion handling 28%, dispatch 24%)
-while finished worker results waited ~17us each to be adopted. The workers were starving behind
-the coordinator, not the reverse.
+To make that tractable it restricts the world to one layout shape:
+**`Struct(Chunked(Flat<i64>))`** — a struct of non-nullable i64 fields, each field a sequence of
+flat chunks, all fields' chunks aligned at the same row boundaries. No compression, no nulls, no
+strings (string datasets are ingested by hashing strings to i64). Real datasets (FineWeb,
+ClickBench, TPC-H lineitem, gnomAD genomics) are converted into this shape so the *scheduling*
+question can be studied without the *encoding* question. Everything below lives inside this
+restriction; the last section says what lifting it takes.
 
-**Idea introduced:** turn a hypothesis into a phase budget before acting on it.
+## 3. Concept: the plan (`SourcePlan`)
 
-## 2. Work reduction does not fix a serialized critical path
+V1 discovers structure lazily by walking reader objects. The experiment instead builds one
+explicit, immutable description of the file up front:
 
-Guided by code audits, we applied the obvious micro-optimizations: allocation-free mask
-adoption (a fused and-count), batching resource joins and fragment transitions, skipping a
-useless scheduler pass, an all-true selection early exit. All correct, all measurable in
-counters — and Q06 moved only **2.53x -> 2.32x**.
+```
+SourcePlan
+├── field_names: ["url_hash", "text_len", ...]
+├── row_count: 14_868_862
+└── chunks: [ChunkPlan { root_coverage: 0..8192, fields: [FlatPlan, FlatPlan, ...] }, ...]
+      where FlatPlan = { field, segment_id, root_coverage, row_count, encoding }
+```
 
-**Idea introduced:** shrinking the work on a serialized path barely moves wall time; you have to
-parallelize or delete the path.
+A `FlatPlan` is one physical leaf: "rows 8192..16384 of field 3 live in segment 1042". That's
+the whole plan — pure metadata, no data, built once per file. Everything the executor does is
+phrased against it. (V1 analogue: the information `register_splits` and the readers hold
+implicitly, made explicit and queryable.)
 
-## 3. Shard the coordinator (2.32x -> 1.40x)
+**Rule learned the hard way (section 12): planning does no compute.** The plan describes; the
+executor works.
 
-`VORTEX_SELF_PACED_SHARDS=N` splits the morsel list into N contiguous groups, each with its own
-`Execution` and coordinator thread, sharing one worker pool. Because morsel boundaries align
-with natural splits, no segment straddles shards: the sharded run read byte-identical I/O.
-Four shards was the sweet spot (2 -> 1.64, 4 -> **1.40**, 8 -> 1.44).
+## 4. Concept: the morsel
 
-**Idea introduced:** most coordination state is morsel-local; partitioning it is nearly free.
+The **morsel** is the self-paced unit of scheduling *and* output: a contiguous root-row range,
+formed by merging 16 consecutive natural splits (so ~1,800 V1 splits become ~116 morsels). A
+morsel may span several chunks. One morsel produces exactly one output batch:
 
-## 4. Delete the coordinator entirely: owned mode (1.40x -> 0.79x)
+```
+ExecBatch { coverage: 524288..655360, selection: BoolArray, array: StructArray }
+```
 
-If sharded coordinators work, why have a coordinator/worker split at all? "Owned" mode runs 16
-threads, each *both* coordinating and evaluating its own morsel group inline — no pool, no
-completion channel, no dispatch, no queue dwell, and the thread count now exactly matches V1's.
-Q06 flipped to a **win (0.79)** and 25 of 28 workloads won.
+Why merge? Each unit of work pays fixed machinery cost; fewer, bigger units amortize it. Why
+not merge everything into one? Parallelism needs at least as many units as cores, and output
+should stream. The experiments ended with an *adaptive* merge (`clamp(splits/32, 1, 16)`)
+because a fixed 16 collapsed compact datasets (8 splits -> 1 morsel -> 1 core).
 
-**Idea introduced:** morsel-driven self-coordination; cross-thread communication was the cost,
-not the coordination logic itself.
+**The fairness contract** for every number in these docs: V1 runs over the *unmerged* natural
+splits, exactly as production V1 would; only self-paced gets morsels; both scan the same
+serialized bytes with the same query, and row counts plus an ordered output hash are validated
+before any timing.
 
-## 5. Make "no caching" an enforced invariant, not a claim
+## 5. Concept: demand
 
-Every timed iteration now must re-read at least its cold warmup's unique-segment byte floor
-(`assert_cold_scan_io`), with byte-exactness required of self-paced under deterministic demand
-policies, and per-iteration row counts checked against the warmup. This immediately caught a
-real V1 behavior (dropped duplicate in-flight reads under-counting bytes ~0.01%) and later had
-to be scoped when adaptive ordering legitimately changed which chunks are read.
+This is the one genuinely new idea; everything else is scheduling. **Demand** is a bitmask over
+a morsel's rows meaning "these rows are still alive". It starts all-true and only ever shrinks:
 
-Separately, 17 workloads were validated against **DuckDB over the original parquet** —
-replicating every fixture derivation in SQL — and all 17 output row counts matched exactly.
+```
+morsel rows:      [r0 r1 r2 r3 r4 r5 r6 r7]
+initial demand:    1  1  1  1  1  1  1  1
+after A > 5:       0  1  1  0  1  0  1  1     <- conjunct A evaluated on all 8 rows
+after B == 3:      0  1  0  0  0  0  1  0     <- B evaluated ONLY on the 5 surviving rows
+projection:       read/decode/copy only what covers rows r1, r6
+```
 
-**Idea introduced:** anti-cheat and correctness checks should run on every measurement, and at
-least once against an oracle that shares no code with the thing being tested.
+Three consequences, each worth money:
 
-## 6. The pipeline executor: extensibility and speed from the same design (0.79x -> 0.41x)
+1. **Later predicates evaluate fewer rows.** On FineWeb Q06, later conjuncts evaluated 25K rows
+   and skipped 29.7M row-visits.
+2. **Whole segments can be skipped.** Before reading a chunk for predicate B or for projection,
+   count demand in that chunk's range; zero means don't read it. The empty-result shapes read
+   only the first filter column (1,823 requests vs V1's 7,292).
+3. **The final demand mask *is* the selection** for the output batch — filtering and output
+   selection are the same object.
 
-Owned mode still carried the reactor's slot/offer/claim machinery. The pipeline rebuild kept
-only two seams:
+V1 has a cousin of this (the mask threaded through `filter_evaluation`), but per split and
+opaque; demand is morsel-wide state the executor can inspect, count, and route work by.
 
-- **`MorselPipeline`** — the scheduler's entire knowledge of execution: morsel range in,
-  `ExecBatch` out. Threads self-schedule morsels off one shared atomic cursor (work stealing,
-  order restored by index). New nodes never touch the scheduler.
-- **`DemandPolicy`** — the shared per-morsel demand mask that gates every struct child is
-  computed by a pluggable policy (`cascade`, `eager`, and later `adaptive`).
+## 6. Generation 0: the reactor (what the handover left us)
 
-Row-domain relationships became **executor-vtable methods**: a *down demand transform*
-(`FieldDomain::push_demand`: cut a parent-range demand into priced child segments, so empty
-children are never read) and *up result transforms* (`pull_mask`, `pull_array`). Each
-relationship is modeled on the layout's native metadata — chunked concatenation on the
-chunk-offset prefix sums, the struct identity as one refcounted demand handle shared by all
-children, a future list node on its offsets buffer. Children with arbitrary, mutually unaligned
-chunk boundaries just work (unit-tested).
+The original executor modeled everything as a task graph: every read, decode, predicate,
+selection, and pack was a **task** flowing through offer -> claim -> complete states, with
+results in **slots**, morsels subdivided into per-chunk **fragments** so demand could advance
+segment-by-segment, and cached predicate results (with explicit evaluated-row coverage) shared
+between consumers. One **coordinator** thread owned all mutable state; a 16-thread pool
+evaluated claimed tasks.
 
-Q06 hit **0.41 (11.4 ms)**. The attribution cornerstone is the wide select-all shape (Q09):
-byte-identical physical I/O on both engines, nothing avoidable, and the pipeline is still ~2.5x
-faster — the remaining advantage is scheduling-unit cost (tens of self-scheduled morsels versus
+It was correct, observable, and **2.5x slower than V1** on the headline workload. The rest of
+this tutorial is what the measurements said and what each redesign changed.
+
+## 7. Measure before believing: phase timing
+
+We added wall-clock attribution to the coordinator loop (drain / advance / schedule / dispatch /
+wait) plus a timestamp on every worker completion. Finding: the coordinator was **89% busy**
+(advance 34%, completion handling 28%, dispatch 24%) and each finished worker result sat ~17us
+in a queue before being absorbed. The workers were starving behind the coordinator.
+
+We then applied every micro-optimization the code audits suggested — allocation-free mask
+adoption, batched state transitions, skipped scheduler passes. Q06 moved 2.53x -> 2.32x.
+**Lesson: reducing work on a serialized path barely moves wall time. You must parallelize the
+path or delete it.**
+
+## 8. Generation 1: sharded coordinators (2.32x -> 1.40x)
+
+Observation: almost all coordinator state is *morsel-local*. So partition the morsel list into
+N contiguous groups, give each group its own private `Execution` and coordinator thread, share
+the worker pool. Because morsel boundaries land on chunk boundaries, no segment straddles
+groups — the sharded run performed byte-identical I/O. Four shards: **1.40x**.
+
+## 9. Generation 2: owned execution (1.40x -> 0.79x)
+
+If four self-contained coordinators work, the coordinator/worker split itself is the question.
+**Owned mode**: 16 threads, each owns a morsel group and runs the *whole* loop inline —
+coordinates its own demand state and executes every read, decode, predicate, and selection
+itself. No pool, no completion channel, no dispatch, no queue. Thread count now equals V1's.
+Q06 became a win (0.79) and the model collapsed to something simple: **morsel-driven
+self-coordination**. The cross-thread communication was the cost; the coordination logic never
+was.
+
+## 10. Generation 3: the pipeline (0.79x -> 0.41x)
+
+Owned mode still ran the reactor's task-graph machinery per morsel. The final rebuild keeps the
+execution *model* (morsels, demand, skipping) and discards the task graph. It is defined by
+three traits — this is the part worth learning, because it is the extensibility story:
+
+**(a) `MorselPipeline` — all the scheduler knows.**
+
+```rust
+trait MorselPipeline {
+    fn execute(&self, ctx: &mut PipelineCtx, morsel: Range<u64>) -> Future<ExecBatch>;
+}
+```
+
+The scheduler is ~40 lines: threads pull morsel indices from one shared atomic counter (work
+stealing — a fast thread takes more morsels; order is restored by index), each on a reused
+pool, each with a `PipelineCtx` holding a per-thread decoded-chunk cache (so a field used by
+filter *and* projection decodes once). Adding any new node or pipeline shape never touches this.
+
+**(b) `DemandPolicy` — how the morsel's demand mask gets computed.**
+
+```rust
+trait DemandPolicy {
+    fn morsel_demand(&self, ctx, fields: &FieldSet, query) -> Future<Option<BitBuffer>>;
+}
+```
+
+The struct node computes demand once per morsel and shares the same refcounted mask with every
+child. Implementations are swappable: `cascade` (conjuncts in order against shrinking demand,
+skipping empty chunks), `eager` (all conjuncts in full, intersect), and the default `adaptive`
+(order conjuncts by observed survival, most selective first; switch any conjunct to
+full-evaluate-and-intersect when demand is >= 50% dense, because gating dense demand costs more
+than it avoids — both behaviors are measured crossovers, and all policies are output-identical
+by construction and by the hash gate).
+
+**(c) `FieldDomain` — row-domain relationships as two vtable transforms.**
+
+Every parent/child row relationship in a layout is expressible as a *down demand transform* and
+*up result transforms*:
+
+```rust
+trait FieldDomain {
+    fn push_demand(&self, range, demand) -> Vec<ChildSegment>;  // down: cut + price
+    fn pull_mask(&self, range, parts)    -> BitBuffer;          // up: masks -> parent domain
+    fn pull_array(&self, segments, arrays, ...) -> ArrayRef;    // up: arrays -> parent domain
+}
+```
+
+`push_demand` cuts a parent row range into child segments — each with its coordinates in both
+domains and its **demanded row count**, so callers skip empty children before any read. Each
+relationship is modeled on the layout's own metadata, never a materialized mapping:
+
+| Relationship | Model | Down | Up |
+| --- | --- | --- | --- |
+| struct (zip) | none — same row domain | share the demand handle by refcount | zero-copy struct pack |
+| chunked (concat) | chunk-offset prefix sums | binary search + `count_range` + mask slice | ordered append / chunk assembly |
+| list (future) | its offsets buffer | two offset loads; run-expand masks | per-run reduce |
+| filter/demand itself | bitmap + rank | `count_range` / `select` | — |
+
+Children with mutually **unaligned** chunk boundaries just work, because alignment is root-row
+arithmetic, not a precondition (unit-tested with fields chunked `[0,3,10)` vs `[0,6,10)`).
+Dispatch happens per *chunk*, never per row, so the whole trait seam measured ~0-5% — the
+abstraction is effectively free.
+
+Result: Q06 at **0.41**. The attribution cornerstone is the wide select-all shape: both engines
+read byte-identical data, nothing is avoidable, and the pipeline is still ~2.5x faster — the
+residual advantage is purely cheaper scheduling units (tens of self-scheduled morsels vs
 thousands of per-split futures) plus inline execution.
 
-**Idea introduced:** the vtable seam costs ~0 because dispatch happens per chunk, never per row.
+## 11. V1 -> self-paced translation table
 
-## 7. Planning does no compute
+| V1 concept | Self-paced counterpart |
+| --- | --- |
+| split | morsel (merged splits; adaptive merge factor) |
+| per-split Tokio future | thread pulling morsels from a shared cursor, executing inline |
+| `register_splits` | the plan's chunk coverage + the harness's split catalog |
+| `filter_evaluation` per split | `DemandPolicy` per morsel (inspectable, ordered, chunk-skipping) |
+| `projection_evaluation` per node | `FieldDomain::push_demand` + `pull_array` |
+| mask argument | demand: morsel-wide, shrinking, countable |
+| reader-internal range translation | `FieldDomain` down/up transforms over native metadata |
 
-An eager "plan-time compilation" of the segment cutting was built — and measured *slower*
-(0.34 -> 0.39 geomean): it serialized, onto one pre-thread path, arithmetic the threads do for
-~100ns/segment in parallel, and per-scan planning amortizes nothing. It was removed. The rule
-that survived, now in the module docs: planning wires topology and shares refcounted demand
-handles; splits are computed once; all compute happens at execution on the owning threads.
+## 12. Two rules that came from failed experiments
 
-**Idea introduced:** negative results get measured, documented, and deleted — not kept as
-opt-in complexity.
+- **Planning does no compute.** Pre-materializing the segment cutting at plan time measured
+  *slower* (it serialized ~100ns/segment arithmetic that threads do in parallel, and per-scan
+  planning amortizes nothing). Deleted. Planning wires topology and shares demand handles; the
+  splits are computed once; all compute happens on the owning threads.
+- **Fixed cost per morsel is its own budget.** Sub-millisecond scans (genomics dataset) exposed
+  per-morsel constants: per-run thread spawns, an all-true mask allocation, per-field `Mask`
+  construction, redundant coverage bit-scans — each individually invisible on a 10ms scan. All
+  removed (reused pool, mask-free full evaluation, single-segment zero-copy paths, one shared
+  selection `Mask` per morsel). Also: 5-iteration medians are noise at this scale; sub-ms
+  shapes use 100-iteration medians.
 
-## 8. Feed the wins back into V1
+## 13. What flowed back into production V1
 
-The I/O audit (per-request order/size dumps) showed V1 re-reading shared segments — up to
-**2.7x the file size** on shared filter/projection scans — because `FlatReader::array_future`
-rebuilt its "shared" future on every call. The pipeline's dedup idea, translated with V1's
-memory discipline (a `WeakShared` memo: shared while any evaluation is live, freed after),
-fixed it: 916 -> 307 requests on the shared-field scan, flat memory, unit-tested for both
-dedup and release. Committed separately off `develop`
-(branch `worktree-v1-flat-reader-dedup`) and also applied here so every comparison is against
-honest V1. Even against fixed V1, all 42 workloads still won.
+The I/O audit caught V1 reading up to **2.7x the file size** on shared filter/projection scans:
+`FlatReader::array_future` rebuilt its "shared" future on every call, so filter and projection
+(and every split subdividing a chunk) re-read and re-decoded the same segment. The fix is the
+pipeline's dedup idea under V1's memory discipline: memoize the future behind a `WeakShared` —
+shared while any evaluation is live, freed when the last consumer drops, so scan memory stays
+flat. Committed independently off `develop` (`worktree-v1-flat-reader-dedup`). All comparisons
+above are against the *fixed* V1.
 
-**Idea introduced:** experiment learnings should flow back to production, with production's
-constraints (no scan-lifetime retention).
+## 14. How we know it's correct
 
-## 9. Widen the evidence: more shapes, more datasets
+Four layers, in increasing independence: (1) every benchmark run validates identical row counts
+and an ordered full-output hash between V1 and self-paced before timing, and every timed
+iteration re-checks row counts; (2) the pipeline is tested against `run_eager`, a trivially
+correct reference, plus unit tests for misaligned children, empty demand, and the FlatReader
+dedup/release semantics; (3) a per-iteration **no-caching invariant**: each run must re-read at
+least its cold warmup's unique-segment bytes (byte-exact under deterministic policies); (4) an
+external oracle — 17 workloads checked against **DuckDB over the original parquet**, all row
+counts exact.
 
-Coverage grew to 52+ workloads: FineWeb Q09-Q17 (wide select-all, shared field, deep chains,
-empty result, ranges, project-all-fields), ClickBench Q43-Q51, and a new **statpopgen** suite
-(gnomAD chr21 VCF via vortex-bench's data-gen; genomic region scans, quality thresholds,
-population columns). Each dataset found something:
+## 15. Where it stands, and how to refine it
 
-- ClickBench's few-morsel shapes exposed thread-tail imbalance -> fixed by work stealing
-  (dashboard 1.06 -> 0.82, Q41 1.31 -> 0.64).
-- Deep chains exposed a kernel defect: dense-but-partial demand used a per-row demand-checking
-  `map_cmp`; two vectorized passes (full evaluate, then AND) are faster (Q45 1.06 -> 0.95).
-- statpopgen exposed the fixed merge-16 roll-up: 1M compact rows -> 8 splits -> one morsel ->
-  concurrency 1. The harness now targets ~2x the worker count (`clamp(splits/32, 1, 16)`).
-
-**Idea introduced:** every new dataset class stresses a different assumption; add shapes until
-new ones stop finding anything.
-
-## 10. Adaptive demand: the policy seam pays off
-
-Query-order conjunct evaluation read a wide column early on dashboard-style queries.
-`AdaptiveDemand` (now default) orders conjuncts by observed survival, most selective first —
-output-identical, validated by the hash gate on every suite — and later gained a
-density switch: when current demand is >= 50% dense, gating costs more than it avoids
-(measured: eager 1.31 vs cascade 2.38 on the dense statpopgen shape), so the conjunct is
-evaluated in full and intersected.
-
-**Idea introduced:** the pluggable-demand seam exists precisely so scheduling policy can evolve
-without touching nodes or scheduler.
-
-## 11. The tiny-scan regime and measurement discipline
-
-Sub-millisecond scans (statpopgen) needed two corrections. Five-iteration medians swing
-0.8-2.5x at this scale — 100-iteration medians are now standard there. And per-morsel constants
-matter: per-run thread spawns were replaced with a reused pool, full-demand evaluation stopped
-allocating an all-true mask, single-segment morsels return masks zero-copy, coverage checks use
-already-priced counts, and the selection `Mask` is built once per morsel and shared by all
-projected fields. Result: five of six statpopgen shapes at or better than parity.
-
-**Idea introduced:** fixed cost per morsel is a distinct budget from cost per row; tiny scans
-are where it shows.
-
-## Where it stands
-
-| Suite | Record vs (fixed) V1 | Geomean |
+| Suite | vs fixed V1 | Geomean |
 | --- | --- | ---: |
 | FineWeb (18 shapes) | 18/18 wins | ~0.33 |
 | TPC-H SF10 (3) | 3/3 wins | ~0.63 |
 | ClickBench (25 shapes) | 25/25 wins | ~0.56 |
 | statpopgen (6, sub-ms) | 3 wins, 2 ties, 1 open | — |
 
-Q06 arc: 2.53 -> 2.32 (micro-opts) -> 1.40 (4 shards) -> 0.79 (owned) -> **0.41 (pipeline)**.
+Q06 arc: 2.53 -> 2.32 (micro-opts) -> 1.40 (sharded) -> 0.79 (owned) -> **0.41 (pipeline)**.
 
-## How to refine from here
+Refinement plan, in order:
 
-1. **The Q02 anomaly (open bug):** the dense statpopgen shape runs 1.31 under the eager policy
-   but 2.62 under the logically equivalent in-policy dense switch. That delta should not exist.
-   A samply profile is captured; this is the first thing to chase.
-2. **TPC-H Q6 makespan:** 29 two-million-row morsels bound wall time at two serial morsels per
-   thread. Intra-morsel parallelism, or a work-aware (byte/CPU) roll-up instead of split-count
-   merging, is the fix.
-3. **Real I/O:** everything here is an in-memory source. The recorded agenda: a ranged/multi-get
-   `SegmentSource` for run coalescing (up to 86x fewer requests on wide scans), per-thread async
-   read-ahead, writer-side chunk sizing for 50KB-segment datasets like FineWeb.
-4. **Generalize the layout:** lift the aligned-chunks restriction for real files by adding the
-   per-field root-range translation as `FieldDomain` impls (the misaligned-children test already
-   proves the seam); then a list node over its offsets buffer.
-5. **Ship the V1 fix:** `worktree-v1-flat-reader-dedup` is PR-ready against `develop` and
-   independent of everything else.
-6. **Validation depth:** extend the DuckDB oracle to value-level checksums and the remaining
-   workloads; consider an opt-in per-iteration hash mode.
+1. **statpopgen Q02 anomaly**: eager policy runs 1.31 but the logically equivalent in-policy
+   dense switch runs 2.62 — that delta shouldn't exist; a samply profile is captured.
+2. **TPC-H Q6 makespan**: 29 huge morsels bound wall time at 2 serial morsels/thread; needs
+   intra-morsel parallelism or byte/CPU-aware roll-up.
+3. **Real I/O**: everything here is in-memory. Agenda: ranged/multi-get `SegmentSource` (run
+   coalescing — up to 86x fewer requests on wide scans), per-thread async read-ahead,
+   writer-side chunk sizing for small-segment datasets.
+4. **Lift the restriction**: unaligned real files need only per-field `FieldDomain` instances
+   (the seam is proven); then a list node over its offsets buffer; then compressed encodings,
+   nulls, general expressions.
+5. **Ship the V1 fix** (independent PR), and deepen the oracle to value-level checks.
