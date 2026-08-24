@@ -593,7 +593,7 @@ fn latent_ptype(ptype: PType) -> VortexResult<PType> {
     }
 }
 
-fn precision_bits(ptype: PType) -> VortexResult<u8> {
+pub(crate) fn precision_bits(ptype: PType) -> VortexResult<u8> {
     match ptype {
         PType::F16 => Ok(10),
         PType::F32 => Ok(23),
@@ -773,7 +773,7 @@ fn split_primary_for_f64(values: &[f64], k: u8, primary_min: u64) -> VortexResul
         .collect::<VortexResult<Vec<_>>>()
 }
 
-fn join_f16(primary: u16, secondary: u16, k: u8) -> f16 {
+pub(crate) fn join_f16(primary: u16, secondary: u16, k: u8) -> f16 {
     let low_mask = (1_u16 << k) - 1;
     let sign_cutoff = (1_u16 << 15) >> k;
     let low = if primary >= sign_cutoff {
@@ -790,7 +790,7 @@ fn join_f16(primary: u16, secondary: u16, k: u8) -> f16 {
     f16::from_bits(bits)
 }
 
-fn join_f32(primary: u32, secondary: u32, k: u8) -> f32 {
+pub(crate) fn join_f32(primary: u32, secondary: u32, k: u8) -> f32 {
     let low_mask = (1_u32 << k) - 1;
     let sign_cutoff = (1_u32 << 31) >> k;
     let low = if primary >= sign_cutoff {
@@ -807,7 +807,7 @@ fn join_f32(primary: u32, secondary: u32, k: u8) -> f32 {
     f32::from_bits(bits)
 }
 
-fn join_f64(primary: u64, secondary: u64, k: u8) -> f64 {
+pub(crate) fn join_f64(primary: u64, secondary: u64, k: u8) -> f64 {
     let low_mask = (1_u64 << k) - 1;
     let sign_cutoff = (1_u64 << 63) >> k;
     let low = if primary >= sign_cutoff {

@@ -409,7 +409,7 @@ fn ordered_u16(bits: u16) -> u16 {
     }
 }
 
-fn unordered_u16(value: u16) -> u16 {
+pub(crate) fn unordered_u16(value: u16) -> u16 {
     if value & (1_u16 << 15) == 0 {
         !value
     } else {
@@ -425,7 +425,7 @@ fn ordered_u32(bits: u32) -> u32 {
     }
 }
 
-fn unordered_u32(value: u32) -> u32 {
+pub(crate) fn unordered_u32(value: u32) -> u32 {
     if value & (1_u32 << 31) == 0 {
         !value
     } else {
@@ -441,7 +441,7 @@ fn ordered_u64(bits: u64) -> u64 {
     }
 }
 
-fn unordered_u64(value: u64) -> u64 {
+pub(crate) fn unordered_u64(value: u64) -> u64 {
     if value & (1_u64 << 63) == 0 {
         !value
     } else {
