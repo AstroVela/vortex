@@ -33,16 +33,23 @@ REGULAR_IDS = (
     "appian-nvme",
     "vortex-queries",
 )
+# TPC-H SF=1 only runs in the explicit `pr-full` and `develop` matrices, never in the
+# label-triggered PR presets.
+SF1_TPCH_IDS = {"tpch-nvme", "tpch-s3"}
 COMPACT_IDS = tuple(
-    benchmark_id for benchmark_id in REGULAR_IDS if benchmark_id not in {"polarsignals", "vortex-queries"}
+    benchmark_id
+    for benchmark_id in REGULAR_IDS
+    if benchmark_id not in {"polarsignals", "vortex-queries"} | SF1_TPCH_IDS
 )
-PR_ALL_IDS = tuple(benchmark_id for benchmark_id in REGULAR_IDS if benchmark_id != "vortex-queries")
+PR_ALL_IDS = tuple(
+    benchmark_id for benchmark_id in REGULAR_IDS if benchmark_id not in {"vortex-queries"} | SF1_TPCH_IDS
+)
 EXPECTED_IDS = {
     "develop": REGULAR_IDS,
     "pr": tuple(
         benchmark_id
         for benchmark_id in REGULAR_IDS
-        if benchmark_id not in {"tpch-s3-10", "appian-nvme", "vortex-queries"}
+        if benchmark_id not in {"tpch-s3-10", "appian-nvme", "vortex-queries"} | SF1_TPCH_IDS
     ),
     "pr-compact": COMPACT_IDS,
     "pr-all": PR_ALL_IDS,
@@ -77,12 +84,15 @@ def test_pr_target_selection() -> None:
     pr_compact = {entry["id"]: entry for entry in _entries("pr-compact")}
     pr_full = {entry["id"]: entry for entry in _entries("pr-full")}
 
-    assert _targets(pr["tpch-nvme"]) == {
+    assert _targets(pr["tpch-nvme-10"]) == {
         ("datafusion", "parquet"),
         ("datafusion", "vortex"),
         ("duckdb", "parquet"),
         ("duckdb", "vortex"),
     }
+    assert "tpch-nvme" not in pr
+    assert "tpch-s3" not in pr
+    assert "tpch-nvme" not in pr_compact
     assert ("datafusion", "lance") in _targets(develop["tpch-nvme"])
     assert all(("datafusion", "lance") not in _targets(entry) for entry in pr_full.values())
     assert "vortex-compact" in cast("list[str]", pr_full["clickbench-nvme"]["data_formats"])

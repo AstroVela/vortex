@@ -111,10 +111,9 @@ BENCHMARKS = (
         name="TPC-H SF=1 on NVME",
         scale_factor=1.0,
         iterations=10,
+        # SF=1 is too small to be a reliable pre-merge signal, so it is excluded from the
+        # label-triggered PR presets and only runs in the explicit `pr-full` and `develop` matrices.
         runs={
-            "pr": DEFAULT,
-            "pr-compact": COMPACT,
-            "pr-all": STANDARD,
             "pr-full": FULL_PR,
             "develop": FULL_LOCAL,
         },
@@ -128,10 +127,8 @@ BENCHMARKS = (
         iterations=10,
         local_dir="vortex-bench/data/tpch/1.0",
         remote_key="tpch/1.0",
+        # See `tpch-nvme`: SF=1 does not run in the label-triggered PR presets.
         runs={
-            "pr": DEFAULT,
-            "pr-compact": COMPACT,
-            "pr-all": STANDARD,
             "pr-full": STANDARD,
             "develop": STANDARD,
         },
