@@ -8,7 +8,8 @@
 using namespace duckdb;
 
 struct VortexCopyBindData final : TableFunctionData {
-    VortexCopyBindData(unique_ptr<CData> ffi_bind) : ffi_bind(std::move(ffi_bind)) {
+    VortexCopyBindData(unique_ptr<CData> ffi_bind, vector<string> column_names)
+        : ffi_bind(std::move(ffi_bind)), column_names(std::move(column_names)) {
     }
     unique_ptr<CData> ffi_bind;
     // Column names in write order, used to key WRITTEN_FILE_STATISTICS.

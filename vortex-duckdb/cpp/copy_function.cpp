@@ -40,9 +40,7 @@ unique_ptr<FunctionData> copy_to_bind(ClientContext &,
         throw BinderException(IntoErrString(error_out));
     }
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
-    auto bind = make_uniq<VortexCopyBindData>(std::move(cdata));
-    bind->column_names = names;
-    return bind;
+    return make_uniq<VortexCopyBindData>(std::move(cdata), names);
 }
 
 unique_ptr<GlobalFunctionData>
@@ -80,6 +78,7 @@ void copy_to_sink(ExecutionContext &,
     }
 }
 
+// CopyToFileInfo::file_stats is owned by the operator's sink state, which outlives gstate.
 void copy_to_get_written_statistics(ClientContext &,
                                     FunctionData &,
                                     GlobalFunctionData &gstate,
