@@ -161,10 +161,11 @@ impl LayoutStrategy for ZonedStrategy {
 
         // The eof used for the data child should appear _before_ our own stats tables.
         let data_eof = eof.split_off();
+        let (data_ctx, data_info) = ctx.child_context();
         let data_layout = self
             .child
             .write_stream(
-                ctx.clone(),
+                data_ctx,
                 Arc::clone(&segment_sink),
                 stream,
                 data_eof,
@@ -178,6 +179,7 @@ impl LayoutStrategy for ZonedStrategy {
         else {
             // If we have no stats (e.g. the DType doesn't support them), then we just return the
             // child layout.
+            ctx.report_chunk_boundaries(data_info.chunk_boundaries());
             return Ok(data_layout);
         };
 
@@ -187,11 +189,19 @@ impl LayoutStrategy for ZonedStrategy {
             .into_array()
             .to_array_stream()
             .sequenced(eof.split_off());
+        let (stats_ctx, _) = ctx.child_context();
         let zones_layout = self
             .stats
-            .write_stream(ctx, Arc::clone(&segment_sink), stats_stream, eof, session)
+            .write_stream(
+                stats_ctx,
+                Arc::clone(&segment_sink),
+                stats_stream,
+                eof,
+                session,
+            )
             .await?;
 
+        ctx.report_chunk_boundaries(data_info.chunk_boundaries());
         Ok(
             ZonedLayout::try_new(data_layout, zones_layout, block_size, aggregate_fns)?
                 .into_layout(),

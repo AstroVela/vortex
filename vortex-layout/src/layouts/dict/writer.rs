@@ -187,36 +187,38 @@ impl LayoutStrategy for DictStrategy {
 
         let handle = session.handle();
         let dtype2 = dtype.clone();
+        let child_context = ctx.clone();
         let child_layouts = stream! {
             pin_mut!(runs);
 
             while let Some((codes_stream, values_fut)) = runs.next().await {
                 let codes = Arc::clone(&self.codes);
                 let codes_eof = eof.split_off();
-                let ctx2 = ctx.clone();
+                let (codes_ctx, codes_info) = child_context.child_context();
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let session2 = session.clone();
                 let codes_fut = handle.spawn_nested(move |h| async move {
                     let session2 = session2.with_handle(h);
-                    codes.write_stream(
-                        ctx2,
+                    let layout = codes.write_stream(
+                        codes_ctx,
                         segment_sink2,
                         codes_stream.sendable(),
                         codes_eof,
                         &session2,
-                    ).await
+                    ).await?;
+                    Ok((layout, codes_info))
                 });
 
                 let values = Arc::clone(&self.values);
                 let values_eof = eof.split_off();
-                let ctx2 = ctx.clone();
+                let (values_ctx, _) = child_context.child_context();
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let dtype2 = dtype2.clone();
                 let session2 = session.clone();
                 let values_layout = handle.spawn_nested(move |h| async move {
                     let session2 = session2.with_handle(h);
                     values.write_stream(
-                        ctx2,
+                        values_ctx,
                         segment_sink2,
                         SequentialStreamAdapter::new(dtype2, once(values_fut)).sendable(),
                         values_eof,
@@ -233,12 +235,43 @@ impl LayoutStrategy for DictStrategy {
         let mut child_layouts = child_layouts
             .buffered(usize::MAX)
             .map(|result| {
-                let (codes_layout, values_layout) = result?;
+                let ((codes_layout, codes_info), values_layout) = result?;
                 // All values are referenced when created via dictionary encoding
-                Ok::<_, VortexError>(DictLayout::new(values_layout, codes_layout).into_layout())
+                Ok::<_, VortexError>((
+                    DictLayout::new(values_layout, codes_layout).into_layout(),
+                    codes_info,
+                ))
             })
             .try_collect::<Vec<_>>()
             .await?;
+
+        let mut chunk_boundaries = Vec::new();
+        let mut row_offset = 0;
+        let mut layouts = Vec::with_capacity(child_layouts.len());
+        for (layout, codes_info) in child_layouts.drain(..) {
+            let row_count = layout.row_count();
+            chunk_boundaries.extend(
+                codes_info
+                    .chunk_boundaries()
+                    .into_iter()
+                    .filter(|&boundary| boundary != 0 && boundary < row_count)
+                    .map(|boundary| row_offset + boundary),
+            );
+            row_offset += row_count;
+            layouts.push(layout);
+        }
+        chunk_boundaries.extend(
+            layouts
+                .iter()
+                .map(|layout| layout.row_count())
+                .scan(0, |row_offset, row_count| {
+                    *row_offset += row_count;
+                    Some(*row_offset)
+                })
+                .take(layouts.len().saturating_sub(1)),
+        );
+        ctx.report_chunk_boundaries(chunk_boundaries);
+        let mut child_layouts = layouts;
 
         if child_layouts.len() == 1 {
             return Ok(child_layouts.remove(0));

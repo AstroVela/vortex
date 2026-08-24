@@ -16,7 +16,12 @@ use std::env;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::pin_mut;
+use vortex_array::arrays::Chunked;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::dtype::Field;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::FieldPath;
@@ -33,6 +38,8 @@ use crate::layouts::struct_::StructStrategy;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
 use crate::sequence::SequencePointer;
+use crate::sequence::SequentialStreamAdapter;
+use crate::sequence::SequentialStreamExt;
 
 /// Whether [`TableStrategy`] writes list fields using a [`ListLayoutStrategy`] by
 /// default. Disabled unless the environment variable `VORTEX_EXPERIMENTAL_LIST_LAYOUT`
@@ -46,6 +53,12 @@ pub fn use_experimental_list_layout() -> bool {
 }
 
 type ListLayoutFactory = Arc<dyn Fn(ListLayoutStrategy) -> Arc<dyn LayoutStrategy> + Send + Sync>;
+
+#[derive(Clone, Copy)]
+enum LeafRole {
+    Default,
+    ListElements,
+}
 
 /// A configurable strategy for writing nested tabular data, dispatching each (sub)stream to the
 /// structural writer for its dtype.
@@ -69,6 +82,10 @@ pub struct TableStrategy {
     validity: Arc<dyn LayoutStrategy>,
     /// The writer for leaf fields, i.e. anything that is not a struct.
     leaf: Arc<dyn LayoutStrategy>,
+    /// Optional leaf strategy used below a list's elements child.
+    list_elements: Option<Arc<dyn LayoutStrategy>>,
+    /// Selects which leaf strategy this descended dispatcher uses.
+    leaf_role: LeafRole,
     /// Optional factory applied to each dynamically constructed [`ListLayoutStrategy`].
     /// Its presence also enables list decomposition.
     ///
@@ -100,6 +117,8 @@ impl TableStrategy {
             leaf_writers: Default::default(),
             validity,
             leaf: fallback,
+            list_elements: None,
+            leaf_role: LeafRole::Default,
             list_layout_factory: None,
         }
     }
@@ -159,6 +178,12 @@ impl TableStrategy {
     /// Override the default strategy for leaf columns that don't have overrides.
     pub fn with_default_strategy(mut self, default: Arc<dyn LayoutStrategy>) -> Self {
         self.leaf = default;
+        self
+    }
+
+    /// Override the leaf strategy used below a list's elements child.
+    pub fn with_list_elements_strategy(mut self, strategy: Arc<dyn LayoutStrategy>) -> Self {
+        self.list_elements = Some(strategy);
         self
     }
 
@@ -231,11 +256,24 @@ impl TableStrategy {
     fn list_strategy(&self) -> Option<Arc<dyn LayoutStrategy>> {
         let factory = self.list_layout_factory.as_ref()?;
         let list_layout = ListLayoutStrategy::default()
-            .with_elements(Arc::new(self.descend_clean()))
+            .with_elements(Arc::new(self.descend_list_elements()))
             .with_offsets(Arc::clone(&self.leaf))
             .with_validity(Arc::clone(&self.validity))
-            .with_fallback(Arc::clone(&self.leaf));
+            .with_fallback(self.leaf_strategy());
         Some(factory(list_layout))
+    }
+
+    fn leaf_strategy(&self) -> Arc<dyn LayoutStrategy> {
+        match (self.leaf_role, &self.list_elements) {
+            (LeafRole::ListElements, Some(strategy)) => Arc::clone(strategy),
+            _ => Arc::clone(&self.leaf),
+        }
+    }
+
+    fn descend_list_elements(&self) -> Self {
+        let mut elements = self.descend_clean();
+        elements.leaf_role = LeafRole::ListElements;
+        elements
     }
 
     /// Descend into a subfield, retaining only the overrides that apply beneath it (rebased to be
@@ -256,6 +294,8 @@ impl TableStrategy {
             leaf_writers: new_writers,
             validity: Arc::clone(&self.validity),
             leaf: Arc::clone(&self.leaf),
+            list_elements: self.list_elements.clone(),
+            leaf_role: self.leaf_role,
             list_layout_factory: self.list_layout_factory.clone(),
         }
     }
@@ -267,6 +307,8 @@ impl TableStrategy {
             leaf_writers: HashMap::default(),
             validity: Arc::clone(&self.validity),
             leaf: Arc::clone(&self.leaf),
+            list_elements: self.list_elements.clone(),
+            leaf_role: self.leaf_role,
             list_layout_factory: self.list_layout_factory.clone(),
         }
     }
@@ -288,6 +330,26 @@ impl TableStrategy {
 
         path
     }
+}
+
+/// Expand chunked leaf arrays created by list-aware structural repartitioning.
+fn flatten_chunked_stream(stream: SendableSequentialStream) -> SendableSequentialStream {
+    let dtype = stream.dtype().clone();
+    let flattened = try_stream! {
+        pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            let (sequence_id, array) = chunk?;
+            if let Some(chunked) = array.as_opt::<Chunked>() {
+                let mut sequence_pointer = sequence_id.descend();
+                for chunk in chunked.chunks() {
+                    yield (sequence_pointer.advance(), chunk);
+                }
+            } else {
+                yield (sequence_id, array);
+            }
+        }
+    };
+    SequentialStreamAdapter::new(dtype, flattened).sendable()
 }
 
 /// Dispatches each stream to the structural writer for its dtype.
@@ -319,7 +381,12 @@ impl LayoutStrategy for TableStrategy {
         }
 
         // Leaf: hand off to the leaf strategy.
-        self.leaf
+        let stream = if matches!(self.leaf_role, LeafRole::ListElements) {
+            flatten_chunked_stream(stream)
+        } else {
+            stream
+        };
+        self.leaf_strategy()
             .write_stream(ctx, segment_sink, stream, eof, session)
             .await
     }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -23,6 +24,7 @@ use crate::LayoutStrategy;
 use crate::LayoutWriterContext;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
+use crate::sequence::SequenceId;
 use crate::sequence::SequencePointer;
 use crate::sequence::SequentialStreamAdapter;
 use crate::sequence::SequentialStreamExt;
@@ -80,6 +82,97 @@ impl RepartitionWriterOptions {
 pub struct RepartitionStrategy {
     child: Arc<dyn LayoutStrategy>,
     options: RepartitionWriterOptions,
+}
+
+/// Coalesce adjacent input chunks toward a target size without splitting any input chunk.
+///
+/// This is used below list elements, where input chunk boundaries have already been snapped to
+/// list offsets and must remain valid boundaries for the eventual physical chunks.
+#[derive(Clone)]
+pub struct CoalescingStrategy {
+    child: Arc<dyn LayoutStrategy>,
+    target_bytes: NonZeroU64,
+}
+
+impl CoalescingStrategy {
+    /// Create a strategy that merges whole chunks until their logical size reaches `target_bytes`.
+    pub fn new<S: LayoutStrategy>(child: S, target_bytes: NonZeroU64) -> Self {
+        Self {
+            child: Arc::new(child),
+            target_bytes,
+        }
+    }
+}
+
+#[async_trait]
+impl LayoutStrategy for CoalescingStrategy {
+    async fn write_stream(
+        &self,
+        ctx: LayoutWriterContext,
+        segment_sink: SegmentSinkRef,
+        stream: SendableSequentialStream,
+        eof: SequencePointer,
+        session: &VortexSession,
+    ) -> VortexResult<LayoutRef> {
+        let dtype = stream.dtype().clone();
+        let dtype_clone = dtype.clone();
+        let target_bytes = self.target_bytes.get();
+        let coalescing_session = session.clone();
+        let coalesced = try_stream! {
+            pin_mut!(stream);
+
+            let mut exec_ctx = coalescing_session.create_execution_ctx();
+            let mut chunks = Vec::new();
+            let mut nbytes = 0u64;
+            let mut last_sequence_id: Option<SequenceId> = None;
+
+            while let Some(chunk) = stream.next().await {
+                let (sequence_id, array) = chunk?;
+                nbytes = nbytes.saturating_add(array.nbytes());
+                chunks.push(array);
+                last_sequence_id = Some(sequence_id);
+
+                if nbytes >= target_bytes {
+                    let array = canonicalize_chunks(&mut chunks, &dtype_clone, &mut exec_ctx)?;
+                    let mut sequence_pointer = last_sequence_id
+                        .take()
+                        .vortex_expect("coalesced chunks have a sequence id")
+                        .descend();
+                    yield (sequence_pointer.advance(), array);
+                    nbytes = 0;
+                }
+            }
+
+            if !chunks.is_empty() {
+                let array = canonicalize_chunks(&mut chunks, &dtype_clone, &mut exec_ctx)?;
+                let mut sequence_pointer = last_sequence_id
+                    .vortex_expect("coalesced chunks have a sequence id")
+                    .descend();
+                yield (sequence_pointer.advance(), array);
+            }
+        };
+
+        self.child
+            .write_stream(
+                ctx,
+                segment_sink,
+                SequentialStreamAdapter::new(dtype, coalesced).sendable(),
+                eof,
+                session,
+            )
+            .await
+    }
+}
+
+fn canonicalize_chunks(
+    chunks: &mut Vec<ArrayRef>,
+    dtype: &DType,
+    exec_ctx: &mut vortex_array::ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    ChunkedArray::try_new(std::mem::take(chunks), dtype.clone())?
+        .into_array()
+        .execute::<Canonical>(exec_ctx)
+        .map(IntoArray::into_array)
 }
 
 impl RepartitionStrategy {
@@ -353,6 +446,46 @@ mod tests {
             canonicalize: false,
         };
         assert_eq!(options.effective_block_len(&dtype), 1);
+    }
+
+    #[test]
+    fn coalescing_strategy_merges_whole_input_chunks() -> VortexResult<()> {
+        let chunks = vec![
+            PrimitiveArray::from_iter([0i32, 1, 2]).into_array(),
+            PrimitiveArray::from_iter([3i32, 4, 5]).into_array(),
+            PrimitiveArray::from_iter([6i32, 7, 8]).into_array(),
+        ];
+        let dtype = chunks[0].dtype().clone();
+        let array = ChunkedArray::try_new(chunks, dtype)?.into_array();
+
+        let segments = Arc::new(TestSegments::default());
+        let (ptr, eof) = SequenceId::root().split();
+        let target_bytes = NonZeroU64::new(16).vortex_expect("16 is non-zero");
+        let strategy = CoalescingStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            target_bytes,
+        );
+        let (ctx, info) = LayoutWriterContext::new(ArrayContext::empty()).child_context();
+        let stream = array.to_array_stream().sequenced(ptr);
+        let layout = block_on(|handle| async move {
+            let session = new_session().with_handle(handle);
+            strategy
+                .write_stream(
+                    ctx,
+                    Arc::<TestSegments>::clone(&segments),
+                    stream,
+                    eof,
+                    &session,
+                )
+                .await
+        })?;
+
+        assert_eq!(layout.nchildren(), 2);
+        let children = layout.children()?;
+        assert_eq!(children[0].row_count(), 6);
+        assert_eq!(children[1].row_count(), 3);
+        assert_eq!(info.chunk_boundaries(), [6]);
+        Ok(())
     }
 
     #[test]

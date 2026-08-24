@@ -34,6 +34,7 @@ use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::layouts::list::ListChunkBoundary;
 use crate::layouts::list::ListLayout;
 use crate::layouts::list::expr::ListChildrenNeeded;
 use crate::layouts::list::expr::get_necessary_bound_list_children;
@@ -358,6 +359,14 @@ impl LayoutReader for ListReader {
     ) -> VortexResult<()> {
         split_range.check_bounds(self.layout.row_count())?;
 
+        let row_range = split_range.row_range();
+        let chunk_boundaries = self.layout.chunk_boundaries();
+        if !chunk_boundaries.is_empty() {
+            register_chunk_boundaries(chunk_boundaries, split_range, splits);
+            splits.push(split_range.root_row_range().end);
+            return Ok(());
+        }
+
         // Splits are difficult to calculate because all children live in different row coordinate spaces.
         // List elements typically comprise the majority of the data in a list, and validity/offsets can be treated
         // as metadata. We therefore want to parallelize the scan based on element work.
@@ -375,7 +384,6 @@ impl LayoutReader for ListReader {
                 &mut element_splits,
             )?;
 
-            let row_range = split_range.row_range();
             let mut last_split = None;
             for element_split in element_splits.into_sorted_deduped() {
                 let Some(split) = map_element_split_to_outer_grid(
@@ -471,6 +479,30 @@ impl LayoutReader for ListReader {
             }
             ListChildrenNeeded::All => self.project_all(row_range, expr, mask),
         }
+    }
+}
+
+/// Adds persisted list chunk boundaries that fall strictly inside `split_range`.
+fn register_chunk_boundaries(
+    chunk_boundaries: &[ListChunkBoundary],
+    split_range: &SplitRange,
+    splits: &mut RowSplits,
+) {
+    let row_range = split_range.row_range();
+    for boundary in chunk_boundaries {
+        let split = boundary.outer_row_end();
+        if split <= row_range.start {
+            continue;
+        }
+        if split >= row_range.end {
+            break;
+        }
+        splits.push(
+            split_range
+                .row_offset()
+                .checked_add(split)
+                .vortex_expect("List layout split offset overflow"),
+        );
     }
 }
 
@@ -613,6 +645,7 @@ mod tests {
     use rstest::rstest;
     use vortex_array::ArrayContext;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::ListArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
@@ -840,6 +873,16 @@ mod tests {
         ListLayoutStrategy::default()
     }
 
+    fn chunk_preserving_list_strategy() -> ListLayoutStrategy {
+        ListLayoutStrategy::default()
+            .with_elements(Arc::new(ChunkedLayoutStrategy::new(
+                FlatLayoutStrategy::default(),
+            )))
+            .with_offsets(Arc::new(ChunkedLayoutStrategy::new(
+                FlatLayoutStrategy::default(),
+            )))
+    }
+
     fn layout_test_session() -> VortexSession {
         vortex_array::array_session()
             .with::<LayoutSession>()
@@ -1061,6 +1104,33 @@ mod tests {
             .map(|grid_index| grid_index * 100_000 / MAX_LIST_SPLIT_COUNT)
             .collect::<Vec<_>>();
         assert_eq!(splits, expected);
+    }
+
+    #[tokio::test]
+    async fn persisted_chunk_boundaries_drive_exact_list_splits() -> VortexResult<()> {
+        let chunk0 = ListArray::try_new(
+            PrimitiveArray::from_iter(0..3_i32).into_array(),
+            buffer![0u32, 2, 3].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let chunk1 = ListArray::try_new(
+            PrimitiveArray::from_iter(3..7_i32).into_array(),
+            buffer![0u32, 1, 4].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let dtype = chunk0.dtype().clone();
+        let list = ChunkedArray::try_new(vec![chunk0, chunk1], dtype)?.into_array();
+
+        let (segments, layout, session) =
+            write_layout(&chunk_preserving_list_strategy(), list).await?;
+        let reader =
+            layout.new_reader("".into(), segments, &session, &LayoutReaderContext::new())?;
+
+        let splits = SplitBy::Layout.splits(reader.as_ref(), &(0..4), &[FieldMask::All])?;
+        assert_eq!(splits, [0, 2, 4]);
+        Ok(())
     }
 
     #[tokio::test]

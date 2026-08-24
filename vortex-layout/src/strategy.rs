@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use parking_lot::Mutex;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayId;
 use vortex_array::aggregate_fn::AggregateFnId;
@@ -72,6 +73,35 @@ impl Drop for BufferedBytesReservation {
     }
 }
 
+/// Write-time information reported by a child layout strategy to its parent.
+///
+/// A parent creates an isolated report with
+/// [`LayoutWriterContext::child_context`] before invoking a child strategy. The child strategy
+/// writes facts about its output into the context and the parent reads the completed report after
+/// the child finishes. This keeps writer-side communication out of serialized layouts until the
+/// parent chooses the information it needs to persist.
+#[derive(Clone, Debug, Default)]
+pub struct LayoutWriterInfo(Arc<Mutex<LayoutWriterInfoData>>);
+
+#[derive(Debug, Default)]
+struct LayoutWriterInfoData {
+    chunk_boundaries: Vec<u64>,
+}
+
+impl LayoutWriterInfo {
+    /// Returns the strictly increasing output-row boundaries reported by the child strategy.
+    pub fn chunk_boundaries(&self) -> Vec<u64> {
+        self.0.lock().chunk_boundaries.clone()
+    }
+
+    fn set_chunk_boundaries(&self, chunk_boundaries: impl IntoIterator<Item = u64>) {
+        let mut chunk_boundaries = chunk_boundaries.into_iter().collect::<Vec<_>>();
+        chunk_boundaries.sort_unstable();
+        chunk_boundaries.dedup();
+        self.0.lock().chunk_boundaries = chunk_boundaries;
+    }
+}
+
 /// State shared by every strategy participating in a single layout write.
 ///
 /// Clones share the [`BufferedBytesTracker`] while retaining the array serialization context.
@@ -82,6 +112,7 @@ pub struct LayoutWriterContext {
     array_ctx: ArrayContext,
     allowed_aggregates: Option<Arc<HashSet<AggregateFnId>>>,
     buffered_bytes: BufferedBytesTracker,
+    writer_info: LayoutWriterInfo,
 }
 
 impl LayoutWriterContext {
@@ -91,6 +122,7 @@ impl LayoutWriterContext {
             array_ctx,
             allowed_aggregates: None,
             buffered_bytes: BufferedBytesTracker::new(),
+            writer_info: LayoutWriterInfo::default(),
         }
     }
 
@@ -139,6 +171,34 @@ impl LayoutWriterContext {
     pub fn reserve_buffered_bytes(&self, bytes: u64) -> BufferedBytesReservation {
         self.buffered_bytes.reserve(bytes)
     }
+
+    /// Creates a context and report for a child strategy with a distinct output row space.
+    ///
+    /// The returned context retains this write's array context, aggregate policy, and buffered
+    /// bytes tracker, but reports its chunk boundaries to the returned [`LayoutWriterInfo`]
+    /// rather than this context. Parents can use the report to translate child boundaries into
+    /// their own row space once the child write completes.
+    pub fn child_context(&self) -> (Self, LayoutWriterInfo) {
+        let writer_info = LayoutWriterInfo::default();
+        (
+            Self {
+                array_ctx: self.array_ctx.clone(),
+                allowed_aggregates: self.allowed_aggregates.clone(),
+                buffered_bytes: self.buffered_bytes.clone(),
+                writer_info: writer_info.clone(),
+            },
+            writer_info,
+        )
+    }
+
+    /// Reports the output-row boundaries between physical chunks written by this strategy.
+    ///
+    /// Boundaries must use the strategy's output row coordinate space. The report is normalized
+    /// to sorted, unique values; structural parents are responsible for translating it when they
+    /// change coordinate spaces.
+    pub fn report_chunk_boundaries(&self, chunk_boundaries: impl IntoIterator<Item = u64>) {
+        self.writer_info.set_chunk_boundaries(chunk_boundaries)
+    }
 }
 
 impl From<ArrayContext> for LayoutWriterContext {
@@ -170,8 +230,10 @@ pub trait LayoutStrategy: 'static + Send + Sync {
     /// with a sequence pointer that indicates its position in the overall array. By passing
     /// around these pointers (essentially vector clocks), the writer can support concurrent
     /// and parallel processing while maintaining a deterministic order of data in the file.
-    /// The `ctx` parameter carries both array serialization state and writer-scoped accounting
-    /// through every child strategy.
+    /// The `ctx` parameter carries array serialization state, writer-scoped accounting, and the
+    /// current output report through every child strategy. Structural strategies that change row
+    /// coordinates create a [`LayoutWriterContext::child_context`] for each child, then translate
+    /// the completed child report before publishing their own.
     ///
     /// The `eof` parameter is a guaranteed to be greater than all sequence pointers in the stream.
     ///
@@ -270,7 +332,10 @@ impl LayoutStrategy for Arc<dyn LayoutStrategy> {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::ArrayContext;
+
     use crate::strategy::BufferedBytesTracker;
+    use crate::strategy::LayoutWriterContext;
 
     #[test]
     fn reservations_accumulate_and_release() {
@@ -299,5 +364,17 @@ mod tests {
 
         drop(reservation);
         assert_eq!(observer.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn child_context_has_an_isolated_writer_report() {
+        let ctx = LayoutWriterContext::new(ArrayContext::empty());
+        let (child_ctx, child_info) = ctx.child_context();
+
+        child_ctx.report_chunk_boundaries([8, 3, 8]);
+
+        assert_eq!(child_info.chunk_boundaries(), [3, 8]);
+        let (_, parent_info) = ctx.child_context();
+        assert!(parent_info.chunk_boundaries().is_empty());
     }
 }

@@ -5,6 +5,7 @@
 
 mod expr;
 mod reader;
+mod repartition;
 pub mod writer;
 
 use std::sync::Arc;
@@ -55,6 +56,35 @@ pub use List as ListLayoutEncoding;
 #[derive(Clone, Debug)]
 pub struct ListData {
     offsets_ptype: PType,
+    chunk_boundaries: Arc<[ListChunkBoundary]>,
+}
+
+/// A physical elements-child chunk boundary expressed in both list row spaces.
+///
+/// The boundary is stored only when an elements chunk end is also an outer-list row boundary.
+/// This lets scan planning split list rows without putting either side of the split across an
+/// elements chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ListChunkBoundary {
+    outer_row_end: u64,
+    element_row_end: u64,
+}
+
+impl ListChunkBoundary {
+    pub(super) fn new(outer_row_end: u64, element_row_end: u64) -> Self {
+        Self {
+            outer_row_end,
+            element_row_end,
+        }
+    }
+
+    pub(super) fn outer_row_end(self) -> u64 {
+        self.outer_row_end
+    }
+
+    pub(super) fn element_row_end(self) -> u64 {
+        self.element_row_end
+    }
 }
 
 /// A list layout shredded into elements, offsets, and optional validity children.
@@ -70,7 +100,10 @@ impl VTable for List {
     }
 
     fn metadata(layout: &Layout<Self>) -> Self::Metadata {
-        ProstMetadata(ListLayoutMetadata::new(layout.offsets_ptype))
+        ProstMetadata(ListLayoutMetadata::new_with_chunk_boundaries(
+            layout.offsets_ptype,
+            &layout.chunk_boundaries,
+        ))
     }
 
     fn deserialize(
@@ -83,7 +116,7 @@ impl VTable for List {
             .dtype
             .as_list_element_opt()
             .ok_or_else(|| vortex_err!("ListLayout requires a List dtype, got {}", args.dtype))?;
-        args.children.child(ELEMENTS_CHILD_INDEX, elements_dtype)?;
+        let elements = args.children.child(ELEMENTS_CHILD_INDEX, elements_dtype)?;
         let offsets_dtype = DType::Primitive(metadata.offsets_ptype(), Nullability::NonNullable);
         let offsets = args.children.child(OFFSETS_CHILD_INDEX, &offsets_dtype)?;
         vortex_error::vortex_ensure!(
@@ -99,8 +132,17 @@ impl VTable for List {
                 "List validity row count does not match parent"
             );
         }
+        let chunk_boundaries = metadata
+            .chunk_boundaries
+            .iter()
+            .map(|boundary| {
+                ListChunkBoundary::new(boundary.outer_row_end, boundary.element_row_end)
+            })
+            .collect::<Vec<_>>();
+        validate_chunk_boundaries(args.row_count, elements.row_count(), &chunk_boundaries)?;
         Ok(ListData {
             offsets_ptype: metadata.offsets_ptype(),
+            chunk_boundaries: chunk_boundaries.into(),
         })
     }
 
@@ -171,8 +213,20 @@ impl Layout<List> {
         offsets: LayoutRef,
         validity: Option<LayoutRef>,
     ) -> Self {
+        Self::new_with_chunk_boundaries(dtype, elements, offsets, validity, Vec::new())
+    }
+
+    pub(super) fn new_with_chunk_boundaries(
+        dtype: DType,
+        elements: LayoutRef,
+        offsets: LayoutRef,
+        validity: Option<LayoutRef>,
+        chunk_boundaries: Vec<ListChunkBoundary>,
+    ) -> Self {
         let row_count = offsets.row_count().saturating_sub(1);
         let offsets_ptype = offsets.dtype().as_ptype();
+        validate_chunk_boundaries(row_count, elements.row_count(), &chunk_boundaries)
+            .vortex_expect("invalid list chunk boundaries");
         let mut children = vec![elements, offsets];
         children.extend(validity);
         Self::validate_children(&dtype, children.len()).vortex_expect("invalid list children");
@@ -182,7 +236,10 @@ impl Layout<List> {
             row_count,
             Vec::new(),
             OwnedLayoutChildren::layout_children(children),
-            ListData { offsets_ptype },
+            ListData {
+                offsets_ptype,
+                chunk_boundaries: chunk_boundaries.into(),
+            },
         )
         .into_typed()
     }
@@ -209,6 +266,10 @@ impl Layout<List> {
         self.offsets_ptype
     }
 
+    pub(super) fn chunk_boundaries(&self) -> &[ListChunkBoundary] {
+        &self.chunk_boundaries
+    }
+
     /// Returns the list element dtype.
     pub fn elements_dtype(&self) -> &DType {
         self.dtype()
@@ -227,12 +288,107 @@ impl Layout<List> {
 pub struct ListLayoutMetadata {
     #[prost(enumeration = "PType", tag = "1")]
     offsets_ptype: i32,
+    #[prost(message, repeated, tag = "2")]
+    chunk_boundaries: Vec<ListChunkBoundaryMetadata>,
+}
+
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+struct ListChunkBoundaryMetadata {
+    #[prost(uint64, tag = "1")]
+    outer_row_end: u64,
+    #[prost(uint64, tag = "2")]
+    element_row_end: u64,
 }
 
 impl ListLayoutMetadata {
     pub fn new(offsets_ptype: PType) -> Self {
+        Self::new_with_chunk_boundaries(offsets_ptype, &[])
+    }
+
+    fn new_with_chunk_boundaries(
+        offsets_ptype: PType,
+        chunk_boundaries: &[ListChunkBoundary],
+    ) -> Self {
         let mut metadata = Self::default();
         metadata.set_offsets_ptype(offsets_ptype);
+        metadata.chunk_boundaries = chunk_boundaries
+            .iter()
+            .map(|boundary| ListChunkBoundaryMetadata {
+                outer_row_end: boundary.outer_row_end(),
+                element_row_end: boundary.element_row_end(),
+            })
+            .collect();
         metadata
+    }
+}
+
+fn validate_chunk_boundaries(
+    outer_row_count: u64,
+    element_row_count: u64,
+    chunk_boundaries: &[ListChunkBoundary],
+) -> VortexResult<()> {
+    vortex_error::vortex_ensure!(
+        chunk_boundaries
+            .iter()
+            .all(|boundary| boundary.outer_row_end() != 0
+                && boundary.outer_row_end() < outer_row_count
+                && boundary.element_row_end() != 0
+                && boundary.element_row_end() < element_row_count),
+        "List chunk boundaries must be interior to their row spaces"
+    );
+    vortex_error::vortex_ensure!(
+        chunk_boundaries
+            .windows(2)
+            .all(|pair| pair[0].outer_row_end() < pair[1].outer_row_end()
+                && pair[0].element_row_end() < pair[1].element_row_end()),
+        "List chunk boundaries must be strictly increasing"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::DeserializeMetadata;
+    use vortex_array::SerializeMetadata;
+
+    use super::*;
+
+    #[test]
+    fn chunk_boundaries_round_trip_through_metadata() -> VortexResult<()> {
+        let boundaries = [
+            ListChunkBoundary::new(8, 21),
+            ListChunkBoundary::new(16, 50),
+        ];
+        let encoded = ProstMetadata(ListLayoutMetadata::new_with_chunk_boundaries(
+            PType::U64,
+            &boundaries,
+        ))
+        .serialize();
+        let decoded =
+            <ProstMetadata<ListLayoutMetadata> as DeserializeMetadata>::deserialize(&encoded)?;
+
+        assert_eq!(decoded.offsets_ptype(), PType::U64);
+        assert_eq!(
+            decoded
+                .chunk_boundaries
+                .iter()
+                .map(|boundary| {
+                    ListChunkBoundary::new(boundary.outer_row_end, boundary.element_row_end)
+                })
+                .collect::<Vec<_>>(),
+            boundaries
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_metadata_has_no_chunk_boundaries() -> VortexResult<()> {
+        let encoded = ProstMetadata(ListLayoutMetadata::new(PType::U32)).serialize();
+        let decoded =
+            <ProstMetadata<ListLayoutMetadata> as DeserializeMetadata>::deserialize(&encoded)?;
+
+        assert_eq!(decoded.offsets_ptype(), PType::U32);
+        assert!(decoded.chunk_boundaries.is_empty());
+        Ok(())
     }
 }

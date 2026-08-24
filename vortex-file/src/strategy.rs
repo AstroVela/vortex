@@ -3,6 +3,7 @@
 
 //! This module defines the default layout strategy for a Vortex file.
 
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use vortex_layout::layouts::compressed::CompressorPlugin;
 use vortex_layout::layouts::dict::writer::DictStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::list::writer::ListLayoutStrategy;
+use vortex_layout::layouts::repartition::CoalescingStrategy;
 use vortex_layout::layouts::repartition::RepartitionStrategy;
 use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 use vortex_layout::layouts::table::TableStrategy;
@@ -176,6 +178,7 @@ impl WriteStrategyBuilder {
     /// Builds the canonical [`LayoutStrategy`] implementation, with the configured overrides
     /// applied.
     pub fn build(self) -> Arc<dyn LayoutStrategy> {
+        let data_block_target_bytes = self.data_block_target_bytes;
         let flat: Arc<dyn LayoutStrategy> = if let Some(flat) = self.flat_strategy {
             flat
         } else {
@@ -223,7 +226,7 @@ impl WriteStrategyBuilder {
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
-            compressing,
+            compressing.clone(),
             RepartitionWriterOptions {
                 // Write stream partitions roughly become segments. Because Vortex never reads less
                 // than one segment, the size of segments and, therefore, partitions, must be small
@@ -231,9 +234,9 @@ impl WriteStrategyBuilder {
                 // sufficient read concurrency for the desired throughput. One megabyte is small
                 // enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object Storage for
                 // High-Performance Analytics", VLDB Vol 16, Iss 11).
-                block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
+                block_size_minimum: data_block_target_bytes.unwrap_or(0),
                 block_len_multiple: self.row_block_size,
-                block_size_target: self.data_block_target_bytes,
+                block_size_target: data_block_target_bytes,
                 canonicalize: true,
             },
         );
@@ -256,7 +259,7 @@ impl WriteStrategyBuilder {
             compress_then_flat.clone(),
             coalescing,
             Default::default(),
-            probe_compressor,
+            Arc::clone(&probe_compressor),
         );
 
         let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
@@ -293,28 +296,52 @@ impl WriteStrategyBuilder {
                 .with_field_writers(self.field_writers);
 
         if self.use_list_layout {
-            // We need a closure here to enable recursive application of list layout.
-            table_strategy = table_strategy.with_list_layout_factory(
-                move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
-                    let zoned = ZonedStrategy::new(
-                        list_layout,
-                        compress_then_flat.clone(),
-                        ZonedLayoutOptions {
-                            block_size: row_block_size,
-                            ..Default::default()
-                        },
-                    );
-                    Arc::new(RepartitionStrategy::new(
-                        zoned,
-                        RepartitionWriterOptions {
-                            block_size_minimum: 0,
-                            block_len_multiple: row_block_size.get(),
-                            block_size_target: None,
-                            canonicalize: false,
-                        },
-                    ))
-                },
-            );
+            let list_repartition_target = data_block_target_bytes.and_then(NonZeroU64::new);
+            let list_coalescing: Arc<dyn LayoutStrategy> =
+                if let Some(target) = list_repartition_target {
+                    Arc::new(CoalescingStrategy::new(compressing, target))
+                } else {
+                    Arc::new(compressing)
+                };
+            // The list writer chooses these element chunk boundaries before decomposition. Keep
+            // them through dictionary encoding and coalesce whole chunks only; never split them.
+            let list_leaf = Arc::new(DictStrategy::new(
+                Arc::clone(&list_coalescing),
+                compress_then_flat.clone(),
+                list_coalescing,
+                Default::default(),
+                probe_compressor,
+            ));
+
+            // The factory is applied recursively to nested lists.
+            table_strategy = table_strategy
+                .with_list_elements_strategy(list_leaf)
+                .with_list_layout_factory(
+                    move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
+                        let list_layout = if let Some(target) = list_repartition_target {
+                            list_layout.with_list_aware_repartition(target)
+                        } else {
+                            list_layout
+                        };
+                        let zoned = ZonedStrategy::new(
+                            list_layout,
+                            compress_then_flat.clone(),
+                            ZonedLayoutOptions {
+                                block_size: row_block_size,
+                                ..Default::default()
+                            },
+                        );
+                        Arc::new(RepartitionStrategy::new(
+                            zoned,
+                            RepartitionWriterOptions {
+                                block_size_minimum: 0,
+                                block_len_multiple: row_block_size.get(),
+                                block_size_target: None,
+                                canonicalize: false,
+                            },
+                        ))
+                    },
+                );
         }
 
         Arc::new(table_strategy)

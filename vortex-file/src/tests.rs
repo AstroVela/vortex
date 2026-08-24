@@ -1922,6 +1922,73 @@ async fn nested_list_of_list_roundtrip() -> VortexResult<()> {
     Ok(())
 }
 
+/// List-element chunks are chosen in element space, then translated through offsets so file
+/// splits remain at complete outer list rows rather than the unrelated input row-block boundary.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn list_layout_uses_offset_aligned_element_chunks_for_splits() -> VortexResult<()> {
+    let items = ListArray::try_new(
+        buffer![0i32, 1, 2, 3, 4, 5, 6, 7, 8, 9].into_array(),
+        buffer![0u32, 2, 4, 9, 10].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let table = StructArray::from_fields(&[("items", items)])?.into_array();
+
+    let strategy = crate::strategy::WriteStrategyBuilder::default()
+        .with_row_block_size(4)
+        .with_data_block_target_bytes(Some(16))
+        .with_list_layout()
+        .build();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut buf, table.to_array_stream())
+        .await?;
+
+    let file = SESSION.open_options().open_buffer(buf)?;
+    assert_eq!(file.splits()?, [0..2, 2..3, 3..4]);
+    Ok(())
+}
+
+/// Child list boundaries climb through a struct's element-row space, then the outer list retains
+/// only the one that lands on an outer list offset.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn list_of_struct_of_list_uses_composed_chunk_splits() -> VortexResult<()> {
+    let nested = ListArray::try_new(
+        buffer![0i32, 1, 2, 3, 4, 5, 6, 7].into_array(),
+        buffer![0u32, 2, 4, 6, 8].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let elements = StructArray::from_fields(&[("nested", nested)])?.into_array();
+    let items = ListArray::try_new(
+        elements,
+        buffer![0u32, 2, 4].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let table = StructArray::from_fields(&[("items", items)])?.into_array();
+
+    let strategy = crate::strategy::WriteStrategyBuilder::default()
+        .with_row_block_size(4)
+        .with_data_block_target_bytes(Some(8))
+        .with_list_layout()
+        .build();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut buf, table.to_array_stream())
+        .await?;
+
+    let file = SESSION.open_options().open_buffer(buf)?;
+    assert_eq!(file.splits()?, [0..1, 1..2]);
+    Ok(())
+}
+
 type MapEntryFixture<'a> = (i32, Option<&'a str>);
 type MapRowFixture<'a> = Option<Vec<MapEntryFixture<'a>>>;
 

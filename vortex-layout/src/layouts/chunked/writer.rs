@@ -52,6 +52,7 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
         let dtype2 = dtype.clone();
         let chunk_strategy = Arc::clone(&self.chunk_strategy);
         let handle = session.handle();
+        let child_context = ctx.clone();
 
         // We spawn each child to allow parallelism when processing chunks.
         let stream = stream! {
@@ -60,16 +61,16 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
                 let chunk_eof = eof.split_off();
 
                 let chunk_strategy = Arc::clone(&chunk_strategy);
-                let ctx = ctx.clone();
+                let (child_ctx, child_info) = child_context.child_context();
                 let segment_sink = Arc::clone(&segment_sink);
                 let dtype = dtype2.clone();
                 let session = session.clone();
 
                 yield handle.spawn_nested(move |handle| async move {
                     let session = session.with_handle(handle);
-                    chunk_strategy
+                    let layout = chunk_strategy
                         .write_stream(
-                            ctx,
+                            child_ctx,
                             segment_sink,
                             SequentialStreamAdapter::new(
                                 dtype,
@@ -79,13 +80,41 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
                             chunk_eof,
                             &session,
                         )
-                        .await
+                        .await?;
+                    Ok::<_, vortex_error::VortexError>((layout, child_info))
                 })
             }
         };
 
         // Poll all of our children concurrently to accumulate their layouts.
-        let mut child_layouts: Vec<LayoutRef> = stream.buffered(usize::MAX).try_collect().await?;
+        let child_results: Vec<_> = stream.buffered(usize::MAX).try_collect().await?;
+        let mut child_layouts = Vec::with_capacity(child_results.len());
+        let mut chunk_boundaries = Vec::new();
+        let mut row_offset = 0;
+
+        for (layout, child_info) in child_results {
+            let row_count = layout.row_count();
+            chunk_boundaries.extend(
+                child_info
+                    .chunk_boundaries()
+                    .into_iter()
+                    .filter(|&boundary| boundary != 0 && boundary < row_count)
+                    .map(|boundary| row_offset + boundary),
+            );
+            row_offset += row_count;
+            child_layouts.push(layout);
+        }
+        chunk_boundaries.extend(
+            child_layouts
+                .iter()
+                .map(|layout| layout.row_count())
+                .scan(0, |row_offset, row_count| {
+                    *row_offset += row_count;
+                    Some(*row_offset)
+                })
+                .take(child_layouts.len().saturating_sub(1)),
+        );
+        ctx.report_chunk_boundaries(chunk_boundaries);
 
         if child_layouts.len() == 1 {
             Ok(child_layouts.pop().vortex_expect("must have one child"))

@@ -217,6 +217,7 @@ impl LayoutStrategy for StructStrategy {
             struct_dtype.names().iter().cloned().collect()
         };
 
+        let child_context = ctx.clone();
         let layout_futures: Vec<_> = column_dtypes
             .into_iter()
             .zip_eq(column_streams_rx)
@@ -227,7 +228,7 @@ impl LayoutStrategy for StructStrategy {
                     SequentialStreamAdapter::new(dtype, recv.into_stream().boxed()).sendable();
                 let child_eof = eof.split_off();
                 let session = session.clone();
-                let ctx = ctx.clone();
+                let (child_ctx, child_info) = child_context.child_context();
                 let segment_sink = Arc::clone(&segment_sink);
                 handle.spawn_nested(move |h| {
                     // Validity is written through the validity strategy; every other field
@@ -243,15 +244,38 @@ impl LayoutStrategy for StructStrategy {
                     let session = session.with_handle(h);
 
                     async move {
-                        writer
-                            .write_stream(ctx, segment_sink, column_stream, child_eof, &session)
-                            .await
+                        let layout = writer
+                            .write_stream(
+                                child_ctx,
+                                segment_sink,
+                                column_stream,
+                                child_eof,
+                                &session,
+                            )
+                            .await?;
+                        Ok((layout, child_info))
                     }
                 })
             })
             .collect();
 
-        let (_success, column_layouts) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
+        let (_success, column_results) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
+        let mut column_layouts = Vec::with_capacity(column_results.len());
+        let mut chunk_boundaries: Option<Vec<u64>> = None;
+        for (layout, child_info) in column_results {
+            let child_boundaries = child_info.chunk_boundaries();
+            if let Some(chunk_boundaries) = &mut chunk_boundaries {
+                chunk_boundaries
+                    .retain(|boundary| child_boundaries.binary_search(boundary).is_ok());
+            } else {
+                chunk_boundaries = Some(child_boundaries);
+            }
+            column_layouts.push(layout);
+        }
+        // A struct boundary is usable only when no field (including validity) crosses it.
+        // Reporting the union would let a parent treat a boundary from one field as though the
+        // whole struct had been physically partitioned there.
+        ctx.report_chunk_boundaries(chunk_boundaries.unwrap_or_default());
         // TODO(os): transposed stream could count row counts as well,
         // This must hold though, all columns must have the same row count of the struct layout
         let row_count = column_layouts.first().map(|l| l.row_count()).unwrap_or(0);
