@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use rstest::rstest;
 use vortex_array::IntoArray;
@@ -458,6 +460,7 @@ async fn wrong_duplicate_and_revoked_tasks_do_not_stay_running() -> VortexResult
         output: offered.output,
         elapsed_ns: 0,
         read_bytes: None,
+        sent_at: None,
         result: Ok(ResolvedValue::Segment(
             vortex_array::buffer::BufferHandle::new_host(vortex_buffer::ByteBuffer::from(vec![0])),
         )),
@@ -471,6 +474,7 @@ async fn wrong_duplicate_and_revoked_tasks_do_not_stay_running() -> VortexResult
                 output: offered.output,
                 elapsed_ns: 0,
                 read_bytes: None,
+                sent_at: None,
                 result: Ok(ResolvedValue::Array(ResolvedArray::plain(
                     vortex_array::arrays::BoolArray::from_iter([true]).into_array(),
                 ))),
@@ -676,7 +680,7 @@ async fn empty_demand_revokes_parallel_predicate_offers() -> VortexResult<()> {
         result
             .trace
             .iter()
-            .any(|event| event.message == "event=executor_pool_start")
+            .any(|event| event.message == "event=executor_pool_ready")
     );
     Ok(())
 }
@@ -1038,5 +1042,175 @@ async fn speculative_io_charges_unknown_size_fallback() -> VortexResult<()> {
 
     assert!(result.metrics.speculative_io_unknown_size > 0);
     assert_eq!(result.metrics.speculative_io_admitted, 0);
+    Ok(())
+}
+
+fn morsel_ranges(row_count: u64, morsel_rows: u64) -> Vec<std::ops::Range<u64>> {
+    (0..row_count)
+        .step_by(usize::try_from(morsel_rows).unwrap_or(1))
+        .map(|start| start..(start + morsel_rows).min(row_count))
+        .collect()
+}
+
+#[rstest]
+#[case::cascade(true)]
+#[case::eager(false)]
+fn pipeline_matches_eager(#[case] cascade: bool) -> VortexResult<()> {
+    let session = new_session().with_tokio();
+    let (plan, source, query) = fixture()?;
+    let source: Arc<dyn SegmentSource> = source;
+    let expected =
+        futures::executor::block_on(run_eager(&plan, &query, 4, Arc::clone(&source), &session))?;
+    let expected = stable_output_hash(&expected, &session)?;
+    let policy: Arc<dyn super::DemandPolicy> = if cascade {
+        Arc::new(super::CascadeDemand)
+    } else {
+        Arc::new(super::EagerDemand)
+    };
+    let pipeline: Arc<dyn super::MorselPipeline> =
+        Arc::new(super::StructScanPipeline::new(&plan, query, policy));
+    let result = super::run_pipeline_sharded(
+        Arc::clone(&pipeline),
+        &morsel_ranges(plan.row_count, 4),
+        source,
+        &session,
+        2,
+    )?;
+    assert_eq!(stable_output_hash(&result.batches, &session)?, expected);
+    Ok(())
+}
+
+#[test]
+fn pipeline_empty_demand_skips_projection_reads() -> VortexResult<()> {
+    let session = new_session().with_tokio();
+    let (plan, source, mut query) = fixture()?;
+    query.conjuncts.truncate(1);
+    query.conjuncts[0].predicate = Predicate::LessThan(i64::MIN);
+    let (counted, requests) = CountingMemorySource::new(source);
+    let source: Arc<dyn SegmentSource> = counted;
+    let pipeline: Arc<dyn super::MorselPipeline> = Arc::new(super::StructScanPipeline::new(
+        &plan,
+        query,
+        Arc::new(super::CascadeDemand),
+    ));
+    let result = super::run_pipeline_sharded(
+        Arc::clone(&pipeline),
+        &morsel_ranges(plan.row_count, 8),
+        source,
+        &session,
+        1,
+    )?;
+    assert_eq!(
+        result
+            .batches
+            .iter()
+            .map(|batch| batch.array.len())
+            .sum::<usize>(),
+        0
+    );
+    // Only the filter field's two chunks are read; projection chunks are skipped entirely.
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
+struct CountingMemorySource {
+    inner: Arc<dyn SegmentSource>,
+    requests: Arc<AtomicUsize>,
+}
+
+impl CountingMemorySource {
+    fn new(inner: Arc<dyn SegmentSource>) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                inner,
+                requests: Arc::clone(&requests),
+            }),
+            requests,
+        )
+    }
+}
+
+impl SegmentSource for CountingMemorySource {
+    fn estimated_size(&self, id: SegmentId) -> Option<usize> {
+        self.inner.estimated_size(id)
+    }
+
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner.request(id)
+    }
+}
+
+/// Two fields over the same 10 logical rows with mutually unaligned chunkings ([0,3,10) versus
+/// [0,6,10)): the pipeline must produce the same output as an eager reference over an aligned
+/// plan holding identical values.
+#[test]
+fn pipeline_aligns_misaligned_children() -> VortexResult<()> {
+    use vortex_buffer::Buffer;
+
+    let session = new_session().with_tokio();
+    let a: Vec<i64> = (0..10).collect();
+    let b: Vec<i64> = (0..10).map(|row| row * 2).collect();
+
+    let source = Arc::new(super::MemorySegments::default());
+    let mut make_chunks = |field: usize, values: &[i64], bounds: &[usize]| -> VortexResult<_> {
+        let mut chunks = Vec::new();
+        for window in bounds.windows(2) {
+            let segment = source.insert(
+                Buffer::from_iter(values[window[0]..window[1]].iter().copied()).into_byte_buffer(),
+            )?;
+            chunks.push(super::FlatPlan {
+                field: FieldId(field),
+                segment,
+                root_coverage: window[0] as u64..window[1] as u64,
+                row_count: window[1] - window[0],
+                estimated_bytes: None,
+                encoding: super::FlatEncoding::RawI64,
+            });
+        }
+        Ok(super::FieldChunks {
+            field: FieldId(field),
+            chunks,
+        })
+    };
+    let fields = vec![
+        make_chunks(0, &a, &[0, 3, 10])?,
+        make_chunks(1, &b, &[0, 6, 10])?,
+    ];
+    let query = ScanQuery {
+        conjuncts: vec![Conjunct {
+            field: FieldId(0),
+            predicate: Predicate::GreaterThan(2),
+        }],
+        projection: vec![FieldId(1)],
+    };
+    let pipeline: Arc<dyn super::MorselPipeline> = Arc::new(super::StructScanPipeline::from_parts(
+        fields,
+        query.clone(),
+        vortex_array::dtype::FieldNames::from(["b"]),
+        Arc::new(super::CascadeDemand),
+    ));
+    let result = super::run_pipeline_sharded(
+        Arc::clone(&pipeline),
+        &morsel_ranges(10, 4),
+        source,
+        &session,
+        2,
+    )?;
+
+    let (aligned_plan, aligned_source) =
+        SourcePlan::from_i64_chunks(vec!["a".into(), "b".into()], vec![vec![a, b]])?;
+    let expected = futures::executor::block_on(run_eager(
+        &aligned_plan,
+        &query,
+        4,
+        aligned_source,
+        &session,
+    ))?;
+    assert_eq!(
+        stable_output_hash(&result.batches, &session)?,
+        stable_output_hash(&expected, &session)?
+    );
     Ok(())
 }

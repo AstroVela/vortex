@@ -10,6 +10,7 @@ mod baseline;
 mod evaluate;
 mod graph;
 mod model;
+mod pipeline;
 mod reactor;
 mod slots;
 
@@ -17,6 +18,7 @@ pub use baseline::*;
 pub use evaluate::*;
 pub use graph::*;
 pub use model::*;
+pub use pipeline::*;
 pub use reactor::*;
 
 #[cfg(test)]

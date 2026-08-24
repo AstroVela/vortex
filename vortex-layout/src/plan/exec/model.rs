@@ -660,6 +660,9 @@ pub struct Completion {
     pub output: OutputSlot,
     pub elapsed_ns: u64,
     pub read_bytes: Option<usize>,
+    /// When phase timing is enabled, the instant the worker queued this completion; the
+    /// coordinator uses it to measure how long finished results waited to be adopted.
+    pub sent_at: Option<std::time::Instant>,
     pub result: VortexResult<ResolvedValue>,
 }
 

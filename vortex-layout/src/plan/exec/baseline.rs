@@ -56,6 +56,74 @@ use crate::segments::SegmentSource;
 
 static EXECUTOR_POOLS: LazyLock<Mutex<BTreeMap<usize, futures::executor::ThreadPool>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Coordinator phase timing is a diagnostic mode: it attributes coordinator wall time to drain,
+/// advance, schedule, dispatch, inline completion, and channel-wait phases. It stays off unless
+/// requested so clean comparison runs pay no `Instant` overhead.
+static PHASE_TIMING: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VORTEX_SELF_PACED_PHASE_TIMING").is_some());
+
+/// Experimental shard count for the concurrent runner. Each shard owns a contiguous group of
+/// morsels with its own coordinator; `1` preserves the single-coordinator behavior.
+static SHARDS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("VORTEX_SELF_PACED_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|shards| *shards >= 1)
+        .unwrap_or(1)
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShardMode {
+    /// Shard coordinators dispatch evaluation work to one shared worker pool.
+    Pooled,
+    /// Every shard thread coordinates its own morsels and evaluates their tasks inline: there is
+    /// no separate coordinator and no cross-thread task dispatch. Shard count defaults to the
+    /// configured concurrency so the thread total matches the pooled worker budget.
+    Owned,
+    /// The extensible streaming pipeline: the scheduler only sees `dyn MorselPipeline`, demand
+    /// compute is a pluggable `DemandPolicy`, and children may have arbitrary chunk boundaries.
+    Pipeline,
+}
+
+static SHARD_MODE: LazyLock<ShardMode> =
+    LazyLock::new(
+        || match std::env::var("VORTEX_SELF_PACED_SHARD_MODE").as_deref() {
+            Ok("owned") => ShardMode::Owned,
+            Ok("pipeline") => ShardMode::Pipeline,
+            _ => ShardMode::Pooled,
+        },
+    );
+
+fn demand_policy_from_env() -> Arc<dyn super::DemandPolicy> {
+    match std::env::var("VORTEX_SELF_PACED_DEMAND").as_deref() {
+        Ok("eager") => Arc::new(super::EagerDemand),
+        Ok("cascade") => Arc::new(super::CascadeDemand),
+        _ => Arc::new(super::AdaptiveDemand::new()),
+    }
+}
+
+fn phase_start(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+fn phase_add(slot: &mut u64, started: Option<Instant>) {
+    if let Some(started) = started {
+        *slot += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+}
+
+#[derive(Default)]
+struct CoordinatorPhases {
+    drain_ns: u64,
+    advance_ns: u64,
+    schedule_ns: u64,
+    dispatch_ns: u64,
+    inline_ns: u64,
+    wait_ns: u64,
+    complete_ns: u64,
+    iterations: usize,
+}
 type OfferedTasks = SmallVec<[TaskId; 16]>;
 type TaskStarts = BTreeMap<TaskId, (Instant, &'static str, Option<MorselId>)>;
 
@@ -103,15 +171,72 @@ pub async fn run_self_paced_ranges(
     session: &VortexSession,
     options: RunOptions,
 ) -> VortexResult<RunResult> {
-    let collect_trace = options.collect_trace;
     if options.concurrency == 0 {
         vortex_bail!("execution concurrency must be non-zero");
     }
     if options.concurrency > 1 {
-        return run_self_paced_concurrent(plan, query, morsel_ranges, source, session, options)
-            .await;
+        if *SHARD_MODE == ShardMode::Pipeline {
+            let threads = if *SHARDS > 1 {
+                *SHARDS
+            } else {
+                options.concurrency
+            }
+            .min(morsel_ranges.len().max(1));
+            let pipeline: Arc<dyn super::MorselPipeline> = Arc::new(
+                super::StructScanPipeline::new(plan, query, demand_policy_from_env()),
+            );
+            return super::run_pipeline_sharded(pipeline, morsel_ranges, source, session, threads);
+        }
+        let owned = *SHARD_MODE == ShardMode::Owned;
+        let requested_shards = if owned && *SHARDS <= 1 {
+            options.concurrency
+        } else {
+            *SHARDS
+        };
+        let shards = requested_shards
+            .min(options.concurrency)
+            .min(morsel_ranges.len().max(1));
+        if shards > 1 || (owned && shards == 1) {
+            return run_self_paced_sharded(
+                plan,
+                query,
+                morsel_ranges,
+                source,
+                session,
+                options,
+                shards,
+                owned,
+            );
+        }
+        let pool = executor_pool(options.concurrency)?;
+        return run_self_paced_concurrent(
+            plan,
+            query,
+            morsel_ranges,
+            source,
+            session,
+            options,
+            options.concurrency,
+            pool,
+        )
+        .await;
     }
 
+    run_self_paced_single(plan, query, morsel_ranges, source, session, options).await
+}
+
+/// The single-threaded runner: one thread both coordinates and evaluates every task inline.
+/// Owned-mode sharding runs one of these per thread over that thread's morsel group, so each
+/// morsel group's coordination happens on the thread that executes its work.
+async fn run_self_paced_single(
+    plan: &SourcePlan,
+    query: ScanQuery,
+    morsel_ranges: &[Range<u64>],
+    source: Arc<dyn SegmentSource>,
+    session: &VortexSession,
+    options: RunOptions,
+) -> VortexResult<RunResult> {
+    let collect_trace = options.collect_trace;
     let init_started = collect_trace.then(Instant::now);
     let mut execution = Execution::try_new_with_policy_and_ranges(
         plan,
@@ -272,6 +397,100 @@ pub async fn run_self_paced_ranges(
     })
 }
 
+fn executor_pool(size: usize) -> VortexResult<futures::executor::ThreadPool> {
+    let mut pools = EXECUTOR_POOLS.lock();
+    if let Some(pool) = pools.get(&size) {
+        return Ok(pool.clone());
+    }
+    let pool = futures::executor::ThreadPoolBuilder::new()
+        .pool_size(size)
+        .name_prefix(format!("self-paced-{size}-"))
+        .create()
+        .map_err(|error| vortex_error::vortex_err!("cannot create executor pool: {error}"))?;
+    pools.insert(size, pool.clone());
+    Ok(pool)
+}
+
+/// Run the scan as independent shards: each shard owns a contiguous group of morsels with its own
+/// `Execution` and coordinator thread, while all shards share one worker pool and split the
+/// admission budget. Resources are deduplicated within a shard only, so a segment straddling a
+/// shard boundary may be read once per shard.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "experimental sharded entry mirrors the concurrent runner's signature"
+)]
+fn run_self_paced_sharded(
+    plan: &SourcePlan,
+    query: ScanQuery,
+    morsel_ranges: &[Range<u64>],
+    source: Arc<dyn SegmentSource>,
+    session: &VortexSession,
+    options: RunOptions,
+    shards: usize,
+    owned: bool,
+) -> VortexResult<RunResult> {
+    let pool = if owned {
+        None
+    } else {
+        Some(executor_pool(options.concurrency)?)
+    };
+    let admission = (options.concurrency / shards).max(1);
+    let group_len = morsel_ranges.len().div_ceil(shards);
+    let results = std::thread::scope(|scope| {
+        let handles = morsel_ranges
+            .chunks(group_len)
+            .map(|ranges| {
+                let query = query.clone();
+                let source = Arc::clone(&source);
+                let session = session.clone();
+                let pool = pool.clone();
+                scope.spawn(move || {
+                    futures::executor::block_on(async move {
+                        match pool {
+                            Some(pool) => {
+                                run_self_paced_concurrent(
+                                    plan, query, ranges, source, &session, options, admission, pool,
+                                )
+                                .await
+                            }
+                            None => {
+                                run_self_paced_single(
+                                    plan, query, ranges, source, &session, options,
+                                )
+                                .await
+                            }
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| vortex_error::vortex_err!("self-paced shard panicked"))?
+            })
+            .collect::<VortexResult<Vec<_>>>()
+    })?;
+    let mut merged: Option<RunResult> = None;
+    for result in results {
+        match &mut merged {
+            None => merged = Some(result),
+            Some(merged) => {
+                merged.batches.extend(result.batches);
+                merged.metrics.absorb(&result.metrics);
+                merged.trace.extend(result.trace);
+            }
+        }
+    }
+    merged.ok_or_else(|| vortex_error::vortex_err!("sharded execution produced no shards"))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sharded runner supplies a shared pool and a per-shard admission budget"
+)]
 async fn run_self_paced_concurrent(
     plan: &SourcePlan,
     query: ScanQuery,
@@ -279,6 +498,8 @@ async fn run_self_paced_concurrent(
     source: Arc<dyn SegmentSource>,
     session: &VortexSession,
     options: RunOptions,
+    admission: usize,
+    pool: futures::executor::ThreadPool,
 ) -> VortexResult<RunResult> {
     let collect_trace = options.collect_trace;
     let init_started = collect_trace.then(Instant::now);
@@ -306,33 +527,19 @@ async fn run_self_paced_concurrent(
     let mut queued = vec![true; morsels.len()];
     let mut offered = OfferedTasks::new();
     if collect_trace {
-        execution.record_trace(None, format_args!("event=executor_pool_start"));
-    }
-    let pool = {
-        let mut pools = EXECUTOR_POOLS.lock();
-        if let Some(pool) = pools.get(&options.concurrency) {
-            pool.clone()
-        } else {
-            let pool = futures::executor::ThreadPoolBuilder::new()
-                .pool_size(options.concurrency)
-                .name_prefix(format!("self-paced-{}-", options.concurrency))
-                .create()
-                .map_err(|error| {
-                    vortex_error::vortex_err!("cannot create executor pool: {error}")
-                })?;
-            pools.insert(options.concurrency, pool.clone());
-            pool
-        }
-    };
-    if collect_trace {
         execution.record_trace(None, format_args!("event=executor_pool_ready"));
     }
     let (completion_tx, mut completion_rx) = mpsc::unbounded();
     let mut running = 0usize;
     let mut task_starts = BTreeMap::new();
     let mut speculative_in_flight = BTreeMap::<TaskId, usize>::new();
+    let phase_timing = *PHASE_TIMING;
+    let mut phases = CoordinatorPhases::default();
+    let run_started = phase_start(phase_timing);
 
     while unfinished != 0 || running != 0 {
+        phases.iterations += 1;
+        let phase_started = phase_start(phase_timing);
         let drained = drain_ready_completions(
             &mut completion_rx,
             &mut execution,
@@ -345,6 +552,8 @@ async fn run_self_paced_concurrent(
             &mut queued,
         )?;
         execution.record_completion_batch(drained);
+        phase_add(&mut phases.drain_ns, phase_started);
+        let phase_started = phase_start(phase_timing);
         while let Some(morsel) = ready.pop_front() {
             queued[morsel.0] = false;
             if batches[morsel.0].is_some() {
@@ -390,9 +599,11 @@ async fn run_self_paced_concurrent(
                 enqueue_morsel(&mut ready, &mut queued, morsel);
             }
         }
+        phase_add(&mut phases.advance_ns, phase_started);
 
         if unfinished != 0 {
-            let capacity = options.concurrency.saturating_sub(running);
+            let phase_started = phase_start(phase_timing);
+            let capacity = admission.saturating_sub(running);
             let speculative_bytes = speculative_in_flight.values().sum::<usize>();
             let available_speculative_bytes = options
                 .speculative_io
@@ -407,6 +618,8 @@ async fn run_self_paced_concurrent(
                 capacity,
             )?;
             execution.record_scheduler_pass(considered, admitted.len());
+            phase_add(&mut phases.schedule_ns, phase_started);
+            let phase_started = phase_start(phase_timing);
             for task_id in admitted {
                 let speculative_charge =
                     speculative_read_charge(&execution, task_id, options.speculative_io)?;
@@ -435,6 +648,7 @@ async fn run_self_paced_concurrent(
                         );
                     }
                     if inline {
+                        let inline_started = phase_start(phase_timing);
                         let wake_morsels = complete_inline_task(
                             task,
                             source.as_ref(),
@@ -446,13 +660,17 @@ async fn run_self_paced_concurrent(
                         )
                         .await?;
                         enqueue_woken_morsels(wake_morsels, &batches, &mut ready, &mut queued);
+                        phase_add(&mut phases.inline_ns, inline_started);
                         continue;
                     }
                     let source = Arc::clone(&source);
                     let session = session.clone();
                     let completion_tx = completion_tx.clone();
                     pool.spawn_ok(async move {
-                        let completion = evaluate(task, source.as_ref(), &session).await;
+                        let mut completion = evaluate(task, source.as_ref(), &session).await;
+                        if phase_timing {
+                            completion.sent_at = Some(Instant::now());
+                        }
                         drop(completion_tx.unbounded_send(completion));
                     });
                     if let Some(charge) = speculative_charge {
@@ -461,6 +679,7 @@ async fn run_self_paced_concurrent(
                     running += 1;
                 }
             }
+            phase_add(&mut phases.dispatch_ns, phase_started);
         }
 
         if !ready.is_empty() {
@@ -486,7 +705,10 @@ async fn run_self_paced_concurrent(
             );
             Some(Instant::now())
         };
+        let phase_wait_started = phase_start(phase_timing);
         if let Some(completion) = completion_rx.next().await {
+            phase_add(&mut phases.wait_ns, phase_wait_started);
+            let phase_started = phase_start(phase_timing);
             let mut drained = 1;
             complete_concurrent_task(
                 completion,
@@ -511,6 +733,7 @@ async fn run_self_paced_concurrent(
                 &mut queued,
             )?;
             execution.record_completion_batch(drained);
+            phase_add(&mut phases.complete_ns, phase_started);
             if let Some(wait_started) = wait_started {
                 execution.record_trace(
                     None,
@@ -525,6 +748,18 @@ async fn run_self_paced_concurrent(
         }
     }
 
+    if phase_timing {
+        let metrics = execution.metrics_mut();
+        metrics.coordinator_loop_iterations = phases.iterations;
+        metrics.coordinator_drain_ns = phases.drain_ns;
+        metrics.coordinator_advance_ns = phases.advance_ns;
+        metrics.coordinator_schedule_ns = phases.schedule_ns;
+        metrics.coordinator_dispatch_ns = phases.dispatch_ns;
+        metrics.coordinator_inline_ns = phases.inline_ns;
+        metrics.coordinator_wait_ns = phases.wait_ns;
+        metrics.coordinator_complete_ns = phases.complete_ns;
+        phase_add(&mut metrics.coordinator_total_ns, run_started);
+    }
     execution.finalize_speculative_io_metrics();
     Ok(RunResult {
         batches: batches.into_iter().flatten().collect(),
@@ -583,6 +818,11 @@ fn complete_concurrent_task(
 ) -> VortexResult<()> {
     *running -= 1;
     let task_id = completion.task;
+    if let Some(sent_at) = completion.sent_at {
+        execution.record_completion_dwell(
+            u64::try_from(sent_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
     speculative_in_flight.remove(&task_id);
     let wake_morsels = execution.completion_morsels(task_id)?;
     if let Some((started, operation, morsel)) = task_starts.remove(&task_id) {
@@ -857,7 +1097,15 @@ fn choose_tasks(
         _ => max_tasks,
     };
     let mut considered = 0;
+    // With speculation disabled, candidate tasks are never offered, so the second necessity pass
+    // would rescan the whole offered list without admitting anything.
+    let speculation_enabled = speculative_io.max_in_flight_bytes != 0
+        && (speculative_io.predicate != SpeculativeReadPolicy::Disabled
+            || speculative_io.projection != SpeculativeReadPolicy::Disabled);
     'necessities: for necessity in [Necessity::Required, Necessity::Candidate] {
+        if necessity == Necessity::Candidate && !speculation_enabled {
+            break;
+        }
         for offset in 0..offered.len() {
             let index = if reverse {
                 start - offset

@@ -52,6 +52,7 @@ pub async fn evaluate(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
         }),
         read_bytes,
+        sent_at: None,
         result,
     }
 }
@@ -293,20 +294,35 @@ async fn evaluate_inner(
             }
             let unfiltered_len = fields.first().map_or(0, |field| field.len());
             let array = pack_struct_array(names.clone(), fields, unfiltered_len)?;
-            let mut included_selection = BitBufferMut::with_capacity(unfiltered_len);
-            for range in selection_ranges {
-                included_selection.append_buffer(&selection_summary.values.slice(range.clone()));
-            }
-            let included_selection = included_selection.freeze();
-            if included_selection.len() != unfiltered_len
-                || included_selection.true_count() != selection_summary.true_count
-            {
-                vortex_bail!("struct selection ranges do not cover every selected row");
-            }
-            let array = if included_selection.true_count() == included_selection.len() {
+            let ranges_len = selection_ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<usize>();
+            let array = if selection_summary.true_count == selection_summary.values.len() {
+                // All-true selection: skip building the per-range mask; the coverage check
+                // reduces to the ranges tiling the whole selection.
+                if ranges_len != unfiltered_len || unfiltered_len != selection_summary.values.len()
+                {
+                    vortex_bail!("struct selection ranges do not cover every selected row");
+                }
                 array
             } else {
-                array.filter(Mask::from_buffer(included_selection))?
+                let mut included_selection = BitBufferMut::with_capacity(unfiltered_len);
+                for range in selection_ranges {
+                    included_selection
+                        .append_buffer(&selection_summary.values.slice(range.clone()));
+                }
+                let included_selection = included_selection.freeze();
+                if included_selection.len() != unfiltered_len
+                    || included_selection.true_count() != selection_summary.true_count
+                {
+                    vortex_bail!("struct selection ranges do not cover every selected row");
+                }
+                if included_selection.true_count() == included_selection.len() {
+                    array
+                } else {
+                    array.filter(Mask::from_buffer(included_selection))?
+                }
             };
             Ok(ResolvedValue::Array(ResolvedArray::plain(array)))
         }
@@ -330,7 +346,7 @@ async fn evaluate_inner(
     }
 }
 
-fn decode_flat(
+pub(crate) fn decode_flat(
     segment: &vortex_array::buffer::BufferHandle,
     encoding: &FlatEncoding,
     row_count: usize,
@@ -375,7 +391,15 @@ fn selected_output(
     Ok(ResolvedValue::Array(ResolvedArray::plain(array)))
 }
 
-fn evaluate_predicate_slice(
+/// Evaluate a predicate over every row: the full-demand fast path without needing a demand mask.
+pub(crate) fn evaluate_predicate_full(values: &[i64], predicate: super::Predicate) -> BitBuffer {
+    BitBuffer::collect_bool_multiversioned(values.len(), |index| {
+        // The collector visits `0..values.len()`.
+        predicate.matches(unsafe { *values.get_unchecked(index) })
+    })
+}
+
+pub(crate) fn evaluate_predicate_slice(
     values: &[i64],
     demand: &BitBuffer,
     true_count: usize,
@@ -396,10 +420,13 @@ fn evaluate_predicate_slice(
         });
         result.freeze()
     } else {
-        demand.map_cmp(|index, selected| {
-            // `map_cmp` visits `0..demand.len()`, which equals `values.len()`.
-            selected && predicate.matches(unsafe { *values.get_unchecked(index) })
-        })
+        // Dense-but-partial demand: two vectorized passes (full evaluation, then AND with the
+        // demand) beat one pass that consults the demand bit per row.
+        let full = BitBuffer::collect_bool_multiversioned(demand.len(), |index| {
+            // The collector visits `0..demand.len()`, which equals `values.len()`.
+            predicate.matches(unsafe { *values.get_unchecked(index) })
+        });
+        &full & demand
     }
 }
 

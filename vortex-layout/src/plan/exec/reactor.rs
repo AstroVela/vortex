@@ -118,6 +118,105 @@ pub struct Metrics {
     pub completions_drained: usize,
     pub max_completion_batch: usize,
     pub completion_wake_candidates_inspected: usize,
+    pub coordinator_loop_iterations: usize,
+    pub coordinator_drain_ns: u64,
+    pub coordinator_advance_ns: u64,
+    pub coordinator_schedule_ns: u64,
+    pub coordinator_dispatch_ns: u64,
+    pub coordinator_inline_ns: u64,
+    pub coordinator_wait_ns: u64,
+    pub coordinator_complete_ns: u64,
+    pub coordinator_total_ns: u64,
+    pub completion_queue_dwell_ns: u64,
+    pub completion_queue_dwell_max_ns: u64,
+}
+
+impl Metrics {
+    /// Accumulate another execution's metrics, summing counters and keeping maxima for the
+    /// `max_*`/`*_max_*` fields. Used to merge per-shard metrics into one report.
+    pub fn absorb(&mut self, other: &Metrics) {
+        self.advance_calls += other.advance_calls;
+        self.transitions += other.transitions;
+        self.nodes_inspected += other.nodes_inspected;
+        self.tasks_offered += other.tasks_offered;
+        self.tasks_claimed += other.tasks_claimed;
+        self.tasks_promoted += other.tasks_promoted;
+        self.tasks_revoked += other.tasks_revoked;
+        self.tasks_completed += other.tasks_completed;
+        self.io_offered += other.io_offered;
+        self.cpu_offered += other.cpu_offered;
+        self.speculative_io_offered += other.speculative_io_offered;
+        self.speculative_io_admitted += other.speculative_io_admitted;
+        self.speculative_io_unknown_size += other.speculative_io_unknown_size;
+        self.speculative_io_estimated_bytes_offered += other.speculative_io_estimated_bytes_offered;
+        self.speculative_io_estimated_bytes_admitted +=
+            other.speculative_io_estimated_bytes_admitted;
+        self.speculative_io_completed_bytes += other.speculative_io_completed_bytes;
+        self.speculative_io_useful_bytes += other.speculative_io_useful_bytes;
+        self.speculative_io_wasted_bytes += other.speculative_io_wasted_bytes;
+        self.speculative_predicate_io_offered += other.speculative_predicate_io_offered;
+        self.speculative_projection_io_offered += other.speculative_projection_io_offered;
+        self.demand_rows_initial += other.demand_rows_initial;
+        self.demand_rows_current += other.demand_rows_current;
+        self.demand_combinations += other.demand_combinations;
+        self.inline_demand_combinations += other.inline_demand_combinations;
+        self.demand_direct_adoptions += other.demand_direct_adoptions;
+        self.demand_noop_adoptions += other.demand_noop_adoptions;
+        self.adaptive_predicate_launches += other.adaptive_predicate_launches;
+        self.adaptive_predicate_waits += other.adaptive_predicate_waits;
+        self.predicate_reorders += other.predicate_reorders;
+        self.segment_reuse_hits += other.segment_reuse_hits;
+        self.decode_reuse_hits += other.decode_reuse_hits;
+        self.resource_nodes += other.resource_nodes;
+        self.predicate_only_resources += other.predicate_only_resources;
+        self.projection_only_resources += other.projection_only_resources;
+        self.shared_predicate_projection_resources += other.shared_predicate_projection_resources;
+        self.predicate_only_read_bytes += other.predicate_only_read_bytes;
+        self.projection_only_read_bytes += other.projection_only_read_bytes;
+        self.shared_predicate_projection_read_bytes += other.shared_predicate_projection_read_bytes;
+        self.shared_decode_reuse_hits += other.shared_decode_reuse_hits;
+        self.shared_decode_reuse_bytes += other.shared_decode_reuse_bytes;
+        self.projection_from_predicate_decode_hits += other.projection_from_predicate_decode_hits;
+        self.projection_from_predicate_decode_bytes += other.projection_from_predicate_decode_bytes;
+        self.demand_fragments += other.demand_fragments;
+        self.fragment_predicates_completed += other.fragment_predicates_completed;
+        self.fragment_demand_updates += other.fragment_demand_updates;
+        self.fragment_merge_tasks += other.fragment_merge_tasks;
+        self.fragment_projection_reads_unblocked += other.fragment_projection_reads_unblocked;
+        self.segment_predicates_fused += other.segment_predicates_fused;
+        self.fragment_cached_predicate_hits += other.fragment_cached_predicate_hits;
+        self.segment_predicate_eval_ns += other.segment_predicate_eval_ns;
+        self.fragment_demand_adoption_ns += other.fragment_demand_adoption_ns;
+        self.fragment_merge_elapsed_ns += other.fragment_merge_elapsed_ns;
+        self.fragment_reduced_demand_predicates += other.fragment_reduced_demand_predicates;
+        self.fragment_reduced_demand_input_rows += other.fragment_reduced_demand_input_rows;
+        self.fragment_reduced_demand_skipped_rows += other.fragment_reduced_demand_skipped_rows;
+        self.fragment_reduced_demand_eval_ns += other.fragment_reduced_demand_eval_ns;
+        self.morsel_slots += other.morsel_slots;
+        self.max_updates_per_advance = self
+            .max_updates_per_advance
+            .max(other.max_updates_per_advance);
+        self.scheduler_passes += other.scheduler_passes;
+        self.scheduler_tasks_considered += other.scheduler_tasks_considered;
+        self.scheduler_tasks_admitted += other.scheduler_tasks_admitted;
+        self.completion_batches += other.completion_batches;
+        self.completions_drained += other.completions_drained;
+        self.max_completion_batch = self.max_completion_batch.max(other.max_completion_batch);
+        self.completion_wake_candidates_inspected += other.completion_wake_candidates_inspected;
+        self.coordinator_loop_iterations += other.coordinator_loop_iterations;
+        self.coordinator_drain_ns += other.coordinator_drain_ns;
+        self.coordinator_advance_ns += other.coordinator_advance_ns;
+        self.coordinator_schedule_ns += other.coordinator_schedule_ns;
+        self.coordinator_dispatch_ns += other.coordinator_dispatch_ns;
+        self.coordinator_inline_ns += other.coordinator_inline_ns;
+        self.coordinator_wait_ns += other.coordinator_wait_ns;
+        self.coordinator_complete_ns += other.coordinator_complete_ns;
+        self.coordinator_total_ns = self.coordinator_total_ns.max(other.coordinator_total_ns);
+        self.completion_queue_dwell_ns += other.completion_queue_dwell_ns;
+        self.completion_queue_dwell_max_ns = self
+            .completion_queue_dwell_max_ns
+            .max(other.completion_queue_dwell_max_ns);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -327,15 +426,17 @@ impl Execution {
         retention: RetentionPolicy,
         policy: SchedulePolicy,
     ) -> VortexResult<Self> {
-        let mut expected_start = 0;
+        // Sharded execution owns a contiguous sub-interval of the scan, so ranges need not start
+        // at row zero or reach the final row; they must stay nonempty, contiguous, and in bounds.
+        let mut expected_start = morsel_ranges.first().map_or(0, |range| range.start);
         for range in morsel_ranges {
             if range.start != expected_start || range.start >= range.end {
                 vortex_bail!("morsel ranges must be nonempty, contiguous, and ordered");
             }
             expected_start = range.end;
         }
-        if expected_start != plan.row_count {
-            vortex_bail!("morsel ranges must cover all {} plan rows", plan.row_count);
+        if expected_start > plan.row_count {
+            vortex_bail!("morsel ranges exceed the {} plan rows", plan.row_count);
         }
         query.coalesce_same_field_predicates();
         for conjunct in &query.conjuncts {
@@ -685,6 +786,16 @@ impl Execution {
         &self.metrics
     }
 
+    pub(crate) fn metrics_mut(&mut self) -> &mut Metrics {
+        &mut self.metrics
+    }
+
+    pub(crate) fn record_completion_dwell(&mut self, dwell_ns: u64) {
+        self.metrics.completion_queue_dwell_ns += dwell_ns;
+        self.metrics.completion_queue_dwell_max_ns =
+            self.metrics.completion_queue_dwell_max_ns.max(dwell_ns);
+    }
+
     pub(crate) fn populate_segment_sizes(&mut self, source: &dyn crate::segments::SegmentSource) {
         for resource in &mut self.resources {
             resource.estimated_bytes = source.estimated_size(resource.segment);
@@ -922,21 +1033,15 @@ impl Execution {
         })
     }
 
-    fn transition(
-        &mut self,
-        morsel_id: MorselId,
-        updates: &mut Vec<TaskUpdate>,
-        output: &mut Option<ExecBatch>,
-    ) -> VortexResult<bool> {
-        if self.cancel_one_morsel_offer(morsel_id, updates)? {
-            return Ok(true);
+    /// Join every unjoined resource use in one transition: the join is pure counter bookkeeping,
+    /// and paying one transition (plus a driver round-trip under a small budget) per use
+    /// serialized thousands of trivial steps on the coordinator. Returns whether any use joined.
+    fn join_pending_resources(&mut self, morsel_id: MorselId) -> bool {
+        if self.morsels[morsel_id.0].activation_cursor >= self.morsels[morsel_id.0].uses.len() {
+            return false;
         }
-        if self.adopt_combine(morsel_id)? {
-            return Ok(true);
-        }
-
-        let activation_cursor = self.morsels[morsel_id.0].activation_cursor;
-        if activation_cursor < self.morsels[morsel_id.0].uses.len() {
+        while self.morsels[morsel_id.0].activation_cursor < self.morsels[morsel_id.0].uses.len() {
+            let activation_cursor = self.morsels[morsel_id.0].activation_cursor;
             let resource = self.morsels[morsel_id.0].uses[activation_cursor].resource;
             self.morsels[morsel_id.0].uses[activation_cursor].joined = true;
             self.morsels[morsel_id.0].activation_cursor += 1;
@@ -957,6 +1062,24 @@ impl Execution {
                     format!("event=resource_join resource={}", resource.0),
                 );
             }
+        }
+        true
+    }
+
+    fn transition(
+        &mut self,
+        morsel_id: MorselId,
+        updates: &mut Vec<TaskUpdate>,
+        output: &mut Option<ExecBatch>,
+    ) -> VortexResult<bool> {
+        if self.cancel_one_morsel_offer(morsel_id, updates)? {
+            return Ok(true);
+        }
+        if self.adopt_combine(morsel_id)? {
+            return Ok(true);
+        }
+
+        if self.join_pending_resources(morsel_id) {
             return Ok(true);
         }
 
@@ -1484,6 +1607,10 @@ impl Execution {
             return Ok(true);
         }
 
+        // The whole function batches every available unit of fragment progress into one
+        // transition: adopting one result per full fragments-x-conjuncts rescan made the
+        // coordinator's advance phase quadratic in fragment-conjuncts per morsel.
+        let mut progress = false;
         for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
             for conjunct_idx in 0..self.query.conjuncts.len() {
                 let state =
@@ -1547,7 +1674,7 @@ impl Execution {
                         ),
                     );
                 }
-                return Ok(true);
+                progress = true;
             }
         }
 
@@ -1557,7 +1684,7 @@ impl Execution {
             .all(|fragment| fragment.sealed)
         {
             if self.morsels[morsel.0].fragment_merge_task.is_some() {
-                return Ok(false);
+                return Ok(progress);
             }
             let inputs = self.morsels[morsel.0]
                 .demand_fragments
@@ -1605,7 +1732,8 @@ impl Execution {
                 .boolean_summary()?
                 .true_count;
             if self.apply_cached_fragment_predicate(morsel, fragment_idx, conjunct_idx, false)? {
-                return Ok(true);
+                progress = true;
+                continue;
             }
             let task = self.offer_task(
                 TaskOwner::Morsel(morsel),
@@ -1643,10 +1771,9 @@ impl Execution {
                     ),
                 );
             }
-            return Ok(true);
+            progress = true;
         }
 
-        let mut waiting = SmallVec::<[ResourceId; 8]>::new();
         for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
             let Some(conjunct_idx) = self.next_fragment_predicate(morsel, fragment_idx) else {
                 continue;
@@ -1683,14 +1810,8 @@ impl Execution {
             self.wait_on_resource(morsel, resource);
             if let Some(update) = self.ensure_resource(resource, Necessity::Required)? {
                 updates.push(update);
-                return Ok(true);
+                progress = true;
             }
-            if !waiting.contains(&resource) {
-                waiting.push(resource);
-            }
-        }
-        for resource in waiting {
-            self.wait_on_resource(morsel, resource);
         }
         for fragment_idx in 0..self.morsels[morsel.0].demand_fragments.len() {
             let fragment = &self.morsels[morsel.0].demand_fragments[fragment_idx];
@@ -1718,11 +1839,11 @@ impl Execution {
                 if let Some(update) = self.ensure_resource(resource, Necessity::Required)? {
                     updates.push(update);
                     self.metrics.fragment_projection_reads_unblocked += 1;
-                    return Ok(true);
+                    progress = true;
                 }
             }
         }
-        Ok(false)
+        Ok(progress)
     }
 
     fn next_fragment_predicate(&self, morsel: MorselId, fragment: usize) -> Option<usize> {
@@ -1795,7 +1916,7 @@ impl Execution {
         let demand = previous_summary.values.clone();
         if !trust_coverage {
             let evaluated = cached.evaluated.slice(local_range.clone());
-            if (&demand & &evaluated).true_count() != previous {
+            if and_true_count(&demand, &evaluated) != previous {
                 return Ok(false);
             }
         }
@@ -1803,16 +1924,36 @@ impl Execution {
         if predicate.len() != demand.len() {
             vortex_bail!("cached predicate length does not match fragment demand");
         }
-        let values = if previous == demand.len() {
-            predicate
+        // Count survivors without materializing the intersection; the combined mask is only
+        // allocated when the adoption actually reduces demand.
+        let current = if previous == demand.len() {
+            predicate.true_count()
         } else {
-            &demand & &predicate
+            and_true_count(&demand, &predicate)
         };
-        let current = values.true_count();
         self.predicate_stats[conjunct_idx].observe(previous, current, cached.elapsed_ns);
+        // The evaluation cost belongs to one observation. Later fragments adopting the same
+        // cached predicate contribute their row counts but must not re-count the elapsed time,
+        // which would skew adaptive predicate ordering toward shared resources.
+        if cached.elapsed_ns != 0
+            && let SlotState::Ready(array) = &mut self
+                .array_slot_mut(self.resources[resource.0].array_slot)
+                .state
+            && let Some(stored) = array
+                .cached_predicates
+                .iter_mut()
+                .find(|stored| stored.conjunct == conjunct_idx)
+        {
+            stored.elapsed_ns = 0;
+        }
         self.metrics.fragment_cached_predicate_hits += 1;
         self.metrics.fragment_predicates_completed += 1;
         if current != previous {
+            let values = if previous == demand.len() {
+                predicate
+            } else {
+                &demand & &predicate
+            };
             self.array_slot_mut(output_slot).state = SlotState::Ready(ResolvedArray::boolean(
                 BoolArray::new(values.clone(), Validity::NonNullable).into_array(),
                 values,
@@ -2857,4 +2998,17 @@ fn select_output_slot(
     } else {
         projection_slot
     }
+}
+
+/// Count `(left & right).true_count()` without materializing the intersection buffer.
+fn and_true_count(left: &BitBuffer, right: &BitBuffer) -> usize {
+    debug_assert_eq!(left.len(), right.len());
+    let left_chunks = left.chunks();
+    let right_chunks = right.chunks();
+    let full: usize = left_chunks
+        .iter()
+        .zip(right_chunks.iter())
+        .map(|(l, r)| (l & r).count_ones() as usize)
+        .sum();
+    full + (left_chunks.remainder_bits() & right_chunks.remainder_bits()).count_ones() as usize
 }
