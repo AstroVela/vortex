@@ -161,7 +161,7 @@ pub mod error {
     pub use vortex_error::*;
 }
 
-/// Built-in extension dtypes such as UUID and temporal types.
+/// Built-in temporal extension dtypes.
 pub mod extension {
     pub use vortex_array::extension::*;
 }
@@ -233,7 +233,7 @@ pub mod utils {
     pub use vortex_utils::*;
 }
 
-/// Maintained array encoding crates.
+/// Maintained array encoding and extension dtype crates.
 pub mod encodings {
     /// Adaptive Lossless floating-point encodings.
     pub mod alp {
@@ -285,6 +285,11 @@ pub mod encodings {
         pub use vortex_sparse::*;
     }
 
+    /// UUID extension dtype, with Arrow canonical `arrow.uuid` interoperability.
+    pub mod uuid {
+        pub use vortex_uuid::*;
+    }
+
     /// Zig-zag integer transform encoding.
     pub mod zigzag {
         pub use vortex_zigzag::*;
@@ -317,6 +322,7 @@ impl VortexSessionDefault for VortexSession {
             .with::<MemorySession>()
             .with::<RuntimeSession>();
         vortex_arrow::initialize(&session);
+        vortex_uuid::initialize(&session);
         editions::register_default_editions(&session);
         editions::enable_default_editions(&session);
 
