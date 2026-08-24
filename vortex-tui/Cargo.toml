@@ -27,6 +27,10 @@ native = [
     "dep:tokio",
     "dep:vortex-datafusion",
     "ratatui/crossterm",
+    "dep:object_store",
+    "dep:url",
+    "vortex/hf",
+    "vortex/object_store_registry",
     "vortex/tokio",
     "vortex/zstd",
 ]
@@ -67,11 +71,17 @@ crossterm = { workspace = true, features = ["event-stream"], optional = true }
 datafusion = { workspace = true, optional = true }
 env_logger = { workspace = true, optional = true }
 indicatif = { workspace = true, features = ["futures"], optional = true }
-parquet = { workspace = true, features = ["arrow", "async"], optional = true }
+object_store = { workspace = true, optional = true }
+parquet = { workspace = true, features = [
+    "arrow",
+    "async",
+    "object_store",
+], optional = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
 ], optional = true }
+url = { workspace = true, optional = true }
 vortex-datafusion = { workspace = true, optional = true }
 
 # WASM-only dependencies

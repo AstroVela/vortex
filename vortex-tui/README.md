@@ -5,7 +5,7 @@ A small, helpful CLI tool for exploring and analyzing Vortex files.
 * `browse`: Browse the structure of your Vortex file with a rich TUI
 * `tree`: Print the encoding tree of a Vortex file
 * `inspect`: Inspect Vortex file footer and metadata
-* `convert`: Convert a Parquet file to a Vortex file
+* `convert`: Convert a Parquet file, local or at a URL, to a Vortex file
 
 ## Examples
 
@@ -100,11 +100,15 @@ Segment details:
 Convert a Parquet file to Vortex format:
 
 ```bash
-# Basic conversion
-vx convert input.parquet --out output.vortex
+# Basic conversion, writing input.vortex
+vx convert input.parquet
 
-# With compression enabled
-vx convert input.parquet --out output.vortex --compress
+# Choose the output path and a more aggressive compression strategy
+vx convert input.parquet --output output.vortex --strategy compact
+
+# Read the Parquet file straight from object storage
+vx convert s3://bucket/data/events.parquet --output events.vortex
+vx convert hf://datasets/openai/gsm8k/main/test-00000-of-00001.parquet
 ```
 
 ## Browser (WASM)

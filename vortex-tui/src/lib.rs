@@ -83,17 +83,21 @@ mod native_cli {
     }
 
     impl Commands {
-        fn file_path(&self) -> &PathBuf {
+        /// The local file this command reads, when it reads one.
+        ///
+        /// `convert` also accepts an object store URL, which has no local path to check for.
+        fn local_path(&self) -> Option<&std::path::Path> {
             match self {
-                Commands::Tree(args) => match &args.mode {
+                Commands::Tree(args) => Some(match &args.mode {
                     super::tree::TreeMode::Array { file, .. } => file,
                     super::tree::TreeMode::Layout { file, .. } => file,
-                },
-                Commands::Browse { file } => file,
-                Commands::Convert(flags) => &flags.file,
-                Commands::Inspect(args) => &args.file,
-                Commands::Query(args) => &args.file,
-                Commands::Segments(args) => &args.file,
+                }),
+                Commands::Browse { file } => Some(file),
+                Commands::Convert(flags) => (!super::convert::is_url(&flags.file))
+                    .then(|| std::path::Path::new(flags.file.as_str())),
+                Commands::Inspect(args) => Some(&args.file),
+                Commands::Query(args) => Some(&args.file),
+                Commands::Segments(args) => Some(&args.file),
             }
         }
     }
@@ -129,8 +133,9 @@ mod native_cli {
         // See https://github.com/vortex-data/vortex/issues/7910.
         let cli = Cli::try_parse_from(args)?;
 
-        let path = cli.command.file_path();
-        if !std::fs::exists(path)? {
+        if let Some(path) = cli.command.local_path()
+            && !std::fs::exists(path)?
+        {
             return Err(Cli::command()
                 .error(
                     clap::error::ErrorKind::Io,
