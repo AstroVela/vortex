@@ -2,8 +2,283 @@
 
 This report records what was learned while implementing and optimizing the restricted
 [self-paced plan execution experiment](self-paced-plan-exec-experiment.md). It includes the
-original 100-iteration comparison on 2026-08-21 and a capacity-saturating FineWeb follow-up on
-2026-08-22. It is evidence about this experiment, not a claim about a production executor.
+original 100-iteration comparison on 2026-08-21, a capacity-saturating FineWeb follow-up on
+2026-08-22, and the coordinator-sharding follow-up on 2026-08-23. It is evidence about this
+experiment, not a claim about a production executor.
+
+## Sharded coordinators (2026-08-23)
+
+Coordinator phase timing (`VORTEX_SELF_PACED_PHASE_TIMING=1`, new `coordinator_*` metrics)
+answered the previous handover's P0 question directly. On full FineWeb Q06 the single coordinator
+loop accounted for the entire ~58 ms self-paced run and was busy ~89% of it: advance ~19.5 ms
+(fragment rescans and transitions), completion handling ~16 ms (including ~6.8 ms fragment mask
+adoption), dispatch ~14 ms (claim, operation clones, spawn), and only ~6.3 ms waiting for
+workers. Completed worker results waited on average ~17 us in the completion queue (~170 ms of
+cumulative dwell against a 58 ms run), so workers were starved behind the coordinator, not the
+reverse.
+
+Work-reduction micro-optimizations (allocation-free adoption counts via a fused and-count,
+batched resource joins, batching all available fragment progress into one transition, skipping
+the speculative necessity pass when speculation is disabled, an all-true `SelectStruct` early
+exit) recovered only 2.53x -> 2.32x on this host. The structural fix was sharding:
+`VORTEX_SELF_PACED_SHARDS=N` runs N coordinator threads, each owning a contiguous group of
+morsels with its own `Execution`, sharing one 16-thread worker pool with a static per-shard
+admission budget of `concurrency / N`. Morsel groups align with natural splits, so no segment
+straddles a shard boundary in these fixtures: the sharded run issued the same 10,918 unique
+segment requests and 714,536,112 bytes as the single-coordinator run, with every segment read
+exactly once. Output row counts and ordered hashes are still validated before timing.
+
+Five-iteration medians on a 16-core, 30 GB host pinned to CPUs 0-15 (note: a smaller host than
+the earlier reports; V1 medians here are correspondingly slower than the 2026-08-22 numbers):
+
+| Shards | FineWeb Q06 self-paced ms | Ratio vs V1 |
+| ---: | ---: | ---: |
+| 1 | 67.8 | 2.501 |
+| 2 | 45.4 | 1.642 |
+| 4 | 38.4 | 1.397 |
+| 8 | 39.2 | 1.436 |
+
+With 4 shards across the suites (same fair merge-16 contract, 5 alternating iterations):
+
+- FineWeb Q00-Q08: ratios 1.115, 0.568, 0.728, 1.219, 0.995, 1.022, 1.415, 1.071, 1.127 —
+  geometric mean ~0.98, self-paced wins 3 of 9 with three near-ties.
+- TPC-H SF10 lineitem (fresh duckdb dbgen Parquet, real natural splits from a regenerated
+  catalog with 458 spans, matching the earlier audit): Q6 0.683, Q1 0.881, V1-friendly 0.619 —
+  self-paced wins all three.
+- ClickBench (20 files, 20,000,000 rows; the 30 GB host cannot hold the 100-file fixture, and
+  the regenerated 21-column catalog is coarser than the 105-column production files audited
+  earlier, so these are internally fair but not comparable to the 2026-08-22 table): self-paced
+  wins 15 of 16 shapes, geometric mean ~0.74; only the dashboard shape loses at 1.176.
+
+Two caveats keep this honest. First, sharding adds N coordinator threads on top of the 16-worker
+pool, so the process briefly runs more runnable threads than V1's 16-worker runtime; admission is
+still capped at 16 evaluation tasks. Second, per-shard `Execution` construction still builds the
+full plan-wide resource table, and the remaining Q06 gap sits in per-shard dispatch (two
+`Operation` clones and a `cached_predicates` Vec clone per claim) and that per-run init;
+phase-sum evidence: with 4 shards the summed advance/dispatch/complete phases were ~29/22/18 ms
+across shards while per-shard wall time was ~30 ms.
+
+### Owned coordination: no central coordinator at all
+
+`VORTEX_SELF_PACED_SHARD_MODE=owned` removes the coordinator/worker split entirely. Each of 16
+threads owns a contiguous morsel group and runs the single-threaded loop over it: the thread
+coordinates its own fragments and evaluates every read, decode, predicate, and selection inline.
+There is no worker pool, no completion channel, no dispatch, and no queue dwell; cross-thread
+communication disappears because resources are deduplicated within the owning thread and morsel
+groups end on natural splits. The thread total (16) now matches V1's worker count exactly, which
+also resolves the pooled-mode thread-fairness caveat.
+
+This mode wins 25 of 28 workloads on the measurement host (five alternating iterations,
+`taskset -c 0-15`):
+
+- FineWeb Q00-Q08: 0.639, 0.524, 0.552, 0.694, 0.621, 0.629, 0.792, 0.612, 0.674 — all nine
+  are wins, geometric mean ~0.63. Q06, the historical worst case, runs 21.0 ms against V1's
+  26.8 ms.
+- TPC-H SF10: Q6 0.562, Q1 0.686, V1-friendly 0.616.
+- ClickBench (20-file fixture): 13 of 16 wins, geometric mean ~0.75; the losses are dashboard
+  1.069, Q40 1.069, and Q41 1.234, with Q42 at parity (0.998).
+
+The FineWeb Q06 progression on this host: 2.53x single coordinator, 2.32x after
+work-reduction micro-optimizations, 1.40x with four pooled shards, 0.76x owned.
+
+Five additional FineWeb scan shapes (query ids 9-13) close the P1 coverage gaps, and owned mode
+wins every one:
+
+| Shape | Ratio | I/O evidence |
+| --- | ---: | --- |
+| Q09 wide select-all (7 fields, all rows survive) | 0.596 | identical 20,216 requests / 953.9 MB on both engines — the win is pure executor efficiency with zero avoidable work |
+| Q10 shared filter/projection field | 0.489 | self-paced 3,645 requests / 238.3 MB vs V1 5,469 / 357.5 MB — one decode serves filter and projection |
+| Q11 five-conjunct chain | 0.951 | near-equal I/O; the dependency chain serializes predicate rounds, the smallest win |
+| Q12 empty result | 0.433 | self-paced 1,823 requests (first predicate column only) vs V1 7,292, equal bytes |
+| Q13 narrow highly selective (1 projected column) | 0.652 | near-equal bytes |
+
+Q09 is the attribution cornerstone: with byte-identical physical work and nothing to avoid,
+owned self-paced still runs 41% faster than V1, so the remaining advantage is scheduling-unit
+cost — 116-168 merged morsels with inline per-thread coordination against V1's 1,823-2,527
+per-split scan futures on a shared runtime.
+
+### The pipeline executor: extensible nodes, pluggable demand, arbitrary child boundaries
+
+`vortex-layout/src/plan/exec/pipeline.rs` (`VORTEX_SELF_PACED_SHARD_MODE=pipeline`) rebuilds the
+executor around two seams. The scheduler knows exactly one trait, `MorselPipeline` (morsel range
+in, `ExecBatch` out), so arbitrary execution nodes are added without scheduler changes; and the
+shared per-morsel demand mask that gates every struct child is computed by a pluggable
+`DemandPolicy` (`VORTEX_SELF_PACED_DEMAND=cascade|eager`). Alignment stopped being a
+precondition: each field exposes chunks at its native boundaries and consumers cut them to root
+row ranges (`overlapping_chunks`), so mutually unaligned children work — covered by a unit test
+zipping fields chunked `[0,3,10)` against `[0,6,10)` byte-identically to an aligned reference.
+Per-thread decoded-chunk caching preserves filter/projection decode sharing. The reactor's slot,
+offer/claim, and fragment machinery does not exist in this mode.
+
+It is also the fastest executor measured (five iterations, same fair contract, cold-scan I/O
+invariant enforced; physical I/O identical to the reactor, e.g. Q06 at 10,918 requests /
+714,536,112 bytes):
+
+- FineWeb Q00-Q13: every shape wins, geometric mean ~0.32 — Q01 0.131, Q12 0.216, Q02 0.246,
+  Q09 0.271, Q06 0.414 (11.4 ms vs V1's 27.6 ms; the owned reactor measured 21.0 ms).
+- TPC-H: Q1 0.537, V1-friendly 0.572, Q6 0.938 (29 two-million-row morsels leave a thread-tail
+  imbalance the reactor's finer pipelining hides; work stealing is the fix).
+- ClickBench (20 files): 13 of 16 wins; the same three uneven-morsel losses (dashboard 1.06,
+  Q40 1.22, Q41 1.31).
+
+Cascade and eager demand differ by within-noise amounts on these shapes (Q06 0.414 vs 0.422,
+Q09 0.271 vs 0.245, Q01 identical): the cascade's chunk-skipping pays off on empty or highly
+selective shapes, eager avoids gating arithmetic on select-all shapes, and swapping them touches
+nothing but the policy object. Executor totals: single coordinator 2.53x -> pooled shards 1.40x
+-> owned 0.79x -> pipeline 0.41x on FineWeb Q06.
+
+The pipeline's row-domain handling was then formalized as an executor vtable rather than inline
+arithmetic: every node relationship is a **down demand transform** plus **up mask/array
+transforms** (`FieldDomain::push_demand` / `pull_mask` / `pull_array`), each modeled on the
+layout's native metadata — `ConcatDomain` uses the chunk-offset prefix sums (binary search down,
+ordered append up), the struct node's identity relationship shares one demand mask by refcount
+and packs zero-copy, and a list node would implement the same two methods over its offsets
+buffer. Demand policies and the projection gather now speak only to the vtable. Re-measured after
+the refactor, the seam is effectively free because dispatch is per chunk, never per row: FineWeb
+geometric mean ~0.34 versus ~0.32 (Q06 0.420 vs 0.414) and TPC-H unchanged (0.93/0.53/0.58).
+
+Three further changes completed the sweep. The suites were widened to 18 FineWeb shapes (adding
+a score-band range predicate, a rare-flag filter projecting all fourteen fields, a two-range
+conjunction, and a shared-and-deep shape as Q14-Q17) and 21 ClickBench shapes (adding wide
+select-all, shared filter/projection, a five-conjunct chain, empty-result, and narrow-selective
+as Q43-Q47). The pipeline scheduler switched from static contiguous morsel groups to threads
+self-scheduling morsels off one shared atomic cursor (order restored by index), which eliminated
+every few-morsel tail loss: ClickBench dashboard 1.06 -> 0.82, Q40 1.22 -> 0.67, Q41 1.31 ->
+0.64, and FineWeb Q01 improved to 0.092. And the predicate kernel's dense-but-partial regime
+(demand between one fifth and all rows) was switched from a per-row demand-consulting `map_cmp`
+to two vectorized passes — full evaluation then AND — which is what made the five-conjunct
+chains competitive under the cascade (ClickBench Q45 1.06 -> 0.95) without needing the eager
+policy. After all three: every measured workload beats V1 — 18/18 FineWeb (geometric mean
+~0.33), 3/3 TPC-H, 21/21 ClickBench (geometric mean ~0.6) — with the one structural remainder
+being TPC-H Q6 at ~0.94, whose 29 two-million-row morsels bound the makespan at two serial
+morsels per thread regardless of scheduling; finer intra-morsel parallelism would need the
+merge-16 contract revisited.
+
+### Adaptive demand, wider suites, and the statpopgen small-data regime (2026-08-23)
+
+`AdaptiveDemand` (now the default; `VORTEX_SELF_PACED_DEMAND=cascade|eager` selects the
+deterministic policies) orders conjuncts by observed survival, most selective first, learning
+across morsels within a run. Output is unchanged — conjunction commutes and every mask is adopted
+as a subset of the demand it was evaluated under — but the effect on the former weak spots is
+direct: ClickBench dashboard 0.84 -> 0.71-0.77 and the five-conjunct chain Q45 0.89 -> 0.76,
+with FineWeb unchanged at ~0.33 geometric mean. Because adaptive ordering legitimately skips
+different chunks as its statistics improve, the harness's byte-exact/floor invariant is enforced
+through the deterministic policies, which share the same read path.
+
+ClickBench gained Q48-Q51 (equality+flag, pure time window, three geometry ranges, region band +
+flag): 0.48-0.59, all wins; the suite now spans 25 shapes, all won, geometric mean ~0.56.
+
+A statpopgen suite was added end to end: gnomAD chr21 VCF converted through vortex-bench's
+data-gen (100k and 1M row variants), ten scalar columns (POS, QUAL milli-units, hashed ID/REF,
+AN populations) as the i64 fixture, an audit mode producing its split catalog, and six
+genomics-flavored shapes (region interval, quality threshold, well-genotyped region, wide
+select-all, empty, shared population field). It exposed two real findings. First, the fixed
+merge-16 roll-up collapses compact data (1M rows compress to 8 natural splits) into one morsel
+and concurrency 1; the harness now targets ~2x the worker count
+(`merge = clamp(splits/32, 1, 16)`), which leaves every large suite at merge 16 and slightly
+improves ClickBench (per-file merge 4-5). Second, with parallelism restored, statpopgen's
+sub-millisecond scans are the first genuine self-paced losses (three shapes at 2.2-2.7x, the
+16-way shapes near parity): the pipeline carries ~100us of per-morsel fixed work (demand and
+included-mask buffers, lazy filter setup, selection, pack) that a 0.5 ms scan cannot amortize —
+confirmed thread-count-independent (1, 2, 4, and 8 threads within noise) after the scheduler
+switched to a reused worker pool (per-run thread spawns were the first suspect and are now
+eliminated). Reducing per-morsel constant cost is the open item for the tiny-scan regime; at
+merge 16 (both engines at concurrency 1) the same shapes won at 0.12-0.34, so the executor's
+fixed cost per *scan* remains far below V1's.
+
+A first round of per-morsel constant cuts followed: full-demand predicate evaluation no longer
+allocates a per-morsel all-true mask (`evaluate_predicate_full`), `pull_mask` returns the single
+part zero-copy when one segment tiles the morsel, and `pull_array` prices its coverage check from
+the segments' already-computed demanded counts (no bit scan) and reuses the single segment's
+demand slice as the filter mask. statpopgen 1M moved from three 2.2-3.4x losses to Q01 1.00,
+Q04 0.77, Q03 0.91, with the remaining gather-heavy shapes at 1.7-1.8x — the residual is one
+`Mask`/filter construction per field per morsel, which a struct-level single filter (valid when
+all fields gather identical row sets, i.e. aligned chunks) would remove. The cuts also set new
+bests on the large suites: FineWeb Q06 0.385 (10.8 ms), Q12 0.184, Q01 0.086.
+
+### Tiny-scan round 2: measurement discipline, shared masks, density-aware adaptive
+
+Three more findings on the statpopgen sub-millisecond regime. First, five-iteration medians are
+unreliable at this scale: shapes swung 0.8-2.5x between identical runs; 100-iteration medians are
+now the standard for sub-millisecond workloads, and under them most of the apparent losses shrank
+(Q00 1.7 -> ~1.0-1.4 before any code change). Second, the per-morsel selection `Mask` is now
+built once and shared by every projection field that gathers the whole range
+(`FieldDomain::pull_array` takes the parent's shared mask), removing per-field
+`Mask::from_buffer` scans. Third, the eager-policy experiment showed dense demand makes gating
+cost more than it avoids (Q02, 87.7% survival: cascade 2.38 vs eager 1.31), so `AdaptiveDemand`
+now switches per conjunct to full-evaluate-and-intersect when current demand density is >= 50%.
+At 100 iterations the statpopgen suite stands at 0.96 / 1.00 / 2.62 / 0.52 / 0.85 / 1.02 —
+five of six at or better than parity. Q02 remains open: it responds to the eager *policy* (1.31)
+but not to the equivalent in-policy dense switch (2.62), an unexplained delta; a samply profile
+of the workload is captured for the follow-up. Self-paced also reads half of V1's requests on
+these shapes (Q00: 12 vs 24) via chunk skipping.
+
+### External oracle validation (2026-08-23)
+
+The harness's own correctness gates (V1-vs-self-paced hash equality, `run_eager` parity) share
+the parquet ingestion and query construction, so a consistent bug there would be invisible to
+them. Seventeen workloads were therefore checked against DuckDB running equivalent SQL over the
+original source Parquet, replicating each fixture derivation (substring-contains flags, date
+digit-folding, score truncation to ppm/milli units, byte lengths, decimal/date-to-i64
+conversion, hash-equality predicates by their defining strings): all seventeen output row counts
+matched exactly — statpopgen 6/6 (84,350 / 0 / 877,404 / 1,000,000 / 0 / 959,526), TPC-H Q6
+1,139,264 and Q1 59,142,609, FineWeb Q01/Q02/Q04/Q05/Q06/Q07/Q10 (including hash-based language
+equality at 11,898), ClickBench Q47 19,491 and Q01 331,750. The timed loop additionally asserts
+every iteration's row count against its warmup for both engines. Remaining validation gaps:
+oracle coverage is row counts rather than full values (value-level agreement rests on the
+cross-engine ordered hash), and zero-row workloads compare only row counts.
+
+### I/O read patterns (2026-08-23)
+
+A per-request order dump (`VORTEX_SELF_PACED_IO_DUMP` in trace mode) recorded every segment
+request's identity and size for both engines across all 42 workloads. Findings:
+
+- **V1 re-reads shared segments; the pipeline never does.** V1's worst cases read the same
+  segments twice or more: tpch_v1_friendly 916 requests / 960 MB versus the pipeline's 458 /
+  480 MB (the filtered column is the projected column and V1 reads it once per role), TPC-H Q6
+  3,206 requests / 3.36 GB versus 1,832 / 1.92 GB, ClickBench Q00/Q01/Q07 exactly 2x. The
+  pipeline's per-thread decoded-chunk cache reads every segment at most once per thread, with at
+  most a handful of cross-thread boundary duplicates (Q45: one).
+- **Demand skipping shows directly in bytes**: FineWeb Q16 297 MB vs V1's 505 MB, Q17 358 vs
+  596 MB, Q12 (empty) 1,823 requests vs 7,292.
+- **One byte regression**: ClickBench dashboard reads 637 MB vs V1's 558 MB despite fewer
+  requests — query-order predicate evaluation reads a wide early column where V1's plan prunes
+  with a cheaper one first. Predicate ordering by observed cost/selectivity (the old adaptive
+  policy, as a `DemandPolicy`) is the fix.
+- **Request sizes are layout-bound**: FineWeb segments average 47-64 KB per request — far below
+  object-store sweet spots — while TPC-H/ClickBench run 0.5-1 MB. The serialized layout
+  interleaves fields by chunk, so a narrow projection's reads are strided and cannot coalesce;
+  wide scans are highly coalescible: merging file-adjacent requests would cut FineWeb Q15 from
+  32,882 requests to 384 ranges (~86x) and averages a ~25% request reduction across workloads.
+- **Arrival order is non-sequential in both engines** under 16-way parallelism (V1 up to 33%
+  adjacent arrivals in single-field phases, pipeline ~0% due to work stealing); fine for
+  concurrent object stores, worth a per-thread field-major sort if targeting spinning media.
+
+None of this changes wall time on the in-memory source (requests are refcount clones), so the
+actionable items are recorded for the real-I/O phase: a ranged/multi-get `SegmentSource` API for
+run coalescing, writer-side chunk sizing for FineWeb-like data, adaptive predicate ordering as a
+demand policy, and a cross-thread once-cell for boundary chunks.
+
+Plan-time materialization of the cutting was built, measured, and removed. Eagerly compiling
+per-morsel segment lists for every plan field regressed FineWeb from ~0.34 to ~0.39, and even
+trimmed to query-touched fields it stayed ~0.36: that "compilation" was compute relocated onto a
+serial pre-thread path, while runtime cutting costs ~100ns per segment distributed across all 16
+threads, and per-scan planning amortizes nothing. The lesson, kept as the module's design rule:
+planning does no compute — building the pipeline wires topology (domains, touched fields, output
+names), the scan computes its morsel splits once, and the struct node shares one refcounted
+demand handle with every child; all remaining work happens at execution on the owning threads.
+The final state re-measured at Q06 0.404 (11.6 ms), Q01 0.135, Q12 0.262.
+
+The harness now also enforces the no-caching contract per iteration instead of asserting it once:
+every timed run's `CountingSource` totals are compared against its cold warmup. Self-paced totals
+must match the warmup exactly (its required reads are deterministic; Q06 re-issued 10,918
+requests / 714,536,112 bytes on every iteration), and both engines must stay above the warmup's
+unique-segment floor (one read of every distinct segment). V1 gets a 1% counting allowance below
+the floor because it sometimes drops a duplicate in-flight segment future whose request was
+counted but whose bytes never resolved — the observed undershoot is ~0.01%, while any real
+cross-run caching would remove a large fraction of the floor and fail the run. On selective
+queries the invariant also documents the honest I/O difference: on Q01 self-paced issues 5,101
+requests / 247.8 MB against V1's 37,905 requests / 257.7 MB with identical validated output.
 
 ## Original headline result
 

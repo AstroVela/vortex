@@ -1,9 +1,9 @@
 # Self-Paced Plan Execution Handover
 
 This document is the implementation handover for the restricted self-paced plan execution
-experiment on branch `ji/self-paced-fair-natural-splits`. It describes the code as it exists at the
-end of the segment-streamed demand experiment. It is not a proposal to merge this executor as a
-production scan path.
+experiment on branch `ji/self-paced-fair-natural-splits`. It describes the code as it exists at
+the end of the coordinator-sharding experiment (2026-08-23), which followed the segment-streamed
+demand experiment. It is not a proposal to merge this executor as a production scan path.
 
 The companion [findings report](self-paced-plan-exec-findings.md) contains the broader benchmark
 record. The [learning ledger](self-paced-plan-exec-learnings.md) keeps provisional conclusions that
@@ -63,6 +63,30 @@ The experimental implementation is concentrated in these files:
   empty demand, sharing, scheduling, and trace behavior.
 - `vortex-file/benches/self_paced_vs_v1.rs` builds the serialized fixtures, enforces the comparison
   contract, runs the suites, and prints traces and metrics.
+- `vortex-layout/src/plan/exec/baseline.rs` also owns the sharded runner
+  (`run_self_paced_sharded`, `VORTEX_SELF_PACED_SHARDS=N`): N coordinator threads over contiguous
+  morsel groups, one shared worker pool, static per-shard admission `concurrency / N`.
+- `VORTEX_SELF_PACED_SHARD_MODE=owned` is the best-performing mode: 16 threads (matching the
+  concurrency budget) each run `run_self_paced_single` over their own morsel group, coordinating
+  and evaluating inline with no pool, no channel, and no dispatch. It wins 25 of 28 workloads on
+  the measurement host and is the recommended configuration for further work.
+- The harness enforces a per-iteration no-caching invariant (`assert_cold_scan_io`): self-paced
+  I/O must equal its cold warmup exactly, and both engines must re-read at least the warmup's
+  unique-segment floor (V1 gets a 1% counting allowance for dropped duplicate in-flight reads).
+- `vortex-layout/src/plan/exec/pipeline.rs` (`VORTEX_SELF_PACED_SHARD_MODE=pipeline`) is the
+  extensible successor and the fastest mode: the scheduler sees only `dyn MorselPipeline`, demand
+  compute is a pluggable `DemandPolicy` (`VORTEX_SELF_PACED_DEMAND=cascade|eager`), children may
+  have arbitrary unaligned chunk boundaries (root-row-space cutting via `overlapping_chunks`),
+  and a per-thread decoded-chunk cache preserves filter/projection sharing. FineWeb geometric
+  mean ~0.32 versus V1; remaining weak spots are thread-tail imbalance on few-morsel workloads
+  (TPC-H Q6 0.94, ClickBench Q40/Q41) — work stealing is the next fix.
+- Coordinator phase timing (`VORTEX_SELF_PACED_PHASE_TIMING=1`) fills the `coordinator_*` and
+  `completion_queue_dwell_*` metrics and the harness prints a `phase_timing` line per self-paced
+  run. Keep it off for reported comparisons.
+- `vortex-file/examples/fineweb_split_audit.rs` regenerates the physical split catalogs
+  (`VORTEX_SPLIT_AUDIT_MODE=fineweb|tpch|clickbench`); the FineWeb and TPC-H catalogs reproduce
+  the previously documented split counts (1,823/2,527 and 458), the ClickBench one does not
+  (21-column audit files versus the 105-column production files).
 
 ## Execution flow
 
@@ -123,7 +147,14 @@ tests and query shapes demonstrate reuse when a field appears in both.
 
 ## Final measured state
 
-The final five-iteration, non-traced FineWeb Q06 comparison was:
+Owned coordination (16 self-coordinating threads, `VORTEX_SELF_PACED_SHARD_MODE=owned`) on a
+16-core, 30 GB host wins 25 of 28 workloads: FineWeb 9/9 (geometric mean ~0.63, Q06 at `0.79`),
+TPC-H 3/3 (0.56-0.69), ClickBench 13/16 (~0.75; losses are dashboard/Q40 at 1.07 and Q41 at
+1.23). The intermediate pooled-shard results (4 shards, `1.40x` on Q06, down from `2.50x`
+single-coordinator on this host) are retained in the findings report along with I/O parity
+evidence and caveats.
+
+The earlier single-coordinator five-iteration FineWeb Q06 comparison (2026-08-22 host) was:
 
 | Executor | Median |
 | --- | ---: |
@@ -161,14 +192,35 @@ non-traced alternating runs for performance comparisons.
 
 ## Priority work
 
-### P0: establish the coordinator cost
+### Done: coordinator cost established and sharding prototyped
 
-- Add wall and CPU timing around completion draining, `advance`, readiness discovery, task claim,
-  inline completion, mask adoption, and output delivery.
-- Count queue operations and mask bytes copied by phase. Existing aggregate predicate timers do
-  not measure how much of the coordinator's critical path is occupied.
-- Prototype two or four independent execution shards without changing predicate semantics. A
-  useful result is a measured reduction in coordinator wall time, not only more worker activity.
+Phase timing showed the single coordinator busy ~89% of the Q06 run (advance 34%, completion
+handling 28%, dispatch 24%) with workers starving behind it (~17 us average completion dwell).
+Two and four shard prototypes reduced Q06 from 2.50x to 1.64x and 1.40x on the measurement host;
+eight shards regressed slightly (admission 2 per shard). Batching fragment transitions, batching
+resource joins, allocation-free adoption counts, and the speculative-pass skip were worth only
+~8% combined: work reduction does not shorten a serialized critical path.
+
+### Done: owned coordination removed the coordinator entirely
+
+Sixteen threads each own a morsel group and both coordinate and evaluate inline
+(`run_self_paced_single` per thread). No pool, channel, dispatch, or dwell remains; thread count
+matches V1's 16 workers. This flipped 25 of 28 workloads to self-paced wins, including every
+FineWeb and TPC-H shape.
+
+### P0: harden owned mode
+
+- Work stealing or dynamic morsel assignment: a thread that finishes its group idles while
+  stragglers run; ClickBench Q40/Q41/dashboard (the three remaining losses) have few, uneven
+  morsels per thread.
+- Build per-thread `Execution` state from only the chunks overlapping the owned rows; every
+  thread still pays the full plan-wide resource table inside the timed region.
+- Cross-thread resource sharing is currently only avoided because morsel groups end on natural
+  splits; segments spanning group boundaries in general layouts need an explicit shared resource
+  registry (or acceptance of bounded duplicate reads).
+- Blocking reads are acceptable for the in-memory source only. Object-store latency needs either
+  a small per-thread async read-ahead or a return to pooled I/O while keeping owned CPU work.
+- Preserve the per-iteration cold-scan I/O invariant in every future comparison.
 
 ### P0: protect correctness
 
@@ -218,16 +270,33 @@ The final focused command was:
 
 ```bash
 taskset -c 0-15 env \
-  VORTEX_FINEWEB_PARQUET=/mnt/vortex-ssd/data/fineweb/parquet \
-  VORTEX_FINEWEB_SPLIT_CATALOG=/tmp/fineweb-natural-splits.json \
+  VORTEX_FINEWEB_PARQUET=<dir with the 15 FineWeb 10BT sample shards> \
+  VORTEX_FINEWEB_SPLIT_CATALOG=<fineweb-natural-splits.json> \
   VORTEX_SELF_PACED_COMPARE_ITERATIONS=5 \
   VORTEX_SELF_PACED_COMPARE_WORKLOAD=fineweb_q06 \
-  /mnt/vortex-ssd/vortex/target/release/deps/self_paced_vs_v1-2351f4c1137e39da
+  VORTEX_SELF_PACED_SHARDS=4 \
+  target/release/deps/self_paced_vs_v1-<hash>
 ```
 
 The executable hash is build-specific; rebuild the `self_paced_vs_v1` benchmark and use the
-resulting binary. For diagnosis, add `VORTEX_SELF_PACED_COMPARE_TRACE=1`, but do not compare that
-timing with non-traced medians.
+resulting binary. For diagnosis, add `VORTEX_SELF_PACED_COMPARE_TRACE=1` or
+`VORTEX_SELF_PACED_PHASE_TIMING=1`, but do not compare either timing with non-traced medians.
+
+Everything needed to reproduce from a clean host is scripted or documented:
+
+- FineWeb: the 15 `sample/10BT/000..014_00000.parquet` shards from
+  `huggingface.co/datasets/HuggingFaceFW/fineweb` at revision `v1.4.0` (~29 GB).
+- TPC-H: `duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=10); COPY lineitem TO
+  'lineitem_sf10.parquet' (FORMAT parquet);"`, passed via `VORTEX_TPCH_LINEITEM_PARQUET`.
+- ClickBench: `hits_0..99.parquet` from the ClickBench `parquet_many` mirror (~14 GB), passed via
+  `VORTEX_CLICKBENCH_PARQUET_DIR` and `VORTEX_CLICKBENCH_MAX_FILES`.
+- Catalogs: `cargo run --release --example fineweb_split_audit -p vortex-file` with
+  `VORTEX_SPLIT_AUDIT_MODE` and `VORTEX_SPLIT_CATALOG_OUT`. The FineWeb catalog reproduces the
+  documented 1,823/2,527 split counts exactly and the serialized fixture byte length matches
+  (1,669,473,052 bytes); the serialized hash differs across hosts even at identical length, so
+  treat the hash as host-specific rather than a portable fixture identity.
+- Memory: the 100-file ClickBench fixture needs more than 22 GB resident; a 30 GB host runs at
+  most ~20 files together with the per-workload rechunked copy.
 
 The final verification before handover was:
 

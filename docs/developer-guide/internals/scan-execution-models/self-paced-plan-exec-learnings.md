@@ -205,6 +205,70 @@ this experiment, not how broadly the statement applies to Vortex.
     tables, wins, geometric mean, rows, bytes, split/morsel counts, and concurrency availability.
     **Confidence: high.** FineWeb Q06 was the clearest example.
 
+## Sharded coordinators (2026-08-23)
+
+46. **The coordinator, not the workers, was the Q06 bottleneck, now measured directly.** Phase
+    timing put the single coordinator at ~89% busy over the whole run (advance ~34%, completion
+    handling ~28%, dispatch ~24%, idle ~11%), with finished worker results waiting ~17 us on
+    average to be adopted. **Confidence: high.** This converts learning 23 from inference to
+    measurement.
+
+47. **Work reduction on a serialized critical path buys little; parallelizing the path buys a
+    lot.** Allocation-free adoption counts, batched joins, batched fragment transitions, and a
+    scheduler-pass skip combined recovered ~8%; four coordinator shards recovered ~44% (2.50x ->
+    1.40x) and flipped TPC-H and most ClickBench shapes to wins. **Confidence: high on this
+    fixture.**
+
+48. **Four shards beat both two and eight on Q06.** Two shards leave each coordinator too busy;
+    eight cut per-shard admission to two workers and lose latency hiding. The right shard count
+    is workload- and core-dependent; a shared admission budget or stealing is still missing.
+    **Confidence: medium-high.**
+
+49. **Aligned shard boundaries make resource duplication a non-issue here.** Morsel groups end on
+    natural splits, so the sharded run read exactly the same 10,918 segments and 714,536,112
+    bytes as the single coordinator, every segment once. General layouts with segments spanning
+    shard boundaries still need an explicit cross-shard resource owner. **Confidence: high for
+    this fixture, by construction elsewhere.**
+
+50. **Per-shard `Execution` init is now a visible cost.** Each shard builds the full plan-wide
+    resource table and pays the morsel-overlap scan inside the timed region; with 4 shards the
+    per-shard coordinator loop accounted for ~30 ms of a ~38 ms run, the rest being init and
+    output plumbing. **Confidence: medium-high.**
+
+51. **The serialized fixture hash is not portable across hosts.** A regenerated FineWeb fixture
+    reproduced the byte length exactly (1,669,473,052) and all split counts, but a different
+    stable hash. Use row counts, split counts, and byte length as cross-host identity, and the
+    hash only within one host. **Confidence: high on observation, unknown cause.**
+
+52. **Catalog regeneration is only faithful when the audit writes what production wrote.** Raw
+    string columns reproduced the FineWeb catalog exactly (1,823/2,527) and the i64-converted
+    lineitem reproduced TPC-H's 458 spans, but a 21-column i64 ClickBench audit produced 1,424
+    all-field splits versus 19,599 from the 105-column production files. An internally fair
+    contract survives; comparability with earlier tables does not. **Confidence: high.**
+
+53. **Memory bounds the fair harness before CPU does on small hosts.** The 100-file ClickBench
+    fixture holds the raw i64 arrays plus one restricted-edition (uncompressed) serialized copy
+    plus a per-workload rechunked copy, exceeding 22 GB; a 30 GB host OOMs above ~20-30 files.
+    **Confidence: high.**
+
+54. **Owned coordination beats both the central coordinator and pooled shards.** Sixteen threads
+    that each coordinate and evaluate their own morsel group inline turned Q06 from 1.40x
+    (4 pooled shards) to 0.79x and flipped 25 of 28 workloads to wins. Per-morsel state needs no
+    cross-thread communication when morsel groups end on natural splits; the scheduling problem
+    collapses to "which thread owns which morsels". **Confidence: high for the in-memory
+    restricted fixture; object-store latency will need read-ahead or async I/O per thread.**
+
+55. **V1's physical request count is not deterministic.** Run-to-run it varies by a few duplicate
+    concurrent segment reads, and a dropped duplicate in-flight future counts its request but
+    never its bytes (~0.01% byte undercount observed). Cold-scan invariants must therefore be
+    floors with a small counting allowance for V1, while self-paced required reads can be held to
+    exact equality. **Confidence: high.**
+
+56. **Enforced invariants beat one-off audits.** Making every timed iteration prove it re-read
+    the warmup's unique-segment floor converts "we checked there is no caching" into a property
+    the harness cannot silently lose, and it surfaced the V1 counting artifact immediately.
+    **Confidence: high.**
+
 ## What remains genuinely unknown
 
 - Whether sharded plan execution makes progressive demand faster than V1 without losing resource
