@@ -7,17 +7,15 @@
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/table_function.hpp"
 
+#include <limits>
+
 using namespace duckdb;
 
 static_assert(sizeof(idx_t) == 8);
 
 bool is_vortex_scan(const TableFunction &function);
 
-// We need this exposed to compare function addresses in optimizer.cpp
-unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &context,
-                                                       TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types,
-                                                       vector<string> &names);
+constexpr inline idx_t COUNT_STAR_PROJ_IDX = std::numeric_limits<idx_t>::max();
 
 struct TableFunctionUngroupedAggregateInput {
     const LogicalGet &get;
