@@ -118,3 +118,43 @@ fn dict_canonicalize_gt_u8(bencher: Bencher, num_indices: usize) {
         .with_inputs(|| (&dict, SESSION.create_execution_ctx()))
         .bench_refs(|(dict, ctx)| (*dict).clone().into_array().execute::<Canonical>(ctx));
 }
+
+/// Dictionary width and index count for the byte-table sweep.
+///
+/// 16 entries is the widest an in-lane `vpshufb` addresses and 48 needs a cross-lane permute, so
+/// the pair brackets the byte-table kernels; 200 exceeds every byte table. Each width is measured
+/// cache-resident and streaming, because the two regimes answer different questions: whether the
+/// kernel itself got faster, and whether that survives contact with memory bandwidth.
+const DICT_SWEEP: &[(usize, usize)] = &[
+    (4, 100_000),
+    (4, 4_000_000),
+    (16, 100_000),
+    (16, 4_000_000),
+    (48, 100_000),
+    (48, 4_000_000),
+    (200, 100_000),
+    (200, 4_000_000),
+];
+
+/// Decode a `u8`-coded dictionary of one-byte values, sweeping value count and index count.
+///
+/// The codes are uniform, so this measures the decode kernel rather than a cache-residency effect
+/// of a skewed code distribution.
+#[vortex_bench_support::cpu_features]
+#[divan::bench(args = DICT_SWEEP)]
+fn dict_canonicalize_u8_values(bencher: Bencher, sweep: &(usize, usize)) {
+    let (dict_size, num_indices) = *sweep;
+    let values = PrimitiveArray::from_iter((0..dict_size).map(|value| value as u8));
+    let range = Uniform::new(0u8, dict_size as u8).unwrap();
+    let codes = PrimitiveArray::from_iter(
+        StdRng::seed_from_u64(0)
+            .sample_iter(range)
+            .take(num_indices),
+    );
+    let dict = DictArray::try_new(codes.into_array(), values.into_array()).unwrap();
+
+    bencher
+        .counter(ItemsCount::new(num_indices))
+        .with_inputs(|| (&dict, SESSION.create_execution_ctx()))
+        .bench_refs(|(dict, ctx)| (*dict).clone().into_array().execute::<Canonical>(ctx));
+}

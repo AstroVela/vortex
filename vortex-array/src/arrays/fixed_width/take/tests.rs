@@ -38,26 +38,84 @@ fn take_eight_byte_values() {
     assert_eq!(taken.as_slice(), &[20, 30, 10]);
 }
 
-#[test]
-fn take_small_byte_table() {
-    let values = [10u8, 20, 30, 40];
-    let indices = (0..128).map(|index| index % 4).collect::<Vec<u8>>();
+/// Byte-table take must agree with the scalar loop at every table size and every kernel
+/// boundary: 16 entries is the widest one `vpshufb` addresses, 32 and 64 are where the blended
+/// sub-tables step up, and 65 must decline the fast path entirely.
+#[rstest]
+#[case(1)]
+#[case(2)]
+#[case(15)]
+#[case(16)]
+#[case(17)]
+#[case(31)]
+#[case(32)]
+#[case(33)]
+#[case(63)]
+#[case(64)]
+#[case(65)]
+#[case(255)]
+fn take_small_byte_table(#[case] num_values: u8) {
+    let values = (0..num_values)
+        .map(|value| value.wrapping_mul(37))
+        .collect::<Vec<u8>>();
+    // The length is deliberately not a multiple of any kernel's vector width, so the remainder
+    // loop runs in every case.
+    let indices = cyclic_codes(num_values, 1013);
     let expected = indices
         .iter()
         .map(|index| values[usize::from(*index)])
         .collect::<Vec<_>>();
+
     assert_eq!(
         take_values(&values, &indices).as_slice(),
         expected.as_slice()
     );
 }
 
+/// Below the vector threshold the scalar loop must still produce the same answer.
 #[test]
-#[should_panic(expected = "take index")]
-fn take_small_byte_table_rejects_out_of_bounds_index() {
-    let mut indices = vec![0u8; 128];
-    indices[64] = 4;
-    drop(take_values(&[10u8, 20, 30, 40], &indices));
+fn take_small_byte_table_below_vector_threshold() {
+    let values = [10u8, 20, 30, 40];
+    let indices = cyclic_codes(4, 17);
+    let expected = indices
+        .iter()
+        .map(|index| values[usize::from(*index)])
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        take_values(&values, &indices).as_slice(),
+        expected.as_slice()
+    );
+}
+
+/// An out-of-bounds code must be rejected wherever it lands: in the first vector, in a later
+/// vector, or in the remainder no vector covered.
+#[rstest]
+#[case(4, 0)]
+#[case(4, 64)]
+#[case(4, 1000)]
+#[case(48, 64)]
+#[case(48, 1000)]
+fn take_small_byte_table_rejects_out_of_bounds_index(
+    #[case] num_values: u8,
+    #[case] position: usize,
+) {
+    let values = (0..num_values).collect::<Vec<u8>>();
+    let mut indices = vec![0u8; 1013];
+    indices[position] = num_values;
+
+    let taken = std::panic::catch_unwind(|| take_values(&values, &indices));
+    assert!(
+        taken.is_err(),
+        "out-of-bounds code at {position} was accepted"
+    );
+}
+
+/// `len` codes cycling through `0..num_values`, staying in the byte domain throughout.
+fn cyclic_codes(num_values: u8, len: usize) -> Vec<u8> {
+    std::iter::successors(Some(0u8), |code| Some((code + 1) % num_values))
+        .take(len)
+        .collect()
 }
 
 #[rstest]

@@ -92,18 +92,15 @@ pub(crate) fn take_values<T: FixedWidthTakeValue, I: UnsignedPType>(
     values: &[T],
     indices: &[I],
 ) -> Buffer<T> {
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    // A `u8`-coded dictionary of one-byte values decodes through a register table far faster than
+    // it gathers, and AVX2 has no gather narrower than 32 bits to fall back on. `small_table`
+    // detects its own kernel and declines the inputs none of them cover.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        target_arch = "x86_64",
+        target_arch = "x86"
+    ))]
     if I::PTYPE == PType::U8 {
-        // SAFETY: the ptype dispatcher guarantees that `I::PTYPE == U8` is the concrete `u8`
-        // implementation, so these slices have identical layouts.
-        let indices = unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), indices.len()) };
-        if let Some(taken) = small_table::take(values, indices) {
-            return taken;
-        }
-    }
-
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    if I::PTYPE == PType::U8 && *HAS_AVX2 {
         // SAFETY: the ptype dispatcher guarantees that `I::PTYPE == U8` is the concrete `u8`
         // implementation, so these slices have identical layouts.
         let indices = unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), indices.len()) };
