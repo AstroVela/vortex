@@ -5,6 +5,7 @@ use crate::expr::BoundExpression;
 use crate::expr::bound::and_collect as bound_and_collect;
 use crate::expr::bound::between as bound_between;
 use crate::expr::bound::binary as bound_binary;
+use crate::expr::bound::lit as bound_lit;
 use crate::scalar_fn::fns::between::BetweenOptions;
 use crate::scalar_fn::fns::between::StrictComparison;
 use crate::scalar_fn::fns::binary::Binary;
@@ -13,12 +14,9 @@ use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::Operator;
 
 /// Look for `x >= a AND x < b` and replace it with a bound `between` expression.
-///
-/// Returns `None` when no rewrite applies, preserving the original tree and its sharing.
-pub(crate) fn find_between_bound(expr: &BoundExpression) -> Option<BoundExpression> {
-    let mut conjuncts = bound_conjuncts(expr);
+pub(crate) fn find_between_bound(expr: BoundExpression) -> BoundExpression {
+    let mut conjuncts = bound_conjuncts(&expr);
     let mut rest = vec![];
-    let mut rewritten = false;
 
     for idx in 0..conjuncts.len() {
         let Some(conjunct) = conjuncts.get(idx).cloned() else {
@@ -33,7 +31,6 @@ pub(crate) fn find_between_bound(expr: &BoundExpression) -> Option<BoundExpressi
                 rest.push(expr);
                 conjuncts.remove(idx2);
                 matched = true;
-                rewritten = true;
                 break;
             }
         }
@@ -42,9 +39,7 @@ pub(crate) fn find_between_bound(expr: &BoundExpression) -> Option<BoundExpressi
         }
     }
 
-    rewritten.then(|| {
-        bound_and_collect(rest).expect("a between rewrite always retains at least one conjunct")
-    })
+    bound_and_collect(rest).unwrap_or_else(|| bound_lit(true))
 }
 
 fn bound_conjuncts(expr: &BoundExpression) -> Vec<BoundExpression> {
@@ -176,15 +171,6 @@ mod tests {
 
     fn optimize(expr: Expression, scope: &DType) -> VortexResult<BoundExpression> {
         expr.bind(scope)?.optimize_recursive()
-    }
-
-    #[test]
-    fn test_no_match_preserves_expression() -> VortexResult<()> {
-        let scope = scope(&["x", "y"]);
-        let expr = and(gt_eq(col("x"), lit(2)), lt(col("y"), lit(5))).bind(&scope)?;
-
-        assert!(super::find_between_bound(&expr).is_none());
-        Ok(())
     }
 
     /// A null literal bound must not change the values of the rewritten expression. Kleene `AND`
