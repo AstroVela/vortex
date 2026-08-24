@@ -3,5 +3,7 @@ source: vortex-btrblocks/tests/golden.rs
 expression: rendered
 ---
 input: u64, len=16384, nbytes=131072
-root: vortex.block_residual(u64, len=16384) nbytes=41324
-  metadata: blocks: 16, slice: 0..16384
+root: fastlanes.for(u64, len=16384) nbytes=49152
+  metadata: reference: 1700000001036u64
+  encoded: fastlanes.bitpacked(u64, len=16384) nbytes=49152
+    metadata: bit_width: 24, offset: 0
