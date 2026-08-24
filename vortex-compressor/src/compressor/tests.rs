@@ -41,6 +41,7 @@ use crate::scheme::DeferredEstimate;
 use crate::scheme::EstimateScore;
 use crate::scheme::EstimateVerdict;
 use crate::scheme::Scheme;
+use crate::scheme::SchemeEntry;
 use crate::scheme::SchemeExt;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
@@ -370,7 +371,10 @@ fn test_no_exclusion_without_history() {
 #[test]
 fn immediate_always_use_wins_immediately() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&DirectRatioScheme, &ImmediateAlwaysUseScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&DirectRatioScheme, &ImmediateAlwaysUseScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&DirectRatioScheme),
+        SchemeEntry::new(&ImmediateAlwaysUseScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -380,7 +384,7 @@ fn immediate_always_use_wins_immediately() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::AlwaysUse))
-            if scheme.id() == ImmediateAlwaysUseScheme.id()
+            if scheme.scheme.id() == ImmediateAlwaysUseScheme.id()
     ));
     Ok(())
 }
@@ -388,7 +392,10 @@ fn immediate_always_use_wins_immediately() -> VortexResult<()> {
 #[test]
 fn callback_always_use_wins_immediately() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&DirectRatioScheme, &CallbackAlwaysUseScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&DirectRatioScheme, &CallbackAlwaysUseScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&DirectRatioScheme),
+        SchemeEntry::new(&CallbackAlwaysUseScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -398,7 +405,7 @@ fn callback_always_use_wins_immediately() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::AlwaysUse))
-            if scheme.id() == CallbackAlwaysUseScheme.id()
+            if scheme.scheme.id() == CallbackAlwaysUseScheme.id()
     ));
     Ok(())
 }
@@ -406,7 +413,10 @@ fn callback_always_use_wins_immediately() -> VortexResult<()> {
 #[test]
 fn callback_skip_is_ignored() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&CallbackSkipScheme, &DirectRatioScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&CallbackSkipScheme, &DirectRatioScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&CallbackSkipScheme),
+        SchemeEntry::new(&DirectRatioScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -416,7 +426,7 @@ fn callback_skip_is_ignored() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::Score(EstimateScore::FiniteCompression(2.0))))
-            if scheme.id() == DirectRatioScheme.id()
+            if scheme.scheme.id() == DirectRatioScheme.id()
     ));
     Ok(())
 }
@@ -424,7 +434,10 @@ fn callback_skip_is_ignored() -> VortexResult<()> {
 #[test]
 fn callback_ratio_competes_numerically() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&DirectRatioScheme, &CallbackRatioScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&DirectRatioScheme, &CallbackRatioScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&DirectRatioScheme),
+        SchemeEntry::new(&CallbackRatioScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -434,7 +447,7 @@ fn callback_ratio_competes_numerically() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::Score(EstimateScore::FiniteCompression(3.0))))
-            if scheme.id() == CallbackRatioScheme.id()
+            if scheme.scheme.id() == CallbackRatioScheme.id()
     ));
     Ok(())
 }
@@ -442,7 +455,10 @@ fn callback_ratio_competes_numerically() -> VortexResult<()> {
 #[test]
 fn zero_byte_sample_loses_to_finite_ratio() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&HugeRatioScheme, &ZeroBytesSamplingScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&HugeRatioScheme, &ZeroBytesSamplingScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&HugeRatioScheme),
+        SchemeEntry::new(&ZeroBytesSamplingScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -452,7 +468,7 @@ fn zero_byte_sample_loses_to_finite_ratio() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::Score(EstimateScore::FiniteCompression(100.0))))
-            if scheme.id() == HugeRatioScheme.id()
+            if scheme.scheme.id() == HugeRatioScheme.id()
     ));
     Ok(())
 }
@@ -460,7 +476,10 @@ fn zero_byte_sample_loses_to_finite_ratio() -> VortexResult<()> {
 #[test]
 fn finite_ratio_displaces_zero_byte_sample() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&ZeroBytesSamplingScheme, &HugeRatioScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&ZeroBytesSamplingScheme, &HugeRatioScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&ZeroBytesSamplingScheme),
+        SchemeEntry::new(&HugeRatioScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -470,7 +489,7 @@ fn finite_ratio_displaces_zero_byte_sample() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::Score(EstimateScore::FiniteCompression(100.0))))
-            if scheme.id() == HugeRatioScheme.id()
+            if scheme.scheme.id() == HugeRatioScheme.id()
     ));
     Ok(())
 }
@@ -478,7 +497,7 @@ fn finite_ratio_displaces_zero_byte_sample() -> VortexResult<()> {
 #[test]
 fn zero_byte_sample_alone_selects_no_scheme() -> VortexResult<()> {
     let compressor = CascadingCompressor::new(vec![&ZeroBytesSamplingScheme]);
-    let schemes: [&'static dyn Scheme; 1] = [&ZeroBytesSamplingScheme];
+    let schemes: [SchemeEntry; 1] = [SchemeEntry::new(&ZeroBytesSamplingScheme)];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -580,7 +599,10 @@ fn callback_always_use_overrides_pass_one_best() -> VortexResult<()> {
     // `CallbackAlwaysUseScheme` returns `AlwaysUse` from its deferred callback in pass 2.
     // The deferred `AlwaysUse` must still win.
     let compressor = CascadingCompressor::new(vec![&HugeRatioScheme, &CallbackAlwaysUseScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&HugeRatioScheme, &CallbackAlwaysUseScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&HugeRatioScheme),
+        SchemeEntry::new(&CallbackAlwaysUseScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -590,7 +612,7 @@ fn callback_always_use_overrides_pass_one_best() -> VortexResult<()> {
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::AlwaysUse))
-            if scheme.id() == CallbackAlwaysUseScheme.id()
+            if scheme.scheme.id() == CallbackAlwaysUseScheme.id()
     ));
     Ok(())
 }
@@ -601,7 +623,10 @@ fn threshold_reflects_pass_one_best() -> VortexResult<()> {
     *OBSERVED_THRESHOLD.lock() = None;
 
     let compressor = CascadingCompressor::new(vec![&DirectRatioScheme, &ThresholdObservingScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&DirectRatioScheme, &ThresholdObservingScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&DirectRatioScheme),
+        SchemeEntry::new(&ThresholdObservingScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -622,7 +647,10 @@ fn threshold_is_none_when_only_prior_is_zero_bytes() -> VortexResult<()> {
 
     let compressor =
         CascadingCompressor::new(vec![&ZeroBytesSamplingScheme, &ThresholdObservingScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&ZeroBytesSamplingScheme, &ThresholdObservingScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&ZeroBytesSamplingScheme),
+        SchemeEntry::new(&ThresholdObservingScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -641,7 +669,7 @@ fn threshold_is_none_when_no_prior_scheme() -> VortexResult<()> {
     *OBSERVED_THRESHOLD.lock() = None;
 
     let compressor = CascadingCompressor::new(vec![&ThresholdObservingScheme]);
-    let schemes: [&'static dyn Scheme; 1] = [&ThresholdObservingScheme];
+    let schemes: [SchemeEntry; 1] = [SchemeEntry::new(&ThresholdObservingScheme)];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -661,7 +689,10 @@ fn threshold_updates_from_earlier_deferred_callback() -> VortexResult<()> {
     // callback must observe it as its threshold.
     let compressor =
         CascadingCompressor::new(vec![&CallbackRatioScheme, &ThresholdObservingScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&CallbackRatioScheme, &ThresholdObservingScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&CallbackRatioScheme),
+        SchemeEntry::new(&ThresholdObservingScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -682,7 +713,10 @@ fn ratio_tie_between_immediate_and_deferred_favors_immediate() -> VortexResult<(
     // the deferred callback's equal ratio cannot displace it.
     let compressor =
         CascadingCompressor::new(vec![&CallbackMatchingRatioScheme, &DirectRatioScheme]);
-    let schemes: [&'static dyn Scheme; 2] = [&CallbackMatchingRatioScheme, &DirectRatioScheme];
+    let schemes: [SchemeEntry; 2] = [
+        SchemeEntry::new(&CallbackMatchingRatioScheme),
+        SchemeEntry::new(&DirectRatioScheme),
+    ];
     let data = estimate_test_data();
     let mut exec_ctx = SESSION.create_execution_ctx();
 
@@ -692,7 +726,7 @@ fn ratio_tie_between_immediate_and_deferred_favors_immediate() -> VortexResult<(
     assert!(matches!(
         winner,
         Some((scheme, WinnerEstimate::Score(EstimateScore::FiniteCompression(r))))
-            if scheme.id() == DirectRatioScheme.id() && r == 2.0
+            if scheme.scheme.id() == DirectRatioScheme.id() && r == 2.0
     ));
     Ok(())
 }

@@ -13,6 +13,7 @@ use crate::builtins::IntDictScheme;
 use crate::scheme::ChildSelection;
 use crate::scheme::DescendantExclusion;
 use crate::scheme::Scheme;
+use crate::scheme::SchemeEntry;
 use crate::scheme::SchemeExt;
 use crate::scheme::SchemeId;
 
@@ -40,8 +41,8 @@ pub(crate) const ROOT_SCHEME_ID: SchemeId = SchemeId {
 /// embedding a custom fixed scheme list or testing scheme interactions.
 #[derive(Debug, Clone)]
 pub struct CascadingCompressor {
-    /// The enabled compression schemes.
-    schemes: Vec<&'static dyn Scheme>,
+    /// The enabled compression schemes and the policy registered with each.
+    schemes: Vec<SchemeEntry>,
 
     /// Descendant exclusion rules for the compressor's own cascading (e.g. excluding Dict from
     /// list offsets).
@@ -53,6 +54,14 @@ impl CascadingCompressor {
     ///
     /// Root-level exclusion rules (e.g. excluding Dict from list offsets) are built automatically.
     pub fn new(schemes: Vec<&'static dyn Scheme>) -> Self {
+        Self::with_entries(schemes.into_iter().map(SchemeEntry::new).collect())
+    }
+
+    /// Creates a new compressor from schemes carrying their own registration policy.
+    ///
+    /// Use this over [`new`](Self::new) to register a scheme with a
+    /// [`min_gain`](SchemeEntry::min_gain) floor.
+    pub fn with_entries(schemes: Vec<SchemeEntry>) -> Self {
         // Root exclusion: exclude IntDict from list/listview offsets (monotonically
         // increasing data where dictionary encoding is wasteful).
         let root_exclusions = vec![DescendantExclusion {

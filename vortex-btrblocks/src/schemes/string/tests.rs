@@ -65,3 +65,67 @@ fn test_sparse_nulls() -> VortexResult<()> {
 
     Ok(())
 }
+
+/// Strings no codec can usefully shrink should land as offset-addressed `varbin`, not as a codec
+/// that barely beats canonical and not as the 16-byte-per-value `varbinview` it started as.
+#[test]
+fn incompressible_strings_fall_back_to_varbin() -> VortexResult<()> {
+    // Deterministic pseudo-random ASCII: no repeated substrings for FSST to build symbols from.
+    let values: Vec<String> = (0..8192)
+        .map(|i| {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..180)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    char::from(b'!' + (x % 90) as u8)
+                })
+                .collect()
+        })
+        .collect();
+    let array = VarBinViewArray::from_iter_str(values.iter().map(String::as_str)).into_array();
+
+    let compressed =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    let display = compressed
+        .display_as(DisplayOptions::MetadataOnly)
+        .to_string()
+        .to_lowercase();
+    assert!(
+        display.starts_with("vortex.varbin("),
+        "expected varbin, got {display}"
+    );
+    assert!(
+        compressed.nbytes() < array.nbytes(),
+        "varbin ({}) should beat canonical views ({})",
+        compressed.nbytes(),
+        array.nbytes()
+    );
+
+    Ok(())
+}
+
+/// A column FSST genuinely compresses must still get FSST: the floor rejects marginal wins, not
+/// real ones.
+#[test]
+fn compressible_strings_still_use_fsst() -> VortexResult<()> {
+    let values: Vec<String> = (0..8192)
+        .map(|i| format!("the quick brown fox jumps over the lazy dog number {i}"))
+        .collect();
+    let array = VarBinViewArray::from_iter_str(values.iter().map(String::as_str)).into_array();
+
+    let compressed =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    let display = compressed
+        .display_as(DisplayOptions::MetadataOnly)
+        .to_string()
+        .to_lowercase();
+    assert!(
+        display.contains("fsst") || display.contains("dict"),
+        "expected a real codec, got {display}"
+    );
+    Ok(())
+}

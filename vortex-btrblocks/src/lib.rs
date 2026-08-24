@@ -84,6 +84,7 @@ pub use vortex_compressor::CascadingCompressor;
 pub use vortex_compressor::scheme::CompressorContext;
 pub use vortex_compressor::scheme::MAX_CASCADE;
 pub use vortex_compressor::scheme::Scheme;
+pub use vortex_compressor::scheme::SchemeEntry;
 pub use vortex_compressor::scheme::SchemeExt;
 pub use vortex_compressor::scheme::SchemeId;
 pub use vortex_compressor::stats::ArrayAndStats;

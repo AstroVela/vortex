@@ -4,6 +4,7 @@
 //! Core cascading compression flow.
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::Canonical;
 use vortex_array::CanonicalValidity;
 use vortex_array::ExecutionCtx;
@@ -19,10 +20,6 @@ use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::VariantArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
-use vortex_array::builders::VarBinBuilder;
-use vortex_array::dtype::OffsetBuilderPType;
-use vortex_array::ArrayView;
-use vortex_mask::Mask;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
@@ -32,13 +29,16 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::union::UnionArrayExt;
 use vortex_array::arrays::union::UnionArraySlotsExt;
 use vortex_array::arrays::variant::VariantArraySlotsExt;
+use vortex_array::builders::VarBinBuilder;
+use vortex_array::dtype::OffsetBuilderPType;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 
 use super::CascadingCompressor;
 use super::constant;
 use crate::scheme::CompressorContext;
-use crate::scheme::Scheme;
+use crate::scheme::SchemeEntry;
 use crate::scheme::SchemeExt;
 use crate::scheme::SchemeId;
 use crate::stats::ArrayAndStats;
@@ -305,11 +305,13 @@ impl CascadingCompressor {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let eligible_schemes: Vec<&'static dyn Scheme> = self
+        let eligible_schemes: Vec<SchemeEntry> = self
             .schemes
             .iter()
             .copied()
-            .filter(|s| s.matches(&canonical) && !self.is_excluded(*s, &compress_ctx))
+            .filter(|entry| {
+                entry.scheme.matches(&canonical) && !self.is_excluded(entry.scheme, &compress_ctx)
+            })
             .collect();
 
         let array: ArrayRef = canonical.into();
@@ -329,7 +331,7 @@ impl CascadingCompressor {
         let merged_opts = eligible_schemes
             .iter()
             .fold(GenerateStatsOptions::default(), |acc, s| {
-                acc.merge(s.stats_options())
+                acc.merge(s.scheme.stats_options())
             });
         let compress_ctx = compress_ctx.with_merged_stats_options(merged_opts);
 
@@ -360,7 +362,7 @@ impl CascadingCompressor {
             return Ok(data.into_array());
         }
 
-        let Some((winner, winner_estimate)) =
+        let Some((winner_entry, winner_estimate)) =
             self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
         else {
             return store_uncompressed(data.into_array(), exec_ctx);
@@ -368,6 +370,7 @@ impl CascadingCompressor {
 
         // Run the winning scheme's `compress`. On failure, emit an ERROR event carrying the
         // scheme name and cascade history before propagating.
+        let winner = winner_entry.scheme;
         let error_ctx = trace::enabled_error_context(&compress_ctx);
         let _winner_span = trace::winner_compress_span(winner.id(), before_nbytes).entered();
         let compressed = winner
@@ -382,11 +385,10 @@ impl CascadingCompressor {
         let after_nbytes = compressed.nbytes();
         let actual_ratio = (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);
 
-        // Accept only when the winner clears its own gain floor. A scheme that barely shrinks the
-        // array still charges full decode price on every read, so `min_gain` lets expensive schemes
-        // (FSST, zstd) decline work that is not worth materializing later, while cheap ones keep
-        // the default floor of zero.
-        let accepted = (after_nbytes as f64) <= (before_nbytes as f64) * (1.0 - winner.min_gain());
+        // The estimate that won selection is only a prediction; hold the real output to the same
+        // floor so a hopeful sample cannot smuggle in a barely-smaller array that costs full
+        // decode price on every read.
+        let accepted = winner_entry.accepts_sizes(before_nbytes, after_nbytes);
 
         trace::record_winner_compress_result(
             after_nbytes,

@@ -9,6 +9,7 @@ use vortex_utils::aliases::hash_set::HashSet;
 use crate::BtrBlocksCompressor;
 use crate::CascadingCompressor;
 use crate::Scheme;
+use crate::SchemeEntry;
 use crate::SchemeExt;
 use crate::SchemeId;
 use crate::schemes::binary;
@@ -18,53 +19,61 @@ use crate::schemes::integer;
 use crate::schemes::string;
 use crate::schemes::temporal;
 
-/// All available compression schemes.
+/// Gain required of schemes whose output costs real per-value work to decode.
+///
+/// Below this, the bytes saved are repaid more slowly than the decode costs: at ~3% saved on an
+/// array a codec cannot compress, the trade only pays off on storage slower than ~15 MB/s.
+pub const DECODE_HEAVY_MIN_GAIN: f64 = 0.1;
+
+/// All available compression schemes, each with the policy registered against it.
 ///
 /// This list is order-sensitive: the builder preserves this order when constructing
 /// the final scheme list, so that tie-breaking is deterministic.
-pub const ALL_SCHEMES: &[&dyn Scheme] = &[
+pub const ALL_SCHEMES: &[SchemeEntry] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Integer schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // NOTE: FoR must precede BitPacking to avoid unnecessary patches.
-    &integer::FoRScheme,
+    SchemeEntry::new(&integer::FoRScheme),
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
-    &integer::ZigZagScheme,
-    &integer::BitPackingScheme,
-    &integer::SparseScheme,
-    &integer::IntDictScheme,
-    &integer::RunEndScheme,
-    &integer::SequenceScheme,
-    &integer::IntRLEScheme,
+    SchemeEntry::new(&integer::ZigZagScheme),
+    SchemeEntry::new(&integer::BitPackingScheme),
+    SchemeEntry::new(&integer::SparseScheme),
+    SchemeEntry::new(&integer::IntDictScheme),
+    SchemeEntry::new(&integer::RunEndScheme),
+    SchemeEntry::new(&integer::SequenceScheme),
+    SchemeEntry::new(&integer::IntRLEScheme),
     // Prefer all other schemes above delta, for now (since its slower to decompress).
     #[cfg(feature = "unstable_encodings")]
-    &integer::DeltaScheme::new(1.25),
+    SchemeEntry::new(&integer::DeltaScheme::new(1.25)),
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Float schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    &float::ALPScheme,
-    &float::ALPRDScheme,
-    &float::FloatDictScheme,
-    &float::NullDominatedSparseScheme,
-    &float::FloatRLEScheme,
+    SchemeEntry::new(&float::ALPScheme),
+    SchemeEntry::new(&float::ALPRDScheme),
+    SchemeEntry::new(&float::FloatDictScheme),
+    SchemeEntry::new(&float::NullDominatedSparseScheme),
+    SchemeEntry::new(&float::FloatRLEScheme),
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // String schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    &string::StringDictScheme,
+    SchemeEntry::new(&string::StringDictScheme),
     // Both string-fragmentation schemes are registered; the sample-based
     // selector keeps whichever is smaller per column.
-    &string::FSSTScheme,
+    // FSST decodes per value, unlike the offsets scan a plain varbin read costs, so a marginal
+    // ratio is a loss repaid on every scan. Require a real gain before paying for it.
+    SchemeEntry::with_min_gain(&string::FSSTScheme, DECODE_HEAVY_MIN_GAIN),
     #[cfg(feature = "unstable_encodings")]
-    &string::OnPairScheme,
-    &string::NullDominatedSparseScheme,
+    SchemeEntry::with_min_gain(&string::OnPairScheme, DECODE_HEAVY_MIN_GAIN),
+    SchemeEntry::new(&string::NullDominatedSparseScheme),
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Binary schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    &binary::BinaryDictScheme,
+    SchemeEntry::new(&binary::BinaryDictScheme),
     // Decimal schemes.
-    &decimal::DecimalScheme,
+    SchemeEntry::new(&decimal::DecimalScheme),
     // Temporal schemes.
-    &temporal::TemporalScheme,
+    SchemeEntry::new(&temporal::TemporalScheme),
 ];
 
 /// Builder for creating configured [`BtrBlocksCompressor`] instances.
@@ -90,7 +99,7 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 /// ```
 #[derive(Debug, Clone)]
 pub struct BtrBlocksCompressorBuilder {
-    schemes: Vec<&'static dyn Scheme>,
+    schemes: Vec<SchemeEntry>,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
@@ -121,12 +130,32 @@ impl BtrBlocksCompressorBuilder {
     /// Panics if a scheme with the same [`SchemeId`] is already present.
     pub fn with_new_scheme(mut self, scheme: &'static dyn Scheme) -> Self {
         assert!(
-            !self.schemes.iter().any(|s| s.id() == scheme.id()),
+            !self.schemes.iter().any(|e| e.scheme.id() == scheme.id()),
             "scheme {:?} is already present in the builder",
             scheme.id(),
         );
 
-        self.schemes.push(scheme);
+        self.schemes.push(SchemeEntry::new(scheme));
+        self
+    }
+
+    /// Adds a scheme that must save at least `min_gain` of the input before it may be chosen.
+    ///
+    /// Use for schemes whose output costs real per-value work to decode, where a marginal ratio
+    /// is repaid on every read rather than once at write time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a scheme with the same [`SchemeId`] is already present.
+    pub fn with_new_scheme_min_gain(mut self, scheme: &'static dyn Scheme, min_gain: f64) -> Self {
+        assert!(
+            !self.schemes.iter().any(|e| e.scheme.id() == scheme.id()),
+            "scheme {:?} is already present in the builder",
+            scheme.id(),
+        );
+
+        self.schemes
+            .push(SchemeEntry::with_min_gain(scheme, min_gain));
         self
     }
 
@@ -197,7 +226,7 @@ impl BtrBlocksCompressorBuilder {
     /// Removes the specified compression schemes by their [`SchemeId`].
     pub fn exclude_schemes(mut self, ids: impl IntoIterator<Item = SchemeId>) -> Self {
         let ids: HashSet<_> = ids.into_iter().collect();
-        self.schemes.retain(|s| !ids.contains(&s.id()));
+        self.schemes.retain(|e| !ids.contains(&e.scheme.id()));
         self
     }
 
@@ -206,14 +235,18 @@ impl BtrBlocksCompressorBuilder {
     /// The file writer uses this to restrict compression to the encodings of its configured
     /// editions.
     pub fn retain_allowed_encodings(mut self, allowed: &HashSet<ArrayId>) -> Self {
-        self.schemes
-            .retain(|s| s.produced_encodings().iter().all(|id| allowed.contains(id)));
+        self.schemes.retain(|e| {
+            e.scheme
+                .produced_encodings()
+                .iter()
+                .all(|id| allowed.contains(id))
+        });
         self
     }
 
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
+        BtrBlocksCompressor(CascadingCompressor::with_entries(self.schemes))
     }
 }
 
@@ -241,7 +274,7 @@ mod tests {
         let allowed: HashSet<ArrayId> = [FoR.id()].into_iter().collect();
         let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
         assert_eq!(builder.schemes.len(), 1);
-        assert_eq!(builder.schemes[0].id(), integer::FoRScheme.id());
+        assert_eq!(builder.schemes[0].scheme.id(), integer::FoRScheme.id());
 
         let none = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&HashSet::new());
         assert!(none.schemes.is_empty());
@@ -251,7 +284,7 @@ mod tests {
     fn retaining_all_declared_outputs_keeps_every_scheme() {
         let allowed: HashSet<ArrayId> = ALL_SCHEMES
             .iter()
-            .flat_map(|scheme| scheme.produced_encodings())
+            .flat_map(|entry| entry.scheme.produced_encodings())
             .collect();
         let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
         assert_eq!(builder.schemes.len(), ALL_SCHEMES.len());
@@ -264,7 +297,7 @@ mod tests {
             !builder
                 .schemes
                 .iter()
-                .any(|s| s.id() == float::ALPRDScheme.id())
+                .any(|e| e.scheme.id() == float::ALPRDScheme.id())
         );
     }
 
@@ -275,14 +308,14 @@ mod tests {
             builder
                 .schemes
                 .iter()
-                .any(|scheme| scheme.id() == string::FSSTScheme.id())
+                .any(|entry| entry.scheme.id() == string::FSSTScheme.id())
         );
         #[cfg(feature = "zstd")]
         assert!(
             !builder
                 .schemes
                 .iter()
-                .any(|scheme| scheme.id() == string::ZstdScheme.id())
+                .any(|entry| entry.scheme.id() == string::ZstdScheme.id())
         );
     }
 
@@ -294,7 +327,7 @@ mod tests {
             .with_new_scheme(&float::PcoScheme)
             .only_cuda_compatible();
         for scheme in [integer::PcoScheme.id(), float::PcoScheme.id()] {
-            assert!(!builder.schemes.iter().any(|s| s.id() == scheme));
+            assert!(!builder.schemes.iter().any(|e| e.scheme.id() == scheme));
         }
     }
 }

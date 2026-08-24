@@ -15,6 +15,7 @@ use crate::scheme::DeferredEstimate;
 use crate::scheme::EstimateScore;
 use crate::scheme::EstimateVerdict;
 use crate::scheme::Scheme;
+use crate::scheme::SchemeEntry;
 use crate::scheme::SchemeExt;
 use crate::stats::ArrayAndStats;
 use crate::trace;
@@ -40,10 +41,15 @@ impl WinnerEstimate {
 
 /// Returns `true` if `score` beats the current best estimate.
 fn is_better_score(
+    entry: &SchemeEntry,
     score: EstimateScore,
-    best: Option<&(&'static dyn Scheme, EstimateScore)>,
+    best: Option<&(SchemeEntry, EstimateScore)>,
 ) -> bool {
-    score.is_valid() && best.is_none_or(|(_, best_score)| score.beats(*best_score))
+    // A scheme that cannot clear its own floor is not a candidate at all, so a cheaper scheme
+    // can win instead of the compressor falling all the way back to uncompressed.
+    score.is_valid()
+        && entry.accepts_estimate(score)
+        && best.is_none_or(|(_, best_score)| score.beats(*best_score))
 }
 
 impl CascadingCompressor {
@@ -64,32 +70,33 @@ impl CascadingCompressor {
     /// [`expected_compression_ratio`]: Scheme::expected_compression_ratio
     pub(super) fn choose_best_scheme(
         &self,
-        schemes: &[&'static dyn Scheme],
+        schemes: &[SchemeEntry],
         data: &ArrayAndStats,
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<(&'static dyn Scheme, WinnerEstimate)>> {
-        let mut best: Option<(&'static dyn Scheme, EstimateScore)> = None;
-        let mut deferred: Vec<(&'static dyn Scheme, DeferredEstimate)> = Vec::new();
+    ) -> VortexResult<Option<(SchemeEntry, WinnerEstimate)>> {
+        let mut best: Option<(SchemeEntry, EstimateScore)> = None;
+        let mut deferred: Vec<(SchemeEntry, DeferredEstimate)> = Vec::new();
 
         // Pass 1: evaluate every immediate verdict. Stash deferred work for pass 2.
         {
             let _verdict_pass = trace::verdict_pass_span().entered();
-            for &scheme in schemes {
+            for &entry in schemes {
+                let scheme = entry.scheme;
                 match scheme.expected_compression_ratio(data, compress_ctx.clone(), exec_ctx) {
                     CompressionEstimate::Verdict(EstimateVerdict::Skip) => {}
                     CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse) => {
-                        return Ok(Some((scheme, WinnerEstimate::AlwaysUse)));
+                        return Ok(Some((entry, WinnerEstimate::AlwaysUse)));
                     }
                     CompressionEstimate::Verdict(EstimateVerdict::Ratio(ratio)) => {
                         let score = EstimateScore::FiniteCompression(ratio);
 
-                        if is_better_score(score, best.as_ref()) {
-                            best = Some((scheme, score));
+                        if is_better_score(&entry, score, best.as_ref()) {
+                            best = Some((entry, score));
                         }
                     }
                     CompressionEstimate::Deferred(deferred_estimate) => {
-                        deferred.push((scheme, deferred_estimate));
+                        deferred.push((entry, deferred_estimate));
                     }
                 }
             }
@@ -97,7 +104,8 @@ impl CascadingCompressor {
 
         // Pass 2: run deferred work. Callbacks receive the current best as a threshold so they can
         // short-circuit with `Skip` when they cannot beat it.
-        for (scheme, deferred_estimate) in deferred {
+        for (entry, deferred_estimate) in deferred {
+            let scheme = entry.scheme;
             let _span = trace::scheme_eval_span(scheme.id()).entered();
             let threshold: Option<EstimateScore> = best.map(|(_, score)| score);
             match deferred_estimate {
@@ -110,21 +118,21 @@ impl CascadingCompressor {
                         exec_ctx,
                     )?;
 
-                    if is_better_score(score, best.as_ref()) {
-                        best = Some((scheme, score));
+                    if is_better_score(&entry, score, best.as_ref()) {
+                        best = Some((entry, score));
                     }
                 }
                 DeferredEstimate::Callback(callback) => {
                     match callback(self, data, threshold, compress_ctx.clone(), exec_ctx)? {
                         EstimateVerdict::Skip => {}
                         EstimateVerdict::AlwaysUse => {
-                            return Ok(Some((scheme, WinnerEstimate::AlwaysUse)));
+                            return Ok(Some((entry, WinnerEstimate::AlwaysUse)));
                         }
                         EstimateVerdict::Ratio(ratio) => {
                             let score = EstimateScore::FiniteCompression(ratio);
 
-                            if is_better_score(score, best.as_ref()) {
-                                best = Some((scheme, score));
+                            if is_better_score(&entry, score, best.as_ref()) {
+                                best = Some((entry, score));
                             }
                         }
                     }
@@ -132,7 +140,7 @@ impl CascadingCompressor {
             }
         }
 
-        Ok(best.map(|(scheme, score)| (scheme, WinnerEstimate::Score(score))))
+        Ok(best.map(|(entry, score)| (entry, WinnerEstimate::Score(score))))
     }
 
     // TODO(connor): Lots of room for optimization here.
@@ -162,7 +170,11 @@ impl CascadingCompressor {
 
         // Push rules: Check if any of our ancestors have excluded us.
         for (ancestor_id, child_idx) in iter {
-            if let Some(ancestor) = self.schemes.iter().find(|s| s.id() == ancestor_id)
+            if let Some(ancestor) = self
+                .schemes
+                .iter()
+                .map(|entry| entry.scheme)
+                .find(|s| s.id() == ancestor_id)
                 && ancestor
                     .descendant_exclusions()
                     .iter()

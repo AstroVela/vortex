@@ -144,19 +144,6 @@ pub trait Scheme: Debug + Send + Sync {
         0
     }
 
-    /// The minimum fraction of bytes this scheme must save for its output to be accepted.
-    ///
-    /// Acceptance is a cost/benefit decision, not a pure size comparison: a scheme that shaves a
-    /// few percent off an array it cannot really compress still charges full decode price on every
-    /// read. Materializing raw `varbin` to Arrow is a pointer handoff, while FSST-decoding the same
-    /// data costs tens of milliseconds per 200k values, so a 2-3% saving is paid back only when
-    /// storage delivers under ~15 MB/s. Schemes whose output decodes essentially for free (and
-    /// those that unlock pruning or pushdown) keep the default floor of zero; schemes that add real
-    /// per-value decode work should demand a gain large enough to be worth it.
-    fn min_gain(&self) -> f64 {
-        0.0
-    }
-
     /// Schemes to exclude from specific children's subtrees (push direction).
     ///
     /// Each rule says: "when I cascade through child Y, do not use scheme X anywhere in that
@@ -248,3 +235,67 @@ pub trait SchemeExt: Scheme {
 }
 
 impl<T: Scheme + ?Sized> SchemeExt for T {}
+
+/// A [`Scheme`] as registered with a compressor, together with the policy attached to it.
+///
+/// Registration, not the trait, is where policy belongs: the same scheme is worth different
+/// things to different callers, and a compressor tuned for scan speed should be able to demand
+/// more of an expensive codec than one tuned for footprint.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemeEntry {
+    /// The registered scheme.
+    pub scheme: &'static dyn Scheme,
+    /// Fraction of bytes the scheme must save before it may be chosen.
+    ///
+    /// `None` accepts any improvement at all, which is right for encodings that decode for
+    /// free. `Some(g)` requires the output to be at most `(1 - g)` of the input, and is meant
+    /// for schemes that charge real per-value decode work on every read: shaving a few percent
+    /// off an array a codec cannot really compress is a loss that is paid back on every scan.
+    /// The floor is applied twice — to the estimate, so a scheme that cannot clear it never
+    /// wins selection and a cheaper scheme can, and to the compressed output, so a hopeful
+    /// estimate still falls back to uncompressed.
+    pub min_gain: Option<f64>,
+}
+
+impl SchemeEntry {
+    /// Registers a scheme that may be chosen on any improvement.
+    pub const fn new(scheme: &'static dyn Scheme) -> Self {
+        Self {
+            scheme,
+            min_gain: None,
+        }
+    }
+
+    /// Registers a scheme that must save at least `min_gain` of the input to be chosen.
+    pub const fn with_min_gain(scheme: &'static dyn Scheme, min_gain: f64) -> Self {
+        Self {
+            scheme,
+            min_gain: Some(min_gain),
+        }
+    }
+
+    /// Whether `after_nbytes` clears this entry's floor relative to `before_nbytes`.
+    pub fn accepts_sizes(&self, before_nbytes: u64, after_nbytes: u64) -> bool {
+        match self.min_gain {
+            None => after_nbytes < before_nbytes,
+            Some(gain) => (after_nbytes as f64) <= (before_nbytes as f64) * (1.0 - gain),
+        }
+    }
+
+    /// Whether an estimated score clears this entry's floor.
+    ///
+    /// A ratio of `before / after` must reach `1 / (1 - min_gain)` to save `min_gain` of the
+    /// input. Non-finite scores are left to the existing validity rules.
+    pub fn accepts_estimate(&self, score: EstimateScore) -> bool {
+        match (self.min_gain, score) {
+            (Some(gain), EstimateScore::FiniteCompression(ratio)) => ratio >= 1.0 / (1.0 - gain),
+            _ => true,
+        }
+    }
+}
+
+impl From<&'static dyn Scheme> for SchemeEntry {
+    fn from(scheme: &'static dyn Scheme) -> Self {
+        Self::new(scheme)
+    }
+}

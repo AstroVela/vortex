@@ -94,7 +94,9 @@ fn test_fsst_in_default_scheme_list() -> VortexResult<()> {
 
     // FSST is registered by default.
     assert!(
-        crate::ALL_SCHEMES.iter().any(|s| s.id() == FSSTScheme.id()),
+        crate::ALL_SCHEMES
+            .iter()
+            .any(|e| e.scheme.id() == FSSTScheme.id()),
         "FSSTScheme should be in ALL_SCHEMES",
     );
 
