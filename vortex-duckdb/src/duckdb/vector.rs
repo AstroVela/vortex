@@ -117,8 +117,8 @@ impl VectorRef {
     }
 
     /// Converts a vector into a flat uncompressed vector vortex call this `canonicalize`.
-    pub fn flatten(&self, length: u64) {
-        unsafe { cpp::duckdb_vector_flatten(self.as_ptr(), length) }
+    pub fn flatten(&self) {
+        unsafe { cpp::duckdb_vector_flatten(self.as_ptr()) }
     }
 
     // NOTE(ngates): vector doesn't hold its own length. Which makes writing a safe
@@ -151,8 +151,21 @@ impl VectorRef {
         !is_valid
     }
 
-    pub unsafe fn set_vector_buffer(&mut self, buffer: &VectorBufferRef) {
-        unsafe { cpp::duckdb_vx_vector_set_vector_data_buffer(self.as_ptr(), buffer.as_ptr()) }
+    pub unsafe fn set_vector_buffer<T>(
+        &mut self,
+        buffer: &VectorBufferRef,
+        data_ptr: *const T,
+        capacity: usize,
+    ) {
+        unsafe {
+            cpp::duckdb_vx_vector_set_vector_data_buffer(
+                self.as_ptr(),
+                buffer.as_ptr(),
+                data_ptr as *mut c_void,
+                capacity as _,
+                size_of::<T>() as _,
+            )
+        }
     }
 
     pub fn add_string_vector_buffer(&mut self, buffer: &VectorBufferRef) {
@@ -599,7 +612,7 @@ mod tests {
         sel_slice[2] = 0;
 
         vector.dictionary(&dict, 2, &sel_vec, 3);
-        vector.flatten(3);
+        vector.flatten();
 
         assert_eq!(vector.as_slice_with_len::<i32>(3), &[100, 200, 100]);
     }

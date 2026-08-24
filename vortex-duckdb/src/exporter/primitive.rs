@@ -56,7 +56,7 @@ impl<T: NativePType> ColumnExporter for PrimitiveExporter<T> {
         assert!(self.len >= offset + len);
 
         let pos = unsafe { self.start.add(offset) };
-        unsafe { vector.set_vector_buffer(&self.shared_buffer) };
+        unsafe { vector.set_vector_buffer(&self.shared_buffer, pos, len) };
 
         Ok(())
     }
