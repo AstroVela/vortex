@@ -26,6 +26,8 @@ extern "C" void duckdb_vx_vector_dictionary(duckdb_vector ffi_vector,
     auto vector = reinterpret_cast<Vector *>(ffi_vector);
     auto dict = reinterpret_cast<Vector *>(ffi_dict);
     auto sel_vec = reinterpret_cast<SelectionVector *>(ffi_sel_vec);
+    // Vector::Dictionary requires dict.size() == dictionary_size
+    dict->BufferMutable().SetVectorSize(dictionary_size);
     vector->Dictionary(*dict, dictionary_size, *sel_vec, count);
 }
 
@@ -49,21 +51,25 @@ static_assert(sizeof(ExternalValidityMask) == sizeof(ValidityMask));
 
 extern "C" void duckdb_vx_string_vector_add_vector_data_buffer(duckdb_vector ffi_vector,
                                                                duckdb_vx_vector_buffer ffi_buffer) {
-    // TODO(myrrc): StringVector now stores one buffer and not N
-    // https://github.com/duckdb/duckdb/pull/21786
     Vector &vector = *reinterpret_cast<Vector *>(ffi_vector);
     buffer_ptr<VectorBuffer> data = *reinterpret_cast<buffer_ptr<ExternalVectorBuffer> *>(ffi_buffer);
-    VectorStringBuffer &string_buffer = StringVector::GetStringBuffer(vector);
-    shared_ptr<BlockHandle> block_handle;
-    BufferHandle buffer_handle(block_handle, {});
-    StringVector::AddHandle(vector, std::move(buffer_handle));
+    StringVector::AddAuxiliaryData(vector, make_uniq<VectorBufferHolder>(std::move(data)));
 }
 
 extern "C" void duckdb_vx_vector_set_vector_data_buffer(duckdb_vector ffi_vector,
-                                                        duckdb_vx_vector_buffer buffer) {
+                                                        duckdb_vx_vector_buffer buffer,
+                                                        void *data_ptr,
+                                                        idx_t capacity,
+                                                        idx_t type_size) {
     Vector &vector = *reinterpret_cast<Vector *>(ffi_vector);
-    buffer_ptr<ExternalVectorBuffer> data = *reinterpret_cast<buffer_ptr<ExternalVectorBuffer> *>(buffer);
-    vector.SetBuffer(data);
+    auto &root = *reinterpret_cast<shared_ptr<ExternalVectorBuffer> *>(buffer);
+    auto new_buffer =
+        make_buffer<ExternalVectorBuffer>(root, static_cast<data_ptr_t>(data_ptr), capacity, type_size);
+    // Carry validity set on the vector before this call
+    if (vector.GetBufferRef() && vector.Buffer().GetBufferType() == VectorBufferType::STANDARD_BUFFER) {
+        new_buffer->GetValidityMask() = vector.BufferMutable().GetValidityMask();
+    }
+    vector.SetBuffer(std::move(new_buffer));
 }
 
 extern "C" void duckdb_vx_vector_set_validity_data(duckdb_vector ffi_vector,
