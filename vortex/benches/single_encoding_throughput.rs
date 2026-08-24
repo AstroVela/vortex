@@ -113,6 +113,27 @@ fn bench_compressor(bencher: Bencher, array: PrimitiveArray, compressor: BtrBloc
         .bench_values(|(array, mut ctx)| compressor.compress(&array, &mut ctx).unwrap());
 }
 
+fn default_with_float_quant() -> BtrBlocksCompressorBuilder {
+    let builder = BtrBlocksCompressorBuilder::default();
+
+    #[cfg(not(feature = "unstable_encodings"))]
+    let builder = builder.with_new_scheme(&FloatQuantScheme);
+
+    builder
+}
+
+fn proposed_default_builder() -> BtrBlocksCompressorBuilder {
+    let builder = BtrBlocksCompressorBuilder::default();
+
+    #[cfg(not(feature = "unstable_encodings"))]
+    let builder = builder
+        .with_new_scheme(&FloatQuantScheme)
+        .with_new_scheme(&OrderedBlockResidualScheme)
+        .with_new_scheme(&BlockResidualScheme);
+
+    builder
+}
+
 // Setup functions
 fn setup_primitive_arrays(len: u64) -> (PrimitiveArray, PrimitiveArray, PrimitiveArray) {
     let mut ctx = SESSION.create_execution_ctx();
@@ -471,7 +492,7 @@ fn encode_prior_default(array: &PrimitiveArray) -> vortex::array::ArrayRef {
 }
 
 fn encode_proposed_default(array: &PrimitiveArray) -> vortex::array::ArrayRef {
-    BtrBlocksCompressorBuilder::default()
+    proposed_default_builder()
         .build()
         .compress(
             &array.clone().into_array(),
@@ -1046,7 +1067,7 @@ fn patch_density_default_compress_u32(bencher: Bencher, stride: u64) {
     bench_compressor(
         bencher,
         setup_patch_density_u32_array(stride),
-        BtrBlocksCompressorBuilder::default().build(),
+        proposed_default_builder().build(),
     );
 }
 
@@ -1363,7 +1384,7 @@ fn bench_float_quant_proposed_default_compress_f16(bencher: Bencher) {
     bench_compressor(
         bencher,
         setup_quantized_f16_array(),
-        BtrBlocksCompressorBuilder::default().build(),
+        proposed_default_builder().build(),
     );
 }
 
@@ -1402,7 +1423,7 @@ fn bench_float_quant_proposed_default_reject_f16(bencher: Bencher) {
     bench_compressor(
         bencher,
         setup_general_f16_array(),
-        BtrBlocksCompressorBuilder::default().build(),
+        proposed_default_builder().build(),
     );
 }
 
@@ -1426,11 +1447,7 @@ macro_rules! float_quant_rejection_benches {
 
         #[divan::bench]
         fn $with_scheme(bencher: Bencher) {
-            bench_compressor(
-                bencher,
-                $setup(),
-                BtrBlocksCompressorBuilder::default().build(),
-            );
+            bench_compressor(bencher, $setup(), default_with_float_quant().build());
         }
     };
 }
@@ -1677,7 +1694,7 @@ fn bench_float_quant_prior_default_compress_f32(bencher: Bencher) {
 
 #[divan::bench(name = "float_quant_default_compress_f32")]
 fn bench_float_quant_default_compress_f32(bencher: Bencher) {
-    let compressor = BtrBlocksCompressorBuilder::default()
+    let compressor = default_with_float_quant()
         .exclude_schemes([OrderedBlockResidualScheme.id(), BlockResidualScheme.id()])
         .build();
     bench_compressor(bencher, setup_quantized_f32_array(), compressor);
@@ -1685,7 +1702,7 @@ fn bench_float_quant_default_compress_f32(bencher: Bencher) {
 
 #[divan::bench(name = "float_quant_proposed_default_compress_f32")]
 fn bench_float_quant_proposed_default_compress_f32(bencher: Bencher) {
-    let compressor = BtrBlocksCompressorBuilder::default().build();
+    let compressor = proposed_default_builder().build();
     bench_compressor(bencher, setup_quantized_f32_array(), compressor);
 }
 
@@ -1703,7 +1720,7 @@ fn bench_float_quant_prior_default_reject_f32(bencher: Bencher) {
 
 #[divan::bench(name = "float_quant_proposed_default_reject_f32")]
 fn bench_float_quant_proposed_default_reject_f32(bencher: Bencher) {
-    let compressor = BtrBlocksCompressorBuilder::default().build();
+    let compressor = proposed_default_builder().build();
     bench_compressor(bencher, setup_general_f32_array(), compressor);
 }
 
@@ -1887,7 +1904,7 @@ fn bench_float_quant_nonzero_secondary_default_compress_f64(bencher: Bencher) {
     bench_compressor(
         bencher,
         setup_nonzero_secondary_array(),
-        BtrBlocksCompressorBuilder::default().build(),
+        proposed_default_builder().build(),
     );
 }
 
@@ -1903,7 +1920,7 @@ fn bench_float_quant_nonzero_secondary_tree_decompress_f64(bencher: Bencher) {
 #[divan::bench(name = "float_quant_nonzero_secondary_default_decompress_f64")]
 fn bench_float_quant_nonzero_secondary_default_decompress_f64(bencher: Bencher) {
     let input = setup_nonzero_secondary_array().into_array();
-    let encoded = BtrBlocksCompressorBuilder::default()
+    let encoded = proposed_default_builder()
         .build()
         .compress(&input, &mut SESSION.create_execution_ctx())
         .unwrap();
