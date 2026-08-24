@@ -15,9 +15,14 @@ use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Masked;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::UnionArray;
+use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::VariantArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
+use vortex_array::builders::VarBinBuilder;
+use vortex_array::dtype::OffsetBuilderPType;
+use vortex_array::ArrayView;
+use vortex_mask::Mask;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
@@ -39,6 +44,66 @@ use crate::scheme::SchemeId;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
 use crate::trace;
+
+/// The array to store when no scheme's output is worth keeping.
+///
+/// Canonical string data is `VarBinView`, which spends 16 bytes of view per value so filters and
+/// takes can address values without walking offsets. That is the right in-memory layout and the
+/// wrong on-disk one: `VarBinArray` describes the same values with a single offset each and
+/// decodes for the price of an offsets scan rather than any per-value work. Declining a codec
+/// should not mean writing the widest layout available, so demote views to offsets on the way out.
+fn store_uncompressed(array: ArrayRef, exec_ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    if !(array.dtype().is_utf8() || array.dtype().is_binary()) {
+        return Ok(array);
+    }
+    let Some(view) = array.as_opt::<VarBinView>() else {
+        return Ok(array);
+    };
+
+    // Materialize validity once: a per-element `is_valid` inside the loop would re-resolve the
+    // validity array for every value.
+    let validity = view.validity()?.execute_mask(view.len(), exec_ctx)?;
+
+    // Narrow offsets whenever the data buffer fits, so the layout that replaces 16-byte views
+    // does not spend 8 bytes per value describing a chunk addressable in 4.
+    let total_bytes: u64 = view.views().iter().map(|v| u64::from(v.len())).sum();
+    let varbin = if total_bytes <= i32::MAX as u64 {
+        build_varbin::<i32>(&view, &validity)
+    } else {
+        build_varbin::<i64>(&view, &validity)
+    };
+
+    // Only worth it when offsets really are cheaper than views, which is false for arrays of
+    // very short values where the data buffer dominates.
+    Ok(if varbin.nbytes() < array.nbytes() {
+        varbin
+    } else {
+        array
+    })
+}
+
+/// Rebuild a view array as offset-addressed `VarBin` with `O`-typed offsets.
+fn build_varbin<O>(view: &ArrayView<'_, VarBinView>, validity: &Mask) -> ArrayRef
+where
+    O: OffsetBuilderPType,
+    usize: num_traits::AsPrimitive<O>,
+{
+    let mut builder = VarBinBuilder::<O>::with_capacity(view.dtype().clone(), view.len());
+    if validity.all_true() {
+        for idx in 0..view.len() {
+            builder.append_value(view.bytes_at(idx).as_slice());
+        }
+    } else {
+        for idx in 0..view.len() {
+            if validity.value(idx) {
+                builder.append_value(view.bytes_at(idx).as_slice());
+            } else {
+                builder.push_null();
+            }
+        }
+    }
+    builder.finish_into_varbin().into_array()
+}
 
 impl CascadingCompressor {
     /// Compresses an array using cascading adaptive compression.
@@ -287,7 +352,7 @@ impl CascadingCompressor {
             return if accepted {
                 Ok(compressed)
             } else {
-                Ok(data.into_array())
+                store_uncompressed(data.into_array(), exec_ctx)
             };
         }
 
@@ -298,7 +363,7 @@ impl CascadingCompressor {
         let Some((winner, winner_estimate)) =
             self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
         else {
-            return Ok(data.into_array());
+            return store_uncompressed(data.into_array(), exec_ctx);
         };
 
         // Run the winning scheme's `compress`. On failure, emit an ERROR event carrying the
@@ -333,7 +398,7 @@ impl CascadingCompressor {
         if accepted {
             Ok(compressed)
         } else {
-            Ok(data.into_array())
+            store_uncompressed(data.into_array(), exec_ctx)
         }
     }
 }
