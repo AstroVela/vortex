@@ -9518,6 +9518,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array 58.4.0",
+ "arrow-schema 58.4.0",
  "codspeed-divan-compat",
  "fastlanes",
  "mimalloc",
