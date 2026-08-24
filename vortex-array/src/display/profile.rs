@@ -38,7 +38,8 @@ use crate::VortexSessionExecute as _;
 pub struct ProfileOptions {
     /// Untimed canonicalizations run before measurement, to warm caches and lazily-computed stats.
     pub warmup: usize,
-    /// Timed canonicalizations. The reported time is the median.
+    /// Timed canonicalizations. The reported time is the median. Values below one are treated as
+    /// one, since a node with no timed run has no time to report.
     pub reps: usize,
 }
 
@@ -120,6 +121,10 @@ impl DecompressionProfile {
     /// Each node is canonicalized `warmup + reps` times, so this performs `O(nodes * reps)`
     /// decompressions. It is a profiling entry point, never something a `Display` implementation
     /// should reach for.
+    ///
+    /// Nodes are identified by the array they hold, so a subtree reachable by more than one path
+    /// is measured once per occurrence but recorded once. Its cost still counts towards each
+    /// parent that reaches it.
     pub fn measure(
         array: &ArrayRef,
         session: &VortexSession,
@@ -196,8 +201,9 @@ fn time_canonicalize(
             .nbytes();
     }
 
-    let mut elapsed = Vec::with_capacity(options.reps);
-    for _ in 0..options.reps {
+    let reps = options.reps.max(1);
+    let mut elapsed = Vec::with_capacity(reps);
+    for _ in 0..reps {
         let mut ctx = session.create_execution_ctx();
         let array = array.clone();
         let start = Instant::now();
@@ -207,10 +213,7 @@ fn time_canonicalize(
     }
 
     elapsed.sort_unstable();
-    Ok((
-        elapsed.get(elapsed.len() / 2).copied().unwrap_or_default(),
-        output_nbytes,
-    ))
+    Ok((elapsed[elapsed.len() / 2], output_nbytes))
 }
 
 #[cfg(test)]
@@ -274,6 +277,16 @@ mod tests {
 
         // Self time and fusion saving are two directions of the same comparison, never both.
         assert!(root.self_time().is_zero() || root.fusion_saving().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_reps_still_reports_a_time() -> VortexResult<()> {
+        let array = buffer![0i32, 1, 2].into_array();
+        let options = ProfileOptions { warmup: 0, reps: 0 };
+        let profile = DecompressionProfile::measure(&array, legacy_session(), options)?;
+
+        assert!(profile.get(&array).is_some());
         Ok(())
     }
 

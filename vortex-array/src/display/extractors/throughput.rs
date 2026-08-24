@@ -8,6 +8,7 @@ use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
+use crate::display::IndentedFormatter;
 use crate::display::extractor::TreeContext;
 use crate::display::extractor::TreeExtractor;
 use crate::display::profile::DecompressionProfile;
@@ -18,7 +19,11 @@ use crate::display::profile::ProfileOptions;
 ///
 /// The line reports the time to canonicalize the subtree, its share of the whole tree's time, the
 /// rates that time implies, and either the node's self time or the amount of child work it fuses
-/// into itself.
+/// into itself. A share above 100% means the child costs more on its own than the parent that
+/// fuses it.
+///
+/// Nodes missing from the profile are left unannotated, so a profile may be rendered against a
+/// subtree of the tree it was measured on.
 pub struct ThroughputExtractor {
     profile: DecompressionProfile,
 }
@@ -51,18 +56,17 @@ impl TreeExtractor<ArrayRef, TreeContext> for ThroughputExtractor {
         &self,
         array: &ArrayRef,
         _ctx: &TreeContext,
-        f: &mut crate::display::IndentedFormatter<'_, '_>,
+        f: &mut IndentedFormatter<'_, '_>,
     ) -> fmt::Result {
         let Some(timing) = self.profile.get(array) else {
             return Ok(());
         };
         let (indent, f) = f.parts();
-        write!(
+        writeln!(
             f,
             "{indent}throughput: {}",
             Timing(timing, self.profile.root_time())
-        )?;
-        writeln!(f)
+        )
     }
 }
 
@@ -97,7 +101,7 @@ struct Elapsed(Duration);
 impl fmt::Display for Elapsed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let secs = self.0.as_secs_f64();
-        for (scale, unit) in [(1.0, "s"), (1e-3, "ms"), (1e-6, "\u{b5}s")] {
+        for (scale, unit) in [(1.0, "s"), (1e-3, "ms"), (1e-6, "µs")] {
             if secs >= scale {
                 return write!(f, "{:.2}{unit}", secs / scale);
             }
@@ -125,5 +129,34 @@ impl fmt::Display for Rate {
             unit = next;
         }
         write!(f, "{:.2} {unit}/s", rate / scale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(Duration::from_nanos(0), "0ns")]
+    #[case(Duration::from_nanos(640), "640ns")]
+    #[case(Duration::from_nanos(1_500), "1.50µs")]
+    #[case(Duration::from_micros(1_810), "1.81ms")]
+    #[case(Duration::from_millis(2_500), "2.50s")]
+    fn elapsed_picks_a_unit(#[case] elapsed: Duration, #[case] expected: &str) {
+        assert_eq!(Elapsed(elapsed).to_string(), expected);
+    }
+
+    #[rstest]
+    #[case(0.0, "0.00 B/s")]
+    #[case(999.0, "999.00 B/s")]
+    #[case(1_000.0, "1.00 kB/s")]
+    #[case(1.9e9, "1.90 GB/s")]
+    // Rates beyond the largest unit keep that unit rather than wrapping around.
+    #[case(2e12, "2000.00 GB/s")]
+    #[case(f64::INFINITY, "n/a")]
+    fn rate_picks_a_unit(#[case] rate: f64, #[case] expected: &str) {
+        assert_eq!(Rate(rate, &["B", "kB", "MB", "GB"]).to_string(), expected);
     }
 }
