@@ -6,15 +6,21 @@ import { ThemePicker } from '../ThemePicker';
 
 interface FileDropScreenProps {
   onFileLoaded: (file: File) => void;
+  onUrlOpen: (url: string) => void;
+  initialUrl?: string;
   loading: boolean;
   error: string | null;
 }
 
-export function FileDropScreen({ onFileLoaded, loading, error }: FileDropScreenProps) {
+export function FileDropScreen({
+  onFileLoaded,
+  onUrlOpen,
+  initialUrl = '',
+  loading,
+  error,
+}: FileDropScreenProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const [url, setUrl] = useState('');
-  const [fetchingUrl, setFetchingUrl] = useState(false);
-  const [urlError, setUrlError] = useState<string | null>(null);
+  const [url, setUrl] = useState(initialUrl);
 
   const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -48,30 +54,15 @@ export function FileDropScreen({ onFileLoaded, loading, error }: FileDropScreenP
   }, [onFileLoaded]);
 
   const handleUrlSubmit = useCallback(
-    async (e: FormEvent) => {
+    (e: FormEvent) => {
       e.preventDefault();
       const trimmed = url.trim();
-      if (!trimmed) return;
-
-      setFetchingUrl(true);
-      setUrlError(null);
-      try {
-        const resp = await fetch(trimmed);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-        const blob = await resp.blob();
-        const name = trimmed.split('/').pop() ?? 'remote.vortex';
-        const file = new File([blob], name, { type: blob.type });
-        onFileLoaded(file);
-      } catch (err) {
-        setUrlError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setFetchingUrl(false);
-      }
+      if (trimmed) onUrlOpen(trimmed);
     },
-    [url, onFileLoaded],
+    [url, onUrlOpen],
   );
 
-  const busy = loading || fetchingUrl;
+  const busy = loading;
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center text-vortex-fg-light dark:text-vortex-fg relative">
@@ -94,9 +85,7 @@ export function FileDropScreen({ onFileLoaded, loading, error }: FileDropScreenP
         }`}
       >
         {busy ? (
-          <p className="font-mono text-lg text-vortex-grey-dark">
-            {fetchingUrl ? 'Fetching…' : 'Loading…'}
-          </p>
+          <p className="font-mono text-lg text-vortex-grey-dark">Loading…</p>
         ) : (
           <div className="text-center">
             <p className="font-mono text-lg text-vortex-grey-dark">
@@ -134,9 +123,7 @@ export function FileDropScreen({ onFileLoaded, loading, error }: FileDropScreenP
         </button>
       </form>
 
-      {(error || urlError) && (
-        <p className="mt-4 max-w-lg font-mono text-sm text-vortex-red">{urlError || error}</p>
-      )}
+      {error && <p className="mt-4 max-w-lg font-mono text-sm text-vortex-red">{error}</p>}
     </div>
   );
 }

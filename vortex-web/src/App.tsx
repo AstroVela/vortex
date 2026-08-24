@@ -12,6 +12,7 @@ import { FileHeader } from './components/explorer/FileHeader';
 import { MainArea, type MainView } from './components/explorer/MainArea';
 import { StatusBar } from './components/explorer/StatusBar';
 import { VortexWorker } from './workers/VortexWorker';
+import { fetchRemoteFile, setUrlQueryParam, urlFromQueryParam } from './utils/remoteFile';
 
 function App() {
   const [fileState, setFileState] = useState<VortexFileState | null>(null);
@@ -21,11 +22,6 @@ function App() {
   const [view, setView] = useState<MainView>('details');
   const dragCounter = useRef(0);
   const workerRef = useRef<VortexWorker | null>(null);
-
-  useEffect(() => {
-    workerRef.current = new VortexWorker();
-    return () => workerRef.current?.terminate();
-  }, []);
 
   const openFile = useCallback(async (file: File) => {
     setError(null);
@@ -48,6 +44,32 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  const openUrl = useCallback(
+    async (url: string) => {
+      setError(null);
+      setLoading(true);
+      try {
+        const file = await fetchRemoteFile(url);
+        await openFile(file);
+        setUrlQueryParam(url);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        setFileState(null);
+        setLoading(false);
+      }
+    },
+    [openFile],
+  );
+
+  useEffect(() => {
+    workerRef.current = new VortexWorker();
+    // Deep link: /?url=https://… opens the hosted file directly.
+    const url = urlFromQueryParam();
+    if (url) void openUrl(url);
+    return () => workerRef.current?.terminate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchEncodingTree = useCallback(
@@ -135,7 +157,10 @@ function App() {
     ],
   );
 
-  const closeFile = useCallback(() => setFileState(null), []);
+  const closeFile = useCallback(() => {
+    setFileState(null);
+    setUrlQueryParam(null);
+  }, []);
 
   const handleDragEnter = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -165,7 +190,15 @@ function App() {
   );
 
   if (!fileContextValue) {
-    return <FileDropScreen onFileLoaded={openFile} loading={loading} error={error} />;
+    return (
+      <FileDropScreen
+        onFileLoaded={openFile}
+        onUrlOpen={openUrl}
+        initialUrl={urlFromQueryParam() ?? ''}
+        loading={loading}
+        error={error}
+      />
+    );
   }
 
   return (
