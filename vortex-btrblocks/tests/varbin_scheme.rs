@@ -111,6 +111,30 @@ fn varbin_scheme_shrinks_binary() -> VortexResult<()> {
     Ok(())
 }
 
+/// FSST on binary is gated by a tiny trial compression: structured payloads must still reach
+/// FSST somewhere in the tree, while incompressible payloads must never pay for a symbol table.
+#[test]
+fn fsst_binary_gate() -> VortexResult<()> {
+    let compressor = BtrBlocksCompressorBuilder::default().build();
+    for (name, array, expect_fsst) in [
+        ("shared prefix", &cases()[2].1, true),
+        ("random 16B (hash)", &cases()[1].1, false),
+        ("random 256B", &cases()[3].1, false),
+    ] {
+        let mut ctx = SESSION.create_execution_ctx();
+        let tree = compressor
+            .compress(array, &mut ctx)?
+            .display_tree()
+            .to_string();
+        assert_eq!(
+            tree.contains("fsst"),
+            expect_fsst,
+            "{name}: unexpected FSST selection\n{tree}"
+        );
+    }
+    Ok(())
+}
+
 /// Same bytes, two dtypes: Binary takes the `VarBinScheme` path, Utf8 takes FSST.
 #[test]
 fn fsst_versus_varbin_on_identical_bytes() -> VortexResult<()> {
