@@ -52,6 +52,7 @@ pub mod wasm;
 #[cfg(feature = "native")]
 mod native_cli {
     use std::ffi::OsString;
+    use std::path::Path;
     use std::path::PathBuf;
 
     use clap::CommandFactory;
@@ -85,16 +86,16 @@ mod native_cli {
     impl Commands {
         /// The local file this command reads, when it reads one.
         ///
-        /// `convert` also accepts an object store URL, which has no local path to check for.
-        fn local_path(&self) -> Option<&std::path::Path> {
+        /// `convert` is absent: its input may be an object store URL, which has no local path
+        /// to stat, and it reports a missing local file itself when it opens one.
+        fn local_path(&self) -> Option<&Path> {
             match self {
                 Commands::Tree(args) => Some(match &args.mode {
-                    super::tree::TreeMode::Array { file, .. } => file,
-                    super::tree::TreeMode::Layout { file, .. } => file,
+                    super::tree::TreeMode::Array { file, .. }
+                    | super::tree::TreeMode::Layout { file, .. } => file,
                 }),
                 Commands::Browse { file } => Some(file),
-                Commands::Convert(flags) => (!super::convert::is_url(&flags.file))
-                    .then(|| std::path::Path::new(flags.file.as_str())),
+                Commands::Convert(_) => None,
                 Commands::Inspect(args) => Some(&args.file),
                 Commands::Query(args) => Some(&args.file),
                 Commands::Segments(args) => Some(&args.file),

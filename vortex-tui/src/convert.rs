@@ -10,16 +10,13 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::LazyLock;
 
 use anyhow::Context;
-use anyhow::anyhow;
 use clap::Parser;
 use clap::ValueEnum;
 use futures::StreamExt;
 use indicatif::ProgressBar;
-use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::registry::ObjectStoreRegistry;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::AsyncFileReader;
@@ -31,9 +28,11 @@ use vortex::array::stream::ArrayStreamAdapter;
 use vortex::cloud::Registry;
 use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::error::VortexExpect;
+use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
+use vortex::file::multi::parse_uri_or_path;
 use vortex::session::VortexSession;
 use vortex_arrow::ArrowSession;
 use vortex_arrow::ArrowSessionExt;
@@ -70,9 +69,14 @@ pub struct ConvertArgs {
     pub quiet: bool,
 }
 
+/// Stores resolved from URLs, cached per bucket for the process.
+///
+/// Every other binding holds the registry this way — see `vortex-python`'s `resolve_store` and
+/// `vortex-duckdb`'s `resolve_filesystem`.
+static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+
 /// Where a conversion reads from.
-#[derive(Debug, Clone)]
-pub enum Source {
+enum Source {
     /// A file on the local filesystem.
     Local(PathBuf),
     /// An object store URL.
@@ -82,58 +86,44 @@ pub enum Source {
 impl Source {
     /// Classifies `input` as a URL or a local path.
     ///
-    /// A single-letter scheme is treated as a path so a Windows `C:\data\x.parquet` is not read
-    /// as a URL with scheme `c`. `file://` URLs resolve back to a local path.
-    pub fn parse(input: &str) -> Self {
-        match Url::parse(input) {
-            Ok(url) if url.scheme() == "file" => url
-                .to_file_path()
-                .map_or_else(|()| Source::Local(PathBuf::from(input)), Source::Local),
-            Ok(url) if url.scheme().len() > 1 => Source::Remote(url),
-            _ => Source::Local(PathBuf::from(input)),
+    /// Delegates to [`parse_uri_or_path`], the parser the language bindings share, so the CLI
+    /// agrees with them on what counts as a URL — including that a Windows `C:\data\x.parquet`
+    /// is a path and not a URL with scheme `c`.
+    fn parse(input: &str) -> VortexResult<Self> {
+        let url = parse_uri_or_path(input)?;
+        if url.scheme() != "file" {
+            return Ok(Source::Remote(url));
         }
-    }
-
-    /// The local path this source reads, if it is local.
-    pub fn local_path(&self) -> Option<&Path> {
-        match self {
-            Source::Local(path) => Some(path),
-            Source::Remote(_) => None,
-        }
+        url.to_file_path()
+            .map(Source::Local)
+            .map_err(|()| vortex_err!("not a local file path: {url}"))
     }
 
     /// The default output path: the input's file name with a `.vortex` extension.
-    fn default_output(&self) -> anyhow::Result<PathBuf> {
+    fn default_output(&self) -> PathBuf {
         match self {
-            Source::Local(path) => Ok(path.with_extension("vortex")),
-            Source::Remote(url) => {
-                let name = url
-                    .path_segments()
-                    .and_then(|mut segments| segments.next_back())
-                    .filter(|segment| !segment.is_empty())
-                    .ok_or_else(|| anyhow!("{url} has no file name; pass --output"))?;
-                Ok(PathBuf::from(name).with_extension("vortex"))
-            }
+            Source::Local(path) => path.with_extension("vortex"),
+            // A URL with no final segment is a directory, which the reader rejects moments
+            // later with a better message than anything this could say.
+            Source::Remote(url) => PathBuf::from(
+                url.path()
+                    .rsplit('/')
+                    .find(|segment| !segment.is_empty())
+                    .unwrap_or("output"),
+            )
+            .with_extension("vortex"),
         }
     }
-}
-
-impl std::fmt::Display for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Source::Local(path) => write!(f, "{}", path.display()),
-            Source::Remote(url) => write!(f, "{url}"),
-        }
-    }
-}
-
-/// Whether `input` names an object store URL rather than a local path.
-pub fn is_url(input: &str) -> bool {
-    Source::parse(input).local_path().is_none()
 }
 
 /// The batch size of the record batches.
 pub const BATCH_SIZE: usize = 8192;
+
+/// How much of a remote file's tail to fetch when looking for the Parquet footer.
+///
+/// Large enough to carry the whole footer for a typical file, so the metadata arrives in one
+/// request instead of a length fetch followed by a body fetch.
+const FOOTER_HINT: usize = 64 * 1024;
 
 /// Convert Parquet files to Vortex.
 ///
@@ -141,14 +131,14 @@ pub const BATCH_SIZE: usize = 8192;
 ///
 /// Returns an error if the input cannot be read or the output file cannot be written.
 pub async fn exec_convert(session: &VortexSession, flags: ConvertArgs) -> anyhow::Result<()> {
-    let source = Source::parse(&flags.file);
-    let output = match flags.output.clone() {
-        Some(output) => output,
-        None => source.default_output()?,
-    };
+    let source = Source::parse(&flags.file)?;
+    let output = flags
+        .output
+        .clone()
+        .unwrap_or_else(|| source.default_output());
 
     if !flags.quiet {
-        eprintln!("Converting input Parquet file: {source}");
+        eprintln!("Converting input Parquet file: {}", flags.file);
     }
 
     match &source {
@@ -159,29 +149,17 @@ pub async fn exec_convert(session: &VortexSession, flags: ConvertArgs) -> anyhow
             convert(session, file, &output, &flags).await
         }
         Source::Remote(url) => {
-            let (store, path) = Registry::new()
+            let (store, path) = REGISTRY
                 .resolve(url)
                 .with_context(|| format!("resolving {url}"))?;
-            let reader = object_reader(store, path, url).await?;
+            // Two deliberate choices, each saving a round trip on a one-shot command:
+            // no `head` first, because given no file size the reader locates the footer with a
+            // suffix range request; and a footer hint large enough that the metadata usually
+            // arrives with it, rather than in a second fetch after the 8-byte length.
+            let reader = ParquetObjectReader::new(store, path).with_footer_size_hint(FOOTER_HINT);
             convert(session, reader, &output, &flags).await
         }
     }
-}
-
-/// Builds a Parquet reader over an object store path.
-///
-/// The object size is fetched up front: Parquet reads its footer from the end of the file, so the
-/// reader needs the length before it can issue that range request.
-async fn object_reader(
-    store: Arc<dyn ObjectStore>,
-    path: object_store::path::Path,
-    url: &Url,
-) -> anyhow::Result<ParquetObjectReader> {
-    let meta = store
-        .head(&path)
-        .await
-        .with_context(|| format!("reading metadata for {url}"))?;
-    Ok(ParquetObjectReader::new(store, path).with_file_size(meta.size))
 }
 
 /// Streams `reader` into a Vortex file at `output`.
@@ -253,64 +231,69 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_local_paths() {
-        for input in ["data.parquet", "./a/b.parquet", "/tmp/x.parquet"] {
-            let source = Source::parse(input);
-            assert_eq!(source.local_path(), Some(Path::new(input)), "{input}");
+    /// The local path `input` resolves to, or `None` if it is a URL.
+    fn local(input: &str) -> Option<PathBuf> {
+        match Source::parse(input).ok()? {
+            Source::Local(path) => Some(path),
+            Source::Remote(_) => None,
         }
     }
 
     #[test]
-    fn parses_a_windows_path_as_local_not_a_url() {
-        let source = Source::parse(r"C:\data\x.parquet");
-        assert_eq!(source.local_path(), Some(Path::new(r"C:\data\x.parquet")));
+    fn relative_paths_resolve_against_the_working_directory() -> anyhow::Result<()> {
+        let path = local("./a/b.parquet").ok_or_else(|| anyhow::anyhow!("expected a path"))?;
+        assert!(path.is_absolute());
+        assert!(path.ends_with("a/b.parquet"));
+        Ok(())
     }
 
     #[test]
-    fn is_url_agrees_with_source_parse() {
-        assert!(is_url("s3://bucket/key.parquet"));
-        assert!(!is_url("data.parquet"));
-        assert!(!is_url("file:///tmp/x.parquet"));
+    fn absolute_and_file_url_inputs_agree() {
+        assert_eq!(
+            local("/tmp/x.parquet"),
+            Some(PathBuf::from("/tmp/x.parquet"))
+        );
+        assert_eq!(
+            local("file:///tmp/x.parquet"),
+            Some(PathBuf::from("/tmp/x.parquet"))
+        );
     }
 
     #[test]
-    fn parses_object_store_urls_as_remote() {
+    fn object_store_urls_are_remote() {
         for input in [
             "s3://bucket/key.parquet",
             "gs://bucket/key.parquet",
             "hf://datasets/owner/name/data/train.parquet",
             "https://example.com/x.parquet",
         ] {
-            assert!(Source::parse(input).local_path().is_none(), "{input}");
+            assert_eq!(local(input), None, "{input}");
         }
-    }
-
-    #[test]
-    fn file_urls_resolve_to_local_paths() {
-        let source = Source::parse("file:///tmp/x.parquet");
-        assert_eq!(source.local_path(), Some(Path::new("/tmp/x.parquet")));
     }
 
     #[test]
     fn default_output_replaces_the_extension() -> anyhow::Result<()> {
         assert_eq!(
-            Source::parse("/tmp/data.parquet").default_output()?,
+            Source::parse("/tmp/data.parquet")?.default_output(),
             PathBuf::from("/tmp/data.vortex")
         );
         assert_eq!(
-            Source::parse("s3://bucket/nested/data.parquet").default_output()?,
+            Source::parse("s3://bucket/nested/data.parquet")?.default_output(),
             PathBuf::from("data.vortex")
         );
         assert_eq!(
-            Source::parse("hf://datasets/owner/name/data/train.parquet").default_output()?,
+            Source::parse("hf://datasets/owner/name/data/train.parquet")?.default_output(),
             PathBuf::from("train.vortex")
         );
         Ok(())
     }
 
     #[test]
-    fn default_output_needs_a_file_name() {
-        assert!(Source::parse("s3://bucket/").default_output().is_err());
+    fn default_output_falls_back_when_a_url_has_no_file_name() -> anyhow::Result<()> {
+        assert_eq!(
+            Source::parse("s3://bucket/")?.default_output(),
+            PathBuf::from("output.vortex")
+        );
+        Ok(())
     }
 }

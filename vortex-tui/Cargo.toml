@@ -30,7 +30,6 @@ native = [
     "dep:object_store",
     "dep:url",
     "vortex/hf",
-    "vortex/object_store_registry",
     "vortex/tokio",
     "vortex/zstd",
 ]
