@@ -13,8 +13,8 @@
 //! permutes values within a 1024-element chunk, and the delta kernel walks each lane in
 //! `FL_ORDER`, which together map back to consecutive original indices; only the `1024 / T` lane
 //! heads per chunk are stored as bases instead. So sampling consecutive values models exactly the
-//! residuals that get packed, and the bases cost exactly one bit per value
-//! (`1024 / T` bases of `T` bits per 1024 values).
+//! residuals that get packed, and the bases cost one bit per value before they are themselves
+//! compressed (`1024 / T` bases of `T` bits per 1024 values).
 //!
 //! See `scripts/delta-analysis/README.md` for the measurements behind the model, including why
 //! delta-of-delta is exposed here as a statistic but not as a scheme.

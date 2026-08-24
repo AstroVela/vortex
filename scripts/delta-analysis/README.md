@@ -48,8 +48,9 @@ Three facts pinned down from the code, which the cost model relies on:
   become bases. (`transpose.rs` + `macros.rs::iterate!` in `fastlanes 0.6.1`; reproduced in
   `study.py`.) The earlier estimate in `DeltaScheme` assumed a lane-stride difference instead,
   which is why it measured residuals by encoding the whole array.
-* **Bases cost exactly one bit per value**: `1024 / T` bases of `T` bits per 1024 values, for every
-  width `T`.
+* **Bases cost one bit per value before compression**: `1024 / T` bases of `T` bits per 1024
+  values, for every width `T`. They are cascaded like any other child, though, so the *charged*
+  cost is lower - see the sweep under Finding 3, which puts the best charge at 0.25 bits.
 * **The layer below Delta is FoR or ZigZag, then BitPacking**, and BitPacking picks its width by
   minimising `packed_bits + exceptions × (byte_width + 4) × 8`. FoR and ZigZag fail on opposite
   inputs: one extreme outlier ruins FoR (it shifts every value up by `|min|`), while ZigZag leaves
