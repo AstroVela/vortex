@@ -96,6 +96,11 @@ fn varbin_scheme_shrinks_binary() -> VortexResult<()> {
             b as f64 / a as f64
         );
 
+        assert!(
+            b <= a,
+            "{name}: enabling VarBinScheme grew the output, {a} -> {b}"
+        );
+
         let mut ctx = SESSION.create_execution_ctx();
         let compressed = with.compress(&array, &mut ctx)?;
         let decoded = compressed
@@ -140,7 +145,19 @@ fn fsst_versus_varbin_on_identical_bytes() -> VortexResult<()> {
             let mut ctx = SESSION.create_execution_ctx();
             compressor.compress(&as_str, &mut ctx)?.nbytes()
         };
-        println!("{:<20}{:>14}{:>14}{:>9.2}", name, bin_bytes, utf8_bytes, utf8_bytes as f64 / bin_bytes as f64);
+        println!(
+            "{:<20}{:>14}{:>14}{:>9.2}",
+            name,
+            bin_bytes,
+            utf8_bytes,
+            utf8_bytes as f64 / bin_bytes as f64
+        );
+
+        // FSST compresses bytes, not codepoints, so the dtype must not change the result.
+        assert_eq!(
+            bin_bytes, utf8_bytes,
+            "{name}: binary and utf8 must compress identically"
+        );
     }
     Ok(())
 }
