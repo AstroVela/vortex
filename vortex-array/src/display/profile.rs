@@ -36,10 +36,10 @@ use crate::VortexSessionExecute as _;
 /// How many times to canonicalize each node when building a [`DecompressionProfile`].
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileOptions {
-    /// Untimed canonicalizations run before measurement, to warm caches and lazily-computed stats.
+    /// Untimed runs performed before measurement, to warm caches and lazily-computed stats.
     pub warmup: usize,
-    /// Timed canonicalizations. The reported time is the median. Values below one are treated as
-    /// one, since a node with no timed run has no time to report.
+    /// Timed runs. The reported time is the median of them. Values below one are treated as one,
+    /// since a node with no timed run has no time to report.
     pub reps: usize,
 }
 
