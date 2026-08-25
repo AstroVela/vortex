@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+#[cfg(feature = "unstable_encodings")]
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -59,16 +60,6 @@ fn test_for_compressed() -> VortexResult<()> {
     Ok(())
 }
 
-/// Values that stay tightly clustered within each 1024-value block but drift far apart over the
-/// array: the shape a single global reference cannot capture.
-#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
-fn drifting_values(len: i64) -> ArrayRef {
-    let values: Vec<i64> = (0..len)
-        .map(|i| 1_000_000 + (i / 1024) * 1_000_000 + ((i * 7919) % 101))
-        .collect();
-    PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array()
-}
-
 /// BlockedFoR is opt-in rather than part of [`crate::ALL_SCHEMES`], so the caller adds it.
 ///
 /// Restricted to the default scheme set: `Delta` and `Pco` model this same shape and beat the
@@ -77,13 +68,17 @@ fn drifting_values(len: i64) -> ArrayRef {
 #[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
 #[test]
 fn test_blocked_for_compressed() -> VortexResult<()> {
+    // Values that stay tightly clustered within each 1024-value block but drift far apart over
+    // the array: the shape a single global reference cannot capture.
+    let values: Vec<i64> = (0..16_384)
+        .map(|i| 1_000_000 + (i / 1024) * 1_000_000 + ((i * 7919) % 101))
+        .collect();
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array();
+
     let btr = BtrBlocksCompressorBuilder::default()
         .with_new_scheme(&BlockedFoRScheme)
         .build();
-    let compressed = btr.compress(
-        &drifting_values(16_384),
-        &mut SESSION.create_execution_ctx(),
-    )?;
+    let compressed = btr.compress(&array, &mut SESSION.create_execution_ctx())?;
     assert!(compressed.is::<BlockedFoR>());
     Ok(())
 }
