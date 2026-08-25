@@ -65,8 +65,8 @@ use crate::BlockResidualCodec;
 use crate::codec::read_wide_bits;
 
 const BLOCK_LEN: usize = 1024;
-const WORDS_PER_WIDTH_BIT: usize = BLOCK_LEN / 64;
-const WORDS_PER_WIDTH_BIT_U32: u32 = (BLOCK_LEN / 64) as u32;
+const WORDS_PER_WIDTH_BIT: usize = WORDS_PER_WIDTH_BIT_U32 as usize;
+const WORDS_PER_WIDTH_BIT_U32: u32 = 16;
 
 /// Block residuals with child arrays for bases and high-bit patches.
 pub type PatchedBlockResidualArray = Array<PatchedBlockResidual>;
