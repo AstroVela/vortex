@@ -264,6 +264,43 @@ The eager oracle survives intact: demand = top, placeholders nowhere, filters ru
 selections — every part degenerates to plain eager execution, and every configuration of parts
 must hash-match it on need-set rows.
 
+### Demand subscribers are few and stratified
+
+A follow-up observation pins down who actually consumes demand, shrinking open question 5:
+
+- **Must consume (sealed):** gather/filter nodes — the sealed mask *is* their map; they cannot
+  run without it.
+- **Should consume (where skipping pays):** data-loading leaves — extent cutting is the only
+  place demand converts to absent IO, and it is one cell read per expand.
+- **May ignore (and it is not the operator's choice):** predicate and projection inputs. Running
+  a conjunct's field IO+CPU in parallel with its siblings is the *scheduler declining to wait*
+  for the prior bound, not an operator ignoring demand; loading a projection column before the
+  mask seals is the scheduler running a leaf on the open bound (legal by superset adoption,
+  priced against byte credits). Cascade versus eager-parallel and prefetch versus demand-wait
+  are admission-timing policies on the same graph — the operator code is identical.
+
+Consequence for counting: demanded-row counts are an **upper bound** that speculative admission
+deliberately overshoots; the overshoot must be charged to the speculation budget, never counted
+as free (lands in the admission machinery, next-discussion problem 4).
+
+### The filter/project split-granularity mismatch
+
+A problem the current implementations cannot express: today one split set serves the whole scan,
+formed as the union of natural boundaries across *all* referenced columns
+(`register_splits` -> `RowSplits`). A coarse-chunked filter column is therefore artificially cut
+to the fine boundaries of the projected columns, and filter-phase work runs at projection
+granularity — per-split fixed machinery multiplied by a count the filter never asked for. This
+is distinct from the `select *` small-splits storm (next-discussion problem 1): that is "splits
+too small absolutely"; this is "splits too small *for one phase* because another phase's
+geometry leaked into the shared split set."
+
+The graph model dissolves it in principle: span formation is per node — each expand cuts against
+its own coverage, so the eval spine spans the filter column's chunks while the projection Plan
+node spans the union of projected boundaries only (exactly as the worked example draws it), and
+driver-side slicing absorbs the misalignment at combine. But this holds only if
+**fragment/ledger granularity is not derived from the all-columns boundary union** — which makes
+it a constraint on the unit-formation design (problem 1), not a free consequence.
+
 ## 7. Decisions recorded from this discussion
 
 1. Base trait is `edges()` + `combine` with expand derived generically; hand-written expand is an
@@ -308,8 +345,13 @@ Carried forward or newly raised:
    superset-adoption; gated snap preserves it across the healed link.
 4. **Pricing from the routing table.** Per-consumer demanded counts derived as
    producer-cell × composed-map — does this reproduce the per-edge counts EV admission assumed?
-5. **Operator subscription API.** What an instance sees at a batch boundary: cell version, mapped
-   bound, density — and what it may cache between batches.
+5. **Operator subscription API.** Narrowed by the subscriber stratification (§6): only leaves
+   (extent cut) and gathers (map) need it; remaining question is what a leaf sees at expand
+   (cell version, mapped bound, density) and what it may cache between batches.
+5a. **Fragment formation must not use the all-columns boundary union** (the filter/project
+   split-granularity mismatch, §6) — a constraint to carry into next-discussion problem 1's
+   unit-formation algorithm, alongside charging speculative overshoot to the speculation
+   budget in problem 4's counting.
 6. **Where the density fact for late gather placement lives** — shared with problem 4's
    `remaining_selectivity` estimation machinery rather than new.
 7. **Velox/DuckDB-style instance splitting** (part 1): instance per unit, per thread, or per
