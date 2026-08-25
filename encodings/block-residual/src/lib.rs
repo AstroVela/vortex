@@ -6,12 +6,14 @@
 mod block_residual_array;
 mod codec;
 mod ordered_float_array;
+mod patched_array;
 mod scalar_fn;
 
 pub use block_residual_array::*;
 pub(crate) use codec::BlockResidualCodec;
 pub(crate) use codec::BlockResidualParts;
 pub use ordered_float_array::*;
+pub use patched_array::*;
 pub use scalar_fn::*;
 use vortex_array::scalar_fn::session::ScalarFnSessionExt;
 use vortex_array::session::ArraySessionExt;

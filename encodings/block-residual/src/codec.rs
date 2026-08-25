@@ -13,8 +13,8 @@ const SERIALIZED_BLOCK_METADATA_BYTES: usize = 12;
 /// Block-local residual codec for ordered unsigned latents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlockResidualCodec {
-    len: usize,
-    blocks: Vec<BlockResidualBlock>,
+    pub(crate) len: usize,
+    pub(crate) blocks: Vec<BlockResidualBlock>,
 }
 
 /// Serialized children for the one-reference block residual codec.
@@ -38,13 +38,13 @@ pub(crate) struct BlockResidualCodecEstimate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BlockResidualBlock {
-    base: u64,
-    residual_width: u8,
-    high_width: u8,
-    residuals: Vec<u64>,
-    patch_positions: Vec<u16>,
-    patch_highs: Vec<u8>,
+pub(crate) struct BlockResidualBlock {
+    pub(crate) base: u64,
+    pub(crate) residual_width: u8,
+    pub(crate) high_width: u8,
+    pub(crate) residuals: Vec<u64>,
+    pub(crate) patch_positions: Vec<u16>,
+    pub(crate) patch_highs: Vec<u8>,
 }
 
 impl BlockResidualCodec {
