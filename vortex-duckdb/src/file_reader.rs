@@ -205,10 +205,18 @@ pub const SPLITS_PER_SCAN: usize = 2;
 /// Takes up to [`SPLITS_PER_SCAN`] splits at once; reader_scan runs them
 /// concurrently so IO for the second split overlaps work on the first.
 pub fn reader_try_initialize_scan(file: &mut OpenFileReader, local: &mut LocalState) -> bool {
-    let take = SPLITS_PER_SCAN.min(file.splits.len());
-    if take == 0 {
+    if file.splits.is_empty() {
         return false;
     }
+    // Only take multiple splits while there are enough left to keep every
+    // scan thread busy; near the tail of a file grabbing two splits per
+    // thread halves effective parallelism on compute-bound scans.
+    let threads = vortex_utils::parallelism::get_available_parallelism().unwrap_or(1);
+    let take = if file.splits.len() >= SPLITS_PER_SCAN * threads {
+        SPLITS_PER_SCAN.min(file.splits.len())
+    } else {
+        1
+    };
     let splits = file.splits.split_off(file.splits.len() - take);
     // file.splits is stored in inverse order, so restore scan order
     let splits = stream::iter(splits.into_iter().rev());
