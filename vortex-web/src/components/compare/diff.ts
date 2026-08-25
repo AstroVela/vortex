@@ -124,12 +124,12 @@ function diffArrayNode(
   type NamedChild = { key: string; node: ArrayEncodingNode };
   const beforeChildren: NamedChild[] =
     before?.children.map((node, index) => ({
-      key: before.childNames[index] || `child:${index}`,
+      key: node.name || `child:${index}`,
       node,
     })) ?? [];
   const afterChildren: NamedChild[] =
     after?.children.map((node, index) => ({
-      key: after.childNames[index] || `child:${index}`,
+      key: node.name || `child:${index}`,
       node,
     })) ?? [];
   const pairs = matchChildren(beforeChildren, afterChildren, (child) => child.key);

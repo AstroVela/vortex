@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import type { LayoutChildKind, LayoutTreeNode } from '../swimlane/types';
+import type { ArrayEncodingNode, LayoutChildKind, LayoutTreeNode } from '../swimlane/types';
 import { diffLayoutTrees, flattenDiff } from './diff';
 
 function node({
@@ -45,6 +45,23 @@ function field(name: string, options: Partial<Parameters<typeof node>[0]> = {}):
 
 function root(children: LayoutTreeNode[]): LayoutTreeNode {
   return node({ id: 'root', childType: { kind: 'root' }, children, encoding: 'vortex.struct' });
+}
+
+function arrayNode(
+  name: string,
+  encoding = 'vortex.primitive',
+  children: ArrayEncodingNode[] = [],
+): ArrayEncodingNode {
+  return {
+    name,
+    encoding,
+    dtype: 'i32',
+    metadataBytes: 0,
+    numBuffers: 0,
+    bufferLengths: [],
+    bufferNames: [],
+    children,
+  };
 }
 
 describe('semantic layout diff', () => {
@@ -102,5 +119,29 @@ describe('semantic layout diff', () => {
     const after = root([field('value'), expandedArrayNode]);
 
     assert.equal(diffLayoutTrees(before, after).status, 'unchanged');
+  });
+
+  it('matches streamed array children by the name carried on each node', () => {
+    const before = field('value');
+    before.arrayEncodingTree = arrayNode('array', 'vortex.struct', [
+      arrayNode('a'),
+      arrayNode('b'),
+    ]);
+    const after = field('value');
+    after.arrayEncodingTree = arrayNode('array', 'vortex.struct', [
+      arrayNode('a'),
+      arrayNode('inserted', 'vortex.constant'),
+      arrayNode('b'),
+    ]);
+
+    const arrayDiff = diffLayoutTrees(root([before]), root([after])).children[0]?.children[0];
+    assert.deepEqual(
+      arrayDiff?.children.map(({ label, status }) => [label, status]),
+      [
+        ['a', 'unchanged'],
+        ['b', 'unchanged'],
+        ['inserted', 'added'],
+      ],
+    );
   });
 });
