@@ -3,11 +3,11 @@
 
 use vortex_error::VortexResult;
 
+use super::RuleRegistry;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionOptimizer;
 use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnVTable;
@@ -18,9 +18,9 @@ use crate::scalar_fn::fns::is_not_null::IsNotNull;
 use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::literal::Literal;
 
-pub(super) fn register(optimizer: &mut BoundExpressionOptimizer) {
-    optimizer.register_rule(RemoveRedundantFillNull);
-    optimizer.register_rule(CaseWhenToFillNull);
+pub(super) fn register(registry: &mut RuleRegistry) {
+    registry.register(RemoveRedundantFillNull);
+    registry.register(CaseWhenToFillNull);
 }
 
 /// Removes `fill_null` when its input is already non-nullable.

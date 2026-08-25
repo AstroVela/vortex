@@ -8,11 +8,11 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_set::HashSet;
 
+use super::RuleRegistry;
 use crate::dtype::FieldNames;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionOptimizer;
 use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnVTable;
@@ -25,10 +25,10 @@ use crate::scalar_fn::fns::pack::Pack;
 use crate::scalar_fn::fns::pack::PackOptions;
 use crate::scalar_fn::fns::select::Select;
 
-pub(super) fn register(optimizer: &mut BoundExpressionOptimizer) {
-    optimizer.register_rule(GetItemFromPack);
-    optimizer.register_rule(MergeToPack);
-    optimizer.register_rule(SelectFromPack);
+pub(super) fn register(registry: &mut RuleRegistry) {
+    registry.register(GetItemFromPack);
+    registry.register(MergeToPack);
+    registry.register(SelectFromPack);
 }
 
 /// Replaces a field access on a pack with the corresponding packed expression.

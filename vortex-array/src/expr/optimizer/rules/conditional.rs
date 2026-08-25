@@ -3,11 +3,11 @@
 
 use vortex_error::VortexResult;
 
+use super::RuleRegistry;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionOptimizer;
 use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar::Scalar;
 use crate::scalar_fn::ScalarFnVTable;
@@ -15,9 +15,9 @@ use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::mask::Mask;
 use crate::scalar_fn::fns::zip::Zip;
 
-pub(super) fn register(optimizer: &mut BoundExpressionOptimizer) {
-    optimizer.register_rule(ConstantMask);
-    optimizer.register_rule(ConstantZip);
+pub(super) fn register(registry: &mut RuleRegistry) {
+    registry.register(ConstantMask);
+    registry.register(ConstantZip);
 }
 
 /// Evaluates a mask whose mask argument is a non-null boolean literal.

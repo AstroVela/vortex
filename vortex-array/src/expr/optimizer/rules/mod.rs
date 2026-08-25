@@ -3,7 +3,7 @@
 
 use vortex_error::VortexResult;
 
-use super::BoundExpressionOptimizer;
+use super::RuleRegistry;
 use crate::dtype::DType;
 use crate::expr::BoundExpression;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -15,12 +15,12 @@ mod conditional;
 mod nulls;
 mod structural;
 
-pub(super) fn register(optimizer: &mut BoundExpressionOptimizer) {
-    binary::register(optimizer);
-    cast::register(optimizer);
-    structural::register(optimizer);
-    nulls::register(optimizer);
-    conditional::register(optimizer);
+pub(super) fn register(registry: &mut RuleRegistry) {
+    binary::register(registry);
+    cast::register(registry);
+    structural::register(registry);
+    nulls::register(registry);
+    conditional::register(registry);
 }
 
 fn preserve_dtype(replacement: BoundExpression, dtype: &DType) -> VortexResult<BoundExpression> {

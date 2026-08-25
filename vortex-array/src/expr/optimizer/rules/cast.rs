@@ -3,17 +3,17 @@
 
 use vortex_error::VortexResult;
 
+use super::RuleRegistry;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionOptimizer;
 use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::literal::Literal;
 
-pub(super) fn register(optimizer: &mut BoundExpressionOptimizer) {
-    optimizer.register_rule(CastLiteralOrIdentity);
+pub(super) fn register(registry: &mut RuleRegistry) {
+    registry.register(CastLiteralOrIdentity);
 }
 
 /// Removes identity casts and evaluates casts of literal values during optimization.

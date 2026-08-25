@@ -4,11 +4,11 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
+use super::RuleRegistry;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionOptimizer;
 use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar::Scalar;
 use crate::scalar_fn::ScalarFnVTable;
@@ -21,10 +21,10 @@ use crate::scalar_fn::fns::get_item::GetItem;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::Operator;
 
-pub(super) fn register(optimizer: &mut BoundExpressionOptimizer) {
-    optimizer.register_rule(BinaryBoolean);
-    optimizer.register_rule(BinaryNullComparison);
-    optimizer.register_rule(FindBetween);
+pub(super) fn register(registry: &mut RuleRegistry) {
+    registry.register(BinaryBoolean);
+    registry.register(BinaryNullComparison);
+    registry.register(FindBetween);
 }
 
 /// Simplifies `AND` and `OR` with literal operands using Kleene boolean semantics.

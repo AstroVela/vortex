@@ -13,29 +13,23 @@
 //! [`BoundExpressionOptimizer::try_optimize`] creates an `OptimizationRun` containing the mutable
 //! state for that traversal.
 //!
-//! A run walks the tree bottom-up without recursion, using one stack of pending tasks and another
-//! stack of completed node results:
+//! A run recursively walks the tree with copy-on-write rebuilding:
 //!
-//! 1. A `Visit` task schedules the node to be finished, then schedules its children in evaluation
-//!    order.
-//! 2. A `Finish` task collects the optimized children and rebuilds the node only if a child
-//!    changed.
-//! 3. Rules registered for the node's expression ID run in registration order. The first matching
-//!    rule wins.
-//! 4. A replacement is visited as a new subtree so that rewrites introduced by other rewrites are
-//!    also optimized. `FinishRewrite` then records that the original subtree changed.
+//! 1. Rules registered for a node's expression ID run in registration order before its children.
+//!    The first matching rule wins, and root rewrites repeat to convergence.
+//! 2. Children are optimized in evaluation order. The node is rebuilt only if a child changed.
+//! 3. A rebuilt node is rewritten again. Any replacement is walked as a new subtree so rules may
+//!    safely introduce expressions that need further optimization.
 //!
 //! Every replacement must preserve the node's dtype and differ from the expression it replaces.
-//! A per-run rewrite limit terminates rule cycles.
+//! A per-run rewrite limit terminates rule cycles, and a depth limit prevents stack overflow.
 
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use smallvec::SmallVec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::expr::BoundExpression;
@@ -44,6 +38,7 @@ use crate::expr::ExpressionId;
 mod rules;
 
 const DEFAULT_MAX_REWRITES: usize = 10_000;
+const MAX_OPTIMIZATION_DEPTH: usize = 256;
 
 /// Shared reference to a bound-expression rewrite rule.
 pub type BoundExpressionRewriteRuleRef = Arc<dyn BoundExpressionRewriteRule>;
@@ -67,22 +62,51 @@ pub trait BoundExpressionRewriteRule: Debug + Send + Sync + 'static {
     fn rewrite(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>>;
 }
 
-/// A deterministic, bottom-up optimizer for [`BoundExpression`] trees.
+/// Rewrite rules indexed by the expression node ID they handle.
+#[derive(Clone, Debug, Default)]
+struct RuleRegistry {
+    rules: HashMap<ExpressionId, Vec<BoundExpressionRewriteRuleRef>>,
+}
+
+impl RuleRegistry {
+    /// Register a rule after existing rules for the same expression node ID.
+    fn register<R: BoundExpressionRewriteRule>(&mut self, rule: R) {
+        self.register_ref(Arc::new(rule));
+    }
+
+    /// Register a shared rule after existing rules for the same expression node ID.
+    fn register_ref(&mut self, rule: BoundExpressionRewriteRuleRef) {
+        self.rules
+            .entry(rule.expression_id())
+            .or_default()
+            .push(rule);
+    }
+
+    /// Return the rules registered for `expression_id`, in application order.
+    fn rules_for(&self, expression_id: ExpressionId) -> Option<&[BoundExpressionRewriteRuleRef]> {
+        self.rules.get(&expression_id).map(Vec::as_slice)
+    }
+}
+
+/// A deterministic optimizer for [`BoundExpression`] trees.
 ///
-/// Rules are grouped by root expression ID and run in registration order. After the first
-/// matching rule rewrites a node, the replacement subtree is optimized from the bottom up before
-/// its parent is revisited. A global rewrite budget terminates cyclic rule sets.
+/// Rules are grouped by root expression ID and run in registration order. Nodes are rewritten
+/// before their children and again after changed children are installed. A global rewrite budget
+/// terminates cyclic rule sets.
 #[derive(Clone, Debug)]
 pub struct BoundExpressionOptimizer {
-    rules: HashMap<ExpressionId, Vec<BoundExpressionRewriteRuleRef>>,
+    rules: RuleRegistry,
     max_rewrites: usize,
 }
 
 impl Default for BoundExpressionOptimizer {
     fn default() -> Self {
-        let mut optimizer = Self::empty();
-        rules::register(&mut optimizer);
-        optimizer
+        let mut registry = RuleRegistry::default();
+        rules::register(&mut registry);
+        Self {
+            rules: registry,
+            max_rewrites: DEFAULT_MAX_REWRITES,
+        }
     }
 }
 
@@ -95,7 +119,7 @@ impl BoundExpressionOptimizer {
     /// Create an optimizer with no registered rules.
     pub fn empty() -> Self {
         Self {
-            rules: HashMap::default(),
+            rules: RuleRegistry::default(),
             max_rewrites: DEFAULT_MAX_REWRITES,
         }
     }
@@ -108,15 +132,12 @@ impl BoundExpressionOptimizer {
 
     /// Register a rewrite after existing rules for the same expression node ID.
     pub fn register_rule<R: BoundExpressionRewriteRule>(&mut self, rule: R) {
-        self.register_rule_ref(Arc::new(rule));
+        self.rules.register(rule);
     }
 
     /// Register a shared rewrite after existing rules for the same expression node ID.
     pub fn register_rule_ref(&mut self, rule: BoundExpressionRewriteRuleRef) {
-        self.rules
-            .entry(rule.expression_id())
-            .or_default()
-            .push(rule);
+        self.rules.register_ref(rule);
     }
 
     /// Optimize an entire bound expression tree, cloning the input when it remains unchanged.
@@ -126,219 +147,144 @@ impl BoundExpressionOptimizer {
 
     /// Optimize an entire bound expression tree, returning `None` when no subtree changed.
     pub fn try_optimize(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        OptimizationRun::new(self, expr).run()
-    }
-
-    /// Run rules for the expression's root ID and return the first successful rewrite.
-    fn rewrite_root(
-        &self,
-        expr: &BoundExpression,
-    ) -> VortexResult<Option<(&'static str, BoundExpression)>> {
-        let Some(rules) = self.rules.get(&expr.id()) else {
-            return Ok(None);
-        };
-
-        for rule in rules {
-            if let Some(replacement) = rule.rewrite(expr)? {
-                return Ok(Some((rule.name(), replacement)));
-            }
-        }
-        Ok(None)
+        OptimizationRun::new(&self.rules, self.max_rewrites).run(expr)
     }
 }
 
 /// Mutable state for one optimizer invocation.
-struct OptimizationRun<'a> {
-    optimizer: &'a BoundExpressionOptimizer,
-    tasks: TaskStack,
-    results: ResultStack,
+struct OptimizationRun<'rules> {
+    rules: &'rules RuleRegistry,
+    max_rewrites: usize,
     rewrite_count: usize,
 }
 
-impl<'a> OptimizationRun<'a> {
-    /// Create a run with the root expression as its first pending visit.
-    fn new(optimizer: &'a BoundExpressionOptimizer, expr: &BoundExpression) -> Self {
-        let mut tasks = TaskStack::new();
-        tasks.push(Task::Visit(expr.clone()));
+impl<'rules> OptimizationRun<'rules> {
+    /// Create a run using the given rule registry and rewrite limit.
+    fn new(rules: &'rules RuleRegistry, max_rewrites: usize) -> Self {
         Self {
-            optimizer,
-            tasks,
-            results: ResultStack::new(),
+            rules,
+            max_rewrites,
             rewrite_count: 0,
         }
     }
 
-    /// Execute pending tasks until the root produces its single optimization result.
-    fn run(mut self) -> VortexResult<Option<BoundExpression>> {
-        while let Some(task) = self.tasks.pop() {
-            match task {
-                Task::Visit(expr) => self.visit(expr)?,
-                Task::Finish { expr, child_count } => self.finish(expr, child_count)?,
-                Task::FinishRewrite => self.finish_rewrite()?,
-            }
-        }
-
-        vortex_ensure!(
-            self.results.len() == 1,
-            "bound-expression optimizer produced {} root results",
-            self.results.len()
-        );
-        let result = self
-            .results
-            .pop()
-            .ok_or_else(|| vortex_err!("bound-expression optimizer produced no root result"))?;
-        Ok(result.changed.then_some(result.expr))
+    /// Optimize `expr`, returning `None` when the complete tree is unchanged.
+    fn run(mut self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
+        self.optimize_subtree(expr, 0)
     }
 
-    /// Schedule an expression's children followed by the task that finishes the expression.
-    ///
-    /// A leaf has no child work to schedule, so it is finished immediately.
-    fn visit(&mut self, expr: BoundExpression) -> VortexResult<()> {
-        let child_count = expr.children().len();
-        if child_count == 0 {
-            return self.finish_node(expr, OptimizedChildren::Unchanged);
-        }
-
-        self.tasks.reserve(child_count + 1);
-        self.results.reserve(child_count);
-        self.tasks.push(Task::Finish {
-            expr: expr.clone(),
-            child_count,
-        });
-        self.tasks
-            .extend(expr.children().iter().rev().cloned().map(Task::Visit));
-        Ok(())
-    }
-
-    /// Collect an expression's child results and finish the expression itself.
-    ///
-    /// When every child is unchanged, their results are discarded and the original expression can
-    /// be reused. Otherwise, all optimized children are collected to rebuild the expression.
-    fn finish(&mut self, expr: BoundExpression, child_count: usize) -> VortexResult<()> {
-        vortex_ensure!(
-            self.results.len() >= child_count,
-            "bound-expression optimizer lost a child result"
-        );
-        let first_child = self.results.len() - child_count;
-        let children = if self.results[first_child..]
-            .iter()
-            .any(|result| result.changed)
-        {
-            let mut children = Vec::with_capacity(child_count);
-            children.extend(self.results.drain(first_child..).map(|result| result.expr));
-            OptimizedChildren::Changed(children)
-        } else {
-            self.results.truncate(first_child);
-            OptimizedChildren::Unchanged
-        };
-        self.finish_node(expr, children)
-    }
-
-    /// Mark an optimized replacement subtree as changed from the expression it replaced.
-    ///
-    /// Optimizing the replacement may itself report no changes, but applying the rule that produced
-    /// it must remain visible to the original expression's parent.
-    fn finish_rewrite(&mut self) -> VortexResult<()> {
-        let Some(mut result) = self.results.pop() else {
-            vortex_bail!("bound-expression optimizer lost a rewrite result")
-        };
-        result.changed = true;
-        self.results.push(result);
-        Ok(())
-    }
-
-    /// Rebuild a node when necessary, then apply the first matching root rewrite.
-    ///
-    /// A node with no matching rule is pushed onto the result stack. A successful replacement is
-    /// validated and scheduled for its own bottom-up optimization.
-    fn finish_node(
+    /// Apply the first matching rule to `expression`.
+    fn try_apply_rule(
         &mut self,
-        original: BoundExpression,
-        children: OptimizedChildren,
-    ) -> VortexResult<()> {
-        let (current, children_changed) = match children {
-            OptimizedChildren::Unchanged => (original, false),
-            OptimizedChildren::Changed(children) => {
-                let original_dtype = original.dtype().clone();
-                let rebuilt = original.with_children(children)?;
-                vortex_ensure!(
-                    rebuilt.dtype() == &original_dtype,
-                    "optimizing children changed a node dtype from {original_dtype} to {}",
-                    rebuilt.dtype()
+        expression: &BoundExpression,
+    ) -> VortexResult<Option<BoundExpression>> {
+        let Some(rules) = self.rules.rules_for(expression.id()) else {
+            return Ok(None);
+        };
+        for rule in rules {
+            let Some(replacement) = rule.rewrite(expression)? else {
+                continue;
+            };
+            let rule_name = rule.name();
+
+            vortex_ensure!(
+                replacement.dtype() == expression.dtype(),
+                "bound-expression rewrite rule {rule_name} changed dtype from {} to {}",
+                expression.dtype(),
+                replacement.dtype()
+            );
+            vortex_ensure!(
+                replacement != *expression,
+                "bound-expression rewrite rule {rule_name} returned an unchanged expression"
+            );
+            if self.rewrite_count >= self.max_rewrites {
+                vortex_bail!(
+                    "Exceeded bound-expression rewrite limit of {} while applying {rule_name} \
+                     (possible rewrite cycle)",
+                    self.max_rewrites
                 );
-                (rebuilt, true)
             }
-        };
+            self.rewrite_count += 1;
+            return Ok(Some(replacement));
+        }
+        Ok(None)
+    }
 
-        let Some((rule_name, replacement)) = self.optimizer.rewrite_root(&current)? else {
-            self.results.push(OptimizationResult {
-                expr: current,
-                changed: children_changed,
-            });
-            return Ok(());
-        };
-
-        vortex_ensure!(
-            replacement.dtype() == current.dtype(),
-            "bound-expression rewrite rule {rule_name} changed dtype from {} to {}",
-            current.dtype(),
-            replacement.dtype()
-        );
-        vortex_ensure!(
-            replacement != current,
-            "bound-expression rewrite rule {rule_name} returned an unchanged expression"
-        );
-        if self.rewrite_count >= self.optimizer.max_rewrites {
+    /// Optimize a subtree to convergence using copy-on-write rebuilding.
+    fn optimize_subtree(
+        &mut self,
+        original: &BoundExpression,
+        depth: usize,
+    ) -> VortexResult<Option<BoundExpression>> {
+        if depth >= MAX_OPTIMIZATION_DEPTH {
             vortex_bail!(
-                "Exceeded bound-expression rewrite limit of {} while applying {rule_name} \
-                 (possible rewrite cycle)",
-                self.optimizer.max_rewrites
+                "Exceeded bound-expression optimization depth limit of \
+                 {MAX_OPTIMIZATION_DEPTH}"
             );
         }
-        self.rewrite_count += 1;
 
-        self.tasks.reserve(2);
-        self.tasks.push(Task::FinishRewrite);
-        self.tasks.push(Task::Visit(replacement));
-        Ok(())
+        let mut current = None;
+        loop {
+            loop {
+                let expression = current.as_ref().unwrap_or(original);
+                let Some(replacement) = self.try_apply_rule(expression)? else {
+                    break;
+                };
+                current = Some(replacement);
+            }
+
+            let expression = current.as_ref().unwrap_or(original);
+            let Some(children) = self.optimize_children(expression, depth)? else {
+                return Ok(current);
+            };
+
+            let original_dtype = expression.dtype().clone();
+            let expression = current.take().unwrap_or_else(|| original.clone());
+            let rebuilt = expression.with_children(children)?;
+            vortex_ensure!(
+                rebuilt.dtype() == &original_dtype,
+                "optimizing children changed a node dtype from {original_dtype} to {}",
+                rebuilt.dtype()
+            );
+
+            let Some(replacement) = self.try_apply_rule(&rebuilt)? else {
+                return Ok(Some(rebuilt));
+            };
+            current = Some(replacement);
+        }
+    }
+
+    /// Optimize a node's children, allocating a replacement vector only after one changes.
+    fn optimize_children(
+        &mut self,
+        expression: &BoundExpression,
+        depth: usize,
+    ) -> VortexResult<Option<Vec<BoundExpression>>> {
+        let children = expression.children();
+        let mut optimized_children = None;
+
+        for (index, child) in children.iter().enumerate() {
+            match self.optimize_subtree(child, depth + 1)? {
+                Some(optimized_child) => {
+                    optimized_children
+                        .get_or_insert_with(|| {
+                            let mut optimized = Vec::with_capacity(children.len());
+                            optimized.extend_from_slice(&children[..index]);
+                            optimized
+                        })
+                        .push(optimized_child);
+                }
+                None => {
+                    if let Some(optimized) = &mut optimized_children {
+                        optimized.push(child.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(optimized_children)
     }
 }
-
-enum Task {
-    /// Visit an expression by scheduling its children followed by [`Task::Finish`].
-    ///
-    /// Childless expressions are finished immediately without scheduling another task.
-    Visit(BoundExpression),
-    /// Finish an original expression after all of its children have been optimized.
-    ///
-    /// The `child_count` most recent results belong to this expression. They are used to rebuild
-    /// the node when any child changed, after which the optimizer tries to rewrite the node itself.
-    Finish {
-        expr: BoundExpression,
-        child_count: usize,
-    },
-    /// Finish a successful root rewrite after its replacement subtree has been optimized.
-    ///
-    /// Unlike [`Task::Finish`], this task has no children to collect or node to rebuild: the
-    /// replacement's result is already on the result stack. It marks that result as changed so the
-    /// rewrite remains visible even when optimizing the replacement made no further changes.
-    FinishRewrite,
-}
-
-/// Optimized children, distinguishing reusable originals from a changed child list.
-enum OptimizedChildren {
-    Unchanged,
-    Changed(Vec<BoundExpression>),
-}
-
-/// A completed subtree and whether any rewrite changed it.
-struct OptimizationResult {
-    expr: BoundExpression,
-    changed: bool,
-}
-
-type TaskStack = SmallVec<[Task; 16]>;
-type ResultStack = SmallVec<[OptimizationResult; 16]>;
 
 #[cfg(test)]
 mod tests {
@@ -416,6 +362,17 @@ mod tests {
         let input = bound::is_null(bound::lit(1i32));
         let mut optimizer = BoundExpressionOptimizer::empty();
         optimizer.register_rule(IsNullToReducibleTree);
+        optimizer.register_rule(AndFalse);
+
+        assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
+        Ok(())
+    }
+
+    #[test]
+    fn retries_root_rules_after_optimizing_children() -> VortexResult<()> {
+        let input = bound::and(bound::is_null(bound::lit(1i32)), bound::lit(true));
+        let mut optimizer = BoundExpressionOptimizer::empty();
+        optimizer.register_rule(IsNullTo(false));
         optimizer.register_rule(AndFalse);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
@@ -517,17 +474,30 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_deep_tree_does_not_recurse() -> VortexResult<()> {
+    fn depth_limit_prevents_stack_overflow() {
         let mut expr = bound::root(DType::Bool(Nullability::NonNullable));
-        for _ in 0..20_000 {
+        for _ in 0..1_000 {
             expr = bound::not(expr);
         }
 
         assert!(
             BoundExpressionOptimizer::empty()
-                .try_optimize(&expr)?
-                .is_none()
+                .try_optimize(&expr)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn root_rewrite_can_discard_a_deep_subtree() -> VortexResult<()> {
+        let mut discarded = bound::root(DType::Bool(Nullability::NonNullable));
+        for _ in 0..1_000 {
+            discarded = bound::not(discarded);
+        }
+        let input = bound::and(bound::lit(false), discarded);
+        let mut optimizer = BoundExpressionOptimizer::empty();
+        optimizer.register_rule(AndFalse);
+
+        assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
     }
 
