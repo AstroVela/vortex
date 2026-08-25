@@ -38,6 +38,7 @@ self-paced-plan-exec-learnings
 scan-execution-framework
 scan-execution-graph-model
 scan-execution-graph-next-discussion
+scan-execution-demand-and-operators
 self-paced-implementation-plan
 self-paced-review
 ```

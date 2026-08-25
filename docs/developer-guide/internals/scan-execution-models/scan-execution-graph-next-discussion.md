@@ -6,6 +6,13 @@ in the [graph model](scan-execution-graph-model.md). Each section states one unr
 the context and evidence a fresh reader (or a fresh session) needs, what the last discussion
 already concluded around it, and the concrete output the next conversation should produce.
 
+A follow-up discussion recorded in
+[demand, operators, and the filter law](scan-execution-demand-and-operators.md) has since
+refined the computational framework — bind-time demand routing, the speculation commutation law,
+the single positional value contract with gather as the only cardinality change, and the
+three-part target architecture — which reshapes problems 3 and 4 below and partially settles the
+graph model's open questions 3 and 7.
+
 Ground rules carried over: decisions already recorded in
 [graph model section 10](scan-execution-graph-model.md#10-decisions-recorded-from-this-discussion)
 are settled unless new evidence reopens them; every performance claim must trace to the
