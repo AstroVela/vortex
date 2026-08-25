@@ -6,12 +6,10 @@
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::time::Instant;
 
 use anyhow::Result;
 use tracing::trace;
 use vortex::error::VortexExpect;
-use vortex::error::vortex_err;
 use vortex_bench::Benchmark;
 use vortex_bench::Format;
 use vortex_bench::IdempotentPath;
