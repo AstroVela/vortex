@@ -22,7 +22,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
-#[cfg(feature = "unstable_encodings")]
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
 use vortex_fastlanes::BlockedFoR;
 use vortex_fastlanes::FoR;
 use vortex_runend::RunEnd;
@@ -31,6 +31,11 @@ use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
 
 use crate::BtrBlocksCompressor;
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
+use crate::BtrBlocksCompressorBuilder;
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
+use crate::schemes::integer::BlockedFoRScheme;
+
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
 #[test]
@@ -56,7 +61,7 @@ fn test_for_compressed() -> VortexResult<()> {
 
 /// Values that stay tightly clustered within each 1024-value block but drift far apart over the
 /// array: the shape a single global reference cannot capture.
-#[cfg_attr(not(feature = "unstable_encodings"), expect(dead_code))]
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
 fn drifting_values(len: i64) -> ArrayRef {
     let values: Vec<i64> = (0..len)
         .map(|i| 1_000_000 + (i / 1024) * 1_000_000 + ((i * 7919) % 101))
@@ -64,10 +69,17 @@ fn drifting_values(len: i64) -> ArrayRef {
     PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array()
 }
 
-#[cfg(feature = "unstable_encodings")]
+/// BlockedFoR is opt-in rather than part of [`crate::ALL_SCHEMES`], so the caller adds it.
+///
+/// Restricted to the default scheme set: `Delta` and `Pco` model this same shape and beat the
+/// blocked scheme on it, so with those compiled in the choice says nothing about this scheme.
+/// The bit-width property it exists for is covered feature-independently in `vortex-fastlanes`.
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
 #[test]
 fn test_blocked_for_compressed() -> VortexResult<()> {
-    let btr = BtrBlocksCompressor::default();
+    let btr = BtrBlocksCompressorBuilder::default()
+        .with_new_scheme(&BlockedFoRScheme)
+        .build();
     let compressed = btr.compress(
         &drifting_values(16_384),
         &mut SESSION.create_execution_ctx(),

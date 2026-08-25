@@ -26,12 +26,7 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Integer schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    // NOTE: frame-of-reference schemes must precede BitPacking to avoid unnecessary patches.
-    // BlockedFoR is a `preview` edition encoding, so it is only writable when the session
-    // enables that family. Keep the scheme out of the default set otherwise: selecting an
-    // encoding the writer cannot serialize fails the write outright.
-    #[cfg(feature = "unstable_encodings")]
-    &integer::BlockedFoRScheme,
+    // NOTE: FoR must precede BitPacking to avoid unnecessary patches.
     &integer::FoRScheme,
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
@@ -184,13 +179,9 @@ impl BtrBlocksCompressorBuilder {
             binary::BinaryDictScheme.id(),
         ];
         // Delta has no GPU decode kernel and its prefix-sum decode is inherently sequential, so it
-        // is incompatible with pure-GPU decompression paths. BlockedFoR likewise has no kernel;
-        // plain FoR stays in the set, so integer columns keep a frame of reference.
+        // is incompatible with pure-GPU decompression paths.
         #[cfg(feature = "unstable_encodings")]
-        excluded.extend([
-            integer::DeltaScheme::default().id(),
-            integer::BlockedFoRScheme.id(),
-        ]);
+        excluded.push(integer::DeltaScheme::default().id());
         #[cfg(feature = "pco")]
         excluded.extend([integer::PcoScheme.id(), float::PcoScheme.id()]);
         let builder = self.exclude_schemes(excluded);
@@ -252,8 +243,6 @@ mod tests {
         let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
         let ids: Vec<_> = builder.schemes.iter().map(|s| s.id()).collect();
         assert!(ids.contains(&integer::FoRScheme.id()));
-        #[cfg(feature = "unstable_encodings")]
-        assert!(ids.contains(&integer::BlockedFoRScheme.id()));
 
         let none = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&HashSet::new());
         assert!(none.schemes.is_empty());
@@ -290,10 +279,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "unstable_encodings")]
+    /// BlockedFoR writes an encoding that only the `preview` edition permits, so it must never
+    /// be in the default set: a write path that does not restrict encodings would otherwise
+    /// produce an array the file writer cannot serialize.
     #[test]
-    fn cuda_compatible_excludes_blocked_for_but_keeps_global_for() {
-        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+    fn default_schemes_exclude_blocked_for() {
+        let builder = BtrBlocksCompressorBuilder::default();
         assert!(
             !builder
                 .schemes
