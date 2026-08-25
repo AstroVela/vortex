@@ -25,6 +25,7 @@ use crate::BitPacked;
 use crate::BitPackedArrayExt;
 use crate::FoRArray;
 use crate::bitpack_decompress;
+use crate::bitpacking::chunked_decompress;
 use crate::r#for::array::FoRArrayExt;
 use crate::r#for::array::FoRArraySlotsExt;
 use crate::unpack_iter::UnpackStrategy;
@@ -143,14 +144,28 @@ pub(crate) fn fused_decompress<
 
 /// Streaming chunked decompression for FoR arrays.
 ///
-/// FoR composes over any encoded child: each chunk the child streams up is shifted by the
-/// reference value in place (one pass over an L1-resident chunk) and forwarded to the downstream
-/// sink. The adapter lives on this stack frame — no heap state is added on the way down.
+/// When the child is a [`BitPacked`] array (the common layout), this streams through the fused
+/// [`FoRStrategy`] unpack kernel — the reference is folded into `unchecked_unfor_pack` itself,
+/// exactly like [`fused_decompress`], so there is no extra add pass at all.
+///
+/// Otherwise FoR composes generically over any encoded child: each chunk the child streams up is
+/// shifted by the reference value in place (one pass over an L1-resident chunk) and forwarded to
+/// the downstream sink. The adapter lives on this stack frame — no heap state is added on the
+/// way down.
 pub(crate) fn decompress_chunks(
     array: ArrayView<'_, crate::FoR>,
     ctx: &mut ExecutionCtx,
     sink: &mut dyn ChunkSink,
 ) -> VortexResult<()> {
+    // Fused fast path, mirroring the dispatch in `decompress`.
+    if array.reference_scalar().dtype().is_unsigned_int()
+        && let Some(bp) = array.encoded().as_opt::<BitPacked>()
+    {
+        return match_each_unsigned_integer_ptype!(array.ptype(), |T| {
+            fused_decompress_chunks::<T>(array, bp, ctx, sink)
+        });
+    }
+
     match_each_integer_ptype!(array.ptype(), |T| {
         let reference = array
             .reference_scalar()
@@ -167,6 +182,43 @@ pub(crate) fn decompress_chunks(
             array.encoded().decompress_chunks(ctx, &mut adapter)
         }
     })
+}
+
+/// Stream FoR-over-BitPacked chunks through the fused unpack kernel: each FastLanes block is
+/// unpacked with the reference added by `unchecked_unfor_pack`, patched in place (patch values
+/// get the reference applied up front), and handed to the sink.
+fn fused_decompress_chunks<T: PhysicalPType<Physical = T> + UnsignedPType + FoR + WrappingAdd>(
+    for_: ArrayView<'_, crate::FoR>,
+    bp: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    if bp.as_ref().is_empty() {
+        return Ok(());
+    }
+
+    let ref_ = for_
+        .reference_scalar()
+        .as_primitive()
+        .as_::<T>()
+        .vortex_expect("cannot be null");
+
+    let mut unpacked = UnpackedChunks::try_new_with_strategy(
+        FoRStrategy { reference: ref_ },
+        bp.packed().as_host().clone(),
+        bp.bit_width() as usize,
+        bp.offset() as usize,
+        bp.len(),
+    )?;
+
+    let patch_list = match bp.patches() {
+        None => Vec::new(),
+        Some(patches) => {
+            chunked_decompress::build_patch_list(&patches, ctx, |v: T| v.wrapping_add(&ref_))?
+        }
+    };
+
+    chunked_decompress::stream_unpacked_chunks(&mut unpacked, &patch_list, sink)
 }
 
 struct AddReferenceSink<'a, T> {

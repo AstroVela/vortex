@@ -50,7 +50,7 @@ use crate::bitpack_decompress::unpack_into_primitive_builder;
 use crate::bitpacking::array::BitPackedSlots;
 use crate::bitpacking::array::BitPackedSlotsView;
 use crate::bitpacking::array::PATCH_SLOTS;
-use crate::bitpacking::array::chunked_decompress;
+use crate::bitpacking::chunked_decompress;
 use crate::bitpacking::vtable::rules::RULES;
 mod kernels;
 mod operations;

@@ -81,8 +81,9 @@ impl ChunkSink for SumSink {
     }
 }
 
-/// Sum through the composable vtable path: BitPacked streams unpacked blocks, FoR shifts each
-/// block in place, the sink folds it — one streaming pass, no materialization.
+/// Sum through the composable vtable path. With an unsigned reference over BitPacked, FoR takes
+/// its fused streaming path: each block is unpacked with the reference folded into the kernel
+/// and handed straight to the sink — one streaming pass, no materialization, no extra add pass.
 #[divan::bench]
 fn chunked_vtable_sum(bencher: Bencher) {
     let array = make_for_bitpacked();
@@ -90,6 +91,44 @@ fn chunked_vtable_sum(bencher: Bencher) {
         .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
         .bench_values(|(array, mut ctx)| {
             let mut sink = SumSink { total: 0 };
+            array
+                .decompress_chunks(&mut ctx, &mut sink)
+                .vortex_expect("bench");
+            black_box(sink.total)
+        });
+}
+
+/// Same as `chunked_vtable_sum` but with a signed FoR reference, which skips the fused
+/// FoR+BitPacked dispatch and exercises the generic composition: BitPacked streams plain
+/// unpacked blocks and FoR's sink adapter adds the reference in place per chunk.
+#[divan::bench]
+fn chunked_vtable_sum_generic_compose(bencher: Bencher) {
+    let mut ctx = SESSION.create_execution_ctx();
+    let deltas = PrimitiveArray::from_iter(
+        (0..LEN as u64).map(|i| i32::try_from((i * 7) % 1000).vortex_expect("fits")),
+    );
+    let bp = bitpack_encode(&deltas, 10, None, &mut ctx).vortex_expect("bench");
+    let array = FoR::try_new(bp.into_array(), Scalar::from(-1_000_000i32))
+        .vortex_expect("bench")
+        .into_array();
+
+    struct SumSinkI32 {
+        total: i64,
+    }
+    impl ChunkSink for SumSinkI32 {
+        #[inline]
+        fn accept(&mut self, chunk: ChunkMut<'_>, _row_range: Range<usize>) -> VortexResult<()> {
+            self.total = self
+                .total
+                .wrapping_add(chunk.as_slice::<i32>().iter().map(|&v| v as i64).sum());
+            Ok(())
+        }
+    }
+
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            let mut sink = SumSinkI32 { total: 0 };
             array
                 .decompress_chunks(&mut ctx, &mut sink)
                 .vortex_expect("bench");
