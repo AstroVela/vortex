@@ -22,6 +22,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
+#[cfg(feature = "unstable_encodings")]
 use vortex_fastlanes::BlockedFoR;
 use vortex_fastlanes::FoR;
 use vortex_runend::RunEnd;
