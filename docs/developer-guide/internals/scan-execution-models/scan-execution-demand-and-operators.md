@@ -301,6 +301,86 @@ driver-side slicing absorbs the misalignment at combine. But this holds only if
 **fragment/ledger granularity is not derived from the all-columns boundary union** — which makes
 it a constraint on the unit-formation design (problem 1), not a free consequence.
 
+## 6a. Two planes: in-band masks, out-of-band demand
+
+A late refinement reconciles the engines-style streaming picture (DuckDB pipelines with
+selection vectors in the chunk; Velox drivers with FilterProject and LazyVector-driven late
+materialization) with the demand system:
+
+- **Data plane (in-band, exact, authoritative).** Batches and conjunct masks stream through the
+  operator chain; the AND and the gather happen where the masks arrive. The gather's requirement
+  is that *its in-band mask input is final* — an ordinary dataflow dependency, no longer a
+  demand-system event.
+- **Control plane (out-of-band, advisory, never blocking).** The demand cells and bind-time
+  routing survive as a side channel with weaker semantics: monotone shrinking supersets, read at
+  admission points (leaf extent cuts, scheduler pricing), never waited on. The commutation law
+  makes any admission-time snapshot sound; the in-band plane corrects everything at the gather.
+  This is sideways information passing (DuckDB dynamic join filters, Velox dynamicFilters) made
+  the primitive rather than a bolt-on — and because the plane only promises supersets, its
+  content generalizes beyond exact masks to any conservative summary: range bounds, zone
+  verdicts, bloom filters, IN-lists, a limit counter.
+
+Optimistic conjunct IO and optimistic projection IO are then the same move: admit reads against
+whatever the OOB cell currently holds (top if nothing landed). Cascade versus parallel is "how
+stale was the snapshot at admission" — a continuum, not two modes. A lost or late OOB update can
+only cost performance, never correctness; the differential harness should therefore run with the
+OOB plane disabled and maximally delayed and require identical results.
+
+## 6b. Morsel-driven build sketch
+
+The concrete instantiation of the three parts, as currently intended:
+
+- **Pipelines.** One pipeline per conjunct and a small number per projection, handed to the
+  scheduler. Struct is *not* a pipeline breaker: fields run as sequential stages of one pipeline
+  instance, with elective field-parallel fan-out only when a field's work exceeds the
+  granularity floor. The only barrier-like point is the per-range mask meet, a countdown. IO
+  tasks precede CPU pipelines; each fixed-size filter or projection range carries its demand
+  mask input.
+- **Morsel planning.** Each claimed morsel is planned **once**, against an OOB demand snapshot:
+  empty snapshot skips the subtree; planning emits IO tasks, CPU pipeline activations, and
+  further planning tasks. Demand is re-read at IO admission, so the shrink between plan time and
+  issue is captured without re-planning (superset-sound; planned tasks whose demand sealed empty
+  evaporate as candidates). The one exception to one-off planning: gated subtrees (dict values,
+  list elements, zoned verdicts) re-plan **on facts** — that is the "more planning" arm, not
+  re-planning on refinement.
+- **Pruning is conjunct 0.** File-level stats resolve once at scan open; zone-level pruning runs
+  as the first step of morsel planning, so its verdicts land in the OOB plane before any other
+  conjunct's IO is admitted — no priority mechanism needed. Zone-metadata reads are themselves
+  small IO: morsel planning parks on that gate or proceeds optimistically below the watermark.
+- **Parallelism.** Morsels are the parallel unit; per-morsel (not per-thread) operator state;
+  work stealing when no new morsel can be claimed, with wakes preferring the owning worker's
+  deque so continuations run warm. No new morsels when: (1) all rows claimed; (2) the memory
+  limit binds (deferred — see below); (3) a limit has sealed the remaining tail.
+- **IO coalescing.** Morsel planning emits the morsel's reads as one batch and the morsel's
+  segments are file-adjacent, so batch-scope coalescing is expected to suffice; dedup by
+  `SegmentId` comes separately from the keyed cells. Verified, not assumed: the stress matrix
+  carries a cold-scan IO parity gate (same bytes, comparable request count versus V1), and only
+  its failure justifies more machinery.
+- **Emission and limits.** Pull-driven: the consumer stopping stops morsel claiming; in-flight
+  morsels finish or park. Limit is a first-k demand producer at the sink writing into
+  projection's OOB cells (per-morsel for ordered prefix consumption; a shared global survivor
+  counter for unordered), transitively bounding filter work — the one legitimately cross-morsel
+  cell.
+- **Deferred, recorded:** the memory model — per-morsel live-byte approximation, attribution of
+  shared cells (first-needer versus split versus shared pool), and the memory-times-ordering
+  deadlock (complete-but-unemittable morsels holding bytes the oldest morsel needs; candidate
+  fix: the oldest unemitted morsel is always admissible).
+
+### Stress matrix versus V1
+
+Correctness (differential, row-hash on the need set): every layout × {no filter, selective,
+non-selective, all-false} × {aligned, unaligned chunks} × {nulls, trapping expressions} ×
+range boundaries straddling chunk and page edges; OOB disabled and maximally delayed; absorb
+versus its blanket impl. Scheduler invariants in a deterministic simulator: no deadlock under
+memory × ordering × limit × cancellation; adversarial IO completion orders; steal-versus-wake
+races. Performance gates: Q01/Q06 (the prefetch split), FineWeb `select *` (small-splits storm),
+selective string predicates (cascade and wide-value elision), dict page skipping, cold-scan IO
+parity, contention counters (entries-considered-per-admission ≈ 1, queue-idle ≈ 0). Layout
+coverage audit: each V1 layout (flat, chunked, struct, dict, list, zoned, row_idx, partitioned,
+table, compressed, buffered, repartition, foreign, file_stats) needs its one-line story or a V1
+fallback adapter mid-tree during migration; plus the degenerate paths — `select *` reduced
+machinery, tiny single-morsel scans without scheduler spin-up, repeated-scan fact reuse.
+
 ## 7. Decisions recorded from this discussion
 
 1. Base trait is `edges()` + `combine` with expand derived generically; hand-written expand is an
