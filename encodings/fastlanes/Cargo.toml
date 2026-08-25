@@ -63,6 +63,10 @@ name = "bitpack_compare"
 harness = false
 
 [[bench]]
+name = "bitpack_patches"
+harness = false
+
+[[bench]]
 name = "bitpack_compare_sweep"
 harness = false
 

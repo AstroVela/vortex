@@ -126,7 +126,9 @@ pub use forever_constant::*;
 pub use open::*;
 pub use strategy::*;
 use vortex_array::arrays::Patched;
+use vortex_array::arrays::Patches;
 use vortex_array::arrays::patched::use_experimental_patches;
+use vortex_array::arrays::patches::use_experimental_patches_array;
 use vortex_array::session::ArraySessionExt;
 use vortex_pco::Pco;
 use vortex_session::VortexSession;
@@ -182,6 +184,9 @@ pub fn register_default_encodings(session: &VortexSession) {
         arrays.register(vortex_zstd::ZstdBuffers);
         if use_experimental_patches() {
             arrays.register(Patched);
+        }
+        if use_experimental_patches_array() {
+            arrays.register(Patches);
         }
     }
 

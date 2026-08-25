@@ -26,10 +26,12 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DictArray;
 use vortex_array::arrays::FilterArray;
 use vortex_array::arrays::Patched;
+use vortex_array::arrays::Patches;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::Struct;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::patched::use_experimental_patches;
+use vortex_array::arrays::patches::use_experimental_patches_array;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
@@ -84,6 +86,9 @@ fn trace_session() -> VortexSession {
         arrays.register(vortex_zstd::ZstdBuffers);
         if use_experimental_patches() {
             arrays.register(Patched);
+        }
+        if use_experimental_patches_array() {
+            arrays.register(Patches);
         }
     }
 

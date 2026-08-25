@@ -10,7 +10,10 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VTable;
 use vortex_array::arrays::Patched;
+use vortex_array::arrays::Patches;
 use vortex_array::arrays::patched::use_experimental_patches;
+use vortex_array::arrays::patches::PatchFn;
+use vortex_array::arrays::patches::use_experimental_patches_array;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
@@ -42,7 +45,9 @@ impl Scheme for BitPackingScheme {
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
         let mut encodings = vec![BitPacked.id()];
-        if use_experimental_patches() {
+        if use_experimental_patches_array() {
+            encodings.push(Patches.id());
+        } else if use_experimental_patches() {
             encodings.push(Patched.id());
         }
         encodings
@@ -89,7 +94,30 @@ impl Scheme for BitPackingScheme {
         let ptype = packed.dtype().as_ptype();
         let mut parts = BitPacked::into_parts(packed);
 
-        let array = if use_experimental_patches() {
+        let array = if use_experimental_patches_array() {
+            let patches = parts.patches.take();
+            // Re-encode patches into the block-relative PatchesArray, wrapping an inner
+            // BitPackedArray.
+            let array = BitPacked::try_new(
+                parts.packed,
+                ptype,
+                parts.validity,
+                None,
+                parts.bit_width,
+                parts.len,
+                parts.offset,
+            )?
+            .into_array();
+
+            match patches {
+                None => array,
+                Some(p) => {
+                    Patches::from_array_and_patches(array, &p, PatchFn::Overwrite, exec_ctx)?
+                        .with_stats_set(packed_stats)
+                        .into_array()
+                }
+            }
+        } else if use_experimental_patches() {
             let patches = parts.patches.take();
             // Transpose patches into G-ALP style PatchedArray, wrapping an inner BitPackedArray.
             let array = BitPacked::try_new(

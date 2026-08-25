@@ -258,6 +258,62 @@ impl<T: PhysicalPType, S: UnpackStrategy<T>> UnpackedChunks<T, S> {
         debug_assert_eq!(local_idx, self.len);
     }
 
+    /// Decode all chunks (initial, full, and trailer) directly into the output range, invoking
+    /// `f` on each chunk right after it is decoded and before moving to the next chunk.
+    ///
+    /// `f` receives the decoded chunk values and the logical output range they cover, so fused
+    /// kernels (e.g. patch application) can rewrite a chunk's values while they are still
+    /// cache-resident. Full chunks are decoded straight into `output` and mutated in place, so
+    /// unlike [`Self::for_each_unpacked_chunk`] no extra scratch-to-output copy is paid for them.
+    pub(crate) fn decode_for_each_chunk<F>(&mut self, output: &mut [MaybeUninit<T>], mut f: F)
+    where
+        F: FnMut(&mut [T], Range<usize>),
+    {
+        debug_assert_eq!(output.len(), self.len);
+        let mut local_idx = 0;
+
+        if let Some(initial) = self.initial() {
+            let chunk_len = initial.len();
+            f(initial, 0..chunk_len);
+            // TODO(connor): use maybe_uninit_write_slice when it gets stabilized.
+            // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
+            let init_initial: &[MaybeUninit<T>] = unsafe { mem::transmute(initial) };
+            output[..chunk_len].copy_from_slice(init_initial);
+            local_idx = chunk_len;
+        }
+
+        if self.num_chunks > 1 {
+            let elems_per_chunk = self.elems_per_chunk();
+            let full_chunks = self.full_chunks_range();
+            let packed_slice: &[T::Physical] = buffer_as_slice(&self.packed);
+            for i in full_chunks {
+                let chunk = &packed_slice[i * elems_per_chunk..][..elems_per_chunk];
+                // SAFETY: `unpack_chunk` initializes every slot of the CHUNK_SIZE range, after
+                // which it is safe to view as `&mut [T]`.
+                unsafe {
+                    let uninit_dst = &mut output[local_idx..local_idx + CHUNK_SIZE];
+                    let dst: &mut [T::Physical] = mem::transmute(&mut *uninit_dst);
+                    self.strategy.unpack_chunk(self.bit_width, chunk, dst);
+                    let decoded: &mut [T] = mem::transmute(&mut *uninit_dst);
+                    f(decoded, local_idx..local_idx + CHUNK_SIZE);
+                }
+                local_idx += CHUNK_SIZE;
+            }
+        }
+
+        if let Some(trailer) = self.trailer() {
+            let chunk_len = trailer.len();
+            f(trailer, local_idx..local_idx + chunk_len);
+            // TODO(connor): use maybe_uninit_write_slice when it gets stabilized.
+            // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
+            let init_trailer: &[MaybeUninit<T>] = unsafe { mem::transmute(trailer) };
+            output[local_idx..][..chunk_len].copy_from_slice(init_trailer);
+            local_idx += chunk_len;
+        }
+
+        debug_assert_eq!(local_idx, self.len);
+    }
+
     /// Walk every *packed* chunk in array order, yielding the raw packed FastLanes block and the
     /// padded bit range it covers, without unpacking it.
     ///
