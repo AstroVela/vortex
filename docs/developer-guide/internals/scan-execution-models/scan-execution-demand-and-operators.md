@@ -343,10 +343,38 @@ The concrete instantiation of the three parts, as currently intended:
   evaporate as candidates). The one exception to one-off planning: gated subtrees (dict values,
   list elements, zoned verdicts) re-plan **on facts** — that is the "more planning" arm, not
   re-planning on refinement.
-- **Pruning is conjunct 0.** File-level stats resolve once at scan open; zone-level pruning runs
-  as the first step of morsel planning, so its verdicts land in the OOB plane before any other
-  conjunct's IO is admitted — no priority mechanism needed. Zone-metadata reads are themselves
-  small IO: morsel planning parks on that gate or proceeds optimistically below the watermark.
+- **Pruning is warm-up work, not a phase.** Zone-map metadata is file-scoped (a few small
+  segments covering all zones), so the first morsels issue the pruning-metadata reads *and*
+  their first conjunct's IO optimistically in parallel — the early wave simply does not benefit
+  from pruning (the accepted speculation cost, overlapped with IO latency). When the stats fact
+  seals, verdicts for every zone in the file are computed in one cheap bulk pass and written to
+  the OOB cells; every subsequent morsel's planning snapshot already contains the prune, paying
+  zero pruning IO and zero pruning compute, with some subtrees never planned at all. The more
+  morsels a file has, the closer pruning is to free.
+- **One-off planning, restated.** Planning runs once per morsel against the snapshot; a shrink
+  after t0 is captured by one late look at the demand cell just before each read issues (drop if
+  dead, shrink if smaller — safe because a read against stale larger demand is merely a superset).
+  There is no re-planning on refinement. Dict/list are not an exception: t0 planning emits a
+  deferred "plan this bit when fact X seals" note — one-off planning, part of which cannot start
+  at t0.
+- **Per-morsel stash.** Each morsel owns a scratch store keyed by (plan edge, range): decoded
+  arrays shared between filter and projection, partially computed arrays, masks awaiting the
+  meet. Lifetime is the morsel's; the whole stash drops at retire; the morsel's live bytes *are*
+  the stash plus in-flight IO, making the deferred memory approximation exact. Cross-morsel
+  sharing shrinks to a thin explicit list of scan-wide keyed cells (dictionary values, file
+  stats, the pruning fact). Boundary case, recorded: once morsel boundaries stop being the
+  all-columns split union, a projected column's chunk can straddle two morsels — default is to
+  decode it twice (the bounded-duplicate principle); promote straddlers to scan-wide cells only
+  if measurement says so.
+- **Morsels are typed by row domain.** A domain change does not add bookkeeping inside the outer
+  morsel; it spawns **child-domain morsels** at gate seal — own demand (the gather set, sealed
+  at birth), own pipelines (the values/elements subplan), own stash — whose results land in the
+  parent morsel's stash for the parent's combine. A heavy list-elements subtree becomes several
+  child morsels: parallelism inside one outer row range. **Inner-domain morsels take priority
+  over claiming new outer splits** — depth-first in work-stealing form (run own newest, steal
+  oldest/outermost). This is the memory bound as much as a latency rule: finish-what's-started
+  keeps work-in-progress near workers × domain-depth, and "all rows claimed" generalizes to
+  "all rows claimed in every domain."
 - **Parallelism.** Morsels are the parallel unit; per-morsel (not per-thread) operator state;
   work stealing when no new morsel can be claimed, with wakes preferring the owning worker's
   deque so continuations run warm. No new morsels when: (1) all rows claimed; (2) the memory
