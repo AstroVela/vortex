@@ -36,6 +36,8 @@ self-paced-plan-exec-findings
 self-paced-plan-exec-handover
 self-paced-plan-exec-learnings
 scan-execution-framework
+scan-execution-graph-model
+scan-execution-graph-next-discussion
 self-paced-implementation-plan
 self-paced-review
 ```
