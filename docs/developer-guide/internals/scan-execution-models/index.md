@@ -39,6 +39,8 @@ scan-execution-framework
 scan-execution-graph-model
 scan-execution-graph-next-discussion
 scan-execution-demand-and-operators
+scan-execution-design
+scan-execution-design-one-pager
 self-paced-implementation-plan
 self-paced-review
 ```
