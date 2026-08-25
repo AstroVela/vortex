@@ -53,6 +53,7 @@ use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -65,6 +66,7 @@ use crate::codec::read_wide_bits;
 
 const BLOCK_LEN: usize = 1024;
 const WORDS_PER_WIDTH_BIT: usize = BLOCK_LEN / 64;
+const WORDS_PER_WIDTH_BIT_U32: u32 = (BLOCK_LEN / 64) as u32;
 
 /// Block residuals with child arrays for bases and high-bit patches.
 pub type PatchedBlockResidualArray = Array<PatchedBlockResidual>;
@@ -93,6 +95,8 @@ pub struct PatchedBlockResidualData {
     payload: ByteBuffer,
     residual_widths: Buffer<u8>,
     residual_words: Buffer<u64>,
+    // Derived at construction, not serialized: prefix word offsets per block.
+    word_starts: Vec<u32>,
 }
 
 impl Display for PatchedBlockResidualData {
@@ -137,22 +141,25 @@ impl PatchedBlockResidualData {
         let residual_words = Buffer::from_byte_buffer(
             payload.slice_with_alignment(widths_padded..payload.len(), Alignment::of::<u64>()),
         );
+        let mut word_starts = Vec::with_capacity(block_count + 1);
+        let mut start = 0u32;
+        word_starts.push(start);
+        for &width in residual_widths.iter() {
+            start += u32::from(width) * WORDS_PER_WIDTH_BIT_U32;
+            word_starts.push(start);
+        }
         Ok(Self {
             len,
             payload,
             residual_widths,
             residual_words,
+            word_starts,
         })
     }
 
     /// Return the word range of one block's packed residuals.
     fn block_words(&self, block_index: usize) -> std::ops::Range<usize> {
-        let start: usize = self.residual_widths[..block_index]
-            .iter()
-            .map(|&width| usize::from(width) * WORDS_PER_WIDTH_BIT)
-            .sum();
-        let len = usize::from(self.residual_widths[block_index]) * WORDS_PER_WIDTH_BIT;
-        start..start + len
+        self.word_starts[block_index] as usize..self.word_starts[block_index + 1] as usize
     }
 }
 
@@ -487,17 +494,55 @@ impl OperationsVTable<PatchedBlockResidual> for PatchedBlockResidual {
                 )
             }
         };
-        if let Some(patches) = array.patches()
-            && let Some(high) = patches.get_patched(index)?
-        {
-            residual |= u64::try_from(&high)? << width;
+        if let Some(high) = patched_high(&array, block_index, index)? {
+            residual |= high << width;
         }
-        let base = u64::try_from(&array.bases().execute_scalar(block_index, ctx)?)?;
+        let base = match array.bases().as_opt::<Primitive>() {
+            Some(bases) => bases.as_slice::<u64>()[block_index],
+            None => u64::try_from(&array.bases().execute_scalar(block_index, ctx)?)?,
+        };
         Ok(Scalar::primitive(
             base.wrapping_add(residual),
             array.dtype().nullability(),
         ))
     }
+}
+
+/// Look up the high bits patched at `index`, downcasting canonical patch children.
+///
+/// Falls back to the generic [`Patches`] search when a patch child is a non-canonical encoding.
+fn patched_high(
+    array: &ArrayView<'_, PatchedBlockResidual>,
+    block_index: usize,
+    index: usize,
+) -> VortexResult<Option<u64>> {
+    let (Some(indices), Some(values), Some(chunk_offsets)) = (
+        array.patch_indices(),
+        array.patch_values(),
+        array.patch_chunk_offsets(),
+    ) else {
+        return Ok(None);
+    };
+    if let (Some(indices), Some(values), Some(chunk_offsets)) = (
+        indices.as_opt::<Primitive>(),
+        values.as_opt::<Primitive>(),
+        chunk_offsets.as_opt::<Primitive>(),
+    ) {
+        let chunk_offsets = chunk_offsets.as_slice::<u32>();
+        let chunk = usize::try_from(chunk_offsets[block_index])?
+            ..usize::try_from(chunk_offsets[block_index + 1])?;
+        let block_indices = &indices.as_slice::<u32>()[chunk.clone()];
+        return Ok(block_indices
+            .binary_search(&u32::try_from(index)?)
+            .ok()
+            .map(|patch_index| values.as_slice::<u64>()[chunk.start + patch_index]));
+    }
+    array
+        .patches()
+        .vortex_expect("patch children are present")
+        .get_patched(index)?
+        .map(|high| u64::try_from(&high))
+        .transpose()
 }
 
 impl ValidityVTable<PatchedBlockResidual> for PatchedBlockResidual {
@@ -524,7 +569,7 @@ pub fn initialize_patched(session: &VortexSession) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::LazyLock;
 
     use vortex_array::ArrayContext;
@@ -539,7 +584,7 @@ mod tests {
     use super::*;
     use crate::BlockResidual;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    pub(crate) static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         let session = array_session();
         crate::initialize(&session);
         initialize_patched(&session);
@@ -547,7 +592,7 @@ mod tests {
     });
 
     /// Ordered-float-like values: a smooth walk with occasional large outliers.
-    fn sample_values(len: usize) -> Vec<u64> {
+    pub(crate) fn sample_values(len: usize) -> Vec<u64> {
         let mut state = 0x9E3779B97F4A7C15_u64;
         let mut walk = 1_u64 << 40;
         (0..len)
@@ -642,6 +687,72 @@ mod tests {
                 (patched_nbytes as f64 / fused_nbytes as f64 - 1.0) * 100.0
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use vortex_array::VortexSessionExecute;
+    use vortex_error::VortexResult;
+
+    use super::tests::SESSION;
+    use super::tests::sample_values;
+    use super::*;
+    use crate::BlockResidual;
+
+    fn time_decodes(array: &ArrayRef, iterations: usize) -> VortexResult<f64> {
+        let mut ctx = SESSION.create_execution_ctx();
+        // Warm up once so first-touch costs are excluded.
+        black_box(array.clone().execute::<PrimitiveArray>(&mut ctx)?);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(array.clone().execute::<PrimitiveArray>(&mut ctx)?);
+        }
+        Ok(start.elapsed().as_secs_f64() / iterations as f64)
+    }
+
+    fn time_scalars(array: &ArrayRef, len: usize) -> VortexResult<f64> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let start = Instant::now();
+        let mut checksum = 0u64;
+        for index in (0..len).step_by(7) {
+            checksum =
+                checksum.wrapping_add(u64::try_from(&array.execute_scalar(index, &mut ctx)?)?);
+        }
+        black_box(checksum);
+        Ok(start.elapsed().as_secs_f64())
+    }
+
+    #[test]
+    #[ignore = "manual perf comparison; run with --release --ignored --nocapture"]
+    fn compare_decode_perf() -> VortexResult<()> {
+        let len = 1 << 20;
+        let original = PrimitiveArray::new(Buffer::from(sample_values(len)), Validity::NonNullable);
+        let fused = BlockResidual::from_primitive(original.as_view())?.into_array();
+        let patched = PatchedBlockResidual::from_primitive(original.as_view())?.into_array();
+
+        let iterations = 20;
+        let fused_decode = time_decodes(&fused, iterations)?;
+        let patched_decode = time_decodes(&patched, iterations)?;
+        println!(
+            "full decode ({len} values): fused {:.3} ms, patched-children {:.3} ms ({:+.1}%)",
+            fused_decode * 1e3,
+            patched_decode * 1e3,
+            (patched_decode / fused_decode - 1.0) * 100.0
+        );
+
+        let fused_scalar = time_scalars(&fused, len)?;
+        let patched_scalar = time_scalars(&patched, len)?;
+        println!(
+            "scalar sweep (every 7th): fused {:.3} ms, patched-children {:.3} ms ({:+.1}%)",
+            fused_scalar * 1e3,
+            patched_scalar * 1e3,
+            (patched_scalar / fused_scalar - 1.0) * 100.0
+        );
         Ok(())
     }
 }
