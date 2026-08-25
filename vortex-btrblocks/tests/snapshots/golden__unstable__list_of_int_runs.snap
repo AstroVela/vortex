@@ -3,7 +3,7 @@ source: vortex-btrblocks/tests/golden.rs
 expression: rendered
 ---
 input: list(i32), len=4066, nbytes=81804
-root: vortex.list(list(i32), len=4066) nbytes=10240
+root: vortex.list(list(i32), len=4066) nbytes=6016
   metadata: 
   elements: vortex.runend(i32, len=16384) nbytes=3968
     metadata: offset: 0
@@ -15,15 +15,9 @@ root: vortex.list(list(i32), len=4066) nbytes=10240
       metadata: reference: -49931i32
       encoded: fastlanes.bitpacked(i32, len=1020) nbytes=2176
         metadata: bit_width: 17, offset: 0
-  offsets: fastlanes.blockedfor(u16, len=4067) nbytes=6272
+  offsets: fastlanes.delta(u16, len=4067) nbytes=2048
     metadata: offset: 0
-    encoded: fastlanes.bitpacked(u16, len=4067) nbytes=6264
-      metadata: bit_width: 12, offset: 0
-      patch_indices: vortex.primitive(u16, len=29) nbytes=58
-        metadata: ptype: u16
-      patch_values: vortex.primitive(u16, len=29) nbytes=58
-        metadata: ptype: u16
-      patch_chunk_offsets: vortex.primitive(u8, len=4) nbytes=4
-        metadata: ptype: u8
-    references: vortex.primitive(u16, len=4) nbytes=8
+    bases: vortex.primitive(u16, len=256) nbytes=512
       metadata: ptype: u16
+    deltas: fastlanes.bitpacked(u16, len=4096) nbytes=1536
+      metadata: bit_width: 3, offset: 0
