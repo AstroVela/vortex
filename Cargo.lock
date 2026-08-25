@@ -9758,6 +9758,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
+ "vortex-fastlanes",
  "vortex-session",
 ]
 

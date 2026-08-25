@@ -58,6 +58,8 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
+use vortex_fastlanes::FoR;
+use vortex_fastlanes::bitpack_compress::bitpack_encode_unchecked;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -588,6 +590,7 @@ pub(crate) mod tests {
         let session = array_session();
         crate::initialize(&session);
         initialize_patched(&session);
+        vortex_fastlanes::initialize(&session);
         session
     });
 
@@ -675,16 +678,22 @@ pub(crate) mod tests {
 
     #[test]
     fn compare_size_with_buffer_layout() -> VortexResult<()> {
-        for len in [1024_usize, 10_000, 100_000] {
+        let mut ctx = SESSION.create_execution_ctx();
+        for len in [1024_usize, 10_000, 100_000, 1 << 20] {
             let original =
                 PrimitiveArray::new(Buffer::from(sample_values(len)), Validity::NonNullable);
             let fused = BlockResidual::from_primitive(original.as_view())?.into_array();
-            let patched = PatchedBlockResidual::from_primitive(original.as_view())?.into_array();
+            let patched = PatchedBlockResidual::from_primitive(original.as_view())?;
+            let compressed = compress_patched_children(patched.clone(), &mut ctx)?.into_array();
+            assert_arrays_eq!(compressed.clone(), original, &mut ctx);
             let fused_nbytes = serialized_nbytes(fused)?;
-            let patched_nbytes = serialized_nbytes(patched)?;
+            let patched_nbytes = serialized_nbytes(patched.into_array())?;
+            let compressed_nbytes = serialized_nbytes(compressed)?;
             println!(
-                "len {len}: fused {fused_nbytes} B, patched-children {patched_nbytes} B ({:+.2}%)",
-                (patched_nbytes as f64 / fused_nbytes as f64 - 1.0) * 100.0
+                "len {len}: fused {fused_nbytes} B, patched-children {patched_nbytes} B \
+                 ({:+.2}%), compressed-children {compressed_nbytes} B ({:+.2}%)",
+                (patched_nbytes as f64 / fused_nbytes as f64 - 1.0) * 100.0,
+                (compressed_nbytes as f64 / fused_nbytes as f64 - 1.0) * 100.0
             );
         }
         Ok(())
@@ -735,14 +744,23 @@ mod perf_tests {
         let fused = BlockResidual::from_primitive(original.as_view())?.into_array();
         let patched = PatchedBlockResidual::from_primitive(original.as_view())?.into_array();
 
+        let compressed = {
+            let mut ctx = SESSION.create_execution_ctx();
+            let array = PatchedBlockResidual::from_primitive(original.as_view())?;
+            compress_patched_children(array, &mut ctx)?.into_array()
+        };
         let iterations = 20;
         let fused_decode = time_decodes(&fused, iterations)?;
         let patched_decode = time_decodes(&patched, iterations)?;
+        let compressed_decode = time_decodes(&compressed, iterations)?;
         println!(
-            "full decode ({len} values): fused {:.3} ms, patched-children {:.3} ms ({:+.1}%)",
+            "full decode ({len} values): fused {:.3} ms, patched-children {:.3} ms ({:+.1}%), \
+             compressed-children {:.3} ms ({:+.1}%)",
             fused_decode * 1e3,
             patched_decode * 1e3,
-            (patched_decode / fused_decode - 1.0) * 100.0
+            (patched_decode / fused_decode - 1.0) * 100.0,
+            compressed_decode * 1e3,
+            (compressed_decode / fused_decode - 1.0) * 100.0
         );
 
         let fused_scalar = time_scalars(&fused, len)?;
@@ -755,4 +773,58 @@ mod perf_tests {
         );
         Ok(())
     }
+}
+
+/// Compress the bases and patch-high children with frame-of-reference bit-packing.
+///
+/// This is the recursive-compression step the child layout enables: the same information the
+/// fused layout stores at fixed width becomes `FoR(BitPacked)` trees. Decode and scalar access
+/// keep working through the generic child fallbacks.
+pub fn compress_patched_children(
+    array: PatchedBlockResidualArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PatchedBlockResidualArray> {
+    let view = array.as_view();
+    let validity_child = PatchedBlockResidualSlotsView::from_slots(view.slots())
+        .validity
+        .cloned();
+    let slots = PatchedBlockResidualSlots {
+        validity: validity_child,
+        bases: for_bitpack_u64(view.bases(), ctx)?,
+        patch_indices: view.patch_indices().cloned(),
+        patch_values: view
+            .patch_values()
+            .map(|values| for_bitpack_u64(values, ctx))
+            .transpose()?,
+        patch_chunk_offsets: view.patch_chunk_offsets().cloned(),
+    }
+    .into_slots();
+    Array::try_from_parts(
+        ArrayParts::new(
+            PatchedBlockResidual,
+            array.dtype().clone(),
+            array.len(),
+            view.data().clone(),
+        )
+        .with_slots(slots),
+    )
+}
+
+fn for_bitpack_u64(child: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    // FastLanes packs whole 1024-value chunks, so smaller children only gain padding.
+    if child.len() < 1024 {
+        return Ok(child.clone());
+    }
+    let primitive = child.clone().execute::<PrimitiveArray>(ctx)?;
+    let values = primitive.as_slice::<u64>();
+    let minimum = values.iter().copied().min().unwrap_or(0);
+    let maximum = values.iter().copied().max().unwrap_or(0);
+    let width = u8::try_from(u64::BITS - (maximum - minimum).leading_zeros())
+        .unwrap_or(64)
+        .max(1);
+    let shifted: Buffer<u64> = values.iter().map(|&value| value - minimum).collect();
+    let shifted = PrimitiveArray::new(shifted, primitive.validity()?);
+    // SAFETY: Every shifted value fits in `width` bits by construction.
+    let packed = unsafe { bitpack_encode_unchecked(shifted, width)? };
+    Ok(FoR::try_new(packed.into_array(), Scalar::primitive(minimum, NonNullable))?.into_array())
 }
