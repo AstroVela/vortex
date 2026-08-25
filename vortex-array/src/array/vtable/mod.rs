@@ -187,6 +187,26 @@ pub trait VTable: 'static + Clone + Sized + Send + Sync + Debug {
     /// incorrectly contains null values.
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult>;
 
+    /// Stream the array's decompressed values through `sink` in cache-resident chunks.
+    ///
+    /// See [`chunk_iter`](crate::chunk_iter) for the contract and cost model. The default
+    /// implementation executes the array to canonical and streams the result (the two-pass
+    /// baseline), so this is always possible; encodings should override it to stream chunks
+    /// directly out of their decompression kernel, and wrapper encodings should compose by
+    /// interposing a stack-allocated [`ChunkSink`](crate::chunk_iter::ChunkSink) adapter and
+    /// recursing into their child via
+    /// [`ArrayRef::decompress_chunks`](crate::ArrayRef::decompress_chunks).
+    ///
+    /// The caller guarantees the array is primitive-typed. Implementations must emit contiguous,
+    /// in-order chunks covering exactly `0..len` (checked in debug builds).
+    fn decompress_chunks(
+        array: ArrayView<'_, Self>,
+        ctx: &mut ExecutionCtx,
+        sink: &mut dyn crate::chunk_iter::ChunkSink,
+    ) -> VortexResult<()> {
+        crate::chunk_iter::decompress_chunks_via_canonical(array.array(), ctx, sink)
+    }
+
     /// Attempt to reduce the array to a simpler representation without changing logical values.
     ///
     /// Reductions are opportunistic and may return `Ok(None)` when no cheaper representation is

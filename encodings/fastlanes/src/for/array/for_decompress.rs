@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::ops::Range;
+
 use fastlanes::FoR;
 use num_traits::PrimInt;
 use num_traits::WrappingAdd;
@@ -8,6 +10,8 @@ use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builders::PrimitiveBuilder;
+use vortex_array::chunk_iter::ChunkMut;
+use vortex_array::chunk_iter::ChunkSink;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PhysicalPType;
 use vortex_array::dtype::UnsignedPType;
@@ -135,6 +139,49 @@ pub(crate) fn fused_decompress<
     }
 
     Ok(builder.finish_into_primitive())
+}
+
+/// Streaming chunked decompression for FoR arrays.
+///
+/// FoR composes over any encoded child: each chunk the child streams up is shifted by the
+/// reference value in place (one pass over an L1-resident chunk) and forwarded to the downstream
+/// sink. The adapter lives on this stack frame — no heap state is added on the way down.
+pub(crate) fn decompress_chunks(
+    array: ArrayView<'_, crate::FoR>,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    match_each_integer_ptype!(array.ptype(), |T| {
+        let reference = array
+            .reference_scalar()
+            .as_primitive()
+            .typed_value::<T>()
+            .vortex_expect("reference must be non-null");
+        if reference == 0 {
+            array.encoded().decompress_chunks(ctx, sink)
+        } else {
+            let mut adapter = AddReferenceSink {
+                reference,
+                inner: sink,
+            };
+            array.encoded().decompress_chunks(ctx, &mut adapter)
+        }
+    })
+}
+
+struct AddReferenceSink<'a, T> {
+    reference: T,
+    inner: &'a mut dyn ChunkSink,
+}
+
+impl<T: NativePType + WrappingAdd> ChunkSink for AddReferenceSink<'_, T> {
+    #[inline]
+    fn accept(&mut self, mut chunk: ChunkMut<'_>, row_range: Range<usize>) -> VortexResult<()> {
+        for v in chunk.as_slice_mut::<T>() {
+            *v = v.wrapping_add(&self.reference);
+        }
+        self.inner.accept(chunk, row_range)
+    }
 }
 
 fn decompress_primitive<T: NativePType + WrappingAdd + PrimInt>(

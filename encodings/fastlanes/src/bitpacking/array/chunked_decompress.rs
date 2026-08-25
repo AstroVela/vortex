@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! Streaming chunked decompression for bit-packed arrays.
+//!
+//! This backs [`VTable::decompress_chunks`](vortex_array::vtable::VTable::decompress_chunks) for
+//! [`BitPacked`]: each FastLanes block is unpacked into the decompressor's cache-resident scratch
+//! buffer, patches falling in that block are applied in place, and the block is handed to the
+//! sink — the array is never materialized in full.
+
+use num_traits::AsPrimitive;
+use vortex_array::ArrayView;
+use vortex_array::ExecutionCtx;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::chunk_iter::ChunkMut;
+use vortex_array::chunk_iter::ChunkSink;
+use vortex_array::match_each_integer_ptype;
+use vortex_array::match_each_unsigned_integer_ptype;
+use vortex_error::VortexResult;
+
+use crate::BitPacked;
+use crate::BitPackedArrayExt;
+use crate::unpack_iter::BitPacked as BitPackedUnpack;
+
+pub(crate) fn decompress_chunks(
+    array: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    match_each_integer_ptype!(array.as_ref().dtype().as_ptype(), |T| {
+        decompress_chunks_typed::<T>(array, ctx, sink)
+    })
+}
+
+fn decompress_chunks_typed<T: BitPackedUnpack>(
+    array: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    if array.as_ref().is_empty() {
+        return Ok(());
+    }
+
+    // Patches are sparse: materialize them once as (local row, value) pairs so the per-chunk
+    // loop only advances a cursor. This is the only heap state the streaming path allocates,
+    // and it is proportional to the patch count, not the array length.
+    let patch_list: Vec<(usize, T)> = match array.patches() {
+        None => Vec::new(),
+        Some(patches) => {
+            let indices = patches.indices().clone().execute::<PrimitiveArray>(ctx)?;
+            let values = patches.values().clone().execute::<PrimitiveArray>(ctx)?;
+            let values = values.as_slice::<T>();
+            let offset = patches.offset();
+            match_each_unsigned_integer_ptype!(indices.ptype(), |P| {
+                indices
+                    .as_slice::<P>()
+                    .iter()
+                    .zip(values)
+                    .map(|(&idx, &v)| (<P as AsPrimitive<usize>>::as_(idx) - offset, v))
+                    .collect()
+            })
+        }
+    };
+
+    let mut chunks = array.unpacked_chunks::<T>()?;
+    let mut patch_cursor = 0usize;
+    let mut result = Ok(());
+    chunks.for_each_unpacked_chunk(|chunk, range| {
+        if result.is_err() {
+            return;
+        }
+        while let Some(&(row, value)) = patch_list.get(patch_cursor)
+            && row < range.end
+        {
+            chunk[row - range.start] = value;
+            patch_cursor += 1;
+        }
+        result = sink.accept(ChunkMut::new(chunk), range);
+    });
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::LazyLock;
+
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::chunk_iter::ChunkMut;
+    use vortex_array::dtype::NativePType;
+    use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
+
+    use crate::BitPackedArrayExt;
+    use crate::FoRArraySlotsExt;
+    use crate::FoRData;
+    use crate::bitpack_compress::bitpack_encode;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = vortex_array::array_session();
+        crate::initialize(&session);
+        session
+    });
+
+    fn collect_chunks<T: NativePType>(array: &vortex_array::ArrayRef) -> VortexResult<Vec<T>> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mut out = Vec::with_capacity(array.len());
+        array.decompress_chunks(&mut ctx, &mut |chunk: ChunkMut<'_>,
+                                                 _range: std::ops::Range<usize>|
+         -> VortexResult<()> {
+            out.extend_from_slice(chunk.as_slice::<T>());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn assert_chunks_match_execute<T: NativePType>(
+        array: vortex_array::ArrayRef,
+    ) -> VortexResult<()> {
+        let chunked = collect_chunks::<T>(&array)?;
+        let mut ctx = SESSION.create_execution_ctx();
+        let expected = array.execute::<PrimitiveArray>(&mut ctx)?;
+        assert_eq!(chunked.as_slice(), expected.as_slice::<T>());
+        Ok(())
+    }
+
+    #[test]
+    fn bitpacked_chunks_match_execute() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter((0..5000u32).map(|i| i % 900));
+        let bp = bitpack_encode(&values, 10, None, &mut ctx)?;
+        assert_chunks_match_execute::<u32>(bp.into_array())
+    }
+
+    #[test]
+    fn bitpacked_chunks_with_patches() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter(
+            (0..5000u32).map(|i| if i % 700 == 0 { 100_000 + i } else { i % 900 }),
+        );
+        let bp = bitpack_encode(&values, 10, None, &mut ctx)?;
+        assert!(bp.patches().is_some());
+        assert_chunks_match_execute::<u32>(bp.into_array())
+    }
+
+    #[test]
+    fn bitpacked_chunks_sliced() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter(
+            (0..5000u32).map(|i| if i % 700 == 0 { 100_000 + i } else { i % 900 }),
+        );
+        let bp = bitpack_encode(&values, 10, None, &mut ctx)?.into_array();
+        // Slice crossing chunk boundaries with a non-zero offset.
+        let sliced = bp.slice(517..4013)?;
+        // The slice may no longer be a BitPacked array head, but chunked iteration must still
+        // stream correct values via whatever encodings the slice resolves to.
+        assert_chunks_match_execute::<u32>(sliced)
+    }
+
+    #[test]
+    fn for_over_bitpacked_chunks() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter((0..5000i64).map(|i| 1_000_000 + (i * 7) % 800));
+        let for_array = FoRData::encode(values, &mut ctx)?;
+        assert!(
+            for_array.encoded().as_opt::<crate::BitPacked>().is_some()
+                || for_array
+                    .encoded()
+                    .as_opt::<vortex_array::arrays::Primitive>()
+                    .is_some()
+        );
+        assert_chunks_match_execute::<i64>(for_array.into_array())
+    }
+
+    #[test]
+    fn fallback_primitive_chunks() -> VortexResult<()> {
+        let values = PrimitiveArray::from_iter(0..3000i32).into_array();
+        assert_chunks_match_execute::<i32>(values)
+    }
+
+    #[test]
+    fn empty_array_chunks() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter(Vec::<u32>::new());
+        let bp = bitpack_encode(&values, 0, None, &mut ctx)?;
+        let chunked = collect_chunks::<u32>(&bp.into_array())?;
+        assert!(chunked.is_empty());
+        Ok(())
+    }
+}
