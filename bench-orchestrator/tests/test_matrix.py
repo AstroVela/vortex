@@ -47,6 +47,7 @@ EXPECTED_IDS = {
     "pr-compact": COMPACT_IDS,
     "pr-all": PR_ALL_IDS,
     "pr-full": REGULAR_IDS,
+    "pr-spatial": ("spatialbench-nvme",),
     "nightly": ("tpch-nvme", "tpch-s3"),
 }
 
@@ -76,6 +77,7 @@ def test_pr_target_selection() -> None:
     pr = {entry["id"]: entry for entry in _entries("pr")}
     pr_compact = {entry["id"]: entry for entry in _entries("pr-compact")}
     pr_full = {entry["id"]: entry for entry in _entries("pr-full")}
+    pr_spatial = {entry["id"]: entry for entry in _entries("pr-spatial")}
 
     assert _targets(pr["tpch-nvme"]) == {
         ("datafusion", "parquet"),
@@ -86,6 +88,14 @@ def test_pr_target_selection() -> None:
     assert ("datafusion", "lance") in _targets(develop["tpch-nvme"])
     assert all(("datafusion", "lance") not in _targets(entry) for entry in pr_full.values())
     assert "vortex-compact" in cast("list[str]", pr_full["clickbench-nvme"]["data_formats"])
+    assert _targets(pr_spatial["spatialbench-nvme"]) == {
+        ("datafusion", "parquet"),
+        ("datafusion", "vortex"),
+        ("duckdb", "parquet"),
+        ("duckdb", "vortex"),
+        ("duckdb", "vortex-spatial-native"),
+    }
+    assert pr_spatial["spatialbench-nvme"]["exclude_queries"] == "5,7,9"
     for entry in pr_compact.values():
         targets = _targets(entry)
         assert {file_format for _engine, file_format in targets} == {"parquet", "vortex-compact"}

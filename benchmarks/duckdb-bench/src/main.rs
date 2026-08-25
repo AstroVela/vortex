@@ -111,8 +111,9 @@ fn main() -> anyhow::Result<()> {
 
     let benchmark = create_benchmark(args.benchmark, &opts)?;
 
+    let query_corpus = benchmark.query_corpus(Engine::DuckDB)?;
     let filtered_queries = filter_queries(
-        benchmark.queries()?,
+        query_corpus,
         args.queries.as_ref(),
         args.exclude_queries.as_ref(),
     );

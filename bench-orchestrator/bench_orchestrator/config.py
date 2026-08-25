@@ -83,11 +83,10 @@ ENGINE_FORMATS: dict[Engine, list[Format]] = {
     Engine.LANCE: [Format.LANCE],
 }
 
-# Engines each benchmark can run on. Benchmarks default to *every* engine; list one here only to
-# restrict it. SpatialBench's queries use DuckDB-specific `ST_*` spatial SQL that DataFusion has no
-# functions for yet.
+# Engines each benchmark can run on. Benchmarks default to every engine. Add an entry only to
+# restrict a benchmark.
 BENCHMARK_ENGINES: dict[Benchmark, frozenset[Engine]] = {
-    Benchmark.SPATIALBENCH: frozenset({Engine.DUCKDB}),
+    Benchmark.SPATIALBENCH: frozenset({Engine.DATAFUSION, Engine.DUCKDB}),
 }
 
 

@@ -3,7 +3,6 @@
 
 //! SpatialBench benchmark implementation
 
-use std::fs;
 use std::path::Path;
 
 use url::Url;
@@ -13,6 +12,7 @@ use crate::BenchmarkDataset;
 use crate::Engine;
 use crate::Format;
 use crate::TableSpec;
+use crate::benchmark::read_query_file;
 use crate::spatialbench::datagen;
 use crate::spatialbench::datagen::Table;
 use crate::utils::file::resolve_data_url;
@@ -62,22 +62,15 @@ impl Benchmark for SpatialBenchBenchmark {
         "vortex-bench/sql/spatialbench.md"
     }
 
-    /// All SpatialBench queries, numbered started at Q1 in `spatialbench.sql` file order.
+    /// All SpatialBench queries, numbered from Q1 in `spatialbench/duckdb.sql` file order.
     fn queries(&self) -> anyhow::Result<Vec<(usize, String)>> {
-        // `;`-separated; a `;` must not appear in a comment, or it would split a statement in two.
-        let queries_file = workspace_root()
-            .join("vortex-bench")
-            .join("sql")
-            .join("spatialbench")
-            .with_extension("sql");
-        let contents = fs::read_to_string(queries_file)?;
-        Ok(contents
-            .split_terminator(';')
-            .map(str::trim)
-            .filter(|stmt| !stmt.is_empty())
-            .enumerate()
-            .map(|(idx, stmt)| (idx + 1, stmt.to_string()))
-            .collect())
+        read_query_file(
+            &workspace_root()
+                .join("vortex-bench")
+                .join("sql")
+                .join("spatialbench")
+                .join("duckdb.sql"),
+        )
     }
 
     async fn generate_base_data(&self) -> anyhow::Result<()> {
@@ -203,4 +196,23 @@ fn zone_parquet_present(parquet_dir: &Path) -> bool {
     glob::glob(&parquet_dir.join("zone_*.parquet").to_string_lossy())
         .map(|mut paths| paths.next().is_some())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_engine_query_corpora() -> anyhow::Result<()> {
+        let benchmark = SpatialBenchBenchmark::new("0.6".to_string(), None)?;
+
+        let duckdb = benchmark.query_corpus(Engine::DuckDB)?;
+        let datafusion = benchmark.query_corpus(Engine::DataFusion)?;
+
+        assert_eq!(duckdb.len(), 12);
+        assert_eq!(datafusion.len(), 12);
+        assert!(duckdb[0].1.contains("ST_X(t.t_pickuploc)"));
+        assert!(datafusion[0].1.contains("ST_GeomFromWKB"));
+        Ok(())
+    }
 }

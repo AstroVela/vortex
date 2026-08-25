@@ -29,6 +29,7 @@ on:
           - "pr-compact"
           - "pr-all"
           - "pr-full"
+          - "pr-spatial"
 
 permissions:
   contents: read

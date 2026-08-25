@@ -24,6 +24,7 @@ class Coverage:
 
     targets: TargetSet
     data_formats: tuple[Format, ...] | None = None
+    exclude_queries: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

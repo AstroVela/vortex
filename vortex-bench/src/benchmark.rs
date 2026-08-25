@@ -3,6 +3,7 @@
 
 //! Core benchmark trait and types.
 
+use std::fs;
 use std::path::Path;
 
 use arrow_schema::Schema;
@@ -12,6 +13,18 @@ use url::Url;
 use crate::BenchmarkDataset;
 use crate::Engine;
 use crate::Format;
+use crate::workspace_root;
+
+pub(crate) fn read_query_file(path: &Path) -> anyhow::Result<Vec<(usize, String)>> {
+    let contents = fs::read_to_string(path)?;
+    Ok(contents
+        .split_terminator(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .enumerate()
+        .map(|(index, statement)| (index + 1, statement.to_owned()))
+        .collect())
+}
 
 /// Specification for a table in a benchmark dataset.
 #[derive(Debug)]
@@ -34,6 +47,22 @@ impl TableSpec {
 pub trait Benchmark: Send + Sync {
     /// Get all available queries for this benchmark
     fn queries(&self) -> anyhow::Result<Vec<(usize, String)>>;
+
+    /// Get the equivalent query corpus for one engine dialect.
+    ///
+    /// If `vortex-bench/sql/<benchmark>/<engine>.sql` exists, this method loads that file.
+    /// Otherwise, it uses the benchmark's default queries.
+    fn query_corpus(&self, engine: Engine) -> anyhow::Result<Vec<(usize, String)>> {
+        let engine_queries = workspace_root()
+            .join("vortex-bench")
+            .join("sql")
+            .join(self.dataset_name())
+            .join(format!("{engine}.sql"));
+        if engine_queries.try_exists()? {
+            return read_query_file(&engine_queries);
+        }
+        self.queries()
+    }
 
     /// SQL an `engine` must run before this benchmark's queries (e.g. loading engine
     /// extensions). Runners replay these after every (re)open. Default: none.

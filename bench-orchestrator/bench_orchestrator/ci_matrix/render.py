@@ -42,6 +42,8 @@ def _matrix_entry(benchmark: BenchmarkCase, coverage: Coverage) -> dict[str, obj
         entry["local_dir"] = benchmark.local_dir
     if benchmark.remote_key is not None:
         entry["remote_key"] = benchmark.remote_key
+    if coverage.exclude_queries:
+        entry["exclude_queries"] = ",".join(str(query) for query in coverage.exclude_queries)
     return entry
 
 
