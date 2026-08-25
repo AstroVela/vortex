@@ -318,3 +318,41 @@ fn two_pass_sum_patched_constant(bencher: Bencher) {
             black_box(total)
         });
 }
+
+/// Sparse decompression baseline: `execute` on Patched(Constant) canonicalizes the constant into
+/// a full-length buffer, then scatters the sparse patches over it — one full-buffer write pass
+/// plus sparse writes, materializing the array.
+#[divan::bench]
+fn sparse_decompress_patched_constant(bencher: Bencher) {
+    let array = make_patched_constant();
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            let primitive = array
+                .execute::<PrimitiveArray>(&mut ctx)
+                .vortex_expect("bench");
+            black_box(primitive.len())
+        });
+}
+
+/// Materialize Patched(Constant) through the chunked path: splat the constant into an 8KB
+/// scratch, patch it, and copy each chunk out to the destination buffer.
+#[divan::bench]
+fn chunked_decompress_into_patched_constant(bencher: Bencher) {
+    let array = make_patched_constant();
+    bencher
+        .with_inputs(|| {
+            (
+                array.clone(),
+                SESSION.create_execution_ctx(),
+                Vec::<u32>::with_capacity(LEN),
+            )
+        })
+        .bench_values(|(array, mut ctx, mut out)| {
+            let mut sink = WriteSink { out: &mut out };
+            array
+                .decompress_chunks(&mut ctx, &mut sink)
+                .vortex_expect("bench");
+            black_box(out.len())
+        });
+}
