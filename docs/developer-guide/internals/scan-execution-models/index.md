@@ -30,6 +30,12 @@ morsel-reactor
 scheduler-visible-work
 morsel-reactor-ideas
 self-paced-plan-exec-experiment
+self-paced-executor-tutorial
+self-paced-executor-reference
+self-paced-plan-exec-findings
+self-paced-plan-exec-handover
+self-paced-plan-exec-learnings
+scan-execution-framework
 self-paced-implementation-plan
 self-paced-review
 ```
