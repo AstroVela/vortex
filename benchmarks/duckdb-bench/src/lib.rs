@@ -131,7 +131,10 @@ impl DuckClient {
         // extension is loaded after the connection is established.
         connection.query("SET parquet_metadata_cache = true")?;
 
+        // this allows collecting LATENCY metric after query
         connection.query("PRAGMA enable_profiling = 'no_output'")?;
+        // this allows collecting metrics specifically for Vortex
+        connection.query("PRAGMA profiling_coverage = 'all'")?;
 
         Ok((db, connection))
     }
