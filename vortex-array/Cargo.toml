@@ -297,3 +297,7 @@ harness = false
 [[bench]]
 name = "slice_dict_primitive"
 harness = false
+
+[[bench]]
+name = "serde_buffer_vs_child"
+harness = false
