@@ -7,8 +7,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use futures::FutureExt;
+use futures::StreamExt as _;
+use futures::stream;
 use object_store::registry::ObjectStoreRegistry;
 use url::Url;
+use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute as _;
 use vortex::array::arrays::struct_::StructArrayExt as _;
 use vortex::cloud::Registry;
@@ -97,6 +100,8 @@ pub struct OpenFileReader {
     pub splits: Vec<Split>,
     pub cache: ConversionCache,
     total_splits: usize,
+    /// Whether split results must be emitted in file order.
+    ordered: bool,
 }
 
 impl OpenFileReader {
@@ -110,6 +115,7 @@ impl OpenFileReader {
             cache: ConversionCache::default(),
             splits: vec![],
             total_splits: 0,
+            ordered: false,
         })
     }
 
@@ -183,19 +189,52 @@ pub fn reader_initialize(file: &mut OpenFileReader, global: &GlobalState) -> Vor
     splits.reverse();
     file.total_splits = splits.len();
     file.splits = splits;
+    file.ordered = ordered;
     Ok(false)
 }
+
+/// Number of splits a single thread drives concurrently, overlapping the IO
+/// of the next split with the decode/export of the current one.
+pub const SPLITS_PER_SCAN: usize = 2;
 
 /// Called by all threads under global lock. If this function returns true,
 /// thread calls reader_scan on this file. If this function returns false,
 /// duckdb thinks file is exhausted, closes the file, and the first thread to
 /// get "false" switches to next file.
+///
+/// Takes up to [`SPLITS_PER_SCAN`] splits at once; reader_scan runs them
+/// concurrently so IO for the second split overlaps work on the first.
 pub fn reader_try_initialize_scan(file: &mut OpenFileReader, local: &mut LocalState) -> bool {
-    let Some(split) = file.splits.pop() else {
+    let take = SPLITS_PER_SCAN.min(file.splits.len());
+    if take == 0 {
         return false;
-    };
-    local.split = Some(split);
+    }
+    let splits = file.splits.split_off(file.splits.len() - take);
+    // file.splits is stored in inverse order, so restore scan order
+    let splits = stream::iter(splits.into_iter().rev());
+    // With a file_row_number column output order matters, so preserve split
+    // order; otherwise emit whichever split finishes first.
+    local.splits = Some(if file.ordered {
+        splits.buffered(SPLITS_PER_SCAN).boxed()
+    } else {
+        splits.buffer_unordered(SPLITS_PER_SCAN).boxed()
+    });
     true
+}
+
+/// Pull the next completed split result from the local split stream. Returns
+/// `None` when all splits taken by this thread are exhausted.
+fn next_split_array(local: &mut LocalState) -> VortexResult<Option<Option<ArrayRef>>> {
+    let Some(splits) = local.splits.as_mut() else {
+        return Ok(None);
+    };
+    match RUNTIME.block_on(splits.next()) {
+        Some(result) => Ok(Some(result?)),
+        None => {
+            local.splits = None;
+            Ok(None)
+        }
+    }
 }
 
 /// Called by all threads operating on a file without locks. If this function
@@ -212,10 +251,10 @@ pub fn reader_scan(
     }
 
     if local.exporter.is_none() {
-        let Some(split) = local.split.take() else {
+        let Some(array) = next_split_array(local)? else {
             return Ok(false);
         };
-        let Some(array) = RUNTIME.block_on(split)? else {
+        let Some(array) = array else {
             // split is filtered
             return Ok(true);
         };
@@ -233,10 +272,10 @@ pub fn reader_scan(
 }
 
 fn reader_scan_aggregate(global: &GlobalState, local: &mut LocalState) -> VortexResult<bool> {
-    let Some(split) = local.split.take() else {
+    let Some(array) = next_split_array(local)? else {
         return Ok(false);
     };
-    let Some(array) = RUNTIME.block_on(split)? else {
+    let Some(array) = array else {
         // split is filtered
         return Ok(true);
     };
