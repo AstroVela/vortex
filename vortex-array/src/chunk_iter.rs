@@ -230,3 +230,72 @@ fn stream_slice_chunks<T: NativePType>(values: &[T], sink: &mut dyn ChunkSink) -
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::buffer;
+
+    use super::*;
+    use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
+    use crate::arrays::ConstantArray;
+    use crate::arrays::Patched;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::patches::Patches;
+    use crate::scalar::Scalar;
+
+    fn collect_chunks<T: NativePType>(array: &ArrayRef) -> VortexResult<Vec<T>> {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut out = Vec::with_capacity(array.len());
+        array.decompress_chunks(&mut ctx, &mut |chunk: ChunkMut<'_>,
+                                                 _range: Range<usize>|
+         -> VortexResult<()> {
+            out.extend_from_slice(chunk.as_slice::<T>());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    #[test]
+    fn constant_chunks() -> VortexResult<()> {
+        // Length deliberately not a multiple of the chunk size.
+        let array = ConstantArray::new(7i32, 2500).into_array();
+        let chunked = collect_chunks::<i32>(&array)?;
+        assert_eq!(chunked, vec![7i32; 2500]);
+        Ok(())
+    }
+
+    #[test]
+    fn null_constant_chunks_cover_length() -> VortexResult<()> {
+        let array = ConstantArray::new(
+            Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable)),
+            100,
+        )
+        .into_array();
+        // Values are unspecified for nulls; only coverage matters (checked in debug builds too).
+        let chunked = collect_chunks::<i32>(&array)?;
+        assert_eq!(chunked.len(), 100);
+        Ok(())
+    }
+
+    #[test]
+    fn patched_over_constant_chunks() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let inner = ConstantArray::new(0u16, 2500).into_array();
+        let patches = Patches::new(
+            2500,
+            0,
+            buffer![1u32, 1023, 1024, 2047, 2499].into_array(),
+            buffer![11u16, 22, 33, 44, 55].into_array(),
+            None,
+        )?;
+        let array = Patched::from_array_and_patches(inner, &patches, &mut ctx)?.into_array();
+
+        let chunked = collect_chunks::<u16>(&array)?;
+        let expected = array.execute::<PrimitiveArray>(&mut ctx)?;
+        assert_eq!(chunked.as_slice(), expected.as_slice::<u16>());
+        Ok(())
+    }
+}

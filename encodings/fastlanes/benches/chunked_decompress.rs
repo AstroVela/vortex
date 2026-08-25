@@ -264,3 +264,57 @@ fn fused_decompress(bencher: Bencher) {
             black_box(primitive.len())
         });
 }
+
+/// Patched(Constant): the base never materializes — Constant re-emits one L1-resident scratch
+/// chunk and Patched's sink adapter overwrites the sparse patch rows per chunk.
+fn make_patched_constant() -> ArrayRef {
+    let mut ctx = SESSION.create_execution_ctx();
+    let inner = vortex_array::arrays::ConstantArray::new(42u32, LEN).into_array();
+    let n_patches = LEN / 1000;
+    let patches = vortex_array::patches::Patches::new(
+        LEN,
+        0,
+        PrimitiveArray::from_iter((0..n_patches as u64).map(|i| i * 1000)).into_array(),
+        PrimitiveArray::from_iter(
+            (0..n_patches as u64).map(|i| u32::try_from(i % 90_000).vortex_expect("fits")),
+        )
+        .into_array(),
+        None,
+    )
+    .vortex_expect("bench");
+    vortex_array::arrays::Patched::from_array_and_patches(inner, &patches, &mut ctx)
+        .vortex_expect("bench")
+        .into_array()
+}
+
+#[divan::bench]
+fn chunked_vtable_sum_patched_constant(bencher: Bencher) {
+    let array = make_patched_constant();
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            let mut sink = SumSink { total: 0 };
+            array
+                .decompress_chunks(&mut ctx, &mut sink)
+                .vortex_expect("bench");
+            black_box(sink.total)
+        });
+}
+
+#[divan::bench]
+fn two_pass_sum_patched_constant(bencher: Bencher) {
+    let array = make_patched_constant();
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            let primitive = array
+                .execute::<PrimitiveArray>(&mut ctx)
+                .vortex_expect("bench");
+            let total: u64 = primitive
+                .as_slice::<u32>()
+                .iter()
+                .map(|&v| v as u64)
+                .fold(0, u64::wrapping_add);
+            black_box(total)
+        });
+}
