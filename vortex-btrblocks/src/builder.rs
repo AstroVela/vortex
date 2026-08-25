@@ -26,8 +26,8 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Integer schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    // NOTE: FoR must precede BitPacking to avoid unnecessary patches.
-    &integer::FoRScheme,
+    // NOTE: BlockedFoR must precede BitPacking to avoid unnecessary patches.
+    &integer::BlockedFoRScheme,
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
     &integer::BitPackingScheme,
@@ -170,6 +170,9 @@ impl BtrBlocksCompressorBuilder {
             allow(unused_mut)
         )]
         let mut excluded: Vec<SchemeId> = vec![
+            // BlockedFoR has no CUDA decode kernel; plain FoR is restored below so integer
+            // columns still get a frame of reference.
+            integer::BlockedFoRScheme.id(),
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
             float::ALPRDScheme.id(),
@@ -184,7 +187,9 @@ impl BtrBlocksCompressorBuilder {
         excluded.push(integer::DeltaScheme::default().id());
         #[cfg(feature = "pco")]
         excluded.extend([integer::PcoScheme.id(), float::PcoScheme.id()]);
-        let builder = self.exclude_schemes(excluded);
+        let builder = self
+            .exclude_schemes(excluded)
+            .with_new_scheme(&integer::FoRScheme);
 
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
         let builder = builder.with_new_scheme(&binary::ZstdBuffersScheme);
@@ -220,6 +225,7 @@ impl BtrBlocksCompressorBuilder {
 #[cfg(test)]
 mod tests {
     use vortex_array::VTable;
+    use vortex_fastlanes::BlockedFoR;
     use vortex_fastlanes::FoR;
 
     use super::*;
@@ -238,10 +244,10 @@ mod tests {
 
     #[test]
     fn retain_allowed_encodings_filters_schemes() {
-        let allowed: HashSet<ArrayId> = [FoR.id()].into_iter().collect();
+        let allowed: HashSet<ArrayId> = [BlockedFoR.id(), FoR.id()].into_iter().collect();
         let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
         assert_eq!(builder.schemes.len(), 1);
-        assert_eq!(builder.schemes[0].id(), integer::FoRScheme.id());
+        assert_eq!(builder.schemes[0].id(), integer::BlockedFoRScheme.id());
 
         let none = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&HashSet::new());
         assert!(none.schemes.is_empty());
@@ -265,6 +271,23 @@ mod tests {
                 .schemes
                 .iter()
                 .any(|s| s.id() == float::ALPRDScheme.id())
+        );
+    }
+
+    #[test]
+    fn cuda_compatible_swaps_blocked_for_for_global_for() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        assert!(
+            !builder
+                .schemes
+                .iter()
+                .any(|s| s.id() == integer::BlockedFoRScheme.id())
+        );
+        assert!(
+            builder
+                .schemes
+                .iter()
+                .any(|s| s.id() == integer::FoRScheme.id())
         );
     }
 

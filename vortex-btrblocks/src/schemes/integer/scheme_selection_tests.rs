@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Constant;
@@ -21,6 +22,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::BlockedFoR;
 use vortex_fastlanes::FoR;
 use vortex_runend::RunEnd;
 use vortex_sequence::Sequence;
@@ -42,7 +44,40 @@ fn test_constant_compressed() -> VortexResult<()> {
 
 #[test]
 fn test_for_compressed() -> VortexResult<()> {
+    // Fewer than 1024 values, so the blocked scheme falls back to a single global reference.
     let values: Vec<i32> = (0..1000).map(|i| 1_000_000 + ((i * 37) % 100)).collect();
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
+    let btr = BtrBlocksCompressor::default();
+    let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+    assert!(compressed.is::<FoR>());
+    Ok(())
+}
+
+/// Values that stay tightly clustered within each 1024-value block but drift far apart over the
+/// array: the shape a single global reference cannot capture.
+fn drifting_values(len: i64) -> ArrayRef {
+    let values: Vec<i64> = (0..len)
+        .map(|i| 1_000_000 + (i / 1024) * 1_000_000 + ((i * 7919) % 101))
+        .collect();
+    PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array()
+}
+
+#[test]
+fn test_blocked_for_compressed() -> VortexResult<()> {
+    let btr = BtrBlocksCompressor::default();
+    let compressed = btr.compress(
+        &drifting_values(16_384),
+        &mut SESSION.create_execution_ctx(),
+    )?;
+    assert!(compressed.is::<BlockedFoR>());
+    Ok(())
+}
+
+/// Per-block references cost more than they save when every block spans the same range as the
+/// whole array, so the scheme must fall back to a single global reference.
+#[test]
+fn test_blocked_for_falls_back_to_global_for() -> VortexResult<()> {
+    let values: Vec<i32> = (0..16_384).map(|i| 1_000_000 + ((i * 37) % 100)).collect();
     let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
     let btr = BtrBlocksCompressor::default();
     let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
@@ -197,7 +232,7 @@ fn test_delta_compressed() -> VortexResult<()> {
 
 /// Returns true if any `Delta` array appears below an ancestor `Delta` in the tree.
 #[cfg(feature = "unstable_encodings")]
-fn has_nested_delta(array: &vortex_array::ArrayRef, under_delta: bool) -> bool {
+fn has_nested_delta(array: &ArrayRef, under_delta: bool) -> bool {
     use vortex_fastlanes::Delta;
 
     let is_delta = array.is::<Delta>();
