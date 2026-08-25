@@ -11,6 +11,7 @@ use std::time::Instant;
 use anyhow::Result;
 use tracing::trace;
 use vortex::error::VortexExpect;
+use vortex::error::vortex_err;
 use vortex_bench::Benchmark;
 use vortex_bench::Format;
 use vortex_bench::IdempotentPath;
@@ -130,6 +131,8 @@ impl DuckClient {
         // extension is loaded after the connection is established.
         connection.query("SET parquet_metadata_cache = true")?;
 
+        connection.query("PRAGMA enable_profiling = 'no_output'")?;
+
         Ok((db, connection))
     }
 
@@ -179,21 +182,6 @@ impl DuckClient {
         })
     }
 
-    /// Execute DuckDB queries for benchmarks using the internal connection.
-    /// Returns `(row_count, optional_timing)` where `optional_timing` is the query's
-    /// internal execution time if available.
-    pub fn execute_query(&self, query: &str) -> Result<(usize, Option<Duration>)> {
-        trace!("execute duckdb query: {query}");
-        let time_instant = Instant::now();
-        let result = self.connection().query(query)?;
-        let query_time = time_instant.elapsed();
-
-        let row_count = usize::try_from(result.row_count()).vortex_expect("row count overflow");
-
-        // TODO: Extract DuckDB's internal timing from profiling info if available
-        Ok((row_count, Some(query_time)))
-    }
-
     /// Register tables for benchmarks using the internal connection.
     pub fn register_tables<B: Benchmark + ?Sized>(
         &self,
@@ -239,13 +227,22 @@ impl DuckClient {
         Ok(())
     }
 
-    /// Execute a query and return a `DuckQueryResult` wrapper.
+    /// Execute a query
+    pub fn execute_query(&self, query: &str) -> Result<()> {
+        trace!("execute duckdb query: {query}");
+        self.connection().query(query)?;
+        Ok(())
+    }
+
+    /// Execute a query and return its result with query duration
     pub fn execute_query_result(&self, query: &str) -> Result<(Option<Duration>, DuckQueryResult)> {
         trace!("execute duckdb query: {query}");
-        let time_instant = Instant::now();
         let result = self.connection().query(query)?;
-        let query_time = time_instant.elapsed();
-        Ok((Some(query_time), DuckQueryResult(result)))
+        let time = self
+            .connection()
+            .last_query_latency()
+            .ok_or_else(|| anyhow::anyhow!("no query latency"))?;
+        Ok((Some(time), DuckQueryResult(result)))
     }
 }
 

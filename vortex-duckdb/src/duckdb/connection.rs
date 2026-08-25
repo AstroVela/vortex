@@ -3,13 +3,16 @@
 
 use std::ffi::CStr;
 use std::ptr;
+use std::time::Duration;
 
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 
 use crate::cpp;
 use crate::duckdb::DatabaseRef;
+use crate::duckdb::ExtractedValue;
 use crate::duckdb::QueryResult;
+use crate::duckdb::Value;
 use crate::duckdb_try;
 use crate::lifetime_wrapper;
 
@@ -57,6 +60,28 @@ impl ConnectionRef {
 
         Ok(unsafe { QueryResult::new(result) })
     }
+
+    /// Last query's wall clock time or None if profiling was disabled.
+    pub fn last_query_latency(&self) -> Option<Duration> {
+        let info = unsafe { cpp::duckdb_get_profiling_info(self.as_ptr()) };
+        if info.is_null() {
+            return None;
+        }
+        let value = unsafe { cpp::duckdb_profiling_info_get_value(info, c"LATENCY".as_ptr()) };
+        if value.is_null() {
+            return None;
+        }
+        let value = unsafe { Value::own(value) };
+
+        let ExtractedValue::Varchar(seconds) = value.extract() else {
+            return None;
+        };
+        seconds
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .map(Duration::from_secs_f64)
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +108,23 @@ mod tests {
         let conn = test_connection().unwrap();
         let result = conn.query("SELECT 1");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_last_query_latency() {
+        let conn = test_connection().unwrap();
+        assert!(
+            conn.last_query_latency().is_none(),
+            "no latency before profiling is enabled"
+        );
+
+        conn.query("PRAGMA enable_profiling = 'no_output'").unwrap();
+        conn.query("SELECT count(*) FROM range(1000000)").unwrap();
+
+        let latency = conn
+            .last_query_latency()
+            .expect("LATENCY metric available once profiling is on");
+        assert!(latency > Duration::ZERO);
     }
 
     #[test]
