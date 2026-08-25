@@ -26,8 +26,13 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Integer schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    // NOTE: BlockedFoR must precede BitPacking to avoid unnecessary patches.
+    // NOTE: frame-of-reference schemes must precede BitPacking to avoid unnecessary patches.
+    // BlockedFoR is a `preview` edition encoding, so it is only writable when the session
+    // enables that family. Keep the scheme out of the default set otherwise: selecting an
+    // encoding the writer cannot serialize fails the write outright.
+    #[cfg(feature = "unstable_encodings")]
     &integer::BlockedFoRScheme,
+    &integer::FoRScheme,
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
     &integer::BitPackingScheme,
@@ -170,9 +175,6 @@ impl BtrBlocksCompressorBuilder {
             allow(unused_mut)
         )]
         let mut excluded: Vec<SchemeId> = vec![
-            // BlockedFoR has no CUDA decode kernel; plain FoR is restored below so integer
-            // columns still get a frame of reference.
-            integer::BlockedFoRScheme.id(),
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
             float::ALPRDScheme.id(),
@@ -182,14 +184,16 @@ impl BtrBlocksCompressorBuilder {
             binary::BinaryDictScheme.id(),
         ];
         // Delta has no GPU decode kernel and its prefix-sum decode is inherently sequential, so it
-        // is incompatible with pure-GPU decompression paths.
+        // is incompatible with pure-GPU decompression paths. BlockedFoR likewise has no kernel;
+        // plain FoR stays in the set, so integer columns keep a frame of reference.
         #[cfg(feature = "unstable_encodings")]
-        excluded.push(integer::DeltaScheme::default().id());
+        excluded.extend([
+            integer::DeltaScheme::default().id(),
+            integer::BlockedFoRScheme.id(),
+        ]);
         #[cfg(feature = "pco")]
         excluded.extend([integer::PcoScheme.id(), float::PcoScheme.id()]);
-        let builder = self
-            .exclude_schemes(excluded)
-            .with_new_scheme(&integer::FoRScheme);
+        let builder = self.exclude_schemes(excluded);
 
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
         let builder = builder.with_new_scheme(&binary::ZstdBuffersScheme);
@@ -246,11 +250,23 @@ mod tests {
     fn retain_allowed_encodings_filters_schemes() {
         let allowed: HashSet<ArrayId> = [BlockedFoR.id(), FoR.id()].into_iter().collect();
         let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
-        assert_eq!(builder.schemes.len(), 1);
-        assert_eq!(builder.schemes[0].id(), integer::BlockedFoRScheme.id());
+        let ids: Vec<_> = builder.schemes.iter().map(|s| s.id()).collect();
+        assert!(ids.contains(&integer::FoRScheme.id()));
+        #[cfg(feature = "unstable_encodings")]
+        assert!(ids.contains(&integer::BlockedFoRScheme.id()));
 
         let none = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&HashSet::new());
         assert!(none.schemes.is_empty());
+    }
+
+    /// A policy that permits `fastlanes.for` but not `fastlanes.blockedfor` — every core edition
+    /// today — must keep a frame of reference rather than losing it with the blocked scheme.
+    #[test]
+    fn retain_allowed_encodings_keeps_global_for_without_blocked() {
+        let allowed: HashSet<ArrayId> = [FoR.id()].into_iter().collect();
+        let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
+        let ids: Vec<_> = builder.schemes.iter().map(|s| s.id()).collect();
+        assert_eq!(ids, vec![integer::FoRScheme.id()]);
     }
 
     #[test]
@@ -274,8 +290,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unstable_encodings")]
     #[test]
-    fn cuda_compatible_swaps_blocked_for_for_global_for() {
+    fn cuda_compatible_excludes_blocked_for_but_keeps_global_for() {
         let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
         assert!(
             !builder

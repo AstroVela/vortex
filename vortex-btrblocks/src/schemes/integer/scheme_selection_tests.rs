@@ -55,6 +55,7 @@ fn test_for_compressed() -> VortexResult<()> {
 
 /// Values that stay tightly clustered within each 1024-value block but drift far apart over the
 /// array: the shape a single global reference cannot capture.
+#[cfg_attr(not(feature = "unstable_encodings"), expect(dead_code))]
 fn drifting_values(len: i64) -> ArrayRef {
     let values: Vec<i64> = (0..len)
         .map(|i| 1_000_000 + (i / 1024) * 1_000_000 + ((i * 7919) % 101))
@@ -62,6 +63,7 @@ fn drifting_values(len: i64) -> ArrayRef {
     PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array()
 }
 
+#[cfg(feature = "unstable_encodings")]
 #[test]
 fn test_blocked_for_compressed() -> VortexResult<()> {
     let btr = BtrBlocksCompressor::default();
@@ -74,7 +76,7 @@ fn test_blocked_for_compressed() -> VortexResult<()> {
 }
 
 /// Per-block references cost more than they save when every block spans the same range as the
-/// whole array, so the scheme must fall back to a single global reference.
+/// whole array, so the blocked scheme must stand aside and let global FoR take the array.
 #[test]
 fn test_blocked_for_falls_back_to_global_for() -> VortexResult<()> {
     let values: Vec<i32> = (0..16_384).map(|i| 1_000_000 + ((i * 37) % 100)).collect();

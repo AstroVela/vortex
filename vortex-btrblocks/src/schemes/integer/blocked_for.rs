@@ -23,11 +23,9 @@ use vortex_error::VortexResult;
 use vortex_fastlanes::BLOCK_SIZE;
 use vortex_fastlanes::BlockedFoR;
 use vortex_fastlanes::BlockedFoRArraySlotsExt;
-use vortex_fastlanes::FoR;
 use vortex_fastlanes::block_summary;
 
 use super::BitPackingScheme;
-use super::FoRScheme;
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
@@ -59,9 +57,7 @@ impl Scheme for BlockedFoRScheme {
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
-        // Arrays that fit in a single block fall back to `FoR`, which holds its one reference in
-        // metadata rather than in a child array.
-        vec![BlockedFoR.id(), FoR.id()]
+        vec![BlockedFoR.id()]
     }
 
     fn num_children(&self) -> usize {
@@ -127,20 +123,15 @@ impl Scheme for BlockedFoRScheme {
         #[expect(clippy::cast_precision_loss, reason = "estimate only")]
         let reference_bits = (num_blocks * full_width as usize) as f64 / len as f64;
 
-        // `compress` falls back to a single global reference whenever per-block references buy
-        // no bits, so the estimate has to price whichever of the two it will actually produce.
-        // `blocked_bits == 0` means every block is constant: RunEnd and RLE model that shape
-        // better, so leave it to the global path rather than packing zero-width residuals.
-        let use_blocked = blocked_bits > 0 && blocked_bits < global_bits && !blocks.all_minima_zero;
-        let effective_bits = if use_blocked {
-            f64::from(blocked_bits) + reference_bits
-        } else {
-            // Global FoR is a no-op when the minimum is already zero.
-            if stats.erased().min_is_zero() {
-                return CompressionEstimate::Verdict(EstimateVerdict::Skip);
-            }
-            f64::from(global_bits)
-        };
+        // Per-block references only pay off when they narrow the residuals. Where they don't,
+        // skip and let `FoRScheme` take the array with a single global reference — this scheme
+        // must never stand in for it, or an encoding policy that forbids `BlockedFoR` would
+        // drop frame of reference altogether. `blocked_bits == 0` means every block is
+        // constant, a shape RunEnd and RLE model better than zero-width residuals.
+        if blocked_bits == 0 || blocked_bits >= global_bits || blocks.all_minima_zero {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+        let effective_bits = f64::from(blocked_bits) + reference_bits;
 
         if let Some(max_log) = stats
             .erased()
@@ -166,24 +157,6 @@ impl Scheme for BlockedFoRScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        // A single-block array has exactly one reference, so blocked FoR degenerates to FoR —
-        // but pays for a child array where FoR pays for a metadata scalar. Use FoR instead.
-        if data.array_len() <= BLOCK_SIZE {
-            return FoRScheme.compress(compressor, data, compress_ctx, exec_ctx);
-        }
-
-        // Per-block references only pay off if they narrow the residuals. When they don't —
-        // data with no local clustering, or a range that rounds to the same bit width — a
-        // single global reference gives the same packing without the reference array.
-        let global_bits = bits_for(u128::from(
-            data.integer_stats(exec_ctx).erased().max_minus_min(),
-        ));
-        let blocked_bits = block_summary(data.array_as_primitive(), exec_ctx)
-            .map_or(global_bits, |blocks| bits_for(blocks.max_range));
-        if blocked_bits == 0 || blocked_bits >= global_bits {
-            return FoRScheme.compress(compressor, data, compress_ctx, exec_ctx);
-        }
-
         let primitive = data.array().clone().execute::<PrimitiveArray>(exec_ctx)?;
         let blocked = BlockedFoR::encode(primitive, exec_ctx)?;
         let residuals = blocked
