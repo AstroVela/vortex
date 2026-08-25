@@ -300,6 +300,10 @@ impl VTable for BitPacked {
         RULES.evaluate(array, parent, child_idx)
     }
 
+    fn supports_decompress_chunks(_array: ArrayView<'_, Self>) -> bool {
+        true
+    }
+
     fn decompress_chunks(
         array: ArrayView<'_, Self>,
         ctx: &mut ExecutionCtx,

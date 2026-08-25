@@ -19,9 +19,12 @@
 //! frames, one frame per encoding level. Leaf producers reuse whatever scratch buffer their
 //! decompressor already maintains (e.g. the FastLanes 1024-element unpack buffer).
 //!
-//! The default implementation executes the array to canonical and then streams the result, which
-//! is exactly the two-pass behavior this API exists to avoid — so `decompress_chunks` is always
-//! possible on any encoding, and monotonically improves as encodings add overrides.
+//! Streaming is an explicit capability, not a silent guarantee: encodings advertise it via
+//! [`VTable::supports_decompress_chunks`](crate::vtable::VTable::supports_decompress_chunks)
+//! (wrappers propagate the check through their children), and
+//! [`ArrayRef::decompress_chunks`] errors on an unsupported tree instead of quietly
+//! materializing it. Callers that want a works-everywhere path opt into the two-pass fallback
+//! by name with [`ArrayRef::decompress_chunks_or_materialize`].
 //!
 //! # Contract
 //!
@@ -145,12 +148,37 @@ where
 }
 
 impl ArrayRef {
+    /// Returns whether this array (recursively, through wrapper encodings) can stream its
+    /// decompressed values via [`Self::decompress_chunks`] without materializing anything.
+    pub fn supports_decompress_chunks(&self) -> bool {
+        self.dtype().is_primitive() && self.dyn_array().supports_decompress_chunks(self)
+    }
+
     /// Stream the array's decompressed values through `sink` in cache-resident chunks.
     ///
-    /// See the [module docs](self) for the contract and cost model. Encodings without a
-    /// specialized implementation fall back to full decompression followed by chunked iteration
-    /// of the result.
+    /// See the [module docs](self) for the contract and cost model. This errors — without
+    /// emitting any chunks — if the encoding tree does not support streaming (check with
+    /// [`Self::supports_decompress_chunks`]); it never silently falls back to full
+    /// materialization. Use [`Self::decompress_chunks_or_materialize`] to opt into that
+    /// fallback explicitly.
     pub fn decompress_chunks(
+        &self,
+        ctx: &mut ExecutionCtx,
+        sink: &mut dyn ChunkSink,
+    ) -> VortexResult<()> {
+        vortex_ensure!(
+            self.supports_decompress_chunks(),
+            "decompress_chunks is not supported by this array tree (root encoding {}, dtype {}); \
+             use decompress_chunks_or_materialize for an explicit two-pass fallback",
+            self.encoding_id(),
+            self.dtype()
+        );
+        self.decompress_chunks_unchecked(ctx, sink)
+    }
+
+    /// Stream chunks if the tree supports it, otherwise fall back to executing the array to
+    /// canonical and streaming the materialized result — the two-pass behavior, chosen by name.
+    pub fn decompress_chunks_or_materialize(
         &self,
         ctx: &mut ExecutionCtx,
         sink: &mut dyn ChunkSink,
@@ -160,7 +188,18 @@ impl ArrayRef {
             "decompress_chunks requires a primitive-typed array, got {}",
             self.dtype()
         );
+        if self.supports_decompress_chunks() {
+            self.decompress_chunks_unchecked(ctx, sink)
+        } else {
+            decompress_chunks_via_canonical(self, ctx, sink)
+        }
+    }
 
+    fn decompress_chunks_unchecked(
+        &self,
+        ctx: &mut ExecutionCtx,
+        sink: &mut dyn ChunkSink,
+    ) -> VortexResult<()> {
         #[cfg(debug_assertions)]
         {
             let mut checked = CoverageCheckSink {
@@ -262,6 +301,7 @@ mod tests {
     fn constant_chunks() -> VortexResult<()> {
         // Length deliberately not a multiple of the chunk size.
         let array = ConstantArray::new(7i32, 2500).into_array();
+        assert!(array.supports_decompress_chunks());
         let chunked = collect_chunks::<i32>(&array)?;
         assert_eq!(chunked, vec![7i32; 2500]);
         Ok(())
@@ -293,9 +333,43 @@ mod tests {
         )?;
         let array = Patched::from_array_and_patches(inner, &patches, &mut ctx)?.into_array();
 
+        assert!(array.supports_decompress_chunks());
         let chunked = collect_chunks::<u16>(&array)?;
         let expected = array.execute::<PrimitiveArray>(&mut ctx)?;
         assert_eq!(chunked.as_slice(), expected.as_slice::<u16>());
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_encoding_errors_without_emitting() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        // A primitive-typed encoding tree with no streaming support: Dict over primitives.
+        let array = crate::arrays::DictArray::try_new(
+            buffer![0u32, 1, 0, 1].into_array(),
+            buffer![10i32, 20].into_array(),
+        )?
+        .into_array();
+        assert!(!array.supports_decompress_chunks());
+
+        let mut emitted = 0usize;
+        let result = array.decompress_chunks(&mut ctx, &mut |chunk: ChunkMut<'_>,
+                                                             _range: Range<usize>|
+         -> VortexResult<()> {
+            emitted += chunk.len();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(emitted, 0, "no chunks may be emitted on unsupported trees");
+
+        // The explicit fallback still works and covers the array.
+        let mut out = Vec::new();
+        array.decompress_chunks_or_materialize(&mut ctx, &mut |chunk: ChunkMut<'_>,
+                                                                _range: Range<usize>|
+         -> VortexResult<()> {
+            out.extend_from_slice(chunk.as_slice::<i32>());
+            Ok(())
+        })?;
+        assert_eq!(out, vec![10i32, 20, 10, 20]);
         Ok(())
     }
 }

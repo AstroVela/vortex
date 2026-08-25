@@ -128,8 +128,10 @@ mod tests {
     fn collect_chunks<T: NativePType>(array: &vortex_array::ArrayRef) -> VortexResult<Vec<T>> {
         let mut ctx = SESSION.create_execution_ctx();
         let mut out = Vec::with_capacity(array.len());
-        array.decompress_chunks(&mut ctx, &mut |chunk: ChunkMut<'_>,
-                                                 _range: std::ops::Range<usize>|
+        array.decompress_chunks_or_materialize(&mut ctx, &mut |chunk: ChunkMut<'_>,
+                                                                _range: std::ops::Range<
+            usize,
+        >|
          -> VortexResult<()> {
             out.extend_from_slice(chunk.as_slice::<T>());
             Ok(())
@@ -152,7 +154,9 @@ mod tests {
         let mut ctx = SESSION.create_execution_ctx();
         let values = PrimitiveArray::from_iter((0..5000u32).map(|i| i % 900));
         let bp = bitpack_encode(&values, 10, None, &mut ctx)?;
-        assert_chunks_match_execute::<u32>(bp.into_array())
+        let array = bp.into_array();
+        assert!(array.supports_decompress_chunks());
+        assert_chunks_match_execute::<u32>(array)
     }
 
     #[test]

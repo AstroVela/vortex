@@ -189,6 +189,10 @@ impl VTable for Constant {
         )?))
     }
 
+    fn supports_decompress_chunks(_array: ArrayView<'_, Self>) -> bool {
+        true
+    }
+
     fn decompress_chunks(
         array: ArrayView<'_, Self>,
         _ctx: &mut ExecutionCtx,

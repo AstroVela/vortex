@@ -220,6 +220,9 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ExecutionResult>;
 
+    /// Returns whether this encoding (recursively) supports streaming chunked decompression.
+    fn supports_decompress_chunks(&self, this: &ArrayRef) -> bool;
+
     /// Stream the array's decompressed values through `sink` in cache-resident chunks.
     fn decompress_chunks(
         &self,
@@ -496,6 +499,11 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
             .map_err(|_| vortex_err!("Failed to downcast array for execute"))
             .vortex_expect("Failed to downcast array for execute");
         V::execute(typed, ctx)
+    }
+
+    fn supports_decompress_chunks(&self, this: &ArrayRef) -> bool {
+        let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
+        V::supports_decompress_chunks(view)
     }
 
     fn decompress_chunks(

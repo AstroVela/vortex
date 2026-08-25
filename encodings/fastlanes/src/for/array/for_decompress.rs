@@ -142,6 +142,13 @@ pub(crate) fn fused_decompress<
     Ok(builder.finish_into_primitive())
 }
 
+/// Whether [`decompress_chunks`] can stream: either the fused FoR+BitPacked path applies, or the
+/// encoded child itself supports streaming (generic composition).
+pub(crate) fn supports_decompress_chunks(array: ArrayView<'_, crate::FoR>) -> bool {
+    (array.reference_scalar().dtype().is_unsigned_int() && array.encoded().is::<BitPacked>())
+        || array.encoded().supports_decompress_chunks()
+}
+
 /// Streaming chunked decompression for FoR arrays.
 ///
 /// When the child is a [`BitPacked`] array (the common layout), this streams through the fused

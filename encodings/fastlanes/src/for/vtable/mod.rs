@@ -164,6 +164,10 @@ impl VTable for FoR {
         Ok(ExecutionResult::done(decompress(&array, ctx)?.into_array()))
     }
 
+    fn supports_decompress_chunks(array: ArrayView<'_, Self>) -> bool {
+        for_decompress::supports_decompress_chunks(array)
+    }
+
     fn decompress_chunks(
         array: ArrayView<'_, Self>,
         ctx: &mut ExecutionCtx,
