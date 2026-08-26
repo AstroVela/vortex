@@ -151,6 +151,12 @@ impl BoundExpressionRewriteRule for SelectFromPack {
         })?;
         let included_fields = selection.normalize_to_included_fields(struct_fields.names())?;
 
+        // Pack expressions always have all-valid struct validity. Other struct expressions may
+        // carry row validity that rebuilding them as a pack would discard, even with no fields.
+        if !child.is::<Pack>() {
+            return Ok(None);
+        }
+
         if included_fields.is_empty() {
             return Ok(Some(Pack.try_new_bound_expr(
                 PackOptions {
@@ -169,7 +175,7 @@ impl BoundExpressionRewriteRule for SelectFromPack {
         });
         let would_intersect_validity =
             struct_nullability.is_nullable() && !all_included_fields_are_nullable;
-        if !child.is::<Pack>() || would_intersect_validity {
+        if would_intersect_validity {
             return Ok(None);
         }
 
@@ -191,7 +197,10 @@ impl BoundExpressionRewriteRule for SelectFromPack {
 mod tests {
     use vortex_error::VortexResult;
 
+    use crate::dtype::DType;
+    use crate::dtype::FieldNames;
     use crate::dtype::Nullability;
+    use crate::dtype::PType;
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
@@ -250,6 +259,18 @@ mod tests {
             optimize(&expr)?,
             bound::pack([("b", bound::lit(2i64))], Nullability::NonNullable)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_select_from_root_is_not_rewritten() -> VortexResult<()> {
+        let dtype = DType::struct_(
+            [("a", DType::Primitive(PType::I32, Nullability::NonNullable))],
+            Nullability::Nullable,
+        );
+        let expr = bound::select(FieldNames::default(), bound::root(dtype));
+
+        assert_eq!(optimize(&expr)?, expr);
         Ok(())
     }
 }

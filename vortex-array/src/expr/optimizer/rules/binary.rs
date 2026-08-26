@@ -199,6 +199,15 @@ fn match_between(
         return Ok(None);
     }
 
+    // Binary comparisons permit an extension value against its raw storage dtype, but Between
+    // requires all three logical dtypes to match.
+    let value_dtype = lower.child(0).dtype();
+    if !value_dtype.eq_ignore_nullability(lower.child(1).dtype())
+        || !value_dtype.eq_ignore_nullability(upper.child(1).dtype())
+    {
+        return Ok(None);
+    }
+
     let lower_strict = comparison_strictness(*lower.as_::<Binary>())?;
     let upper_strict = comparison_strictness(*upper.as_::<Binary>())?;
     Ok(Some(Between.try_new_bound_expr(
@@ -254,6 +263,8 @@ mod tests {
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
     use crate::expr::optimizer::ExpressionOptimizerSession;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::between::Between;
     use crate::scalar_fn::fns::between::BetweenOptions;
@@ -335,6 +346,27 @@ mod tests {
         );
 
         assert!(!optimize(&expr)?.contains::<Between>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn extension_storage_bounds_do_not_lower_to_between() -> VortexResult<()> {
+        let scope = DType::struct_(
+            [(
+                "x",
+                DType::Extension(
+                    Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased(),
+                ),
+            )],
+            Nullability::NonNullable,
+        );
+        let x = bound::col("x", scope);
+        let expr = bound::and(
+            bound::gt_eq(x.clone(), bound::lit(2i64)),
+            bound::lt(x, bound::lit(5i64)),
+        );
+
+        assert_eq!(optimize(&expr)?, expr);
         Ok(())
     }
 }
