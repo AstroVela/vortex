@@ -11,10 +11,10 @@ use vortex_session::SessionExt;
 use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 
-use super::BoundExpressionRewriteRule;
-use super::BoundExpressionRewriteRuleRef;
 use super::rules::BinaryBoolean;
 use super::rules::BinaryNullComparison;
+use super::rules::BoundExpressionRewriteRule;
+use super::rules::BoundExpressionRewriteRuleRef;
 use super::rules::CaseWhenToFillNull;
 use super::rules::CastLiteralOrIdentity;
 use super::rules::ConstantMask;

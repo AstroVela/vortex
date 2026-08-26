@@ -4,11 +4,11 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
+use super::BoundExpressionRewriteRule;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar::Scalar;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;

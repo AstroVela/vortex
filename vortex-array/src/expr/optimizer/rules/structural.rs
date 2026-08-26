@@ -8,11 +8,11 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_set::HashSet;
 
+use super::BoundExpressionRewriteRule;
 use crate::dtype::FieldNames;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;

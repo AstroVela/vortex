@@ -11,8 +11,8 @@
 //!
 //! [`ExpressionOptimizerSession`] holds the reusable rule registry. A
 //! [`BoundExpressionOptimizer`] takes that session and configures the rewrite limit. Each call to
-//! [`BoundExpressionOptimizer::try_optimize`] snapshots the session's rules and creates an
-//! `OptimizationRun` containing the mutable state for that traversal.
+//! [`BoundExpressionOptimizer::try_optimize`] creates an `OptimizationRun` containing a reference
+//! to the session's rule registry and the mutable state for that traversal.
 //!
 //! A run recursively walks the tree with copy-on-write rebuilding:
 //!
@@ -25,20 +25,17 @@
 //! Every replacement must preserve the node's dtype and differ from the expression it replaces.
 //! A per-run rewrite limit terminates rule cycles, and a depth limit prevents stack overflow.
 
-use std::fmt::Debug;
-use std::sync::Arc;
-
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::expr::BoundExpression;
-use crate::expr::ExpressionId;
 
 mod rules;
 mod session;
 
+pub use rules::BoundExpressionRewriteRule;
+pub use rules::BoundExpressionRewriteRuleRef;
 pub use session::ExpressionOptimizerRuleRegistry;
 pub use session::ExpressionOptimizerRuleSet;
 pub use session::ExpressionOptimizerSession;
@@ -46,28 +43,6 @@ pub use session::ExpressionOptimizerSessionExt;
 
 const DEFAULT_MAX_REWRITES: usize = 10_000;
 const MAX_OPTIMIZATION_DEPTH: usize = 256;
-
-/// Shared reference to a bound-expression rewrite rule.
-pub type BoundExpressionRewriteRuleRef = Arc<dyn BoundExpressionRewriteRule>;
-
-/// An equivalence rewrite for bound expressions with a particular root node implementation.
-///
-/// The optimizer invokes a rule only when the expression's root ID equals
-/// [`Self::expression_id`]. Returning `None` means the rule does not match. A replacement must be
-/// semantically equivalent to the input and have exactly the same dtype, including nullability.
-/// The optimizer verifies the dtype and rejects unchanged replacements.
-pub trait BoundExpressionRewriteRule: Debug + Send + Sync + 'static {
-    /// Returns a diagnostic name for this rule.
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
-    /// Returns the expression node ID handled by this rule.
-    fn expression_id(&self) -> ExpressionId;
-
-    /// Try to rewrite `expr` to a semantically equivalent bound expression.
-    fn rewrite(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>>;
-}
 
 /// A deterministic optimizer for [`BoundExpression`] trees.
 ///
@@ -85,7 +60,6 @@ impl BoundExpressionOptimizer {
     /// Create an optimizer backed by `session`.
     ///
     /// Cloning the session is cheap and keeps later rule registrations visible to the optimizer.
-    /// Each optimization observes one consistent snapshot of the registered rules.
     pub fn new(session: &ExpressionOptimizerSession) -> Self {
         Self {
             session: session.clone(),
@@ -106,26 +80,22 @@ impl BoundExpressionOptimizer {
 
     /// Optimize an entire bound expression tree, returning `None` when no subtree changed.
     pub fn try_optimize(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        let rules = self.session.registry().snapshot();
-        OptimizationRun::new(&rules, self.max_rewrites).run(expr)
+        OptimizationRun::new(self.session.registry(), self.max_rewrites).run(expr)
     }
 }
 
 /// Mutable state for one optimizer invocation.
 struct OptimizationRun<'rules> {
-    rules: &'rules HashMap<ExpressionId, ExpressionOptimizerRuleSet>,
+    registry: &'rules ExpressionOptimizerRuleRegistry,
     max_rewrites: usize,
     rewrite_count: usize,
 }
 
 impl<'rules> OptimizationRun<'rules> {
     /// Create a run using the given rule registry and rewrite limit.
-    fn new(
-        rules: &'rules HashMap<ExpressionId, ExpressionOptimizerRuleSet>,
-        max_rewrites: usize,
-    ) -> Self {
+    fn new(registry: &'rules ExpressionOptimizerRuleRegistry, max_rewrites: usize) -> Self {
         Self {
-            rules,
+            registry,
             max_rewrites,
             rewrite_count: 0,
         }
@@ -141,7 +111,7 @@ impl<'rules> OptimizationRun<'rules> {
         &mut self,
         expression: &BoundExpression,
     ) -> VortexResult<Option<BoundExpression>> {
-        let Some(rules) = self.rules.get(&expression.id()) else {
+        let Some(rules) = self.registry.get(&expression.id()) else {
             return Ok(None);
         };
         for rule in rules.iter() {

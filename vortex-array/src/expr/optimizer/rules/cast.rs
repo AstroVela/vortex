@@ -3,10 +3,10 @@
 
 use vortex_error::VortexResult;
 
+use super::BoundExpressionRewriteRule;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
-use crate::expr::optimizer::BoundExpressionRewriteRule;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::literal::Literal;
