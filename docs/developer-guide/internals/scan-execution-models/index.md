@@ -17,6 +17,12 @@ That distinction matters. A good plan representation does not by itself provide 
 backpressure, memory control, or a useful batching contract. Conversely, a mature executor can be
 difficult to optimize if planning and mutable runtime state are represented by the same objects.
 
+The **current working direction** is
+[morsel-based plan execution](morsel-based-plan-execution.md): one stateful exec-node graph per
+fixed row morsel, a lazy `IO | Plan` stream whose planning state remains internal to the morsel,
+resumable value execution, and explicit retirement. The comparison and earlier proposals below
+remain as design history and evidence.
+
 ```{toctree}
 ---
 maxdepth: 1
@@ -41,6 +47,7 @@ scan-execution-graph-next-discussion
 scan-execution-demand-and-operators
 scan-execution-design
 scan-execution-design-one-pager
+morsel-based-plan-execution
 self-paced-implementation-plan
 self-paced-review
 ```
