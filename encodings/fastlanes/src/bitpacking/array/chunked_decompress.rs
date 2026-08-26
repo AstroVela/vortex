@@ -119,7 +119,7 @@ mod tests {
     use crate::FoRData;
     use crate::bitpack_compress::bitpack_encode;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    pub(super) static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         let session = vortex_array::array_session();
         crate::initialize(&session);
         session
@@ -229,6 +229,45 @@ mod tests {
         let bp = bitpack_encode(&values, 0, None, &mut ctx)?;
         let chunked = collect_chunks::<u32>(&bp.into_array())?;
         assert!(chunked.is_empty());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::chunk_iter::set_chunked_execute_enabled;
+    use vortex_array::scalar::Scalar;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+    use vortex_error::VortexResult;
+
+    use super::tests::SESSION;
+    use crate::FoR;
+    use crate::bitpack_compress::bitpack_encode;
+
+    /// The executor's stream-to-canonical shortcut must produce the same canonical array as
+    /// level-wise execution, including validity, on a nullable multi-level tree.
+    #[test]
+    fn execute_via_chunks_matches_levelwise() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = Buffer::from_iter((0..5000i32).map(|i| i % 900));
+        let validity = Validity::from_iter((0..5000).map(|i| i % 7 != 0));
+        let deltas = PrimitiveArray::new(values, validity);
+        let bp = bitpack_encode(&deltas, 10, None, &mut ctx)?;
+        // Signed reference so the generic streaming composition (not the fused path) is used.
+        let array = FoR::try_new(bp.into_array(), Scalar::from(-1_000_000i32))?.into_array();
+
+        set_chunked_execute_enabled(false);
+        let levelwise = array.clone().execute::<PrimitiveArray>(&mut ctx);
+        set_chunked_execute_enabled(true);
+        let levelwise = levelwise?;
+        let streaming = array.execute::<PrimitiveArray>(&mut ctx)?;
+
+        assert_arrays_eq!(streaming, levelwise, &mut ctx);
         Ok(())
     }
 }

@@ -356,3 +356,88 @@ fn chunked_decompress_into_patched_constant(bencher: Bencher) {
             black_box(out.len())
         });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Executor integration: execute::<PrimitiveArray> with the stream-to-canonical shortcut
+// (execute_until step 2c) enabled vs disabled, on realistic multi-level trees.
+// ---------------------------------------------------------------------------------------------
+
+/// FoR(signed reference) over BitPacked: the common shape for signed integers. The level-wise
+/// executor unpacks the full buffer, then does a second full-buffer wrapping-add pass; the
+/// streaming shortcut does the add in L1 per block and writes the output once.
+fn make_signed_for_bitpacked() -> ArrayRef {
+    let mut ctx = SESSION.create_execution_ctx();
+    let deltas = PrimitiveArray::from_iter(
+        (0..LEN as u64).map(|i| i32::try_from((i * 7) % 1000).vortex_expect("fits")),
+    );
+    let bp = bitpack_encode(&deltas, 10, None, &mut ctx).vortex_expect("bench");
+    FoR::try_new(bp.into_array(), Scalar::from(-1_000_000i32))
+        .vortex_expect("bench")
+        .into_array()
+}
+
+/// Patched(FoR(BitPacked)): G-ALP-style tree — bitpacked base, frame-of-reference shift, and
+/// sparse exceptions patched at the top.
+fn make_patched_for_bitpacked() -> ArrayRef {
+    let mut ctx = SESSION.create_execution_ctx();
+    let inner = make_for_bitpacked();
+    let n_patches = LEN / 1000;
+    let patches = vortex_array::patches::Patches::new(
+        LEN,
+        0,
+        PrimitiveArray::from_iter((0..n_patches as u64).map(|i| i * 1000)).into_array(),
+        PrimitiveArray::from_iter(
+            (0..n_patches as u64)
+                .map(|i| u32::try_from(2_000_000 + i % 90_000).vortex_expect("fits")),
+        )
+        .into_array(),
+        None,
+    )
+    .vortex_expect("bench");
+    vortex_array::arrays::Patched::from_array_and_patches(inner, &patches, &mut ctx)
+        .vortex_expect("bench")
+        .into_array()
+}
+
+fn bench_execute(bencher: Bencher, array: ArrayRef, streaming: bool) {
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            vortex_array::chunk_iter::set_chunked_execute_enabled(streaming);
+            let result = array
+                .execute::<PrimitiveArray>(&mut ctx)
+                .vortex_expect("bench");
+            vortex_array::chunk_iter::set_chunked_execute_enabled(true);
+            black_box(result.len())
+        });
+}
+
+#[divan::bench]
+fn execute_signed_for_bp_streaming(bencher: Bencher) {
+    bench_execute(bencher, make_signed_for_bitpacked(), true);
+}
+
+#[divan::bench]
+fn execute_signed_for_bp_levelwise(bencher: Bencher) {
+    bench_execute(bencher, make_signed_for_bitpacked(), false);
+}
+
+#[divan::bench]
+fn execute_patched_for_bp_streaming(bencher: Bencher) {
+    bench_execute(bencher, make_patched_for_bitpacked(), true);
+}
+
+#[divan::bench]
+fn execute_patched_for_bp_levelwise(bencher: Bencher) {
+    bench_execute(bencher, make_patched_for_bitpacked(), false);
+}
+
+#[divan::bench]
+fn execute_fused_for_bp_streaming(bencher: Bencher) {
+    bench_execute(bencher, make_for_bitpacked(), true);
+}
+
+#[divan::bench]
+fn execute_fused_for_bp_levelwise(bencher: Bencher) {
+    bench_execute(bencher, make_for_bitpacked(), false);
+}

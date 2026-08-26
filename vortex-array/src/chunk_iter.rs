@@ -37,7 +37,10 @@
 //! - Currently only primitive-typed arrays are supported.
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -45,6 +48,7 @@ use vortex_error::vortex_ensure;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::arrays::PrimitiveArray;
+use crate::builders::PrimitiveBuilder;
 use crate::dtype::NativePType;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
@@ -218,6 +222,80 @@ impl ArrayRef {
         }
         #[cfg(not(debug_assertions))]
         self.dyn_array().decompress_chunks(self, ctx, sink)
+    }
+}
+
+/// Global toggle for the executor's stream-to-canonical shortcut (see
+/// [`execute_via_chunks`]). Enabled by default; exposed only so benchmarks and tests can compare
+/// the executor with and without the shortcut inside one process.
+static CHUNKED_EXECUTE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_chunked_execute_enabled(enabled: bool) {
+    CHUNKED_EXECUTE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns whether the executor should shortcut this array's canonicalization through
+/// [`execute_via_chunks`].
+///
+/// True when the shortcut is enabled, the whole tree streams
+/// ([`ArrayRef::supports_decompress_chunks`], which cascades: an encoding only advertises
+/// support when the children it streams from do), and the tree is at least two streaming levels
+/// deep. A lone streaming leaf (e.g. BitPacked with canonical patch children) decodes directly
+/// into the builder on its normal execute path, so streaming it would only add a scratch copy;
+/// the shortcut pays off when the normal path would materialize a full intermediate per level.
+pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
+    CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
+        && array.supports_decompress_chunks()
+        && array
+            .children_iter()
+            .any(|child| !child.is_canonical() && child.supports_decompress_chunks())
+}
+
+/// Execute a streaming-capable primitive array tree to a canonical [`PrimitiveArray`] by
+/// decompressing chunks straight into the output buffer: each block is decoded and transformed
+/// while L1-resident, and the only full-length write is the final copy into the builder.
+///
+/// The caller must have checked [`ArrayRef::supports_decompress_chunks`].
+pub fn execute_via_chunks(
+    array: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let len = array.len();
+    let validity_mask = array.validity()?.execute_mask(len, ctx)?;
+    match_each_native_ptype!(array.dtype().as_ptype(), |T| {
+        let mut builder = PrimitiveBuilder::<T>::with_capacity(array.dtype().nullability(), len);
+        let mut uninit_range = builder.uninit_range(len);
+        // SAFETY: every value slot is initialized by the chunk stream below, which covers
+        // exactly 0..len (checked in debug builds).
+        unsafe {
+            uninit_range.append_mask(&validity_mask);
+        }
+        {
+            // SAFETY: the chunk stream covers 0..len contiguously.
+            let dst = unsafe { uninit_range.slice_uninit_mut(0, len) };
+            let mut sink = BuilderSink::<T> { dst };
+            array.decompress_chunks(ctx, &mut sink)?;
+        }
+        // SAFETY: mask appended for len rows and all len values initialized above.
+        unsafe {
+            uninit_range.finish();
+        }
+        Ok(builder.finish_into_primitive())
+    })
+}
+
+struct BuilderSink<'a, T> {
+    dst: &'a mut [MaybeUninit<T>],
+}
+
+impl<T: NativePType> ChunkSink for BuilderSink<'_, T> {
+    #[inline]
+    fn accept(&mut self, chunk: ChunkMut<'_>, row_range: Range<usize>) -> VortexResult<()> {
+        // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
+        let src: &[MaybeUninit<T>] = unsafe { std::mem::transmute(chunk.as_slice::<T>()) };
+        self.dst[row_range].copy_from_slice(src);
+        Ok(())
     }
 }
 
