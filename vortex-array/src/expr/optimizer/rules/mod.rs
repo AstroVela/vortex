@@ -3,7 +3,6 @@
 
 use vortex_error::VortexResult;
 
-use super::RuleRegistry;
 use crate::dtype::DType;
 use crate::expr::BoundExpression;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -15,13 +14,17 @@ mod conditional;
 mod nulls;
 mod structural;
 
-pub(super) fn register(registry: &mut RuleRegistry) {
-    binary::register(registry);
-    cast::register(registry);
-    structural::register(registry);
-    nulls::register(registry);
-    conditional::register(registry);
-}
+pub(crate) use binary::BinaryBoolean;
+pub(crate) use binary::BinaryNullComparison;
+pub(crate) use binary::FindBetween;
+pub(crate) use cast::CastLiteralOrIdentity;
+pub(crate) use conditional::ConstantMask;
+pub(crate) use conditional::ConstantZip;
+pub(crate) use nulls::CaseWhenToFillNull;
+pub(crate) use nulls::RemoveRedundantFillNull;
+pub(crate) use structural::GetItemFromPack;
+pub(crate) use structural::MergeToPack;
+pub(crate) use structural::SelectFromPack;
 
 fn preserve_dtype(replacement: BoundExpression, dtype: &DType) -> VortexResult<BoundExpression> {
     if replacement.dtype() == dtype {

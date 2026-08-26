@@ -4,7 +4,6 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
-use super::RuleRegistry;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -21,12 +20,6 @@ use crate::scalar_fn::fns::get_item::GetItem;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::Operator;
 
-pub(super) fn register(registry: &mut RuleRegistry) {
-    registry.register(BinaryBoolean);
-    registry.register(BinaryNullComparison);
-    registry.register(FindBetween);
-}
-
 /// Simplifies `AND` and `OR` with literal operands using Kleene boolean semantics.
 ///
 /// # Example
@@ -36,7 +29,7 @@ pub(super) fn register(registry: &mut RuleRegistry) {
 /// rewritten: value
 /// ```
 #[derive(Debug)]
-struct BinaryBoolean;
+pub(crate) struct BinaryBoolean;
 
 impl BoundExpressionRewriteRule for BinaryBoolean {
     fn expression_id(&self) -> ExpressionId {
@@ -87,7 +80,7 @@ impl BoundExpressionRewriteRule for BinaryBoolean {
 /// rewritten: lit(Scalar::null(nullable_bool))
 /// ```
 #[derive(Debug)]
-struct BinaryNullComparison;
+pub(crate) struct BinaryNullComparison;
 
 impl BoundExpressionRewriteRule for BinaryNullComparison {
     fn expression_id(&self) -> ExpressionId {
@@ -117,7 +110,7 @@ impl BoundExpressionRewriteRule for BinaryNullComparison {
 /// rewritten: between(x, lit(1), lit(10), BetweenOptions { lower_strict: NonStrict, upper_strict: Strict })
 /// ```
 #[derive(Debug)]
-struct FindBetween;
+pub(crate) struct FindBetween;
 
 impl BoundExpressionRewriteRule for FindBetween {
     fn expression_id(&self) -> ExpressionId {
@@ -260,13 +253,14 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
+    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::between::Between;
     use crate::scalar_fn::fns::between::BetweenOptions;
     use crate::scalar_fn::fns::between::StrictComparison;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::default().optimize(expr)
+        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
     }
 
     #[test]

@@ -26,6 +26,7 @@ use vortex_array::expr::BoundExpressionOptimizer;
 use vortex_array::expr::BoundExpressionRewriteRule;
 use vortex_array::expr::Expression;
 use vortex_array::expr::ExpressionId;
+use vortex_array::expr::ExpressionOptimizerSession;
 use vortex_array::expr::and;
 use vortex_array::expr::col;
 use vortex_array::expr::eq;
@@ -163,7 +164,7 @@ mod builtins {
         let scope = struct_scope();
         let unbound = build_expression(*case);
         let expr = unbound.bind(&scope).unwrap();
-        let optimizer = BoundExpressionOptimizer::default();
+        let optimizer = BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default());
 
         let expected = unbound
             .optimize_recursive(&scope)
@@ -181,7 +182,7 @@ mod builtins {
     fn bound_expression_empty(bencher: Bencher, case: &RewriteCase) {
         let scope = struct_scope();
         let expr = build_expression(*case).bind(&scope).unwrap();
-        let optimizer = BoundExpressionOptimizer::empty();
+        let optimizer = BoundExpressionOptimizer::new(&ExpressionOptimizerSession::empty());
 
         bencher
             .counter(ItemsCount::new(case.node_count()))
@@ -295,11 +296,12 @@ fn rule_dispatch(bencher: Bencher, case: &RuleDispatchCase) {
     let rewrite_case = case.rewrite_case();
     let scope = struct_scope();
     let expr = build_expression(rewrite_case).bind(&scope).unwrap();
-    let mut optimizer = BoundExpressionOptimizer::empty();
+    let session = ExpressionOptimizerSession::empty();
     for _ in 1..case.candidate_rules {
-        optimizer.register_rule(AndTrueRule { enabled: false });
+        session.register(AndTrueRule { enabled: false });
     }
-    optimizer.register_rule(AndTrueRule { enabled: true });
+    session.register(AndTrueRule { enabled: true });
+    let optimizer = BoundExpressionOptimizer::new(&session);
 
     bencher
         .counter(ItemsCount::new(rewrite_case.node_count()))

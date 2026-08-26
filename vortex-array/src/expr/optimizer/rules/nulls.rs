@@ -3,7 +3,6 @@
 
 use vortex_error::VortexResult;
 
-use super::RuleRegistry;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -18,11 +17,6 @@ use crate::scalar_fn::fns::is_not_null::IsNotNull;
 use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::literal::Literal;
 
-pub(super) fn register(registry: &mut RuleRegistry) {
-    registry.register(RemoveRedundantFillNull);
-    registry.register(CaseWhenToFillNull);
-}
-
 /// Removes `fill_null` when its input is already non-nullable.
 ///
 /// # Example
@@ -32,7 +26,7 @@ pub(super) fn register(registry: &mut RuleRegistry) {
 /// rewritten: non_nullable_value
 /// ```
 #[derive(Debug)]
-struct RemoveRedundantFillNull;
+pub(crate) struct RemoveRedundantFillNull;
 
 impl BoundExpressionRewriteRule for RemoveRedundantFillNull {
     fn expression_id(&self) -> ExpressionId {
@@ -56,7 +50,7 @@ impl BoundExpressionRewriteRule for RemoveRedundantFillNull {
 /// rewritten: fill_null(value, fill)
 /// ```
 #[derive(Debug)]
-struct CaseWhenToFillNull;
+pub(crate) struct CaseWhenToFillNull;
 
 impl BoundExpressionRewriteRule for CaseWhenToFillNull {
     fn expression_id(&self) -> ExpressionId {
@@ -107,11 +101,12 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
+    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::fill_null::FillNull;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::default().optimize(expr)
+        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
     }
 
     #[test]

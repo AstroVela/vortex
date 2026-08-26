@@ -9,9 +9,10 @@
 //!
 //! # How optimization works
 //!
-//! [`BoundExpressionOptimizer`] holds the reusable rule registry and rewrite limit. Each call to
-//! [`BoundExpressionOptimizer::try_optimize`] creates an `OptimizationRun` containing the mutable
-//! state for that traversal.
+//! [`ExpressionOptimizerSession`] holds the reusable rule registry. A
+//! [`BoundExpressionOptimizer`] takes that session and configures the rewrite limit. Each call to
+//! [`BoundExpressionOptimizer::try_optimize`] snapshots the session's rules and creates an
+//! `OptimizationRun` containing the mutable state for that traversal.
 //!
 //! A run recursively walks the tree with copy-on-write rebuilding:
 //!
@@ -36,6 +37,12 @@ use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 
 mod rules;
+mod session;
+
+pub use session::ExpressionOptimizerRuleRegistry;
+pub use session::ExpressionOptimizerRuleSet;
+pub use session::ExpressionOptimizerSession;
+pub use session::ExpressionOptimizerSessionExt;
 
 const DEFAULT_MAX_REWRITES: usize = 10_000;
 const MAX_OPTIMIZATION_DEPTH: usize = 256;
@@ -62,64 +69,26 @@ pub trait BoundExpressionRewriteRule: Debug + Send + Sync + 'static {
     fn rewrite(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>>;
 }
 
-/// Rewrite rules indexed by the expression node ID they handle.
-#[derive(Clone, Debug, Default)]
-struct RuleRegistry {
-    rules: HashMap<ExpressionId, Vec<BoundExpressionRewriteRuleRef>>,
-}
-
-impl RuleRegistry {
-    /// Register a rule after existing rules for the same expression node ID.
-    fn register<R: BoundExpressionRewriteRule>(&mut self, rule: R) {
-        self.register_ref(Arc::new(rule));
-    }
-
-    /// Register a shared rule after existing rules for the same expression node ID.
-    fn register_ref(&mut self, rule: BoundExpressionRewriteRuleRef) {
-        self.rules
-            .entry(rule.expression_id())
-            .or_default()
-            .push(rule);
-    }
-
-    /// Return the rules registered for `expression_id`, in application order.
-    fn rules_for(&self, expression_id: ExpressionId) -> Option<&[BoundExpressionRewriteRuleRef]> {
-        self.rules.get(&expression_id).map(Vec::as_slice)
-    }
-}
-
 /// A deterministic optimizer for [`BoundExpression`] trees.
 ///
-/// Rules are grouped by root expression ID and run in registration order. Nodes are rewritten
-/// before their children and again after changed children are installed. A global rewrite budget
-/// terminates cyclic rule sets.
+/// The optimizer uses the rules registered in its [`ExpressionOptimizerSession`]. Rules are
+/// grouped by root expression ID and run in registration order. Nodes are rewritten before their
+/// children and again after changed children are installed. A global rewrite budget terminates
+/// cyclic rule sets.
 #[derive(Clone, Debug)]
 pub struct BoundExpressionOptimizer {
-    rules: RuleRegistry,
+    session: ExpressionOptimizerSession,
     max_rewrites: usize,
 }
 
-impl Default for BoundExpressionOptimizer {
-    fn default() -> Self {
-        let mut registry = RuleRegistry::default();
-        rules::register(&mut registry);
-        Self {
-            rules: registry,
-            max_rewrites: DEFAULT_MAX_REWRITES,
-        }
-    }
-}
-
 impl BoundExpressionOptimizer {
-    /// Create an optimizer containing the built-in Vortex expression rewrites.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create an optimizer with no registered rules.
-    pub fn empty() -> Self {
+    /// Create an optimizer backed by `session`.
+    ///
+    /// Cloning the session is cheap and keeps later rule registrations visible to the optimizer.
+    /// Each optimization observes one consistent snapshot of the registered rules.
+    pub fn new(session: &ExpressionOptimizerSession) -> Self {
         Self {
-            rules: RuleRegistry::default(),
+            session: session.clone(),
             max_rewrites: DEFAULT_MAX_REWRITES,
         }
     }
@@ -130,16 +99,6 @@ impl BoundExpressionOptimizer {
         self
     }
 
-    /// Register a rewrite after existing rules for the same expression node ID.
-    pub fn register_rule<R: BoundExpressionRewriteRule>(&mut self, rule: R) {
-        self.rules.register(rule);
-    }
-
-    /// Register a shared rewrite after existing rules for the same expression node ID.
-    pub fn register_rule_ref(&mut self, rule: BoundExpressionRewriteRuleRef) {
-        self.rules.register_ref(rule);
-    }
-
     /// Optimize an entire bound expression tree, cloning the input when it remains unchanged.
     pub fn optimize(&self, expr: &BoundExpression) -> VortexResult<BoundExpression> {
         Ok(self.try_optimize(expr)?.unwrap_or_else(|| expr.clone()))
@@ -147,20 +106,24 @@ impl BoundExpressionOptimizer {
 
     /// Optimize an entire bound expression tree, returning `None` when no subtree changed.
     pub fn try_optimize(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        OptimizationRun::new(&self.rules, self.max_rewrites).run(expr)
+        let rules = self.session.registry().snapshot();
+        OptimizationRun::new(&rules, self.max_rewrites).run(expr)
     }
 }
 
 /// Mutable state for one optimizer invocation.
 struct OptimizationRun<'rules> {
-    rules: &'rules RuleRegistry,
+    rules: &'rules HashMap<ExpressionId, ExpressionOptimizerRuleSet>,
     max_rewrites: usize,
     rewrite_count: usize,
 }
 
 impl<'rules> OptimizationRun<'rules> {
     /// Create a run using the given rule registry and rewrite limit.
-    fn new(rules: &'rules RuleRegistry, max_rewrites: usize) -> Self {
+    fn new(
+        rules: &'rules HashMap<ExpressionId, ExpressionOptimizerRuleSet>,
+        max_rewrites: usize,
+    ) -> Self {
         Self {
             rules,
             max_rewrites,
@@ -178,10 +141,10 @@ impl<'rules> OptimizationRun<'rules> {
         &mut self,
         expression: &BoundExpression,
     ) -> VortexResult<Option<BoundExpression>> {
-        let Some(rules) = self.rules.rules_for(expression.id()) else {
+        let Some(rules) = self.rules.get(&expression.id()) else {
             return Ok(None);
         };
-        for rule in rules {
+        for rule in rules.iter() {
             let Some(replacement) = rule.rewrite(expression)? else {
                 continue;
             };
@@ -292,6 +255,7 @@ mod tests {
 
     use super::BoundExpressionOptimizer;
     use super::BoundExpressionRewriteRule;
+    use super::ExpressionOptimizerSession;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -320,10 +284,23 @@ mod tests {
     #[test]
     fn rules_run_in_registration_order() -> VortexResult<()> {
         let input = bound::is_null(bound::lit(1i32));
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(IsNullTo(true));
-        optimizer.register_rule(IsNullTo(false));
+        let session = ExpressionOptimizerSession::empty();
+        session.register(IsNullTo(true));
+        session.register(IsNullTo(false));
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
+        assert_eq!(optimizer.optimize(&input)?, bound::lit(true));
+        Ok(())
+    }
+
+    #[test]
+    fn optimizer_observes_later_session_registrations() -> VortexResult<()> {
+        let input = bound::is_null(bound::lit(1i32));
+        let session = ExpressionOptimizerSession::empty();
+        let optimizer = BoundExpressionOptimizer::new(&session);
+
+        assert_eq!(optimizer.optimize(&input)?, input);
+        session.register(IsNullTo(true));
         assert_eq!(optimizer.optimize(&input)?, bound::lit(true));
         Ok(())
     }
@@ -360,9 +337,10 @@ mod tests {
     #[test]
     fn optimizes_subtrees_introduced_by_rules() -> VortexResult<()> {
         let input = bound::is_null(bound::lit(1i32));
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(IsNullToReducibleTree);
-        optimizer.register_rule(AndFalse);
+        let session = ExpressionOptimizerSession::empty();
+        session.register(IsNullToReducibleTree);
+        session.register(AndFalse);
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
@@ -371,9 +349,10 @@ mod tests {
     #[test]
     fn retries_root_rules_after_optimizing_children() -> VortexResult<()> {
         let input = bound::and(bound::is_null(bound::lit(1i32)), bound::lit(true));
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(IsNullTo(false));
-        optimizer.register_rule(AndFalse);
+        let session = ExpressionOptimizerSession::empty();
+        session.register(IsNullTo(false));
+        session.register(AndFalse);
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
@@ -395,8 +374,9 @@ mod tests {
     #[test]
     fn rejects_dtype_changes() {
         let input = bound::is_null(bound::lit(1i32));
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(WrongDType);
+        let session = ExpressionOptimizerSession::empty();
+        session.register(WrongDType);
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
         assert!(optimizer.optimize(&input).is_err());
     }
@@ -417,8 +397,9 @@ mod tests {
     #[test]
     fn rejects_unchanged_replacements() {
         let input = bound::is_null(bound::lit(1i32));
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(Unchanged);
+        let session = ExpressionOptimizerSession::empty();
+        session.register(Unchanged);
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
         assert!(optimizer.optimize(&input).is_err());
     }
@@ -444,8 +425,9 @@ mod tests {
 
     #[test]
     fn rewrite_budget_terminates_cycles() {
-        let mut optimizer = BoundExpressionOptimizer::empty().with_max_rewrites(4);
-        optimizer.register_rule(ToggleBoolean);
+        let session = ExpressionOptimizerSession::empty();
+        session.register(ToggleBoolean);
+        let optimizer = BoundExpressionOptimizer::new(&session).with_max_rewrites(4);
 
         assert!(optimizer.optimize(&bound::lit(true)).is_err());
     }
@@ -466,8 +448,9 @@ mod tests {
     #[test]
     fn rules_can_target_non_scalar_expression_nodes() -> VortexResult<()> {
         let input = bound::root(DType::Primitive(PType::I32, Nullability::NonNullable));
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(RootToOne(input.id()));
+        let session = ExpressionOptimizerSession::empty();
+        session.register(RootToOne(input.id()));
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(1i32));
         Ok(())
@@ -481,7 +464,7 @@ mod tests {
         }
 
         assert!(
-            BoundExpressionOptimizer::empty()
+            BoundExpressionOptimizer::new(&ExpressionOptimizerSession::empty())
                 .try_optimize(&expr)
                 .is_err()
         );
@@ -494,8 +477,9 @@ mod tests {
             discarded = bound::not(discarded);
         }
         let input = bound::and(bound::lit(false), discarded);
-        let mut optimizer = BoundExpressionOptimizer::empty();
-        optimizer.register_rule(AndFalse);
+        let session = ExpressionOptimizerSession::empty();
+        session.register(AndFalse);
+        let optimizer = BoundExpressionOptimizer::new(&session);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
@@ -507,7 +491,8 @@ mod tests {
         let expr = bound::cast(bound::lit(1i32), target);
 
         assert_eq!(
-            BoundExpressionOptimizer::default().optimize(&expr)?,
+            BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default())
+                .optimize(&expr)?,
             bound::lit(1i64)
         );
         Ok(())

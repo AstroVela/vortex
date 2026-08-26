@@ -3,7 +3,6 @@
 
 use vortex_error::VortexResult;
 
-use super::RuleRegistry;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -15,11 +14,6 @@ use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::mask::Mask;
 use crate::scalar_fn::fns::zip::Zip;
 
-pub(super) fn register(registry: &mut RuleRegistry) {
-    registry.register(ConstantMask);
-    registry.register(ConstantZip);
-}
-
 /// Evaluates a mask whose mask argument is a non-null boolean literal.
 ///
 /// # Example
@@ -29,7 +23,7 @@ pub(super) fn register(registry: &mut RuleRegistry) {
 /// rewritten: nullable_value
 /// ```
 #[derive(Debug)]
-struct ConstantMask;
+pub(crate) struct ConstantMask;
 
 impl BoundExpressionRewriteRule for ConstantMask {
     fn expression_id(&self) -> ExpressionId {
@@ -62,7 +56,7 @@ impl BoundExpressionRewriteRule for ConstantMask {
 /// rewritten: if_true
 /// ```
 #[derive(Debug)]
-struct ConstantZip;
+pub(crate) struct ConstantZip;
 
 impl BoundExpressionRewriteRule for ConstantZip {
     fn expression_id(&self) -> ExpressionId {
@@ -91,10 +85,11 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
+    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::default().optimize(expr)
+        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
     }
 
     #[test]

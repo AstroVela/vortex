@@ -125,6 +125,8 @@ pub use exprs::zip_expr;
 pub use optimizer::BoundExpressionOptimizer;
 pub use optimizer::BoundExpressionRewriteRule;
 pub use optimizer::BoundExpressionRewriteRuleRef;
+pub use optimizer::ExpressionOptimizerSession;
+pub use optimizer::ExpressionOptimizerSessionExt;
 pub use scope::*;
 
 /// A globally unique identifier for an expression node implementation.

@@ -8,7 +8,6 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_set::HashSet;
 
-use super::RuleRegistry;
 use crate::dtype::FieldNames;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -25,12 +24,6 @@ use crate::scalar_fn::fns::pack::Pack;
 use crate::scalar_fn::fns::pack::PackOptions;
 use crate::scalar_fn::fns::select::Select;
 
-pub(super) fn register(registry: &mut RuleRegistry) {
-    registry.register(GetItemFromPack);
-    registry.register(MergeToPack);
-    registry.register(SelectFromPack);
-}
-
 /// Replaces a field access on a pack with the corresponding packed expression.
 ///
 /// # Example
@@ -40,7 +33,7 @@ pub(super) fn register(registry: &mut RuleRegistry) {
 /// rewritten: b
 /// ```
 #[derive(Debug)]
-struct GetItemFromPack;
+pub(crate) struct GetItemFromPack;
 
 impl BoundExpressionRewriteRule for GetItemFromPack {
     fn expression_id(&self) -> ExpressionId {
@@ -79,7 +72,7 @@ impl BoundExpressionRewriteRule for GetItemFromPack {
 /// rewritten: pack([("a", get_item("a", left)), ("b", get_item("b", right))], NonNullable)
 /// ```
 #[derive(Debug)]
-struct MergeToPack;
+pub(crate) struct MergeToPack;
 
 impl BoundExpressionRewriteRule for MergeToPack {
     fn expression_id(&self) -> ExpressionId {
@@ -141,7 +134,7 @@ impl BoundExpressionRewriteRule for MergeToPack {
 /// rewritten: pack([("b", b)], NonNullable)
 /// ```
 #[derive(Debug)]
-struct SelectFromPack;
+pub(crate) struct SelectFromPack;
 
 impl BoundExpressionRewriteRule for SelectFromPack {
     fn expression_id(&self) -> ExpressionId {
@@ -202,11 +195,12 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
+    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::pack::Pack;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::default().optimize(expr)
+        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
     }
 
     #[test]
