@@ -12,6 +12,7 @@ family = "preview"
 [added]
 arrays = []
 layouts = [
+    "vortex.cuda_flat",
     "vortex.list",
 ]
 dtypes = []
@@ -30,6 +31,7 @@ arrays = [
     "vortex.zstd_buffers",
 ]
 layouts = [
+    "vortex.cuda_flat",
     "vortex.list",
 ]
 dtypes = [
