@@ -647,7 +647,9 @@ impl SerializedArray {
                             segment.len(),
                         );
                     }
-                    segment.slice(start..end).ensure_aligned(alignment)?
+                    segment
+                        .slice_with_alignment(start..end, Alignment::of::<u8>())?
+                        .ensure_aligned(alignment)?
                 };
 
                 offset = end;

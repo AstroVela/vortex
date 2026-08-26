@@ -13,6 +13,7 @@ use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_utils::dyn_traits::DynEq;
 use vortex_utils::dyn_traits::DynHash;
 
@@ -201,6 +202,42 @@ impl BufferHandle {
         }
     }
 
+    /// Creates a new handle to a subrange whose reported alignment is at least `alignment`.
+    ///
+    /// The returned handle reports the strongest alignment still guaranteed by the sliced view.
+    /// Returns an error if the sliced view cannot preserve the requested alignment.
+    pub fn slice_with_alignment(
+        &self,
+        range: Range<usize>,
+        alignment: Alignment,
+    ) -> VortexResult<Self> {
+        match &self.0 {
+            Inner::Host(host) => {
+                let sliced_alignment = offset_alignment(host.alignment(), range.start);
+                if !sliced_alignment.is_aligned_to(alignment) {
+                    vortex_bail!(
+                        "sliced host buffer alignment {sliced_alignment} is weaker than requested \
+                         alignment {alignment}"
+                    );
+                }
+                Ok(BufferHandle::new_host(
+                    host.slice_with_alignment(range, sliced_alignment),
+                ))
+            }
+            Inner::Device(device) => {
+                let sliced = BufferHandle::new_device(device.slice(range));
+                if !sliced.is_aligned_to(alignment) {
+                    vortex_bail!(
+                        "sliced device buffer alignment {} is weaker than requested alignment {}",
+                        sliced.alignment(),
+                        alignment,
+                    );
+                }
+                Ok(sliced)
+            }
+        }
+    }
+
     /// Reinterpret the pointee as a buffer of `T` and slice the provided element range.
     ///
     /// # Example
@@ -215,10 +252,16 @@ impl BufferHandle {
     /// assert_eq!(result, buffer![2, 3, 4]);
     /// ```
     pub fn slice_typed<T: Sized>(&self, range: Range<usize>) -> Self {
+        self.try_slice_typed::<T>(range)
+            .vortex_expect("typed buffer slice should preserve type alignment")
+    }
+
+    /// Reinterpret the pointee as a buffer of `T` and slice the provided element range.
+    pub fn try_slice_typed<T: Sized>(&self, range: Range<usize>) -> VortexResult<Self> {
         let start = range.start * size_of::<T>();
         let end = range.end * size_of::<T>();
 
-        self.slice(start..end)
+        self.slice_with_alignment(start..end, Alignment::of::<T>())
     }
 
     #[expect(clippy::panic)]
@@ -403,6 +446,38 @@ impl BufferHandle {
                 .await
                 .vortex_expect("into_host: copy from device to host failed")
         })
+    }
+}
+
+fn offset_alignment(base: Alignment, offset: usize) -> Alignment {
+    if offset == 0 {
+        return base;
+    }
+    let exponent = base
+        .exponent()
+        .min(u8::try_from(offset.trailing_zeros()).unwrap_or(u8::MAX));
+    Alignment::from_exponent(exponent)
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::Buffer;
+
+    use super::*;
+
+    #[test]
+    fn host_slice_reports_strongest_supported_view_alignment() -> VortexResult<()> {
+        let values =
+            Buffer::<f32>::copy_from_aligned([0.0, 1.0, 2.0, 3.0], Alignment::DEFAULT_ALIGNMENT);
+        let handle = BufferHandle::new_host(values.into_byte_buffer());
+
+        let aligned = handle.slice_with_alignment(0..8, Alignment::of::<f32>())?;
+        assert_eq!(aligned.alignment(), Alignment::DEFAULT_ALIGNMENT);
+
+        let offset = handle.slice_with_alignment(4..12, Alignment::of::<f32>())?;
+        assert_eq!(offset.alignment(), Alignment::of::<f32>());
+
+        Ok(())
     }
 }
 
