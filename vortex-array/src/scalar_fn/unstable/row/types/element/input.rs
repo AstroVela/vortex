@@ -47,6 +47,9 @@ pub unsafe trait InputElement: 'static {
     /// Whether [`decode`](Self::decode) is infallible for _legal_ input data.
     ///
     /// This excludes infrastructural failures such as IO or allocation.
+    /// It is independent of
+    /// [`RowFn::INFALLIBLE`](crate::scalar_fn::unstable::row::RowFn::INFALLIBLE), which describes
+    /// the row operation rather than input decoding.
     const DECODE_INFALLIBLE: bool;
 
     /// Validate that `dtype` is an acceptable input column dtype for this element type.
@@ -90,7 +93,9 @@ pub unsafe trait InputElement: 'static {
     /// Borrow the representation used when this argument varies within the batch.
     ///
     /// Called once before the hot loop. Constants do not use this view because the tuple adapter
-    /// keeps their one-row decoded representation separate.
+    /// keeps their one-row decoded representation separate. For every index below the returned
+    /// view's length, [`get_from_view`](Self::get_from_view) must produce the same element as
+    /// [`get`](Self::get) on `column`.
     fn view(column: &Self::Column) -> Self::View<'_>;
 
     /// Read one row from a [`View`](Self::View).

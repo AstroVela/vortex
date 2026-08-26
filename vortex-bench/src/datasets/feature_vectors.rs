@@ -29,6 +29,7 @@ use crate::datasets::Dataset;
 use crate::idempotent_async;
 use crate::random_access::BenchDataset;
 use crate::random_access::data_path;
+use crate::random_access::parquet_to_arrow_file;
 use crate::vector_dataset::TrainLayout;
 use crate::vector_dataset::VectorDataset;
 use crate::vector_dataset::download;
@@ -103,6 +104,10 @@ impl BenchDataset for FeatureVectorsData {
 
     async fn path(&self, format: Format) -> Result<PathBuf> {
         match format {
+            Format::ArrowIpc => {
+                let parquet_path = feature_vectors_parquet().await?;
+                parquet_to_arrow_file(parquet_path, data_path(DATASET, Format::ArrowIpc))
+            }
             Format::OnDiskVortex => feature_vectors_vortex().await,
             Format::VortexCompact => feature_vectors_vortex_compact().await,
             Format::Parquet => feature_vectors_parquet().await,

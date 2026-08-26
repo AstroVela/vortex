@@ -333,7 +333,8 @@ fn trace_scan_compare_on_compressed_shipmode() -> VortexResult<()> {
 
 /// Q13-style predicate over the comment column: `l_comment LIKE '%special%'`.
 ///
-/// The column compresses to `fsst -> bitpacked lengths/offsets`.
+/// The column compresses to `fsst -> bitpacked lengths/offsets`, or to `fsst -> delta offsets`
+/// (with bitpacked residuals) when `unstable_encodings` makes Delta available.
 fn comment_predicate(column: ArrayRef, len: usize) -> VortexResult<ArrayRef> {
     Like::try_new(
         column,
@@ -358,6 +359,8 @@ fn trace_scan_like_on_compressed_comment() -> VortexResult<()> {
     // No reduce rule rewrites a like over FSST; the FSST like kernel compiles the pattern and
     // matches in compressed space at execution time.
     insta::assert_snapshot!(optimized.trace.to_string(), @"");
+    // Delta is only registered under `unstable_encodings`. Without it, the offsets stay bitpacked.
+    // The FSST kernel canonicalizes those offsets without an extra child execution.
     #[cfg(not(feature = "unstable_encodings"))]
     insta::assert_snapshot!(executed.trace.to_string(), @"
     execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
@@ -370,8 +373,13 @@ fn trace_scan_like_on_compressed_comment() -> VortexResult<()> {
     insta::assert_snapshot!(executed.trace.to_string(), @"
     execute_until target=AnyCanonical root=vortex.like(bool, len=4096)
       iter 0 current=vortex.like(bool, len=4096) builder_active=false
-    execute_until target=AnyCanonical root=vortex.block_residual(u16, len=4097)
-      iter 0 current=vortex.block_residual(u16, len=4097) builder_active=false
+    execute_until target=AnyCanonical root=fastlanes.delta(u16, len=4097)
+      iter 0 current=fastlanes.delta(u16, len=4097) builder_active=false
+    execute_until target=AnyCanonical root=vortex.block_residual(u16, len=5120)
+      iter 0 current=vortex.block_residual(u16, len=5120) builder_active=false
+        Done array=vortex.primitive(u16, len=5120)
+      iter 1 current=vortex.primitive(u16, len=5120) builder_active=false
+      return output=vortex.primitive(u16, len=5120)
         Done array=vortex.primitive(u16, len=4097)
       iter 1 current=vortex.primitive(u16, len=4097) builder_active=false
       return output=vortex.primitive(u16, len=4097)
