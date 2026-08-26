@@ -53,6 +53,17 @@ typedef struct {
 
 duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_db);
 
+// Number of threads DuckDB's task scheduler runs for this client context.
+//
+// This is deliberately not `std::thread::available_parallelism`: DuckDB sizes its
+// scheduler from `std::thread::hardware_concurrency`, which ignores the process CPU
+// affinity mask, so under a `taskset`/`numactl` pin the two disagree. Split scheduling
+// has to reason about the threads that actually contend for splits.
+//
+// `context` is the same raw ClientContext pointer this FFI passes in
+// `duckdb_vx_tfunc_init_input`, not DuckDB's opaque C API client context.
+idx_t duckdb_vx_client_context_num_threads(duckdb_client_context context);
+
 typedef struct duckdb_vx_agg_input_ *duckdb_vx_agg_input;
 idx_t duckdb_vx_aggregate_len(duckdb_vx_agg_input ffi);
 duckdb_vx_expr duckdb_vx_aggregate_at(duckdb_vx_agg_input ffi, idx_t index, idx_t *proj_idx);

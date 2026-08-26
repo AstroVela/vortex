@@ -102,6 +102,8 @@ pub struct OpenFileReader {
     total_splits: usize,
     /// Whether split results must be emitted in file order.
     ordered: bool,
+    /// Number of DuckDB scan threads contending for this file's splits.
+    scan_threads: usize,
 }
 
 impl OpenFileReader {
@@ -116,6 +118,7 @@ impl OpenFileReader {
             splits: vec![],
             total_splits: 0,
             ordered: false,
+            scan_threads: 1,
         })
     }
 
@@ -190,12 +193,40 @@ pub fn reader_initialize(file: &mut OpenFileReader, global: &GlobalState) -> Vor
     file.total_splits = splits.len();
     file.splits = splits;
     file.ordered = ordered;
+    file.scan_threads = global.scan_threads;
     Ok(false)
 }
 
 /// Number of splits a single thread drives concurrently, overlapping the IO
 /// of the next split with the decode/export of the current one.
 pub const SPLITS_PER_SCAN: usize = 2;
+
+/// How many rounds of work every thread must still have left before a thread is
+/// allowed to take [`SPLITS_PER_SCAN`] splits instead of one.
+///
+/// Taking two splits per thread only overlaps IO if the file has splits to spare.
+/// At exactly `SPLITS_PER_SCAN * threads` remaining it does the opposite: half the
+/// threads take two splits and the other half get none, halving the file's effective
+/// parallelism. TPC-H SF=10 shows both regimes — `lineitem` scans (~7 splits per
+/// thread) gain ~5% hot / ~7% cold, while `orders`-dominated scans (~1.8 splits per
+/// thread) are a wash — so require a few rounds of headroom before doubling up.
+const SPLIT_HEADROOM: usize = 2;
+
+/// How many splits one thread should take, given how many the file has left and how
+/// many DuckDB scan threads compete for them.
+///
+/// `threads` is DuckDB's own thread count rather than `get_available_parallelism()`:
+/// the latter honours the process CPU affinity mask while DuckDB's scheduler does
+/// not, so under a `taskset`/`numactl` pin (as CI's single-socket benchmark runs use)
+/// they differ by the pin ratio, and the threshold would otherwise be computed
+/// against a fraction of the threads that actually contend for splits.
+fn splits_to_take(remaining: usize, threads: usize) -> usize {
+    if remaining >= SPLITS_PER_SCAN * threads.max(1) * SPLIT_HEADROOM {
+        SPLITS_PER_SCAN.min(remaining)
+    } else {
+        1
+    }
+}
 
 /// Called by all threads under global lock. If this function returns true,
 /// thread calls reader_scan on this file. If this function returns false,
@@ -208,15 +239,7 @@ pub fn reader_try_initialize_scan(file: &mut OpenFileReader, local: &mut LocalSt
     if file.splits.is_empty() {
         return false;
     }
-    // Only take multiple splits while there are enough left to keep every
-    // scan thread busy; near the tail of a file grabbing two splits per
-    // thread halves effective parallelism on compute-bound scans.
-    let threads = vortex_utils::parallelism::get_available_parallelism().unwrap_or(1);
-    let take = if file.splits.len() >= SPLITS_PER_SCAN * threads {
-        SPLITS_PER_SCAN.min(file.splits.len())
-    } else {
-        1
-    };
+    let take = splits_to_take(file.splits.len(), file.scan_threads);
     let splits = file.splits.split_off(file.splits.len() - take);
     // file.splits is stored in inverse order, so restore scan order
     let splits = stream::iter(splits.into_iter().rev());
@@ -340,4 +363,33 @@ pub fn reader_get_progress_in_file(file: &OpenFileReader) -> f64 {
     let left = file.splits.len();
     let denom = total + (total == 0) as usize;
     100.0 * (total - left) as f64 / denom as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::SPLITS_PER_SCAN;
+    use super::splits_to_take;
+
+    #[rstest]
+    // A file with headroom for every thread doubles up.
+    #[case::plenty(10_000, 64, SPLITS_PER_SCAN)]
+    // Exactly at `SPLITS_PER_SCAN * threads` half the threads would starve.
+    #[case::at_the_old_threshold(128, 64, 1)]
+    // ...and just under the headroom bound too.
+    #[case::just_under_headroom(255, 64, 1)]
+    #[case::at_headroom(256, 64, SPLITS_PER_SCAN)]
+    // The tail of a file always falls back to one split per thread.
+    #[case::tail(1, 64, 1)]
+    #[case::single_threaded(4, 1, SPLITS_PER_SCAN)]
+    // A zero thread count from DuckDB must not divide the threshold away.
+    #[case::zero_threads(1, 0, 1)]
+    fn takes_splits_only_with_headroom(
+        #[case] remaining: usize,
+        #[case] threads: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(splits_to_take(remaining, threads), expected);
+    }
 }

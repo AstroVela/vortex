@@ -31,6 +31,22 @@ impl<'a> TableInitInput<'a> {
         unsafe { std::slice::from_raw_parts(self.input.column_ids, self.input.column_ids_count) }
     }
 
+    /// Number of threads DuckDB will run for this scan.
+    ///
+    /// DuckDB sizes its task scheduler from `std::thread::hardware_concurrency`, which
+    /// ignores the process CPU affinity mask, so this can differ from
+    /// [`vortex_utils::parallelism::get_available_parallelism`] whenever the process is
+    /// pinned (`taskset`, `numactl`, a container cpuset). Scan-side scheduling decisions
+    /// need the number of threads that actually contend for splits, which is this one.
+    pub fn num_threads(&self) -> usize {
+        if self.input.client_context.is_null() {
+            return 1;
+        }
+        let threads =
+            unsafe { cpp::duckdb_vx_client_context_num_threads(self.input.client_context) };
+        usize::try_from(threads).unwrap_or(1).max(1)
+    }
+
     /// Returns the table filter set for the table function.
     pub fn table_filter_set(&self) -> Option<&TableFilterSetRef> {
         let ptr = self.input.filters;

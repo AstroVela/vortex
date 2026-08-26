@@ -17,6 +17,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -105,6 +106,15 @@ extern "C" void duckdb_vx_tfunc_bind_result_add_column(duckdb_bind_result ffi_re
 
     result.names.emplace_back(name_str, name_len);
     result.return_types.emplace_back(logical_type);
+}
+
+extern "C" idx_t duckdb_vx_client_context_num_threads(duckdb_client_context context) {
+    D_ASSERT(context);
+    // As with every other duckdb_client_context in this FFI (see InitializeGlobalState),
+    // this is a raw ClientContext pointer rather than DuckDB's own opaque C API wrapper.
+    ClientContext &client_context = *reinterpret_cast<ClientContext *>(context);
+    const int32_t threads = TaskScheduler::GetScheduler(client_context).NumberOfThreads();
+    return threads > 0 ? static_cast<idx_t>(threads) : 1;
 }
 
 extern "C" void duckdb_vx_string_map_insert(duckdb_vx_string_map map, const char *key, const char *value) {
