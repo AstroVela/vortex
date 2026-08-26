@@ -3,7 +3,7 @@
 
 use vortex_error::VortexResult;
 
-use super::BoundExpressionRewriteRule;
+use super::OptimizerRule;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -28,7 +28,7 @@ use crate::scalar_fn::fns::literal::Literal;
 #[derive(Debug)]
 pub(crate) struct RemoveRedundantFillNull;
 
-impl BoundExpressionRewriteRule for RemoveRedundantFillNull {
+impl OptimizerRule for RemoveRedundantFillNull {
     fn expression_id(&self) -> ExpressionId {
         FillNull.id()
     }
@@ -52,7 +52,7 @@ impl BoundExpressionRewriteRule for RemoveRedundantFillNull {
 #[derive(Debug)]
 pub(crate) struct CaseWhenToFillNull;
 
-impl BoundExpressionRewriteRule for CaseWhenToFillNull {
+impl OptimizerRule for CaseWhenToFillNull {
     fn expression_id(&self) -> ExpressionId {
         CaseWhen.id()
     }
@@ -101,12 +101,11 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
-    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::fill_null::FillNull;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
+        BoundExpressionOptimizer::default().optimize(expr)
     }
 
     #[test]

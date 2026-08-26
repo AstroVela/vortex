@@ -123,10 +123,9 @@ pub use exprs::union_child_validities;
 pub use exprs::variant_get;
 pub use exprs::zip_expr;
 pub use optimizer::BoundExpressionOptimizer;
-pub use optimizer::BoundExpressionRewriteRule;
-pub use optimizer::BoundExpressionRewriteRuleRef;
-pub use optimizer::ExpressionOptimizerSession;
-pub use optimizer::ExpressionOptimizerSessionExt;
+pub use optimizer::OptimizerRule;
+pub use optimizer::OptimizerRuleRef;
+pub use optimizer::OptimizerRuleRegistry;
 pub use scope::*;
 
 /// A globally unique identifier for an expression node implementation.

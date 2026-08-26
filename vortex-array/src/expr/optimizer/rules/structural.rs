@@ -8,7 +8,7 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_set::HashSet;
 
-use super::BoundExpressionRewriteRule;
+use super::OptimizerRule;
 use crate::dtype::FieldNames;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -35,7 +35,7 @@ use crate::scalar_fn::fns::select::Select;
 #[derive(Debug)]
 pub(crate) struct GetItemFromPack;
 
-impl BoundExpressionRewriteRule for GetItemFromPack {
+impl OptimizerRule for GetItemFromPack {
     fn expression_id(&self) -> ExpressionId {
         GetItem.id()
     }
@@ -74,7 +74,7 @@ impl BoundExpressionRewriteRule for GetItemFromPack {
 #[derive(Debug)]
 pub(crate) struct MergeToPack;
 
-impl BoundExpressionRewriteRule for MergeToPack {
+impl OptimizerRule for MergeToPack {
     fn expression_id(&self) -> ExpressionId {
         Merge.id()
     }
@@ -136,7 +136,7 @@ impl BoundExpressionRewriteRule for MergeToPack {
 #[derive(Debug)]
 pub(crate) struct SelectFromPack;
 
-impl BoundExpressionRewriteRule for SelectFromPack {
+impl OptimizerRule for SelectFromPack {
     fn expression_id(&self) -> ExpressionId {
         Select.id()
     }
@@ -204,12 +204,11 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
-    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::pack::Pack;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
+        BoundExpressionOptimizer::default().optimize(expr)
     }
 
     #[test]

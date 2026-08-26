@@ -3,7 +3,7 @@
 
 use vortex_error::VortexResult;
 
-use super::BoundExpressionRewriteRule;
+use super::OptimizerRule;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
 use crate::expr::bound;
@@ -22,7 +22,7 @@ use crate::scalar_fn::fns::literal::Literal;
 #[derive(Debug)]
 pub(crate) struct CastLiteralOrIdentity;
 
-impl BoundExpressionRewriteRule for CastLiteralOrIdentity {
+impl OptimizerRule for CastLiteralOrIdentity {
     fn expression_id(&self) -> ExpressionId {
         Cast.id()
     }

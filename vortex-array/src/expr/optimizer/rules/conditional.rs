@@ -3,7 +3,7 @@
 
 use vortex_error::VortexResult;
 
-use super::BoundExpressionRewriteRule;
+use super::OptimizerRule;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -25,7 +25,7 @@ use crate::scalar_fn::fns::zip::Zip;
 #[derive(Debug)]
 pub(crate) struct ConstantMask;
 
-impl BoundExpressionRewriteRule for ConstantMask {
+impl OptimizerRule for ConstantMask {
     fn expression_id(&self) -> ExpressionId {
         Mask.id()
     }
@@ -58,7 +58,7 @@ impl BoundExpressionRewriteRule for ConstantMask {
 #[derive(Debug)]
 pub(crate) struct ConstantZip;
 
-impl BoundExpressionRewriteRule for ConstantZip {
+impl OptimizerRule for ConstantZip {
     fn expression_id(&self) -> ExpressionId {
         Zip.id()
     }
@@ -85,11 +85,10 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
-    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::scalar::Scalar;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
+        BoundExpressionOptimizer::default().optimize(expr)
     }
 
     #[test]

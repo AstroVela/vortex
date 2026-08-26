@@ -4,7 +4,7 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
-use super::BoundExpressionRewriteRule;
+use super::OptimizerRule;
 use super::preserve_dtype;
 use crate::expr::BoundExpression;
 use crate::expr::ExpressionId;
@@ -31,7 +31,7 @@ use crate::scalar_fn::fns::operators::Operator;
 #[derive(Debug)]
 pub(crate) struct BinaryBoolean;
 
-impl BoundExpressionRewriteRule for BinaryBoolean {
+impl OptimizerRule for BinaryBoolean {
     fn expression_id(&self) -> ExpressionId {
         Binary.id()
     }
@@ -82,7 +82,7 @@ impl BoundExpressionRewriteRule for BinaryBoolean {
 #[derive(Debug)]
 pub(crate) struct BinaryNullComparison;
 
-impl BoundExpressionRewriteRule for BinaryNullComparison {
+impl OptimizerRule for BinaryNullComparison {
     fn expression_id(&self) -> ExpressionId {
         Binary.id()
     }
@@ -112,7 +112,7 @@ impl BoundExpressionRewriteRule for BinaryNullComparison {
 #[derive(Debug)]
 pub(crate) struct FindBetween;
 
-impl BoundExpressionRewriteRule for FindBetween {
+impl OptimizerRule for FindBetween {
     fn expression_id(&self) -> ExpressionId {
         Binary.id()
     }
@@ -262,7 +262,6 @@ mod tests {
     use crate::expr::BoundExpression;
     use crate::expr::bound;
     use crate::expr::optimizer::BoundExpressionOptimizer;
-    use crate::expr::optimizer::ExpressionOptimizerSession;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
     use crate::scalar::Scalar;
@@ -271,7 +270,7 @@ mod tests {
     use crate::scalar_fn::fns::between::StrictComparison;
 
     fn optimize(expr: &BoundExpression) -> VortexResult<BoundExpression> {
-        BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default()).optimize(expr)
+        BoundExpressionOptimizer::default().optimize(expr)
     }
 
     #[test]

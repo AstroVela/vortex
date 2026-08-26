@@ -9,10 +9,11 @@
 //!
 //! # How optimization works
 //!
-//! [`ExpressionOptimizerSession`] holds the reusable rule registry. A
-//! [`BoundExpressionOptimizer`] takes that session and configures the rewrite limit. Each call to
-//! [`BoundExpressionOptimizer::try_optimize`] creates an `OptimizationRun` containing a reference
-//! to the session's rule registry and the mutable state for that traversal.
+//! [`OptimizerRuleRegistry`] holds the reusable rewrite rules. A
+//! [`BoundExpressionOptimizer`] takes ownership of a configured registry and applies its rules
+//! with a configurable rewrite limit. Each call to [`BoundExpressionOptimizer::try_optimize`]
+//! creates an `OptimizationRun` containing a reference to the registry and the mutable state for
+//! that traversal.
 //!
 //! A run recursively walks the tree with copy-on-write rebuilding:
 //!
@@ -32,37 +33,37 @@ use vortex_error::vortex_ensure;
 use crate::expr::BoundExpression;
 
 mod rules;
-mod session;
 
-pub use rules::BoundExpressionRewriteRule;
-pub use rules::BoundExpressionRewriteRuleRef;
-pub use session::ExpressionOptimizerRuleRegistry;
-pub use session::ExpressionOptimizerRuleSet;
-pub use session::ExpressionOptimizerSession;
-pub use session::ExpressionOptimizerSessionExt;
+pub use rules::OptimizerRule;
+pub use rules::OptimizerRuleRef;
+pub use rules::OptimizerRuleRegistry;
 
 const DEFAULT_MAX_REWRITES: usize = 10_000;
-const MAX_OPTIMIZATION_DEPTH: usize = 256;
+const MAX_DEPTH: usize = 256;
 
 /// A deterministic optimizer for [`BoundExpression`] trees.
 ///
-/// The optimizer uses the rules registered in its [`ExpressionOptimizerSession`]. Rules are
+/// The optimizer uses the rules in its [`OptimizerRuleRegistry`]. Rules are
 /// grouped by root expression ID and run in registration order. Nodes are rewritten before their
 /// children and again after changed children are installed. A global rewrite budget terminates
 /// cyclic rule sets.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BoundExpressionOptimizer {
-    session: ExpressionOptimizerSession,
+    registry: OptimizerRuleRegistry,
     max_rewrites: usize,
 }
 
+impl Default for BoundExpressionOptimizer {
+    fn default() -> Self {
+        Self::new(OptimizerRuleRegistry::default())
+    }
+}
+
 impl BoundExpressionOptimizer {
-    /// Create an optimizer backed by `session`.
-    ///
-    /// Cloning the session is cheap and keeps later rule registrations visible to the optimizer.
-    pub fn new(session: &ExpressionOptimizerSession) -> Self {
+    /// Create an optimizer from a configured rule registry.
+    pub fn new(registry: OptimizerRuleRegistry) -> Self {
         Self {
-            session: session.clone(),
+            registry,
             max_rewrites: DEFAULT_MAX_REWRITES,
         }
     }
@@ -80,20 +81,20 @@ impl BoundExpressionOptimizer {
 
     /// Optimize an entire bound expression tree, returning `None` when no subtree changed.
     pub fn try_optimize(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        OptimizationRun::new(self.session.registry(), self.max_rewrites).run(expr)
+        OptimizationRun::new(&self.registry, self.max_rewrites).run(expr)
     }
 }
 
 /// Mutable state for one optimizer invocation.
 struct OptimizationRun<'rules> {
-    registry: &'rules ExpressionOptimizerRuleRegistry,
+    registry: &'rules OptimizerRuleRegistry,
     max_rewrites: usize,
     rewrite_count: usize,
 }
 
 impl<'rules> OptimizationRun<'rules> {
     /// Create a run using the given rule registry and rewrite limit.
-    fn new(registry: &'rules ExpressionOptimizerRuleRegistry, max_rewrites: usize) -> Self {
+    fn new(registry: &'rules OptimizerRuleRegistry, max_rewrites: usize) -> Self {
         Self {
             registry,
             max_rewrites,
@@ -111,7 +112,7 @@ impl<'rules> OptimizationRun<'rules> {
         &mut self,
         expression: &BoundExpression,
     ) -> VortexResult<Option<BoundExpression>> {
-        let Some(rules) = self.registry.get(&expression.id()) else {
+        let Some(rules) = self.registry.get(expression.id()) else {
             return Ok(None);
         };
         for rule in rules.iter() {
@@ -149,10 +150,10 @@ impl<'rules> OptimizationRun<'rules> {
         original: &BoundExpression,
         depth: usize,
     ) -> VortexResult<Option<BoundExpression>> {
-        if depth >= MAX_OPTIMIZATION_DEPTH {
+        if depth >= MAX_DEPTH {
             vortex_bail!(
                 "Exceeded bound-expression optimization depth limit of \
-                 {MAX_OPTIMIZATION_DEPTH}"
+                 {MAX_DEPTH}"
             );
         }
 
@@ -224,8 +225,8 @@ mod tests {
     use vortex_error::VortexResult;
 
     use super::BoundExpressionOptimizer;
-    use super::BoundExpressionRewriteRule;
-    use super::ExpressionOptimizerSession;
+    use super::OptimizerRule;
+    use super::OptimizerRuleRegistry;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -241,7 +242,7 @@ mod tests {
     #[derive(Debug)]
     struct IsNullTo(bool);
 
-    impl BoundExpressionRewriteRule for IsNullTo {
+    impl OptimizerRule for IsNullTo {
         fn expression_id(&self) -> ExpressionId {
             IsNull.id()
         }
@@ -254,23 +255,11 @@ mod tests {
     #[test]
     fn rules_run_in_registration_order() -> VortexResult<()> {
         let input = bound::is_null(bound::lit(1i32));
-        let session = ExpressionOptimizerSession::empty();
-        session.register(IsNullTo(true));
-        session.register(IsNullTo(false));
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(IsNullTo(true));
+        registry.register(IsNullTo(false));
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
-        assert_eq!(optimizer.optimize(&input)?, bound::lit(true));
-        Ok(())
-    }
-
-    #[test]
-    fn optimizer_observes_later_session_registrations() -> VortexResult<()> {
-        let input = bound::is_null(bound::lit(1i32));
-        let session = ExpressionOptimizerSession::empty();
-        let optimizer = BoundExpressionOptimizer::new(&session);
-
-        assert_eq!(optimizer.optimize(&input)?, input);
-        session.register(IsNullTo(true));
         assert_eq!(optimizer.optimize(&input)?, bound::lit(true));
         Ok(())
     }
@@ -278,7 +267,7 @@ mod tests {
     #[derive(Debug)]
     struct IsNullToReducibleTree;
 
-    impl BoundExpressionRewriteRule for IsNullToReducibleTree {
+    impl OptimizerRule for IsNullToReducibleTree {
         fn expression_id(&self) -> ExpressionId {
             IsNull.id()
         }
@@ -291,7 +280,7 @@ mod tests {
     #[derive(Debug)]
     struct AndFalse;
 
-    impl BoundExpressionRewriteRule for AndFalse {
+    impl OptimizerRule for AndFalse {
         fn expression_id(&self) -> ExpressionId {
             Binary.id()
         }
@@ -307,10 +296,10 @@ mod tests {
     #[test]
     fn optimizes_subtrees_introduced_by_rules() -> VortexResult<()> {
         let input = bound::is_null(bound::lit(1i32));
-        let session = ExpressionOptimizerSession::empty();
-        session.register(IsNullToReducibleTree);
-        session.register(AndFalse);
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(IsNullToReducibleTree);
+        registry.register(AndFalse);
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
@@ -319,10 +308,10 @@ mod tests {
     #[test]
     fn retries_root_rules_after_optimizing_children() -> VortexResult<()> {
         let input = bound::and(bound::is_null(bound::lit(1i32)), bound::lit(true));
-        let session = ExpressionOptimizerSession::empty();
-        session.register(IsNullTo(false));
-        session.register(AndFalse);
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(IsNullTo(false));
+        registry.register(AndFalse);
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
@@ -331,7 +320,7 @@ mod tests {
     #[derive(Debug)]
     struct WrongDType;
 
-    impl BoundExpressionRewriteRule for WrongDType {
+    impl OptimizerRule for WrongDType {
         fn expression_id(&self) -> ExpressionId {
             IsNull.id()
         }
@@ -344,9 +333,9 @@ mod tests {
     #[test]
     fn rejects_dtype_changes() {
         let input = bound::is_null(bound::lit(1i32));
-        let session = ExpressionOptimizerSession::empty();
-        session.register(WrongDType);
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(WrongDType);
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
         assert!(optimizer.optimize(&input).is_err());
     }
@@ -354,7 +343,7 @@ mod tests {
     #[derive(Debug)]
     struct Unchanged;
 
-    impl BoundExpressionRewriteRule for Unchanged {
+    impl OptimizerRule for Unchanged {
         fn expression_id(&self) -> ExpressionId {
             IsNull.id()
         }
@@ -367,9 +356,9 @@ mod tests {
     #[test]
     fn rejects_unchanged_replacements() {
         let input = bound::is_null(bound::lit(1i32));
-        let session = ExpressionOptimizerSession::empty();
-        session.register(Unchanged);
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(Unchanged);
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
         assert!(optimizer.optimize(&input).is_err());
     }
@@ -377,7 +366,7 @@ mod tests {
     #[derive(Debug)]
     struct ToggleBoolean;
 
-    impl BoundExpressionRewriteRule for ToggleBoolean {
+    impl OptimizerRule for ToggleBoolean {
         fn expression_id(&self) -> ExpressionId {
             Literal.id()
         }
@@ -395,9 +384,9 @@ mod tests {
 
     #[test]
     fn rewrite_budget_terminates_cycles() {
-        let session = ExpressionOptimizerSession::empty();
-        session.register(ToggleBoolean);
-        let optimizer = BoundExpressionOptimizer::new(&session).with_max_rewrites(4);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(ToggleBoolean);
+        let optimizer = BoundExpressionOptimizer::new(registry).with_max_rewrites(4);
 
         assert!(optimizer.optimize(&bound::lit(true)).is_err());
     }
@@ -405,7 +394,7 @@ mod tests {
     #[derive(Debug)]
     struct RootToOne(ExpressionId);
 
-    impl BoundExpressionRewriteRule for RootToOne {
+    impl OptimizerRule for RootToOne {
         fn expression_id(&self) -> ExpressionId {
             self.0
         }
@@ -418,9 +407,9 @@ mod tests {
     #[test]
     fn rules_can_target_non_scalar_expression_nodes() -> VortexResult<()> {
         let input = bound::root(DType::Primitive(PType::I32, Nullability::NonNullable));
-        let session = ExpressionOptimizerSession::empty();
-        session.register(RootToOne(input.id()));
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(RootToOne(input.id()));
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(1i32));
         Ok(())
@@ -434,7 +423,7 @@ mod tests {
         }
 
         assert!(
-            BoundExpressionOptimizer::new(&ExpressionOptimizerSession::empty())
+            BoundExpressionOptimizer::new(OptimizerRuleRegistry::empty())
                 .try_optimize(&expr)
                 .is_err()
         );
@@ -447,9 +436,9 @@ mod tests {
             discarded = bound::not(discarded);
         }
         let input = bound::and(bound::lit(false), discarded);
-        let session = ExpressionOptimizerSession::empty();
-        session.register(AndFalse);
-        let optimizer = BoundExpressionOptimizer::new(&session);
+        let mut registry = OptimizerRuleRegistry::empty();
+        registry.register(AndFalse);
+        let optimizer = BoundExpressionOptimizer::new(registry);
 
         assert_eq!(optimizer.optimize(&input)?, bound::lit(false));
         Ok(())
@@ -461,8 +450,7 @@ mod tests {
         let expr = bound::cast(bound::lit(1i32), target);
 
         assert_eq!(
-            BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default())
-                .optimize(&expr)?,
+            BoundExpressionOptimizer::default().optimize(&expr)?,
             bound::lit(1i64)
         );
         Ok(())

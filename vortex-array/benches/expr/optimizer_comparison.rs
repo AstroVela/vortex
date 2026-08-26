@@ -23,10 +23,10 @@ use vortex_array::dtype::PType;
 use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::BoundExpressionOptimizer;
-use vortex_array::expr::BoundExpressionRewriteRule;
 use vortex_array::expr::Expression;
 use vortex_array::expr::ExpressionId;
-use vortex_array::expr::ExpressionOptimizerSession;
+use vortex_array::expr::OptimizerRule;
+use vortex_array::expr::OptimizerRuleRegistry;
 use vortex_array::expr::and;
 use vortex_array::expr::col;
 use vortex_array::expr::eq;
@@ -164,7 +164,7 @@ mod builtins {
         let scope = struct_scope();
         let unbound = build_expression(*case);
         let expr = unbound.bind(&scope).unwrap();
-        let optimizer = BoundExpressionOptimizer::new(&ExpressionOptimizerSession::default());
+        let optimizer = BoundExpressionOptimizer::default();
 
         let expected = unbound
             .optimize_recursive(&scope)
@@ -182,7 +182,7 @@ mod builtins {
     fn bound_expression_empty(bencher: Bencher, case: &RewriteCase) {
         let scope = struct_scope();
         let expr = build_expression(*case).bind(&scope).unwrap();
-        let optimizer = BoundExpressionOptimizer::new(&ExpressionOptimizerSession::empty());
+        let optimizer = BoundExpressionOptimizer::new(OptimizerRuleRegistry::empty());
 
         bencher
             .counter(ItemsCount::new(case.node_count()))
@@ -196,7 +196,7 @@ struct AndTrueRule {
     enabled: bool,
 }
 
-impl BoundExpressionRewriteRule for AndTrueRule {
+impl OptimizerRule for AndTrueRule {
     fn expression_id(&self) -> ExpressionId {
         Binary.id()
     }
@@ -296,12 +296,12 @@ fn rule_dispatch(bencher: Bencher, case: &RuleDispatchCase) {
     let rewrite_case = case.rewrite_case();
     let scope = struct_scope();
     let expr = build_expression(rewrite_case).bind(&scope).unwrap();
-    let session = ExpressionOptimizerSession::empty();
+    let mut registry = OptimizerRuleRegistry::empty();
     for _ in 1..case.candidate_rules {
-        session.register(AndTrueRule { enabled: false });
+        registry.register(AndTrueRule { enabled: false });
     }
-    session.register(AndTrueRule { enabled: true });
-    let optimizer = BoundExpressionOptimizer::new(&session);
+    registry.register(AndTrueRule { enabled: true });
+    let optimizer = BoundExpressionOptimizer::new(registry);
 
     bencher
         .counter(ItemsCount::new(rewrite_case.node_count()))
