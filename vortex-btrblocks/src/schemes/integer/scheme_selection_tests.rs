@@ -35,7 +35,11 @@ use crate::BtrBlocksCompressor;
 #[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
 use crate::BtrBlocksCompressorBuilder;
 #[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
+use crate::SchemeExt;
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
 use crate::schemes::integer::BlockedFoRScheme;
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
+use crate::schemes::integer::FoRScheme;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
@@ -117,8 +121,44 @@ fn test_blocked_for_never_loses_to_default_schemes_on_runs() -> VortexResult<()>
     Ok(())
 }
 
+/// The blocked scheme must stand in for `FoRScheme` where that scheme is absent.
+///
+/// Every block here spans the same range as the whole array, so per-block references narrow
+/// nothing. The blocked scheme must still take the array: its references are all equal and cascade
+/// to a constant for almost nothing. Skipping instead would leave a compressor built without
+/// `FoRScheme` applying no frame of reference at all, dropping the array to plain bit packing —
+/// on ClickBench `WatchID` that cost 1.61%.
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
+#[test]
+fn test_blocked_for_stands_in_for_global_for() -> VortexResult<()> {
+    let values: Vec<i32> = (0..16_384).map(|i| 1_000_000 + ((i * 37) % 100)).collect();
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array();
+
+    let compressed = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([FoRScheme.id()])
+        .with_new_scheme(&BlockedFoRScheme)
+        .build()
+        .compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        compressed.is::<BlockedFoR>(),
+        "expected the blocked scheme to stand in for global FoR, got {}",
+        compressed.encoding_id()
+    );
+
+    let global =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+    assert!(
+        compressed.nbytes() <= global.nbytes() + global.nbytes() / 100,
+        "standing in for FoR cost more than 1%: {} vs {}",
+        compressed.nbytes(),
+        global.nbytes()
+    );
+    Ok(())
+}
+
 /// Per-block references cost more than they save when every block spans the same range as the
-/// whole array, so the blocked scheme must stand aside and let global FoR take the array.
+/// whole array, so where global FoR is available it should take the array.
 #[test]
 fn test_blocked_for_falls_back_to_global_for() -> VortexResult<()> {
     let values: Vec<i32> = (0..16_384).map(|i| 1_000_000 + ((i * 37) % 100)).collect();

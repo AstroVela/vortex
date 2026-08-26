@@ -124,12 +124,16 @@ impl Scheme for BlockedFoRScheme {
         #[expect(clippy::cast_precision_loss, reason = "estimate only")]
         let reference_bits = (num_blocks * full_width as usize) as f64 / len as f64;
 
-        // Per-block references only pay off when they narrow the residuals. Where they don't,
-        // skip and let `FoRScheme` take the array with a single global reference — this scheme
-        // must never stand in for it, or an encoding policy that forbids `BlockedFoR` would
-        // drop frame of reference altogether. `blocked_bits == 0` means every block is
-        // constant, a shape RunEnd and RLE model better than zero-width residuals.
-        if blocked_bits == 0 || blocked_bits >= global_bits || blocks.all_minima_zero {
+        // This scheme subsumes a global frame of reference: when no block narrows the residuals
+        // its references are all equal, and the cascading child compressor folds them to a
+        // constant for almost nothing. So take the array even at `blocked_bits == global_bits`
+        // rather than deferring — deferring would leave nothing to apply a frame of reference
+        // where `FoRScheme` is absent.
+        //
+        // `blocked_bits == 0` means every block is constant, a shape RunEnd and RLE model better
+        // than zero-width residuals. `all_minima_zero` means subtracting a reference is a no-op,
+        // so plain BitPacking reaches the same width without the extra layer.
+        if blocked_bits == 0 || blocks.all_minima_zero {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 

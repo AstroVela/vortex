@@ -29,7 +29,9 @@ use tpch::benchmark::TpcHBenchmark;
 pub use utils::file::*;
 pub use utils::logging::*;
 use vortex::compressor::BtrBlocksCompressorBuilder;
+use vortex::compressor::SchemeExt;
 use vortex::compressor::schemes::integer::BlockedFoRScheme;
+use vortex::compressor::schemes::integer::FoRScheme;
 use vortex::editions::CORE_2026_08_4;
 use vortex::editions::ComponentKind;
 use vortex::editions::EditionSessionExt;
@@ -103,7 +105,13 @@ pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 /// a strategy without an allow list would fail to serialize it rather than silently fall back.
 /// The benchmarks opt in explicitly, alongside the edition enabled on [`SESSION`].
 pub fn bench_btrblocks_builder(compaction: CompactionStrategy) -> BtrBlocksCompressorBuilder {
-    let builder = BtrBlocksCompressorBuilder::default().with_new_scheme(&BlockedFoRScheme);
+    // Replace rather than add. `BlockedFoRScheme` subsumes `FoRScheme` — with no block narrower
+    // than the array its references fold to a constant — but the two estimates are close enough
+    // that leaving both in lets `FoRScheme` win races the block-wise form serves better. On
+    // TPC-H SF=1 replacing gains 3.21% against 1.92% for merely adding.
+    let builder = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([FoRScheme.id()])
+        .with_new_scheme(&BlockedFoRScheme);
     match compaction {
         CompactionStrategy::Compact => builder.with_compact(),
         CompactionStrategy::Default => builder,
