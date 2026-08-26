@@ -92,6 +92,7 @@ impl<T: BenchPrimitive> RowFn for InfallibleBool<T> {
 
     const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("bench.row_fn_output.infallible_bool");

@@ -3,9 +3,9 @@
 
 //! The [`RowFn`] contract for scalar functions whose natural kernel computes one row at a time.
 //!
-//! Implementations declare their arity and fallibility, then use [`RowFn::dispatch`] to select the
-//! typed row signature for each supported dtype combination. Optional methods provide
-//! serialization without putting persistence plumbing in the row kernel.
+//! Implementations declare their arity, semantic fallibility, and decode fallibility, then use
+//! [`RowFn::dispatch`] to select the typed row signature for each supported dtype combination.
+//! Optional methods provide serialization without putting persistence plumbing in the row kernel.
 
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -51,14 +51,35 @@ pub trait RowFn: 'static + Sized + Clone + Send + Sync {
     /// infallible.
     ///
     /// Input decoding declares its fallibility independently through
-    /// [`InputElement::DECODE_INFALLIBLE`] and does not affect this flag. The framework checks
-    /// row-result fallibility. A conservative `false` is allowed.
+    /// [`DECODE_INFALLIBLE`](Self::DECODE_INFALLIBLE) and does not affect this flag. The framework
+    /// checks row-result fallibility. A conservative `false` is allowed.
     ///
     /// See [`ScalarFnVTable::is_infallible`] for the definition of semantic errors.
     ///
-    /// [`InputElement::DECODE_INFALLIBLE`]: crate::scalar_fn::unstable::row::InputElement::DECODE_INFALLIBLE
     /// [`ScalarFnVTable::is_infallible`]: crate::scalar_fn::ScalarFnVTable::is_infallible
     const INFALLIBLE: bool;
+
+    /// Whether every input element selected by [`dispatch`](Self::dispatch) declares
+    /// [`InputElement::DECODE_INFALLIBLE`].
+    ///
+    /// This describes conversion into the Rust-native column representation. It is independent of
+    /// [`INFALLIBLE`](Self::INFALLIBLE), which describes the row operation, and
+    /// [`InputElement::DENSE_SAFE`], which describes whether dense execution can tolerate null-row
+    /// payloads.
+    ///
+    /// This function-wide summary is necessary because [`ScalarFnVTable::is_infallible`] receives
+    /// no argument dtypes and cannot inspect the tuple selected by [`dispatch`](Self::dispatch).
+    /// The framework checks every selected tuple against a positive declaration. A conservative
+    /// `false` is allowed.
+    ///
+    /// The blanket [`ScalarFnVTable`] advertises infallibility only when both this constant and
+    /// [`INFALLIBLE`](Self::INFALLIBLE) are `true`.
+    ///
+    /// [`InputElement::DECODE_INFALLIBLE`]: crate::scalar_fn::unstable::row::InputElement::DECODE_INFALLIBLE
+    /// [`InputElement::DENSE_SAFE`]: crate::scalar_fn::unstable::row::InputElement::DENSE_SAFE
+    /// [`ScalarFnVTable`]: crate::scalar_fn::ScalarFnVTable
+    /// [`ScalarFnVTable::is_infallible`]: crate::scalar_fn::ScalarFnVTable::is_infallible
+    const DECODE_INFALLIBLE: bool;
 
     /// Returns the ID of the scalar function.
     fn id(&self) -> ScalarFnId;

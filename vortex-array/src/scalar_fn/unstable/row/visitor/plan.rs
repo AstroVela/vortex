@@ -292,7 +292,7 @@ pub(crate) enum RowPolicy {
 impl RowPolicy {
     /// The policy for an infallible owned output.
     pub(crate) const fn for_owned_output<Args: ElementTuple>() -> Self {
-        if Args::DENSE_SAFE && Args::DECODE_INFALLIBLE {
+        if Args::DENSE_SAFE {
             Self::Dense
         } else {
             Self::ValidOnly
@@ -301,7 +301,7 @@ impl RowPolicy {
 
     /// The policy for an owned output carrying batch-deferred failure evidence.
     pub(crate) const fn for_deferred_output<Args: ElementTuple>() -> Self {
-        if Args::DENSE_SAFE && Args::DECODE_INFALLIBLE {
+        if Args::DENSE_SAFE {
             Self::DenseWithRetry
         } else {
             Self::ValidOnly
@@ -310,7 +310,7 @@ impl RowPolicy {
 
     /// The policy for a sink-writing output.
     pub(crate) const fn for_sink<Args: ElementTuple, ApplyResult: SinkResult>() -> Self {
-        if Args::DENSE_SAFE && Args::DECODE_INFALLIBLE && ApplyResult::INFALLIBLE {
+        if Args::DENSE_SAFE && ApplyResult::INFALLIBLE {
             Self::Dense
         } else {
             Self::ValidOnly

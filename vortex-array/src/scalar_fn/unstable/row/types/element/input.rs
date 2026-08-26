@@ -44,12 +44,12 @@ pub unsafe trait InputElement: 'static {
     /// null rows to the row closure.
     const DENSE_SAFE: bool;
 
-    /// Whether [`decode`](Self::decode) is infallible for _legal_ input data.
+    /// Whether [`decode`](Self::decode) is guaranteed not to reject legal, well-typed values while
+    /// constructing the Rust-native [`Column`](Self::Column) representation.
     ///
-    /// This excludes infrastructural failures such as IO or allocation.
-    /// It is independent of
+    /// This excludes infrastructural failures such as IO or allocation. It is independent of
     /// [`RowFn::INFALLIBLE`](crate::scalar_fn::unstable::row::RowFn::INFALLIBLE), which describes
-    /// the row operation rather than input decoding.
+    /// the row operation, and [`DENSE_SAFE`](Self::DENSE_SAFE), which describes null-row payloads.
     const DECODE_INFALLIBLE: bool;
 
     /// Validate that `dtype` is an acceptable input column dtype for this element type.

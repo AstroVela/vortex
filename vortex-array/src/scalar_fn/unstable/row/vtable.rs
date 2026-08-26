@@ -84,7 +84,7 @@ impl<F: RowFn> ScalarFnVTable for F {
     }
 
     fn is_infallible(&self, _options: &Self::Options) -> bool {
-        F::INFALLIBLE
+        F::INFALLIBLE && F::DECODE_INFALLIBLE
     }
 }
 
@@ -231,6 +231,7 @@ mod tests {
     use crate::dtype::DType;
     use crate::scalar_fn::EmptyOptions;
     use crate::scalar_fn::ScalarFnId;
+    use crate::scalar_fn::ScalarFnVTable;
     use crate::scalar_fn::VecExecutionArgs;
     use crate::scalar_fn::unstable::row::RowFn;
     use crate::scalar_fn::unstable::row::RowVisitor;
@@ -259,6 +260,7 @@ mod tests {
 
         const ARG_NAMES: &'static [&'static str] = &[];
         const INFALLIBLE: bool = true;
+        const DECODE_INFALLIBLE: bool = true;
 
         fn id(&self) -> ScalarFnId {
             static ID: CachedId = CachedId::new("test.nullary_seven");
@@ -281,6 +283,7 @@ mod tests {
         const ARG_NAMES: &'static [&'static str] = &["value"];
 
         const INFALLIBLE: bool = true;
+        const DECODE_INFALLIBLE: bool = true;
 
         fn id(&self) -> ScalarFnId {
             static ID: CachedId = CachedId::new("test.indexing_row_fn");
@@ -304,6 +307,7 @@ mod tests {
 
         const ARG_NAMES: &'static [&'static str] = &["value"];
         const INFALLIBLE: bool = false;
+        const DECODE_INFALLIBLE: bool = true;
 
         fn id(&self) -> ScalarFnId {
             static ID: CachedId = CachedId::new("test.changing_dispatch_row_fn");
@@ -326,6 +330,11 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_infallible_row_fn_advertises_both_guarantees() {
+        assert!(ScalarFnVTable::is_infallible(&IndexingRowFn, &EmptyOptions));
     }
 
     #[test]

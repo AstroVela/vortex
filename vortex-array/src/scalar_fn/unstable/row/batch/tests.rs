@@ -35,6 +35,7 @@ use crate::extension::datetime::Timestamp;
 use crate::scalar::Scalar;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::VecExecutionArgs;
 use crate::scalar_fn::unstable::row::FixedSizeListSink;
 use crate::scalar_fn::unstable::row::InitializedRow;
@@ -192,6 +193,113 @@ unsafe impl InputElement for DenseRetryI64 {
     }
 }
 
+const REJECTED_DECODE_VALUE: i64 = i64::MIN;
+
+struct DecodeFallibleI64;
+
+// SAFETY: the view and unchecked access delegate to the `i64` implementation. Decoding inspects
+// only valid rows, so null-row payloads cannot cause its data-dependent error.
+unsafe impl InputElement for DecodeFallibleI64 {
+    type Column = Buffer<i64>;
+    type View<'a> = &'a [i64];
+    type Elem<'a> = i64;
+
+    const DENSE_SAFE: bool = true;
+    const DECODE_INFALLIBLE: bool = false;
+
+    fn validate(dtype: &DType) -> VortexResult<()> {
+        <i64 as InputElement>::validate(dtype)
+    }
+
+    fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+        let valid = array.validity()?.execute_mask(array.len(), ctx)?;
+        let values = <i64 as InputElement>::decode(array, ctx)?;
+
+        if valid
+            .to_bit_buffer()
+            .iter()
+            .zip(values.iter())
+            .any(|(is_valid, value)| is_valid && *value == REJECTED_DECODE_VALUE)
+        {
+            vortex_bail!(InvalidArgument: "test decoder rejected a valid value");
+        }
+
+        Ok(values)
+    }
+
+    fn get(column: &Self::Column, index: usize) -> i64 {
+        <i64 as InputElement>::get(column, index)
+    }
+
+    fn view(column: &Self::Column) -> Self::View<'_> {
+        <i64 as InputElement>::view(column)
+    }
+
+    fn get_from_view<'a>(view: &Self::View<'a>, index: usize) -> i64
+    where
+        Self: 'a,
+    {
+        <i64 as InputElement>::get_from_view(view, index)
+    }
+
+    unsafe fn get_from_view_unchecked<'a>(view: &Self::View<'a>, index: usize) -> i64
+    where
+        Self: 'a,
+    {
+        // SAFETY: forwarded from this method's contract.
+        unsafe { <i64 as InputElement>::get_from_view_unchecked(view, index) }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DecodeFallibleIdentity {
+    prepare_count: Arc<AtomicUsize>,
+    apply_count: Arc<AtomicUsize>,
+}
+
+impl DecodeFallibleIdentity {
+    fn prepare_count(&self) -> usize {
+        self.prepare_count.load(Ordering::Relaxed)
+    }
+
+    fn apply_count(&self) -> usize {
+        self.apply_count.load(Ordering::Relaxed)
+    }
+}
+
+impl RowFn for DecodeFallibleIdentity {
+    type Options = EmptyOptions;
+
+    const ARG_NAMES: &'static [&'static str] = &["value"];
+    const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = false;
+
+    fn id(&self) -> ScalarFnId {
+        static ID: CachedId = CachedId::new("test.decode_fallible_identity");
+        *ID
+    }
+
+    fn dispatch<V: RowVisitor>(
+        &self,
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::VisitResult> {
+        let prepare_count = Arc::clone(&self.prepare_count);
+        let apply_count = Arc::clone(&self.apply_count);
+
+        visitor.visit_prepared::<(DecodeFallibleI64,), i64, _>(
+            move |_| {
+                prepare_count.fetch_add(1, Ordering::Relaxed);
+            },
+            move |&(), (value,)| {
+                apply_count.fetch_add(1, Ordering::Relaxed);
+                value
+            },
+        )
+    }
+}
+
 /// Produces a null row to exercise output validation at the row-function boundary.
 #[derive(Default)]
 struct NullProducingI64(i64);
@@ -249,6 +357,7 @@ impl RowFn for RepeatValue {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.repeat_value");
@@ -278,6 +387,7 @@ impl RowFn for DeferredAdd {
 
     const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
     const INFALLIBLE: bool = false;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.deferred_add");
@@ -313,6 +423,7 @@ impl RowFn for ValidOnlyIdentity {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = false;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.valid_only_identity");
@@ -337,6 +448,7 @@ impl RowFn for FilterAndScatterIdentity {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = false;
+    const DECODE_INFALLIBLE: bool = false;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.filter_and_scatter_identity");
@@ -358,6 +470,7 @@ impl RowFn for DenseRetryIncrement {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = false;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.dense_retry_increment");
@@ -388,6 +501,7 @@ impl RowFn for FilterAndScatterRepeat {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = false;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.filter_and_scatter_repeat");
@@ -418,6 +532,7 @@ impl RowFn for InvalidKernelOutput {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.invalid_kernel_output");
@@ -432,6 +547,55 @@ impl RowFn for InvalidKernelOutput {
     ) -> VortexResult<V::VisitResult> {
         visitor.visit::<(i64,), NullProducingI64>(|(value,)| NullProducingI64(value))
     }
+}
+
+#[test]
+fn test_decode_fallibility_disables_scalar_fn_infallibility_not_dense_execution() -> VortexResult<()>
+{
+    let function = DecodeFallibleIdentity::default();
+    let input = PrimitiveArray::new(
+        vec![
+            1_i64,                 // valid
+            REJECTED_DECODE_VALUE, // null
+            3,                     // valid
+        ],
+        Validity::from_iter([true, false, true]),
+    )
+    .into_array();
+    let expected = input.clone();
+    let args = VecExecutionArgs::new(vec![input], 3);
+    let mut ctx = array_session().create_execution_ctx();
+
+    let actual = execute_rows(&function, &EmptyOptions, &args, &mut ctx)?;
+
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    assert_eq!(function.prepare_count(), 1);
+    assert_eq!(function.apply_count(), 3);
+    assert!(!ScalarFnVTable::is_infallible(&function, &EmptyOptions));
+    Ok(())
+}
+
+#[test]
+fn test_decode_error_precedes_prepare_and_apply() -> VortexResult<()> {
+    let function = DecodeFallibleIdentity::default();
+    let input = PrimitiveArray::from_iter([REJECTED_DECODE_VALUE]).into_array();
+    let args = VecExecutionArgs::new(vec![input], 1);
+    let mut ctx = array_session().create_execution_ctx();
+
+    let error = match execute_rows(&function, &EmptyOptions, &args, &mut ctx) {
+        Err(error) => error,
+        Ok(_) => vortex_bail!("a rejected decoded value must fail execution"),
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("test decoder rejected a valid value"),
+        "unexpected error: {error}",
+    );
+    assert_eq!(function.prepare_count(), 0);
+    assert_eq!(function.apply_count(), 0);
+    Ok(())
 }
 
 #[rstest]
@@ -491,6 +655,7 @@ impl RowFn for PackedPositive {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.packed_positive");
@@ -512,6 +677,7 @@ impl RowFn for PackedGreaterThan {
 
     const ARG_NAMES: &'static [&'static str] = &["lhs", "rhs"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.packed_greater_than");
@@ -533,6 +699,7 @@ impl RowFn for ValidOnlyPositive {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.valid_only_positive");
@@ -557,6 +724,7 @@ impl RowFn for NullaryTrue {
 
     const ARG_NAMES: &'static [&'static str] = &[];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.nullary_true");
@@ -903,6 +1071,7 @@ impl RowFn for DeclaredOutput {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.declared_output");
@@ -933,6 +1102,7 @@ impl RowFn for DeclaredSinkOutput {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = false;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.declared_sink_output");
@@ -965,6 +1135,7 @@ impl RowFn for ChangingOutputDType {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.changing_output_dtype");
@@ -1125,6 +1296,7 @@ impl RowFn for MismatchedStorage {
 
     const ARG_NAMES: &'static [&'static str] = &["value"];
     const INFALLIBLE: bool = true;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("test.mismatched_storage");

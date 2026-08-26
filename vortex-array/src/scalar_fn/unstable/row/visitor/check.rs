@@ -33,6 +33,10 @@ const fn assert_input_visit_contract<F: RowFn, Args: ElementTuple>() {
         Args::ARITY == F::ARG_NAMES.len(),
         "the visited argument tuple must have the arity declared by RowFn::ARG_NAMES",
     );
+    assert!(
+        !F::DECODE_INFALLIBLE || Args::DECODE_INFALLIBLE,
+        "RowFn::DECODE_INFALLIBLE must be false when an input decoder can fail",
+    );
 }
 
 pub(super) const fn assert_owned_visit_contract<Function, Args, Out>()

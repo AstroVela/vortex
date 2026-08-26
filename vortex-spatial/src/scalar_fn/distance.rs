@@ -41,6 +41,9 @@ impl RowFn for SpatialDistance {
     const ARG_NAMES: &'static [&'static str] = &["a", "b"];
     const INFALLIBLE: bool = true;
 
+    // GeometryRow decoding can return a data-dependent error.
+    const DECODE_INFALLIBLE: bool = false;
+
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.st.distance");
         *ID
@@ -200,6 +203,11 @@ mod tests {
             SpatialDistance.return_dtype(&EmptyOptions, &[dtype.as_nullable(), dtype])?;
         assert!(nullable.is_nullable());
         Ok(())
+    }
+
+    #[test]
+    fn distance_does_not_advertise_speculative_infallibility() {
+        assert!(!SpatialDistance.is_infallible(&EmptyOptions));
     }
 
     /// A null row in a geometry operand yields a null result; valid rows are unaffected.

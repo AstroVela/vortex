@@ -55,6 +55,7 @@ impl RowFn for NumericBinary {
 
     // Fallibility is queried without input dtypes, so this conservatively covers integer widths.
     const INFALLIBLE: bool = false;
+    const DECODE_INFALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         // `NumericBinary` is a private implementation detail of `Binary`: it is never registered or
