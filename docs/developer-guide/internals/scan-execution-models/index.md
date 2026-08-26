@@ -21,7 +21,8 @@ The **current working direction** is
 [morsel-based plan execution](morsel-based-plan-execution.md): one stateful exec-node graph per
 fixed row morsel, a lazy `IO | Plan` stream whose planning state remains internal to the morsel,
 resumable value execution, and explicit retirement. The comparison and earlier proposals below
-remain as design history and evidence.
+remain as design history and evidence. Its [documents-to-use
+section](morsel-based-plan-execution.md#documents-to-use) is the short reading map.
 
 ```{toctree}
 ---

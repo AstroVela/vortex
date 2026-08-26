@@ -4,6 +4,25 @@ Status: **current working direction (2026-08-26)**. This document is the focus f
 scan-execution design work. Earlier documents in this directory remain useful evidence and
 derivation, but this document owns the model described below.
 
+## Documents to use
+
+Use these documents together; treat the remaining files in this directory as historical working
+notes unless one of these links points to them:
+
+- **Current direction:** this document owns the morsel, internal `IO | Plan` iterator, exec-node,
+  and retirement contracts.
+- **Current implementation context:** [plan v2](plan-v2.md) describes today's physical operators;
+  [scan plans](../scan-planning.md) and [array execution](../execution.md) describe the existing
+  planning and array-execution APIs that this proposal would change or reuse.
+- **Measured evidence:** the [self-paced experiment findings](self-paced-plan-exec-findings.md) and
+  [executor reference](self-paced-executor-reference.md) record the benchmark results, ownership
+  lessons, and implemented experimental machinery that should constrain a prototype.
+- **Prior derivation:** the [previous consolidated design](scan-execution-design.md) and
+  [demand/operator discussion](scan-execution-demand-and-operators.md) contain useful reasoning,
+  but this document wins when their contracts disagree with it.
+- **Archive map:** the [scan execution model index](index.md) links every earlier proposal, review,
+  experiment, and handover.
+
 The short version is:
 
 - divide each root row domain into independent morsels, initially about 128K rows;
