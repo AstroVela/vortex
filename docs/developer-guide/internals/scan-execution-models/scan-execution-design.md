@@ -52,7 +52,8 @@ Everything in the design is licensed by three statements.
 Optimistic conjunct IO and optimistic projection IO are the same move: admit reads against
 whatever the cell currently holds (top if nothing landed). Cascade versus parallel-eager is
 "how stale was the snapshot at admission" — a continuum controlled by the scheduler, not two
-code paths.
+code paths. The conjunct sequence itself is the same kind of decision: an admission ordering
+priced from the kernel table and adaptive selectivity estimates, not plan structure.
 
 ## 4. Architecture
 
@@ -62,11 +63,26 @@ Three parts.
 
 Per layout, per scan: operator pipelines in the DuckDB/Velox style — instances that hold
 buffers, accumulators, and scratch, owned by the morsel (not the thread) and driven as plain
-function calls. One pipeline per conjunct; a small number per projection. Struct is **not** a
+function calls. Pipelines are compiled, not authored: the binder derives kernel chains from
+the layout declarations (§9), fuses privately connected stages into templates, and morsel
+planning instantiates per-morsel instances from them. One pipeline per conjunct; a small number per projection. Struct is **not** a
 pipeline breaker: fields are sequential stages of one instance, with elective field-parallel
 fan-out only above the granularity floor. The only barrier-like point is the per-range mask
-meet, implemented as a countdown. Statefulness is safe because demand is not the operators'
+meet, implemented as a countdown; the AND folds on arrival, so the meet holds one accumulator
+mask rather than k conjunct parts. Statefulness is safe because demand is not the operators'
 job (law 3).
+
+Every fan-in readiness check is this countdown, generalized. Where input boundaries are
+static, ranges are cut at the boundary union and the counter is parts-outstanding. Where
+producers advance variable prefixes (elective field fan-out, child-domain results), the
+counter is a generation-tagged word in the stash — (epoch, children still at the emit
+frontier) — decremented in O(1) only by a producer advancing *past* the frontier; blockers
+pin the frontier, so the check is race-free, and the epoch resolves the reinstall race. The
+decrement to zero enqueues the combine, which computes the min frontier itself (O(fan-out),
+work it already pays), emits the common prefix, and installs the next blocker set. A struct
+zip therefore has no task at all until every field is non-empty: the last producer is the
+scheduler check, no exact min is maintained (a tournament tree's O(log n) increase-key buys
+a value nobody reads between activations), and entries-per-admission ≈ 1 is preserved.
 
 ### 4.2 The demand system
 
@@ -76,13 +92,22 @@ domain relationships (chunk shifts, dict codes-to-values, list offsets, the filt
 crossing) are edge maps — static ones composed at bind, gated ones snapped in when their fact
 seals.
 
+Cells are scoped per (domain, region) because demand content must only shrink: a scan-wide
+needs aggregate across morsels would *grow* as morsels are claimed — the wrong lattice
+direction. Anything that accumulates needs across morsels (dict values pages, straddling
+chunks) is work dedup through keyed data cells, never demand; the limit is the one legitimate
+cross-morsel demand precisely because remaining-k shrinks (§8).
+
 ### 4.3 The scheduler
 
 Morsel-driven with work stealing.
 
 - **Morsels are typed by row domain** and claimed from a per-domain queue. A domain change
-  spawns **child-domain morsels** at gate seal — own demand (sealed at birth), own pipelines,
-  own stash — whose results land in the parent's stash for the parent's combine.
+  spawns **child-domain morsels** at gate seal — own demand (the gather set, sealed at birth),
+  own pipelines, own stash. Where the child domain is morsel-private (list elements), results
+  land in the parent's stash for the parent's combine; where it is scan-static (dict values),
+  results land in the scan-wide keyed cells of §6 and the parent's stash holds references —
+  reads dedup by `SegmentId` across morsels either way.
 - **Depth-first priority**: inner-domain morsels run before new outer splits are claimed
   (workers run their own newest work, steal the oldest/outermost). This bounds work-in-progress
   near workers × domain-depth and drains stashes before opening new ones.
@@ -143,6 +168,36 @@ explicit list of scan-wide keyed cells: dictionary values, file stats, the pruni
 Chunks straddling a morsel boundary are decoded twice by default (bounded-duplicate
 principle); promote straddlers to scan-wide cells only on measured need.
 
+The fan-in counter of §4.1 lives here, and its API has three faces (design-shaped sketch):
+
+```rust
+// Driver-internal; never part of the layout surface (§9).
+// One per (fan-in point, range); arity installed post-gate when dynamic.
+struct FanIn {
+    epoch_blockers: AtomicU64,       // packed (epoch, children still at the emit frontier)
+    emit_frontier:  u64,             // E — stable while blockers > 0; written at fire
+    inputs:         SmallVec<Input>, // per edge: produced-to frontier, final flag, parts
+}
+
+// Producer face — called by the driver where results land (stage commit, IO
+// completion, child-morsel retire); O(1); No when the producer was not a blocker.
+fn advance(edge: EdgeId, range: RangeId, to: u64, is_final: bool) -> Fired;
+enum Fired { No, Inline(Activation), Enqueued }
+
+// Fire path, on the last producer's thread at blockers == 0:
+//   m = min input frontiers (O(fan-out)); slice parts to [E, m) per edge map;
+//   node.combine(subrange, children)   — the unchanged §9 call, once per subrange;
+//   E = m; CAS-install (epoch + 1, new argmin count); racing producers retry.
+```
+
+Exec nodes opt into nothing: `combine` still receives complete, pre-cut, aligned children,
+and combine-once holds because fire points *split the range* — each common prefix is a
+complete combine over a smaller range, the opportunistic arm of the rebatcher. The scheduler
+gains no API either: `Enqueued` is an ordinary priced CPU task pushed to the local deque,
+wrap-only combines below the floor run inline, and readiness is never a query — which is what
+keeps entries-per-admission ≈ 1. The mask meet is the same counter with the core-owned AND
+folded in the producer path.
+
 ## 7. Memory (deferred, recorded)
 
 Per-morsel live-byte approximation is the admission input. Unresolved and consciously
@@ -156,7 +211,10 @@ oversized morsel needs a degenerate path (shrink or go sequential), not just "no
 Emission is pull-driven: the consumer stopping stops morsel claiming; in-flight morsels finish
 or park. Limit is a first-k demand producer at the sink writing into projection's OOB cells —
 per-morsel for ordered prefix consumption, a shared survivor counter for unordered — and
-transitively bounds filter work. It is the one legitimately cross-morsel demand. Errors seal
+transitively bounds filter work. It is the one legitimately cross-morsel demand. For the
+ordered case each morsel's cell starts at first-k and shrinks as earlier morsels' survivor
+counts seal — a superset of the true need by construction, so overshoot is charged as
+speculation and the in-band pull enforces exactness at emit; no coordinator is involved. Errors seal
 cells with an error value and ride the ordinary wake path.
 
 ## 9. What a layout implements
@@ -167,12 +225,15 @@ cells with an error value and ride the ordinary wake path.
   deferred-planning tasks — derived generically from the declarations for most layouts;
   overridden only where planning is semantic (Zoned pruning, Dict, List).
 - **Combine**: assemble pre-cut, pre-aligned children (zip, wrap, intersect, take). O(parts)
-  if inline; a combine that touches rows must be priced. The opt-in `absorb` refinement
-  (order-free folds, accumulator is a `Value`) exists for stragglers' memory and producer-
-  thread cache warmth, tested against its buffer-then-combine blanket impl.
+  if inline; a combine that touches rows must be priced. Arrival-time folding is not part of
+  this surface: pipeline instances hold their own accumulators for sequential stages, the one
+  order-free fold in the system is the core-owned mask meet (§4.1), and the remaining combines
+  are wrap-shaped, where early absorption frees nothing. The `absorb` refinement from the
+  [derivation](scan-execution-demand-and-operators.md) is shelved (§12).
 
 Explicitly not a layout's job: scheduling, demand, coordinates (driver slices by the recorded
-cut, per edge map), buffering (stash), ordering, retention. Not expressible by design:
+cut, per edge map), buffering (stash), ordering, retention, pipeline construction (compiled
+from the declarations, §4.1). Not expressible by design:
 node-level mutable state outside the stash, order-dependent folds in the scan path.
 
 ## 10. Correctness and testing
@@ -183,9 +244,10 @@ node-level mutable state outside the stash, order-dependent folds in the scan pa
 - **Law suites**: `DomainMap` round-trip and composition-preserves-superset properties;
   kernel totality flags (`can_trap`) audited — v1's `CAST(a, u8) WHERE a < 256` comment is the
   live counterexample gating elective gathers and CPU speculation; OOB plane disabled and
-  maximally delayed must produce identical results; `absorb` versus blanket impl.
+  maximally delayed must produce identical results.
 - **Simulator**: deterministic scheduler tests — no deadlock under memory × ordering × limit ×
-  cancellation, adversarial IO completion orders, steal-versus-wake races.
+  cancellation, adversarial IO completion orders, steal-versus-wake races, blocker-counter
+  epoch races at fan-in (§4.1).
 - **Performance gates**: Q01/Q06 (prefetch split), FineWeb `select *` (splits storm), selective
   string predicates (cascade + wide-value elision), dict page skipping, cold-scan IO parity
   (same bytes, comparable request count as V1 — the check on batch-scope coalescing),
@@ -208,4 +270,6 @@ scheduler spin-up, repeated-scan fact reuse.
 The memory model (§7); the `can_trap` audit mechanics; kernel-table payload representation;
 pool scope (per-scan versus session); speculation floor; the ordered-emission window for
 streaming consumers; whether any node-level trait remains once planning contributions and
-combines are the whole layout surface.
+combines are the whole layout surface; the shelved `absorb` fold, revived only by a measured
+straggler-memory case in a layout combine, with buffer-then-combine as its blanket impl and
+differential oracle.

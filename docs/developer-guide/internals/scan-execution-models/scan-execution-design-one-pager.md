@@ -31,6 +31,7 @@ Full version: [design](scan-execution-design.md).
                                               | CHILD-DOMAIN MORSELS (list elems, dict     |
                                               | values): own demand (sealed at birth),     |
                                               | pipelines, stash; results -> parent stash  |
+                                              | (list) or scan-wide cells (dict values)    |
                                               +--------------------------------------------+
 ```
 
@@ -50,7 +51,8 @@ Full version: [design](scan-execution-design.md).
 - **Demand plane**: bind-time composed routing (producer -> consumer maps); content is any
   superset summary (bounds, zone verdicts, blooms, limit). SIP is this plane, not a feature.
 - **Scheduler**: morsels + work stealing; optimistic IO/CPU below the watermark; cascade vs
-  parallel = snapshot staleness at admission, one code path.
+  parallel = snapshot staleness at admission, one code path; conjunct order = admission
+  pricing, not plan structure.
 
 ## Rules
 
@@ -63,12 +65,16 @@ Full version: [design](scan-execution-design.md).
   sealed the tail.
 - Stash is the buffering home; cross-morsel sharing = short list of scan-wide cells
   (dictionaries, stats, prune fact); straddling chunks decode twice (bounded duplicate).
+- Demand cells only shrink; needs that grow across morsels (dict value pages) are keyed-cell
+  dedup, not demand; ordered limit = per-morsel first-k cells shrinking as earlier survivor
+  counts seal (superset by construction, exactness enforced at emit).
 
 ## Layout author writes
 
 Declarations (edges, maps, coverage, kernels) + a combine (zip/wrap/intersect/take, priced if
-per-row) + optional planning override (Zoned, Dict, List) + optional order-free `absorb`.
-Never: scheduling, demand, coordinates, buffering, ordering.
+per-row) + optional planning override (Zoned, Dict, List).
+Never: scheduling, demand, coordinates, buffering, ordering, pipelines (compiled from the
+declarations).
 
 ## Gates
 
