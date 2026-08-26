@@ -226,9 +226,13 @@ impl ArrayRef {
 }
 
 /// Global toggle for the executor's stream-to-canonical shortcut (see
-/// [`execute_via_chunks`]). Enabled by default; exposed only so benchmarks and tests can compare
-/// the executor with and without the shortcut inside one process.
-static CHUNKED_EXECUTE_ENABLED: AtomicBool = AtomicBool::new(true);
+/// [`execute_via_chunks`]). Enabled by default; `VORTEX_CHUNKED_EXECUTE=0` disables it at process
+/// start, and [`set_chunked_execute_enabled`] overrides it at runtime — both exist only so
+/// benchmarks and tests can compare the executor with and without the shortcut.
+static CHUNKED_EXECUTE_ENABLED: std::sync::LazyLock<AtomicBool> =
+    std::sync::LazyLock::new(|| {
+        AtomicBool::new(!std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "0"))
+    });
 
 #[doc(hidden)]
 pub fn set_chunked_execute_enabled(enabled: bool) {
