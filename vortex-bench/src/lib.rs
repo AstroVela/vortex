@@ -36,6 +36,7 @@ use vortex::editions::EditionSessionExt;
 use vortex::error::VortexExpect;
 use vortex::error::vortex_err;
 use vortex::file::VortexWriteOptions;
+use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
 use vortex::utils::aliases::hash_map::HashMap;
 
@@ -122,6 +123,16 @@ pub fn bench_strategy_builder(compaction: CompactionStrategy) -> WriteStrategyBu
                 .into_iter()
                 .collect(),
         )
+}
+
+/// The write options every benchmark must write Vortex files with.
+///
+/// A bare [`VortexSession::write_options`] builds its strategy from the default scheme set, which
+/// omits [`BlockedFoRScheme`]. A benchmark that writes through one measures a file the encoding
+/// never entered — identical to its base except for the edition's larger encoding table. Route
+/// every benchmark write through here so no call site can silently opt out.
+pub fn bench_write_options(compaction: CompactionStrategy) -> VortexWriteOptions {
+    compaction.apply_options(SESSION.write_options())
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
