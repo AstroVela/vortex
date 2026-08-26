@@ -41,9 +41,43 @@ pub fn split_exec<A: 'static + Send>(
     limit: Option<&mut u64>,
 ) -> VortexResult<TaskFuture<Option<A>>> {
     let row_range = read_mask.row_range();
+    let filter_mask = filter_mask(Arc::clone(&ctx), &read_mask, limit)?;
+    project_exec_with_mask(ctx, row_range, filter_mask)
+}
+
+/// Evaluate pruning and the exact filter for one physical filter range.
+pub fn filter_exec<A: 'static + Send>(
+    ctx: Arc<TaskContext<A>>,
+    read_mask: RowMask,
+) -> VortexResult<TaskFuture<RowMask>> {
+    let row_offset = read_mask.row_range().start;
+    let filter_mask = filter_mask(ctx, &read_mask, None)?;
+    Ok(async move { Ok(RowMask::new(row_offset, filter_mask.await?)) }.boxed())
+}
+
+/// Project one physical projection range after its exact filter mask is known.
+pub fn project_exec<A: 'static + Send>(
+    ctx: Arc<TaskContext<A>>,
+    read_mask: RowMask,
+) -> VortexResult<TaskFuture<Option<A>>> {
+    if read_mask.mask().all_false() {
+        return Ok(async { Ok(None) }.boxed());
+    }
+
+    let row_range = read_mask.row_range();
+    let mask = MaskFuture::ready(read_mask.mask().clone());
+    project_exec_with_mask(ctx, row_range, mask)
+}
+
+fn filter_mask<A: 'static + Send>(
+    ctx: Arc<TaskContext<A>>,
+    read_mask: &RowMask,
+    limit: Option<&mut u64>,
+) -> VortexResult<MaskFuture> {
+    let row_range = read_mask.row_range();
     let row_mask = read_mask.mask().clone();
 
-    let filter_mask = match ctx.filter.as_ref() {
+    Ok(match ctx.filter.as_ref() {
         // No filter == immediate mask
         None => {
             let row_mask = match limit {
@@ -68,8 +102,6 @@ pub fn split_exec<A: 'static + Send>(
             // we want to start prefetching the IO for this split.
             let reader = Arc::clone(&ctx.reader);
             let filter = Arc::clone(filter);
-            let row_range = row_range.clone();
-
             MaskFuture::new(row_mask.len(), async move {
                 let mut mask = row_mask;
                 let mut dynamic_versions = vec![None; filter.conjuncts().len()];
@@ -133,8 +165,14 @@ pub fn split_exec<A: 'static + Send>(
                 Ok(mask)
             })
         }
-    };
+    })
+}
 
+fn project_exec_with_mask<A: 'static + Send>(
+    ctx: Arc<TaskContext<A>>,
+    row_range: std::ops::Range<u64>,
+    filter_mask: MaskFuture,
+) -> VortexResult<TaskFuture<Option<A>>> {
     // Step 4: execute the projection, only at the mask for rows which match the filter
     let projection_future =
         ctx.reader
