@@ -83,6 +83,40 @@ fn test_blocked_for_compressed() -> VortexResult<()> {
     Ok(())
 }
 
+/// Adding the blocked scheme must never make an array bigger than the default set alone does.
+///
+/// Its estimate is closed-form, so on repeated values it cannot see that `RunEnd` cascades to
+/// two `Sequence` children for zero bytes, or that global `FoR` already packs the run's narrow
+/// range. Without a guard the analytic ratio outbids both — TPC-H `ps_partkey`, four suppliers
+/// per part, went from 0 bytes to 800 kB.
+#[cfg(not(any(feature = "unstable_encodings", feature = "pco")))]
+#[test]
+fn test_blocked_for_never_loses_to_default_schemes_on_runs() -> VortexResult<()> {
+    // Run length 4, drifting far enough over the array that per-block references would narrow
+    // the residuals from 12 bits to 8 and so win on the closed-form estimate alone.
+    let values: Vec<i64> = (0..16_384).map(|i| 1 + i / 4).collect();
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array();
+
+    let baseline =
+        BtrBlocksCompressor::default().compress(&array, &mut SESSION.create_execution_ctx())?;
+    let blocked = BtrBlocksCompressorBuilder::default()
+        .with_new_scheme(&BlockedFoRScheme)
+        .build()
+        .compress(&array, &mut SESSION.create_execution_ctx())?;
+
+    assert!(
+        !blocked.is::<BlockedFoR>(),
+        "blocked scheme took a run-length array"
+    );
+    assert!(
+        blocked.nbytes() <= baseline.nbytes(),
+        "{} bytes with the blocked scheme vs {} without",
+        blocked.nbytes(),
+        baseline.nbytes()
+    );
+    Ok(())
+}
+
 /// Per-block references cost more than they save when every block spans the same range as the
 /// whole array, so the blocked scheme must stand aside and let global FoR take the array.
 #[test]

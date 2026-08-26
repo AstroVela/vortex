@@ -26,6 +26,7 @@ use vortex_fastlanes::BlockedFoRArraySlotsExt;
 use vortex_fastlanes::block_summary;
 
 use super::BitPackingScheme;
+use super::runend::RUN_END_THRESHOLD;
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
@@ -129,6 +130,14 @@ impl Scheme for BlockedFoRScheme {
         // drop frame of reference altogether. `blocked_bits == 0` means every block is
         // constant, a shape RunEnd and RLE model better than zero-width residuals.
         if blocked_bits == 0 || blocked_bits >= global_bits || blocks.all_minima_zero {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+
+        // A run of repeats packs to nothing under RunEnd, whose ends and values often cascade to
+        // `Sequence` for zero bytes. This scheme's estimate is closed-form and cannot see that,
+        // so on runs it would outbid a free encoding with a merely good one. `RunEndScheme` takes
+        // everything at or above the same threshold, so defer rather than compete.
+        if stats.average_run_length() >= RUN_END_THRESHOLD {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
         let effective_bits = f64::from(blocked_bits) + reference_bits;
