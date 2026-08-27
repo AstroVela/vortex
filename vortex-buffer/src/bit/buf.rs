@@ -197,21 +197,22 @@ impl BitBuffer {
     ///
     /// # Code generation
     ///
-    /// Each full 64-value chunk is materialized as a byte-per-value `[bool; 64]`, then packed into
-    /// one bitmap word. For simple predicates, LLVM vectorizes the loop and removes the physical
+    /// `collect_bool_words` calls `collect_bool_words_inline`, which selects a `pack_bool_word_*`
+    /// kernel at compile time and passes it to `collect_bool_words_with`. That shared word loop
+    /// materializes each full 64-value chunk as a byte-per-value `[bool; 64]`, then passes it to the
+    /// selected kernel. For simple predicates, LLVM vectorizes the loop and removes the physical
     /// stack array. On AVX-512, it still combines the comparison masks, expands the result into 64
-    /// `0` or `1` bytes with `vpbroadcastq` and `vmovdqu8`, then recreates the mask with
-    /// `vptestmb`.
+    /// `0` or `1` bytes with `vpbroadcastq` and `vmovdqu8`, then recreates the mask with `vptestmb`.
     /// [LLVM issue #219235](https://github.com/llvm/llvm-project/issues/219235) tracks replacing
     /// that round trip with a direct `kmovq` store. The conversion is per chunk. This method does
     /// not create a full-column byte buffer.
     ///
     /// # Performance
     ///
-    /// The packing kernel is selected at compile time, so the fill-and-pack loop can inline into
-    /// its caller. A retained bounds check inside `f` can prevent vectorization. A caller that
-    /// proves `len <= values.len()` can use `unsafe { *values.get_unchecked(i) }` because this
-    /// method only passes indices in `0..len`.
+    /// `collect_bool_words_inline` and `collect_bool_words_with` can inline into the caller, so LLVM
+    /// sees `f`, the fill loop, and the packing kernel together. A retained bounds check inside `f`
+    /// can prevent vectorization. A caller that proves `len <= values.len()` can use
+    /// `unsafe { *values.get_unchecked(i) }` because this method only passes indices in `0..len`.
     ///
     /// Use this method for general predicates. Use [`Self::collect_bool_multiversioned`] only for
     /// the specialized predicates described there.
@@ -222,10 +223,11 @@ impl BitBuffer {
 
     /// Collects Boolean values with a fill-and-pack loop selected for the current CPU.
     ///
-    /// This has the same callback contract as [`Self::collect_bool`]. On x86-64, it compiles the
-    /// complete loop, including `f`, for AVX-512BW, AVX2, and the statically enabled fallback, then
-    /// selects a version at runtime. Each wider version is a `#[target_feature]` function, so Rust
-    /// cannot inline it into a caller compiled without those features.
+    /// This has the same callback contract as [`Self::collect_bool`]. On x86-64,
+    /// `collect_bool_words_multiversioned` selects `collect_bool_words_avx512`,
+    /// `collect_bool_words_avx2`, or `collect_bool_words_inline` at runtime. Each wider version is a
+    /// `#[target_feature]` function, so Rust cannot inline it into a caller compiled without those
+    /// features.
     ///
     /// Use this method only for a small, bounds-check-free predicate whose wider loop has been
     /// benchmarked. Use [`Self::collect_bool`] for general predicates.
