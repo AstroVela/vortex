@@ -63,20 +63,21 @@ closing it is prerequisite to any production comparison. It is not folded into a
 ## Results, SF=1
 
 4 physical cores (no hyperthreading), segments in memory, 5 alternating iterations, median.
-Ratios against V1 single-threaded. Note that single-query differences under ~20% are within this
+Ratios against V1 single-threaded. `D x4 per-split` is the cut that matches V1's split set exactly
+and so isolates the executor comparison from the choice of morsel size. Note that single-query differences under ~20% are within this
 host's run-to-run noise — Q15's V1 single-thread time varied 17.1 to 23.9 ms across runs.
 
-| query | V1 x1 | V1 tok4 | D x1 | D x1 no-reuse | D x4 | D x4 64k |
-|---|--:|--:|--:|--:|--:|--:|
-| Q6 | 46.0 ms | 0.33x | 0.92x | 0.90x | 0.27x | 0.31x |
-| Q1 | 15.8 ms | 0.55x | 0.83x | 0.84x | 0.36x | 0.30x |
-| Q14 | 17.0 ms | 0.42x | 0.86x | 0.86x | 0.35x | 0.26x |
-| Q15 | 17.1 ms | 0.43x | 0.87x | 0.90x | 0.37x | 0.31x |
-| Q12 | 43.1 ms | 0.33x | 0.85x | 0.83x | 0.24x | 0.26x |
-| Q19 | 47.4 ms | 0.59x | **0.54x** | 0.69x | 0.27x | **0.12x** |
-| scan-6col | 5.1 ms | 0.99x | 0.43x | 0.39x | 0.35x | 0.30x |
-| selective | 22.4 ms | 0.43x | 0.87x | 0.86x | 0.29x | 0.29x |
-| **geomean** | — | **0.48x** | **0.75x** | 0.76x | **0.31x** | **0.26x** |
+| query | sel | V1 x1 | V1 tok4 | D x1 128k | D x1 no-reuse | D x4 128k | D x4 per-split |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| Q6 | 1.90% | 45.163 ms | 0.32x | 0.92x | 0.92x | 0.28x | 0.26x |
+| Q1 | 98.59% | 16.172 ms | 0.46x | 0.83x | 0.80x | 0.31x | 0.29x |
+| Q14 | 1.27% | 16.717 ms | 0.43x | 0.89x | 0.91x | 0.37x | 0.33x |
+| Q15 | 3.77% | 16.209 ms | 0.45x | 0.89x | 0.91x | 0.34x | 0.27x |
+| Q12 | 1.81% | 40.280 ms | 0.37x | 1.16x | 1.17x | 0.35x | 0.25x |
+| Q19 | 59.97% | 45.608 ms | 0.60x | 0.34x | 0.35x | 0.12x | 0.27x |
+| scan-6col | 100.00% | 4.403 ms | 0.96x | 0.54x | 0.47x | 0.36x | 0.33x |
+| selective | 0.00% | 21.903 ms | 0.41x | 0.93x | 0.92x | 0.34x | 0.30x |
+| **geomean** | — | — | **0.47x** | **0.77x** | **0.76x** | **0.29x** | **0.29x** |
 
 ### Why the four-thread rows win
 
@@ -108,21 +109,46 @@ concurrent units and still wins, because it does more useful work per scheduling
 relying on latency hiding to keep cores fed. With in-memory segments there is no IO latency to
 hide; whether that holds against real storage is exactly what gate E2 exists to answer.
 
-### Morsel coalescing does *not* generally help
+### Morsel size: 128k rows is the default, and it is a redistribution not a free win
 
-Excluding Q19, coalescing to 64k-row morsels is **1.02x — no effect at all**. The whole of the
-`D x4 64k` geomean advantage is Q19, at 0.42x:
+The default morsel is 128k rows rather than one per natural split. Two things forced the change.
 
-```text
-Q19, per-split morsels: 366 morsels, 11.20 ms
-Q19, 64k morsels:        92 morsels,  4.69 ms
-```
+First, `cut_morsels` could only *coalesce*, never subdivide. The natural splits at SF=1 are
+already about 65k rows, so every target at or below that produced exactly the natural splits —
+earlier "16k", "32k" and "64k" rows in this document were all silently the same cut, and the only
+column that ever differed was Q19's. That is now fixed: `target_rows` is a maximum, subdividing as
+well as coalescing.
 
-Q19 is the only query whose columns misalign, for the same reason its decode sharing fires: its
-string columns compress to sizes that land on different block boundaries, giving it 366 natural
-splits where every other query has 92. Past 64k rows coalescing turns harmful — Q12 goes from
-9.3 ms to 22.7 ms at 1M-row morsels, because a morsel that large stops fitting the working-set
-bound the design's law 8 assumes.
+Second, and more important, tying morsels to natural splits makes the morsel count *a property of
+the file*. SF=1 yields 92 splits: 23 per core on four cores, but 1.4 per core on a 64-core host,
+with no way to ask for more. A fixed row target decouples the two.
+
+The measured effect at SF=1 is a redistribution rather than an improvement. At four threads the
+geomeans are identical (0.29x either way); the per-query spread is what moved:
+
+| | per-split | 128k | effect |
+|---|--:|--:|---|
+| Q19 (misaligned, 366 splits) | 0.27x | **0.12x** | coalescing fixes the misalignment |
+| Q12 (4 wide columns, column-to-column predicates) | 0.25x | 0.35x | a 128k morsel exceeds cache |
+
+Single-threaded, the same trade is sharper and it costs one query outright: **Q12 goes to 1.16x,
+slower than V1 on one thread**, where the per-split cut had it at 0.85x. Q12 projects four columns
+including two strings and compares columns to each other rather than to literals, so its working
+set per row is the largest of the eight; at 128k rows a morsel no longer fits cache. The same
+effect run to its limit is the single-morsel column of the sweep, where Q12 costs 98.8 ms against
+33.8 ms for 92 morsels.
+
+This is the working-set bound of the design's law 8 showing up as a real, measurable cliff rather
+than a principle. A fixed row count is the wrong long-run answer for the same reason a fixed split
+count was: the right morsel size depends on bytes per row, not rows. Sizing morsels by estimated
+working-set bytes is the obvious next step and is not implemented.
+
+### A caution for many-core hosts
+
+A fixed 128k target makes the morsel count `rows / 128k`, independent of core count. At SF=1 that
+is 46 morsels — ample on four cores, but **0.7 per core on a 64-core host**, which is core
+starvation rather than a small regression. Run SF=10 or larger there (460 morsels), or add a floor
+that shrinks the target when 128k would leave cores idle. Neither is done here.
 
 ### The headline, stated at equal core count
 
@@ -130,43 +156,58 @@ The honest comparison is like for like on threads:
 
 | | 1 thread | 4 threads |
 |---|--:|--:|
-| V1 `LayoutReader` | 1.00x | 0.48x |
-| morsel executor | 0.75x | 0.31x |
-| **morsel speedup** | **1.33x** | **1.55x** |
+| V1 `LayoutReader` | 1.00x | 0.47x |
+| morsel executor | 0.77x | 0.29x |
+| **morsel speedup** | **1.30x** | **1.62x** |
 
-The morsel executor is ~1.3x faster than V1 single-threaded and ~1.5x faster at four cores, on
-real TPC-H with real encodings. The 0.26x for coalesced 64k-row morsels is a
-Q19 artifact, not a general result — see the coalescing section above.
+The morsel executor is ~1.3x faster than V1 single-threaded and ~1.6x faster at four cores, on
+real TPC-H with real encodings. Against V1 tuned to its own best concurrency rather than its
+default, the four-thread figure is 1.64x — see below.
 
 ### The number that dropped, and why
 
-On synthetic fixtures the single-thread figure was 0.54x; on real TPC-H it is 0.75x. The P1
+On synthetic fixtures the single-thread figure was 0.54x; on real TPC-H it is 0.77x. The P1
 findings predicted this in as many words — that writing uncompressed leaves understated decode
 cost, which both executors share, and so inflated the prototype's apparent margin. Compressed
-decode now dominates, and the margin narrows to what the executor actually controls. Q6 (0.92x)
-and Q12 (0.85x) are the clearest cases: both read few columns with heavy predicates, so almost all
-of the wall time is inside decode and predicate kernels identical to V1's. `scan-6col` (0.43x) is
-the opposite extreme — a bare projection where per-split machinery is most of V1's cost.
+decode now dominates, and the margin narrows to what the executor actually controls. Q6 (0.92x),
+Q14 (0.89x) and `selective` (0.93x) are the clearest cases: all read few columns with heavy
+predicates, so almost all of the wall time is inside decode and predicate kernels identical to
+V1's. `scan-6col` (0.54x) is the opposite extreme — a bare projection where per-split machinery
+is most of V1's cost.
 
-### Decode reuse is neutral on real TPC-H, and that is a negative result worth stating
+The sweep measures this directly rather than inferring it. Driving the whole scan as a *single*
+morsel removes every per-morsel cost — no reset, planning, cutting or emission — leaving only
+decode and kernels. On Q6 that still costs 93% of V1's single-threaded time, on Q14 92%, on Q15
+93%, on `selective` 91%. **There is only ~7-9% on those queries for any executor to win**, and
+the prototype takes most of it. Where the kernel-bound share is low the prototype wins large:
+Q19 35%, `scan-6col` 44%. The executor's advantage is inversely proportional to how decode-bound
+the query is, which also means no amount of scheduling work will improve Q6.
+
+Per-morsel scheduling cost is, separately, near zero and often *negative* — cutting into morsels
+beats one large unit on five of the eight queries, because a morsel's working set fits cache.
+
+### Decode reuse is neutral, and coalescing subsumes what little it did
 
 The leased shared cells were built because cross-morsel decode reuse was worth ~2x on the
-synthetic misaligned fixtures. On real TPC-H the geomean with sharing (0.75x) and without (0.76x)
+synthetic misaligned fixtures. On real TPC-H the geomean with sharing (0.77x) and without (0.76x)
 are indistinguishable. The reason is visible in the counters: the real write pipeline repartitions
 **every column onto the same row blocks**, so the misalignment the synthetic fixtures forced does
-not occur. Where reuses do fire it is because a column appears in both the filter and the
-projection — Q6 registers 276 reuses for `l_discount`, Q12 registers 460 — and that saves a decode
-without saving wall time, because the second decode would have hit the same warm buffers.
+not occur. Where reuses fire it is because a column appears in both the filter and the projection
+— Q6 registers 276, Q12 460 — and that saves a decode without saving wall time, because the second
+decode would have hit the same warm buffers.
 
-**The exception is Q19**, and it is instructive: 366 morsels instead of 92, 2,102 reuses, and
-0.54x with sharing against 0.69x without. Q19 projects `l_shipmode` and `l_shipinstruct`, whose
-compressed sizes differ enough from the numeric columns that the 1 MiB coalescing lands them on
-different boundaries. So real files *do* misalign — just only when column widths diverge, which is
-exactly the string-heavy case, and nothing like as often as the synthetic fixture assumed.
+Q19 was the one query where sharing genuinely paid, at the per-split cut: 366 morsels, 1,856
+reuses, 0.54x with sharing against 0.69x without. **The 128k default removes even that.** Coalescing
+gives Q19 46 morsels instead of 366, and with them 826 requests instead of 1,893 and 826 decodes
+instead of 1,072 — so sharing now measures 0.34x against 0.35x without it, i.e. nothing.
 
-The conclusion for P2: keyed cells earn their place on width-divergent schemas and on
-filter-and-project column overlap, not as a general-purpose win. Sizing their machinery for the
-synthetic case would have been over-building.
+That is worth stating flatly because it is a negative result about work in this branch: **sizing
+morsels independently of the file's splits achieves what the shared cells were built to achieve,
+more cheaply and without the bookkeeping.** The cells' remaining justification is the case
+coalescing cannot reach — a unit genuinely needed by two morsels at once, which on these files
+means only a column appearing in both filter and projection. P2 should treat the mechanism as
+unproven rather than carried over, and the honest test for it is a schema with more width
+divergence than `lineitem` has.
 
 ### A measured cost the fix removed
 
