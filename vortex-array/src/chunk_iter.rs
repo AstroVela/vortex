@@ -229,10 +229,9 @@ impl ArrayRef {
 /// [`execute_via_chunks`]). Enabled by default; `VORTEX_CHUNKED_EXECUTE=0` disables it at process
 /// start, and [`set_chunked_execute_enabled`] overrides it at runtime — both exist only so
 /// benchmarks and tests can compare the executor with and without the shortcut.
-static CHUNKED_EXECUTE_ENABLED: std::sync::LazyLock<AtomicBool> =
-    std::sync::LazyLock::new(|| {
-        AtomicBool::new(!std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "0"))
-    });
+static CHUNKED_EXECUTE_ENABLED: std::sync::LazyLock<AtomicBool> = std::sync::LazyLock::new(|| {
+    AtomicBool::new(!std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "0"))
+});
 
 #[doc(hidden)]
 pub fn set_chunked_execute_enabled(enabled: bool) {
@@ -249,25 +248,11 @@ pub fn set_chunked_execute_enabled(enabled: bool) {
 /// into the builder on its normal execute path, so streaming it would only add a scratch copy;
 /// the shortcut pays off when the normal path would materialize a full intermediate per level.
 pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
-    let fires = CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
+    CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
         && array.supports_decompress_chunks()
         && array
             .children_iter()
-            .any(|child| !child.is_canonical() && child.supports_decompress_chunks());
-    // TEMPORARY diagnostics, not for merge.
-    if std::env::var("VORTEX_CHUNKED_EXECUTE_TRACE").is_ok() && !array.is_canonical() {
-        eprintln!(
-            "CHUNKED_EXEC fires={} len={} root={} children={:?}",
-            fires,
-            array.len(),
-            array.encoding_id(),
-            array
-                .children_iter()
-                .map(|c| c.encoding_id().to_string())
-                .collect::<Vec<_>>()
-        );
-    }
-    fires
+            .any(|child| !child.is_canonical() && child.supports_decompress_chunks())
 }
 
 /// Execute a streaming-capable primitive array tree to a canonical [`PrimitiveArray`] by
