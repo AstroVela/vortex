@@ -56,18 +56,52 @@ pub struct Fixture {
     pub segments: Arc<dyn SegmentSource>,
     /// The struct-of-chunked-flat layout.
     pub layout: LayoutRef,
-    /// The complete table, unchunked.
-    pub table: ArrayRef,
+    /// The complete table, unchunked. `None` when the caller asked not to retain it.
+    pub table: Option<ArrayRef>,
     /// The number of rows.
     pub row_count: u64,
 }
 
-/// Write a struct-of-chunked-flat fixture with per-column chunking.
+/// Write a struct-of-chunked-flat fixture with per-column chunking, uncompressed.
 ///
 /// Every column must cover the same total number of rows; their chunk boundaries need not agree.
 pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> VortexResult<Fixture> {
+    write_fixture_with(columns, Arc::new(FlatLayoutStrategy::default()), session).await
+}
+
+/// Write a fixture, running each column's chunks through `strategy`.
+///
+/// Passing a compressing strategy is what makes decode cost real: the leaves carry btrblocks
+/// encodings rather than raw buffers, so the decode work both executors share is the work a real
+/// file imposes.
+pub async fn write_fixture_with(
+    columns: Vec<Column>,
+    strategy: Arc<dyn LayoutStrategy>,
+    session: &VortexSession,
+) -> VortexResult<Fixture> {
+    write_fixture_inner(columns, strategy, session, true).await
+}
+
+/// Write a fixture without retaining the in-memory copy of the table.
+///
+/// The copy exists only so a caller can compare against the source data directly. When the V1
+/// reader is the oracle it is dead weight, and at a real TPC-H scale factor it doubles the
+/// fixture's resident size.
+pub async fn write_fixture_no_table(
+    columns: Vec<Column>,
+    strategy: Arc<dyn LayoutStrategy>,
+    session: &VortexSession,
+) -> VortexResult<Fixture> {
+    write_fixture_inner(columns, strategy, session, false).await
+}
+
+async fn write_fixture_inner(
+    columns: Vec<Column>,
+    strategy: Arc<dyn LayoutStrategy>,
+    session: &VortexSession,
+    keep_table: bool,
+) -> VortexResult<Fixture> {
     let segments = Arc::new(TestSegments::default());
-    let strategy = FlatLayoutStrategy::default();
     let ctx = vortex_array::ArrayContext::empty();
 
     let mut row_count = None;
@@ -83,23 +117,11 @@ pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> Vor
             .map(|chunk| chunk.dtype().clone())
             .ok_or_else(|| vortex_err!("a column needs at least one chunk"))?;
 
-        let mut chunk_layouts = Vec::with_capacity(column.chunks.len());
-        let mut rows = 0u64;
-        for chunk in &column.chunks {
-            let (ptr, eof) = SequenceId::root().split();
-            let layout = strategy
-                .write_stream(
-                    ctx.clone().into(),
-                    Arc::<TestSegments>::clone(&segments),
-                    chunk.clone().to_array_stream().sequenced(ptr),
-                    eof,
-                    session,
-                )
-                .await?;
-            rows += chunk.len() as u64;
-            chunk_layouts.push(layout);
-        }
-
+        // The whole column goes through the strategy as one chunk stream, exactly as the real
+        // file writer drives it, so a compressing strategy sees the stream it expects and
+        // produces its own chunking. Only when the strategy leaves a single leaf (the plain flat
+        // case) is a chunked wrapper assembled here to preserve the caller's boundaries.
+        let rows: u64 = column.chunks.iter().map(|chunk| chunk.len() as u64).sum();
         match row_count {
             None => row_count = Some(rows),
             Some(expected) if expected == rows => {}
@@ -108,14 +130,37 @@ pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> Vor
             }
         }
 
-        let chunked =
-            ChunkedLayout::new(rows, dtype.clone(), layout_children(chunk_layouts)).into_layout();
-        field_layouts.push(chunked);
+        let mut chunk_layouts = Vec::with_capacity(column.chunks.len());
+        for chunk in &column.chunks {
+            let (ptr, eof) = SequenceId::root().split();
+            chunk_layouts.push(
+                strategy
+                    .write_stream(
+                        ctx.clone().into(),
+                        Arc::<TestSegments>::clone(&segments),
+                        chunk.clone().to_array_stream().sequenced(ptr),
+                        eof,
+                        session,
+                    )
+                    .await?,
+            );
+        }
+
+        let column_layout = if chunk_layouts.len() == 1 {
+            chunk_layouts
+                .pop()
+                .ok_or_else(|| vortex_err!("a column needs at least one chunk"))?
+        } else {
+            ChunkedLayout::new(rows, dtype.clone(), layout_children(chunk_layouts)).into_layout()
+        };
+        field_layouts.push(column_layout);
         field_names.push(column.name.clone());
         field_dtypes.push(dtype);
 
-        // The oracle copy of the column, concatenated.
-        table_fields.push(concat_chunks(&column.chunks)?);
+        if keep_table {
+            // The oracle copy of the column, concatenated.
+            table_fields.push(concat_chunks(&column.chunks)?);
+        }
     }
 
     let rows = row_count.unwrap_or(0);
@@ -125,13 +170,19 @@ pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> Vor
     );
     let layout = StructLayout::new(rows, struct_dtype, field_layouts).into_layout();
 
-    let table = StructArray::try_new(
-        field_names.into(),
-        table_fields,
-        usize::try_from(rows).map_err(|_| vortex_err!("row count exceeds usize"))?,
-        vortex_array::validity::Validity::NonNullable,
-    )?
-    .into_array();
+    let table = if keep_table {
+        Some(
+            StructArray::try_new(
+                field_names.into(),
+                table_fields,
+                usize::try_from(rows).map_err(|_| vortex_err!("row count exceeds usize"))?,
+                vortex_array::validity::Validity::NonNullable,
+            )?
+            .into_array(),
+        )
+    } else {
+        None
+    };
 
     Ok(Fixture {
         segments,

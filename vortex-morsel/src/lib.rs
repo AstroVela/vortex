@@ -47,6 +47,8 @@ pub mod node;
 pub mod nodes;
 pub mod stats;
 #[cfg(any(test, feature = "_test-harness"))]
+pub mod tpch;
+#[cfg(any(test, feature = "_test-harness"))]
 pub mod workloads;
 
 pub use build::ExecPlan;

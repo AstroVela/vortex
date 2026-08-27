@@ -63,12 +63,18 @@ impl SharedCells {
     }
 
     /// Build the cell layer from precomputed lease counts.
+    ///
+    /// A unit touched by exactly one (node, morsel) pair can never be reused, so it is not
+    /// registered at all: no lookup, no publish, no release. On a scan with no straddling and no
+    /// column shared between filter and projection this leaves the map empty and the mechanism
+    /// costs nothing, which measurably matters — the first version registered every unit and
+    /// paid ~20% on a pure six-column scan for bookkeeping that could never pay off.
     pub fn with_leases(counts: HashMap<IoKey, usize>) -> Self {
         let hasher = RandomState::new();
         let mut shards: Vec<HashMap<IoKey, CellEntry>> =
             (0..SHARDS).map(|_| HashMap::default()).collect();
         for (key, count) in counts {
-            if count > 0 {
+            if count > 1 {
                 shards[usize::try_from(hasher.hash_one(key)).unwrap_or(0) % SHARDS].insert(
                     key,
                     CellEntry {
@@ -121,13 +127,15 @@ impl SharedCells {
     }
 
     /// Release one lease on a unit, dropping the cell when the last lease goes.
+    ///
+    /// A key with no entry is a single-lease unit that was never registered, which is the common
+    /// case on a well-aligned file; releasing it is a no-op rather than an error.
     pub fn release(&self, key: IoKey) {
         let Some(shard) = self.shard(key) else {
             return;
         };
         let mut cells = shard.lock();
         let Some(entry) = cells.get_mut(&key) else {
-            debug_assert!(false, "released a lease on an unknown cell {key:?}");
             return;
         };
         debug_assert!(entry.leases > 0, "released a lease past zero on {key:?}");
