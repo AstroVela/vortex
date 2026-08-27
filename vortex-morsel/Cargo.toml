@@ -1,0 +1,45 @@
+[package]
+name = "vortex-morsel"
+authors.workspace = true
+description = "Experimental morsel-driven scan executor for Vortex layouts"
+edition = { workspace = true }
+homepage = { workspace = true }
+categories = { workspace = true }
+include = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+publish = false
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+_test-harness = ["vortex-layout/_test-harness", "vortex-array/_test-harness", "dep:vortex-io"]
+
+[dependencies]
+vortex-array = { workspace = true }
+vortex-buffer = { workspace = true }
+vortex-error = { workspace = true }
+vortex-layout = { workspace = true }
+vortex-mask = { workspace = true }
+vortex-session = { workspace = true }
+vortex-utils = { workspace = true }
+
+futures = { workspace = true }
+vortex-io = { workspace = true, optional = true }
+itertools = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-layout = { workspace = true, features = ["_test-harness"] }
+vortex-io = { workspace = true }
+vortex-scan = { workspace = true }
+rstest = { workspace = true }
+
+[lints]
+workspace = true
