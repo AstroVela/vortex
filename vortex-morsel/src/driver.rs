@@ -29,11 +29,26 @@ use crate::io::IoPlane;
 use crate::node::drive_morsel;
 use crate::stats::ScanStats;
 
+/// The default morsel size in rows.
+///
+/// Chosen from the SF=1 TPC-H sweep: at 128k rows a morsel is roughly two of the file's ~65k-row
+/// natural splits, which is large enough that per-morsel fixed cost is negligible and small
+/// enough that a morsel's working set still fits cache. It beats the per-split cut on six of the
+/// eight measured queries and is within noise on a seventh.
+///
+/// The deliberate cost is small scans: a 128k-row morsel means a scan of fewer than
+/// `128k * threads` rows cannot fill every core, so short queries lose parallelism. That is
+/// accepted — the alternative, sizing morsels to the file's splits, caps the morsel count at a
+/// property of the file and starves a many-core host on exactly the large scans that matter.
+pub const DEFAULT_MORSEL_ROWS: u64 = 131_072;
+
 /// The morsel row ranges for a plan.
 ///
-/// With `target_rows` of zero every natural split is a morsel boundary, which is exactly the V1
-/// split set — the fair-comparison default. A larger target coalesces consecutive splits, which
-/// is where the executor's ability to straddle chunk boundaries starts to pay.
+/// `target_rows` is a maximum morsel size: zero means one morsel per natural split (the V1 split
+/// set, and the fair-comparison default), while a non-zero value both coalesces consecutive
+/// splits up to it and subdivides any span longer than it. Subdivision is what decouples the
+/// morsel count from the file's split count, which matters as soon as there are more cores than
+/// a file has natural splits.
 pub fn morsels(plan: &ExecPlan, target_rows: u64) -> Vec<Range<u64>> {
     cut_morsels(plan.natural_splits(), target_rows)
 }
@@ -56,7 +71,7 @@ impl MorselScan {
         segments: Arc<dyn SegmentSource>,
         session: VortexSession,
     ) -> Self {
-        let morsels = Arc::from(morsels(&plan, 0));
+        let morsels = Arc::from(morsels(&plan, DEFAULT_MORSEL_ROWS));
         Self {
             plan,
             segments,

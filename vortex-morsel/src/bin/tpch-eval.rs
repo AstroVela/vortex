@@ -65,6 +65,8 @@ impl Row {
                 };
                 let morsel = if config.morsel_rows == 0 {
                     "splits".to_string()
+                } else if config.morsel_rows == vortex_morsel::driver::DEFAULT_MORSEL_ROWS {
+                    "128k".to_string()
                 } else {
                     format!("{}r", config.morsel_rows)
                 };
@@ -202,7 +204,7 @@ fn main() -> VortexResult<()> {
             }),
             Row::Morsel(MorselConfig {
                 threads,
-                morsel_rows: 65_536,
+                morsel_rows: 0,
                 ..Default::default()
             }),
         ]
@@ -389,36 +391,105 @@ fn sweep(
     }
     println!();
 
-    println!("## Morsel size at {cores} threads");
+    println!("## Morsel size at {cores} threads: is there enough work to fill the cores?");
     println!();
-    println!("| query | morsels@splits | splits | 16k | 64k | 256k | 1M |");
-    println!("|---|--:|--:|--:|--:|--:|--:|");
+    println!(
+        "`n` is the morsel count, `n/core` is morsels per driving thread. Below roughly 4 \
+         morsels per core the tail of the last morsel is a large fraction of the run and load \
+         balance falls apart, whatever the per-morsel overhead is."
+    );
+    println!();
+    let sizes: [(u64, &str); 8] = [
+        (0, "splits"),
+        (16_384, "16k"),
+        (32_768, "32k"),
+        (65_536, "64k"),
+        (131_072, "128k"),
+        (262_144, "256k"),
+        (1_048_576, "1M"),
+        (u64::MAX / 2, "single"),
+    ];
+    print!("| query |");
+    for (_, label) in &sizes {
+        print!(" {label} |");
+    }
+    println!();
+    print!("|---|");
+    for _ in 0..sizes.len() {
+        print!("--:|");
+    }
+    println!();
+
     for query in queries {
-        let mut cells = Vec::new();
-        let mut morsel_count = 0;
-        for size in [0u64, 16_384, 65_536, 262_144, 1_048_576] {
+        print!("| {} |", query.name);
+        for (size, _) in &sizes {
             let config = MorselConfig {
                 threads: cores,
-                morsel_rows: size,
+                morsel_rows: *size,
                 ..Default::default()
             };
-            if size == 0 {
-                morsel_count = run_morsel(session, &fixture.layout, segments, query, config)?
-                    .stats
-                    .as_ref()
-                    .map(|s| s.morsels)
-                    .unwrap_or(0);
-            }
+            let probe = run_morsel(session, &fixture.layout, segments, query, config)?;
+            let count = probe.stats.as_ref().map(|s| s.morsels).unwrap_or(0);
             let wall = median(ITERATIONS, || {
                 run_morsel(session, &fixture.layout, segments, query, config)
             })?;
-            cells.push(millis(wall));
+            let per_core = count as f64 / cores as f64;
+            print!(" {} n={count} ({per_core:.1}/core) |", millis(wall));
         }
+        println!();
+    }
+    println!();
+
+    println!("## Where the single-threaded time goes");
+    println!();
+    println!(
+        "`1 morsel` drives the whole scan as one unit: no per-morsel reset, planning, cutting or \
+         emission, and no cross-morsel sharing to do. Whatever it costs is decode plus predicate \
+         and gather kernels — work identical to V1's. The gap between it and the per-split column \
+         is the executor's entire scheduling overhead."
+    );
+    println!();
+    println!(
+        "| query | V1 x1 | D x1 per-split | D x1 one morsel | scheduling overhead | kernel-bound share |"
+    );
+    println!("|---|--:|--:|--:|--:|--:|");
+    for query in queries {
+        let v1 = median(ITERATIONS, || {
+            run_v1(session, &fixture.layout, segments, query)
+        })?;
+        let split = median(ITERATIONS, || {
+            run_morsel(
+                session,
+                &fixture.layout,
+                segments,
+                query,
+                MorselConfig {
+                    threads: 1,
+                    ..Default::default()
+                },
+            )
+        })?;
+        let single = median(ITERATIONS, || {
+            run_morsel(
+                session,
+                &fixture.layout,
+                segments,
+                query,
+                MorselConfig {
+                    threads: 1,
+                    morsel_rows: u64::MAX / 2,
+                    ..Default::default()
+                },
+            )
+        })?;
         println!(
-            "| {} | {} | {} |",
+            "| {} | {} | {} | {} | {:.1}% | {:.0}% |",
             query.name,
-            morsel_count,
-            cells.join(" | ")
+            millis(v1),
+            millis(split),
+            millis(single),
+            (split.as_secs_f64() - single.as_secs_f64()) / split.as_secs_f64() * 100.0,
+            single.as_secs_f64() / v1.as_secs_f64() * 100.0,
         );
     }
     println!();

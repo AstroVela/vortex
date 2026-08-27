@@ -63,6 +63,8 @@ impl Row {
                 };
                 let morsel = if config.morsel_rows == 0 {
                     "splits".to_string()
+                } else if config.morsel_rows == vortex_morsel::driver::DEFAULT_MORSEL_ROWS {
+                    "128k".to_string()
                 } else {
                     format!("{}r", config.morsel_rows)
                 };
@@ -154,7 +156,7 @@ fn main() -> VortexResult<()> {
                 }),
                 Row::Morsel(MorselConfig {
                     threads,
-                    morsel_rows: 65_536,
+                    morsel_rows: 0,
                     ..Default::default()
                 }),
                 Row::Morsel(MorselConfig {

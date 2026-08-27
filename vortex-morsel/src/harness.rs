@@ -198,7 +198,8 @@ pub fn run_v1_tokio_with(
 pub struct MorselConfig {
     /// Driving threads.
     pub threads: usize,
-    /// Morsel coalescing target; zero means "one morsel per natural split", matching V1.
+    /// Maximum morsel size in rows; zero means "one morsel per natural split", which is the V1
+    /// split set and so the cut that isolates the executor comparison from the cut choice.
     pub morsel_rows: u64,
     /// Conjunct evaluation policy.
     pub mode: ConjunctMode,
@@ -210,7 +211,7 @@ impl Default for MorselConfig {
     fn default() -> Self {
         Self {
             threads: 1,
-            morsel_rows: 0,
+            morsel_rows: crate::driver::DEFAULT_MORSEL_ROWS,
             mode: ConjunctMode::Cascade,
             share_decodes: true,
         }

@@ -406,7 +406,18 @@ fn split_conjuncts(expr: &Expression) -> Vec<Expression> {
     conjuncts
 }
 
-/// The morsel row ranges for a plan, from its natural splits, coalesced to `target_rows`.
+/// The morsel row ranges for a plan, given a target morsel size in rows.
+///
+/// `target_rows` is a *maximum*, not a minimum: consecutive natural splits are coalesced up to
+/// it, and a span longer than it is subdivided. Zero means "one morsel per natural split", which
+/// is the V1 split set and the fair-comparison default.
+///
+/// Subdividing matters more than it looks. The number of natural splits is a property of the
+/// file — at TPC-H SF=1 with a 1 MiB block target there are 92, each about 65k rows — so without
+/// subdivision the morsel count is capped by the file no matter how many cores are available. On
+/// four cores 92 morsels is 23 per core and ample; on 64 cores it would be 1.4 per core and the
+/// tail of a single morsel would dominate the run. Coalescing alone cannot fix that; only cutting
+/// below a natural split can.
 pub(crate) fn cut_morsels(splits: &[u64], target_rows: u64) -> Vec<Range<u64>> {
     let mut morsels = Vec::new();
     let mut start = 0u64;
@@ -414,7 +425,20 @@ pub(crate) fn cut_morsels(splits: &[u64], target_rows: u64) -> Vec<Range<u64>> {
         if split <= start {
             continue;
         }
-        if split - start >= target_rows {
+        if target_rows == 0 {
+            morsels.push(start..split);
+            start = split;
+            continue;
+        }
+        // Cut a span longer than the target into target-sized pieces. The executor handles an
+        // arbitrary range, so a morsel boundary need not be a chunk boundary.
+        while split - start > target_rows {
+            morsels.push(start..start + target_rows);
+            start += target_rows;
+        }
+        // Emit an exact-sized morsel; a short remainder is carried into the next split so small
+        // splits coalesce rather than producing a run of tiny morsels.
+        if split - start == target_rows {
             morsels.push(start..split);
             start = split;
         }

@@ -403,6 +403,7 @@ fn shared_cells_are_not_observable(#[values(1, 4)] threads: usize) -> VortexResu
             &query,
             MorselConfig {
                 threads,
+                morsel_rows: 0,
                 ..Default::default()
             },
         )?;
@@ -413,6 +414,7 @@ fn shared_cells_are_not_observable(#[values(1, 4)] threads: usize) -> VortexResu
             &query,
             MorselConfig {
                 threads,
+                morsel_rows: 0,
                 share_decodes: false,
                 ..Default::default()
             },
@@ -435,6 +437,10 @@ fn shared_cells_are_not_observable(#[values(1, 4)] threads: usize) -> VortexResu
 
 /// Property: on the misaligned fixture, sharing actually fires — a chunk overlapped by several
 /// per-split morsels is decoded once and reused for the rest.
+///
+/// This pins `morsel_rows: 0` rather than taking the default. The default morsel is 128k rows,
+/// which swallows this 1000-row fixture whole; the mechanism under test only exists when a unit
+/// is touched by more than one morsel, so the cut has to be stated, not inherited.
 #[rstest]
 fn shared_cells_reuse_straddled_chunks() -> VortexResult<()> {
     let session = session();
@@ -451,7 +457,10 @@ fn shared_cells_reuse_straddled_chunks() -> VortexResult<()> {
         &fixture.layout,
         &segments,
         &query,
-        MorselConfig::default(),
+        MorselConfig {
+            morsel_rows: 0,
+            ..Default::default()
+        },
     )?;
     let stats = run.stats.as_ref().expect("morsel runs report stats");
     assert!(
