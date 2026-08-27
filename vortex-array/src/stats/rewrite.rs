@@ -17,6 +17,7 @@ use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::operators::Operator;
+use crate::stats::session::StatsRewriteKind;
 use crate::stats::session::StatsSessionExt;
 
 mod builtins;
@@ -107,15 +108,39 @@ impl<'a> StatsRewriteCtx<'a> {
     }
 
     /// Rewrite `expr` into a stats-backed falsifier.
+    ///
+    /// Results are cached in the session, so readers that share the same bound expression share
+    /// one lowered falsifier.
     pub fn falsify(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        self.ensure_predicate(expr)?;
-        rewrite(expr, self, StatsRewriteRule::falsify)
+        self.cached_rewrite(StatsRewriteKind::Falsify, expr, StatsRewriteRule::falsify)
     }
 
     /// Rewrite `expr` into a stats-backed satisfier.
+    ///
+    /// Results are cached in the session, so readers that share the same bound expression share
+    /// one lowered satisfier.
     pub fn satisfy(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
+        self.cached_rewrite(StatsRewriteKind::Satisfy, expr, StatsRewriteRule::satisfy)
+    }
+
+    fn cached_rewrite(
+        &self,
+        kind: StatsRewriteKind,
+        expr: &BoundExpression,
+        apply: RewriteFn,
+    ) -> VortexResult<Option<BoundExpression>> {
         self.ensure_predicate(expr)?;
-        rewrite(expr, self, StatsRewriteRule::satisfy)
+
+        let stats = self.session.stats();
+        if let Some(cached) = stats.cached_rewrite(kind, expr) {
+            return Ok(cached);
+        }
+
+        // Rules recurse through this context, so the rewrite must run without holding the cache
+        // lock. Errors are not cached: they are rare and the caller decides how to report them.
+        let rewritten = rewrite(expr, self, apply)?;
+
+        Ok(stats.cache_rewrite(kind, expr, rewritten))
     }
 
     fn ensure_predicate(&self, expr: &BoundExpression) -> VortexResult<()> {
@@ -128,14 +153,16 @@ impl<'a> StatsRewriteCtx<'a> {
     }
 }
 
+type RewriteFn = fn(
+    &dyn StatsRewriteRule,
+    &BoundExpression,
+    &StatsRewriteCtx<'_>,
+) -> VortexResult<Option<BoundExpression>>;
+
 fn rewrite(
     expr: &BoundExpression,
     ctx: &StatsRewriteCtx<'_>,
-    apply: fn(
-        &dyn StatsRewriteRule,
-        &BoundExpression,
-        &StatsRewriteCtx<'_>,
-    ) -> VortexResult<Option<BoundExpression>>,
+    apply: RewriteFn,
 ) -> VortexResult<Option<BoundExpression>> {
     // The scope alone proves nothing about the rows it contains.
     let Some(scalar_fn) = expr.as_scalar() else {
@@ -160,6 +187,10 @@ fn rewrite(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use vortex_error::VortexResult;
 
     use super::StatsRewriteCtx;
@@ -168,6 +199,7 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::expr::BoundExpression;
+    use crate::expr::ExactBoundExpr;
     use crate::expr::lit;
     use crate::expr::or;
     use crate::scalar_fn::ScalarFnId;
@@ -200,6 +232,26 @@ mod tests {
             _ctx: &StatsRewriteCtx<'_>,
         ) -> VortexResult<Option<BoundExpression>> {
             Ok(self.satisfier.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingRule {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StatsRewriteRule for CountingRule {
+        fn scalar_fn_id(&self) -> ScalarFnId {
+            Literal.id()
+        }
+
+        fn falsify(
+            &self,
+            expr: &BoundExpression,
+            _ctx: &StatsRewriteCtx<'_>,
+        ) -> VortexResult<Option<BoundExpression>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(lit(false).bind(expr.dtype())?))
         }
     }
 
@@ -251,6 +303,52 @@ mod tests {
         let expr = lit(true).bind(&dtype)?;
         assert_eq!(expr.falsify(&session)?, None);
         assert_eq!(expr.satisfy(&session)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn readers_sharing_an_expression_share_the_cached_falsifier() -> VortexResult<()> {
+        let session = crate::array_session();
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let calls = Arc::new(AtomicUsize::new(0));
+        session.stats().register_rewrite(CountingRule {
+            calls: Arc::clone(&calls),
+        });
+
+        // Two readers in one scan hold clones of the same bound predicate.
+        let expr = lit(true).bind(&dtype)?;
+        let reader_a = expr.clone();
+        let first_reader = reader_a.falsify(&session)?;
+        let second_reader = expr.falsify(&session)?;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(first_reader.is_some());
+        assert_eq!(
+            first_reader.clone().map(ExactBoundExpr),
+            second_reader.map(ExactBoundExpr),
+        );
+
+        // A structurally equal predicate bound independently is a different tree and misses.
+        let rebound = lit(true).bind(&dtype)?;
+        assert_eq!(rebound.falsify(&session)?, first_reader);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn registering_a_rule_invalidates_cached_rewrites() -> VortexResult<()> {
+        let session = crate::array_session();
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let expr = lit(true).bind(&dtype)?;
+        assert_eq!(expr.falsify(&session)?, None);
+
+        session.stats().register_rewrite(StaticLiteralRule {
+            falsifier: Some(lit(false).bind(&dtype)?),
+            satisfier: None,
+        });
+
+        assert_eq!(expr.falsify(&session)?, Some(lit(false).bind(&dtype)?));
         Ok(())
     }
 

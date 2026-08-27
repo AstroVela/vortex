@@ -38,7 +38,6 @@ use crate::layouts::zoned::zone_map::ZoneMap;
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
 pub(super) type SharedPruningResult =
     Shared<BoxFuture<'static, SharedVortexResult<Arc<PruningResult>>>>;
-type PredicateCache = Arc<OnceLock<Option<BoundExpression>>>;
 
 pub(super) struct PruningState {
     zone_count: usize,
@@ -50,7 +49,6 @@ pub(super) struct PruningState {
     session: VortexSession,
     pruning_result: LazyLock<DashMap<ExactBoundExpr, Option<SharedPruningResult>>>,
     zone_map: OnceLock<SharedZoneMap>,
-    pruning_predicates: LazyLock<Arc<DashMap<ExactBoundExpr, PredicateCache>>>,
 }
 
 impl PruningState {
@@ -74,7 +72,6 @@ impl PruningState {
             session,
             pruning_result: Default::default(),
             zone_map: Default::default(),
-            pruning_predicates: Default::default(),
         }
     }
 
@@ -126,20 +123,19 @@ impl PruningState {
             .clone()
     }
 
+    /// Lower `expr` into a pruning predicate.
+    ///
+    /// The session caches lowered predicates, so every reader and zone that shares `expr` reuses
+    /// one falsifier. The per-expression `pruning_result` entry already keeps this reader from
+    /// asking twice.
     fn pruning_predicate(&self, expr: BoundExpression) -> Option<BoundExpression> {
-        let key = ExactBoundExpr(expr.clone());
-
-        self.pruning_predicates
-            .entry(key)
-            .or_default()
-            .get_or_init(move || match expr.falsify(&self.session) {
-                Ok(predicate) => predicate,
-                Err(error) => {
-                    trace!(%expr, %error, "failed to construct stats rewrite predicate");
-                    None
-                }
-            })
-            .clone()
+        match expr.falsify(&self.session) {
+            Ok(predicate) => predicate,
+            Err(error) => {
+                trace!(%expr, %error, "failed to construct stats rewrite predicate");
+                None
+            }
+        }
     }
 
     fn zone_map(&self) -> SharedZoneMap {
