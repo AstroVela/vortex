@@ -30,6 +30,23 @@ DEFAULT_XET_CACHE = DEFAULT_DATA_DIR / "xet-cache"
 DEFAULT_DOWNLOAD_BUFFER_BYTES = 64_000_000_000
 DEFAULT_UPLOAD_BUFFER_BYTES = 128_000_000_000
 PARQUET_BATCH_ROWS = 65_536
+LOG_LOCK = threading.Lock()
+
+
+def safe_print(*values, file=None, **kwargs):
+    """Write progress without allowing a detached output pipe to stop conversion."""
+    target = file if file is not None else sys.stdout
+    try:
+        with LOG_LOCK:
+            print(*values, file=target, **kwargs)
+    except BrokenPipeError:
+        replacement = open(os.devnull, "w")
+        if target is sys.stdout:
+            sys.stdout = replacement
+        elif target is sys.stderr:
+            sys.stderr = replacement
+        else:
+            replacement.close()
 
 
 def retry_call(operation, attempts, base_delay=1.0):
@@ -402,6 +419,21 @@ def fits_download_buffer(inflight_bytes, next_bytes, limit_bytes):
     return inflight_bytes == 0 or inflight_bytes + next_bytes <= limit_bytes
 
 
+def needs_source_download(file_state, outputs):
+    """Return whether any output lacks both a remote commit and reusable local encoding."""
+    for fmt, local_path in outputs.items():
+        output_state = file_state.get("outputs", {}).get(fmt, {})
+        upload_complete = output_state.get("upload", {}).get("status") == "complete"
+        local_complete = (
+            local_path.exists()
+            and local_path.stat().st_size == output_state.get("metrics", {}).get("size_bytes")
+        )
+        encoding_complete = output_state.get("status") == "complete" and local_complete
+        if not upload_complete and not encoding_complete:
+            return True
+    return False
+
+
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -466,7 +498,7 @@ def write_reports(checkpoint, output_dir, selection):
                "selected_files": len(selection), "format_size_bytes": totals,
                "format_comparison": comparisons}
     atomic_json(metrics_dir / "summary.json", summary)
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    safe_print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 def metric(source_name, fmt, path, input_size, seconds):
@@ -591,12 +623,12 @@ def main():
     if args.upload_repo:
         require_xet_repository(
             api, args.upload_repo, args.upload_revision, args.hub_attempts)
-    print(
+    safe_print(
         f"Xet enabled: range_gets={args.xet_range_gets}, "
         f"high_performance={args.xet_high_performance}, cache={args.xet_cache}",
         flush=True,
     )
-    print(
+    safe_print(
         f"Transfer buffers: downloads={args.shard_workers} workers/"
         f"{args.download_buffer_size / 1e9:.1f} GB, uploads={args.upload_workers} workers/"
         f"{args.upload_buffer_size / 1e9:.1f} GB",
@@ -677,16 +709,7 @@ def main():
 
     def shard_needs_download(shard):
         _, outputs = shard_paths(shard)
-        state = checkpoint["files"][shard["path"]]
-        for fmt, local_path in outputs.items():
-            output_state = state["outputs"].get(fmt, {})
-            upload_complete = output_state.get("upload", {}).get("status") == "complete"
-            local_complete = (local_path.exists() and
-                              local_path.stat().st_size == output_state.get("metrics", {}).get("size_bytes"))
-            encoding_complete = output_state.get("status") == "complete" and local_complete
-            if not upload_complete and not encoding_complete:
-                return True
-        return False
+        return needs_source_download(checkpoint["files"][shard["path"]], outputs)
 
     missing_shards = [shard for shard in selection if shard_needs_download(shard)]
     download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.shard_workers)
@@ -742,7 +765,10 @@ def main():
     for position, shard in enumerate(selection, 1):
         source_name = shard["path"]
         raw, outputs = shard_paths(shard)
-        print(f"[{position}/{len(selection)}] {source_name} ({shard['size'] / 1e9:.2f} GB)", flush=True)
+        safe_print(
+            f"[{position}/{len(selection)}] {source_name} ({shard['size'] / 1e9:.2f} GB)",
+            flush=True,
+        )
         state = checkpoint["files"].setdefault(source_name, {"size": shard["size"], "outputs": {}})
         completed_outputs = []
         for fmt, destination in outputs.items():
@@ -756,7 +782,10 @@ def main():
         if len(completed_outputs) == len(outputs):
             state["status"] = "complete"
             save_checkpoint()
-            print("  file checkpoint/sink scan complete; no download or conversion needed", flush=True)
+            safe_print(
+                "  file checkpoint/sink scan complete; no download or conversion needed",
+                flush=True,
+            )
             continue
         if source_name in download_futures:
             state["status"] = "downloading"
@@ -772,7 +801,10 @@ def main():
                 state["status"] = "converting"
                 state.pop("error", None)
                 save_checkpoint()
-                print(f"  downloaded {shard['size'] / 1e9:.2f} GB in {download_seconds:.1f}s", flush=True)
+                safe_print(
+                    f"  downloaded {shard['size'] / 1e9:.2f} GB in {download_seconds:.1f}s",
+                    flush=True,
+                )
             except Exception as error:
                 state["status"] = "failed"
                 state["error"] = f"download: {error}"
@@ -796,7 +828,10 @@ def main():
             if complete:
                 size = output_state["metrics"]["size_bytes"]
                 location = "Hub" if not destination.exists() else "local"
-                print(f"  {fmt}: checkpoint complete ({size / 1e9:.2f} GB, {location})", flush=True)
+                safe_print(
+                    f"  {fmt}: checkpoint complete ({size / 1e9:.2f} GB, {location})",
+                    flush=True,
+                )
                 return
             if not local_complete:
                 output_state["status"] = "converting"
@@ -820,47 +855,57 @@ def main():
                     with checkpoint_lock:
                         atomic_json(checkpoint_path, checkpoint)
                     raise
-                print(f"  {fmt}: {destination.stat().st_size / 1e9:.2f} GB", flush=True)
+                safe_print(
+                    f"  {fmt}: {destination.stat().st_size / 1e9:.2f} GB",
+                    flush=True,
+                )
             else:
-                print(f"  {fmt}: reusing local encoding for upload", flush=True)
+                safe_print(f"  {fmt}: reusing local encoding for upload", flush=True)
             if uploader and output_state.get("upload", {}).get("status") != "complete":
                 sink_path = destination_path(source_name, fmt, args.upload_prefix)
                 output_state["upload"] = {"status": "queued", "hub_path": sink_path}
                 with checkpoint_lock:
                     atomic_json(checkpoint_path, checkpoint)
 
+                def record_upload_failure(error):
+                    with checkpoint_lock:
+                        output_state["upload"] = {"status": "failed", "hub_path": sink_path,
+                                                  "error": str(error)}
+                        state["status"] = "failed"
+                        state["error"] = f"upload {fmt}: {error}"
+                        atomic_json(checkpoint_path, checkpoint)
+
                 def upload_task():
                     with checkpoint_lock:
                         output_state["upload"] = {"status": "uploading", "hub_path": sink_path}
                         atomic_json(checkpoint_path, checkpoint)
-                    try:
-                        if isinstance(uploader, HuggingFaceBatchUploader):
+                    if isinstance(uploader, HuggingFaceBatchUploader):
+                        try:
                             upload = uploader.upload(destination, sink_path,
                                                      format_name=fmt, ordinal=position)
-                            if upload["status"] == "complete":
-                                apply_committed_batch(upload)
-                                print(f"    committed batch: {upload['url']}", flush=True)
-                            else:
-                                with checkpoint_lock:
-                                    output_state["upload"] = upload
-                                    atomic_json(checkpoint_path, checkpoint)
-                                print(f"    preuploaded: {sink_path}", flush=True)
+                        except Exception as error:
+                            record_upload_failure(error)
+                            raise
+                        if upload["status"] == "complete":
+                            apply_committed_batch(upload)
+                            safe_print(f"    committed batch: {upload['url']}", flush=True)
                         else:
-                            upload = upload_then_maybe_delete(
-                                uploader, destination, sink_path, args.delete_after_upload)
                             with checkpoint_lock:
                                 output_state["upload"] = upload
-                                output_state["local_deleted"] = upload["local_deleted"]
                                 atomic_json(checkpoint_path, checkpoint)
-                            print(f"    uploaded: {upload['url']}", flush=True)
-                    except Exception as error:
+                            safe_print(f"    preuploaded: {sink_path}", flush=True)
+                    else:
+                        try:
+                            upload = upload_then_maybe_delete(
+                                uploader, destination, sink_path, args.delete_after_upload)
+                        except Exception as error:
+                            record_upload_failure(error)
+                            raise
                         with checkpoint_lock:
-                            output_state["upload"] = {"status": "failed", "hub_path": sink_path,
-                                                      "error": str(error)}
-                            state["status"] = "failed"
-                            state["error"] = f"upload {fmt}: {error}"
+                            output_state["upload"] = upload
+                            output_state["local_deleted"] = upload["local_deleted"]
                             atomic_json(checkpoint_path, checkpoint)
-                        raise
+                        safe_print(f"    uploaded: {upload['url']}", flush=True)
 
                 pending_uploads.append(upload_executor.submit(upload_task))
 
@@ -889,7 +934,7 @@ def main():
     if isinstance(uploader, HuggingFaceBatchUploader):
         for final_batch in uploader.flush():
             apply_committed_batch(final_batch)
-            print(f"    committed final batch: {final_batch['url']}", flush=True)
+            safe_print(f"    committed final batch: {final_batch['url']}", flush=True)
     write_reports(checkpoint, args.output_dir, selection)
     return 0
 
@@ -898,8 +943,11 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("interrupted; partial downloads and completed outputs are resumable", file=sys.stderr)
+        safe_print(
+            "interrupted; partial downloads and completed outputs are resumable",
+            file=sys.stderr,
+        )
         sys.exit(130)
     except Exception as error:
-        print(f"error: {error}", file=sys.stderr)
+        safe_print(f"error: {error}", file=sys.stderr)
         sys.exit(1)

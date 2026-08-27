@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import importlib.util
+import sys
 import types
 import tempfile
 import unittest
@@ -16,6 +17,27 @@ SPEC.loader.exec_module(MODULE)
 
 
 class LocalCopyUploaderTest(unittest.TestCase):
+    def test_closed_stdout_cannot_stop_conversion(self):
+        class BrokenStream:
+            def write(self, _value):
+                raise BrokenPipeError("detached terminal")
+
+            def flush(self):
+                raise BrokenPipeError("detached terminal")
+
+        original = sys.stdout
+        replacement = None
+        try:
+            sys.stdout = BrokenStream()
+            MODULE.safe_print("progress", flush=True)
+            replacement = sys.stdout
+            self.assertIsNot(replacement, original)
+            self.assertFalse(isinstance(replacement, BrokenStream))
+        finally:
+            sys.stdout = original
+            if replacement is not None and replacement is not original:
+                replacement.close()
+
     def test_requires_xet_enabled_repository(self):
         class FakeApi:
             def __init__(self, enabled):
@@ -150,6 +172,28 @@ class LocalCopyUploaderTest(unittest.TestCase):
         self.assertTrue(MODULE.fits_download_buffer(0, 20, 10))
         self.assertTrue(MODULE.fits_download_buffer(4, 6, 10))
         self.assertFalse(MODULE.fits_download_buffer(4, 7, 10))
+
+    def test_resume_reuses_local_outputs_and_skips_committed_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local = root / "pending.vortex"
+            local.write_bytes(b"encoded")
+            outputs = {"vortex": local, "vortex-compact": root / "committed.vortex"}
+            state = {"outputs": {
+                "vortex": {
+                    "status": "complete",
+                    "metrics": {"size_bytes": len(b"encoded")},
+                    "upload": {"status": "failed"},
+                },
+                "vortex-compact": {
+                    "status": "complete",
+                    "upload": {"status": "complete"},
+                },
+            }}
+
+            self.assertFalse(MODULE.needs_source_download(state, outputs))
+            local.unlink()
+            self.assertTrue(MODULE.needs_source_download(state, outputs))
 
     def test_failed_huggingface_commit_retains_preuploaded_file(self):
         class FakeApi:

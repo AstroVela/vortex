@@ -9,8 +9,14 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+
+class ForwardedSignal(Exception):
+    def __init__(self, signum):
+        self.signum = signum
 
 
 def parse_args():
@@ -18,6 +24,8 @@ def parse_args():
     parser.add_argument("--interval", type=float, default=1.0, help="sample interval in seconds")
     parser.add_argument("--output", type=Path, required=True, help="final JSON summary")
     parser.add_argument("--samples", type=Path, help="optional JSON Lines samples")
+    parser.add_argument("--log", type=Path,
+                        help="child stdout/stderr log (default: next to --output with .log suffix)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="command after --")
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
@@ -107,9 +115,25 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def signal_handler(signum, _frame):
+    raise ForwardedSignal(signum)
+
+
+def safe_print(*values, **kwargs):
+    try:
+        print(*values, **kwargs)
+    except BrokenPipeError:
+        sys.stdout = open(os.devnull, "w")
+
+
 def main():
     args = parse_args()
     args.output = args.output.resolve()
+    if args.log is None:
+        args.log = args.output.with_suffix(".log")
+    else:
+        args.log = args.log.resolve()
+    args.log.parent.mkdir(parents=True, exist_ok=True)
     if args.samples:
         args.samples = args.samples.resolve()
         args.samples.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +142,22 @@ def main():
     started = time.monotonic()
     # Keep the child in its own process group so this wrapper can always write
     # the final summary before forwarding an interactive interruption.
-    process = subprocess.Popen(args.command, start_new_session=True)
+    log_file = args.log.open("a", buffering=1)
+    log_file.write(
+        f"\n[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_wall))}] "
+        f"starting: {subprocess.list2cmdline(args.command)}\n"
+    )
+    process = subprocess.Popen(
+        args.command,
+        start_new_session=True,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    previous_handlers = {
+        signum: signal.signal(signum, signal_handler)
+        for signum in (signal.SIGHUP, signal.SIGTERM)
+    }
     previous_time = started
     previous_process = process_stats(process.pid)
     previous_network = network_bytes()
@@ -134,6 +173,7 @@ def main():
     sample_count = 0
     samples_file = args.samples.open("w") if args.samples else None
     interrupted = False
+    received_signal = None
     try:
         while process.poll() is None:
             time.sleep(args.interval)
@@ -191,10 +231,11 @@ def main():
             previous_time = now
             previous_process = current_process
             previous_network = current_network
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ForwardedSignal) as error:
         interrupted = True
+        received_signal = error.signum if isinstance(error, ForwardedSignal) else signal.SIGINT
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGINT)
+            os.killpg(process.pid, received_signal)
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -203,6 +244,9 @@ def main():
     finally:
         if samples_file:
             samples_file.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        log_file.close()
 
     if process.poll() is None:
         process.wait()
@@ -212,6 +256,8 @@ def main():
         "running": False,
         "exit_code": process.returncode,
         "interrupted": interrupted,
+        "received_signal": received_signal,
+        "log": str(args.log),
         "started_at_unix_seconds": started_wall,
         "elapsed_seconds": time.monotonic() - started,
         "sample_interval_seconds": args.interval,
@@ -221,7 +267,7 @@ def main():
         "peaks": peaks,
     }
     atomic_json(args.output, result)
-    print(json.dumps(result, indent=2, sort_keys=True), flush=True)
+    safe_print(json.dumps(result, indent=2, sort_keys=True), flush=True)
     raise SystemExit(process.returncode)
 
 
