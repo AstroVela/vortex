@@ -25,13 +25,17 @@ use vortex_layout::layouts::list::writer::ListLayoutStrategy;
 use vortex_layout::layouts::repartition::RepartitionStrategy;
 use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 use vortex_layout::layouts::table::TableStrategy;
-use vortex_layout::layouts::table::use_experimental_list_layout;
 use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
 use vortex_layout::layouts::zoned::writer::ZonedStrategy;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::aliases::hash_set::HashSet;
 
 const ONE_MEG: u64 = 1 << 20;
+
+#[cfg(feature = "unstable_encodings")]
+const USE_LIST_LAYOUT_BY_DEFAULT: bool = true;
+#[cfg(not(feature = "unstable_encodings"))]
+const USE_LIST_LAYOUT_BY_DEFAULT: bool = false;
 
 /// How the compressor was configured on [`WriteStrategyBuilder`].
 enum CompressorConfig {
@@ -63,6 +67,7 @@ pub struct WriteStrategyBuilder {
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
     probe_compressor: Option<Arc<dyn CompressorPlugin>>,
     /// Whether to write list fields using [`ListLayoutStrategy`].
+    /// Enabled by default with the `unstable_encodings` feature.
     ///
     /// [`ListLayoutStrategy`]: vortex_layout::layouts::list::writer::ListLayoutStrategy
     use_list_layout: bool,
@@ -80,7 +85,7 @@ impl Default for WriteStrategyBuilder {
             allow_encodings: None,
             flat_strategy: None,
             probe_compressor: None,
-            use_list_layout: use_experimental_list_layout(),
+            use_list_layout: USE_LIST_LAYOUT_BY_DEFAULT,
         }
     }
 }
@@ -105,6 +110,8 @@ impl WriteStrategyBuilder {
     }
 
     /// Enable writing list fields with [`ListLayoutStrategy`].
+    ///
+    /// This is already enabled by default when the `unstable_encodings` feature is active.
     ///
     /// **Note**: this is an unstable and experimental layout that is expected to change.
     /// Using it may lead to unreadable files in the future.
@@ -351,5 +358,22 @@ impl WriteStrategyBuilder {
         }
 
         Arc::new(table_strategy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WriteStrategyBuilder;
+
+    #[test]
+    #[cfg(feature = "unstable_encodings")]
+    fn unstable_encodings_enables_list_layout_by_default() {
+        assert!(WriteStrategyBuilder::default().use_list_layout);
+    }
+
+    #[test]
+    #[cfg(not(feature = "unstable_encodings"))]
+    fn list_layout_is_disabled_by_default() {
+        assert!(!WriteStrategyBuilder::default().use_list_layout);
     }
 }
