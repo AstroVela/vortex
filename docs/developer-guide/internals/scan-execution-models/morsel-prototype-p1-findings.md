@@ -45,6 +45,13 @@ Design points that survived contact with the code:
 - **Unsupported shapes are build errors.** Nested structs, non-struct roots, nullable root
   structs and non-flat/non-chunked columns fail in `build_plan` rather than falling back, so an
   unsupported query cannot be timed as if the prototype had executed it.
+- **No state V1 does not have.** An earlier revision carried a per-thread decoded-chunk cache; it
+  was removed because V1 has no reader-level decode cache, so timing against it with one was not
+  a comparison of executors. The IO plane's keyed cells live only for the duration of one morsel
+  (released at retire), so a segment named twice *within* a morsel resolves to one read — that is
+  the registration mechanism itself, not a cache — and across morsels every segment is re-read
+  and re-decoded exactly as V1 re-reads and re-decodes it per evaluation. The eval's counters
+  confirm this: requests, uses and decodes are equal in every configuration.
 
 One deviation from the sketch worth recording: rather than rewriting expressions to push
 predicates onto individual fields, each conjunct and the projection are re-bound against the
@@ -54,7 +61,7 @@ V1's by construction (the same `apply_bound` on the same assembled struct).
 
 ## Correctness
 
-16 differential tests, all passing. Every one uses the V1 `LayoutReader` as the oracle and
+15 differential tests, all passing. Every one uses the V1 `LayoutReader` as the oracle and
 asserts equal row counts and equal ordered content over 8 query shapes:
 
 | Property | Test |
@@ -64,14 +71,13 @@ asserts equal row counts and equal ordered content over 8 query shapes:
 | The document's `[0,3,10)` vs `[0,6,10)` case, and its split set | `document_misalignment_case` |
 | Result independent of morsel size (1, 7, 128, 4096 rows, and per-split) | `independent_of_morsel_size` |
 | Cascade and parallel conjunct policies observationally identical | `conjunct_policy_is_not_observable` |
-| Decode cache is an optimisation only | `decode_cache_is_not_observable` |
 | Every read was named by a planning stream | `every_read_was_planned` |
 | All-false filter emits nothing | `empty_filter_emits_nothing` |
 | Unsupported layouts are build errors | `rejects_unsupported_layouts` |
 
 The evaluation binary re-runs the oracle check for **every** configuration on **every** query
 before any timing happens; a configuration that disagrees is reported as a failure and excluded
-from the timing table. All 105 configuration-query pairs in the run below matched.
+from the timing table. All 90 configuration-query pairs in the run below matched.
 
 ## What could not be evaluated, and why
 
@@ -88,9 +94,7 @@ reasons, all environmental rather than results anyone should read past:
    ClickBench's `hits` is far larger; this host has 4 cores and 15 GB of RAM, and the harness
    holds segments in memory. TPC-H SF10 needs a generator that is not vendored.
 3. **P0's latency-injection IO source and chaos mode are not built.** They gate E2 and E3, which
-   are P2 work and out of scope for P1 anyway. The decode-cache-disabled row is the nearest P1
-   analogue of chaos mode — a component that must not change a single row when removed — and it
-   is asserted both in the tests and in the eval.
+   are P2 work and out of scope for P1 anyway.
 
 What was measured instead is a set of **shape-matched synthetic workloads**: struct-of-chunked-flat
 columns whose per-column chunk boundaries deliberately disagree, scanned under conjunctive filters
@@ -118,78 +122,76 @@ Geometric means over all 15 queries:
 | Row | Geomean vs V1(1) | Range |
 |---|--:|---|
 | A  V1, 1 thread | 1.000 | — |
-| A' V1, tokio x4 | 0.788 | 0.31 – 1.82 |
-| D  morsel, 1 thread, per-split morsels | **0.553** | 0.31 – 0.83 |
-| D  morsel, 1 thread, decode cache disabled | 0.657 | 0.33 – 1.00 |
-| D  morsel, 4 threads, per-split morsels | 0.388 | 0.26 – 0.92 |
-| D  morsel, 4 threads, 64k-row morsels | **0.251** | 0.11 – 0.66 |
-| D  morsel, 4 threads, parallel conjuncts | 0.349 | 0.21 – 0.71 |
+| A' V1, tokio x4 | 0.794 | 0.30 – 1.63 |
+| D  morsel, 1 thread, per-split morsels | **0.650** | 0.35 – 0.99 |
+| D  morsel, 4 threads, per-split morsels | 0.359 | 0.22 – 0.76 |
+| D  morsel, 4 threads, 64k-row morsels | **0.238** | 0.09 – 0.58 |
+| D  morsel, 4 threads, parallel conjuncts | 0.337 | 0.20 – 0.62 |
 
 Per workload (geomean vs V1(1)):
 
 | Row | string-heavy | wide-numeric | narrow-analytic |
 |---|--:|--:|--:|
-| A' V1, tokio x4 | 0.589 | 0.980 | 0.910 |
-| D  morsel, 1 thread | 0.620 | 0.503 | 0.532 |
-| D  morsel, 1 thread, no cache | 0.890 | 0.535 | 0.539 |
-| D  morsel, 4 threads | 0.414 | 0.328 | 0.480 |
-| D  morsel, 4 threads, 64k morsels | 0.312 | 0.176 | 0.329 |
+| A' V1, tokio x4 | 0.538 | 1.059 | 0.972 |
+| D  morsel, 1 thread | 0.788 | 0.582 | 0.553 |
+| D  morsel, 4 threads | 0.387 | 0.300 | 0.442 |
+| D  morsel, 4 threads, 64k morsels | 0.271 | 0.173 | 0.346 |
 
 The full table, every query and every counter, is in
 [`morsel-prototype-p1-eval.md`](morsel-prototype-p1-eval.md).
 
 ### What the numbers say
 
-**Single-threaded, the prototype is ~1.8x faster than V1 on the same cut.** Both executors walk
-the same natural splits and read the same segments; D has no future per evaluation and no task
-per split. That difference alone is the 0.553.
+**Single-threaded, the prototype is ~1.5x faster than V1 on the same cut, and the win is
+inversely proportional to how decode-dominated the query is.** Both executors walk the same
+natural splits, read the same segments the same number of times, and decode the same chunks the
+same number of times — the counters show requests = uses = decodes on every configuration. What
+differs is the machinery around that work: V1 builds a future per evaluation and drives it
+through a stream; D drives a morsel inline with a program counter. On the wide-numeric workload,
+where per-split fixed cost dominates, that is 0.582. On string-heavy `SH1 select-all`, where wall
+time is almost entirely decode (which is identical by construction), D is 0.97 — the honest
+number: an executor cannot be much faster than V1 at a query whose cost V1 also spends almost
+entirely inside the shared decode kernel.
 
-**The decode cache is the whole story on string-heavy data and almost none of it on numeric
-data.** Disabling it moves string-heavy from 0.620 to 0.890 — on `SH1 select-all`, from 15.2 ms
-back to 31.2 ms, which is exactly V1's 31.2 ms — while wide-numeric barely moves, 0.503 to 0.535.
-The reason is visible in the counters: on `SH1 select-all`, 310 named uses collapse to 121 reads
-and 189 cache hits, because the text column is chunked at 4,096 rows while `token_count` is
-chunked at 65,536, so a wide chunk is re-entered by sixteen consecutive morsels. V1 re-decodes it
-each time — `FlatReader::array_future` builds a fresh shared future per evaluation, with no
-reader-level cache. This is the single largest measured win and it comes directly from the design
-rule that a straddling morsel joins the *same* keyed cell rather than issuing its own read.
+An earlier revision of this document reported 0.49 on that query. That number came from a
+per-thread decoded-chunk cache the prototype had and V1 does not; it was measuring a cache, not
+an executor, and it is gone — both from the code and from every table here. The magnitude of the
+delta (0.49 → 0.97 on SH1) is itself a finding: on misaligned string-heavy layouts, *decode
+reuse across morsels is worth ~2x*, and if that win is ever wanted it must be designed as a
+shared, budgeted facility both executors could use — P2's keyed cells — not smuggled in as
+executor-private state.
 
 **Coalescing morsels is worth more than threads on wide tables.** `WN1 select-all` at 4 threads
-goes from 0.30 (per-split morsels) to 0.12 (64k-row morsels): 228 morsels become 16, and 4,560
-named uses become 1,476. The per-morsel fixed cost is real, and the executor's ability to straddle
-chunk boundaries is what makes coalescing legal at all. This is the `select *` small-splits storm
-from [problem 1 of the next-discussion document](scan-execution-graph-next-discussion.md) —
-measured, and answered by unit formation rather than by more machinery.
+goes from 0.24 (per-split morsels) to 0.09 (64k-row morsels): 228 morsels become 16, and 4,560
+uses/requests/decodes become 1,476. This is not caching — it is genuinely fewer scheduling units
+doing genuinely less repeated work, because one morsel spanning sixteen chunk boundaries slices
+each chunk once where sixteen per-split morsels each pay the full per-morsel cost. This is the
+`select *` small-splits storm from
+[problem 1 of the next-discussion document](scan-execution-graph-next-discussion.md), measured,
+and answered by unit formation rather than by more machinery.
 
-**Cascade beats parallel, but not by much** (0.388 vs 0.349 at 4 threads — parallel is actually
-slightly *faster* here). On these workloads the conjuncts are cheap scalar comparisons, so
-evaluating both against the full mask and intersecting costs about what the serial dependency
-costs. On a workload where the second conjunct is expensive (a `LIKE` over a text column) cascade
-should win clearly; that case is not in these fixtures and the policy question stays open.
+**Cascade and parallel conjuncts are within noise of each other here** (0.359 vs 0.337 at 4
+threads). On these workloads the conjuncts are cheap scalar comparisons, so evaluating both
+against the full mask and intersecting costs about what the serial dependency costs. On a
+workload where the second conjunct is expensive (a `LIKE` over a text column) cascade should win
+clearly; that case is not in these fixtures and the policy question stays open.
 
-### Two honest caveats in D's favour, and one against
+**The cold-scan IO invariant holds everywhere.** With cells released per morsel, every
+configuration — 1 thread, 4 threads, coalesced, parallel — shows requests = uses = decodes, and
+the per-split rows show exactly the counts V1's evaluation structure implies. The earlier
+revision's 4-thread rows read up to 3x the bytes of the 1-thread rows (per-thread cells shared
+nothing); that asymmetry is gone along with the cache.
 
-*In D's favour, to discount:*
+### Two honest caveats in D's favour, to discount
 
-- **The 4-thread rows spawn threads per run.** Sub-millisecond queries (`SH6`, `NA3`) show D at 4
-  threads *losing* to D at 1 thread — 498 µs vs 404 µs on `SH6` — because ~200 µs of thread spawn
-  dominates. A real implementation uses a pool. Read the 4-thread rows only on queries above a
-  few milliseconds.
+- **The 4-thread rows spawn threads per run.** Sub-millisecond queries show D at 4 threads
+  losing ground to D at 1 thread because ~200 µs of thread spawn dominates. A real
+  implementation uses a pool. Read the 4-thread rows only on queries above a few milliseconds.
 - **Time-to-first-batch is not directly comparable.** D's is measured from the first morsel a
-  thread completes, V1's from the first item off the stream. D's numbers are dramatically better
-  (76 µs vs 529 µs on `SH6`; 525 µs vs 9.2 ms on `SH1`) and the direction is real — D emits as
-  soon as one morsel finishes rather than after the pipeline fills — but the two clocks are not
-  measuring quite the same event.
-
-*Against D, and this one matters for P2:*
-
-- **Multi-threaded D reads more bytes than V1.** The IO plane is per-thread, so a segment touched
-  by three threads is read three times: on `WN1`, 1,332 reads at one thread become 3,908 at four.
-  With in-memory segments that is nearly free and it is why the 4-thread rows still win. Over real
-  object-store IO it would be a straightforward regression, and it is exactly what P2's shared
-  keyed cells with leases are for. **The cold-scan IO invariant that gate E1 requires — byte-identical
-  IO across rows — holds for D at one thread and does not hold for D at four.** No claim in this
-  document should be read as saying otherwise.
+  thread completes, V1's from the first item off the stream. D's numbers are much better
+  (0.55 ms vs 8.7 ms on `SH1`) and the direction is real — D emits as soon as one morsel
+  finishes rather than after the pipeline fills — but the two clocks are not measuring quite
+  the same event.
 
 ## Where this leaves the phase order
 
@@ -207,5 +209,8 @@ Two things would need to happen before the gate means anything:
    encodings. Comparing a synthetic-fixture ratio against a real-suite ratio is not sound, and
    this document does not do it.
 
-P2's shared cells are motivated independently of the gate by the per-thread read duplication
-above, which is a measured defect rather than a speculative one.
+P2's shared cells are now motivated by a measured number rather than a speculative one: the
+removed decode cache showed cross-morsel decode reuse is worth ~2x on misaligned string-heavy
+layouts. P2 is where that win gets rebuilt as a shared, scheduler-visible facility with leases
+and byte budgets — available to any executor, accounted for, and disabled in the fair rows of
+any future comparison.

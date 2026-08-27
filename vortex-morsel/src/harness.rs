@@ -181,8 +181,6 @@ pub struct MorselConfig {
     pub threads: usize,
     /// Morsel coalescing target; zero means "one morsel per natural split", matching V1.
     pub morsel_rows: u64,
-    /// Per-thread decoded-chunk cache budget; zero disables the cache.
-    pub decode_cache_bytes: usize,
     /// Conjunct evaluation policy.
     pub mode: ConjunctMode,
 }
@@ -192,7 +190,6 @@ impl Default for MorselConfig {
         Self {
             threads: 1,
             morsel_rows: 0,
-            decode_cache_bytes: crate::driver::DEFAULT_DECODE_CACHE_BYTES,
             mode: ConjunctMode::Cascade,
         }
     }
@@ -215,8 +212,7 @@ pub fn run_morsel(
     let cut = morsels(&plan, config.morsel_rows);
     let scan = MorselScan::new(plan, Arc::clone(segments), session.clone())
         .with_threads(config.threads)
-        .with_morsels(cut)
-        .with_decode_cache_bytes(config.decode_cache_bytes);
+        .with_morsels(cut);
 
     let start = Instant::now();
     let (batches, stats) = scan.run()?;

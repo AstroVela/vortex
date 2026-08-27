@@ -386,47 +386,6 @@ fn conjunct_policy_is_not_observable() -> VortexResult<()> {
     Ok(())
 }
 
-/// Property: the decoded-chunk cache is an optimisation only. Disabling it must not change a
-/// single row — the chaos-mode analogue for P1.
-#[rstest]
-fn decode_cache_is_not_observable() -> VortexResult<()> {
-    let session = session();
-    let fixture = misaligned_fixture(&session, ROWS)?;
-    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
-
-    for query in queries() {
-        let dtype = v1_dtype(&fixture.layout, &query)?;
-        let cached = run_morsel(
-            &session,
-            &fixture.layout,
-            &segments,
-            &query,
-            MorselConfig::default(),
-        )?;
-        let uncached = run_morsel(
-            &session,
-            &fixture.layout,
-            &segments,
-            &query,
-            MorselConfig {
-                decode_cache_bytes: 0,
-                ..Default::default()
-            },
-        )?;
-        assert_same_rows(&session, &dtype, &cached, &uncached)
-            .map_err(|err| err.with_context(format!("query {}", query.name)))?;
-
-        // And the cache must actually be doing something on a misaligned fixture.
-        let cached_stats = cached.stats.as_ref().expect("morsel runs report stats");
-        let uncached_stats = uncached.stats.as_ref().expect("morsel runs report stats");
-        assert!(
-            cached_stats.decodes <= uncached_stats.decodes,
-            "the cache must not increase decode count"
-        );
-    }
-    Ok(())
-}
-
 /// Property: every read a node waits on was named by its own planning stream, so the number of
 /// distinct segments read never exceeds the number of uses named.
 #[rstest]

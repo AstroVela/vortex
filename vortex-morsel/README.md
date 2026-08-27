@@ -10,13 +10,15 @@ by registering keyed uses against the IO plane, and `execute` may only wait on t
 planning stream emitted.
 
 The crate is a prototype and is not part of the public API. It supports flat, chunked and
-struct layouts only; anything else is a build error rather than a fallback.
+struct layouts only; anything else is a build error rather than a fallback. It deliberately holds
+no state the V1 `LayoutReader` does not have: no decoded-array cache, and a morsel's IO cells are
+released when it retires — the eval counters show requests = uses = decodes everywhere.
 
 ## Measured
 
 Against the V1 `LayoutReader` on shape-matched workloads (see
-`docs/.../morsel-prototype-p1-findings.md` for the full contract and caveats): geomean 0.553 at
-equal thread count, 0.251 at four threads with coalesced morsels, with every configuration
+`docs/.../morsel-prototype-p1-findings.md` for the full contract and caveats): geomean 0.650 at
+equal thread count, 0.238 at four threads with coalesced morsels, with every configuration
 validated against V1's output before timing.
 
 ## Running the evaluation

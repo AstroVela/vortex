@@ -57,11 +57,6 @@ impl Row {
             Row::V1Single => "A  V1 (1 thread)".to_string(),
             Row::V1Tokio(threads) => format!("A' V1 (tokio x{threads})"),
             Row::Morsel(config) => {
-                let cache = if config.decode_cache_bytes == 0 {
-                    ", no cache"
-                } else {
-                    ""
-                };
                 let mode = match config.mode {
                     ConjunctMode::Cascade => "",
                     ConjunctMode::Parallel => ", parallel",
@@ -71,7 +66,7 @@ impl Row {
                 } else {
                     format!("{}r", config.morsel_rows)
                 };
-                format!("D  morsel (x{}, {morsel}{cache}{mode})", config.threads)
+                format!("D  morsel (x{}, {morsel}{mode})", config.threads)
             }
         }
     }
@@ -84,7 +79,6 @@ struct Timing {
     ttfb: Option<Duration>,
     requests: Option<u64>,
     decodes: Option<u64>,
-    decode_hits: Option<u64>,
     io_uses: Option<u64>,
     morsels: Option<u64>,
 }
@@ -141,11 +135,6 @@ fn main() -> VortexResult<()> {
                 Row::V1Tokio(threads),
                 Row::Morsel(MorselConfig {
                     threads: 1,
-                    ..Default::default()
-                }),
-                Row::Morsel(MorselConfig {
-                    threads: 1,
-                    decode_cache_bytes: 0,
                     ..Default::default()
                 }),
                 Row::Morsel(MorselConfig {
@@ -210,7 +199,6 @@ fn main() -> VortexResult<()> {
                         ttfb: median.time_to_first_batch,
                         requests: median.stats.as_ref().map(|s| s.io_requests),
                         decodes: median.stats.as_ref().map(|s| s.decodes),
-                        decode_hits: median.stats.as_ref().map(|s| s.decode_hits),
                         io_uses: median.stats.as_ref().map(|s| s.io_uses),
                         morsels: median.stats.as_ref().map(|s| s.morsels),
                     }
@@ -268,10 +256,8 @@ fn report(query: &Query, timings: &[Timing]) {
 
     println!("### {}", query.name);
     println!();
-    println!(
-        "| executor | wall | vs V1 | rows | ttfb | morsels | uses | reqs | decodes | cache hits |"
-    );
-    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
+    println!("| executor | wall | vs V1 | rows | ttfb | morsels | uses | reqs | decodes |");
+    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|");
     for timing in timings {
         let ratio = if baseline.is_zero() {
             "—".to_string()
@@ -282,7 +268,7 @@ fn report(query: &Query, timings: &[Timing]) {
             )
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             timing.label,
             millis(timing.median),
             ratio,
@@ -292,7 +278,6 @@ fn report(query: &Query, timings: &[Timing]) {
             opt(timing.io_uses),
             opt(timing.requests),
             opt(timing.decodes),
-            opt(timing.decode_hits),
         );
     }
     println!();

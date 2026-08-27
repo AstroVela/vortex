@@ -24,10 +24,6 @@ pub struct ScanStats {
     pub io_bytes: u64,
     /// Segment decodes performed.
     pub decodes: u64,
-    /// Decodes served from the per-thread decoded-chunk cache.
-    pub decode_hits: u64,
-    /// Bytes of decoded arrays evicted from the per-thread cache.
-    pub decode_evictions: u64,
     /// Conjuncts skipped because the mask was already all-false.
     pub conjuncts_short_circuited: u64,
     /// Morsels whose filter selected no rows.
@@ -47,8 +43,6 @@ impl ScanStats {
         self.io_bypassed += other.io_bypassed;
         self.io_bytes += other.io_bytes;
         self.decodes += other.decodes;
-        self.decode_hits += other.decode_hits;
-        self.decode_evictions += other.decode_evictions;
         self.conjuncts_short_circuited += other.conjuncts_short_circuited;
         self.morsels_empty += other.morsels_empty;
         self.time_to_first_batch = match (self.time_to_first_batch, other.time_to_first_batch) {

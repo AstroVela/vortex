@@ -20,18 +20,20 @@
 //!   stream already emitted; it consumes the cell behind a ticket and produces
 //!   [`ValueBatch`]es covering a dense range of input rows.
 //!
-//! Compared to the V1 `LayoutReader` path this executor differs in three measurable ways:
+//! Compared to the V1 `LayoutReader` path this executor differs in two measurable ways:
 //!
 //! 1. There is no future per evaluation. A morsel is driven inline, depth-first, on one thread.
-//! 2. Decoded segments are cached per thread, so a chunk straddling several morsels is decoded
-//!    once rather than once per morsel that touches it.
-//! 3. Morsels are self-scheduled off one atomic cursor; emission order is restored by index.
+//! 2. Morsels are self-scheduled off one atomic cursor; emission order is restored by index.
+//!
+//! It deliberately holds **no more state than V1 does**: there is no decoded-array cache, and a
+//! morsel's IO cells are released when it retires. A segment reached twice within one morsel is
+//! read once because both uses name the same cell — that is registration, not caching — and a
+//! segment straddling two morsels is read once per morsel, exactly as V1 does it.
 //!
 //! Only the FLAT, CHUNKED and STRUCT layout nodes are supported, plus the FILTER and
 //! CONJUNCT_PARALLEL operators. Anything else is rejected at build time by [`build::build_plan`].
 
 pub mod build;
-pub mod cache;
 pub mod driver;
 #[cfg(any(test, feature = "_test-harness"))]
 pub mod fixtures;

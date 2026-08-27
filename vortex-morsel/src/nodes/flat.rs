@@ -14,7 +14,6 @@ use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::segments::SegmentId;
 use vortex_session::registry::ReadContext;
 
-use crate::cache::array_bytes;
 use crate::io::IoBatch;
 use crate::io::IoKey;
 use crate::io::IoTicket;
@@ -34,8 +33,8 @@ use crate::node::ValueBatch;
 /// The only node that touches the world: one stored segment, decoded and sliced.
 ///
 /// `next_plan` names the segment exactly once per morsel. `execute` waits on that one ticket,
-/// decodes (or takes the decode from the per-thread cache), slices to the morsel's local range
-/// and applies the demand mask.
+/// decodes, slices to the morsel's local range and applies the demand mask. There is no decoded
+/// cache: like V1, a segment straddling several morsels is decoded once per morsel.
 pub struct FlatExec {
     segment: SegmentId,
     dtype: DType,
@@ -77,10 +76,6 @@ impl FlatExec {
     }
 
     fn decode(&self, cx: &mut ExecCx<'_>) -> VortexResult<ArrayRef> {
-        if let Some(cached) = cx.cache_get(self.segment) {
-            return Ok(cached);
-        }
-
         let ticket = self
             .ticket
             .ok_or_else(|| crate::io::unplanned_ticket(self.producer))?;
@@ -95,9 +90,6 @@ impl FlatExec {
         let session = cx.session().clone();
         let array = parts.decode(&self.dtype, rows, &self.read_ctx, &session)?;
         cx.stats().decodes += 1;
-
-        let bytes = array_bytes(&array);
-        cx.cache_insert(self.segment, array.clone(), bytes);
         Ok(array)
     }
 }

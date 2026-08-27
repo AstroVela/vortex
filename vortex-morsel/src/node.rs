@@ -10,11 +10,9 @@ use vortex_array::buffer::BufferHandle;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
-use vortex_layout::segments::SegmentId;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
-use crate::cache::DecodeCache;
 use crate::io::IoBatch;
 use crate::io::IoPlane;
 use crate::io::IoTicket;
@@ -264,7 +262,6 @@ impl<'a> PlanCx<'a> {
 pub struct ExecCx<'a> {
     arena: &'a mut Arena,
     io: &'a IoPlane,
-    cache: &'a DecodeCache,
     session: &'a VortexSession,
     stats: &'a mut ScanStats,
     demand: Mask,
@@ -284,24 +281,9 @@ impl<'a> ExecCx<'a> {
         self.io
     }
 
-    /// The per-thread decoded-chunk cache.
-    pub fn cache(&self) -> &DecodeCache {
-        self.cache
-    }
-
     /// The session, for creating expression execution contexts.
     pub fn session(&self) -> &VortexSession {
         self.session
-    }
-
-    /// Look up a decoded segment in the per-thread cache.
-    pub fn cache_get(&mut self, id: SegmentId) -> Option<ArrayRef> {
-        self.cache.get(id, self.stats)
-    }
-
-    /// Insert a decoded segment into the per-thread cache.
-    pub fn cache_insert(&mut self, id: SegmentId, array: ArrayRef, bytes: usize) {
-        self.cache.insert(id, array, bytes, self.stats)
     }
 
     /// Consume the bytes behind a ticket this node's planning stream emitted.
@@ -384,7 +366,6 @@ pub fn drive_morsel(
     root: NodeId,
     range: Range<u64>,
     io: &IoPlane,
-    cache: &DecodeCache,
     session: &VortexSession,
     stats: &mut ScanStats,
 ) -> VortexResult<Option<ArrayRef>> {
@@ -416,7 +397,6 @@ pub fn drive_morsel(
         let mut cx = ExecCx {
             arena,
             io,
-            cache,
             session,
             stats,
             demand: Mask::new_true(rows),
@@ -439,11 +419,13 @@ pub fn drive_morsel(
         out?
     };
 
-    // Retirement.
+    // Retirement. The morsel's IO cells are released with it: the executor retains no bytes
+    // and no decoded arrays across morsels, matching V1's per-evaluation state exactly.
     {
         let mut cx = RetireCx { arena, stats };
         cx.retire_child(root);
     }
+    io.clear();
 
     let array = value.map(|batch| batch.value.into_array()).transpose()?;
     Ok(array.and_then(|a| (!a.is_empty()).then_some(a)))

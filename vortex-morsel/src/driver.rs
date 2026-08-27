@@ -23,13 +23,9 @@ use vortex_session::VortexSession;
 
 use crate::build::ExecPlan;
 use crate::build::cut_morsels;
-use crate::cache::DecodeCache;
 use crate::io::IoPlane;
 use crate::node::drive_morsel;
 use crate::stats::ScanStats;
-
-/// Default byte budget for one thread's decoded-chunk cache.
-pub const DEFAULT_DECODE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The morsel row ranges for a plan.
 ///
@@ -47,7 +43,6 @@ pub struct MorselScan {
     session: VortexSession,
     morsels: Arc<[Range<u64>]>,
     threads: usize,
-    decode_cache_bytes: usize,
     inline_floor_bytes: usize,
 }
 
@@ -65,7 +60,6 @@ impl MorselScan {
             session,
             morsels,
             threads: 1,
-            decode_cache_bytes: DEFAULT_DECODE_CACHE_BYTES,
             inline_floor_bytes: 0,
         }
     }
@@ -79,12 +73,6 @@ impl MorselScan {
     /// Override the morsel cut.
     pub fn with_morsels(mut self, morsels: Vec<Range<u64>>) -> Self {
         self.morsels = Arc::from(morsels);
-        self
-    }
-
-    /// Set the per-thread decoded-chunk cache budget. Zero disables the cache.
-    pub fn with_decode_cache_bytes(mut self, bytes: usize) -> Self {
-        self.decode_cache_bytes = bytes;
         self
     }
 
@@ -110,7 +98,6 @@ impl MorselScan {
             let mut arena = self.plan.instantiate();
             let io = IoPlane::new(Arc::clone(&self.segments))
                 .with_inline_floor_bytes(self.inline_floor_bytes);
-            let cache = DecodeCache::new(self.decode_cache_bytes);
             let mut local = ScanStats::default();
             let mut local_results: Vec<(usize, ArrayRef)> = Vec::new();
 
@@ -124,7 +111,6 @@ impl MorselScan {
                     self.plan.root(),
                     range.clone(),
                     &io,
-                    &cache,
                     &self.session,
                     &mut local,
                 )?;
