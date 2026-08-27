@@ -399,16 +399,26 @@ fn make_patched_for_bitpacked() -> ArrayRef {
         .into_array()
 }
 
+/// Canonicalize `array`, either by streaming chunks into the builder or by level-wise execution.
+/// Driving `execute_via_chunks` directly measures the mechanism itself, independent of the
+/// executor's depth heuristic.
 fn bench_execute(bencher: Bencher, array: ArrayRef, streaming: bool) {
     bencher
         .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
         .bench_values(|(array, mut ctx)| {
-            vortex_array::chunk_iter::set_chunked_execute_enabled(streaming);
-            let result = array
-                .execute::<PrimitiveArray>(&mut ctx)
-                .vortex_expect("bench");
-            vortex_array::chunk_iter::set_chunked_execute_enabled(true);
-            black_box(result.len())
+            let len = if streaming {
+                vortex_array::chunk_iter::execute_via_chunks(&array, &mut ctx)
+                    .vortex_expect("bench")
+                    .len()
+            } else {
+                vortex_array::chunk_iter::set_chunked_execute_enabled(false);
+                let result = array
+                    .execute::<PrimitiveArray>(&mut ctx)
+                    .vortex_expect("bench");
+                vortex_array::chunk_iter::set_chunked_execute_enabled(true);
+                result.len()
+            };
+            black_box(len)
         });
 }
 
@@ -514,4 +524,42 @@ fn filter_bp_sum_execute_then_read(bencher: Bencher, keep: usize) {
                 .fold(0, u64::wrapping_add);
             black_box(total)
         });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Depth sweep: does the streaming win grow with stack depth?
+//
+// Each level above the innermost fused FoR+BitPacked pair is a generic composition step. For
+// level-wise execution that is one extra *full-buffer* read+write pass over every value; for
+// streaming it is one extra pass over an L1-resident block. If the model is right, the gap
+// should widen roughly linearly with depth.
+// ---------------------------------------------------------------------------------------------
+
+/// `depth` nested FoR levels over one BitPacked leaf.
+fn make_for_stack(depth: usize) -> ArrayRef {
+    let mut ctx = SESSION.create_execution_ctx();
+    let deltas = PrimitiveArray::from_iter(
+        (0..LEN as u64).map(|i| u32::try_from((i * 7) % 1000).vortex_expect("fits")),
+    );
+    let mut array = bitpack_encode(&deltas, 10, None, &mut ctx)
+        .vortex_expect("bench")
+        .into_array();
+    for _ in 0..depth {
+        array = FoR::try_new(array, Scalar::from(1_000u32))
+            .vortex_expect("bench")
+            .into_array();
+    }
+    array
+}
+
+const STACK_DEPTHS: &[usize] = &[1, 2, 4, 8];
+
+#[divan::bench(args = STACK_DEPTHS)]
+fn execute_for_stack_streaming(bencher: Bencher, depth: usize) {
+    bench_execute(bencher, make_for_stack(depth), true);
+}
+
+#[divan::bench(args = STACK_DEPTHS)]
+fn execute_for_stack_levelwise(bencher: Bencher, depth: usize) {
+    bench_execute(bencher, make_for_stack(depth), false);
 }

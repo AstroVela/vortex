@@ -3,38 +3,55 @@
 
 //! Streaming chunked decompression.
 //!
-//! [`ArrayRef::decompress_chunks`] walks an array's decompressed values in cache-resident chunks
-//! (~1024 elements) without materializing the full array. Each encoding can override
-//! [`VTable::decompress_chunks`](crate::vtable::VTable::decompress_chunks) to stream chunks
-//! straight out of its decompression kernel; wrapper encodings (e.g. FoR) compose by interposing
-//! a stack-allocated [`ChunkSink`] adapter around the downstream sink and recursing into their
-//! child through the erased [`ArrayRef`] entry point.
+//! [`ArrayRef::decompress_chunks`] walks an encoding tree's decompressed values in cache-resident
+//! chunks of [`DECOMPRESS_CHUNK_LEN`] without materializing the array. Leaf encodings stream
+//! blocks straight out of their decompression kernel; wrapper encodings compose by interposing a
+//! stack-allocated [`ChunkSink`] adapter and recursing into their child through the erased
+//! [`ArrayRef`] entry point, so a whole tree decompresses and transforms one L1-resident block at
+//! a time.
 //!
-//! # Cost model
+//! # The vtable API
 //!
-//! The composition cost is one virtual call per chunk per encoding level (amortized over ~1024
-//! elements, i.e. fractions of a nanosecond per element) plus, for each wrapper level, one
-//! in-place pass over an L1-resident chunk. There is no per-element dynamic dispatch and no
-//! heap-allocated state introduced on the way down: the sink chain lives in the caller's stack
-//! frames, one frame per encoding level. Leaf producers reuse whatever scratch buffer their
-//! decompressor already maintains (e.g. the FastLanes 1024-element unpack buffer).
+//! Encodings implement two methods (see [`VTable`](crate::vtable::VTable)):
 //!
-//! Streaming is an explicit capability, not a silent guarantee: encodings advertise it via
-//! [`VTable::supports_decompress_chunks`](crate::vtable::VTable::supports_decompress_chunks)
-//! (wrappers propagate the check through their children), and
-//! [`ArrayRef::decompress_chunks`] errors on an unsupported tree instead of quietly
-//! materializing it. Callers that want a works-everywhere path opt into the two-pass fallback
-//! by name with [`ArrayRef::decompress_chunks_or_materialize`].
+//! ```ignore
+//! fn supports_decompress_chunks(array: ArrayView<'_, Self>) -> bool;      // default: false
+//! fn decompress_chunks(
+//!     array: ArrayView<'_, Self>,
+//!     ctx: &mut ExecutionCtx,
+//!     sink: &mut dyn ChunkSink,
+//! ) -> VortexResult<()>;                                                  // default: unsupported
+//! ```
+//!
+//! They are separate because support must be answerable *before* any work happens, and because it
+//! **cascades**: a wrapper only advertises support when the children it streams from do, so the
+//! whole tree is validated up front and [`ArrayRef::decompress_chunks`] can reject an unsupported
+//! tree without emitting a partial stream. There is no silent fallback — callers that want one
+//! ask for it by name via [`ArrayRef::decompress_chunks_or_materialize`].
 //!
 //! # Contract
 //!
-//! - Chunks arrive in order, are contiguous, and cover `0..array.len()` exactly.
-//! - Chunks are producer-owned scratch: the sink may mutate them freely (wrappers rely on this to
-//!   transform values in place), and their contents are invalid once `accept` returns.
-//! - Validity is *not* streamed: positions that are logically null contain unspecified (but
-//!   initialized) values, matching `execute`'s decompression behavior. Callers that need null
-//!   information should fetch `array.validity()` separately.
-//! - Currently only primitive-typed arrays are supported.
+//! - Chunks arrive in order, are contiguous, and cover `0..array.len()` exactly (debug-checked).
+//! - Chunks may be shorter than [`DECOMPRESS_CHUNK_LEN`] (sliced blocks, filtered blocks).
+//! - Chunks are producer-owned scratch: a sink may mutate one freely — wrappers rely on this to
+//!   transform values in place — and its contents are invalid once `accept` returns.
+//! - Validity is *not* streamed. Positions that are logically null hold unspecified but
+//!   initialized values, matching what `execute` produces; read `array.validity()` separately.
+//! - Primitive-typed arrays only.
+//!
+//! # Cost model
+//!
+//! Dispatch is per chunk, never per value: one virtual call per ~1024 values per encoding level
+//! (~0.06 ns/element), with all per-element work monomorphized behind a real typed slice. No heap
+//! state is introduced descending the tree — the sink chain is one stack frame per level — and
+//! leaf producers reuse the scratch buffer their decompressor already owns.
+//!
+//! What streaming trades: one full-length intermediate buffer per encoding level becomes one pass
+//! over an L1-resident block, at the cost of a final scratch-to-output copy when the consumer
+//! wants a buffer. So it wins outright for consumers that never materialize (folding values
+//! directly), and for materialization it wins once a tree is deep enough that the eliminated
+//! intermediates outweigh that copy — see [`MIN_STREAMING_CHAIN`] for the measured threshold the
+//! executor uses.
 
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -158,6 +175,13 @@ impl ArrayRef {
         self.dtype().is_primitive() && self.dyn_array().supports_decompress_chunks(self)
     }
 
+    /// Returns whether the executor will canonicalize this array by streaming chunks (see
+    /// [`should_execute_via_chunks`]). Exposed for diagnostics and tests.
+    #[doc(hidden)]
+    pub fn should_execute_via_chunks(&self) -> bool {
+        should_execute_via_chunks(self)
+    }
+
     /// Stream the array's decompressed values through `sink` in cache-resident chunks.
     ///
     /// See the [module docs](self) for the contract and cost model. This errors — without
@@ -225,21 +249,13 @@ impl ArrayRef {
     }
 }
 
-/// Global toggle for the executor's stream-to-canonical shortcut (see [`execute_via_chunks`]).
-///
-/// **Disabled by default.** Streaming only beats level-wise execution for *materialization* when
-/// the level-wise path performs an extra full-buffer pass over an intermediate; when it already
-/// decodes straight into the destination (`decode_into` for fused FoR, Patched, and the Filter
-/// compaction kernel), streaming just adds a scratch-to-output copy. Measured over three rounds
-/// on 4Mi-row trees: signed `FoR(BitPacked)` (which does a separate wrapping-add pass) is
-/// 10-25% faster streaming, while fused `FoR(BitPacked)` and `Patched(FoR(BitPacked))` are
-/// ~5-10% slower. Since the outcome depends on the child's decode path rather than on anything
-/// the executor can see, the shortcut stays opt-in until sinks can offer a destination slice
-/// (which would remove the extra copy).
-///
-/// Set `VORTEX_CHUNKED_EXECUTE=1` to enable it, or use [`set_chunked_execute_enabled`].
+/// Global kill switch for the executor's stream-to-canonical shortcut (see
+/// [`execute_via_chunks`]). Enabled by default, subject to the depth rule in
+/// [`should_execute_via_chunks`]; set `VORTEX_CHUNKED_EXECUTE=0` to disable it entirely, or use
+/// [`set_chunked_execute_enabled`] at runtime (benchmarks and tests use this to compare both
+/// executor paths in one process).
 static CHUNKED_EXECUTE_ENABLED: std::sync::LazyLock<AtomicBool> = std::sync::LazyLock::new(|| {
-    AtomicBool::new(std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "1"))
+    AtomicBool::new(!std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "0"))
 });
 
 #[doc(hidden)]
@@ -247,30 +263,49 @@ pub fn set_chunked_execute_enabled(enabled: bool) {
     CHUNKED_EXECUTE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Returns whether the executor should shortcut this array's canonicalization through
-/// [`execute_via_chunks`].
+/// Minimum streaming chain length for the executor to canonicalize via chunk streaming.
 ///
-/// True when the shortcut is enabled, the whole tree streams
-/// ([`ArrayRef::supports_decompress_chunks`], which cascades: an encoding only advertises
-/// support when the children it streams from do), and the tree is at least two streaming levels
-/// deep. A lone streaming leaf (e.g. BitPacked with canonical patch children) decodes directly
-/// into the builder on its normal execute path, so streaming it would only add a scratch copy;
-/// the shortcut pays off when the normal path would materialize a full intermediate per level.
+/// Streaming trades one full-length intermediate buffer per encoding level for one pass over an
+/// L1-resident block, but pays a scratch-to-output copy at the end. That trade only pays off once
+/// a tree is deep enough. Measured on 4Mi-row `FoR`-over-`BitPacked` stacks (three rounds,
+/// medians): the marginal cost of an added level is ~0.83ms level-wise versus ~0.53ms streaming,
+/// so chains of 5 and 9 nodes run 1.24x and 1.46x faster streaming, while chains of 2-3 are
+/// within noise or slightly slower (their level-wise paths decode straight into the destination
+/// via `decode_into`, leaving no intermediate to eliminate). Streaming also has far tighter tail
+/// latency: p100/median ~1.2x versus 2.5-5x for level-wise, which repeatedly allocates
+/// full-length intermediates.
+const MIN_STREAMING_CHAIN: usize = 4;
+
+/// Length of the streaming chain rooted at `array`: the number of consecutive
+/// streaming-capable nodes from the root down to and including the deepest leaf producer.
+///
+/// Only children that a streaming parent actually decodes *through* extend the chain: a child
+/// must itself stream, must not already be canonical (canonical children are read directly, with
+/// no decode to eliminate), and must preserve row count. The cardinality rule is what keeps
+/// selection encodings such as `Filter` out of the executor path: their level-wise kernels decode
+/// the child straight into the output buffer and compact in place, so streaming would only add a
+/// copy. Streaming them is still available to consumers that never materialize, via
+/// [`ArrayRef::decompress_chunks`].
+fn streaming_chain_len(array: &ArrayRef) -> usize {
+    if !array.supports_decompress_chunks() {
+        return 0;
+    }
+    1 + array
+        .children_iter()
+        .filter(|child| !child.is_canonical() && child.len() == array.len())
+        .map(streaming_chain_len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Returns whether the executor should canonicalize this array by streaming chunks rather than
+/// materializing an intermediate per encoding level.
+///
+/// True when streaming is enabled and the tree's streaming chain reaches
+/// [`MIN_STREAMING_CHAIN`] nodes — the depth at which streaming is measured to win.
 pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
     CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
-        && array.supports_decompress_chunks()
-        && array.children_iter().any(|child| {
-            !child.is_canonical()
-                    && child.supports_decompress_chunks()
-                    // Cardinality-preserving only. When a level changes row count (e.g. Filter),
-                    // its level-wise path decodes the child straight into the output buffer and
-                    // compacts in place, so there is no intermediate for streaming to eliminate —
-                    // streaming only adds a scratch-to-output copy. Measured on Filter(BitPacked)
-                    // at 64K rows: streaming is 1.2-2.6x slower than level-wise for
-                    // materialization. Streaming such trees is still available to consumers that
-                    // never materialize, via `decompress_chunks`.
-                    && child.len() == array.len()
-        })
+        && streaming_chain_len(array) >= MIN_STREAMING_CHAIN
 }
 
 /// Execute a streaming-capable primitive array tree to a canonical [`PrimitiveArray`] by

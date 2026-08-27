@@ -235,11 +235,12 @@ mod tests {
 
 #[cfg(test)]
 mod executor_tests {
+    use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_array::chunk_iter::set_chunked_execute_enabled;
+    use vortex_array::chunk_iter::execute_via_chunks;
     use vortex_array::scalar::Scalar;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
@@ -249,25 +250,61 @@ mod executor_tests {
     use crate::FoR;
     use crate::bitpack_compress::bitpack_encode;
 
-    /// The executor's stream-to-canonical shortcut must produce the same canonical array as
-    /// level-wise execution, including validity, on a nullable multi-level tree.
-    #[test]
-    fn execute_via_chunks_matches_levelwise() -> VortexResult<()> {
-        let mut ctx = SESSION.create_execution_ctx();
+    /// `depth` nested FoR levels over a nullable BitPacked leaf.
+    fn for_stack(depth: usize, ctx: &mut vortex_array::ExecutionCtx) -> VortexResult<ArrayRef> {
         let values = Buffer::from_iter((0..5000i32).map(|i| i % 900));
         let validity = Validity::from_iter((0..5000).map(|i| i % 7 != 0));
-        let deltas = PrimitiveArray::new(values, validity);
-        let bp = bitpack_encode(&deltas, 10, None, &mut ctx)?;
-        // Signed reference so the generic streaming composition (not the fused path) is used.
-        let array = FoR::try_new(bp.into_array(), Scalar::from(-1_000_000i32))?.into_array();
+        let mut array =
+            bitpack_encode(&PrimitiveArray::new(values, validity), 10, None, ctx)?.into_array();
+        for _ in 0..depth {
+            // A signed reference keeps every level on the generic streaming composition rather
+            // than the fused FoR+BitPacked kernel.
+            array = FoR::try_new(array, Scalar::from(-1_000i32))?.into_array();
+        }
+        Ok(array)
+    }
 
-        set_chunked_execute_enabled(false);
-        let levelwise = array.clone().execute::<PrimitiveArray>(&mut ctx);
-        set_chunked_execute_enabled(true);
-        let levelwise = levelwise?;
-        let streaming = array.execute::<PrimitiveArray>(&mut ctx)?;
+    /// Streaming a tree to canonical must match level-wise execution exactly, including
+    /// validity, at every stack depth.
+    #[rstest::rstest]
+    #[case::single(1)]
+    #[case::pair(2)]
+    #[case::deep(5)]
+    fn execute_via_chunks_matches_levelwise(#[case] depth: usize) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = for_stack(depth, &mut ctx)?;
+        assert!(array.supports_decompress_chunks());
+
+        let streaming = execute_via_chunks(&array, &mut ctx)?;
+        let levelwise = array.execute::<PrimitiveArray>(&mut ctx)?;
 
         assert_arrays_eq!(streaming, levelwise, &mut ctx);
+        Ok(())
+    }
+
+    /// The executor only takes the streaming shortcut once a tree is deep enough for it to pay
+    /// off, and never for cardinality-changing roots.
+    #[test]
+    fn executor_depth_rule() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+
+        assert!(!for_stack(1, &mut ctx)?.should_execute_via_chunks());
+        assert!(!for_stack(2, &mut ctx)?.should_execute_via_chunks());
+        assert!(for_stack(3, &mut ctx)?.should_execute_via_chunks());
+        assert!(for_stack(8, &mut ctx)?.should_execute_via_chunks());
+
+        // A Filter root streams, but never through the executor: its level-wise kernel already
+        // decodes into the output and compacts in place, so there is no intermediate to remove.
+        let filtered = for_stack(0, &mut ctx)?
+            .filter(vortex_mask::Mask::from_iter((0..5000).map(|i| i % 3 == 0)))?;
+        assert!(filtered.supports_decompress_chunks());
+        assert!(!filtered.should_execute_via_chunks());
+
+        // Filter push-down can sink a filter beneath a deep stack; the levels above it still
+        // stream, because each of them would otherwise materialize a full intermediate.
+        let deep_filtered = for_stack(8, &mut ctx)?
+            .filter(vortex_mask::Mask::from_iter((0..5000).map(|i| i % 3 == 0)))?;
+        assert!(deep_filtered.should_execute_via_chunks());
         Ok(())
     }
 }
@@ -279,7 +316,7 @@ mod filter_tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_array::chunk_iter::set_chunked_execute_enabled;
+    use vortex_array::chunk_iter::execute_via_chunks;
     use vortex_error::VortexResult;
     use vortex_mask::Mask;
 
@@ -305,11 +342,8 @@ mod filter_tests {
         let filtered = bp.filter(mask)?;
         assert!(filtered.supports_decompress_chunks());
 
-        set_chunked_execute_enabled(false);
-        let levelwise = filtered.clone().execute::<PrimitiveArray>(&mut ctx);
-        set_chunked_execute_enabled(true);
-        let levelwise = levelwise?;
-        let streaming = filtered.execute::<PrimitiveArray>(&mut ctx)?;
+        let streaming = execute_via_chunks(&filtered, &mut ctx)?;
+        let levelwise = filtered.execute::<PrimitiveArray>(&mut ctx)?;
 
         assert_eq!(streaming.len(), levelwise.len());
         assert_arrays_eq!(streaming, levelwise, &mut ctx);
