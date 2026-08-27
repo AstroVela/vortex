@@ -150,7 +150,7 @@ impl ExecNode for ChunkedExec {
             let cut = self.cuts[idx].clone();
             let child_demand = slice_mask(&demand, cut.mask_range);
             let array = cx.child_array(self.children[cut.chunk], child_demand)?;
-            if array.len() > 0 {
+            if !array.is_empty() {
                 parts.push(array);
             }
         }

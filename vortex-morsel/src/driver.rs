@@ -10,11 +10,11 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use vortex_array::ArrayRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -136,14 +136,8 @@ impl MorselScan {
                 }
             }
 
-            results
-                .lock()
-                .map_err(|_| vortex_err!("results mutex poisoned"))?
-                .extend(local_results);
-            stats
-                .lock()
-                .map_err(|_| vortex_err!("stats mutex poisoned"))?
-                .merge(&local);
+            results.lock().extend(local_results);
+            stats.lock().merge(&local);
             Ok(())
         };
 
@@ -151,9 +145,7 @@ impl MorselScan {
             run_thread()?;
         } else {
             std::thread::scope(|scope| -> VortexResult<()> {
-                let handles: Vec<_> = (0..self.threads)
-                    .map(|_| scope.spawn(&run_thread))
-                    .collect();
+                let handles: Vec<_> = (0..self.threads).map(|_| scope.spawn(run_thread)).collect();
                 for handle in handles {
                     handle
                         .join()
@@ -164,14 +156,10 @@ impl MorselScan {
         }
 
         // Ordering is restored by index, not maintained during execution.
-        let mut ordered = results
-            .into_inner()
-            .map_err(|_| vortex_err!("results mutex poisoned"))?;
+        let mut ordered = results.into_inner();
         ordered.sort_unstable_by_key(|(idx, _)| *idx);
         let batches = ordered.into_iter().map(|(_, array)| array).collect();
-        let stats = stats
-            .into_inner()
-            .map_err(|_| vortex_err!("stats mutex poisoned"))?;
+        let stats = stats.into_inner();
         Ok((batches, stats))
     }
 }

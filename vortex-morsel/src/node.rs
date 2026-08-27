@@ -10,8 +10,8 @@ use vortex_array::buffer::BufferHandle;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
-use vortex_mask::Mask;
 use vortex_layout::segments::SegmentId;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::cache::DecodeCache;
@@ -226,7 +226,9 @@ impl<'a> PlanCx<'a> {
 
     /// Register a batch of IO uses, spending budget and returning tickets.
     pub fn register(&mut self, batch: IoBatch) -> VortexResult<Vec<IoTicket>> {
-        self.budget = self.budget.saturating_sub(batch.uses().len() as u32);
+        self.budget = self
+            .budget
+            .saturating_sub(u32::try_from(batch.uses().len()).unwrap_or(u32::MAX));
         self.stats.io_uses += batch.uses().len() as u64;
         self.io.register(batch, self.stats)
     }
@@ -298,12 +300,7 @@ impl<'a> ExecCx<'a> {
     }
 
     /// Insert a decoded segment into the per-thread cache.
-    pub fn cache_insert(
-        &mut self,
-        id: SegmentId,
-        array: ArrayRef,
-        bytes: usize,
-    ) {
+    pub fn cache_insert(&mut self, id: SegmentId, array: ArrayRef, bytes: usize) {
         self.cache.insert(id, array, bytes, self.stats)
     }
 
@@ -449,5 +446,5 @@ pub fn drive_morsel(
     }
 
     let array = value.map(|batch| batch.value.into_array()).transpose()?;
-    Ok(array.and_then(|a| (a.len() > 0).then_some(a)))
+    Ok(array.and_then(|a| (!a.is_empty()).then_some(a)))
 }

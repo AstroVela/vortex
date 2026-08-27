@@ -23,6 +23,7 @@ use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::analysis::referenced_field_paths;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
@@ -124,7 +125,11 @@ impl ExecPlan {
                     NodeSpec::Flat {
                         layout,
                         root_offset,
-                    } => Box::new(FlatExec::new(layout, *root_offset, ProducerId(idx as u32))),
+                    } => Box::new(FlatExec::new(
+                        layout,
+                        *root_offset,
+                        ProducerId(u32::try_from(idx).unwrap_or(u32::MAX)),
+                    )),
                     NodeSpec::Chunked {
                         chunk_offsets,
                         children,
@@ -193,7 +198,7 @@ pub fn build_plan(
 
     let mut builder = Builder {
         nodes: Vec::new(),
-        layout: layout.clone(),
+        layout: LayoutRef::clone(layout),
         root_fields,
         splits: Vec::new(),
     };
@@ -248,7 +253,7 @@ struct Builder {
 impl Builder {
     fn push(&mut self, spec: NodeSpec) -> NodeId {
         self.nodes.push(spec);
-        (self.nodes.len() - 1) as NodeId
+        NodeId::try_from(self.nodes.len() - 1).vortex_expect("exec plan exceeds u32 nodes")
     }
 
     /// Build the subtree for one expression: a struct over exactly the top-level fields the

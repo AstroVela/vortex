@@ -17,7 +17,13 @@ version = { workspace = true }
 all-features = true
 
 [features]
-_test-harness = ["vortex-layout/_test-harness", "vortex-array/_test-harness", "dep:vortex-io"]
+_test-harness = [
+    "vortex-layout/_test-harness",
+    "vortex-array/_test-harness",
+    "dep:vortex-io",
+    "vortex-io/tokio",
+    "dep:tokio",
+]
 
 [dependencies]
 vortex-array = { workspace = true }
@@ -30,6 +36,7 @@ vortex-utils = { workspace = true }
 
 futures = { workspace = true }
 vortex-io = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread"] }
 itertools = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
@@ -37,9 +44,15 @@ tracing = { workspace = true }
 [dev-dependencies]
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-layout = { workspace = true, features = ["_test-harness"] }
-vortex-io = { workspace = true }
+vortex-io = { workspace = true, features = ["tokio"] }
 vortex-scan = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[[bin]]
+name = "morsel-eval"
+path = "src/bin/morsel-eval.rs"
+required-features = ["_test-harness"]
 
 [lints]
 workspace = true

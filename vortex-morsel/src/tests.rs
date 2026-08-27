@@ -8,14 +8,18 @@
 //! expressed as a variation the output must be invariant under — thread count, morsel size,
 //! conjunct policy, decode-cache budget, chunk alignment.
 
+// Fixture generation counts rows into `i32` columns at sizes that trivially fit; the cast lint
+// only makes the generators harder to read.
+#![allow(clippy::cast_possible_truncation)]
+
 use std::sync::Arc;
 
 use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
+use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::array_session;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::and;
@@ -84,9 +88,9 @@ fn cut<'a>(values: &'a [i32], boundaries: &[usize]) -> Vec<&'a [i32]> {
 
 /// The canonical misaligned fixture: three columns cut on three different boundary sets.
 fn misaligned_fixture(session: &VortexSession, rows: usize) -> VortexResult<Fixture> {
-    let a: Vec<i32> = (0..rows as i32).collect();
-    let b: Vec<i32> = (0..rows as i32).map(|v| (v * 7) % 101).collect();
-    let c: Vec<i32> = (0..rows as i32).map(|v| (v * 13) % 17).collect();
+    let col_a: Vec<i32> = (0..rows as i32).collect();
+    let col_b: Vec<i32> = (0..rows as i32).map(|v| (v * 7) % 101).collect();
+    let col_c: Vec<i32> = (0..rows as i32).map(|v| (v * 13) % 17).collect();
 
     let thirds = boundaries(rows, 3);
     let fifths = boundaries(rows, 5);
@@ -95,9 +99,9 @@ fn misaligned_fixture(session: &VortexSession, rows: usize) -> VortexResult<Fixt
     block_on(|_handle| async {
         write_fixture(
             vec![
-                Column::new("a", i32_chunks(&a, &thirds)),
-                Column::new("b", i32_chunks(&b, &fifths)),
-                Column::new("c", utf8_chunks(&c, &sevenths)),
+                Column::new("a", i32_chunks(&col_a, &thirds)),
+                Column::new("b", i32_chunks(&col_b, &fifths)),
+                Column::new("c", utf8_chunks(&col_c, &sevenths)),
             ],
             session,
         )
@@ -107,17 +111,17 @@ fn misaligned_fixture(session: &VortexSession, rows: usize) -> VortexResult<Fixt
 
 /// The same data with every column cut on the same boundaries — the aligned reference.
 fn aligned_fixture(session: &VortexSession, rows: usize) -> VortexResult<Fixture> {
-    let a: Vec<i32> = (0..rows as i32).collect();
-    let b: Vec<i32> = (0..rows as i32).map(|v| (v * 7) % 101).collect();
-    let c: Vec<i32> = (0..rows as i32).map(|v| (v * 13) % 17).collect();
+    let col_a: Vec<i32> = (0..rows as i32).collect();
+    let col_b: Vec<i32> = (0..rows as i32).map(|v| (v * 7) % 101).collect();
+    let col_c: Vec<i32> = (0..rows as i32).map(|v| (v * 13) % 17).collect();
     let single = vec![rows];
 
     block_on(|_handle| async {
         write_fixture(
             vec![
-                Column::new("a", i32_chunks(&a, &single)),
-                Column::new("b", i32_chunks(&b, &single)),
-                Column::new("c", utf8_chunks(&c, &single)),
+                Column::new("a", i32_chunks(&col_a, &single)),
+                Column::new("b", i32_chunks(&col_b, &single)),
+                Column::new("c", utf8_chunks(&col_c, &single)),
             ],
             session,
         )
@@ -183,10 +187,7 @@ fn queries() -> Vec<Query> {
         Query {
             name: "packed-projection",
             projection: pack(
-                vec![
-                    ("x", get_item("a", root())),
-                    ("y", get_item("b", root())),
-                ],
+                vec![("x", get_item("a", root())), ("y", get_item("b", root()))],
                 Nullability::NonNullable,
             ),
             filter: Some(gt(get_item("a", root()), lit(200i32))),

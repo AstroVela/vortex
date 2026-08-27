@@ -72,12 +72,7 @@ impl ConjunctExec {
     }
 
     /// Evaluate one conjunct under `incoming`, returning the refined mask.
-    fn eval(
-        &self,
-        idx: usize,
-        incoming: &Mask,
-        cx: &mut ExecCx<'_>,
-    ) -> VortexResult<Mask> {
+    fn eval(&self, idx: usize, incoming: &Mask, cx: &mut ExecCx<'_>) -> VortexResult<Mask> {
         let slot = &self.slots[idx];
 
         // The regime switch: over a sparse mask, filter first and correct by rank; over a dense
@@ -121,7 +116,11 @@ impl ExecNode for ConjunctExec {
             }
             let fresh = !self.plan_started;
             self.plan_started = true;
-            if cx.plan_child(self.slots[self.plan_cursor].input, self.range.clone(), fresh)? {
+            if cx.plan_child(
+                self.slots[self.plan_cursor].input,
+                self.range.clone(),
+                fresh,
+            )? {
                 self.plan_cursor += 1;
                 self.plan_started = false;
             } else {

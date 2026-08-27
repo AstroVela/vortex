@@ -185,5 +185,7 @@ fn estimate_bytes(dtype: &DType, rows: u64) -> usize {
         DType::Utf8(_) | DType::Binary(_) => 16,
         _ => 8,
     };
-    usize::try_from(rows).unwrap_or(usize::MAX).saturating_mul(per_row)
+    usize::try_from(rows)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(per_row)
 }

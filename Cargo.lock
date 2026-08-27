@@ -11299,6 +11299,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-morsel"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "itertools 0.14.0",
+ "parking_lot",
+ "rstest",
+ "tokio",
+ "tracing",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-mask",
+ "vortex-scan",
+ "vortex-session",
+ "vortex-utils",
+]
+
+[[package]]
 name = "vortex-nvcomp"
 version = "0.1.0"
 dependencies = [

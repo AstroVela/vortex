@@ -17,6 +17,8 @@ use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_layout::LayoutRef;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::layout_children;
@@ -79,7 +81,7 @@ pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> Vor
             .chunks
             .first()
             .map(|chunk| chunk.dtype().clone())
-            .expect("a column needs at least one chunk");
+            .ok_or_else(|| vortex_err!("a column needs at least one chunk"))?;
 
         let mut chunk_layouts = Vec::with_capacity(column.chunks.len());
         let mut rows = 0u64;
@@ -100,7 +102,10 @@ pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> Vor
 
         match row_count {
             None => row_count = Some(rows),
-            Some(expected) => assert_eq!(expected, rows, "columns must have equal row counts"),
+            Some(expected) if expected == rows => {}
+            Some(expected) => {
+                vortex_bail!("columns must have equal row counts: {expected} vs {rows}")
+            }
         }
 
         let chunked =
@@ -123,7 +128,7 @@ pub async fn write_fixture(columns: Vec<Column>, session: &VortexSession) -> Vor
     let table = StructArray::try_new(
         field_names.into(),
         table_fields,
-        usize::try_from(rows).expect("row count fits usize"),
+        usize::try_from(rows).map_err(|_| vortex_err!("row count exceeds usize"))?,
         vortex_array::validity::Validity::NonNullable,
     )?
     .into_array();

@@ -41,6 +41,8 @@ pub mod io;
 pub mod node;
 pub mod nodes;
 pub mod stats;
+#[cfg(any(test, feature = "_test-harness"))]
+pub mod workloads;
 
 pub use build::ExecPlan;
 pub use build::build_plan;

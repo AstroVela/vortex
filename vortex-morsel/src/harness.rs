@@ -23,6 +23,7 @@ use vortex_array::expr::Expression;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_io::runtime::single::block_on;
+use vortex_io::runtime::tokio::TokioRuntime;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::LayoutRef;
 use vortex_layout::scan::scan_builder::ScanBuilder;
@@ -85,6 +86,65 @@ pub fn run_v1(
     let (batches, first) = block_on(move |handle| {
         let session = session.with_handle(handle);
         async move {
+            let stream = ScanBuilder::new(session, reader)
+                .with_projection(projection)
+                .with_some_filter(filter)
+                .with_ordered(true)
+                .into_stream()?;
+            futures::pin_mut!(stream);
+
+            let mut batches: Vec<ArrayRef> = Vec::new();
+            let mut first: Option<Duration> = None;
+            while let Some(batch) = stream.try_next().await? {
+                if first.is_none() {
+                    first = Some(start.elapsed());
+                }
+                batches.push(batch);
+            }
+            VortexResult::Ok((batches, first))
+        }
+    })?;
+    let wall = start.elapsed();
+
+    let rows = batches.iter().map(|b| b.len()).sum();
+    Ok(RunOutcome {
+        batches,
+        rows,
+        wall,
+        time_to_first_batch: first,
+        stats: None,
+    })
+}
+
+/// Run the V1 `LayoutReader` scan path on a multi-threaded Tokio runtime.
+///
+/// The single-threaded [`run_v1`] is the apples-to-apples row against a one-thread morsel run;
+/// this is the row that gives V1 the same core count the morsel driver gets, which is how it is
+/// actually driven under DataFusion.
+pub fn run_v1_tokio(
+    runtime: &tokio::runtime::Runtime,
+    session: &VortexSession,
+    layout: &LayoutRef,
+    segments: &Arc<dyn SegmentSource>,
+    query: &Query,
+) -> VortexResult<RunOutcome> {
+    let reader = layout.new_reader(
+        "morsel-harness".into(),
+        Arc::clone(segments),
+        session,
+        &Default::default(),
+    )?;
+    let projection = query.projection.bind(reader.dtype())?;
+    let filter = query
+        .filter
+        .as_ref()
+        .map(|expr| expr.bind(reader.dtype()))
+        .transpose()?;
+
+    let session = session.clone();
+    let start = Instant::now();
+    let (batches, first) = runtime.block_on(async move {
+        let session = session.with_handle(TokioRuntime::current());
         let stream = ScanBuilder::new(session, reader)
             .with_projection(projection)
             .with_some_filter(filter)
@@ -101,7 +161,6 @@ pub fn run_v1(
             batches.push(batch);
         }
         VortexResult::Ok((batches, first))
-        }
     })?;
     let wall = start.elapsed();
 
