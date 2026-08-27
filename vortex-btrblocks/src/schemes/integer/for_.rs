@@ -24,7 +24,10 @@ use vortex_fastlanes::FoR;
 use vortex_fastlanes::FoRArrayExt;
 use vortex_fastlanes::FoRArraySlotsExt;
 
+#[cfg(not(feature = "unstable_encodings"))]
 use super::BitPackingScheme;
+#[cfg(feature = "unstable_encodings")]
+use super::BitPackingV2Scheme;
 use crate::ArrayAndStats;
 use crate::CascadingCompressor;
 use crate::CompressorContext;
@@ -143,7 +146,11 @@ impl Scheme for FoRScheme {
         let leaf_ctx = compress_ctx.clone().as_leaf();
         let biased_data =
             ArrayAndStats::new(biased.into_array(), compress_ctx.merged_stats_options());
+        #[cfg(not(feature = "unstable_encodings"))]
         let compressed = BitPackingScheme.compress(compressor, &biased_data, leaf_ctx, exec_ctx)?;
+        #[cfg(feature = "unstable_encodings")]
+        let compressed =
+            BitPackingV2Scheme.compress(compressor, &biased_data, leaf_ctx, exec_ctx)?;
 
         // TODO(connor): This should really be `new_unchecked`.
         let for_compressed = FoR::try_new(compressed, for_array.reference_scalar().clone())?;

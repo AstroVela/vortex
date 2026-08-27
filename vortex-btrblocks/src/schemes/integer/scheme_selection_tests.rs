@@ -20,7 +20,13 @@ use vortex_array::expr::stats::StatsProviderExt;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+#[cfg(not(feature = "unstable_encodings"))]
 use vortex_fastlanes::BitPacked;
+#[cfg(feature = "unstable_encodings")]
+use vortex_fastlanes::BitPackedV2;
+#[cfg(feature = "unstable_encodings")]
+use vortex_fastlanes::BitPackedV2ArrayExt;
 use vortex_fastlanes::FoR;
 use vortex_runend::RunEnd;
 use vortex_sequence::Sequence;
@@ -56,7 +62,10 @@ fn test_bitpacking_compressed() -> VortexResult<()> {
     let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable);
     let btr = BtrBlocksCompressor::default();
     let compressed = btr.compress(&array.into_array(), &mut SESSION.create_execution_ctx())?;
+    #[cfg(not(feature = "unstable_encodings"))]
     assert!(compressed.is::<BitPacked>());
+    #[cfg(feature = "unstable_encodings")]
+    assert!(compressed.is::<BitPackedV2>());
     assert_eq!(
         compressed.statistics().get_as::<u64>(Stat::NullCount),
         Precision::exact(0u64)
@@ -69,6 +78,30 @@ fn test_bitpacking_compressed() -> VortexResult<()> {
         compressed.statistics().get_as::<u32>(Stat::Max),
         Precision::exact(15u32)
     );
+    Ok(())
+}
+
+#[cfg(feature = "unstable_encodings")]
+#[test]
+fn test_bitpacking_v2_compresses_attached_patches() -> VortexResult<()> {
+    use vortex_array::assert_arrays_eq;
+
+    let mut values: Vec<u64> = (0..4096).map(|i| i % 32).collect();
+    for chunk in 0..4 {
+        values[chunk * 1024 + 7] = u64::MAX;
+    }
+    let array = PrimitiveArray::new(Buffer::copy_from(&values), Validity::NonNullable).into_array();
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressed = BtrBlocksCompressor::default().compress(&array, &mut ctx)?;
+    assert!(compressed.is::<BitPackedV2>());
+    let patches = compressed
+        .as_::<BitPackedV2>()
+        .patches()
+        .ok_or_else(|| vortex_err!("outliers must be attached as patches"))?;
+    assert!(patches.indices().is::<Constant>());
+    assert!(patches.values().is::<Constant>());
+    assert_arrays_eq!(compressed, array, &mut ctx);
     Ok(())
 }
 

@@ -30,7 +30,11 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     &integer::FoRScheme,
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
+    #[cfg(not(feature = "unstable_encodings"))]
     &integer::BitPackingScheme,
+    // Preview builds use chunk-wise bit-packing exclusively.
+    #[cfg(feature = "unstable_encodings")]
+    &integer::BitPackingV2Scheme,
     &integer::SparseScheme,
     &integer::IntDictScheme,
     &integer::RunEndScheme,

@@ -18,6 +18,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         min_vortex_version: None,
     },
     added: &[
+        EditionMember::array(&"fastlanes.bitpacked_v2"),
         EditionMember::layout(&"vortex.list"),
         // Written only by CUDA-enabled sessions, which register the layout through
         // `vortex_cuda::layout::register_cuda_layout`. A writer resolves layouts against the
