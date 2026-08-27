@@ -15,6 +15,7 @@ use crate::Alignment;
 use crate::BitBufferMeta;
 use crate::BitBufferMut;
 use crate::Buffer;
+use crate::BufferAllocatorRef;
 use crate::BufferMut;
 use crate::ByteBuffer;
 use crate::bit::BitChunks;
@@ -30,7 +31,6 @@ use crate::bit::ops::bitwise_binary_op_lhs_owned;
 use crate::bit::ops::bitwise_unary_op;
 use crate::bit::ops::bitwise_unary_op_copy;
 use crate::bit::select::bit_select;
-use crate::buffer;
 
 /// An immutable bitset stored as a packed byte buffer.
 #[derive(Debug, Clone, Eq)]
@@ -147,8 +147,14 @@ impl BitBuffer {
     /// Create a new `BoolBuffer` of length `len` where all bits are set (true).
     #[inline]
     pub fn new_set(len: usize) -> Self {
+        Self::new_set_in(len, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Create a set bit buffer with the provided allocator.
+    #[inline]
+    pub fn new_set_in(len: usize, allocator: BufferAllocatorRef) -> Self {
         let words = len.div_ceil(8);
-        let buffer = buffer![0xFF; words];
+        let buffer = Buffer::full_in(0xFF, words, allocator);
 
         Self {
             buffer,
@@ -160,8 +166,14 @@ impl BitBuffer {
     /// Create a new `BoolBuffer` of length `len` where all bits are unset (false).
     #[inline]
     pub fn new_unset(len: usize) -> Self {
+        Self::new_unset_in(len, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Create an unset bit buffer with the provided allocator.
+    #[inline]
+    pub fn new_unset_in(len: usize, allocator: BufferAllocatorRef) -> Self {
         let words = len.div_ceil(8);
-        let buffer = Buffer::zeroed(words);
+        let buffer = Buffer::zeroed_in(words, allocator);
 
         Self {
             buffer,
@@ -184,10 +196,16 @@ impl BitBuffer {
     /// Create a new `BitBuffer` of length `len` where all bits are set to `value`.
     #[inline]
     pub fn full(value: bool, len: usize) -> Self {
+        Self::full_in(value, len, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Create a full bit buffer with the provided allocator.
+    #[inline]
+    pub fn full_in(value: bool, len: usize, allocator: BufferAllocatorRef) -> Self {
         if value {
-            Self::new_set(len)
+            Self::new_set_in(len, allocator)
         } else {
-            Self::new_unset(len)
+            Self::new_unset_in(len, allocator)
         }
     }
 
@@ -213,6 +231,16 @@ impl BitBuffer {
         BitBufferMut::collect_bool(len, f).freeze()
     }
 
+    /// Collects predicate results with the provided allocator.
+    #[inline]
+    pub fn collect_bool_in<F: FnMut(usize) -> bool>(
+        len: usize,
+        f: F,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
+        BitBufferMut::collect_bool_in(len, f, allocator).freeze()
+    }
+
     /// Like [`Self::collect_bool`], but compiles the packing loop — with `f` inside it — once
     /// per CPU feature level (AVX-512BW/AVX2/baseline) and selects a clone by runtime feature
     /// detection.
@@ -226,7 +254,17 @@ impl BitBuffer {
     /// [`collect_bool_words_multiversioned`](crate::bit::collect_bool_words_multiversioned).
     #[inline]
     pub fn collect_bool_multiversioned<F: FnMut(usize) -> bool>(len: usize, f: F) -> Self {
-        BitBufferMut::collect_bool_multiversioned(len, f).freeze()
+        Self::collect_bool_multiversioned_in(len, f, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Collects multiversioned predicate results with the provided allocator.
+    #[inline]
+    pub fn collect_bool_multiversioned_in<F: FnMut(usize) -> bool>(
+        len: usize,
+        f: F,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
+        BitBufferMut::collect_bool_multiversioned_in(len, f, allocator).freeze()
     }
 
     /// Maps over each bit in this buffer, calling `f(index, bit_value)` and collecting results.
