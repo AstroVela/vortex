@@ -10,10 +10,12 @@ use async_stream::try_stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
+use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use itertools::Either;
 use itertools::Itertools;
 use vortex_array::ArrayRef;
+use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
 use vortex_array::iter::ArrayIterator;
@@ -24,9 +26,9 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_io::runtime::BlockingRuntime;
+use vortex_io::runtime::Handle;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_mask::Mask;
-use vortex_scan::row_mask::RowMask;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
@@ -35,9 +37,13 @@ use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
 use crate::scan::splits::Splits;
 use crate::scan::tasks::TaskContext;
-use crate::scan::tasks::filter_exec;
-use crate::scan::tasks::project_exec;
+use crate::scan::tasks::filter_after_pruning;
+use crate::scan::tasks::project_exec_with_mask;
+use crate::scan::tasks::prune_exec;
 use crate::scan::tasks::split_exec;
+
+/// Number of pruning-surviving projections to register before exact filters begin polling.
+const PROJECTION_REGISTRATION_WINDOW: usize = 16;
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
 ///
@@ -232,37 +238,66 @@ impl<A: 'static + Send> RepeatedScan<A> {
             mapper: Arc::clone(&self.map_fn),
         });
 
-        // Build filter evaluations eagerly so the readers can register all filter I/O before the
-        // tasks begin making progress. Buffering remains ordered because projection masks cannot
-        // be assembled until all preceding filter ranges are known.
-        let mut filter_tasks = Vec::with_capacity(filter_ranges.len());
+        // Resolve metadata pruning first. Projection I/O is registered only for ranges which
+        // pruning cannot eliminate; their exact filters remain unresolved so filtering can make
+        // progress concurrently with those projection reads.
+        let mut pruning_tasks = Vec::with_capacity(filter_ranges.len());
         for range in filter_ranges {
             let row_mask = self.selection.row_mask(&range);
-            filter_tasks.push(filter_exec(Arc::clone(&ctx), row_mask)?);
+            pruning_tasks.push(prune_exec(Arc::clone(&ctx), row_mask)?);
         }
 
         let num_workers = get_available_parallelism().unwrap_or(1);
         let concurrency = self.concurrency * num_workers;
         let handle = self.session.handle();
-        let filter_handle = handle.clone();
-        let filtered_masks = futures::stream::iter(filter_tasks)
-            .map(move |task: BoxFuture<'static, VortexResult<RowMask>>| filter_handle.spawn(task))
+        let pruning_handle = handle.clone();
+        let pruned_masks = futures::stream::iter(pruning_tasks)
+            .map(move |task| pruning_handle.spawn(task))
             .buffered(concurrency)
             .boxed();
 
+        let registration_batch_size = cmp::min(PROJECTION_REGISTRATION_WINDOW, concurrency).max(1);
+        let projection_handle = handle.clone();
         let projection_tasks = try_stream! {
-            let mut repartitioner = ProjectionMaskRepartitioner::new(projection_ranges);
-            futures::pin_mut!(filtered_masks);
+            let mut repartitioner = ProjectionMaskRepartitioner::new(
+                projection_ranges,
+                projection_handle,
+            );
+            let mut pending = Vec::with_capacity(registration_batch_size);
+            futures::pin_mut!(pruned_masks);
 
-            while let Some(filtered_mask) = filtered_masks.try_next().await? {
-                for projection_mask in repartitioner.push(filtered_mask)? {
-                    if !projection_mask.mask().all_false() {
-                        yield project_exec(Arc::clone(&ctx), projection_mask)?;
+            while let Some(pruned) = pruned_masks.try_next().await? {
+                let row_range = pruned.row_range();
+                let pruning_mask = pruned.mask().clone();
+                let filter_mask = filter_after_pruning(Arc::clone(&ctx), pruned)?;
+                let filter_mask = PrunedFilterMask {
+                    row_range,
+                    pruning_mask,
+                    filter_mask,
+                };
+
+                for projection_mask in repartitioner.push(filter_mask)? {
+                    if projection_mask.pruning_mask.all_false() {
+                        continue;
+                    }
+
+                    pending.push(project_exec_with_mask(
+                        Arc::clone(&ctx),
+                        projection_mask.row_range,
+                        projection_mask.filter_mask,
+                    )?);
+                    if pending.len() == registration_batch_size {
+                        for task in pending.drain(..) {
+                            yield task;
+                        }
                     }
                 }
             }
 
             repartitioner.finish()?;
+            for task in pending {
+                yield task;
+            }
         };
 
         let projection_tasks = projection_tasks
@@ -297,11 +332,25 @@ struct ProjectionMaskRepartitioner {
     ranges: std::vec::IntoIter<Range<u64>>,
     current: Option<Range<u64>>,
     next_row: Option<u64>,
-    fragments: Vec<Mask>,
+    pruning_fragments: Vec<Mask>,
+    filter_fragments: Vec<MaskFuture>,
+    handle: Handle,
+}
+
+struct PrunedFilterMask {
+    row_range: Range<u64>,
+    pruning_mask: Mask,
+    filter_mask: MaskFuture,
+}
+
+struct ProjectionMask {
+    row_range: Range<u64>,
+    pruning_mask: Mask,
+    filter_mask: MaskFuture,
 }
 
 impl ProjectionMaskRepartitioner {
-    fn new(ranges: Vec<Range<u64>>) -> Self {
+    fn new(ranges: Vec<Range<u64>>, handle: Handle) -> Self {
         let mut ranges = ranges.into_iter();
         let current = ranges.next();
         let next_row = current.as_ref().map(|range| range.start);
@@ -309,12 +358,14 @@ impl ProjectionMaskRepartitioner {
             ranges,
             current,
             next_row,
-            fragments: Vec::new(),
+            pruning_fragments: Vec::new(),
+            filter_fragments: Vec::new(),
+            handle,
         }
     }
 
-    fn push(&mut self, filtered: RowMask) -> VortexResult<Vec<RowMask>> {
-        let filtered_range = filtered.row_range();
+    fn push(&mut self, filtered: PrunedFilterMask) -> VortexResult<Vec<ProjectionMask>> {
+        let filtered_range = filtered.row_range;
         vortex_ensure!(
             self.next_row == Some(filtered_range.start),
             "non-contiguous filter mask: expected row {:?}, got {}",
@@ -324,7 +375,7 @@ impl ProjectionMaskRepartitioner {
 
         let mut completed = Vec::new();
         let mut source_start = 0;
-        while source_start < filtered.mask().len() {
+        while source_start < filtered.pruning_mask.len() {
             let projection_range = self
                 .current
                 .as_ref()
@@ -336,24 +387,45 @@ impl ProjectionMaskRepartitioner {
             );
 
             let projection_remaining = usize::try_from(projection_range.end - next_row)?;
-            let fragment_len = projection_remaining.min(filtered.mask().len() - source_start);
-            self.fragments.push(
-                filtered
-                    .mask()
-                    .slice(source_start..source_start + fragment_len),
-            );
+            let fragment_len = projection_remaining.min(filtered.pruning_mask.len() - source_start);
+            let fragment_range = source_start..source_start + fragment_len;
+            self.pruning_fragments
+                .push(filtered.pruning_mask.slice(fragment_range.clone()));
+            self.filter_fragments
+                .push(filtered.filter_mask.slice(fragment_range));
             source_start += fragment_len;
             let next_row = next_row + fragment_len as u64;
             self.next_row = Some(next_row);
 
             if next_row == projection_range.end {
-                let projection_start = projection_range.start;
-                let mask = if self.fragments.len() == 1 {
-                    self.fragments.pop().vortex_expect("one mask fragment")
+                let row_range = projection_range.clone();
+                let pruning_mask = if self.pruning_fragments.len() == 1 {
+                    self.pruning_fragments
+                        .pop()
+                        .vortex_expect("one pruning mask fragment")
                 } else {
-                    Mask::from_iter(std::mem::take(&mut self.fragments))
+                    Mask::from_iter(std::mem::take(&mut self.pruning_fragments))
                 };
-                completed.push(RowMask::new(projection_start, mask));
+                let filter_mask = if self.filter_fragments.len() == 1 {
+                    self.filter_fragments
+                        .pop()
+                        .vortex_expect("one filter mask fragment")
+                } else {
+                    let fragments = std::mem::take(&mut self.filter_fragments);
+                    let handle = self.handle.clone();
+                    MaskFuture::new(pruning_mask.len(), async move {
+                        let masks = try_join_all(
+                            fragments.into_iter().map(|fragment| handle.spawn(fragment)),
+                        )
+                        .await?;
+                        Ok(Mask::from_iter(masks))
+                    })
+                };
+                completed.push(ProjectionMask {
+                    row_range,
+                    pruning_mask,
+                    filter_mask,
+                });
 
                 self.current = self.ranges.next();
                 self.next_row = self.current.as_ref().map(|range| range.start);
@@ -372,7 +444,9 @@ impl ProjectionMaskRepartitioner {
 
     fn finish(self) -> VortexResult<()> {
         vortex_ensure!(
-            self.current.is_none() && self.fragments.is_empty(),
+            self.current.is_none()
+                && self.pruning_fragments.is_empty()
+                && self.filter_fragments.is_empty(),
             "filter masks ended before projection ranges"
         );
         Ok(())
@@ -414,61 +488,108 @@ fn intersect_ranges(left: Option<&Range<u64>>, right: Option<Range<u64>>) -> Opt
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use futures::future::try_join_all;
+    use vortex_array::MaskFuture;
     use vortex_error::VortexResult;
+    use vortex_io::runtime::single::block_on;
     use vortex_mask::Mask;
-    use vortex_scan::row_mask::RowMask;
 
     use super::ProjectionMaskRepartitioner;
+    use super::PrunedFilterMask;
     use super::natural_ranges;
 
     #[test]
-    fn splits_one_filter_mask_across_projection_ranges() -> VortexResult<()> {
-        let input = Mask::from_iter([
-            true, false, true, true, false, false, true, false, false, true,
-        ]);
-        let mut repartitioner = ProjectionMaskRepartitioner::new(vec![2..5, 5..9, 9..12]);
+    fn splits_shared_filter_future_across_projection_ranges() -> VortexResult<()> {
+        block_on(|handle| async move {
+            let evaluations = Arc::new(AtomicUsize::new(0));
+            let evaluation_count = Arc::clone(&evaluations);
+            let filter_mask = MaskFuture::new(10, async move {
+                evaluation_count.fetch_add(1, Ordering::Relaxed);
+                Ok(Mask::from_iter([
+                    true, false, true, true, false, false, true, false, false, true,
+                ]))
+            });
+            let input = PrunedFilterMask {
+                row_range: 2..12,
+                pruning_mask: Mask::from_iter([
+                    true, true, true, true, false, false, true, true, true, true,
+                ]),
+                filter_mask,
+            };
+            let mut repartitioner =
+                ProjectionMaskRepartitioner::new(vec![2..5, 5..9, 9..12], handle);
 
-        let output = repartitioner.push(RowMask::new(2, input))?;
-        repartitioner.finish()?;
+            let output = repartitioner.push(input)?;
+            repartitioner.finish()?;
 
-        assert_eq!(output.len(), 3);
-        assert_eq!(output[0].row_range(), 2..5);
-        assert_eq!(output[0].mask(), &Mask::from_iter([true, false, true]));
-        assert_eq!(output[1].row_range(), 5..9);
-        assert_eq!(
-            output[1].mask(),
-            &Mask::from_iter([true, false, false, true])
-        );
-        assert_eq!(output[2].row_range(), 9..12);
-        assert_eq!(output[2].mask(), &Mask::from_iter([false, false, true]));
-        Ok(())
+            assert_eq!(evaluations.load(Ordering::Relaxed), 0);
+            assert_eq!(output.len(), 3);
+            assert_eq!(output[0].row_range, 2..5);
+            assert_eq!(output[0].pruning_mask, Mask::from_iter([true, true, true]));
+            assert_eq!(output[1].row_range, 5..9);
+            assert_eq!(
+                output[1].pruning_mask,
+                Mask::from_iter([true, false, false, true])
+            );
+            assert_eq!(output[2].row_range, 9..12);
+            assert_eq!(output[2].pruning_mask, Mask::from_iter([true, true, true]));
+
+            let masks = try_join_all(output.into_iter().map(|mask| mask.filter_mask)).await?;
+            assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+            assert_eq!(masks[0], Mask::from_iter([true, false, true]));
+            assert_eq!(masks[1], Mask::from_iter([true, false, false, true]));
+            assert_eq!(masks[2], Mask::from_iter([false, false, true]));
+            Ok(())
+        })
     }
 
     #[test]
-    fn combines_filter_masks_into_projection_ranges() -> VortexResult<()> {
-        let mut repartitioner = ProjectionMaskRepartitioner::new(vec![2..8, 8..12]);
-        let mut output = Vec::new();
+    fn combines_filter_futures_into_projection_ranges() -> VortexResult<()> {
+        block_on(|handle| async move {
+            let mut repartitioner = ProjectionMaskRepartitioner::new(vec![2..8, 8..12], handle);
+            let mut output = Vec::new();
 
-        output.extend(repartitioner.push(RowMask::new(2, Mask::from_iter([true, false])))?);
-        output.extend(repartitioner.push(RowMask::new(4, Mask::from_iter([true, true, false])))?);
-        output.extend(repartitioner.push(RowMask::new(
-            7,
-            Mask::from_iter([false, true, false, false, true]),
-        ))?);
-        repartitioner.finish()?;
+            output.extend(repartitioner.push(PrunedFilterMask {
+                row_range: 2..4,
+                pruning_mask: Mask::from_iter([true, true]),
+                filter_mask: MaskFuture::ready(Mask::from_iter([true, false])),
+            })?);
+            output.extend(repartitioner.push(PrunedFilterMask {
+                row_range: 4..7,
+                pruning_mask: Mask::from_iter([true, true, false]),
+                filter_mask: MaskFuture::ready(Mask::from_iter([true, true, false])),
+            })?);
+            output.extend(repartitioner.push(PrunedFilterMask {
+                row_range: 7..12,
+                pruning_mask: Mask::from_iter([false, true, true, true, true]),
+                filter_mask: MaskFuture::ready(Mask::from_iter([false, true, false, false, true])),
+            })?);
+            repartitioner.finish()?;
 
-        assert_eq!(output.len(), 2);
-        assert_eq!(output[0].row_range(), 2..8);
-        assert_eq!(
-            output[0].mask(),
-            &Mask::from_iter([true, false, true, true, false, false])
-        );
-        assert_eq!(output[1].row_range(), 8..12);
-        assert_eq!(
-            output[1].mask(),
-            &Mask::from_iter([true, false, false, true])
-        );
-        Ok(())
+            assert_eq!(output.len(), 2);
+            assert_eq!(output[0].row_range, 2..8);
+            assert_eq!(
+                output[0].pruning_mask,
+                Mask::from_iter([true, true, true, true, false, false])
+            );
+            assert_eq!(output[1].row_range, 8..12);
+            assert_eq!(
+                output[1].pruning_mask,
+                Mask::from_iter([true, true, true, true])
+            );
+
+            let masks = try_join_all(output.into_iter().map(|mask| mask.filter_mask)).await?;
+            assert_eq!(
+                masks[0],
+                Mask::from_iter([true, false, true, true, false, false])
+            );
+            assert_eq!(masks[1], Mask::from_iter([true, false, false, true]));
+            Ok(())
+        })
     }
 
     #[test]
