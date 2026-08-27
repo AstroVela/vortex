@@ -1012,6 +1012,19 @@ mod test {
     }
 
     #[test]
+    fn test_preferred_alignment_is_not_reported() {
+        let alignment = Alignment::of::<u32>();
+        let buf = BufferMut::<u32>::with_capacity_preferred_aligned(
+            1,
+            alignment,
+            Some(Alignment::DEFAULT_ALIGNMENT),
+        );
+
+        assert_eq!(buf.alignment(), alignment);
+        assert_eq!(buf.freeze().alignment(), alignment);
+    }
+
+    #[test]
     fn buffer_mut_zeroed() {
         const LEN: usize = 17;
 

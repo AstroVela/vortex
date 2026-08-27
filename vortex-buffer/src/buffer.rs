@@ -335,8 +335,8 @@ impl<T> Buffer<T> {
     ///
     /// # Panics
     ///
-    /// Requires that `begin <= end` and `end <= self.len()`.
-    /// Also requires that both `begin` and `end` are aligned to the given alignment.
+    /// Requires that `begin <= end` and `end <= self.len()`. The buffer and the byte offset at
+    /// `begin` must be aligned to `alignment`.
     pub fn slice_with_alignment(
         &self,
         range: impl RangeBounds<usize>,
@@ -374,6 +374,12 @@ impl<T> Buffer<T> {
         let begin_byte = begin * size_of::<T>();
         let end_byte = end * size_of::<T>();
 
+        if !self.alignment.is_aligned_to(alignment) {
+            vortex_panic!(
+                "Slice alignment {alignment} must not be stronger than buffer alignment {}",
+                self.alignment
+            );
+        }
         if !alignment.is_offset_aligned(begin_byte) {
             vortex_panic!(
                 "range start must be aligned to {alignment:?}, byte {}",
@@ -813,6 +819,15 @@ mod test {
         let buf = buffer![0i32, 1, 2, 3, 4].into_byte_buffer();
         // We should only be able to slice this buffer on 4-byte (i32) boundaries.
         buf.slice(1..2);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be stronger than buffer alignment")]
+    fn test_slice_with_alignment_cannot_strengthen_alignment() {
+        let buf = ByteBuffer::from(vec![0u8, 1]);
+        assert_eq!(buf.alignment(), Alignment::of::<u8>());
+
+        buf.slice_with_alignment(0..1, Alignment::new(256));
     }
 
     #[test]
