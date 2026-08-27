@@ -37,11 +37,14 @@
 //! difference and is reported as one, not hidden inside a ratio.
 
 use std::sync::Arc;
+use std::sync::Arc as StdArc;
 
+use arrow_schema::Schema;
 use tpchgen::generators::LineItemGenerator;
 use tpchgen_arrow::LineItemArrow;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::PType;
 use vortex_array::expr::Expression;
 use vortex_array::expr::and;
 use vortex_array::expr::get_item;
@@ -51,10 +54,15 @@ use vortex_array::expr::lt;
 use vortex_array::expr::lt_eq;
 use vortex_array::expr::root;
 use vortex_array::expr::select;
+use vortex_array::scalar::DecimalValue;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_layout::LayoutStrategy;
+use vortex_session::VortexSession;
 
+use crate::fixtures::Column;
 use crate::harness::Query;
 
 /// One generated TPC-H table: its rows as Vortex struct arrays, one per generator batch.
@@ -74,20 +82,20 @@ pub struct Table {
 /// import path — the same one `vortex-bench` uses to build its TPC-H files — so extension types
 /// such as `l_shipdate`'s date are imported exactly as a real conversion would import them.
 pub fn lineitem(
-    session: &vortex_session::VortexSession,
+    session: &VortexSession,
     scale_factor: f64,
     batch_rows: usize,
 ) -> VortexResult<Table> {
     use tpchgen_arrow::RecordBatchIterator;
     use vortex_arrow::ArrowSessionExt;
 
-    let mut iter =
+    let iter =
         LineItemArrow::new(LineItemGenerator::new(scale_factor, 1, 1)).with_batch_size(batch_rows);
-    let schema = iter.schema().clone();
+    let schema: StdArc<Schema> = StdArc::clone(iter.schema());
 
     let mut batches = Vec::new();
     let mut row_count = 0u64;
-    while let Some(batch) = iter.next() {
+    for batch in iter {
         row_count += batch.num_rows() as u64;
         batches.push(session.arrow().from_arrow_record_batch(batch, &schema)?);
     }
@@ -119,7 +127,7 @@ fn date32(year: i32, month: u32, day: u32) -> i32 {
 fn date_lit(dtype: &DType, year: i32, month: u32, day: u32) -> VortexResult<Expression> {
     Ok(lit(Scalar::primitive_value(
         date32(year, month, day).into(),
-        vortex_array::dtype::PType::I32,
+        PType::I32,
         dtype.nullability(),
     )))
 }
@@ -285,9 +293,19 @@ fn decimal_lit(dtype: &DType, value: f64) -> VortexResult<Expression> {
         return Ok(lit(value));
     };
     let scale = decimal.scale();
-    let scaled = (value * 10f64.powi(i32::from(scale))).round() as i128;
+    let scaled = (value * 10f64.powi(i32::from(scale))).round();
+    // TPC-H literals are small and exactly representable at DECIMAL(15,2); the guard keeps a
+    // typo in a query from silently wrapping rather than failing.
+    if !scaled.is_finite() || scaled.abs() > i128::MAX as f64 {
+        vortex_bail!("decimal literal {value} is out of range for {dtype}");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the range check above proves the value fits an i128"
+    )]
+    let scaled = scaled as i128;
     Ok(lit(Scalar::decimal(
-        vortex_array::scalar::DecimalValue::I128(scaled),
+        DecimalValue::I128(scaled),
         *decimal,
         dtype.nullability(),
     )))
@@ -326,8 +344,8 @@ pub fn aligned_chunking(rows_per_chunk: usize) -> usize {
 pub fn columns(
     table: &Table,
     chunk_rows: usize,
-    session: &vortex_session::VortexSession,
-) -> VortexResult<Vec<crate::fixtures::Column>> {
+    session: &VortexSession,
+) -> VortexResult<Vec<Column>> {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::StructArray;
     use vortex_array::arrays::struct_::StructArrayExt;
@@ -362,7 +380,7 @@ pub fn columns(
         .iter()
         .cloned()
         .zip(per_field)
-        .map(|(name, chunks)| crate::fixtures::Column { name, chunks })
+        .map(|(name, chunks)| Column { name, chunks })
         .collect())
 }
 
@@ -372,19 +390,17 @@ pub fn columns(
 /// This is `WriteStrategyBuilder`'s stack with the zoned-statistics and dictionary-*layout* stages
 /// removed — repartition, coalesce, compress, buffer, chunk, flat — so segments carry real
 /// btrblocks encodings while the layout tree stays struct-of-chunked-flat.
-pub fn write_strategy(
-    row_block_size: usize,
-    block_target_bytes: u64,
-) -> Arc<dyn vortex_layout::LayoutStrategy> {
+pub fn write_strategy(row_block_size: usize, block_target_bytes: u64) -> Arc<dyn LayoutStrategy> {
     use vortex_btrblocks::BtrBlocksCompressorBuilder;
     use vortex_layout::layouts::buffered::BufferedStrategy;
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::compressed::CompressingStrategy;
+    use vortex_layout::layouts::compressed::CompressorPlugin;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::layouts::repartition::RepartitionStrategy;
     use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 
-    let compressor: Arc<dyn vortex_layout::layouts::compressed::CompressorPlugin> =
+    let compressor: Arc<dyn CompressorPlugin> =
         Arc::new(BtrBlocksCompressorBuilder::default().build());
 
     let flat = FlatLayoutStrategy::default();

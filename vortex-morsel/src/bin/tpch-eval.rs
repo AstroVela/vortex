@@ -156,8 +156,10 @@ fn main() -> VortexResult<()> {
     .map(|plan| plan.natural_splits().len())
     .unwrap_or(0);
     println!(
-        "lineitem SF={scale}: {} rows ({generated_rows} generated), {ncolumns} columns,          {splits} natural splits; generated in {:.1?}, written in {:.1?}",
-        fixture.row_count, gen_elapsed, write_elapsed
+        "lineitem SF={scale}: {} rows ({generated_rows} generated), {ncolumns} columns,          {splits} natural splits; generated in {}, written in {}",
+        fixture.row_count,
+        millis(gen_elapsed),
+        millis(write_elapsed)
     );
     println!(
         "written through the btrblocks compressing pipeline (repartition {row_block} rows -> \

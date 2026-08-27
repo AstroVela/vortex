@@ -11302,6 +11302,7 @@ dependencies = [
 name = "vortex-morsel"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema 59.2.0",
  "futures",
  "itertools 0.14.0",
  "parking_lot",

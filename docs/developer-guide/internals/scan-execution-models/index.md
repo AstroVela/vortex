@@ -30,6 +30,13 @@ numbers say, and which parts of the plan's evaluation matrix could not be run he
 written was *not* evaluated, because rows B and C do not exist in this repository. The raw
 evaluation output is in [P1 evaluation output](morsel-prototype-p1-eval.md).
 
+Those P1 numbers came from synthetic fixtures. **Real TPC-H at SF=1** — `tpchgen` data, real
+decimals and dates, written through the btrblocks compressing pipeline, running the real scan
+portions of Q1/Q6/Q12/Q14/Q15/Q19 — is measured in
+[real TPC-H results](morsel-prototype-tpch-findings.md): the prototype is ~1.3x faster than V1 at
+one thread and ~1.5x at four, and the cross-morsel decode reuse that mattered on synthetic
+fixtures turns out to be neutral on a real file except on width-divergent schemas.
+
 ```{toctree}
 ---
 maxdepth: 1
@@ -53,6 +60,8 @@ scan-execution-graph-model
 scan-execution-graph-next-discussion
 morsel-prototype-p1-findings
 morsel-prototype-p1-eval
+morsel-prototype-tpch-findings
+morsel-prototype-tpch-eval
 scan-execution-demand-and-operators
 scan-execution-design
 scan-execution-design-one-pager
