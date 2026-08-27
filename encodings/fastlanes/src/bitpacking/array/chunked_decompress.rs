@@ -271,3 +271,63 @@ mod executor_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod filter_tests {
+    use rstest::rstest;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::chunk_iter::set_chunked_execute_enabled;
+    use vortex_error::VortexResult;
+    use vortex_mask::Mask;
+
+    use super::tests::SESSION;
+    use crate::bitpack_compress::bitpack_encode;
+
+    /// Filter over BitPacked must stream to the same canonical result as level-wise execution,
+    /// across selectivities and mask shapes that straddle the 1024-element block boundary.
+    #[rstest]
+    #[case::sparse(97)]
+    #[case::medium(7)]
+    #[case::dense(2)]
+    #[case::every_row(1)]
+    fn filter_over_bitpacked_streams_like_execute(#[case] keep_every: usize) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let len = 5000;
+        let values = PrimitiveArray::from_iter((0..len as u32).map(|i| i % 900));
+        let bp = bitpack_encode(&values, 10, None, &mut ctx)?.into_array();
+
+        // A run-structured mask: keeps a 3-wide run every `keep_every` rows, so runs cross
+        // block boundaries at 1024/2048/... for several of these cases.
+        let mask = Mask::from_iter((0..len).map(|i| (i % keep_every) < 3));
+        let filtered = bp.filter(mask)?;
+        assert!(filtered.supports_decompress_chunks());
+
+        set_chunked_execute_enabled(false);
+        let levelwise = filtered.clone().execute::<PrimitiveArray>(&mut ctx);
+        set_chunked_execute_enabled(true);
+        let levelwise = levelwise?;
+        let streaming = filtered.execute::<PrimitiveArray>(&mut ctx)?;
+
+        assert_eq!(streaming.len(), levelwise.len());
+        assert_arrays_eq!(streaming, levelwise, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_all_false_and_all_true_over_bitpacked() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter((0..3000u32).map(|i| i % 900));
+        let bp = bitpack_encode(&values, 10, None, &mut ctx)?.into_array();
+
+        let none = bp.filter(Mask::new_false(3000))?;
+        assert_eq!(none.execute::<PrimitiveArray>(&mut ctx)?.len(), 0);
+
+        let all = bp.filter(Mask::new_true(3000))?;
+        let all = all.execute::<PrimitiveArray>(&mut ctx)?;
+        assert_arrays_eq!(all, values, &mut ctx);
+        Ok(())
+    }
+}

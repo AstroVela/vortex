@@ -441,3 +441,77 @@ fn execute_fused_for_bp_streaming(bencher: Bencher) {
 fn execute_fused_for_bp_levelwise(bencher: Bencher) {
     bench_execute(bencher, make_for_bitpacked(), false);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Filter(BitPacked): the dominant TPC-H scan tree (736x at 65,536 rows in the Q1/Q6 trace).
+// Compares the streaming path (unpack a block, compact it in L1, write survivors once) against
+// level-wise execution (materialize the full 64K child, then run the compaction kernel over it).
+// ---------------------------------------------------------------------------------------------
+
+const SPLIT_LEN: usize = 65_536;
+
+/// Filter over BitPacked keeping `keep` rows out of every 16 (i.e. selectivity `keep/16`),
+/// giving the mask realistic run structure rather than alternating single rows.
+fn make_filter_bitpacked(keep: usize) -> ArrayRef {
+    let mut ctx = SESSION.create_execution_ctx();
+    let values = PrimitiveArray::from_iter(
+        (0..SPLIT_LEN as u64).map(|i| u32::try_from((i * 7) % 1000).vortex_expect("fits")),
+    );
+    let bp = bitpack_encode(&values, 10, None, &mut ctx)
+        .vortex_expect("bench")
+        .into_array();
+    const PERIOD: usize = 16;
+    assert!(keep < PERIOD, "mask must filter some rows out");
+    let mask = vortex_mask::Mask::from_iter((0..SPLIT_LEN).map(|i| (i % PERIOD) < keep));
+    bp.filter(mask).vortex_expect("bench")
+}
+
+/// `keep` rows out of every 16.
+const FILTER_KEEP: &[usize] = &[1, 4, 8, 12];
+
+#[divan::bench(args = FILTER_KEEP)]
+fn execute_filter_bp_streaming(bencher: Bencher, keep: usize) {
+    bench_execute(bencher, make_filter_bitpacked(keep), true);
+}
+
+#[divan::bench(args = FILTER_KEEP)]
+fn execute_filter_bp_levelwise(bencher: Bencher, keep: usize) {
+    bench_execute(bencher, make_filter_bitpacked(keep), false);
+}
+
+/// Consumption (not materialization): sum a Filter(BitPacked) tree. Streaming compacts each
+/// block in L1 and folds it directly; the baseline canonicalizes the filtered array first and
+/// then reads it back.
+#[divan::bench(args = FILTER_KEEP)]
+fn filter_bp_sum_streaming(bencher: Bencher, keep: usize) {
+    let array = make_filter_bitpacked(keep);
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            let mut sink = SumSink { total: 0 };
+            array
+                .decompress_chunks(&mut ctx, &mut sink)
+                .vortex_expect("bench");
+            black_box(sink.total)
+        });
+}
+
+#[divan::bench(args = FILTER_KEEP)]
+fn filter_bp_sum_execute_then_read(bencher: Bencher, keep: usize) {
+    let array = make_filter_bitpacked(keep);
+    bencher
+        .with_inputs(|| (array.clone(), SESSION.create_execution_ctx()))
+        .bench_values(|(array, mut ctx)| {
+            vortex_array::chunk_iter::set_chunked_execute_enabled(false);
+            let primitive = array
+                .execute::<PrimitiveArray>(&mut ctx)
+                .vortex_expect("bench");
+            vortex_array::chunk_iter::set_chunked_execute_enabled(true);
+            let total: u64 = primitive
+                .as_slice::<u32>()
+                .iter()
+                .map(|&v| v as u64)
+                .fold(0, u64::wrapping_add);
+            black_box(total)
+        });
+}

@@ -225,12 +225,21 @@ impl ArrayRef {
     }
 }
 
-/// Global toggle for the executor's stream-to-canonical shortcut (see
-/// [`execute_via_chunks`]). Enabled by default; `VORTEX_CHUNKED_EXECUTE=0` disables it at process
-/// start, and [`set_chunked_execute_enabled`] overrides it at runtime — both exist only so
-/// benchmarks and tests can compare the executor with and without the shortcut.
+/// Global toggle for the executor's stream-to-canonical shortcut (see [`execute_via_chunks`]).
+///
+/// **Disabled by default.** Streaming only beats level-wise execution for *materialization* when
+/// the level-wise path performs an extra full-buffer pass over an intermediate; when it already
+/// decodes straight into the destination (`decode_into` for fused FoR, Patched, and the Filter
+/// compaction kernel), streaming just adds a scratch-to-output copy. Measured over three rounds
+/// on 4Mi-row trees: signed `FoR(BitPacked)` (which does a separate wrapping-add pass) is
+/// 10-25% faster streaming, while fused `FoR(BitPacked)` and `Patched(FoR(BitPacked))` are
+/// ~5-10% slower. Since the outcome depends on the child's decode path rather than on anything
+/// the executor can see, the shortcut stays opt-in until sinks can offer a destination slice
+/// (which would remove the extra copy).
+///
+/// Set `VORTEX_CHUNKED_EXECUTE=1` to enable it, or use [`set_chunked_execute_enabled`].
 static CHUNKED_EXECUTE_ENABLED: std::sync::LazyLock<AtomicBool> = std::sync::LazyLock::new(|| {
-    AtomicBool::new(!std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "0"))
+    AtomicBool::new(std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "1"))
 });
 
 #[doc(hidden)]
@@ -250,9 +259,18 @@ pub fn set_chunked_execute_enabled(enabled: bool) {
 pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
     CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
         && array.supports_decompress_chunks()
-        && array
-            .children_iter()
-            .any(|child| !child.is_canonical() && child.supports_decompress_chunks())
+        && array.children_iter().any(|child| {
+            !child.is_canonical()
+                    && child.supports_decompress_chunks()
+                    // Cardinality-preserving only. When a level changes row count (e.g. Filter),
+                    // its level-wise path decodes the child straight into the output buffer and
+                    // compacts in place, so there is no intermediate for streaming to eliminate —
+                    // streaming only adds a scratch-to-output copy. Measured on Filter(BitPacked)
+                    // at 64K rows: streaming is 1.2-2.6x slower than level-wise for
+                    // materialization. Streaming such trees is still available to consumers that
+                    // never materialize, via `decompress_chunks`.
+                    && child.len() == array.len()
+        })
 }
 
 /// Execute a streaming-capable primitive array tree to a canonical [`PrimitiveArray`] by
