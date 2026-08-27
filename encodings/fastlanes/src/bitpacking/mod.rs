@@ -13,6 +13,10 @@ pub use array::unpack_iter;
 
 pub(crate) mod compute;
 
+#[cfg(feature = "_test-harness")]
+#[doc(hidden)]
+pub use compute::list_contains::test_harness as list_contains_test_harness;
+
 mod plugin;
 mod vtable;
 

@@ -49,6 +49,11 @@ name = "bitpacking_take"
 harness = false
 
 [[bench]]
+name = "bitpacking_list_contains"
+harness = false
+required-features = ["_test-harness"]
+
+[[bench]]
 name = "canonicalize_bench"
 harness = false
 required-features = ["_test-harness"]
