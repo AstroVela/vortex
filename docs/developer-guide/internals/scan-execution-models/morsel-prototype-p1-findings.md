@@ -45,13 +45,25 @@ Design points that survived contact with the code:
 - **Unsupported shapes are build errors.** Nested structs, non-struct roots, nullable root
   structs and non-flat/non-chunked columns fail in `build_plan` rather than falling back, so an
   unsupported query cannot be timed as if the prototype had executed it.
-- **No state V1 does not have.** An earlier revision carried a per-thread decoded-chunk cache; it
-  was removed because V1 has no reader-level decode cache, so timing against it with one was not
-  a comparison of executors. The IO plane's keyed cells live only for the duration of one morsel
-  (released at retire), so a segment named twice *within* a morsel resolves to one read — that is
-  the registration mechanism itself, not a cache — and across morsels every segment is re-read
-  and re-decoded exactly as V1 re-reads and re-decodes it per evaluation. The eval's counters
-  confirm this: requests, uses and decodes are equal in every configuration.
+- **Retention is derived from demand, never from a budget.** An earlier revision carried a
+  per-thread decoded-chunk cache; it was removed because a budget-and-eviction cache is state V1
+  does not have and its numbers measured the cache, not the executor. What replaced it is the P1
+  slice of P2's keyed cells: **leased shared decoded cells** (`cells.rs`). Before the scan
+  starts, the driver counts — from the morsel cut and the plan's flat nodes alone — exactly how
+  many (node, morsel) pairs will touch each stored unit. The first morsel to decode a unit
+  publishes the array into its cell; every retiring morsel releases its lease whether it used
+  the cell or not; the last release drops the array. Nothing is held speculatively, nothing has
+  a budget, nothing survives the scan, and the lease ledger is asserted to drain to zero. A
+  morsel whose planning finds the cell already populated skips issuing the read entirely — its
+  own unreleased lease guarantees the value survives until it retires. The `no-reuse`
+  configuration disables the layer completely and holds no state across morsels at all; it is
+  kept as the fairness row and as the chaos check (`decodes + reuses` in a sharing run must
+  exactly equal `decodes` in a non-sharing run, asserted per query).
+- **The cell map is sharded 16 ways.** The first cut used one mutex, and the wide-numeric
+  workload at 4 threads got *slower* than 1 thread (0.53 vs 0.50 vs V1): 4,560 lease touches on
+  one lock serialised the scan. Sixteen shards restored 0.34. The measured lesson for P2: lease
+  traffic scales with (nodes × morsels), so the cell index must be sharded or lock-free from the
+  start.
 
 One deviation from the sketch worth recording: rather than rewriting expressions to push
 predicates onto individual fields, each conjunct and the projection are re-bound against the
@@ -61,7 +73,7 @@ V1's by construction (the same `apply_bound` on the same assembled struct).
 
 ## Correctness
 
-15 differential tests, all passing. Every one uses the V1 `LayoutReader` as the oracle and
+18 differential tests, all passing. Every one uses the V1 `LayoutReader` as the oracle and
 asserts equal row counts and equal ordered content over 8 query shapes:
 
 | Property | Test |
@@ -71,13 +83,15 @@ asserts equal row counts and equal ordered content over 8 query shapes:
 | The document's `[0,3,10)` vs `[0,6,10)` case, and its split set | `document_misalignment_case` |
 | Result independent of morsel size (1, 7, 128, 4096 rows, and per-split) | `independent_of_morsel_size` |
 | Cascade and parallel conjunct policies observationally identical | `conjunct_policy_is_not_observable` |
+| Shared cells change no output, at 1 and 4 threads, and account exactly | `shared_cells_are_not_observable` |
+| Straddled chunks are decoded exactly once per scan | `shared_cells_reuse_straddled_chunks` |
 | Every read was named by a planning stream | `every_read_was_planned` |
 | All-false filter emits nothing | `empty_filter_emits_nothing` |
 | Unsupported layouts are build errors | `rejects_unsupported_layouts` |
 
 The evaluation binary re-runs the oracle check for **every** configuration on **every** query
 before any timing happens; a configuration that disagrees is reported as a failure and excluded
-from the timing table. All 90 configuration-query pairs in the run below matched.
+from the timing table. All 105 configuration-query pairs in the run below matched.
 
 ## What could not be evaluated, and why
 
@@ -122,65 +136,58 @@ Geometric means over all 15 queries:
 | Row | Geomean vs V1(1) | Range |
 |---|--:|---|
 | A  V1, 1 thread | 1.000 | — |
-| A' V1, tokio x4 | 0.794 | 0.30 – 1.63 |
-| D  morsel, 1 thread, per-split morsels | **0.650** | 0.35 – 0.99 |
-| D  morsel, 4 threads, per-split morsels | 0.359 | 0.22 – 0.76 |
-| D  morsel, 4 threads, 64k-row morsels | **0.238** | 0.09 – 0.58 |
-| D  morsel, 4 threads, parallel conjuncts | 0.337 | 0.20 – 0.62 |
+| A' V1, tokio x4 | 0.743 | 0.31 – 1.63 |
+| D  morsel, 1 thread, per-split morsels | **0.539** | 0.30 – 0.81 |
+| D  morsel, 1 thread, sharing disabled (no-reuse) | 0.644 | 0.36 – 1.02 |
+| D  morsel, 4 threads, per-split morsels | 0.366 | 0.22 – 0.84 |
+| D  morsel, 4 threads, 64k-row morsels | **0.249** | 0.12 – 0.60 |
+| D  morsel, 4 threads, parallel conjuncts | 0.340 | 0.22 – 0.66 |
 
 Per workload (geomean vs V1(1)):
 
 | Row | string-heavy | wide-numeric | narrow-analytic |
 |---|--:|--:|--:|
-| A' V1, tokio x4 | 0.538 | 1.059 | 0.972 |
-| D  morsel, 1 thread | 0.788 | 0.582 | 0.553 |
-| D  morsel, 4 threads | 0.387 | 0.300 | 0.442 |
-| D  morsel, 4 threads, 64k morsels | 0.271 | 0.173 | 0.346 |
+| A' V1, tokio x4 | 0.545 | 0.958 | 0.833 |
+| D  morsel, 1 thread | 0.594 | 0.494 | 0.531 |
+| D  morsel, 1 thread, no-reuse | 0.816 | 0.546 | 0.558 |
+| D  morsel, 4 threads | 0.384 | 0.343 | 0.379 |
+| D  morsel, 4 threads, 64k morsels | 0.303 | 0.188 | 0.296 |
 
 The full table, every query and every counter, is in
 [`morsel-prototype-p1-eval.md`](morsel-prototype-p1-eval.md).
 
 ### What the numbers say
 
-**Single-threaded, the prototype is ~1.5x faster than V1 on the same cut, and the win is
-inversely proportional to how decode-dominated the query is.** Both executors walk the same
-natural splits, read the same segments the same number of times, and decode the same chunks the
-same number of times — the counters show requests = uses = decodes on every configuration. What
-differs is the machinery around that work: V1 builds a future per evaluation and drives it
-through a stream; D drives a morsel inline with a program counter. On the wide-numeric workload,
-where per-split fixed cost dominates, that is 0.582. On string-heavy `SH1 select-all`, where wall
-time is almost entirely decode (which is identical by construction), D is 0.97 — the honest
-number: an executor cannot be much faster than V1 at a query whose cost V1 also spends almost
-entirely inside the shared decode kernel.
+**The leased cells recover the cross-morsel decode reuse the removed cache had shown, this time
+by construction rather than by budget.** On string-heavy `SH1 select-all`, the no-reuse row
+decodes 310 times; the sharing row decodes 121 times — exactly once per chunk — and serves the
+other 189 from cells, moving 0.87 to 0.46 single-threaded. The counters give the mechanism its
+own audit: in every sharing run, `decodes + reuses` equals the non-sharing run's `decodes`
+exactly (asserted per query in the tests), and the lease ledger is asserted empty at scan end.
+Because a plan-time cell hit skips the read as well, requests fall with decodes: the sharing row
+issues 121 requests where the no-reuse row issues 310. Retention peaked at the scan's active
+window — the morsels overlapping one unit are consecutive indices off a monotone cursor, so a
+cell lives from the first of them to the last.
 
-An earlier revision of this document reported 0.49 on that query. That number came from a
-per-thread decoded-chunk cache the prototype had and V1 does not; it was measuring a cache, not
-an executor, and it is gone — both from the code and from every table here. The magnitude of the
-delta (0.49 → 0.97 on SH1) is itself a finding: on misaligned string-heavy layouts, *decode
-reuse across morsels is worth ~2x*, and if that win is ever wanted it must be designed as a
-shared, budgeted facility both executors could use — P2's keyed cells — not smuggled in as
-executor-private state.
+**Even with sharing disabled, the executor beats V1 on the same cut** (0.644 geomean): no future
+per evaluation, no task per split. That row is the state-for-state comparison with V1 and is the
+floor the sharing mechanism builds on, not a number sharing inflates.
 
-**Coalescing morsels is worth more than threads on wide tables.** `WN1 select-all` at 4 threads
-goes from 0.24 (per-split morsels) to 0.09 (64k-row morsels): 228 morsels become 16, and 4,560
-uses/requests/decodes become 1,476. This is not caching — it is genuinely fewer scheduling units
-doing genuinely less repeated work, because one morsel spanning sixteen chunk boundaries slices
-each chunk once where sixteen per-split morsels each pay the full per-morsel cost. This is the
-`select *` small-splits storm from
-[problem 1 of the next-discussion document](scan-execution-graph-next-discussion.md), measured,
-and answered by unit formation rather than by more machinery.
+**Coalescing morsels remains worth more than sharing on wide tables.** `WN1 select-all` at 4
+threads: per-split morsels with sharing 0.24; 64k-row morsels 0.12 with zero reuses — one morsel
+spanning sixteen chunks slices each chunk once, so there is nothing left to share. Sharing and
+coalescing are substitutes on wide numeric data and complements on misaligned string data, where
+even coalesced morsels straddle the small text chunks.
 
-**Cascade and parallel conjuncts are within noise of each other here** (0.359 vs 0.337 at 4
-threads). On these workloads the conjuncts are cheap scalar comparisons, so evaluating both
-against the full mask and intersecting costs about what the serial dependency costs. On a
-workload where the second conjunct is expensive (a `LIKE` over a text column) cascade should win
-clearly; that case is not in these fixtures and the policy question stays open.
+**The one-lock version of the cells was a measured failure.** With a single mutex, wide-numeric
+at 4 threads ran *slower* than at 1 (0.53 vs 0.50): thousands of tiny lease operations serialised
+the scan. Sixteen shards restored 0.34. This is the admission-plane lesson E2 is designed to
+catch — a shared structure touched per (node, morsel) must never be a single point of
+serialisation — surfaced early by the lease ledger.
 
-**The cold-scan IO invariant holds everywhere.** With cells released per morsel, every
-configuration — 1 thread, 4 threads, coalesced, parallel — shows requests = uses = decodes, and
-the per-split rows show exactly the counts V1's evaluation structure implies. The earlier
-revision's 4-thread rows read up to 3x the bytes of the 1-thread rows (per-thread cells shared
-nothing); that asymmetry is gone along with the cache.
+**Cascade and parallel conjuncts remain within noise of each other** on these cheap-predicate
+workloads (0.366 vs 0.340 at 4 threads); the expensive-conjunct case that should separate them
+is still not in the fixtures.
 
 ### Two honest caveats in D's favour, to discount
 
@@ -209,8 +216,10 @@ Two things would need to happen before the gate means anything:
    encodings. Comparing a synthetic-fixture ratio against a real-suite ratio is not sound, and
    this document does not do it.
 
-P2's shared cells are now motivated by a measured number rather than a speculative one: the
-removed decode cache showed cross-morsel decode reuse is worth ~2x on misaligned string-heavy
-layouts. P2 is where that win gets rebuilt as a shared, scheduler-visible facility with leases
-and byte budgets — available to any executor, accounted for, and disabled in the fair rows of
-any future comparison.
+The leased shared cells built here are the first P2 slice landed ahead of schedule: the ~2x
+cross-morsel decode reuse on misaligned string layouts is now delivered by demand-derived
+retention (leases counted from the morsel cut, drained to zero by retirement) rather than by a
+cache, with the no-reuse configuration retained as the state-for-state fairness row. What P2
+still owes on top: sharing the *bytes* cells across threads the same way, verdict-driven
+cancellation of unissued uses, and the latency-grid experiments (E2) that decide when
+registration should be bypassed entirely.

@@ -13,7 +13,9 @@ use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
+use crate::cells::SharedCells;
 use crate::io::IoBatch;
+use crate::io::IoKey;
 use crate::io::IoPlane;
 use crate::io::IoTicket;
 use crate::stats::ScanStats;
@@ -206,6 +208,7 @@ impl Arena {
 pub struct PlanCx<'a> {
     arena: &'a mut Arena,
     io: &'a IoPlane,
+    cells: &'a SharedCells,
     stats: &'a mut ScanStats,
     /// Remaining IO uses this planning quantum may emit before the node should yield.
     budget: u32,
@@ -220,6 +223,14 @@ impl<'a> PlanCx<'a> {
     /// Whether the planning quantum is exhausted.
     pub fn out_of_budget(&self) -> bool {
         self.budget == 0
+    }
+
+    /// Whether a shared cell already holds the decoded value for a unit.
+    ///
+    /// A hit lets the node skip issuing the read entirely: the caller's own lease (counted into
+    /// the cell before the scan started) keeps the value alive until this morsel retires.
+    pub fn decoded_available(&self, key: IoKey) -> bool {
+        self.cells.decoded(key).is_some()
     }
 
     /// Register a batch of IO uses, spending budget and returning tickets.
@@ -262,6 +273,7 @@ impl<'a> PlanCx<'a> {
 pub struct ExecCx<'a> {
     arena: &'a mut Arena,
     io: &'a IoPlane,
+    cells: &'a SharedCells,
     session: &'a VortexSession,
     stats: &'a mut ScanStats,
     demand: Mask,
@@ -289,6 +301,20 @@ impl<'a> ExecCx<'a> {
     /// Consume the bytes behind a ticket this node's planning stream emitted.
     pub fn consume(&mut self, ticket: IoTicket) -> VortexResult<BufferHandle> {
         self.io.consume(ticket, self.stats)
+    }
+
+    /// Take a decoded value from the shared cell for a unit, if a morsel already published one.
+    pub fn shared_decoded(&mut self, key: IoKey) -> Option<ArrayRef> {
+        let hit = self.cells.decoded(key);
+        if hit.is_some() {
+            self.stats.decode_reuses += 1;
+        }
+        hit
+    }
+
+    /// Publish a decoded value into the shared cell for a unit.
+    pub fn publish_decoded(&self, key: IoKey, array: &ArrayRef) {
+        self.cells.publish(key, array);
     }
 
     /// Mutable access to the run's counters.
@@ -340,6 +366,7 @@ impl<'a> ExecCx<'a> {
 /// Context handed to [`ExecNode::retire`].
 pub struct RetireCx<'a> {
     arena: &'a mut Arena,
+    cells: &'a SharedCells,
     stats: &'a mut ScanStats,
 }
 
@@ -355,6 +382,11 @@ impl<'a> RetireCx<'a> {
     pub fn stats(&mut self) -> &mut ScanStats {
         self.stats
     }
+
+    /// Release this morsel's lease on a unit, dropping the shared cell at the last release.
+    pub fn release_use(&mut self, key: IoKey) {
+        self.cells.release(key);
+    }
 }
 
 /// The number of IO uses one planning quantum may emit before a node should yield.
@@ -366,6 +398,7 @@ pub fn drive_morsel(
     root: NodeId,
     range: Range<u64>,
     io: &IoPlane,
+    cells: &SharedCells,
     session: &VortexSession,
     stats: &mut ScanStats,
 ) -> VortexResult<Option<ArrayRef>> {
@@ -376,6 +409,7 @@ pub fn drive_morsel(
         let mut cx = PlanCx {
             arena,
             io,
+            cells,
             stats,
             budget: PLAN_BUDGET,
         };
@@ -397,6 +431,7 @@ pub fn drive_morsel(
         let mut cx = ExecCx {
             arena,
             io,
+            cells,
             session,
             stats,
             demand: Mask::new_true(rows),
@@ -422,7 +457,11 @@ pub fn drive_morsel(
     // Retirement. The morsel's IO cells are released with it: the executor retains no bytes
     // and no decoded arrays across morsels, matching V1's per-evaluation state exactly.
     {
-        let mut cx = RetireCx { arena, stats };
+        let mut cx = RetireCx {
+            arena,
+            cells,
+            stats,
+        };
         cx.retire_child(root);
     }
     io.clear();

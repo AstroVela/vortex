@@ -386,6 +386,83 @@ fn conjunct_policy_is_not_observable() -> VortexResult<()> {
     Ok(())
 }
 
+/// Property: the leased shared cells are an optimisation only. Disabling them must not change
+/// a single row, at any thread count — the chaos check for the decode-reuse mechanism.
+#[rstest]
+fn shared_cells_are_not_observable(#[values(1, 4)] threads: usize) -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+
+    for query in queries() {
+        let dtype = v1_dtype(&fixture.layout, &query)?;
+        let shared = run_morsel(
+            &session,
+            &fixture.layout,
+            &segments,
+            &query,
+            MorselConfig {
+                threads,
+                ..Default::default()
+            },
+        )?;
+        let unshared = run_morsel(
+            &session,
+            &fixture.layout,
+            &segments,
+            &query,
+            MorselConfig {
+                threads,
+                share_decodes: false,
+                ..Default::default()
+            },
+        )?;
+        assert_same_rows(&session, &dtype, &shared, &unshared)
+            .map_err(|err| err.with_context(format!("query {}", query.name)))?;
+
+        let shared_stats = shared.stats.as_ref().expect("morsel runs report stats");
+        let unshared_stats = unshared.stats.as_ref().expect("morsel runs report stats");
+        assert_eq!(unshared_stats.decode_reuses, 0);
+        assert_eq!(
+            shared_stats.decodes + shared_stats.decode_reuses,
+            unshared_stats.decodes,
+            "query {}: every skipped decode must be accounted for by a reuse",
+            query.name
+        );
+    }
+    Ok(())
+}
+
+/// Property: on the misaligned fixture, sharing actually fires — a chunk overlapped by several
+/// per-split morsels is decoded once and reused for the rest.
+#[rstest]
+fn shared_cells_reuse_straddled_chunks() -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+
+    let query = Query {
+        name: "reuse",
+        projection: select(vec!["a", "b", "c"], root()),
+        filter: None,
+    };
+    let run = run_morsel(
+        &session,
+        &fixture.layout,
+        &segments,
+        &query,
+        MorselConfig::default(),
+    )?;
+    let stats = run.stats.as_ref().expect("morsel runs report stats");
+    assert!(
+        stats.decode_reuses > 0,
+        "expected cross-morsel decode reuse on a misaligned fixture, got none"
+    );
+    // Each of the 15 chunks (3 + 5 + 7) is decoded exactly once across the whole scan.
+    assert_eq!(stats.decodes, 15);
+    Ok(())
+}
+
 /// Property: every read a node waits on was named by its own planning stream, so the number of
 /// distinct segments read never exceeds the number of uses named.
 #[rstest]

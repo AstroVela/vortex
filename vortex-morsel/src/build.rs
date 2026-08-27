@@ -33,6 +33,7 @@ use vortex_layout::layouts::flat::Flat;
 use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::layouts::struct_::Struct;
 
+use crate::io::IoKey;
 use crate::io::ProducerId;
 use crate::node::Arena;
 use crate::node::ExecNode;
@@ -102,6 +103,25 @@ impl ExecPlan {
     /// The union of every column's chunk boundaries, in root coordinates.
     pub fn natural_splits(&self) -> &[u64] {
         &self.natural_splits
+    }
+
+    /// Every flat node's stored unit and its root-coordinate row range, one entry per node.
+    ///
+    /// A segment referenced from two subtrees (a column in both filter and projection) appears
+    /// once per referencing node, because each node registers its own use per morsel. This is
+    /// the input to the shared-cell lease counts: the count for a unit is the number of
+    /// (node, morsel) pairs whose ranges overlap.
+    pub fn flat_uses(&self) -> impl Iterator<Item = (IoKey, Range<u64>)> + '_ {
+        self.nodes.iter().filter_map(|spec| match spec {
+            NodeSpec::Flat {
+                layout,
+                root_offset,
+            } => Some((
+                IoKey::Segment(layout.segment_id()),
+                *root_offset..*root_offset + layout.row_count(),
+            )),
+            _ => None,
+        })
     }
 
     /// The number of nodes in the plan.

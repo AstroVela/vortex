@@ -66,7 +66,12 @@ impl Row {
                 } else {
                     format!("{}r", config.morsel_rows)
                 };
-                format!("D  morsel (x{}, {morsel}{mode})", config.threads)
+                let reuse = if config.share_decodes {
+                    ""
+                } else {
+                    ", no-reuse"
+                };
+                format!("D  morsel (x{}, {morsel}{mode}{reuse})", config.threads)
             }
         }
     }
@@ -79,6 +84,7 @@ struct Timing {
     ttfb: Option<Duration>,
     requests: Option<u64>,
     decodes: Option<u64>,
+    reuses: Option<u64>,
     io_uses: Option<u64>,
     morsels: Option<u64>,
 }
@@ -135,6 +141,11 @@ fn main() -> VortexResult<()> {
                 Row::V1Tokio(threads),
                 Row::Morsel(MorselConfig {
                     threads: 1,
+                    ..Default::default()
+                }),
+                Row::Morsel(MorselConfig {
+                    threads: 1,
+                    share_decodes: false,
                     ..Default::default()
                 }),
                 Row::Morsel(MorselConfig {
@@ -199,6 +210,7 @@ fn main() -> VortexResult<()> {
                         ttfb: median.time_to_first_batch,
                         requests: median.stats.as_ref().map(|s| s.io_requests),
                         decodes: median.stats.as_ref().map(|s| s.decodes),
+                        reuses: median.stats.as_ref().map(|s| s.decode_reuses),
                         io_uses: median.stats.as_ref().map(|s| s.io_uses),
                         morsels: median.stats.as_ref().map(|s| s.morsels),
                     }
@@ -256,8 +268,10 @@ fn report(query: &Query, timings: &[Timing]) {
 
     println!("### {}", query.name);
     println!();
-    println!("| executor | wall | vs V1 | rows | ttfb | morsels | uses | reqs | decodes |");
-    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|");
+    println!(
+        "| executor | wall | vs V1 | rows | ttfb | morsels | uses | reqs | decodes | reuses |"
+    );
+    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
     for timing in timings {
         let ratio = if baseline.is_zero() {
             "—".to_string()
@@ -268,7 +282,7 @@ fn report(query: &Query, timings: &[Timing]) {
             )
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             timing.label,
             millis(timing.median),
             ratio,
@@ -278,6 +292,7 @@ fn report(query: &Query, timings: &[Timing]) {
             opt(timing.io_uses),
             opt(timing.requests),
             opt(timing.decodes),
+            opt(timing.reuses),
         );
     }
     println!();

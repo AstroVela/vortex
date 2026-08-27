@@ -20,9 +20,11 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_layout::segments::SegmentSource;
 use vortex_session::VortexSession;
+use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::build::ExecPlan;
 use crate::build::cut_morsels;
+use crate::cells::SharedCells;
 use crate::io::IoPlane;
 use crate::node::drive_morsel;
 use crate::stats::ScanStats;
@@ -44,6 +46,7 @@ pub struct MorselScan {
     morsels: Arc<[Range<u64>]>,
     threads: usize,
     inline_floor_bytes: usize,
+    share_decodes: bool,
 }
 
 impl MorselScan {
@@ -61,6 +64,7 @@ impl MorselScan {
             morsels,
             threads: 1,
             inline_floor_bytes: 0,
+            share_decodes: true,
         }
     }
 
@@ -82,6 +86,34 @@ impl MorselScan {
         self
     }
 
+    /// Enable or disable the leased shared decoded cells.
+    ///
+    /// Disabled, the executor holds no state across morsels — the configuration whose retained
+    /// state exactly matches the V1 `LayoutReader`, kept for fair comparison and as the chaos
+    /// check that sharing changes no output.
+    pub fn with_share_decodes(mut self, share: bool) -> Self {
+        self.share_decodes = share;
+        self
+    }
+
+    /// Lease counts for the shared cells: for each stored unit, the number of (node, morsel)
+    /// pairs whose ranges overlap. This is the same arithmetic planning runs per morsel, summed
+    /// over the cut up front, which is what makes release-at-retire drain every count to zero.
+    fn lease_counts(&self) -> HashMap<crate::io::IoKey, usize> {
+        let mut counts: HashMap<crate::io::IoKey, usize> = HashMap::default();
+        for (key, range) in self.plan.flat_uses() {
+            let overlapping = self
+                .morsels
+                .iter()
+                .filter(|morsel| morsel.start < range.end && range.start < morsel.end)
+                .count();
+            if overlapping > 0 {
+                *counts.entry(key).or_default() += overlapping;
+            }
+        }
+        counts
+    }
+
     /// The morsels this scan will drive.
     pub fn morsel_ranges(&self) -> &[Range<u64>] {
         &self.morsels
@@ -89,6 +121,11 @@ impl MorselScan {
 
     /// Run the scan, returning batches in row order plus the run's counters.
     pub fn run(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats)> {
+        let cells = if self.share_decodes {
+            SharedCells::with_leases(self.lease_counts())
+        } else {
+            SharedCells::disabled()
+        };
         let cursor = AtomicUsize::new(0);
         let results: Mutex<Vec<(usize, ArrayRef)>> = Mutex::new(Vec::new());
         let stats = Mutex::new(ScanStats::default());
@@ -111,6 +148,7 @@ impl MorselScan {
                     self.plan.root(),
                     range.clone(),
                     &io,
+                    &cells,
                     &self.session,
                     &mut local,
                 )?;
@@ -140,6 +178,12 @@ impl MorselScan {
                 Ok(())
             })?;
         }
+
+        debug_assert_eq!(
+            cells.live(),
+            0,
+            "every lease must be released by the end of the scan"
+        );
 
         // Ordering is restored by index, not maintained during execution.
         let mut ordered = results.into_inner();

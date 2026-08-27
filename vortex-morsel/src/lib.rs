@@ -25,15 +25,18 @@
 //! 1. There is no future per evaluation. A morsel is driven inline, depth-first, on one thread.
 //! 2. Morsels are self-scheduled off one atomic cursor; emission order is restored by index.
 //!
-//! It deliberately holds **no more state than V1 does**: there is no decoded-array cache, and a
-//! morsel's IO cells are released when it retires. A segment reached twice within one morsel is
-//! read once because both uses name the same cell — that is registration, not caching — and a
-//! segment straddling two morsels is read once per morsel, exactly as V1 does it.
+//! Retention is **derived from demand, never from a budget**. There is no decoded-array cache:
+//! the only cross-morsel state is the leased shared cell ([`cells::SharedCells`]), where a
+//! decoded chunk lives exactly while some not-yet-retired morsel holds a lease on it — counts
+//! computed from the morsel cut before the scan starts — and is dropped at the last release.
+//! With sharing disabled the executor holds nothing across evaluations at all, matching the V1
+//! `LayoutReader` state for state; that configuration is the fairness row of the eval.
 //!
 //! Only the FLAT, CHUNKED and STRUCT layout nodes are supported, plus the FILTER and
 //! CONJUNCT_PARALLEL operators. Anything else is rejected at build time by [`build::build_plan`].
 
 pub mod build;
+pub mod cells;
 pub mod driver;
 #[cfg(any(test, feature = "_test-harness"))]
 pub mod fixtures;

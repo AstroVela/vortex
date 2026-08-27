@@ -183,6 +183,8 @@ pub struct MorselConfig {
     pub morsel_rows: u64,
     /// Conjunct evaluation policy.
     pub mode: ConjunctMode,
+    /// Whether the leased shared decoded cells are enabled.
+    pub share_decodes: bool,
 }
 
 impl Default for MorselConfig {
@@ -191,6 +193,7 @@ impl Default for MorselConfig {
             threads: 1,
             morsel_rows: 0,
             mode: ConjunctMode::Cascade,
+            share_decodes: true,
         }
     }
 }
@@ -212,7 +215,8 @@ pub fn run_morsel(
     let cut = morsels(&plan, config.morsel_rows);
     let scan = MorselScan::new(plan, Arc::clone(segments), session.clone())
         .with_threads(config.threads)
-        .with_morsels(cut);
+        .with_morsels(cut)
+        .with_share_decodes(config.share_decodes);
 
     let start = Instant::now();
     let (batches, stats) = scan.run()?;

@@ -32,9 +32,11 @@ use crate::node::ValueBatch;
 
 /// The only node that touches the world: one stored segment, decoded and sliced.
 ///
-/// `next_plan` names the segment exactly once per morsel. `execute` waits on that one ticket,
-/// decodes, slices to the morsel's local range and applies the demand mask. There is no decoded
-/// cache: like V1, a segment straddling several morsels is decoded once per morsel.
+/// `next_plan` names the segment exactly once per morsel. If the shared cell for the segment
+/// already holds a decoded value, planning skips issuing the read — the morsel's own lease keeps
+/// that value alive until it retires. Otherwise `execute` waits on the one ticket, decodes,
+/// publishes into the cell, then slices to the morsel's local range and applies the demand mask.
+/// Retire releases the lease whether the value was used or not; the last release drops the cell.
 pub struct FlatExec {
     segment: SegmentId,
     dtype: DType,
@@ -76,6 +78,10 @@ impl FlatExec {
     }
 
     fn decode(&self, cx: &mut ExecCx<'_>) -> VortexResult<ArrayRef> {
+        if let Some(shared) = cx.shared_decoded(IoKey::Segment(self.segment)) {
+            return Ok(shared);
+        }
+
         let ticket = self
             .ticket
             .ok_or_else(|| crate::io::unplanned_ticket(self.producer))?;
@@ -90,6 +96,7 @@ impl FlatExec {
         let session = cx.session().clone();
         let array = parts.decode(&self.dtype, rows, &self.read_ctx, &session)?;
         cx.stats().decodes += 1;
+        cx.publish_decoded(IoKey::Segment(self.segment), &array);
         Ok(array)
     }
 }
@@ -113,6 +120,14 @@ impl ExecNode for FlatExec {
         }
         if cx.out_of_budget() {
             return Ok(PlanPoll::Item(PlanItem::Plan));
+        }
+
+        // A decoded value already published by another morsel makes the read unnecessary. The
+        // lease this morsel holds (counted before the scan started) pins the value until retire,
+        // so skipping the read here can never leave execute empty-handed.
+        if cx.decoded_available(IoKey::Segment(self.segment)) {
+            self.planned = true;
+            return Ok(PlanPoll::Complete);
         }
 
         // The extent is the whole stored unit: two morsels straddling this segment name the same
@@ -156,8 +171,12 @@ impl ExecNode for FlatExec {
         }))
     }
 
-    fn retire(&mut self, _cx: &mut RetireCx<'_>) {
+    fn retire(&mut self, cx: &mut RetireCx<'_>) {
+        if self.planned {
+            cx.release_use(IoKey::Segment(self.segment));
+        }
         self.ticket = None;
+        self.planned = false;
     }
 
     fn children(&self) -> &[NodeId] {
