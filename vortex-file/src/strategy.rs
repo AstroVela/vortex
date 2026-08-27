@@ -219,7 +219,7 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        let compressing = CompressingStrategy::new(buffered, data_compressor);
+        let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
@@ -243,7 +243,8 @@ impl WriteStrategyBuilder {
             CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
             CompressorConfig::Opaque(compressor) => compressor,
         };
-        let compress_then_flat = CompressingStrategy::new(flat, Arc::clone(&stats_compressor));
+        let compress_then_flat =
+            CompressingStrategy::new(Arc::clone(&flat), Arc::clone(&stats_compressor));
 
         // 3. apply dict encoding or fallback
         let probe_compressor = if let Some(probe_compressor) = self.probe_compressor {
@@ -256,7 +257,7 @@ impl WriteStrategyBuilder {
             compress_then_flat.clone(),
             coalescing,
             Default::default(),
-            probe_compressor,
+            Arc::clone(&probe_compressor),
         );
 
         let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
@@ -293,12 +294,44 @@ impl WriteStrategyBuilder {
                 .with_field_writers(self.field_writers);
 
         if self.use_list_layout {
-            // We need a closure here to enable recursive application of list layout.
+            let list_flat = Arc::clone(&flat);
+            let list_data_compressor = Arc::clone(&data_compressor);
+            let list_probe_compressor = Arc::clone(&probe_compressor);
+            let list_compress_then_flat = compress_then_flat;
+            let data_block_target_bytes = self.data_block_target_bytes;
+            let row_block_len = self.row_block_size;
             table_strategy = table_strategy.with_list_layout_factory(
                 move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
+                    let list_layout = list_layout
+                        .with_leaf(Arc::clone(&list_flat))
+                        .with_fallback(Arc::clone(&list_flat));
+
+                    // Preserve the normal flat-column pipeline and replace only its terminal
+                    // FlatLayout with a ListLayout. Compression therefore sees the complete list
+                    // page and makes the same recursive encoding choices as the flat format.
+                    let chunked = ChunkedLayoutStrategy::new(list_layout);
+                    let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG);
+                    let compressing =
+                        CompressingStrategy::new(buffered, Arc::clone(&list_data_compressor));
+                    let coalescing = RepartitionStrategy::new(
+                        compressing,
+                        RepartitionWriterOptions {
+                            block_size_minimum: data_block_target_bytes.unwrap_or(0),
+                            block_len_multiple: row_block_len,
+                            block_size_target: data_block_target_bytes,
+                            canonicalize: true,
+                        },
+                    );
+                    let dict = DictStrategy::new(
+                        coalescing.clone(),
+                        list_compress_then_flat.clone(),
+                        coalescing,
+                        Default::default(),
+                        Arc::clone(&list_probe_compressor),
+                    );
                     let zoned = ZonedStrategy::new(
-                        list_layout,
-                        compress_then_flat.clone(),
+                        dict,
+                        list_compress_then_flat.clone(),
                         ZonedLayoutOptions {
                             block_size: row_block_size,
                             ..Default::default()
@@ -308,7 +341,7 @@ impl WriteStrategyBuilder {
                         zoned,
                         RepartitionWriterOptions {
                             block_size_minimum: 0,
-                            block_len_multiple: row_block_size.get(),
+                            block_len_multiple: row_block_len,
                             block_size_target: None,
                             canonicalize: false,
                         },
