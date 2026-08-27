@@ -31,6 +31,10 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
     &integer::ZigZagScheme,
     &integer::BitPackingScheme,
+    // Chunk-wise bit-packing. Inert unless `VORTEX_BITPACKED_V2=1` is set; it sits after the
+    // single-width scheme so that scheme wins on a tie.
+    #[cfg(feature = "unstable_encodings")]
+    &integer::BitPackingV2Scheme,
     &integer::SparseScheme,
     &integer::IntDictScheme,
     &integer::RunEndScheme,

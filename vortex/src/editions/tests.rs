@@ -634,6 +634,56 @@ fn custom_compressing_flat_strategy() -> Arc<dyn LayoutStrategy> {
     ))
 }
 
+/// [`BitPackedV2`] is a preview-edition encoding, so a session with the preview edition enabled
+/// must be able to write one to a file and read it back unchanged.
+#[cfg(feature = "unstable_encodings")]
+#[tokio::test]
+async fn bitpacked_v2_round_trips_through_a_file() -> VortexResult<()> {
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_fastlanes::bitpack_v2_compress::bitpack_v2_encode;
+
+    use crate::VortexSessionDefault;
+
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
+
+    // Four FastLanes chunks, each needing a different bit width.
+    let values =
+        PrimitiveArray::from_iter((0..4 * 1024u32).map(|i| i % (1 << (1 + 2 * (i / 1024)))));
+    let encoded = bitpack_v2_encode(&values, &mut ctx)?.into_array();
+
+    let mut buffer = ByteBufferMut::empty();
+    session
+        .write_options()
+        .with_strategy(Arc::new(FlatLayoutStrategy::default()))
+        .write(&mut buffer, encoded.to_array_stream())
+        .await?;
+
+    let round_tripped = session
+        .open_options()
+        .open_buffer(buffer)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    assert!(
+        round_tripped
+            .depth_first_traversal()
+            .any(|array| array.encoding_id().as_str() == "fastlanes.bitpacked_v2"),
+        "the round-tripped array no longer holds a bitpacked_v2 array"
+    );
+    assert_eq!(
+        round_tripped
+            .execute::<PrimitiveArray>(&mut ctx)?
+            .as_slice::<u32>(),
+        values.as_slice::<u32>(),
+    );
+
+    Ok(())
+}
+
 async fn assert_round_trip_encodings_are_enabled(
     session: &VortexSession,
     strategy: Option<Arc<dyn LayoutStrategy>>,
