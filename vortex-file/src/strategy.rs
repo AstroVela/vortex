@@ -208,8 +208,19 @@ impl WriteStrategyBuilder {
             flat
         };
 
-        // 7. for each chunk create a flat layout
-        let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
+        // 7. write each compressed chunk as either a shallow list layout or a flat layout.
+        // Chunking stays outside ListLayoutStrategy so every list layout receives exactly one
+        // complete page and its elements, offsets, and validity are direct flat leaves.
+        let terminal: Arc<dyn LayoutStrategy> = if self.use_list_layout {
+            Arc::new(
+                ListLayoutStrategy::default()
+                    .with_leaf(Arc::clone(&flat))
+                    .with_fallback(Arc::clone(&flat)),
+            )
+        } else {
+            Arc::clone(&flat)
+        };
+        let chunked = ChunkedLayoutStrategy::new(terminal);
         // 6. buffer chunks so they end up with closer segment ids physically
         let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
 
@@ -226,7 +237,7 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
+        let compressing = CompressingStrategy::new(buffered, data_compressor);
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
@@ -264,7 +275,7 @@ impl WriteStrategyBuilder {
             compress_then_flat.clone(),
             coalescing,
             Default::default(),
-            Arc::clone(&probe_compressor),
+            probe_compressor,
         );
 
         let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
@@ -293,69 +304,11 @@ impl WriteStrategyBuilder {
         );
 
         // 0. start with splitting columns
-        let validity_strategy = CollectStrategy::new(compress_then_flat.clone());
+        let validity_strategy = CollectStrategy::new(compress_then_flat);
 
         // Take any field overrides from the builder and apply them to the final strategy.
-        let mut table_strategy =
-            TableStrategy::new(Arc::new(validity_strategy), Arc::new(repartition))
-                .with_field_writers(self.field_writers);
-
-        if self.use_list_layout {
-            let list_flat = Arc::clone(&flat);
-            let list_data_compressor = Arc::clone(&data_compressor);
-            let list_probe_compressor = Arc::clone(&probe_compressor);
-            let list_compress_then_flat = compress_then_flat;
-            let data_block_target_bytes = self.data_block_target_bytes;
-            let row_block_len = self.row_block_size;
-            table_strategy = table_strategy.with_list_layout_factory(
-                move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
-                    let list_layout = list_layout
-                        .with_leaf(Arc::clone(&list_flat))
-                        .with_fallback(Arc::clone(&list_flat));
-
-                    // Preserve the normal flat-column pipeline and replace only its terminal
-                    // FlatLayout with a ListLayout. Compression therefore sees the complete list
-                    // page and makes the same recursive encoding choices as the flat format.
-                    let chunked = ChunkedLayoutStrategy::new(list_layout);
-                    let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG);
-                    let compressing =
-                        CompressingStrategy::new(buffered, Arc::clone(&list_data_compressor));
-                    let coalescing = RepartitionStrategy::new(
-                        compressing,
-                        RepartitionWriterOptions {
-                            block_size_minimum: data_block_target_bytes.unwrap_or(0),
-                            block_len_multiple: row_block_len,
-                            block_size_target: data_block_target_bytes,
-                            canonicalize: true,
-                        },
-                    );
-                    let dict = DictStrategy::new(
-                        coalescing.clone(),
-                        list_compress_then_flat.clone(),
-                        coalescing,
-                        Default::default(),
-                        Arc::clone(&list_probe_compressor),
-                    );
-                    let zoned = ZonedStrategy::new(
-                        dict,
-                        list_compress_then_flat.clone(),
-                        ZonedLayoutOptions {
-                            block_size: row_block_size,
-                            ..Default::default()
-                        },
-                    );
-                    Arc::new(RepartitionStrategy::new(
-                        zoned,
-                        RepartitionWriterOptions {
-                            block_size_minimum: 0,
-                            block_len_multiple: row_block_len,
-                            block_size_target: None,
-                            canonicalize: false,
-                        },
-                    ))
-                },
-            );
-        }
+        let table_strategy = TableStrategy::new(Arc::new(validity_strategy), Arc::new(repartition))
+            .with_field_writers(self.field_writers);
 
         Arc::new(table_strategy)
     }
