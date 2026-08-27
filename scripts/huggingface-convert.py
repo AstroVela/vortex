@@ -31,6 +31,7 @@ DEFAULT_DOWNLOAD_BUFFER_BYTES = 64_000_000_000
 DEFAULT_UPLOAD_BUFFER_BYTES = 128_000_000_000
 PARQUET_BATCH_ROWS = 65_536
 LOG_LOCK = threading.Lock()
+OPERATIONAL_CONFIG_KEYS = {"xet_cache", "xet_high_performance", "xet_range_gets"}
 
 
 def safe_print(*values, file=None, **kwargs):
@@ -434,6 +435,11 @@ def needs_source_download(file_state, outputs):
     return False
 
 
+def resumability_config(config):
+    """Remove transfer-tuning fields that do not affect selected files or encoded bytes."""
+    return {key: value for key, value in config.items() if key not in OPERATIONAL_CONFIG_KEYS}
+
+
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -665,7 +671,8 @@ def main():
     checkpoint_path = args.output_dir / "checkpoint.json"
     checkpoint = load_checkpoint(checkpoint_path)
     previous_config = checkpoint.get("config")
-    if previous_config is not None and previous_config != run_config:
+    if (previous_config is not None
+            and resumability_config(previous_config) != resumability_config(run_config)):
         raise RuntimeError(
             f"arguments do not match {checkpoint_path}; resume with the same arguments or use another --output-dir")
     checkpoint["config"] = run_config

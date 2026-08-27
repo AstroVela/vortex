@@ -195,6 +195,16 @@ class LocalCopyUploaderTest(unittest.TestCase):
             local.unlink()
             self.assertTrue(MODULE.needs_source_download(state, outputs))
 
+    def test_resume_allows_xet_tuning_changes(self):
+        old = {"repo": "owner/source", "formats": ["vortex"], "xet_range_gets": 4}
+        new = {**old, "xet_range_gets": 8, "xet_cache": "/new/cache"}
+
+        self.assertEqual(MODULE.resumability_config(old), MODULE.resumability_config(new))
+        self.assertNotEqual(
+            MODULE.resumability_config(old),
+            MODULE.resumability_config({**new, "formats": ["vortex-compact"]}),
+        )
+
     def test_failed_huggingface_commit_retains_preuploaded_file(self):
         class FakeApi:
             def dataset_info(self, repo, revision=None, timeout=None):
