@@ -73,7 +73,7 @@ canonicalises first) but cost performance:
 
 ## Tests
 
-Already run and passing:
+Already run and passing (see the measured sections below for the TPC-H runs):
 
 ```bash
 cargo nextest run -p vortex-fastlanes                          # 342 + 22 new tests
@@ -139,11 +139,31 @@ Reading these:
 - Four tables are byte-identical, i.e. v2 correctly declined to displace v1 where it had nothing
   to offer.
 
-Not yet verified: that these files *read back* correctly end to end. The encoding has an in-memory
-round-trip test and a single-array file round-trip test, but nothing has scanned a
-compressor-produced v2 file with patches and slicing. Running the TPC-H query benchmark below
-against `vortex-v2/` is the correctness gate — it checks result row counts against
-`EXPECTED_ROW_COUNTS_SF1` — and should be done before this goes any further.
+These files were subsequently verified to read back correctly — see the next section.
+
+## Measured: TPC-H sf=1 correctness and query time
+
+`datafusion-bench tpch --formats vortex -i 10`, run against both directories on the same machine.
+
+**Correctness gate: passed.** All 22 queries returned the expected row counts against the v2 files
+(`runner.rs` asserts each query's count against `EXPECTED_ROW_COUNTS_SF1`, so a decode bug fails
+the run). This exercises compressor-produced v2 arrays through real scans — filters, projections,
+joins — including patches and slicing, which the unit tests do not cover.
+
+**Query time: within noise, do not quote these numbers.** Totals came out at -3.5% (v2 faster) at
+10 iterations, after +3.3% (v2 slower) at 3 iterations on the same files. Individual queries swung
+by ±40% between the two runs and disagreed on sign for most of them. This was measured on a shared
+4-core VM; it needs re-running on a quiet machine before anything is concluded.
+
+What *is* worth following up: four queries regressed in both runs, which is the pattern you would
+expect from v2's missing kernels rather than from noise — q16, q19, q20 (+21% at 10 iterations,
+the largest), q21. If a real regression survives a clean re-run, those queries name the columns
+whose filter/take kernels should be written first.
+
+The absence of a large overall regression is itself mildly surprising given that every filter and
+take over a v2 column currently canonicalises first. The likely explanation is that at sf=1 the
+smaller reads offset the fallback, which would not hold at larger scale factors or on a
+filter-heavy workload. Do not read it as evidence that the kernels are unnecessary.
 
 ## Benchmarks to run
 
@@ -196,8 +216,8 @@ Since v2 has no filter/take/compare kernels yet, this is expected to regress and
 measure by how much, and on which queries:
 
 ```bash
-cargo run --release -p datafusion-bench --features unstable_encodings -- \
-    --benchmark tpch --formats on-disk-vortex
+cargo build --release -p datafusion-bench --features unstable_encodings
+./target/release/datafusion-bench tpch --formats vortex -i 10 --hide-progress-bar
 ```
 
 Run it against both directories produced above (rename the one under test back to
