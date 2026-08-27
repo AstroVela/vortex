@@ -21,7 +21,6 @@ use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use url::Url;
-use vortex_bench::Benchmark;
 use vortex_bench::Format;
 use vortex_bench::SESSION;
 use vortex_datafusion::VortexFormat;
@@ -57,13 +56,6 @@ pub fn get_session_context() -> SessionContext {
     }
 
     SessionContext::new_with_state(session_state_builder.build())
-}
-
-/// Register functions required by one benchmark in a DataFusion session.
-pub fn setup_session(session: &SessionContext, benchmark: &dyn Benchmark) {
-    if benchmark.dataset_name() == "spatialbench" {
-        geodatafusion::register(session);
-    }
 }
 
 pub fn make_object_store(

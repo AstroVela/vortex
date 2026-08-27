@@ -89,13 +89,11 @@ def test_pr_target_selection() -> None:
     assert all(("datafusion", "lance") not in _targets(entry) for entry in pr_full.values())
     assert "vortex-compact" in cast("list[str]", pr_full["clickbench-nvme"]["data_formats"])
     assert _targets(pr_spatial["spatialbench-nvme"]) == {
-        ("datafusion", "parquet"),
-        ("datafusion", "vortex"),
         ("duckdb", "parquet"),
         ("duckdb", "vortex"),
         ("duckdb", "vortex-spatial-native"),
     }
-    assert pr_spatial["spatialbench-nvme"]["exclude_queries"] == "5,7,9"
+    assert "exclude_queries" not in pr_spatial["spatialbench-nvme"]
     for entry in pr_compact.values():
         targets = _targets(entry)
         assert {file_format for _engine, file_format in targets} == {"parquet", "vortex-compact"}

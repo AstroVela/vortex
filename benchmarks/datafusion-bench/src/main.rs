@@ -183,7 +183,6 @@ async fn main() -> anyhow::Result<()> {
                 let benchmark = &*benchmark;
                 async move {
                     let session = datafusion_bench::get_session_context();
-                    datafusion_bench::setup_session(&session, benchmark);
                     datafusion_bench::make_object_store(&session, benchmark.data_url())?;
                     register_benchmark_tables(&session, benchmark, format).await?;
                     Ok((session, format))

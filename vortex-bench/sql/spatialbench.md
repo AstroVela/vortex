@@ -1,12 +1,9 @@
 # SpatialBench benchmark
 
-The [Apache Sedona SpatialBench](https://sedona.apache.org/spatialbench/) spatial
-analytics benchmark has twelve queries over a trips/zones schema. The queries exercise spatial
-predicates and functions such as `ST_DWithin`, `ST_Intersects`, and `ST_Distance`.
+The [Apache Sedona SpatialBench](https://sedona.apache.org/spatialbench/) benchmark has twelve spatial analytics queries over a trips/zones schema.
 
 [`spatialbench/duckdb.sql`](./spatialbench/duckdb.sql) contains the DuckDB dialect.
-[`spatialbench/datafusion.sql`](./spatialbench/datafusion.sql) contains the equivalent DataFusion
-dialect. The query logic matches upstream `sedona-spatialbench`.
+The query logic matches upstream `sedona-spatialbench`.
 
 Engine dialects use the `sql/<benchmark>/<engine>.sql` path.
 The harness selects the matching file automatically.
@@ -19,21 +16,16 @@ The harness lives in [`src/spatialbench`](../src/spatialbench).
 vx-bench run spatialbench
 ```
 
-The default command compares Parquet and Vortex with DataFusion and DuckDB. To run the native
-Vortex spatial representation explicitly:
+The default command compares the Parquet and Vortex WKB representations with DuckDB.
+
+Run the native Vortex spatial representation:
 
 ```bash
 vx-bench run spatialbench --engine duckdb --format vortex-spatial-native
 ```
 
-To compare all three representations in one run:
+Compare all three representations:
 
 ```bash
 vx-bench run spatialbench --engine duckdb --format parquet,vortex,vortex-spatial-native
-```
-
-To compare DataFusion over Parquet and Vortex:
-
-```bash
-vx-bench run spatialbench --engine datafusion --format parquet,vortex
 ```

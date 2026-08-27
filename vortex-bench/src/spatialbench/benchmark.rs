@@ -207,12 +207,9 @@ mod tests {
         let benchmark = SpatialBenchBenchmark::new("0.6".to_string(), None)?;
 
         let duckdb = benchmark.query_corpus(Engine::DuckDB)?;
-        let datafusion = benchmark.query_corpus(Engine::DataFusion)?;
 
         assert_eq!(duckdb.len(), 12);
-        assert_eq!(datafusion.len(), 12);
         assert!(duckdb[0].1.contains("ST_X(t.t_pickuploc)"));
-        assert!(datafusion[0].1.contains("ST_GeomFromWKB"));
         Ok(())
     }
 }

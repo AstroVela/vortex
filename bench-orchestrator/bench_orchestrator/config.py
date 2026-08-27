@@ -86,7 +86,7 @@ ENGINE_FORMATS: dict[Engine, list[Format]] = {
 # Engines each benchmark can run on. Benchmarks default to every engine. Add an entry only to
 # restrict a benchmark.
 BENCHMARK_ENGINES: dict[Benchmark, frozenset[Engine]] = {
-    Benchmark.SPATIALBENCH: frozenset({Engine.DATAFUSION, Engine.DUCKDB}),
+    Benchmark.SPATIALBENCH: frozenset({Engine.DUCKDB}),
 }
 
 

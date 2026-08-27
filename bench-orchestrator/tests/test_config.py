@@ -57,7 +57,7 @@ def test_resolve_axis_targets_filters_unsupported_combinations() -> None:
     assert warnings == ["Format lance is not supported by engine duckdb"]
 
 
-def test_resolve_axis_targets_supports_spatialbench_datafusion() -> None:
+def test_resolve_axis_targets_skips_engines_a_benchmark_cannot_run() -> None:
     targets, warnings = resolve_axis_targets(
         [Engine.DATAFUSION, Engine.DUCKDB],
         [Format.PARQUET, Format.VORTEX],
@@ -65,12 +65,10 @@ def test_resolve_axis_targets_supports_spatialbench_datafusion() -> None:
     )
 
     assert targets == [
-        BenchmarkTarget(engine=Engine.DATAFUSION, format=Format.PARQUET),
-        BenchmarkTarget(engine=Engine.DATAFUSION, format=Format.VORTEX),
         BenchmarkTarget(engine=Engine.DUCKDB, format=Format.PARQUET),
         BenchmarkTarget(engine=Engine.DUCKDB, format=Format.VORTEX),
     ]
-    assert warnings == []
+    assert warnings == ["Benchmark spatialbench does not support engine datafusion"]
 
 
 def test_resolve_axis_targets_supports_spatialbench_three_lanes() -> None:
@@ -90,14 +88,14 @@ def test_resolve_axis_targets_supports_spatialbench_three_lanes() -> None:
     assert warnings == []
 
 
-def test_validate_targets_accepts_spatialbench_datafusion() -> None:
+def test_validate_targets_rejects_engine_a_benchmark_cannot_run() -> None:
     errors = validate_targets(
         [BenchmarkTarget(engine=Engine.DATAFUSION, format=Format.PARQUET)],
         {},
         Benchmark.SPATIALBENCH,
     )
 
-    assert errors == []
+    assert errors == ["Benchmark spatialbench does not support engine datafusion"]
 
 
 def test_validate_targets_rejects_remote_lance() -> None:

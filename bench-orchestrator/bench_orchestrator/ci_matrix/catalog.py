@@ -17,7 +17,7 @@ PRESETS = {
     "pr-compact": "Pull-request SQL benchmarks for Vortex Compact plus Parquet controls.",
     "pr-all": "The union of the focused PR and PR Compact benchmark matrices.",
     "pr-full": "Every regular SQL benchmark at full PR target coverage.",
-    "pr-spatial": "SpatialBench across DataFusion and DuckDB targets.",
+    "pr-spatial": "SpatialBench across DuckDB targets.",
     "nightly": "Large-scale SF=100 TPC-H on NVMe and S3 at default targets.",
 }
 
@@ -60,7 +60,7 @@ COMPACT_TARGETS = df(Format.PARQUET, Format.VORTEX_COMPACT) | duck(
     Format.VORTEX_COMPACT,
 )
 COMPACT_DUCKDB_TARGETS = duck(Format.PARQUET, Format.VORTEX_COMPACT)
-SPATIAL_TARGETS = df(Format.PARQUET, Format.VORTEX) | duck(
+SPATIAL_TARGETS = duck(
     Format.PARQUET,
     Format.VORTEX,
     Format.VORTEX_SPATIAL_NATIVE,
@@ -86,7 +86,6 @@ COMPACT_DUCKDB = Coverage(COMPACT_DUCKDB_TARGETS)
 SPATIAL = Coverage(
     SPATIAL_TARGETS,
     data_formats=(Format.PARQUET, Format.VORTEX, Format.VORTEX_SPATIAL_NATIVE),
-    exclude_queries=(5, 7, 9),
 )
 
 # Concrete benchmark cases
