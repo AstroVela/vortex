@@ -127,7 +127,24 @@ patch-value cut), dictionary referenced-values. **Gate (E4).**
 Per-conjunct estimator-driven admission weighting, just-in-time speculation horizon from measured
 latency and frontier velocity, pending-refiner discounts, re-cut thresholds. **Gate (E5).**
 
-## Experiments
+## Evaluation matrix
+
+The headline evaluation is a same-host, same-fixture comparison of four executors over the
+restricted real layout node set — **FLAT, CHUNKED, and STRUCT only, plus FILTER and
+CONJUNCT_PARALLEL** (every suite query already lowers to struct-of-chunked-flat columns with
+conjunct predicates, so no query changes are needed; list, dictionary, and ALP-RD gated planning
+stay out of the matrix and are evaluated separately in E4):
+
+| Row | Executor | Role |
+| --- | --- | --- |
+| A | V1 `LayoutReader` | semantic oracle and baseline; validates row counts and ordered hashes |
+| B | Self-paced **graph/reactor** (existing experimental code, single-coordinator and owned modes) | the dependency-graph-as-data comparator |
+| C | Self-paced **pipeline** mode | the fastest recorded stateful executor; the bar the new API must not regress |
+| D | **This prototype** (stateful execute spine + IO plane) | the system under test |
+
+Rows B and C are rerun on the measurement host, not quoted from the findings doc, so all four
+rows share hardware, fixtures, and iteration discipline. Every experiment below reports the full
+matrix unless it names a subset.
 
 All experiments record, per run: wall time, requests issued, bytes read, bytes cancelled
 pre-issue, speculative bytes wasted, demand-plane microseconds, per-morsel use counts, wake
@@ -137,12 +154,15 @@ under the fair contract.
 ### E1: overhead parity on local NVMe (gate for P1)
 
 *Hypothesis:* the trait seam costs nothing; the stateful spine reproduces pipeline-mode
-performance.
+performance and preserves the measured ordering D ≈ C < B(owned) < B(coordinator), with V1
+between B's two modes.
 
-Run the full 42-workload suite (18 FineWeb, 3 TPC-H, 21 ClickBench). Success: geometric means
-within 5% of the recorded pipeline results (~0.33 FineWeb, ~0.6 ClickBench vs V1), and a Q09
-rerun (byte-identical IO by construction) shows the same scheduling-unit win. A miss localizes
-to the trait dispatch or arena layout and must be profiled before proceeding.
+Run the full 42-workload suite (18 FineWeb, 3 TPC-H, 21 ClickBench) across the whole matrix.
+Success: D's geometric means within 5% of C's same-host rerun (~0.33 FineWeb, ~0.6 ClickBench vs
+V1 in the recorded results), and a Q09 rerun (byte-identical IO by construction across all four
+rows) reproduces the scheduling-unit attribution — D and C beat A and B with equal physical
+work. A miss localizes to the trait dispatch or arena layout and must be profiled before
+proceeding.
 
 ### E2: does the IO plane earn its overhead? (gate for P2)
 
@@ -151,11 +171,14 @@ amount that grows with latency, and on NVMe the floor bypass keeps it at E1 pari
 
 Grid: {inline-only, IO plane with bypass, IO plane forced (no bypass)} x {0, 1, 10, 50 ms} over
 a latency-sensitive subset (FineWeb Q06, Q09, Q10; TPC-H Q6; ClickBench dashboard plus two
-selective shapes). Success: forced-plane at 0 ms costs <5% vs inline (bounds the reification
-tax); with-bypass at 0 ms is at parity; at 10 ms+ the plane wins materially on every shape with
-overlappable IO, on both wall time and time-to-first-batch. Also record queue dwell and admission
-loop occupancy to confirm no coordinator-style serial section reappears (admission busy <10% of
-one core).
+selective shapes), with rows A and B run at each latency point as external references — the
+graph row is the interesting comparator here, since request visibility is the one thing it
+bought. Success: forced-plane at 0 ms costs <5% vs inline (bounds the reification tax);
+with-bypass at 0 ms is at parity; at 10 ms+ the plane wins materially on every shape with
+overlappable IO, on both wall time and time-to-first-batch, and D at 10 ms+ is at least at
+parity with B — showing the IO plane recovers the graph's latency-hiding without its CPU
+bookkeeping. Also record queue dwell and admission loop occupancy to confirm no
+coordinator-style serial section reappears (admission busy <10% of one core).
 
 ### E3: demand value and speculation pricing (with P2)
 
