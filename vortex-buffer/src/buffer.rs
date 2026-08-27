@@ -376,7 +376,7 @@ impl<T> Buffer<T> {
 
         if !self.alignment.is_aligned_to(alignment) {
             vortex_panic!(
-                "Slice alignment {alignment} must not be stronger than buffer alignment {}",
+                "Slice alignment {alignment} must not be wider than buffer alignment {}",
                 self.alignment
             );
         }
