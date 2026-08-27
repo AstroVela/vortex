@@ -302,7 +302,6 @@ impl VTable for BitPackedV2 {
 pub struct BitPackedV2;
 
 impl BitPackedV2 {
-    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         packed: BufferHandle,
         bit_widths: BufferHandle,
