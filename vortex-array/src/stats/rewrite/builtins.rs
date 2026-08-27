@@ -556,11 +556,9 @@ impl NonNanProof for NanCountProof {
     const EMIT_UNGUARDED_REWRITES: bool = true;
 
     fn check(ctx: &StatsRewriteCtx<'_>, expr: &BoundExpression) -> VortexResult<NanCheck> {
-        non_nan_check(ctx, expr, |expr| {
-            match stat_expr(expr, Stat::NaNCount, ctx) {
-                Some(nan_count) => NanCheck::Check(eq(nan_count, lit(0u64))),
-                None => NanCheck::Unavailable,
-            }
+        non_nan_check(expr, |expr| match stat_expr(expr, Stat::NaNCount, ctx) {
+            Some(nan_count) => NanCheck::Check(eq(nan_count, lit(0u64))),
+            None => NanCheck::Unavailable,
         })
     }
 }
@@ -570,8 +568,8 @@ struct AllNonNanProof;
 impl NonNanProof for AllNonNanProof {
     const EMIT_UNGUARDED_REWRITES: bool = false;
 
-    fn check(ctx: &StatsRewriteCtx<'_>, expr: &BoundExpression) -> VortexResult<NanCheck> {
-        non_nan_check(ctx, expr, |expr| {
+    fn check(_ctx: &StatsRewriteCtx<'_>, expr: &BoundExpression) -> VortexResult<NanCheck> {
+        non_nan_check(expr, |expr| {
             NanCheck::Check(stat_fn(expr.clone(), AllNonNan.bind(AggregateEmptyOptions)))
         })
     }
@@ -581,7 +579,6 @@ impl NonNanProof for AllNonNanProof {
 // candidate value is known to be non-NaN. Cast result dtypes are not enough: a cast
 // from float to non-float still needs a proof about the float source values.
 fn non_nan_check(
-    ctx: &StatsRewriteCtx<'_>,
     expr: &BoundExpression,
     proof: impl FnOnce(&BoundExpression) -> NanCheck,
 ) -> VortexResult<NanCheck> {
@@ -597,14 +594,14 @@ fn non_nan_check(
     }
 
     if expr.is::<Cast>() {
-        if !has_nans(&ctx.return_dtype(expr.child(0))?) {
+        if !has_nans(expr.child(0).dtype()) {
             return Ok(NanCheck::NotNeeded);
         }
 
-        return non_nan_check(ctx, expr.child(0), proof);
+        return non_nan_check(expr.child(0), proof);
     }
 
-    if !has_nans(&ctx.return_dtype(expr)?) {
+    if !has_nans(expr.dtype()) {
         return Ok(NanCheck::NotNeeded);
     }
 
@@ -639,9 +636,8 @@ fn stat_expr(
     // The aggregate may not support the expression's dtype, e.g. min/max over structs,
     // even when the predicate itself is well-typed. Such stats cannot be lowered later,
     // so do not reference them in the rewrite.
-    let input_dtype = ctx.return_dtype(expr).ok()?;
     aggregate_fn
-        .return_dtype(&input_dtype)
+        .return_dtype(expr.dtype())
         .is_some()
         .then(|| stat_fn(expr.clone(), aggregate_fn))
 }

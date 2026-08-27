@@ -41,8 +41,8 @@ pub type StatsRewriteRuleRef = Arc<dyn StatsRewriteRule>;
 /// `OR`, so every proof returned by an individual rule must be sound on its own.
 ///
 /// `expr` is the full predicate expression whose root scalar function id is
-/// [`Self::scalar_fn_id`]. Use [`StatsRewriteCtx`] to resolve dtypes and recursively rewrite child
-/// predicates.
+/// [`Self::scalar_fn_id`]. Read dtypes from [`BoundExpression::dtype`], and use
+/// [`StatsRewriteCtx`] to recursively rewrite child predicates.
 pub trait StatsRewriteRule: Debug + Send + Sync + 'static {
     /// Returns the scalar function id handled by this rule.
     fn scalar_fn_id(&self) -> ScalarFnId;
@@ -101,11 +101,6 @@ impl<'a> StatsRewriteCtx<'a> {
         self.session
     }
 
-    /// Return the dtype of `expr` within this rewrite scope.
-    pub fn return_dtype(&self, expr: &BoundExpression) -> VortexResult<DType> {
-        Ok(expr.dtype().clone())
-    }
-
     /// Rewrite `expr` into a stats-backed falsifier.
     pub fn falsify(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
         self.ensure_predicate(expr)?;
@@ -119,7 +114,7 @@ impl<'a> StatsRewriteCtx<'a> {
     }
 
     fn ensure_predicate(&self, expr: &BoundExpression) -> VortexResult<()> {
-        let dtype = self.return_dtype(expr)?;
+        let dtype = expr.dtype();
         vortex_ensure!(
             matches!(dtype, DType::Bool(_)),
             "Stats rewrites require a boolean predicate, got {dtype}",
