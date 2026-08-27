@@ -16,10 +16,21 @@ use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
 /// A future that resolves to a mask.
+///
+/// Masks that are known up-front (e.g. scans without a filter) are stored resolved, so awaiting,
+/// cloning, and slicing them never allocates a boxed future.
 #[derive(Clone)]
 pub struct MaskFuture {
-    inner: Shared<BoxFuture<'static, SharedVortexResult<Mask>>>,
+    inner: Inner,
     len: usize,
+}
+
+#[derive(Clone)]
+enum Inner {
+    /// The mask is already resolved.
+    Ready(Mask),
+    /// The mask is still being computed.
+    Pending(Shared<BoxFuture<'static, SharedVortexResult<Mask>>>),
 }
 
 impl MaskFuture {
@@ -29,8 +40,8 @@ impl MaskFuture {
         F: Future<Output = VortexResult<Mask>> + Send + 'static,
     {
         Self {
-            inner: fut
-                .inspect(move |r| {
+            inner: Inner::Pending(
+                fut.inspect(move |r| {
                     if let Ok(mask) = r
                         && mask.len() != len {
                             vortex_panic!("MaskFuture created with future that returned mask of incorrect length (expected {}, got {})", len, mask.len());
@@ -39,6 +50,7 @@ impl MaskFuture {
                 .map_err(Arc::new)
                 .boxed()
                 .shared(),
+            ),
             len,
         }
     }
@@ -55,7 +67,10 @@ impl MaskFuture {
 
     /// Create a MaskFuture from a ready mask.
     pub fn ready(mask: Mask) -> Self {
-        Self::new(mask.len(), async move { Ok(mask) })
+        Self {
+            len: mask.len(),
+            inner: Inner::Ready(mask),
+        }
     }
 
     /// Create a MaskFuture that resolves to a mask with all values set to true.
@@ -65,25 +80,42 @@ impl MaskFuture {
 
     /// Create a MaskFuture that resolves to a slice of the original mask.
     pub fn slice(&self, range: Range<usize>) -> Self {
-        // Slicing the whole mask is the identity. Cloning shares the existing future instead of
-        // allocating another boxed, shared one that would await it only to hand the mask back.
+        // Slicing the whole mask is the identity. Cloning shares the existing state instead of
+        // allocating another boxed, shared future that would await it only to hand the mask back.
         if range.start == 0 && range.end == self.len {
             return self.clone();
         }
 
-        let inner = self.inner.clone();
-        Self::new(range.len(), async move { Ok(inner.await?.slice(range)) })
+        match &self.inner {
+            Inner::Ready(mask) => Self::ready(mask.slice(range)),
+            Inner::Pending(inner) => {
+                let inner = inner.clone();
+                Self::new(range.len(), async move { Ok(inner.await?.slice(range)) })
+            }
+        }
     }
 
+    /// Observe the resolved mask.
+    ///
+    /// An already-resolved mask calls `f` immediately rather than deferring it to the first poll.
     pub fn inspect(
         self,
         f: impl FnOnce(&SharedVortexResult<Mask>) + 'static + Send + Sync,
     ) -> Self {
         let len = self.len;
 
-        Self {
-            inner: self.inner.inspect(f).boxed().shared(),
-            len,
+        match self.inner {
+            Inner::Ready(mask) => {
+                f(&Ok(mask.clone()));
+                Self {
+                    inner: Inner::Ready(mask),
+                    len,
+                }
+            }
+            Inner::Pending(inner) => Self {
+                inner: Inner::Pending(inner.inspect(f).boxed().shared()),
+                len,
+            },
         }
     }
 }
@@ -95,12 +127,18 @@ impl Future for MaskFuture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        self.inner.poll_unpin(cx).map_err(VortexError::from)
+        match &mut self.inner {
+            Inner::Ready(mask) => std::task::Poll::Ready(Ok(mask.clone())),
+            Inner::Pending(inner) => inner.poll_unpin(cx).map_err(VortexError::from),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
     use vortex_buffer::BitBuffer;
 
     use super::*;
@@ -120,6 +158,43 @@ mod tests {
             let partial = fut.slice(0..mask.len() - 1);
             assert_eq!(partial.len(), mask.len() - 1);
             assert_eq!(partial.await?, mask.slice(0..mask.len() - 1));
+            Ok(())
+        })
+    }
+
+    /// Ready and pending variants must behave identically through slice and await.
+    #[test]
+    fn pending_slice_matches_ready_slice() -> VortexResult<()> {
+        futures::executor::block_on(async {
+            let mask = Mask::from_buffer(BitBuffer::from_iter([true, false, true, true, false]));
+            let ready = MaskFuture::ready(mask.clone());
+            let pending = {
+                let mask = mask.clone();
+                MaskFuture::new(mask.len(), async move { Ok(mask) })
+            };
+
+            assert_eq!(ready.slice(1..4).await?, pending.slice(1..4).await?);
+            assert_eq!(ready.clone().await?, pending.clone().await?);
+            Ok(())
+        })
+    }
+
+    /// Inspect fires for an already-resolved mask and preserves the resolved value.
+    #[test]
+    fn inspect_fires_on_ready_mask() -> VortexResult<()> {
+        futures::executor::block_on(async {
+            let mask = Mask::from_buffer(BitBuffer::from_iter([true, false]));
+            let fired = Arc::new(AtomicBool::new(false));
+            let fut = MaskFuture::ready(mask.clone()).inspect({
+                let fired = Arc::clone(&fired);
+                move |r| {
+                    assert!(r.is_ok());
+                    fired.store(true, Ordering::Relaxed);
+                }
+            });
+
+            assert!(fired.load(Ordering::Relaxed));
+            assert_eq!(fut.await?, mask);
             Ok(())
         })
     }
