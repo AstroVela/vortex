@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Microbenchmarks for [`ZoneMap::prune`].
+//! Microbenchmarks for zoned pruning.
 //!
-//! Each case pre-falsifies its predicate so the timed region covers exactly what `prune` does:
-//! lowering the stats placeholders against the zone map, then evaluating the result per zone.
+//! Each case pre-falsifies its predicate, then runs it two ways over the same zone map:
+//!
+//! - `prune`: lower the stats placeholders against the zone map, then evaluate per zone.
+//! - `prepared`: lower once up front, then time only the per-zone evaluation.
+//!
+//! The gap between the two groups is the repeated lowering cost that readers pay when they
+//! re-prune, such as when a dynamic predicate tightens.
 
 #![expect(clippy::unwrap_used)]
 
@@ -256,6 +261,7 @@ fn falsify(expr: Expression, column_dtype: &DType) -> BoundExpression {
         .unwrap()
 }
 
+/// Time `prune`, which lowers the predicate against the zone map on every call.
 fn run(bencher: Bencher, zone_map: ZoneMap, predicate: BoundExpression) {
     bencher.bench(|| {
         divan::black_box(
@@ -266,69 +272,130 @@ fn run(bencher: Bencher, zone_map: ZoneMap, predicate: BoundExpression) {
     });
 }
 
-/// Integer range predicate: binds to `max` only, no row count, no NaN guard.
-#[divan::bench(args = ZONE_COUNTS)]
-fn int_gt(bencher: Bencher, num_zones: usize) {
-    static PREDICATE: LazyLock<BoundExpression> =
-        LazyLock::new(|| falsify(gt(root(), lit(5_000i32)), &i32_dtype()));
-    run(
-        bencher,
-        numeric_zone_map(i32_dtype(), num_zones),
-        PREDICATE.clone(),
-    );
+/// Time evaluation alone, with the predicate lowered once outside the timed region.
+fn run_prepared(bencher: Bencher, zone_map: ZoneMap, predicate: BoundExpression) {
+    let prepared = zone_map.prepare(&predicate).unwrap();
+    bencher.bench(|| divan::black_box(prepared.evaluate(&SESSION).unwrap()));
 }
+
+/// Integer range predicate: binds to `max` only, no row count, no NaN guard.
+static INT_GT: LazyLock<BoundExpression> =
+    LazyLock::new(|| falsify(gt(root(), lit(5_000i32)), &i32_dtype()));
 
 /// Float range predicate: the NaN-guarded and unguarded rules both fire, and on a zone map that
 /// stores `nan_count` they lower to the same expression.
-#[divan::bench(args = ZONE_COUNTS)]
-fn float_gt(bencher: Bencher, num_zones: usize) {
-    static PREDICATE: LazyLock<BoundExpression> =
-        LazyLock::new(|| falsify(gt(root(), lit(5_000f64)), &f64_dtype()));
-    run(
-        bencher,
-        numeric_zone_map(f64_dtype(), num_zones),
-        PREDICATE.clone(),
-    );
-}
+static FLOAT_GT: LazyLock<BoundExpression> =
+    LazyLock::new(|| falsify(gt(root(), lit(5_000f64)), &f64_dtype()));
 
 /// Null predicate: lowers to `null_count == row_count`, exercising the row-count path.
-#[divan::bench(args = ZONE_COUNTS)]
-fn is_not_null_pred(bencher: Bencher, num_zones: usize) {
-    static PREDICATE: LazyLock<BoundExpression> =
-        LazyLock::new(|| falsify(is_not_null(root()), &i32_dtype()));
-    run(
-        bencher,
-        numeric_zone_map(i32_dtype(), num_zones),
-        PREDICATE.clone(),
-    );
-}
+static IS_NOT_NULL: LazyLock<BoundExpression> =
+    LazyLock::new(|| falsify(is_not_null(root()), &i32_dtype()));
 
 /// A 16-term `OR` chain, which is where lowering cost grows relative to evaluation cost.
-#[divan::bench(args = ZONE_COUNTS)]
-fn or_chain(bencher: Bencher, num_zones: usize) {
-    static PREDICATE: LazyLock<BoundExpression> = LazyLock::new(|| {
-        let expr = (0..16i32)
-            .map(|i| eq(root(), lit(i * 500)))
-            .reduce(or)
-            .unwrap();
-        falsify(expr, &i32_dtype())
-    });
-    run(
-        bencher,
-        numeric_zone_map(i32_dtype(), num_zones),
-        PREDICATE.clone(),
-    );
+static OR_CHAIN: LazyLock<BoundExpression> = LazyLock::new(|| {
+    let expr = (0..16i32)
+        .map(|i| eq(root(), lit(i * 500)))
+        .reduce(or)
+        .unwrap();
+    falsify(expr, &i32_dtype())
+});
+
+mod prune {
+    use super::*;
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn int_gt(bencher: Bencher, num_zones: usize) {
+        run(
+            bencher,
+            numeric_zone_map(i32_dtype(), num_zones),
+            INT_GT.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn float_gt(bencher: Bencher, num_zones: usize) {
+        run(
+            bencher,
+            numeric_zone_map(f64_dtype(), num_zones),
+            FLOAT_GT.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn is_not_null_pred(bencher: Bencher, num_zones: usize) {
+        run(
+            bencher,
+            numeric_zone_map(i32_dtype(), num_zones),
+            IS_NOT_NULL.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn or_chain(bencher: Bencher, num_zones: usize) {
+        run(
+            bencher,
+            numeric_zone_map(i32_dtype(), num_zones),
+            OR_CHAIN.clone(),
+        );
+    }
+
+    /// The zone map lacks min/max, so every proof binds to a null literal and the lowered
+    /// predicate is constant.
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn missing_stats(bencher: Bencher, num_zones: usize) {
+        run(
+            bencher,
+            counts_only_zone_map(i32_dtype(), num_zones),
+            INT_GT.clone(),
+        );
+    }
 }
 
-/// The zone map lacks min/max, so every proof binds to a null literal and the lowered predicate is
-/// constant.
-#[divan::bench(args = ZONE_COUNTS)]
-fn missing_stats(bencher: Bencher, num_zones: usize) {
-    static PREDICATE: LazyLock<BoundExpression> =
-        LazyLock::new(|| falsify(gt(root(), lit(5_000i32)), &i32_dtype()));
-    run(
-        bencher,
-        counts_only_zone_map(i32_dtype(), num_zones),
-        PREDICATE.clone(),
-    );
+mod prepared {
+    use super::*;
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn int_gt(bencher: Bencher, num_zones: usize) {
+        run_prepared(
+            bencher,
+            numeric_zone_map(i32_dtype(), num_zones),
+            INT_GT.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn float_gt(bencher: Bencher, num_zones: usize) {
+        run_prepared(
+            bencher,
+            numeric_zone_map(f64_dtype(), num_zones),
+            FLOAT_GT.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn is_not_null_pred(bencher: Bencher, num_zones: usize) {
+        run_prepared(
+            bencher,
+            numeric_zone_map(i32_dtype(), num_zones),
+            IS_NOT_NULL.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn or_chain(bencher: Bencher, num_zones: usize) {
+        run_prepared(
+            bencher,
+            numeric_zone_map(i32_dtype(), num_zones),
+            OR_CHAIN.clone(),
+        );
+    }
+
+    #[divan::bench(args = ZONE_COUNTS)]
+    fn missing_stats(bencher: Bencher, num_zones: usize) {
+        run_prepared(
+            bencher,
+            counts_only_zone_map(i32_dtype(), num_zones),
+            INT_GT.clone(),
+        );
+    }
 }

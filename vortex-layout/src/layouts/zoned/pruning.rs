@@ -33,6 +33,7 @@ use crate::Layout;
 use crate::LazyReaderChildren;
 use crate::VTable;
 use crate::layouts::zoned::ZonedData;
+use crate::layouts::zoned::zone_map::PreparedPruning;
 use crate::layouts::zoned::zone_map::ZoneMap;
 
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
@@ -102,16 +103,22 @@ impl PruningState {
                         Some(
                             async move {
                                 let zone_map = zone_map.await?;
-                                let initial_mask =
-                                    zone_map.prune(&predicate, &session).map_err(|err| {
-                                        err.with_context(format!(
+                                let context = || {
+                                    format!(
                                         "While evaluating pruning predicate {} (derived from {})",
                                         predicate, expr
-                                    ))
-                                    })?;
+                                    )
+                                };
+
+                                let prepared = zone_map
+                                    .prepare(&predicate)
+                                    .map_err(|err| err.with_context(context()))?;
+                                let initial_mask = prepared
+                                    .evaluate(&session)
+                                    .map_err(|err| err.with_context(context()))?;
+
                                 Ok(Arc::new(PruningResult {
-                                    zone_map,
-                                    predicate,
+                                    prepared,
                                     dynamic_updates,
                                     latest_result: RwLock::new((0, initial_mask)),
                                     session,
@@ -190,8 +197,8 @@ impl PruningState {
 }
 
 pub(super) struct PruningResult {
-    zone_map: ZoneMap,
-    predicate: BoundExpression,
+    // The pruning predicate, lowered once against the zone map.
+    prepared: PreparedPruning,
     dynamic_updates: Option<DynamicExprUpdates>,
     latest_result: RwLock<(u64, Mask)>,
     session: VortexSession,
@@ -219,19 +226,16 @@ impl PruningResult {
 
         trace!(
             version,
-            predicate = %self.predicate,
+            predicate = %self.prepared.predicate(),
             "recomputing pruning mask"
         );
 
-        let next_mask = self
-            .zone_map
-            .prune(&self.predicate, &self.session)
-            .map_err(|err| {
-                err.with_context(format!(
-                    "While evaluating pruning predicate {}",
-                    self.predicate
-                ))
-            })?;
+        let next_mask = self.prepared.evaluate(&self.session).map_err(|err| {
+            err.with_context(format!(
+                "While evaluating pruning predicate {}",
+                self.prepared.predicate()
+            ))
+        })?;
         *guard = (version, next_mask.clone());
 
         Ok(next_mask)
