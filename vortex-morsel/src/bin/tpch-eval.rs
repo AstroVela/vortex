@@ -38,6 +38,7 @@ use vortex_morsel::harness::assert_same_rows;
 use vortex_morsel::harness::run_morsel;
 use vortex_morsel::harness::run_v1;
 use vortex_morsel::harness::run_v1_tokio;
+use vortex_morsel::harness::run_v1_tokio_with;
 use vortex_morsel::nodes::ConjunctMode;
 use vortex_morsel::tpch;
 use vortex_session::VortexSession;
@@ -176,6 +177,12 @@ fn main() -> VortexResult<()> {
 
     let queries = tpch::lineitem_queries(fixture.layout.dtype())?;
 
+    // Sweep mode: thread-scaling curves and a morsel-size sweep, to decompose *why* the
+    // four-thread rows win rather than only reporting that they do.
+    if std::env::var("TPCH_SWEEP").is_ok_and(|v| v == "1") {
+        return sweep(&runtime, &session, &fixture, &segments, &queries, threads);
+    }
+
     let configs = |threads: usize| {
         vec![
             Row::V1Single,
@@ -271,6 +278,163 @@ fn main() -> VortexResult<()> {
 /// A whole-row projection, used only to count the file's natural splits for the header line.
 fn queries_probe() -> vortex_array::expr::Expression {
     vortex_array::expr::root()
+}
+
+/// Decompose the four-thread win, and probe oversubscription.
+///
+/// This host reports `Thread(s) per core: 1`, so physical and logical cores are the same number
+/// and "one driving thread per physical core" is exactly the `D x4` row. What that leaves open is
+/// whether going *past* one thread per core helps. It matters because the two executors sit at
+/// very different points already: the morsel driver runs one morsel per thread, so four threads
+/// means four concurrent units, while V1 spawns `concurrency` split tasks per worker (default 4),
+/// so four workers means sixteen concurrent units on four threads. V1 is already heavily
+/// oversubscribed at the task level; the morsel driver is not oversubscribed at all.
+fn sweep(
+    runtime: &tokio::runtime::Runtime,
+    session: &VortexSession,
+    fixture: &vortex_morsel::fixtures::Fixture,
+    segments: &Arc<dyn SegmentSource>,
+    queries: &[Query],
+    cores: usize,
+) -> VortexResult<()> {
+    println!("## Driving threads vs cores ({cores} physical cores, 1 thread per core)");
+    println!();
+    println!(
+        "Morsel driver: one morsel in flight per thread. `x{cores}` is one thread per physical \
+         core; beyond that the host is oversubscribed."
+    );
+    println!();
+
+    let thread_counts = [1usize, 2, cores, cores * 2, cores * 4];
+    print!("| query |");
+    for n in &thread_counts {
+        print!(" D x{n} |");
+    }
+    println!(" best | vs D x{cores} |");
+    print!("|---|");
+    for _ in 0..thread_counts.len() + 2 {
+        print!("--:|");
+    }
+    println!();
+
+    for query in queries {
+        let mut walls = Vec::new();
+        for &n in &thread_counts {
+            walls.push(median(ITERATIONS, || {
+                run_morsel(
+                    session,
+                    &fixture.layout,
+                    segments,
+                    query,
+                    MorselConfig {
+                        threads: n,
+                        ..Default::default()
+                    },
+                )
+            })?);
+        }
+        let at_cores = walls[2];
+        let best = walls
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, w)| **w)
+            .map(|(idx, w)| (thread_counts[idx], *w))
+            .unwrap_or((cores, at_cores));
+        print!("| {} |", query.name);
+        for wall in &walls {
+            print!(" {} |", millis(*wall));
+        }
+        println!(
+            " x{} | {:.2}x |",
+            best.0,
+            best.1.as_secs_f64() / at_cores.as_secs_f64()
+        );
+    }
+    println!();
+
+    println!("## V1 concurrent units: {cores} workers x per-worker split concurrency");
+    println!();
+    println!(
+        "V1's parallelism is workers x concurrency. This sweeps the second factor to check the \
+         baseline is not simply mis-tuned."
+    );
+    println!();
+    print!("| query | V1 x1 |");
+    for c in [1usize, 2, 4, 8, 16] {
+        print!(" tok{cores} c={c} |");
+    }
+    println!(" best |");
+    print!("|---|--:|");
+    for _ in 0..6 {
+        print!("--:|");
+    }
+    println!();
+
+    for query in queries {
+        let single = median(ITERATIONS, || {
+            run_v1(session, &fixture.layout, segments, query)
+        })?;
+        let mut walls = Vec::new();
+        for c in [1usize, 2, 4, 8, 16] {
+            walls.push(median(ITERATIONS, || {
+                run_v1_tokio_with(runtime, session, &fixture.layout, segments, query, Some(c))
+            })?);
+        }
+        let best = walls.iter().copied().min().unwrap_or(single);
+        print!("| {} | {} |", query.name, millis(single));
+        for wall in &walls {
+            print!(" {} |", millis(*wall));
+        }
+        println!(" {} |", millis(best));
+    }
+    println!();
+
+    println!("## Morsel size at {cores} threads");
+    println!();
+    println!("| query | morsels@splits | splits | 16k | 64k | 256k | 1M |");
+    println!("|---|--:|--:|--:|--:|--:|--:|");
+    for query in queries {
+        let mut cells = Vec::new();
+        let mut morsel_count = 0;
+        for size in [0u64, 16_384, 65_536, 262_144, 1_048_576] {
+            let config = MorselConfig {
+                threads: cores,
+                morsel_rows: size,
+                ..Default::default()
+            };
+            if size == 0 {
+                morsel_count = run_morsel(session, &fixture.layout, segments, query, config)?
+                    .stats
+                    .as_ref()
+                    .map(|s| s.morsels)
+                    .unwrap_or(0);
+            }
+            let wall = median(ITERATIONS, || {
+                run_morsel(session, &fixture.layout, segments, query, config)
+            })?;
+            cells.push(millis(wall));
+        }
+        println!(
+            "| {} | {} | {} |",
+            query.name,
+            morsel_count,
+            cells.join(" | ")
+        );
+    }
+    println!();
+    Ok(())
+}
+
+fn median(
+    iterations: usize,
+    mut run: impl FnMut() -> VortexResult<RunOutcome>,
+) -> VortexResult<Duration> {
+    let mut walls = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        walls.push(run()?.wall);
+    }
+    walls.sort_unstable();
+    Ok(walls[walls.len() / 2])
 }
 
 fn run_once(

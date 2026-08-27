@@ -62,8 +62,9 @@ closing it is prerequisite to any production comparison. It is not folded into a
 
 ## Results, SF=1
 
-4 logical cores, segments in memory, 5 alternating iterations, median. Ratios against V1
-single-threaded.
+4 physical cores (no hyperthreading), segments in memory, 5 alternating iterations, median.
+Ratios against V1 single-threaded. Note that single-query differences under ~20% are within this
+host's run-to-run noise — Q15's V1 single-thread time varied 17.1 to 23.9 ms across runs.
 
 | query | V1 x1 | V1 tok4 | D x1 | D x1 no-reuse | D x4 | D x4 64k |
 |---|--:|--:|--:|--:|--:|--:|
@@ -77,6 +78,52 @@ single-threaded.
 | selective | 22.4 ms | 0.43x | 0.87x | 0.86x | 0.29x | 0.29x |
 | **geomean** | — | **0.48x** | **0.75x** | 0.76x | **0.31x** | **0.26x** |
 
+### Why the four-thread rows win
+
+Measured by sweeping both executors rather than asserted
+([sweep output](morsel-prototype-tpch-sweep.md)). V1 is tuned to its *best* per-worker split
+concurrency first, so this is not a straw man — its default of 4 is slightly under-tuned and
+c=16 is better on every query.
+
+| query | D 1thr ÷ V1 1thr | D scaling, 4 cores | V1 scaling, 4 cores | D x4 ÷ V1 best |
+|---|--:|--:|--:|--:|
+| Q6 | 0.92x | 3.66x | 3.26x | 0.82x |
+| Q1 | 0.83x | 3.14x | 2.22x | 0.59x |
+| Q14 | 0.84x | 3.26x | 2.50x | 0.64x |
+| Q15 | 0.61x | 3.31x | 4.00x | 0.74x |
+| Q12 | 0.84x | 3.69x | 3.27x | 0.74x |
+| Q19 | 0.60x | 2.21x | 1.76x | 0.48x |
+| scan-6col | 0.47x | 1.58x | 1.12x | 0.33x |
+| selective | 0.85x | 3.42x | 3.01x | 0.75x |
+| **geomean** | **0.73x** | **2.93x** | **2.47x** | **0.61x** |
+
+The win decomposes as **~75% single-thread base advantage, ~25% better scaling**:
+0.73 x (2.47 / 2.93) = 0.61.
+
+**It is not oversubscription.** This host reports `Thread(s) per core: 1`, so `D x4` is exactly
+one driving thread per physical core, and that is optimal on seven of the eight queries — x8
+costs ~10%, x16 ~20%. Meanwhile V1 reaches its best at 4 workers x concurrency 16, i.e. **64
+in-flight split tasks against the morsel driver's 4 morsels**. The morsel driver needs 16x fewer
+concurrent units and still wins, because it does more useful work per scheduling unit rather than
+relying on latency hiding to keep cores fed. With in-memory segments there is no IO latency to
+hide; whether that holds against real storage is exactly what gate E2 exists to answer.
+
+### Morsel coalescing does *not* generally help
+
+Excluding Q19, coalescing to 64k-row morsels is **1.02x — no effect at all**. The whole of the
+`D x4 64k` geomean advantage is Q19, at 0.42x:
+
+```text
+Q19, per-split morsels: 366 morsels, 11.20 ms
+Q19, 64k morsels:        92 morsels,  4.69 ms
+```
+
+Q19 is the only query whose columns misalign, for the same reason its decode sharing fires: its
+string columns compress to sizes that land on different block boundaries, giving it 366 natural
+splits where every other query has 92. Past 64k rows coalescing turns harmful — Q12 goes from
+9.3 ms to 22.7 ms at 1M-row morsels, because a morsel that large stops fitting the working-set
+bound the design's law 8 assumes.
+
 ### The headline, stated at equal core count
 
 The honest comparison is like for like on threads:
@@ -88,8 +135,8 @@ The honest comparison is like for like on threads:
 | **morsel speedup** | **1.33x** | **1.55x** |
 
 The morsel executor is ~1.3x faster than V1 single-threaded and ~1.5x faster at four cores, on
-real TPC-H with real encodings. With coalesced 64k-row morsels the four-thread figure is 0.26x,
-i.e. 1.85x faster than V1 at the same core count.
+real TPC-H with real encodings. The 0.26x for coalesced 64k-row morsels is a
+Q19 artifact, not a general result — see the coalescing section above.
 
 ### The number that dropped, and why
 

@@ -128,6 +128,22 @@ pub fn run_v1_tokio(
     segments: &Arc<dyn SegmentSource>,
     query: &Query,
 ) -> VortexResult<RunOutcome> {
+    run_v1_tokio_with(runtime, session, layout, segments, query, None)
+}
+
+/// Run V1 on Tokio with an explicit per-worker split concurrency.
+///
+/// V1's parallelism has two knobs: the runtime's worker count, and how many splits each worker
+/// keeps in flight (`concurrency`, default 4). The product is V1's real concurrent-unit count,
+/// which is what to compare against the morsel driver's thread count.
+pub fn run_v1_tokio_with(
+    runtime: &tokio::runtime::Runtime,
+    session: &VortexSession,
+    layout: &LayoutRef,
+    segments: &Arc<dyn SegmentSource>,
+    query: &Query,
+    concurrency: Option<usize>,
+) -> VortexResult<RunOutcome> {
     let reader = layout.new_reader(
         "morsel-harness".into(),
         Arc::clone(segments),
@@ -145,11 +161,14 @@ pub fn run_v1_tokio(
     let start = Instant::now();
     let (batches, first) = runtime.block_on(async move {
         let session = session.with_handle(TokioRuntime::current());
-        let stream = ScanBuilder::new(session, reader)
+        let mut builder = ScanBuilder::new(session, reader)
             .with_projection(projection)
             .with_some_filter(filter)
-            .with_ordered(true)
-            .into_stream()?;
+            .with_ordered(true);
+        if let Some(concurrency) = concurrency {
+            builder = builder.with_concurrency(concurrency);
+        }
+        let stream = builder.into_stream()?;
         futures::pin_mut!(stream);
 
         let mut batches: Vec<ArrayRef> = Vec::new();

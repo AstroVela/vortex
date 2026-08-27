@@ -36,6 +36,8 @@ portions of Q1/Q6/Q12/Q14/Q15/Q19 — is measured in
 [real TPC-H results](morsel-prototype-tpch-findings.md): the prototype is ~1.3x faster than V1 at
 one thread and ~1.5x at four, and the cross-morsel decode reuse that mattered on synthetic
 fixtures turns out to be neutral on a real file except on width-divergent schemas.
+[The handoff](morsel-prototype-handoff.md) says how to re-run all of it on other hardware and
+which conclusions are host-specific.
 
 ```{toctree}
 ---
@@ -62,6 +64,8 @@ morsel-prototype-p1-findings
 morsel-prototype-p1-eval
 morsel-prototype-tpch-findings
 morsel-prototype-tpch-eval
+morsel-prototype-tpch-sweep
+morsel-prototype-handoff
 scan-execution-demand-and-operators
 scan-execution-design
 scan-execution-design-one-pager
