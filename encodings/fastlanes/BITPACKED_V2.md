@@ -104,6 +104,47 @@ Worth adding:
 - Sliced-array serde: the current file round-trip test writes an unsliced array, so a non-zero
   `offset` has only been exercised in memory.
 
+## Measured: TPC-H sf=1 compression
+
+Run on this branch, `data-gen` release build with `--features unstable_encodings`, converting the
+same generated Parquet twice — once with `VORTEX_BITPACKED_V2` unset, once with it set to `1`.
+
+| table | v1 bytes | v2 bytes | delta | change |
+| --- | ---: | ---: | ---: | ---: |
+| customer | 8,681,588 | 8,681,588 | 0 | 0.00% |
+| lineitem | 161,637,688 | 161,590,968 | -46,720 | -0.03% |
+| nation | 8,508 | 8,812 | +304 | +3.57% |
+| orders | 37,253,916 | 34,441,740 | -2,812,176 | -7.55% |
+| part | 5,018,416 | 4,958,784 | -59,632 | -1.19% |
+| partsupp | 24,646,920 | 24,645,200 | -1,720 | -0.01% |
+| region | 5,216 | 5,216 | 0 | 0.00% |
+| supplier | 582,832 | 582,832 | 0 | 0.00% |
+| **total** | **237,835,084** | **234,915,140** | **-2,919,944** | **-1.23%** |
+
+Reading these:
+
+- **`orders` is the win** (-7.55%, and 96% of the total saving). It is the table whose integer
+  columns drift in magnitude down the file, which is exactly the shape chunk-local widths exist
+  for. Confirmed reproducible by regenerating `orders.vortex` alone, twice each way: 37,253,916
+  bytes without the env var, 34,441,740 with it, both times.
+- **`lineitem` barely moves** (-0.03%) despite being 68% of the dataset. Worth understanding
+  before drawing conclusions: its integer columns mostly cascade through delta or dictionary
+  encoding first, so bit-packing sees a residual that is already uniform. If v2 is meant to pay
+  off here, the lever is probably the interaction with the *parent* scheme, not the packing.
+- **`nation` regresses** (+304 bytes on a 184-row table). This is the widths-buffer overhead
+  showing up where there is nothing to amortise it against, plus the sample-based estimator
+  picking v2 on a sample too small to be representative. A guard — skip v2 below some chunk count,
+  or require the estimate to beat v1 by a margin rather than a tie — is the obvious fix and is not
+  implemented.
+- Four tables are byte-identical, i.e. v2 correctly declined to displace v1 where it had nothing
+  to offer.
+
+Not yet verified: that these files *read back* correctly end to end. The encoding has an in-memory
+round-trip test and a single-array file round-trip test, but nothing has scanned a
+compressor-produced v2 file with patches and slicing. Running the TPC-H query benchmark below
+against `vortex-v2/` is the correctness gate — it checks result row counts against
+`EXPECTED_ROW_COUNTS_SF1` — and should be done before this goes any further.
+
 ## Benchmarks to run
 
 ### 1. TPC-H sf=1 compression ratio (the headline number)
@@ -116,16 +157,22 @@ to be moved aside between runs.
 cargo build --release -p vortex-bench --bin data-gen --features unstable_encodings
 
 # Baseline (v1 bit-packing). Generates parquet into vortex-bench/data/tpch/1.0/ as a side effect.
-./target/release/data-gen tpch --formats on-disk-vortex
-mv vortex-bench/data/tpch/1.0/vortex vortex-bench/data/tpch/1.0/vortex-baseline
+./target/release/data-gen tpch --formats vortex
+mv vortex-bench/data/tpch/1.0/vortex-file-compressed \
+   vortex-bench/data/tpch/1.0/vortex-baseline
 
 # Chunk-local widths.
-VORTEX_BITPACKED_V2=1 ./target/release/data-gen tpch --formats on-disk-vortex
-mv vortex-bench/data/tpch/1.0/vortex vortex-bench/data/tpch/1.0/vortex-v2
+VORTEX_BITPACKED_V2=1 ./target/release/data-gen tpch --formats vortex
+mv vortex-bench/data/tpch/1.0/vortex-file-compressed \
+   vortex-bench/data/tpch/1.0/vortex-v2
 
 du -b vortex-bench/data/tpch/1.0/vortex-baseline/* | sort -k2
 du -b vortex-bench/data/tpch/1.0/vortex-v2/* | sort -k2
 ```
+
+The conversion is idempotent on the output path, so the directory really does have to be moved
+between runs or the second one silently no-ops. Note the output directory is named
+`vortex-file-compressed`, and the format flag is `--formats vortex` (not `on-disk-vortex`).
 
 Report per-table sizes, not just the total: `lineitem` dominates sf=1, and the interesting columns
 are the ones whose magnitude drifts across the file (`l_orderkey`, `o_orderkey`, the date columns
@@ -136,8 +183,12 @@ that the sample-based estimator is picking v2 when it should not.
 Useful cross-check on which encoding each column actually got:
 
 ```bash
-cargo run --release -p vortex-tui -- <file.vortex>   # inspect the encoding tree
+cargo run --release -p vortex-tui --features native -- <file.vortex>   # encoding tree
 ```
+
+Note that the compressor's `RUST_LOG=debug` scheme trace does *not* list `vortex.int.bitpacking_v2`
+among its `scheme_candidate` spans even when the scheme is active and winning, so do not use the
+trace to decide whether v2 was selected — compare file sizes or inspect the encoding tree.
 
 ### 2. TPC-H sf=1 query time
 
@@ -149,8 +200,13 @@ cargo run --release -p datafusion-bench --features unstable_encodings -- \
     --benchmark tpch --formats on-disk-vortex
 ```
 
-Run it against both directories produced above. If the regression is confined to queries that
-push filters into a v2 column, that is the prioritised list for which kernels to write first.
+Run it against both directories produced above (rename the one under test back to
+`vortex-file-compressed`). If the regression is confined to queries that push filters into a v2
+column, that is the prioritised list for which kernels to write first.
+
+This run doubles as the correctness gate described above: the benchmark compares each query's
+result row count against `EXPECTED_ROW_COUNTS_SF1`, so a decode bug in v2 shows up as a wrong
+count rather than as a silent corruption.
 
 ### 3. Encoding/decoding throughput
 
