@@ -3,12 +3,11 @@
 
 //! Benchmarks for the binary comparison path, over every array kind it accepts.
 //!
-//! The primitive cases carry `#[cpu_features]`, so they are measured on every walltime
-//! CPU-feature leg rather than in simulation. Each is written once and compiled differently
-//! per leg: today the primitive comparison path is a portable lane kernel, and how well it
-//! auto-vectorizes is decided by the build. That is the baseline a hand-written kernel
-//! selected through `cfg(target_feature)` has to beat, measured on the silicon it would run
-//! on.
+//! The primitive cases carry `#[cpu_features]`, so they are measured on every walltime CPU-feature
+//! leg rather than in simulation. They all exercise the same [`RowFn`] comparison path, including
+//! its runtime-selected packed Boolean collector.
+//!
+//! [`RowFn`]: vortex_array::scalar_fn::unstable::row::RowFn
 //!
 //! The boolean, decimal, string, and struct cases are not tagged. A wider vector register is
 //! not what decides them: booleans are already word-at-a-time over a bitmap, decimals are
