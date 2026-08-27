@@ -11,6 +11,8 @@ notes unless one of these links points to them:
 
 - **Current direction:** this document owns the morsel, internal `IO | Plan` iterator, exec-node,
   and retirement contracts.
+- **Prototype plan:** the [morsel prototype plan](morsel-prototype-plan.md) sequences the
+  implementation phases and the real-query experiments that gate them.
 - **Current implementation context:** [plan v2](plan-v2.md) describes today's physical operators;
   [scan plans](../scan-planning.md) and [array execution](../execution.md) describe the existing
   planning and array-execution APIs that this proposal would change or reuse.
