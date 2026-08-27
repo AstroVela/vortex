@@ -1,0 +1,10 @@
+[package]
+name = "intrinsics-thresholds"
+description = "Standalone crossover benchmark for Vortex scalar and CPU-intrinsic kernels"
+edition = { workspace = true }
+license = { workspace = true }
+publish = false
+version = { workspace = true }
+
+[lints]
+workspace = true

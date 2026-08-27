@@ -70,6 +70,7 @@ members = [
     "benchmarks/duckdb-bench",
     "benchmarks/random-access-bench",
     "benchmarks/string-bench",
+    "benchmarks/intrinsics-thresholds",
     "vortex-spatial",
 ]
 exclude = ["java/testfiles", "wasm-test"]
