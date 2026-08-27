@@ -249,11 +249,25 @@ pub fn set_chunked_execute_enabled(enabled: bool) {
 /// into the builder on its normal execute path, so streaming it would only add a scratch copy;
 /// the shortcut pays off when the normal path would materialize a full intermediate per level.
 pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
-    CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
+    let fires = CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
         && array.supports_decompress_chunks()
         && array
             .children_iter()
-            .any(|child| !child.is_canonical() && child.supports_decompress_chunks())
+            .any(|child| !child.is_canonical() && child.supports_decompress_chunks());
+    // TEMPORARY diagnostics, not for merge.
+    if std::env::var("VORTEX_CHUNKED_EXECUTE_TRACE").is_ok() && !array.is_canonical() {
+        eprintln!(
+            "CHUNKED_EXEC fires={} len={} root={} children={:?}",
+            fires,
+            array.len(),
+            array.encoding_id(),
+            array
+                .children_iter()
+                .map(|c| c.encoding_id().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+    fires
 }
 
 /// Execute a streaming-capable primitive array tree to a canonical [`PrimitiveArray`] by
