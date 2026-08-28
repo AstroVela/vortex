@@ -59,6 +59,10 @@ pub struct RunOutcome {
     pub time_to_first_batch: Option<Duration>,
     /// Executor counters, where the executor reports them.
     pub stats: Option<ScanStats>,
+    /// I/O operations observed by benchmark instrumentation at the runner's measurement layer.
+    pub source_io_requests: Option<u64>,
+    /// I/O bytes observed by benchmark instrumentation at the runner's measurement layer.
+    pub source_io_bytes: Option<u64>,
 }
 
 /// Run the V1 `LayoutReader` scan path.
@@ -113,6 +117,8 @@ pub fn run_v1(
         wall,
         time_to_first_batch: first,
         stats: None,
+        source_io_requests: None,
+        source_io_bytes: None,
     })
 }
 
@@ -190,6 +196,8 @@ pub fn run_v1_tokio_with(
         wall,
         time_to_first_batch: first,
         stats: None,
+        source_io_requests: None,
+        source_io_bytes: None,
     })
 }
 
@@ -217,7 +225,12 @@ impl Default for MorselConfig {
     }
 }
 
-/// Run the morsel executor.
+/// Run the morsel executor with worker lifecycle excluded from the reported wall time.
+///
+/// This matches the V1 Tokio rows, whose runtime workers are also created outside their timed
+/// interval. Plan construction and morsel cutting remain outside timing for the same reason V1's
+/// reader construction and expression binding do; scan-specific preparation and execution remain
+/// inside timing.
 pub fn run_morsel(
     session: &VortexSession,
     layout: &LayoutRef,
@@ -237,9 +250,7 @@ pub fn run_morsel(
         .with_morsels(cut)
         .with_share_decodes(config.share_decodes);
 
-    let start = Instant::now();
-    let (batches, stats) = scan.run()?;
-    let wall = start.elapsed();
+    let (batches, stats, wall) = scan.run_timed()?;
 
     let rows = batches.iter().map(|b| b.len()).sum();
     Ok(RunOutcome {
@@ -248,6 +259,8 @@ pub fn run_morsel(
         batches,
         wall,
         stats: Some(stats),
+        source_io_requests: None,
+        source_io_bytes: None,
     })
 }
 

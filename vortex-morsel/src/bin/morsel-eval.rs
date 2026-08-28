@@ -9,8 +9,8 @@
 //! 2. Validate every executor's output against V1's — same row count, same ordered content —
 //!    *before* anything is timed. A configuration that disagrees is reported as a failure and
 //!    never appears in the timing table.
-//! 3. Warm up once per executor, then run five alternating iterations so drift in machine state
-//!    hits both rows equally. Report the median.
+//! 3. Warm up and sample each in-memory executor independently. Report median and min/max so
+//!    scheduler noise remains visible.
 //!
 //! Run with: `cargo run --release -p vortex-morsel --features _test-harness --bin morsel-eval`
 
@@ -38,7 +38,7 @@ use vortex_morsel::workloads;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
-const ITERATIONS: usize = 5;
+const DEFAULT_ITERATIONS: usize = 5;
 
 /// The executor configurations in the matrix.
 #[derive(Clone, Copy)]
@@ -80,6 +80,8 @@ impl Row {
 struct Timing {
     label: String,
     median: Duration,
+    min: Duration,
+    max: Duration,
     rows: usize,
     ttfb: Option<Duration>,
     requests: Option<u64>,
@@ -104,24 +106,54 @@ fn main() -> VortexResult<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_000_000);
+    let fineweb_rows = env_rows("MORSEL_FINEWEB_ROWS")?.unwrap_or(scale / 4);
+    let clickbench_rows = env_rows("MORSEL_CLICKBENCH_ROWS")?.unwrap_or(scale);
+    let iterations = env_rows("MORSEL_EVAL_ITERATIONS")?
+        .unwrap_or(DEFAULT_ITERATIONS)
+        .max(1);
+    let selected_morsel_rows = std::env::var("MORSEL_EVAL_MORSEL_ROWS")
+        .ok()
+        .map(|value| parse_row_sizes("MORSEL_EVAL_MORSEL_ROWS", &value))
+        .transpose()?;
+    let selected_workload = std::env::var("MORSEL_EVAL_WORKLOAD").ok();
 
     println!("# Morsel executor evaluation (E1)");
     println!();
     println!(
-        "host: {threads} logical cores; segments in memory; {scale} rows per workload; \
-         {ITERATIONS} alternating iterations, median reported"
+        "host: {threads} logical cores; segments in memory; fineweb-shaped={fineweb_rows} rows, \
+         clickbench-shaped={clickbench_rows} rows; {iterations} grouped iterations, median reported"
     );
+    println!("both executors use workers prepared outside the timed interval");
     println!();
 
-    let workloads = vec![
-        workloads::string_heavy(scale / 4),
-        workloads::wide_numeric(scale),
-        workloads::narrow_analytic(scale),
-    ];
+    let mut workload_set = Vec::new();
+    if selected_workload
+        .as_deref()
+        .is_none_or(|name| name == "string-heavy")
+    {
+        workload_set.push(workloads::string_heavy(fineweb_rows));
+    }
+    if selected_workload
+        .as_deref()
+        .is_none_or(|name| name == "wide-numeric")
+    {
+        workload_set.push(workloads::wide_numeric(clickbench_rows));
+    }
+    if selected_workload
+        .as_deref()
+        .is_none_or(|name| name == "narrow-analytic")
+    {
+        workload_set.push(workloads::narrow_analytic(scale));
+    }
+    if workload_set.is_empty() {
+        vortex_error::vortex_bail!(
+            "MORSEL_EVAL_WORKLOAD must be string-heavy, wide-numeric, or narrow-analytic"
+        );
+    }
 
     let mut failures = Vec::new();
 
-    for workload in workloads {
+    for workload in workload_set {
         let fixture =
             block_on(|_handle| async { write_fixture(workload.columns, &session).await })?;
         let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
@@ -136,33 +168,46 @@ fn main() -> VortexResult<()> {
         println!();
 
         for query in &workload.queries {
-            let rows_config = [
-                Row::V1Single,
-                Row::V1Tokio(threads),
-                Row::Morsel(MorselConfig {
-                    threads: 1,
-                    ..Default::default()
-                }),
-                Row::Morsel(MorselConfig {
-                    threads: 1,
-                    share_decodes: false,
-                    ..Default::default()
-                }),
-                Row::Morsel(MorselConfig {
-                    threads,
-                    ..Default::default()
-                }),
-                Row::Morsel(MorselConfig {
-                    threads,
-                    morsel_rows: 65_536,
-                    ..Default::default()
-                }),
-                Row::Morsel(MorselConfig {
-                    threads,
-                    mode: ConjunctMode::Parallel,
-                    ..Default::default()
-                }),
-            ];
+            let rows_config: Vec<Row> = match &selected_morsel_rows {
+                Some(sizes) => sizes
+                    .iter()
+                    .copied()
+                    .map(|morsel_rows| {
+                        Row::Morsel(MorselConfig {
+                            threads,
+                            morsel_rows,
+                            ..Default::default()
+                        })
+                    })
+                    .collect(),
+                None => vec![
+                    Row::V1Single,
+                    Row::V1Tokio(threads),
+                    Row::Morsel(MorselConfig {
+                        threads: 1,
+                        ..Default::default()
+                    }),
+                    Row::Morsel(MorselConfig {
+                        threads: 1,
+                        share_decodes: false,
+                        ..Default::default()
+                    }),
+                    Row::Morsel(MorselConfig {
+                        threads,
+                        ..Default::default()
+                    }),
+                    Row::Morsel(MorselConfig {
+                        threads,
+                        morsel_rows: 65_536,
+                        ..Default::default()
+                    }),
+                    Row::Morsel(MorselConfig {
+                        threads,
+                        mode: ConjunctMode::Parallel,
+                        ..Default::default()
+                    }),
+                ],
+            };
 
             // Step 1: the oracle. Every row must agree with V1 before any timing happens.
             let oracle = run_v1(&session, &fixture.layout, &segments, query)?;
@@ -172,7 +217,7 @@ fn main() -> VortexResult<()> {
                 .dtype()
                 .clone();
             let mut validated = Vec::new();
-            for row in rows_config {
+            for &row in &rows_config {
                 let outcome = run_once(&runtime, &session, &fixture.layout, &segments, query, row)?;
                 match assert_same_rows(&session, &dtype, &oracle, &outcome) {
                     Ok(()) => validated.push(row),
@@ -187,12 +232,21 @@ fn main() -> VortexResult<()> {
                 }
             }
 
-            // Step 2: alternating iterations over the validated rows.
+            // Step 2: independently warm and sample each in-memory configuration.
             let mut samples: Vec<Vec<RunOutcome>> = validated.iter().map(|_| Vec::new()).collect();
-            for _ in 0..ITERATIONS {
-                for (idx, row) in validated.iter().enumerate() {
-                    let outcome =
+            for (idx, row) in validated.iter().enumerate() {
+                drop(run_once(
+                    &runtime,
+                    &session,
+                    &fixture.layout,
+                    &segments,
+                    query,
+                    *row,
+                )?);
+                for _ in 0..iterations {
+                    let mut outcome =
                         run_once(&runtime, &session, &fixture.layout, &segments, query, *row)?;
+                    outcome.batches.clear();
                     samples[idx].push(outcome);
                 }
             }
@@ -202,10 +256,14 @@ fn main() -> VortexResult<()> {
                 .zip(samples)
                 .map(|(row, mut runs)| {
                     runs.sort_by_key(|run| run.wall);
+                    let min = runs.first().map(|run| run.wall).unwrap_or_default();
+                    let max = runs.last().map(|run| run.wall).unwrap_or_default();
                     let median = &runs[runs.len() / 2];
                     Timing {
                         label: row.label(),
                         median: median.wall,
+                        min,
+                        max,
                         rows: median.rows,
                         ttfb: median.time_to_first_batch,
                         requests: median.stats.as_ref().map(|s| s.io_requests),
@@ -282,9 +340,11 @@ fn report(query: &Query, timings: &[Timing]) {
             )
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} [{},{}] | {} | {} | {} | {} | {} | {} | {} | {} |",
             timing.label,
             millis(timing.median),
+            millis(timing.min),
+            millis(timing.max),
             ratio,
             timing.rows,
             timing.ttfb.map(millis).unwrap_or_else(|| "—".to_string()),
@@ -296,6 +356,32 @@ fn report(query: &Query, timings: &[Timing]) {
         );
     }
     println!();
+}
+
+fn env_rows(name: &str) -> VortexResult<Option<usize>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| vortex_error::vortex_err!("invalid {name} value `{value}`: {err}"))
+        })
+        .transpose()
+}
+
+fn parse_row_sizes(name: &str, value: &str) -> VortexResult<Vec<u64>> {
+    let sizes: Vec<u64> = value
+        .split(',')
+        .map(str::trim)
+        .map(|size| {
+            size.parse::<u64>()
+                .map_err(|err| vortex_error::vortex_err!("invalid {name} value `{size}`: {err}"))
+        })
+        .collect::<VortexResult<_>>()?;
+    if sizes.is_empty() || sizes.contains(&0) {
+        vortex_error::vortex_bail!("{name} must contain positive comma-separated row counts");
+    }
+    Ok(sizes)
 }
 
 /// Format a duration in milliseconds, avoiding `Debug` formatting.

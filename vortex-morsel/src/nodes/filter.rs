@@ -7,8 +7,13 @@ use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+use vortex_mask::Mask;
 
+use crate::io::IoPriority;
+use crate::node::ChildPoll;
 use crate::node::ExecCx;
 use crate::node::ExecNode;
 use crate::node::ExecPoll;
@@ -31,6 +36,7 @@ pub struct FilterExec {
     range: Range<u64>,
     plan_stage: u8,
     plan_started: bool,
+    mask: Option<Mask>,
     done: bool,
     children: Vec<NodeId>,
 }
@@ -52,6 +58,7 @@ impl FilterExec {
             range: 0..0,
             plan_stage: 0,
             plan_started: false,
+            mask: None,
             done: false,
             children,
         }
@@ -63,6 +70,7 @@ impl ExecNode for FilterExec {
         self.range = range;
         self.plan_stage = 0;
         self.plan_started = false;
+        self.mask = None;
         self.done = false;
     }
 
@@ -78,7 +86,12 @@ impl ExecNode for FilterExec {
             }
             let fresh = !self.plan_started;
             self.plan_started = true;
-            if cx.plan_child(child, self.range.clone(), fresh)? {
+            let priority = if self.predicate.is_some() && self.plan_stage > 0 {
+                IoPriority::Speculative
+            } else {
+                IoPriority::Required
+            };
+            if cx.plan_child_with_priority(child, self.range.clone(), fresh, priority)? {
                 self.plan_stage += if self.plan_stage == 0 && self.predicate.is_none() {
                     2
                 } else {
@@ -95,26 +108,45 @@ impl ExecNode for FilterExec {
         if self.done {
             return Ok(ExecPoll::Done);
         }
-        self.done = true;
+        if self.mask.is_none() {
+            let demand = cx.demand().clone();
+            let mask = match self.predicate {
+                Some(predicate) => match cx.child_mask(predicate, demand)? {
+                    ChildPoll::Value(mask) => mask,
+                    ChildPoll::Blocked(waits) => return Ok(ExecPoll::Blocked(waits)),
+                    ChildPoll::Done => {
+                        return Err(vortex_err!("filter predicate produced no value"));
+                    }
+                },
+                None => demand,
+            };
 
-        let demand = cx.demand().clone();
-        let mask = match self.predicate {
-            Some(predicate) => cx.child_mask(predicate, demand)?,
-            None => demand,
-        };
-
-        if mask.all_false() {
-            cx.stats().morsels_empty += 1;
-            return Ok(ExecPoll::Value(ValueBatch {
-                coverage: self.range.clone(),
-                value: Value::Array(Canonical::empty(&self.output_dtype).into_array()),
-            }));
+            if mask.all_false() {
+                self.done = true;
+                cx.stats().morsels_empty += 1;
+                return Ok(ExecPoll::Value(ValueBatch {
+                    coverage: self.range.clone(),
+                    value: Value::Array(Canonical::empty(&self.output_dtype).into_array()),
+                }));
+            }
+            self.mask = Some(mask);
         }
 
-        // The projection subtree reads only the surviving rows: the mask is the demand, so a
-        // sealed-empty chunk under it costs no read at all.
-        let array = cx.child_array(self.projection, mask)?;
+        // The projection subtree executes only for surviving rows. A sealed-empty chunk avoids
+        // cloning and decoding its projection tickets, although planning may have prefetched them.
+        let mask = self
+            .mask
+            .as_ref()
+            .vortex_expect("non-empty predicate mask is retained")
+            .clone();
+        let array = match cx.child_array(self.projection, mask)? {
+            ChildPoll::Value(array) => array,
+            ChildPoll::Blocked(waits) => return Ok(ExecPoll::Blocked(waits)),
+            ChildPoll::Done => return Err(vortex_err!("filter projection produced no value")),
+        };
         let array = array.apply_bound(&self.projection_expr)?;
+        self.mask = None;
+        self.done = true;
 
         Ok(ExecPoll::Value(ValueBatch {
             coverage: self.range.clone(),
@@ -123,6 +155,7 @@ impl ExecNode for FilterExec {
     }
 
     fn retire(&mut self, cx: &mut RetireCx<'_>) {
+        self.mask = None;
         for &child in &self.children {
             cx.retire_child(child);
         }

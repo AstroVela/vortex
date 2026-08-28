@@ -9,13 +9,19 @@
 
 use std::sync::Arc;
 
+use futures::FutureExt;
+use futures::future;
+use futures::stream;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
+use vortex_array::stream::ArrayStreamAdapter;
+use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
@@ -25,6 +31,9 @@ use vortex_layout::layout_children;
 use vortex_layout::layouts::chunked::ChunkedLayout;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::struct_::StructLayout;
+use vortex_layout::segments::ReadAtNowait;
+use vortex_layout::segments::SegmentFuture;
+use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::segments::TestSegments;
 use vortex_layout::sequence::SequenceId;
@@ -37,6 +46,33 @@ pub struct Column {
     pub name: FieldName,
     /// The chunks, in row order. Chunk boundaries need not agree with any other column's.
     pub chunks: Vec<ArrayRef>,
+}
+
+/// An immutable in-memory segment source used after fixture writing completes.
+struct MemorySegments {
+    buffers: Arc<[ByteBuffer]>,
+}
+
+impl SegmentSource for MemorySegments {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        future::ready(
+            self.buffers
+                .get(*id as usize)
+                .cloned()
+                .map(BufferHandle::new_host)
+                .ok_or_else(|| vortex_err!("Segment not found")),
+        )
+        .boxed()
+    }
+
+    fn request_nowait(&self, id: SegmentId) -> VortexResult<ReadAtNowait> {
+        self.buffers
+            .get(*id as usize)
+            .cloned()
+            .map(BufferHandle::new_host)
+            .map(ReadAtNowait::Ready)
+            .ok_or_else(|| vortex_err!("Segment not found"))
+    }
 }
 
 impl Column {
@@ -54,6 +90,8 @@ impl Column {
 pub struct Fixture {
     /// The segment source the layout reads from.
     pub segments: Arc<dyn SegmentSource>,
+    /// The exact encoded segment buffers, in segment-id order.
+    pub segment_buffers: Vec<ByteBuffer>,
     /// The struct-of-chunked-flat layout.
     pub layout: LayoutRef,
     /// The complete table, unchunked. `None` when the caller asked not to retain it.
@@ -79,20 +117,20 @@ pub async fn write_fixture_with(
     strategy: Arc<dyn LayoutStrategy>,
     session: &VortexSession,
 ) -> VortexResult<Fixture> {
-    write_fixture_inner(columns, strategy, session, true).await
+    write_fixture_inner(columns, strategy, session, true, false).await
 }
 
-/// Write a fixture without retaining the in-memory copy of the table.
+/// Write a fixture as whole-column streams without retaining an in-memory table copy.
 ///
-/// The copy exists only so a caller can compare against the source data directly. When the V1
-/// reader is the oracle it is dead weight, and at a real TPC-H scale factor it doubles the
-/// fixture's resident size.
-pub async fn write_fixture_no_table(
+/// This matches how the file writer drives a strategy: repartitioning and buffering see across
+/// incoming array boundaries. The omitted copy exists only so a caller can compare against the
+/// source data directly; when V1 is the oracle it is dead weight.
+pub async fn write_streaming_fixture_no_table(
     columns: Vec<Column>,
     strategy: Arc<dyn LayoutStrategy>,
     session: &VortexSession,
 ) -> VortexResult<Fixture> {
-    write_fixture_inner(columns, strategy, session, false).await
+    write_fixture_inner(columns, strategy, session, false, true).await
 }
 
 async fn write_fixture_inner(
@@ -100,6 +138,7 @@ async fn write_fixture_inner(
     strategy: Arc<dyn LayoutStrategy>,
     session: &VortexSession,
     keep_table: bool,
+    stream_whole_column: bool,
 ) -> VortexResult<Fixture> {
     let segments = Arc::new(TestSegments::default());
     let ctx = vortex_array::ArrayContext::empty();
@@ -117,10 +156,6 @@ async fn write_fixture_inner(
             .map(|chunk| chunk.dtype().clone())
             .ok_or_else(|| vortex_err!("a column needs at least one chunk"))?;
 
-        // The whole column goes through the strategy as one chunk stream, exactly as the real
-        // file writer drives it, so a compressing strategy sees the stream it expects and
-        // produces its own chunking. Only when the strategy leaves a single leaf (the plain flat
-        // case) is a chunked wrapper assembled here to preserve the caller's boundaries.
         let rows: u64 = column.chunks.iter().map(|chunk| chunk.len() as u64).sum();
         match row_count {
             None => row_count = Some(rows),
@@ -130,28 +165,47 @@ async fn write_fixture_inner(
             }
         }
 
-        let mut chunk_layouts = Vec::with_capacity(column.chunks.len());
-        for chunk in &column.chunks {
+        let column_layout = if stream_whole_column {
+            // The TPC-H column goes through one strategy invocation, exactly as the real file
+            // writer drives it. Repartitioning and buffering therefore see across incoming batch
+            // boundaries instead of treating each generated batch as end-of-file.
             let (ptr, eof) = SequenceId::root().split();
-            chunk_layouts.push(
-                strategy
-                    .write_stream(
-                        ctx.clone().into(),
-                        Arc::<TestSegments>::clone(&segments),
-                        chunk.clone().to_array_stream().sequenced(ptr),
-                        eof,
-                        session,
-                    )
-                    .await?,
-            );
-        }
-
-        let column_layout = if chunk_layouts.len() == 1 {
-            chunk_layouts
-                .pop()
-                .ok_or_else(|| vortex_err!("a column needs at least one chunk"))?
+            let chunks = column.chunks.clone().into_iter().map(VortexResult::Ok);
+            strategy
+                .write_stream(
+                    ctx.clone().into(),
+                    Arc::<TestSegments>::clone(&segments),
+                    ArrayStreamAdapter::new(dtype.clone(), stream::iter(chunks)).sequenced(ptr),
+                    eof,
+                    session,
+                )
+                .await?
         } else {
-            ChunkedLayout::new(rows, dtype.clone(), layout_children(chunk_layouts)).into_layout()
+            // Small correctness fixtures intentionally preserve caller-provided per-column chunk
+            // boundaries and do not require a runtime-backed chunked writer.
+            let mut chunk_layouts = Vec::with_capacity(column.chunks.len());
+            for chunk in &column.chunks {
+                let (ptr, eof) = SequenceId::root().split();
+                chunk_layouts.push(
+                    strategy
+                        .write_stream(
+                            ctx.clone().into(),
+                            Arc::<TestSegments>::clone(&segments),
+                            chunk.clone().to_array_stream().sequenced(ptr),
+                            eof,
+                            session,
+                        )
+                        .await?,
+                );
+            }
+            if chunk_layouts.len() == 1 {
+                chunk_layouts
+                    .pop()
+                    .ok_or_else(|| vortex_err!("a column needs at least one chunk"))?
+            } else {
+                ChunkedLayout::new(rows, dtype.clone(), layout_children(chunk_layouts))
+                    .into_layout()
+            }
         };
         field_layouts.push(column_layout);
         field_names.push(column.name.clone());
@@ -184,8 +238,14 @@ async fn write_fixture_inner(
         None
     };
 
+    let segment_buffers = segments.buffers();
+    let frozen_segments: Arc<dyn SegmentSource> = Arc::new(MemorySegments {
+        buffers: segment_buffers.clone().into(),
+    });
+
     Ok(Fixture {
-        segments,
+        segment_buffers,
+        segments: frozen_segments,
         layout,
         table,
         row_count: rows,

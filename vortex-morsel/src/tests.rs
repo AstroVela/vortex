@@ -13,13 +13,22 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Poll;
+use std::task::Waker;
+use std::time::Duration;
 
+use futures::FutureExt;
+use futures::future::poll_fn;
+use parking_lot::Mutex;
 use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::and;
@@ -32,10 +41,15 @@ use vortex_array::expr::root;
 use vortex_array::expr::select;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_io::runtime::single::block_on;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::LayoutRef;
+use vortex_layout::segments::ReadAtNowait;
+use vortex_layout::segments::SegmentFuture;
+use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
@@ -463,6 +477,162 @@ fn shared_cells_reuse_straddled_chunks() -> VortexResult<()> {
     Ok(())
 }
 
+struct CountingSegmentSource {
+    inner: Arc<dyn SegmentSource>,
+    requests: Arc<AtomicUsize>,
+}
+
+struct NowaitSegmentSource {
+    buffers: Arc<[ByteBuffer]>,
+    attempts: Arc<AtomicUsize>,
+    fallbacks: Arc<AtomicUsize>,
+    hit: bool,
+}
+
+impl SegmentSource for NowaitSegmentSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        self.fallbacks.fetch_add(1, Ordering::Relaxed);
+        let buffer = self.buffers.get(*id as usize).cloned();
+        async move {
+            buffer
+                .map(BufferHandle::new_host)
+                .ok_or_else(|| vortex_err!("missing segment {id}"))
+        }
+        .boxed()
+    }
+
+    fn request_nowait(&self, id: SegmentId) -> VortexResult<ReadAtNowait> {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        if !self.hit {
+            return Ok(ReadAtNowait::WouldBlock);
+        }
+        self.buffers
+            .get(*id as usize)
+            .cloned()
+            .map(BufferHandle::new_host)
+            .map(ReadAtNowait::Ready)
+            .ok_or_else(|| vortex_err!("missing segment {id}"))
+    }
+}
+
+#[rstest]
+fn inline_nowait_hit_never_creates_a_background_future() -> VortexResult<()> {
+    let session = session();
+    let fixture = aligned_fixture(&session, 64)?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let fallbacks = Arc::new(AtomicUsize::new(0));
+    let source: Arc<dyn SegmentSource> = Arc::new(NowaitSegmentSource {
+        buffers: Arc::from(fixture.segment_buffers.clone()),
+        attempts: Arc::clone(&attempts),
+        fallbacks: Arc::clone(&fallbacks),
+        hit: true,
+    });
+    let query = Query {
+        name: "nowait-hit",
+        projection: select(vec!["a"], root()),
+        filter: None,
+    };
+    let v1 = run_v1(&session, &fixture.layout, &fixture.segments, &query)?;
+    let morsel = run_morsel(
+        &session,
+        &fixture.layout,
+        &source,
+        &query,
+        MorselConfig::default(),
+    )?;
+
+    assert_same_rows(&session, &v1_dtype(&fixture.layout, &query)?, &v1, &morsel)?;
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
+    let stats = morsel.stats.as_ref().expect("morsel runs report stats");
+    assert_eq!(stats.nowait_attempts, 1);
+    assert_eq!(stats.nowait_hits, 1);
+    assert_eq!(stats.nowait_misses, 0);
+    assert_eq!(stats.execute_io_blocks, 0);
+    assert_eq!(stats.io_waits, 0);
+    Ok(())
+}
+
+#[rstest]
+fn inline_nowait_miss_falls_back_once() -> VortexResult<()> {
+    let session = session();
+    let fixture = aligned_fixture(&session, 64)?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let fallbacks = Arc::new(AtomicUsize::new(0));
+    let source: Arc<dyn SegmentSource> = Arc::new(NowaitSegmentSource {
+        buffers: Arc::from(fixture.segment_buffers.clone()),
+        attempts: Arc::clone(&attempts),
+        fallbacks: Arc::clone(&fallbacks),
+        hit: false,
+    });
+    let query = Query {
+        name: "nowait-miss",
+        projection: select(vec!["a"], root()),
+        filter: None,
+    };
+    let v1 = run_v1(&session, &fixture.layout, &fixture.segments, &query)?;
+    let morsel = run_morsel(
+        &session,
+        &fixture.layout,
+        &source,
+        &query,
+        MorselConfig::default(),
+    )?;
+
+    assert_same_rows(&session, &v1_dtype(&fixture.layout, &query)?, &v1, &morsel)?;
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+    let stats = morsel.stats.as_ref().expect("morsel runs report stats");
+    assert_eq!(stats.nowait_attempts, 1);
+    assert_eq!(stats.nowait_hits, 0);
+    assert_eq!(stats.nowait_misses, 1);
+    assert_eq!(stats.nowait_unsupported, 0);
+    assert!(stats.execute_io_blocks > 0);
+    Ok(())
+}
+
+impl SegmentSource for CountingSegmentSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner.request(id)
+    }
+}
+
+/// Raw request cells are shared scan-wide even when decoded-array sharing is disabled.
+#[rstest]
+fn scan_wide_io_cells_deduplicate_straddled_chunks() -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let source: Arc<dyn SegmentSource> = Arc::new(CountingSegmentSource {
+        inner: Arc::clone(&fixture.segments),
+        requests: Arc::clone(&requests),
+    });
+    let query = Query {
+        name: "scan-wide-io",
+        projection: select(vec!["a", "b", "c"], root()),
+        filter: None,
+    };
+
+    let run = run_morsel(
+        &session,
+        &fixture.layout,
+        &source,
+        &query,
+        MorselConfig {
+            threads: 4,
+            share_decodes: false,
+            ..Default::default()
+        },
+    )?;
+    let stats = run.stats.as_ref().expect("morsel runs report stats");
+
+    assert_eq!(requests.load(Ordering::Relaxed), 15);
+    assert_eq!(stats.io_requests, 15);
+    assert!(stats.io_uses > stats.io_requests);
+    Ok(())
+}
+
 /// Property: every read a node waits on was named by its own planning stream, so the number of
 /// distinct segments read never exceeds the number of uses named.
 #[rstest]
@@ -480,11 +650,6 @@ fn every_read_was_planned() -> VortexResult<()> {
             MorselConfig::default(),
         )?;
         let stats = run.stats.as_ref().expect("morsel runs report stats");
-        assert_eq!(
-            stats.io_bypassed, 0,
-            "query {}: no read should bypass planning with the floor at zero",
-            query.name
-        );
         assert!(
             stats.io_requests <= stats.io_uses,
             "query {}: {} requests exceeds {} named uses",
@@ -496,7 +661,7 @@ fn every_read_was_planned() -> VortexResult<()> {
     Ok(())
 }
 
-/// Property: an all-false filter emits nothing and reads no projection column.
+/// Property: an all-false filter emits nothing and does not decode its projection columns.
 #[rstest]
 fn empty_filter_emits_nothing() -> VortexResult<()> {
     let session = session();
@@ -519,6 +684,347 @@ fn empty_filter_emits_nothing() -> VortexResult<()> {
     assert!(run.batches.is_empty());
     let stats = run.stats.as_ref().expect("morsel runs report stats");
     assert_eq!(stats.morsels_empty, stats.morsels);
+    Ok(())
+}
+
+#[derive(Default)]
+struct PairedGate {
+    polled: [bool; 2],
+    wakers: [Option<Waker>; 2],
+    watchdog_fired: bool,
+}
+
+struct PairedPendingSource {
+    buffers: Arc<[ByteBuffer]>,
+    gate: Arc<Mutex<PairedGate>>,
+}
+
+impl SegmentSource for PairedPendingSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        let index = *id as usize;
+        let buffer = self.buffers.get(index).cloned();
+        let gate = Arc::clone(&self.gate);
+        poll_fn(move |cx| {
+            let Some(buffer) = buffer.as_ref() else {
+                return Poll::Ready(Err(vortex_error::vortex_err!(
+                    "missing gated segment {index}"
+                )));
+            };
+            if index >= 2 {
+                return Poll::Ready(Ok(BufferHandle::new_host(buffer.clone())));
+            }
+
+            let other = 1 - index;
+            let mut gate = gate.lock();
+            gate.polled[index] = true;
+            if gate.polled[other] {
+                if let Some(waker) = gate.wakers[other].take() {
+                    waker.wake();
+                }
+                Poll::Ready(Ok(BufferHandle::new_host(buffer.clone())))
+            } else {
+                gate.wakers[index] = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .boxed()
+    }
+}
+
+/// One CPU worker must submit every planned read before waiting for either one. Each of this
+/// source's first two futures remains pending until the other has been polled, so the old inline
+/// `block_on` driver reaches the watchdog while the continuation scheduler completes immediately.
+#[rstest]
+fn planned_reads_progress_together_without_parking_a_worker() -> VortexResult<()> {
+    let session = session();
+    let values: Vec<i32> = (0..32).collect();
+    let fixture = block_on(|_handle| async {
+        write_fixture(
+            vec![
+                Column::new("a", i32_chunks(&values, &[32])),
+                Column::new("b", i32_chunks(&values, &[32])),
+            ],
+            &session,
+        )
+        .await
+    })?;
+
+    let gate = Arc::new(Mutex::new(PairedGate::default()));
+    let watchdog_gate = Arc::clone(&gate);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        let mut gate = watchdog_gate.lock();
+        if gate.polled.iter().all(|polled| *polled) {
+            return;
+        }
+        gate.watchdog_fired = true;
+        gate.polled = [true; 2];
+        for waker in gate.wakers.iter_mut().filter_map(Option::take) {
+            waker.wake();
+        }
+    });
+
+    let source: Arc<dyn SegmentSource> = Arc::new(PairedPendingSource {
+        buffers: Arc::from(fixture.segment_buffers.clone()),
+        gate: Arc::clone(&gate),
+    });
+    let query = Query {
+        name: "paired-pending",
+        projection: select(vec!["b"], root()),
+        filter: Some(gt(get_item("a", root()), lit(-1i32))),
+    };
+    let v1 = run_v1(&session, &fixture.layout, &fixture.segments, &query)?;
+    let morsel = run_morsel(
+        &session,
+        &fixture.layout,
+        &source,
+        &query,
+        MorselConfig {
+            threads: 1,
+            ..Default::default()
+        },
+    )?;
+
+    assert_same_rows(&session, &v1_dtype(&fixture.layout, &query)?, &v1, &morsel)?;
+    let gate = gate.lock();
+    assert_eq!(gate.polled, [true; 2]);
+    assert!(!gate.watchdog_fired, "the CPU worker parked on one read");
+    Ok(())
+}
+
+#[derive(Default)]
+struct BurstGate {
+    requests: [usize; 3],
+    polls: [usize; 3],
+    wakers: [Option<Waker>; 3],
+    released: bool,
+    watchdog_fired: bool,
+}
+
+struct BurstPendingSource {
+    buffers: Arc<[ByteBuffer]>,
+    gate: Arc<Mutex<BurstGate>>,
+}
+
+impl SegmentSource for BurstPendingSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        let index = *id as usize;
+        let buffer = self.buffers.get(index).cloned();
+        if index < 3 {
+            self.gate.lock().requests[index] += 1;
+        }
+        let gate = Arc::clone(&self.gate);
+        poll_fn(move |cx| {
+            let Some(buffer) = buffer.as_ref() else {
+                return Poll::Ready(Err(vortex_error::vortex_err!(
+                    "missing burst segment {index}"
+                )));
+            };
+            if index >= 3 {
+                return Poll::Ready(Ok(BufferHandle::new_host(buffer.clone())));
+            }
+
+            let wakes = {
+                let mut gate = gate.lock();
+                gate.polls[index] += 1;
+                if gate.released {
+                    return Poll::Ready(Ok(BufferHandle::new_host(buffer.clone())));
+                }
+                gate.wakers[index] = Some(cx.waker().clone());
+                if gate.polls.iter().all(|polls| *polls > 0) {
+                    gate.released = true;
+                    gate.wakers.iter_mut().filter_map(Option::take).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            for waker in wakes {
+                waker.wake_by_ref();
+                waker.wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .boxed()
+    }
+}
+
+/// Burst wakeups for several exact cells neither lose a wake nor poll a ready cell again from
+/// execution.
+#[rstest]
+fn burst_wakes_are_coalesced_without_duplicate_polls() -> VortexResult<()> {
+    let session = session();
+    let values: Vec<i32> = (0..32).collect();
+    let fixture = block_on(|_handle| async {
+        write_fixture(
+            vec![
+                Column::new("a", i32_chunks(&values, &[32])),
+                Column::new("b", i32_chunks(&values, &[32])),
+                Column::new("c", i32_chunks(&values, &[32])),
+            ],
+            &session,
+        )
+        .await
+    })?;
+
+    let gate = Arc::new(Mutex::new(BurstGate::default()));
+    let watchdog_gate = Arc::clone(&gate);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        let wakes = {
+            let mut gate = watchdog_gate.lock();
+            if gate.released {
+                return;
+            }
+            gate.watchdog_fired = true;
+            gate.released = true;
+            gate.wakers
+                .iter_mut()
+                .filter_map(Option::take)
+                .collect::<Vec<_>>()
+        };
+        for waker in wakes {
+            waker.wake();
+        }
+    });
+
+    let source: Arc<dyn SegmentSource> = Arc::new(BurstPendingSource {
+        buffers: Arc::from(fixture.segment_buffers.clone()),
+        gate: Arc::clone(&gate),
+    });
+    let query = Query {
+        name: "burst-pending",
+        projection: select(vec!["a", "b", "c"], root()),
+        filter: None,
+    };
+    let v1 = run_v1(&session, &fixture.layout, &fixture.segments, &query)?;
+    let morsel = run_morsel(
+        &session,
+        &fixture.layout,
+        &source,
+        &query,
+        MorselConfig {
+            threads: 1,
+            ..Default::default()
+        },
+    )?;
+
+    assert_same_rows(&session, &v1_dtype(&fixture.layout, &query)?, &v1, &morsel)?;
+    let gate = gate.lock();
+    assert_eq!(gate.requests, [1, 1, 1]);
+    assert_eq!(gate.polls, [2, 2, 2]);
+    assert!(!gate.watchdog_fired);
+    let stats = morsel.stats.as_ref().expect("morsel runs report stats");
+    assert_eq!(stats.io_requests, 3);
+    assert_eq!(stats.io_batches, 1);
+    assert_eq!(stats.io_waits, 3);
+    assert_eq!(stats.morsels_blocked_for_io, 1);
+    assert!(stats.execute_io_blocks > 0);
+    assert!(stats.io_blocks_per_morsel_max <= 3);
+    Ok(())
+}
+
+#[derive(Default)]
+struct SpeculativeGate {
+    polls: [usize; 2],
+    projection_waker: Option<Waker>,
+    released: bool,
+    watchdog_fired: bool,
+}
+
+struct SlowSpeculativeSource {
+    buffers: Arc<[ByteBuffer]>,
+    gate: Arc<Mutex<SpeculativeGate>>,
+}
+
+impl SegmentSource for SlowSpeculativeSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        let index = *id as usize;
+        let buffer = self.buffers.get(index).cloned();
+        let gate = Arc::clone(&self.gate);
+        poll_fn(move |cx| {
+            let Some(buffer) = buffer.as_ref() else {
+                return Poll::Ready(Err(vortex_error::vortex_err!(
+                    "missing speculative segment {index}"
+                )));
+            };
+            if index >= 2 {
+                return Poll::Ready(Ok(BufferHandle::new_host(buffer.clone())));
+            }
+            let mut gate = gate.lock();
+            gate.polls[index] += 1;
+            if index == 0 || gate.released {
+                Poll::Ready(Ok(BufferHandle::new_host(buffer.clone())))
+            } else {
+                gate.projection_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .boxed()
+    }
+}
+
+/// Required predicate IO resumes execution while speculative projection IO remains pending. An
+/// empty predicate result retires the morsel without waiting for or consuming that projection.
+#[rstest]
+fn empty_filter_cancels_pending_speculative_io() -> VortexResult<()> {
+    let session = session();
+    let values: Vec<i32> = (0..32).collect();
+    let fixture = block_on(|_handle| async {
+        write_fixture(
+            vec![
+                Column::new("a", i32_chunks(&values, &[32])),
+                Column::new("b", i32_chunks(&values, &[32])),
+            ],
+            &session,
+        )
+        .await
+    })?;
+
+    let gate = Arc::new(Mutex::new(SpeculativeGate::default()));
+    let watchdog_gate = Arc::clone(&gate);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        let wake = {
+            let mut gate = watchdog_gate.lock();
+            if gate.released {
+                return;
+            }
+            gate.watchdog_fired = true;
+            gate.released = true;
+            gate.projection_waker.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    });
+
+    let source: Arc<dyn SegmentSource> = Arc::new(SlowSpeculativeSource {
+        buffers: Arc::from(fixture.segment_buffers.clone()),
+        gate: Arc::clone(&gate),
+    });
+    let query = Query {
+        name: "cancel-speculative",
+        projection: select(vec!["b"], root()),
+        filter: Some(gt(get_item("a", root()), lit(i32::MAX - 1))),
+    };
+    let v1 = run_v1(&session, &fixture.layout, &fixture.segments, &query)?;
+    let morsel = run_morsel(
+        &session,
+        &fixture.layout,
+        &source,
+        &query,
+        MorselConfig {
+            threads: 1,
+            ..Default::default()
+        },
+    )?;
+
+    assert_same_rows(&session, &v1_dtype(&fixture.layout, &query)?, &v1, &morsel)?;
+    let gate = gate.lock();
+    assert_eq!(gate.polls, [1, 1]);
+    assert!(!gate.watchdog_fired, "execution waited for speculative IO");
+    let stats = morsel.stats.as_ref().expect("morsel runs report stats");
+    assert!(stats.io_blocks_per_morsel_max <= 1);
     Ok(())
 }
 

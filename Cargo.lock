@@ -11160,6 +11160,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "rstest",
+ "rustix",
  "smol",
  "tempfile",
  "tokio",
@@ -11303,10 +11304,12 @@ name = "vortex-morsel"
 version = "0.1.0"
 dependencies = [
  "arrow-schema 59.2.0",
+ "crossbeam-channel",
  "futures",
  "itertools 0.14.0",
  "parking_lot",
  "rstest",
+ "rustix",
  "tokio",
  "tpchgen",
  "tpchgen-arrow",

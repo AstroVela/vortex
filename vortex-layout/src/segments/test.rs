@@ -13,6 +13,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
+use crate::segments::ReadAtNowait;
 use crate::segments::SegmentFuture;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSink;
@@ -34,6 +35,25 @@ impl SegmentSource for TestSegments {
                 .ok_or_else(|| vortex_err!("Segment not found"))
         }
         .boxed()
+    }
+
+    fn request_nowait(&self, id: SegmentId) -> VortexResult<ReadAtNowait> {
+        self.segments
+            .lock()
+            .get(*id as usize)
+            .cloned()
+            .map(BufferHandle::new_host)
+            .map(ReadAtNowait::Ready)
+            .ok_or_else(|| vortex_err!("Segment not found"))
+    }
+}
+
+impl TestSegments {
+    /// Return handles to the stored segment buffers in segment-id order.
+    ///
+    /// This lets test harnesses materialize the exact fixture into another segment source.
+    pub fn buffers(&self) -> Vec<ByteBuffer> {
+        self.segments.lock().clone()
     }
 }
 

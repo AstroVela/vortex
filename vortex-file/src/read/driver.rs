@@ -36,6 +36,8 @@ pin_project! {
         coalesce_window: Option<CoalesceConfig>,
         // Maximum physical reads returned by one stream item.
         batch_size: usize,
+        // A single cooperative turn lets concurrently registered neighbors join this batch.
+        deferred_for_coalescing: bool,
         state: State,
     }
 }
@@ -59,6 +61,7 @@ impl<S> IoRequestStream<S> {
             inner_done: false,
             coalesce_window,
             batch_size,
+            deferred_for_coalescing: false,
             state: State::new(metrics, coalesced_buffer_alignment),
         }
     }
@@ -75,9 +78,11 @@ where
 
         // Apply all events already available before choosing work. This gives coalescing visibility
         // into registered neighbors without delaying emission for future events.
+        let mut saw_event = false;
         loop {
             match this.events.as_mut().poll_next(cx) {
                 Poll::Ready(Some(event)) => {
+                    saw_event = true;
                     this.state.on_event(event);
                 }
                 Poll::Ready(None) => {
@@ -89,6 +94,13 @@ where
                 }
             }
         }
+
+        if saw_event && this.coalesce_window.is_some() && !*this.deferred_for_coalescing {
+            *this.deferred_for_coalescing = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        *this.deferred_for_coalescing = false;
 
         // Emit a partial batch immediately so the downstream driver can fill free I/O slots.
         let mut batch = Vec::with_capacity(*this.batch_size);

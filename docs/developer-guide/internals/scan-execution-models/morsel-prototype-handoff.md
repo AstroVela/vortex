@@ -1,148 +1,188 @@
 # Morsel Prototype: Handoff
 
-Everything needed to re-run the morsel-executor evaluation on other hardware and interpret what
-comes back. All the code is on branch `claude/morsel-executor-prototype-vvrscx`.
+Everything needed to rerun and interpret the morsel-executor evaluation. The code is on branch
+`claude/morsel-executor-prototype-vvrscx`.
 
-The numbers already recorded came off a **4-core Intel Xeon @ 2.10 GHz with 15 GB RAM, no
-hyperthreading, segments held in memory**. That box is small enough that several conclusions are
-provisional; the "what to look for" section below says which ones and why.
+The latest measurements used a 16-core/32-thread Intel Xeon 6975P. Compute-only results use CPUs
+0–15 (one hardware thread per physical core). File-backed results use all 32 logical CPUs because
+SMT hides file-driver latency on this machine.
 
-## 1. Get it running
+## 1. Run it
 
 ```bash
 git fetch origin claude/morsel-executor-prototype-vvrscx
 git checkout claude/morsel-executor-prototype-vvrscx
 cargo build --release -p vortex-morsel --features _test-harness --bins
-```
-
-Needs nothing external: TPC-H data is generated in-process by `tpchgen`, which was already a
-workspace dependency.
-
-```bash
-# Correctness. 18 differential tests against the V1 LayoutReader.
 cargo test -p vortex-morsel
 
-# Real TPC-H at SF=1. ~1 min including generation and write.
-./target/release/tpch-eval 1
+# Compute only: immutable in-memory segments, one worker per physical core.
+taskset -c 0-15 ./target/release/tpch-eval 1
 
-# Bigger. Memory scales roughly 1.5 GB per scale factor; SF=10 wants ~24 GB.
-./target/release/tpch-eval 10
+# Real file reads, hot and advisory-cold, using SMT to hide I/O latency.
+TPCH_DISK_PATH=target/tpch-morsel-sf1.segments TPCH_CACHE_MODE=hot \
+  taskset -c 0-31 ./target/release/tpch-eval 1
+TPCH_DISK_PATH=target/tpch-morsel-sf1.segments TPCH_CACHE_MODE=cold \
+  taskset -c 0-31 ./target/release/tpch-eval 1
 
-# Thread scaling, V1 concurrency tuning, morsel-size sweep.
+# Focus one query or report only the primary 128k morsel row.
+TPCH_QUERY=Q12 TPCH_ITERATIONS=31 ./target/release/tpch-eval 1
+TPCH_QUERY=Q12 TPCH_MORSEL_ONLY=1 TPCH_ITERATIONS=31 \
+  ./target/release/tpch-eval 1
+
+# Thread and morsel-size sweeps for the memory backend.
 TPCH_SWEEP=1 ./target/release/tpch-eval 1
-
-# The synthetic workloads (string-heavy / wide-numeric / narrow-analytic).
-MORSEL_EVAL_ROWS=1000000 ./target/release/morsel-eval
 ```
 
-Knobs: `TPCH_SCALE`, `TPCH_ROW_BLOCK` (default 8192, the write pipeline's repartition size),
-`TPCH_BLOCK_BYTES` (default 1 MiB, the coalescing target — **this is what decides how many
-natural splits the file has**, so it is the first thing to vary if you want more morsels),
-`MORSEL_EVAL_ROWS`.
+TPC-H is generated in-process; there are no downloads. SF=10 wants roughly 24 GB. Relevant knobs
+are `TPCH_SCALE`, `TPCH_ROW_BLOCK` (default 8192), `TPCH_BLOCK_BYTES` (default 1 MiB and the first
+write-side knob to vary for more natural splits), `TPCH_DISK_PATH`,
+`TPCH_CACHE_MODE={hot,cold}`, `TPCH_QUERY`, `TPCH_ITERATIONS`, `TPCH_MORSEL_ONLY=1`,
+`TPCH_COALESCE_DISTANCE`, `TPCH_COALESCE_MAX_BYTES`, and `MORSEL_EVAL_ROWS`.
 
-## 2. What the eval guarantees
+The primary read-side morsel is 131,072 rows. This does not rewrite or repartition the file. The
+file still uses the normal 8192-row write repartition and 1 MiB write coalescing target; 128k is
+only a read-time row-range cut.
 
-`tpch-eval` validates **before it times anything**: every configuration's output is compared to
-V1's on dtype, row count and ordered content, and a mismatch aborts the run rather than quietly
-dropping a row from the table. If you see a timing table, the exactness check passed for every
-row in it. Then five alternating iterations, median reported.
+At SF=1 the segment pack contains 1,789 logical segments and 174,410,852 payload bytes. Segment
+sizes are 3,780/102,396/393,492 bytes min/median/max. The aligned pack is a benchmark payload file,
+not a complete Vortex file with a footer.
 
-The morsel executor rejects at build time anything outside its scope (nested structs, non-struct
-roots, nullable root structs, non-flat/non-chunked columns), so an unsupported query can never be
-timed as if it had run.
+## 2. Fairness and correctness
 
-## 3. Results to expect, and what would falsify them
+Before timing, every configuration is compared with V1 on dtype, row count, and ordered content.
+A mismatch aborts the run. The 27 `vortex-morsel` tests include differential coverage against the
+V1 `LayoutReader` and scheduler/I/O regressions.
 
-Geomeans over the 8 TPC-H scan queries at SF=1, ratios against V1 single-threaded:
+The executor rejects unsupported layouts at plan-build time. Timed runs prepare worker threads and
+their reusable arenas before the timer. Memory configurations get an independent warm-up and are
+sampled as grouped steady-state runs. File configurations alternate readers and report median plus
+min/max.
 
-| configuration | expected |
-|---|--:|
-| V1, 4 tokio workers, default concurrency | 0.48x |
-| morsel, 1 thread | 0.75x |
-| morsel, 1 thread, decode sharing off | 0.76x |
-| morsel, 4 threads | 0.31x |
-| morsel, 4 threads, 64k morsels | 0.26x |
+Statistics pruning is disabled for V1 until morsel execution implements the same pruning. Zone maps
+and dictionary layout are disabled for both paths, so the comparison measures execution rather
+than giving only V1 a pruning capability.
 
-Against V1 tuned to its *best* concurrency, the morsel executor at 4 threads is **0.61x geomean
-(1.64x faster)**, decomposing as ~0.73x single-thread base advantage × ~1.19x better scaling.
+## 3. Execution and I/O model
 
-**Claims that should hold on any hardware:**
+There is one affinity-owned active morsel per worker. Its arena and partial operator state never
+migrate. Each worker reuses one arena across the scan. Planning registers keyed cells and divides
+work into shared required and speculative queues. While its morsel is suspended, a worker polls
+I/O work. Exact ticket completion wakes only the waiting continuation; stale generation/epoch
+wakes are ignored.
 
-- The morsel executor beats V1 at equal core count on every query.
-- `decodes + reuses` with sharing enabled equals `decodes` with it disabled, exactly, per query.
-- Time to first batch is an order of magnitude lower (structural: D emits on the first completed
-  morsel, V1 after the pipeline fills).
+File sources advertise background reads. Planning therefore creates and submits every file future
+before execute can consume its ticket: the file-backed execute path makes no `open`, `pread`,
+`preadv2`, or other system call. An unfiltered scan exposes its complete exact segment set before
+workers start. A filtered scan exposes the initial active window—one morsel per worker—which is the
+same speculative depth worker-local planning immediately names anyway. Later morsels remain
+demand-driven. This improves coalescing visibility without migrating state or increasing lookahead.
 
-**Claims that are host-specific and worth re-testing:**
+In-memory sources retain the inline path. Their `request_nowait` is an immutable buffer lookup, not
+a system call, and they never enter the background queue or report blocked morsels.
 
-- **One driving thread per physical core is optimal.** Measured on 4 cores with no
-  hyperthreading, where x8 costs ~10% and x16 ~20%. On a many-core box, or one with SMT, or with
-  real storage latency to hide, the optimum may move. This is the single most valuable thing to
-  re-measure.
-- **Scaling efficiency (2.93x on 4 cores).** Will degrade at higher core counts; where it breaks
-  is unknown and matters for P2's admission design.
-- **Morsel coalescing is neutral.** Excluding Q19 it is 1.02x — no effect. It only helps Q19
-  (0.42x) because Q19's string columns land on different block boundaries, giving it 366 natural
-  splits where other queries have 92. Past 64k rows it hurts (Q12: 9.3 → 22.7 ms at 1M).
-- **Decode sharing is neutral** (0.75x vs 0.76x), because the real write pipeline repartitions
-  every column onto the same row blocks. Q19 again is the exception (0.54x vs 0.69x). A schema
-  with more width divergence than `lineitem` would show more.
+The local-file coalescing window is 64 KiB/4 MiB (distance/maximum range), changed from 1 MiB/4 MiB
+after the larger gap repeatedly amplified bytes. The file request stream also defers dispatch for
+one bounded cooperative turn after registration. On `scan-6col`, exact whole-plan lookahead reduces
+169 physical reads to 16, versus V1's 18, while reading exactly 59,933,416 bytes.
 
-**Measurement noise on the recorded host was significant** — Q15's V1 single-thread time varied
-17.1 ms to 23.9 ms between runs, ~40%. Treat single-query differences under ~20% as noise unless
-they reproduce. A quieter machine is one of the main reasons to re-run this.
+## 4. In-memory results
 
-## 4. What is not covered
+These are SF=1 medians for V1 Tokio and the primary 128k morsel using CPUs 0–15, one warm-up, and
+15 grouped samples. The immutable source performs no file opens, syscalls, page-cache probes,
+background reads, or I/O waits.
 
-- **Zone maps and dictionary layout are disabled for both executors.** P1 supports neither; V1
-  supports both. Writing them would compare a pruning executor against a non-pruning one. This is
-  a real capability gap in the prototype and is prerequisite to any production comparison — on
-  the selective queries V1-with-zone-maps would skip blocks the prototype must read.
-- **Segments are in memory.** No IO latency, so nothing here says how either executor behaves on
-  object storage. The prototype plan's gate E2 (a latency grid of {0,1,10,50} ms) is not built.
-- **Gate E1 as written cannot be evaluated in this repository.** It requires rows B and C — the
-  self-paced graph/reactor and pipeline executors — and neither exists at any commit reachable
-  here (`self_paced`, `morsel`, `vortex-scan-v2` all find nothing). If those exist on a branch
-  elsewhere, running row C against these same fixtures is the highest-value next measurement.
-- **`lineitem` only.** The joins in Q12/Q14/Q15/Q19 are above the scan.
-- **V1 exposes no IO counters**, so the cold-scan IO invariant is unverified for V1. Output
-  equality is proven; IO equality is not.
-- ClickBench and FineWeb still need multi-gigabyte downloads and remain synthetic
-  (`morsel-eval`). Their absolute times are not comparable to any published suite number.
+| query | V1 x16 | morsel x16/128k | speedup |
+|---|--:|--:|--:|
+| Q6 | 2.756 ms | 1.888 ms | 1.46x |
+| Q1 | 2.253 ms | 0.954 ms | 2.36x |
+| Q14 | 1.567 ms | 0.895 ms | 1.75x |
+| Q15 | 1.634 ms | 0.868 ms | 1.88x |
+| Q12 | 2.830 ms | 1.802 ms | 1.57x |
+| Q19 | 6.795 ms | 1.336 ms | 5.09x |
+| scan-6col | 1.550 ms | 0.645 ms | 2.40x |
+| selective | 1.742 ms | 1.047 ms | 1.66x |
 
-## 5. Code map
+The SMT question is settled for this compute-only workload. Focused Q12/128k medians were 1.784 ms
+on 16 physical workers, 2.198 ms on 23 workers, and 2.166 ms on all 32 SMT threads. Use one worker
+per physical core for memory scans on this host. File scans move the other way: x32 was consistently
+faster than x16 because workers can poll background I/O while their morsels wait.
 
-| path | what |
+Samply showed roughly 9.3% of focused Q12 worker CPU in timed per-scan arena/node teardown. Reusing
+one thread-local arena per worker moved that work outside the timer and improved Q12 by about 6–9%.
+The profile is `/tmp/q12-memory-128k.profile.json.gz` on the measurement host and can be opened with:
+
+```bash
+samply load /tmp/q12-memory-128k.profile.json.gz
+```
+
+## 5. Local-file hot and cold results
+
+This complete SF=1 matrix uses all 32 logical CPUs, 128k-row morsels, 15 alternating samples, and
+the best V1 row (`LayoutReader` on Tokio x32). Bytes are successful reader bytes after coalescing,
+shown as V1/morsel decimal MB.
+
+| query | hot V1 / morsel | hot speedup | hot MB V1/morsel | cold V1 / morsel | cold speedup | cold MB V1/morsel |
+|---|--:|--:|--:|--:|--:|--:|
+| Q6 | 3.652 / 3.202 ms | 1.14x | 43.87 / 34.56 | 3.909 / 3.197 ms | 1.22x | 44.36 / 34.56 |
+| Q1 | 3.326 / 2.990 ms | 1.11x | 39.91 / 39.91 | 3.295 / 3.036 ms | 1.09x | 39.91 / 39.91 |
+| Q14 | 3.061 / 2.327 ms | 1.32x | 52.56 / 43.55 | 3.104 / 2.095 ms | 1.48x | 52.56 / 43.55 |
+| Q15 | 2.958 / 2.244 ms | 1.32x | 49.56 / 40.55 | 2.827 / 2.155 ms | 1.31x | 49.56 / 40.55 |
+| Q12 | 4.498 / 3.675 ms | 1.22x | 40.48 / 39.69 | 4.468 / 3.679 ms | 1.21x | 39.69 / 39.77 |
+| Q19 | 9.949 / 4.001 ms | 2.49x | 43.04 / 43.04 | 9.312 / 3.513 ms | 2.65x | 43.04 / 43.04 |
+| scan-6col | 3.073 / 1.902 ms | 1.62x | 59.93 / 59.93 | 2.951 / 1.877 ms | 1.57x | 59.93 / 59.93 |
+| selective | 3.376 / 2.553 ms | 1.32x | 55.44 / 44.92 | 3.381 / 2.695 ms | 1.25x | 56.73 / 44.92 |
+
+Every primary morsel row beats the best V1 row in both modes. Morsel physical bytes equal named
+segment bytes except for 75,572 bytes (0.19%) of cold Q12 coalescing. Q6, Q14, Q15, and the
+selective scan read materially fewer bytes than V1 because their filter/projection plan avoids
+V1's wider physical ranges; this is not statistics pruning.
+
+`cold` means `POSIX_FADV_DONTNEED` before every reader construction. It is advisory. The current
+device is local non-rotational NVMe (`nvme0n1`), not the earlier 125 MiB/s EBS volume. A direct,
+cache-bypassing read of the 174,410,852-byte pack completed in 22.9 ms (7.6 GB/s), so millisecond
+cold rows and close hot/cold medians are plausible. For strict device-level attribution use an
+aligned `O_DIRECT` fixture or block-I/O tracing; successful reader bytes are not a block-device
+counter.
+
+Time to first batch is internal readiness because output is collected and reordered at scan end;
+it is not yet delivery time to a streaming consumer.
+
+The accounting invariant remains: `decodes + reuses` with sharing equals decode work without
+sharing. A dedicated test also proves that 15 straddled segments produce exactly 15 source requests
+across four workers when decoded sharing is disabled.
+
+## 6. Scope and remaining work
+
+- Statistics pruning must be added to morsel execution before enabling it for either reader.
+- Local file I/O is covered; object-store latency and cancellation are not.
+- Output needs a bounded reorder buffer for real consumer-visible streaming.
+- Completed raw buffers remain in the scan-wide service until scan teardown; add byte-bounded
+  retention without breaking exact-ticket wakeups.
+- Q6 is now the smallest in-memory and file-backed win. Profile worker occupancy and predicate
+  decode before changing scheduling.
+- The one-turn coalescing delay is intentionally bounded. A production implementation should make
+  coalescing/admission policy explicit rather than growing an unbounded timer-based window.
+- Add real zone-map pruning and rerun V1 and morsel with identical statistics.
+- The joins in Q12/Q14/Q15/Q19 are above the scan; only `lineitem` scan work is measured.
+- ClickBench and FineWeb still require downloads and remain represented by `morsel-eval` synthetic
+  workloads.
+
+## 7. Code map
+
+| path | responsibility |
 |---|---|
-| `vortex-morsel/src/node.rs` | The `ExecNode` contract, the arena, `drive_morsel` |
-| `vortex-morsel/src/nodes/` | FLAT, CHUNKED, STRUCT, CONJUNCT (cascade/parallel), FILTER |
-| `vortex-morsel/src/io.rs` | The IO plane: keyed cells, tickets, registration |
-| `vortex-morsel/src/cells.rs` | Leased shared decoded cells (lease counts from the morsel cut) |
-| `vortex-morsel/src/build.rs` | `ExecPlan`: immutable blueprint, per-thread instantiation |
-| `vortex-morsel/src/driver.rs` | Atomic-cursor morsel scheduling, order restoration |
-| `vortex-morsel/src/tpch.rs` | Real TPC-H generation, queries, write strategy |
-| `vortex-morsel/src/harness.rs` | Fair-comparison harness, V1 and morsel runners |
-| `vortex-morsel/src/bin/tpch-eval.rs` | The TPC-H evaluation and sweep |
-| `vortex-morsel/src/bin/morsel-eval.rs` | The synthetic evaluation |
+| `vortex-morsel/src/node.rs` | `ExecNode`, exact wait sets, and retry propagation |
+| `vortex-morsel/src/nodes/` | FLAT, CHUNKED, STRUCT, CONJUNCT, and FILTER nodes |
+| `vortex-morsel/src/io.rs` | Scan-wide raw cells and morsel-local ticket views |
+| `vortex-morsel/src/cells.rs` | Lease-counted shared decoded cells |
+| `vortex-morsel/src/build.rs` | Immutable `ExecPlan` and initial I/O lookahead set |
+| `vortex-morsel/src/driver.rs` | Worker affinity, I/O queues, wakeups, and output ordering |
+| `vortex-morsel/src/bin/tpch-eval.rs` | Exactness, hot/cold backends, counters, and timing matrix |
+| `vortex-io/src/read_at.rs` | Reader contract and local/object-store coalescing defaults |
+| `vortex-file/src/read/driver.rs` | Physical request batching and coalescing |
+| `vortex-file/src/segments/source.rs` | File segment futures and background-read preference |
 
 Design context: [morsel-based plan execution](morsel-based-plan-execution.md),
-[graph model](scan-execution-graph-model.md). Results:
+[graph model](scan-execution-graph-model.md). Related results:
 [TPC-H findings](morsel-prototype-tpch-findings.md),
 [P1 findings](morsel-prototype-p1-findings.md).
-
-## 6. If you are picking this up
-
-In rough order of value:
-
-1. **Re-run `TPCH_SWEEP=1` on a many-core box.** Where thread scaling breaks, and whether one
-   thread per core is still optimal, are the two facts P2's admission loop needs and the two this
-   host was least able to answer.
-2. **Find rows B and C.** The gate this was written against is unmeasurable without them.
-3. **Add zone-map support** (a pass-through node ignoring stats is enough to start), then
-   re-enable them in the write strategy so the comparison includes pruning.
-4. **Build the latency-injection segment source** for gate E2. The IO plane already carries
-   `source_range`, `extent`, `producer` and `estimated_bytes`; nothing reads them yet, and the
-   latency grid is what makes them earn their place.
-5. **A wider schema than `lineitem`.** Decode sharing and morsel coalescing both looked neutral
-   here specifically because the write pipeline aligns every column. Q19 shows what happens when
-   it does not.
