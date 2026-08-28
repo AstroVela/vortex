@@ -85,7 +85,7 @@ Measured by sweeping both executors rather than asserted
 concurrency first, so this is not a straw man — its default of 4 is slightly under-tuned and
 c=16 is better on every query.
 
-| query | D 1thr ÷ V1 1thr | D scaling, 4 cores | V1 scaling, 4 cores | D x4 ÷ V1 best |
+| query | D 1 thread ÷ V1 1 thread | D scaling, 4 cores | V1 scaling, 4 cores | D x4 ÷ V1 best |
 |---|--:|--:|--:|--:|
 | Q6 | 0.92x | 3.66x | 3.26x | 0.82x |
 | Q1 | 0.83x | 3.14x | 2.22x | 0.59x |

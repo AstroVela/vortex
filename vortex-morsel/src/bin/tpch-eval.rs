@@ -701,7 +701,7 @@ fn sweep(
     println!();
     println!(
         "V1's parallelism is workers x concurrency. This sweeps the second factor to check the \
-         baseline is not simply mis-tuned."
+         baseline is not simply poorly tuned."
     );
     println!();
     print!("| query | V1 x1 |");

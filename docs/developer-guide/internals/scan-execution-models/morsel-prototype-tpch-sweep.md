@@ -5,7 +5,7 @@ Raw output of
 
 Three sweeps: driving threads against physical cores (including oversubscription), V1's
 concurrent-unit count (workers x per-worker split concurrency, to check the baseline is not
-mis-tuned), and morsel size. Analysis in
+poorly tuned), and morsel size. Analysis in
 [`morsel-prototype-tpch-findings.md`](morsel-prototype-tpch-findings.md).
 
 
@@ -32,7 +32,7 @@ Morsel driver: one morsel in flight per thread. `x4` is one thread per physical 
 
 ## V1 concurrent units: 4 workers x per-worker split concurrency
 
-V1's parallelism is workers x concurrency. This sweeps the second factor to check the baseline is not simply mis-tuned.
+V1's parallelism is workers x concurrency. This sweeps the second factor to check the baseline is not simply poorly tuned.
 
 | query | V1 x1 | tok4 c=1 | tok4 c=2 | tok4 c=4 | tok4 c=8 | tok4 c=16 | best |
 |---|--:|--:|--:|--:|--:|--:|--:|
@@ -57,4 +57,3 @@ V1's parallelism is workers x concurrency. This sweeps the second factor to chec
 | Q19 | 366 | 11.331ms | 11.591ms | 4.693ms | 4.513ms | 5.665ms |
 | scan-6col | 92 | 1.416ms | 1.398ms | 1.466ms | 1.279ms | 1.266ms |
 | selective | 92 | 6.097ms | 5.715ms | 5.891ms | 6.068ms | 6.797ms |
-
