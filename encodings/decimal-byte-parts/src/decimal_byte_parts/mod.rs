@@ -365,7 +365,7 @@ impl DecimalByteParts {
     }
 }
 
-/// The `vortex.decimal_byte_parts_v2` serialized format: byte parts carrying lower parts.
+/// The `vortex.decimal_byte_parts.v2` serialized format: byte parts carrying lower parts.
 ///
 /// This is a serialized format, not a second in-memory encoding. `vortex.decimal_byte_parts`
 /// froze promising a single child, so an array with lower parts serializes under this id
@@ -377,7 +377,7 @@ pub struct DecimalBytePartsV2;
 
 impl ArrayPlugin for DecimalBytePartsV2 {
     fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.decimal_byte_parts_v2");
+        static ID: CachedId = CachedId::new("vortex.decimal_byte_parts.v2");
         *ID
     }
 

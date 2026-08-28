@@ -2880,7 +2880,7 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
 /// that applies here: the writer recompresses its input, and the decimal scheme declines to
 /// split values too wide for a single signed part, so the column lands as a canonical decimal
 /// with no children. The other mechanism — the permitted-encoding check refusing the
-/// `vortex.decimal_byte_parts_v2` serialized format outside its edition — is the backstop
+/// `vortex.decimal_byte_parts.v2` serialized format outside its edition — is the backstop
 /// for a write strategy that does not recompress, and is covered in the encoding crate and
 /// the `vortex` editions tests.
 #[tokio::test]

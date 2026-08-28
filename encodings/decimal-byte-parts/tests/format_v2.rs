@@ -4,7 +4,7 @@
 //! The v2 serialized format.
 //!
 //! Lower parts can be built and computed over freely. What changes with them is the bytes:
-//! an array carrying lower parts serializes under `vortex.decimal_byte_parts_v2` rather
+//! an array carrying lower parts serializes under `vortex.decimal_byte_parts.v2` rather
 //! than the frozen `vortex.decimal_byte_parts` format, so a writer restricted to editions
 //! without the v2 format refuses it, and a reader that predates lower parts fails with an
 //! unknown-encoding error instead of misreading the children. These tests pin all of that:

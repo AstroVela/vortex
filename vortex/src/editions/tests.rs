@@ -145,7 +145,7 @@ fn decimal_byte_parts_v2_joins_unstable_2026_08() {
         session
             .encodings_in(edition)
             .iter()
-            .any(|inclusion| inclusion.encoding_id.as_str() == "vortex.decimal_byte_parts_v2")
+            .any(|inclusion| inclusion.encoding_id.as_str() == "vortex.decimal_byte_parts.v2")
     };
     assert!(!in_edition(&UNSTABLE_2026_06_0));
     assert!(in_edition(&UNSTABLE_2026_08_0));
@@ -464,7 +464,7 @@ async fn configured_btrblocks_builder_uses_enabled_editions_in_either_order() ->
     Ok(())
 }
 
-/// Build a byte-parts array that must serialize under `vortex.decimal_byte_parts_v2`.
+/// Build a byte-parts array that must serialize under `vortex.decimal_byte_parts.v2`.
 fn wide_byte_parts_column() -> VortexResult<ArrayRef> {
     use vortex_array::arrays::DecimalArray;
     use vortex_array::dtype::DecimalDType;
