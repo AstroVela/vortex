@@ -45,6 +45,8 @@ use vortex::dtype::extension::ExtDType;
 use vortex::dtype::extension::ExtDTypeRef;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
+#[cfg(feature = "unstable_encodings")]
+use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
@@ -56,6 +58,10 @@ use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_set::HashSet;
 use vortex::utils::parallelism::get_available_parallelism;
 use vortex_arrow::ArrowSessionExt;
+#[cfg(feature = "unstable_encodings")]
+use vortex_onpair::OnPair;
+#[cfg(feature = "unstable_encodings")]
+use vortex_onpair::OnPairArraySlotsExt;
 use vortex_spatial::extension::SpatialMetadata;
 use vortex_spatial::extension::WellKnownBinary;
 use wkb::Endianness;
@@ -214,7 +220,65 @@ pub async fn convert_parquet_file_to_vortex(
             ArrayStreamExt::boxed(ArrayStreamAdapter::new(dtype, stream)),
         )
         .await?;
+    output_file.flush().await?;
+    drop(output_file);
 
+    #[cfg(feature = "unstable_encodings")]
+    verify_forced_indexed_onpair(output_path).await?;
+
+    Ok(())
+}
+
+/// Check the first serialized split for fields exercised by the ClickBench and
+/// FineWeb LIKE queries. This is intentionally part of the temporary benchmark
+/// override: a benchmark run must fail rather than silently time FSST,
+/// dictionary encoding, or unindexed OnPair under the `vortex` label.
+#[cfg(feature = "unstable_encodings")]
+async fn verify_forced_indexed_onpair(path: &Path) -> anyhow::Result<()> {
+    const SEARCH_FIELDS: &[&str] = &["URL", "url", "text", "date", "file_path"];
+
+    let file = SESSION.open_options().open_path(path).await?;
+    let mut chunks = file.scan()?.into_array_stream()?;
+    let chunk = chunks
+        .try_next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{} contains no Vortex row splits", path.display()))?;
+    let Some(root) = chunk.as_opt::<Struct>() else {
+        return Ok(());
+    };
+
+    let mut checked = Vec::new();
+    for &name in SEARCH_FIELDS {
+        let Some(field) = root.unmasked_field_by_name_opt(name) else {
+            continue;
+        };
+        let mut found_onpair = false;
+        for node in field.depth_first_traversal() {
+            let Some(onpair) = node.as_opt::<OnPair>() else {
+                continue;
+            };
+            found_onpair = true;
+            anyhow::ensure!(
+                onpair.token_frequency_index_child().is_some(),
+                "{} field {name} contains unindexed OnPair",
+                path.display()
+            );
+        }
+        anyhow::ensure!(
+            found_onpair,
+            "{} field {name} was not encoded with OnPair",
+            path.display()
+        );
+        checked.push(name);
+    }
+
+    if !checked.is_empty() {
+        info!(
+            path = %path.display(),
+            fields = ?checked,
+            "verified forced indexed OnPair benchmark fields"
+        );
+    }
     Ok(())
 }
 
@@ -347,6 +411,9 @@ pub async fn write_parquet_as_vortex(
             .write(&mut output_file, data.into_array().to_array_stream())
             .await?;
         output_file.flush().await?;
+        drop(output_file);
+        #[cfg(feature = "unstable_encodings")]
+        verify_forced_indexed_onpair(&output_fname).await?;
         Ok(())
     })
     .await
@@ -495,4 +562,78 @@ fn wkb_field_to_little_endian(field: &ArrayRef, ctx: &mut ExecutionCtx) -> Vorte
         })
         .collect::<VortexResult<_>>()?;
     Ok(VarBinViewArray::from_iter_nullable_bin(little_endian).into_array())
+}
+
+#[cfg(test)]
+#[cfg(feature = "unstable_encodings")]
+mod tests {
+    use tempfile::NamedTempFile;
+    use vortex::array::dtype::FieldNames;
+    use vortex::array::expr::get_item;
+    use vortex::array::expr::like;
+    use vortex::array::expr::lit;
+    use vortex::array::expr::root;
+    use vortex::array::validity::Validity;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn benchmark_writer_persists_indexed_onpair_for_search_fields() -> anyhow::Result<()> {
+        let values = (0..4096)
+            .map(|row| {
+                let host = if row % 2 == 0 {
+                    "www.google.com"
+                } else {
+                    "www.example.com"
+                };
+                format!("https://{host}/search?q=vortex-{row:04}")
+            })
+            .collect::<Vec<_>>();
+        let urls = VarBinViewArray::from_iter_str(values.iter().map(String::as_str)).into_array();
+        let rows = urls.len();
+        let input = StructArray::try_new(
+            FieldNames::from(["URL"]),
+            vec![urls],
+            rows,
+            Validity::NonNullable,
+        )?
+        .into_array();
+
+        let output = NamedTempFile::new()?;
+        let path = output.path().to_path_buf();
+        drop(output);
+        let mut file = File::create(&path).await?;
+        CompactionStrategy::Default
+            .apply_options(SESSION.write_options())
+            .write(&mut file, input.to_array_stream())
+            .await?;
+        file.flush().await?;
+        drop(file);
+
+        verify_forced_indexed_onpair(&path).await?;
+
+        let file = SESSION.open_options().open_path(&path).await?;
+        let filter = like(get_item("URL", root()), lit("%google%"))
+            .optimize_recursive(file.dtype())?
+            .bind(file.dtype())?;
+        let result = file
+            .scan()?
+            .with_filter(filter)
+            .into_array_stream()?
+            .read_all()
+            .await?;
+        assert_eq!(result.len(), rows / 2);
+
+        let prefix = like(get_item("URL", root()), lit("https://www.google.%"))
+            .optimize_recursive(file.dtype())?
+            .bind(file.dtype())?;
+        let result = file
+            .scan()?
+            .with_filter(prefix)
+            .into_array_stream()?
+            .read_all()
+            .await?;
+        assert_eq!(result.len(), rows / 2);
+        Ok(())
+    }
 }
