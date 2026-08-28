@@ -115,14 +115,22 @@ impl<T> BufferMut<T> {
         let size = capacity
             .checked_mul(size_of::<T>())
             .vortex_expect("buffer capacity overflow");
-        let layout = Layout::from_size_align(size, *actual)
+        let allocation_size = if size == 0 {
+            0
+        } else {
+            size.checked_add(*actual - 1)
+                .vortex_expect("buffer capacity overflow")
+        };
+        let allocation_alignment = if size == 0 { *actual } else { 1 };
+        let layout = Layout::from_size_align(allocation_size, allocation_alignment)
             .unwrap_or_else(|_| vortex_panic!("buffer capacity exceeds maximum allocation size"));
-        let allocation = Allocation::allocate(layout, allocator);
-        let capacity = allocation.size() / size_of::<T>();
+        let allocation = Allocation::allocate(layout, actual, allocator);
+        let offset = allocation.ptr().as_ptr().align_offset(*actual);
+        let capacity = (allocation.size() - offset) / size_of::<T>();
 
         Self {
             allocation,
-            offset: 0,
+            offset,
             length: 0,
             capacity,
             alignment,
@@ -193,13 +201,21 @@ impl<T> BufferMut<T> {
         let size = len
             .checked_mul(size_of::<T>())
             .vortex_expect("buffer length overflow");
-        let layout = Layout::from_size_align(size, *actual_alignment)
+        let allocation_size = if size == 0 {
+            0
+        } else {
+            size.checked_add(*actual_alignment - 1)
+                .vortex_expect("buffer length overflow")
+        };
+        let allocation_alignment = if size == 0 { *actual_alignment } else { 1 };
+        let layout = Layout::from_size_align(allocation_size, allocation_alignment)
             .unwrap_or_else(|_| vortex_panic!("buffer length exceeds maximum allocation size"));
-        let allocation = Allocation::allocate_zeroed(layout, allocator);
-        let capacity = allocation.size() / size_of::<T>();
+        let allocation = Allocation::allocate_zeroed(layout, actual_alignment, allocator);
+        let offset = allocation.ptr().as_ptr().align_offset(*actual_alignment);
+        let capacity = (allocation.size() - offset) / size_of::<T>();
         Self {
             allocation,
-            offset: 0,
+            offset,
             length: len,
             capacity,
             alignment,
@@ -441,26 +457,32 @@ impl<T> BufferMut<T> {
         let new_size = new_capacity
             .checked_mul(size_of::<T>())
             .vortex_expect("buffer capacity overflow");
-        let physical_alignment = max(self.alignment, self.allocation.alignment());
-        let layout = Layout::from_size_align(new_size, *physical_alignment)
+        let physical_alignment = max(self.alignment, self.allocation.buffer_alignment());
+        let allocation_size = new_size
+            .checked_add(*physical_alignment - 1)
+            .vortex_expect("buffer capacity overflow");
+        let layout = Layout::from_size_align(allocation_size, 1)
             .unwrap_or_else(|_| vortex_panic!("buffer capacity exceeds maximum allocation size"));
 
-        if self.offset == 0 {
-            self.allocation.grow(layout);
-        } else {
-            let mut allocation = Allocation::allocate(layout, self.allocation.allocator().clone());
-            // SAFETY: both ranges are valid for the initialized byte length and do not overlap.
+        let old_offset = self.offset;
+        self.allocation.grow(layout, physical_alignment);
+        let new_offset = self
+            .allocation
+            .ptr()
+            .as_ptr()
+            .align_offset(*physical_alignment);
+        if old_offset != new_offset {
+            // SAFETY: both ranges are within the allocation and may overlap.
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.as_ptr().cast::<u8>(),
-                    allocation.ptr().as_ptr(),
+                std::ptr::copy(
+                    self.allocation.ptr().as_ptr().add(old_offset),
+                    self.allocation.ptr().as_ptr().add(new_offset),
                     self.length * size_of::<T>(),
                 );
             }
-            std::mem::swap(&mut self.allocation, &mut allocation);
-            self.offset = 0;
         }
-        self.capacity = self.allocation.size() / size_of::<T>();
+        self.offset = new_offset;
+        self.capacity = (self.allocation.size() - new_offset) / size_of::<T>();
     }
 
     /// Returns the spare capacity of the buffer as a slice of `MaybeUninit<T>`.
