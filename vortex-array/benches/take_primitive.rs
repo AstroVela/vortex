@@ -29,8 +29,8 @@ fn main() {
 /// Number of indices to take. The top tier is sized to keep CodSpeed simulation under 1ms.
 const NUM_INDICES: &[usize] = &[1_000, 10_000, 25_000];
 
-/// Large enough to measure both cache-resident and streaming dictionary decoding.
-const GT_NUM_INDICES: &[usize] = &[1_000_000, 16_000_000];
+/// Sized to keep each CodSpeed sample near or under 0.1ms while staying stable.
+const GT_NUM_INDICES: &[usize] = &[100_000, 250_000];
 
 /// Size of the source vector / dictionary values.
 const VECTOR_SIZE: &[usize] = &[16, 256, 2048, 8192];
