@@ -183,8 +183,10 @@ where
     }
 
     fn reset(&mut self) -> ArrayRef {
+        self.lookup.clear();
+        self.null_code = OnceCell::new();
         PrimitiveArray::new(
-            self.values.clone(),
+            mem::take(&mut self.values),
             Validity::from_bit_buffer(mem::take(&mut self.values_nulls).freeze(), self.nullability),
         )
         .into_array()
@@ -200,14 +202,19 @@ mod test {
     use std::sync::LazyLock;
 
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
     use crate::IntoArray as _;
     use crate::VortexSessionExecute;
     use crate::arrays::dict::DictArraySlotsExt;
     use crate::assert_arrays_eq;
+    use crate::builders::dict::DictEncoder;
+    use crate::builders::dict::UNCONSTRAINED;
     use crate::builders::dict::dict_encode;
     use crate::builders::dict::primitive::PrimitiveArray;
+    use crate::builders::dict::primitive::PrimitiveDictBuilder;
+    use crate::dtype::Nullability;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
 
@@ -246,5 +253,29 @@ mod test {
         let expected_values =
             PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array();
         assert_arrays_eq!(dict.values(), expected_values, &mut ctx);
+    }
+
+    #[test]
+    fn reset_starts_a_fresh_dictionary() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mut encoder =
+            PrimitiveDictBuilder::<i32, u8>::new(Nullability::NonNullable, &UNCONSTRAINED);
+
+        let first = buffer![10i32, 20, 10].into_array();
+        assert_eq!(
+            encoder.encode(&first, &mut ctx)?.as_slice::<u8>(),
+            &[0, 1, 0]
+        );
+        assert_eq!(encoder.reset().len(), 2);
+
+        // Codes handed out after a reset address the new dictionary, so the builder must not
+        // remember the values it flushed.
+        let second = buffer![30i32, 10, 30].into_array();
+        assert_eq!(
+            encoder.encode(&second, &mut ctx)?.as_slice::<u8>(),
+            &[0, 1, 0]
+        );
+        assert_eq!(encoder.reset().len(), 2);
+        Ok(())
     }
 }
