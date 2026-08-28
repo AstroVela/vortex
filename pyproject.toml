@@ -32,7 +32,7 @@ managed = true
 required-version = ">=0.8.0"
 
 [tool.uv.workspace]
-members = ["bench-orchestrator", "vortex-python", "docs"]
+members = ["bench-orchestrator", "docs", "scripts", "vortex-python"]
 
 [tool.uv.sources]
 bench-orchestrator = { workspace = true }

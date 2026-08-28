@@ -11,6 +11,7 @@ members = [
     "bench-orchestrator",
     "docs",
     "vortex-data",
+    "vortex-scripts",
     "workspace",
 ]
 
@@ -2406,6 +2407,25 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "vortex-data", specifier = "==0.1.0" }]
+
+[[package]]
+name = "vortex-scripts"
+version = "0.1.0"
+source = { virtual = "scripts" }
+dependencies = [
+    { name = "hf-xet" },
+    { name = "httpx" },
+    { name = "huggingface-hub" },
+    { name = "pyarrow" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hf-xet", specifier = ">=1.1.10" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "huggingface-hub", specifier = ">=0.34.0" },
+    { name = "pyarrow", specifier = ">=17.0.0" },
+]
 
 [[package]]
 name = "wcwidth"
