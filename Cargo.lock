@@ -10639,6 +10639,8 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-arrow",
+ "vortex-btrblocks",
+ "vortex-onpair",
  "vortex-spatial",
  "vortex-tensor",
  "wkb",

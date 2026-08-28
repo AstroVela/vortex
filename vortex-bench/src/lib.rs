@@ -73,6 +73,20 @@ use vortex::VortexSessionDefault;
 pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+#[cfg(feature = "unstable_encodings")]
+use vortex_btrblocks::SchemeExt;
+#[cfg(feature = "unstable_encodings")]
+use vortex_btrblocks::schemes::string::FSSTScheme;
+#[cfg(feature = "unstable_encodings")]
+use vortex_btrblocks::schemes::string::NullDominatedSparseScheme;
+#[cfg(feature = "unstable_encodings")]
+use vortex_btrblocks::schemes::string::OnPairScheme;
+#[cfg(feature = "unstable_encodings")]
+use vortex_btrblocks::schemes::string::StringDictScheme;
+#[cfg(feature = "unstable_encodings")]
+use vortex_btrblocks::schemes::string::ZstdScheme;
+#[cfg(feature = "unstable_encodings")]
+use vortex_onpair::OnPairIndexSet;
 
 // All benchmarks run with mimalloc for consistency.
 #[global_allocator]
@@ -250,6 +264,20 @@ pub enum CompactionStrategy {
 
 impl CompactionStrategy {
     pub fn apply_options(&self, options: VortexWriteOptions) -> VortexWriteOptions {
+        #[cfg(feature = "unstable_encodings")]
+        {
+            tracing::warn!(
+                compaction = ?self,
+                "temporary benchmark configuration: forcing indexed OnPair for UTF-8 columns"
+            );
+            options.with_strategy(
+                WriteStrategyBuilder::default()
+                    .with_btrblocks_builder(forced_indexed_onpair_builder(*self))
+                    .build(),
+            )
+        }
+
+        #[cfg(not(feature = "unstable_encodings"))]
         match self {
             CompactionStrategy::Compact => options.with_strategy(
                 WriteStrategyBuilder::default()
@@ -259,6 +287,31 @@ impl CompactionStrategy {
             CompactionStrategy::Default => options,
         }
     }
+}
+
+#[cfg(feature = "unstable_encodings")]
+const INDEXED_ONPAIR: OnPairScheme =
+    OnPairScheme::new().with_indexes(OnPairIndexSet::empty().with_token_frequency());
+
+/// Temporary benchmark-only compressor configuration used to obtain attributable
+/// end-to-end OnPair search numbers. Keep every non-string scheme, replace all
+/// selectable UTF-8 schemes with indexed OnPair, and preserve compact-mode
+/// schemes for non-string columns.
+#[cfg(feature = "unstable_encodings")]
+fn forced_indexed_onpair_builder(compaction: CompactionStrategy) -> BtrBlocksCompressorBuilder {
+    let builder = match compaction {
+        CompactionStrategy::Default => BtrBlocksCompressorBuilder::default(),
+        CompactionStrategy::Compact => BtrBlocksCompressorBuilder::default().with_compact(),
+    };
+    builder
+        .exclude_schemes([
+            StringDictScheme.id(),
+            FSSTScheme.id(),
+            OnPairScheme::new().id(),
+            NullDominatedSparseScheme.id(),
+            ZstdScheme.id(),
+        ])
+        .with_new_scheme(&INDEXED_ONPAIR)
 }
 
 /// Verify that local data has already been prepared for the requested benchmark formats.

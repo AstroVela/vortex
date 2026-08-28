@@ -28,6 +28,8 @@ vortex = { workspace = true, features = [
     "zstd",
 ] }
 vortex-arrow = { workspace = true }
+vortex-btrblocks = { workspace = true, features = ["zstd"], optional = true }
+vortex-onpair = { workspace = true, optional = true }
 vortex-spatial = { workspace = true }
 vortex-tensor = { workspace = true } # TODO(connor): In the future, this might be inside vortex.
 
@@ -88,4 +90,9 @@ rstest = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-unstable_encodings = ["vortex/unstable_encodings"]
+unstable_encodings = [
+    "dep:vortex-btrblocks",
+    "dep:vortex-onpair",
+    "vortex/unstable_encodings",
+    "vortex-btrblocks/unstable_encodings",
+]
