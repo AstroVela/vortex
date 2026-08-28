@@ -23,6 +23,9 @@
 //! 3. A rebuilt node is rewritten again. Any replacement is walked as a new subtree so rules may
 //!    safely introduce expressions that need further optimization.
 //!
+//! After the rule-driven traversal reaches a fixpoint, compatible bounds in the top-level
+//! conjunction are combined into `between` expressions.
+//!
 //! Every replacement must preserve the node's dtype and differ from the expression it replaces.
 //! A per-run rewrite limit terminates rule cycles, and a depth limit prevents stack overflow.
 
@@ -32,8 +35,10 @@ use vortex_error::vortex_ensure;
 
 use crate::expr::BoundExpression;
 
+mod find_between;
 mod rules;
 
+use find_between::find_between;
 pub use rules::OptimizerRule;
 pub use rules::OptimizerRuleRef;
 pub use rules::OptimizerRuleRegistry;
@@ -81,7 +86,9 @@ impl BoundExpressionOptimizer {
 
     /// Optimize an entire bound expression tree, returning `None` when no subtree changed.
     pub fn try_optimize(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        OptimizationRun::new(&self.registry, self.max_rewrites).run(expr)
+        let optimized = OptimizationRun::new(&self.registry, self.max_rewrites).run(expr)?;
+        let expression = optimized.as_ref().unwrap_or(expr);
+        Ok(find_between(expression)?.or(optimized))
     }
 }
 

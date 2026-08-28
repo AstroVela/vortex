@@ -3,9 +3,8 @@
 
 //! Compares the legacy `Expression` optimizer with the rule-driven `BoundExpression` optimizer.
 //!
-//! Expressions are constructed and bound outside the timed region. `builtins` varies both tree
-//! size and the number of nodes that the built-in rules can rewrite. `rule_dispatch` isolates the
-//! bound optimizer and varies the number of rules checked before a successful rewrite.
+//! Expressions are constructed and bound outside the timed region. The benchmarks vary tree size
+//! and the number of nodes that the default optimizer rules can rewrite.
 
 #![expect(clippy::unwrap_used)]
 
@@ -21,22 +20,16 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::StructFields;
-use vortex_array::expr::BoundExpression;
 use vortex_array::expr::BoundExpressionOptimizer;
 use vortex_array::expr::Expression;
-use vortex_array::expr::ExpressionId;
-use vortex_array::expr::OptimizerRule;
-use vortex_array::expr::OptimizerRuleRegistry;
 use vortex_array::expr::and;
+use vortex_array::expr::and_collect;
 use vortex_array::expr::col;
 use vortex_array::expr::eq;
+use vortex_array::expr::gt_eq;
 use vortex_array::expr::lit;
+use vortex_array::expr::lt;
 use vortex_array::expr::or_collect;
-use vortex_array::scalar_fn::ScalarFnVTable;
-use vortex_array::scalar_fn::fns::binary::Binary;
-use vortex_array::scalar_fn::fns::literal::Literal;
-use vortex_array::scalar_fn::fns::operators::Operator;
-use vortex_error::VortexResult;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -127,13 +120,6 @@ const REWRITE_CASES: &[RewriteCase] = &[
     },
 ];
 
-const NO_REWRITE_CASES: &[RewriteCase] = &[
-    REWRITE_CASES[0],
-    REWRITE_CASES[2],
-    REWRITE_CASES[5],
-    REWRITE_CASES[8],
-];
-
 fn build_expression(case: RewriteCase) -> Expression {
     or_collect((0..case.terms).map(|idx| {
         let term = eq(col("x"), lit(i32::try_from(idx).unwrap()));
@@ -177,133 +163,84 @@ mod builtins {
             .counter(ItemsCount::new(case.node_count()))
             .bench(|| black_box(optimizer.optimize(&expr).unwrap()));
     }
+}
 
-    #[divan::bench(args = NO_REWRITE_CASES)]
-    fn bound_expression_empty(bencher: Bencher, case: &RewriteCase) {
+const CONJUNCTION_SIZES: &[usize] = &[16, 64, 128];
+
+fn build_range_conjunction(pairs: usize) -> Expression {
+    and_collect((0..pairs).flat_map(|idx| {
+        let lower = i32::try_from(idx * 2).unwrap();
+        [gt_eq(col("x"), lit(lower)), lt(col("x"), lit(lower + 1))]
+    }))
+    .unwrap()
+}
+
+fn build_no_range_conjunction(terms: usize) -> Expression {
+    and_collect((0..terms).map(|idx| eq(col("x"), lit(i32::try_from(idx).unwrap())))).unwrap()
+}
+
+mod conjunctions {
+    use super::*;
+
+    #[divan::bench(args = CONJUNCTION_SIZES)]
+    fn expression_ranges(bencher: Bencher, pairs: &usize) {
         let scope = struct_scope();
-        let expr = build_expression(*case).bind(&scope).unwrap();
-        let optimizer = BoundExpressionOptimizer::new(OptimizerRuleRegistry::empty());
+        let expr = build_range_conjunction(*pairs);
 
         bencher
-            .counter(ItemsCount::new(case.node_count()))
+            .counter(ItemsCount::new(10 * *pairs - 1))
+            .bench(|| black_box(expr.optimize_recursive(&scope).unwrap()));
+    }
+
+    #[divan::bench(args = CONJUNCTION_SIZES)]
+    fn bound_expression_ranges(bencher: Bencher, pairs: &usize) {
+        let scope = struct_scope();
+        let unbound = build_range_conjunction(*pairs);
+        let expr = unbound.bind(&scope).unwrap();
+        let optimizer = BoundExpressionOptimizer::default();
+
+        assert_eq!(
+            optimizer.optimize(&expr).unwrap(),
+            unbound
+                .optimize_recursive(&scope)
+                .unwrap()
+                .bind(&scope)
+                .unwrap()
+        );
+
+        bencher
+            .counter(ItemsCount::new(10 * *pairs - 1))
             .bench(|| black_box(optimizer.optimize(&expr).unwrap()));
     }
-}
 
-/// A binary rule that either declines every node or simplifies `value AND true`.
-#[derive(Debug)]
-struct AndTrueRule {
-    enabled: bool,
-}
+    #[divan::bench(args = CONJUNCTION_SIZES)]
+    fn expression_no_ranges(bencher: Bencher, terms: &usize) {
+        let scope = struct_scope();
+        let expr = build_no_range_conjunction(*terms);
 
-impl OptimizerRule for AndTrueRule {
-    fn expression_id(&self) -> ExpressionId {
-        Binary.id()
+        bencher
+            .counter(ItemsCount::new(5 * *terms - 1))
+            .bench(|| black_box(expr.optimize_recursive(&scope).unwrap()));
     }
 
-    fn rewrite(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
-        if !self.enabled || expr.as_opt::<Binary>() != Some(&Operator::And) {
-            return Ok(None);
-        }
-        let rhs_is_true = expr
-            .child(1)
-            .as_opt::<Literal>()
-            .and_then(|scalar| scalar.as_bool_opt())
-            .is_some_and(|value| value.value() == Some(true));
-        Ok(rhs_is_true.then(|| expr.child(0).clone()))
+    #[divan::bench(args = CONJUNCTION_SIZES)]
+    fn bound_expression_no_ranges(bencher: Bencher, terms: &usize) {
+        let scope = struct_scope();
+        let unbound = build_no_range_conjunction(*terms);
+        let expr = unbound.bind(&scope).unwrap();
+        let optimizer = BoundExpressionOptimizer::default();
+
+        assert_eq!(
+            optimizer.optimize(&expr).unwrap(),
+            unbound
+                .optimize_recursive(&scope)
+                .unwrap()
+                .bind(&scope)
+                .unwrap()
+        );
+
+        bencher
+            .counter(ItemsCount::new(5 * *terms - 1))
+            .bench(|| black_box(optimizer.optimize(&expr).unwrap()));
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RuleDispatchCase {
-    terms: usize,
-    candidate_rules: usize,
-}
-
-impl RuleDispatchCase {
-    fn rewrite_case(self) -> RewriteCase {
-        RewriteCase {
-            terms: self.terms,
-            rewrite_sites: self.terms,
-        }
-    }
-}
-
-impl Display for RuleDispatchCase {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(
-            f,
-            "nodes={}, candidate_rules={}",
-            self.rewrite_case().node_count(),
-            self.candidate_rules
-        )
-    }
-}
-
-const RULE_DISPATCH_CASES: &[RuleDispatchCase] = &[
-    RuleDispatchCase {
-        terms: 16,
-        candidate_rules: 1,
-    },
-    RuleDispatchCase {
-        terms: 16,
-        candidate_rules: 4,
-    },
-    RuleDispatchCase {
-        terms: 16,
-        candidate_rules: 16,
-    },
-    RuleDispatchCase {
-        terms: 16,
-        candidate_rules: 64,
-    },
-    RuleDispatchCase {
-        terms: 128,
-        candidate_rules: 1,
-    },
-    RuleDispatchCase {
-        terms: 128,
-        candidate_rules: 4,
-    },
-    RuleDispatchCase {
-        terms: 128,
-        candidate_rules: 16,
-    },
-    RuleDispatchCase {
-        terms: 128,
-        candidate_rules: 64,
-    },
-    RuleDispatchCase {
-        terms: 512,
-        candidate_rules: 1,
-    },
-    RuleDispatchCase {
-        terms: 512,
-        candidate_rules: 4,
-    },
-    RuleDispatchCase {
-        terms: 512,
-        candidate_rules: 16,
-    },
-    RuleDispatchCase {
-        terms: 512,
-        candidate_rules: 64,
-    },
-];
-
-#[divan::bench(args = RULE_DISPATCH_CASES)]
-fn rule_dispatch(bencher: Bencher, case: &RuleDispatchCase) {
-    let rewrite_case = case.rewrite_case();
-    let scope = struct_scope();
-    let expr = build_expression(rewrite_case).bind(&scope).unwrap();
-    let mut registry = OptimizerRuleRegistry::empty();
-    for _ in 1..case.candidate_rules {
-        registry.register(AndTrueRule { enabled: false });
-    }
-    registry.register(AndTrueRule { enabled: true });
-    let optimizer = BoundExpressionOptimizer::new(registry);
-
-    bencher
-        .counter(ItemsCount::new(rewrite_case.node_count()))
-        .bench(|| black_box(optimizer.optimize(&expr).unwrap()));
 }

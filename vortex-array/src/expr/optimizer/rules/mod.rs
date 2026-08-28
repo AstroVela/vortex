@@ -21,7 +21,6 @@ mod structural;
 
 pub(crate) use binary::BinaryBoolean;
 pub(crate) use binary::BinaryNullComparison;
-pub(crate) use binary::FindBetween;
 pub(crate) use cast::CastLiteralOrIdentity;
 pub(crate) use conditional::ConstantMask;
 pub(crate) use conditional::ConstantZip;
@@ -87,7 +86,6 @@ impl Default for OptimizerRuleRegistry {
 
         registry.register(BinaryBoolean);
         registry.register(BinaryNullComparison);
-        registry.register(FindBetween);
         registry.register(CastLiteralOrIdentity);
         registry.register(GetItemFromPack);
         registry.register(MergeToPack);
