@@ -20,6 +20,7 @@ use std::task::Waker;
 use std::time::Duration;
 
 use futures::FutureExt;
+use futures::TryStreamExt;
 use futures::future::poll_fn;
 use parking_lot::Mutex;
 use rstest::rstest;
@@ -46,7 +47,13 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_io::runtime::single::block_on;
 use vortex_io::session::RuntimeSession;
+use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::LayoutRef;
+use vortex_layout::layouts::flat::Flat;
+use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
+use vortex_layout::layouts::zoned::writer::ZonedStrategy;
+use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::segments::ReadAtNowait;
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentId;
@@ -54,9 +61,11 @@ use vortex_layout::segments::SegmentSource;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
+use crate::MorselScanExecutor;
 use crate::fixtures::Column;
 use crate::fixtures::Fixture;
 use crate::fixtures::write_fixture;
+use crate::fixtures::write_fixture_with;
 use crate::harness::MorselConfig;
 use crate::harness::Query;
 use crate::harness::assert_same_rows;
@@ -210,6 +219,95 @@ fn queries() -> Vec<Query> {
 }
 
 const ROWS: usize = 1000;
+
+struct CountingSource {
+    buffers: Arc<[ByteBuffer]>,
+    requests: Arc<[AtomicUsize]>,
+}
+
+impl SegmentSource for CountingSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        let index = *id as usize;
+        self.requests[index].fetch_add(1, Ordering::Relaxed);
+        let buffer = self.buffers.get(index).cloned();
+        async move {
+            buffer
+                .map(BufferHandle::new_host)
+                .ok_or_else(|| vortex_err!("missing segment {index}"))
+        }
+        .boxed()
+    }
+}
+
+#[rstest]
+fn scan_builder_streams_ordered_morsels_and_prunes_zones() -> VortexResult<()> {
+    let session = session();
+    let values: Vec<i32> = (0..16).collect();
+    let strategy = Arc::new(ZonedStrategy::new(
+        FlatLayoutStrategy::default(),
+        FlatLayoutStrategy::default(),
+        ZonedLayoutOptions {
+            block_size: std::num::NonZeroUsize::new(8).expect("non-zero zone size"),
+            ..Default::default()
+        },
+    ));
+    let (batches, first_data_requests) = block_on(|handle| async {
+        let run_session = session.clone().with_handle(handle);
+        let fixture = write_fixture_with(
+            vec![Column::new("a", i32_chunks(&values, &[8, 16]))],
+            strategy,
+            &run_session,
+        )
+        .await?;
+        let first_data_segment = fixture
+            .layout
+            .slot(1)?
+            .expect("field layout")
+            .slot(0)?
+            .expect("first chunk")
+            .slot(0)?
+            .expect("zoned data child")
+            .as_::<Flat>()
+            .segment_id();
+        let requests: Arc<[AtomicUsize]> = (0..fixture.segment_buffers.len())
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+        let segments: Arc<dyn SegmentSource> = Arc::new(CountingSource {
+            buffers: fixture.segment_buffers.clone().into(),
+            requests: Arc::clone(&requests),
+        });
+        let reader = fixture.layout.new_reader(
+            "scan-builder-morsel".into(),
+            Arc::clone(&segments),
+            &run_session,
+            &Default::default(),
+        )?;
+        let projection = select(vec!["a"], root()).bind(reader.dtype())?;
+        let filter = gt(get_item("a", root()), lit(11_i32)).bind(reader.dtype())?;
+        let executor = Arc::new(
+            MorselScanExecutor::new(Arc::clone(&fixture.layout), segments).with_target_rows(8),
+        );
+
+        let batches = ScanBuilder::new(run_session, reader)
+            .with_projection(projection)
+            .with_filter(filter)
+            .with_executor(executor)
+            .into_stream()?
+            .try_collect::<Vec<_>>()
+            .await?;
+        VortexResult::Ok((
+            batches,
+            requests[*first_data_segment as usize].load(Ordering::Relaxed),
+        ))
+    })?;
+
+    assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 4);
+    assert_eq!(
+        first_data_requests, 0,
+        "the first zoned morsel should be pruned before reading its data segment"
+    );
+    Ok(())
+}
 
 /// Property: the executor agrees with V1 on every query, over misaligned chunks.
 #[rstest]

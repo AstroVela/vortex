@@ -10906,6 +10906,7 @@ dependencies = [
  "url",
  "vortex",
  "vortex-arrow",
+ "vortex-morsel",
  "vortex-utils",
 ]
 
@@ -10967,6 +10968,7 @@ dependencies = [
  "url",
  "vortex",
  "vortex-array",
+ "vortex-morsel",
  "vortex-runend",
  "vortex-sequence",
  "vortex-spatial",
