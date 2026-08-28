@@ -18,7 +18,6 @@ use crate::dtype::DType;
 use crate::expr::display::DisplayTreeExpr;
 use crate::expr::is_not_null;
 use crate::expr::lambda::Lambda;
-use crate::expr::scope::Scope;
 use crate::expr::traversal::TraversalOrder;
 use crate::expr::traversal::pre_order_visit_down;
 use crate::expr::variable::Variable;
@@ -158,31 +157,29 @@ impl Expression {
         }
     }
 
-    /// Computes the return dtype of this expression against a lexical scope.
-    pub fn return_dtype(&self, scope: impl Into<Scope>) -> VortexResult<DType> {
-        self.return_dtype_inner(&scope.into())
-    }
-
-    fn return_dtype_inner(&self, scope: &Scope) -> VortexResult<DType> {
+    /// Computes the return dtype of this expression given the root dtype.
+    ///
+    /// Variables and lambdas require an enclosing higher-order function to establish their
+    /// lexical meaning, so they do not have a standalone dtype.
+    pub fn return_dtype(&self, root_dtype: &DType) -> VortexResult<DType> {
         match self {
-            Self::Root => Ok(scope.root().clone()),
-            Self::Variable(variable) => {
-                let Some((dtype, _)) = scope.resolve(variable) else {
-                    vortex_bail!("unbound variable '{variable}'");
-                };
-                Ok(dtype.clone())
-            }
+            Self::Root => Ok(root_dtype.clone()),
+            Self::Variable(variable) => vortex_bail!(
+                "variable '{variable}' has no standalone dtype; it must be bound by a higher-order function"
+            ),
             Self::Scalar {
                 scalar_fn,
                 children,
             } => {
                 let arg_dtypes = children
                     .iter()
-                    .map(|child| child.return_dtype_inner(scope))
+                    .map(|child| child.return_dtype(root_dtype))
                     .collect::<VortexResult<Vec<_>>>()?;
                 scalar_fn.return_dtype(&arg_dtypes)
             }
-            Self::Lambda(_) => vortex_bail!("a lambda has no standalone dtype"),
+            Self::Lambda(_) => vortex_bail!(
+                "a lambda has no standalone dtype; it must be bound by a higher-order function"
+            ),
         }
     }
 

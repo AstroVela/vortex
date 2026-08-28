@@ -5,13 +5,15 @@ use std::cell::RefCell;
 
 use itertools::Itertools;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::dtype::DType;
 use crate::expr::Expression;
-use crate::expr::Scope;
 use crate::expr::transform::match_between::find_between;
+use crate::expr::traversal::TraversalOrder;
+use crate::expr::traversal::pre_order_visit_down;
 use crate::scalar_fn::ExpressionReduceNode;
 use crate::scalar_fn::SimplifyCtx;
 
@@ -22,13 +24,9 @@ impl Expression {
     /// 1. `simplify_untyped` - type-independent simplifications
     /// 2. `simplify` - type-aware simplifications
     /// 3. `reduce` - abstract reduction rules via `ReduceNode`
-    pub fn optimize(&self, scope: &DType) -> VortexResult<Expression> {
-        self.optimize_scope(&Scope::new(scope.clone()))
-    }
-
-    /// Optimize the root expression node against a lexical scope.
-    pub fn optimize_scope(&self, scope: &Scope) -> VortexResult<Expression> {
-        let cache = SimplifyCache::new(scope);
+    pub fn optimize(&self, root_dtype: &DType) -> VortexResult<Expression> {
+        self.ensure_optimizable()?;
+        let cache = SimplifyCache::new(root_dtype);
         Ok(self.try_optimize(&cache)?.unwrap_or_else(|| self.clone()))
     }
 
@@ -38,7 +36,7 @@ impl Expression {
     fn simplify_untyped_node(&self) -> VortexResult<Option<Expression>> {
         match self {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.simplify_untyped(self),
-            _ => Ok(None),
+            Expression::Variable(_) | Expression::Lambda(_) | Expression::Root => Ok(None),
         }
     }
 
@@ -46,7 +44,7 @@ impl Expression {
     fn simplify_node(&self, ctx: &dyn SimplifyCtx) -> VortexResult<Option<Expression>> {
         match self {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.simplify(self, ctx),
-            _ => Ok(None),
+            Expression::Variable(_) | Expression::Lambda(_) | Expression::Root => Ok(None),
         }
     }
 
@@ -57,7 +55,7 @@ impl Expression {
     ) -> VortexResult<Option<ExpressionReduceNode<'a>>> {
         match self {
             Expression::Scalar { scalar_fn, .. } => scalar_fn.reduce_expression(node),
-            _ => Ok(None),
+            Expression::Variable(_) | Expression::Lambda(_) | Expression::Root => Ok(None),
         }
     }
 
@@ -92,11 +90,11 @@ impl Expression {
                 changed = true;
             }
 
-            // Try reduce via ReduceNode. The node borrows the expression and scope, so
+            // Try reduce via ReduceNode. The node borrows the expression and root dtype, so
             // constructing it is free; the block scopes the borrows so `current` can be updated.
             let reduced = {
                 let expr = current.as_ref().unwrap_or(self);
-                let reduce_node = ExpressionReduceNode::new(expr, cache.scope);
+                let reduce_node = ExpressionReduceNode::new(expr, cache.root_dtype);
                 expr.reduce_node(&reduce_node)?
                     .map(ExpressionReduceNode::into_expression)
             };
@@ -116,30 +114,17 @@ impl Expression {
     /// Optimize the entire expression tree recursively.
     ///
     /// Optimizes children first (bottom-up), then optimizes the root.
-    pub fn optimize_recursive(&self, scope: &DType) -> VortexResult<Expression> {
-        self.optimize_recursive_scope(&Scope::new(scope.clone()))
-    }
-
-    /// Optimize the entire expression tree recursively against a lexical scope.
-    ///
-    /// Variables are resolved from `scope` during type-aware simplification. Higher-order
-    /// functions establish a child scope for each lambda body, so the body is optimized under its
-    /// own root dtype and parameter frame while keeping enclosing captures available.
-    pub fn optimize_recursive_scope(&self, scope: &Scope) -> VortexResult<Expression> {
+    pub fn optimize_recursive(&self, root_dtype: &DType) -> VortexResult<Expression> {
         Ok(self
             .clone()
-            .try_optimize_recursive_scope(scope)?
+            .try_optimize_recursive(root_dtype)?
             .unwrap_or_else(|| self.clone()))
     }
 
     /// Try to optimize the entire expression tree recursively.
-    pub fn try_optimize_recursive(&self, scope: &DType) -> VortexResult<Option<Expression>> {
-        self.try_optimize_recursive_scope(&Scope::new(scope.clone()))
-    }
-
-    /// Try to optimize the entire expression tree recursively against a lexical scope.
-    pub fn try_optimize_recursive_scope(&self, scope: &Scope) -> VortexResult<Option<Expression>> {
-        let cache = SimplifyCache::new(scope);
+    pub fn try_optimize_recursive(&self, root_dtype: &DType) -> VortexResult<Option<Expression>> {
+        self.ensure_optimizable()?;
+        let cache = SimplifyCache::new(root_dtype);
         let result = self.try_optimize_recursive_inner(&cache)?;
 
         // Apply the between optimization once at the top level only.
@@ -179,17 +164,29 @@ impl Expression {
 
         Ok(current)
     }
+
+    fn ensure_optimizable(&self) -> VortexResult<()> {
+        pre_order_visit_down(self, |expr| match expr {
+            Expression::Variable(variable) => vortex_bail!(
+                "cannot optimize an expression containing variable '{variable}'; variables must be optimized by their enclosing higher-order function"
+            ),
+            Expression::Lambda(_) => vortex_bail!(
+                "cannot optimize an expression containing a lambda; lambdas must be optimized by their enclosing higher-order function"
+            ),
+            Expression::Scalar { .. } | Expression::Root => Ok(TraversalOrder::Continue),
+        })
+    }
 }
 
 struct SimplifyCache<'a> {
-    scope: &'a Scope,
+    root_dtype: &'a DType,
     dtype_cache: RefCell<HashMap<Expression, DType>>,
 }
 
 impl<'a> SimplifyCache<'a> {
-    fn new(scope: &'a Scope) -> Self {
+    fn new(root_dtype: &'a DType) -> Self {
         Self {
-            scope,
+            root_dtype,
             dtype_cache: RefCell::new(HashMap::new()),
         }
     }
@@ -197,17 +194,9 @@ impl<'a> SimplifyCache<'a> {
 
 impl SimplifyCtx for SimplifyCache<'_> {
     fn return_dtype(&self, expr: &Expression) -> VortexResult<DType> {
-        // If the expression is "root", return the scope dtype
+        // If the expression is root, return the root dtype.
         if expr.is_root() {
-            return Ok(self.scope.root().clone());
-        }
-
-        if let Some(variable) = expr.as_variable() {
-            return self
-                .scope
-                .resolve(variable)
-                .map(|(dtype, _)| dtype.clone())
-                .ok_or_else(|| vortex_err!("unbound variable '{variable}'"));
+            return Ok(self.root_dtype.clone());
         }
 
         if let Some(dtype) = self.dtype_cache.borrow().get(expr) {
@@ -223,12 +212,12 @@ impl SimplifyCtx for SimplifyCache<'_> {
                     .try_collect()?;
                 scalar_fn.return_dtype(&input_dtypes)?
             }
-            Expression::Lambda(_) => {
+            Expression::Lambda(_) | Expression::Variable(_) => {
                 return Err(vortex_err!(
-                    "a lambda has no standalone return dtype; it must be bound by a higher-order function"
+                    "cannot determine the standalone dtype of {expr}"
                 ));
             }
-            Expression::Root | Expression::Variable(_) => unreachable!("handled above"),
+            Expression::Root => unreachable!("handled above"),
         };
         self.dtype_cache
             .borrow_mut()
@@ -247,12 +236,11 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::dtype::StructFields;
-    use crate::expr::Scope;
-    use crate::expr::Variable;
     use crate::expr::cast;
     use crate::expr::col;
     use crate::expr::eq;
     use crate::expr::get_item;
+    use crate::expr::lambda;
     use crate::expr::lit;
     use crate::expr::lt_eq;
     use crate::expr::or;
@@ -327,15 +315,18 @@ mod tests {
     }
 
     #[test]
-    fn optimization_resolves_variables_from_a_lexical_scope() -> VortexResult<()> {
-        let scope = Scope::new(DType::Null).with_bindings([(
-            Variable::new("value"),
-            DType::Primitive(PType::I32, Nullability::NonNullable),
-        )])?;
+    fn optimization_rejects_lexical_expressions() -> VortexResult<()> {
         let expression = eq(var("value"), lit(42_i32));
+        let error = expression
+            .optimize_recursive(&DType::Null)
+            .expect_err("variables must not be optimized outside their enclosing lambda");
+        assert!(error.to_string().contains("variable 'value'"));
 
-        let optimized = expression.optimize_recursive_scope(&scope)?;
-        assert_eq!(optimized, expression);
+        let expression = lambda(["value"], var("value"))?;
+        let error = expression.optimize_recursive(&DType::Null).expect_err(
+            "lambdas must not be optimized outside their enclosing higher-order function",
+        );
+        assert!(error.to_string().contains("lambda"));
         Ok(())
     }
 }

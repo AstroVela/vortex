@@ -541,7 +541,7 @@ mod tests {
         for expr in [root(), col("a"), eq(col("a"), lit(1_i32)), lit(true)] {
             assert_eq!(
                 expr.bind(struct_dtype())?.dtype()?,
-                &expr.return_dtype(struct_dtype())?,
+                &expr.return_dtype(&struct_dtype())?,
                 "disagreement for {expr}"
             );
         }
@@ -632,7 +632,7 @@ mod tests {
         let lambda_scope =
             scope().with_bindings([(Variable::new("value"), value_dtype.clone())])?;
 
-        assert!(lambda.return_dtype(scope()).is_err());
+        assert!(lambda.return_dtype(&struct_dtype()).is_err());
 
         let bound = lambda.bind(&lambda_scope)?;
         assert!(bound.dtype().is_err());
